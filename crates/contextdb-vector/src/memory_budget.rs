@@ -52,6 +52,281 @@ pub trait MemoryBudget: Debug + Send + Sync {
     }
 }
 
+/// An owned, already admitted charge supplied by the executing caller.
+/// Ordinary drop releases its exact retained bytes. `transfer` disarms that
+/// release only after another owner has adopted the complete reservation.
+#[doc(hidden)]
+pub trait PrepaidVectorCopyCharge: Send + Sync {
+    fn accountant(&self) -> Arc<dyn MemoryBudget>;
+    fn retained_bytes(&self) -> usize;
+    fn transfer(self: Box<Self>);
+}
+
+/// Explicit caller-owned admission for materialized vector copies.
+/// Construct this with the executing transaction or read working-set accountant.
+/// Keep it alive until every output charged to it has been destroyed; returning
+/// an output transfers that lifetime obligation to the caller, never to a store.
+#[doc(hidden)]
+pub struct VectorCopyAdmission {
+    accountant: Arc<dyn MemoryBudget>,
+    prepaid: Option<Box<dyn PrepaidVectorCopyCharge>>,
+    prepaid_bytes: usize,
+    additional_bytes: usize,
+    used_bytes: usize,
+}
+
+impl Debug for VectorCopyAdmission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VectorCopyAdmission")
+            .field("accountant", &self.accountant)
+            .field("prepaid_bytes", &self.prepaid_bytes)
+            .field("additional_bytes", &self.additional_bytes)
+            .field("used_bytes", &self.used_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+impl VectorCopyAdmission {
+    pub fn new(accountant: Arc<dyn MemoryBudget>) -> Self {
+        Self {
+            accountant,
+            prepaid: None,
+            prepaid_bytes: 0,
+            additional_bytes: 0,
+            used_bytes: 0,
+        }
+    }
+
+    /// Consume the caller's real prepaid owner without admitting it again.
+    /// A mismatched accountant refuses and drops the supplied charge normally.
+    pub fn from_prepaid<C: PrepaidVectorCopyCharge + 'static>(
+        accountant: Arc<dyn MemoryBudget>,
+        charge: C,
+    ) -> Result<Self> {
+        if !Arc::ptr_eq(&accountant, &charge.accountant()) {
+            return Err(contextdb_core::Error::Other(
+                "vector copy prepaid charge has a different accountant".into(),
+            ));
+        }
+        let prepaid_bytes = charge.retained_bytes();
+        Ok(Self {
+            accountant,
+            prepaid: Some(Box::new(charge)),
+            prepaid_bytes,
+            additional_bytes: 0,
+            used_bytes: 0,
+        })
+    }
+
+    /// Complete held reservation, including prepaid capacity not yet consumed.
+    pub fn retained_bytes(&self) -> usize {
+        self.prepaid_bytes + self.additional_bytes
+    }
+
+    /// Report one retained credit and whether its actual funder is the caller.
+    /// Both trait pointers are compared by data address, independent of vtables.
+    /// The callback receives scalar observations and cannot obtain the funder.
+    #[doc(hidden)]
+    pub fn visit_retained_copy_credit(
+        credit: &Arc<Self>,
+        caller: &dyn MemoryBudget,
+        visit: &mut dyn FnMut(usize, usize, bool),
+    ) {
+        let funded_by_caller = Arc::as_ptr(&credit.accountant) as *const ()
+            == caller as *const dyn MemoryBudget as *const ();
+        visit(
+            Arc::as_ptr(credit) as usize,
+            credit.retained_bytes(),
+            funded_by_caller,
+        );
+    }
+
+    pub fn reserve(&mut self, bytes: usize) -> Result<()> {
+        self.reserve_for(
+            bytes,
+            "vector_copy",
+            "materialize",
+            "Reduce the selected copy or raise the executing statement's memory limit.",
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn reserve_for(
+        &mut self,
+        bytes: usize,
+        component: &str,
+        operation: &str,
+        hint: &str,
+    ) -> Result<()> {
+        let used_bytes = self
+            .used_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| contextdb_core::Error::Other("vector copy admission overflow".into()))?;
+        let additional_bytes = used_bytes.saturating_sub(self.prepaid_bytes);
+        if additional_bytes > self.additional_bytes {
+            self.accountant.try_allocate_for(
+                additional_bytes - self.additional_bytes,
+                component,
+                operation,
+                hint,
+            )?;
+        }
+        self.additional_bytes = additional_bytes;
+        self.used_bytes = used_bytes;
+        Ok(())
+    }
+
+    /// Consume this token after the destination has adopted `retained_bytes()`.
+    /// No allocation or release occurs here; the destination now releases it.
+    pub fn transfer(mut self) {
+        if let Some(charge) = self.prepaid.take() {
+            charge.transfer();
+        }
+        self.prepaid_bytes = 0;
+        self.additional_bytes = 0;
+    }
+
+    pub(crate) fn accountant(&self) -> &Arc<dyn MemoryBudget> {
+        &self.accountant
+    }
+
+    /// A prepaid owner already holds its copy capacity until transfer/drop.
+    #[doc(hidden)]
+    pub fn is_prepaid(&self) -> bool {
+        self.prepaid.is_some()
+    }
+
+    /// Local copies reuse prepaid headroom; other owners get a scoped charge.
+    #[doc(hidden)]
+    pub fn local_scratch(&self) -> Option<Self> {
+        (!self.is_prepaid()).then(|| self.scratch())
+    }
+
+    /// Borrow the admission's actual funder for deterministic ownership proofs.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn accountant_for_test(&self) -> &Arc<dyn MemoryBudget> {
+        &self.accountant
+    }
+
+    /// The executing operation's actual funder. An operation-owned loader
+    /// keeps it so the residency it returns is charged to, and released by,
+    /// the same reader that admitted its load, never a store-wide parent.
+    #[doc(hidden)]
+    pub fn funder(&self) -> Arc<dyn MemoryBudget> {
+        Arc::clone(&self.accountant)
+    }
+
+    #[doc(hidden)]
+    pub fn scratch(&self) -> Self {
+        Self::new(self.accountant.clone())
+    }
+}
+
+/// A local copy and only its own charge. Field order frees the value first.
+/// Returned and retained outputs keep their existing caller-owned admissions.
+#[doc(hidden)]
+pub struct ScopedVectorCopy<T> {
+    value: T,
+    _admission: Option<VectorCopyAdmission>,
+}
+
+impl<T> ScopedVectorCopy<T> {
+    /// A native value and its per-value charge. Declaration order ensures
+    /// the complete decoded value drops before the admission is released.
+    #[doc(hidden)]
+    pub fn from_admitted(value: T, admission: Option<VectorCopyAdmission>) -> Self {
+        Self { value, _admission: admission }
+    }
+
+    /// Transform while source and output coexist under the same admitted
+    /// window; on every exit the source buffer drops before its token.
+    #[doc(hidden)]
+    pub fn try_map<U>(self, materialize: impl FnOnce(&T) -> Result<U>) -> Result<ScopedVectorCopy<U>> {
+        let value = materialize(&self.value)?;
+        drop(self.value);
+        Ok(ScopedVectorCopy { value, _admission: self._admission })
+    }
+
+    /// Only for provider paths whose allocation is already funded elsewhere.
+    #[doc(hidden)]
+    pub fn into_already_funded(self) -> Result<T> {
+        if self._admission.is_some() {
+            return Err(contextdb_core::Error::Other("admitted value cannot detach its charge".into()));
+        }
+        Ok(self.value)
+    }
+
+    #[doc(hidden)]
+    pub fn new(
+        owner: &mut VectorCopyAdmission,
+        materialize: impl FnOnce(&mut VectorCopyAdmission) -> Result<T>,
+    ) -> Result<Self> {
+        let mut admission = owner.local_scratch();
+        let value = materialize(admission.as_mut().unwrap_or(owner))?;
+        Ok(Self {
+            value,
+            _admission: admission,
+        })
+    }
+}
+
+impl<T> std::ops::Deref for ScopedVectorCopy<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.value
+    }
+}
+
+impl<T> std::ops::DerefMut for ScopedVectorCopy<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.value
+    }
+}
+
+/// Workspace-internal layout copy; public layout fields remain unchanged.
+#[doc(hidden)]
+pub fn scoped_index_layout(
+    store: &crate::VectorStore,
+    index: &contextdb_core::VectorIndexRef,
+    owner: &mut VectorCopyAdmission,
+) -> Result<ScopedVectorCopy<crate::store::VectorIndexLayout>> {
+    ScopedVectorCopy::new(owner, |scratch| store.index_layout(index, scratch))
+}
+
+impl<T> ScopedVectorCopy<Vec<T>> {
+    pub fn into_iter(self) -> ScopedVectorCopy<std::vec::IntoIter<T>> {
+        ScopedVectorCopy {
+            value: self.value.into_iter(),
+            _admission: self._admission,
+        }
+    }
+}
+
+impl<I: Iterator> Iterator for ScopedVectorCopy<I> {
+    type Item = I::Item;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.value.next()
+    }
+}
+
+impl<'a, T> IntoIterator for &'a ScopedVectorCopy<Vec<T>> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.value.iter()
+    }
+}
+
+impl Drop for VectorCopyAdmission {
+    fn drop(&mut self) {
+        if self.additional_bytes != 0 {
+            self.accountant.release(self.additional_bytes);
+        }
+        // The original prepaid token releases its own charge exactly once.
+    }
+}
+
 #[derive(Debug)]
 struct UnlimitedMemoryBudget;
 
@@ -83,6 +358,29 @@ pub struct VectorWorkspaceReservation {
 }
 
 impl VectorWorkspaceReservation {
+    pub fn accountant(&self) -> &Arc<dyn MemoryBudget> {
+        &self.accountant
+    }
+
+    /// Complete capacity held by this workspace's actual funder.
+    pub fn retained_bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// The destination has adopted this funding. End workspace residency
+    /// without returning the same funding a second time.
+    pub fn transfer(mut self) {
+        let previous = self.live_bytes.fetch_sub(self.bytes, Ordering::SeqCst);
+        debug_assert!(previous >= self.bytes);
+        self.bytes = 0;
+    }
+
+    /// Validate a materialization against this already admitted workspace.
+    /// The caller retains this reservation until all copied output is dropped.
+    pub fn require_capacity(&self, bytes: usize) -> Result<()> {
+        require_copy_capacity(self.bytes, bytes)
+    }
+
     pub(crate) fn try_new(
         accountant: Arc<dyn MemoryBudget>,
         live_bytes: Arc<AtomicUsize>,
@@ -124,11 +422,27 @@ impl VectorWorkspaceReservation {
     }
 }
 
+impl PrepaidVectorCopyCharge for VectorWorkspaceReservation {
+    fn accountant(&self) -> Arc<dyn MemoryBudget> {
+        self.accountant.clone()
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.bytes
+    }
+
+    fn transfer(self: Box<Self>) {
+        VectorWorkspaceReservation::transfer(*self);
+    }
+}
+
 impl Drop for VectorWorkspaceReservation {
     fn drop(&mut self) {
         let previous = self.live_bytes.fetch_sub(self.bytes, Ordering::SeqCst);
         debug_assert!(previous >= self.bytes);
-        self.accountant.release(self.bytes);
+        if self.bytes != 0 {
+            self.accountant.release(self.bytes);
+        }
         self.bytes = 0;
     }
 }
@@ -200,4 +514,18 @@ mod tests {
         assert_eq!(budget.0.load(Ordering::SeqCst), 0);
         assert_eq!(live.load(Ordering::SeqCst), 0);
     }
+}
+
+pub(crate) fn require_copy_capacity(capacity: usize, bytes: usize) -> Result<()> {
+    if bytes > capacity {
+        return Err(contextdb_core::Error::MemoryBudgetExceeded {
+            subsystem: "vector_copy".into(),
+            operation: "materialize_in_workspace".into(),
+            requested_bytes: bytes,
+            available_bytes: capacity,
+            budget_limit_bytes: capacity,
+            hint: "Admit the generation copy before materialization.".into(),
+        });
+    }
+    Ok(())
 }

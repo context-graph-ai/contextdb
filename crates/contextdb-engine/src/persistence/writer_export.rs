@@ -1,18 +1,43 @@
 //! Checkpoint history copies retain one admitted occurrence at the captured root.
 use super::*;
+use super::writer_source::SourceWindowOwner;
 use std::ops::Bound;
 
 impl WriterSnapshot {
+    pub(crate) fn copy_config_into(self: &Arc<Self>, owner: SourceWindowOwner, artifact: &RedbPersistence) -> Result<()> {
+        let mut cursor = self.config_cursor(owner, "")?;
+        while let Some(window) = cursor.next(|key, bytes| {
+            crate::read_image_memory::reserve(
+                bytes
+                    .len()
+                    .saturating_mul(2)
+                    .saturating_add(key.len())
+                    .saturating_add(256),
+            )?;
+            Ok(bytes.to_vec())
+        })? {
+            let key =
+                std::str::from_utf8(window.position()).map_err(|_| Error::StoreCorrupted {
+                    path: "config".into(),
+                    reason: "configuration key is not UTF-8".into(),
+                })?;
+            artifact.append_encoded_config_occurrence(key, &window.value)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn copy_ddl_into(
         self: &Arc<Self>,
+        owner: SourceWindowOwner,
         artifact: &RedbPersistence,
         through: Lsn,
     ) -> Result<()> {
-        let _keys = self.adapter_control(64)?;
+        let _keys = self.adapter_control(&owner, 64)?;
         // Include every ordinal at the watermark, preserving the physical
         // occurrence key even when a same-LSN run spans several windows.
         let upper = format!("{:020};", through.0);
         let mut cursor = self.cursor(
+            owner,
             "ddl_log",
             writer_source::WriterCursorFamily::Text,
             Bound::Unbounded,
@@ -53,7 +78,56 @@ impl WriterSnapshot {
 }
 
 impl RedbPersistence {
+    fn append_encoded_config_occurrence(&self, key: &str, encoded: &[u8]) -> Result<()> {
+        let mut admission = self.proof_admission();
+        admission.admit(
+            encoded
+                .len()
+                .saturating_mul(64)
+                .saturating_add(key.len().saturating_mul(8))
+                .saturating_add(4096),
+        )?;
+        self.with_db(|db| {
+            let write = db.begin_write().map_err(Self::storage_error)?;
+            Self::raise_config_identity_floors_in_write(&write, key, encoded)?;
+            Self::update_policy_hold_release_index(&write, key, true)?;
+            write
+                .open_table(CONFIG_TABLE)
+                .map_err(Self::storage_error)?
+                .insert(key, encoded)
+                .map_err(Self::storage_error)?;
+            let mutations = content_identity::config_mutations(key, Some(encoded));
+            Self::apply_content_identity_mutations_in_write(&write, &mutations, &mut admission)?;
+            Self::write_writer_recovery_bounds_in_write(&write, None)?;
+            write.commit().map_err(Self::storage_error)
+        })
+    }
+
     fn append_ddl_occurrence(&self, key: &str, lsn: Lsn, change: &DdlChange) -> Result<()> {
+        let mut admission = self.proof_admission();
+        struct Counter(usize);
+        impl std::io::Write for Counter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0 = self
+                    .0
+                    .checked_add(bytes.len())
+                    .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?;
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut length = Counter(0);
+        bincode::serde::encode_into_std_write(change, &mut length, bincode::config::standard())
+            .map_err(|error| Error::Other(format!("declaration encoding failed: {error}")))?;
+        admission.admit(
+            length
+                .0
+                .saturating_mul(64)
+                .saturating_add(key.len().saturating_mul(8))
+                .saturating_add(4096),
+        )?;
         self.with_db(|db| {
             let write = db.begin_write().map_err(Self::storage_error)?;
             let encoded = Self::encode(change)?;
@@ -62,12 +136,9 @@ impl RedbPersistence {
                 .map_err(Self::storage_error)?
                 .insert(key, encoded.as_slice())
                 .map_err(Self::storage_error)?;
+            Self::append_ddl_summary_in_write(&write, key, change)?;
             let mutation = content_identity::encoded_history_mutation(key, change)?;
-            Self::apply_content_identity_mutations_in_write(
-                &write,
-                &[mutation],
-                &mut self.proof_admission(),
-            )?;
+            Self::apply_content_identity_mutations_in_write(&write, &[mutation], &mut admission)?;
             Self::raise_noncanonical_writer_floors_in_write(&write, TxId(0), lsn, RowId(0))?;
             Self::write_writer_recovery_bounds_in_write(&write, None)?;
             write.commit().map_err(Self::storage_error)

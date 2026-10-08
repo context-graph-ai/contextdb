@@ -2548,7 +2548,13 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
         );
         let level = new_point.p_id.0;
         for l in (0..level + 1).rev() {
-            for q in &new_point.neighbours.read()[l as usize] {
+            // Never hold one point's adjacency guard while acquiring another
+            // point's write guard: simultaneous mutual links otherwise cycle.
+            let neighbours = {
+                let guard = new_point.neighbours.read();
+                guard[l as usize].clone()
+            };
+            for q in &neighbours {
                 if new_point.p_id != q.point_ref.p_id {
                     // as new point is in global table, do not loop and deadlock!!
                     let q_point = &q.point_ref;
@@ -2608,6 +2614,25 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
         }
         //   println!("     exitingreverse update neighbourhood for  new point {:?} ", new_point.p_id);
     } // end of reverse_update_neighborhood
+
+    /// Conservative live allocation bound for one insertion with candidate
+    /// extension disabled. Includes hash-table rehash, heap reallocation and
+    /// conversion, reciprocal-copy and pruning buffers. No vector bodies are
+    /// copied into search scratch. Overflow refuses before worker creation.
+    pub fn insertion_scratch_bound(points: usize, ef: usize, m: usize) -> Option<usize> {
+        let n = points.max(ef).max(4).checked_add(1)?;
+        let buckets = n.checked_mul(8)?.div_ceil(7).checked_next_power_of_two()?;
+        let map_slot = std::mem::size_of::<(PointId, Arc<Point<'b, T>>)>() + 1;
+        let heap_slot = std::mem::size_of::<PointWithOrder<'b, T>>();
+        // At most N distinct visited nodes, one pending candidate per node,
+        // ef return/discarded nodes and conversion heaps. Eight full-capacity
+        // heap buffers dominate their simultaneous old/new growth buffers.
+        let heaps = n.checked_next_power_of_two()?.checked_mul(8)?.checked_mul(heap_slot)?;
+        let maps = buckets.checked_mul(map_slot)?.checked_mul(2)?.checked_add(32)?;
+        // Copy one reciprocal list and prune it while its old list stays live.
+        let links = m.checked_mul(2)?.checked_add(1)?.checked_mul(8)?.checked_mul(heap_slot)?;
+        maps.checked_add(heaps)?.checked_add(links)?.checked_add(4096)
+    }
 
     pub fn get_point_indexation(&self) -> &PointIndexation<'b, T> {
         &self.layer_indexed_points

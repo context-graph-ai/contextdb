@@ -198,7 +198,11 @@ async fn main() {
         db.clone(),
         &endpoint,
         contextdb_core::TenantId::from(&args.tenant),
-    );
+    )
+    .unwrap_or_else(|err| {
+        eprintln!("cannot construct sync client: {err}");
+        std::process::exit(EXIT_ERROR);
+    });
 
     match args.command {
         Command::Submit {

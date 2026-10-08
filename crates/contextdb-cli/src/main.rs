@@ -413,9 +413,16 @@ fn main() {
             canonical_help_signatures().contains(&operation.spelling()),
             "every operational spelling is part of the one discovery surface"
         );
-        let exit_code =
-            contextdb_cli::ops::run_operational(operation.spelling(), operation.arguments())
-                .expect("the command tree only resolves spellings the operations answer to");
+        let read_parent = contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+            args.read_configuration().limits.memory,
+        );
+        let exit_code = contextdb_cli::ops::run_operational(
+            operation.spelling(),
+            operation.arguments(),
+            || read_parent.child().map(|operation| (operation, read_parent.clone())),
+        )
+        .expect("the command tree only resolves spellings the operations answer to");
+        drop(read_parent);
         std::process::exit(exit_code);
     }
 
@@ -472,6 +479,10 @@ fn main() {
             refuse_invocation(args.json, &format!("invalid --disk-limit: {err}"));
         });
 
+    let read_memory = contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+        read.limits.memory,
+    );
+
     if !writes_permitted {
         // A reading session opens no database at all. There is no handle here
         // that could create the store, change a byte of it, or start an owner
@@ -512,7 +523,7 @@ fn main() {
             }
         };
         let exit_code = run(
-            &Session::reading(reader, std::path::PathBuf::from(&path)),
+            &Session::reading(reader, std::path::PathBuf::from(&path), read_memory.clone()),
             None,
             None,
             None,
@@ -625,11 +636,25 @@ fn main() {
         let endpoint = sync_endpoint
             .clone()
             .expect("an endpoint is resolved whenever --tenant-id is present");
-        let client = Arc::new(contextdb_server::SyncClient::new(
-            db.clone(),
-            &endpoint,
-            contextdb_core::TenantId::from(tenant_id.as_str()),
-        ));
+        let constructed = read_memory.child().and_then(|request_memory| {
+            contextdb_server::SyncClient::new_with_read_memory(
+                db.clone(),
+                &endpoint,
+                contextdb_core::TenantId::from(tenant_id.as_str()),
+                request_memory,
+            )
+        });
+        let client = Arc::new(match constructed {
+            Ok(client) => client,
+            Err(contextdb_core::Error::ReadFailure(failure)) => {
+                output.report_read_failure(&failure, None);
+                std::process::exit(EXIT_ERROR);
+            }
+            Err(error) => {
+                output.report_error(ErrorClass::of(&error), &error.to_string());
+                std::process::exit(EXIT_ERROR);
+            }
+        });
         (rt, client)
     });
 
@@ -662,6 +687,7 @@ fn main() {
     // Spawn background debounced push task if sync is configured.
     let push_handle = if let (Some(rt_ref), Some(client), Some(rx)) = (rt, sync_client, push_rx) {
         let client_clone = Arc::clone(client);
+        let push_read_memory = read_memory.clone();
         let plugin_clone = sync_plugin_arc.clone().expect("sync plugin configured");
         let config = auto_sync::AutoSyncConfig {
             debounce: Duration::from_millis(args.sync_debounce_ms),
@@ -672,9 +698,10 @@ fn main() {
             config,
             move || {
                 let client = client_clone.clone();
+                let read_memory = push_read_memory.clone();
                 let plugin = plugin_clone.clone();
                 async move {
-                    let result = match client.push().await {
+                    let result = match async { client.push_with_read_memory(read_memory.child()?).await }.await {
                         Ok(result) => result,
                         Err(contextdb_core::Error::SyncPushUnconfirmed { detail }) => {
                             // Interrupted after the batch was sent: the data may
@@ -744,7 +771,7 @@ fn main() {
     // push never downgrades a 1.
     // A writing session still reads through a bounded view over its own live
     // database, so a writer's SELECTs are bounded exactly like anyone else's.
-    let session = match Session::writing(db.clone(), read.limits) {
+    let session = match Session::writing(db.clone(), read.limits, read_memory.clone()) {
         Ok(session) => session,
         Err(error) => {
             output.report_error(
@@ -772,7 +799,10 @@ fn main() {
     // Graceful shutdown: stop background notifications, wait for any in-flight
     // auto-sync work to finish, then do one final flush before closing the DB.
     if let Some((rt, client)) = rt_and_client {
-        if let Err(err) = db.execute("ROLLBACK", &std::collections::HashMap::new()) {
+        if let Err(err) = read_memory
+            .child()
+            .and_then(|root| db.execute_with_read_memory("ROLLBACK", &std::collections::HashMap::new(), root))
+        {
             output.report_error(
                 ErrorClass::of(&err),
                 &format!("Final transaction rollback failed: {err}"),
@@ -793,8 +823,14 @@ fn main() {
             );
             exit_code = EXIT_ERROR;
         }
-        match client.has_pending_push_changes() {
-            Ok(true) => match rt.block_on(client.push()) {
+        match read_memory
+            .child()
+            .and_then(|root| client.has_pending_push_changes_with_read_memory(root))
+        {
+            Ok(true) => match read_memory
+                .child()
+                .and_then(|root| rt.block_on(client.push_with_read_memory(root)))
+            {
                 Ok(_) => {}
                 Err(contextdb_core::Error::SyncPushUnconfirmed { detail }) => {
                     // Interrupted after send: the data may already have landed.

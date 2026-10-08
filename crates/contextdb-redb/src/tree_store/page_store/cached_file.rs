@@ -1,5 +1,6 @@
 use crate::tree_store::page_store::base::PageHint;
-use crate::tree_store::page_store::lru_cache::LRUCache;
+use crate::tree_store::page_store::header::DB_HEADER_SIZE;
+use crate::tree_store::page_store::lru_cache::{EntryArena, LRUCache, WriteCache};
 use crate::{CacheStats, DatabaseError, Result, StorageBackend, StorageError};
 use std::ops::{Index, IndexMut};
 use std::slice::SliceIndex;
@@ -38,14 +39,16 @@ pub(crate) enum PageMemory {
 pub(crate) struct CachedPage {
     bytes: Arc<[u8]>,
     counted: Arc<AtomicUsize>,
+    byte_node_checksum: Mutex<Option<u128>>,
 }
 
 impl CachedPage {
-    /// `counted` must already include this page's length.
+    /// `counted` must already include payload and immutable owner controls.
     fn admitted(bytes: Arc<[u8]>, counted: &Arc<AtomicUsize>) -> Arc<Self> {
         Arc::new(Self {
             bytes,
             counted: Arc::clone(counted),
+            byte_node_checksum: Mutex::new(None),
         })
     }
 
@@ -56,13 +59,110 @@ impl CachedPage {
 
 impl Drop for CachedPage {
     fn drop(&mut self) {
-        self.counted.fetch_sub(self.bytes.len(), Ordering::AcqRel);
+        self.counted
+            .fetch_sub(cached_page_bytes(self.bytes.len()), Ordering::AcqRel);
     }
 }
 
 pub(crate) struct ChargedPage {
     bytes: Arc<[u8]>,
     _charge: crate::read_admission::ReadPageCharge,
+    byte_node_checksum: Mutex<Option<u128>>,
+}
+
+// Arc's two reference counters precede its aligned inline value. The byte
+// allocation has the same two counters; the slot itself allocates no heap.
+const fn arc_control_bytes<T>() -> usize {
+    let header = 2 * size_of::<usize>();
+    let alignment = align_of::<T>();
+    header.next_multiple_of(alignment) + size_of::<T>()
+}
+
+const fn cached_page_bytes(len: usize) -> usize {
+    len.saturating_add(2 * size_of::<usize>())
+        .saturating_add(arc_control_bytes::<CachedPage>())
+}
+
+const fn admitted_page_bytes(len: usize) -> usize {
+    // Preserve the pre-existing directory/window allowance independently of
+    // the actual immutable wrapper and Arc controls; it never funds the memo.
+    let controls = if arc_control_bytes::<CachedPage>() > arc_control_bytes::<ChargedPage>() {
+        arc_control_bytes::<CachedPage>()
+    } else {
+        arc_control_bytes::<ChargedPage>()
+    };
+    len.saturating_add(128)
+        .saturating_add(2 * size_of::<usize>())
+        .saturating_add(controls)
+}
+
+#[cfg(test)]
+thread_local! {
+    // Computations for Cached/Charged/Plain, followed by Cached/Charged hits.
+    static BYTE_CHECKSUM_COUNTS: std::cell::Cell<[usize; 5]> = const { std::cell::Cell::new([0; 5]) };
+}
+
+impl PageMemory {
+    #[cfg(test)]
+    pub(crate) fn admitted_bytes_for_test(len: usize) -> usize {
+        admitted_page_bytes(len)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn byte_checksum_counts_for_test() -> [usize; 5] {
+        BYTE_CHECKSUM_COUNTS.with(std::cell::Cell::get)
+    }
+
+    /// Cache only the computation for variable-width byte nodes. The caller
+    /// must validate their layout first and compare its expected checksum on
+    /// every visit. This slot grants no authentication or root authority.
+    pub(crate) fn memoized_byte_node_checksum(
+        &self,
+        compute: impl FnOnce() -> Result<u128>,
+    ) -> Result<u128> {
+        let slot = match self {
+            Self::Cached(page) => &page.byte_node_checksum,
+            Self::Charged(page) => &page.byte_node_checksum,
+            Self::Plain(_) => {
+                #[cfg(test)]
+                BYTE_CHECKSUM_COUNTS.with(|counts| {
+                    let mut value = counts.get();
+                    value[2] += 1;
+                    counts.set(value);
+                });
+                return compute();
+            }
+        };
+        // Only immutable bytes are read by compute; no cache, admission, or
+        // page-manager callback runs under this object-local mutex.
+        let mut stored = slot.lock().unwrap();
+        if let Some(checksum) = *stored {
+            #[cfg(test)]
+            BYTE_CHECKSUM_COUNTS.with(|counts| {
+                let mut value = counts.get();
+                value[if matches!(self, Self::Cached(_)) {
+                    3
+                } else {
+                    4
+                }] += 1;
+                counts.set(value);
+            });
+            return Ok(checksum);
+        }
+        #[cfg(test)]
+        BYTE_CHECKSUM_COUNTS.with(|counts| {
+            let mut value = counts.get();
+            value[if matches!(self, Self::Cached(_)) {
+                0
+            } else {
+                1
+            }] += 1;
+            counts.set(value);
+        });
+        let checksum = compute()?;
+        *stored = Some(checksum);
+        Ok(checksum)
+    }
 }
 
 impl std::fmt::Debug for PageMemory {
@@ -129,7 +229,7 @@ impl<I: SliceIndex<[u8]>> IndexMut<I> for WritablePage {
 
 #[derive(Default)]
 struct LRUWriteCache {
-    cache: LRUCache<Option<Arc<[u8]>>>,
+    cache: WriteCache<Option<Arc<[u8]>>>,
 }
 
 impl LRUWriteCache {
@@ -318,7 +418,7 @@ pub(super) struct PagedCachedFile {
     writes_hits: AtomicU64,
     #[cfg(feature = "cache_metrics")]
     evictions: AtomicU64,
-    read_cache: Vec<RwLock<LRUCache<Arc<CachedPage>>>>,
+    read_cache: Box<[RwLock<LRUCache<Arc<CachedPage>>>]>,
     // TODO: maybe move this cache to WriteTransaction?
     write_buffer: Arc<Mutex<LRUWriteCache>>,
 }
@@ -329,9 +429,7 @@ impl PagedCachedFile {
         page_size: u64,
         max_cache_size: usize,
     ) -> Result<Self, DatabaseError> {
-        let read_cache = (0..Self::lock_stripes())
-            .map(|_| RwLock::new(LRUCache::new()))
-            .collect();
+        let read_cache = Self::new_read_index(max_cache_size, page_size as usize, 0);
 
         Ok(Self {
             file: CheckedBackend::new(file),
@@ -353,6 +451,51 @@ impl PagedCachedFile {
             read_cache,
             write_buffer: Arc::new(Mutex::new(LRUWriteCache::new())),
         })
+    }
+
+    fn read_index_entries(bytes: usize, page_size: usize, held_entries: usize) -> usize {
+        // Only the database header can be smaller than a full page, and its
+        // offset-zero key occupies at most one slot across all stripes.
+        (bytes / cached_page_bytes(page_size))
+            .saturating_add(1)
+            .max(held_entries)
+    }
+
+    fn new_read_index(
+        bytes: usize,
+        page_size: usize,
+        held_entries: usize,
+    ) -> Box<[RwLock<LRUCache<Arc<CachedPage>>>]> {
+        let entries = Self::read_index_entries(bytes, page_size, held_entries);
+        let arena = EntryArena::new(entries);
+        let heads = entries
+            .div_ceil(Self::lock_stripes() as usize)
+            .next_power_of_two();
+        (0..Self::lock_stripes())
+            .map(|_| RwLock::new(LRUCache::new(arena.clone(), heads)))
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+    }
+
+    fn uncached(
+        buffer: Arc<[u8]>,
+        charge: Option<crate::read_admission::ReadPageCharge>,
+    ) -> PageMemory {
+        match charge {
+            Some(charge) => PageMemory::Charged(Arc::new(ChargedPage {
+                bytes: buffer,
+                _charge: charge,
+                byte_node_checksum: Mutex::new(None),
+            })),
+            None => PageMemory::Plain(buffer),
+        }
+    }
+
+    pub(crate) fn index_bytes(&self) -> usize {
+        let read = self.read_cache[0].read().unwrap();
+        read.arena_index_bytes()
+            + read.index_bytes() * self.read_cache.len()
+            + self.read_cache.len() * size_of::<RwLock<LRUCache<Arc<CachedPage>>>>()
     }
 
     #[allow(clippy::unused_self)]
@@ -395,15 +538,33 @@ impl PagedCachedFile {
     pub(crate) fn settle_startup_cache_budget(&self, bytes: usize) -> Result<usize> {
         if self.max_cache_size.load(Ordering::Acquire) != bytes {
             self.flush_write_buffer()?;
-            let lock = self.write_buffer.lock().unwrap();
-            self.max_cache_size.store(bytes, Ordering::Release);
-            let retained = self.read_cache_bytes.load(Ordering::Acquire);
-            self.evict_from_read_cache(retained.saturating_sub(bytes), &lock);
         }
+        let write = self.write_buffer.lock().unwrap();
+        self.max_cache_size.store(bytes, Ordering::Release);
+        let retained = self.read_cache_bytes.load(Ordering::Acquire);
+        self.evict_from_read_cache(retained.saturating_sub(bytes), &write);
+        let mut locks = self
+            .read_cache
+            .iter()
+            .map(|stripe| stripe.write().unwrap())
+            .collect::<Vec<_>>();
+        let held_entries = locks.iter().map(|stripe| stripe.len()).sum();
+        let required_entries =
+            Self::read_index_entries(bytes, self.page_size as usize, held_entries);
+        if locks[0].arena_capacity() != required_entries {
+            let next = Self::new_read_index(bytes, self.page_size as usize, held_entries);
+            for (old, replacement) in locks.iter_mut().zip(next.iter()) {
+                let mut replacement = replacement.write().unwrap();
+                old.transfer_to(&mut replacement);
+                std::mem::swap(&mut **old, &mut *replacement);
+            }
+        }
+        drop(locks);
+        drop(write);
         Ok(bytes.max(
             self.read_cache_bytes.load(Ordering::Acquire)
                 + self.write_buffer_bytes.load(Ordering::Acquire),
-        ))
+        ) + self.index_bytes())
     }
 
     pub(crate) fn close(&self) -> Result {
@@ -442,16 +603,17 @@ impl PagedCachedFile {
             let stripe = (start + i) % num_stripes;
             let mut lock = self.read_cache[stripe].write().unwrap();
             while freed < bytes_needed {
-                if let Some((_, v)) = lock.pop_lowest_priority() {
+                if let Some((_, v)) =
+                    lock.pop_lowest_priority_where(|page| Arc::strong_count(page) == 1)
+                {
                     #[cfg(feature = "cache_metrics")]
                     {
                         self.evictions.fetch_add(1, Ordering::Relaxed);
                     }
-                    // A page a reader still holds is not freed by leaving the
-                    // cache; it stays counted until that reader drops it.
-                    if Arc::strong_count(&v) == 1 {
-                        freed += v.len();
-                    }
+                    // The stripe write lock prevents a new cache holder from
+                    // appearing after victim selection. Pinned entries stay
+                    // linked, so their later release cannot leave a cache hole.
+                    freed += cached_page_bytes(v.len());
                 } else {
                     break;
                 }
@@ -470,22 +632,27 @@ impl PagedCachedFile {
         // drained, so the total check only considers the read cache size.
         for (offset, buffer) in write_buffer.cache.iter_mut() {
             let buffer = buffer.take().unwrap();
+            let page_bytes = cached_page_bytes(buffer.len());
             let cache_size = self
                 .read_cache_bytes
-                .fetch_add(buffer.len(), Ordering::AcqRel);
+                .fetch_add(page_bytes, Ordering::AcqRel);
 
-            if cache_size + buffer.len() <= self.max_cache_size.load(Ordering::Acquire) {
+            if cache_size + page_bytes <= self.max_cache_size.load(Ordering::Acquire) {
                 let cache_slot: usize = (offset % Self::lock_stripes()).try_into().unwrap();
                 let mut lock = self.read_cache[cache_slot].write().unwrap();
                 // A race could replace an existing buffer; dropping it gives
                 // back its count once no reader holds it.
-                drop(lock.insert(
+                debug_assert!(
+                    buffer.len() >= self.page_size as usize
+                        || (*offset == 0 && buffer.len() == DB_HEADER_SIZE)
+                );
+                drop(lock.try_insert(
                     *offset,
                     CachedPage::admitted(buffer, &self.read_cache_bytes),
                 ));
             } else {
                 self.read_cache_bytes
-                    .fetch_sub(buffer.len(), Ordering::AcqRel);
+                    .fetch_sub(page_bytes, Ordering::AcqRel);
                 break;
             }
         }
@@ -511,8 +678,8 @@ impl PagedCachedFile {
             loop {
                 let stale = lock
                     .iter()
-                    .find(|(offset, page)| **offset + page.len() as u64 > len)
-                    .map(|(offset, _)| *offset);
+                    .find(|(offset, page)| *offset + page.len() as u64 > len)
+                    .map(|(offset, _)| offset);
                 let Some(offset) = stale else {
                     break;
                 };
@@ -551,7 +718,7 @@ impl PagedCachedFile {
     ) -> Result<(Arc<[u8]>, Option<crate::read_admission::ReadPageCharge>)> {
         // The page and its cache entry must be admitted before allocation,
         // including a single value larger than the configured cache.
-        let charge = crate::read_admission::admit_read_memory(len.saturating_add(128))?;
+        let charge = crate::read_admission::admit_read_memory(admitted_page_bytes(len))?;
         let mut arc = zero_filled_arc(len);
         self.file.read(offset, Arc::get_mut(&mut arc).unwrap())?;
         Ok((arc, charge))
@@ -586,8 +753,9 @@ impl PagedCachedFile {
         }
 
         let (buffer, charge) = self.read_direct_into_arc(offset, len)?;
+        let page_bytes = cached_page_bytes(len);
         if crate::read_admission::scan_reads_active()
-            && !crate::read_admission::take_scan_growth(len)
+            && !crate::read_admission::take_scan_growth(page_bytes)
         {
             // Past its growth allowance a scan's miss replaces evictable
             // cached bytes and never grows the cache. When nothing evictable
@@ -596,35 +764,49 @@ impl PagedCachedFile {
             let before = self.read_cache_bytes.load(Ordering::Acquire);
             {
                 let lock = self.write_buffer.lock().unwrap();
-                self.evict_from_read_cache(len, &lock);
+                self.evict_from_read_cache(page_bytes, &lock);
             }
             let after = self.read_cache_bytes.load(Ordering::Acquire);
-            if before.saturating_sub(after) < len {
+            if before.saturating_sub(after) < page_bytes {
                 return Ok(match charge {
                     Some(charge) => PageMemory::Charged(Arc::new(ChargedPage {
                         bytes: buffer,
                         _charge: charge,
+                        byte_node_checksum: Mutex::new(None),
                     })),
                     None => PageMemory::Plain(buffer),
                 });
             }
             // Installed at lowest priority: the scan's next miss replaces it
             // unless it is read again, leaving the warm working set in place.
-            let previous = self.read_cache_bytes.fetch_add(len, Ordering::AcqRel);
+            let previous = self
+                .read_cache_bytes
+                .fetch_add(page_bytes, Ordering::AcqRel);
             let write_bytes = self.write_buffer_bytes.load(Ordering::Acquire);
-            if previous + len + write_bytes <= self.max_cache_size.load(Ordering::Acquire) {
-                let page = CachedPage::admitted(buffer, &self.read_cache_bytes);
+            if previous + page_bytes + write_bytes <= self.max_cache_size.load(Ordering::Acquire) {
+                debug_assert!(
+                    len >= self.page_size as usize || (offset == 0 && len == DB_HEADER_SIZE)
+                );
+                let page = CachedPage::admitted(buffer.clone(), &self.read_cache_bytes);
                 let mut write_lock = self.read_cache[cache_slot].write().unwrap();
-                drop(write_lock.insert_lowest_priority(offset, page.clone()));
+                let inserted = write_lock
+                    .try_insert_lowest_priority(offset, page.clone())
+                    .is_ok();
                 drop(write_lock);
-                drop(charge);
-                return Ok(PageMemory::Cached(page));
+                if inserted {
+                    drop(charge);
+                    return Ok(PageMemory::Cached(page));
+                }
+                drop(page);
+                return Ok(Self::uncached(buffer, charge));
             }
-            self.read_cache_bytes.fetch_sub(len, Ordering::AcqRel);
+            self.read_cache_bytes
+                .fetch_sub(page_bytes, Ordering::AcqRel);
             return Ok(match charge {
                 Some(charge) => PageMemory::Charged(Arc::new(ChargedPage {
                     bytes: buffer,
                     _charge: charge,
+                    byte_node_checksum: Mutex::new(None),
                 })),
                 None => PageMemory::Plain(buffer),
             });
@@ -635,35 +817,45 @@ impl PagedCachedFile {
         // stays counted until it is dropped.
         let write_bytes = self.write_buffer_bytes.load(Ordering::Acquire);
         let cache_size = self.read_cache_bytes.load(Ordering::Acquire);
-        if cache_size + len + write_bytes > self.max_cache_size.load(Ordering::Acquire) {
+        if cache_size + page_bytes + write_bytes > self.max_cache_size.load(Ordering::Acquire) {
             let lock = self.write_buffer.lock().unwrap();
             self.evict_from_read_cache(
-                cache_size + len + write_bytes - self.max_cache_size.load(Ordering::Acquire),
+                cache_size + page_bytes + write_bytes - self.max_cache_size.load(Ordering::Acquire),
                 &lock,
             );
         }
 
         // Admit the page to the cache only if its count still fits the
         // budget, so every page the cache's count covers stays inside it.
-        let previous = self.read_cache_bytes.fetch_add(len, Ordering::AcqRel);
+        let previous = self
+            .read_cache_bytes
+            .fetch_add(page_bytes, Ordering::AcqRel);
         let write_bytes = self.write_buffer_bytes.load(Ordering::Acquire);
-        if previous + len + write_bytes <= self.max_cache_size.load(Ordering::Acquire) {
-            let page = CachedPage::admitted(buffer, &self.read_cache_bytes);
+        if previous + page_bytes + write_bytes <= self.max_cache_size.load(Ordering::Acquire) {
+            debug_assert!(
+                len >= self.page_size as usize || (offset == 0 && len == DB_HEADER_SIZE)
+            );
+            let page = CachedPage::admitted(buffer.clone(), &self.read_cache_bytes);
             let mut write_lock = self.read_cache[cache_slot].write().unwrap();
             // A race could replace an existing buffer; dropping it gives back
             // its count once no reader holds it.
-            drop(write_lock.insert(offset, page.clone()));
+            let inserted = write_lock.try_insert(offset, page.clone()).is_ok();
             drop(write_lock);
-            // The cache's budget pays for the page from here on, so any
-            // reader charge is given back at once.
-            drop(charge);
-            return Ok(PageMemory::Cached(page));
+            if inserted {
+                // The native reserve owns a page only after index insertion.
+                drop(charge);
+                return Ok(PageMemory::Cached(page));
+            }
+            drop(page);
+            return Ok(Self::uncached(buffer, charge));
         }
-        self.read_cache_bytes.fetch_sub(len, Ordering::AcqRel);
+        self.read_cache_bytes
+            .fetch_sub(page_bytes, Ordering::AcqRel);
         Ok(match charge {
             Some(charge) => PageMemory::Charged(Arc::new(ChargedPage {
                 bytes: buffer,
                 _charge: charge,
+                byte_node_checksum: Mutex::new(None),
             })),
             None => PageMemory::Plain(buffer),
         })
@@ -683,7 +875,7 @@ impl PagedCachedFile {
                 "page window exceeds allocation".into(),
             ));
         }
-        let charge = crate::read_admission::admit_read_memory(range.len().saturating_add(128))?;
+        let charge = crate::read_admission::admit_read_memory(admitted_page_bytes(range.len()))?;
         let mut bytes = zero_filled_arc(range.len());
         let output = Arc::get_mut(&mut bytes).unwrap();
         let mut copied = false;
@@ -709,6 +901,7 @@ impl PagedCachedFile {
             Some(charge) => PageMemory::Charged(Arc::new(ChargedPage {
                 bytes,
                 _charge: charge,
+                byte_node_checksum: Mutex::new(None),
             })),
             None => PageMemory::Plain(bytes),
         })
@@ -915,7 +1108,10 @@ mod test {
         cached_file.invalidate_cache(384, 128);
         assert_eq!(cached_file.read_cache_bytes.load(Ordering::Acquire), 0);
         cached_file.read(128, 128, PageHint::None).unwrap();
-        assert_eq!(cached_file.read_cache_bytes.load(Ordering::Acquire), 128);
+        assert_eq!(
+            cached_file.read_cache_bytes.load(Ordering::Acquire),
+            super::cached_page_bytes(128)
+        );
         // A hit is served from the cache.
         let hit = crate::read_admission::with_scan_reads(|| {
             cached_file.read(128, 128, PageHint::None).unwrap()
@@ -931,7 +1127,10 @@ mod test {
             cached_file.read(256, 128, PageHint::None).unwrap()
         });
         assert!(matches!(replaced, super::PageMemory::Cached(_)));
-        assert_eq!(cached_file.read_cache_bytes.load(Ordering::Acquire), 128);
+        assert_eq!(
+            cached_file.read_cache_bytes.load(Ordering::Acquire),
+            super::cached_page_bytes(128)
+        );
     }
 
     #[test]
@@ -964,5 +1163,160 @@ mod test {
         t2.join().unwrap();
         cached_file.invalidate_cache(0, 128);
         assert_eq!(cached_file.read_cache_bytes.load(Ordering::Acquire), 0);
+    }
+    #[test]
+    fn immutable_byte_checksum_owners_are_charged_and_release_at_final_holder() {
+        struct Charge(Arc<std::sync::atomic::AtomicUsize>, usize);
+        impl Drop for Charge {
+            fn drop(&mut self) {
+                self.0.fetch_sub(self.1, Ordering::SeqCst);
+            }
+        }
+        let backend = InMemoryBackend::new();
+        backend.set_len(1024).unwrap();
+        let bytes = super::cached_page_bytes(128);
+        let file = PagedCachedFile::new(Box::new(backend), 128, bytes).unwrap();
+        let page = file.read(0, 128, PageHint::Clean).unwrap();
+        assert!(matches!(page, super::PageMemory::Cached(_)));
+        assert_eq!(file.read_cache_bytes.load(Ordering::SeqCst), bytes);
+        let clone = page.clone();
+        file.invalidate_cache(0, 128);
+        assert_eq!(file.read_cache_bytes.load(Ordering::SeqCst), bytes);
+        let charged_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let charged = charged_bytes.clone();
+        let held = crate::with_read_page_charge(
+            Arc::new(move |size| {
+                assert_eq!(size, super::admitted_page_bytes(128));
+                charged.fetch_add(size, Ordering::SeqCst);
+                Ok(Box::new(Charge(charged.clone(), size)))
+            }),
+            || file.read(128, 128, PageHint::Clean).unwrap(),
+        );
+        assert!(matches!(held, super::PageMemory::Charged(_)));
+        let held_clone = held.clone();
+        drop(held);
+        assert_eq!(
+            charged_bytes.load(Ordering::SeqCst),
+            super::admitted_page_bytes(128)
+        );
+        drop(held_clone);
+        assert_eq!(charged_bytes.load(Ordering::SeqCst), 0);
+        drop(page);
+        assert_eq!(file.read_cache_bytes.load(Ordering::SeqCst), bytes);
+        drop(clone);
+        assert_eq!(file.read_cache_bytes.load(Ordering::SeqCst), 0);
+        let replacement = file.read(0, 128, PageHint::Clean).unwrap();
+        assert!(matches!(replacement, super::PageMemory::Cached(_)));
+        #[cfg(feature = "cache_metrics")]
+        assert_eq!(file.cache_stats().used_bytes, bytes);
+        eprintln!(
+            "owner controls: CachedPage={} ChargedPage={} slot={} cached128={} admission128={}",
+            size_of::<super::CachedPage>(),
+            size_of::<super::ChargedPage>(),
+            size_of::<std::sync::Mutex<Option<u128>>>(),
+            bytes,
+            super::admitted_page_bytes(128)
+        );
+    }
+
+    #[test]
+    fn immutable_byte_checksum_memo_lifecycle_and_plain_exclusion() {
+        let backend = InMemoryBackend::new();
+        backend.set_len(1024).unwrap();
+        let file = PagedCachedFile::new(Box::new(backend), 128, 1024).unwrap();
+        let before = super::PageMemory::byte_checksum_counts_for_test();
+        let cached = file.read(0, 128, PageHint::Clean).unwrap();
+        assert!(
+            cached
+                .memoized_byte_node_checksum(|| Err(crate::StorageError::Corrupted(
+                    "failed layout".into()
+                )))
+                .is_err()
+        );
+        assert_eq!(cached.memoized_byte_node_checksum(|| Ok(41)).unwrap(), 41);
+        assert_eq!(
+            cached
+                .clone()
+                .memoized_byte_node_checksum(|| panic!("cached computation repeated"))
+                .unwrap(),
+            41
+        );
+        file.invalidate_cache(0, 128);
+        // Reusing the offset constructs a fresh object, while the old holder
+        // retains its bytes, memo, and original native charge.
+        let new = file.read(0, 128, PageHint::Clean).unwrap();
+        assert_eq!(new.memoized_byte_node_checksum(|| Ok(42)).unwrap(), 42);
+        assert_eq!(
+            cached
+                .memoized_byte_node_checksum(|| panic!("old owner lost its memo"))
+                .unwrap(),
+            41
+        );
+        let charged = crate::with_read_page_charge(Arc::new(|_| Ok(Box::new(()))), || {
+            let backend = InMemoryBackend::new();
+            backend.set_len(128).unwrap();
+            PagedCachedFile::new(Box::new(backend), 128, 0)
+                .unwrap()
+                .read(0, 128, PageHint::Clean)
+                .unwrap()
+        });
+        assert!(matches!(charged, super::PageMemory::Charged(_)));
+        assert_eq!(charged.memoized_byte_node_checksum(|| Ok(43)).unwrap(), 43);
+        assert_eq!(
+            charged
+                .clone()
+                .memoized_byte_node_checksum(|| panic!("charged computation repeated"))
+                .unwrap(),
+            43
+        );
+        let synchronized = file.read(384, 128, PageHint::Clean).unwrap();
+        let starts = Arc::new(std::sync::Barrier::new(8));
+        let computations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let page = synchronized.clone();
+                let starts = starts.clone();
+                let computations = computations.clone();
+                scope.spawn(move || {
+                    starts.wait();
+                    assert_eq!(
+                        page.memoized_byte_node_checksum(|| {
+                            computations.fetch_add(1, Ordering::SeqCst);
+                            Ok(47)
+                        })
+                        .unwrap(),
+                        47
+                    );
+                });
+            }
+        });
+        assert_eq!(computations.load(Ordering::SeqCst), 1);
+        let plain = super::PageMemory::Plain(super::zero_filled_arc(128));
+        assert_eq!(plain.memoized_byte_node_checksum(|| Ok(44)).unwrap(), 44);
+        assert_eq!(plain.memoized_byte_node_checksum(|| Ok(45)).unwrap(), 45);
+        let after = super::PageMemory::byte_checksum_counts_for_test();
+        assert_eq!(
+            std::array::from_fn::<_, 5, _>(|i| after[i] - before[i]),
+            [3, 1, 2, 2, 1]
+        );
+        eprintln!(
+            "memo lifecycle deltas Cached/Charged/Plain computations, Cached/Charged hits: [3,1,2,2,1]"
+        );
+        // Flushed mutable bytes become a new immutable wrapper, empty memo.
+        drop(new);
+        drop(cached);
+        let mut writable = file.write(256, 128, true).unwrap();
+        writable.mem_mut()[0] = 9;
+        drop(writable);
+        let plain = file.read(256, 128, PageHint::None).unwrap();
+        assert!(matches!(plain, super::PageMemory::Plain(_)));
+        drop(plain);
+        file.write_barrier().unwrap();
+        let transferred = file.read(256, 128, PageHint::Clean).unwrap();
+        assert!(matches!(transferred, super::PageMemory::Cached(_)));
+        assert_eq!(
+            transferred.memoized_byte_node_checksum(|| Ok(46)).unwrap(),
+            46
+        );
     }
 }

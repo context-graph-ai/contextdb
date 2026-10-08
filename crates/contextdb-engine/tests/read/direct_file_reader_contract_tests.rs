@@ -1490,12 +1490,9 @@ fn exact_empty_page(columns: &[String], snapshot: DirectSnapshot) -> DirectCurso
         rows: Vec::new(),
         has_more: false,
     };
-    DirectCursorPage {
-        canonical_bytes: encode_cursor_page(&page)
-            .expect("shared encoder supplies empty terminal-page bytes"),
-        page,
-        snapshot,
-    }
+    let canonical_bytes =
+        encode_cursor_page(&page).expect("shared encoder supplies empty terminal-page bytes");
+    DirectCursorPage::new_for_test(page, canonical_bytes, snapshot)
 }
 
 fn cursor_pages(fixture: &Fixture, reader: &DirectFileReader) -> Vec<DirectCursorPage> {

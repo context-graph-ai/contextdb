@@ -17,9 +17,34 @@
 #![cfg(feature = "test-seams")]
 
 use contextdb_core::{VectorIndexRef, VectorQuantization};
-use contextdb_vector::VectorStore;
+use contextdb_vector::{MemoryBudget, VectorStore};
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
+
+#[derive(Debug, Default)]
+struct FixtureColumnOwner {
+    used: AtomicUsize,
+}
+impl MemoryBudget for FixtureColumnOwner {
+    fn try_allocate_for(
+        &self,
+        bytes: usize,
+        _subsystem: &str,
+        _operation: &str,
+        _hint: &str,
+    ) -> contextdb_core::Result<()> {
+        self.used.fetch_add(bytes, Ordering::SeqCst);
+        Ok(())
+    }
+    fn release(&self, bytes: usize) {
+        let previous = self.used.fetch_sub(bytes, Ordering::SeqCst);
+        assert!(
+            previous >= bytes,
+            "fixture allocation releases its own charge once"
+        );
+    }
+}
 
 /// Long enough that an address freed by a dropped store is handed out again
 /// many times over. Holding a thousand stores alive at once would never reuse
@@ -33,16 +58,31 @@ fn index_named(ordinal: usize) -> VectorIndexRef {
 #[test]
 fn a_thousand_stores_built_and_dropped_in_turn_each_carry_a_different_identity() {
     let mut identities = Vec::with_capacity(STORES);
+    let declared_column_owner = Arc::new(FixtureColumnOwner::default());
 
     for ordinal in 0..STORES {
         let store = VectorStore::new(Arc::new(OnceLock::new()));
         // Registering takes the index's maintenance lock and pushes this
         // store onto the thread's held-locks stack, then gives both back --
         // the traffic the guards are about.
-        store.register_index(index_named(ordinal), 3, VectorQuantization::F32);
+        store
+            .register_index(
+                index_named(ordinal),
+                3,
+                VectorQuantization::F32,
+                declared_column_owner.clone(),
+            )
+            .unwrap();
         // A second index on the SAME store, so the stack holds more than one
         // entry for one store before it unwinds.
-        store.register_index(index_named(ordinal + STORES), 3, VectorQuantization::F32);
+        store
+            .register_index(
+                index_named(ordinal + STORES),
+                3,
+                VectorQuantization::F32,
+                declared_column_owner.clone(),
+            )
+            .unwrap();
         identities.push(store.store_identity_for_test());
         // Dropped here, freeing its address for the store built next turn.
         drop(store);
@@ -65,8 +105,22 @@ fn a_thousand_stores_built_and_dropped_in_turn_each_carry_a_different_identity()
     let first = VectorStore::new(Arc::new(OnceLock::new()));
     let second = VectorStore::new(Arc::new(OnceLock::new()));
     let shared = VectorIndexRef::new("docs", "embedding");
-    first.register_index(shared.clone(), 3, VectorQuantization::F32);
-    second.register_index(shared, 3, VectorQuantization::F32);
+    first
+        .register_index(
+            shared.clone(),
+            3,
+            VectorQuantization::F32,
+            declared_column_owner.clone(),
+        )
+        .unwrap();
+    second
+        .register_index(
+            shared,
+            3,
+            VectorQuantization::F32,
+            declared_column_owner.clone(),
+        )
+        .unwrap();
     assert_ne!(
         first.store_identity_for_test(),
         second.store_identity_for_test(),

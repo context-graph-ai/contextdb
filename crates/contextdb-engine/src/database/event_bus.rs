@@ -18,7 +18,7 @@ const ATTEMPT_COUNT_MASK: u32 = !UNCONFIRMED_ATTEMPT;
 type SinkCallback = Arc<dyn Fn(&SinkEvent) -> std::result::Result<(), SinkError> + Send + Sync>;
 
 pub(crate) struct EventBusState {
-    definitions: Mutex<EventBusDefinitions>,
+    pub(super) definitions: Mutex<EventBusDefinitions>,
     callbacks: RwLock<HashMap<String, SinkRegistration>>,
     queues: Mutex<HashMap<String, VecDeque<SinkQueueEntry>>>,
     /// Entries a committed read image counted but left in the store. Always
@@ -1124,15 +1124,20 @@ impl Database {
             .unwrap_or_default()
     }
 
-    pub(super) fn apply_event_bus_ddl_from_user(&self, ddl: Vec<DdlChange>) -> Result<()> {
+    pub(super) fn apply_event_bus_ddl_from_user(
+        &self,
+        ddl: Vec<DdlChange>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<()> {
         self.require_admin_event_bus_ddl()?;
-        self.apply_event_bus_ddl_batch(ddl)
+        self.apply_event_bus_ddl_batch(ddl, read_memory.clone())
     }
 
     pub(super) fn stage_event_bus_ddl_for_commit(
         &self,
         lsn: Lsn,
         ddl: &[DdlChange],
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<u32> {
         if ddl.is_empty() {
             return Ok(0);
@@ -1152,8 +1157,9 @@ impl Database {
             .collect::<Vec<_>>();
         // PersistentCompositeStore writes event-bus DDL before trigger DDL in
         // this commit, so event-bus provenance owns the leading ordinals.
-        let generation_sidecars = self.ddl_generation_sidecars(ddl)?;
-        let provenance_values = self.ddl_generation_sidecar_values(lsn, ddl, 0)?;
+        let generation_sidecars = self.ddl_generation_sidecars(ddl, read_memory.clone())?;
+        let provenance_values =
+            self.ddl_generation_sidecar_values(lsn, ddl, 0, read_memory.clone())?;
         config_values.extend(provenance_values);
         let persistence = EventBusPersistenceCommit {
             config_values,
@@ -1205,7 +1211,11 @@ impl Database {
             .remove(&lsn);
     }
 
-    pub(super) fn apply_event_bus_ddl_batch(&self, ddl: Vec<DdlChange>) -> Result<()> {
+    pub(super) fn apply_event_bus_ddl_batch(
+        &self,
+        ddl: Vec<DdlChange>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<()> {
         if ddl.is_empty() {
             return Ok(());
         }
@@ -1213,10 +1223,10 @@ impl Database {
         if *self.event_bus.definitions.lock() == projected {
             return Ok(());
         }
-        self.commit_event_bus_definitions_and_log_batch(projected, ddl)
+        self.commit_event_bus_definitions_and_log_batch(projected, ddl, read_memory.clone())
     }
 
-    fn event_bus_definitions_with_ddl(
+    pub(super) fn event_bus_definitions_with_ddl(
         &self,
         tx: Option<TxId>,
         ddl: &[DdlChange],
@@ -1690,14 +1700,16 @@ impl Database {
     pub(super) fn prepare_sink_events_for_write_set(
         &self,
         ws: &contextdb_tx::WriteSet,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Vec<PreparedSinkEvent>> {
-        self.prepare_sink_events_for_write_set_with_event_bus_ddl(ws, &[])
+        self.prepare_sink_events_for_write_set_with_event_bus_ddl(ws, &[], read_memory)
     }
 
     pub(super) fn prepare_sink_events_for_write_set_with_event_bus_ddl(
         &self,
         ws: &contextdb_tx::WriteSet,
         event_bus_ddl: &[DdlChange],
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Vec<PreparedSinkEvent>> {
         if ws.relational_inserts.is_empty() && ws.relational_deletes.is_empty() {
             return Ok(Vec::new());
@@ -1712,8 +1724,10 @@ impl Database {
         // Preparation observes the committed predecessor after all callbacks,
         // independently of a caller's retained transaction base.
         let published = self.tx_mgr.capture_published_read();
-        let _current_source =
-            self.enter_writer_read(super::writer_read::durable_root(published.handle)?);
+        let _current_source = self.enter_writer_read(
+            super::writer_read::durable_root(published.handle)?,
+            read_memory.clone(),
+        );
         let mut static_gate_cache = HashMap::new();
         if ws.relational_deletes.is_empty() {
             let mut out = Vec::with_capacity(ws.relational_inserts.len());
@@ -1730,11 +1744,12 @@ impl Database {
                     lsn,
                     ws,
                     &mut static_gate_cache,
+                    read_memory.clone(),
                 )?;
             }
             return Ok(out);
         }
-        let (candidates, _candidate_memory) = self.row_event_candidates(ws)?;
+        let (candidates, _candidate_memory) = self.row_event_candidates(ws, read_memory.clone())?;
         let mut out = Vec::new();
         for candidate in candidates {
             self.append_prepared_sink_events_for_candidate(
@@ -1749,6 +1764,7 @@ impl Database {
                 lsn,
                 ws,
                 &mut static_gate_cache,
+                read_memory.clone(),
             )?;
         }
         Ok(out)
@@ -1911,6 +1927,7 @@ impl Database {
         lsn: Lsn,
         ws: &contextdb_tx::WriteSet,
         static_gate_cache: &mut HashMap<String, EventGateSnapshot>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<()> {
         for event_type in definitions.event_types.values() {
             if event_type.table != candidate.table || event_type.trigger != candidate.trigger {
@@ -1927,6 +1944,7 @@ impl Database {
                 candidate.values,
                 ws,
                 static_gate_cache,
+                read_memory.clone(),
             )?;
             for route in definitions
                 .routes
@@ -1966,6 +1984,7 @@ impl Database {
         values: &HashMap<String, Value>,
         ws: &contextdb_tx::WriteSet,
         static_gate_cache: &mut HashMap<String, EventGateSnapshot>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<EventGateSnapshot> {
         if let Some(gate) = static_gate_cache.get(table) {
             return Ok(gate.clone());
@@ -1978,7 +1997,7 @@ impl Database {
             static_gate_cache.insert(table.to_string(), gate.clone());
             return Ok(gate);
         }
-        self.event_gate_snapshot_with_meta(&meta, values, ws)
+        self.event_gate_snapshot_with_meta(&meta, values, ws, read_memory)
     }
 
     fn event_gate_snapshot_with_meta(
@@ -1986,6 +2005,7 @@ impl Database {
         meta: &TableMeta,
         values: &HashMap<String, Value>,
         ws: &contextdb_tx::WriteSet,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<EventGateSnapshot> {
         let snapshot = self.snapshot();
         let mut gate = event_gate_snapshot_from_meta(meta);
@@ -2009,7 +2029,13 @@ impl Database {
                     _ => None,
                 };
                 let grant_rows = match acl_id {
-                    Some(acl_id) => self.grant_rows_for_acl(&acl_ref, acl_id, snapshot, ws)?,
+                    Some(acl_id) => self.grant_rows_for_acl(
+                        &acl_ref,
+                        acl_id,
+                        snapshot,
+                        ws,
+                        read_memory.clone(),
+                    )?,
                     None => EventGrantRows::default(),
                 };
                 Ok(EventAclGate {
@@ -2031,6 +2057,7 @@ impl Database {
         acl_id: uuid::Uuid,
         snapshot: SnapshotId,
         ws: &contextdb_tx::WriteSet,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<EventGrantRows> {
         let deleted_row_ids = ws
             .relational_deletes
@@ -2041,16 +2068,20 @@ impl Database {
         let mut grants = Vec::new();
         let mut memory =
             crate::memory_accounting::OwnedMemoryReservation::new(self.accountant.clone());
-        let visited = self.visit_writer_rows::<Error>(&acl_ref.ref_table, |row| {
-            if row.visible_at(snapshot)
-                && !deleted_row_ids.contains(&row.row_id)
-                && row.values.get(&acl_ref.ref_column) == Some(&Value::Uuid(acl_id))
-            {
-                Self::admit_event_grant_copy(&mut memory, grants.is_empty(), row)?;
-                grants.push(row.values.clone());
-            }
-            Ok(())
-        })?;
+        let visited = self.visit_writer_rows::<Error>(
+            &acl_ref.ref_table,
+            |row| {
+                if row.visible_at(snapshot)
+                    && !deleted_row_ids.contains(&row.row_id)
+                    && row.values.get(&acl_ref.ref_column) == Some(&Value::Uuid(acl_id))
+                {
+                    Self::admit_event_grant_copy(&mut memory, grants.is_empty(), row)?;
+                    grants.push(row.values.clone());
+                }
+                Ok(())
+            },
+            read_memory,
+        )?;
         if !visited {
             let tables = self.relational_store.tables.read();
             for row in tables.get(&acl_ref.ref_table).into_iter().flatten() {
@@ -2234,6 +2265,7 @@ impl Database {
             sink: sink.to_string(),
             event_bus: self.event_bus.clone(),
             persistence: self.persistence.clone(),
+            tx_mgr: Arc::clone(&self.tx_mgr),
         };
         let thread_shutdown = shutdown.clone();
         #[cfg(feature = "test-seams")]
@@ -2263,14 +2295,19 @@ impl Database {
         &self,
         definitions: EventBusDefinitions,
         ddl: Vec<DdlChange>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<()> {
         if *self.event_bus.definitions.lock() == definitions {
             return Ok(());
         }
-        self.commit_event_bus_ddl_changes(ddl)
+        self.commit_event_bus_ddl_changes(ddl, read_memory.clone())
     }
 
-    fn commit_event_bus_ddl_changes(&self, ddl: Vec<DdlChange>) -> Result<()> {
+    fn commit_event_bus_ddl_changes(
+        &self,
+        ddl: Vec<DdlChange>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<()> {
         let mut projected = self.event_bus.definitions.lock().clone();
         for change in &ddl {
             self.apply_event_bus_ddl_to_definitions(&mut projected, change)?;
@@ -2296,7 +2333,8 @@ impl Database {
                         .into_iter()
                         .map(|(key, value)| (key as &str, value))
                         .collect();
-                let provenance_values = self.ddl_generation_sidecar_values(lsn, &ddl, 0)?;
+                let provenance_values =
+                    self.ddl_generation_sidecar_values(lsn, &ddl, 0, read_memory.clone())?;
                 config_values.extend(
                     provenance_values
                         .iter()
@@ -2308,7 +2346,7 @@ impl Database {
                     &ddl,
                 )?;
             } else {
-                self.record_ddl_generation_sidecars(lsn, &ddl)?;
+                self.record_ddl_generation_sidecars(lsn, &ddl, read_memory.clone())?;
             }
             self.apply_event_bus_definitions_to_memory_under_queue_mutation_lease(projected);
             self.ddl_log
@@ -2373,6 +2411,7 @@ impl Database {
     fn row_event_candidates(
         &self,
         ws: &contextdb_tx::WriteSet,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<(
         Vec<RowEventCandidate>,
         crate::memory_accounting::OwnedMemoryReservation,
@@ -2396,7 +2435,12 @@ impl Database {
             HashMap::with_capacity(delete_capacity);
         let root = self.writer_read_root()?;
         let source = root
-            .map(crate::persistence::writer_adapters::WriterRelationalSource::new)
+            .map(|root| {
+                crate::persistence::writer_adapters::WriterRelationalSource::new_for_read(
+                    root,
+                    read_memory.clone(),
+                )
+            })
             .transpose()?;
         for (table, row_id, _) in &ws.relational_deletes {
             let row = if let Some(source) = &source {
@@ -2483,6 +2527,7 @@ struct EventBusWorker {
     sink: String,
     event_bus: Arc<EventBusState>,
     persistence: Option<Arc<RedbPersistence>>,
+    tx_mgr: Arc<TransactionManager<DynStore>>,
 }
 
 impl EventBusWorker {
@@ -2770,61 +2815,71 @@ impl EventBusWorker {
     }
 
     fn transition_attempt(&self, entry_id: u64, start: bool, uncertain: bool) -> Result<u32> {
-        let _queue_mutation = self.event_bus.begin_dispatcher_queue_mutation()?;
-        let mut queues = self.event_bus.queues.lock();
-        let entry = queues
-            .get_mut(&self.sink)
-            .and_then(|queue| queue.iter_mut().find(|entry| entry.id == entry_id))
-            .ok_or_else(|| Error::Other(format!("pending sink action disappeared: {entry_id}")))?;
-        let mut updated = entry.clone();
-        let attempts = updated.attempts & ATTEMPT_COUNT_MASK;
-        updated.attempts = if start {
-            if updated.attempts & UNCONFIRMED_ATTEMPT != 0 {
-                return Err(Error::Other(format!(
-                    "sink action has an unresolved attempt: {entry_id}"
-                )));
+        self.tx_mgr.with_maintenance_publication(|publication| {
+            let _queue_mutation = self.event_bus.begin_dispatcher_queue_mutation()?;
+            let mut queues = self.event_bus.queues.lock();
+            let entry = queues
+                .get_mut(&self.sink)
+                .and_then(|queue| queue.iter_mut().find(|entry| entry.id == entry_id))
+                .ok_or_else(|| {
+                    Error::Other(format!("pending sink action disappeared: {entry_id}"))
+                })?;
+            let mut updated = entry.clone();
+            let attempts = updated.attempts & ATTEMPT_COUNT_MASK;
+            updated.attempts = if start {
+                if updated.attempts & UNCONFIRMED_ATTEMPT != 0 {
+                    return Err(Error::Other(format!(
+                        "sink action has an unresolved attempt: {entry_id}"
+                    )));
+                }
+                attempts.saturating_add(1).min(ATTEMPT_COUNT_MASK) | UNCONFIRMED_ATTEMPT
+            } else {
+                attempts
+            };
+            let was_unconfirmed = entry.attempts & UNCONFIRMED_ATTEMPT != 0;
+            let unconfirmed_delta = if start {
+                1
+            } else if was_unconfirmed {
+                -1
+            } else {
+                0
+            };
+            if self.persistence.is_some() {
+                publication.reserve()?;
             }
-            attempts.saturating_add(1).min(ATTEMPT_COUNT_MASK) | UNCONFIRMED_ATTEMPT
-        } else {
-            attempts
-        };
-        let was_unconfirmed = entry.attempts & UNCONFIRMED_ATTEMPT != 0;
-        let unconfirmed_delta = if start {
-            1
-        } else if was_unconfirmed {
-            -1
-        } else {
-            0
-        };
-        persist_sink_queue_update(
-            &self.persistence,
-            &self.sink,
-            None,
-            Some(&updated),
-            uncertain,
-            unconfirmed_delta,
-        )?;
-        entry.attempts = updated.attempts;
-        if start {
-            self.event_bus
-                .metrics
-                .lock()
-                .entry(self.sink.clone())
-                .or_default()
-                .unconfirmed += 1;
-        } else if was_unconfirmed {
-            let mut metrics = self.event_bus.metrics.lock();
-            let state = metrics.entry(self.sink.clone()).or_default();
-            state.unconfirmed = state.unconfirmed.saturating_sub(1);
-        }
-        Ok(attempts.max(1))
+            persist_sink_queue_update(
+                &self.persistence,
+                &self.sink,
+                None,
+                Some(&updated),
+                uncertain,
+                unconfirmed_delta,
+            )?;
+            if self.persistence.is_some() {
+                publication.complete();
+            }
+            entry.attempts = updated.attempts;
+            if start {
+                self.event_bus
+                    .metrics
+                    .lock()
+                    .entry(self.sink.clone())
+                    .or_default()
+                    .unconfirmed += 1;
+            } else if was_unconfirmed {
+                let mut metrics = self.event_bus.metrics.lock();
+                let state = metrics.entry(self.sink.clone()).or_default();
+                state.unconfirmed = state.unconfirmed.saturating_sub(1);
+            }
+            Ok(attempts.max(1))
+        })
     }
 
     fn ack_front_entries(&self, entry_ids: &[u64]) -> Result<()> {
         if entry_ids.is_empty() {
             return Ok(());
         }
-        let result = (|| -> Result<()> {
+        let result = self.tx_mgr.with_maintenance_publication(|publication| {
             let _queue_mutation = self.event_bus.begin_dispatcher_queue_mutation()?;
             let mut queues = self.event_bus.queues.lock();
             if let Some(queue) = queues.get_mut(&self.sink) {
@@ -2841,12 +2896,18 @@ impl EventBusWorker {
                         .take(removable.len())
                         .filter(|entry| entry.attempts & UNCONFIRMED_ATTEMPT != 0)
                         .count() as u64;
+                    if self.persistence.is_some() {
+                        publication.reserve()?;
+                    }
                     persist_sink_queue_removals(
                         &self.persistence,
                         &self.sink,
                         &removable,
                         unconfirmed,
                     )?;
+                    if self.persistence.is_some() {
+                        publication.complete();
+                    }
                     for _ in 0..removable.len() {
                         queue.pop_front();
                     }
@@ -2856,7 +2917,7 @@ impl EventBusWorker {
                 }
             }
             Ok(())
-        })();
+        });
         for entry_id in entry_ids {
             self.event_bus
                 .finish_checked_out_entry(&self.sink, *entry_id);

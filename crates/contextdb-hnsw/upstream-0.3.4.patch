@@ -1629,7 +1629,16 @@
 @@ -1229 +2543 @@
 -    fn reverse_update_neighborhood_simple(&self, new_point: Arc<Point<T>>) {
 +    fn reverse_update_neighborhood(&self, new_point: Arc<Point<'b, T>>) {
-@@ -1243,3 +2557,8 @@
+@@ -1237 +2551,7 @@
+-            for q in &new_point.neighbours.read()[l as usize] {
++            // Never hold one point's adjacency guard while acquiring another
++            // point's write guard: simultaneous mutual links otherwise cycle.
++            let neighbours = {
++                let guard = new_point.neighbours.read();
++                guard[l as usize].clone()
++            };
++            for q in &neighbours {
+@@ -1243,3 +2563,8 @@
 -                    // must be sure that we add a point at the correct level. See the comment to search_layer!
 -                    // this ensures that reverse updating do not add problems.
 -                    let l_n = n_to_add.point_ref.p_id.0 as usize;
@@ -1641,13 +1650,13 @@
 +                    if q_point_neighbours.len() <= l_n {
 +                        q_point_neighbours.resize_with(l_n + 1, Vec::new);
 +                    }
-@@ -1256 +2575 @@
+@@ -1256 +2581 @@
 -                    q_point_neighbours[l_n].push(Arc::new(n_to_add));
 +                    q_point_neighbours[l_n].push(n_to_add);
-@@ -1263 +2582 @@
+@@ -1263 +2588 @@
 -                        2 * self.max_nb_connection
 +                        self.get_max_nb_connection_layer0()
-@@ -1265,7 +2584,20 @@
+@@ -1265,7 +2590,20 @@
 -                    let shrink = nbn_at_l > threshold_shrinking;
 -                    {
 -                        // sort and shring if necessary
@@ -1675,28 +1684,47 @@
 +                            &mut selected,
 +                        );
 +                        q_point_neighbours[l_n] = selected;
-@@ -1272,0 +2605 @@
+@@ -1272,0 +2611 @@
 +                    q_point_neighbours[l_n].sort_unstable();
-@@ -1277 +2610 @@
+@@ -1277 +2616,20 @@
 -    } // end of reverse_update_neighborhood_simple
 +    } // end of reverse_update_neighborhood
-@@ -1290 +2623 @@
++
++    /// Conservative live allocation bound for one insertion with candidate
++    /// extension disabled. Includes hash-table rehash, heap reallocation and
++    /// conversion, reciprocal-copy and pruning buffers. No vector bodies are
++    /// copied into search scratch. Overflow refuses before worker creation.
++    pub fn insertion_scratch_bound(points: usize, ef: usize, m: usize) -> Option<usize> {
++        let n = points.max(ef).max(4).checked_add(1)?;
++        let buckets = n.checked_mul(8)?.div_ceil(7).checked_next_power_of_two()?;
++        let map_slot = std::mem::size_of::<(PointId, Arc<Point<'b, T>>)>() + 1;
++        let heap_slot = std::mem::size_of::<PointWithOrder<'b, T>>();
++        // At most N distinct visited nodes, one pending candidate per node,
++        // ef return/discarded nodes and conversion heaps. Eight full-capacity
++        // heap buffers dominate their simultaneous old/new growth buffers.
++        let heaps = n.checked_next_power_of_two()?.checked_mul(8)?.checked_mul(heap_slot)?;
++        let maps = buckets.checked_mul(map_slot)?.checked_mul(2)?.checked_add(32)?;
++        // Copy one reciprocal list and prune it while its old list stays live.
++        let links = m.checked_mul(2)?.checked_add(1)?.checked_mul(8)?.checked_mul(heap_slot)?;
++        maps.checked_add(heaps)?.checked_add(links)?.checked_add(4096)
++    }
+@@ -1290 +2648 @@
 -        candidates: &mut BinaryHeap<Arc<PointWithOrder<'b, T>>>,
 +        candidates: &mut BinaryHeap<PointWithOrder<'b, T>>,
-@@ -1295 +2628 @@
+@@ -1295 +2653 @@
 -        neighbours_vec: &mut Vec<Arc<PointWithOrder<'b, T>>>,
 +        neighbours_vec: &mut Vec<PointWithOrder<'b, T>>,
-@@ -1312,2 +2645 @@
+@@ -1312,2 +2670 @@
 -                    neighbours_vec
 -                        .push(Arc::new(PointWithOrder::new(&p.point_ref, -p.dist_to_ref)));
 +                    neighbours_vec.push(PointWithOrder::new(&p.point_ref, -p.dist_to_ref));
-@@ -1325 +2657 @@
+@@ -1325 +2682 @@
 -            let mut candidates_set = HashMap::<PointId, Arc<Point<T>>>::new();
 +            let mut candidates_set = BTreeMap::<PointId, Arc<Point<T>>>::new();
-@@ -1329 +2661 @@
+@@ -1329 +2686 @@
 -            let mut new_candidates_set = HashMap::<PointId, Arc<Point<T>>>::new();
 +            let mut new_candidates_set = BTreeMap::<PointId, Arc<Point<T>>>::new();
-@@ -1331,2 +2663,6 @@
+@@ -1331,2 +2688,6 @@
 -            for (_p_id, p_point) in candidates_set.iter() {
 -                let n_p_layer = &p_point.neighbours.read()[layer as usize];
 +            for p_point in candidates_set.values() {
@@ -1705,34 +1733,34 @@
 +                    .get(layer as usize)
 +                    .map(Vec::as_slice)
 +                    .unwrap_or_default();
-@@ -1346 +2682 @@
+@@ -1346 +2707 @@
 -            for (_p_id, p_point) in new_candidates_set.iter() {
 +            for p_point in new_candidates_set.values() {
-@@ -1348 +2684 @@
+@@ -1348 +2709 @@
 -                candidates.push(Arc::new(PointWithOrder::new(p_point, -dist_topoint)));
 +                candidates.push(PointWithOrder::new(p_point, -dist_topoint));
-@@ -1352 +2688 @@
+@@ -1352 +2713 @@
 -        let mut discarded_points = BinaryHeap::<Arc<PointWithOrder<T>>>::new();
 +        let mut discarded_points = BinaryHeap::<PointWithOrder<T>>::new();
-@@ -1367,4 +2703 @@
+@@ -1367,4 +2728 @@
 -                    neighbours_vec.push(Arc::new(PointWithOrder::new(
 -                        &e_p.point_ref,
 -                        -e_p.dist_to_ref,
 -                    )));
 +                    neighbours_vec.push(PointWithOrder::new(&e_p.point_ref, -e_p.dist_to_ref));
-@@ -1376,4 +2709 @@
+@@ -1376,4 +2734 @@
 -                        discarded_points.push(Arc::new(PointWithOrder::new(
 -                            &e_p.point_ref,
 -                            e_p.dist_to_ref,
 -                        )));
 +                        discarded_points.push(PointWithOrder::new(&e_p.point_ref, e_p.dist_to_ref));
-@@ -1392 +2722 @@
+@@ -1392 +2747 @@
 -                neighbours_vec.push(Arc::new(PointWithOrder::new(
 +                neighbours_vec.push(PointWithOrder::new(
-@@ -1395 +2725 @@
+@@ -1395 +2750 @@
 -                )));
 +                ));
-@@ -1460,7 +2790 @@
+@@ -1460,7 +2815 @@
 -            .map(|p| {
 -                Neighbour::new(
 -                    p.as_ref().point_ref.origin_id,
@@ -1741,29 +1769,29 @@
 -                )
 -            })
 +            .map(|p| Neighbour::new(p.point_ref.origin_id, p.dist_to_ref, p.point_ref.p_id))
-@@ -1472,2 +2796,2 @@
+@@ -1472,2 +2821,2 @@
 -    /// a filtered version of [`Self::search`].  
 -    /// A filter can be added to the search to get nodes with a particular property or id constraint.  
 +    /// a filtered version of [`Self::search`].
 +    /// A filter can be added to the search to get nodes with a particular property or id constraint.
-@@ -1503 +2827,5 @@
+@@ -1503 +2852,5 @@
 -                let neighbours = &pivot.neighbours.read()[layer as usize];
 +                let neighbours_guard = pivot.neighbours.read();
 +                let neighbours = neighbours_guard
 +                    .get(layer as usize)
 +                    .map(Vec::as_slice)
 +                    .unwrap_or_default();
-@@ -1541 +2869 @@
+@@ -1541 +2894 @@
 -                    if filter_t.hnsw_filter(&p.as_ref().point_ref.origin_id) {
 +                    if filter_t.hnsw_filter(&p.point_ref.origin_id) {
-@@ -1543,3 +2871,3 @@
+@@ -1543,3 +2896,3 @@
 -                            p.as_ref().point_ref.origin_id,
 -                            p.as_ref().dist_to_ref,
 -                            p.as_ref().point_ref.p_id,
 +                            p.point_ref.origin_id,
 +                            p.dist_to_ref,
 +                            p.point_ref.p_id,
-@@ -1559,7 +2887 @@
+@@ -1559,7 +2912 @@
 -                .map(|p| {
 -                    Neighbour::new(
 -                        p.as_ref().point_ref.origin_id,
@@ -1772,13 +1800,13 @@
 -                    )
 -                })
 +                .map(|p| Neighbour::new(p.point_ref.origin_id, p.dist_to_ref, p.point_ref.p_id))
-@@ -1583 +2905 @@
+@@ -1583 +2930 @@
 -    /// search the first knbn nearest neigbours of a data and returns a Vector of Neighbour.   
 +    /// search the first knbn nearest neigbours of a data and returns a Vector of Neighbour.
-@@ -1585 +2907 @@
+@@ -1585 +2932 @@
 -    /// than number of neighbours asked.  
 +    /// than number of neighbours asked.
-@@ -1588,0 +2911,439 @@
+@@ -1588,0 +2936,439 @@
 +    }
 +
 +    /// Additive request-bounded search. Source-entry and distance controls are
@@ -2218,29 +2246,29 @@
 +            .map(HnswAllowedSearchStatus::Incomplete)
 +            .unwrap_or(HnswAllowedSearchStatus::Complete);
 +        Ok(traversal.result(result, status))
-@@ -1633,2 +3394,2 @@
+@@ -1633,2 +3419,2 @@
 -    heap_points: &mut BinaryHeap<Arc<PointWithOrder<'b, T>>>,
 -) -> Vec<Arc<PointWithOrder<'b, T>>> {
 +    heap_points: &mut BinaryHeap<PointWithOrder<'b, T>>,
 +) -> Vec<PointWithOrder<'b, T>> {
-@@ -1636 +3397 @@
+@@ -1636 +3422 @@
 -    let mut vec_points = Vec::<Arc<PointWithOrder<T>>>::with_capacity(nb_points);
 +    let mut vec_points = Vec::<PointWithOrder<T>>::with_capacity(nb_points);
-@@ -1640 +3401 @@
+@@ -1640 +3426 @@
 -        let reverse_p = Arc::new(PointWithOrder::new(&p.point_ref, -p.dist_to_ref));
 +        let reverse_p = PointWithOrder::new(&p.point_ref, -p.dist_to_ref);
-@@ -1655,2 +3416,2 @@
+@@ -1655,2 +3441,2 @@
 -    positive_heap: &mut BinaryHeap<Arc<PointWithOrder<'b, T>>>,
 -) -> BinaryHeap<Arc<PointWithOrder<'b, T>>> {
 +    positive_heap: &mut BinaryHeap<PointWithOrder<'b, T>>,
 +) -> BinaryHeap<PointWithOrder<'b, T>> {
-@@ -1658 +3419 @@
+@@ -1658 +3444 @@
 -    let mut negative_heap = BinaryHeap::<Arc<PointWithOrder<T>>>::with_capacity(nb_points);
 +    let mut negative_heap = BinaryHeap::<PointWithOrder<T>>::with_capacity(nb_points);
-@@ -1662 +3423 @@
+@@ -1662 +3448 @@
 -        let reverse_p = Arc::new(PointWithOrder::new(&p.point_ref, -p.dist_to_ref));
 +        let reverse_p = PointWithOrder::new(&p.point_ref, -p.dist_to_ref);
-@@ -1751,0 +3513,75 @@
+@@ -1751,0 +3538,75 @@
 +    #[test]
 +    fn reverse_edge_pruning_preserves_a_distinct_direction_within_the_degree_limit() {
 +        let mut graph = Hnsw::new_with_seed(2, 6, 16, 8, dist::DistL1, 17);
@@ -2316,7 +2344,7 @@
 +        assert_eq!(result.neighbours[0].d_id, 3);
 +    }
 +
-@@ -1804,0 +3641,6 @@
+@@ -1804,0 +3666,6 @@
 +    fn iterating_a_graph_with_no_points_yields_nothing() {
 +        let hns = Hnsw::<f32, dist::DistL1>::new(10, 1, 16, 25, dist::DistL1 {});
 +        assert_eq!(hns.get_point_indexation().into_iter().count(), 0);
@@ -3397,7 +3425,7 @@
 +//! The AnnT trait is implemented with macros for u32, u16, u8, f32, f64 and i32.
 --- /dev/null
 +++ b/src/paged.rs
-@@ -0,0 +1,1122 @@
+@@ -0,0 +1,1172 @@
 +//! Storage-access version of the seeded, sequential HNSW construction algorithm.
 +//!
 +//! A provider owns node persistence and transactions. This module retains only
@@ -3558,6 +3586,18 @@
 +    }
 +    fn pop_search_candidate(&mut self) -> Result<Option<Option<PagedEdge>>, Self::Error> {
 +        Ok(None)
++    }
++    /// Run one finite selection window. Providers admit its retained point
++    /// capacity before the callback allocates and release it after return.
++    fn with_selection_window<R>(
++        &mut self,
++        _points: usize,
++        select: impl FnOnce(&mut Self) -> Result<R, PagedGraphError<Self::Error>>,
++    ) -> Result<R, PagedGraphError<Self::Error>>
++    where
++        Self: Sized,
++    {
++        select(self)
 +    }
 +    /// Allowed-set admission affects retained results, while navigation may
 +    /// pass through excluded nodes. Construction uses unfiltered traversal.
@@ -3875,6 +3915,24 @@
 +    Ok(())
 +}
 +
++// The window owns each loaded body once; comparisons borrow it in place.
++fn selection_point<T, S: PagedPointStorage<T>>(
++    storage: &mut S,
++    points: &mut Vec<PagedPoint<T>>,
++    id: PointId,
++    policy: PagedGraphPolicy,
++) -> Result<usize, PagedGraphError<S::Error>> {
++    if let Some(index) = points.iter().position(|point| point.id == id) {
++        storage.checkpoint()?;
++        return Ok(index);
++    }
++    let point = load(storage, id, policy)?;
++    let index = points.len();
++    debug_assert!(index < points.capacity());
++    points.push(point);
++    Ok(index)
++}
++
 +#[allow(clippy::too_many_arguments)]
 +fn select<T: Send + Sync, S: PagedPointStorage<T>, D: Distance<T>>(
 +    storage: &mut S,
@@ -3886,88 +3944,108 @@
 +    extend: bool,
 +    metric: &D,
 +) -> Result<(), PagedGraphError<S::Error>> {
-+    workspace.selected.clear();
-+    workspace.discarded.clear();
-+    workspace.extension.clear();
 +    if workspace.candidates.len() <= cap && !extend {
++        workspace.selected.clear();
++        workspace.discarded.clear();
++        workspace.extension.clear();
 +        while let Some(edge) = workspace.candidates.pop() {
 +            PagedGraphWorkspace::grow_vec(&mut workspace.selected, workspace.capacity);
 +            workspace.selected.push(edge.reversed());
 +        }
 +        return Ok(());
 +    }
-+    if workspace.candidates.len() <= cap && extend {
-+        for candidate in workspace.candidates.iter() {
-+            let point = load(storage, candidate.point_id, policy)?;
-+            for edge in point.neighbours.get(layer).into_iter().flatten() {
-+                if workspace
-+                    .candidates
-+                    .iter()
-+                    .any(|c| c.point_id == edge.point_id)
-+                    || workspace.extension.contains(&edge.point_id)
-+                {
-+                    continue;
++    let count = workspace.candidates.len();
++    let body_bound = if count <= cap && extend {
++        count
++            .checked_mul(1 + policy.degree(layer))
++            .ok_or(PagedGraphError::ScratchExhausted)?
++    } else {
++        count
++    };
++    storage.with_selection_window(body_bound, |storage| {
++        let mut points = Vec::with_capacity(body_bound);
++        workspace.selected.clear();
++        workspace.discarded.clear();
++        workspace.extension.clear();
++        if workspace.candidates.len() <= cap && extend {
++            for candidate in workspace.candidates.iter() {
++                let index = selection_point(storage, &mut points, candidate.point_id, policy)?;
++                let point = &points[index];
++                for edge in point.neighbours.get(layer).into_iter().flatten() {
++                    if workspace
++                        .candidates
++                        .iter()
++                        .any(|c| c.point_id == edge.point_id)
++                        || workspace.extension.contains(&edge.point_id)
++                    {
++                        continue;
++                    }
++                    if workspace.extension.len() >= workspace.capacity {
++                        return Err(PagedGraphError::ScratchExhausted);
++                    }
++                    PagedGraphWorkspace::grow_vec(&mut workspace.extension, workspace.capacity);
++                    workspace.extension.push(edge.point_id);
 +                }
-+                if workspace.extension.len() >= workspace.capacity {
-+                    return Err(PagedGraphError::ScratchExhausted);
-+                }
-+                PagedGraphWorkspace::grow_vec(&mut workspace.extension, workspace.capacity);
-+                workspace.extension.push(edge.point_id);
++            }
++            workspace.extension.sort_unstable();
++            for id in &workspace.extension {
++                let index = selection_point(storage, &mut points, *id, policy)?;
++                let point = &points[index];
++                let score = measured_distance(storage, metric, values, &point.values)?;
++                PagedGraphWorkspace::push(
++                    workspace.capacity,
++                    &mut workspace.candidates,
++                    PagedEdge {
++                        point_id: *id,
++                        origin_id: point.origin_id,
++                        distance: -score,
++                    },
++                )?;
 +            }
 +        }
-+        workspace.extension.sort_unstable();
-+        for id in &workspace.extension {
-+            let point = load(storage, *id, policy)?;
-+            let score = measured_distance(storage, metric, values, &point.values)?;
-+            PagedGraphWorkspace::push(
-+                workspace.capacity,
-+                &mut workspace.candidates,
-+                PagedEdge {
-+                    point_id: *id,
-+                    origin_id: point.origin_id,
-+                    distance: -score,
-+                },
-+            )?;
-+        }
-+    }
-+    while workspace.selected.len() < cap {
-+        let Some(candidate) = workspace.candidates.pop() else {
-+            break;
-+        };
-+        let point = load(storage, candidate.point_id, policy)?;
-+        let mut accepted = true;
-+        for prior in &workspace.selected {
-+            let previous = load(storage, prior.point_id, policy)?;
-+            if measured_distance(storage, metric, &point.values, &previous.values)?
-+                <= -candidate.distance
-+            {
-+                accepted = false;
-+                break;
-+            }
-+        }
-+        if accepted {
-+            if workspace.selected.len() >= workspace.capacity {
-+                return Err(PagedGraphError::ScratchExhausted);
-+            }
-+            PagedGraphWorkspace::grow_vec(&mut workspace.selected, workspace.capacity);
-+            workspace.selected.push(candidate.reversed());
-+        } else if policy.keep_pruned {
-+            PagedGraphWorkspace::push(workspace.capacity, &mut workspace.discarded, candidate)?;
-+        }
-+    }
-+    if policy.keep_pruned {
 +        while workspace.selected.len() < cap {
-+            let Some(candidate) = workspace.discarded.pop() else {
++            let Some(candidate) = workspace.candidates.pop() else {
 +                break;
 +            };
-+            if workspace.selected.len() >= workspace.capacity {
-+                return Err(PagedGraphError::ScratchExhausted);
++            let index = selection_point(storage, &mut points, candidate.point_id, policy)?;
++            let mut accepted = true;
++            for prior in &workspace.selected {
++                let previous = selection_point(storage, &mut points, prior.point_id, policy)?;
++                if measured_distance(
++                    storage,
++                    metric,
++                    &points[index].values,
++                    &points[previous].values,
++                )? <= -candidate.distance
++                {
++                    accepted = false;
++                    break;
++                }
 +            }
-+            PagedGraphWorkspace::grow_vec(&mut workspace.selected, workspace.capacity);
-+            workspace.selected.push(candidate.reversed());
++            if accepted {
++                if workspace.selected.len() >= workspace.capacity {
++                    return Err(PagedGraphError::ScratchExhausted);
++                }
++                PagedGraphWorkspace::grow_vec(&mut workspace.selected, workspace.capacity);
++                workspace.selected.push(candidate.reversed());
++            } else if policy.keep_pruned {
++                PagedGraphWorkspace::push(workspace.capacity, &mut workspace.discarded, candidate)?;
++            }
 +        }
-+    }
-+    Ok(())
++        if policy.keep_pruned {
++            while workspace.selected.len() < cap {
++                let Some(candidate) = workspace.discarded.pop() else {
++                    break;
++                };
++                if workspace.selected.len() >= workspace.capacity {
++                    return Err(PagedGraphError::ScratchExhausted);
++                }
++                PagedGraphWorkspace::grow_vec(&mut workspace.selected, workspace.capacity);
++                workspace.selected.push(candidate.reversed());
++            }
++        }
++        Ok(())
++    })
 +}
 +
 +/// Insert one point using the same descent, diversity selection, reciprocal

@@ -18,6 +18,12 @@ pub struct WriterQueryWork {
     pub target_source_calls: [u64; 4],
     pub target_backend_bytes: [u64; 4],
     pub target_entries_examined: u64,
+    /// Actual writer key-projection admission retained by this observed apply.
+    pub sync_parent_key_projection_bytes: usize,
+    /// Maximum simultaneous key-projection admission within this observation.
+    pub sync_parent_key_projection_peak_bytes: usize,
+    #[cfg(feature = "test-seams")]
+    pub content_size_table_totals_visits: u64,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -377,4 +383,35 @@ pub(crate) fn source_posting_operation(
 ) -> redb::BackendReadObservation {
     let selected = TARGET_KEY.with(|slot| slot.borrow().as_ref().is_none_or(matches));
     physical_operation_selected(PhysicalFamily::Posting, table, selected)
+}
+
+/// Observe each actual declared-table content-total lookup, including refusals.
+#[cfg(feature = "test-seams")]
+pub(crate) fn note_content_size_table_total() {
+    WORK.with(|slot| {
+        if let Some(mut work) = slot.get() {
+            work.content_size_table_totals_visits += 1;
+            slot.set(Some(work));
+        }
+    });
+}
+
+/// Observe an existing apply reservation without changing its funding or lifetime.
+/// Use `observe` around the complete apply, including commit or abort.
+pub(crate) fn note_sync_parent_key_projection(bytes: usize, retained: bool) {
+    WORK.with(|slot| {
+        if let Some(mut work) = slot.get() {
+            if retained {
+                work.sync_parent_key_projection_bytes =
+                    work.sync_parent_key_projection_bytes.saturating_add(bytes);
+                work.sync_parent_key_projection_peak_bytes = work
+                    .sync_parent_key_projection_peak_bytes
+                    .max(work.sync_parent_key_projection_bytes);
+            } else {
+                work.sync_parent_key_projection_bytes =
+                    work.sync_parent_key_projection_bytes.saturating_sub(bytes);
+            }
+            slot.set(Some(work));
+        }
+    });
 }

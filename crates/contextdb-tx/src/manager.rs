@@ -7,7 +7,7 @@ use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "test-seams")]
@@ -19,22 +19,38 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+thread_local! {
+    // Identifies only this thread's commit guard; no allocation or retained owner.
+    static CURRENT_COMMIT_MANAGER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+struct OwedPublication {
+    sequence: u64,
+    reservation: Option<Box<dyn Any + Send>>,
+}
+
 #[derive(Default)]
 struct CommitRelease {
     epoch: Mutex<u64>,
     changed: Condvar,
 }
 
-struct CommitLockGuard<'a> {
+struct CommitLockGuard<'a, S: WriteSetApplicator> {
+    manager: &'a TransactionManager<S>,
+    previous_manager: usize,
     lock: Option<MutexGuard<'a, ()>>,
     release: &'a CommitRelease,
 }
 
-impl Drop for CommitLockGuard<'_> {
+impl<S: WriteSetApplicator> Drop for CommitLockGuard<'_, S> {
     fn drop(&mut self) {
         // Wake only after the mutex is actually available. The epoch lock
         // closes the gap between a waiter's failed try_lock and its park.
+        CURRENT_COMMIT_MANAGER.with(|current| current.set(self.previous_manager));
         drop(self.lock.take());
+        // Reservations were admitted before the corresponding durable writes.
+        // Completion is infallible and takes a fresh boundary after this one unwinds.
+        self.manager.drain_owed_publications();
         let mut epoch = self.release.epoch.lock();
         *epoch = epoch.wrapping_add(1);
         self.release.changed.notify_all();
@@ -65,10 +81,24 @@ pub struct MaintenancePublication<'guard, S: WriteSetApplicator> {
 
 impl<S: WriteSetApplicator> MaintenancePublication<'_, S> {
     /// Admit the successor immediately before a nonempty durable mutation.
+    /// A completed cycle may be followed by another under this same guard.
     pub fn reserve(&mut self) -> Result<()> {
-        assert!(!self.completed && self.reservation.is_none());
-        self.reservation = Some(self.manager.store.reserve_metadata_publication()?);
+        if self.reservation.is_some() {
+            return Err(Error::InvalidStateTransition(
+                "metadata publication already has an active reservation".into(),
+            ));
+        }
+        let reservation = self.manager.store.reserve_metadata_publication()?;
+        self.completed = false;
+        self.reservation = Some(reservation);
         Ok(())
+    }
+
+    /// Abandon a refused durable mutation before starting the next cycle.
+    /// The failed storage transaction committed nothing; its admission drops.
+    pub fn abandon(&mut self) {
+        self.reservation.take();
+        self.completed = false;
     }
 
     /// Durability and memory settlement succeeded; preserve the logical pair
@@ -109,6 +139,8 @@ pub struct TransactionManager<S: WriteSetApplicator> {
     commit_index: Arc<dyn CommitDirectory>,
     commit_mutex: Mutex<()>,
     commit_release: Arc<CommitRelease>,
+    owed_publication: Mutex<Option<OwedPublication>>,
+    direct_commit_sequence: AtomicU64,
     store: S,
 }
 
@@ -179,6 +211,8 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
             commit_index: directory,
             commit_mutex: Mutex::new(()),
             commit_release: Arc::new(CommitRelease::default()),
+            owed_publication: Mutex::new(None),
+            direct_commit_sequence: AtomicU64::new(0),
             store,
         }
     }
@@ -277,12 +311,20 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         active.get(&tx).cloned().ok_or(Error::TxNotFound(tx))
     }
 
-    pub fn commit(&self, tx: TxId) -> Result<()> {
-        self.commit_with_lsn(tx).map(|_| ())
+    pub fn commit(
+        &self,
+        tx: TxId,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<()> {
+        self.commit_with_lsn(tx, read_memory).map(|_| ())
     }
 
-    pub fn commit_with_lsn(&self, tx: TxId) -> Result<Lsn> {
-        self.commit_with_lsn_prepared(tx, |_| Ok(()))
+    pub fn commit_with_lsn(
+        &self,
+        tx: TxId,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<Lsn> {
+        self.commit_with_lsn_prepared(tx, read_memory, |_| Ok(()))
             .map(|(lsn, _)| lsn)
             .map_err(|failure| failure.error)
     }
@@ -290,6 +332,7 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
     pub fn commit_with_reserved_lsn_callback<F, G>(
         &self,
         tx: TxId,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         before_commit: F,
         prepare: G,
     ) -> std::result::Result<(Lsn, WriteSet), CommitFailure>
@@ -297,12 +340,13 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         F: FnOnce(Lsn) -> Result<()>,
         G: FnOnce(&WriteSet) -> Result<()>,
     {
-        self.commit_with_reserved_lsn_callback_mut(tx, before_commit, |ws| prepare(ws))
+        self.commit_with_reserved_lsn_callback_mut(tx, read_memory, before_commit, |ws| prepare(ws))
     }
 
     pub fn commit_with_reserved_lsn_callback_mut<F, G>(
         &self,
         tx: TxId,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         before_commit: F,
         prepare: G,
     ) -> std::result::Result<(Lsn, WriteSet), CommitFailure>
@@ -346,7 +390,7 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
 
         // Prepare may replace the write set; the manager remains the identity authority.
         ws.finalized_tx = Some(visibility_tx);
-        if let Err(error) = self.store.apply(&ws) {
+        if let Err(error) = self.store.apply(&ws, read_memory.clone()) {
             self.next_lsn.store(lsn, Ordering::SeqCst);
             return Err(CommitFailure {
                 error,
@@ -361,17 +405,19 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
     pub fn commit_with_lsn_prepared<F>(
         &self,
         tx: TxId,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         prepare: F,
     ) -> std::result::Result<(Lsn, WriteSet), CommitFailure>
     where
         F: FnOnce(&WriteSet) -> Result<()>,
     {
-        self.commit_with_lsn_prepared_and_applied(tx, prepare, |_, _| {})
+        self.commit_with_lsn_prepared_and_applied(tx, read_memory, prepare, |_, _| {})
     }
 
     pub fn commit_with_lsn_prepared_and_applied<F, G>(
         &self,
         tx: TxId,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         prepare: F,
         after_apply: G,
     ) -> std::result::Result<(Lsn, WriteSet), CommitFailure>
@@ -379,12 +425,18 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         F: FnOnce(&WriteSet) -> Result<()>,
         G: FnOnce(Lsn, &WriteSet),
     {
-        self.commit_with_lsn_prepared_and_applied_mut(tx, |ws| prepare(ws), after_apply)
+        self.commit_with_lsn_prepared_and_applied_mut(
+            tx,
+            read_memory,
+            |ws| prepare(ws),
+            after_apply,
+        )
     }
 
     pub fn commit_with_lsn_prepared_and_applied_mut<F, G>(
         &self,
         tx: TxId,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         prepare: F,
         after_apply: G,
     ) -> std::result::Result<(Lsn, WriteSet), CommitFailure>
@@ -419,7 +471,7 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
 
         // Prepare may replace the write set; the manager remains the identity authority.
         ws.finalized_tx = Some(visibility_tx);
-        if let Err(error) = self.store.apply(&ws) {
+        if let Err(error) = self.store.apply(&ws, read_memory.clone()) {
             self.next_lsn.store(lsn, Ordering::SeqCst);
             return Err(CommitFailure {
                 error,
@@ -439,6 +491,33 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
     pub fn commit_with_lsn_active_prepare_and_applied_mut<F, G>(
         &self,
         tx: TxId,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        active_prepare: F,
+        prepare: G,
+        after_apply: impl FnOnce(Lsn, &WriteSet),
+    ) -> std::result::Result<(Lsn, WriteSet), CommitFailure>
+    where
+        F: FnOnce(Lsn, TxId) -> Result<()>,
+        G: FnOnce(&mut WriteSet) -> Result<()>,
+    {
+        self.commit_with_lsn_precanonicalized_active_prepare_and_applied_mut(
+            tx,
+            read_memory,
+            || Ok(false),
+            active_prepare,
+            prepare,
+            after_apply,
+        )
+    }
+
+    /// Internal commit preparation before no-op detection. The projection runs
+    /// under the commit guard, without holding the active transaction map.
+    #[doc(hidden)]
+    pub fn commit_with_lsn_precanonicalized_active_prepare_and_applied_mut<F, G>(
+        &self,
+        tx: TxId,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        requires_commit: impl FnOnce() -> Result<bool>,
         active_prepare: F,
         prepare: G,
         after_apply: impl FnOnce(Lsn, &WriteSet),
@@ -448,12 +527,26 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         G: FnOnce(&mut WriteSet) -> Result<()>,
     {
         let _lock = self.lock_commit_boundary();
+        if !self.active_txs.lock().contains_key(&tx) {
+            return Err(CommitFailure {
+                error: Error::TxNotFound(tx),
+                write_set: None,
+            });
+        }
+        let requires_commit = match requires_commit() {
+            Ok(required) => required,
+            Err(error) => {
+                let write_set = self.active_txs.lock().remove(&tx).map(Box::new);
+                return Err(CommitFailure { error, write_set });
+            }
+        };
         let visibility_tx = {
             let mut active = self.active_txs.lock();
             let ws = active.get_mut(&tx).ok_or(CommitFailure {
                 error: Error::TxNotFound(tx),
                 write_set: None,
             })?;
+            ws.requires_commit_lsn |= requires_commit;
             ws.canonicalize_final_state();
             if ws.is_empty() {
                 let ws = active.remove(&tx).expect("checked active tx exists");
@@ -503,7 +596,7 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
 
         // Prepare may replace the write set; the manager remains the identity authority.
         ws.finalized_tx = Some(visibility_tx);
-        if let Err(error) = self.store.apply(&ws) {
+        if let Err(error) = self.store.apply(&ws, read_memory.clone()) {
             self.next_lsn.store(lsn, Ordering::SeqCst);
             return Err(CommitFailure {
                 error,
@@ -805,10 +898,79 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         result
     }
 
-    fn lock_commit_boundary(&self) -> CommitLockGuard<'_> {
+    fn lock_commit_boundary(&self) -> CommitLockGuard<'_, S> {
+        self.commit_guard(self.commit_mutex.lock(), &self.commit_release)
+    }
+
+    fn commit_guard<'a>(
+        &'a self,
+        lock: MutexGuard<'a, ()>,
+        release: &'a CommitRelease,
+    ) -> CommitLockGuard<'a, S> {
+        let previous_manager =
+            CURRENT_COMMIT_MANAGER.with(|current| current.replace(self as *const Self as usize));
         CommitLockGuard {
-            lock: Some(self.commit_mutex.lock()),
-            release: &self.commit_release,
+            manager: self,
+            previous_manager,
+            lock: Some(lock),
+            release,
+        }
+    }
+
+    /// Internal caller guard identity for helpers used both standalone and
+    /// inside ordinary/DDL publication. This never acquires a second lock.
+    #[doc(hidden)]
+    pub fn commit_boundary_held_by_current_thread(&self) -> bool {
+        CURRENT_COMMIT_MANAGER.with(|current| current.get() == self as *const Self as usize)
+    }
+
+    /// Internal plumbing for a direct durable write inside a commit callback.
+    /// Admission must happen before persistence; an unsuccessful write simply
+    /// drops this reservation without recording a publication debt.
+    #[doc(hidden)]
+    pub fn reserve_deferred_metadata_publication(&self) -> Result<Option<Box<dyn Any + Send>>> {
+        self.store.reserve_metadata_publication()
+    }
+
+    /// Record a successful direct commit and publish before operation return.
+    /// Inside this thread's commit guard, its unwind performs completion instead.
+    #[doc(hidden)]
+    pub fn owe_metadata_publication(&self, reservation: Option<Box<dyn Any + Send>>) {
+        let sequence = self.direct_commit_sequence.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut owed = self.owed_publication.lock();
+        if let Some(existing) = owed.as_mut() {
+            existing.sequence = existing.sequence.max(sequence);
+            // One prepared successor covers the combined durable writes. The
+            // redundant reservation is released, never transferred twice.
+            drop(reservation);
+        } else {
+            *owed = Some(OwedPublication {
+                sequence,
+                reservation,
+            });
+        }
+        drop(owed);
+        if !self.commit_boundary_held_by_current_thread() {
+            self.drain_owed_publications();
+        }
+    }
+
+    fn drain_owed_publications(&self) {
+        if self.owed_publication.lock().is_none() {
+            return;
+        }
+        let _lock = self.commit_mutex.lock();
+        loop {
+            // Take only debts known before preparing this root. An overlapping
+            // append records a later debt in the now-empty slot and is drained
+            // separately; it cannot be cleared by this publication.
+            let Some(owed) = self.owed_publication.lock().take() else {
+                break;
+            };
+            let (snapshot, lsn) = self.published_read_snapshot();
+            self.store
+                .complete_metadata_publication(owed.reservation, snapshot, lsn);
+            self.publish_read_snapshot(lsn, None);
         }
     }
 
@@ -820,10 +982,10 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
     where
         F: FnOnce() -> R,
     {
-        let _lock = CommitLockGuard {
-            lock: Some(self.commit_mutex.try_lock_for(duration)?),
-            release: &self.commit_release,
-        };
+        let _lock = self.commit_guard(
+            self.commit_mutex.try_lock_for(duration)?,
+            &self.commit_release,
+        );
         Some(f())
     }
 
@@ -857,10 +1019,7 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
             }
             if let Some(lock) = self.commit_mutex.try_lock() {
                 drop(epoch);
-                let _guard = CommitLockGuard {
-                    lock: Some(lock),
-                    release: &release,
-                };
+                let _guard = self.commit_guard(lock, &release);
                 if cancelled.is_cancelled() {
                     return None;
                 }
@@ -926,8 +1085,12 @@ impl<S: WriteSetApplicator> contextdb_core::TransactionManager for TransactionMa
         TransactionManager::begin(self)
     }
 
-    fn commit(&self, tx: TxId) -> Result<()> {
-        TransactionManager::commit(self, tx)
+    fn commit(
+        &self,
+        tx: TxId,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<()> {
+        TransactionManager::commit(self, tx, read_memory)
     }
 
     fn rollback(&self, tx: TxId) -> Result<()> {

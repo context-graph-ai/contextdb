@@ -4,7 +4,8 @@
 //! the crate-private bounded-kernel entrance in the parent module.
 
 pub use super::bounded::{
-    ContinuationBytes, PENDING_INDEX_RUNS, take_vector_candidate_identity_decisions_for_test,
+    ContinuationBytes, GraphCreditTransferCut, GraphCreditTransferPhase, PENDING_INDEX_RUNS,
+    take_vector_candidate_identity_decisions_for_test,
 };
 use super::{
     BoundedCursorHandle, BoundedExecutionError, BoundedExecutionProbe, BoundedExecutionTelemetry,
@@ -78,6 +79,9 @@ pub trait ExecutionProbe: Send + Sync {
     ) {
     }
     fn cancellation_observed(&self, completed_work: u64);
+    /// One cold vector graph load's credit move: before the destination
+    /// admits, after it admits, and after the read's credit is split off.
+    fn graph_credit_transfer(&self, _cut: GraphCreditTransferCut) {}
 }
 
 struct ProbeAdapter(Arc<dyn ExecutionProbe>);
@@ -142,6 +146,10 @@ impl BoundedExecutionProbe for ProbeAdapter {
 
     fn cancellation_observed(&self, completed_work: u64) {
         self.0.cancellation_observed(completed_work);
+    }
+
+    fn graph_credit_transfer(&self, cut: GraphCreditTransferCut) {
+        self.0.graph_credit_transfer(cut);
     }
 }
 
@@ -293,13 +301,15 @@ pub fn execute(db: &Database, request: &BoundedReadRequest) -> Result<TestResult
         db,
         &request.sql,
         &request.params,
+        db.declared_reader_memory()
+            .map_err(|error| test_error(error.into()))?,
         request.limits,
         Arc::clone(&request.clock),
         request.cancellation.clone(),
         adapted_probe(request),
     )
     .map(|outcome| TestResult {
-        result: outcome.result,
+        result: outcome.result.into_public(),
         telemetry: outcome.telemetry.into(),
     })
     .map_err(test_error)
@@ -310,10 +320,14 @@ pub fn open_cursor(
     db: Arc<Database>,
     request: &BoundedReadRequest,
 ) -> Result<TestCursorOpen, TestError> {
+    let read_memory = db
+        .declared_reader_memory()
+        .map_err(|error| test_error(error.into()))?;
     open_bounded_cursor(
         db,
         &request.sql,
         &request.params,
+        read_memory,
         request.limits,
         Arc::clone(&request.clock),
         request.cancellation.clone(),
@@ -324,7 +338,7 @@ pub fn open_cursor(
             handle: outcome.cursor,
             probe: request.probe.as_ref().map(Arc::clone),
         },
-        first_page: outcome.first_page,
+        first_page: outcome.first_page.into_public(),
         telemetry: outcome.telemetry.into(),
     })
     .map_err(test_error)
@@ -342,7 +356,7 @@ impl TestCursor {
         });
         fetch_bounded_cursor(&mut self.handle, rows, cancellation, probe)
             .map(|outcome| TestCursorFetch {
-                page: outcome.page,
+                page: outcome.page.into_public(),
                 telemetry: outcome.telemetry.into(),
             })
             .map_err(test_error)

@@ -5,20 +5,27 @@ use contextdb_core::EdgeDiscardMode;
 
 pub(crate) struct Stage {
     pub(crate) durable: AuthoritativePurgePersistenceProjection,
-    pub(crate) _vector_workspace: contextdb_vector::VectorWorkspaceReservation,
     pub(crate) publish: Box<dyn FnOnce() + Send>,
+    pub(crate) _vector_workspace: crate::read_image_memory::ImageVectorCopy,
 }
 pub(crate) type StageRegistry = Arc<Mutex<HashMap<Lsn, Stage>>>;
 
 impl Database {
-    pub(crate) fn discard_policy(&self, table: &str) -> Result<Option<(String, EdgeDiscardMode)>> {
+    pub(crate) fn discard_policy(
+        &self,
+        table: &str,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<Option<(String, EdgeDiscardMode)>> {
         // Stopping the server does not remove durable hub authority.
         if self.sync_relay_mode_enabled()
-            || self.custody_authority()?.iter().any(|record| match record {
-                Record::Control(control) => control.hub_node.is_some(),
-                Record::Policy(policy) => policy.first_bound_position.is_some(),
-                _ => false,
-            })
+            || self
+                .custody_authority(read_memory.clone())?
+                .iter()
+                .any(|record| match record {
+                    Record::Control(control) => control.hub_node.is_some(),
+                    Record::Policy(policy) => policy.first_bound_position.is_some(),
+                    _ => false,
+                })
         {
             return Err(Error::DiscardNotOnHub);
         }
@@ -45,7 +52,7 @@ impl Database {
         let Some(hub) = self.retention_sync_peer() else {
             return Ok(None);
         };
-        let records = self.custody_authority()?;
+        let records = self.custody_authority(read_memory.clone())?;
         let destination = records.iter().find_map(|r| match r {
             Record::Destination(d) if d.namespace.hub_node == hub => Some(&d.namespace),
             _ => None,
@@ -76,8 +83,11 @@ impl Database {
         &self,
         tx: TxId,
         tables: &[(String, Vec<(NaturalKey, RowId)>)],
+
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<QueryResult> {
-        let authority = self.custody_authority()?;
+        let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
+        let authority = self.custody_authority(read_memory.clone())?;
         let hub = self.retention_sync_peer();
         let destination = authority.iter().find_map(|r| match r {
             Record::Destination(d) if Some(d.namespace.hub_node.as_str()) == hub.as_deref() => {
@@ -102,15 +112,16 @@ impl Database {
         let mut selected_rows = BTreeSet::new();
         let mut selected_references = Vec::new();
         for (table, rows) in tables {
-            let policy = self.discard_policy(table)?;
+            let policy = self.discard_policy(table, read_memory.clone())?;
             let mut pending = BTreeSet::new();
             for (key, row_id) in rows {
                 let reference = RowRef {
                     table: table.clone(),
                     key: key.clone(),
                 };
-                let records = self.custody_rows(std::slice::from_ref(&reference))?;
-                for record in &records {
+                let records =
+                    self.custody_rows(std::slice::from_ref(&reference), read_memory.clone())?;
+                for record in records.iter() {
                     if let Record::Manifest(m) = record && m.rows.iter().any(|e| e.reference == reference)
                         && records.iter().any(|r| matches!(r,Record::Root{submission,..} if *submission==m.id))
                         && !records.iter().any(|r| matches!(r,Record::Terminal{edge:true,record:t} if t.submission==m.id && destination==Some(&t.namespace))) { pending.insert(m.id.as_bytes().to_vec()); }
@@ -123,14 +134,23 @@ impl Database {
                     }
                 }
                 let committed_key = self
-                    .find_row_by_id_at(table, *row_id, self.snapshot_for_read())
+                    .find_row_by_id_at(
+                        table,
+                        *row_id,
+                        self.snapshot_for_read(),
+                        read_memory.clone(),
+                    )
                     .ok()
                     .and_then(|row| {
                         self.table_meta(table)
                             .and_then(|meta| natural_key_from_row_values(&meta, &row.values))
                     });
                 if let Some(key) = committed_key {
-                    selections.push(self.resolve_authoritative_purge_selection(table, &key)?);
+                    selections.push(self.resolve_authoritative_purge_selection(
+                        table,
+                        &key,
+                        read_memory.clone(),
+                    )?);
                 } else if self
                     .table_meta(table)
                     .is_some_and(|m| m.delivery_manifest_tables.is_some())
@@ -169,7 +189,7 @@ impl Database {
             result.rows.push(vec![
                 Value::Text(table.clone()),
                 Value::Int64(rows.len() as i64),
-                Value::Json(serde_json::json!([])),
+                Value::Json(serde_json::json!([]).into()),
                 Value::Int64(reported_pending as i64),
             ]);
         }
@@ -236,7 +256,7 @@ impl Database {
             ws.rebind_ordered_staged_rows();
             Ok(())
         })??;
-        self.release_insert_allocations(&removed);
+        self.release_insert_allocations(&removed, &mut vector_copy_owner)?;
         result.rows_affected = selected_rows.len() as u64;
         let mut pending = self.pending_commit_metadata.lock();
         let metadata = pending.entry(tx).or_default();
@@ -263,20 +283,28 @@ impl Database {
         token: event_bus::AuthoritativePurgeQueueMutationToken,
         guard: &crate::blob_repository::BlobExclusiveHashSetGuard,
         read_publication: &AuthoritativePurgePublicationGuard,
+        _vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<CommitStageRegistration<Stage>> {
         let lsn = ws
             .commit_lsn
             .ok_or_else(crate::custody::canonical::invalid)?;
         // Selected immutable row identities are revalidated under the ordinary commit mutex.
-        let vector_workspace = self.reserve_authoritative_erasure_workspace(selections)?;
+        let mut vector_workspace =
+            self.reserve_authoritative_erasure_workspace(selections, read_memory.clone())?;
         let prepared = self.prepare_authoritative_purge_set_batch(
             selections,
             token,
             crate::custody::erasure::PurgeReportShape::None,
             lsn,
+            &mut vector_workspace.owner,
+            read_memory.clone(),
         )?;
-        let (selected_hashes, mut survivors) =
-            self.authoritative_purge_current_blob_references(selections, true)?;
+        let (selected_hashes, mut survivors) = self.authoritative_purge_current_blob_references(
+            selections,
+            true,
+            read_memory.clone(),
+        )?;
         for (table, row) in &ws.relational_inserts {
             if table == "work_jobs"
                 && let Some(refs) = row.values.get("input_refs")
@@ -299,6 +327,7 @@ impl Database {
                     key: s.natural_key.clone(),
                 })
                 .collect::<Vec<_>>(),
+            read_memory.clone(),
         )?;
         for owner in &prepared.lineage_config_owners {
             keys.extend([
@@ -363,7 +392,11 @@ impl Database {
             .persistence
             .as_ref()
             .map(|persistence| {
-                persistence.prepare_writer_erasure(&erased_tables, &durable.graph_entries)
+                persistence.prepare_writer_erasure(
+                    self.accountant.clone(),
+                    &erased_tables,
+                    &durable.graph_entries,
+                )
             })
             .transpose()?;
         let read_gate = read_publication.gate.clone();

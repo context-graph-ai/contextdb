@@ -308,6 +308,15 @@ impl crate::Database {
         tx: TxId,
         manifest: DeliveryManifest<'_>,
     ) -> contextdb_core::Result<()> {
+        self.register_delivery_manifest_with_read_memory(tx, manifest, self.declared_reader_memory()?)
+    }
+
+    pub(crate) fn register_delivery_manifest_with_read_memory(
+        &self,
+        tx: TxId,
+        manifest: DeliveryManifest<'_>,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> contextdb_core::Result<()> {
         let runtime =
             self.custody_runtime()
                 .ok_or_else(|| contextdb_core::Error::SchemaInvalid {
@@ -332,6 +341,7 @@ impl crate::Database {
                     })
                     .collect(),
             },
+            read_memory,
         )
     }
     /// Read the durable outcome for the visible current root at the registered destination.
@@ -343,18 +353,32 @@ impl crate::Database {
         root_table: &str,
         root_key: &NaturalKey,
     ) -> contextdb_core::Result<Option<DeliveryOutcome>> {
-        crate::custody::inspection::outcome(self, root_table, root_key)
+        self.delivery_outcome_with_read_memory(root_table, root_key, self.declared_reader_memory()?)
+    }
+
+    pub(crate) fn delivery_outcome_with_read_memory(
+        &self,
+        root_table: &str,
+        root_key: &NaturalKey,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> contextdb_core::Result<Option<DeliveryOutcome>> {
+        crate::custody::inspection::outcome(self, root_table, root_key, read_memory)
     }
     /// Count visible eligible units and their accepted, equivalent, refused, and pending states.
     ///
     /// Only an admitted durable outcome grants credit; transport watermarks do not. `SYNC OFF`
     /// returns disabled and zero eligible units. Counts obey this handle's row scope and do not
     /// mutate custody. Administrative `SHOW` queries use the ordinary read session limits.
-    pub fn delivery_status(
+    pub fn delivery_status(&self, root_table: &str) -> contextdb_core::Result<DeliveryStatusCounts> {
+        self.delivery_status_with_read_memory(root_table, self.declared_reader_memory()?)
+    }
+
+    pub(crate) fn delivery_status_with_read_memory(
         &self,
         root_table: &str,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> contextdb_core::Result<DeliveryStatusCounts> {
-        crate::custody::inspection::status(self, root_table)
+        crate::custody::inspection::status(self, root_table, read_memory)
     }
 }
 

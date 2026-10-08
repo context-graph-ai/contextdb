@@ -2,7 +2,7 @@
 //! pages and durable lookup directories; this module never retains an all-node
 //! graph or row/exact-vector map.
 use super::{DistQuantizedCosine, HNSW_BUILD_SEED, exact_key_for_stored_vector, hnsw_f32_distance};
-use crate::memory_budget::{MemoryBudget, VectorWorkspaceReservation};
+use crate::memory_budget::{MemoryBudget, VectorWorkspaceReservation, VectorCopyAdmission, ScopedVectorCopy};
 use crate::quantized::StoredVector;
 use crate::store::{ResolvedVectorPolicy, VectorPartitionRef};
 use contextdb_core::{
@@ -200,10 +200,63 @@ fn workspace_overflow() -> Error {
     Error::Other("paged vector workspace size overflow".into())
 }
 
+/// Native allocation request at one captured root. The admitted capability
+/// covers point, identity and directory copies, without changing traversal.
+#[doc(hidden)]
+pub enum PagedVectorReadRequest<'q> {
+    Point { id: PointId },
+    Identity { data_id: usize },
+    PointForRow { row: RowId, snapshot: SnapshotId },
+    ExactRows { key: &'q [u8], snapshot: SnapshotId, after: Option<RowId>, limit: usize },
+    VisibleCount { snapshot: SnapshotId },
+    RowWindow { snapshot: SnapshotId, after: Option<RowId>, limit: usize },
+    RowBounds,
+    PointAtOrAfter { row: RowId },
+    GraphPointForRow { row: RowId },
+    ExactGraphRowAfter { key: &'q [u8], after: Option<RowId> },
+}
+#[doc(hidden)]
+pub enum PagedVectorReadValue {
+    Point(ScopedVectorCopy<PagedVectorPoint>),
+    Identity(ScopedVectorCopy<PagedVectorIdentity>),
+    PointForRow(ScopedVectorCopy<Option<PointId>>),
+    ExactRows(ScopedVectorCopy<Vec<RowId>>),
+    VisibleCount(ScopedVectorCopy<usize>),
+    RowWindow(ScopedVectorCopy<Vec<RowId>>),
+    RowBounds(ScopedVectorCopy<Option<(RowId, RowId, usize)>>),
+    PointAtOrAfter(ScopedVectorCopy<Option<(RowId, PointId)>>),
+    GraphPointForRow(ScopedVectorCopy<Option<PointId>>),
+    ExactGraphRowAfter(ScopedVectorCopy<Option<RowId>>),
+}
+
 /// A captured-root serving reader. Every load validates checksum, generation,
 /// point identity, dimensions and all referenced identities. A reader may keep
 /// only admitted, evictable serving pages, never a directory of every point.
 pub trait PagedVectorReader: Send {
+    /// Explicit native admission seam. Native providers authenticate and
+    /// validate borrowed lengths, then invoke `admit` before any owned copy.
+    /// Each returned value retains its per-value token through value drop.
+    /// The default introduces no admission: it is only valid when every
+    /// returned allocation is already funded by the provider's workspace.
+    fn read_with_copy_admission(
+        &mut self,
+        request: PagedVectorReadRequest<'_>,
+        _admit: &mut dyn FnMut(usize) -> Result<Option<VectorCopyAdmission>>,
+    ) -> Result<PagedVectorReadValue> {
+        Ok(match request {
+            PagedVectorReadRequest::Point { id } => PagedVectorReadValue::Point(ScopedVectorCopy::from_admitted(self.load_point(id)?, None)),
+            PagedVectorReadRequest::Identity { data_id } => PagedVectorReadValue::Identity(ScopedVectorCopy::from_admitted(self.identity(data_id)?, None)),
+            PagedVectorReadRequest::PointForRow { row, snapshot } => PagedVectorReadValue::PointForRow(ScopedVectorCopy::from_admitted(self.point_for_row(row, snapshot)?, None)),
+            PagedVectorReadRequest::ExactRows { key, snapshot, after, limit } => PagedVectorReadValue::ExactRows(ScopedVectorCopy::from_admitted(self.exact_rows(key, snapshot, after, limit)?, None)),
+            PagedVectorReadRequest::VisibleCount { snapshot } => PagedVectorReadValue::VisibleCount(ScopedVectorCopy::from_admitted(self.visible_count(snapshot)?, None)),
+            PagedVectorReadRequest::RowWindow { snapshot, after, limit } => PagedVectorReadValue::RowWindow(ScopedVectorCopy::from_admitted(self.row_window(snapshot, after, limit)?, None)),
+            PagedVectorReadRequest::RowBounds => PagedVectorReadValue::RowBounds(ScopedVectorCopy::from_admitted(self.row_bounds()?, None)),
+            PagedVectorReadRequest::PointAtOrAfter { row } => PagedVectorReadValue::PointAtOrAfter(ScopedVectorCopy::from_admitted(self.point_at_or_after(row)?, None)),
+            PagedVectorReadRequest::GraphPointForRow { row } => PagedVectorReadValue::GraphPointForRow(ScopedVectorCopy::from_admitted(self.graph_point_for_row(row)?, None)),
+            PagedVectorReadRequest::ExactGraphRowAfter { key, after } => PagedVectorReadValue::ExactGraphRowAfter(ScopedVectorCopy::from_admitted(self.exact_graph_row_after(key, after)?, None)),
+        })
+    }
+
     fn load_point(&mut self, id: PointId) -> Result<PagedVectorPoint>;
     fn identity(&mut self, data_id: usize) -> Result<PagedVectorIdentity>;
     /// Ordered point probe into the durable row directory, at this root.
@@ -247,6 +300,68 @@ pub trait PagedVectorReader: Send {
     fn exact_graph_row_after(&mut self, key: &[u8], after: Option<RowId>) -> Result<Option<RowId>>;
 }
 
+/// Stack adapter carrying the executing query funder, never TLS state.
+pub(crate) struct AdmittedPagedReader<'a> {
+    reader: &'a mut dyn PagedVectorReader,
+    owner: Option<Arc<dyn MemoryBudget>>,
+    reclaim: Option<&'a dyn Fn() -> bool>,
+}
+impl<'a> AdmittedPagedReader<'a> {
+    pub(crate) fn with_reclamation(reader: &'a mut dyn PagedVectorReader, owner: Option<Arc<dyn MemoryBudget>>, reclaim: &'a dyn Fn() -> bool) -> Self { Self { reader, owner, reclaim: Some(reclaim) } }
+    fn read(&mut self, request: PagedVectorReadRequest<'_>) -> Result<PagedVectorReadValue> {
+        let owner = self.owner.as_ref();
+        let reclaim = self.reclaim;
+        self.reader.read_with_copy_admission(request, &mut |bytes| {
+            let Some(owner) = owner else { return Ok(None); };
+            let mut token = VectorCopyAdmission::new(Arc::clone(owner));
+            loop {
+                match token.reserve_for(bytes, "vector_index", "read_paged_vector_window", "Reduce the selected reader working set or raise its declared memory limit.") {
+                    Ok(()) => break,
+                    Err(error) if super::union::navigation_memory_refusal(&error) && reclaim.is_some_and(|reclaim| reclaim()) => {},
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(Some(token))
+        })
+    }
+    pub(crate) fn load_point(&mut self, id: PointId) -> Result<ScopedVectorCopy<PagedVectorPoint>> {
+        match self.read(PagedVectorReadRequest::Point { id })? {
+            PagedVectorReadValue::Point(value) => Ok(value),
+            _ => Err(Error::Other("paged admission returned the wrong request kind".into())),
+        }
+    }
+    pub(crate) fn identity(&mut self, data_id: usize) -> Result<ScopedVectorCopy<PagedVectorIdentity>> {
+        match self.read(PagedVectorReadRequest::Identity { data_id })? {
+            PagedVectorReadValue::Identity(value) => Ok(value),
+            _ => Err(Error::Other("paged admission returned the wrong request kind".into())),
+        }
+    }
+    pub(crate) fn row_bounds(&mut self) -> Result<Option<(RowId, RowId, usize)>> {
+        match self.read(PagedVectorReadRequest::RowBounds)? {
+            PagedVectorReadValue::RowBounds(value) => Ok(*value),
+            _ => Err(Error::Other("paged admission returned the wrong request kind".into())),
+        }
+    }
+    pub(crate) fn point_at_or_after(&mut self, row: RowId) -> Result<Option<(RowId, PointId)>> {
+        match self.read(PagedVectorReadRequest::PointAtOrAfter { row })? {
+            PagedVectorReadValue::PointAtOrAfter(value) => Ok(*value),
+            _ => Err(Error::Other("paged admission returned the wrong request kind".into())),
+        }
+    }
+    pub(crate) fn graph_point_for_row(&mut self, row: RowId) -> Result<Option<PointId>> {
+        match self.read(PagedVectorReadRequest::GraphPointForRow { row })? {
+            PagedVectorReadValue::GraphPointForRow(value) => Ok(*value),
+            _ => Err(Error::Other("paged admission returned the wrong request kind".into())),
+        }
+    }
+    pub(crate) fn exact_graph_row_after(&mut self, key: &[u8], after: Option<RowId>) -> Result<Option<RowId>> {
+        match self.read(PagedVectorReadRequest::ExactGraphRowAfter { key, after })? {
+            PagedVectorReadValue::ExactGraphRowAfter(value) => Ok(*value),
+            _ => Err(Error::Other("paged admission returned the wrong request kind".into())),
+        }
+    }
+}
+
 /// All mutations go directly into the engine's one admitted transaction. Its
 /// bounded dirty-page owner belongs to the batch plan; failures discard every
 /// scratch point, directory update and progress change in this transaction.
@@ -278,6 +393,13 @@ pub trait PagedVectorTransaction: PagedVectorReader {
 /// fresh writer read for a prior descriptor. The engine shares its captured
 /// durable root/buffer pool and admits every page/record window it serves.
 pub trait PagedVectorGraphSource: Send + Sync {
+    /// Create a captured reader exposing its native admission capability.
+    /// Already-funded sources use the ordinary reader by default; wrappers
+    /// must forward `read_with_copy_admission` to the actual native provider.
+    fn reader_with_copy_admission(&self) -> Result<Box<dyn PagedVectorReader>> {
+        self.reader()
+    }
+
     fn reader(&self) -> Result<Box<dyn PagedVectorReader>>;
     /// Exclusive resident source controls transferred to each fresh tail root.
     /// Return a fresh exclusive Arc for these controls; captured pool/root
@@ -306,6 +428,8 @@ struct PointAdapter<'a> {
     max_node_bytes: usize,
     dimension: usize,
     quantization: VectorQuantization,
+    accountant: &'a Arc<dyn MemoryBudget>,
+    live_workspace: &'a Arc<AtomicUsize>,
 }
 fn point_bytes<T>(point: &PagedPoint<T>) -> Option<usize> {
     point
@@ -327,6 +451,20 @@ fn point_bytes<T>(point: &PagedPoint<T>) -> Option<usize> {
         .checked_add(std::mem::size_of::<PagedVectorPoint>())
 }
 impl PointAdapter<'_> {
+    fn reserve_selection_window<T>(&self, points: usize) -> Result<VectorWorkspaceReservation> {
+        let bytes = self
+            .max_node_bytes
+            .checked_add(std::mem::size_of::<PagedPoint<T>>())
+            .and_then(|node| node.checked_mul(points))
+            .ok_or_else(workspace_overflow)?;
+        VectorWorkspaceReservation::try_new(
+            Arc::clone(self.accountant),
+            Arc::clone(self.live_workspace),
+            bytes,
+            "paged_vector_selection",
+            "release idle serving pages",
+        )
+    }
     fn before_write(&mut self) -> Result<()> {
         if self.writes >= self.max_writes {
             return Err(Error::Other(
@@ -347,6 +485,14 @@ impl PointAdapter<'_> {
 }
 impl PagedPointStorage<f32> for PointAdapter<'_> {
     type Error = Error;
+    fn with_selection_window<R>(
+        &mut self,
+        points: usize,
+        select: impl FnOnce(&mut Self) -> std::result::Result<R, PagedGraphError<Error>>,
+    ) -> std::result::Result<R, PagedGraphError<Error>> {
+        let _reservation = self.reserve_selection_window::<f32>(points)?;
+        select(self)
+    }
     fn load_point(&mut self, id: PointId) -> Result<PagedPoint<f32>> {
         let PagedVectorPoint::F32(point) = self.transaction.load_point(id)? else {
             return Err(Error::Other(
@@ -404,6 +550,14 @@ impl PagedPointStorage<f32> for PointAdapter<'_> {
 }
 impl PagedPointStorage<u8> for PointAdapter<'_> {
     type Error = Error;
+    fn with_selection_window<R>(
+        &mut self,
+        points: usize,
+        select: impl FnOnce(&mut Self) -> std::result::Result<R, PagedGraphError<Error>>,
+    ) -> std::result::Result<R, PagedGraphError<Error>> {
+        let _reservation = self.reserve_selection_window::<u8>(points)?;
+        select(self)
+    }
     fn load_point(&mut self, id: PointId) -> Result<PagedPoint<u8>> {
         let PagedVectorPoint::Quantized(point) = self.transaction.load_point(id)? else {
             return Err(Error::Other(
@@ -474,6 +628,18 @@ fn graph_error(error: PagedGraphError<Error>) -> Error {
         other => Error::Other(format!("paged HNSW operation refused: {other:?}")),
     }
 }
+// Construction scratch is an algorithm window, not the writer accountant.
+// Non-spilling providers can exhaust navigation visits; spilling providers
+// still require sufficient result and pruning windows for their policy.
+fn build_graph_error(error: PagedGraphError<Error>) -> Error {
+    match error {
+        PagedGraphError::ScratchExhausted => Error::Other(
+            "HNSW build scratch window exhausted; inspect the construction provider and policy"
+                .into(),
+        ),
+        other => graph_error(other),
+    }
+}
 fn graph_policy(
     policy: ResolvedVectorPolicy,
     quantization: VectorQuantization,
@@ -523,6 +689,13 @@ struct RetainedPagedReader {
     _charge: Arc<PagedRootCharge>,
 }
 impl PagedVectorReader for RetainedPagedReader {
+    fn read_with_copy_admission(
+        &mut self, request: PagedVectorReadRequest<'_>,
+        admit: &mut dyn FnMut(usize) -> Result<Option<VectorCopyAdmission>>,
+    ) -> Result<PagedVectorReadValue> {
+        self.reader.read_with_copy_admission(request, admit)
+    }
+
     fn load_point(&mut self, id: PointId) -> Result<PagedVectorPoint> {
         self.reader.load_point(id)
     }
@@ -671,10 +844,11 @@ impl PagedVectorTail {
     }
     pub(super) fn graph_reader(&self) -> Result<Box<dyn PagedVectorReader>> {
         Ok(Box::new(RetainedPagedReader {
-            reader: self.source.reader()?,
+            reader: self.source.reader_with_copy_admission()?,
             _charge: Arc::clone(&self.root_charge),
         }))
     }
+
     pub(crate) fn definition(&self) -> (usize, VectorQuantization, ResolvedVectorPolicy) {
         (self.dimension, self.quantization, self.policy)
     }
@@ -765,6 +939,8 @@ impl PagedVectorTail {
                 max_node_bytes: plan.max_node_bytes,
                 dimension: self.dimension,
                 quantization: self.quantization,
+                accountant: &self.accountant,
+                live_workspace: &self.live_workspace,
             };
             for entry in entries {
                 self.insert_entry(&mut adapter, &mut workspace, &mut next, entry)?;
@@ -839,7 +1015,7 @@ impl PagedVectorTail {
                 },
             ),
         }
-        .map_err(graph_error)?;
+        .map_err(build_graph_error)?;
         adapter.transaction.store_identity(&PagedVectorIdentity {
             point,
             data_id,
@@ -1312,7 +1488,13 @@ pub trait PagedGenerationTransaction: PagedVectorTransaction {
     fn seal_point(&mut self, point: PointId, encoded: &[u8]) -> Result<()>;
     /// Verify the complete encoded base plus searchable suffix through this
     /// LSN, and atomically publish descriptor/coverage. Retain old reader roots.
-    fn publish(&mut self, progress: &PagedVectorProgress, through_lsn: Lsn) -> Result<()>;
+    /// An emptied route instead returns Abandoned with its storage queued
+    /// for cleanup in the same transaction.
+    fn publish(
+        &mut self,
+        progress: &PagedVectorProgress,
+        through_lsn: Lsn,
+    ) -> Result<PagedVectorPhase>;
     /// Remove at most max_keys eligible keys after the exclusive cursor. The
     /// engine rechecks reader/external floors and erasure fences transactionally.
     fn reclaim(
@@ -1695,6 +1877,8 @@ impl PagedGenerationBuilder {
                 max_node_bytes: plan.max_node_bytes,
                 dimension: self.dimension,
                 quantization: self.quantization,
+                accountant: &self.accountant,
+                live_workspace: &self.live_workspace,
             };
             let data_id = next.graph.points;
             let policy = graph_policy(self.policy, self.quantization);
@@ -1715,7 +1899,7 @@ impl PagedGenerationBuilder {
                         data_id,
                         &hnsw_f32_distance(),
                     )
-                    .map_err(graph_error)?;
+                    .map_err(build_graph_error)?;
                     (id, exact_key)
                 }
                 PagedVectorValues::Quantized(values)
@@ -1752,7 +1936,7 @@ impl PagedGenerationBuilder {
                             quantization: self.quantization,
                         },
                     )
-                    .map_err(graph_error)?;
+                    .map_err(build_graph_error)?;
                     (id, exact_key)
                 }
                 _ => {
@@ -1800,6 +1984,8 @@ impl PagedGenerationBuilder {
                 max_node_bytes: plan.max_node_bytes,
                 dimension: self.dimension,
                 quantization: self.quantization,
+                accountant: &self.accountant,
+                live_workspace: &self.live_workspace,
             };
             let mut bytes = Vec::with_capacity(plan.max_node_bytes);
             match self.quantization {
@@ -1881,9 +2067,17 @@ impl PagedGenerationBuilder {
         }
         self.transact(plan, checkpoint, |_, transaction, previous, checkpoint| {
             checkpoint()?;
-            transaction.publish(previous, through_lsn)?;
+            let phase = transaction.publish(previous, through_lsn)?;
+            if !matches!(
+                phase,
+                PagedVectorPhase::Published | PagedVectorPhase::Abandoned
+            ) {
+                return Err(Error::Other(
+                    "paged publication returned a nonterminal phase".into(),
+                ));
+            }
             let mut next = previous.clone();
-            next.phase = PagedVectorPhase::Published;
+            next.phase = phase;
             Ok(next)
         })
     }

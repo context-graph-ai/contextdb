@@ -1,6 +1,7 @@
 //! Root-scoped relational reads. Implementations retain the engine's admitted
 //! source window, never a second decoded cache or a fresh root per lookup.
 use crate::store::{IndexEntry, SyncSourceKind};
+use contextdb_core::read_memory::{OwnedReadBox, ReadCredit};
 use contextdb_core::{IndexKey, Lsn, Result, RowId, SnapshotId, TxId, VersionedRow};
 use contextdb_tx::{OrderedStagedRows, StagedPosition};
 use std::ops::Bound;
@@ -13,12 +14,12 @@ pub trait RelationalWindow<T>: Send {
 }
 
 pub trait RelationalCursor<T>: Send {
-    fn next_window(&mut self) -> Result<Option<Box<dyn RelationalWindow<T>>>>;
+    fn next_window(&mut self) -> Result<Option<OwnedReadBox<dyn RelationalWindow<T>>>>;
     /// Admit work after a record exists and before decoding its payload.
     fn next_window_before(
         &mut self,
         before: &mut dyn FnMut() -> Result<()>,
-    ) -> Result<Option<Box<dyn RelationalWindow<T>>>> {
+    ) -> Result<Option<OwnedReadBox<dyn RelationalWindow<T>>>> {
         before()?;
         self.next_window()
     }
@@ -47,6 +48,10 @@ pub trait RelationalPositionKey: Send {
 /// WriterSnapshot; this interface has no publication or root-capture door.
 pub trait RelationalReadSource: Send + Sync {
     fn snapshot(&self) -> SnapshotId;
+    /// Current postings are selected only at this captured source frontier.
+    fn ordered_prefix_snapshot_is_current(&self, snapshot: SnapshotId) -> bool {
+        snapshot == self.snapshot()
+    }
     fn validate_table(&self, _table: &str) -> Result<()> {
         Ok(())
     }
@@ -57,32 +62,32 @@ pub trait RelationalReadSource: Send + Sync {
         lower: Bound<&[u8]>,
         upper: Bound<&[u8]>,
         reverse: bool,
-    ) -> Result<Box<dyn RelationalCursor<VersionedRow>>>;
+    ) -> Result<RelationalCursorOwner<VersionedRow>>;
     /// Reverse version order within one row identity.
     fn row_id_cursor(
         &self,
         table: &str,
         row: RowId,
         snapshot: SnapshotId,
-    ) -> Result<Box<dyn RelationalCursor<VersionedRow>>>;
+    ) -> Result<RelationalCursorOwner<VersionedRow>>;
     fn exact_row(
         &self,
         table: &str,
         position: &[u8; 24],
-    ) -> Result<Option<Box<dyn RelationalWindow<VersionedRow>>>>;
+    ) -> Result<Option<OwnedReadBox<dyn RelationalWindow<VersionedRow>>>>;
     fn index_cursor(
         &self,
         table: &str,
         index: &str,
         range: RelationalIndexRange<'_>,
-    ) -> Result<Box<dyn RelationalCursor<RelationalPosting>>>;
+    ) -> Result<RelationalCursorOwner<RelationalPosting>>;
     fn exact_index_cursor(
         &self,
         table: &str,
         index: &str,
         current: bool,
         key: &IndexKey,
-    ) -> Result<Box<dyn RelationalCursor<RelationalPosting>>>;
+    ) -> Result<RelationalCursorOwner<RelationalPosting>>;
     /// Construct full physical endpoints under source scratch admission.
     fn index_position_key(
         &self,
@@ -90,7 +95,7 @@ pub trait RelationalReadSource: Send + Sync {
         key: &IndexKey,
         row: RowId,
         created: TxId,
-    ) -> Result<Box<dyn RelationalPositionKey>>;
+    ) -> Result<OwnedReadBox<dyn RelationalPositionKey>>;
     fn sync_source(&self, table: &str, row: RowId) -> Result<Option<(Lsn, SyncSourceKind)>>;
 }
 
@@ -100,7 +105,7 @@ pub fn visible_row(
     table: &str,
     row: RowId,
     snapshot: SnapshotId,
-) -> Result<Option<Box<dyn RelationalWindow<VersionedRow>>>> {
+) -> Result<Option<OwnedReadBox<dyn RelationalWindow<VersionedRow>>>> {
     ensure_snapshot(source, snapshot)?;
     let mut cursor = source.row_id_cursor(table, row, snapshot)?;
     while let Some(window) = cursor.next_window()? {
@@ -134,7 +139,7 @@ pub struct StagedExactProbe<'a> {
 }
 
 pub enum RelationalProbeHit<'a> {
-    Committed(Box<dyn RelationalWindow<VersionedRow>>),
+    Committed(OwnedReadBox<dyn RelationalWindow<VersionedRow>>),
     Staged(&'a VersionedRow),
 }
 
@@ -233,8 +238,8 @@ pub struct StagedRelationalPosting<'a> {
 
 pub enum OrderedRelationalHit<'a> {
     Committed {
-        posting: Box<dyn RelationalWindow<RelationalPosting>>,
-        row: Box<dyn RelationalWindow<VersionedRow>>,
+        posting: OwnedReadBox<dyn RelationalWindow<RelationalPosting>>,
+        row: OwnedReadBox<dyn RelationalWindow<VersionedRow>>,
     },
     Staged(StagedRelationalPosting<'a>),
 }
@@ -261,9 +266,9 @@ impl OrderedRelationalHit<'_> {
 /// releases its root, cursor and pending window even before exhaustion.
 pub struct OrderedRelationalMerge<'a> {
     source: Option<std::sync::Arc<dyn RelationalReadSource>>,
-    committed: Option<Box<dyn RelationalCursor<RelationalPosting>>>,
+    committed: Option<RelationalCursorOwner<RelationalPosting>>,
     staged: Option<Box<dyn Iterator<Item = Result<StagedRelationalPosting<'a>>> + 'a>>,
-    committed_head: Option<Box<dyn RelationalWindow<RelationalPosting>>>,
+    committed_head: Option<OwnedReadBox<dyn RelationalWindow<RelationalPosting>>>,
     staged_head: Option<StagedRelationalPosting<'a>>,
     snapshot: SnapshotId,
     table: &'a str,
@@ -283,7 +288,7 @@ impl<'a> OrderedRelationalMerge<'a> {
         range: RelationalIndexRange<'_>,
     ) -> Result<Self> {
         ensure_snapshot(source.as_ref(), snapshot)?;
-        if range.current != (snapshot == source.snapshot()) {
+        if range.current != source.ordered_prefix_snapshot_is_current(snapshot) {
             return Err(contextdb_core::Error::Other(
                 "relational posting family differs from the requested snapshot".into(),
             ));
@@ -328,7 +333,16 @@ impl<'a> OrderedRelationalMerge<'a> {
         &mut self,
         hidden_committed: impl FnMut(RowId) -> bool,
     ) -> Result<Option<OrderedRelationalHit<'a>>> {
-        let result = self.next_inner(hidden_committed);
+        self.next_observed(hidden_committed, |_, _| Ok(()))
+    }
+
+    /// Observe each committed posting before visibility and suppression.
+    pub fn next_observed(
+        &mut self,
+        hidden_committed: impl FnMut(RowId) -> bool,
+        observed: impl FnMut(&IndexKey, RowId) -> Result<()>,
+    ) -> Result<Option<OrderedRelationalHit<'a>>> {
+        let result = self.next_inner(hidden_committed, observed);
         if result.is_err() {
             self.cancel();
         }
@@ -338,6 +352,7 @@ impl<'a> OrderedRelationalMerge<'a> {
     fn next_inner(
         &mut self,
         mut hidden_committed: impl FnMut(RowId) -> bool,
+        mut observed: impl FnMut(&IndexKey, RowId) -> Result<()>,
     ) -> Result<Option<OrderedRelationalHit<'a>>> {
         loop {
             while self.committed_head.is_none() && !self.committed_done {
@@ -350,6 +365,7 @@ impl<'a> OrderedRelationalMerge<'a> {
                     self.committed_done = true;
                     break;
                 };
+                observed(&window.value().key, window.value().entry.row_id)?;
                 let entry = &window.value().entry;
                 if !hidden_committed(entry.row_id) && entry.visible_at(self.snapshot) {
                     self.committed_head = Some(window);
@@ -401,5 +417,37 @@ impl<'a> OrderedRelationalMerge<'a> {
                 return Ok(Some(OrderedRelationalHit::Committed { posting, row }));
             }
         }
+    }
+}
+
+/// Restricted cursor owner: complete Box destruction precedes credit release.
+#[doc(hidden)]
+pub struct RelationalCursorOwner<T> {
+    payload: Box<dyn RelationalCursor<T>>,
+    _credit: ReadCredit,
+}
+impl<T> RelationalCursorOwner<T> {
+    pub fn new(payload: Box<dyn RelationalCursor<T>>, credit: ReadCredit) -> Self {
+        Self {
+            payload,
+            _credit: credit,
+        }
+    }
+    pub fn as_ref(&self) -> &dyn RelationalCursor<T> {
+        self.payload.as_ref()
+    }
+}
+impl<T> RelationalCursor<T> for RelationalCursorOwner<T> {
+    fn next_window(&mut self) -> Result<Option<OwnedReadBox<dyn RelationalWindow<T>>>> {
+        self.payload.next_window()
+    }
+    fn next_window_before(
+        &mut self,
+        before: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Option<OwnedReadBox<dyn RelationalWindow<T>>>> {
+        self.payload.next_window_before(before)
+    }
+    fn examined_entries(&self) -> u64 {
+        self.payload.examined_entries()
     }
 }

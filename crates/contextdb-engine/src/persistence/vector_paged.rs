@@ -18,6 +18,9 @@ use contextdb_vector::hnsw::paged_builder::{
     encode_paged_point_into,
 };
 use std::ops::Bound;
+use std::cell::RefCell;
+use contextdb_vector::{ScopedVectorCopy, VectorCopyAdmission};
+use contextdb_vector::hnsw::paged_builder::{PagedVectorReadRequest, PagedVectorReadValue};
 
 pub(super) const PAGES: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("vector_paged_generation_pages");
@@ -29,6 +32,11 @@ const SCRATCH: TableDefinition<&[u8], &[u8]> = TableDefinition::new("vector_page
 const COUNTERS: TableDefinition<&str, u64> = TableDefinition::new("vector_paged_counters");
 /// Frontier of an in-flight whole (resident) build, per partition route.
 const FLOORS: TableDefinition<&[u8], u64> = TableDefinition::new("vector_build_floors");
+/// A source cursor cannot have this length/value. Incomplete resident exports
+/// are discarded on restart; their pages remain owned by BUILDS until queued
+/// for cleanup. Complete exports clear it before native publication.
+pub(crate) const RESIDENT_EXPORT_MARKER: &[u8] = b"resident-export";
+
 const NEXT_STORAGE: &str = "next_storage_id";
 
 const KIND_POINT: u8 = 1;
@@ -47,7 +55,7 @@ const CANONICAL_BYTES: usize = 32;
 /// Physical source companion suffix width (`vector_membership_pages::source_key`).
 const SOURCE_SUFFIX_BYTES: usize = 24;
 
-pub(super) fn corruption(reason: impl Into<String>) -> Error {
+pub(crate) fn corruption(reason: impl Into<String>) -> Error {
     Error::StoreCorrupted {
         path: "vector_paged_generation_pages".into(),
         reason: reason.into(),
@@ -150,8 +158,10 @@ fn decode_image_build_record(payload: &[u8]) -> Result<PagedBuildRecord> {
     // Callers hold the actual operation's encoded-byte reservation through all
     // uses of the owned record. Complete inspection proves each allocation hint
     // has its elements in that already admitted input before serde can reserve.
-    RedbPersistence::decode_exact(payload)
-        .map_err(|_| corruption("paged build record cannot be decoded"))
+    let record: PagedBuildRecord = RedbPersistence::decode_exact(payload)
+        .map_err(|_| corruption("paged build record cannot be decoded"))?;
+    if record.storage_id == 0 { return Err(corruption("paged build storage identity is reserved")); }
+    Ok(record)
 }
 
 fn phase_code(phase: PagedVectorPhase) -> u8 {
@@ -236,6 +246,7 @@ pub(crate) struct PagedBuildRecord {
 
 impl PagedBuildRecord {
     pub(crate) fn progress(&self) -> Result<PagedVectorProgress> {
+        if self.storage_id == 0 { return Err(corruption("paged build storage identity is reserved")); }
         self.progress.to_progress()
     }
 }
@@ -260,6 +271,9 @@ impl PagedGenerationMeta {
         }
         let meta: Self = RedbPersistence::decode_exact(bytes)
             .map_err(|_| corruption("paged generation metadata cannot be decoded"))?;
+        if meta.storage_id == 0 {
+            return Err(corruption("paged generation storage identity is reserved"));
+        }
         if meta.magic != META_MAGIC {
             return Err(corruption("paged generation metadata has the wrong magic"));
         }
@@ -267,6 +281,7 @@ impl PagedGenerationMeta {
     }
 
     pub(crate) fn progress(&self) -> Result<PagedVectorProgress> {
+        if self.storage_id == 0 { return Err(corruption("paged build storage identity is reserved")); }
         self.progress.to_progress()
     }
 }
@@ -475,41 +490,41 @@ fn identity_visible(identity: &PagedVectorIdentity, snapshot: SnapshotId) -> boo
     identity.created_tx <= tx && identity.deleted_tx.is_none_or(|deleted| deleted > tx)
 }
 
-/// Shared page lookups over either the build's write handle or a captured
-/// root. Each call returns at most one owned record window.
+/// One storage-guard-scoped admission before any native owned page copy.
 trait PageSource {
-    fn page(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
-    fn first_after(&self, lower: Bound<&[u8]>, upper: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>>;
-    fn last_before(&self, lower: &[u8], upper: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>>;
+    fn admitted_page(&self, key: &[u8], before_copy: &mut dyn FnMut(&[u8]) -> Result<Option<VectorCopyAdmission>>) -> Result<Option<ScopedVectorCopy<Vec<u8>>>>;
+    fn first_after(&self, lower: Bound<&[u8]>, upper: &[u8], before_copy: &mut dyn FnMut(&[u8], &[u8]) -> Result<Option<VectorCopyAdmission>>) -> Result<Option<ScopedVectorCopy<(Vec<u8>, Vec<u8>)>>>;
+    fn last_before(&self, lower: &[u8], upper: &[u8], before_copy: &mut dyn FnMut(&[u8], &[u8]) -> Result<Option<VectorCopyAdmission>>) -> Result<Option<ScopedVectorCopy<(Vec<u8>, Vec<u8>)>>>;
 }
-
 impl<T: ReadableTable<&'static [u8], &'static [u8]>> PageSource for T {
-    fn page(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        Ok(self
-            .get(key)
-            .map_err(RedbPersistence::storage_error)?
-            .map(|value| value.value().to_vec()))
+    fn admitted_page(&self, key: &[u8], before_copy: &mut dyn FnMut(&[u8]) -> Result<Option<VectorCopyAdmission>>) -> Result<Option<ScopedVectorCopy<Vec<u8>>>> {
+        let value = self.get(key).map_err(RedbPersistence::storage_error)?;
+        match value {
+            Some(value) => {
+                let admission = before_copy(value.value())?;
+                Ok(Some(ScopedVectorCopy::from_admitted(value.value().to_vec(), admission)))
+            }
+            None => Ok(None),
+        }
     }
-    fn first_after(&self, lower: Bound<&[u8]>, upper: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
-        let mut range = self
-            .range::<&[u8]>((lower, Bound::Excluded(upper)))
-            .map_err(RedbPersistence::storage_error)?;
+    fn first_after(&self, lower: Bound<&[u8]>, upper: &[u8], before_copy: &mut dyn FnMut(&[u8], &[u8]) -> Result<Option<VectorCopyAdmission>>) -> Result<Option<ScopedVectorCopy<(Vec<u8>, Vec<u8>)>>> {
+        let mut range = self.range::<&[u8]>((lower, Bound::Excluded(upper))).map_err(RedbPersistence::storage_error)?;
         Ok(match range.next() {
             Some(entry) => {
                 let (key, value) = entry.map_err(RedbPersistence::storage_error)?;
-                Some((key.value().to_vec(), value.value().to_vec()))
+                let admission = before_copy(key.value(), value.value())?;
+                Some(ScopedVectorCopy::from_admitted((key.value().to_vec(), value.value().to_vec()), admission))
             }
             None => None,
         })
     }
-    fn last_before(&self, lower: &[u8], upper: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
-        let mut range = self
-            .range::<&[u8]>((Bound::Included(lower), Bound::Excluded(upper)))
-            .map_err(RedbPersistence::storage_error)?;
+    fn last_before(&self, lower: &[u8], upper: &[u8], before_copy: &mut dyn FnMut(&[u8], &[u8]) -> Result<Option<VectorCopyAdmission>>) -> Result<Option<ScopedVectorCopy<(Vec<u8>, Vec<u8>)>>> {
+        let mut range = self.range::<&[u8]>((Bound::Included(lower), Bound::Excluded(upper))).map_err(RedbPersistence::storage_error)?;
         Ok(match range.next_back() {
             Some(entry) => {
                 let (key, value) = entry.map_err(RedbPersistence::storage_error)?;
-                Some((key.value().to_vec(), value.value().to_vec()))
+                let admission = before_copy(key.value(), value.value())?;
+                Some(ScopedVectorCopy::from_admitted((key.value().to_vec(), value.value().to_vec()), admission))
             }
             None => None,
         })
@@ -517,7 +532,8 @@ impl<T: ReadableTable<&'static [u8], &'static [u8]>> PageSource for T {
 }
 
 /// Point, identity and directory reads common to construction and serving.
-struct PagedLookup<'s, S: PageSource> {
+struct PagedLookup<'s, 'a, S: PageSource> {
+    admission: Option<&'s RefCell<&'a mut dyn FnMut(usize) -> Result<Option<VectorCopyAdmission>>>>,
     pages: &'s S,
     storage: [u8; 8],
     dimension: usize,
@@ -525,14 +541,101 @@ struct PagedLookup<'s, S: PageSource> {
     node_limit: usize,
 }
 
-impl<S: PageSource> PagedLookup<'_, S> {
-    fn load_point(&self, id: PointId) -> Result<PagedVectorPoint> {
+// This layout mirrors the fork's private decoded neighbour fields. Both
+// old decoded neighbours and new PagedEdge representations are funded.
+#[allow(dead_code)]
+struct DecodedNeighbourLayout { origin: usize, point: (u8, i32), distance: f32 }
+
+/// Authenticate before this structural borrowed-frame walk. Every fixed-int
+/// length must fit its exact bytes before serde sees a length or allocates.
+/// Three times the greater of a nonempty sequence's real length and Vec's
+/// minimum capacity bounds final capacity and overlapping reallocations.
+fn point_decode_window(payload: &[u8], value_bytes: usize) -> Result<usize> {
+    let invalid = || corruption("paged point encoded lengths or window size are invalid");
+    if payload.len() < 13 || payload[8] >= 16
+        || i32::from_le_bytes(payload[9..13].try_into().unwrap()) < 0
+    {
+        return Err(invalid());
+    }
+    let mut at = 13usize;
+    let count = |at: &mut usize| -> Result<usize> {
+        let end = at.checked_add(8).ok_or_else(invalid)?;
+        let bytes = payload.get(*at..end).ok_or_else(invalid)?;
+        *at = end;
+        usize::try_from(u64::from_le_bytes(bytes.try_into().unwrap())).map_err(|_| invalid())
+    };
+    let growth = |n: usize, bytes: usize, minimum: usize| -> Result<usize> {
+        if n == 0 { return Ok(0); }
+        n.max(minimum).checked_mul(bytes).and_then(|v| v.checked_mul(3)).ok_or_else(invalid)
+    };
+    let values = count(&mut at)?;
+    at = at.checked_add(values.checked_mul(value_bytes).ok_or_else(invalid)?).ok_or_else(invalid)?;
+    if at > payload.len() { return Err(invalid()); }
+    let layers = count(&mut at)?;
+    if layers > 16 { return Err(invalid()); }
+    let header = std::mem::size_of::<Vec<PagedEdge>>();
+    let old_edge = std::mem::size_of::<DecodedNeighbourLayout>();
+    let new_edge = std::mem::size_of::<PagedEdge>();
+    let mut decoded = growth(values, value_bytes, if value_bytes == 1 { 8 } else { 4 })?
+        .checked_add(growth(layers, header, 4)?).ok_or_else(invalid)?;
+    let mut conversion = layers.checked_mul(header).ok_or_else(invalid)?;
+    for _ in 0..layers {
+        let edges = count(&mut at)?;
+        at = at.checked_add(edges.checked_mul(17).ok_or_else(invalid)?).ok_or_else(invalid)?;
+        if at > payload.len() { return Err(invalid()); }
+        decoded = decoded.checked_add(growth(edges, old_edge, 4)?).ok_or_else(invalid)?;
+        conversion = conversion.checked_add(edges.checked_mul(new_edge).ok_or_else(invalid)?).ok_or_else(invalid)?;
+    }
+    if at != payload.len() { return Err(invalid()); }
+    decoded.checked_add(conversion)
+        .and_then(|n| n.checked_add(std::mem::size_of::<PagedVectorPoint>()))
+        .ok_or_else(invalid)
+}
+
+impl<S: PageSource> PagedLookup<'_, '_, S> {
+    fn admit(&self, bytes: usize) -> Result<Option<VectorCopyAdmission>> {
+        match self.admission { Some(admit) => (admit.borrow_mut())(bytes), None => Ok(None) }
+    }
+    fn directory_admission(&self, key: &[u8], frame: &[u8]) -> Result<Option<VectorCopyAdmission>> {
+        let payload = open_value(key, frame)?;
+        if key.len() < 9 || key[..8] != self.storage {
+            return Err(corruption("paged directory key is invalid"));
+        }
+        match key[8] {
+            KIND_ROW => {
+                if key.len() != 25 { return Err(corruption("paged row directory key is invalid")); }
+                decode_point_id(payload)?;
+            }
+            KIND_EXACT => {
+                if key.len() < 29 { return Err(corruption("paged exact directory key is invalid")); }
+                let exact_len = u32::from_be_bytes(key[9..13].try_into().unwrap()) as usize;
+                if exact_len.checked_add(29) != Some(key.len()) || !payload.is_empty() {
+                    return Err(corruption("paged exact directory record is invalid"));
+                }
+            }
+            _ => return Err(corruption("paged directory kind is invalid")),
+        }
+        let bytes = key.len().checked_add(frame.len()).and_then(|n| n.checked_add(2 * std::mem::size_of::<Vec<u8>>())).ok_or_else(|| corruption("paged directory window size overflow"))?;
+        self.admit(bytes)
+    }
+    fn load_point(&self, id: PointId) -> Result<ScopedVectorCopy<PagedVectorPoint>> {
         let key = point_key(&self.storage, id);
         let value = self
             .pages
-            .page(&key)?
+            .admitted_page(&key, &mut |frame| {
+                let payload = open_value(&key, frame)?;
+                if payload.len() > self.node_limit {
+                    return Err(corruption("HNSW point exceeds its admitted decode window"));
+                }
+                let decoded = point_decode_window(payload, if self.quantization == VectorQuantization::F32 { 4 } else { 1 })?;
+                let window = frame.len().checked_add(decoded)
+                    .and_then(|n| n.checked_add(std::mem::size_of::<Vec<u8>>()))
+                    .ok_or_else(|| corruption("paged point window size overflow"))?;
+                self.admit(window)
+            })?
             .ok_or_else(|| corruption("paged vector graph names a missing point"))?;
-        let payload = open_value(&key, &value)?;
+        value.try_map(|value| {
+        let payload = open_value(&key, value)?;
         let point = match self.quantization {
             VectorQuantization::F32 => {
                 let point: PagedPoint<f32> = decode_paged_point(payload, self.node_limit)
@@ -558,19 +661,42 @@ impl<S: PageSource> PagedLookup<'_, S> {
             return Err(corruption("paged point identity disagrees with its key"));
         }
         Ok(point)
+        })
     }
 
-    fn identity(&self, data_id: usize) -> Result<PagedVectorIdentity> {
+    fn identity(&self, data_id: usize) -> Result<ScopedVectorCopy<PagedVectorIdentity>> {
         let key = identity_key(&self.storage, data_id);
         let value = self
             .pages
-            .page(&key)?
+            .admitted_page(&key, &mut |frame| {
+                let payload = open_value(&key, frame)?;
+                if payload.len() < 50 {
+                    return Err(corruption("paged vector identity record is invalid"));
+                }
+                let key_len = u32::from_be_bytes(payload[46..50].try_into().unwrap()) as usize;
+                if payload.len()
+                    != 50usize
+                        .checked_add(key_len)
+                        .ok_or_else(|| corruption("paged identity window size overflow"))?
+                {
+                    return Err(corruption("paged vector identity record is invalid"));
+                }
+                let window = frame
+                    .len()
+                    .checked_add(key_len)
+                    .and_then(|n| n.checked_add(std::mem::size_of::<Vec<u8>>()))
+                    .and_then(|n| n.checked_add(std::mem::size_of::<PagedVectorIdentity>()))
+                    .ok_or_else(|| corruption("paged identity window size overflow"))?;
+                self.admit(window)
+            })?
             .ok_or_else(|| corruption("paged vector graph names a missing identity"))?;
-        let identity = decode_identity(open_value(&key, &value)?)?;
+        value.try_map(|value| {
+        let identity = decode_identity(open_value(&key, value)?)?;
         if identity.data_id != data_id {
             return Err(corruption("paged identity disagrees with its key"));
         }
         Ok(identity)
+        })
     }
 
     fn row_entry(&self, key: &[u8], value: &[u8]) -> Result<(RowId, usize, PointId)> {
@@ -593,8 +719,8 @@ impl<S: PageSource> PagedLookup<'_, S> {
         let lower = row_key(&self.storage, row, 0);
         let upper = self.rows_end();
         self.pages
-            .first_after(Bound::Included(&lower), &upper)?
-            .map(|(key, value)| self.row_entry(&key, &value))
+            .first_after(Bound::Included(&lower), &upper, &mut |key, value| self.directory_admission(key, value))?
+            .map(|entry| self.row_entry(&entry.0, &entry.1))
             .transpose()
     }
 
@@ -603,8 +729,8 @@ impl<S: PageSource> PagedLookup<'_, S> {
         let lower = row_key(&self.storage, row, data_id);
         let upper = self.rows_end();
         self.pages
-            .first_after(Bound::Excluded(&lower), &upper)?
-            .map(|(key, value)| self.row_entry(&key, &value))
+            .first_after(Bound::Excluded(&lower), &upper, &mut |key, value| self.directory_admission(key, value))?
+            .map(|entry| self.row_entry(&entry.0, &entry.1))
             .transpose()
     }
 
@@ -629,27 +755,34 @@ impl<S: PageSource> PagedLookup<'_, S> {
     }
 
     fn exact_after(&self, exact: &[u8], after: Option<RowId>) -> Result<Option<(RowId, usize)>> {
-        let prefix = exact_prefix(&self.storage, exact);
+        let prefix_len = exact.len().checked_add(13).ok_or_else(|| corruption("paged exact prefix size overflow"))?;
+        let cursor_bytes = prefix_len.checked_add(16).and_then(|n| n.checked_mul(5))
+            .and_then(|n| n.checked_add(3 * std::mem::size_of::<Vec<u8>>()))
+            .ok_or_else(|| corruption("paged exact cursor window size overflow"))?;
+        let prefix_admission = self.admit(cursor_bytes)?;
+        let prefix = ScopedVectorCopy::from_admitted(exact_prefix(&self.storage, exact), prefix_admission);
         let upper = writer_source::prefix_end(&prefix)
             .ok_or_else(|| corruption("paged exact directory prefix has no successor"))?;
         let lower = match after {
             Some(row) => {
-                let mut key = prefix.clone();
+                let mut key = Vec::with_capacity(prefix_len + 16);
+                key.extend_from_slice(&prefix);
                 key.extend_from_slice(&row.0.to_be_bytes());
                 key.extend_from_slice(&u64::MAX.to_be_bytes());
                 key
             }
-            None => prefix.clone(),
+            None => prefix.to_vec(),
         };
         let bound = if after.is_some() {
             Bound::Excluded(lower.as_slice())
         } else {
             Bound::Included(lower.as_slice())
         };
-        let Some((key, value)) = self.pages.first_after(bound, &upper)? else {
+        let Some(entry) = self.pages.first_after(bound, &upper, &mut |key, value| self.directory_admission(key, value))? else {
             return Ok(None);
         };
-        open_value(&key, &value)?;
+        let (key, value) = &*entry;
+        open_value(key, value)?;
         if key.len() != prefix.len() + 16 || !key.starts_with(&prefix) {
             return Err(corruption("paged exact directory key is invalid"));
         }
@@ -670,8 +803,9 @@ impl<S: PageSource> PagedLookup<'_, S> {
         mut after: Option<RowId>,
         limit: usize,
         checkpoint: &mut dyn FnMut() -> Result<()>,
-    ) -> Result<Vec<RowId>> {
-        let mut rows = Vec::new();
+    ) -> Result<ScopedVectorCopy<Vec<RowId>>> {
+        let credit = self.admit(limit.checked_mul(std::mem::size_of::<RowId>()).and_then(|n| n.checked_add(std::mem::size_of::<Vec<RowId>>())).ok_or_else(|| corruption("paged row window overflow"))?)?;
+        let mut rows = ScopedVectorCopy::from_admitted(Vec::with_capacity(limit), credit);
         while rows.len() < limit {
             checkpoint()?;
             let Some((row, data_id)) = self.exact_after(exact, after)? else {
@@ -697,8 +831,9 @@ impl<S: PageSource> PagedLookup<'_, S> {
         after: Option<RowId>,
         limit: usize,
         checkpoint: &mut dyn FnMut() -> Result<()>,
-    ) -> Result<Vec<RowId>> {
-        let mut rows: Vec<RowId> = Vec::new();
+    ) -> Result<ScopedVectorCopy<Vec<RowId>>> {
+        let credit = self.admit(limit.checked_mul(std::mem::size_of::<RowId>()).and_then(|n| n.checked_add(std::mem::size_of::<Vec<RowId>>())).ok_or_else(|| corruption("paged row window overflow"))?)?;
+        let mut rows = ScopedVectorCopy::from_admitted(Vec::with_capacity(limit), credit);
         let mut cursor = match after {
             Some(row) => self.row_after(row, usize::MAX)?,
             None => self.row_at_or_after(RowId(0))?,
@@ -725,16 +860,16 @@ impl<S: PageSource> PagedLookup<'_, S> {
     fn row_bounds(&self, points: usize) -> Result<Option<(RowId, RowId, usize)>> {
         let lower = kind_prefix(&self.storage, KIND_ROW);
         let upper = self.rows_end();
-        let Some((first_key, first_value)) =
-            self.pages.first_after(Bound::Included(&lower), &upper)?
+        let Some(first_entry) =
+            self.pages.first_after(Bound::Included(&lower), &upper, &mut |key, value| self.directory_admission(key, value))?
         else {
             return Ok(None);
         };
-        let Some((last_key, last_value)) = self.pages.last_before(&lower, &upper)? else {
+        let Some(last_entry) = self.pages.last_before(&lower, &upper, &mut |key, value| self.directory_admission(key, value))? else {
             return Err(corruption("paged row directory lost its last entry"));
         };
-        let (first, _, _) = self.row_entry(&first_key, &first_value)?;
-        let (last, _, _) = self.row_entry(&last_key, &last_value)?;
+        let (first, _, _) = self.row_entry(&first_entry.0, &first_entry.1)?;
+        let (last, _, _) = self.row_entry(&last_entry.0, &last_entry.1)?;
         Ok(Some((first, last, points)))
     }
 
@@ -754,7 +889,8 @@ impl<S: PageSource> PagedLookup<'_, S> {
         let mut visible = 0usize;
         for data_id in 0..points {
             checkpoint()?;
-            if identity_visible(&self.identity(data_id)?, snapshot) {
+            let identity = self.identity(data_id)?;
+            if identity_visible(&identity, snapshot) {
                 visible += 1;
             }
         }
@@ -858,6 +994,7 @@ impl NativePagedGeneration {
         let record: PagedBuildRecord =
             RedbPersistence::decode_exact(open_value(&self.record_key, value.value())?)
                 .map_err(|_| corruption("paged build record cannot be decoded"))?;
+        if record.storage_id == 0 { return Err(corruption("paged build storage identity is reserved")); }
         if record.storage_id != self.storage_id || record.declaration != self.declaration {
             return Err(Error::Other(
                 "paged vector build record changed outside this builder".into(),
@@ -968,7 +1105,10 @@ impl PagedGenerationPersistence for NativePagedGeneration {
                     let mut builds = write
                         .open_table(BUILDS)
                         .map_err(RedbPersistence::storage_error)?;
-                    if published {
+                    if matches!(
+                        next.phase,
+                        PagedVectorPhase::Published | PagedVectorPhase::Abandoned
+                    ) {
                         builds
                             .remove(self.record_key.as_slice())
                             .map_err(RedbPersistence::storage_error)?;
@@ -1084,8 +1224,9 @@ impl<'t> NativeBatch<'t> {
         })
     }
 
-    fn lookup(&self) -> PagedLookup<'_, redb::Table<'t, &'static [u8], &'static [u8]>> {
+    fn lookup(&self) -> PagedLookup<'_, '_, redb::Table<'t, &'static [u8], &'static [u8]>> {
         PagedLookup {
+            admission: None,
             pages: &self.pages,
             storage: self.storage,
             dimension: self.declaration.dimension as usize,
@@ -1204,10 +1345,10 @@ impl<'t> NativeBatch<'t> {
 
 impl PagedVectorReader for NativeBatch<'_> {
     fn load_point(&mut self, id: PointId) -> Result<PagedVectorPoint> {
-        self.lookup().load_point(id)
+        self.lookup().load_point(id)?.into_already_funded()
     }
     fn identity(&mut self, data_id: usize) -> Result<PagedVectorIdentity> {
-        self.lookup().identity(data_id)
+        self.lookup().identity(data_id)?.into_already_funded()
     }
     fn point_for_row(&mut self, row: RowId, snapshot: SnapshotId) -> Result<Option<PointId>> {
         self.lookup().visible_point_for_row(row, snapshot)
@@ -1221,7 +1362,7 @@ impl PagedVectorReader for NativeBatch<'_> {
     ) -> Result<Vec<RowId>> {
         let checkpoint = Arc::clone(&self.hooks.checkpoint);
         self.lookup()
-            .exact_rows(key, snapshot, after, limit, &mut || checkpoint())
+            .exact_rows(key, snapshot, after, limit, &mut || checkpoint())?.into_already_funded()
     }
     fn checkpoint(&mut self) -> Result<()> {
         self.check()
@@ -1248,7 +1389,7 @@ impl PagedVectorReader for NativeBatch<'_> {
     ) -> Result<Vec<RowId>> {
         let checkpoint = Arc::clone(&self.hooks.checkpoint);
         self.lookup()
-            .row_window(snapshot, after, limit, &mut || checkpoint())
+            .row_window(snapshot, after, limit, &mut || checkpoint())?.into_already_funded()
     }
     fn row_bounds(&mut self) -> Result<Option<(RowId, RowId, usize)>> {
         let points = self.previous.graph.points + self.inserted;
@@ -1266,11 +1407,11 @@ impl PagedVectorReader for NativeBatch<'_> {
 }
 
 impl PagedVectorTransaction for NativeBatch<'_> {
-    /// Search scratch stays in the batch's fixed-capacity workspace. Spilling
-    /// it into storage pages made every visit and queue pop rewrite a leaf
-    /// page, multiplying the batch's dirty pages (measured, decisions.md).
+    /// Unique navigation visits and queued candidates can grow with the graph.
+    /// Spill them into this transaction's admitted pages; only the bounded
+    /// neighbor selection and pruning windows remain in the heap workspace.
     fn spills_search_scratch(&self) -> bool {
-        false
+        true
     }
 
     fn store_point(&mut self, point: &PagedVectorPoint) -> Result<()> {
@@ -1520,7 +1661,11 @@ impl PagedGenerationTransaction for NativeBatch<'_> {
         Ok(())
     }
 
-    fn publish(&mut self, progress: &PagedVectorProgress, through_lsn: Lsn) -> Result<()> {
+    fn publish(
+        &mut self,
+        progress: &PagedVectorProgress,
+        through_lsn: Lsn,
+    ) -> Result<PagedVectorPhase> {
         let publication = self
             .publication
             .ok_or_else(|| Error::Other("paged publication was not staged by the engine".into()))?;
@@ -1532,6 +1677,20 @@ impl PagedGenerationTransaction for NativeBatch<'_> {
             return Err(Error::Other(
                 "paged generation cannot publish incomplete coverage".into(),
             ));
+        }
+        // Empty routes cannot acquire a base record. Keep the existing page
+        // storage discoverable through cleanup before retiring its restart
+        // record in this same transaction.
+        if vector_membership_pages::is_empty_partitioned_route_in_write(
+            self.write,
+            &publication.prepared.catalog_route,
+        )? {
+            self.write
+                .open_table(CLEANUP)
+                .map_err(RedbPersistence::storage_error)?
+                .insert(u64::from_be_bytes(self.storage), [].as_slice())
+                .map_err(RedbPersistence::storage_error)?;
+            return Ok(PagedVectorPhase::Abandoned);
         }
         // The catalog must still name the generation this build replaces;
         // otherwise another publication won and this frontier is stale.
@@ -1586,7 +1745,7 @@ impl PagedGenerationTransaction for NativeBatch<'_> {
         #[cfg(not(feature = "test-seams"))]
         let _ = pending;
         self.published = true;
-        Ok(())
+        Ok(PagedVectorPhase::Published)
     }
 
     fn reclaim(
@@ -1736,8 +1895,9 @@ struct NativePagedReader {
 }
 
 impl NativePagedReader {
-    fn lookup(&self) -> PagedLookup<'_, redb::ReadOnlyTable<&'static [u8], &'static [u8]>> {
+    fn lookup(&self) -> PagedLookup<'_, '_, redb::ReadOnlyTable<&'static [u8], &'static [u8]>> {
         PagedLookup {
+            admission: None,
             pages: &self.pages,
             storage: self.storage,
             dimension: self.dimension,
@@ -1748,14 +1908,34 @@ impl NativePagedReader {
 }
 
 impl PagedVectorReader for NativePagedReader {
+    fn read_with_copy_admission(&mut self, request: PagedVectorReadRequest<'_>, admit: &mut dyn FnMut(usize) -> Result<Option<VectorCopyAdmission>>) -> Result<PagedVectorReadValue> {
+        let admission = RefCell::new(admit);
+        let lookup = PagedLookup {
+            admission: Some(&admission), pages: &self.pages, storage: self.storage,
+            dimension: self.dimension, quantization: self.quantization, node_limit: self.node_limit,
+        };
+        Ok(match request {
+            PagedVectorReadRequest::Point { id } => PagedVectorReadValue::Point(lookup.load_point(id)?),
+            PagedVectorReadRequest::Identity { data_id } => PagedVectorReadValue::Identity({ if data_id >= self.points { return Err(corruption("paged graph names an identity beyond its count")); } lookup.identity(data_id)? }),
+            PagedVectorReadRequest::PointForRow { row, snapshot } => PagedVectorReadValue::PointForRow(ScopedVectorCopy::from_admitted(lookup.visible_point_for_row(row, snapshot)?, None)),
+            PagedVectorReadRequest::ExactRows { key, snapshot, after, limit } => PagedVectorReadValue::ExactRows(lookup.exact_rows(key, snapshot, after, limit, &mut || (self.checkpoint)())?),
+            PagedVectorReadRequest::VisibleCount { snapshot } => PagedVectorReadValue::VisibleCount(ScopedVectorCopy::from_admitted(lookup.visible_count(snapshot, self.frontier, self.points, &mut || (self.checkpoint)())?, None)),
+            PagedVectorReadRequest::RowWindow { snapshot, after, limit } => PagedVectorReadValue::RowWindow(lookup.row_window(snapshot, after, limit, &mut || (self.checkpoint)())?),
+            PagedVectorReadRequest::RowBounds => PagedVectorReadValue::RowBounds(ScopedVectorCopy::from_admitted(lookup.row_bounds(self.points)?, None)),
+            PagedVectorReadRequest::PointAtOrAfter { row } => PagedVectorReadValue::PointAtOrAfter(ScopedVectorCopy::from_admitted(lookup.row_at_or_after(row)?.map(|(row, _, point)| (row, point)), None)),
+            PagedVectorReadRequest::GraphPointForRow { row } => PagedVectorReadValue::GraphPointForRow(ScopedVectorCopy::from_admitted(lookup.row_at_or_after(row)?.filter(|(found, _, _)| *found == row).map(|(_, _, point)| point), None)),
+            PagedVectorReadRequest::ExactGraphRowAfter { key, after } => PagedVectorReadValue::ExactGraphRowAfter(ScopedVectorCopy::from_admitted(lookup.exact_after(key, after)?.map(|(row, _)| row), None)),
+        })
+    }
+
     fn load_point(&mut self, id: PointId) -> Result<PagedVectorPoint> {
-        self.lookup().load_point(id)
+        self.lookup().load_point(id)?.into_already_funded()
     }
     fn identity(&mut self, data_id: usize) -> Result<PagedVectorIdentity> {
         if data_id >= self.points {
             return Err(corruption("paged graph names an identity beyond its count"));
         }
-        self.lookup().identity(data_id)
+        self.lookup().identity(data_id)?.into_already_funded()
     }
     fn point_for_row(&mut self, row: RowId, snapshot: SnapshotId) -> Result<Option<PointId>> {
         self.lookup().visible_point_for_row(row, snapshot)
@@ -1769,7 +1949,7 @@ impl PagedVectorReader for NativePagedReader {
     ) -> Result<Vec<RowId>> {
         let checkpoint = Arc::clone(&self.checkpoint);
         self.lookup()
-            .exact_rows(key, snapshot, after, limit, &mut || checkpoint())
+            .exact_rows(key, snapshot, after, limit, &mut || checkpoint())?.into_already_funded()
     }
     fn checkpoint(&mut self) -> Result<()> {
         (self.checkpoint)()
@@ -1793,7 +1973,7 @@ impl PagedVectorReader for NativePagedReader {
     ) -> Result<Vec<RowId>> {
         let checkpoint = Arc::clone(&self.checkpoint);
         self.lookup()
-            .row_window(snapshot, after, limit, &mut || checkpoint())
+            .row_window(snapshot, after, limit, &mut || checkpoint())?.into_already_funded()
     }
     fn row_bounds(&mut self) -> Result<Option<(RowId, RowId, usize)>> {
         self.lookup().row_bounds(self.points)
@@ -2284,14 +2464,55 @@ impl RedbPersistence {
         frontier_lsn: Lsn,
         total_points: usize,
     ) -> Result<PagedBuildRecord> {
+        self.begin_paged_build_inner(
+            partition, declaration, reason, generation_id, previous_generation_id,
+            frontier_tx, frontier_lsn, total_points,
+            false,
+        )
+    }
+
+    pub(crate) fn begin_resident_paged_export(
+        &self,
+        partition: &VectorPartitionRef,
+        declaration: PagedDeclaration,
+        reason: PagedBuildReason,
+        generation_id: u64,
+        previous_generation_id: u64,
+        frontier_tx: TxId,
+        frontier_lsn: Lsn,
+        total_points: usize,
+    ) -> Result<PagedBuildRecord> {
+        self.begin_paged_build_inner(
+            partition, declaration, reason, generation_id, previous_generation_id,
+            frontier_tx, frontier_lsn, total_points,
+            true,
+        )
+    }
+
+    fn begin_paged_build_inner(
+        &self,
+        partition: &VectorPartitionRef,
+        declaration: PagedDeclaration,
+        reason: PagedBuildReason,
+        generation_id: u64,
+        previous_generation_id: u64,
+        frontier_tx: TxId,
+        frontier_lsn: Lsn,
+        total_points: usize,
+        resident_export: bool,
+    ) -> Result<PagedBuildRecord> {
         let key = Self::vector_partition_prefix(&partition.index, &partition.partition_key);
-        let progress = PagedVectorProgress::new(
+        let mut progress = PagedVectorProgress::new(
             generation_id,
             declaration.digest()?,
             frontier_tx,
             frontier_lsn,
             total_points,
         );
+        if resident_export {
+            progress.phase = PagedVectorPhase::Encoding;
+            progress.last_source_key = Some(RESIDENT_EXPORT_MARKER.to_vec());
+        }
         self.with_db(|db| {
             let write = db.begin_write().map_err(Self::storage_error)?;
             let storage_id = {
@@ -2301,6 +2522,7 @@ impl RedbPersistence {
                     .map_err(Self::storage_error)?
                     .map(|value| value.value())
                     .unwrap_or(1);
+                if next == 0 { return Err(corruption("paged storage allocation counter is reserved")); }
                 counters
                     .insert(
                         NEXT_STORAGE,
@@ -2355,6 +2577,7 @@ impl RedbPersistence {
                 };
                 let record: PagedBuildRecord = Self::decode_exact(open_value(&key, value.value())?)
                     .map_err(|_| corruption("paged build record cannot be decoded"))?;
+                if record.storage_id == 0 { return Err(corruption("paged build storage identity is reserved")); }
                 drop(value);
                 write
                     .open_table(CLEANUP)
@@ -2374,11 +2597,11 @@ impl RedbPersistence {
         write: &redb::WriteTransaction,
         meta_bytes: &[u8],
     ) -> Result<()> {
-        let meta = PagedGenerationMeta::decode(meta_bytes)?;
+        let storage_id = authenticated_native_storage_id(meta_bytes)?;
         write
             .open_table(CLEANUP)
             .map_err(Self::storage_error)?
-            .insert(meta.storage_id, [].as_slice())
+            .insert(storage_id, [].as_slice())
             .map_err(Self::storage_error)?;
         Ok(())
     }
@@ -2389,8 +2612,10 @@ impl RedbPersistence {
         &self,
         max_keys: usize,
         mut admit: impl FnMut(usize) -> Result<()>,
+        mut checkpoint: impl FnMut() -> Result<()>,
     ) -> Result<usize> {
         self.with_db(|db| {
+            checkpoint()?;
             let write = db.begin_write().map_err(Self::storage_error)?;
             let removed = {
                 let mut cleanup = match write.open_table(CLEANUP) {
@@ -2398,7 +2623,10 @@ impl RedbPersistence {
                     Err(error) => return Err(Self::storage_error(error)),
                 };
                 let Some((storage_id, cursor)) = cleanup
-                    .first()
+                    .range(1..)
+                    .map_err(Self::storage_error)?
+                    .next()
+                    .transpose()
                     .map_err(Self::storage_error)?
                     .map(|(key, value)| {
                         admit(
@@ -2420,7 +2648,7 @@ impl RedbPersistence {
                     &storage,
                     (!cursor.is_empty()).then_some(cursor.as_slice()),
                     max_keys,
-                    &mut admit,
+                    &mut |bytes| { checkpoint()?; admit(bytes) },
                 )?;
                 if result.complete {
                     cleanup.remove(storage_id).map_err(Self::storage_error)?;
@@ -2432,6 +2660,7 @@ impl RedbPersistence {
                 result.keys_removed
             };
             Self::write_writer_recovery_bounds_in_write(&write, None)?;
+            checkpoint()?;
             write.commit().map_err(Self::storage_error)?;
             Ok(removed)
         })
@@ -2441,7 +2670,8 @@ impl RedbPersistence {
         self.with_db(|db| {
             let read = db.begin_read().map_err(Self::storage_error)?;
             match read.open_table(CLEANUP) {
-                Ok(table) => Ok(!table.is_empty().map_err(Self::storage_error)?),
+                Ok(table) => Ok(table.range(1..).map_err(Self::storage_error)?
+                    .next().transpose().map_err(Self::storage_error)?.is_some()),
                 Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
                 Err(error) => Err(Self::storage_error(error)),
             }
@@ -2455,8 +2685,44 @@ impl RedbPersistence {
         &self,
         write: &redb::WriteTransaction,
         prefix: &[u8],
+        accountant: Arc<dyn contextdb_vector::MemoryBudget>,
+        operation: &str,
     ) -> Result<()> {
-        let mut storage_ids = Vec::new();
+        Self::refuse_unresolved_vector_erasure_in_write(write)?;
+        let mut pages = write.open_table(PAGES).map_err(Self::storage_error)?;
+        let mut cleanup = write.open_table(CLEANUP).map_err(Self::storage_error)?;
+        let mut erase_storage = |storage_id: u64| -> Result<()> {
+            let storage = storage_prefix(storage_id);
+            loop {
+                // A batch holds only its high-water seek-key working set. Its
+                // owner releases after the returned cursor has been dropped.
+                let mut owner = contextdb_vector::VectorCopyAdmission::new(accountant.clone());
+                let mut admitted = 0usize;
+                let step = reclaim_storage_keys_with_admission(
+                    &mut pages,
+                    &storage,
+                    None,
+                    4096,
+                    &mut |bytes| {
+                        if bytes > admitted {
+                            owner.reserve_for(
+                                bytes - admitted,
+                                "vector",
+                                operation,
+                                "Raise MEMORY_LIMIT before erasing vector storage.",
+                            )?;
+                            admitted = bytes;
+                        }
+                        Ok(())
+                    },
+                )?;
+                if step.complete {
+                    break;
+                }
+            }
+            cleanup.remove(storage_id).map_err(Self::storage_error)?;
+            Ok(())
+        };
         {
             let bases = match write.open_table(VECTOR_PARTITION_BASE_GENERATION_TABLE) {
                 Ok(table) => Some(table),
@@ -2469,14 +2735,37 @@ impl RedbPersistence {
                     if !key.value().starts_with(prefix) {
                         break;
                     }
+                    // Only one decoded route is held at a time; do not retain
+                    // a partition-population-sized list of storage identities.
+                    let mut owner = contextdb_vector::VectorCopyAdmission::new(accountant.clone());
+                    owner.reserve_for(
+                        value.value().len().saturating_add(std::mem::size_of::<
+                            VectorPartitionBaseGenerationRecord,
+                        >()),
+                        "vector",
+                        operation,
+                        "Raise MEMORY_LIMIT before erasing vector storage.",
+                    )?;
                     let record: VectorPartitionBaseGenerationRecord = self
                         .decode_vector_partition_record(
                             VectorPartitionRecordKind::BaseGeneration,
                             value.value(),
                         )?;
                     if record.graph_format_version == VECTOR_GRAPH_PAGED_FORMAT_VERSION {
-                        storage_ids
-                            .push(PagedGenerationMeta::decode(&record.graph.bytes)?.storage_id);
+                        // The frozen decoder owns two progress cursors. Fund
+                        // those copies while the decoded base is still held.
+                        owner.reserve_for(
+                            record
+                                .graph
+                                .bytes
+                                .len()
+                                .saturating_add(std::mem::size_of::<PagedGenerationMeta>()),
+                            "vector",
+                            operation,
+                            "Raise MEMORY_LIMIT before erasing vector storage.",
+                        )?;
+                        let meta = PagedGenerationMeta::decode(&record.graph.bytes)?;
+                        erase_storage(meta.storage_id)?;
                     }
                 }
             }
@@ -2485,10 +2774,18 @@ impl RedbPersistence {
             let mut builds = write.open_table(BUILDS).map_err(Self::storage_error)?;
             let removed = builds.remove(prefix).map_err(Self::storage_error)?;
             if let Some(value) = removed {
-                let record: PagedBuildRecord =
-                    Self::decode_exact(open_value(prefix, value.value())?)
-                        .map_err(|_| corruption("paged build record cannot be decoded"))?;
-                storage_ids.push(record.storage_id);
+                let mut owner = contextdb_vector::VectorCopyAdmission::new(accountant.clone());
+                owner.reserve_for(
+                    value
+                        .value()
+                        .len()
+                        .saturating_add(std::mem::size_of::<PagedBuildRecord>()),
+                    "vector",
+                    operation,
+                    "Raise MEMORY_LIMIT before erasing vector storage.",
+                )?;
+                let record = decode_image_build_record(open_value(prefix, value.value())?)?;
+                erase_storage(record.storage_id)?;
             }
         }
         write
@@ -2496,18 +2793,6 @@ impl RedbPersistence {
             .map_err(Self::storage_error)?
             .remove(prefix)
             .map_err(Self::storage_error)?;
-        let mut pages = write.open_table(PAGES).map_err(Self::storage_error)?;
-        let mut cleanup = write.open_table(CLEANUP).map_err(Self::storage_error)?;
-        for storage_id in storage_ids {
-            let storage = storage_prefix(storage_id);
-            loop {
-                let step = reclaim_storage_keys(&mut pages, &storage, None, 4096)?;
-                if step.complete {
-                    break;
-                }
-            }
-            cleanup.remove(storage_id).map_err(Self::storage_error)?;
-        }
         Ok(())
     }
 
@@ -2590,5 +2875,541 @@ impl RedbPersistence {
             declaration: declaration.clone(),
             progress: ProgressRecord::from_progress(progress),
         })
+    }
+}
+
+/// Zero is never allocated as native storage. It is the authenticated fence
+/// for storage whose damaged ownership reference has been retired.
+const REPAIR_FENCE: u64 = 0;
+
+impl RedbPersistence {
+    pub(super) fn repair_fence_in_write(write: &redb::WriteTransaction) -> Result<bool> {
+        match write.open_table(CLEANUP) {
+            Ok(table) => Ok(table.get(REPAIR_FENCE).map_err(Self::storage_error)?.is_some()),
+            Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
+            Err(error) => Err(Self::storage_error(error)),
+        }
+    }
+
+    pub(crate) fn has_vector_repair_fence(&self) -> Result<bool> {
+        self.with_db(|db| {
+            let read = db.begin_read().map_err(Self::storage_error)?;
+            match read.open_table(CLEANUP) {
+                Ok(table) => Ok(table.get(REPAIR_FENCE).map_err(Self::storage_error)?.is_some()),
+                Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
+                Err(error) => Err(Self::storage_error(error)),
+            }
+        })
+    }
+
+    /// The decoded cutoff is proof input, never evidence that the fence is absent.
+    /// Malformed fence bytes force a new proof over the current allocation range.
+    fn repair_fence_cutoff_in_read(read: &redb::ReadTransaction) -> Result<Option<(u64, bool)>> {
+        let cleanup = match read.open_table(CLEANUP) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(error) => return Err(Self::storage_error(error)),
+        };
+        let Some(value) = cleanup.get(REPAIR_FENCE).map_err(Self::storage_error)? else {
+            return Ok(None);
+        };
+        let decoded = (value.value().len() <= 1024)
+            .then(|| open_value(&REPAIR_FENCE.to_be_bytes(), value.value()).ok()).flatten()
+            .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
+            .map(u64::from_be_bytes);
+        if let Some(cutoff) = decoded.filter(|cutoff| *cutoff != 0) {
+            return Ok(Some((cutoff, true)));
+        }
+        let counters = read.open_table(COUNTERS).map_err(Self::storage_error)?;
+        let cutoff = counters.get(NEXT_STORAGE).map_err(Self::storage_error)?
+            .map(|value| value.value()).unwrap_or(1);
+        if cutoff == 0 { return Err(corruption("repair fence allocation cutoff is reserved")); }
+        Ok(Some((cutoff, false)))
+    }
+
+    pub(super) fn raise_repair_fence_in_write(write: &redb::WriteTransaction) -> Result<u64> {
+        let mut counters = write.open_table(COUNTERS).map_err(Self::storage_error)?;
+        let next = counters.get(NEXT_STORAGE).map_err(Self::storage_error)?
+            .map(|value| value.value()).unwrap_or(1);
+        if next == 0 { return Err(corruption("repair fence allocation counter is reserved")); }
+        // Reserve an unused identity so even consecutive retirements without
+        // construction have distinct, strictly increasing proof epochs.
+        let cutoff = next.checked_add(1)
+            .ok_or_else(|| Error::Other("paged vector storage identities are exhausted".into()))?;
+        counters.insert(NEXT_STORAGE, cutoff).map_err(Self::storage_error)?;
+        drop(counters);
+        let mut cleanup = write.open_table(CLEANUP).map_err(Self::storage_error)?;
+        let previous = cleanup.get(REPAIR_FENCE).map_err(Self::storage_error)?
+            .and_then(|value| (value.value().len() <= 1024)
+                .then(|| open_value(&REPAIR_FENCE.to_be_bytes(), value.value()).ok()).flatten()
+                .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok()).map(u64::from_be_bytes));
+        if previous.is_some_and(|previous| previous >= cutoff) {
+            // A valid fence cannot refer to an unallocated future identity.
+            return Err(corruption("repair fence exceeds the storage allocation counter"));
+        }
+        let encoded = seal_value(&REPAIR_FENCE.to_be_bytes(), &cutoff.to_be_bytes());
+        cleanup.insert(REPAIR_FENCE, encoded.as_slice()).map_err(Self::storage_error)?;
+        Ok(cutoff)
+    }
+
+    /// Atomic logical retirement. No body is decoded and no storage id is
+    /// guessed. Healthy retained generation records and authoritative vectors
+    /// remain; bounded cleanup removes eligible records separately.
+    pub(crate) fn retire_broken_vector_catalog(&self, partition: &VectorPartitionRef, mut checkpoint: impl FnMut() -> Result<()>) -> Result<()> {
+        let key = Self::vector_partition_catalog_key_from_parts(&partition.index, &partition.partition_key);
+        self.with_db(|db| {
+            checkpoint()?;
+            let write = db.begin_write().map_err(Self::storage_error)?;
+            Self::raise_repair_fence_in_write(&write)?;
+            write.open_table(VECTOR_PARTITION_GENERATION_CATALOG_TABLE)
+                .map_err(Self::storage_error)?.remove(key.as_slice()).map_err(Self::storage_error)?;
+            vector_membership_pages::reset_pending_frontier(&write, partition)?;
+            // An old construction record cannot install into the reset route.
+            // Only an authenticated record is permitted to name cleanup storage.
+            let mut builds = write.open_table(BUILDS).map_err(Self::storage_error)?;
+            let existing = builds.get(key.as_slice()).map_err(Self::storage_error)?;
+            let storage = existing.as_ref().and_then(|value|
+                Self::authenticated_build_storage_id(&key, value.value()).ok());
+            drop(existing);
+            builds.remove(key.as_slice()).map_err(Self::storage_error)?;
+            drop(builds);
+            if let Some(storage) = storage.filter(|id| *id != REPAIR_FENCE) {
+                write.open_table(CLEANUP).map_err(Self::storage_error)?
+                    .insert(storage, [].as_slice()).map_err(Self::storage_error)?;
+            }
+            write.open_table(FLOORS).map_err(Self::storage_error)?
+                .remove(key.as_slice()).map_err(Self::storage_error)?;
+            Self::write_writer_recovery_bounds_in_write(&write, None)?;
+            checkpoint()?;
+            write.commit().map_err(Self::storage_error)
+        })
+    }
+
+    /// A restart learns the retired initial-build route from existing durable
+    /// facts. No volatile quarantine or new marker directory is required.
+    pub(crate) fn retired_vector_rebuild_pending(&self, partition: &VectorPartitionRef) -> Result<bool> {
+        if !self.has_vector_repair_fence()? { return Ok(false); }
+        let key_bound = Self::vector_partition_physical_key_bound(
+            &partition.index, &partition.partition_key, 0,
+        );
+        // canonical_bytes and the physical lookup key coexist. Both are
+        // admitted before either is constructed; no catalog is owned/decoded.
+        let _keys = self.proof_accountant().map(|accountant|
+            crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+                accountant, key_bound.saturating_mul(4), "vector_index",
+                "prepare_vector_generation", "Free writer memory before inspecting retired vector routes.",
+            )).transpose()?;
+        let key = Self::vector_partition_prefix(&partition.index, &partition.partition_key);
+        let catalog_present = self.with_db(|db| {
+            let read = db.begin_read().map_err(Self::storage_error)?;
+            let table = match read.open_table(VECTOR_PARTITION_GENERATION_CATALOG_TABLE) {
+                Ok(table) => table,
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+                Err(error) => return Err(Self::storage_error(error)),
+            };
+            Ok(table.get(key.as_slice()).map_err(Self::storage_error)?.is_some())
+        })?;
+        // Present but corrupt catalogs are handled by this route's existing
+        // quarantine/repair path. They cannot abort another route's sample.
+        if catalog_present { return Ok(false); }
+        drop(key);
+        drop(_keys);
+        Ok(self.highest_retired_vector_generation_key(partition)? != 0)
+    }
+
+    /// Physical generation identities remain ordered even if their payload is
+    /// unusable. The caller has already retired the catalog under the fence.
+    /// Last-key seeks inspect only two B-tree paths, not every retained body.
+    pub(crate) fn highest_retired_vector_generation_key(&self, partition: &VectorPartitionRef) -> Result<u64> {
+        let key_bound = Self::vector_partition_physical_key_bound(
+            &partition.index, &partition.partition_key, 16,
+        );
+        let _keys = self.proof_accountant().map(|accountant|
+            crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+                accountant, key_bound.saturating_mul(4), "vector_index",
+                "prepare_vector_generation", "Free writer memory before inspecting retired generation identities.",
+            )).transpose()?;
+        let prefix = Self::vector_partition_prefix(&partition.index, &partition.partition_key);
+        let end = writer_source::prefix_end(&prefix)
+            .ok_or_else(|| corruption("vector generation prefix has no upper bound"))?;
+        self.with_db(|db| {
+            let read = db.begin_read().map_err(Self::storage_error)?;
+            let mut highest = 0;
+            for (definition, suffix) in [
+                (VECTOR_PARTITION_BASE_GENERATION_TABLE, 8usize),
+                (VECTOR_PARTITION_CHANGE_GENERATION_TABLE, 16usize),
+            ] {
+                let table = match read.open_table(definition) {
+                    Ok(table) => table,
+                    Err(redb::TableError::TableDoesNotExist(_)) => continue,
+                    Err(error) => return Err(Self::storage_error(error)),
+                };
+                let last = table.range(prefix.as_slice()..end.as_slice())
+                    .map_err(Self::storage_error)?.next_back().transpose().map_err(Self::storage_error)?;
+                if let Some((key, _)) = last {
+                    if !key.value().starts_with(&prefix) || key.value().len() != prefix.len() + suffix {
+                        return Err(corruption("vector generation physical key is malformed"));
+                    }
+                    for bytes in key.value()[prefix.len()..].chunks_exact(8) {
+                        highest = highest.max(u64::from_be_bytes(bytes.try_into().unwrap()));
+                    }
+                }
+            }
+            Ok(highest)
+        })
+    }
+
+    pub(super) fn refuse_unresolved_vector_erasure_in_write(write: &redb::WriteTransaction) -> Result<()> {
+        let cleanup = match write.open_table(CLEANUP) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+            Err(error) => return Err(Self::storage_error(error)),
+        };
+        if !cleanup.is_empty().map_err(Self::storage_error)? {
+            return Err(corruption("vector page ownership or cleanup is incomplete; run maintenance before authoritative erasure"));
+        }
+        Ok(())
+    }
+}
+
+/// Only an authenticated native metadata body may supply deletion identity.
+pub(super) fn authenticated_native_storage_id(bytes: &[u8]) -> Result<u64> {
+    // Inspect positionally, never materialize ProgressRecord's cursor Vecs.
+    // Over-width authenticated metadata is UNKNOWN to the orphan proof.
+    if bytes.len() > 64 * 1024 {
+        return Err(corruption("native ownership metadata exceeds its bounded window"));
+    }
+    type Meta = ([u8; 8], u64, PagedDeclaration, InspectedProgressRecord);
+    let ((magic, id, _, progress), consumed) =
+        bincode::serde::borrow_decode_from_slice::<Meta, _>(bytes, bincode::config::standard())
+            .map_err(|_| corruption("native ownership metadata cannot be inspected"))?;
+    if consumed != bytes.len() || magic != META_MAGIC || id == REPAIR_FENCE
+        || progress.last_source_key.as_ref().is_some_and(|key| key.count > 64 * 1024)
+        || progress.cleanup_cursor.as_ref().is_some_and(|key| key.count > 64 * 1024)
+    { return Err(corruption("native ownership metadata is invalid or oversized")); }
+    Ok(id)
+}
+
+impl RedbPersistence {
+    pub(super) fn authenticated_build_storage_id(key: &[u8], encoded: &[u8]) -> Result<u64> {
+        if encoded.len() > 64 * 1024 {
+            return Err(corruption("build ownership metadata exceeds its bounded window"));
+        }
+        let payload = open_value(key, encoded)?;
+        type Record = (u64, u64, PagedBuildReason, PagedDeclaration, InspectedProgressRecord);
+        let ((id, _, _, _, progress), consumed) =
+            bincode::serde::borrow_decode_from_slice::<Record, _>(payload, bincode::config::standard())
+                .map_err(|_| corruption("build ownership metadata cannot be inspected"))?;
+        if consumed != payload.len() || id == REPAIR_FENCE
+            || progress.last_source_key.as_ref().is_some_and(|key| key.count > 64 * 1024)
+            || progress.cleanup_cursor.as_ref().is_some_and(|key| key.count > 64 * 1024)
+        { return Err(corruption("build ownership metadata is invalid or oversized")); }
+        Ok(id)
+    }
+
+    pub(super) fn queue_authenticated_native_storage_in_write(write: &redb::WriteTransaction, id: u64) -> Result<()> {
+        if id == REPAIR_FENCE { return Err(corruption("native storage identity is reserved")); }
+        write.open_table(CLEANUP).map_err(Self::storage_error)?
+            .insert(id, [].as_slice()).map_err(Self::storage_error)?;
+        Ok(())
+    }
+
+    /// Borrow graph bytes, authenticate their envelope and checksum, and
+    /// bound owned route metadata independently of the graph population.
+    pub(super) fn authenticated_generation_storage(encoded: &[u8], physical: &[u8], is_base: bool) -> Result<Option<u64>> {
+        let kind = if is_base { VectorPartitionRecordKind::BaseGeneration } else { VectorPartitionRecordKind::ChangeGeneration };
+        let payload = vector_partition_record_payload(kind, encoded).map_err(corruption)?;
+        let route_bytes = inspect_vector_partition_metadata_route(payload).map_err(corruption)?;
+        let route_decode_bound = Self::vector_partition_record_decode_bound(
+            route_bytes, std::mem::size_of::<BorrowedVectorPartitionBaseGenerationRecord<'_>>()
+                .max(std::mem::size_of::<BorrowedVectorPartitionChangeGenerationRecord<'_>>()),
+        );
+        if route_decode_bound > 64 * 1024 || physical.len() > 64 * 1024 {
+            return Err(corruption("generation route exceeds bounded ownership inspection"));
+        }
+        prevalidate_vector_partition_metadata_routes(kind, payload).map_err(corruption)?;
+        let (format, graph) = if is_base {
+            let (record, consumed): (BorrowedVectorPartitionBaseGenerationRecord<'_>, usize) =
+                bincode::serde::borrow_decode_from_slice(payload, bincode::config::standard())
+                    .map_err(|_| corruption("base ownership reference cannot be decoded"))?;
+            if consumed != payload.len() || Self::vector_partition_base_generation_key_from_parts(
+                &record.index, &record.partition_key, record.generation_id).as_slice() != physical {
+                return Err(corruption("base ownership reference disagrees with its physical key"));
+            }
+            (record.graph_format_version, record.graph)
+        } else {
+            let (record, consumed): (BorrowedVectorPartitionChangeGenerationRecord<'_>, usize) =
+                bincode::serde::borrow_decode_from_slice(payload, bincode::config::standard())
+                    .map_err(|_| corruption("change ownership reference cannot be decoded"))?;
+            if consumed != payload.len() || Self::vector_partition_change_generation_key_from_parts(
+                &record.index, &record.partition_key, record.base_generation_id, record.change_generation_id).as_slice() != physical {
+                return Err(corruption("change ownership reference disagrees with its physical key"));
+            }
+            (record.graph_format_version, record.graph)
+        };
+        if *blake3::hash(graph.bytes).as_bytes() != graph.checksum {
+            return Err(corruption("ownership reference graph checksum mismatch"));
+        }
+        if format == VECTOR_GRAPH_PAGED_FORMAT_VERSION {
+            Ok(Some(authenticated_native_storage_id(graph.bytes)?))
+        } else if format == 1 {
+            Ok(None)
+        } else {
+            Err(corruption("ownership reference format is unsupported"))
+        }
+    }
+}
+
+
+const AUDIT_KEYS: usize = 64;
+const AUDIT_METADATA_BYTES: usize = 256 * 1024;
+const AUDIT_REFERENCE_BYTES: usize = 32 * 1024 * 1024;
+
+/// One volatile proof cursor, never a set indexed by the population. A restart
+/// repeats proof; the durable fence is the sole authority to refuse erasure.
+pub(super) struct RepairAudit {
+    cutoff: u64,
+    epoch: [Option<[u8; 32]>; 5],
+    after_storage: u64,
+    candidate: Option<u64>,
+    phase: usize,
+    after_key: Vec<u8>,
+    referenced: bool,
+    unknown: bool,
+    finished: bool,
+    pending_orphan: Option<u64>,
+    validated_references: bool,
+    pub(super) _memory: crate::memory_accounting::OwnedMemoryReservation,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum RepairAuditStatus { Absent, Progressing, Blocked }
+
+impl RedbPersistence {
+    fn repair_reference_epoch(read: &redb::ReadTransaction) -> Result<[Option<[u8; 32]>; 5]> {
+        Ok([
+            read.table_root_fingerprint(VECTOR_PARTITION_BASE_GENERATION_TABLE).map_err(Self::storage_error)?,
+            read.table_root_fingerprint(VECTOR_PARTITION_CHANGE_GENERATION_TABLE).map_err(Self::storage_error)?,
+            read.table_root_fingerprint(BUILDS).map_err(Self::storage_error)?,
+            read.table_root_fingerprint(VECTOR_PARTITION_JOURNAL_TABLE).map_err(Self::storage_error)?,
+            read.table_root_fingerprint(VECTOR_PARTITION_GENERATION_CATALOG_TABLE).map_err(Self::storage_error)?,
+        ])
+    }
+
+    fn repair_audit_cursor(&self, cutoff: u64, epoch: [Option<[u8; 32]>; 5]) -> Result<RepairAudit> {
+        let accountant = self.proof_accountant.get().cloned()
+            .ok_or_else(|| Error::Other("vector ownership audit requires the owning accountant".into()))?;
+        let memory = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+            accountant, AUDIT_METADATA_BYTES, "vector", "audit_vector_page_ownership",
+            "Free writer memory before auditing retired vector pages.",
+        )?;
+        Ok(RepairAudit { cutoff, epoch, after_storage: 0, candidate: None, phase: 0,
+            after_key: Vec::new(), referenced: false, unknown: false, finished: false, pending_orphan: None, validated_references: false, _memory: memory })
+    }
+
+    /// The caller holds the engine's existing maintenance publication guard
+    /// and source-page admission. No root is retained across calls.
+    pub(crate) fn repair_orphan_audit_step(&self, mut checkpoint: impl FnMut() -> Result<()>) -> Result<RepairAuditStatus> {
+        let mut cursor = self.vector_repair_audit.lock();
+        let result = self.with_db(|db| {
+            checkpoint()?;
+            let read = db.begin_read().map_err(Self::storage_error)?;
+            let Some((cutoff, authenticated)) = Self::repair_fence_cutoff_in_read(&read)? else {
+                *cursor = None;
+                return Ok(RepairAuditStatus::Absent);
+            };
+            let epoch = Self::repair_reference_epoch(&read)?;
+            if cursor.as_ref().is_none_or(|c| c.cutoff != cutoff || c.epoch != epoch) {
+                *cursor = Some(self.repair_audit_cursor(cutoff, epoch)?);
+            }
+            let c = cursor.as_mut().unwrap();
+            if c.finished && c.unknown { return Ok(RepairAuditStatus::Blocked); }
+            let mut scanned = 0;
+            let mut metadata = 0usize;
+            let mut inspected = 0usize;
+            let mut queue = None;
+            while scanned < AUDIT_KEYS && metadata < AUDIT_METADATA_BYTES {
+                checkpoint()?;
+                // Independently validate all retired references even when no
+                // PAGES exist. A corrupt whole record keeps restart's fence
+                // until bounded generation cleanup retires that record.
+                if !c.validated_references && c.phase == 4 {
+                    c.validated_references = true;
+                    c.phase = 0;
+                    c.after_key.clear();
+                    if c.unknown { c.finished = true; break; }
+                }
+                if c.validated_references && c.candidate.is_none() {
+                    let pages = match read.open_table(PAGES) {
+                        Ok(table) => Some(table),
+                        Err(redb::TableError::TableDoesNotExist(_)) => None,
+                        Err(error) => return Err(Self::storage_error(error)),
+                    };
+                    let lower = c.after_storage.checked_add(1).unwrap_or(u64::MAX).to_be_bytes();
+                    let next = if let Some(pages) = pages.as_ref() {
+                        pages.range(lower.as_slice()..).map_err(Self::storage_error)?
+                            .next().transpose().map_err(Self::storage_error)?
+                    } else { None };
+                    let id = next.as_ref().and_then(|(key, _)| key.value().get(..8))
+                        .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok()).map(u64::from_be_bytes);
+                    if next.is_some() && id.is_none() {
+                        c.unknown = true; c.finished = true; break;
+                    }
+                    let Some(id) = id.filter(|id| *id < cutoff) else { c.finished = true; break; };
+                    if id == REPAIR_FENCE { c.unknown = true; c.finished = true; break; }
+                    c.candidate = Some(id); c.phase = 0; c.after_key.clear(); c.referenced = false;
+                    scanned += 1;
+                    // Existing positive rows already own the deletion cursor.
+                    let cleanup = read.open_table(CLEANUP).map_err(Self::storage_error)?;
+                    if cleanup.get(id).map_err(Self::storage_error)?.is_some() {
+                        c.after_storage = id; c.candidate = None; continue;
+                    }
+                }
+                let id = c.candidate;
+                if c.validated_references && (c.phase == 4 || c.referenced) {
+                    let id = id.unwrap();
+                    c.after_storage = id; c.candidate = None;
+                    if !c.referenced && !c.unknown {
+                        queue = c.pending_orphan.replace(id);
+                        if queue.is_some() { break; }
+                    }
+                    continue;
+                }
+                let definition = match c.phase {
+                    0 => VECTOR_PARTITION_BASE_GENERATION_TABLE,
+                    1 => VECTOR_PARTITION_CHANGE_GENERATION_TABLE,
+                    2 => BUILDS,
+                    _ => VECTOR_PARTITION_JOURNAL_TABLE,
+                };
+                let table = match read.open_table(definition) {
+                    Ok(table) => table,
+                    Err(redb::TableError::TableDoesNotExist(_)) => { c.phase += 1; c.after_key.clear(); continue; }
+                    Err(error) => return Err(Self::storage_error(error)),
+                };
+                let lower = if c.after_key.is_empty() { std::ops::Bound::Unbounded }
+                    else { std::ops::Bound::Excluded(c.after_key.as_slice()) };
+                let next = table.range::<&[u8]>((lower, std::ops::Bound::Unbounded))
+                    .map_err(Self::storage_error)?.next().transpose().map_err(Self::storage_error)?;
+                let Some((key, value)) = next else { c.phase += 1; c.after_key.clear(); continue; };
+                scanned += 1;
+                if key.value().len() > 64 * 1024 {
+                    c.unknown = true; c.finished = true; break;
+                }
+                if value.value().len() <= AUDIT_REFERENCE_BYTES && inspected != 0
+                    && inspected.saturating_add(value.value().len()) > AUDIT_REFERENCE_BYTES { break; }
+                inspected = inspected.saturating_add(value.value().len().min(AUDIT_REFERENCE_BYTES));
+                metadata = metadata.saturating_add(key.value().len());
+                // Accounted source-page admission precedes allocation. The
+                // proof never clones an entire graph or decodes an owned one.
+                let mut reference = if value.value().len() > AUDIT_REFERENCE_BYTES {
+                    Err(corruption("ownership reference exceeds bounded inspection"))
+                } else if c.phase < 2 {
+                    Self::authenticated_generation_storage(value.value(), key.value(), c.phase == 0)
+                } else if c.phase == 2 {
+                    Self::authenticated_build_storage_id(key.value(), value.value()).map(Some)
+                } else {
+                    Self::authenticated_journal_ownership_reference(value.value(), key.value())
+                };
+                if reference.is_ok() && c.phase == 0 {
+                    let prefix_len = key.value().len().checked_sub(8);
+                    let catalogs = match read.open_table(VECTOR_PARTITION_GENERATION_CATALOG_TABLE) {
+                        Ok(table) => Some(table),
+                        Err(redb::TableError::TableDoesNotExist(_)) => None,
+                        Err(error) => return Err(Self::storage_error(error)),
+                    };
+                    let catalog_present = if let (Some(table), Some(end)) = (catalogs.as_ref(), prefix_len) {
+                        table.get(&key.value()[..end]).map_err(Self::storage_error)?.is_some()
+                    } else { false };
+                    if !catalog_present {
+                        reference = Err(corruption("retired route has not published its replacement catalog"));
+                    }
+                }
+                match reference {
+                    Ok(Some(storage)) if id == Some(storage) => c.referenced = true,
+                    Ok(_) => {},
+                    Err(_) => c.unknown = true,
+                }
+                c.after_key.clear(); c.after_key.extend_from_slice(key.value());
+            }
+            let finished = c.finished;
+            let unknown = c.unknown;
+            if finished && !unknown { queue = c.pending_orphan.take(); }
+            drop(read);
+            // Reference publication cannot interleave: the caller owns the
+            // commit gate. Recheck the fence inside the cleanup transaction.
+            if queue.is_some() || (finished && !unknown) || !authenticated {
+                checkpoint()?;
+                let write = db.begin_write().map_err(Self::storage_error)?;
+                let mut cleanup = write.open_table(CLEANUP).map_err(Self::storage_error)?;
+                let current = cleanup.get(REPAIR_FENCE).map_err(Self::storage_error)?;
+                let current_cutoff = current.as_ref().filter(|v| v.value().len() <= 1024)
+                    .and_then(|v| open_value(&REPAIR_FENCE.to_be_bytes(), v.value()).ok())
+                    .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok()).map(u64::from_be_bytes);
+                if authenticated && current_cutoff != Some(cutoff) {
+                    *cursor = None; return Ok(RepairAuditStatus::Progressing);
+                }
+                drop(current);
+                if !authenticated {
+                    let encoded = seal_value(&REPAIR_FENCE.to_be_bytes(), &cutoff.to_be_bytes());
+                    cleanup.insert(REPAIR_FENCE, encoded.as_slice()).map_err(Self::storage_error)?;
+                }
+                if let Some(id) = queue { cleanup.insert(id, [].as_slice()).map_err(Self::storage_error)?; }
+                if finished && !unknown { cleanup.remove(REPAIR_FENCE).map_err(Self::storage_error)?; }
+                drop(cleanup);
+                checkpoint()?;
+                write.commit().map_err(Self::storage_error)?;
+                if finished && !unknown { *cursor = None; }
+            }
+            Ok(if unknown { RepairAuditStatus::Blocked } else { RepairAuditStatus::Progressing })
+        });
+        // The volatile cursor must never commit speculative advancement after
+        // admission, IO, or commit failure. Previously queued durable rows
+        // remain valid and are rediscovered by the restarted proof.
+        if result.is_err() { *cursor = None; }
+        result
+    }
+}
+
+impl RedbPersistence {
+    pub(crate) fn repair_orphan_audit_blocked(&self) -> bool {
+        self.vector_repair_audit.lock().as_ref().is_some_and(|cursor| cursor.unknown)
+    }
+}
+
+impl RedbPersistence {
+    pub(crate) fn abandon_vector_repair_audit_cursor(&self) {
+        *self.vector_repair_audit.lock() = None;
+    }
+}
+
+impl RedbPersistence {
+    fn authenticated_journal_ownership_reference(encoded: &[u8], physical: &[u8]) -> Result<Option<u64>> {
+        // Journal metadata has no graph/body Vec. Width and both route
+        // allocation shapes are checked before the admitted owned decode.
+        // The cursor's 256 KiB owner covers these at-most-64 KiB temporaries.
+        if encoded.len() > 64 * 1024 || physical.len() > 64 * 1024 {
+            return Err(corruption("journal ownership reference exceeds bounded metadata"));
+        }
+        let payload = vector_partition_record_payload(VectorPartitionRecordKind::Journal, encoded).map_err(corruption)?;
+        prevalidate_vector_partition_metadata_routes(VectorPartitionRecordKind::Journal, payload).map_err(corruption)?;
+        let decode_bound = Self::vector_partition_record_decode_bound(
+            payload.len(), std::mem::size_of::<VectorPartitionJournalRecord>(),
+        );
+        if decode_bound > 64 * 1024 {
+            return Err(corruption("journal ownership route exceeds bounded metadata"));
+        }
+        let record: VectorPartitionJournalRecord = Self::decode_exact(payload)
+            .map_err(|_| corruption("journal ownership reference cannot be decoded"))?;
+        if Self::vector_partition_journal_key(&record).as_slice() != physical {
+            return Err(corruption("journal ownership reference disagrees with its physical key"));
+        }
+        let membership = match &record.change {
+            VectorPartitionJournalChange::Upsert(membership) => membership,
+            VectorPartitionJournalChange::Tombstone(tombstone) => &tombstone.membership,
+        };
+        if membership.index != record.index || membership.partition_key != record.partition_key {
+            return Err(corruption("journal ownership reference has conflicting routes"));
+        }
+        Ok(None)
     }
 }

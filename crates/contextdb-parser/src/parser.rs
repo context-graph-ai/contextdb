@@ -19,14 +19,20 @@ pub fn parse(input: &str) -> Result<Statement> {
     if starts_with_keywords(sql, &["WITH", "RECURSIVE"]) {
         return Err(Error::RecursiveCteNotSupported);
     }
+    // GROUP BY is read in exactly one form: COUNT(*) per group of one table's
+    // columns, which the engine answers from a declared maintained count.
+    // Every other statement naming it keeps the established refusal, whatever
+    // else is wrong with it.
     if contains_keyword_sequence_outside_strings(sql, &["GROUP", "BY"]) {
-        return Err(Error::ParseError("GROUP BY is not supported".to_string()));
+        return match parse_statement(sql) {
+            Ok(statement) if is_grouped_count(&statement) => Ok(statement),
+            _ => Err(Error::ParseError("GROUP BY is not supported".to_string())),
+        };
     }
-    if contains_token_outside_strings(sql, "OVER")
-        && !contains_keyword_sequence_outside_strings(sql, &["DELIVERY", "MANIFEST", "OVER"])
-    {
-        return Err(Error::WindowFunctionNotSupported);
-    }
+    parse_statement(sql)
+}
+
+fn parse_statement(sql: &str) -> Result<Statement> {
     if contains_where_match_operator(sql) {
         return Err(Error::FullTextSearchNotSupported);
     }
@@ -84,6 +90,7 @@ pub fn parse(input: &str) -> Result<Statement> {
         Rule::show_memory_limit => Statement::ShowMemoryLimit,
         Rule::set_disk_limit => Statement::SetDiskLimit(build_set_disk_limit(inner)?),
         Rule::show_disk_limit => Statement::ShowDiskLimit,
+        Rule::show_content_size => Statement::ShowContentSize,
         Rule::set_maintenance_poll_interval => {
             Statement::SetMaintenancePollInterval(build_maintenance_poll_interval(inner)?)
         }
@@ -212,6 +219,7 @@ fn build_select_core(pair: Pair<'_, Rule>) -> Result<SelectBody> {
     let mut from = Vec::new();
     let mut joins = Vec::new();
     let mut where_clause = None;
+    let mut group_by = Vec::new();
     let mut order_by = Vec::new();
     let mut use_vector = None;
     let mut use_rank = None;
@@ -232,6 +240,10 @@ fn build_select_core(pair: Pair<'_, Rule>) -> Result<SelectBody> {
             Rule::where_clause => {
                 where_clause = Some(build_where_clause(p)?);
             }
+            Rule::group_by_clause => {
+                group_by = p.into_inner().map(build_expr).collect::<Result<_>>()?;
+            }
+            Rule::named_window_clause => return Err(window_refusal("named window")),
             Rule::order_by_clause => {
                 order_by = build_order_by_clause(p)?;
             }
@@ -248,12 +260,29 @@ fn build_select_core(pair: Pair<'_, Rule>) -> Result<SelectBody> {
         }
     }
 
+    // Compare parsed specifications within this SELECT scope. Nested SELECTs
+    // are validated by their own builder, so unrelated CTE scopes never collide.
+    let mut window = None;
+    for column in &columns {
+        validate_window_spec(&column.expr, &mut window)?;
+    }
+    for order in &order_by {
+        validate_window_spec(&order.expr, &mut window)?;
+    }
+    if let Some(predicate) = &where_clause {
+        validate_window_spec(predicate, &mut window)?;
+    }
+    for join in &joins {
+        validate_window_spec(&join.on, &mut window)?;
+    }
+
     Ok(SelectBody {
         distinct,
         columns,
         from,
         joins,
         where_clause,
+        group_by,
         order_by,
         use_vector,
         use_rank,
@@ -1161,6 +1190,7 @@ fn build_primary_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
         .ok_or_else(|| Error::ParseError("invalid primary expression".to_string()))?;
 
     match first.as_rule() {
+        Rule::window_call => build_window_call(first),
         Rule::function_call => build_function_call(first),
         Rule::parameter => Ok(Expr::Parameter(
             first.as_str().trim_start_matches('$').to_string(),
@@ -1197,6 +1227,84 @@ fn build_primary_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
             "unsupported primary expression".to_string(),
         )),
     }
+}
+
+fn window_refusal(form: &str) -> Error {
+    Error::WindowFunctionNotSupported {
+        form: form.to_string(),
+    }
+}
+
+fn build_window_call(pair: Pair<'_, Rule>) -> Result<Expr> {
+    let mut parts = pair.into_inner();
+    let call = parts
+        .next()
+        .ok_or_else(|| Error::ParseError("window function missing".into()))?;
+    let Expr::FunctionCall { name, args } = build_function_call(call)? else {
+        return Err(window_refusal("unsupported window function"));
+    };
+    if !name.eq_ignore_ascii_case("ROW_NUMBER") {
+        let form = match name.to_ascii_uppercase().as_str() {
+            "RANK" => "RANK window",
+            "DENSE_RANK" => "DENSE_RANK window",
+            "SUM" => "SUM window",
+            "COUNT" => "COUNT window",
+            "AVG" => "AVG window",
+            "MIN" => "MIN window",
+            "MAX" => "MAX window",
+            "LAG" => "LAG window",
+            "LEAD" => "LEAD window",
+            _ => "unsupported window function",
+        };
+        return Err(window_refusal(form));
+    }
+    if !args.is_empty() {
+        return Err(window_refusal("ROW_NUMBER with arguments"));
+    }
+    let spec = parts
+        .next()
+        .ok_or_else(|| Error::ParseError("OVER clause missing".into()))?;
+    if spec.as_rule() == Rule::identifier {
+        return Err(window_refusal("named window"));
+    }
+    let mut partition_by = Vec::new();
+    let mut order_by = Vec::new();
+    for part in spec.into_inner() {
+        match part.as_rule() {
+            Rule::window_partition => {
+                for expression in part.into_inner() {
+                    let Expr::Column(column) = build_expr(expression)? else {
+                        return Err(window_refusal("computed window partition expression"));
+                    };
+                    partition_by.push(column);
+                }
+            }
+            Rule::order_by_clause => {
+                for item in build_order_by_clause(part)? {
+                    let Expr::Column(column) = item.expr else {
+                        return Err(window_refusal("computed window ordering expression"));
+                    };
+                    if item.direction == SortDirection::CosineDistance {
+                        return Err(window_refusal("computed window ordering expression"));
+                    }
+                    order_by.push(WindowOrderColumn {
+                        column,
+                        direction: item.direction,
+                    });
+                }
+            }
+            Rule::window_reference => return Err(window_refusal("named window")),
+            Rule::window_frame => return Err(window_refusal("explicit window frame")),
+            other => return Err(unexpected_rule(other, "build_window_call")),
+        }
+    }
+    if order_by.is_empty() {
+        return Err(window_refusal("ROW_NUMBER without ORDER BY"));
+    }
+    Ok(Expr::RowNumber(RowNumberWindow {
+        partition_by,
+        order_by,
+    }))
 }
 
 fn build_function_call(pair: Pair<'_, Rule>) -> Result<Expr> {
@@ -3444,6 +3552,93 @@ fn build_update(pair: Pair<'_, Rule>) -> Result<Update> {
     })
 }
 
+/// The one grouped form the engine answers: `COUNT(*)` per group of plain
+/// columns of one table, the WHERE clause pinning columns with `= literal`,
+/// `= parameter` or `IS NULL`. Whether a maintained count backs the columns is
+/// the engine's decision; this is the shape only.
+fn is_grouped_count(statement: &Statement) -> bool {
+    let Statement::Select(select) = statement else {
+        return false;
+    };
+    let body = &select.body;
+    if !select.ctes.is_empty()
+        || body.group_by.is_empty()
+        || body.distinct
+        || !body.joins.is_empty()
+        || !body.order_by.is_empty()
+        || body.use_vector.is_some()
+        || body.use_rank.is_some()
+        || body.limit.is_some()
+    {
+        return false;
+    }
+    let [FromItem::Table { name, alias }] = body.from.as_slice() else {
+        return false;
+    };
+    let in_scope = |column: &ColumnRef| {
+        column.column != "*"
+            && column
+                .table
+                .as_deref()
+                .is_none_or(|qualifier| qualifier == name || alias.as_deref() == Some(qualifier))
+    };
+    let mut grouped = Vec::with_capacity(body.group_by.len());
+    for item in &body.group_by {
+        let Expr::Column(column) = item else {
+            return false;
+        };
+        if !in_scope(column) || grouped.contains(&column.column.as_str()) {
+            return false;
+        }
+        grouped.push(column.column.as_str());
+    }
+    let mut counted = false;
+    for column in &body.columns {
+        match &column.expr {
+            Expr::Column(reference)
+                if in_scope(reference) && grouped.contains(&reference.column.as_str()) => {}
+            Expr::FunctionCall { name, args }
+                if name.eq_ignore_ascii_case("COUNT")
+                    && matches!(
+                        args.as_slice(),
+                        [Expr::Column(ColumnRef { table: None, column })] if column == "*"
+                    ) =>
+            {
+                counted = true;
+            }
+            _ => return false,
+        }
+    }
+    counted
+        && body
+            .where_clause
+            .as_ref()
+            .is_none_or(|filter| grouped_count_pins(filter, &in_scope))
+}
+
+fn grouped_count_pins(expr: &Expr, in_scope: &dyn Fn(&ColumnRef) -> bool) -> bool {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinOp::And,
+            right,
+        } => grouped_count_pins(left, in_scope) && grouped_count_pins(right, in_scope),
+        Expr::BinaryOp {
+            left,
+            op: BinOp::Eq,
+            right,
+        } => matches!(
+            (left.as_ref(), right.as_ref()),
+            (Expr::Column(column), Expr::Literal(_) | Expr::Parameter(_)) if in_scope(column)
+        ),
+        Expr::IsNull {
+            expr,
+            negated: false,
+        } => matches!(expr.as_ref(), Expr::Column(column) if in_scope(column)),
+        _ => false,
+    }
+}
+
 fn validate_statement(stmt: &Statement) -> Result<()> {
     if let Statement::Select(sel) = stmt {
         validate_select(sel)?;
@@ -3581,7 +3776,11 @@ fn validate_expr(expr: &Expr) -> Result<()> {
                 validate_expr(arg)?;
             }
         }
-        Expr::Column(_) | Expr::Literal(_) | Expr::Parameter(_) => {}
+        Expr::RowNumber(_)
+        | Expr::WindowRank(_)
+        | Expr::Column(_)
+        | Expr::Literal(_)
+        | Expr::Parameter(_) => {}
     }
     Ok(())
 }
@@ -3636,7 +3835,11 @@ fn validate_subquery_expr(expr: &Expr, cte_names: &[&str]) -> Result<()> {
                 validate_subquery_expr(element, cte_names)?;
             }
         }
-        Expr::Column(_) | Expr::Literal(_) | Expr::Parameter(_) => {}
+        Expr::RowNumber(_)
+        | Expr::WindowRank(_)
+        | Expr::Column(_)
+        | Expr::Literal(_)
+        | Expr::Parameter(_) => {}
     }
 
     Ok(())
@@ -3721,165 +3924,93 @@ fn parse_f64(s: &str, err: &str) -> Result<f64> {
 }
 
 fn starts_with_keywords(input: &str, words: &[&str]) -> bool {
-    let tokens: Vec<&str> = input.split_whitespace().take(words.len()).collect();
-
-    if tokens.len() != words.len() {
-        return false;
-    }
-
-    tokens
-        .iter()
-        .zip(words)
-        .all(|(a, b)| a.eq_ignore_ascii_case(b))
+    let tokens = syntax_keyword_tokens(input);
+    tokens.len() >= words.len()
+        && tokens
+            .iter()
+            .take(words.len())
+            .zip(words)
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
 }
 
-fn contains_token_outside_strings(input: &str, token: &str) -> bool {
-    let mut in_str = false;
-    let mut chars = input.char_indices().peekable();
-
-    while let Some((idx, ch)) = chars.next() {
-        if ch == '\'' {
-            if in_str {
-                if let Some((_, next_ch)) = chars.peek()
-                    && *next_ch == '\''
-                {
-                    let _ = chars.next();
-                    continue;
+/// Keyword prechecks use lexical boundaries, not SQL data or comments.
+fn syntax_keyword_tokens(input: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch.is_whitespace() {
+            continue;
+        }
+        if ch == '-' && chars.peek() == Some(&'-') {
+            chars.next();
+            for ch in chars.by_ref() {
+                if ch == '\n' {
+                    break;
                 }
-                in_str = false;
-            } else {
-                in_str = true;
             }
             continue;
         }
-
-        if in_str {
+        if ch == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            while let Some(ch) = chars.next() {
+                if ch == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    break;
+                }
+            }
             continue;
         }
-
-        // `idx` is a char boundary, but `idx + token.len()` need not be: a
-        // multi-byte character starting inside the fixed-width window would put
-        // it mid-character. `get` returns None there instead of panicking, and
-        // a window that ends mid-character can never equal an ASCII token.
-        if is_word_boundary(input, idx.saturating_sub(1))
-            && input
-                .get(idx..idx + token.len())
-                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(token))
-            && is_word_boundary(input, idx + token.len())
-        {
-            return true;
+        if ch == '\'' || ch == '"' {
+            while let Some(next) = chars.next() {
+                if next == ch {
+                    if chars.peek() == Some(&ch) {
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            tokens.push("<quoted>".into());
+        } else if ch.is_ascii_alphanumeric() || ch == '_' {
+            let mut token = String::from(ch);
+            while chars
+                .peek()
+                .is_some_and(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+            {
+                if let Some(next) = chars.next() {
+                    token.push(next);
+                }
+            }
+            tokens.push(token.to_ascii_uppercase());
+        } else {
+            tokens.push(ch.to_string());
         }
     }
-
-    false
+    tokens
 }
 
 fn contains_keyword_sequence_outside_strings(input: &str, words: &[&str]) -> bool {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut in_str = false;
-    let mut chars = input.chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        if ch == '\'' {
-            if in_str {
-                if chars.peek() == Some(&'\'') {
-                    let _ = chars.next();
-                    continue;
-                }
-                in_str = false;
-            } else {
-                in_str = true;
-            }
-            if !current.is_empty() {
-                tokens.push(std::mem::take(&mut current));
-            }
-            continue;
-        }
-
-        if in_str {
-            continue;
-        }
-
-        if ch.is_ascii_alphanumeric() || ch == '_' {
-            current.push(ch);
-        } else if !current.is_empty() {
-            tokens.push(std::mem::take(&mut current));
-        }
-    }
-
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-
-    tokens.windows(words.len()).any(|window| {
-        window
-            .iter()
-            .zip(words)
-            .all(|(a, b)| a.eq_ignore_ascii_case(b))
-    })
+    syntax_keyword_tokens(input)
+        .windows(words.len())
+        .any(|window| {
+            window
+                .iter()
+                .zip(words)
+                .all(|(a, b)| a.eq_ignore_ascii_case(b))
+        })
 }
 
 fn contains_where_match_operator(input: &str) -> bool {
-    let mut in_str = false;
-    let mut word = String::new();
     let mut seen_where = false;
-
-    for ch in input.chars() {
-        if ch == '\'' {
-            in_str = !in_str;
-            if !word.is_empty() {
-                if word.eq_ignore_ascii_case("WHERE") {
-                    seen_where = true;
-                } else if seen_where && word.eq_ignore_ascii_case("MATCH") {
-                    return true;
-                }
-                word.clear();
-            }
-            continue;
-        }
-
-        if in_str {
-            continue;
-        }
-
-        if ch.is_ascii_alphanumeric() || ch == '_' {
-            word.push(ch);
-            continue;
-        }
-
-        if !word.is_empty() {
-            if word.eq_ignore_ascii_case("WHERE") {
-                seen_where = true;
-            } else if seen_where && word.eq_ignore_ascii_case("GRAPH_TABLE") {
-                // A later graph traversal can legitimately contain MATCH; do not
-                // keep a prior WHERE active across that boundary.
-                seen_where = false;
-            } else if seen_where && word.eq_ignore_ascii_case("MATCH") {
-                return true;
-            } else if seen_where
-                && (word.eq_ignore_ascii_case("GROUP")
-                    || word.eq_ignore_ascii_case("ORDER")
-                    || word.eq_ignore_ascii_case("LIMIT"))
-            {
-                seen_where = false;
-            }
-            word.clear();
+    for word in syntax_keyword_tokens(input) {
+        match word.as_str() {
+            "WHERE" => seen_where = true,
+            "MATCH" if seen_where => return true,
+            "GRAPH_TABLE" | "GROUP" | "ORDER" | "LIMIT" => seen_where = false,
+            _ => {}
         }
     }
-
-    if !word.is_empty() && seen_where && word.eq_ignore_ascii_case("MATCH") {
-        return true;
-    }
-
     false
-}
-
-fn is_word_boundary(s: &str, idx: usize) -> bool {
-    if idx >= s.len() {
-        return true;
-    }
-    !s.as_bytes()[idx].is_ascii_alphanumeric() && s.as_bytes()[idx] != b'_'
 }
 
 fn build_set_memory_limit(pair: Pair<'_, Rule>) -> Result<SetMemoryLimitValue> {
@@ -4008,4 +4139,44 @@ fn parse_size_with_unit(text: &str) -> Result<u64> {
         _ => return Err(Error::ParseError(format!("unknown size suffix: {suffix}"))),
     };
     Ok(base * multiplier)
+}
+
+fn validate_window_spec<'a>(
+    expr: &'a Expr,
+    window: &mut Option<&'a RowNumberWindow>,
+) -> Result<()> {
+    match expr {
+        Expr::RowNumber(spec) => {
+            if window.is_some_and(|existing| existing != spec) {
+                return Err(window_refusal("several distinct windows"));
+            }
+            *window = Some(spec);
+        }
+        Expr::BinaryOp { left, right, .. } | Expr::CosineDistance { left, right } => {
+            validate_window_spec(left, window)?;
+            validate_window_spec(right, window)?;
+        }
+        Expr::UnaryOp { operand, .. } | Expr::IsNull { expr: operand, .. } => {
+            validate_window_spec(operand, window)?
+        }
+        Expr::FunctionCall { args, .. } | Expr::Row(args) => {
+            for arg in args {
+                validate_window_spec(arg, window)?;
+            }
+        }
+        Expr::InList { expr, list, .. } => {
+            validate_window_spec(expr, window)?;
+            for item in list {
+                validate_window_spec(item, window)?;
+            }
+        }
+        Expr::Like { expr, pattern, .. } => {
+            validate_window_spec(expr, window)?;
+            validate_window_spec(pattern, window)?;
+        }
+        Expr::InSubquery { expr, .. } => validate_window_spec(expr, window)?,
+        Expr::RowVectorSource { key, .. } => validate_window_spec(key, window)?,
+        Expr::WindowRank(_) | Expr::Column(_) | Expr::Literal(_) | Expr::Parameter(_) => {}
+    }
+    Ok(())
 }

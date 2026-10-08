@@ -3,7 +3,7 @@ use super::{
     LOCAL_PROTOCOL_MARKER, LOCAL_PROTOCOL_VERSION, LocalTransportError, MAX_FRAME_BYTES,
     frame_read_refusal, invalid_channel_data, response_decode_refusal,
 };
-use crate::read_contract::{decode_cursor_page, decode_metadata_page};
+use crate::read_contract::decode_metadata_page;
 use bincode::config::standard;
 use bincode::serde::{decode_from_slice, encode_to_vec};
 use contextdb_core::read_contract::{
@@ -34,6 +34,7 @@ pub enum PayloadViolation {
     /// name the number they would have to raise.
     MemoryCeilingExceeded {
         ceiling: u64,
+        required: Option<u64>,
     },
     TrailingBytes,
 }
@@ -471,6 +472,11 @@ pub enum LocalResponse {
     CancelApplied {
         request_ordinal: u64,
     },
+    /// A cancelled fetch publishes only the work that actually ran. The
+    /// cursor remains open and the client still receives ReadCancelled.
+    CursorCancelled {
+        page: CursorPageResponse,
+    },
 }
 
 /// An engine answer, carried in the read channel's own vocabulary.
@@ -658,7 +664,9 @@ const fn payload_answer_budget(
 fn answer_payload_mut(response: &mut LocalResponse) -> Option<&mut Vec<u8>> {
     match response {
         LocalResponse::CursorOpened { opened } => Some(&mut opened.payload),
-        LocalResponse::CursorPage { page } => Some(&mut page.payload),
+        LocalResponse::CursorPage { page } | LocalResponse::CursorCancelled { page } => {
+            Some(&mut page.payload)
+        }
         LocalResponse::Metadata { metadata } => Some(&mut metadata.payload),
         LocalResponse::Explain { payload } => Some(payload),
         _ => None,
@@ -680,6 +688,7 @@ const fn ends_the_exchange(response: &LocalResponse) -> bool {
 #[derive(Debug)]
 pub struct LocalProtocolBoundary {
     effective_limits: ReadLimits,
+    cursor_receive_memory: Option<u64>,
     ordinary_bytes: std::sync::Mutex<OrdinaryBoundaryBytes>,
     payload_assembly: std::sync::Mutex<PayloadAssemblyBytes>,
 }
@@ -688,9 +697,30 @@ impl LocalProtocolBoundary {
     pub fn with_effective_limits(effective_limits: ReadLimits) -> Self {
         Self {
             effective_limits,
+            cursor_receive_memory: None,
             ordinary_bytes: std::sync::Mutex::new(OrdinaryBoundaryBytes::default()),
             payload_assembly: std::sync::Mutex::new(PayloadAssemblyBytes::default()),
         }
+    }
+
+    /// Private headroom from the cursor's existing retention owner. This
+    /// never changes the request envelope or the owner's execution limits.
+    pub(crate) fn with_cursor_receive_memory(mut self, memory: Option<u64>) -> Self {
+        self.cursor_receive_memory = memory;
+        self
+    }
+
+    pub(crate) fn cursor_frame_allowance(&self) -> Result<Option<u64>, LocalTransportError> {
+        let Some(memory) = self.cursor_receive_memory else {
+            return Ok(None);
+        };
+        let held = self
+            .payload_assembly
+            .lock()
+            .map_err(|_| invalid_channel_data())?
+            .inbound
+            .capacity() as u64;
+        Ok(Some(memory.saturating_sub(held)))
     }
 
     pub const fn effective_limits(&self) -> ReadLimits {
@@ -764,8 +794,12 @@ impl LocalProtocolBoundary {
             LocalInboundKind::Response(LocalResponseExpectation::OrdinaryResult)
         );
         let received = (|| {
-            let payload =
-                read_payload_with_admission(reader, allocator).map_err(frame_read_refusal)?;
+            let payload = read_payload_with_memory_admission(
+                reader,
+                allocator,
+                self.cursor_frame_allowance()?,
+            )
+            .map_err(frame_read_refusal)?;
             self.decode_payload(kind, &payload).map_err(|error| {
                 if response_frame {
                     response_decode_refusal(error)
@@ -796,7 +830,9 @@ impl LocalProtocolBoundary {
         reader: &mut dyn FrameReader,
         allocator: &mut dyn FrameBufferAllocator,
     ) -> Result<LocalInboundMessage, LocalTransportError> {
-        let payload = read_payload_with_admission(reader, allocator).map_err(frame_read_refusal)?;
+        let payload =
+            read_payload_with_memory_admission(reader, allocator, self.cursor_frame_allowance()?)
+                .map_err(frame_read_refusal)?;
         self.decode_payload(kind, &payload)
     }
 
@@ -859,18 +895,50 @@ impl LocalProtocolBoundary {
                 Ok(LocalInboundMessage::Request(request))
             }
             LocalInboundKind::Response(expectation) => {
-                let memory_ceiling = self.effective_limits.memory;
+                let memory_ceiling = self
+                    .cursor_frame_allowance()?
+                    .map_or(self.effective_limits.memory, |available| {
+                        available.saturating_sub(payload.len() as u64)
+                    });
                 let continued = self.answer_assembly_in_flight();
                 preflight_response(payload, &expectation, memory_ceiling, continued)?;
-                let response: LocalResponse = if continued {
-                    decode_preflighted_message(payload)?
-                } else {
-                    decode_message_under_memory_ceiling(payload, memory_ceiling)?
-                };
+                let response: LocalResponse = decode_preflighted_message(payload)?;
                 // The frame ceiling stops here: an answer that arrived in
                 // pieces is whole again before anything validates or reads it.
-                let (response, position) = self.assemble_inbound_answer(response, &expectation)?;
-                validate_response(&response, &expectation, self.effective_limits, position)?;
+                let (response, position) =
+                    self.assemble_inbound_answer(response, &expectation, payload.len())?;
+                let mut validation_limits = self.effective_limits;
+                if let Some(memory) = self.cursor_receive_memory {
+                    let cursor_payload = match &response {
+                        LocalResponse::CursorOpened { opened } => Some(opened.payload.as_slice()),
+                        LocalResponse::CursorPage { page }
+                        | LocalResponse::CursorCancelled { page } => Some(page.payload.as_slice()),
+                        _ => None,
+                    };
+                    if let Some(bytes) = cursor_payload {
+                        validation_limits.memory = memory
+                            .saturating_sub(payload.len() as u64)
+                            .saturating_sub(bytes.len() as u64);
+                        preflight_observed_cursor_page_payload(
+                            bytes,
+                            memory
+                                .saturating_sub(payload.len() as u64)
+                                .saturating_sub(bytes.len() as u64),
+                        )
+                        .map_err(|error| match error {
+                            crate::read_contract::ReadEncodingError::MemoryCeilingExceeded {
+                                ceiling,
+                            } => LocalTransportError::Payload(
+                                PayloadViolation::MemoryCeilingExceeded {
+                                    ceiling,
+                                    required: None,
+                                },
+                            ),
+                            _ => invalid_channel_data(),
+                        })?;
+                    }
+                }
+                validate_response(&response, &expectation, validation_limits, position)?;
                 self.admit_ordinary_response(
                     &response,
                     &expectation,
@@ -1004,6 +1072,7 @@ impl LocalProtocolBoundary {
         &self,
         mut response: LocalResponse,
         expectation: &LocalResponseExpectation,
+        wire_bytes: usize,
     ) -> Result<(LocalResponse, PayloadPosition), LocalTransportError> {
         let Some(budget) = payload_answer_budget(expectation, self.effective_limits) else {
             return Ok((response, PayloadPosition::Whole));
@@ -1022,7 +1091,21 @@ impl LocalProtocolBoundary {
                 tracked.inbound = Vec::new();
                 return Err(invalid_channel_data());
             }
-            tracked.inbound.extend_from_slice(&chunk.bytes);
+            if let Some(memory) = self.cursor_receive_memory {
+                admit_cursor_assembly(
+                    memory,
+                    wire_bytes,
+                    tracked.inbound.capacity(),
+                    chunk.bytes.capacity(),
+                    total as usize,
+                )?;
+                let mut whole = Vec::with_capacity(total as usize);
+                whole.extend_from_slice(&tracked.inbound);
+                whole.extend_from_slice(&chunk.bytes);
+                tracked.inbound = whole;
+            } else {
+                tracked.inbound.extend_from_slice(&chunk.bytes);
+            }
             return Ok((response, PayloadPosition::AnswerFrame { earlier_bytes }));
         }
         if !ends_the_exchange(&response) {
@@ -1033,7 +1116,24 @@ impl LocalProtocolBoundary {
             return Ok((response, PayloadPosition::Whole));
         }
         if let Some(slot) = answer_payload_mut(&mut response) {
-            let mut whole = earlier;
+            let mut whole = if let Some(memory) = self.cursor_receive_memory {
+                let total = earlier
+                    .len()
+                    .checked_add(slot.len())
+                    .ok_or_else(invalid_channel_data)?;
+                admit_cursor_assembly(
+                    memory,
+                    wire_bytes,
+                    earlier.capacity(),
+                    slot.capacity(),
+                    total,
+                )?;
+                let mut whole = Vec::with_capacity(total);
+                whole.extend_from_slice(&earlier);
+                whole
+            } else {
+                earlier
+            };
             whole.extend_from_slice(slot);
             if u64::try_from(whole.len()).map_err(|_| invalid_channel_data())? > budget {
                 return Err(invalid_channel_data());
@@ -1042,6 +1142,28 @@ impl LocalProtocolBoundary {
         }
         Ok((response, PayloadPosition::Whole))
     }
+}
+
+fn admit_cursor_assembly(
+    memory: u64,
+    wire: usize,
+    earlier: usize,
+    fragment: usize,
+    whole: usize,
+) -> Result<(), LocalTransportError> {
+    let bytes = wire
+        .checked_add(earlier)
+        .and_then(|n| n.checked_add(fragment))
+        .and_then(|n| n.checked_add(whole));
+    if bytes.is_none_or(|bytes| bytes as u64 > memory) {
+        return Err(LocalTransportError::Payload(
+            PayloadViolation::MemoryCeilingExceeded {
+                ceiling: memory,
+                required: bytes.map(|bytes| bytes as u64),
+            },
+        ));
+    }
+    Ok(())
 }
 
 /// A received ordinary reply cannot be rendered until its terminal success
@@ -1525,9 +1647,24 @@ impl<'a> CanonicalAllocationPreflight<'a> {
             if lists > self.remaining() {
                 return Self::malformed();
             }
+            self.charge::<Vec<(String, bool)>>(lists)?;
             for _ in 0..lists {
                 self.maintained_count_columns()?;
             }
+        }
+        let groups = self.length()?;
+        if groups > self.remaining() {
+            return Self::malformed();
+        }
+        self.charge::<crate::database::GroupDisclosure>(groups)?;
+        for _ in 0..groups {
+            // Keep the serde wire order of GroupDisclosure: ordinal precedes
+            // the rendered partition key, then the counters and route.
+            self.u64()?;
+            self.string()?;
+            self.u64()?;
+            self.u64()?;
+            self.enumeration(1)?;
         }
         Ok(())
     }
@@ -1546,19 +1683,58 @@ impl<'a> CanonicalAllocationPreflight<'a> {
         Ok(())
     }
 
-    fn query_result(mut self) -> Result<(), crate::read_contract::ReadEncodingError> {
+    fn observed_cursor_page(&mut self) -> Result<u64, crate::read_contract::ReadEncodingError> {
+        self.charge::<crate::read_contract::cursor_observation::CanonicalObservedCursorPage>(1)?;
+        let columns = self.length()?;
+        if columns > self.remaining() {
+            return Self::malformed();
+        }
+        self.charge::<String>(columns)?;
+        for _ in 0..columns {
+            self.string()?;
+        }
+        let rows = self.length()?;
+        if rows > self.remaining() {
+            return Self::malformed();
+        }
+        if rows != 0 {
+            self.charge::<u8>(crate::owned_cursor_page::SharedRows::allocation_header_bytes())?;
+        }
+        self.charge::<Vec<Value>>(rows)?;
+        for _ in 0..rows {
+            let values = self.length()?;
+            if values != columns || values > self.remaining() {
+                return Self::malformed();
+            }
+            self.charge::<Value>(values)?;
+            for _ in 0..values {
+                self.value()?;
+            }
+        }
+        self.boolean()?;
+        let before_trace = self.charged_bytes;
+        self.query_trace()?;
+        if self.offset != self.bytes.len() {
+            return Self::malformed();
+        }
+        Ok(self.charged_bytes - before_trace)
+    }
+
+    fn query_result(&mut self) -> Result<u64, crate::read_contract::ReadEncodingError> {
         self.charge::<crate::read_contract::CanonicalQueryResult>(1)?;
         self.strings()?;
         self.rows()?;
         self.u64()?;
+        let before_trace = self.charged_bytes;
         self.query_trace()?;
+        let trace_bytes = self.charged_bytes - before_trace;
         if self.option()? {
             self.strings()?;
         }
         if self.offset != self.bytes.len() {
             return Self::malformed();
         }
-        Ok(())
+        Ok(trace_bytes)
     }
 }
 
@@ -1767,7 +1943,9 @@ impl OrdinaryResultReceiver {
         bytes: &[u8],
         memory_ceiling: u64,
     ) -> Result<(), crate::read_contract::ReadEncodingError> {
-        let admitted = CanonicalAllocationPreflight::new(bytes, memory_ceiling).query_result();
+        let admitted = CanonicalAllocationPreflight::new(bytes, memory_ceiling)
+            .query_result()
+            .map(|_| ());
         #[cfg(feature = "test-seams")]
         Self::observe_canonical_preflight_for_test(bytes, memory_ceiling, admitted.is_ok());
         admitted
@@ -1988,6 +2166,7 @@ impl OrdinaryResultReceiver {
                         } => {
                             LocalTransportError::Payload(PayloadViolation::MemoryCeilingExceeded {
                                 ceiling,
+                                required: None,
                             })
                         }
                         _ => invalid_channel_data(),
@@ -2075,6 +2254,17 @@ pub(crate) fn decode_message_under_memory_ceiling<T: serde::de::DeserializeOwned
 ) -> Result<T, LocalTransportError> {
     preflight_known_message::<T>(bytes, memory_ceiling)?;
     decode_preflighted_message(bytes)
+}
+
+/// Decode a bounded blob refusal through the existing read-channel grammar.
+pub(crate) fn decode_read_error_under_memory_ceiling(
+    bytes: &[u8],
+    memory_ceiling: u64,
+) -> Result<contextdb_core::Error, LocalTransportError> {
+    if bytes.len() > super::engine_answer::BLOB_SOURCE_REFUSAL_MAX_BYTES {
+        return Err(LocalTransportError::Payload(PayloadViolation::Malformed));
+    }
+    decode_message_under_memory_ceiling::<ReadChannelError>(bytes, memory_ceiling).map(Into::into)
 }
 
 /// Decode a payload whose structural preflight has already run, with the
@@ -2285,6 +2475,7 @@ impl<'a> WirePreflight<'a> {
             return Err(LocalTransportError::Payload(
                 PayloadViolation::MemoryCeilingExceeded {
                     ceiling: self.budget.memory_ceiling,
+                    required: Some(charged),
                 },
             ));
         }
@@ -2295,9 +2486,18 @@ impl<'a> WirePreflight<'a> {
     /// Walk a cursor page carried inside this payload under the same running
     /// total, so the page cannot claim a fresh allowance by being nested.
     fn nested_cursor_page(&mut self, payload: &[u8]) -> Result<(), LocalTransportError> {
-        let mut nested = WirePreflight::with_budget(payload, self.budget);
-        nested.cursor_page()?;
-        self.budget = nested.finish_into_budget()?;
+        let mut nested = CanonicalAllocationPreflight::new(payload, self.budget.memory_ceiling);
+        nested.charged_bytes = self.budget.charged_bytes;
+        nested.observed_cursor_page().map_err(|error| match error {
+            crate::read_contract::ReadEncodingError::MemoryCeilingExceeded { ceiling } => {
+                LocalTransportError::Payload(PayloadViolation::MemoryCeilingExceeded {
+                    ceiling,
+                    required: None,
+                })
+            }
+            _ => LocalTransportError::Payload(PayloadViolation::Malformed),
+        })?;
+        self.budget.charged_bytes = nested.charged_bytes;
         Ok(())
     }
 
@@ -2745,7 +2945,22 @@ pub(crate) fn preflight_canonical_query_result(
     bytes: &[u8],
     memory_ceiling: u64,
 ) -> Result<(), crate::read_contract::ReadEncodingError> {
-    CanonicalAllocationPreflight::new(bytes, memory_ceiling).query_result()
+    CanonicalAllocationPreflight::new(bytes, memory_ceiling)
+        .query_result()
+        .map(|_| ())
+}
+
+/// Exact decoded and trace allocation sizes, walked before answer allocation.
+pub(crate) fn query_result_allocation_bytes(
+    bytes: &[u8],
+    memory_ceiling: u64,
+) -> Result<(usize, usize), crate::read_contract::ReadEncodingError> {
+    let mut preflight = CanonicalAllocationPreflight::new(bytes, memory_ceiling);
+    let trace = preflight.query_result()?;
+    let convert = |bytes| {
+        usize::try_from(bytes).map_err(|_| crate::read_contract::ReadEncodingError::InvalidPayload)
+    };
+    Ok((convert(preflight.charged_bytes)?, convert(trace)?))
 }
 
 /// Admit one cursor-page payload on its own, charging its decoded footprint
@@ -2757,6 +2972,28 @@ pub(crate) fn preflight_cursor_page_payload(
     let mut wire = WirePreflight::over_admitted_answer(bytes, memory_ceiling);
     wire.cursor_page()?;
     wire.finish()
+}
+
+pub(crate) fn preflight_observed_cursor_page_payload(
+    bytes: &[u8],
+    memory_ceiling: u64,
+) -> Result<(), crate::read_contract::ReadEncodingError> {
+    CanonicalAllocationPreflight::new(bytes, memory_ceiling)
+        .observed_cursor_page()
+        .map(|_| ())
+}
+
+/// Decoded allocation allowance, obtained without allocating the answer.
+pub(crate) fn observed_cursor_page_allocation_bytes(
+    bytes: &[u8],
+    memory_ceiling: u64,
+) -> Result<(usize, usize), crate::read_contract::ReadEncodingError> {
+    let mut preflight = CanonicalAllocationPreflight::new(bytes, memory_ceiling);
+    let trace = preflight.observed_cursor_page()?;
+    let convert = |bytes| {
+        usize::try_from(bytes).map_err(|_| crate::read_contract::ReadEncodingError::InvalidPayload)
+    };
+    Ok((convert(preflight.charged_bytes)?, convert(trace)?))
 }
 
 /// Admit one metadata-page payload on its own, charging its decoded footprint
@@ -2793,7 +3030,7 @@ fn preflight_response(
     continued: bool,
 ) -> Result<(), LocalTransportError> {
     let mut wire = WirePreflight::with_memory_ceiling(bytes, memory_ceiling);
-    match wire.enumeration(12)? {
+    match wire.enumeration(13)? {
         0 | 1 | 6 | 8 => {
             wire.byte_vector()?;
         }
@@ -2819,7 +3056,7 @@ fn preflight_response(
                 wire.nested_cursor_page(payload)?;
             }
         }
-        3 => {
+        3 | 13 => {
             let payload = wire.byte_vector()?;
             if !continued {
                 wire.nested_cursor_page(payload)?;
@@ -2880,12 +3117,28 @@ pub fn read_payload_with_admission(
     reader: &mut dyn FrameReader,
     allocator: &mut dyn FrameBufferAllocator,
 ) -> Result<Vec<u8>, LocalTransportError> {
+    read_payload_with_memory_admission(reader, allocator, None)
+}
+
+fn read_payload_with_memory_admission(
+    reader: &mut dyn FrameReader,
+    allocator: &mut dyn FrameBufferAllocator,
+    memory: Option<u64>,
+) -> Result<Vec<u8>, LocalTransportError> {
     let mut prefix = [0_u8; 4];
     reader.read_exact(&mut prefix)?;
     let length = u32::from_be_bytes(prefix) as usize;
     if length > MAX_FRAME_BYTES {
         return Err(LocalTransportError::Frame(
             FrameViolation::LengthExceedsMaximum,
+        ));
+    }
+    if memory.is_some_and(|available| length as u64 > available) {
+        return Err(LocalTransportError::Payload(
+            PayloadViolation::MemoryCeilingExceeded {
+                ceiling: memory.unwrap(),
+                required: Some(length as u64),
+            },
         ));
     }
     let mut payload = allocator.allocate(length)?;
@@ -3001,7 +3254,7 @@ fn validate_response(
             LocalResponse::CursorOpened { .. },
             LocalResponseExpectation::CursorOpen
         ) | (
-            LocalResponse::CursorPage { .. },
+            LocalResponse::CursorPage { .. } | LocalResponse::CursorCancelled { .. },
             LocalResponseExpectation::CursorFetch
         ) | (
             LocalResponse::CursorClosed { .. },
@@ -3049,13 +3302,15 @@ fn validate_response(
                 limits.cursor_page_bytes,
             )?;
             if position.is_whole() {
-                decode_cursor_page(&opened.payload).map_err(|_| invalid_channel_data())?;
+                crate::read_contract::decode_observed_cursor_page(&opened.payload, limits.memory)
+                    .map_err(|_| invalid_channel_data())?;
             }
         }
-        LocalResponse::CursorPage { page } => {
+        LocalResponse::CursorPage { page } | LocalResponse::CursorCancelled { page } => {
             validate_answer_payload_limit(page.payload.len(), position, limits.cursor_page_bytes)?;
             if position.is_whole() {
-                decode_cursor_page(&page.payload).map_err(|_| invalid_channel_data())?;
+                crate::read_contract::decode_observed_cursor_page(&page.payload, limits.memory)
+                    .map_err(|_| invalid_channel_data())?;
             }
         }
         LocalResponse::Metadata { metadata } => {

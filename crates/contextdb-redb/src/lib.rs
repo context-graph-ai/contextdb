@@ -62,6 +62,9 @@
 //! [lmdb]: https://www.lmdb.tech/doc/
 //! [design]: https://github.com/cberner/redb/blob/master/docs/design.md
 
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub use db::scratch_backend_allocation_size;
 pub use db::{
     Builder, CacheStats, Database, MultimapTableDefinition, MultimapTableHandle, ReadOnlyDatabase,
     ReadableDatabase, RepairSession, ScratchBackend, StorageBackend, TableDefinition, TableHandle,

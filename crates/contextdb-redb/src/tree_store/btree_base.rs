@@ -224,6 +224,16 @@ impl<'a, V: Value + 'static> AccessGuard<'a, V> {
         }
     }
 
+    /// Bytes in the complete backing allocation retained by this guard.
+    /// Fork-only accounting quote; inspecting it neither allocates nor reads IO.
+    #[doc(hidden)]
+    pub fn retained_page_bytes(&self) -> usize {
+        match &self.page {
+            EitherPage::OwnedMemory(value) => value.capacity(),
+            _ => self.page.memory().len(),
+        }
+    }
+
     /// Access the stored value
     pub fn value(&self) -> V::SelfType<'_> {
         V::from_bytes(&self.page.memory()[self.offset..(self.offset + self.len)])

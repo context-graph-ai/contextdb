@@ -12,7 +12,7 @@ pub(super) const SUMMARY: TableDefinition<&[u8], &[u8]> =
 const GLOBAL: &[u8] = b"";
 const MAGIC: &[u8] = b"CDBVMS01";
 
-#[derive(Default, Clone, Serialize, Deserialize)]
+#[derive(Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct MembershipSummary {
     pub(super) entries: u64,
     pub(super) live_entries: u64,
@@ -24,7 +24,7 @@ pub(super) struct MembershipSummary {
 }
 
 /// One catalog frontier and one in-progress frontier; independent of rows.
-#[derive(Default, Clone, Serialize, Deserialize)]
+#[derive(Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct PendingCounts {
     pub(super) covered_tx: TxId,
     pub(super) pending_inserts: u64,
@@ -122,6 +122,11 @@ fn update_pending_summary(
         }
     };
     update(&mut summary)?;
+    if summary.entries == 0 && !partition.partition_key.is_unpartitioned() {
+        table.remove(key.as_slice()).map_err(metadata_error)?;
+        drop(table);
+        return write_fingerprints(write);
+    }
     let encoded = encode_summary(&key, &summary)?;
     let unchanged = table
         .get_bounded(key.as_slice())
@@ -134,6 +139,39 @@ fn update_pending_summary(
     }
     drop(table);
     write_fingerprints(write)
+}
+
+/// Check the authoritative route in the same transaction before installing
+/// a generation catalog. A late candidate cannot resurrect an empty partition.
+pub(super) fn is_empty_partitioned_route_in_write(
+    write: &redb::WriteTransaction,
+    partition: &VectorPartitionRef,
+) -> Result<bool> {
+    if partition.partition_key.is_unpartitioned() {
+        return Ok(false);
+    }
+    let key = RedbPersistence::vector_partition_prefix(&partition.index, &partition.partition_key);
+    let summaries = write.open_table(SUMMARY).map_err(metadata_error)?;
+    if let Some(value) = summaries
+        .get_bounded(key.as_slice())
+        .map_err(metadata_error)?
+    {
+        return Ok(decode_summary(&key, value.value())?.entries == 0);
+    }
+    let source = write.open_table(SOURCE).map_err(metadata_error)?;
+    if source
+        .prefix_bounded(key.as_slice())
+        .map_err(metadata_error)?
+        .next()
+        .transpose()
+        .map_err(metadata_error)?
+        .is_some()
+    {
+        return Err(corruption(
+            "membership summary is missing for a nonempty partition",
+        ));
+    }
+    Ok(true)
 }
 
 /// A vector declaration owns its empty unpartitioned route from this commit.
@@ -342,9 +380,15 @@ pub(super) fn read_partition_summary(
                 .map_err(metadata_error)?
                 .is_some()
             {
-                return Err(corruption(
-                    "membership summary is missing beside a generation catalog",
-                ));
+                if partition.partition_key.is_unpartitioned() {
+                    return Err(corruption(
+                        "membership summary is missing beside a generation catalog",
+                    ));
+                }
+                // Authoritative memberships were proven absent above. Reclaim
+                // keeps this catalog while a retired generation chain is pinned;
+                // its partitioned summary has already retired atomically.
+                return Ok(MembershipSummary::default());
             }
         }
         Err(redb::TableError::TableDoesNotExist(_)) => {}
@@ -444,7 +488,7 @@ fn component<'a>(key: &mut &'a [u8]) -> Result<&'a [u8]> {
     Ok(component)
 }
 
-fn source_key_from_membership_key(mut key: &[u8]) -> Result<Vec<u8>> {
+fn reverse_key_from_membership_key(mut key: &[u8]) -> Result<Vec<u8>> {
     let table = std::str::from_utf8(component(&mut key)?)
         .map_err(|_| corruption("membership table name is not UTF-8"))?;
     let column = std::str::from_utf8(component(&mut key)?)
@@ -459,13 +503,13 @@ fn source_key_from_membership_key(mut key: &[u8]) -> Result<Vec<u8>> {
     let lsn = Lsn(u64::from_be_bytes(key[16..24].try_into().unwrap()));
     let vector_created = TxId(u64::from_be_bytes(key[24..32].try_into().unwrap()));
     let vector_lsn = Lsn(u64::from_be_bytes(key[32..40].try_into().unwrap()));
-    let mut source =
-        RedbPersistence::vector_partition_prefix(&VectorIndexRef::new(table, column), &partition);
-    source.extend_from_slice(&canonical_source_key(row, lsn, created.max(vector_created)));
-    source.extend_from_slice(&(!created.0).to_be_bytes());
-    source.extend_from_slice(&(!vector_created.0).to_be_bytes());
-    source.extend_from_slice(&(!vector_lsn.0).to_be_bytes());
-    Ok(source)
+    let mut reverse = reverse_row_prefix(&VectorIndexRef::new(table, column), row);
+    reverse.extend_from_slice(&created.0.to_be_bytes());
+    reverse.extend_from_slice(&lsn.0.to_be_bytes());
+    RedbPersistence::append_partition_key_component(&mut reverse, &partition.canonical_bytes());
+    reverse.extend_from_slice(&vector_created.0.to_be_bytes());
+    reverse.extend_from_slice(&vector_lsn.0.to_be_bytes());
+    Ok(reverse)
 }
 
 fn decode_member(key: &[u8], encoded: &[u8]) -> Result<VectorPartitionMembershipRecord> {
@@ -479,6 +523,25 @@ fn decode_member(key: &[u8], encoded: &[u8]) -> Result<VectorPartitionMembership
     if source_key(&record) != key {
         return Err(corruption(
             "membership source key does not match its authenticated identity",
+        ));
+    }
+    Ok(record)
+}
+
+fn decode_primary_member(
+    membership_key: &[u8],
+    encoded: &[u8],
+) -> Result<VectorPartitionMembershipRecord> {
+    let payload = vector_partition_record_payload(VectorPartitionRecordKind::Membership, encoded)
+        .map_err(|reason| corruption(&reason))?;
+    prevalidate_vector_partition_metadata_routes(VectorPartitionRecordKind::Membership, payload)
+        .map_err(|reason| corruption(&reason))?;
+    let record: VectorPartitionMembershipRecord =
+        decode_vector_partition_record_payload(VectorPartitionRecordKind::Membership, encoded)
+            .map_err(|reason| corruption(&reason))?;
+    if RedbPersistence::vector_partition_membership_key(&record) != membership_key {
+        return Err(corruption(
+            "one owning row version has conflicting vector placements",
         ));
     }
     Ok(record)
@@ -527,6 +590,132 @@ fn adjust(
     Ok(())
 }
 
+fn decode_referenced_body_count(bytes: &[u8]) -> Result<u64> {
+    let bytes: [u8; 8] = bytes
+        .try_into()
+        .map_err(|_| corruption("distinct vector body count has invalid size"))?;
+    Ok(u64::from_be_bytes(bytes))
+}
+
+pub(super) fn referenced_body_count_in_read(read: &redb::ReadTransaction) -> Result<u64> {
+    let metadata = read
+        .open_table(CONTENT_IDENTITY_METADATA_TABLE)
+        .map_err(metadata_error)?;
+    metadata
+        .get(VECTOR_REFERENCED_BODY_COUNT_KEY)
+        .map_err(metadata_error)?
+        .map(|value| decode_referenced_body_count(value.value()))
+        .transpose()
+        .map(|count| count.unwrap_or(0))
+}
+
+pub(super) fn referenced_body_count_in_write(write: &redb::WriteTransaction) -> Result<u64> {
+    let metadata = write
+        .open_table(CONTENT_IDENTITY_METADATA_TABLE)
+        .map_err(metadata_error)?;
+    metadata
+        .get(VECTOR_REFERENCED_BODY_COUNT_KEY)
+        .map_err(metadata_error)?
+        .map(|value| decode_referenced_body_count(value.value()))
+        .transpose()
+        .map(|count| count.unwrap_or(0))
+}
+
+fn same_body(a: &VectorPartitionMembershipRecord, b: &VectorPartitionMembershipRecord) -> bool {
+    a.index == b.index
+        && a.row_id == b.row_id
+        && a.vector_created_tx == b.vector_created_tx
+        && a.vector_lsn == b.vector_lsn
+}
+
+fn lifetimes_overlap(
+    a: &VectorPartitionMembershipRecord,
+    b: &VectorPartitionMembershipRecord,
+) -> bool {
+    let nonempty =
+        |r: &VectorPartitionMembershipRecord| r.deleted_tx.is_none_or(|end| r.visible_from < end);
+    nonempty(a)
+        && nonempty(b)
+        && a.deleted_tx.is_none_or(|end| b.visible_from < end)
+        && b.deleted_tx.is_none_or(|end| a.visible_from < end)
+}
+
+/// Existing reverse keys order owning row stamps rather than interval starts.
+/// Check only this row's history, keeping one charged decoded neighbour at a
+/// time. A row's history can require quadratic work over successive producers;
+/// unrelated rows are never scanned and no population identity set is built.
+#[cfg(test)]
+thread_local! {
+    static BODY_PLACEMENT_VALIDATION_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn body_placement_validation_calls() -> u64 {
+    BODY_PLACEMENT_VALIDATION_CALLS.with(std::cell::Cell::get)
+}
+
+fn validate_body_placement_transition<const CHECK_OVERLAP: bool>(
+    write: &redb::WriteTransaction,
+    reverse: &redb::Table<'_, &[u8], &[u8]>,
+    previous: Option<&VectorPartitionMembershipRecord>,
+    next: Option<&VectorPartitionMembershipRecord>,
+    accountant: Option<&Arc<crate::memory_accounting::MemoryAccountant>>,
+) -> Result<u64> {
+    #[cfg(test)]
+    BODY_PLACEMENT_VALIDATION_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
+    let record = previous
+        .or(next)
+        .expect("a membership transition has a record");
+    let prefix = reverse_row_prefix(&record.index, record.row_id);
+    let own_key = reverse_key(record);
+    let mut another_reference = false;
+    for item in reverse
+        .prefix_bounded(prefix.as_slice())
+        .map_err(metadata_error)?
+    {
+        let (key, value) = item.map_err(metadata_error)?;
+        if key.value() == own_key.as_slice() {
+            continue;
+        }
+        let _window = accountant
+            .map(|accountant| {
+                crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+                    Arc::clone(accountant),
+                    value.value().len().saturating_mul(16).saturating_add(4096),
+                    "vector",
+                    "validate_body_placement",
+                    "Raise MEMORY_LIMIT to validate this vector placement history.",
+                )
+            })
+            .transpose()?;
+        let other: VectorPartitionMembershipRecord = decode_vector_partition_record_payload(
+            VectorPartitionRecordKind::Membership,
+            value.value(),
+        )
+        .map_err(|reason| corruption(&reason))?;
+        if reverse_key(&other).as_slice() != key.value() {
+            return Err(corruption(
+                "reverse membership key disagrees with its body identity",
+            ));
+        }
+        if same_body(record, &other) {
+            another_reference = true;
+            if CHECK_OVERLAP && next.is_some_and(|next| lifetimes_overlap(next, &other)) {
+                return Err(corruption(
+                    "one vector body has overlapping placement lifetimes",
+                ));
+            }
+        }
+    }
+    let count = referenced_body_count_in_write(write)?;
+    match (previous.is_some(), next.is_some(), another_reference) {
+        (false, true, false) => count.checked_add(1),
+        (true, false, false) => count.checked_sub(1),
+        _ => Some(count),
+    }
+    .ok_or_else(|| corruption("distinct vector body count overflow/underflow"))
+}
+
 /// Called by the existing membership commitment door, in that same transaction.
 /// Replacement removes the old authenticated interval before installing the new
 /// one. Deletes still have its durable source companion after the forward key
@@ -538,10 +727,46 @@ pub(super) fn publish_membership(
     accountant: Option<Arc<crate::memory_accounting::MemoryAccountant>>,
     pending_transition: bool,
 ) -> Result<()> {
+    publish_membership_impl::<true>(
+        write,
+        membership_key,
+        encoded,
+        accountant,
+        pending_transition,
+    )
+}
+
+/// Adversarial fixture publication: authenticate records and companions while
+/// deliberately allowing overlapping placement lifetimes.
+#[cfg(any(test, feature = "test-seams"))]
+pub(super) fn publish_corrupt_store_membership_for_test(
+    write: &redb::WriteTransaction,
+    membership_key: &[u8],
+    encoded: Option<&[u8]>,
+    accountant: Option<Arc<crate::memory_accounting::MemoryAccountant>>,
+    pending_transition: bool,
+) -> Result<()> {
+    publish_membership_impl::<false>(
+        write,
+        membership_key,
+        encoded,
+        accountant,
+        pending_transition,
+    )
+}
+
+fn publish_membership_impl<const CHECK_OVERLAP: bool>(
+    write: &redb::WriteTransaction,
+    membership_key: &[u8],
+    encoded: Option<&[u8]>,
+    accountant: Option<Arc<crate::memory_accounting::MemoryAccountant>>,
+    pending_transition: bool,
+) -> Result<()> {
     let _scratch = accountant
+        .as_ref()
         .map(|accountant| {
             crate::memory_accounting::OwnedMemoryReservation::try_new_for(
-                accountant,
+                Arc::clone(accountant),
                 membership_key.len().saturating_mul(32).saturating_add(4096),
                 "vector",
                 "publish_membership_pages",
@@ -549,10 +774,13 @@ pub(super) fn publish_membership(
             )
         })
         .transpose()?;
-    let key = source_key_from_membership_key(membership_key)?;
-    let mut source = write.open_table(SOURCE).map_err(metadata_error)?;
-    let previous = source
-        .get_bounded(key.as_slice())
+    // The primary identity does not contain the independent placement start.
+    // Recover the previous interval from its exact authenticated reverse record;
+    // derive the next interval only from the supplied authenticated record.
+    let reverse_identity_key = reverse_key_from_membership_key(membership_key)?;
+    let mut reverse = write.open_table(REVERSE).map_err(metadata_error)?;
+    let previous = reverse
+        .get_bounded(reverse_identity_key.as_slice())
         .map_err(metadata_error)?
         .map(|value| {
             if value.value().len() > membership_key.len().saturating_mul(8).saturating_add(512) {
@@ -565,20 +793,44 @@ pub(super) fn publish_membership(
         .transpose()?;
     let previous_record = previous
         .as_deref()
-        .map(|bytes| decode_member(&key, bytes))
+        .map(|bytes| decode_primary_member(membership_key, bytes))
         .transpose()?;
-    let next_record = encoded
-        .map(|bytes| decode_member(&key, bytes))
-        .transpose()?;
-    for record in [previous_record.as_ref(), next_record.as_ref()]
-        .into_iter()
-        .flatten()
+    if previous_record
+        .as_ref()
+        .is_some_and(|record| reverse_key(record) != reverse_identity_key)
     {
-        if RedbPersistence::vector_partition_membership_key(record) != membership_key {
+        return Err(corruption(
+            "reverse membership key disagrees with its body identity",
+        ));
+    }
+    let next_record = encoded
+        .map(|bytes| decode_primary_member(membership_key, bytes))
+        .transpose()?;
+    let previous_key = previous_record.as_ref().map(source_key);
+    let next_key = next_record.as_ref().map(source_key);
+    let mut source = write.open_table(SOURCE).map_err(metadata_error)?;
+    if let (Some(key), Some(bytes)) = (previous_key.as_ref(), previous.as_deref()) {
+        let stored = source
+            .get_bounded(key.as_slice())
+            .map_err(metadata_error)?
+            .ok_or_else(|| corruption("reverse membership has no exact source companion"))?;
+        if stored.value() != bytes {
             return Err(corruption(
-                "one owning row version has conflicting vector placements",
+                "membership source and reverse companions disagree",
             ));
         }
+        decode_member(key, stored.value())?;
+    }
+    if let Some(key) = next_key.as_ref() {
+        if previous_key.as_ref() != Some(key)
+            && source
+                .get_bounded(key.as_slice())
+                .map_err(metadata_error)?
+                .is_some()
+        {
+            return Err(corruption("membership source identity is already occupied"));
+        }
+        decode_member(key, encoded.expect("next source key has an encoded record"))?;
     }
     let route = previous_record.as_ref().or(next_record.as_ref());
     let Some(route) = route else {
@@ -632,7 +884,6 @@ pub(super) fn publish_membership(
             });
         }
     }
-    let mut reverse = write.open_table(REVERSE).map_err(metadata_error)?;
     if source.len().map_err(metadata_error)? != global.entries
         || reverse.len().map_err(metadata_error)? != global.entries
     {
@@ -640,17 +891,31 @@ pub(super) fn publish_membership(
             "membership companion cardinality disagrees with its maintained summary",
         ));
     }
-    if let (Some(record), Some(bytes)) = (previous_record.as_ref(), previous.as_ref()) {
-        adjust(&mut global, &key, bytes, record, false)?;
-        adjust(&mut partition, &key, bytes, record, false)?;
+    let distinct_bodies = validate_body_placement_transition::<CHECK_OVERLAP>(
+        write,
+        &reverse,
+        previous_record.as_ref(),
+        next_record.as_ref(),
+        accountant.as_ref(),
+    )?;
+    content_size::membership_transition(write, previous_record.as_ref(), next_record.as_ref())?;
+    if let (Some(record), Some(bytes), Some(key)) = (
+        previous_record.as_ref(),
+        previous.as_ref(),
+        previous_key.as_ref(),
+    ) {
+        adjust(&mut global, key, bytes, record, false)?;
+        adjust(&mut partition, key, bytes, record, false)?;
         reverse
             .remove(reverse_key(record).as_slice())
             .map_err(metadata_error)?;
         source.remove(key.as_slice()).map_err(metadata_error)?;
     }
-    if let (Some(record), Some(bytes)) = (next_record.as_ref(), encoded) {
-        adjust(&mut global, &key, bytes, record, true)?;
-        adjust(&mut partition, &key, bytes, record, true)?;
+    if let (Some(record), Some(bytes), Some(key)) =
+        (next_record.as_ref(), encoded, next_key.as_ref())
+    {
+        adjust(&mut global, key, bytes, record, true)?;
+        adjust(&mut partition, key, bytes, record, true)?;
         reverse
             .insert(reverse_key(record).as_slice(), bytes)
             .map_err(metadata_error)?;
@@ -658,18 +923,35 @@ pub(super) fn publish_membership(
             .insert(key.as_slice(), bytes)
             .map_err(metadata_error)?;
     }
+    write
+        .open_table(CONTENT_IDENTITY_METADATA_TABLE)
+        .map_err(metadata_error)?
+        .insert(
+            VECTOR_REFERENCED_BODY_COUNT_KEY,
+            distinct_bodies.to_be_bytes().as_slice(),
+        )
+        .map_err(metadata_error)?;
     if pending_transition {
         global.pending_transition(previous_record.as_ref(), next_record.as_ref())?;
         partition.pending_transition(previous_record.as_ref(), next_record.as_ref())?;
     }
     let global_bytes = encode_summary(GLOBAL, &global)?;
-    let partition_bytes = encode_summary(&partition_key, &partition)?;
     summaries
         .insert(GLOBAL, global_bytes.as_slice())
         .map_err(metadata_error)?;
-    summaries
-        .insert(partition_key.as_slice(), partition_bytes.as_slice())
-        .map_err(metadata_error)?;
+    if pending_transition && partition.entries == 0 && !route.partition_key.is_unpartitioned() {
+        // Retire only the authoritative summary. Reclaim owns catalogs and
+        // graph pages until every pinned chain is released. Rename suppresses
+        // this retirement so its pending frontier can move with the route.
+        summaries
+            .remove(partition_key.as_slice())
+            .map_err(metadata_error)?;
+    } else {
+        let partition_bytes = encode_summary(&partition_key, &partition)?;
+        summaries
+            .insert(partition_key.as_slice(), partition_bytes.as_slice())
+            .map_err(metadata_error)?;
+    }
     drop((source, reverse, summaries));
     Ok(())
 }
@@ -678,6 +960,12 @@ pub(super) fn publish_membership(
 /// image in one transaction. Its derived companions are rebuilt in that same
 /// transaction, retaining no stale renamed/dropped route keys.
 pub(super) fn reset_in_write(write: &redb::WriteTransaction) -> Result<()> {
+    content_size::reset_memberships(write)?;
+    write
+        .open_table(CONTENT_IDENTITY_METADATA_TABLE)
+        .map_err(metadata_error)?
+        .remove(VECTOR_REFERENCED_BODY_COUNT_KEY)
+        .map_err(metadata_error)?;
     for definition in [SOURCE, REVERSE, SUMMARY] {
         match write.delete_table(definition) {
             Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
@@ -746,11 +1034,17 @@ pub(super) fn rename_pending_routes(
                     let old = decode_summary(key.value(), value.value())?;
                     let route = partition_from_prefix(key.value())?;
                     let target = RedbPersistence::vector_partition_prefix(to, &route.partition_key);
-                    Ok((key.value().to_vec(), target, old, memory))
+                    Ok((
+                        key.value().to_vec(),
+                        target,
+                        old,
+                        memory,
+                        route.partition_key.is_unpartitioned(),
+                    ))
                 })
                 .transpose()?
         };
-        let Some((key, target, old, _memory)) = next else {
+        let Some((key, target, old, _memory, unpartitioned)) = next else {
             break;
         };
         let mut renamed = summaries
@@ -762,12 +1056,18 @@ pub(super) fn rename_pending_routes(
         renamed.pending = old.pending;
         renamed.base_pending = old.base_pending;
         renamed.candidate_pending = old.candidate_pending;
-        summaries
-            .insert(
-                target.as_slice(),
-                encode_summary(&target, &renamed)?.as_slice(),
-            )
-            .map_err(metadata_error)?;
+        if renamed.entries == 0 && !unpartitioned {
+            summaries
+                .remove(target.as_slice())
+                .map_err(metadata_error)?;
+        } else {
+            summaries
+                .insert(
+                    target.as_slice(),
+                    encode_summary(&target, &renamed)?.as_slice(),
+                )
+                .map_err(metadata_error)?;
+        }
         summaries.remove(key.as_slice()).map_err(metadata_error)?;
     }
     drop(summaries);
@@ -930,6 +1230,46 @@ pub(super) fn partition_from_prefix(mut key: &[u8]) -> Result<VectorPartitionRef
         VectorIndexRef::new(table, column),
         partition,
     ))
+}
+
+/// Decode one retained route only after its concrete component capacity and
+/// text payload upper bound have been admitted by the executing owner.
+pub(super) fn partition_from_prefix_admitted(
+    encoded: &[u8],
+    owner: &mut contextdb_vector::VectorCopyAdmission,
+) -> Result<VectorPartitionRef> {
+    let mut remaining = encoded;
+    let table = component(&mut remaining)?;
+    let column = component(&mut remaining)?;
+    let partition = component(&mut remaining)?;
+    if !remaining.is_empty() {
+        return Err(corruption("partition route key has trailing bytes"));
+    }
+    let count_bytes: [u8; 8] = partition
+        .get(1..9)
+        .ok_or_else(|| corruption("partition route component count is truncated"))?
+        .try_into()
+        .map_err(|_| corruption("partition route component count is invalid"))?;
+    let count = usize::try_from(u64::from_be_bytes(count_bytes))
+        .map_err(|_| corruption("partition route component count is too large"))?;
+    // Every canonical component requires at least a tag and one value byte.
+    // Refuse impossible count headers before the existing decoder reserves Vec.
+    if count > partition.len().saturating_sub(9) / 2 {
+        return Err(corruption(
+            "partition route component count exceeds its encoding",
+        ));
+    }
+    let component_bytes = count
+        .checked_mul(std::mem::size_of::<contextdb_core::VectorPartitionComponent>())
+        .ok_or_else(|| corruption("partition route component capacity overflow"))?;
+    let bytes = std::mem::size_of::<VectorPartitionRef>()
+        .checked_add(table.len())
+        .and_then(|bytes| bytes.checked_add(column.len()))
+        .and_then(|bytes| bytes.checked_add(component_bytes))
+        .and_then(|bytes| bytes.checked_add(partition.len()))
+        .ok_or_else(|| corruption("partition route copy capacity overflow"))?;
+    owner.reserve(bytes)?;
+    partition_from_prefix(encoded)
 }
 
 /// Live membership count of one partition from its maintained summary.

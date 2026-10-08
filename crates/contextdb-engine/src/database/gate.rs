@@ -1,25 +1,26 @@
+use super::graph_read_memory::*;
 use super::*;
 
 /// Cached identities retain their actual controls independently of source
 /// windows and of the reader that originally built the cache entry.
 pub(super) struct AdmittedAclIds {
     ids: HashSet<uuid::Uuid>,
-    memory: crate::memory_accounting::OwnedMemoryReservation,
+    memory: contextdb_core::read_memory::ReadCredit,
     map_bytes: usize,
 }
 impl AdmittedAclIds {
-    fn workspace(accountant: Arc<MemoryAccountant>) -> Self {
+    fn workspace(read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>) -> Self {
         Self {
             ids: HashSet::new(),
-            memory: crate::memory_accounting::OwnedMemoryReservation::new(accountant),
+            memory: contextdb_core::read_memory::ReadCredit::new(read_memory),
             map_bytes: 0,
         }
     }
-    fn new(accountant: Arc<MemoryAccountant>) -> Result<Self> {
-        let mut owner = Self::workspace(accountant);
+    fn new(read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>) -> Result<Self> {
+        let mut owner = Self::workspace(read_memory);
         owner.memory.try_grow_for(
             std::mem::size_of::<Self>().saturating_add(32),
-            "writer_source",
+            "reader",
             "acl_identities",
             "Raise MEMORY_LIMIT to retain these ACL identities.",
         )?;
@@ -34,7 +35,7 @@ impl AdmittedAclIds {
             let bytes = held::map::<uuid::Uuid, ()>(wanted);
             self.memory.try_grow_for(
                 bytes,
-                "writer_source",
+                "reader",
                 "acl_identities",
                 "Raise MEMORY_LIMIT to retain these ACL identities.",
             )?;
@@ -46,13 +47,16 @@ impl AdmittedAclIds {
         }
         Ok(self.ids.insert(id))
     }
-    fn copy(&self, accountant: Arc<MemoryAccountant>) -> Result<Self> {
-        let mut copy = Self::new(accountant)?;
+    fn copy(
+        &self,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<Self> {
+        let mut copy = Self::new(read_memory)?;
         if !self.ids.is_empty() {
             let bytes = held::map::<uuid::Uuid, ()>(self.ids.len());
             copy.memory.try_grow_for(
                 bytes,
-                "writer_source",
+                "reader",
                 "acl_identities",
                 "Raise MEMORY_LIMIT to retain these ACL identities.",
             )?;
@@ -75,11 +79,11 @@ impl std::ops::Deref for AdmittedAclIds {
 
 pub(super) struct AdmittedAclGrantCache {
     entries: HashMap<AclGrantCacheKey, AdmittedAclGrantCacheEntry>,
-    map_memory: Option<crate::memory_accounting::OwnedMemoryReservation>,
+    map_memory: Option<contextdb_core::read_memory::ReadCredit>,
 }
 struct AdmittedAclGrantCacheEntry {
     ids: Arc<AdmittedAclIds>,
-    _key_memory: crate::memory_accounting::OwnedMemoryReservation,
+    _key_memory: contextdb_core::read_memory::ReadCredit,
 }
 impl AdmittedAclGrantCache {
     pub(super) fn new() -> Self {
@@ -463,16 +467,14 @@ impl Database {
         principal: &Principal,
         acl_ref: &AclRef,
         snapshot: SnapshotId,
-    ) -> Result<(
-        AclGrantCacheKey,
-        crate::memory_accounting::OwnedMemoryReservation,
-    )> {
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<(AclGrantCacheKey, contextdb_core::read_memory::ReadCredit)> {
         let principal_bytes = match principal {
             Principal::System => 0,
             Principal::Agent(id) | Principal::Human(id) => held::text(id),
         };
-        let memory = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
-            self.accountant.clone(),
+        let memory = contextdb_core::read_memory::ReadCredit::try_new(
+            read_memory,
             principal_bytes
                 .saturating_add(held::text(&acl_ref.ref_table))
                 .saturating_add(held::text(&acl_ref.ref_column)),
@@ -606,8 +608,18 @@ impl Database {
         meta: &TableMeta,
         row: &VersionedRow,
         snapshot: SnapshotId,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<bool> {
-        self.read_allowed_for_row_cached_in_tx(None, table, meta, row, snapshot, None)
+        self.read_allowed_for_row_cached_in_tx(
+            None,
+            table,
+            meta,
+            row,
+            snapshot,
+            None,
+            read_memory.clone(),
+        )
     }
 
     /// Borrow resident access metadata; no row/vector body or hidden candidate
@@ -618,26 +630,99 @@ impl Database {
         table: &str,
         snapshot: SnapshotId,
         mut visit: impl FnMut(&VersionedRow) -> Result<()>,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<()> {
         self.assert_table_read_allowed(table)?;
         let meta = self
             .table_meta(table)
             .ok_or_else(|| Error::TableNotFound(table.to_owned()))?;
-        if self.visit_writer_rows::<Error>(table, |row| {
-            if row.visible_at(snapshot)
-                && self.bounded_read_allowed_for_row(
+        if self.visit_writer_rows::<Error>(
+            table,
+            |row| {
+                if row.visible_at(snapshot)
+                    && self.bounded_read_allowed_for_row(
+                        None,
+                        table,
+                        &meta,
+                        row,
+                        snapshot,
+                        &mut |_| Ok::<(), Error>(()),
+                        read_memory.clone(),
+                    )?
+                {
+                    visit(row)?;
+                }
+                Ok(())
+            },
+            read_memory.clone(),
+        )? {
+            return Ok(());
+        }
+        if self.retained_relational_source.is_some() {
+            if let (Some(contexts), Some(column)) =
+                (&self.access.contexts, self.context_column(&meta))
+                && meta
+                    .indexes
+                    .iter()
+                    .any(|index| index.columns.len() == 1 && index.columns[0].0 == column.name)
+            {
+                for context in contexts {
+                    let _rows_scope = self.writer_temporary_output_scope(read_memory.clone())?;
+                    let rows = self.indexed_rows_for_values(
+                        table, std::slice::from_ref(&column.name), &[Value::Uuid(context.0)],
+                        snapshot, read_memory.clone(),
+                    )?.ok_or_else(|| Error::Other(format!("retained access metadata table {table} has no covering context index")))?;
+                    for row in rows {
+                        if self.bounded_read_allowed_for_row(
+                            None,
+                            table,
+                            &meta,
+                            &row,
+                            snapshot,
+                            &mut |_| Ok::<(), Error>(()),
+                            read_memory.clone(),
+                        )? {
+                            visit(&row)?;
+                        }
+                    }
+                }
+                return Ok(());
+            }
+            let mut cursor = self.bounded_physical_table_cursor(table)?;
+            loop {
+                let mut row_memory =
+                    contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
+                let Some(row) = self.bounded_physical_table_row_next(
+                    read_memory.clone(),
+                    table,
+                    snapshot,
+                    &mut cursor,
+                    || Ok::<(), Error>(()),
+                    |bytes| {
+                        row_memory.try_grow_for(
+                            bytes,
+                            "reader",
+                            "access_metadata_row",
+                            "Raise the declared read memory limit to inspect access metadata.",
+                        )
+                    },
+                )?
+                else {
+                    break;
+                };
+                if self.bounded_read_allowed_for_row(
                     None,
                     table,
                     &meta,
-                    row,
+                    &row,
                     snapshot,
                     &mut |_| Ok::<(), Error>(()),
-                )?
-            {
-                visit(row)?;
+                    read_memory.clone(),
+                )? {
+                    visit(&row)?;
+                }
             }
-            Ok(())
-        })? {
             return Ok(());
         }
         let tables = self.relational_store.tables.read();
@@ -654,6 +739,7 @@ impl Database {
                     row,
                     snapshot,
                     |_| Ok::<(), Error>(()),
+                    read_memory.clone(),
                 )?
             {
                 visit(row)?;
@@ -805,6 +891,8 @@ impl Database {
         row: &VersionedRow,
         snapshot: SnapshotId,
         before_access_row: impl FnMut(usize) -> std::result::Result<(), E>,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<bool, E>
     where
         E: From<Error>,
@@ -817,6 +905,7 @@ impl Database {
             row,
             snapshot,
             before_access_row,
+            read_memory.clone(),
         )
     }
 
@@ -839,6 +928,8 @@ impl Database {
         row: &VersionedRow,
         snapshot: SnapshotId,
         before_access_row: impl FnMut(usize) -> std::result::Result<(), E>,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<bool, E>
     where
         E: From<Error>,
@@ -851,6 +942,7 @@ impl Database {
             row,
             snapshot,
             before_access_row,
+            read_memory.clone(),
         )
     }
 
@@ -864,6 +956,8 @@ impl Database {
         row: &VersionedRow,
         snapshot: SnapshotId,
         before_access_row: impl FnMut(usize) -> std::result::Result<(), E>,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<Option<Error>, E>
     where
         E: From<Error>,
@@ -876,6 +970,7 @@ impl Database {
             row,
             snapshot,
             before_access_row,
+            read_memory.clone(),
         )
     }
 
@@ -894,6 +989,8 @@ impl Database {
         row: &VersionedRow,
         snapshot: SnapshotId,
         before_access_row: impl FnMut(usize) -> std::result::Result<(), E>,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<Option<Error>, E>
     where
         E: From<Error>,
@@ -906,6 +1003,7 @@ impl Database {
             row,
             snapshot,
             before_access_row,
+            read_memory.clone(),
         )
     }
 
@@ -919,6 +1017,8 @@ impl Database {
         row: &VersionedRow,
         snapshot: SnapshotId,
         before_access_row: impl FnMut(usize) -> std::result::Result<(), E>,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<bool, E>
     where
         E: From<Error>,
@@ -932,6 +1032,7 @@ impl Database {
                 row,
                 snapshot,
                 before_access_row,
+                read_memory.clone(),
             )?
             .is_none())
     }
@@ -949,6 +1050,8 @@ impl Database {
         row: &VersionedRow,
         snapshot: SnapshotId,
         mut before_access_row: impl FnMut(usize) -> std::result::Result<(), E>,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<Option<Error>, E>
     where
         E: From<Error>,
@@ -1028,6 +1131,7 @@ impl Database {
                 acl_ref,
                 snapshot,
                 &mut before_access_row,
+                read_memory.clone(),
             )?,
             None if self.retained_relational_source.is_some() || self.persistence.is_some() => self
                 .bounded_allowed_acl_ids_in_retained_source(
@@ -1035,6 +1139,7 @@ impl Database {
                     acl_ref,
                     snapshot,
                     &mut before_access_row,
+                    read_memory.clone(),
                 )?,
             None => {
                 let tables = self.relational_store.tables.read();
@@ -1044,6 +1149,7 @@ impl Database {
                     acl_ref,
                     snapshot,
                     &mut before_access_row,
+                    read_memory.clone(),
                 )?
             }
         };
@@ -1054,6 +1160,7 @@ impl Database {
             snapshot,
             committed,
             &mut before_access_row,
+            read_memory.clone(),
         )?;
         Ok((!allowed.contains(acl_id)).then(acl_denied))
     }
@@ -1064,6 +1171,8 @@ impl Database {
         acl_ref: &AclRef,
         snapshot: SnapshotId,
         before_access_row: &mut impl FnMut(usize) -> std::result::Result<(), E>,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<Arc<AdmittedAclIds>, E>
     where
         E: From<Error>,
@@ -1075,9 +1184,9 @@ impl Database {
         } else {
             None
         };
-        let _scope = self.enter_writer_read(root);
+        let _scope = self.enter_writer_read(root, read_memory.clone());
         let (cache_key, key_memory) = self
-            .admitted_acl_cache_key(principal, acl_ref, snapshot)
+            .admitted_acl_cache_key(principal, acl_ref, snapshot, read_memory.clone())
             .map_err(E::from)?;
         if let Some(cached) = self
             .acl_grant_cache
@@ -1091,7 +1200,7 @@ impl Database {
         let (kind, principal_id) = match principal {
             Principal::System => {
                 return Ok(Arc::new(
-                    AdmittedAclIds::new(self.accountant.clone()).map_err(E::from)?,
+                    AdmittedAclIds::new(read_memory.clone()).map_err(E::from)?,
                 ));
             }
             Principal::Agent(id) => ("Agent", id.as_str()),
@@ -1100,7 +1209,7 @@ impl Database {
         let meta = self
             .table_meta(&acl_ref.ref_table)
             .ok_or_else(|| E::from(Error::TableNotFound(acl_ref.ref_table.clone())))?;
-        let mut allowed = AdmittedAclIds::new(self.accountant.clone()).map_err(E::from)?;
+        let mut allowed = AdmittedAclIds::new(read_memory.clone()).map_err(E::from)?;
         let mut admit = |grant: &VersionedRow| {
             if grant.visible_at(snapshot)
                 && self
@@ -1123,14 +1232,19 @@ impl Database {
                     before_access_row(grant.estimated_bytes())?;
                     admit(grant)
                 },
+                read_memory.clone(),
             )?;
-        } else if !self.visit_writer_rows_phased::<E>(&acl_ref.ref_table, |grant| match grant {
-            None => before_access_row(0),
-            Some(grant) => {
-                before_access_row(grant.estimated_bytes())?;
-                admit(grant)
-            }
-        })? {
+        } else if !self.visit_writer_rows_phased::<E>(
+            &acl_ref.ref_table,
+            |grant| match grant {
+                None => before_access_row(0),
+                Some(grant) => {
+                    before_access_row(grant.estimated_bytes())?;
+                    admit(grant)
+                }
+            },
+            read_memory.clone(),
+        )? {
             return Err(E::from(Error::Other(
                 "ACL source requested without a captured relational source".to_owned(),
             )));
@@ -1154,12 +1268,13 @@ impl Database {
         acl_ref: &AclRef,
         snapshot: SnapshotId,
         before_access_row: &mut impl FnMut(usize) -> std::result::Result<(), E>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<Arc<AdmittedAclIds>, E>
     where
         E: From<Error>,
     {
         let (cache_key, key_memory) = self
-            .admitted_acl_cache_key(principal, acl_ref, snapshot)
+            .admitted_acl_cache_key(principal, acl_ref, snapshot, read_memory.clone())
             .map_err(E::from)?;
         if let Some(cached) = self
             .acl_grant_cache
@@ -1173,13 +1288,13 @@ impl Database {
         let (kind, principal_id) = match principal {
             Principal::System => {
                 return Ok(Arc::new(
-                    AdmittedAclIds::new(self.accountant.clone()).map_err(E::from)?,
+                    AdmittedAclIds::new(read_memory.clone()).map_err(E::from)?,
                 ));
             }
             Principal::Agent(id) => ("Agent", id.as_str()),
             Principal::Human(id) => ("Human", id.as_str()),
         };
-        let mut allowed = AdmittedAclIds::new(self.accountant.clone()).map_err(E::from)?;
+        let mut allowed = AdmittedAclIds::new(read_memory.clone()).map_err(E::from)?;
         if let Some(rows) = tables.get(&acl_ref.ref_table) {
             for grant in rows {
                 before_access_row(grant.estimated_bytes())?;
@@ -1219,6 +1334,8 @@ impl Database {
         snapshot: SnapshotId,
         committed: Arc<AdmittedAclIds>,
         before_access_row: &mut impl FnMut(usize) -> std::result::Result<(), E>,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<Arc<AdmittedAclIds>, E>
     where
         E: From<Error>,
@@ -1232,7 +1349,7 @@ impl Database {
             Principal::Human(id) => ("Human", id.as_str()),
         };
         let overlay = self
-            .transaction_table_overlay(tx, &acl_ref.ref_table)
+            .transaction_table_overlay(tx, &acl_ref.ref_table, read_memory.clone())
             .map_err(E::from)?;
         if overlay.is_empty() {
             return Ok(committed);
@@ -1240,14 +1357,19 @@ impl Database {
         // The grant rows this transaction staged, read one at a time and
         // charged like every other access row, and the committed grants it
         // withdrew, dropped by the identity they were granted under.
-        let mut withdrawn = AdmittedAclIds::workspace(self.accountant.clone());
+        let mut withdrawn = AdmittedAclIds::workspace(read_memory.clone());
         for staged in overlay.staged_rows.iter().flat_map(|rows| rows.rows()) {
             before_access_row(staged.estimated_bytes())?;
         }
         let source = self
             .writer_read_root()
             .map_err(E::from)?
-            .map(crate::persistence::writer_adapters::WriterRelationalSource::new)
+            .map(|root| {
+                crate::persistence::writer_adapters::WriterRelationalSource::new_for_read(
+                    root,
+                    read_memory.clone(),
+                )
+            })
             .transpose()
             .map_err(E::from)?;
         for row_id in &overlay.deleted {
@@ -1291,7 +1413,7 @@ impl Database {
         {
             return Ok(committed);
         }
-        let mut allowed = committed.copy(self.accountant.clone()).map_err(E::from)?;
+        let mut allowed = committed.copy(read_memory.clone()).map_err(E::from)?;
         for acl_id in withdrawn.iter() {
             allowed.remove(acl_id);
         }
@@ -1316,8 +1438,18 @@ impl Database {
         row: &VersionedRow,
         snapshot: SnapshotId,
         allowed_acl_ids: Option<&HashSet<uuid::Uuid>>,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<bool> {
-        self.read_allowed_for_row_cached_in_tx(None, table, meta, row, snapshot, allowed_acl_ids)
+        self.read_allowed_for_row_cached_in_tx(
+            None,
+            table,
+            meta,
+            row,
+            snapshot,
+            allowed_acl_ids,
+            read_memory.clone(),
+        )
     }
 
     fn read_allowed_for_row_in_tx(
@@ -1327,8 +1459,18 @@ impl Database {
         meta: &TableMeta,
         row: &VersionedRow,
         snapshot: SnapshotId,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<bool> {
-        self.read_allowed_for_row_cached_in_tx(tx, table, meta, row, snapshot, None)
+        self.read_allowed_for_row_cached_in_tx(
+            tx,
+            table,
+            meta,
+            row,
+            snapshot,
+            None,
+            read_memory.clone(),
+        )
     }
 
     fn read_allowed_for_row_cached_in_tx(
@@ -1339,9 +1481,19 @@ impl Database {
         row: &VersionedRow,
         snapshot: SnapshotId,
         allowed_acl_ids: Option<&HashSet<uuid::Uuid>>,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<bool> {
         Ok(self
-            .read_denial_for_row_cached_in_tx(tx, table, meta, row, snapshot, allowed_acl_ids)?
+            .read_denial_for_row_cached_in_tx(
+                tx,
+                table,
+                meta,
+                row,
+                snapshot,
+                allowed_acl_ids,
+                read_memory.clone(),
+            )?
             .is_none())
     }
 
@@ -1352,8 +1504,18 @@ impl Database {
         row: &VersionedRow,
         snapshot: SnapshotId,
         allowed_acl_ids: Option<&HashSet<uuid::Uuid>>,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Option<Error>> {
-        self.read_denial_for_row_cached_in_tx(None, table, meta, row, snapshot, allowed_acl_ids)
+        self.read_denial_for_row_cached_in_tx(
+            None,
+            table,
+            meta,
+            row,
+            snapshot,
+            allowed_acl_ids,
+            read_memory.clone(),
+        )
     }
 
     fn read_denial_for_row_cached_in_tx(
@@ -1364,6 +1526,8 @@ impl Database {
         row: &VersionedRow,
         snapshot: SnapshotId,
         allowed_acl_ids: Option<&HashSet<uuid::Uuid>>,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Option<Error>> {
         if self.access_is_admin() {
             return Ok(None);
@@ -1421,7 +1585,12 @@ impl Database {
                     None => {
                         let acl_ref = column.acl_ref.as_ref().expect("acl column");
                         self.principal_has_acl_grant_in_tx(
-                            tx, principal, acl_ref, *acl_id, snapshot,
+                            tx,
+                            principal,
+                            acl_ref,
+                            *acl_id,
+                            snapshot,
+                            read_memory.clone(),
                         )?
                     }
                 },
@@ -1443,6 +1612,8 @@ impl Database {
         table: &str,
         row: &VersionedRow,
         snapshot: SnapshotId,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<bool> {
         self.assert_table_read_allowed(table)?;
         if self.access_is_admin() {
@@ -1460,6 +1631,7 @@ impl Database {
                         .expect("assert_table_read_allowed rejects missing principals"),
                     column.acl_ref.as_ref().expect("acl column"),
                     snapshot,
+                    read_memory.clone(),
                 )?,
             )
         } else {
@@ -1471,6 +1643,7 @@ impl Database {
             row,
             snapshot,
             allowed.as_ref().map(|ids| &ids.ids),
+            read_memory.clone(),
         )
     }
 
@@ -1479,8 +1652,10 @@ impl Database {
         table: &str,
         rows: Vec<VersionedRow>,
         snapshot: SnapshotId,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Vec<VersionedRow>> {
-        self.filter_rows_for_read_in_tx(None, table, rows, snapshot)
+        self.filter_rows_for_read_in_tx(None, table, rows, snapshot, read_memory.clone())
     }
 
     pub(crate) fn filter_rows_for_read_in_tx(
@@ -1489,6 +1664,8 @@ impl Database {
         table: &str,
         rows: Vec<VersionedRow>,
         snapshot: SnapshotId,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Vec<VersionedRow>> {
         self.assert_table_read_allowed(table)?;
         if self.access_is_admin() || rows.is_empty() {
@@ -1508,6 +1685,7 @@ impl Database {
                 principal,
                 column.acl_ref.as_ref().expect("acl column"),
                 snapshot,
+                read_memory.clone(),
             )?)
         } else {
             None
@@ -1520,6 +1698,7 @@ impl Database {
                 &row,
                 snapshot,
                 allowed_acl_ids.as_ref().map(|ids| &ids.ids),
+                read_memory.clone(),
             )? {
                 out.push(row);
             }
@@ -1533,6 +1712,8 @@ impl Database {
         table: &str,
         rows: Vec<VersionedRow>,
         snapshot: SnapshotId,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Vec<VersionedRow>> {
         self.assert_table_read_allowed(table)?;
         if self.access_is_admin() || rows.is_empty() {
@@ -1552,6 +1733,7 @@ impl Database {
                 principal,
                 column.acl_ref.as_ref().expect("acl column"),
                 snapshot,
+                read_memory.clone(),
             )?)
         } else {
             None
@@ -1565,6 +1747,7 @@ impl Database {
                 &row,
                 snapshot,
                 allowed_acl_ids.as_ref().map(|ids| &ids.ids),
+                read_memory.clone(),
             )? {
                 Some(err) => {
                     if first_denial.is_none() {
@@ -1589,6 +1772,8 @@ impl Database {
         row_id: RowId,
         values: &HashMap<ColName, Value>,
         snapshot: SnapshotId,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<()> {
         if self.access_is_admin() {
             return Ok(());
@@ -1646,7 +1831,13 @@ impl Database {
             let allowed = match values.get(&column.name) {
                 Some(Value::Uuid(acl_id)) => {
                     let acl_ref = column.acl_ref.as_ref().expect("acl column");
-                    self.principal_has_acl_grant(principal, acl_ref, *acl_id, snapshot)?
+                    self.principal_has_acl_grant(
+                        principal,
+                        acl_ref,
+                        *acl_id,
+                        snapshot,
+                        read_memory.clone(),
+                    )?
                 }
                 _ => false,
             };
@@ -1667,11 +1858,13 @@ impl Database {
         row_id: RowId,
         values: &HashMap<ColName, Value>,
         snapshot: SnapshotId,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<()> {
         let Some(meta) = self.table_meta(table) else {
             return Err(Error::TableNotFound(table.to_string()));
         };
-        self.write_allowed_for_values(table, &meta, row_id, values, snapshot)
+        self.write_allowed_for_values(table, &meta, row_id, values, snapshot, read_memory.clone())
     }
 
     fn principal_has_acl_grant(
@@ -1680,8 +1873,17 @@ impl Database {
         acl_ref: &AclRef,
         acl_id: uuid::Uuid,
         snapshot: SnapshotId,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<bool> {
-        self.principal_has_acl_grant_in_tx(None, principal, acl_ref, acl_id, snapshot)
+        self.principal_has_acl_grant_in_tx(
+            None,
+            principal,
+            acl_ref,
+            acl_id,
+            snapshot,
+            read_memory.clone(),
+        )
     }
 
     fn principal_has_acl_grant_in_tx(
@@ -1691,9 +1893,17 @@ impl Database {
         acl_ref: &AclRef,
         acl_id: uuid::Uuid,
         snapshot: SnapshotId,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<bool> {
         Ok(self
-            .allowed_acl_ids_for_principal_in_tx(tx, principal, acl_ref, snapshot)?
+            .allowed_acl_ids_for_principal_in_tx(
+                tx,
+                principal,
+                acl_ref,
+                snapshot,
+                read_memory.clone(),
+            )?
             .contains(&acl_id))
     }
 
@@ -1736,6 +1946,8 @@ impl Database {
         principal: &Principal,
         acl_ref: &AclRef,
         snapshot: SnapshotId,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Arc<AdmittedAclIds>> {
         if self.retained_relational_source.is_some() || self.writer_read_root()?.is_some() {
             return self.bounded_allowed_acl_ids_in_retained_source(
@@ -1746,9 +1958,11 @@ impl Database {
                     crate::executor::observe_bounded_access_control_row();
                     Ok::<(), Error>(())
                 },
+                read_memory.clone(),
             );
         }
-        let (cache_key, key_memory) = self.admitted_acl_cache_key(principal, acl_ref, snapshot)?;
+        let (cache_key, key_memory) =
+            self.admitted_acl_cache_key(principal, acl_ref, snapshot, read_memory.clone())?;
         if let Some(cached) = self
             .acl_grant_cache
             .read()
@@ -1760,16 +1974,16 @@ impl Database {
         }
         let (kind, principal_id) = match principal {
             Principal::System => {
-                return Ok(Arc::new(AdmittedAclIds::new(self.accountant.clone())?));
+                return Ok(Arc::new(AdmittedAclIds::new(read_memory.clone())?));
             }
             Principal::Agent(id) => ("Agent", id.as_str()),
             Principal::Human(id) => ("Human", id.as_str()),
         };
         let tables = self.relational_store.tables.read();
         let Some(rows) = tables.get(&acl_ref.ref_table) else {
-            return Ok(Arc::new(AdmittedAclIds::new(self.accountant.clone())?));
+            return Ok(Arc::new(AdmittedAclIds::new(read_memory.clone())?));
         };
-        let mut allowed = AdmittedAclIds::new(self.accountant.clone())?;
+        let mut allowed = AdmittedAclIds::new(read_memory.clone())?;
         for row in rows {
             crate::executor::observe_bounded_access_control_row();
             if row.visible_at(snapshot)
@@ -1796,13 +2010,41 @@ impl Database {
     fn remember_allowed_acl_ids(
         &self,
         cache_key: AclGrantCacheKey,
-        key_memory: crate::memory_accounting::OwnedMemoryReservation,
+        key_memory: contextdb_core::read_memory::ReadCredit,
         allowed: Arc<AdmittedAclIds>,
     ) -> Result<()> {
+        // Promotion is only an allocation optimization. Admission failure here
+        // never changes the operation's already computed authorization answer.
+        let promoted = (|| -> Result<_> {
+            let budget = self.declared_read_memory.acl_cache_budget()?;
+            let ids = Arc::new(allowed.copy(budget.clone())?);
+            let bytes = held::text(&cache_key.ref_table)
+                .saturating_add(held::text(&cache_key.ref_column))
+                .saturating_add(match &cache_key.principal {
+                    Principal::System => 0,
+                    Principal::Agent(id) | Principal::Human(id) => held::text(id),
+                });
+            let parent_key_memory = contextdb_core::read_memory::ReadCredit::try_new(
+                budget.clone(),
+                bytes,
+                "reader_acl_cache",
+                "key",
+                "Increase reader memory to cache ACL grants.",
+            )?;
+            let parent_key = cache_key.clone();
+            Ok((budget, ids, parent_key_memory, parent_key))
+        })();
+        let Ok((budget, ids, parent_key_memory, parent_key)) = promoted else {
+            return Ok(());
+        };
+        // The original key remains operation-funded until its own allocation
+        // drops. Only the separately admitted copy enters the standing cache.
+        drop(cache_key);
+        drop(key_memory);
         loop {
             let mut cache = self.acl_grant_cache.write();
-            if let Some(entry) = cache.entries.get_mut(&cache_key) {
-                entry.ids = allowed;
+            if let Some(entry) = cache.entries.get_mut(&parent_key) {
+                entry.ids = ids;
                 return Ok(());
             }
             if cache.entries.len() >= RETAINED_GRANT_SET_CEILING {
@@ -1810,23 +2052,26 @@ impl Database {
             }
             if cache.entries.len() < cache.entries.capacity() {
                 cache.entries.insert(
-                    cache_key,
+                    parent_key,
                     AdmittedAclGrantCacheEntry {
-                        ids: allowed,
-                        _key_memory: key_memory,
+                        ids,
+                        _key_memory: parent_key_memory,
                     },
                 );
                 return Ok(());
             }
             let wanted = cache.entries.capacity().max(1).saturating_mul(2);
             drop(cache);
-            let memory = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
-                self.accountant.clone(),
+            let memory = contextdb_core::read_memory::ReadCredit::try_new(
+                budget.clone(),
                 held::map::<AclGrantCacheKey, AdmittedAclGrantCacheEntry>(wanted),
-                "writer_source",
-                "acl_cache_controls",
-                "Raise MEMORY_LIMIT to retain this ACL cache entry.",
-            )?;
+                "reader_acl_cache",
+                "controls",
+                "Increase reader memory to cache ACL grants.",
+            );
+            let Ok(memory) = memory else {
+                return Ok(());
+            };
             let mut replacement = HashMap::with_capacity(wanted);
             let mut cache = self.acl_grant_cache.write();
             if cache.entries.len() < cache.entries.capacity()
@@ -1846,8 +2091,11 @@ impl Database {
         principal: &Principal,
         acl_ref: &AclRef,
         snapshot: SnapshotId,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Arc<AdmittedAclIds>> {
-        let committed = self.allowed_acl_ids_for_principal(principal, acl_ref, snapshot)?;
+        let committed =
+            self.allowed_acl_ids_for_principal(principal, acl_ref, snapshot, read_memory.clone())?;
         self.bounded_acl_ids_with_transaction(
             tx,
             principal,
@@ -1858,6 +2106,7 @@ impl Database {
                 crate::executor::observe_bounded_access_control_row();
                 Ok::<(), Error>(())
             },
+            read_memory.clone(),
         )
     }
 
@@ -1867,6 +2116,8 @@ impl Database {
         table: &str,
         row_id: RowId,
         snapshot: SnapshotId,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Option<VersionedRow>> {
         if let Some(tx) = tx {
             let staged = self.tx_mgr.with_write_set(tx, |ws| {
@@ -1894,7 +2145,7 @@ impl Database {
                 return Ok(staged);
             }
         }
-        self.committed_row_at(table, row_id, snapshot)
+        self.committed_row_at(table, row_id, snapshot, read_memory.clone())
     }
 
     fn raw_row_missing_due_to_staged_delete(&self, tx: TxId, table: &str, row_id: RowId) -> bool {
@@ -1915,9 +2166,19 @@ impl Database {
         table: &str,
         row_id: RowId,
         snapshot: SnapshotId,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<()> {
-        if let Some(row) = self.raw_row_by_id_in_tx(tx, table, row_id, snapshot)? {
-            self.assert_row_write_allowed(table, row.row_id, &row.values, snapshot)?;
+        if let Some(row) =
+            self.raw_row_by_id_in_tx(tx, table, row_id, snapshot, read_memory.clone())?
+        {
+            self.assert_row_write_allowed(
+                table,
+                row.row_id,
+                &row.values,
+                snapshot,
+                read_memory.clone(),
+            )?;
         } else if !tx.is_some_and(|tx| self.raw_row_missing_due_to_staged_delete(tx, table, row_id))
         {
             return Err(Error::NotFound(format!("row {row_id} in table {table}")));
@@ -1931,17 +2192,29 @@ impl Database {
         table: &str,
         row_id: RowId,
         snapshot: SnapshotId,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<()> {
-        let Some(row) = self.raw_row_by_id_in_tx(tx, table, row_id, snapshot)? else {
+        let Some(row) =
+            self.raw_row_by_id_in_tx(tx, table, row_id, snapshot, read_memory.clone())?
+        else {
             return Err(Error::NotFound(format!("row {row_id} in table {table}")));
         };
-        self.assert_row_write_allowed(table, row.row_id, &row.values, snapshot)
+        self.assert_row_write_allowed(
+            table,
+            row.row_id,
+            &row.values,
+            snapshot,
+            read_memory.clone(),
+        )
     }
 
     fn readable_row_id_filter(
         &self,
         table: &str,
         snapshot: SnapshotId,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Option<RoaringTreemap>> {
         if !self.table_has_read_gate(table)? {
             return Ok(None);
@@ -1951,28 +2224,37 @@ impl Database {
             .table_meta(table)
             .ok_or_else(|| Error::TableNotFound(table.to_owned()))?;
         let mut bitmap = RoaringTreemap::new();
-        let mut output =
-            crate::memory_accounting::OwnedMemoryReservation::new(self.accountant.clone());
-        if self.visit_writer_rows_phased::<Error>(table, |row| {
-            if let Some(row) = row
-                && row.visible_at(snapshot)
-                && self.read_allowed_for_row(table, &meta, row, snapshot)?
-            {
-                output.try_grow_for(
-                    64,
-                    "writer_source",
-                    "read_gate_candidates",
-                    "Raise MEMORY_LIMIT to retain these read candidates.",
-                )?;
-                bitmap.insert(row.row_id.0);
-            }
-            Ok(())
-        })? {
+        let mut output = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
+        if self.visit_writer_rows_phased::<Error>(
+            table,
+            |row| {
+                if let Some(row) = row
+                    && row.visible_at(snapshot)
+                    && self.read_allowed_for_row(
+                        table,
+                        &meta,
+                        row,
+                        snapshot,
+                        read_memory.clone(),
+                    )?
+                {
+                    output.try_grow_for(
+                        64,
+                        "writer_source",
+                        "read_gate_candidates",
+                        "Raise MEMORY_LIMIT to retain these read candidates.",
+                    )?;
+                    bitmap.insert(row.row_id.0);
+                }
+                Ok(())
+            },
+            read_memory.clone(),
+        )? {
             self.retain_writer_output(output);
             return Ok(Some(bitmap));
         }
-        let rows = self.relational.scan(table, snapshot)?;
-        let rows = self.filter_rows_for_read(table, rows, snapshot)?;
+        let rows = self.committed_rows_at(table, snapshot, read_memory.clone())?;
+        let rows = self.filter_rows_for_read(table, rows, snapshot, read_memory.clone())?;
         for row in rows {
             bitmap.insert(row.row_id.0);
         }
@@ -1984,6 +2266,8 @@ impl Database {
         table: &str,
         snapshot: SnapshotId,
         candidates: Option<&RoaringTreemap>,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Option<RoaringTreemap>> {
         if let Some(candidates) = candidates {
             if !self.table_has_read_gate(table)? {
@@ -1992,7 +2276,12 @@ impl Database {
             let mut readable = RoaringTreemap::new();
             let root = self.writer_read_root()?;
             let source = root
-                .map(crate::persistence::writer_adapters::WriterRelationalSource::new)
+                .map(|root| {
+                    crate::persistence::writer_adapters::WriterRelationalSource::new_for_read(
+                        root,
+                        read_memory.clone(),
+                    )
+                })
                 .transpose()?;
             let meta = self
                 .table_meta(table)
@@ -2000,13 +2289,29 @@ impl Database {
             for id in candidates.iter() {
                 let allowed = if let Some(source) = &source {
                     contextdb_relational::source::visible_row(source, table, RowId(id), snapshot)?
-                        .map(|row| self.read_allowed_for_row(table, &meta, row.value(), snapshot))
+                        .map(|row| {
+                            self.read_allowed_for_row(
+                                table,
+                                &meta,
+                                row.value(),
+                                snapshot,
+                                read_memory.clone(),
+                            )
+                        })
                         .transpose()?
                         .unwrap_or(false)
                 } else {
                     self.relational_store
                         .row_by_id(table, RowId(id), snapshot)
-                        .map(|row| self.read_allowed_for_row(table, &meta, &row, snapshot))
+                        .map(|row| {
+                            self.read_allowed_for_row(
+                                table,
+                                &meta,
+                                &row,
+                                snapshot,
+                                read_memory.clone(),
+                            )
+                        })
                         .transpose()?
                         .unwrap_or(false)
                 };
@@ -2016,7 +2321,7 @@ impl Database {
             }
             return Ok(Some(readable));
         }
-        self.readable_row_id_filter(table, snapshot)
+        self.readable_row_id_filter(table, snapshot, read_memory.clone())
     }
 
     fn indexed_rows_for_values(
@@ -2025,12 +2330,138 @@ impl Database {
         columns: &[String],
         values: &[Value],
         snapshot: SnapshotId,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Option<Vec<VersionedRow>>> {
         if columns.is_empty() || columns.len() != values.len() {
-            return Ok(Some(Vec::new()));
+            return Err(Error::Other(
+                "graph metadata probe requires a nonempty matching key".to_owned(),
+            ));
         }
         if self.writer_read_root()?.is_some() {
-            return self.writer_indexed_rows_for_values(table, columns, values, snapshot);
+            return self.writer_indexed_rows_for_values(
+                table,
+                columns,
+                values,
+                snapshot,
+                read_memory.clone(),
+            );
+        }
+
+        if let Some(source) = &self.retained_relational_source {
+            let meta = self
+                .table_meta(table)
+                .ok_or_else(|| Error::TableNotFound(table.to_owned()))?;
+            let Some(index) = meta.indexes.iter().find(|index| {
+                index.columns.len() >= columns.len()
+                    && (!index.is_exact_only() || index.columns.len() == columns.len())
+                    && index
+                        .columns
+                        .iter()
+                        .zip(columns)
+                        .all(|((have, _), want)| have == want)
+            }) else {
+                return Ok(None);
+            };
+            let mut scratch = contextdb_core::read_memory::ReadCredit::try_new(
+                read_memory.clone(),
+                values
+                    .iter()
+                    .map(Value::estimated_bytes)
+                    .sum::<usize>()
+                    .saturating_mul(8)
+                    .saturating_add(256),
+                "reader",
+                "metadata_keys",
+                "Raise the declared read memory limit to inspect this metadata key.",
+            )?;
+            let key = index_key_from_values(&index.columns[..columns.len()], values);
+            let mut identities = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
+            let mut output = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
+            let mut seen = HashSet::new();
+            let mut rows = Vec::new();
+            let mut retain_row = |identity: VersionedRow| -> Result<()> {
+                if seen.contains(&identity.row_id) {
+                    return Ok(());
+                }
+                scratch.try_grow_for(
+                    96,
+                    "reader",
+                    "metadata_identities",
+                    "Raise the declared read memory limit to inspect these metadata rows.",
+                )?;
+                seen.insert(identity.row_id);
+                let row = self
+                    .committed_row_at(table, identity.row_id, snapshot, read_memory.clone())?
+                    .ok_or_else(|| Error::StoreCorrupted {
+                        path: source.database_path().display().to_string(),
+                        reason: format!(
+                            "retained metadata index {} names missing row {}",
+                            index.name, identity.row_id.0
+                        ),
+                    })?;
+                output.try_grow_for(
+                    128,
+                    "reader",
+                    "metadata_output",
+                    "Raise the declared read memory limit to return these metadata rows.",
+                )?;
+                rows.push(row);
+                Ok(())
+            };
+            if index.columns.len() == columns.len() {
+                let mut cursor =
+                    contextdb_relational::mem::BoundedExactIndexCursor::for_keys([key]);
+                cursor.select_identities_only();
+                while let Some(identity) =
+                    self.bounded_exact_index_row_next(
+                        read_memory.clone(),
+                        table,
+                        &index.name,
+                        snapshot,
+                        &mut cursor,
+                        || Ok::<(), Error>(()),
+                        |_| Ok(()),
+                        |_| Ok(()),
+                        |bytes| {
+                            identities.try_grow_for(bytes, "reader", "metadata_identity",
+                        "Raise the declared read memory limit to inspect these metadata rows.")
+                        },
+                    )?
+                {
+                    retain_row(identity)?;
+                }
+            } else {
+                let mut cursor = contextdb_relational::mem::BoundedOrderedRowCursor::for_index(
+                    index.name.clone(),
+                    false,
+                )
+                .seeking_run(
+                    std::ops::Bound::Included(key.clone()),
+                    std::ops::Bound::Included(key),
+                );
+                cursor.select_identities_only();
+                while let Some(identity) =
+                    self.bounded_ordered_table_row_next(
+                        read_memory.clone(),
+                        table,
+                        &index.columns[0].0,
+                        index.columns[0].1,
+                        snapshot,
+                        &mut cursor,
+                        || Ok::<(), Error>(()),
+                        || Ok(()),
+                        |bytes| {
+                            identities.try_grow_for(bytes, "reader", "metadata_identity",
+                        "Raise the declared read memory limit to inspect these metadata rows.")
+                        },
+                    )?
+                {
+                    retain_row(identity)?;
+                }
+            }
+            self.retain_writer_output(output);
+            return Ok(Some(rows));
         }
 
         let row_ids = {
@@ -2091,8 +2522,10 @@ impl Database {
         &self,
         node: NodeId,
         snapshot: SnapshotId,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Vec<(String, VersionedRow)>> {
-        self.rows_for_node_in_tx(None, node, snapshot)
+        self.rows_for_node_in_tx(None, node, snapshot, read_memory.clone())
     }
 
     fn rows_for_node_in_tx(
@@ -2100,13 +2533,22 @@ impl Database {
         tx: Option<TxId>,
         node: NodeId,
         snapshot: SnapshotId,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Vec<(String, VersionedRow)>> {
         let id_column = vec!["id".to_string()];
         let id_value = vec![Value::Uuid(node)];
-        let (table_names, _table_memory) = self.graph_metadata_tables(Self::has_uuid_id_column)?;
+        let (table_names, _table_memory) =
+            self.graph_metadata_tables(Self::has_uuid_id_column, read_memory.clone())?;
         let mut rows = Vec::new();
         for (table, has_read_gate) in table_names {
-            match self.indexed_rows_for_values(&table, &id_column, &id_value, snapshot)? {
+            match self.indexed_rows_for_values(
+                &table,
+                &id_column,
+                &id_value,
+                snapshot,
+                read_memory.clone(),
+            )? {
                 Some(mut table_rows) => {
                     if let Some(tx) = tx {
                         self.overlay_tx_node_rows(tx, &table, node, &mut table_rows)?;
@@ -2127,12 +2569,9 @@ impl Database {
     fn graph_metadata_tables(
         &self,
         matches: fn(&TableMeta) -> bool,
-    ) -> Result<(
-        Vec<(String, bool)>,
-        crate::memory_accounting::OwnedMemoryReservation,
-    )> {
-        let mut memory =
-            crate::memory_accounting::OwnedMemoryReservation::new(self.accountant.clone());
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<(Vec<(String, bool)>, contextdb_core::read_memory::ReadCredit)> {
+        let mut memory = contextdb_core::read_memory::ReadCredit::new(read_memory);
         if let Some(root) = self.writer_read_root()? {
             let mut names = Vec::new();
             for (name, meta) in root
@@ -2149,14 +2588,17 @@ impl Database {
             }
             return Ok((names, memory));
         }
-        let names = self
-            .relational_store
-            .table_meta
-            .read()
-            .iter()
-            .filter(|(_, meta)| matches(meta))
-            .map(|(table, meta)| (table.clone(), self.meta_has_read_gate(meta)))
-            .collect::<Vec<_>>();
+        let mut names = Vec::new();
+        let metadata = self.relational_store.table_meta.read();
+        for (table, meta) in metadata.iter().filter(|(_, meta)| matches(meta)) {
+            memory.try_grow_for(
+                held::text(table).saturating_add(128),
+                "reader",
+                "graph_metadata_tables",
+                "Raise reader memory to inspect graph metadata tables.",
+            )?;
+            names.push((table.clone(), self.meta_has_read_gate(meta)));
+        }
         Ok((names, memory))
     }
 
@@ -2204,28 +2646,25 @@ impl Database {
         node: NodeId,
         rows: &mut Vec<VersionedRow>,
         work: &mut dyn FnMut(crate::executor::GraphPredicateWork) -> Result<()>,
-        memory: &mut crate::memory_accounting::OwnedMemoryReservation,
+        memory: &mut contextdb_core::read_memory::ReadCredit,
     ) -> Result<()> {
         self.tx_mgr.with_write_set(tx, |ws| {
-            let deletes = ws
-                .relational_deletes
-                .iter()
-                .filter(|(delete_table, _, _)| delete_table == table)
-                .count();
-            let bytes = ws
-                .relational_inserts
-                .iter()
-                .filter(|(insert_table, row)| {
-                    insert_table == table && row.values.get("id") == Some(&Value::Uuid(node))
-                })
-                .fold(
-                    rows.len().saturating_add(deletes).saturating_mul(96),
-                    |bytes, (_, row)| {
-                        bytes.saturating_add(row.estimated_bytes().saturating_add(224))
-                    },
-                );
+            let mut deletes = 0usize;
+            for (delete_table, _, _) in &ws.relational_deletes {
+                work(crate::executor::GraphPredicateWork::AccessRow(0))?;
+                if delete_table == table {
+                    deletes = deletes.saturating_add(1);
+                }
+            }
+            let mut bytes = rows.len().saturating_add(deletes).saturating_mul(96);
+            for (insert_table, row) in &ws.relational_inserts {
+                work(crate::executor::GraphPredicateWork::AccessRow(0))?;
+                if insert_table == table && row.values.get("id") == Some(&Value::Uuid(node)) {
+                    bytes = bytes.saturating_add(row.estimated_bytes().saturating_add(224));
+                }
+            }
             work(crate::executor::GraphPredicateWork::Checkpoint)?;
-            work(crate::executor::GraphPredicateWork::ReserveRows(bytes))?;
+
             memory.try_grow_for(
                 bytes,
                 "graph",
@@ -2233,28 +2672,28 @@ impl Database {
                 "Raise MEMORY_LIMIT to inspect staged graph metadata.",
             )?;
             let committed_row_ids = rows.iter().map(|row| row.row_id).collect::<HashSet<_>>();
-            let deleted_row_ids = ws
-                .relational_deletes
-                .iter()
-                .filter(|(delete_table, _, _)| delete_table == table)
-                .map(|(_, row_id, _)| *row_id)
-                .collect::<HashSet<_>>();
+            let mut deleted_row_ids = HashSet::new();
+            for (delete_table, row_id, _) in &ws.relational_deletes {
+                work(crate::executor::GraphPredicateWork::AccessRow(0))?;
+                if delete_table == table {
+                    deleted_row_ids.insert(*row_id);
+                }
+            }
             rows.retain(|row| !deleted_row_ids.contains(&row.row_id));
 
             let mut seen_inserts = HashSet::new();
-            let mut inserts = ws
-                .relational_inserts
-                .iter()
-                .rev()
-                .filter(|(insert_table, row)| {
-                    insert_table == table
-                        && row.values.get("id") == Some(&Value::Uuid(node))
-                        && seen_inserts.insert(row.row_id)
-                        && (!deleted_row_ids.contains(&row.row_id)
-                            || committed_row_ids.contains(&row.row_id))
-                })
-                .map(|(_, row)| row.clone())
-                .collect::<Vec<_>>();
+            let mut inserts = Vec::new();
+            for (insert_table, row) in ws.relational_inserts.iter().rev() {
+                work(crate::executor::GraphPredicateWork::AccessRow(0))?;
+                if insert_table == table
+                    && row.values.get("id") == Some(&Value::Uuid(node))
+                    && seen_inserts.insert(row.row_id)
+                    && (!deleted_row_ids.contains(&row.row_id)
+                        || committed_row_ids.contains(&row.row_id))
+                {
+                    inserts.push(row.clone());
+                }
+            }
             inserts.reverse();
             rows.extend(inserts);
             Ok::<(), Error>(())
@@ -2275,9 +2714,11 @@ impl Database {
         target: NodeId,
         edge_type: &str,
         snapshot: SnapshotId,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Vec<(String, VersionedRow)>> {
         let (edge_tables, _table_memory) =
-            self.graph_metadata_tables(Self::has_graph_edge_columns)?;
+            self.graph_metadata_tables(Self::has_graph_edge_columns, read_memory.clone())?;
         let edge_table_set = edge_tables
             .iter()
             .map(|(table, _)| table.clone())
@@ -2305,7 +2746,13 @@ impl Database {
         };
         let mut rows = Vec::new();
         for (table, _) in &edge_tables {
-            match self.indexed_rows_for_values(table, &columns, &values, snapshot)? {
+            match self.indexed_rows_for_values(
+                table,
+                &columns,
+                &values,
+                snapshot,
+                read_memory.clone(),
+            )? {
                 Some(table_rows) => {
                     rows.extend(table_rows.into_iter().filter_map(|row| {
                         (!deleted_by_table.contains(&(table.clone(), row.row_id)))
@@ -2370,8 +2817,17 @@ impl Database {
         target: NodeId,
         edge_type: &str,
         snapshot: SnapshotId,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<bool> {
-        self.edge_read_allowed_in_tx(None, source, target, edge_type, snapshot)
+        self.edge_read_allowed_in_tx(
+            None,
+            source,
+            target,
+            edge_type,
+            snapshot,
+            read_memory.clone(),
+        )
     }
 
     fn edge_read_allowed_in_tx(
@@ -2381,12 +2837,20 @@ impl Database {
         target: NodeId,
         edge_type: &str,
         snapshot: SnapshotId,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<bool> {
         if self.access_is_admin() {
             return Ok(true);
         }
-        let edge_rows =
-            self.edge_rows_for_graph_edge_in_tx(tx, source, target, edge_type, snapshot)?;
+        let edge_rows = self.edge_rows_for_graph_edge_in_tx(
+            tx,
+            source,
+            target,
+            edge_type,
+            snapshot,
+            read_memory.clone(),
+        )?;
         if edge_rows.is_empty() {
             return Ok(false);
         }
@@ -2396,10 +2860,17 @@ impl Database {
                 visible = true;
                 continue;
             }
-            let Some(meta) = self.table_meta(&table) else {
-                continue;
-            };
-            if !self.read_allowed_for_row_in_tx(tx, &table, &meta, &row, snapshot)? {
+            let meta = self
+                .table_meta(&table)
+                .ok_or_else(|| Error::TableNotFound(table.clone()))?;
+            if !self.read_allowed_for_row_in_tx(
+                tx,
+                &table,
+                &meta,
+                &row,
+                snapshot,
+                read_memory.clone(),
+            )? {
                 return Ok(false);
             }
             visible = true;
@@ -2414,17 +2885,31 @@ impl Database {
         target: NodeId,
         edge_type: &str,
         snapshot: SnapshotId,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<()> {
         if self.access_is_admin() {
             return Ok(());
         }
-        let edge_rows =
-            self.edge_rows_for_graph_edge_in_tx(tx, source, target, edge_type, snapshot)?;
+        let edge_rows = self.edge_rows_for_graph_edge_in_tx(
+            tx,
+            source,
+            target,
+            edge_type,
+            snapshot,
+            read_memory.clone(),
+        )?;
         if edge_rows.is_empty() {
             return self.reject_graph_edge_without_metadata();
         }
         for (table, row) in edge_rows {
-            self.assert_row_write_allowed(&table, row.row_id, &row.values, snapshot)?;
+            self.assert_row_write_allowed(
+                &table,
+                row.row_id,
+                &row.values,
+                snapshot,
+                read_memory.clone(),
+            )?;
         }
         Ok(())
     }
@@ -2435,12 +2920,13 @@ impl Database {
         edge_types: Option<&[EdgeType]>,
         direction: Direction,
         snapshot: SnapshotId,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Vec<GatedGraphNeighbor>> {
         let mut results = Vec::new();
-        let mut output =
-            crate::memory_accounting::OwnedMemoryReservation::new(self.accountant.clone());
+        let mut output = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
 
-        let root = self.writer_graph_root()?;
+        let root = self.writer_graph_root(read_memory.clone())?;
         for orientation in [Direction::Outgoing, Direction::Incoming] {
             if !matches!(direction, Direction::Both) && direction != orientation {
                 continue;
@@ -2493,18 +2979,21 @@ impl Database {
         edge_types: Option<&[EdgeType]>,
         direction: Direction,
         snapshot: SnapshotId,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<(Vec<CountedGraphNeighbor>, u64)> {
-        if !self.access_is_admin() && !self.node_read_allowed_in_tx(tx, node, snapshot)? {
+        if !self.access_is_admin()
+            && !self.node_read_allowed_in_tx(tx, node, snapshot, read_memory.clone())?
+        {
             return Ok((Vec::new(), 0));
         }
 
         let (deleted, staged_inserts) = self.graph_tx_edge_overlay(tx)?;
 
         let mut candidates = Vec::<CountedGraphNeighbor>::new();
-        let mut output =
-            crate::memory_accounting::OwnedMemoryReservation::new(self.accountant.clone());
+        let mut output = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
 
-        let root = self.writer_graph_root()?;
+        let root = self.writer_graph_root(read_memory.clone())?;
         for orientation in [Direction::Outgoing, Direction::Incoming] {
             if !matches!(direction, Direction::Both) && direction != orientation {
                 continue;
@@ -2588,9 +3077,15 @@ impl Database {
         let mut results = Vec::new();
         let mut examined = 0_u64;
         for (neighbor, edge_type, source, target) in candidates {
-            if self
-                .graph_neighbor_read_allowed(tx, neighbor, source, target, &edge_type, snapshot)?
-            {
+            if self.graph_neighbor_read_allowed(
+                tx,
+                neighbor,
+                source,
+                target,
+                &edge_type,
+                snapshot,
+                read_memory.clone(),
+            )? {
                 examined += 1;
                 results.push((neighbor, edge_type, source, target));
             }
@@ -2713,12 +3208,23 @@ impl Database {
         target: NodeId,
         edge_type: &str,
         snapshot: SnapshotId,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<bool> {
         if self.access_is_admin() {
             return Ok(true);
         }
-        Ok(self.node_read_allowed_in_tx(tx, neighbor, snapshot)?
-            && self.edge_read_allowed_in_tx(tx, source, target, edge_type, snapshot)?)
+        Ok(
+            self.node_read_allowed_in_tx(tx, neighbor, snapshot, read_memory.clone())?
+                && self.edge_read_allowed_in_tx(
+                    tx,
+                    source,
+                    target,
+                    edge_type,
+                    snapshot,
+                    read_memory.clone(),
+                )?,
+        )
     }
 
     /// Decide one traversal candidate for the bounded pull path, charging the
@@ -2733,6 +3239,8 @@ impl Database {
         edge_type: &str,
         snapshot: SnapshotId,
         before_access: &mut impl FnMut(usize) -> std::result::Result<(), E>,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<bool, E>
     where
         E: From<Error>,
@@ -2740,23 +3248,27 @@ impl Database {
         if self.access_is_admin() {
             return Ok(true);
         }
-        Ok(
-            self.bounded_node_read_allowed(tx, candidate.start, snapshot, before_access)?
-                && self.bounded_node_read_allowed(
-                    tx,
-                    candidate.neighbor,
-                    snapshot,
-                    before_access,
-                )?
-                && self.bounded_edge_read_allowed(
-                    tx,
-                    candidate.source,
-                    candidate.target,
-                    edge_type,
-                    snapshot,
-                    before_access,
-                )?,
-        )
+        Ok(self.bounded_node_read_allowed(
+            tx,
+            candidate.start,
+            snapshot,
+            before_access,
+            read_memory.clone(),
+        )? && self.bounded_node_read_allowed(
+            tx,
+            candidate.neighbor,
+            snapshot,
+            before_access,
+            read_memory.clone(),
+        )? && self.bounded_edge_read_allowed(
+            tx,
+            candidate.source,
+            candidate.target,
+            edge_type,
+            snapshot,
+            before_access,
+            read_memory.clone(),
+        )?)
     }
 
     /// The neighbour half of the same decision, for a traversal that reaches a
@@ -2771,6 +3283,8 @@ impl Database {
         edge_type: &str,
         snapshot: SnapshotId,
         before_access: &mut impl FnMut(usize) -> std::result::Result<(), E>,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<bool, E>
     where
         E: From<Error>,
@@ -2778,39 +3292,45 @@ impl Database {
         if self.access_is_admin() {
             return Ok(true);
         }
-        Ok(
-            self.bounded_node_read_allowed(tx, neighbor, snapshot, before_access)?
-                && self.bounded_edge_read_allowed(
-                    tx,
-                    source,
-                    target,
-                    edge_type,
-                    snapshot,
-                    before_access,
-                )?,
-        )
+        Ok(self.bounded_node_read_allowed(
+            tx,
+            neighbor,
+            snapshot,
+            before_access,
+            read_memory.clone(),
+        )? && self.bounded_edge_read_allowed(
+            tx,
+            source,
+            target,
+            edge_type,
+            snapshot,
+            before_access,
+            read_memory.clone(),
+        )?)
     }
 
-    fn bounded_node_read_allowed<E>(
+    pub(super) fn bounded_node_read_allowed<E>(
         &self,
         tx: Option<TxId>,
         node: NodeId,
         snapshot: SnapshotId,
         before_access: &mut impl FnMut(usize) -> std::result::Result<(), E>,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<bool, E>
     where
         E: From<Error>,
     {
         let rows = self
-            .rows_for_node_in_tx(tx, node, snapshot)
+            .rows_for_node_in_tx(tx, node, snapshot, read_memory.clone())
             .map_err(E::from)?;
         for (table, row) in rows {
             if !self.table_has_read_gate(&table).map_err(E::from)? {
                 continue;
             }
-            let Some(meta) = self.table_meta(&table) else {
-                continue;
-            };
+            let meta = self
+                .table_meta(&table)
+                .ok_or_else(|| E::from(Error::TableNotFound(table.clone())))?;
             if !self.bounded_read_allowed_for_row_with_tables(
                 tx,
                 None,
@@ -2819,6 +3339,7 @@ impl Database {
                 &row,
                 snapshot,
                 &mut *before_access,
+                read_memory.clone(),
             )? {
                 return Ok(false);
             }
@@ -2835,12 +3356,21 @@ impl Database {
         edge_type: &str,
         snapshot: SnapshotId,
         before_access: &mut impl FnMut(usize) -> std::result::Result<(), E>,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<bool, E>
     where
         E: From<Error>,
     {
         let edge_rows = self
-            .edge_rows_for_graph_edge_in_tx(tx, source, target, edge_type, snapshot)
+            .edge_rows_for_graph_edge_in_tx(
+                tx,
+                source,
+                target,
+                edge_type,
+                snapshot,
+                read_memory.clone(),
+            )
             .map_err(E::from)?;
         if edge_rows.is_empty() {
             return Ok(false);
@@ -2851,9 +3381,9 @@ impl Database {
                 visible = true;
                 continue;
             }
-            let Some(meta) = self.table_meta(&table) else {
-                continue;
-            };
+            let meta = self
+                .table_meta(&table)
+                .ok_or_else(|| E::from(Error::TableNotFound(table.clone())))?;
             if !self.bounded_read_allowed_for_row_with_tables(
                 tx,
                 None,
@@ -2862,6 +3392,7 @@ impl Database {
                 &row,
                 snapshot,
                 &mut *before_access,
+                read_memory.clone(),
             )? {
                 return Ok(false);
             }
@@ -2876,19 +3407,29 @@ impl Database {
         candidate: GraphScanCandidate,
         edge_type: &str,
         snapshot: SnapshotId,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<bool> {
         if self.access_is_admin() {
             return Ok(true);
         }
-        Ok(self.node_read_allowed_in_tx(tx, candidate.start, snapshot)?
-            && self.node_read_allowed_in_tx(tx, candidate.neighbor, snapshot)?
-            && self.edge_read_allowed_in_tx(
-                tx,
-                candidate.source,
-                candidate.target,
-                edge_type,
-                snapshot,
-            )?)
+        Ok(
+            self.node_read_allowed_in_tx(tx, candidate.start, snapshot, read_memory.clone())?
+                && self.node_read_allowed_in_tx(
+                    tx,
+                    candidate.neighbor,
+                    snapshot,
+                    read_memory.clone(),
+                )?
+                && self.edge_read_allowed_in_tx(
+                    tx,
+                    candidate.source,
+                    candidate.target,
+                    edge_type,
+                    snapshot,
+                    read_memory.clone(),
+                )?,
+        )
     }
 
     pub(crate) fn graph_edges_scan_counted(
@@ -2897,48 +3438,53 @@ impl Database {
         edge_types: Option<&[EdgeType]>,
         direction: Direction,
         snapshot: SnapshotId,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<(Vec<CountedGraphScanEdge>, u64)> {
         let (deleted, staged_inserts) = self.graph_tx_edge_overlay(tx)?;
         let mut candidates = Vec::<CountedGraphScanCandidate>::new();
 
-        let mut output =
-            crate::memory_accounting::OwnedMemoryReservation::new(self.accountant.clone());
+        let mut output = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
         for (orientation, reverse) in [(Direction::Outgoing, false), (Direction::Incoming, true)] {
             if !matches!(direction, Direction::Both) && direction != orientation {
                 continue;
             }
-            self.visit_graph_adjacency(reverse, |entry| {
-                if !entry.visible_at(snapshot)
-                    || edge_types.is_some_and(|types| !types.contains(&entry.edge_type))
-                    || deleted.contains(&(entry.source, entry.edge_type.clone(), entry.target))
-                {
-                    return Ok(());
-                }
-                output.try_grow_for(
-                    entry.edge_type.len().saturating_add(
-                        std::mem::size_of::<CountedGraphScanCandidate>().saturating_mul(2),
-                    ),
-                    "writer_source",
-                    "graph_scan_candidates",
-                    "Raise MEMORY_LIMIT to scan these graph edges.",
-                )?;
-                let (start, neighbor) = if reverse {
-                    (entry.target, entry.source)
-                } else {
-                    (entry.source, entry.target)
-                };
-                candidates.push((
-                    GraphScanCandidate {
-                        start,
-                        neighbor,
-                        source: entry.source,
-                        target: entry.target,
-                    },
-                    entry.edge_type.clone(),
-                    (start, neighbor),
-                ));
-                Ok(())
-            })?;
+            self.visit_graph_adjacency(
+                reverse,
+                |entry| {
+                    if !entry.visible_at(snapshot)
+                        || edge_types.is_some_and(|types| !types.contains(&entry.edge_type))
+                        || deleted.contains(&(entry.source, entry.edge_type.clone(), entry.target))
+                    {
+                        return Ok(());
+                    }
+                    output.try_grow_for(
+                        entry.edge_type.len().saturating_add(
+                            std::mem::size_of::<CountedGraphScanCandidate>().saturating_mul(2),
+                        ),
+                        "writer_source",
+                        "graph_scan_candidates",
+                        "Raise MEMORY_LIMIT to scan these graph edges.",
+                    )?;
+                    let (start, neighbor) = if reverse {
+                        (entry.target, entry.source)
+                    } else {
+                        (entry.source, entry.target)
+                    };
+                    candidates.push((
+                        GraphScanCandidate {
+                            start,
+                            neighbor,
+                            source: entry.source,
+                            target: entry.target,
+                        },
+                        entry.edge_type.clone(),
+                        (start, neighbor),
+                    ));
+                    Ok(())
+                },
+                read_memory.clone(),
+            )?;
         }
 
         for entry in staged_inserts {
@@ -2977,7 +3523,13 @@ impl Database {
         let mut seen = HashSet::<CountedGraphScanEdge>::new();
         let mut examined = 0_u64;
         for (candidate, edge_type, edge) in candidates {
-            if self.graph_scan_edge_allowed(tx, candidate, &edge_type, snapshot)? {
+            if self.graph_scan_edge_allowed(
+                tx,
+                candidate,
+                &edge_type,
+                snapshot,
+                read_memory.clone(),
+            )? {
                 examined += 1;
                 if seen.insert(edge) {
                     results.push(edge);
@@ -2995,9 +3547,16 @@ impl Database {
         edge_types: Option<&[EdgeType]>,
         direction: Direction,
         snapshot: SnapshotId,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<(Vec<NodeId>, u64)> {
-        let (edges, examined) =
-            self.graph_edges_scan_counted(tx, edge_types, direction, snapshot)?;
+        let (edges, examined) = self.graph_edges_scan_counted(
+            tx,
+            edge_types,
+            direction,
+            snapshot,
+            read_memory.clone(),
+        )?;
         let starts = edges
             .into_iter()
             .map(|(start, _)| start)
@@ -3014,9 +3573,17 @@ impl Database {
         edge_types: Option<&[EdgeType]>,
         direction: Direction,
         snapshot: SnapshotId,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<(TraversalResult, u64)> {
-        let (neighbors, examined) =
-            self.graph_neighbors_counted_in_tx(tx, start, edge_types, direction, snapshot)?;
+        let (neighbors, examined) = self.graph_neighbors_counted_in_tx(
+            tx,
+            start,
+            edge_types,
+            direction,
+            snapshot,
+            read_memory.clone(),
+        )?;
         let mut seen = HashSet::new();
         let mut nodes = Vec::new();
         for (neighbor_id, edge_type, _, _) in neighbors {
@@ -3040,63 +3607,96 @@ impl Database {
         direction: Direction,
         depth_range: std::ops::RangeInclusive<u32>,
         snapshot: SnapshotId,
-    ) -> Result<(TraversalResult, u64)> {
-        let min_depth = *depth_range.start();
-        let max_depth = *depth_range.end();
-        if !self.access_is_admin() && !self.node_read_allowed_in_tx(tx, start, snapshot)? {
-            return Ok((TraversalResult { nodes: Vec::new() }, 0));
-        }
 
-        let gated = !self.access_is_admin();
-        let max_visited = if gated { 10_000 } else { 100_000 };
-        let mut visited = HashSet::new();
-        visited.insert(start);
-        let mut queue: VecDeque<GatedBfsEntry> = VecDeque::new();
-        queue.push_back((start, 0, vec![]));
-        let mut result_nodes = Vec::new();
-        let mut examined = 0_u64;
-
-        while let Some((current, depth, path)) = queue.pop_front() {
-            if !gated && depth > 0 && depth >= min_depth {
-                result_nodes.push(TraversalNode {
-                    id: current,
-                    depth,
-                    path: path.clone(),
-                });
-            }
-            if depth >= max_depth {
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<(
+        TraversalResult,
+        u64,
+        contextdb_core::read_memory::ReadCredit,
+    )> {
+        use std::cell::{Cell, RefCell};
+        let memory = RefCell::new(contextdb_core::read_memory::ReadCredit::new(
+            read_memory.clone(),
+        ));
+        let examined = Cell::new(0_u64);
+        let cursor = self.bounded_graph_bfs_cursor::<Error>(
+            tx,
+            start,
+            edge_types,
+            direction,
+            *depth_range.start(),
+            *depth_range.end(),
+            snapshot,
+            |_| Ok(()),
+            |bytes| charged_bfs_admit(&mut memory.borrow_mut(), bytes),
+            |bytes| {
+                memory
+                    .borrow_mut()
+                    .try_shrink(bytes)
+                    .expect("graph kernel releases only admitted storage")
+            },
+            read_memory.clone(),
+        )?;
+        let Some(mut cursor) = cursor else {
+            return Ok((
+                TraversalResult { nodes: Vec::new() },
+                0,
+                memory.into_inner(),
+            ));
+        };
+        let cap = if self.access_is_admin() {
+            100_000
+        } else {
+            10_000
+        };
+        let mut nodes = Vec::new();
+        let mut emitted = HashSet::new();
+        let mut emitted_credit = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
+        let single_hop = *depth_range.start() == 1 && *depth_range.end() == 1;
+        while let Some(output) = self.bounded_graph_bfs_next::<Error>(
+            &mut cursor,
+            || Ok(()),
+            || Ok(()),
+            |_| Ok(()),
+            |bytes| charged_bfs_admit(&mut memory.borrow_mut(), bytes),
+            |bytes| {
+                memory
+                    .borrow_mut()
+                    .try_shrink(bytes)
+                    .expect("graph kernel releases only admitted storage")
+            },
+            || Ok(()),
+            |bytes| charged_bfs_admit(&mut memory.borrow_mut(), bytes),
+            |bytes| {
+                memory
+                    .borrow_mut()
+                    .try_shrink(bytes)
+                    .expect("graph kernel releases only admitted storage")
+            },
+            || examined.set(examined.get().saturating_add(1)),
+            Some(cap),
+            tx,
+            read_memory.clone(),
+        )? {
+            if !single_hop && !charged_bfs_visit(&mut emitted, output.node.id, &mut emitted_credit)?
+            {
+                let bytes = output.reserved_bytes;
+                drop(output);
+                memory.borrow_mut().try_shrink(bytes)?;
                 continue;
             }
-            let (neighbors, neighbor_examined) =
-                self.graph_neighbors_counted_in_tx(tx, current, edge_types, direction, snapshot)?;
-            examined += neighbor_examined;
-            for (neighbor_id, edge_type, _, _) in neighbors {
-                let next_depth = depth + 1;
-                let mut new_path = path.clone();
-                new_path.push((current, edge_type));
-                if gated && next_depth >= min_depth {
-                    result_nodes.push(TraversalNode {
-                        id: neighbor_id,
-                        depth: next_depth,
-                        path: new_path.clone(),
-                    });
-                }
-                if neighbor_id == current || visited.contains(&neighbor_id) {
-                    continue;
-                }
-                visited.insert(neighbor_id);
-                if visited.len() > max_visited {
-                    return Err(Error::BfsVisitedExceeded(max_visited));
-                }
-                queue.push_back((neighbor_id, next_depth, new_path));
-            }
+            charged_bfs_vec_space(&mut nodes, &mut memory.borrow_mut())?;
+            nodes.push(output.node);
         }
-
+        memory
+            .borrow_mut()
+            .try_shrink(cursor.into_retained_bytes())?;
+        drop(emitted);
+        drop(emitted_credit);
         Ok((
-            TraversalResult {
-                nodes: result_nodes,
-            },
-            examined,
+            TraversalResult { nodes },
+            examined.get(),
+            memory.into_inner(),
         ))
     }
 
@@ -3237,6 +3837,8 @@ impl Database {
         // One count per adjacency entry this scan reads, the same figure the
         // walker reports and the same one the uncapped door calls examined.
         mut entry_read: impl FnMut(),
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<Option<CountedGraphScanEdge>, E>
     where
         E: From<Error>,
@@ -3257,6 +3859,7 @@ impl Database {
                     &mut before_retain,
                     &mut release_retained,
                     &mut entry_read,
+                    read_memory.clone(),
                 )? {
                     return Ok(Some(edge));
                 }
@@ -3278,6 +3881,7 @@ impl Database {
                     &mut before_retain,
                     &mut release_retained,
                     &mut entry_read,
+                    read_memory.clone(),
                 )? {
                     return Ok(Some(edge));
                 }
@@ -3542,6 +4146,11 @@ impl Database {
             )?;
             let visible = entry.visible_at(cursor.snapshot);
             let type_allowed = edge_types.is_none_or(|types| types.contains(&entry.edge_type));
+            // A Both scan already emitted this physical self-loop in its
+            // forward phase. Distinct parallel edges remain distinct bindings.
+            let repeated_self_loop = matches!(cursor.direction, Direction::Both)
+                && matches!(cursor.phase, BoundedGraphScanPhase::Reverse)
+                && entry.source == entry.target;
             let oriented = match cursor.phase {
                 BoundedGraphScanPhase::Forward if entry.source == key => {
                     Some((entry.source, entry.target))
@@ -3559,7 +4168,8 @@ impl Database {
                 && type_allowed
                 && oriented.is_some()
                 && self.transaction_hides_edge(tx, entry.source, &entry.edge_type, entry.target)?;
-            if !visible || !type_allowed || oriented.is_none() || hidden_by_tx {
+            if !visible || !type_allowed || oriented.is_none() || hidden_by_tx || repeated_self_loop
+            {
                 drop(entries_guard);
                 cursor.edge_position = next_position;
                 continue;
@@ -3601,6 +4211,7 @@ impl Database {
                 &anchored_edge_type.edge_type,
                 snapshot,
                 &mut before_access,
+                read_memory.clone(),
             )?;
             cursor.edge_position = next_position;
             if allowed {
@@ -3626,6 +4237,8 @@ impl Database {
         before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
         release_retained: &mut impl FnMut(usize) -> std::result::Result<(), E>,
         entry_read: &mut impl FnMut(),
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<Option<CountedGraphScanEdge>, E>
     where
         E: From<Error>,
@@ -3652,6 +4265,9 @@ impl Database {
                     durable
                         .root
                         .cursor(
+                            crate::persistence::writer_source::SourceWindowOwner::Read(
+                                read_memory.clone(),
+                            ),
                             if reverse { "graph_rev" } else { "graph_fwd" },
                             crate::persistence::writer_source::WriterCursorFamily::Bytes,
                             lower,
@@ -3701,6 +4317,7 @@ impl Database {
                 edge_types,
                 tx,
                 before_access,
+                read_memory.clone(),
             );
             let emitted = match decided {
                 Ok(emitted) => emitted,
@@ -3762,11 +4379,14 @@ impl Database {
         edge_types: Option<&[EdgeType]>,
         tx: Option<TxId>,
         before_access: &mut impl FnMut(usize) -> std::result::Result<(), E>,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<Option<CountedGraphScanEdge>, E>
     where
         E: From<Error>,
     {
-        if !entry.visible_at(cursor.snapshot)
+        if (reverse && matches!(cursor.direction, Direction::Both) && entry.source == entry.target)
+            || !entry.visible_at(cursor.snapshot)
             || edge_types.is_some_and(|types| !types.contains(&entry.edge_type))
             || self
                 .transaction_hides_edge(tx, entry.source, &entry.edge_type, entry.target)
@@ -3794,6 +4414,7 @@ impl Database {
             &entry.edge_type,
             cursor.snapshot,
             before_access,
+            read_memory.clone(),
         )?;
         Ok(allowed.then_some(oriented))
     }
@@ -3818,6 +4439,8 @@ impl Database {
         before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
         release_retained: &mut impl FnMut(usize) -> std::result::Result<(), E>,
         entry_read: &mut impl FnMut(),
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<Option<CountedGraphScanEdge>, E>
     where
         E: From<Error>,
@@ -3836,6 +4459,12 @@ impl Database {
             else {
                 break;
             };
+            if matches!(cursor.direction, Direction::Both)
+                && matches!(cursor.phase, BoundedGraphScanPhase::StagedReverse)
+                && source == target
+            {
+                continue;
+            }
             // Charged before it is taken, measured where it still lives rather
             // than after a copy of it already exists.
             let name_bytes = Self::staged_edge_type_bytes(type_len);
@@ -3885,6 +4514,7 @@ impl Database {
                 &edge_type,
                 cursor.snapshot,
                 before_access,
+                read_memory.clone(),
             );
             release_retained(name_bytes)?;
             if allowed? {
@@ -3922,6 +4552,8 @@ impl Database {
         mut before_access: impl FnMut(usize) -> std::result::Result<(), E>,
         before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
         release_retained: impl FnMut(usize),
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<Option<contextdb_graph::mem::BoundedBfsCursor>, E>
     where
         E: From<Error>,
@@ -3929,7 +4561,13 @@ impl Database {
         let gated = !self.access_is_admin();
         if gated {
             before_access(0)?;
-            if !self.bounded_node_read_allowed(tx, start, snapshot, &mut before_access)? {
+            if !self.bounded_node_read_allowed(
+                tx,
+                start,
+                snapshot,
+                &mut before_access,
+                read_memory.clone(),
+            )? {
                 return Ok(None);
             }
         }
@@ -3941,7 +4579,8 @@ impl Database {
                 min_depth,
                 max_depth,
                 snapshot,
-                self.writer_graph_root().map_err(E::from)?,
+                self.writer_graph_root(read_memory.clone())
+                    .map_err(E::from)?,
                 before_retain,
                 release_retained,
             )
@@ -3978,6 +4617,8 @@ impl Database {
         // walk that asks the store which one is active is told none and steps
         // over the caller's own staged edges.
         tx: Option<TxId>,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<Option<contextdb_graph::mem::BoundedTraversalNode>, E>
     where
         E: From<Error>,
@@ -4015,6 +4656,7 @@ impl Database {
                     edge_type,
                     snapshot,
                     &mut before_access,
+                    read_memory.clone(),
                 )
             },
             |node, direction, from| {
@@ -4069,8 +4711,13 @@ impl Database {
         )
     }
 
-    pub(super) fn node_read_allowed(&self, node: NodeId, snapshot: SnapshotId) -> Result<bool> {
-        self.node_read_allowed_in_tx(None, node, snapshot)
+    pub(super) fn node_read_allowed(
+        &self,
+        node: NodeId,
+        snapshot: SnapshotId,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<bool> {
+        self.node_read_allowed_in_tx(None, node, snapshot, read_memory.clone())
     }
 
     fn node_read_allowed_in_tx(
@@ -4078,8 +4725,10 @@ impl Database {
         tx: Option<TxId>,
         node: NodeId,
         snapshot: SnapshotId,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<bool> {
-        let rows = self.rows_for_node_in_tx(tx, node, snapshot)?;
+        let rows = self.rows_for_node_in_tx(tx, node, snapshot, read_memory.clone())?;
         if rows.is_empty() {
             return Ok(true);
         }
@@ -4087,10 +4736,17 @@ impl Database {
             if !self.table_has_read_gate(&table)? {
                 continue;
             }
-            let Some(meta) = self.table_meta(&table) else {
-                continue;
-            };
-            if !self.read_allowed_for_row_in_tx(tx, &table, &meta, &row, snapshot)? {
+            let meta = self
+                .table_meta(&table)
+                .ok_or_else(|| Error::TableNotFound(table.clone()))?;
+            if !self.read_allowed_for_row_in_tx(
+                tx,
+                &table,
+                &meta,
+                &row,
+                snapshot,
+                read_memory.clone(),
+            )? {
                 return Ok(false);
             }
         }
@@ -4104,7 +4760,9 @@ impl Database {
         column: &str,
         snapshot: SnapshotId,
         work: &mut dyn FnMut(crate::executor::GraphPredicateWork) -> Result<()>,
-        memory: &mut crate::memory_accounting::OwnedMemoryReservation,
+        memory: &mut contextdb_core::read_memory::ReadCredit,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Vec<Value>> {
         work(crate::executor::GraphPredicateWork::Checkpoint)?;
         if column == "id" {
@@ -4129,13 +4787,24 @@ impl Database {
         let mut values = Vec::new();
         for (table, has_read_gate) in table_names {
             work(crate::executor::GraphPredicateWork::Checkpoint)?;
-            let _rows_scope = self.writer_temporary_output_scope()?;
+            let _rows_scope = self.writer_temporary_output_scope(read_memory.clone())?;
             let rows = if self.writer_read_root()?.is_some() {
                 self.writer_indexed_rows_for_values_within(
-                    &table, &id_column, &id_value, snapshot, work,
+                    &table,
+                    &id_column,
+                    &id_value,
+                    snapshot,
+                    work,
+                    read_memory.clone(),
                 )?
             } else {
-                self.indexed_rows_for_values(&table, &id_column, &id_value, snapshot)?
+                self.indexed_rows_for_values(
+                    &table,
+                    &id_column,
+                    &id_value,
+                    snapshot,
+                    read_memory.clone(),
+                )?
             };
             let Some(mut table_rows) = rows else {
                 return Err(Error::Other(format!(
@@ -4143,7 +4812,7 @@ impl Database {
                 )));
             };
             let mut overlay_memory =
-                crate::memory_accounting::OwnedMemoryReservation::new(self.accountant.clone());
+                contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
             if let Some(tx) = tx {
                 self.overlay_tx_node_rows_within(
                     tx,
@@ -4166,13 +4835,13 @@ impl Database {
                             &row,
                             snapshot,
                             |bytes| work(crate::executor::GraphPredicateWork::AccessRow(bytes)),
+                            read_memory.clone(),
                         )?)
                 {
                     continue;
                 }
                 if let Some(value) = row.values.get(column) {
                     let bytes = 128usize.saturating_add(value.estimated_bytes().saturating_mul(2));
-                    work(crate::executor::GraphPredicateWork::ReserveValues(bytes))?;
                     memory.try_grow_for(
                         bytes,
                         "graph",
@@ -4182,7 +4851,6 @@ impl Database {
                     values.push(value.clone());
                 }
             }
-            work(crate::executor::GraphPredicateWork::ReleaseRows)?;
         }
         Ok(values)
     }
@@ -4202,12 +4870,14 @@ impl Database {
         tx: Option<TxId>,
         nodes: &[NodeId],
         snapshot: SnapshotId,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<()> {
         if self.access_is_admin() {
             return Ok(());
         }
         for node in nodes {
-            let rows = self.rows_for_node_in_tx(tx, *node, snapshot)?;
+            let rows = self.rows_for_node_in_tx(tx, *node, snapshot, read_memory.clone())?;
             if rows.is_empty() {
                 continue;
             }
@@ -4218,12 +4888,18 @@ impl Database {
                     visible = true;
                     continue;
                 }
-                let Some(meta) = self.table_meta(&table) else {
-                    continue;
-                };
-                match self
-                    .read_denial_for_row_cached_in_tx(tx, &table, &meta, &row, snapshot, None)?
-                {
+                let meta = self
+                    .table_meta(&table)
+                    .ok_or_else(|| Error::TableNotFound(table.clone()))?;
+                match self.read_denial_for_row_cached_in_tx(
+                    tx,
+                    &table,
+                    &meta,
+                    &row,
+                    snapshot,
+                    None,
+                    read_memory.clone(),
+                )? {
                     Some(err) => {
                         if first_denial.is_none() {
                             first_denial = Some(err);
@@ -4252,6 +4928,8 @@ impl Database {
         nodes: &[NodeId],
         snapshot: SnapshotId,
         mut before_access_row: impl FnMut(usize) -> std::result::Result<(), E>,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<(), E>
     where
         E: From<Error>,
@@ -4260,7 +4938,7 @@ impl Database {
             return Ok(());
         }
         for node in nodes {
-            let rows = self.rows_for_node_in_tx(tx, *node, snapshot)?;
+            let rows = self.rows_for_node_in_tx(tx, *node, snapshot, read_memory.clone())?;
             if rows.is_empty() {
                 continue;
             }
@@ -4271,9 +4949,9 @@ impl Database {
                     visible = true;
                     continue;
                 }
-                let Some(meta) = self.table_meta(&table) else {
-                    continue;
-                };
+                let meta = self
+                    .table_meta(&table)
+                    .ok_or_else(|| E::from(Error::TableNotFound(table.clone())))?;
                 match self.bounded_read_denial_for_row_with_tables(
                     tx,
                     None,
@@ -4282,6 +4960,7 @@ impl Database {
                     &row,
                     snapshot,
                     &mut before_access_row,
+                    read_memory.clone(),
                 )? {
                     Some(err) => {
                         if first_denial.is_none() {
@@ -4302,9 +4981,11 @@ impl Database {
         &self,
         node: NodeId,
         snapshot: SnapshotId,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<()> {
-        for (table, row) in self.rows_for_node(node, snapshot)? {
-            self.assert_graph_endpoint_allowed(&table, &row, snapshot)?;
+        for (table, row) in self.rows_for_node(node, snapshot, read_memory.clone())? {
+            self.assert_graph_endpoint_allowed(&table, &row, snapshot, read_memory.clone())?;
         }
         Ok(())
     }
@@ -4314,6 +4995,8 @@ impl Database {
         table: &str,
         row: &VersionedRow,
         snapshot: SnapshotId,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<()> {
         if self.access_is_admin() {
             return Ok(());
@@ -4321,9 +5004,15 @@ impl Database {
         let Some(meta) = self.table_meta(table) else {
             return Err(Error::TableNotFound(table.to_string()));
         };
-        self.write_allowed_for_values(table, &meta, row.row_id, &row.values, snapshot)
+        self.write_allowed_for_values(
+            table,
+            &meta,
+            row.row_id,
+            &row.values,
+            snapshot,
+            read_memory.clone(),
+        )
     }
-
     pub(crate) fn query_bfs_gated(
         &self,
         start: NodeId,
@@ -4332,53 +5021,18 @@ impl Database {
         min_depth: u32,
         max_depth: u32,
         snapshot: SnapshotId,
-    ) -> Result<TraversalResult> {
-        if !self.node_read_allowed(start, snapshot)? {
-            return Ok(TraversalResult { nodes: Vec::new() });
-        }
 
-        let mut visited = HashSet::new();
-        visited.insert(start);
-        let mut queue: VecDeque<GatedBfsEntry> = VecDeque::new();
-        queue.push_back((start, 0, vec![]));
-        let mut result_nodes = Vec::new();
-
-        while let Some((current, depth, path)) = queue.pop_front() {
-            if depth >= max_depth {
-                continue;
-            }
-            for (neighbor_id, edge_type, _, edge_source, edge_target) in
-                self.graph_neighbors_with_orientation(current, edge_types, direction, snapshot)?
-            {
-                if !self.node_read_allowed(neighbor_id, snapshot)? {
-                    continue;
-                }
-                if !self.edge_read_allowed(edge_source, edge_target, &edge_type, snapshot)? {
-                    continue;
-                }
-                let next_depth = depth + 1;
-                let mut new_path = path.clone();
-                new_path.push((current, edge_type.clone()));
-                if next_depth >= min_depth {
-                    result_nodes.push(TraversalNode {
-                        id: neighbor_id,
-                        depth: next_depth,
-                        path: new_path.clone(),
-                    });
-                }
-                if neighbor_id == current || visited.contains(&neighbor_id) {
-                    continue;
-                }
-                visited.insert(neighbor_id);
-                if visited.len() > 10_000 {
-                    return Err(Error::BfsVisitedExceeded(10_000));
-                }
-                queue.push_back((neighbor_id, next_depth, new_path));
-            }
-        }
-
-        Ok(TraversalResult {
-            nodes: result_nodes,
-        })
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<(TraversalResult, contextdb_core::read_memory::ReadCredit)> {
+        let (result, _, credit) = self.graph_bfs_counted(
+            None,
+            start,
+            edge_types,
+            direction,
+            min_depth..=max_depth,
+            snapshot,
+            read_memory,
+        )?;
+        Ok((result, credit))
     }
 }

@@ -251,6 +251,20 @@ impl OwnerClient {
         progress: Option<&Arc<dyn ReadProgressObserver>>,
         cancellation: Option<&OwnerReadCancellation>,
     ) -> OwnerReadScaffoldResult<Vec<LocalResponse>> {
+        self.request_watching_under_cursor_memory(envelope, progress, cancellation, None)
+            .await
+    }
+
+    /// Cursor retention is already owned by the caller. Carry its remaining
+    /// allowance explicitly into the same transport boundary before allocation.
+    #[cfg(unix)]
+    pub(crate) async fn request_watching_under_cursor_memory(
+        &mut self,
+        envelope: LocalRequestEnvelope,
+        progress: Option<&Arc<dyn ReadProgressObserver>>,
+        cancellation: Option<&OwnerReadCancellation>,
+        cursor_memory: Option<u64>,
+    ) -> OwnerReadScaffoldResult<Vec<LocalResponse>> {
         // A statement its caller has already withdrawn is not sent at all.
         // Sending it and interrupting it a moment later makes the answer a
         // race the caller cannot see or influence: an owner that finishes the
@@ -275,7 +289,8 @@ impl OwnerClient {
             None => None,
         };
         self.requests_sent = self.requests_sent.saturating_add(1);
-        let boundary = LocalProtocolBoundary::with_effective_limits(envelope.limits);
+        let boundary = LocalProtocolBoundary::with_effective_limits(envelope.limits)
+            .with_cursor_receive_memory(cursor_memory);
         let expectation = response_expectation(&envelope.request);
         let carrier = UnixLocalCarrier;
         // An owner that refuses a connection answers it and then closes, so
@@ -366,6 +381,19 @@ impl OwnerClient {
             {
                 Ok(response) => response,
                 Err(error) => {
+                    // Prefix admission may leave the rejected payload unread.
+                    // Close this selected carrier before a caller attempts a
+                    // best-effort cursor close on that incomplete exchange.
+                    if cursor_memory.is_some()
+                        && matches!(
+                            &error,
+                            crate::local_transport::LocalTransportError::Payload(
+                                crate::local_transport::PayloadViolation::MemoryCeilingExceeded { .. }
+                            )
+                        )
+                    {
+                        let _ = self.stream.shutdown(Shutdown::Both);
+                    }
                     if let Some(receiver) = ordinary_receiver.as_mut() {
                         let _discarded = receiver
                             .disconnect()

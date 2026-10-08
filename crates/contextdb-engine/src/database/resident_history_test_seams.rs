@@ -98,6 +98,49 @@ fn map_capacity<K, V>(map: &HashMap<K, V>) -> usize {
     map.capacity() * (std::mem::size_of::<(K, V)>() + 1)
 }
 impl Database {
+    /// Actual declared allocator regions and allocated durable pages.
+    #[doc(hidden)]
+    pub fn __durable_page_population_for_test(&self) -> Result<(usize, u64)> {
+        self.persistence
+            .as_ref()
+            .expect("file fixture")
+            .durable_page_population_for_test()
+    }
+
+    /// Resident owners omitted from the older resident mirror set.
+    ///
+    /// Slots 1–5 report collection backing capacity: reverse adjacency,
+    /// accepted sync authors, refusal scans, DDL slots, and paged publications.
+    /// Slot 6 is vector graph ownership receipt, not allocator backing capacity.
+    #[doc(hidden)]
+    pub fn __additional_resident_owners_for_test(&self) -> [usize; 6] {
+        let reverse = self.graph_store.reverse_adj.read();
+        let authors = self.accepted_sync_row_authors.read();
+        let refusals = self.terminal_refusal_scans.read();
+        let ddl = self.ddl_log.read();
+        let vectors = self.vector_store.memory_ownership_snapshot_for_test();
+        [
+            map_capacity(&reverse)
+                + reverse
+                    .values()
+                    .map(|entries| entries.capacity() * std::mem::size_of::<AdjEntry>())
+                    .sum::<usize>(),
+            map_capacity(&authors)
+                + authors
+                    .iter()
+                    .map(|((table, key), author)| {
+                        table.capacity() + key.capacity() + author.capacity()
+                    })
+                    .sum::<usize>(),
+            map_capacity(&refusals),
+            ddl.capacity() * std::mem::size_of::<(Lsn, DdlChange)>(),
+            self.persistence
+                .as_ref()
+                .map_or(0, |p| p.paged_publication_owners_for_test()),
+            vectors.base_graph + vectors.change_graph + vectors.retired_pinned_graph_bytes,
+        ]
+    }
+
     #[doc(hidden)]
     pub fn __create_region_fixture_for_test(path: &Path, region_bytes: u64) -> Result<()> {
         RedbPersistence::create_region_fixture_for_test(path, region_bytes)
@@ -188,10 +231,11 @@ impl Database {
     pub fn __maintenance_with_stop_for_test(
         &self,
         stop: Arc<AtomicBool>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<MaintenanceReport> {
         let mut context = self.maintenance_context();
         context.worker_stop = Some(stop);
-        context.run_cycle(CurrencyGate::Always)
+        context.run_cycle(CurrencyGate::Always, read_memory.clone())
     }
     #[doc(hidden)]
     pub fn __storage_batch_for_test(&self) -> Result<(bool, usize, usize)> {
@@ -249,6 +293,14 @@ impl Database {
             .expect("file-backed fixture")
             .resident_cache_stats_for_test()
     }
+    /// Actual allocated native cache-index bytes, excluding page payload reserve.
+    #[doc(hidden)]
+    pub fn __writer_cache_index_bytes_for_test(&self) -> Result<usize> {
+        self.persistence
+            .as_ref()
+            .expect("file-backed fixture")
+            .cache_index_bytes_for_test()
+    }
     /// An actual redb body-page owner survives cache eviction until drop.
     #[doc(hidden)]
     pub fn __hold_row_page_for_test(
@@ -274,4 +326,150 @@ impl Database {
             .expect("file-backed fixture")
             .damage_membership_envelope_for_test(partition)
     }
+}
+
+/// Passive cuts after each source-unit scope has destroyed its scratch owners.
+#[derive(Debug, Clone, Copy)]
+pub struct SourceUnitCreditCut {
+    pub committed_lsn: Lsn,
+    pub used: usize,
+    pub peak: usize,
+}
+
+#[derive(Debug)]
+pub struct SourceUnitCreditReport {
+    pub baseline: usize,
+    pub cuts: Vec<SourceUnitCreditCut>,
+    pub before_caller_drop: usize,
+    pub after_caller_drop: usize,
+    pub after_standing_drop: usize,
+    pub parent_before: u64,
+    pub parent_after: u64,
+}
+
+#[derive(Debug)]
+struct SourceUnitCreditObserver {
+    source: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    used: std::sync::atomic::AtomicUsize,
+    peak: std::sync::atomic::AtomicUsize,
+    cuts: Mutex<Vec<SourceUnitCreditCut>>,
+}
+impl contextdb_core::read_memory::ReadMemoryBudget for SourceUnitCreditObserver {
+    fn try_reserve(
+        &self,
+        bytes: usize,
+        subsystem: &'static str,
+        operation: &'static str,
+        hint: &'static str,
+    ) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        self.source.try_reserve(bytes, subsystem, operation, hint)?;
+        let used = self.used.fetch_add(bytes, Ordering::SeqCst) + bytes;
+        self.peak.fetch_max(used, Ordering::SeqCst);
+        Ok(())
+    }
+    fn release(&self, bytes: usize) {
+        use std::sync::atomic::Ordering;
+        let before = self.used.fetch_sub(bytes, Ordering::SeqCst);
+        assert!(before >= bytes, "source-unit credit releases at most once");
+        self.source.release(bytes);
+    }
+}
+thread_local! {
+    static SOURCE_UNIT_CREDIT_OBSERVER: std::cell::RefCell<Option<Arc<SourceUnitCreditObserver>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn note_source_unit_credit_boundary_for_test(committed_lsn: Lsn) {
+    use std::sync::atomic::Ordering;
+    SOURCE_UNIT_CREDIT_OBSERVER.with(|active| {
+        if let Some(observer) = active.borrow().as_ref() {
+            let used = observer.used.load(Ordering::SeqCst);
+            let peak = observer.peak.swap(used, Ordering::SeqCst);
+            observer.cuts.lock().push(SourceUnitCreditCut {
+                committed_lsn,
+                used,
+                peak,
+            });
+        }
+    });
+}
+
+pub(crate) fn source_unit_boundaries_for_test<'a>(
+    units: Vec<ChangeSet>,
+    database: &'a Database,
+) -> impl Iterator<Item = ChangeSet> + 'a {
+    let mut units = units.into_iter();
+    std::iter::from_fn(move || {
+        // Includes the final next() returning None, after the final iteration
+        // has destroyed all of its unit-local owners.
+        note_source_unit_credit_boundary_for_test(database.current_lsn());
+        units.next()
+    })
+}
+
+/// Drive the real received apply kernel with an observed declared operation child.
+#[doc(hidden)]
+pub fn observe_source_unit_credit_for_test(
+    database: &Database,
+    changes: ChangeSet,
+    policies: &ConflictPolicies,
+) -> (Result<ApplyResult>, SourceUnitCreditReport) {
+    use contextdb_core::read_memory::ReadCredit;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Restore(Option<Arc<SourceUnitCreditObserver>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SOURCE_UNIT_CREDIT_OBSERVER.with(|active| *active.borrow_mut() = self.0.take());
+        }
+    }
+    let parent_before = database
+        .declared_read_memory
+        .retained_bytes_for_source_unit_test();
+    let observer = Arc::new(SourceUnitCreditObserver {
+        source: database
+            .declared_reader_memory()
+            .expect("declare the received apply child"),
+        used: AtomicUsize::new(0),
+        peak: AtomicUsize::new(0),
+        cuts: Mutex::new(Vec::new()),
+    });
+    let standing = ReadCredit::try_new(
+        observer.clone(),
+        257,
+        "test",
+        "standing_source_unit_credit",
+        "test",
+    )
+    .expect("retain a nonzero source-unit operation baseline");
+    let baseline = observer.used.load(Ordering::SeqCst);
+    let restore = Restore(
+        SOURCE_UNIT_CREDIT_OBSERVER.with(|active| active.borrow_mut().replace(observer.clone())),
+    );
+    let mut caller = crate::vector_read_memory::admission(observer.clone());
+    let result =
+        database.apply_changes_with_read_memory(changes, policies, &mut caller, observer.clone());
+    let before_caller_drop = observer.used.load(Ordering::SeqCst);
+    drop(caller);
+    let after_caller_drop = observer.used.load(Ordering::SeqCst);
+    drop(standing);
+    let after_standing_drop = observer.used.load(Ordering::SeqCst);
+    let cuts = observer.cuts.lock().clone();
+    drop(restore);
+    drop(observer);
+    let parent_after = database
+        .declared_read_memory
+        .retained_bytes_for_source_unit_test();
+    (
+        result,
+        SourceUnitCreditReport {
+            baseline,
+            cuts,
+            before_caller_drop,
+            after_caller_drop,
+            after_standing_drop,
+            parent_before,
+            parent_after,
+        },
+    )
 }

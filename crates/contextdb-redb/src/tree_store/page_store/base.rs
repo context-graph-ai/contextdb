@@ -209,6 +209,9 @@ impl Drop for PageImpl {
         *value -= 1;
         if *value == 0 {
             open_pages.remove(&self.page_number);
+            if open_pages.is_empty() {
+                *open_pages = HashMap::new();
+            }
         }
     }
 }
@@ -272,7 +275,13 @@ impl Page for PageMut<'_> {
 impl Drop for PageMut<'_> {
     fn drop(&mut self) {
         #[cfg(debug_assertions)]
-        assert!(self.open_pages.lock().unwrap().remove(&self.page_number));
+        {
+            let mut open_pages = self.open_pages.lock().unwrap();
+            assert!(open_pages.remove(&self.page_number));
+            if open_pages.is_empty() {
+                *open_pages = HashSet::new();
+            }
+        }
     }
 }
 

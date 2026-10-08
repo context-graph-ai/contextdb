@@ -100,7 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         root.join("hub.key").display()
     ))
     .await?;
-    let server = Arc::new(SyncServer::new(hub.clone(), &endpoint, tenant.clone()));
+    let server = Arc::new(SyncServer::new(hub.clone(), &endpoint, tenant.clone())?);
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let server = server.clone();
@@ -130,7 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
         tenant,
         identity,
-    );
+    )?;
     client
         .bind_application_table_policy(
             ApplicationTablePolicyExpectation::new()

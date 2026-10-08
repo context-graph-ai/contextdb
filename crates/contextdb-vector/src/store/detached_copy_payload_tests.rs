@@ -51,29 +51,21 @@ struct CopyReload {
     entries: Vec<VectorEntry>,
     budget: Arc<CopyBudget>,
     quantization: VectorQuantization,
-    workspace_bytes: usize,
 }
 
 impl DormantRawVectorLoader for CopyReload {
-    fn load(&self, directory: &[RawVectorDirectoryEntry]) -> Result<LoadedRawVectorPartition> {
-        assert_eq!(directory.len(), self.entries.len());
-        let resident_bytes = self
-            .entries
-            .iter()
-            .map(|entry| stored_vector_resident_bytes(entry.vector.len(), self.quantization))
-            .sum::<usize>();
-        self.budget.try_allocate_for(
-            resident_bytes + self.workspace_bytes,
-            "vector_index",
-            "copy_fixture_load",
-            "test",
-        )?;
-        Ok(LoadedRawVectorPartition {
-            entries: self.entries.clone(),
-            resident_bytes,
-            workspace_bytes: self.workspace_bytes,
-            accountant: self.budget.clone(),
-        })
+    fn load(
+        &self,
+        directory: &[RawVectorDirectoryEntry],
+        owner: &mut VectorCopyAdmission,
+    ) -> Result<LoadedRawVectorPartition> {
+        load_co_created_fixture_carriers(
+            &self.entries,
+            Some(directory),
+            self.budget.clone(),
+            self.quantization,
+            owner,
+        )
     }
 
     fn load_candidate(
@@ -107,7 +99,9 @@ fn dormant_copy_store(
     budget: &Arc<CopyBudget>,
 ) -> (VectorStore, Arc<IndexState>) {
     let store = VectorStore::default();
-    store.register_index(index.clone(), dimension, quantization);
+    store
+        .register_index(index.clone(), dimension, quantization, budget.clone())
+        .unwrap();
     let state = store.state(index).unwrap();
     let directory = entries
         .iter()
@@ -116,11 +110,14 @@ fn dormant_copy_store(
             created_tx: entry.created_tx,
             deleted_tx: entry.deleted_tx,
             lsn: entry.lsn,
+            membership: VectorMembershipProvenance::new(
+                entry.created_tx,
+                entry.lsn,
+                entry.created_tx,
+                entry.deleted_tx,
+            ),
         })
         .collect();
-    // Exercise returned decoder workspace as well as the resident body charge.
-    let workspace_bytes = entries.len()
-        * (std::mem::size_of::<VectorEntry>() + dimension * std::mem::size_of::<f32>());
     state
         .install_dormant_raw_directory(
             directory,
@@ -128,7 +125,6 @@ fn dormant_copy_store(
                 entries,
                 budget: budget.clone(),
                 quantization,
-                workspace_bytes,
             }),
         )
         .unwrap();
@@ -213,6 +209,9 @@ fn detached_copy_unique_unwrap_moves_the_body_and_preserves_shared_or_charged_ow
 
 #[test]
 fn detached_copy_hydration_retains_only_new_singleton_bodies_and_releases_headers() {
+    let executing_accountant = Arc::new(super::tests::CountingMemoryBudget::default());
+    let mut executing_admission = VectorCopyAdmission::new(executing_accountant.clone());
+
     for quantization in [
         VectorQuantization::F32,
         VectorQuantization::SQ8,
@@ -234,7 +233,10 @@ fn detached_copy_hydration_retains_only_new_singleton_bodies_and_releases_header
             .try_allocate_for(copy_bytes, "test", "detached_copy", "test")
             .unwrap();
         let copies = store
-            .try_partitioned_entries_matching(|selected| selected == &index)
+            .try_partitioned_entries_matching(
+                |selected| selected == &index,
+                &mut executing_admission,
+            )
             .unwrap();
         assert_eq!(copies.len(), 120);
         let body_bytes = 120 * stored_vector_resident_bytes(64, quantization);
@@ -279,6 +281,9 @@ fn detached_copy_hydration_retains_only_new_singleton_bodies_and_releases_header
 
 #[test]
 fn detached_copy_header_refusal_releases_loader_body_workspace_and_retries() {
+    let executing_accountant = Arc::new(super::tests::CountingMemoryBudget::default());
+    let mut executing_admission = VectorCopyAdmission::new(executing_accountant.clone());
+
     let budget = Arc::new(CopyBudget::default());
     let index = VectorIndexRef::new("receiver_refusal", "embedding");
     let item = copy_entry(&index, RowId(1), TxId(1), vec![0.0, 1.0]);
@@ -291,7 +296,7 @@ fn detached_copy_header_refusal_releases_loader_body_workspace_and_retries() {
         .unwrap();
     budget.refuse_headers.store(true, Ordering::SeqCst);
     assert!(
-        matches!(store.try_partitioned_entries_matching(|_| true), Err(Error::MemoryBudgetExceeded { operation, requested_bytes, .. }) if operation == "load_raw_vector_headers" && requested_bytes == shared_payload_header_bytes())
+        matches!(store.try_partitioned_entries_matching(|_| true, &mut executing_admission), Err(Error::MemoryBudgetExceeded { operation, requested_bytes, .. }) if operation == "load_raw_vector_headers" && requested_bytes == shared_payload_header_bytes())
     );
     assert_eq!(budget.used.load(Ordering::SeqCst), before + copy_bytes);
     assert!(!state.raw_resident.load(Ordering::SeqCst));
@@ -300,7 +305,9 @@ fn detached_copy_header_refusal_releases_loader_body_workspace_and_retries() {
     assert_eq!(store.raw_payload_bytes.load(Ordering::SeqCst), 0);
     assert_eq!(store.raw_payload_header_bytes.load(Ordering::SeqCst), 0);
     budget.refuse_headers.store(false, Ordering::SeqCst);
-    let copies = store.try_partitioned_entries_matching(|_| true).unwrap();
+    let copies = store
+        .try_partitioned_entries_matching(|_| true, &mut executing_admission)
+        .unwrap();
     assert_eq!(copies.len(), 1);
     assert_eq!(budget.header_requests.load(Ordering::SeqCst), 2);
     assert_eq!(budget.used.load(Ordering::SeqCst), before + copy_bytes + 8);
@@ -318,6 +325,9 @@ fn detached_copy_header_refusal_releases_loader_body_workspace_and_retries() {
 
 #[test]
 fn detached_copy_mixed_history_preserves_bits_and_shared_final_holder_charges() {
+    let executing_accountant = Arc::new(super::tests::CountingMemoryBudget::default());
+    let mut executing_admission = VectorCopyAdmission::new(executing_accountant.clone());
+
     for quantization in [
         VectorQuantization::F32,
         VectorQuantization::SQ8,
@@ -339,7 +349,9 @@ fn detached_copy_mixed_history_preserves_bits_and_shared_final_holder_charges() 
         budget
             .try_allocate_for(copy_bytes, "test", "detached_copy", "test")
             .unwrap();
-        let copies = store.try_partitioned_entries_matching(|_| true).unwrap();
+        let copies = store
+            .try_partitioned_entries_matching(|_| true, &mut executing_admission)
+            .unwrap();
         let body_bytes = stored_vector_resident_bytes(1, quantization);
         assert_eq!(
             store.raw_payload_bytes.load(Ordering::SeqCst),
@@ -380,7 +392,11 @@ fn detached_copy_mixed_history_preserves_bits_and_shared_final_holder_charges() 
         );
         drop(state);
         let released = store
-            .prune_row_ids(&HashSet::from([RowId(1)]), budget.as_ref())
+            .prune_row_ids(
+                &HashSet::from([RowId(1)]),
+                budget.as_ref(),
+                &mut executing_admission,
+            )
             .unwrap();
         budget.release(released);
         assert_eq!(store.raw_payload_bytes.load(Ordering::SeqCst), body_bytes);
@@ -401,6 +417,9 @@ fn detached_copy_mixed_history_preserves_bits_and_shared_final_holder_charges() 
 
 #[test]
 fn detached_copy_already_resident_sources_keep_representation_charge_and_funder() {
+    let executing_accountant = Arc::new(super::tests::CountingMemoryBudget::default());
+    let mut executing_admission = VectorCopyAdmission::new(executing_accountant.clone());
+
     for quantization in [
         VectorQuantization::F32,
         VectorQuantization::SQ8,
@@ -412,7 +431,9 @@ fn detached_copy_already_resident_sources_keep_representation_charge_and_funder(
         let entry = copy_entry(&index, RowId(1), TxId(1), vec![0.0, 1.0]);
         let (store, state) =
             dormant_copy_store(&index, 2, quantization, vec![entry], &loader_budget);
-        state.ensure_raw_vectors_loaded().unwrap();
+        state
+            .ensure_raw_vectors_loaded(&mut executing_admission)
+            .unwrap();
         let before = loader_budget.used.load(Ordering::SeqCst);
         let receipt = store.memory_ownership_snapshot_for_test();
         let (identity, pointer) = state.with_entries(|entries| {
@@ -426,7 +447,9 @@ fn detached_copy_already_resident_sources_keep_representation_charge_and_funder(
         copy_budget
             .try_allocate_for(copy_bytes, "test", "detached_copy", "test")
             .unwrap();
-        let copies = store.try_partitioned_entries_matching(|_| true).unwrap();
+        let copies = store
+            .try_partitioned_entries_matching(|_| true, &mut executing_admission)
+            .unwrap();
         assert_eq!(loader_budget.used.load(Ordering::SeqCst), before);
         assert_eq!(copy_budget.used.load(Ordering::SeqCst), copy_bytes);
         assert_eq!(store.memory_ownership_snapshot_for_test(), receipt);

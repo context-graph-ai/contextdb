@@ -18,6 +18,7 @@ pub enum Statement {
     ShowMemoryLimit,
     SetDiskLimit(SetDiskLimitValue),
     ShowDiskLimit,
+    ShowContentSize,
     SetMaintenancePollInterval(u64),
     ShowMaintenancePollInterval,
     /// The serving page cache a maintained vector partition may keep resident.
@@ -186,6 +187,10 @@ pub struct SelectBody {
     pub from: Vec<FromItem>,
     pub joins: Vec<JoinClause>,
     pub where_clause: Option<Expr>,
+    /// `GROUP BY` items as written. `parse` admits a nonempty list only in the
+    /// one grouped form the engine answers: `COUNT(*)` per group of plain
+    /// columns of one table.
+    pub group_by: Vec<Expr>,
     pub order_by: Vec<OrderByItem>,
     pub use_vector: Option<VectorSearchMode>,
     pub use_rank: Option<String>,
@@ -246,6 +251,10 @@ pub enum SortDirection {
 
 #[derive(Debug, Clone)]
 pub enum Expr {
+    /// Parsed window specification. It is lowered before scalar evaluation.
+    RowNumber(RowNumberWindow),
+    /// Planner-only binding in the WindowRank output, separate from named columns.
+    WindowRank(WindowBindingId),
     Column(ColumnRef),
     Literal(Literal),
     Parameter(String),
@@ -296,10 +305,28 @@ pub enum Expr {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnRef {
     pub table: Option<String>,
     pub column: String,
+}
+
+/// A binding is local to its WindowRank node and consumed at that query's projection.
+/// SQL identifiers cannot create or address this namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WindowBindingId(pub u32);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowNumberWindow {
+    /// Empty means a single partition over the input.
+    pub partition_by: Vec<ColumnRef>,
+    pub order_by: Vec<WindowOrderColumn>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowOrderColumn {
+    pub column: ColumnRef,
+    pub direction: SortDirection,
 }
 
 #[derive(Debug, Clone)]

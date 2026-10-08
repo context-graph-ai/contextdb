@@ -14,12 +14,22 @@ impl Database {
         &self,
         changes: ChangeSet,
         confirmed: Lsn,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Vec<OutboundSyncUnit>> {
-        crate::custody::outbound::units(self, changes, confirmed)
+        crate::custody::outbound::units(
+            self,
+            changes,
+            confirmed,
+            vector_copy_owner,
+            read_memory.clone(),
+        )
     }
     pub(crate) fn custody_parent_refs(
         &self,
         row: &RowChange,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Vec<crate::custody::records::RowRef>> {
         let mut parents = Vec::new();
         if let Some(meta) = self.table_meta(&row.table) {
@@ -56,6 +66,8 @@ impl Database {
                     &values,
                     self.snapshot(),
                     &HashSet::new(),
+                    vector_copy_owner,
+                    read_memory.clone(),
                 )? {
                     parents.push(crate::custody::records::RowRef {
                         table,
@@ -110,12 +122,23 @@ impl Database {
             ))
         })
     }
-    pub(crate) fn custody_records(&self) -> Result<Vec<Record>> {
-        self.custody_records_in(&["tenant_".into(), "delivery_".into()])
+    pub(crate) fn custody_records(
+        &self,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<crate::custody::store::AdmittedRecords> {
+        self.custody_records_in(&["tenant_".into(), "delivery_".into()], read_memory.clone())
     }
-    pub(crate) fn custody_records_in(&self, selectors: &[String]) -> Result<Vec<Record>> {
+    pub(crate) fn custody_records_in(
+        &self,
+        selectors: &[String],
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<crate::custody::store::AdmittedRecords> {
+        let memory = crate::read_image_memory::ImageMemory::charging_reader(
+            self.accountant.clone(),
+            read_memory.clone(),
+        );
         self.with_custody_store(|store| {
-            let records = store.select(selectors);
+            let records = store.select(selectors, memory.clone())?;
             self.verify_selected_custody_records(store, &records)?;
             Ok(records)
         })
@@ -141,9 +164,17 @@ impl Database {
         }
         Ok(())
     }
-    pub(crate) fn custody_table(&self, table: &str) -> Result<Vec<Record>> {
+    pub(crate) fn custody_table(
+        &self,
+        table: &str,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<crate::custody::store::AdmittedRecords> {
+        let memory = crate::read_image_memory::ImageMemory::charging_reader(
+            self.accountant.clone(),
+            read_memory.clone(),
+        );
         self.with_custody_store(|store| {
-            let records = store.select_table(table);
+            let records = store.select_table(table, memory.clone())?;
             self.verify_selected_custody_records(store, &records)?;
             Ok(records)
         })
@@ -151,28 +182,49 @@ impl Database {
     pub(crate) fn custody_rows(
         &self,
         rows: &[crate::custody::records::RowRef],
-    ) -> Result<Vec<Record>> {
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<crate::custody::store::AdmittedRecords> {
+        let memory = crate::read_image_memory::ImageMemory::charging_reader(
+            self.accountant.clone(),
+            read_memory.clone(),
+        );
         self.with_custody_store(|store| {
-            let records = store.select_rows(rows)?;
+            let records = store.select_rows(rows, memory.clone())?;
             self.verify_selected_custody_records(store, &records)?;
             Ok(records)
         })
     }
-    pub(crate) fn custody_authority(&self) -> Result<Vec<Record>> {
-        self.custody_records_in(&["@authority".into(), "@policies".into()])
+    pub(crate) fn custody_authority(
+        &self,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<crate::custody::store::AdmittedRecords> {
+        self.custody_records_in(
+            &["@authority".into(), "@policies".into()],
+            read_memory.clone(),
+        )
     }
-    pub(crate) fn custody_submission(&self, submission: uuid::Uuid) -> Result<Vec<Record>> {
-        self.custody_records_in(&[format!(
-            "@{}",
-            crate::custody::store::submission_group(submission)
-        )])
+    pub(crate) fn custody_submission(
+        &self,
+        submission: uuid::Uuid,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<crate::custody::store::AdmittedRecords> {
+        self.custody_records_in(
+            &[format!(
+                "@{}",
+                crate::custody::store::submission_group(submission)
+            )],
+            read_memory.clone(),
+        )
     }
     pub(crate) fn custody_root(
         &self,
         root: &crate::custody::records::RowRef,
-    ) -> Result<Vec<Record>> {
-        let roots =
-            self.custody_records_in(&[format!("@{}", crate::custody::store::root_group(root))])?;
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<crate::custody::store::AdmittedRecords> {
+        let roots = self.custody_records_in(
+            &[format!("@{}", crate::custody::store::root_group(root))],
+            read_memory.clone(),
+        )?;
         let ids = roots
             .iter()
             .filter_map(|r| match r {
@@ -185,14 +237,27 @@ impl Database {
             &ids.into_iter()
                 .map(|id| format!("@{}", crate::custody::store::submission_group(id)))
                 .collect::<Vec<_>>(),
+            read_memory.clone(),
         )
     }
-    pub(crate) fn custody_pending_manifests(&self) -> Result<Vec<Record>> {
-        self.with_custody_store(|store| Ok(store.pending()))
+    pub(crate) fn custody_pending_manifests(
+        &self,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<crate::custody::store::AdmittedRecords> {
+        let memory = crate::read_image_memory::ImageMemory::charging_reader(
+            self.accountant.clone(),
+            read_memory,
+        );
+        self.with_custody_store(|store| store.pending(memory))
     }
     // Only complete adjudication may publish a batch bookmark.
-    pub(crate) fn finish_custody_push(&self, receipt: &SyncApplyReceipt) -> Result<()> {
-        self.commit_sync_apply_receipt_only(receipt)?;
+    pub(crate) fn finish_custody_push(
+        &self,
+        receipt: &SyncApplyReceipt,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<()> {
+        self.commit_sync_apply_receipt_only(receipt, vector_copy_owner, read_memory.clone())?;
         if self.persistence.is_none() {
             let key = Self::applied_push_watermark_node_incarnation_key(
                 &receipt.tenant_id,
@@ -221,9 +286,16 @@ impl Database {
         lineages: &[(String, NaturalKey, Lsn, crate::protocol::WireRowLineage)],
         ddl: Option<&crate::protocol::ReceivedDdlContext>,
         dependency_complete: bool,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<ApplyResult> {
         let frontier = self
-            .persisted_sync_applied_push_watermark_for_node_incarnation(tenant, edge, incarnation)?
+            .persisted_sync_applied_push_watermark_for_node_incarnation_with_read_memory(
+                tenant,
+                edge,
+                incarnation,
+                read_memory.clone(),
+            )?
             .unwrap_or(Lsn(0));
         self.apply_authenticated_received_changes_with_outcome(
             changes,
@@ -241,11 +313,15 @@ impl Database {
             lineages,
             ddl,
             None,
+            vector_copy_owner,
+            read_memory.clone(),
         )
     }
     pub(crate) fn custody_row(
         &self,
         reference: &crate::custody::records::RowRef,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Option<VersionedRow>> {
         // Custody digests cover every committed column, so a file-backed
         // writer's paged-out bodies are read back for the row it hands on.
@@ -254,6 +330,7 @@ impl Database {
             &reference.key,
             self.snapshot(),
             &HashSet::new(),
+            read_memory.clone(),
         )?
         else {
             return Ok(None);
@@ -262,6 +339,7 @@ impl Database {
             &reference.table,
             &row,
             &crate::database::ChangeProjection::unbounded(),
+            read_memory.clone(),
         )?;
         row.values.extend(shed);
         Ok(Some(row))
@@ -270,13 +348,20 @@ impl Database {
     // A replacement or deletion ends ownership of the
     // previous committed manifest. Preserve its signed history and terminals;
     // current rows require a registration from their own writing transaction.
-    fn retire_changed_custody_roots(&self, ws: &mut WriteSet, snapshot: SnapshotId) -> Result<()> {
+    fn retire_changed_custody_roots(
+        &self,
+        ws: &mut WriteSet,
+        snapshot: SnapshotId,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<()> {
         use crate::custody::{canonical::hex, records::RowRef};
         if ws.relational_deletes.is_empty() {
             return Ok(());
         }
         let mut selectors = BTreeSet::new();
-        for (table, rows) in self.deleted_row_snapshots_by_table(ws, snapshot)? {
+        for (table, rows) in
+            self.deleted_row_snapshots_by_table(ws, snapshot, read_memory.clone())?
+        {
             let Some(meta) = self.table_meta(&table) else {
                 continue;
             };
@@ -298,7 +383,11 @@ impl Database {
         if selectors.is_empty() {
             return Ok(());
         }
-        for record in self.custody_records_in(&selectors.into_iter().collect::<Vec<_>>())? {
+        let selected = self.custody_records_in(
+            &selectors.into_iter().collect::<Vec<_>>(),
+            read_memory.clone(),
+        )?;
+        for record in selected.iter() {
             let Record::Manifest(m) = record else {
                 continue;
             };
@@ -307,7 +396,7 @@ impl Database {
                 submission: m.id,
             };
             let key = root.key()?;
-            let owned = self.custody_submission(m.id)?;
+            let owned = self.custody_submission(m.id, read_memory.clone())?;
             if !owned.iter().any(|r| {
                 matches!(r, Record::Root { life, submission }
                 if *life == m.root_life && *submission == m.id)
@@ -324,11 +413,16 @@ impl Database {
         Ok(())
     }
 
-    pub(super) fn prepare_custody_commit(&self, ws: &mut WriteSet) -> Result<Option<CustodyDelta>> {
+    pub(super) fn prepare_custody_commit(
+        &self,
+        ws: &mut WriteSet,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<Option<CustodyDelta>> {
         self.retire_changed_custody_roots(
             ws,
             self.scoped_writer_root()
                 .map_or_else(|| self.snapshot_for_read(), |root| root.snapshot),
+            read_memory.clone(),
         )?;
         if !ws.config_writes.iter().any(|(key, _)| owned_key(key))
             && !ws.config_deletes.iter().any(|key| owned_key(key))

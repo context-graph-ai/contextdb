@@ -1,9 +1,134 @@
 use std::cell::RefCell;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 
-type VectorLoadReservationTransfer = Arc<dyn Fn(usize) -> contextdb_core::Result<()> + Send + Sync>;
+// Ordinary writer mutations share this gate. Runtime activation alone takes
+// its exclusive side. The build lease is independent and never an admission gate.
+#[derive(Debug)]
+struct ProcessNativeReservation { bytes: usize }
+#[derive(Debug)]
+struct ResidentInsertionRuntime {
+    width: usize,
+    funder_identity: usize,
+    reservation: ProcessNativeReservation,
+}
+#[derive(Debug)]
+struct WriterRegistration {
+    identity: usize,
+    limit: Arc<AtomicUsize>,
+    used: Arc<AtomicUsize>,
+    next: Option<Box<WriterRegistration>>,
+}
+#[derive(Debug)]
+struct ProcessWriterBudgetDomain {
+    native: Option<ResidentInsertionRuntime>,
+    writers: Option<Box<WriterRegistration>>,
+    next_identity: usize,
+}
+static PROCESS_WRITER_BUDGET_DOMAIN: parking_lot::RwLock<ProcessWriterBudgetDomain> =
+    parking_lot::RwLock::new(ProcessWriterBudgetDomain {
+        native: None, writers: None, next_identity: 1,
+    });
+pub(crate) static RESIDENT_INSERTION_BUILD_LEASE: parking_lot::Mutex<()> =
+    parking_lot::Mutex::new(());
+
+// The only conversion from a supplied accountant is this domain factory. Its
+// association is installed once, cannot be removed, and is retained by every
+// reservation holding the accountant. Private writable assembly accepts this
+// opaque handle, never a reader/standalone accountant.
+#[derive(Debug, Clone)]
+pub(crate) struct WriterBudget { accountant: Arc<MemoryAccountant> }
+impl WriterBudget {
+    pub(crate) fn from_accountant(accountant: Arc<MemoryAccountant>) -> contextdb_core::Result<Self> {
+        let mut domain = PROCESS_WRITER_BUDGET_DOMAIN.write();
+        if accountant.writer_identity.get().is_none() {
+            let identity = domain.next_identity;
+            let next_identity = identity.checked_add(1)
+                .ok_or_else(|| contextdb_core::Error::Other("writer identity overflow".into()))?;
+            // Fixed registration ownership: the linked node and the two shared
+            // counter allocations. No unpriced growable registration directory.
+            let registration_bytes = std::mem::size_of::<WriterRegistration>()
+                + 2 * (2 * std::mem::size_of::<usize>() + std::mem::size_of::<AtomicUsize>());
+            let used = accountant.used.load(Ordering::SeqCst);
+            used.checked_add(registration_bytes)
+                .ok_or_else(|| contextdb_core::Error::Other("writer registration size overflow".into()))?;
+            // Like startup cache ownership this allocation is unavoidable on
+            // open. A narrowed limit retains its ownership; future growth refuses.
+            accountant.charge_retained_under_admission(registration_bytes);
+            accountant.writer_identity.set(identity)
+                .expect("writer association is installed exactly once under the gate");
+            domain.next_identity = next_identity;
+            let registration = WriterRegistration {
+                identity, limit: Arc::clone(&accountant.limit), used: Arc::clone(&accountant.used),
+                next: domain.writers.take(),
+            };
+            domain.writers = Some(Box::new(registration));
+        }
+        drop(domain);
+        Ok(Self { accountant })
+    }
+    pub(crate) fn accountant(&self) -> Arc<MemoryAccountant> { Arc::clone(&self.accountant) }
+}
+impl Drop for MemoryAccountant {
+    fn drop(&mut self) {
+        let Some(identity) = self.writer_identity.get().copied() else { return; };
+        let mut domain = PROCESS_WRITER_BUDGET_DOMAIN.write();
+        let mut slot = &mut domain.writers;
+        while slot.is_some() {
+            if slot.as_ref().is_some_and(|record| record.identity == identity) {
+                let mut record = slot.take().expect("registration exists");
+                *slot = record.next.take();
+                return;
+            }
+            slot = &mut slot.as_mut().expect("registration exists").next;
+        }
+    }
+}
+
+// The complete workspace transition is the only operation permitted to use
+// this exclusive-admission scope. No allocation/reclaimer/observer callback
+// runs here; vector's ordinary transition delegates straight to the kernel.
+thread_local! {
+    static ACTIVATING_WRITER: std::cell::Cell<Option<(usize, usize)>> = const { std::cell::Cell::new(None) };
+}
+struct ActivationScope(Option<(usize, usize)>);
+impl Drop for ActivationScope {
+    fn drop(&mut self) { ACTIVATING_WRITER.with(|slot| slot.set(self.0)); }
+}
+struct WriterAdmission {
+    _gate: Option<parking_lot::RwLockReadGuard<'static, ProcessWriterBudgetDomain>>,
+    native_bytes: usize,
+}
+
+// One envelope calculation for admission, replacement credit, fit and reports.
+// The old local ownership is removed BEFORE the process debit. Unlimited
+// remains unlimited; finite arithmetic cannot manufacture capacity on overflow.
+struct WriterHeadroom {
+    available: Option<usize>,
+    combined_used: Option<usize>,
+    within_limit: bool,
+}
+fn writer_headroom(limit: usize, used: usize, releasing: usize, private: usize, native: usize) -> WriterHeadroom {
+    let occupied = used.checked_sub(releasing)
+        .expect("replacement credit must be owned by this accountant");
+    let combined_used = occupied.checked_add(native);
+    let effective = limit.checked_add(private).unwrap_or(usize::MAX);
+    WriterHeadroom {
+        available: (limit != 0).then(|| effective.checked_sub(native)
+            .and_then(|n| n.checked_sub(occupied)).unwrap_or(0)),
+        combined_used,
+        within_limit: limit == 0 || combined_used.is_some_and(|bytes| bytes <= effective),
+    }
+}
+
+pub(crate) fn resident_insertion_runtime_snapshot() -> Option<(usize, usize, usize)> {
+    PROCESS_WRITER_BUDGET_DOMAIN.read().native.as_ref()
+        .map(|runtime| (runtime.width, runtime.reservation.bytes, runtime.funder_identity))
+}
+
+pub(crate) type VectorLoadReservationTransfer =
+    Arc<dyn Fn(&MemoryAccountant, usize) -> contextdb_core::Result<()> + Send + Sync>;
 
 struct ActiveVectorLoadReservationTransfer {
     accountant: usize,
@@ -55,7 +180,7 @@ fn adopt_vector_load_reservation(
         if active.accountant != accountant as *const MemoryAccountant as usize {
             return Ok(false);
         }
-        (active.transfer)(bytes)?;
+        (active.transfer)(accountant, bytes)?;
         Ok(true)
     })
 }
@@ -106,8 +231,9 @@ impl Drop for TransitionHeadroomScope {
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct MemoryAccountant {
-    limit: AtomicUsize,
-    used: AtomicUsize,
+    limit: Arc<AtomicUsize>,
+    used: Arc<AtomicUsize>,
+    writer_identity: OnceLock<usize>,
     #[cfg(feature = "test-seams")]
     high_water_for_test: AtomicUsize,
     #[cfg(feature = "test-seams")]
@@ -502,11 +628,32 @@ impl Drop for OwnedMemoryReservation {
 }
 
 impl MemoryAccountant {
+    /// Hand loaded graph residency from an operation to its retention owner.
+    /// Admit first so the live graph is never unfunded. A failed source split
+    /// rolls back this destination admission and leaves the source untouched.
+    pub(crate) fn transfer_vector_load_reservation(
+        &self,
+        bytes: usize,
+        release_reader: impl FnOnce() -> contextdb_core::Result<()>,
+    ) -> contextdb_core::Result<()> {
+        self.try_allocate_for(
+            bytes,
+            "vector_generation",
+            "retain_loaded_graph",
+            "Raise MEMORY_LIMIT to retain the loaded vector generation.",
+        )?;
+        if let Err(error) = release_reader() {
+            self.release(bytes);
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// No budget enforcement. All allocations succeed. Default behavior.
     pub fn no_limit() -> Self {
         Self {
-            limit: AtomicUsize::new(0),
-            used: AtomicUsize::new(0),
+            limit: Arc::new(AtomicUsize::new(0)),
+            used: Arc::new(AtomicUsize::new(0)),
             #[cfg(feature = "test-seams")]
             high_water_for_test: AtomicUsize::new(0),
             #[cfg(feature = "test-seams")]
@@ -515,6 +662,7 @@ impl MemoryAccountant {
             retained_charge_bytes_for_test: AtomicUsize::new(0),
             startup_ceiling: AtomicUsize::new(0),
             has_ceiling: AtomicBool::new(false),
+            writer_identity: OnceLock::new(),
             idle_graph_reclaimer: parking_lot::Mutex::new(None),
             #[cfg(any(test, feature = "test-seams"))]
             underflow_count: AtomicUsize::new(0),
@@ -530,8 +678,8 @@ impl MemoryAccountant {
     /// Set a byte ceiling. Allocations exceeding this fail.
     pub fn with_budget(bytes: usize) -> Self {
         Self {
-            limit: AtomicUsize::new(bytes),
-            used: AtomicUsize::new(0),
+            limit: Arc::new(AtomicUsize::new(bytes)),
+            used: Arc::new(AtomicUsize::new(0)),
             #[cfg(feature = "test-seams")]
             high_water_for_test: AtomicUsize::new(0),
             #[cfg(feature = "test-seams")]
@@ -540,6 +688,7 @@ impl MemoryAccountant {
             retained_charge_bytes_for_test: AtomicUsize::new(0),
             startup_ceiling: AtomicUsize::new(bytes),
             has_ceiling: AtomicBool::new(true),
+            writer_identity: OnceLock::new(),
             idle_graph_reclaimer: parking_lot::Mutex::new(None),
             #[cfg(any(test, feature = "test-seams"))]
             underflow_count: AtomicUsize::new(0),
@@ -557,8 +706,8 @@ impl MemoryAccountant {
     /// into forbidden attempts to cross a ceiling the operator never passed.
     pub(crate) fn with_runtime_budget(bytes: usize) -> Self {
         Self {
-            limit: AtomicUsize::new(bytes),
-            used: AtomicUsize::new(0),
+            limit: Arc::new(AtomicUsize::new(bytes)),
+            used: Arc::new(AtomicUsize::new(0)),
             #[cfg(feature = "test-seams")]
             high_water_for_test: AtomicUsize::new(0),
             #[cfg(feature = "test-seams")]
@@ -567,6 +716,7 @@ impl MemoryAccountant {
             retained_charge_bytes_for_test: AtomicUsize::new(0),
             startup_ceiling: AtomicUsize::new(0),
             has_ceiling: AtomicBool::new(false),
+            writer_identity: OnceLock::new(),
             idle_graph_reclaimer: parking_lot::Mutex::new(None),
             #[cfg(any(test, feature = "test-seams"))]
             underflow_count: AtomicUsize::new(0),
@@ -607,29 +757,101 @@ impl MemoryAccountant {
             .unwrap_or(0)
     }
 
+    pub(crate) fn writer_budget(bytes: usize) -> contextdb_core::Result<WriterBudget> {
+        WriterBudget::from_accountant(Arc::new(Self::with_budget(bytes)))
+    }
+    pub(crate) fn writer_no_limit() -> contextdb_core::Result<WriterBudget> {
+        WriterBudget::from_accountant(Arc::new(Self::no_limit()))
+    }
+    fn exclusive_activation(&self) -> Option<usize> {
+        let identity = self.writer_identity.get().copied()?;
+        ACTIVATING_WRITER.with(|slot| slot.get().filter(|(id, _)| *id == identity).map(|(_, bytes)| bytes))
+    }
+    fn writer_admission(&self) -> WriterAdmission {
+        if let Some(native_bytes) = self.exclusive_activation() {
+            return WriterAdmission { _gate: None, native_bytes };
+        }
+        let gate = PROCESS_WRITER_BUDGET_DOMAIN.read();
+        let native_bytes = if self.writer_identity.get().is_some() {
+            gate.native.as_ref().map_or(0, |runtime| runtime.reservation.bytes)
+        } else { 0 };
+        WriterAdmission { _gate: Some(gate), native_bytes }
+    }
+    // Exclusive activation validates ALL live records and admits the requesting
+    // build's complete local peak before publishing the one permanent owner.
+    // The closure only changes the existing workspace token/counters.
+    pub(crate) fn activate_resident_insertion_runtime(
+        &self, width: usize, native_bytes: usize, old_workspace: usize, complete_peak: usize,
+        admit_workspace: impl FnOnce() -> contextdb_core::Result<()>,
+    ) -> contextdb_core::Result<bool> {
+        let identity = self.writer_identity.get().copied()
+            .expect("resident insertion requires a writer budget");
+        let mut domain = PROCESS_WRITER_BUDGET_DOMAIN.write();
+        if domain.native.is_some() { return Ok(false); }
+        let mut next = domain.writers.as_deref();
+        while let Some(record) = next {
+            let limit = record.limit.load(Ordering::SeqCst);
+            let used = record.used.load(Ordering::SeqCst);
+            // Activation has no private transition allowance on other writers.
+            let releasing = if record.identity == identity { old_workspace } else { 0 };
+            let requested = if record.identity == identity { complete_peak } else { 0 };
+            let local = used.checked_sub(releasing)
+                .and_then(|bytes| bytes.checked_add(requested))
+                .ok_or_else(|| contextdb_core::Error::Other("runtime activation envelope overflow".into()))?;
+            let envelope = writer_headroom(limit, local, 0, 0, native_bytes);
+            if envelope.combined_used.is_none() {
+                return Err(contextdb_core::Error::Other("runtime activation combined size overflow".into()));
+            }
+            if !envelope.within_limit { return Ok(false); }
+            next = record.next.as_deref();
+        }
+        let previous = ACTIVATING_WRITER.with(|slot| slot.replace(Some((identity, native_bytes))));
+        let scope = ActivationScope(previous);
+        admit_workspace()?;
+        drop(scope);
+        domain.native = Some(ResidentInsertionRuntime {
+            width, funder_identity: identity,
+            reservation: ProcessNativeReservation { bytes: native_bytes },
+        });
+        // Drop the exclusive gate before bodies, spawn, joins, export or callbacks.
+        drop(domain);
+        Ok(true)
+    }
+
+    /// A fit probe may replace its own workspace, but must subtract the
+    /// retained process debit after returning only that workspace's credit.
+    pub(crate) fn available_after_releasing(&self, bytes: usize) -> Option<usize> {
+        let admission = self.writer_admission();
+        writer_headroom(self.limit.load(Ordering::SeqCst), self.used.load(Ordering::SeqCst),
+            bytes, self.private_transition_headroom(), admission.native_bytes).available
+    }
+
     /// Attempt to allocate bytes. CAS-based, no TOCTOU.
     pub fn try_allocate(&self, bytes: usize) -> contextdb_core::Result<()> {
         if bytes == 0 {
             return Ok(());
         }
 
+        let admission = self.writer_admission();
+        #[cfg(test)]
+        let mut admission = admission;
         loop {
             let used = self.used.load(Ordering::SeqCst);
             let published = self.limit.load(Ordering::SeqCst);
             let limit = if published == 0 {
                 0
             } else {
-                published.saturating_add(self.private_transition_headroom())
+                published.checked_add(self.private_transition_headroom()).unwrap_or(usize::MAX)
             };
             if limit != 0 {
-                let available = limit.saturating_sub(used);
+                let available = writer_headroom(limit, used, 0, 0, admission.native_bytes).available.unwrap_or(usize::MAX - used);
                 if bytes > available {
                     // TOCTOU window: `limit` was loaded above; a concurrent
                     // `set_budget(None)` may have cleared it since. The re-check
                     // below closes that window. In test builds a hook lets a
                     // unit test land exactly that interleaving deterministically.
                     #[cfg(test)]
-                    self.fire_alloc_race_hook();
+                    if self.fire_accounting_hook_without_gate(&mut admission, false) { continue; }
                     if self.limit.load(Ordering::SeqCst) != published {
                         continue;
                     }
@@ -662,7 +884,7 @@ impl MemoryAccountant {
             // here, and the CAS below still runs. In test builds a hook lands
             // exactly that order deterministically.
             #[cfg(test)]
-            self.fire_admission_race_hook();
+            if self.fire_accounting_hook_without_gate(&mut admission, true) { continue; }
             if self
                 .used
                 .compare_exchange(used, next, Ordering::SeqCst, Ordering::SeqCst)
@@ -683,10 +905,10 @@ impl MemoryAccountant {
                 let admissible = if current == 0 {
                     0
                 } else {
-                    current.saturating_add(self.private_transition_headroom())
+                    current.checked_add(self.private_transition_headroom()).unwrap_or(usize::MAX)
                 };
-                if admissible != 0 && next > admissible {
-                    self.release(bytes);
+                if writer_headroom(admissible, used, 0, 0, admission.native_bytes).available.is_some_and(|available| bytes > available) {
+                    self.release_under_admission(bytes);
                     continue;
                 }
                 #[cfg(feature = "test-seams")]
@@ -710,6 +932,9 @@ impl MemoryAccountant {
         operation: &str,
         hint: &str,
     ) -> contextdb_core::Result<()> {
+        let admission = self.writer_admission();
+        #[cfg(test)]
+        let mut admission = admission;
         loop {
             let used = self.used.load(Ordering::SeqCst);
             let others = used
@@ -719,18 +944,15 @@ impl MemoryAccountant {
             let limit = if published == 0 {
                 0
             } else {
-                published.saturating_add(self.private_transition_headroom())
+                published.checked_add(self.private_transition_headroom()).unwrap_or(usize::MAX)
             };
-            let available = if limit == 0 {
-                usize::MAX - others
-            } else {
-                limit.saturating_sub(others)
-            };
+            let available = writer_headroom(limit, used, old_bytes, 0, admission.native_bytes).available
+                .unwrap_or(usize::MAX - others);
             // A shrinking phase always remains admitted, including after a
             // budget is narrowed below already-retained ownership.
             if new_bytes > old_bytes && new_bytes > available {
                 #[cfg(test)]
-                self.fire_alloc_race_hook();
+                if self.fire_accounting_hook_without_gate(&mut admission, false) { continue; }
                 if self.limit.load(Ordering::SeqCst) != published {
                     continue;
                 }
@@ -738,11 +960,8 @@ impl MemoryAccountant {
                     subsystem: subsystem.to_owned(),
                     operation: operation.to_owned(),
                     requested_bytes: new_bytes - old_bytes,
-                    available_bytes: if limit == 0 {
-                        usize::MAX - used
-                    } else {
-                        limit.saturating_sub(used)
-                    },
+                    available_bytes: writer_headroom(limit, used, 0, 0, admission.native_bytes).available
+                        .unwrap_or(usize::MAX - used),
                     budget_limit_bytes: if limit == 0 { usize::MAX } else { limit },
                     hint: hint.to_owned(),
                 });
@@ -758,7 +977,7 @@ impl MemoryAccountant {
                 }
             })?;
             #[cfg(test)]
-            self.fire_admission_race_hook();
+            if self.fire_accounting_hook_without_gate(&mut admission, true) { continue; }
             if self
                 .used
                 .compare_exchange(used, next, Ordering::SeqCst, Ordering::SeqCst)
@@ -773,10 +992,10 @@ impl MemoryAccountant {
             let admissible = if current == 0 {
                 0
             } else {
-                current.saturating_add(self.private_transition_headroom())
+                current.checked_add(self.private_transition_headroom()).unwrap_or(usize::MAX)
             };
-            if new_bytes > old_bytes && admissible != 0 && next > admissible {
-                self.release(new_bytes - old_bytes);
+            if new_bytes > old_bytes && writer_headroom(admissible, used, old_bytes, 0, admission.native_bytes).available.is_some_and(|available| new_bytes > available) {
+                self.release_under_admission(new_bytes - old_bytes);
                 continue;
             }
             #[cfg(feature = "test-seams")]
@@ -809,10 +1028,13 @@ impl MemoryAccountant {
     /// were charged what stopped an import that outgrew a declared
     /// MEMORY_LIMIT was the machine's out-of-memory kill, not the engine.
     pub fn charge_retained(&self, bytes: usize) {
-        if bytes == 0 {
-            return;
-        }
-        self.used.fetch_add(bytes, Ordering::SeqCst);
+        let _admission = self.writer_admission();
+        self.charge_retained_under_admission(bytes);
+    }
+    fn charge_retained_under_admission(&self, bytes: usize) {
+        if bytes == 0 { return; }
+        self.used.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| used.checked_add(bytes))
+            .expect("retained ownership cannot overflow its counter");
         #[cfg(feature = "test-seams")]
         {
             self.high_water_for_test
@@ -885,6 +1107,10 @@ impl MemoryAccountant {
 
     /// Return freed bytes to the budget.
     pub fn release(&self, bytes: usize) {
+        let _admission = self.writer_admission();
+        self.release_under_admission(bytes);
+    }
+    fn release_under_admission(&self, bytes: usize) {
         if bytes == 0 {
             return;
         }
@@ -914,6 +1140,7 @@ impl MemoryAccountant {
     /// Runtime budget adjustment. None removes limit.
     /// Returns Err if new limit exceeds startup ceiling.
     pub fn set_budget(&self, limit: Option<usize>) -> contextdb_core::Result<()> {
+        let _admission = self.writer_admission();
         if self.has_ceiling.load(Ordering::SeqCst) {
             let ceiling = self.startup_ceiling.load(Ordering::SeqCst);
             match limit {
@@ -976,8 +1203,18 @@ impl MemoryAccountant {
         self.retained_charge_bytes_for_test.load(Ordering::SeqCst)
     }
 
+    pub(crate) fn writer_envelope_usage(&self) -> contextdb_core::Result<(usize, usize, usize)> {
+        let admission = self.writer_admission();
+        let used = self.used.load(Ordering::SeqCst);
+        let envelope = writer_headroom(self.limit.load(Ordering::SeqCst), used, 0, 0, admission.native_bytes);
+        let combined = envelope.combined_used
+            .ok_or_else(|| contextdb_core::Error::Other("writer report combined size overflow".into()))?;
+        Ok((used, admission.native_bytes, combined))
+    }
+
     /// Snapshot of current memory state.
     pub fn usage(&self) -> MemoryUsage {
+        let admission = self.writer_admission();
         let limit = match self.limit.load(Ordering::SeqCst) {
             0 => None,
             bytes => Some(bytes),
@@ -990,7 +1227,7 @@ impl MemoryAccountant {
         MemoryUsage {
             limit,
             used,
-            available: limit.map(|limit| limit.saturating_sub(used)),
+            available: writer_headroom(limit.unwrap_or(0), used, 0, 0, admission.native_bytes).available,
             startup_ceiling,
         }
     }
@@ -1157,6 +1394,8 @@ impl contextdb_vector::MemoryBudget for MemoryAccountant {
     ) -> contextdb_core::Result<()> {
         let mut transition =
             self.transition_reservation(old_bytes, new_bytes, subsystem, operation, hint);
+        // Activation's short exclusive scope never invokes a reclaimer.
+        if self.exclusive_activation().is_some() { return transition; }
         // Workspace growth preserves ordinary admission's cache give-back:
         // these pages can be filled again and their release is independent
         // of the caller's still-held old reservation.
@@ -1217,6 +1456,20 @@ impl contextdb_core::read_memory::ReadMemoryBudget for MemoryAccountant {
 
 #[cfg(test)]
 impl MemoryAccountant {
+    // The existing hooks can join a thread that mutates this accountant.
+    // Release the shared gate before invoking them and refresh the native
+    // snapshot afterward. If activation changed it, price again before CAS.
+    // Exclusive activation performs only the counter/token transition and
+    // never calls these arbitrary test callbacks while holding its gate.
+    fn fire_accounting_hook_without_gate(&self, admission: &mut WriterAdmission, success: bool) -> bool {
+        if self.exclusive_activation().is_some() { return false; }
+        let native_before = admission.native_bytes;
+        drop(admission._gate.take());
+        if success { self.fire_admission_race_hook(); } else { self.fire_alloc_race_hook(); }
+        *admission = self.writer_admission();
+        admission.native_bytes != native_before
+    }
+
     /// Test-build only: install the one-shot interleaving hook.
     fn set_alloc_race_hook(&self, hook: Box<dyn Fn() + Send + Sync>) {
         *self.alloc_race_hook.0.lock().unwrap() = Some(hook);

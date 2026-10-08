@@ -53,6 +53,10 @@ fn copied_body_bytes(entries: &[VectorEntry]) -> usize {
 
 #[test]
 fn selected_generation_materialization_preserves_all_representations_and_snapshot_intervals() {
+    let executing_accountant = Arc::new(super::tests::CountingMemoryBudget::default());
+    let mut executing_admission = VectorCopyAdmission::new(executing_accountant.clone());
+
+    let declared_column_owner = Arc::new(super::tests::CountingMemoryBudget::default());
     for quantization in [
         VectorQuantization::F32,
         VectorQuantization::SQ8,
@@ -61,7 +65,14 @@ fn selected_generation_materialization_preserves_all_representations_and_snapsho
         let store = VectorStore::default();
         let index = VectorIndexRef::new("selection_items", "embedding");
         let key = VectorPartitionKey::unpartitioned();
-        store.register_index(index.clone(), 32, quantization);
+        store
+            .register_index(
+                index.clone(),
+                32,
+                quantization,
+                declared_column_owner.clone(),
+            )
+            .unwrap();
         // Scalar repeats retain distinct identities; tx 33 changes the body
         // and its quantized bounds. Row 2 is deleted, row 3 has a future
         // tombstone, and row 4 lies beyond the tested generation frontier.
@@ -91,7 +102,21 @@ fn selected_generation_materialization_preserves_all_representations_and_snapsho
             true,
         ));
         history.push(retained_entry(&index, RowId(4), TxId(66), None, false));
-        store.apply_inserts(history);
+        store
+            .apply_inserts(
+                history,
+                VectorCopyAdmission::new(executing_accountant.clone()),
+            )
+            .unwrap();
+        let state = store.partition_state(&index, &key).unwrap();
+        let executing_workspace = store
+            .reserve_workspace(
+                executing_accountant.clone(),
+                state.generation_copy_bytes(&index, state.vectors.read().entries.len()),
+                "generation_selection_fixture",
+                "fund fixture materialization with its executing accountant",
+            )
+            .unwrap();
         for snapshot in [0, 1, 4, 12, 32, 33, 65, 70] {
             for after_lsn in [
                 None,
@@ -101,7 +126,12 @@ fn selected_generation_materialization_preserves_all_representations_and_snapsho
                 Some(Lsn(99)),
             ] {
                 let full = store
-                    .entries_for_partition_at_snapshot(&index, &key, SnapshotId(snapshot))
+                    .entries_for_partition_at_snapshot(
+                        &index,
+                        &key,
+                        SnapshotId(snapshot),
+                        &executing_workspace,
+                    )
                     .unwrap();
                 let expected = full
                     .iter()
@@ -117,6 +147,7 @@ fn selected_generation_materialization_preserves_all_representations_and_snapsho
                         &key,
                         SnapshotId(snapshot),
                         after_lsn,
+                        &executing_workspace,
                     )
                     .unwrap();
                 assert_bit_identical(&selected, &expected);
@@ -127,6 +158,7 @@ fn selected_generation_materialization_preserves_all_representations_and_snapsho
                         &key,
                         SnapshotId(snapshot),
                         after_lsn,
+                        &mut executing_admission,
                     )
                     .unwrap();
                 assert_eq!(full.len(), raw_count);
@@ -135,10 +167,16 @@ fn selected_generation_materialization_preserves_all_representations_and_snapsho
             }
         }
         let full = store
-            .entries_for_partition_at_snapshot(&index, &key, SnapshotId(65))
+            .entries_for_partition_at_snapshot(&index, &key, SnapshotId(65), &executing_workspace)
             .unwrap();
         let selected = store
-            .entries_for_partition_generation_at_snapshot(&index, &key, SnapshotId(65), None)
+            .entries_for_partition_generation_at_snapshot(
+                &index,
+                &key,
+                SnapshotId(65),
+                None,
+                &executing_workspace,
+            )
             .unwrap();
         assert_eq!(full.len(), 67);
         assert_eq!(selected.len(), 2);
@@ -159,7 +197,13 @@ fn selected_generation_materialization_preserves_all_representations_and_snapsho
             assert_eq!(selected[0].vector[1].to_bits(), (-0.0f32).to_bits());
         }
         let before_change = store
-            .entries_for_partition_generation_at_snapshot(&index, &key, SnapshotId(32), None)
+            .entries_for_partition_generation_at_snapshot(
+                &index,
+                &key,
+                SnapshotId(32),
+                None,
+                &executing_workspace,
+            )
             .unwrap();
         assert_eq!(before_change[0].created_tx, TxId(32));
         assert_eq!(before_change[0].deleted_tx, None);
@@ -168,7 +212,9 @@ fn selected_generation_materialization_preserves_all_representations_and_snapsho
             selected[0].vector[3].to_bits()
         );
         // Selection did not prune or rewrite any retained membership.
-        let retained = store.entries_for_partition(&index, &key).unwrap();
+        let retained = store
+            .entries_for_partition(&index, &key, &mut executing_admission)
+            .unwrap();
         assert_eq!(retained.len(), 68);
         assert_eq!(retained[31].deleted_tx, Some(TxId(33)));
         assert_eq!(retained[66].deleted_tx, Some(TxId(70)));
@@ -184,15 +230,39 @@ fn selected_generation_materialization_preserves_all_representations_and_snapsho
 
 #[test]
 fn selected_generation_refuses_inconsistent_metadata_before_body_materialization() {
+    let executing_accountant = Arc::new(super::tests::CountingMemoryBudget::default());
+    let mut executing_admission = VectorCopyAdmission::new(executing_accountant.clone());
+
+    let declared_column_owner = Arc::new(super::tests::CountingMemoryBudget::default());
     let store = VectorStore::default();
     let index = VectorIndexRef::new("selection_items", "embedding");
     let key = VectorPartitionKey::unpartitioned();
-    store.register_index(index.clone(), 32, VectorQuantization::F32);
-    store.apply_inserts(vec![retained_entry(&index, RowId(1), TxId(1), None, false)]);
+    store
+        .register_index(
+            index.clone(),
+            32,
+            VectorQuantization::F32,
+            declared_column_owner.clone(),
+        )
+        .unwrap();
+    store
+        .apply_inserts(
+            vec![retained_entry(&index, RowId(1), TxId(1), None, false)],
+            VectorCopyAdmission::new(executing_accountant.clone()),
+        )
+        .unwrap();
     let state = store.partition_state(&index, &key).unwrap();
+    let executing_workspace = store
+        .reserve_workspace(
+            executing_accountant.clone(),
+            state.generation_copy_bytes(&index, state.vectors.read().entries.len()),
+            "generation_selection_fixture",
+            "fund fixture materialization with its executing accountant",
+        )
+        .unwrap();
     state.raw_directory.write().clear();
     assert!(matches!(
-        store.entries_for_partition_generation_at_snapshot(&index, &key, SnapshotId(1), None),
+        store.entries_for_partition_generation_at_snapshot(&index, &key, SnapshotId(1), None, &executing_workspace),
         Err(Error::StoreCorrupted { reason, .. })
             if reason == "generation selection differs from its raw directory"
     ));

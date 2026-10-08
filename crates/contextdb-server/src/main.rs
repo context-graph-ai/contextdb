@@ -299,7 +299,8 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     }
     // Retain publication ordering through the established constructor.
     let server = publish_then_activate(&args, db, &endpoint, |db, endpoint, tenant| {
-        Ok(SyncServer::new(db, endpoint, tenant))
+        let read_host = db.declared_read_request_provider();
+        SyncServer::new_with_read_budget_provider(db, endpoint, tenant, read_host)
     })?;
 
     let shutdown = Arc::new(AtomicBool::new(false));

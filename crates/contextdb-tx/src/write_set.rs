@@ -302,7 +302,11 @@ pub fn row_matches_delete_predicates(
 }
 
 pub trait WriteSetApplicator: Send + Sync {
-    fn apply(&self, ws: &WriteSet) -> Result<()>;
+    fn apply(
+        &self,
+        ws: &WriteSet,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<()>;
     fn new_row_id(&self) -> RowId;
     /// Return the already prepared root after successful durable apply. All
     /// fallible reservation/root creation belongs to prepare/apply; a failure
@@ -346,8 +350,12 @@ impl WriteSetApplicator for Box<dyn WriteSetApplicator> {
         (**self).publication_handle()
     }
 
-    fn apply(&self, ws: &WriteSet) -> Result<()> {
-        (**self).apply(ws)
+    fn apply(
+        &self,
+        ws: &WriteSet,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<()> {
+        (**self).apply(ws, read_memory)
     }
 
     fn new_row_id(&self) -> RowId {

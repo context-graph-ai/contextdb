@@ -3,6 +3,9 @@
 //! The encoder is intentionally route-neutral: it accepts query and page values, never a file
 //! handle, owner channel, or route. The local protocol layer owns framing and byte-level fixtures.
 
+pub(crate) mod cursor_observation;
+pub(crate) use cursor_observation::{decode_observed_cursor_page, encode_observed_cursor_page};
+
 use crate::local_transport::{
     preflight_canonical_query_result, preflight_cursor_page_payload,
     preflight_metadata_page_payload,
@@ -40,6 +43,7 @@ pub struct CanonicalQueryTrace {
     /// in-process `.explain` prints.
     #[serde(default)]
     pub maintained_count: Option<CanonicalMaintainedCountDisclosure>,
+    pub groups: Vec<crate::database::GroupDisclosure>,
 }
 
 /// `used` is the maintained count serving the answer; `false` with `declared`
@@ -362,6 +366,7 @@ impl From<&QueryTrace> for CanonicalQueryTrace {
             query_vector_source: trace.query_vector_source.clone(),
             vector_search: trace.vector_search.as_ref().map(Into::into),
             rows_examined: trace.rows_examined,
+            groups: trace.groups.to_vec(),
             maintained_count: trace.maintained_count.as_deref().map(|disclosure| {
                 use crate::maintained_counts::MaintainedCountDisclosure;
                 let (used, declared, table, columns, already_declared) = match disclosure {
@@ -483,7 +488,7 @@ fn encoding_error_from_transport(
 ) -> ReadEncodingError {
     match error {
         crate::local_transport::LocalTransportError::Payload(
-            crate::local_transport::PayloadViolation::MemoryCeilingExceeded { ceiling },
+            crate::local_transport::PayloadViolation::MemoryCeilingExceeded { ceiling, .. },
         ) => ReadEncodingError::MemoryCeilingExceeded { ceiling },
         _ => ReadEncodingError::InvalidPayload,
     }

@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+use crate::owned_cursor_page::OwnedCursorPage;
 use crate::direct_file_reader::{
     DirectMetadataBody as MetadataBody, DirectMetadataRequest as MetadataRequest,
 };
@@ -15,6 +16,7 @@ use crate::executor::bounded_read_test_support::{ExecutionProbe, TestSourceTouch
 use crate::plugin::{CorePlugin, DatabasePlugin};
 use crate::read_progress::{ReadProgressObserver, with_progress_observer};
 use crate::{Database, QueryResult};
+use crate::database::OwnedQueryResult;
 use contextdb_core::read_contract::ChannelAddress;
 #[cfg(feature = "test-seams")]
 use contextdb_core::read_contract::DeadlineClock;
@@ -1837,11 +1839,15 @@ struct LiveCursorExecution {
 }
 
 impl OwnedCursorExecution for LiveCursorExecution {
+    fn work_observation(&mut self) -> Result<Option<crate::executor::CursorObservation>> {
+        self.handle.work_observation().map_err(read_error)
+    }
+
     fn fetch(
         &mut self,
         rows: Option<NonZeroUsize>,
         cancellation: &OwnerReadCancellation,
-    ) -> Result<CursorPage> {
+    ) -> Result<ObservedCursorPage> {
         #[cfg(feature = "test-seams")]
         let probe = self.kernel_observer.as_ref().map(|observer| {
             observed_kernel_probe(
@@ -1862,7 +1868,14 @@ impl OwnedCursorExecution for LiveCursorExecution {
         self.database.publish_authoritative_read(
             &fetched.publication,
             |error| error,
-            || Ok(fetched.page),
+            || {
+                Ok(ObservedCursorPage {
+                    cancelled: false,
+                    page: fetched.page,
+                    observation: fetched.observation,
+                    owner_trace_charge: None,
+                })
+            },
         )
     }
 
@@ -2283,6 +2296,16 @@ impl ReadSession {
     /// see `a_read_only_session_pays_nothing_at_the_writers_retention_door`.
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
+    pub fn file_cache_index_charge_for_test(&self) -> Option<(usize, usize)> {
+        match self.state.as_ref() {
+            ReadSessionState::DirectFile(reader) => Some(
+                crate::direct_file_reader::test_seams::cache_index_charge_for_test(reader)),
+            _ => None,
+        }
+    }
+
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
     pub fn file_retained_charge_bytes_for_test(&self) -> Option<usize> {
         match self.state.as_ref() {
             ReadSessionState::DirectFile(reader) => {
@@ -2664,7 +2687,7 @@ impl ReadSession {
             })
         });
         contextdb_core::find_attribution::finish();
-        executed
+        executed.map(OwnedQueryResult::into_public)
     }
 
     fn execute_within_route(
@@ -2672,13 +2695,14 @@ impl ReadSession {
         sql: &str,
         params: &HashMap<String, Value>,
         cancellation: &OwnerReadCancellation,
-    ) -> Result<QueryResult> {
+    ) -> Result<OwnedQueryResult> {
         match self.state.as_ref() {
             ReadSessionState::LiveDatabase(database) => {
                 let executed = crate::executor::execute_bounded(
                     database,
                     sql,
                     params,
+                    database.declared_read_request_provider().request_budget()?,
                     self.options.limits,
                     self.session_clock(),
                     cancellation.clone(),
@@ -2701,6 +2725,9 @@ impl ReadSession {
                     reader.execution_target().as_ref(),
                     sql,
                     params,
+                    reader
+                        .request_read_memory()
+                        .map_err(|error| direct_error(Path::new(""), error))?,
                     self.options.limits,
                     self.session_clock(),
                     cancellation.clone(),
@@ -2711,6 +2738,11 @@ impl ReadSession {
                 reader.publish_bounded_result(&executed.publication, executed.result)
             }
             ReadSessionState::OwnerChannel(owner) => {
+                let receiving_memory = crate::read_image_memory::ImageMemory::new(Some(
+                    usize::try_from(self.options.limits.memory)
+                        .unwrap_or(usize::MAX)
+                        .min(self.options.memory_limit.unwrap_or(usize::MAX)),
+                ));
                 let responses = owner.ask(
                     self.options.limits,
                     crate::local_transport::LocalRequest::Query {
@@ -2721,7 +2753,7 @@ impl ReadSession {
                     #[cfg(feature = "test-seams")]
                     self.observer.as_ref(),
                 )?;
-                published_query_result(responses, self.options.limits)
+                published_query_result(responses, self.options.limits, receiving_memory)
             }
         }
     }
@@ -2800,6 +2832,7 @@ impl ReadSession {
                 );
                 let answer = crate::read_image::project_metadata_from_database(
                     database,
+                    database.declared_read_request_provider().request_budget()?,
                     request,
                     self.options.limits,
                     clock,
@@ -2995,16 +3028,35 @@ impl ReadSession {
                 if let Some(observer) = self.observer.as_ref() {
                     observer.observe_event(ReadSessionEvent::OwnerCursorHandoffStarted);
                 }
-                let responses = owner.ask(
+                let retained_memory = crate::read_image_memory::ImageMemory::new(Some(
+                    usize::try_from(self.options.limits.memory)
+                        .unwrap_or(usize::MAX)
+                        .min(self.options.memory_limit.unwrap_or(usize::MAX)),
+                ));
+                // The request owns a statement clone throughout the reply.
+                // Admit it into this same owner before making that clone.
+                let request_bytes = crate::executor::bounded::cursor_statement_bytes(sql, params)
+                    .map_err(read_error)?;
+                retained_memory.reserve(request_bytes)?;
+                let request_charge = OwnerTraceCharge {
+                    memory: Arc::clone(&retained_memory),
+                    bytes: request_bytes,
+                };
+                let responses = owner.ask_with_cursor_memory(
                     self.options.limits,
                     crate::local_transport::LocalRequest::CursorOpen {
                         statement: sql.to_owned(),
                         params: params.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
                     },
                     Some(cancellation),
+                    Some(cursor_receive_allowance(
+                        self.options.limits.memory,
+                        &retained_memory,
+                    )),
                     #[cfg(feature = "test-seams")]
                     self.observer.as_ref(),
                 )?;
+                drop(request_charge);
                 let opened_cursor_id = responses.iter().find_map(|response| match response {
                     crate::local_transport::LocalResponse::CursorOpened { opened } => {
                         Some(opened.cursor_id)
@@ -3014,6 +3066,7 @@ impl ReadSession {
                 let published = match published_cursor_open(
                     responses,
                     self.options.limits,
+                    &retained_memory,
                     #[cfg(feature = "test-seams")]
                     self.observer.as_ref(),
                 ) {
@@ -3035,6 +3088,8 @@ impl ReadSession {
                 let PublishedOwnerCursor {
                     cursor_id,
                     first_page,
+                    observation,
+                    owner_trace_charge,
                     snapshot,
                     physical_identity,
                     limits,
@@ -3072,17 +3127,46 @@ impl ReadSession {
                             let retained_bytes =
                                 crate::executor::bounded::cursor_statement_bytes(sql, params)
                                     .map_err(read_error)?;
-                            let retained_memory = crate::read_image_memory::ImageMemory::new(Some(
-                                usize::try_from(limits.memory).unwrap_or(usize::MAX),
-                            ));
+                            if retained_bytes
+                                .checked_add(retained_memory.held())
+                                .is_none_or(|bytes| bytes as u64 > limits.memory)
+                            {
+                                return Err(read_encoding_error(
+                                    crate::read_contract::ReadEncodingError::MemoryCeilingExceeded {
+                                        ceiling: limits.memory,
+                                    }));
+                            }
                             retained_memory.reserve(retained_bytes)?;
+                            let mut statement_charge = OwnerTraceCharge {
+                                memory: Arc::clone(&retained_memory),
+                                bytes: retained_bytes,
+                            };
+                            let retained_sql = sql.to_owned();
+                            let retained_params = params.clone();
+                            let actual_statement_bytes =
+                                crate::executor::bounded::cursor_statement_bytes(
+                                    &retained_sql,
+                                    &retained_params,
+                                )
+                                .map_err(read_error)?;
+                            if actual_statement_bytes > retained_bytes {
+                                return Err(Error::Other(
+                                    "cursor statement exceeded its admitted clone allowance"
+                                        .to_string(),
+                                ));
+                            }
+                            retained_memory.release(retained_bytes - actual_statement_bytes);
+                            statement_charge.bytes = 0;
                             Some(OwnerCursorContinuation {
-                                retained_memory,
+                                retained_memory: Arc::clone(&retained_memory),
+                                retained_statement_bytes: actual_statement_bytes,
+                                discarded_rows_examined: 0,
+                                failed_open_observation: None,
                                 path: owner.path.clone(),
                                 registration: Some(registration),
                                 config,
-                                sql: sql.to_owned(),
-                                params: params.clone(),
+                                sql: retained_sql,
+                                params: retained_params,
                                 delivered: first_page.rows.len(),
                                 cursor: None,
                                 skipped: 0,
@@ -3104,24 +3188,48 @@ impl ReadSession {
                         return Err(error);
                     }
                 };
+                let owner_groups =
+                    match OwnerGroupBaseline::capture(&observation.trace, &retained_memory) {
+                        Ok(groups) => groups,
+                        Err(error) => {
+                            let _ = owner.ask(
+                                limits,
+                                crate::local_transport::LocalRequest::CursorClose { cursor_id },
+                                None,
+                                #[cfg(feature = "test-seams")]
+                                self.observer.as_ref(),
+                            );
+                            return Err(error);
+                        }
+                    };
                 let complete = !first_page.has_more;
                 if !complete {
                     self.resources
                         .active_cursors
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
+                let owner_rows_examined = observation.rows_examined;
+                let (trace, observation) = take_cursor_observation(observation);
                 let cursor = ReadCursor {
+                    trace,
+                    observation,
+                    owner_trace_charge: Some(owner_trace_charge),
                     state: Arc::new(SuspendedReadCursorState {
                         route: self.route,
                         session: Arc::clone(&self.state),
                         resources: Arc::clone(&self.resources),
                         progress: self.progress.as_ref().map(Arc::clone),
-                        first_page,
+                        first_page: first_page.into_public(),
                         execution: Mutex::new(Box::new(OwnerCursorExecution {
                             session: Arc::clone(&self.state),
                             resources: Arc::clone(&self.resources),
                             limits,
                             cursor_id,
+                            owner_rows_examined,
+                            owner_groups,
+                            cancelled_observation: None,
+                            cancelled_trace_charge: None,
+                            retained_memory: Arc::clone(&retained_memory),
                             continuation: if complete { None } else { continuation },
                             last_used_ms: clock.now_ms(),
                             clock,
@@ -3159,13 +3267,17 @@ impl ReadSession {
                 self.resources
                     .active_cursors
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let (trace, observation) = take_cursor_observation(opened.first_page.observation);
                 Ok(ReadCursor {
+                    trace,
+                    observation,
+                    owner_trace_charge: None,
                     state: Arc::new(SuspendedReadCursorState {
                         route: self.route,
                         session: Arc::clone(&self.state),
                         resources: Arc::clone(&self.resources),
                         progress: self.progress.as_ref().map(Arc::clone),
-                        first_page: opened.first_page.page,
+                        first_page: opened.first_page.page.into_public(),
                         execution: Mutex::new(Box::new(DirectCursorExecution {
                             cursor: opened.cursor,
                             resources: Arc::clone(&self.resources),
@@ -3194,6 +3306,7 @@ impl ReadSession {
                     Arc::clone(database),
                     sql,
                     params,
+                    database.declared_read_request_provider().request_budget()?,
                     self.options.limits,
                     self.session_clock(),
                     cancellation.clone(),
@@ -3206,13 +3319,17 @@ impl ReadSession {
                     &publication,
                     |error| error,
                     || {
+                        let (trace, observation) = take_cursor_observation(opened.observation);
                         Ok(ReadCursor {
+                            trace,
+                            observation,
+                            owner_trace_charge: None,
                             state: Arc::new(SuspendedReadCursorState {
                                 route: self.route,
                                 session: Arc::clone(&self.state),
                                 resources: Arc::clone(&self.resources),
                                 progress: self.progress.as_ref().map(Arc::clone),
-                                first_page: opened.first_page,
+                                first_page: opened.first_page.into_public(),
                                 execution: Mutex::new(Box::new(LiveCursorExecution {
                                     database: Arc::clone(database),
                                     handle: opened.cursor,
@@ -3517,6 +3634,24 @@ impl OwnerRoute {
         cancellation: Option<&OwnerReadCancellation>,
         #[cfg(feature = "test-seams")] observer: Option<&Arc<dyn ReadSessionTestObserver>>,
     ) -> Result<Vec<crate::local_transport::LocalResponse>> {
+        self.ask_with_cursor_memory(
+            limits,
+            request,
+            cancellation,
+            None,
+            #[cfg(feature = "test-seams")]
+            observer,
+        )
+    }
+
+    fn ask_with_cursor_memory(
+        &self,
+        limits: ReadLimits,
+        request: crate::local_transport::LocalRequest,
+        cancellation: Option<&OwnerReadCancellation>,
+        cursor_memory: Option<u64>,
+        #[cfg(feature = "test-seams")] observer: Option<&Arc<dyn ReadSessionTestObserver>>,
+    ) -> Result<Vec<crate::local_transport::LocalResponse>> {
         self.resources.note_channel_operation();
         let progress = crate::read_progress::observer_for_this_read();
         let mut client = self.client.lock().expect("selected owner channel");
@@ -3527,10 +3662,11 @@ impl OwnerRoute {
                 observer.observe_event(ReadSessionEvent::ResponseFrameReceived { terminal });
             })));
         }
-        let answered = wait_for_local_answer(client.request_watching(
+        let answered = wait_for_local_answer(client.request_watching_under_cursor_memory(
             crate::local_transport::LocalRequestEnvelope { limits, request },
             progress.as_ref(),
             cancellation,
+            cursor_memory,
         ));
         #[cfg(feature = "test-seams")]
         client.observe_response_frames_for_test(None);
@@ -3848,7 +3984,8 @@ fn read_encoding_error(error: crate::read_contract::ReadEncodingError) -> Error 
 fn published_query_result(
     responses: Vec<crate::local_transport::LocalResponse>,
     limits: ReadLimits,
-) -> Result<QueryResult> {
+    receiving_memory: Arc<crate::read_image_memory::ImageMemory>,
+) -> Result<OwnedQueryResult> {
     use crate::local_transport::{OrdinaryResultReceiver, ResultReceiveOutcome};
     let mut receiver =
         OrdinaryResultReceiver::with_effective_ceilings(limits.result_bytes, limits.memory)
@@ -3872,10 +4009,31 @@ fn published_query_result(
         }
     }
     let bytes = published.ok_or_else(|| Error::ReadFailure(owner_disconnected()))?;
-    let canonical =
-        crate::read_contract::decode_query_result_under_memory_ceiling(&bytes, limits.memory)
+    let available = cursor_receive_allowance(limits.memory, &receiving_memory)
+        .saturating_sub(bytes.len() as u64);
+    let (decoded_bytes, trace_bytes) =
+        crate::local_transport::query_result_allocation_bytes(&bytes, available)
             .map_err(read_encoding_error)?;
-    restored_query_result(canonical)
+    let admitted = decoded_bytes
+        .checked_add(
+            trace_bytes
+                .checked_mul(2)
+                .ok_or_else(|| Error::Other("query trace memory overflow".into()))?,
+        )
+        .and_then(|bytes| bytes.checked_add(2 * std::mem::size_of::<crate::QueryTrace>()))
+        .ok_or_else(|| Error::Other("query answer memory overflow".into()))?;
+    if admitted as u64 > available {
+        return Err(read_encoding_error(
+            crate::read_contract::ReadEncodingError::MemoryCeilingExceeded {
+                ceiling: limits.memory,
+            },
+        ));
+    }
+    receiving_memory.reserve(admitted)?;
+    let canonical =
+        crate::read_contract::decode_query_result_under_memory_ceiling(&bytes, available)
+            .map_err(read_encoding_error)?;
+    restored_query_result(canonical, receiving_memory)
 }
 
 /// Turn the owner's canonical answer back into the same value an in-process
@@ -3887,8 +4045,28 @@ fn published_query_result(
 /// the channel, not a result to hand back.
 fn restored_query_result(
     canonical: crate::read_contract::CanonicalQueryResult,
-) -> Result<QueryResult> {
-    let physical_plan = known_plan_label(&canonical.trace.physical_plan).ok_or_else(|| {
+    receiving_memory: Arc<crate::read_image_memory::ImageMemory>,
+) -> Result<OwnedQueryResult> {
+    Ok(OwnedQueryResult {
+        result: QueryResult {
+        columns: canonical.columns,
+        rows: canonical.rows,
+        rows_affected: canonical.rows_affected,
+        trace: restored_query_trace(canonical.trace)?,
+        cascade: None,
+        },
+        answer_charge: crate::read_image_memory::AnswerCharge::holding(receiving_memory.clone()),
+        vector_copy_charge: crate::read_image_memory::AnswerCharge::holding(
+            receiving_memory.clone(),
+        ),
+        retained_read_memory: Some(receiving_memory),
+    })
+}
+
+fn restored_query_trace(
+    canonical: crate::read_contract::CanonicalQueryTrace,
+) -> Result<crate::QueryTrace> {
+    let physical_plan = known_plan_label(&canonical.physical_plan).ok_or_else(|| {
         Error::ReadFailure(
             contextdb_core::read_contract::ReadFailure::new(
                 contextdb_core::read_contract::ReadFailureKind::InvalidChannelData,
@@ -3898,7 +4076,6 @@ fn restored_query_result(
         )
     })?;
     let vector_search = canonical
-        .trace
         .vector_search
         .map(crate::database::VectorSearchDisclosure::try_from)
         .transpose()
@@ -3911,39 +4088,30 @@ fn restored_query_result(
                 .expect("invalid channel data accepts canonical empty detail"),
             )
         })?;
-    Ok(QueryResult {
-        columns: canonical.columns,
-        rows: canonical.rows,
-        rows_affected: canonical.rows_affected,
-        trace: crate::database::QueryTrace {
-            physical_plan,
-            index_used: canonical.trace.index_used,
-            predicates_pushed: canonical
-                .trace
-                .predicates_pushed
-                .into_iter()
-                .map(std::borrow::Cow::Owned)
-                .collect(),
-            indexes_considered: canonical
-                .trace
-                .indexes_considered
-                .into_iter()
-                .map(|candidate| crate::database::IndexCandidate {
-                    name: candidate.name,
-                    rejected_reason: std::borrow::Cow::Owned(candidate.rejected_reason),
-                })
-                .collect(),
-            sort_elided: canonical.trace.sort_elided,
-            query_vector_source: canonical.trace.query_vector_source,
-            vector_search,
-            rows_examined: canonical.trace.rows_examined,
-            maintained_count: canonical.trace.maintained_count.map(|disclosure| {
-                Box::new(
-                    crate::read_contract::CanonicalMaintainedCountDisclosure::restored(disclosure),
-                )
-            }),
-        },
-        cascade: None,
+    Ok(crate::database::QueryTrace {
+        physical_plan,
+        index_used: canonical.index_used,
+        predicates_pushed: canonical
+            .predicates_pushed
+            .into_iter()
+            .map(std::borrow::Cow::Owned)
+            .collect(),
+        indexes_considered: canonical
+            .indexes_considered
+            .into_iter()
+            .map(|candidate| crate::database::IndexCandidate {
+                name: candidate.name,
+                rejected_reason: std::borrow::Cow::Owned(candidate.rejected_reason),
+            })
+            .collect(),
+        sort_elided: canonical.sort_elided,
+        query_vector_source: canonical.query_vector_source,
+        vector_search,
+        rows_examined: canonical.rows_examined,
+        groups: canonical.groups.into_boxed_slice(),
+        maintained_count: canonical.maintained_count.map(|disclosure| {
+            Box::new(crate::read_contract::CanonicalMaintainedCountDisclosure::restored(disclosure))
+        }),
     })
 }
 
@@ -3977,6 +4145,12 @@ struct DirectCursorExecution {
 }
 
 impl OwnedCursorExecution for DirectCursorExecution {
+    fn work_observation(&mut self) -> Result<Option<crate::executor::CursorObservation>> {
+        self.cursor
+            .work_observation()
+            .map_err(|error| direct_error(Path::new(""), error))
+    }
+
     #[cfg(feature = "test-seams")]
     fn file_resource_witness_for_test(
         &self,
@@ -3990,7 +4164,7 @@ impl OwnedCursorExecution for DirectCursorExecution {
         &mut self,
         rows: Option<NonZeroUsize>,
         cancellation: &OwnerReadCancellation,
-    ) -> Result<CursorPage> {
+    ) -> Result<ObservedCursorPage> {
         #[cfg(feature = "test-seams")]
         let probe = self.kernel_observer.as_ref().map(|observer| {
             observed_kernel_probe(
@@ -4007,7 +4181,7 @@ impl OwnedCursorExecution for DirectCursorExecution {
         #[cfg(not(feature = "test-seams"))]
         let fetched = self.cursor.fetch_with_cancellation(rows, cancellation);
         fetched
-            .map(|fetched| fetched.page)
+            .map(ObservedCursorPage::from)
             .map_err(|error| direct_error(Path::new(""), error))
     }
 
@@ -4032,10 +4206,167 @@ impl OwnedCursorExecution for DirectCursorExecution {
     }
 }
 
+struct ObservedCursorPage {
+    cancelled: bool,
+    page: OwnedCursorPage,
+    observation: crate::executor::CursorObservation,
+    owner_trace_charge: Option<Arc<OwnerTraceCharge>>,
+}
+impl std::ops::Deref for ObservedCursorPage {
+    type Target = OwnedCursorPage;
+    fn deref(&self) -> &OwnedCursorPage {
+        &self.page
+    }
+}
+impl std::ops::DerefMut for ObservedCursorPage {
+    fn deref_mut(&mut self) -> &mut OwnedCursorPage {
+        &mut self.page
+    }
+}
+impl From<crate::direct_file_reader::DirectCursorPage> for ObservedCursorPage {
+    fn from(page: crate::direct_file_reader::DirectCursorPage) -> Self {
+        Self {
+            cancelled: false,
+            page: page.page,
+            observation: page.observation,
+            owner_trace_charge: None,
+        }
+    }
+}
+fn take_cursor_observation(
+    observation: crate::executor::CursorObservation,
+) -> (
+    crate::QueryTrace,
+    Option<crate::executor::CursorObservation>,
+) {
+    let rows_examined = observation.rows_examined;
+    if observation.charge.is_none() && observation.group_page_returns.is_none() {
+        // Channel restoration already owns its admitted trace; move it into
+        // the handle instead of allocating another copy.
+        let mut trace =
+            Arc::try_unwrap(observation.trace).unwrap_or_else(|trace| trace.as_ref().clone());
+        trace.rows_examined = rows_examined;
+        (trace, None)
+    } else {
+        // This single owned copy is covered by the shared kernel snapshot's
+        // charge and reused until actual plan metadata changes.
+        let mut trace = observation.trace.as_ref().clone();
+        trace.rows_examined = rows_examined;
+        (trace, Some(observation))
+    }
+}
+/// Restored metadata remains charged to the continuation's existing owner
+/// until the handle replaces it or drops, including after execution ends.
+struct OwnerTraceCharge {
+    memory: Arc<crate::read_image_memory::ImageMemory>,
+    bytes: usize,
+}
+impl Drop for OwnerTraceCharge {
+    fn drop(&mut self) {
+        self.memory.release(self.bytes);
+    }
+}
+fn cursor_receive_allowance(
+    memory: u64,
+    retained_memory: &crate::read_image_memory::ImageMemory,
+) -> u64 {
+    let configured = retained_memory
+        .accountant
+        .usage()
+        .limit
+        .map_or(u64::MAX, |bytes| u64::try_from(bytes).unwrap_or(u64::MAX));
+    memory
+        .min(configured)
+        .saturating_sub(retained_memory.held() as u64)
+}
+fn decode_observed_page(
+    payload: &[u8],
+    memory: u64,
+    retained_memory: &Arc<crate::read_image_memory::ImageMemory>,
+) -> Result<ObservedCursorPage> {
+    // The wire payload is still live while canonical containers and the
+    // restored trace are built; it cannot spend the same allowance twice.
+    let available =
+        cursor_receive_allowance(memory, retained_memory).saturating_sub(payload.len() as u64);
+    let (decoded_bytes, trace_bytes) =
+        crate::local_transport::observed_cursor_page_allocation_bytes(payload, available)
+            .map_err(read_encoding_error)?;
+    // Canonical containers coexist with the restored trace. Two trace
+    // footprints cover restored container growth; fixed trace and Arc owners
+    // are added separately. Admission precedes decoding and restoration.
+    let admitted = trace_bytes
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(decoded_bytes))
+        .and_then(|bytes| {
+            bytes.checked_add(
+                2 * std::mem::size_of::<crate::QueryTrace>()
+                    + std::mem::size_of::<OwnerTraceCharge>()
+                    + 4 * std::mem::size_of::<u64>(),
+            )
+        })
+        .ok_or_else(|| Error::Other("cursor trace memory overflow".to_string()))?;
+    if admitted as u64 > available {
+        return Err(read_encoding_error(
+            crate::read_contract::ReadEncodingError::MemoryCeilingExceeded { ceiling: memory },
+        ));
+    }
+    let mut credit = contextdb_core::read_memory::ReadCredit::try_new(
+        retained_memory.clone(),
+        admitted,
+        "read_channel",
+        "decode_cursor_page",
+        "Reduce the page or raise the reader memory limit.",
+    )?;
+    let decoded = crate::read_contract::decode_observed_cursor_page(payload, available)
+        .map_err(read_encoding_error)?;
+    let rows_examined = decoded.trace.rows_examined;
+    let trace = restored_query_trace(decoded.trace)?;
+    let actual = crate::executor::bounded::query_trace_capacity_bytes(&trace)
+        .map_err(read_error)?
+        .checked_add(
+            std::mem::size_of::<crate::QueryTrace>()
+                + std::mem::size_of::<OwnerTraceCharge>()
+                + 4 * std::mem::size_of::<usize>(),
+        )
+        .ok_or_else(|| Error::Other("cursor trace memory overflow".to_string()))?;
+    let page_bytes = decoded_bytes
+        .checked_sub(trace_bytes)
+        .ok_or_else(|| Error::Other("cursor page admission underflow".into()))?;
+    let retained = actual
+        .checked_add(page_bytes)
+        .ok_or_else(|| Error::Other("cursor page retention overflow".into()))?;
+    if retained > admitted {
+        return Err(Error::Other(
+            "cursor trace exceeded its admitted restoration allowance".into(),
+        ));
+    }
+    let page_credit = credit.try_split_off(page_bytes)?;
+    credit.try_shrink(admitted - retained)?;
+    let charge = OwnerTraceCharge {
+        memory: retained_memory.clone(),
+        bytes: actual,
+    };
+    credit.transfer();
+    Ok(ObservedCursorPage {
+        cancelled: false,
+        page: decoded.page.with_credit(page_credit),
+        observation: crate::executor::CursorObservation {
+            trace: Arc::new(trace),
+            rows_examined,
+            charge: None,
+            group_page_returns: None,
+        },
+        owner_trace_charge: Some(Arc::new(charge)),
+    })
+}
+
 /// A route-bound bounded cursor. Its lifetime is independent from the handle
 /// that opened it: the cursor owns an `Arc` containing the route, session
 /// snapshot owner, and suspended execution state.
 pub struct ReadCursor {
+    trace: crate::QueryTrace,
+    observation: Option<crate::executor::CursorObservation>,
+    owner_trace_charge: Option<Arc<OwnerTraceCharge>>,
     state: Arc<SuspendedReadCursorState>,
 }
 
@@ -4064,12 +4395,62 @@ struct SuspendedReadCursorState {
 /// The owner serves pages while available. This side retains the exact
 /// registered storage root, statement and delivered-row position so an owner
 /// withdrawal can resume through the existing file execution kernel.
+struct OwnerGroupBaseline {
+    groups: Box<[crate::database::GroupDisclosure]>,
+    ordinals: Box<[u64]>,
+    _charge: OwnerTraceCharge,
+}
+impl OwnerGroupBaseline {
+    fn capture(
+        trace: &crate::QueryTrace,
+        memory: &Arc<crate::read_image_memory::ImageMemory>,
+    ) -> Result<Self> {
+        let bytes = trace
+            .groups
+            .len()
+            .checked_mul(
+                std::mem::size_of::<crate::database::GroupDisclosure>()
+                    + std::mem::size_of::<u64>(),
+            )
+            .and_then(|bytes| {
+                trace.groups.iter().try_fold(bytes, |bytes, group| {
+                    bytes.checked_add(group.partition_key.len())
+                })
+            })
+            .ok_or_else(|| Error::Other("group baseline memory overflow".into()))?;
+        memory.reserve(bytes)?;
+        let charge = OwnerTraceCharge {
+            memory: memory.clone(),
+            bytes,
+        };
+        let groups = trace
+            .groups
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let ordinals = trace.groups.iter().map(|group| group.ordinal)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Ok(Self {
+            groups,
+            ordinals,
+            _charge: charge,
+        })
+    }
+}
+
 struct OwnerCursorExecution {
     session: Arc<ReadSessionState>,
     resources: Arc<RouteResources>,
     limits: ReadLimits,
     cursor_id: [u8; 16],
     continuation: Option<OwnerCursorContinuation>,
+    owner_rows_examined: u64,
+    owner_groups: OwnerGroupBaseline,
+    cancelled_observation: Option<crate::executor::CursorObservation>,
+    cancelled_trace_charge: Option<Arc<OwnerTraceCharge>>,
+    retained_memory: Arc<crate::read_image_memory::ImageMemory>,
     clock: Arc<dyn contextdb_core::read_contract::DeadlineClock>,
     created_ms: u64,
     last_used_ms: u64,
@@ -4082,6 +4463,9 @@ struct OwnerCursorExecution {
 
 struct OwnerCursorContinuation {
     retained_memory: Arc<crate::read_image_memory::ImageMemory>,
+    retained_statement_bytes: usize,
+    discarded_rows_examined: u64,
+    failed_open_observation: Option<crate::executor::CursorObservation>,
     path: PathBuf,
     registration: Option<crate::persistence::ReadSnapshotRegistrationGuard>,
     config: crate::direct_file_reader::DirectReaderConfig,
@@ -4092,12 +4476,18 @@ struct OwnerCursorContinuation {
     skipped: usize,
 }
 
+impl Drop for OwnerCursorContinuation {
+    fn drop(&mut self) {
+        self.retained_memory.release(self.retained_statement_bytes);
+    }
+}
+
 impl OwnerCursorContinuation {
     fn fetch(
         &mut self,
         rows: Option<NonZeroUsize>,
         cancellation: &OwnerReadCancellation,
-    ) -> Result<CursorPage> {
+    ) -> Result<ObservedCursorPage> {
         crate::executor::bounded::cursor_replay_checkpoint().map_err(read_error)?;
         if rows.is_some_and(|rows| rows.get() as u64 > self.config.limits.result_rows) {
             return Err(Error::ReadFailure(
@@ -4120,6 +4510,7 @@ impl OwnerCursorContinuation {
             let mut config = self.config.clone();
             let available = usize::try_from(config.limits.memory)
                 .unwrap_or(usize::MAX)
+                .min(config.memory_limit.unwrap_or(usize::MAX))
                 .saturating_sub(self.retained_memory.held());
             config.memory_limit = Some(config.memory_limit.unwrap_or(available).min(available));
             config.limits.memory = config.limits.memory.min(available as u64);
@@ -4133,8 +4524,8 @@ impl OwnerCursorContinuation {
                 registration,
             )
             .map_err(|error| direct_error(&self.path, error))?;
-            let opened = reader
-                .open_cursor_with_cancellation(
+            let (opened, examined, open_observation) = crate::executor::bounded::with_cursor_open_work(|| {
+                reader.open_cursor_with_cancellation(
                     &self.sql,
                     &self.params,
                     NonZeroUsize::new(
@@ -4145,14 +4536,34 @@ impl OwnerCursorContinuation {
                     .unwrap(),
                     cancellation,
                 )
-                .map_err(|error| direct_error(&self.path, error))?;
-            let mut first_page = opened.first_page.page;
+            });
+            let opened = match opened {
+                Ok(opened) => opened,
+                Err(error) => {
+                    self.failed_open_observation = open_observation
+                        .map(|receipt| receipt.into_observation().map_err(read_error))
+                        .transpose()?
+                        .flatten();
+                    self.discarded_rows_examined = self
+                        .discarded_rows_examined
+                        .checked_add(examined.map_err(read_error)?)
+                        .ok_or_else(|| {
+                            Error::Other("cursor rows-examined counter overflow".to_string())
+                        })?;
+                    return Err(direct_error(&self.path, error));
+                }
+            };
+            let mut first_page = ObservedCursorPage::from(opened.first_page);
             self.cursor = Some(opened.cursor);
             if self.delivered == 0 {
                 return Ok(first_page);
             }
             self.skipped = first_page.rows.len();
             if !crate::executor::bounded::cursor_replay_work_available() {
+                first_page.observation = first_page
+                    .observation
+                    .unpublished_groups_withdrawn()
+                    .map_err(read_error)?;
                 first_page.rows.clear();
                 first_page.has_more = true;
                 return Ok(first_page);
@@ -4171,13 +4582,17 @@ impl OwnerCursorContinuation {
                     ),
                     cancellation,
                 )
-                .map_err(|error| direct_error(&self.path, error))?
-                .page;
+                .map(ObservedCursorPage::from)
+                .map_err(|error| direct_error(&self.path, error))?;
             self.skipped += page.rows.len();
             if !page.has_more && self.skipped < self.delivered {
                 return Err(Error::ReadFailure(owner_disconnected()));
             }
             if !crate::executor::bounded::cursor_replay_work_available() {
+                page.observation = page
+                    .observation
+                    .unpublished_groups_withdrawn()
+                    .map_err(read_error)?;
                 page.rows.clear();
                 page.has_more = true;
                 return Ok(page);
@@ -4190,19 +4605,55 @@ impl OwnerCursorContinuation {
                 rows.or_else(|| NonZeroUsize::new(self.config.limits.cursor_page_rows as usize)),
                 cancellation,
             )
-            .map(|page| page.page)
+            .map(ObservedCursorPage::from)
             .map_err(|error| direct_error(&self.path, error))
     }
 }
 
 impl OwnerCursorExecution {
+    fn merge_replay_groups(
+        &self,
+        mut observation: crate::executor::CursorObservation,
+    ) -> Result<crate::executor::CursorObservation> {
+        let groups = &observation.trace.groups;
+        if groups.len() != self.owner_groups.groups.len()
+            || groups
+                .iter()
+                .zip(self.owner_groups.ordinals.iter())
+                .any(|(group, prior)| group.ordinal != *prior)
+        {
+            return Err(Error::ReadFailure(
+                contextdb_core::read_contract::ReadFailure::new(
+                    contextdb_core::read_contract::ReadFailureKind::InvalidChannelData,
+                    contextdb_core::read_contract::ReadFailureDetail::None,
+                )
+                .expect("invalid replay group sequence accepts empty detail"),
+            ));
+        }
+        for (replayed, owner) in groups.iter().zip(self.owner_groups.groups.iter()) {
+            replayed
+                .examined_entries
+                .checked_add(owner.examined_entries)
+                .ok_or_else(|| Error::Other("group examined counter overflow".into()))?;
+        }
+        // The existing kernel observation credit owns the outward trace copy.
+        for (replayed, owner) in Arc::make_mut(&mut observation.trace)
+            .groups
+            .iter_mut()
+            .zip(self.owner_groups.groups.iter())
+        {
+            replayed.examined_entries += owner.examined_entries;
+        }
+        Ok(observation)
+    }
+
     fn fetch_continuation(
         &mut self,
         rows: Option<NonZeroUsize>,
         cancellation: &OwnerReadCancellation,
         started_ms: u64,
-    ) -> Result<CursorPage> {
-        crate::executor::bounded::with_cursor_replay_budget(
+    ) -> Result<ObservedCursorPage> {
+        let fetched = crate::executor::bounded::with_cursor_replay_budget(
             self.limits,
             Arc::clone(&self.clock),
             started_ms,
@@ -4214,7 +4665,34 @@ impl OwnerCursorExecution {
                     .unwrap()
                     .fetch(rows, cancellation)
             },
-        )
+        );
+        if fetched.is_err() {
+            let failed = self.continuation.as_mut().unwrap().failed_open_observation.take();
+            if let Some(observation) = failed {
+                // Alignment is checked before merging or updating the durable
+                // replay baseline. The failed open published no rows.
+                let mut observation = self.merge_replay_groups(observation)?;
+                for (baseline, merged) in self.owner_groups.groups.iter_mut()
+                    .zip(observation.trace.groups.iter()) {
+                    baseline.examined_entries = merged.examined_entries;
+                }
+                observation.rows_examined = self.owner_rows_examined
+                    .checked_add(self.continuation.as_ref().unwrap().discarded_rows_examined)
+                    .ok_or_else(|| Error::Other("cursor rows-examined counter overflow".into()))?;
+                // Move the admitted carrier to the outer observation path;
+                // its charge survives terminal resource release.
+                self.cancelled_observation = Some(observation);
+            }
+        }
+        fetched.and_then(|mut page| {
+            page.observation = self.merge_replay_groups(page.observation)?;
+            page.observation.rows_examined = self
+                .owner_rows_examined
+                .checked_add(self.continuation.as_ref().unwrap().discarded_rows_examined)
+                .and_then(|total| total.checked_add(page.observation.rows_examined))
+                .ok_or_else(|| Error::Other("cursor rows-examined counter overflow".to_string()))?;
+            Ok(page)
+        })
     }
 
     fn release_local_cursor_slot(&mut self) {
@@ -4295,10 +4773,16 @@ impl OwnerCursorExecution {
         let ReadSessionState::OwnerChannel(owner) = self.session.as_ref() else {
             return Err(Error::ReadFailure(owner_not_running()));
         };
-        owner.ask(
+        let cursor_memory = matches!(
+            request,
+            crate::local_transport::LocalRequest::CursorFetch { .. }
+        )
+        .then(|| cursor_receive_allowance(self.limits.memory, &self.retained_memory));
+        owner.ask_with_cursor_memory(
             self.limits,
             request,
             cancellation,
+            cursor_memory,
             #[cfg(feature = "test-seams")]
             self.observer.as_ref(),
         )
@@ -4306,11 +4790,41 @@ impl OwnerCursorExecution {
 }
 
 impl OwnedCursorExecution for OwnerCursorExecution {
+    fn work_observation(&mut self) -> Result<Option<crate::executor::CursorObservation>> {
+        if let Some(observation) = self.cancelled_observation.take() {
+            return Ok(Some(observation));
+        }
+        if let Some(continuation) = self.continuation.as_ref() {
+            if let Some(cursor) = &continuation.cursor {
+                let observation = cursor
+                    .work_observation()
+                    .map_err(|error| direct_error(&continuation.path, error))?;
+                return observation
+                    .map(|observation| {
+                        let mut observation = self.merge_replay_groups(observation)?;
+                        observation.rows_examined = self
+                            .owner_rows_examined
+                            .checked_add(continuation.discarded_rows_examined)
+                            .and_then(|total| total.checked_add(observation.rows_examined))
+                            .ok_or_else(|| {
+                                Error::Other("cursor rows-examined counter overflow".into())
+                            })?;
+                        Ok(observation)
+                    })
+                    .transpose();
+            }
+        }
+        Ok(None)
+    }
+    fn take_work_trace_charge(&mut self) -> Option<Arc<OwnerTraceCharge>> {
+        self.cancelled_trace_charge.take()
+    }
+
     fn fetch(
         &mut self,
         rows: Option<NonZeroUsize>,
         cancellation: &OwnerReadCancellation,
-    ) -> Result<CursorPage> {
+    ) -> Result<ObservedCursorPage> {
         let now = self.clock.now_ms();
         self.expire_if_due(now);
         if let Some(expiry) = self.expired {
@@ -4350,6 +4864,7 @@ impl OwnedCursorExecution for OwnerCursorExecution {
                 published_cursor_page(
                     responses,
                     self.limits,
+                    &self.retained_memory,
                     #[cfg(feature = "test-seams")]
                     self.observer.as_ref(),
                 )
@@ -4368,6 +4883,45 @@ impl OwnedCursorExecution for OwnerCursorExecution {
             page => (page, true),
         };
         if let Ok(page) = &page {
+            if self
+                .continuation
+                .as_ref()
+                .is_none_or(|continuation| continuation.cursor.is_none())
+            {
+                self.owner_groups = match OwnerGroupBaseline::capture(
+                    &page.observation.trace,
+                    &self.retained_memory,
+                ) {
+                    Ok(groups) => groups,
+                    Err(error) => {
+                        self.release_local_cursor_slot();
+                        if owner_cursor_may_be_live {
+                            let _ = self.ask(
+                                crate::local_transport::LocalRequest::CursorClose {
+                                    cursor_id: self.cursor_id,
+                                },
+                                None,
+                            );
+                        }
+                        return Err(error);
+                    }
+                };
+            }
+            if page.cancelled {
+                self.owner_rows_examined = page.observation.rows_examined;
+                self.cancelled_observation = Some(page.observation.clone());
+                self.cancelled_trace_charge = page.owner_trace_charge.clone();
+                return Err(Error::ReadCancelled);
+            }
+            self.cancelled_observation = None;
+            self.cancelled_trace_charge = None;
+            if self
+                .continuation
+                .as_ref()
+                .is_none_or(|continuation| continuation.cursor.is_none())
+            {
+                self.owner_rows_examined = page.observation.rows_examined;
+            }
             self.last_used_ms = self.clock.now_ms();
             if let Some(continuation) = &mut self.continuation
                 && continuation.cursor.is_none()
@@ -4458,7 +5012,9 @@ impl OwnedCursorExecution for OwnerCursorExecution {
 
 struct PublishedOwnerCursor {
     cursor_id: [u8; 16],
-    first_page: CursorPage,
+    first_page: OwnedCursorPage,
+    observation: crate::executor::CursorObservation,
+    owner_trace_charge: Arc<OwnerTraceCharge>,
     snapshot: Option<redb::StorageSnapshotIdentity>,
     physical_identity: Option<(u64, u64)>,
     limits: ReadLimits,
@@ -4468,6 +5024,7 @@ struct PublishedOwnerCursor {
 fn published_cursor_open(
     responses: Vec<crate::local_transport::LocalResponse>,
     limits: ReadLimits,
+    retained_memory: &Arc<crate::read_image_memory::ImageMemory>,
     #[cfg(feature = "test-seams")] observer: Option<&Arc<dyn ReadSessionTestObserver>>,
 ) -> Result<PublishedOwnerCursor> {
     for response in responses {
@@ -4480,11 +5037,10 @@ fn published_cursor_open(
                 let payload = replacement.as_deref().unwrap_or(&opened.payload);
                 #[cfg(not(feature = "test-seams"))]
                 let payload = &opened.payload;
-                let page = crate::read_contract::decode_cursor_page_under_memory_ceiling(
-                    payload,
-                    limits.memory,
-                )
-                .map_err(read_encoding_error)?;
+                let limits =
+                    ReadLimits::stricter_of(limits, opened.effective_limits.unwrap_or(limits))
+                        .map_err(|error| Error::Other(error.to_string()))?;
+                let page = decode_observed_page(payload, limits.memory, retained_memory)?;
                 let snapshot = opened.storage_snapshot.map(|(transaction_id, root)| {
                     redb::StorageSnapshotIdentity {
                         transaction_id,
@@ -4497,12 +5053,13 @@ fn published_cursor_open(
                         }),
                     }
                 });
-                let limits =
-                    ReadLimits::stricter_of(limits, opened.effective_limits.unwrap_or(limits))
-                        .map_err(|error| Error::Other(error.to_string()))?;
                 return Ok(PublishedOwnerCursor {
                     cursor_id: opened.cursor_id,
-                    first_page: page,
+                    first_page: page.page,
+                    observation: page.observation,
+                    owner_trace_charge: page
+                        .owner_trace_charge
+                        .expect("owner page retains its trace charge"),
                     snapshot,
                     physical_identity: opened.physical_identity,
                     limits,
@@ -4521,10 +5078,22 @@ fn published_cursor_open(
 fn published_cursor_page(
     responses: Vec<crate::local_transport::LocalResponse>,
     limits: ReadLimits,
+    retained_memory: &Arc<crate::read_image_memory::ImageMemory>,
     #[cfg(feature = "test-seams")] observer: Option<&Arc<dyn ReadSessionTestObserver>>,
-) -> Result<CursorPage> {
+) -> Result<ObservedCursorPage> {
     for response in responses {
         match response {
+            crate::local_transport::LocalResponse::CursorCancelled { page } => {
+                let mut observed =
+                    decode_observed_page(&page.payload, limits.memory, retained_memory)?;
+                if !observed.rows.is_empty() {
+                    return Err(Error::Other(
+                        "cancelled cursor observation contains rows".into(),
+                    ));
+                }
+                observed.cancelled = true;
+                return Ok(observed);
+            }
             crate::local_transport::LocalResponse::CursorPage { page } => {
                 #[cfg(feature = "test-seams")]
                 let replacement = observer
@@ -4533,11 +5102,7 @@ fn published_cursor_page(
                 let payload = replacement.as_deref().unwrap_or(&page.payload);
                 #[cfg(not(feature = "test-seams"))]
                 let payload = &page.payload;
-                return crate::read_contract::decode_cursor_page_under_memory_ceiling(
-                    payload,
-                    limits.memory,
-                )
-                .map_err(read_encoding_error);
+                return decode_observed_page(payload, limits.memory, retained_memory);
             }
             crate::local_transport::LocalResponse::Failure { failure } => {
                 return Err(Error::ReadFailure(failure));
@@ -4555,6 +5120,13 @@ type CursorExpiryWatch = (
 );
 
 trait OwnedCursorExecution: Send {
+    fn take_work_trace_charge(&mut self) -> Option<Arc<OwnerTraceCharge>> {
+        None
+    }
+    fn work_observation(&mut self) -> Result<Option<crate::executor::CursorObservation>> {
+        Ok(None)
+    }
+
     #[cfg(feature = "test-seams")]
     fn file_resource_witness_for_test(
         &self,
@@ -4566,7 +5138,7 @@ trait OwnedCursorExecution: Send {
         &mut self,
         rows: Option<NonZeroUsize>,
         cancellation: &OwnerReadCancellation,
-    ) -> Result<CursorPage>;
+    ) -> Result<ObservedCursorPage>;
 
     fn close(&mut self) -> Result<()>;
 
@@ -4679,6 +5251,35 @@ impl ReadCursor {
         &self.state.first_page
     }
 
+    /// The actual plan and cumulative source work at the latest successfully
+    /// published page. A failed fetch retains the preceding observation;
+    /// work from a cancelled kernel attempt is included by its next successful
+    /// page. Owner withdrawal continues counting actual file replay work too.
+    ///
+    /// ```no_run
+    /// # fn example() -> contextdb_core::Result<()> {
+    /// use contextdb_engine::ReadSession;
+    /// use std::collections::HashMap;
+    /// let session = ReadSession::open("store.db")?;
+    /// let mut cursor = session.open_cursor("SELECT * FROM items", &HashMap::new())?;
+    /// println!("{}: {}", cursor.trace().physical_plan, cursor.rows_examined());
+    /// while cursor.first_page().has_more && cursor.is_live() {
+    ///     let page = cursor.fetch(None)?;
+    ///     println!("examined {}", cursor.trace().rows_examined);
+    ///     if !page.has_more { break; }
+    /// }
+    /// # Ok(()) }
+    /// ```
+    pub fn trace(&self) -> &crate::QueryTrace {
+        &self.trace
+    }
+
+    /// Cumulative rows, index entries and adjacency entries actually examined
+    /// through the latest successful page; this is not the number of emitted rows.
+    pub fn rows_examined(&self) -> u64 {
+        self.trace.rows_examined
+    }
+
     /// Fetch a cursor page with a fresh cancellation token.
     pub fn fetch(&mut self, rows: Option<NonZeroUsize>) -> Result<CursorPage> {
         self.fetch_with_cancellation(rows, &OwnerReadCancellation::new())
@@ -4710,10 +5311,39 @@ impl ReadCursor {
         #[cfg(feature = "test-seams")]
         let _ = (&self.state.observer, &self.state.kernel_observer);
         let fetched = execution.fetch(rows, cancellation);
+        if fetched.is_err() {
+            if let Ok(Some(observation)) = execution.work_observation() {
+                let observation = observation
+                    .unpublished_groups_withdrawn()
+                    .map_err(read_error)?;
+                (self.trace, self.observation) = take_cursor_observation(observation);
+                if let Some(charge) = execution.take_work_trace_charge() {
+                    self.owner_trace_charge = Some(charge);
+                }
+            }
+        }
         if fetched.is_err() && !execution.is_live() {
             let _ = execution.close();
         }
-        fetched
+        fetched.map(|page| {
+            // The owner answers a later exhausted fetch with its empty sentinel.
+            // It contains no new execution and cannot replace the last trace.
+            if !(page.columns.is_empty() && page.rows.is_empty() && !page.has_more) {
+                let rows_examined = page.observation.rows_examined;
+                if self
+                    .observation
+                    .as_ref()
+                    .is_none_or(|prior| !Arc::ptr_eq(&prior.trace, &page.observation.trace))
+                {
+                    (self.trace, self.observation) = take_cursor_observation(page.observation);
+                    self.owner_trace_charge = page.owner_trace_charge;
+                } else {
+                    self.observation = Some(page.observation);
+                }
+                self.trace.rows_examined = rows_examined;
+            }
+            page.page.into_public()
+        })
     }
 
     /// Whether this cursor still holds the read it was opened with.

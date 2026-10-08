@@ -102,9 +102,15 @@ pub(crate) mod read_contract;
 pub mod read_contract;
 mod read_image;
 mod read_image_memory;
+pub mod vector_read_memory;
 #[cfg(feature = "test-seams")]
 mod read_probe;
 mod read_progress;
+#[cfg(not(feature = "test-seams"))]
+mod owned_cursor_page;
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub mod owned_cursor_page;
 #[cfg(not(feature = "test-seams"))]
 mod read_session;
 #[cfg(feature = "test-seams")]

@@ -67,10 +67,12 @@ pub(crate) fn fixed_key_value_location<K: Key>(
             // allocator payload enters the page cache during navigation.
             let keys_start = 4 + count * 4;
             let values_start = keys_start + count * width;
-            let extent = header
-                .root
-                .page_size_bytes(mem.get_page_size().try_into().unwrap())
-                as usize;
+            let extent = usize::try_from(
+                header
+                    .root
+                    .page_size_bytes(mem.get_page_size().try_into().unwrap()),
+            )
+            .map_err(|_| corrupt())?;
             if values_start > extent {
                 return Err(corrupt());
             }

@@ -294,7 +294,11 @@ impl Database {
     }
 
     #[cfg(any(test, feature = "test-seams"))]
-    pub fn cron_run_due_now_for_test(&self) -> Result<u64> {
+    pub fn cron_run_due_now_for_test(
+        &self,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<u64> {
         let _operation = self.open_operation()?;
         // Bounded at 1s: comfortably covers the short-but-not-instant
         // intervals a real test schedule uses (e.g. "EVERY '200
@@ -302,7 +306,7 @@ impl Database {
         // than that returns unfired rather than sleeping the test through
         // it.
         self.wait_for_imminent_cron_due_for_test(Duration::from_millis(1_000));
-        self.dispatch_due_cron_schedules(true)
+        self.dispatch_due_cron_schedules(true, vector_copy_owner, read_memory.clone())
     }
 
     #[cfg(any(test, feature = "test-seams"))]
@@ -399,7 +403,13 @@ impl Database {
                 && !shutdown.load(Ordering::SeqCst)
                 && !self.resource_closed.load(Ordering::SeqCst)
             {
-                let _ = self.dispatch_due_cron_schedules(false);
+                let _ = (|| -> Result<()> {
+                    let read_memory = self.declared_reader_memory()?;
+                    let mut vector_copy_owner =
+                        crate::vector_read_memory::admission(read_memory.clone());
+                    self.dispatch_due_cron_schedules(false, &mut vector_copy_owner, read_memory)?;
+                    Ok(())
+                })();
             }
             if shutdown.load(Ordering::SeqCst) || self.resource_closed.load(Ordering::SeqCst) {
                 break;
@@ -444,7 +454,12 @@ impl Database {
         }
     }
 
-    fn dispatch_due_cron_schedules(&self, manual: bool) -> Result<u64> {
+    fn dispatch_due_cron_schedules(
+        &self,
+        manual: bool,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<u64> {
         let reserved_runs = self.reserve_due_cron_runs()?;
         let mut successful_fires = 0u64;
         let mut fail_loud_error = None;
@@ -457,6 +472,8 @@ impl Database {
                 manual,
                 &mut successful_fires,
                 &mut fail_loud_error,
+                vector_copy_owner,
+                read_memory.clone(),
             );
             self.cron.running_schedules.lock().remove(&schedule_name);
             self.cron.waiters.notify_all();
@@ -529,6 +546,8 @@ impl Database {
         manual: bool,
         successful_fires: &mut u64,
         fail_loud_error: &mut Option<Error>,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<()> {
         let schedule = run.schedule;
         let decision = run.decision;
@@ -569,7 +588,11 @@ impl Database {
         };
 
         for _ in 0..decision.fire_count {
-            match self.run_cron_callback_transaction(callback.clone()) {
+            match self.run_cron_callback_transaction(
+                callback.clone(),
+                vector_copy_owner,
+                read_memory.clone(),
+            ) {
                 Ok(lsn) => {
                     *successful_fires += 1;
                     if let Some(current) = self.cron.schedules.lock().get_mut(&schedule.name) {
@@ -589,179 +612,225 @@ impl Database {
         Ok(())
     }
 
-    fn run_cron_callback_transaction(&self, callback: CronCallback) -> Result<Lsn> {
-        let _callback_thread = self.cron.enter_callback_thread_scope();
-        let tx = self.begin_for_internal_write()?;
-        let mut pending_sink_events = Vec::new();
-        let pending_trigger_audits = std::cell::RefCell::new(Vec::new());
-        let pending_trigger_active_guards =
-            std::cell::RefCell::new(Vec::<TriggerCallbackThreadGuard>::new());
-        let mut committed_trigger_audit_entries = Vec::new();
-        // Cron callbacks are arbitrary user code and can stage vector writes
-        // while the tx manager's commit mutex is held. Acquire current vector
-        // schema refs before entering that mutex so DDL keeps the normal
-        // schema-gate -> commit-mutex lock order.
-        let mut vector_schema_guard =
-            Some(self.vector_schema_read_many(self.vector_store_schema_refs()));
-        let delete_release_bytes = std::cell::RefCell::new(DeleteReleaseBytes::default());
-        // Armed just before the durable apply; see `PublicationInterruptionWatch`
-        // in `database.rs`. A scheduled job's commit is durable the moment the
-        // manager applies it, and its sink events, trigger audits and commit
-        // event reach memory only afterwards -- so an unwind in between leaves
-        // this handle behind its own durable image, exactly as it does on the
-        // local and received doors, and it must stop serving until reopened.
-        let publication_watch =
-            std::cell::RefCell::new(None::<super::PublicationInterruptionWatch>);
-        let result = self.tx_mgr.commit_with_reserved_lsn_callback_mut(
-            tx,
-            |reserved_lsn| {
-                let callback_result = CRON_LSN_OVERRIDE.with(|slot| {
-                    let prior_lsn = slot.replace(Some(reserved_lsn));
-                    let prior_tx = CRON_CALLBACK_TX.with(|tx_slot| tx_slot.replace(Some(tx)));
-                    let this_db = self.identity();
-                    let prior_db = CRON_CALLBACK_DB.with(|db_slot| db_slot.replace(Some(this_db)));
-                    let gate_id = self.vector_schema_gate_id();
-                    let prior_gate = CRON_CALLBACK_VECTOR_SCHEMA_GATE
-                        .with(|gate_slot| gate_slot.replace(Some(gate_id)));
-                    let prior_active = CRON_CALLBACK_ACTIVE.with(|active| active.replace(true));
-                    let mut result = catch_unwind(AssertUnwindSafe(|| callback(self)));
-                    if let Ok(Ok(())) = &result
-                        && let Err(error) = self.prepare_active_trigger_write_set_for_dispatch(tx)
-                    {
-                        result = Ok(Err(error));
-                    }
-                    if let Ok(Ok(())) = &result {
-                        match self.dispatch_triggers_for_tx(tx) {
-                            Ok(outcome) => {
-                                *pending_trigger_audits.borrow_mut() = outcome.pending;
-                                pending_trigger_active_guards
-                                    .borrow_mut()
-                                    .extend(outcome.active_guards);
-                            }
-                            Err(failure) => {
-                                let failure = *failure;
-                                pending_trigger_active_guards
-                                    .borrow_mut()
-                                    .extend(failure.active_guards);
-                                result = Ok(Err(failure.error));
+    fn run_cron_callback_transaction(
+        &self,
+        callback: CronCallback,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<Lsn> {
+        (|| {
+            let vector_copy_owner = std::cell::RefCell::new(vector_copy_owner);
+
+            let _callback_thread = self.cron.enter_callback_thread_scope();
+            let tx = self.begin_for_internal_write()?;
+            let mut pending_sink_events = Vec::new();
+            let pending_trigger_audits = std::cell::RefCell::new(Vec::new());
+            let pending_trigger_active_guards =
+                std::cell::RefCell::new(Vec::<TriggerCallbackThreadGuard>::new());
+            let mut committed_trigger_audit_entries = Vec::new();
+            // Cron callbacks are arbitrary user code and can stage vector writes
+            // while the tx manager's commit mutex is held. Acquire current vector
+            // schema refs before entering that mutex so DDL keeps the normal
+            // schema-gate -> commit-mutex lock order.
+            let mut vector_schema_guard = Some(self.vector_schema_read_many(
+                self.vector_store_schema_refs(&mut vector_copy_owner.borrow_mut())?,
+            ));
+            let delete_release_bytes = std::cell::RefCell::new(DeleteReleaseBytes::default());
+            // Armed just before the durable apply; see `PublicationInterruptionWatch`
+            // in `database.rs`. A scheduled job's commit is durable the moment the
+            // manager applies it, and its sink events, trigger audits and commit
+            // event reach memory only afterwards -- so an unwind in between leaves
+            // this handle behind its own durable image, exactly as it does on the
+            // local and received doors, and it must stop serving until reopened.
+            let publication_watch =
+                std::cell::RefCell::new(None::<super::PublicationInterruptionWatch>);
+            let result = self.tx_mgr.commit_with_reserved_lsn_callback_mut(
+                tx,
+                read_memory.clone(),
+                |reserved_lsn| {
+                    let callback_result = CRON_LSN_OVERRIDE.with(|slot| {
+                        let prior_lsn = slot.replace(Some(reserved_lsn));
+                        let prior_tx = CRON_CALLBACK_TX.with(|tx_slot| tx_slot.replace(Some(tx)));
+                        let this_db = self.identity();
+                        let prior_db =
+                            CRON_CALLBACK_DB.with(|db_slot| db_slot.replace(Some(this_db)));
+                        let gate_id = self.vector_schema_gate_id();
+                        let prior_gate = CRON_CALLBACK_VECTOR_SCHEMA_GATE
+                            .with(|gate_slot| gate_slot.replace(Some(gate_id)));
+                        let prior_active = CRON_CALLBACK_ACTIVE.with(|active| active.replace(true));
+                        let mut result = catch_unwind(AssertUnwindSafe(|| callback(self)));
+                        if let Ok(Ok(())) = &result
+                            && let Err(error) = self.prepare_active_trigger_write_set_for_dispatch(
+                                tx,
+                                &mut **vector_copy_owner.borrow_mut(),
+                                read_memory.clone(),
+                            )
+                        {
+                            result = Ok(Err(error));
+                        }
+                        if let Ok(Ok(())) = &result {
+                            match self.dispatch_triggers_for_tx(
+                                tx,
+                                &mut **vector_copy_owner.borrow_mut(),
+                                read_memory.clone(),
+                            ) {
+                                Ok(outcome) => {
+                                    *pending_trigger_audits.borrow_mut() = outcome.pending;
+                                    pending_trigger_active_guards
+                                        .borrow_mut()
+                                        .extend(outcome.active_guards);
+                                }
+                                Err(failure) => {
+                                    let failure = *failure;
+                                    pending_trigger_active_guards
+                                        .borrow_mut()
+                                        .extend(failure.active_guards);
+                                    result = Ok(Err(failure.error));
+                                }
                             }
                         }
+                        if let Ok(Ok(())) = &result
+                            && let Err(error) = self.prepare_active_trigger_write_set_for_dispatch(
+                                tx,
+                                &mut **vector_copy_owner.borrow_mut(),
+                                read_memory.clone(),
+                            )
+                        {
+                            result = Ok(Err(error));
+                        }
+                        CRON_CALLBACK_ACTIVE.with(|active| active.set(prior_active));
+                        CRON_CALLBACK_DB.with(|db_slot| db_slot.set(prior_db));
+                        CRON_CALLBACK_VECTOR_SCHEMA_GATE
+                            .with(|gate_slot| gate_slot.set(prior_gate));
+                        CRON_CALLBACK_TX.with(|tx_slot| tx_slot.set(prior_tx));
+                        slot.replace(prior_lsn);
+                        result
+                    });
+                    match callback_result {
+                        Ok(result) => result,
+                        Err(payload) => Err(Error::Other(format!(
+                            "cron callback panicked: {}",
+                            panic_payload_to_string(payload)
+                        ))),
                     }
-                    if let Ok(Ok(())) = &result
-                        && let Err(error) = self.prepare_active_trigger_write_set_for_dispatch(tx)
-                    {
-                        result = Ok(Err(error));
+                },
+                |ws| {
+                    if !ws.is_empty() {
+                        debug_assert!(
+                            !Self::write_set_touches_vector_schema(ws)
+                                || vector_schema_guard.is_some()
+                        );
+                        self.rewrite_txid_placeholders(tx, ws)?;
+                        let _validation = self.commit_validate(
+                            tx,
+                            ws,
+                            &mut **vector_copy_owner.borrow_mut(),
+                            read_memory.clone(),
+                        )?;
+                        self.plugin.pre_commit(ws, CommitSource::AutoCommit)?;
+                        let prepared_sink_events =
+                            self.prepare_sink_events_for_write_set(ws, read_memory.clone())?;
+                        if !prepared_sink_events.is_empty() {
+                            self.event_bus
+                                .ensure_queue_capacity(&prepared_sink_events)?;
+                        }
+                        if self.persistence.is_some() && !prepared_sink_events.is_empty() {
+                            ws.config_writes.push((
+                                super::event_bus::NEXT_ACTION_ID_CONFIG_KEY.to_string(),
+                                RedbPersistence::encode_config_value(
+                                    &self.event_bus.next_action_id(),
+                                )?,
+                            ));
+                        }
+                        if self.persistence.is_some()
+                            && let Some(lsn) = ws.commit_lsn
+                        {
+                            self.event_bus
+                                .stage_sink_events_for_persistence(lsn, prepared_sink_events);
+                        } else {
+                            pending_sink_events = prepared_sink_events;
+                        }
+                        if let Some(lsn) = ws.commit_lsn {
+                            let pending = pending_trigger_audits.borrow();
+                            committed_trigger_audit_entries =
+                                self.committed_trigger_audits_for_pending(&pending, ws, lsn);
+                            self.stage_trigger_audits_for_persistence(
+                                lsn,
+                                &committed_trigger_audit_entries,
+                            );
+                        }
+                        *delete_release_bytes.borrow_mut() = self
+                            .delete_release_bytes_for_write_set(
+                                ws,
+                                &mut **vector_copy_owner.borrow_mut(),
+                                read_memory.clone(),
+                            )?;
                     }
-                    CRON_CALLBACK_ACTIVE.with(|active| active.set(prior_active));
-                    CRON_CALLBACK_DB.with(|db_slot| db_slot.set(prior_db));
-                    CRON_CALLBACK_VECTOR_SCHEMA_GATE.with(|gate_slot| gate_slot.set(prior_gate));
-                    CRON_CALLBACK_TX.with(|tx_slot| tx_slot.set(prior_tx));
-                    slot.replace(prior_lsn);
-                    result
-                });
-                match callback_result {
-                    Ok(result) => result,
-                    Err(payload) => Err(Error::Other(format!(
-                        "cron callback panicked: {}",
-                        panic_payload_to_string(payload)
-                    ))),
-                }
-            },
-            |ws| {
-                if !ws.is_empty() {
-                    debug_assert!(
-                        !Self::write_set_touches_vector_schema(ws) || vector_schema_guard.is_some()
+                    *publication_watch.borrow_mut() = Some(
+                        super::PublicationInterruptionWatch::arm(&self.publication_interrupted),
                     );
-                    self.rewrite_txid_placeholders(tx, ws)?;
-                    let _validation = self.commit_validate(tx, ws)?;
-                    self.plugin.pre_commit(ws, CommitSource::AutoCommit)?;
-                    let prepared_sink_events = self.prepare_sink_events_for_write_set(ws)?;
-                    if !prepared_sink_events.is_empty() {
-                        self.event_bus
-                            .ensure_queue_capacity(&prepared_sink_events)?;
-                    }
-                    if self.persistence.is_some() && !prepared_sink_events.is_empty() {
-                        ws.config_writes.push((
-                            super::event_bus::NEXT_ACTION_ID_CONFIG_KEY.to_string(),
-                            RedbPersistence::encode_config_value(&self.event_bus.next_action_id())?,
-                        ));
-                    }
-                    if self.persistence.is_some()
-                        && let Some(lsn) = ws.commit_lsn
-                    {
-                        self.event_bus
-                            .stage_sink_events_for_persistence(lsn, prepared_sink_events);
-                    } else {
-                        pending_sink_events = prepared_sink_events;
-                    }
-                    if let Some(lsn) = ws.commit_lsn {
-                        let pending = pending_trigger_audits.borrow();
-                        committed_trigger_audit_entries =
-                            self.committed_trigger_audits_for_pending(&pending, ws, lsn);
-                        self.stage_trigger_audits_for_persistence(
+                    Ok(())
+                },
+            );
+
+            match result {
+                Ok((lsn, ws)) => {
+                    self.pending_commit_metadata.lock().remove(&tx);
+                    if !ws.is_empty() {
+                        #[cfg(test)]
+                        super::take_local_commit_stage_fault_for_test(
+                            super::LocalCommitStageFaultPoint::AfterScheduledJobDurableCommit,
+                        );
+                        self.release_delete_allocations_from_bytes(&delete_release_bytes.borrow());
+                        drop(vector_schema_guard.take());
+                        self.plugin.post_commit(&ws, CommitSource::AutoCommit);
+                        let sink_events_to_publish = if self.persistence.is_some() {
+                            ws.commit_lsn
+                                .and_then(|lsn| {
+                                    self.event_bus.take_staged_sink_events_for_persistence(lsn)
+                                })
+                                .map(EventBusState::materialize_staged_sink_events)
+                                .unwrap_or_default()
+                        } else {
+                            pending_sink_events
+                        };
+                        self.publish_prepared_sink_events_to_memory(sink_events_to_publish);
+                        self.append_trigger_audits_to_memory(committed_trigger_audit_entries);
+                        self.publish_commit_event_if_subscribers(
+                            &ws,
+                            CommitSource::AutoCommit,
                             lsn,
-                            &committed_trigger_audit_entries,
                         );
                     }
-                    *delete_release_bytes.borrow_mut() =
-                        self.delete_release_bytes_for_write_set(ws);
+                    if let Some(watch) = publication_watch.borrow_mut().take() {
+                        watch.completed();
+                    }
+                    Ok(lsn)
                 }
-                *publication_watch.borrow_mut() = Some(super::PublicationInterruptionWatch::arm(
-                    &self.publication_interrupted,
-                ));
-                Ok(())
-            },
-        );
-
-        match result {
-            Ok((lsn, ws)) => {
-                self.pending_commit_metadata.lock().remove(&tx);
-                if !ws.is_empty() {
-                    #[cfg(test)]
-                    super::take_local_commit_stage_fault_for_test(
-                        super::LocalCommitStageFaultPoint::AfterScheduledJobDurableCommit,
-                    );
-                    self.release_delete_allocations_from_bytes(&delete_release_bytes.borrow());
-                    drop(vector_schema_guard.take());
-                    self.plugin.post_commit(&ws, CommitSource::AutoCommit);
-                    let sink_events_to_publish = if self.persistence.is_some() {
-                        ws.commit_lsn
-                            .and_then(|lsn| {
-                                self.event_bus.take_staged_sink_events_for_persistence(lsn)
-                            })
-                            .map(EventBusState::materialize_staged_sink_events)
-                            .unwrap_or_default()
+                Err(failure) => {
+                    if let Some(watch) = publication_watch.borrow_mut().take() {
+                        watch.completed();
+                    }
+                    self.pending_commit_metadata.lock().remove(&tx);
+                    if let Some(lsn) = failure.write_set.as_ref().and_then(|ws| ws.commit_lsn) {
+                        let _ = self.event_bus.take_staged_sink_events_for_persistence(lsn);
+                        self.discard_staged_trigger_audits_for_persistence(lsn);
+                    }
+                    if let Some(ws) = failure.write_set {
+                        self.release_insert_allocations(&ws, &mut vector_copy_owner.borrow_mut())?;
                     } else {
-                        pending_sink_events
-                    };
-                    self.publish_prepared_sink_events_to_memory(sink_events_to_publish);
-                    self.append_trigger_audits_to_memory(committed_trigger_audit_entries);
-                    self.publish_commit_event_if_subscribers(&ws, CommitSource::AutoCommit, lsn);
+                        let _ = self.rollback_without_callback_tx_control(tx);
+                    }
+                    let pending = pending_trigger_audits.borrow();
+                    self.append_rolled_back_trigger_audits(
+                        &pending,
+                        tx,
+                        &failure.error.to_string(),
+                    )?;
+                    Err(failure.error)
                 }
-                if let Some(watch) = publication_watch.borrow_mut().take() {
-                    watch.completed();
-                }
-                Ok(lsn)
             }
-            Err(failure) => {
-                if let Some(watch) = publication_watch.borrow_mut().take() {
-                    watch.completed();
-                }
-                self.pending_commit_metadata.lock().remove(&tx);
-                if let Some(lsn) = failure.write_set.as_ref().and_then(|ws| ws.commit_lsn) {
-                    let _ = self.event_bus.take_staged_sink_events_for_persistence(lsn);
-                    self.discard_staged_trigger_audits_for_persistence(lsn);
-                }
-                if let Some(ws) = failure.write_set {
-                    self.release_insert_allocations(&ws);
-                } else {
-                    let _ = self.rollback_without_callback_tx_control(tx);
-                }
-                let pending = pending_trigger_audits.borrow();
-                self.append_rolled_back_trigger_audits(&pending, tx, &failure.error.to_string())?;
-                Err(failure.error)
-            }
-        }
+        })()
     }
 
     fn append_cron_audit(
@@ -795,7 +864,9 @@ impl Database {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        persistence.flush_config_value(CRON_SCHEDULES_CONFIG_KEY, &schedules)
+        self.publish_direct_metadata(|| {
+            persistence.flush_config_value(CRON_SCHEDULES_CONFIG_KEY, &schedules)
+        })
     }
 
     /// Encoded cron-schedule config for checkpoint export. DDL-declared
@@ -820,12 +891,15 @@ impl Database {
             return Ok(());
         };
         let audit = self.cron.audit.lock().iter().cloned().collect::<Vec<_>>();
-        persistence.flush_config_value(CRON_AUDIT_CONFIG_KEY, &audit)
+        self.publish_direct_metadata(|| {
+            persistence.flush_config_value(CRON_AUDIT_CONFIG_KEY, &audit)
+        })
     }
 
     fn worker_handle_for_background(&self) -> Database {
         Database {
             id: super::DatabaseId::next(),
+            declared_read_memory: self.declared_read_memory.clone(),
             tx_mgr: self.tx_mgr.clone(),
             relational_store: self.relational_store.clone(),
             vector_serving_cache_bytes: self.vector_serving_cache_bytes.clone(),

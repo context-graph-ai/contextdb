@@ -44,7 +44,8 @@ impl Database {
             return Err(invalid());
         }
         let edge = identity.node_id();
-        self.sync_incarnation(&tenant)?;
+        let read_memory = self.declared_reader_memory()?;
+        self.sync_incarnation_with_read_memory(&tenant, read_memory.clone())?;
         self.stage_delivery_registration(
             tx,
             SourceRegistration {
@@ -64,6 +65,7 @@ impl Database {
                     .collect(),
                 signer: std::sync::Arc::new(move |bytes| Ok(identity.sign_lineage(bytes))),
             },
+            read_memory,
         )
     }
     /// Fail this unit's real storage commit, including on a receiver worker.
@@ -90,9 +92,9 @@ impl Database {
     pub fn __delivery_prerequisite_wires_for_test(
         &self,
     ) -> Result<Vec<crate::protocol::WireDeliveryOutcome>> {
-        let records = self.custody_records()?;
+        let records = self.custody_records(self.declared_reader_memory()?)?;
         let mut wires = Vec::new();
-        for record in &records {
+        for record in records.iter() {
             if let Record::Terminal { record: t, .. } = record {
                 let block = records
                     .iter()
@@ -118,7 +120,7 @@ impl Database {
     }
     #[doc(hidden)]
     pub fn __delivery_metadata_bytes_for_test(&self) -> Result<Vec<Vec<u8>>> {
-        self.custody_records()?
+        self.custody_records(self.declared_reader_memory()?)?
             .iter()
             .map(super::records::encode)
             .collect()
@@ -176,7 +178,9 @@ impl Database {
         tenant: TenantId,
         expectation: ApplicationTablePolicyExpectation,
     ) -> Result<()> {
-        let existing = self.custody_records()?;
+        let read_memory = self.declared_reader_memory()?;
+        let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
+        let existing = self.custody_records(read_memory.clone())?;
         if existing
             .iter()
             .any(|r| matches!(r,Record::Policy(p) if p.tenant.as_ref().is_some_and(|t|t!=&tenant)))
@@ -209,19 +213,19 @@ impl Database {
         if records.is_empty() {
             return Ok(());
         }
-        self.commit_delivery_metadata(|_| Ok(records))
+        self.commit_delivery_metadata(|_| Ok(records), &mut vector_copy_owner, read_memory)
     }
     /// Inspect actual canonical prerequisite records independently of public delivery reads.
     #[doc(hidden)]
     pub fn __delivery_prerequisites_for_test(&self) -> Result<serde_json::Value> {
-        let records = self.custody_records()?;
-        for r in &records {
+        let records = self.custody_records(self.declared_reader_memory()?)?;
+        for r in records.iter() {
             match r {
             Record::Root{life,submission}=>{if !records.iter().any(|r|matches!(r,Record::Manifest(m) if m.id==*submission&&m.root_life==*life)){return Err(invalid());}},
             Record::MemberOwner{member,root,submission}=>{if !records.iter().any(|r|matches!(r,Record::Manifest(m) if m.id==*submission&&m.root_life==*root&&m.member_lives.contains(member))){return Err(invalid());}},
             Record::Terminal{edge:true,record:t}=>{if !records.iter().any(|r|matches!(r,Record::Manifest(m) if m.id==t.submission&&m.seal.digest()==t.seal_digest)){return Err(invalid());}},_=>{} }
         }
-        serde_json::to_value(records).map_err(|_| invalid())
+        serde_json::to_value(&*records).map_err(|_| invalid())
     }
     #[doc(hidden)]
     pub fn __arm_erasure_boundary_persist_fault_for_test(&self) {
@@ -237,10 +241,11 @@ impl Database {
 pub(crate) use super::delivery::manifested_request;
 
 pub(crate) fn manifest_rows(db: &Database, m: &ManifestRecord) -> Result<Vec<RowChange>> {
+    let read_memory = db.declared_reader_memory()?;
     m.rows
         .iter()
         .map(|e| {
-            let row = actual_row(db, &e.reference)?;
+            let row = actual_row(db, &e.reference, read_memory.clone())?;
             if full_row_digest(&row.values) != e.row_digest {
                 return Err(invalid());
             }
@@ -267,7 +272,9 @@ pub(crate) fn issue_fixture_binding(
     signer: &LineageSigner,
 ) -> Result<SignedBindingPacket> {
     let expected = input.expectation.clone();
-    let records = db.custody_records()?;
+    let read_memory = db.declared_reader_memory()?;
+    let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
+    let records = db.custody_records(read_memory.clone())?;
     for (table, policy) in &mut input.expectation.tables {
         if let Some(declared) = records.iter().find_map(|r| match r {
             Record::Policy(p) if p.table == *table => Some(&p.policy),
@@ -276,7 +283,16 @@ pub(crate) fn issue_fixture_binding(
             *policy = declared.clone();
         }
     }
-    let mut packet = commit_binding(db, tenant, hub, edge, input, signer)?;
+    let mut packet = commit_binding(
+        db,
+        tenant,
+        hub,
+        edge,
+        input,
+        signer,
+        &mut vector_copy_owner,
+        read_memory,
+    )?;
     for p in &mut packet.binding.tables {
         p.policy = normalized(&p.table, expected.tables[&p.table].clone())?;
         p.digest = policy_digest(&p.table, &p.policy)?;

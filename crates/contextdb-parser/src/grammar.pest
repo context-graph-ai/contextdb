@@ -38,6 +38,7 @@ stmt = _{
     | show_memory_limit
     | set_disk_limit
     | show_disk_limit
+    | show_content_size
     | set_maintenance_poll_interval
     | show_maintenance_poll_interval
     | set_vector_serving_cache
@@ -69,6 +70,7 @@ show_memory_limit = { ^"SHOW" ~ ^"MEMORY_LIMIT" }
 memory_limit_value = { ^"none" | size_with_unit }
 set_disk_limit = { ^"SET" ~ ^"DISK_LIMIT" ~ ("'" ~ disk_limit_value ~ "'" | disk_limit_value) }
 show_disk_limit = { ^"SHOW" ~ ^"DISK_LIMIT" }
+show_content_size = { ^"SHOW" ~ ^"CONTENT_SIZE" }
 disk_limit_value = { ^"none" | size_with_unit }
 set_maintenance_poll_interval = {
     ^"SET" ~ ^"MAINTENANCE_POLL_INTERVAL"
@@ -104,6 +106,8 @@ select_core = {
     ~ from_clause?
     ~ join_clause*
     ~ where_clause?
+    ~ group_by_clause?
+    ~ named_window_clause?
     ~ order_by_clause?
     ~ use_vector_clause?
     ~ use_rank_clause?
@@ -116,15 +120,20 @@ star = { "*" }
 select_item = { expr ~ (^"AS" ~ identifier)? }
 
 from_clause = { ^"FROM" ~ from_item ~ ("," ~ from_item)* }
-join_clause = { join_type ~ join_table_ref ~ ^"ON" ~ expr ~ &(join_type | where_start | order_by_start | use_vector_start | use_rank_start | limit_start | clause_end) }
+join_clause = { join_type ~ join_table_ref ~ ^"ON" ~ expr ~ &(join_type | where_start | group_by_start | order_by_start | use_vector_start | use_rank_start | limit_start | clause_end) }
 join_table_ref = { identifier ~ (^"AS" ~ identifier | identifier ~ &(^"ON"))? }
 join_type = { (^"LEFT" ~ ^"JOIN") | (^"INNER" ~ ^"JOIN") }
 from_item = { graph_table | table_ref }
 table_ref = { identifier ~ ((^"AS")? ~ table_alias)? }
-table_alias = { !(join_type | where_start | order_by_start | use_vector_start | use_rank_start | limit_start | clause_end) ~ identifier }
+table_alias = { !(join_type | where_start | group_by_start | named_window_start | order_by_start | use_vector_start | use_rank_start | limit_start | clause_end) ~ identifier }
 
-where_clause = { ^"WHERE" ~ expr ~ &(order_by_start | use_vector_start | use_rank_start | limit_start | clause_end) }
+where_clause = { ^"WHERE" ~ expr ~ &(group_by_start | named_window_start | order_by_start | use_vector_start | use_rank_start | limit_start | clause_end) }
 where_start = _{ ^"WHERE" }
+// Parsed in every SELECT; `parse` admits only COUNT(*) grouped by plain columns
+// and refuses every other statement that names GROUP BY.
+group_by_clause = { group_by_start ~ expr ~ ("," ~ expr)* ~ &(named_window_start | order_by_start | use_vector_start | use_rank_start | limit_start | clause_end) }
+group_by_start = _{ ^"GROUP" ~ ^"BY" }
+named_window_start = _{ ^"WINDOW" }
 order_by_start = _{ ^"ORDER" ~ ^"BY" }
 use_vector_start = _{ ^"USE" ~ ^"VECTOR" }
 use_rank_start = _{ ^"USE" ~ ^"RANK" }
@@ -585,7 +594,8 @@ unary_math_expr = { unary_minus* ~ primary_expr }
 unary_minus = { "-" }
 
 primary_expr = {
-    function_call
+    window_call
+    | function_call
     | parameter
     | null_lit
     | bool_lit
@@ -598,6 +608,12 @@ primary_expr = {
 }
 vector_lit = { "[" ~ vector_component ~ ("," ~ vector_component)* ~ "]" }
 vector_component = @{ "-"? ~ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }
+window_call = { function_call ~ ^"OVER" ~ (window_spec | identifier) }
+window_spec = { "(" ~ window_reference? ~ window_partition? ~ order_by_clause? ~ window_frame? ~ ")" }
+window_reference = { !(^"PARTITION" | ^"ORDER" | ^"ROWS" | ^"RANGE" | ^"GROUPS") ~ identifier }
+named_window_clause = { ^"WINDOW" ~ identifier ~ ^"AS" ~ window_spec ~ ("," ~ identifier ~ ^"AS" ~ window_spec)* }
+window_partition = { ^"PARTITION" ~ ^"BY" ~ expr ~ ("," ~ expr)* }
+window_frame = { (^"ROWS" | ^"RANGE" | ^"GROUPS") ~ (!")" ~ ANY)* }
 function_call = { identifier ~ "(" ~ (star | (expr ~ ("," ~ expr)*))? ~ ")" }
 column_ref = { identifier ~ ("." ~ identifier)? }
 

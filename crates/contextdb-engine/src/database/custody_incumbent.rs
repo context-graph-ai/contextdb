@@ -7,23 +7,35 @@ use crate::custody::{
 };
 
 impl Database {
-    pub(crate) fn custody_incumbent_digest(&self, root: &RowRef) -> Result<Option<Digest>> {
+    pub(crate) fn custody_incumbent_digest(
+        &self,
+        root: &RowRef,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<Option<Digest>> {
         let Some(meta) = self.table_meta(&root.table) else {
             return Ok(None);
         };
         let snapshot = self.snapshot_for_read();
-        let Some(row) =
-            self.visible_row_by_natural_key(&root.table, &root.key, snapshot, &HashSet::new())?
+        let Some(row) = self.visible_row_by_natural_key(
+            &root.table,
+            &root.key,
+            snapshot,
+            &HashSet::new(),
+            read_memory.clone(),
+        )?
         else {
             return Ok(None);
         };
         // An existing manifest owns exact membership, even when no edge has
         // delivered this locally written unit. Never grow it by foreign keys.
-        if let Some(manifest) = preparation::current_manifest(self, &root.table, &root.key)? {
+        if let Some(manifest) =
+            preparation::current_manifest(self, &root.table, &root.key, read_memory.clone())?
+        {
             return Ok(Some(manifest.seal.unit_digest));
         }
         let (_, values) = self
-            .row_change_values_from_row(&root.table, &row)?
+            .row_change_values_from_row(&root.table, &row, vector_copy_owner, read_memory.clone())?
             .ok_or_else(invalid)?;
         let parent = RowChange {
             table: root.table.clone(),
@@ -42,9 +54,20 @@ impl Database {
             if self.table_meta(table).is_none() {
                 continue;
             }
-            for row in self.relational_scan_filter_with_tx(None, table, snapshot, &|_| true)? {
+            for row in self.relational_scan_filter_with_tx(
+                None,
+                table,
+                snapshot,
+                &|_| true,
+                read_memory.clone(),
+            )? {
                 let (key, values) = self
-                    .row_change_values_from_row(table, &row)?
+                    .row_change_values_from_row(
+                        table,
+                        &row,
+                        vector_copy_owner,
+                        read_memory.clone(),
+                    )?
                     .ok_or_else(invalid)?;
                 let child = RowChange {
                     table: table.clone(),

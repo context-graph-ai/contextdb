@@ -21,6 +21,13 @@ Index selection happens in the engine.
 Never add a catalog handle here to make a plan "smarter". The planner maps
 `MAINTAIN COUNT` declarations to the engine's sort direction and passes
 `SET`/`SHOW VECTOR_SERVING_CACHE` as plan variants; the engine owns storage and execution.
+`SHOW CONTENT_SIZE` maps directly to `ShowContentSize`; the engine owns byte accounting and
+the file-backed scope. A grouped `COUNT(*)` (the only `GROUP BY` the parser admits) plans as
+`GroupedCount { input: Scan, group_by, columns }` with no schema lookup; whether a declared
+maintained count serves it, counts it from the rows, or refuses it is the engine's decision.
+A `ROW_NUMBER` window lowers to `WindowRank { input, window, binding }` between the source
+filter and the projection; the engine binds its columns at runtime and chooses per-group index
+seeks or the Sort-and-rank fallback.
 
 ## Seams
 

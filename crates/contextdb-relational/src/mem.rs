@@ -1,3 +1,4 @@
+use crate::source::RelationalCursor as _;
 use crate::store::{RelationalStore, index_key_from_values};
 use contextdb_core::read_memory::ReadMemoryBudget;
 use contextdb_core::*;
@@ -90,6 +91,12 @@ pub struct BoundedOrderedRowCursor {
     source_cache_key: Option<[u8; 32]>,
     source_cache_position: usize,
     source_run_precharged: bool,
+    /// The window operator's remaining visible-rank demand. This bounds each
+    /// authenticated source window; suppression and staged merge update demand
+    /// before requesting another window. None preserves ordinary source reads.
+    source_prefix_quota: Option<u64>,
+    /// Quota completion is not proof that the declared range is exhausted.
+    source_prefix_stopped: bool,
     /// Opaque read a retained source keeps open for every run this cursor
     /// walks, so one statement opens its read and its physical index once
     /// rather than once per window. The relational layer never looks inside.
@@ -129,6 +136,8 @@ impl Default for BoundedOrderedRowCursor {
             source_cache_key: None,
             source_cache_position: 0,
             source_run_precharged: false,
+            source_prefix_quota: None,
+            source_prefix_stopped: false,
             source_read: None,
             source_proof: None,
         }
@@ -161,6 +170,8 @@ impl BoundedOrderedRowCursor {
             source_cache_key: None,
             source_cache_position: 0,
             source_run_precharged: false,
+            source_prefix_quota: None,
+            source_prefix_stopped: false,
             source_read: None,
             source_proof: None,
         }
@@ -427,6 +438,30 @@ impl BoundedOrderedRowCursor {
         self.key_generation
     }
 
+    /// Update the next window's demand after the caller applies suppression
+    /// and ranks a visible row. An existing proved window is retained: its
+    /// entries were examined under its original demand and remain accounted.
+    #[doc(hidden)]
+    pub fn source_set_prefix_quota(&mut self, remaining: Option<u64>) {
+        self.source_prefix_quota = remaining;
+        self.source_prefix_stopped = remaining == Some(0);
+    }
+
+    #[doc(hidden)]
+    pub fn source_prefix_quota(&self) -> Option<u64> {
+        self.source_prefix_quota
+    }
+
+    #[doc(hidden)]
+    pub fn source_prefix_stopped(&self) -> bool {
+        self.source_prefix_stopped
+    }
+
+    #[doc(hidden)]
+    pub fn source_stop_prefix(&mut self) {
+        self.source_prefix_stopped = true;
+    }
+
     #[doc(hidden)]
     pub fn source_position(&self) -> Option<&[u8]> {
         self.source_key.as_deref()
@@ -598,8 +633,12 @@ fn run_prefix_len(start: &Bound<IndexKey>, end: &Bound<IndexKey>) -> usize {
 }
 
 fn key_prefix_cmp(key: &IndexKey, edge: &IndexKey, prefix_len: usize) -> std::cmp::Ordering {
-    key.get(..prefix_len)
-        .map(|prefix| prefix.cmp(&edge[..prefix_len]))
+    // A run can pair a group boundary with a longer component cutoff. Each
+    // endpoint compares in its own domain: the shorter endpoint includes or
+    // excludes the whole group, while the longer one restricts that group.
+    let edge_len = prefix_len.min(edge.len());
+    key.get(..edge_len)
+        .map(|prefix| prefix.cmp(&edge[..edge_len]))
         .unwrap_or(std::cmp::Ordering::Less)
 }
 
@@ -1343,7 +1382,27 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         &self,
         table: &str,
         cursor: &mut BoundedPhysicalCursor,
+        before_touch: impl FnMut() -> std::result::Result<(), E>,
+        before_clone: impl FnOnce(usize) -> std::result::Result<(), E>,
+    ) -> std::result::Result<Option<VersionedRow>, E>
+    where
+        E: From<Error>,
+    {
+        self.bounded_physical_row_next_observed(
+            table,
+            cursor,
+            before_touch,
+            |_| Ok(()),
+            before_clone,
+        )
+    }
+
+    pub fn bounded_physical_row_next_observed<E>(
+        &self,
+        table: &str,
+        cursor: &mut BoundedPhysicalCursor,
         mut before_touch: impl FnMut() -> std::result::Result<(), E>,
+        mut observed: impl FnMut(&VersionedRow) -> std::result::Result<(), E>,
         before_clone: impl FnOnce(usize) -> std::result::Result<(), E>,
     ) -> std::result::Result<Option<VersionedRow>, E>
     where
@@ -1376,6 +1435,7 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
                     loop {
                         before_touch()?;
                         let row = &rows[candidate];
+                        observed(row)?;
                         let identity = Some((row.row_id, row.created_tx));
                         if identity == cursor.last_inspected {
                             found = Some((candidate, true));
@@ -1430,6 +1490,7 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         }
         before_touch()?;
         let row = &rows[cursor.position];
+        observed(row)?;
         before_clone(row.estimated_bytes())?;
         let row = row.clone();
         cursor.last_inspected = Some((row.row_id, row.created_tx));
@@ -1733,7 +1794,35 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         direction: SortDirection,
         snapshot: SnapshotId,
         cursor: &mut BoundedOrderedRowCursor,
+        before_touch: impl FnMut() -> std::result::Result<(), E>,
+        before_clone: impl FnOnce(usize) -> std::result::Result<(), E>,
+    ) -> std::result::Result<Option<VersionedRow>, E>
+    where
+        E: From<Error>,
+    {
+        self.bounded_ordered_row_next_observed(
+            table,
+            column,
+            direction,
+            snapshot,
+            cursor,
+            before_touch,
+            |_, _| Ok(()),
+            before_clone,
+        )
+    }
+
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn bounded_ordered_row_next_observed<E>(
+        &self,
+        table: &str,
+        column: &str,
+        direction: SortDirection,
+        snapshot: SnapshotId,
+        cursor: &mut BoundedOrderedRowCursor,
         mut before_touch: impl FnMut() -> std::result::Result<(), E>,
+        mut observed: impl FnMut(&IndexKey, RowId) -> std::result::Result<(), E>,
         before_clone: impl FnOnce(usize) -> std::result::Result<(), E>,
     ) -> std::result::Result<Option<VersionedRow>, E>
     where
@@ -1763,6 +1852,7 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
                 return Ok(None);
             };
             before_touch()?;
+            observed(key, entry.row_id)?;
             self.store.bump_index_entries_touched(1);
             let key_changed = cursor.key.as_ref() != Some(key);
             let key_bytes = if key_changed {
@@ -1855,13 +1945,14 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
             cursor.image = Some(storage.current_image(snapshot).cloned());
             if matches!(cursor.image, Some(Some(_))) {
                 drop(indexes);
-                return self.bounded_ordered_row_next(
+                return self.bounded_ordered_row_next_observed(
                     table,
                     column,
                     direction,
                     snapshot,
                     cursor,
                     before_touch,
+                    observed,
                     before_clone,
                 );
             }
@@ -1940,8 +2031,9 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         // key. Resolve the row version separately: an unchanged indexed key
         // can retain a posting created before the visible row version. Charge
         // every retained posting examined, but return the row once per key.
-        for _ in &entries[run_start..run_end] {
+        for entry in &entries[run_start..run_end] {
             before_touch()?;
+            observed(key, entry.row_id)?;
             self.store.bump_index_entries_touched(1);
         }
         let visible_entry = entries[run_start..run_end]

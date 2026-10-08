@@ -212,6 +212,9 @@ SELECT [DISTINCT] columns FROM table
   [LIMIT n]
 ```
 
+`GROUP BY` is accepted only as `COUNT(*)` grouped by a declared `MAINTAIN COUNT` list; see
+[Grouped counts](#maintain-count).
+
 A `SELECT`-list column that does not exist on the table is `ColumnNotFound { table, column }` — the same class WHERE/JOIN/ORDER BY already use for an identical unknown-name failure — never `Ok` with a wrong or missing column:
 
 ```sql
@@ -291,6 +294,41 @@ SELECT * FROM active WHERE name LIKE 'sensor%'
 
 Multiple CTEs via comma separation. Non-recursive only.
 
+### Ranked rows per group
+
+`ROW_NUMBER() OVER (PARTITION BY cols ORDER BY col [ASC|DESC], ...)` numbers each partition's
+rows 1, 2, 3, ... in the window's order; `OVER (ORDER BY ...)` without `PARTITION BY` numbers the
+whole input as one partition. Ties get distinct numbers in the window's order. Filter on the
+number in an outer query to take the first rows of each partition:
+
+```sql
+WITH ranked AS (
+  SELECT context_id, connector_id, session_ref, latest_occurred_at,
+         ROW_NUMBER() OVER (PARTITION BY context_id
+                            ORDER BY latest_occurred_at DESC, connector_id ASC, session_ref ASC)
+           AS session_rank
+  FROM event_context_sessions
+  WHERE context_id IN ($a, $b) AND latest_occurred_at IS NOT NULL
+)
+SELECT context_id, connector_id, session_ref FROM ranked
+WHERE (context_id = $a AND session_rank <= $n) OR (context_id = $b AND session_rank <= $m)
+ORDER BY context_id ASC, session_rank ASC
+```
+
+When each selected partition is named by equality with its own `rank <=` limit, and an index
+leads with the partition columns followed by the window's order columns in the same directions (a
+column the inner WHERE pins with `=` or `IS NULL` may sit between them), each partition is read as
+one index seek that stops at its own limit: it examines at most its limit plus one entry, however
+many rows the partition holds. Otherwise the input is sorted by partition and order and numbered —
+the same answer, within the statement's ordinary work and memory budgets. A reversed index does
+not serve a mixed-direction order, so newest-first and oldest-first each need their own index.
+The trace's `groups` lists each partition the read touched, its key redacted, with the entries it
+examined, the rows it returned, and whether `Index` or `Sort` served it.
+
+Every other window form is refused with `WindowFunctionNotSupported` naming it: `RANK`,
+`DENSE_RANK`, aggregates with `OVER`, `ROW_NUMBER` without `ORDER BY`, frames, named windows,
+several different windows in one `SELECT`, and computed partition or order expressions.
+
 ### Anchor-Shape vs List-Shape Reads
 
 Scoped handles filter ordinary reads to the rows visible to that handle. List
@@ -335,6 +373,7 @@ SET MEMORY_LIMIT NONE;
 SET DISK_LIMIT 1G;
 SET DISK_LIMIT NONE;
 SHOW DISK_LIMIT;
+SHOW CONTENT_SIZE;
 SET MAINTENANCE_POLL_INTERVAL 250 MILLISECONDS;
 SET MAINTENANCE_POLL_INTERVAL '5 SECONDS';
 SHOW MAINTENANCE_POLL_INTERVAL;
@@ -349,6 +388,22 @@ Size suffixes are binary. Both settings accept an unquoted or quoted size and `N
 which are separate from whole-process RSS.
 
 `SHOW DISK_LIMIT` returns the same columns for file-backed storage. On `:memory:` databases, disk limit commands are accepted but ignored.
+
+`SHOW CONTENT_SIZE` is a read-only inspection of a file-backed store's captured committed snapshot.
+It returns one row with `live_row_bytes`, `live_vector_bytes`, `live_content_bytes`,
+`retained_row_bytes`, and `retained_vector_bytes`. The live fields count current row versions and
+canonical vector body values; `live_content_bytes` is their checked sum. Superseded or deleted
+`HISTORY ALL` content appears only in the retained fields. Row bytes are the exact persisted row
+value lengths. Vector bytes are the exact encoded canonical body lengths, including that body's
+identity and version metadata once; disjoint placement memberships share the body's one count.
+Membership, journal, graph/index, file padding, free pages, and reclaimed bytes are excluded.
+
+The report reads maintained per-table totals under the executing reader's limits. It performs no
+row or history scan and observes the same captured root on both read routes and an open cursor.
+Missing, incomplete, or corrupt committed totals are refused with a typed error. A memory-only
+store returns a typed unsupported inspection refusal because it has no persisted committed values.
+The CLI's existing `--json` result envelope carries these five columns.
+<!-- proof pending: crates/contextdb-engine/tests/read/content_size_independent_contract.rs::memory_content_size_refuses_without_inventing_persisted_bytes; ::file_content_totals_match_persisted_values_through_replacement_delete_and_prune; ::content_size_reads_one_total_per_table_at_fixed_table_count -->
 
 `SHOW MAINTENANCE_POLL_INTERVAL` returns one `milliseconds` column. The default is 60,000 ms.
 `SET MAINTENANCE_POLL_INTERVAL` accepts a positive integer followed by `MILLISECONDS` or `SECONDS`,
@@ -977,6 +1032,24 @@ replaces the whole declared set, the advice carries the lists the table already
 declares alongside the missing one — following it never drops a count you
 already asked for.
 
+**Grouped counts.** `COUNT(*)` grouped by the rest of a declared list, with the list's leading
+columns pinned by `=` or `IS NULL`, is answered from the stored counts — one stored count per
+group, so its work is the number of groups and never the number of rows they count:
+
+```sql
+SELECT connector_id, source_instance_ref, COUNT(*) AS event_count
+FROM events WHERE context_id = $context_id
+GROUP BY connector_id, source_instance_ref
+```
+
+A writable handle and the owner read route serve it from the counts at the statement's own
+snapshot (`maintained count: used (...)`). A transaction that has staged rows of the table, a
+table whose rows are filtered per reader, and a store read as a committed image count the same
+groups from the rows instead, and the trace says `declared (...), counted from the index range on
+this read route`. Groups come back in the declared list's order. A grouped `COUNT(*)` over columns
+the table maintains no count for is refused, naming the `ALTER TABLE ... SET MAINTAIN COUNT` that
+would serve it.
+
 **The refusals.** A list no index leads with is refused, naming the list and
 the indexes considered — a count nothing can read is not a thing to maintain.
 A list a primary key or unique constraint already bounds at 0 or 1 is refused
@@ -1171,7 +1244,12 @@ WHERE embedding IS NOT NULL
 | `COALESCE(a, b, ...)` | varies | First non-NULL argument |
 | `NOW()` | TIMESTAMP | Current Unix timestamp |
 
-COUNT and SUM operate over the entire result set. No GROUP BY or HAVING — use CTEs or application-level grouping for aggregation.
+COUNT and SUM operate over the entire result set. The one grouped form is `COUNT(*)` grouped by a
+column list the table declares under [MAINTAIN COUNT](#maintain-count) — the WHERE clause pins that
+list's leading columns with `=` or `IS NULL` and `GROUP BY` names the rest — and it is answered
+from the stored counts. Every other grouped form is refused: `HAVING`, `SUM` or `COUNT(col)` per
+group, a select item that is neither a grouped column nor `COUNT(*)`, and `DISTINCT`, `ORDER BY`,
+`LIMIT`, joins or CTEs around a grouped read.
 
 **`NOW()` in an `INSERT ... VALUES` list is refused for a `NOT NULL` column.** Writing it into a
 nullable column is accepted, and `UPDATE ... SET ts = NOW()` is accepted for either; but
@@ -1272,6 +1350,14 @@ MATCH (a)-[:EDGE]->{1,10}(b)
 
 An explicit upper bound is always required. Maximum traversal depth enforced by the engine is 10.
 
+### What a Match Returns
+
+The same matching rule applies to every reader. Access rules only remove the nodes and edges a reader may not see; they never change how the rest are matched.
+
+- **A single hop** returns one row for each matching edge. `MATCH (a)-[:LINKS]->(b)` with edges x→z and y→z returns (x, z) and (y, z). Two edges between the same nodes that both match, such as edges of two types under `MATCH (a)-[]->(b)`, return two rows. An undirected hop reports a self-loop once.
+- **A longer match** (a variable-length step or several steps) walks every matching edge out from each start, up to the upper bound. An edge back to a node already reached still counts, so cycles and self-loops count as reachable, and a cycle that returns to a start node reports that start node when the cycle's length is within the range.
+- **Each combination of target nodes is reported once** in a longer match, at the shallowest depth any start node reaches it. When two start nodes reach it at the same depth, the start node that comes first wins: first in the order the start nodes are given (an `IN` list, or the rows of a start subquery), or the smallest node id when the match does not name its start nodes.
+
 ### Filtering and Projection
 
 Use WHERE to filter after traversal, COLUMNS to project results:
@@ -1284,6 +1370,8 @@ SELECT target_id FROM GRAPH_TABLE(
   COLUMNS (b.id AS target_id)
 )
 ```
+
+`COLUMNS` can project the id of each node the match binds (`a.id`, `b.id`), plus `id` and `depth` for the node reached and its depth. It cannot yet project any other property of a bound node: `COLUMNS (b.context_id AS context)` fails with `project column not found: b.context_id`. To read such a property, project the node's id and join the node table on it.
 
 ### Composing with SQL via CTEs
 
@@ -1607,10 +1695,11 @@ These are explicitly rejected with descriptive error messages:
 | Feature | Error |
 |---------|-------|
 | `WITH RECURSIVE` | `RecursiveCteNotSupported` |
-| Window functions (`OVER`) | `WindowFunctionNotSupported` |
+| Window functions other than `ROW_NUMBER() OVER ([PARTITION BY ...] ORDER BY ...)` | `WindowFunctionNotSupported { form }` |
 | `CREATE PROCEDURE` / `CREATE FUNCTION` | `StoredProcNotSupported` |
 | Full-text search (`WHERE col MATCH pattern`) | `FullTextSearchNotSupported` |
-| `GROUP BY` / `HAVING` | Not supported |
+| `GROUP BY` other than `COUNT(*)` grouped by a declared `MAINTAIN COUNT` list, and `HAVING` | `ParseError("GROUP BY is not supported")` |
+| `COUNT(*)` grouped by columns the table maintains no count over | `PlanError` naming the `ALTER TABLE ... SET MAINTAIN COUNT` that would serve it |
 | `UNION` / `INTERSECT` / `EXCEPT` | Not supported |
 | `INSERT ... SELECT` | Not supported |
 | Subqueries outside `IN` | `SubqueryNotSupported` |

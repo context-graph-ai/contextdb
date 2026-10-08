@@ -514,7 +514,11 @@ fn logical_history_key(kind: u8, position: &[u8]) -> Vec<u8> {
     key
 }
 
-pub fn committed_content_for_test(path: &Path) -> Result<CommittedContentForTest> {
+pub fn committed_content_for_test(
+    path: &Path,
+    operation_read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    declared_read_memory: Arc<crate::vector_read_memory::DeclaredReadMemory>,
+) -> Result<CommittedContentForTest> {
     let load = crate::persistence::load_read_image(path)
         .map_err(|e| contextdb_core::Error::Other(e.to_string()))?;
     let (mut image, receipt, retained_source) = load.into_parts();
@@ -584,11 +588,24 @@ pub fn committed_content_for_test(path: &Path) -> Result<CommittedContentForTest
         })
         .collect::<HashMap<_, _>>();
     let accountant = parts.memory.accountant.clone();
+    let read_memory = operation_read_memory;
     // Test-only use of the existing committed decoder target provides metadata
     // and history semantics; no replacement full image enters a reader's life.
-    let database =
-        Database::open_committed_image(parts, Arc::new(crate::plugin::CorePlugin), accountant)?;
-    let mut content = project_test_content(&database, graph, vectors, commits, maintained_digest)?;
+    let database = Database::open_committed_image(
+        parts,
+        Arc::new(crate::plugin::CorePlugin),
+        accountant,
+        read_memory.clone(),
+        declared_read_memory,
+    )?;
+    let mut content = project_test_content(
+        &database,
+        graph,
+        vectors,
+        commits,
+        maintained_digest,
+        read_memory,
+    )?;
     content.configuration.memory_limit_bytes = memory_limit;
     content.durable_auxiliary = auxiliary;
     for row in &content.relational_rows {
@@ -714,14 +731,21 @@ fn project_test_content(
     vectors: Vec<DirectStoredVector>,
     commit_index: Vec<(Lsn, TxId)>,
     maintained_digest: DirectTypedImageDigest,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<CommittedContentForTest> {
+    let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
     let snapshot_id = database.snapshot();
     let mut table_names = database.table_names();
     table_names.sort();
 
     let mut relational_rows = Vec::new();
     for table in &table_names {
-        for row in database.scan(table, snapshot_id)? {
+        for row in database.scan_with_read_memory(
+            table,
+            snapshot_id,
+            &mut vector_copy_owner,
+            read_memory.clone(),
+        )? {
             relational_rows.push(DirectStoredRow {
                 table: table.clone(),
                 row_id: row.row_id,
@@ -741,7 +765,11 @@ fn project_test_content(
         })
         .collect::<Vec<_>>();
 
-    let (changes, arrivals) = database.changes_since_with_arrivals(Lsn(0));
+    let (changes, arrivals) = database.changes_since_with_arrivals_with_read_memory(
+        Lsn(0),
+        &mut vector_copy_owner,
+        read_memory,
+    )?;
     let changes_state = DirectChangeState {
         current_lsn: database.current_lsn(),
         committed_watermark: database.committed_watermark(),

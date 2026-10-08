@@ -18,6 +18,7 @@ impl Database {
         tenant: &TenantId,
         peer: Option<&str>,
         requested: Lsn,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Option<HiddenPullScan>> {
         let Some(peer) = peer else {
             return Ok(None);
@@ -34,12 +35,16 @@ impl Database {
         // The caller holds the outbound schema lease. A declaration change
         // invalidates hidden progress, so a newly pullable old row is revisited.
         let schema = if let Some(root) = self.writer_read_root()? {
-            let mut cursor = root.ddl_history_cursor_ordered(Lsn(0), true)?;
+            let mut cursor = root.ddl_history_cursor_ordered(
+                crate::persistence::writer_source::SourceWindowOwner::Read(read_memory.clone()),
+                Lsn(0),
+                true,
+            )?;
             cursor.next_ddl_history()?.map(|window| window.value.0)
         } else {
             self.ddl_log.read().last().map(|(lsn, _)| *lsn)
         };
-        let incarnation = self.existing_sync_incarnation(tenant)?;
+        let incarnation = self.existing_sync_incarnation(tenant, read_memory.clone())?;
         let through = self.current_lsn();
         self.with_custody_store(|store| {
             let since = store

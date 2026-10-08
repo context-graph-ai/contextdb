@@ -297,6 +297,7 @@ fn client_for(db: &Arc<Database>, ticket: &str, identity: &Path, tenant: &str) -
         &peer_dial_spec(ticket, identity),
         TenantId::from(tenant),
     )
+    .unwrap_or_else(|err| die("construct the sync client", err))
 }
 
 fn receipt_lines(prefix: &str, receipts: &[TransferReceipt]) {
@@ -942,11 +943,10 @@ async fn run_hub(
     write_atomically(ticket_file, &ticket.to_string());
     emit("hub.ticket_file", ticket_file.display());
 
-    let server = Arc::new(SyncServer::new(
-        db.clone(),
-        &endpoint,
-        TenantId::from(tenant),
-    ));
+    let server = Arc::new(
+        SyncServer::new(db.clone(), &endpoint, TenantId::from(tenant))
+            .unwrap_or_else(|err| die("construct the sync server", err)),
+    );
 
     let shutdown = Arc::new(AtomicBool::new(false));
     {
@@ -1502,8 +1502,9 @@ async fn run_s4_size(db_path: &Path, retain_secs: u64, rows: u64, row_bytes: usi
     emit("s4.whole_file_field_compiled_against", "whole_file_bytes");
 
     let empty = match db.table_size_estimate(RETAINED_TABLE) {
-        Some(estimate) => estimate,
-        None => die("size estimate for the retained table", "no answer"),
+        Ok(Some(estimate)) => estimate,
+        Ok(None) => die("size estimate for the retained table", "no answer"),
+        Err(err) => die("size estimate for the retained table", err),
     };
     emit("s4.empty.estimated_live_bytes", empty.estimated_live_bytes);
     emit("s4.empty.row_count", empty.row_count);
@@ -1520,8 +1521,9 @@ async fn run_s4_size(db_path: &Path, retain_secs: u64, rows: u64, row_bytes: usi
     insert_windows(&db, rows, 1, &metric);
     insert_notes(&db, 5, 1);
     let filled = match db.table_size_estimate(RETAINED_TABLE) {
-        Some(estimate) => estimate,
-        None => die("size estimate after inserts", "no answer"),
+        Ok(Some(estimate)) => estimate,
+        Ok(None) => die("size estimate after inserts", "no answer"),
+        Err(err) => die("size estimate after inserts", err),
     };
     emit(
         "s4.filled.estimated_live_bytes",
@@ -1533,8 +1535,9 @@ async fn run_s4_size(db_path: &Path, retain_secs: u64, rows: u64, row_bytes: usi
         filled.whole_file_bytes.unwrap_or(0),
     );
     let control = match db.table_size_estimate(CONTROL_TABLE) {
-        Some(estimate) => estimate,
-        None => die("size estimate for the control table", "no answer"),
+        Ok(Some(estimate)) => estimate,
+        Ok(None) => die("size estimate for the control table", "no answer"),
+        Err(err) => die("size estimate for the control table", err),
     };
     emit(
         "s4.control.estimated_live_bytes",
@@ -1553,8 +1556,9 @@ async fn run_s4_size(db_path: &Path, retain_secs: u64, rows: u64, row_bytes: usi
     };
     emit("s4.pruned_rows", report.pruning.pruned_rows);
     let pruned = match db.table_size_estimate(RETAINED_TABLE) {
-        Some(estimate) => estimate,
-        None => die("size estimate after prune", "no answer"),
+        Ok(Some(estimate)) => estimate,
+        Ok(None) => die("size estimate after prune", "no answer"),
+        Err(err) => die("size estimate after prune", err),
     };
     emit(
         "s4.pruned.estimated_live_bytes",
@@ -1698,7 +1702,9 @@ async fn run_blob_holder(
         Ok(endpoint) => endpoint,
         Err(err) => die("bind the blob serving endpoint", err),
     };
-    holder.serve_on(&endpoint);
+    holder
+        .serve_on(&endpoint)
+        .unwrap_or_else(|err| die("serve blobs", err));
     write_atomically(ticket_file, &endpoint.ticket().to_string());
     emit("blob.holder_ticket_file", ticket_file.display());
 
@@ -2362,18 +2368,20 @@ async fn run_currency_plateau(
     // per-arm numbers (this process is ONE arm; the script invokes this
     // scenario twice, once per ballast multiplier).
     match db.table_size_estimate("currency_ballast_vectors") {
-        Some(estimate) => emit(
+        Ok(Some(estimate)) => emit(
             "currency_plateau.ballast_vectors_estimated_bytes",
             estimate.estimated_live_bytes,
         ),
-        None => emit("currency_plateau.ballast_vectors_estimated_bytes", 0),
+        Ok(None) => emit("currency_plateau.ballast_vectors_estimated_bytes", 0),
+        Err(err) => die("size estimate for currency ballast vectors", err),
     }
     match db.table_size_estimate("currency_ballast_plain") {
-        Some(estimate) => emit(
+        Ok(Some(estimate)) => emit(
             "currency_plateau.ballast_plain_estimated_bytes",
             estimate.estimated_live_bytes,
         ),
-        None => emit("currency_plateau.ballast_plain_estimated_bytes", 0),
+        Ok(None) => emit("currency_plateau.ballast_plain_estimated_bytes", 0),
+        Err(err) => die("size estimate for currency ballast plain", err),
     }
 
     let _ = db.close();

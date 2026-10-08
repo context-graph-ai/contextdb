@@ -2,6 +2,7 @@
 //! authenticate each record when used, and reuse one admitted decode window.
 //! No decoded directory is retained by the vector store.
 use super::{DormantVectorLoadRequest, RawVectorDirectoryEntry, VectorGraphGeneration};
+use crate::MemoryBudget;
 use contextdb_core::{
     Error, Lsn, Result, RowId, SnapshotId, TxId, VectorIndexRef, VectorPartitionKey,
 };
@@ -52,11 +53,19 @@ pub enum RawVectorSuffixChange {
     },
 }
 
+/// Opaque selected membership. Engines accept only their own private receipt,
+/// which retains the physical operation root and exact forward record.
+#[doc(hidden)]
+pub trait RawVectorMembershipSelection: Send {
+    fn identity(&self) -> RawVectorDirectoryEntry;
+    fn as_any(&self) -> &dyn std::any::Any;
+}
+
 /// Storage-neutral access to a partition's authoritative membership directory.
 /// The engine supplies the root and record verification. Implementations must
 /// never hydrate a partition to answer any of these methods.
 /// The source and its raw-body loader must share the same pinned durable root.
-/// Point/count operations admit their own transient scratch and release it on
+/// Point/count operations admit transient scratch through the explicit executing owner and release it on
 /// success or error. Before each physical record read, including invisible
 /// intervals, they must call `before_read` to check cancellation and charge
 /// statement work. A false result stops before that read and returns an error.
@@ -64,14 +73,38 @@ pub enum RawVectorSuffixChange {
 /// root while a reader holds it.
 #[doc(hidden)]
 pub trait RawVectorMembershipSource: Send + Sync {
+    /// Borrow retained metadata credits without resolving or copying a source.
+    /// Callbacks must not call store or source operations, including reads;
+    /// visitation holds store guards or the lazy source mutex.
+    fn visit_retained_copy_credits(
+        &self,
+        _caller: &dyn MemoryBudget,
+        _visit: &mut dyn FnMut(usize, usize, bool),
+    ) {
+    }
+
+    /// Authenticate one serving selection on this operation's physical root.
+    /// No default is permitted: every supplier must bind its root explicitly.
+    fn capture_serving_selection(
+        &self,
+        snapshot: SnapshotId,
+        frozen_base: Option<&VectorGraphGeneration>,
+        frozen_change: Option<&VectorGraphGeneration>,
+        owner: &mut super::VectorCopyAdmission,
+    ) -> Result<super::CapturedVectorServingSelection>;
+
     /// Rebind a live writer source after its durable index keys are renamed.
     /// Captured cursors retain their original source and root.
     fn for_renamed_index(
         &self,
         index: &VectorIndexRef,
-    ) -> Option<std::sync::Arc<dyn RawVectorMembershipSource>> {
-        let _ = index;
-        None
+        owner: &mut super::VectorCopyAdmission,
+        retained: super::VectorCopyAdmission,
+    ) -> Result<std::sync::Arc<dyn RawVectorMembershipSource>> {
+        let _ = (index, owner, retained);
+        Err(Error::Other(
+            "this membership source cannot prepare an index rename".into(),
+        ))
     }
 
     /// Already-validated catalog metadata for the published frontier. This
@@ -82,7 +115,11 @@ pub trait RawVectorMembershipSource: Send + Sync {
     /// after a durable removal the store did not publish itself (retention,
     /// version cleanup, purge). A source pinned to one root returns its
     /// published summary.
-    fn current_summary(&self) -> Result<RawVectorMembershipSummary> {
+    fn current_summary(
+        &self,
+        owner: &mut super::VectorCopyAdmission,
+    ) -> Result<RawVectorMembershipSummary> {
+        let _ = owner;
         Ok(self.published_summary())
     }
 
@@ -93,20 +130,66 @@ pub trait RawVectorMembershipSource: Send + Sync {
         &self,
         snapshot: SnapshotId,
         before_read: &mut dyn FnMut() -> bool,
+        owner: &mut super::VectorCopyAdmission,
     ) -> Result<usize>;
+
+    fn supports_root_selection(&self) -> bool {
+        false
+    }
+
+    fn select_visible_by_row(
+        &self,
+        row: RowId,
+        snapshot: SnapshotId,
+        before_read: &mut dyn FnMut() -> bool,
+        owner: &mut super::VectorCopyAdmission,
+    ) -> Result<Option<Box<dyn RawVectorMembershipSelection>>> {
+        let _ = (row, snapshot, before_read, owner);
+        Err(Error::Other(
+            "this membership source has no root-bound selection".into(),
+        ))
+    }
+
+    fn select_identity_by_row_lsn(
+        &self,
+        row: RowId,
+        lsn: Lsn,
+        before_read: &mut dyn FnMut() -> bool,
+        owner: &mut super::VectorCopyAdmission,
+    ) -> Result<Option<Box<dyn RawVectorMembershipSelection>>> {
+        let _ = (row, lsn, before_read, owner);
+        Err(Error::Other(
+            "this membership source has no root-bound selection".into(),
+        ))
+    }
 
     fn visible_by_row(
         &self,
         row: RowId,
         snapshot: SnapshotId,
         before_read: &mut dyn FnMut() -> bool,
+        owner: &mut super::VectorCopyAdmission,
     ) -> Result<Option<RawVectorDirectoryEntry>>;
+
+    /// Borrowed native reservation seam. Providers with already funded
+    /// copies keep their existing visible lookup through this default.
+    fn visible_by_row_with_copy_admission(
+        &self,
+        row: RowId,
+        snapshot: SnapshotId,
+        before_read: &mut dyn FnMut() -> bool,
+        owner: &mut super::VectorCopyAdmission,
+        _admit: super::VectorCopyAdmissionCallback<'_>,
+    ) -> Result<Option<RawVectorDirectoryEntry>> {
+        self.visible_by_row(row, snapshot, before_read, owner)
+    }
 
     fn contains_row_lsn(
         &self,
         row: RowId,
         lsn: Lsn,
         before_read: &mut dyn FnMut() -> bool,
+        owner: &mut super::VectorCopyAdmission,
     ) -> Result<bool>;
 
     /// Resolve the exact retained row version within this partition's row
@@ -117,6 +200,7 @@ pub trait RawVectorMembershipSource: Send + Sync {
         row: RowId,
         lsn: Lsn,
         before_read: &mut dyn FnMut() -> bool,
+        owner: &mut super::VectorCopyAdmission,
     ) -> Result<Option<RawVectorDirectoryEntry>>;
 
     /// Whether commits already maintain authoritative pending summaries in
@@ -127,8 +211,12 @@ pub trait RawVectorMembershipSource: Send + Sync {
 
     /// Fixed durable metadata for the published serving frontier. No journal,
     /// directory or body reads are permitted; failure must reach inspection.
-    fn pending_counts(&self, covered: Option<TxId>) -> Result<Option<(usize, usize)>> {
-        let _ = covered;
+    fn pending_counts(
+        &self,
+        covered: Option<TxId>,
+        owner: &mut super::VectorCopyAdmission,
+    ) -> Result<Option<(usize, usize)>> {
+        let _ = (covered, owner);
         Ok(None)
     }
 
@@ -138,8 +226,9 @@ pub trait RawVectorMembershipSource: Send + Sync {
     fn inspection_snapshot(
         &self,
         serving_covered: Option<TxId>,
+        owner: &mut super::VectorCopyAdmission,
     ) -> Result<Option<RawVectorInspectionSnapshot>> {
-        let _ = serving_covered;
+        let _ = (serving_covered, owner);
         Ok(None)
     }
 
@@ -147,8 +236,12 @@ pub trait RawVectorMembershipSource: Send + Sync {
     /// after it, counted from a durable LSN-ordered change suffix without
     /// reading the covered memberships. `None` when this source keeps no such
     /// suffix.
-    fn pending_after(&self, covered_lsn: Lsn) -> Result<Option<(usize, usize)>> {
-        let _ = covered_lsn;
+    fn pending_after(
+        &self,
+        covered_lsn: Lsn,
+        owner: &mut super::VectorCopyAdmission,
+    ) -> Result<Option<(usize, usize)>> {
+        let _ = (covered_lsn, owner);
         Ok(None)
     }
 
@@ -158,8 +251,9 @@ pub trait RawVectorMembershipSource: Send + Sync {
         &self,
         after_lsn: Lsn,
         visit: &mut dyn FnMut(RawVectorSuffixChange) -> Result<()>,
+        owner: &mut super::VectorCopyAdmission,
     ) -> Result<bool> {
-        let _ = (after_lsn, visit);
+        let _ = (after_lsn, visit, owner);
         Ok(false)
     }
 
@@ -170,8 +264,9 @@ pub trait RawVectorMembershipSource: Send + Sync {
         row: RowId,
         before_read: &mut dyn FnMut() -> bool,
         visit: &mut dyn FnMut(RawVectorDirectoryEntry) -> Result<()>,
+        owner: &mut super::VectorCopyAdmission,
     ) -> Result<()> {
-        let _ = (row, before_read, visit);
+        let _ = (row, before_read, visit, owner);
         Err(Error::Other(
             "this vector membership source cannot visit row versions".into(),
         ))
@@ -182,8 +277,9 @@ pub trait RawVectorMembershipSource: Send + Sync {
         &self,
         before_read: &mut dyn FnMut() -> bool,
         visit: &mut dyn FnMut(RawVectorDirectoryEntry) -> Result<()>,
+        owner: &mut super::VectorCopyAdmission,
     ) -> Result<()> {
-        let _ = (before_read, visit);
+        let _ = (before_read, visit, owner);
         Err(Error::Other(
             "this vector membership source cannot list body identities".into(),
         ))
@@ -202,8 +298,13 @@ pub trait RawVectorMembershipSource: Send + Sync {
 
 #[doc(hidden)]
 pub trait RawVectorMembershipCursor: Send {
-    /// `open` reserves the complete fixed decode window before returning.
-    /// Advances reuse it; they may request checkpoints but no further reserve.
+    fn selected_receipt(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
+
+    /// `open` reserves the initial decode window before returning. Advances
+    /// reuse it and request admission before decoding a larger record. Refused
+    /// growth preserves the same record for retry under the captured root.
     ///
     /// Return one authenticated interval, including intervals invisible at the
     /// statement snapshot so physical work and cancellation stay observable.
@@ -213,6 +314,16 @@ pub trait RawVectorMembershipCursor: Send {
         &mut self,
         request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool,
     ) -> Result<Option<RawVectorDirectoryEntry>>;
+
+    /// Return the visibility interval and its authenticated body identity.
+    /// A row-only publication can start later than the unchanged vector body.
+    fn next_with_body_identity(
+        &mut self,
+        request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool,
+    ) -> Result<Option<(RawVectorDirectoryEntry, RawVectorDirectoryEntry)>> {
+        self.next(request)
+            .map(|entry| entry.map(|entry| (entry.clone(), entry)))
+    }
 }
 
 impl std::fmt::Debug for dyn RawVectorMembershipCursor {
@@ -230,21 +341,38 @@ impl std::fmt::Debug for dyn RawVectorMembershipCursor {
 /// A false callback stops before the read and returns an error.
 #[doc(hidden)]
 pub trait RawVectorReverseMembershipSource: Send + Sync {
+    /// Borrow retained metadata credits without resolving or copying a source.
+    /// Callbacks must not call store or source operations, including reads;
+    /// visitation holds store guards or the lazy source mutex.
+    fn visit_retained_copy_credits(
+        &self,
+        _caller: &dyn MemoryBudget,
+        _visit: &mut dyn FnMut(usize, usize, bool),
+    ) {
+    }
+
     /// Rebind a live writer source after its durable index keys are renamed.
     /// Captured cursors retain their original source and root.
     fn for_renamed_index(
         &self,
         index: &VectorIndexRef,
-    ) -> Option<std::sync::Arc<dyn RawVectorReverseMembershipSource>> {
-        let _ = index;
-        None
+        owner: &mut super::VectorCopyAdmission,
+        retained: super::VectorCopyAdmission,
+    ) -> Result<std::sync::Arc<dyn RawVectorReverseMembershipSource>> {
+        let _ = (index, owner, retained);
+        Err(Error::Other(
+            "this membership source cannot prepare an index rename".into(),
+        ))
     }
 
-    fn visible_partition(
+    /// Resolve a point route with the executing copy owner. Admit route scratch
+    /// before allocating it; the caller retains the charge until the key dies.
+    fn visible_partition_admitted(
         &self,
         row: RowId,
         snapshot: SnapshotId,
         before_read: &mut dyn FnMut() -> bool,
+        owner: &mut crate::VectorCopyAdmission,
     ) -> Result<Option<VectorPartitionKey>>;
 
     /// Stream only this row's retained partition identities, current first.
@@ -253,13 +381,17 @@ pub trait RawVectorReverseMembershipSource: Send + Sync {
         &self,
         row: RowId,
         before_read: &mut dyn FnMut() -> bool,
+        owner: &mut crate::VectorCopyAdmission,
     ) -> Result<Box<dyn RawVectorReverseMembershipCursor>>;
 }
 
 #[doc(hidden)]
 pub trait RawVectorReverseMembershipCursor: Send {
-    fn next(&mut self, before_read: &mut dyn FnMut() -> bool)
-    -> Result<Option<VectorPartitionKey>>;
+    fn next(
+        &mut self,
+        before_read: &mut dyn FnMut() -> bool,
+        owner: &mut crate::VectorCopyAdmission,
+    ) -> Result<Option<VectorPartitionKey>>;
 }
 
 /// Bridge a storage callback to the statement's typed checkpoint/work error.
@@ -296,6 +428,10 @@ where
 /// verification scratch itself and calls before_read for every physical read.
 #[doc(hidden)]
 pub trait RawVectorMembershipFactory: Send + Sync {
+    fn supports_root_selection(&self) -> bool {
+        false
+    }
+
     fn load(
         &self,
         before_read: &mut dyn FnMut() -> bool,
@@ -376,6 +512,60 @@ impl LazyRawVectorMembershipSource {
     }
 }
 impl RawVectorMembershipSource for LazyRawVectorMembershipSource {
+    // Nonreentrant: even source reads can reacquire this held mutex.
+    fn visit_retained_copy_credits(
+        &self,
+        caller: &dyn MemoryBudget,
+        visit: &mut dyn FnMut(usize, usize, bool),
+    ) {
+        let slot = self.source.lock();
+        if let Some(source) = slot.source.as_ref() {
+            source.visit_retained_copy_credits(caller, visit);
+        }
+    }
+
+    fn capture_serving_selection(
+        &self,
+        snapshot: SnapshotId,
+        frozen_base: Option<&VectorGraphGeneration>,
+        frozen_change: Option<&VectorGraphGeneration>,
+        owner: &mut super::VectorCopyAdmission,
+    ) -> Result<super::CapturedVectorServingSelection> {
+        self.resolve(&mut || true)?.capture_serving_selection(
+            snapshot,
+            frozen_base,
+            frozen_change,
+            owner,
+        )
+    }
+
+    fn supports_root_selection(&self) -> bool {
+        self.source.lock().source.as_ref().map_or_else(
+            || self.factory.supports_root_selection(),
+            |source| source.supports_root_selection(),
+        )
+    }
+    fn select_visible_by_row(
+        &self,
+        row: RowId,
+        snapshot: SnapshotId,
+        before_read: &mut dyn FnMut() -> bool,
+        owner: &mut super::VectorCopyAdmission,
+    ) -> Result<Option<Box<dyn RawVectorMembershipSelection>>> {
+        self.resolve(before_read)?
+            .select_visible_by_row(row, snapshot, before_read, owner)
+    }
+    fn select_identity_by_row_lsn(
+        &self,
+        row: RowId,
+        lsn: Lsn,
+        before_read: &mut dyn FnMut() -> bool,
+        owner: &mut super::VectorCopyAdmission,
+    ) -> Result<Option<Box<dyn RawVectorMembershipSelection>>> {
+        self.resolve(before_read)?
+            .select_identity_by_row_lsn(row, lsn, before_read, owner)
+    }
+
     fn published_summary(&self) -> RawVectorMembershipSummary {
         self.summary
     }
@@ -383,36 +573,51 @@ impl RawVectorMembershipSource for LazyRawVectorMembershipSource {
         &self,
         snapshot: SnapshotId,
         before_read: &mut dyn FnMut() -> bool,
+        owner: &mut super::VectorCopyAdmission,
     ) -> Result<usize> {
         self.resolve(before_read)?
-            .visible_count(snapshot, before_read)
+            .visible_count(snapshot, before_read, owner)
     }
     fn visible_by_row(
         &self,
         row: RowId,
         snapshot: SnapshotId,
         before_read: &mut dyn FnMut() -> bool,
+        owner: &mut super::VectorCopyAdmission,
     ) -> Result<Option<RawVectorDirectoryEntry>> {
         self.resolve(before_read)?
-            .visible_by_row(row, snapshot, before_read)
+            .visible_by_row(row, snapshot, before_read, owner)
+    }
+    fn visible_by_row_with_copy_admission(
+        &self,
+        row: RowId,
+        snapshot: SnapshotId,
+        before_read: &mut dyn FnMut() -> bool,
+        owner: &mut super::VectorCopyAdmission,
+        admit: &mut dyn FnMut(&mut super::VectorCopyAdmission, usize, &str, &str, &str) -> Result<()>,
+    ) -> Result<Option<RawVectorDirectoryEntry>> {
+        self.resolve(before_read)?
+            .visible_by_row_with_copy_admission(row, snapshot, before_read, owner, admit)
     }
     fn contains_row_lsn(
         &self,
         row: RowId,
         lsn: Lsn,
         before_read: &mut dyn FnMut() -> bool,
+        owner: &mut super::VectorCopyAdmission,
     ) -> Result<bool> {
         self.resolve(before_read)?
-            .contains_row_lsn(row, lsn, before_read)
+            .contains_row_lsn(row, lsn, before_read, owner)
     }
     fn identity_by_row_lsn(
         &self,
         row: RowId,
         lsn: Lsn,
         before_read: &mut dyn FnMut() -> bool,
+        owner: &mut super::VectorCopyAdmission,
     ) -> Result<Option<RawVectorDirectoryEntry>> {
         self.resolve(before_read)?
-            .identity_by_row_lsn(row, lsn, before_read)
+            .identity_by_row_lsn(row, lsn, before_read, owner)
     }
     fn open(
         &self,

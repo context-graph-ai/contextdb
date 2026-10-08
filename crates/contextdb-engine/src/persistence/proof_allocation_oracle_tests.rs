@@ -164,7 +164,7 @@ fn accountant(limit: usize) -> Arc<MemoryAccountant> {
 #[serial]
 fn a_wide_key_writer_allocates_no_more_than_it_admitted() {
     let root = tempfile::tempdir().unwrap();
-    let database = redb::Database::create(root.path().join("writer.db")).unwrap();
+    let database = ProofFixtureDatabase::create(root.path().join("writer.db")).unwrap();
     let records = (0..24_u64)
         .map(|row| wide_posting(row, 70 * 1024))
         .collect::<Vec<_>>();
@@ -173,7 +173,7 @@ fn a_wide_key_writer_allocates_no_more_than_it_admitted() {
     RedbPersistence::apply_content_identity_mutations_in_write(
         &write,
         &records,
-        &mut ProofAdmission::unaccounted(),
+        &mut database.admission(None),
     )
     .unwrap();
     write.commit().unwrap();
@@ -211,7 +211,7 @@ fn a_wide_key_writer_allocates_no_more_than_it_admitted() {
 
     let budget = accountant(64 * 1024 * 1024);
     let write = database.begin_write().unwrap();
-    let mut admission = ProofAdmission::new(Some(Arc::clone(&budget)));
+    let mut admission = database.admission(Some(Arc::clone(&budget)));
     reset_work_for_test();
     let (result, peak, retained) = measured(|| {
         RedbPersistence::apply_content_identity_mutations_in_write(
@@ -262,7 +262,7 @@ fn a_wide_key_writer_allocates_no_more_than_it_admitted() {
     // size of the admitted peak is enough to run it, and half of it is not.
     let exact = accountant(admitted + 64 * 1024);
     let write = database.begin_write().unwrap();
-    let mut admission = ProofAdmission::new(Some(Arc::clone(&exact)));
+    let mut admission = database.admission(Some(Arc::clone(&exact)));
     RedbPersistence::apply_content_identity_mutations_in_write(
         &write,
         &replacements,
@@ -273,7 +273,7 @@ fn a_wide_key_writer_allocates_no_more_than_it_admitted() {
     drop(write);
     let halved = accountant(admitted / 2);
     let write = database.begin_write().unwrap();
-    let mut admission = ProofAdmission::new(Some(Arc::clone(&halved)));
+    let mut admission = database.admission(Some(Arc::clone(&halved)));
     assert!(
         matches!(
             RedbPersistence::apply_content_identity_mutations_in_write(
@@ -291,7 +291,7 @@ fn a_wide_key_writer_allocates_no_more_than_it_admitted() {
     // A refusal unwinds: nothing admitted and nothing still allocated.
     let tight = accountant(192 * 1024);
     let write = database.begin_write().unwrap();
-    let mut admission = ProofAdmission::new(Some(Arc::clone(&tight)));
+    let mut admission = database.admission(Some(Arc::clone(&tight)));
     let (refused, refusal_peak, refusal_retained) = measured(|| {
         RedbPersistence::apply_content_identity_mutations_in_write(
             &write,
@@ -327,7 +327,7 @@ fn a_wide_key_writer_allocates_no_more_than_it_admitted() {
 #[serial]
 fn a_wide_key_reader_allocates_no_more_than_its_admitted_pool() {
     let root = tempfile::tempdir().unwrap();
-    let database = redb::Database::create(root.path().join("reader.db")).unwrap();
+    let database = ProofFixtureDatabase::create(root.path().join("reader.db")).unwrap();
     let records = (0..24_u64)
         .map(|row| wide_posting(row, 70 * 1024))
         .collect::<Vec<_>>();
@@ -336,7 +336,7 @@ fn a_wide_key_reader_allocates_no_more_than_its_admitted_pool() {
     RedbPersistence::apply_content_identity_mutations_in_write(
         &write,
         &records,
-        &mut ProofAdmission::unaccounted(),
+        &mut database.admission(None),
     )
     .unwrap();
     write.commit().unwrap();
@@ -423,8 +423,8 @@ fn a_wide_key_reader_allocates_no_more_than_its_admitted_pool() {
 // grows with the store.
 // ---------------------------------------------------------------------------
 
-fn reset_family_fixture(path: &std::path::Path, nodes: u64) -> redb::Database {
-    let database = redb::Database::create(path).unwrap();
+fn reset_family_fixture(path: &std::path::Path, nodes: u64) -> ProofFixtureDatabase {
+    let database = ProofFixtureDatabase::create(path).unwrap();
     // The family this test resets, plus a second family that must survive it
     // untouched.
     let mut records = (0..nodes)
@@ -442,7 +442,7 @@ fn reset_family_fixture(path: &std::path::Path, nodes: u64) -> redb::Database {
     RedbPersistence::apply_content_identity_mutations_in_write(
         &write,
         &records,
-        &mut ProofAdmission::unaccounted(),
+        &mut database.admission(None),
     )
     .unwrap();
     write.commit().unwrap();
@@ -495,7 +495,7 @@ fn a_family_reset_admits_its_batches_and_its_peak_does_not_grow_with_the_store()
         );
 
         let budget = accountant(64 * 1024 * 1024);
-        let mut admission = ProofAdmission::new(Some(Arc::clone(&budget)));
+        let mut admission = database.admission(Some(Arc::clone(&budget)));
         let write = database.begin_write().unwrap();
         let (result, peak, _) = measured(|| {
             RedbPersistence::reset_content_identity_families_in_write(
@@ -579,7 +579,7 @@ fn a_refused_family_reset_changes_no_stored_byte_and_leaves_nothing_admitted() {
     let before_nodes = family_node_count(&database, selected);
 
     let budget = accountant(64);
-    let mut admission = ProofAdmission::new(Some(Arc::clone(&budget)));
+    let mut admission = database.admission(Some(Arc::clone(&budget)));
     let write = database.begin_write().unwrap();
     let refused = RedbPersistence::reset_content_identity_families_in_write(
         &write,

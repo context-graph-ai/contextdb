@@ -2,6 +2,21 @@
 use super::*;
 use redb::{ReadableDatabase, ReadableTable};
 impl RedbPersistence {
+    pub(crate) fn durable_page_population_for_test(&self) -> Result<(usize, u64)> {
+        self.with_db(|db| {
+            let snapshot = db
+                .storage_statistics_snapshot()
+                .map_err(Self::storage_error)?;
+            Ok((
+                db.allocator_regions_for_test(),
+                snapshot
+                    .stats()
+                    .map_err(Self::storage_error)?
+                    .allocated_pages(),
+            ))
+        })
+    }
+
     pub(crate) fn create_region_fixture_for_test(path: &Path, region_bytes: u64) -> Result<()> {
         let mut builder = redb::Database::builder();
         builder.set_region_size(region_bytes);
@@ -94,15 +109,19 @@ impl RedbPersistence {
             let name = Self::rel_table_name(table);
             let definition = TableDefinition::<&[u8], &[u8]>::new(&name);
             let regular = read.open_table(definition).map_err(Self::storage_error)?;
-            let key = regular
-                .iter()
-                .map_err(Self::storage_error)?
-                .nth(ordinal)
-                .ok_or_else(|| Error::Other("fixture body ordinal absent".into()))?
-                .map_err(Self::storage_error)?
-                .0
-                .value()
-                .to_vec();
+            let mut entries = regular.iter().map_err(Self::storage_error)?;
+            let mut position = 0;
+            let key = loop {
+                let (key, _) = entries
+                    .next()
+                    .ok_or_else(|| Error::Other("fixture body ordinal absent".into()))?
+                    .map_err(Self::storage_error)?;
+                if position == ordinal {
+                    break key.value().to_vec();
+                }
+                position += 1;
+            };
+            drop(entries);
             let bounded = read
                 .open_byte_table_bounded(definition)
                 .map_err(Self::storage_error)?;

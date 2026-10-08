@@ -7,7 +7,7 @@
 //! them without the vector store holding any decoded directory. Each record
 //! read is authenticated (checksum, key and route) before it is used.
 use super::*;
-use crate::memory_accounting::{MemoryAccountant, OwnedMemoryReservation};
+use crate::memory_accounting::MemoryAccountant;
 use contextdb_vector::store::{
     DormantRawVectorLoader, DormantVectorLoadRequest, RawVectorInspectionSnapshot,
     RawVectorMembershipCursor, RawVectorMembershipSource, RawVectorMembershipSummary,
@@ -37,10 +37,55 @@ pub(crate) fn with_pending_summary_failure_for_test<R>(
     action()
 }
 
-fn damage(reason: &str) -> Error {
+pub(super) fn damage(reason: &str) -> Error {
     Error::StoreCorrupted {
         path: "vector_partition_memberships".into(),
         reason: reason.into(),
+    }
+}
+
+#[derive(Clone)]
+pub(crate) enum MembershipOwner {
+    Writable(Arc<RedbPersistence>),
+    Retained(Arc<RetainedReadSource>),
+}
+impl MembershipOwner {
+    fn capture(&self) -> Result<MembershipRoot> {
+        match self {
+            Self::Writable(persistence) => MembershipRoot::capture(persistence),
+            Self::Retained(source) => {
+                let read = source.begin_read()?;
+                if read.storage_snapshot_identity() != source.storage_identity() {
+                    return Err(damage("membership read escaped its retained physical root"));
+                }
+                vector_membership_pages::validate_in_read(&read)?;
+                Ok(MembershipRoot {
+                    read: Arc::new(read),
+                    writer: None,
+                    retained: Some(source.clone()),
+                })
+            }
+        }
+    }
+    fn latest(&self) -> Result<MembershipRoot> {
+        match self {
+            Self::Writable(persistence) => Ok(MembershipRoot {
+                read: Arc::new(
+                    persistence
+                        .with_db(|db| db.begin_read().map_err(RedbPersistence::storage_error))?,
+                ),
+                writer: None,
+                retained: None,
+            }),
+            Self::Retained(_) => self.capture(),
+        }
+    }
+    #[cfg(feature = "test-seams")]
+    fn persistence_identity(&self) -> Option<usize> {
+        match self {
+            Self::Writable(persistence) => Some(Arc::as_ptr(persistence) as usize),
+            Self::Retained(_) => None,
+        }
     }
 }
 
@@ -50,19 +95,31 @@ fn damage(reason: &str) -> Error {
 struct MembershipRoot {
     read: Arc<redb::ReadTransaction>,
     writer: Option<Arc<WriterSnapshot>>,
+    // Hold the registered committed source throughout each cursor operation.
+    retained: Option<Arc<RetainedReadSource>>,
 }
 
 impl MembershipRoot {
     fn capture(persistence: &RedbPersistence) -> Result<Self> {
         if let Ok(capture) = persistence.paged_root_capture() {
-            let (read, handle) =
+            let (_read, handle) =
                 capture().map_err(vector_membership_pages::typed_metadata_error)?;
             let writer = handle
                 .downcast::<WriterSnapshot>()
                 .map_err(|_| damage("writer root capture returned another owner"))?;
+            let identity = writer.storage_identity();
+            let read = persistence.with_db(|db| {
+                db.begin_external_read(identity)
+                    .map_err(vector_membership_pages::metadata_error)
+            })?;
+            if read.storage_snapshot_identity() != identity {
+                return Err(damage("membership read escaped its captured physical root"));
+            }
+            vector_membership_pages::validate_in_read(&read)?;
             return Ok(Self {
-                read,
+                read: Arc::new(read),
                 writer: Some(writer),
+                retained: None,
             });
         }
         let read = persistence.with_db(|db| {
@@ -72,10 +129,16 @@ impl MembershipRoot {
         Ok(Self {
             read: Arc::new(read),
             writer: None,
+            retained: None,
         })
     }
 
     fn check_scope(&self, table: &str) -> Result<()> {
+        if let Some(source) = &self.retained
+            && self.read.storage_snapshot_identity() != source.storage_identity()
+        {
+            return Err(damage("membership cursor escaped its retained root"));
+        }
         match &self.writer {
             Some(writer) => writer.check_table_scope(table),
             None => Ok(()),
@@ -88,7 +151,78 @@ impl MembershipRoot {
     }
 }
 
-fn read_summary(
+pub(crate) struct SelectedVectorMembership {
+    root: MembershipRoot,
+    owner: MembershipOwner,
+    record: VectorPartitionMembershipRecord,
+    _copy_owner: contextdb_vector::VectorCopyAdmission,
+}
+
+impl contextdb_vector::store::RawVectorMembershipSelection for SelectedVectorMembership {
+    fn identity(&self) -> RawVectorDirectoryEntry {
+        body_identity(&self.record)
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+impl SelectedVectorMembership {
+    pub(crate) fn read_body(
+        &self,
+        owner: &MembershipOwner,
+        partition: &VectorPartitionRef,
+        dimension: usize,
+        quantization: VectorQuantization,
+    ) -> Result<VectorEntry> {
+        let same_source = match (&self.owner, owner) {
+            (MembershipOwner::Writable(a), MembershipOwner::Writable(b)) => Arc::ptr_eq(a, b),
+            (MembershipOwner::Retained(a), MembershipOwner::Retained(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        };
+        if !same_source
+            || self.record.index != partition.index
+            || self.record.partition_key != partition.partition_key
+        {
+            return Err(damage(
+                "selected membership belongs to another source or route",
+            ));
+        }
+        self.root.check_scope(&partition.index.table)?;
+        let identity = body_identity(&self.record);
+        match owner {
+            MembershipOwner::Writable(source) => {
+                let pin = self
+                    .root
+                    .writer
+                    .as_ref()
+                    .map(|writer| writer.clone() as Arc<dyn std::any::Any + Send + Sync>);
+                source
+                    .open_raw_vector_body_scan_at(&partition.index, self.root.read.clone(), pin)?
+                    .read_partition_body(
+                        &partition.index,
+                        &partition.partition_key,
+                        &identity,
+                        dimension,
+                        quantization,
+                        true,
+                    )
+            }
+            MembershipOwner::Retained(source) => source
+                .open_raw_vector_body_scan_at(self.root.read.clone())?
+                .read_partition_body(
+                    &partition.index,
+                    &partition.partition_key,
+                    &identity,
+                    dimension,
+                    quantization,
+                    true,
+                ),
+        }
+    }
+}
+
+pub(super) fn read_summary(
     read: &redb::ReadTransaction,
     partition: &VectorPartitionRef,
 ) -> Result<RawVectorMembershipSummary> {
@@ -115,6 +249,12 @@ fn body_identity(record: &VectorPartitionMembershipRecord) -> RawVectorDirectory
         created_tx: record.vector_created_tx,
         deleted_tx: record.deleted_tx,
         lsn: record.vector_lsn,
+        membership: contextdb_vector::store::VectorMembershipProvenance::new(
+            record.row_created_tx,
+            record.row_lsn,
+            record.visible_from,
+            record.deleted_tx,
+        ),
     }
 }
 
@@ -126,6 +266,12 @@ fn visibility_interval(record: &VectorPartitionMembershipRecord) -> RawVectorDir
         created_tx: record.visible_from,
         deleted_tx: record.deleted_tx,
         lsn: record.vector_lsn,
+        membership: contextdb_vector::store::VectorMembershipProvenance::new(
+            record.row_created_tx,
+            record.row_lsn,
+            record.visible_from,
+            record.deleted_tx,
+        ),
     }
 }
 
@@ -164,28 +310,58 @@ pub(crate) type PublishedMembershipRoot =
 /// One partition's membership directory, read from the forward membership
 /// table at each operation's captured root.
 pub(crate) struct DurableMembershipSource {
-    published_root: PublishedMembershipRoot,
-    persistence: Arc<RedbPersistence>,
+    published_root: Option<PublishedMembershipRoot>,
+    owner: MembershipOwner,
     partition: VectorPartitionRef,
     summary: RawVectorMembershipSummary,
     accountant: Arc<MemoryAccountant>,
+    _copy_owner: Option<Arc<contextdb_vector::VectorCopyAdmission>>,
 }
 
 impl DurableMembershipSource {
-    pub(crate) fn new(
-        persistence: Arc<RedbPersistence>,
-        partition: VectorPartitionRef,
+    pub(crate) fn from_owner_admitted(
+        source_owner: MembershipOwner,
+        published_root: Option<PublishedMembershipRoot>,
+        partition: &VectorPartitionRef,
         summary: RawVectorMembershipSummary,
         accountant: Arc<MemoryAccountant>,
-        published_root: PublishedMembershipRoot,
-    ) -> Arc<Self> {
-        Arc::new(Self {
+        workspace: &mut contextdb_vector::VectorCopyAdmission,
+        mut retained: contextdb_vector::VectorCopyAdmission,
+    ) -> Result<Arc<Self>> {
+        workspace.reserve(
+            std::mem::size_of::<Self>()
+                .saturating_add(std::mem::size_of::<contextdb_vector::VectorCopyAdmission>())
+                .saturating_add(4 * std::mem::size_of::<usize>())
+                .saturating_add(
+                    partition
+                        .index
+                        .table
+                        .len()
+                        .saturating_add(partition.index.column.len())
+                        .saturating_add(partition.partition_key.estimated_bytes()),
+                ),
+        )?;
+        retained.reserve(
+            std::mem::size_of::<Self>()
+                .saturating_add(std::mem::size_of::<contextdb_vector::VectorCopyAdmission>())
+                .saturating_add(4 * std::mem::size_of::<usize>())
+                .saturating_add(
+                    partition
+                        .index
+                        .table
+                        .len()
+                        .saturating_add(partition.index.column.len())
+                        .saturating_add(partition.partition_key.estimated_bytes()),
+                ),
+        )?;
+        Ok(Arc::new(Self {
+            owner: source_owner,
             published_root,
-            persistence,
-            partition,
+            partition: partition.clone(),
             summary,
             accountant,
-        })
+            _copy_owner: Some(Arc::new(retained)),
+        }))
     }
 
     // Compare physical user-tree headers, independent of logical TxId and
@@ -194,9 +370,83 @@ impl DurableMembershipSource {
         let Some(captured) = &root.writer else {
             return Ok(false);
         };
-        let published = (self.published_root)()?
-            .ok_or_else(|| damage("writer publication has no durable root"))?;
+        let published = (self
+            .published_root
+            .as_ref()
+            .ok_or_else(|| damage("writer publication has no root capture"))?)(
+        )?
+        .ok_or_else(|| damage("writer publication has no durable root"))?;
         Ok(captured.storage_identity().user_root != published.storage_identity().user_root)
+    }
+
+    fn inspection_in_root(
+        &self,
+        root: &MembershipRoot,
+        generations: Option<(
+            VectorPartitionGenerationDescriptor,
+            Option<VectorPartitionGenerationDescriptor>,
+        )>,
+        serving_covered: Option<TxId>,
+    ) -> Result<RawVectorInspectionSnapshot> {
+        let mut summary = self.read_pending_metadata(root)?;
+        let retired_empty = !self.partition.partition_key.is_unpartitioned()
+            && summary == vector_membership_pages::MembershipSummary::default();
+        let (base, change) = generations.map_or((None, None), |(base, change)| {
+            let identity = |generation: VectorPartitionGenerationDescriptor| {
+                contextdb_vector::store::VectorGraphGeneration {
+                    generation_id: generation.generation_id,
+                    covered_tx: generation.covered_tx,
+                    covered_lsn: generation.covered_lsn,
+                    durable_bytes: generation.durable_bytes,
+                    policy_revision: generation.policy_revision,
+                    hnsw_m: generation.hnsw_m,
+                    hnsw_ef_construction: generation.hnsw_ef_construction,
+                }
+            };
+            (Some(identity(base)), change.map(identity))
+        });
+        let covered = change
+            .or(base)
+            .map_or(summary.pending.covered_tx, |generation| {
+                generation.covered_tx
+            });
+        // Serving metadata and counters are committed together. A candidate
+        // matching some other frontier cannot authenticate this catalog.
+        if retired_empty {
+            // A pinned retired catalog outlives its removed summary. The read
+            // helper validated authoritative membership absence on this root.
+            summary.pending.covered_tx = covered;
+        } else if summary.pending.covered_tx != covered {
+            return Err(damage(
+                "pending summary disagrees with captured catalog frontier",
+            ));
+        }
+        let captured_catalog = self.captured_catalog_required(root)?;
+        let frontier = if captured_catalog || generations.is_none() {
+            covered
+        } else {
+            serving_covered.unwrap_or(covered)
+        };
+        let (pending_inserts, tombstones) = Self::pending_counts_for(&summary, Some(frontier))?;
+        Ok(RawVectorInspectionSnapshot {
+            captured_catalog,
+            summary: summary_counts(&summary)?,
+            base,
+            change,
+            pending_inserts,
+            tombstones,
+            #[cfg(feature = "test-seams")]
+            base_pending: {
+                let frontier = base.map_or(TxId(0), |generation| generation.covered_tx);
+                [
+                    &summary.pending,
+                    summary.base_pending.as_ref().unwrap_or(&summary.pending),
+                ]
+                .into_iter()
+                .find(|counts| counts.covered_tx == frontier)
+                .map(|counts| (counts.pending_inserts as usize, counts.tombstones as usize))
+            },
+        })
     }
 
     fn catalog_frontier(&self, root: &MembershipRoot) -> Result<Option<TxId>> {
@@ -213,14 +463,12 @@ impl DurableMembershipSource {
             Option<VectorPartitionGenerationDescriptor>,
         )>,
     > {
-        match self
-            .persistence
-            .vector_partition_generation_descriptors_in_read(
-                &root.read,
-                &self.partition.index,
-                &self.partition.partition_key,
-            )
-            .map_err(vector_membership_pages::typed_metadata_error)
+        match RedbPersistence::vector_partition_generation_descriptors_in_read(
+            &root.read,
+            &self.partition.index,
+            &self.partition.partition_key,
+        )
+        .map_err(vector_membership_pages::typed_metadata_error)
         {
             Ok(generations) => Ok(generations),
             // Catalog damage belongs to its route. The caller has already
@@ -249,18 +497,21 @@ impl DurableMembershipSource {
         #[cfg(feature = "test-seams")]
         crate::database::resident_history_test_seams::note(|work| work.pending_summary_reads += 1);
         #[cfg(feature = "test-seams")]
-        if PENDING_SUMMARY_FAILURE.with(|slot| slot.get())
-            == Some(Arc::as_ptr(&self.persistence) as usize)
-        {
+        if self.owner.persistence_identity().is_some_and(|identity| {
+            PENDING_SUMMARY_FAILURE.with(|slot| slot.get()) == Some(identity)
+        }) {
             return Err(damage("injected pending summary metadata read failure"));
         }
         let summary = vector_membership_pages::read_partition_summary(&root.read, &self.partition)?;
         Ok(summary)
     }
 
-    fn pending_metadata_window(&self) -> Result<OwnedMemoryReservation> {
-        OwnedMemoryReservation::try_new_for(
-            self.accountant.clone(),
+    fn pending_metadata_window(
+        &self,
+        owner: &mut contextdb_vector::VectorCopyAdmission,
+    ) -> Result<contextdb_vector::VectorCopyAdmission> {
+        let mut scratch = owner.scratch();
+        scratch.reserve_for(
             self.partition
                 .index
                 .table
@@ -273,7 +524,8 @@ impl DurableMembershipSource {
             "vector",
             "pending_metadata",
             HINT,
-        )
+        )?;
+        Ok(scratch)
     }
 
     fn pending_counts_for(
@@ -301,8 +553,9 @@ impl DurableMembershipSource {
         &self,
         covered: Option<TxId>,
         capture: impl FnOnce() -> Result<MembershipRoot>,
+        owner: &mut contextdb_vector::VectorCopyAdmission,
     ) -> Result<Option<(usize, usize)>> {
-        let _window = self.pending_metadata_window()?;
+        let _window = self.pending_metadata_window(owner)?;
         let root = capture()?;
         let summary = self.read_pending_metadata(&root)?;
         let covered = if self.captured_catalog_required(&root)? {
@@ -322,7 +575,7 @@ impl DurableMembershipSource {
     }
 
     fn cursor(&self, row: Option<RowId>) -> Result<MembershipCursor> {
-        let root = MembershipRoot::capture(&self.persistence)?;
+        let root = self.owner.capture()?;
         root.check_scope(&self.partition.index.table)?;
         let prefix = match row {
             Some(row) => RedbPersistence::vector_partition_membership_row_prefix(
@@ -340,10 +593,13 @@ impl DurableMembershipSource {
             None => Some(read_summary(&root.read, &self.partition)?.entries),
         };
         Ok(MembershipCursor {
+            owner: self.owner.clone(),
+            selected_identity: None,
             root,
             partition: self.partition.clone(),
             prefix,
             range: None,
+            last_success: None,
             done: false,
             max_bytes: self.window_bytes(),
             seen: 0,
@@ -357,8 +613,11 @@ impl DurableMembershipSource {
         &self,
         after_lsn: Lsn,
         visit: &mut dyn FnMut(VectorPartitionJournalChange) -> bool,
+        owner: &mut contextdb_vector::VectorCopyAdmission,
     ) -> Result<()> {
-        let root = MembershipRoot::capture(&self.persistence)?;
+        let mut scratch = owner.scratch();
+        scratch.reserve_for(self.window_bytes(), "vector", "membership_window", HINT)?;
+        let root = self.owner.capture()?;
         root.check_scope(&self.partition.index.table)?;
         let table = match root.read.open_table(VECTOR_PARTITION_JOURNAL_TABLE) {
             Ok(table) => table,
@@ -378,13 +637,25 @@ impl DurableMembershipSource {
             .map_err(vector_membership_pages::metadata_error)?
         {
             let (key, value) = item.map_err(vector_membership_pages::metadata_error)?;
-            let record: VectorPartitionJournalRecord =
-                self.persistence.decode_expected_vector_partition_metadata(
-                    VectorPartitionRecordKind::Journal,
-                    value.value(),
-                    &self.partition.index,
-                    &self.partition.partition_key,
-                )?;
+            let required = key
+                .value()
+                .len()
+                .saturating_mul(2)
+                .saturating_add(value.value().len().saturating_mul(2))
+                .saturating_add(self.window_bytes());
+            if required > scratch.retained_bytes() {
+                scratch.reserve(required - scratch.retained_bytes())?;
+            }
+            let record: VectorPartitionJournalRecord = decode_vector_partition_record_payload(
+                VectorPartitionRecordKind::Journal,
+                value.value(),
+            )
+            .map_err(|reason| damage(&reason))?;
+            if record.index != self.partition.index
+                || record.partition_key != self.partition.partition_key
+            {
+                return Err(damage("journal route disagrees with membership source"));
+            }
             if RedbPersistence::vector_partition_journal_key(&record).as_slice() != key.value()
                 || record.lsn <= after_lsn
             {
@@ -399,21 +670,97 @@ impl DurableMembershipSource {
 
     /// Walk one row prefix (or the whole partition) under a single admitted
     /// window, stopping at the first record `select` accepts.
+    fn find_selected(
+        &self,
+        row: RowId,
+        before: &mut dyn FnMut() -> bool,
+        select: impl Fn(&VectorPartitionMembershipRecord) -> bool,
+        owner: &mut contextdb_vector::VectorCopyAdmission,
+    ) -> Result<Option<Box<dyn contextdb_vector::store::RawVectorMembershipSelection>>> {
+        let mut scratch = owner.scratch();
+        scratch.reserve_for(self.window_bytes(), "vector", "membership_window", HINT)?;
+        let mut cursor = self.cursor(Some(row))?;
+        loop {
+            let mut interrupted = None;
+            let next = cursor.next_record(&mut |request| match request {
+                DormantVectorLoadRequest::Reserve(bytes) => match scratch.reserve(bytes) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        interrupted = Some(error);
+                        false
+                    }
+                },
+                _ => before(),
+            });
+            if let Some(error) = interrupted {
+                return Err(error);
+            }
+            let Some(record) = next? else {
+                return Ok(None);
+            };
+            if select(&record) {
+                let mut retained = owner.scratch();
+                retained.reserve(
+                    std::mem::size_of::<SelectedVectorMembership>()
+                        .saturating_add(
+                            std::mem::size_of::<WritableRawVectorBodyScan>()
+                                .max(std::mem::size_of::<RetainedRawVectorBodyScan>()),
+                        )
+                        .saturating_add(std::mem::size_of::<redb::ReadTransaction>())
+                        .saturating_add(4 * std::mem::size_of::<usize>())
+                        .saturating_add(record.index.table.len())
+                        .saturating_add(record.index.column.len())
+                        .saturating_add(record.partition_key.estimated_bytes()),
+                )?;
+                return Ok(Some(Box::new(SelectedVectorMembership {
+                    root: cursor.root,
+                    owner: self.owner.clone(),
+                    record,
+                    _copy_owner: retained,
+                })));
+            }
+        }
+    }
+
     fn find<T>(
         &self,
         row: Option<RowId>,
         before: &mut dyn FnMut() -> bool,
-        mut select: impl FnMut(&VectorPartitionMembershipRecord) -> Option<T>,
+        select: impl FnMut(&VectorPartitionMembershipRecord) -> Option<T>,
+        owner: &mut contextdb_vector::VectorCopyAdmission,
     ) -> Result<Option<T>> {
-        let _window = OwnedMemoryReservation::try_new_for(
-            self.accountant.clone(),
-            self.window_bytes(),
-            "vector",
-            "membership_window",
-            HINT,
-        )?;
+        self.find_with_copy_admission(row, before, select, owner, &mut |token, bytes, component, operation, hint| token.reserve_for(bytes, component, operation, hint))
+    }
+
+    fn find_with_copy_admission<T>(
+        &self,
+        row: Option<RowId>,
+        before: &mut dyn FnMut() -> bool,
+        mut select: impl FnMut(&VectorPartitionMembershipRecord) -> Option<T>,
+        owner: &mut contextdb_vector::VectorCopyAdmission,
+        admit: &mut dyn FnMut(&mut contextdb_vector::VectorCopyAdmission, usize, &str, &str, &str) -> Result<()>,
+    ) -> Result<Option<T>> {
+        let mut scratch = owner.scratch();
+        admit(&mut scratch, self.window_bytes(), "vector", "membership_window", HINT)?;
         let mut cursor = self.cursor(row)?;
-        while let Some(record) = cursor.next_record(before)? {
+        loop {
+            let mut interrupted = None;
+            let next = cursor.next_record(&mut |request| match request {
+                DormantVectorLoadRequest::Reserve(bytes) => match admit(&mut scratch, bytes, "vector_copy", "materialize", "Reduce the selected copy or raise the executing statement's memory limit.") {
+                    Ok(()) => true,
+                    Err(error) => {
+                        interrupted = Some(error);
+                        false
+                    }
+                },
+                _ => before(),
+            });
+            if let Some(error) = interrupted {
+                return Err(error);
+            }
+            let Some(record) = next? else {
+                break;
+            };
             if let Some(value) = select(&record) {
                 return Ok(Some(value));
             }
@@ -422,11 +769,14 @@ impl DurableMembershipSource {
     }
 }
 
-struct MembershipCursor {
+pub(crate) struct MembershipCursor {
+    owner: MembershipOwner,
+    selected_identity: Option<RawVectorDirectoryEntry>,
     root: MembershipRoot,
     partition: VectorPartitionRef,
     prefix: Vec<u8>,
     range: Option<redb::Range<'static, &'static [u8], &'static [u8]>>,
+    last_success: Option<Vec<u8>>,
     done: bool,
     max_bytes: usize,
     seen: usize,
@@ -434,20 +784,86 @@ struct MembershipCursor {
 }
 
 impl MembershipCursor {
+    pub(crate) fn open_body_scan(
+        &self,
+        owner: &MembershipOwner,
+        partition: &VectorPartitionRef,
+    ) -> Result<Box<dyn contextdb_vector::store::RawVectorBodyScan>> {
+        self.validate_selected(owner, &self.root.read, partition)?;
+        match owner {
+            MembershipOwner::Writable(source) => {
+                let pin = self
+                    .root
+                    .writer
+                    .as_ref()
+                    .map(|writer| writer.clone() as Arc<dyn std::any::Any + Send + Sync>);
+                Ok(Box::new(source.open_raw_vector_body_scan_at(
+                    &partition.index,
+                    self.root.read.clone(),
+                    pin,
+                )?))
+            }
+            MembershipOwner::Retained(source) => Ok(Box::new(
+                source.open_raw_vector_body_scan_at(self.root.read.clone())?,
+            )),
+        }
+    }
+
+    pub(crate) fn validate_selected(
+        &self,
+        owner: &MembershipOwner,
+        read: &redb::ReadTransaction,
+        partition: &VectorPartitionRef,
+    ) -> Result<RawVectorDirectoryEntry> {
+        let same_source = match (&self.owner, owner) {
+            (MembershipOwner::Writable(a), MembershipOwner::Writable(b)) => Arc::ptr_eq(a, b),
+            (MembershipOwner::Retained(a), MembershipOwner::Retained(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        };
+        if !same_source
+            || self.partition != *partition
+            || self.root.read.storage_snapshot_identity() != read.storage_snapshot_identity()
+        {
+            return Err(damage(
+                "streamed membership belongs to another source, route or physical root",
+            ));
+        }
+        self.root.check_scope(&partition.index.table)?;
+        self.selected_identity
+            .clone()
+            .ok_or_else(|| damage("membership cursor has no selected record"))
+    }
+
     fn next_record(
         &mut self,
-        before: &mut dyn FnMut() -> bool,
+        request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool,
+    ) -> Result<Option<VectorPartitionMembershipRecord>> {
+        self.selected_identity = None;
+        let result = self.next_record_attempt(request);
+        if let Ok(Some(record)) = &result {
+            self.selected_identity = Some(body_identity(record));
+        }
+        if result.is_err() {
+            // The failed iterator step may already have moved its leaf cursor.
+            // Reopen only after the last authenticated success at this same root.
+            self.range = None;
+        }
+        result
+    }
+
+    fn next_record_attempt(
+        &mut self,
+        request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool,
     ) -> Result<Option<VectorPartitionMembershipRecord>> {
         if self.done {
             return Ok(None);
         }
-        if !before() {
+        if !request(DormantVectorLoadRequest::Checkpoint) {
             return Err(Error::ReadCancelled);
         }
         self.root.check_scope(&self.partition.index.table)?;
-        // A whole-partition stream reads each page once; it must not fill
-        // the shared read cache. Row probes keep ordinary cached reads.
-        let _scan = self.expected.is_some().then(redb::scan_reads);
+        // Membership pages use the writer's declared native cache share.
+        // Repeated exhaustive reads reuse admitted pages without a decoded mirror.
         if self.range.is_none() {
             let table = match self.root.read.open_table(VECTOR_PARTITION_MEMBERSHIP_TABLE) {
                 Ok(table) => table,
@@ -468,7 +884,12 @@ impl MembershipCursor {
             // each record advances within its leaf.
             self.range = Some(
                 table
-                    .range::<&[u8]>((Bound::Included(self.prefix.as_slice()), upper))
+                    .range::<&[u8]>((
+                        self.last_success
+                            .as_deref()
+                            .map_or(Bound::Included(self.prefix.as_slice()), Bound::Excluded),
+                        upper,
+                    ))
                     .map_err(vector_membership_pages::metadata_error)?,
             );
         }
@@ -488,68 +909,219 @@ impl MembershipCursor {
             self.done = true;
             return Ok(None);
         };
-        if key
+        let required = key
             .value()
             .len()
-            .saturating_add(value.value().len())
-            .saturating_mul(3)
-            > self.max_bytes
-        {
-            return Err(damage(
-                "membership record exceeds its admitted metadata window",
-            ));
+            .checked_add(value.value().len())
+            .and_then(|bytes| bytes.checked_mul(3))
+            .ok_or_else(|| damage("membership metadata window overflow"))?;
+        if required > self.max_bytes {
+            // Admission precedes decode and the retained retry-key copy.
+            // Refusal leaves this same record available for a funded retry.
+            if !request(DormantVectorLoadRequest::Reserve(required - self.max_bytes)) {
+                return Err(Error::ReadCancelled);
+            }
+            self.max_bytes = required;
         }
         let record = decode_forward(&self.partition, key.value(), value.value())?;
+        // The admitted metadata window includes this retained retry key.
+        self.last_success = Some(key.value().to_vec());
         self.seen += 1;
         Ok(Some(record))
     }
 }
 
 impl RawVectorMembershipCursor for MembershipCursor {
+    fn selected_receipt(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
+    fn next_with_body_identity(
+        &mut self,
+        request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool,
+    ) -> Result<Option<(RawVectorDirectoryEntry, RawVectorDirectoryEntry)>> {
+        self.next_record(request).map(|record| {
+            record
+                .as_ref()
+                .map(|record| (visibility_interval(record), body_identity(record)))
+        })
+    }
+
     fn next(
         &mut self,
         request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool,
     ) -> Result<Option<RawVectorDirectoryEntry>> {
-        self.next_record(&mut || request(DormantVectorLoadRequest::Checkpoint))
+        self.next_record(request)
             .map(|record| record.as_ref().map(visibility_interval))
     }
 }
 
 impl RawVectorMembershipSource for DurableMembershipSource {
+    fn visit_retained_copy_credits(
+        &self,
+        caller: &dyn contextdb_vector::MemoryBudget,
+        visit: &mut dyn FnMut(usize, usize, bool),
+    ) {
+        if let Some(credit) = &self._copy_owner {
+            contextdb_vector::VectorCopyAdmission::visit_retained_copy_credit(
+                credit, caller, visit,
+            );
+        }
+    }
+
+    fn capture_serving_selection(
+        &self,
+        snapshot: SnapshotId,
+        frozen_base: Option<&contextdb_vector::store::VectorGraphGeneration>,
+        frozen_change: Option<&contextdb_vector::store::VectorGraphGeneration>,
+        owner: &mut contextdb_vector::VectorCopyAdmission,
+    ) -> Result<contextdb_vector::store::CapturedVectorServingSelection> {
+        let _window = self.pending_metadata_window(owner)?;
+        let root = match &self.owner {
+            MembershipOwner::Writable(persistence) => {
+                let writer = persistence
+                    .scoped_vector_root_capture
+                    .get()
+                    .ok_or_else(|| {
+                        damage("writable vector serving has no scoped root supplier")
+                    })?()?
+                .ok_or_else(|| damage("writable vector serving has no operation-scoped root"))?;
+                writer.check_table_scope(&self.partition.index.table)?;
+                let read = writer.owner_read()?;
+                if read.storage_snapshot_identity().user_root != writer.storage_identity().user_root
+                {
+                    return Err(damage("serving read escaped its operation physical root"));
+                }
+                vector_membership_pages::validate_in_read(&read)?;
+                MembershipRoot {
+                    read,
+                    writer: Some(writer),
+                    retained: None,
+                }
+            }
+            MembershipOwner::Retained(_) => self.owner.capture()?,
+        };
+        root.check_scope(&self.partition.index.table)?;
+        // Unlike passive inspection, serving cannot turn catalog corruption
+        // into catalog absence or substitute a raw-only/fresh-root route.
+        let generations = RedbPersistence::vector_partition_generation_descriptors_in_read(
+            &root.read,
+            &self.partition.index,
+            &self.partition.partition_key,
+        )
+        .map_err(vector_membership_pages::typed_metadata_error)?;
+        let mut inspection = self.inspection_in_root(&root, generations, None)?;
+        let frozen_lsn = frozen_change
+            .or(frozen_base)
+            .map_or(Lsn(0), |layer| layer.covered_lsn);
+        let catalog_floor =
+            generations.map_or(Lsn(0), |(base, change)| change.unwrap_or(base).covered_lsn);
+        if generations.is_none() || (!inspection.captured_catalog && frozen_lsn < catalog_floor) {
+            // The catalog can commit and its journal prefix be truncated before
+            // the registry installs. Serve that same root's coherent catalog,
+            // never replay its missing prefix against the frozen predecessor.
+            inspection.captured_catalog = true;
+        }
+        if inspection
+            .change
+            .or(inspection.base)
+            .is_some_and(|generation| generation.covered_tx > TxId::from_snapshot(snapshot))
+        {
+            return Err(damage(
+                "captured serving frontier is newer than the requested snapshot",
+            ));
+        }
+        if generations.is_none() {
+            let summary = self.read_pending_metadata(&root)?;
+            if summary.pending.covered_tx != TxId(0) {
+                return Err(damage(
+                    "missing captured catalog has a nonempty serving frontier",
+                ));
+            }
+        }
+        match &self.owner {
+            MembershipOwner::Writable(persistence) => persistence
+                .captured_vector_serving_selection_in_read(
+                    root.read,
+                    root.writer,
+                    root.retained,
+                    &self.partition,
+                    generations,
+                    inspection,
+                    snapshot,
+                    owner,
+                ),
+            MembershipOwner::Retained(source) => source.captured_vector_serving_selection_in_read(
+                root.read,
+                root.writer,
+                root.retained,
+                &self.partition,
+                generations,
+                inspection,
+                snapshot,
+                owner,
+            ),
+        }
+    }
+
     fn for_renamed_index(
         &self,
         index: &VectorIndexRef,
-    ) -> Option<Arc<dyn RawVectorMembershipSource>> {
-        Some(Self::new(
-            self.persistence.clone(),
-            VectorPartitionRef::new(index.clone(), self.partition.partition_key.clone()),
-            self.summary,
-            self.accountant.clone(),
-            self.published_root.clone(),
-        ))
+        owner: &mut contextdb_vector::VectorCopyAdmission,
+        mut retained: contextdb_vector::VectorCopyAdmission,
+    ) -> Result<Arc<dyn RawVectorMembershipSource>> {
+        let mut charge = owner.scratch();
+        charge.reserve(
+            std::mem::size_of::<Self>()
+                .saturating_add(std::mem::size_of::<contextdb_vector::VectorCopyAdmission>())
+                .saturating_add(4 * std::mem::size_of::<usize>())
+                .saturating_add(index.table.len())
+                .saturating_add(index.column.len())
+                .saturating_add(self.partition.partition_key.estimated_bytes()),
+        )?;
+        retained.reserve(
+            std::mem::size_of::<Self>()
+                .saturating_add(std::mem::size_of::<contextdb_vector::VectorCopyAdmission>())
+                .saturating_add(4 * std::mem::size_of::<usize>())
+                .saturating_add(index.table.len())
+                .saturating_add(index.column.len())
+                .saturating_add(self.partition.partition_key.estimated_bytes()),
+        )?;
+        Ok(Arc::new(Self {
+            owner: self.owner.clone(),
+            published_root: self.published_root.clone(),
+            partition: VectorPartitionRef::new(index.clone(), self.partition.partition_key.clone()),
+            summary: self.summary,
+            accountant: self.accountant.clone(),
+            _copy_owner: Some(Arc::new(retained)),
+        }))
     }
 
     fn published_summary(&self) -> RawVectorMembershipSummary {
         self.summary
     }
 
-    fn current_summary(&self) -> Result<RawVectorMembershipSummary> {
+    fn current_summary(
+        &self,
+        owner: &mut contextdb_vector::VectorCopyAdmission,
+    ) -> Result<RawVectorMembershipSummary> {
+        let _window = self.pending_metadata_window(owner)?;
         // Called after a removal the store did not publish itself (cleanup,
         // retention, purge), which commits before the writer republishes its
         // root: read the latest committed summary.
-        let read = self.persistence.with_db(|db| {
-            db.begin_read()
-                .map_err(vector_membership_pages::metadata_error)
-        })?;
-        read_summary(&read, &self.partition)
+        let root = self.owner.latest()?;
+        read_summary(&root.read, &self.partition)
     }
 
     fn visible_count(
         &self,
         snapshot: SnapshotId,
         before: &mut dyn FnMut() -> bool,
+        owner: &mut contextdb_vector::VectorCopyAdmission,
     ) -> Result<usize> {
-        let root = MembershipRoot::capture(&self.persistence)?;
+        let mut scratch = owner.scratch();
+        scratch.reserve_for(self.window_bytes(), "vector", "membership_window", HINT)?;
+        let root = self.owner.capture()?;
         root.check_scope(&self.partition.index.table)?;
         if root.snapshot().is_some_and(|newest| snapshot.0 >= newest.0) {
             // Every membership in this root is committed at or before the
@@ -558,12 +1130,42 @@ impl RawVectorMembershipSource for DurableMembershipSource {
             return Ok(read_summary(&root.read, &self.partition)?.live_entries);
         }
         drop(root);
+        drop(scratch);
         let mut count = 0;
-        self.find(None, before, |record| {
-            count += usize::from(visible(record, snapshot));
-            None::<()>
-        })?;
+        self.find(
+            None,
+            before,
+            |record| {
+                count += usize::from(visible(record, snapshot));
+                None::<()>
+            },
+            owner,
+        )?;
         Ok(count)
+    }
+
+    fn supports_root_selection(&self) -> bool {
+        true
+    }
+
+    fn select_visible_by_row(
+        &self,
+        row: RowId,
+        snapshot: SnapshotId,
+        before: &mut dyn FnMut() -> bool,
+        owner: &mut contextdb_vector::VectorCopyAdmission,
+    ) -> Result<Option<Box<dyn contextdb_vector::store::RawVectorMembershipSelection>>> {
+        self.find_selected(row, before, |record| visible(record, snapshot), owner)
+    }
+
+    fn select_identity_by_row_lsn(
+        &self,
+        row: RowId,
+        lsn: Lsn,
+        before: &mut dyn FnMut() -> bool,
+        owner: &mut contextdb_vector::VectorCopyAdmission,
+    ) -> Result<Option<Box<dyn contextdb_vector::store::RawVectorMembershipSelection>>> {
+        self.find_selected(row, before, |record| record.vector_lsn == lsn, owner)
     }
 
     fn visible_by_row(
@@ -571,10 +1173,26 @@ impl RawVectorMembershipSource for DurableMembershipSource {
         row: RowId,
         snapshot: SnapshotId,
         before: &mut dyn FnMut() -> bool,
+        owner: &mut contextdb_vector::VectorCopyAdmission,
     ) -> Result<Option<RawVectorDirectoryEntry>> {
-        self.find(Some(row), before, |record| {
-            visible(record, snapshot).then(|| body_identity(record))
-        })
+        self.visible_by_row_with_copy_admission(row, snapshot, before, owner, &mut |token, bytes, component, operation, hint| token.reserve_for(bytes, component, operation, hint))
+    }
+
+    fn visible_by_row_with_copy_admission(
+        &self,
+        row: RowId,
+        snapshot: SnapshotId,
+        before: &mut dyn FnMut() -> bool,
+        owner: &mut contextdb_vector::VectorCopyAdmission,
+        admit: &mut dyn FnMut(&mut contextdb_vector::VectorCopyAdmission, usize, &str, &str, &str) -> Result<()>,
+    ) -> Result<Option<RawVectorDirectoryEntry>> {
+        self.find_with_copy_admission(
+            Some(row),
+            before,
+            |record| visible(record, snapshot).then(|| body_identity(record)),
+            owner,
+            admit,
+        )
     }
 
     fn contains_row_lsn(
@@ -582,8 +1200,9 @@ impl RawVectorMembershipSource for DurableMembershipSource {
         row: RowId,
         lsn: Lsn,
         before: &mut dyn FnMut() -> bool,
+        owner: &mut contextdb_vector::VectorCopyAdmission,
     ) -> Result<bool> {
-        Ok(self.identity_by_row_lsn(row, lsn, before)?.is_some())
+        Ok(self.identity_by_row_lsn(row, lsn, before, owner)?.is_some())
     }
 
     fn identity_by_row_lsn(
@@ -591,54 +1210,63 @@ impl RawVectorMembershipSource for DurableMembershipSource {
         row: RowId,
         lsn: Lsn,
         before: &mut dyn FnMut() -> bool,
+        owner: &mut contextdb_vector::VectorCopyAdmission,
     ) -> Result<Option<RawVectorDirectoryEntry>> {
-        self.find(Some(row), before, |record| {
-            (record.vector_lsn == lsn).then(|| body_identity(record))
-        })
+        self.find(
+            Some(row),
+            before,
+            |record| (record.vector_lsn == lsn).then(|| body_identity(record)),
+            owner,
+        )
     }
 
     fn visit_suffix(
         &self,
         after_lsn: Lsn,
         visit: &mut dyn FnMut(contextdb_vector::store::RawVectorSuffixChange) -> Result<()>,
+        owner: &mut contextdb_vector::VectorCopyAdmission,
     ) -> Result<bool> {
         use contextdb_vector::store::RawVectorSuffixChange;
         let mut failed = None;
-        self.journal_suffix(after_lsn, &mut |change| {
-            let result = match change {
-                VectorPartitionJournalChange::Upsert(membership) => {
-                    let opened = visit(RawVectorSuffixChange::Opened {
-                        identity: RawVectorDirectoryEntry {
-                            deleted_tx: None,
-                            ..body_identity(&membership)
-                        },
-                        visible_from: membership.visible_from,
-                    });
-                    match (opened, membership.deleted_tx) {
-                        (Ok(()), Some(deleted_tx)) => visit(RawVectorSuffixChange::Closed {
-                            row_id: membership.row_id,
-                            created_tx: membership.vector_created_tx,
-                            lsn: membership.vector_lsn,
-                            deleted_tx,
-                        }),
-                        (result, _) => result,
+        self.journal_suffix(
+            after_lsn,
+            &mut |change| {
+                let result = match change {
+                    VectorPartitionJournalChange::Upsert(membership) => {
+                        let opened = visit(RawVectorSuffixChange::Opened {
+                            identity: RawVectorDirectoryEntry {
+                                deleted_tx: None,
+                                ..body_identity(&membership)
+                            },
+                            visible_from: membership.visible_from,
+                        });
+                        match (opened, membership.deleted_tx) {
+                            (Ok(()), Some(deleted_tx)) => visit(RawVectorSuffixChange::Closed {
+                                row_id: membership.row_id,
+                                created_tx: membership.vector_created_tx,
+                                lsn: membership.vector_lsn,
+                                deleted_tx,
+                            }),
+                            (result, _) => result,
+                        }
                     }
+                    VectorPartitionJournalChange::Tombstone(tombstone) => {
+                        visit(RawVectorSuffixChange::Closed {
+                            row_id: tombstone.membership.row_id,
+                            created_tx: tombstone.membership.vector_created_tx,
+                            lsn: tombstone.membership.vector_lsn,
+                            deleted_tx: tombstone.deleted_tx,
+                        })
+                    }
+                };
+                if let Err(error) = result {
+                    failed = Some(error);
+                    return false;
                 }
-                VectorPartitionJournalChange::Tombstone(tombstone) => {
-                    visit(RawVectorSuffixChange::Closed {
-                        row_id: tombstone.membership.row_id,
-                        created_tx: tombstone.membership.vector_created_tx,
-                        lsn: tombstone.membership.vector_lsn,
-                        deleted_tx: tombstone.deleted_tx,
-                    })
-                }
-            };
-            if let Err(error) = result {
-                failed = Some(error);
-                return false;
-            }
-            true
-        })?;
+                true
+            },
+            owner,
+        )?;
         failed.map_or(Ok(true), Err)
     }
 
@@ -646,85 +1274,45 @@ impl RawVectorMembershipSource for DurableMembershipSource {
         true
     }
 
-    fn pending_counts(&self, covered: Option<TxId>) -> Result<Option<(usize, usize)>> {
-        self.read_pending_counts(covered, || MembershipRoot::capture(&self.persistence))
+    fn pending_counts(
+        &self,
+        covered: Option<TxId>,
+        owner: &mut contextdb_vector::VectorCopyAdmission,
+    ) -> Result<Option<(usize, usize)>> {
+        self.read_pending_counts(covered, || self.owner.capture(), owner)
     }
 
     fn inspection_snapshot(
         &self,
         serving_covered: Option<TxId>,
+        owner: &mut contextdb_vector::VectorCopyAdmission,
     ) -> Result<Option<RawVectorInspectionSnapshot>> {
-        let _window = self.pending_metadata_window()?;
-        let root = MembershipRoot::capture(&self.persistence)?;
-        let summary = self.read_pending_metadata(&root)?;
+        let _window = self.pending_metadata_window(owner)?;
+        let root = self.owner.capture()?;
         let generations = self.catalog_generations(&root)?;
-        let (base, change) = generations.map_or((None, None), |(base, change)| {
-            let identity = |generation: VectorPartitionGenerationDescriptor| {
-                contextdb_vector::store::VectorGraphGeneration {
-                    generation_id: generation.generation_id,
-                    covered_tx: generation.covered_tx,
-                    covered_lsn: generation.covered_lsn,
-                    durable_bytes: generation.durable_bytes,
-                    policy_revision: generation.policy_revision,
-                    hnsw_m: generation.hnsw_m,
-                    hnsw_ef_construction: generation.hnsw_ef_construction,
-                }
-            };
-            (Some(identity(base)), change.map(identity))
-        });
-        let covered = change
-            .or(base)
-            .map_or(summary.pending.covered_tx, |generation| {
-                generation.covered_tx
-            });
-        // Serving metadata and counters are committed together. A candidate
-        // matching some other frontier cannot authenticate this catalog.
-        if summary.pending.covered_tx != covered {
-            return Err(damage(
-                "pending summary disagrees with captured catalog frontier",
-            ));
-        }
-        let captured_catalog = self.captured_catalog_required(&root)?;
-        let frontier = if captured_catalog || generations.is_none() {
-            covered
-        } else {
-            serving_covered.unwrap_or(covered)
-        };
-        let (pending_inserts, tombstones) = Self::pending_counts_for(&summary, Some(frontier))?;
-        Ok(Some(RawVectorInspectionSnapshot {
-            captured_catalog,
-            summary: summary_counts(&summary)?,
-            base,
-            change,
-            pending_inserts,
-            tombstones,
-            #[cfg(feature = "test-seams")]
-            base_pending: {
-                let frontier = base.map_or(TxId(0), |generation| generation.covered_tx);
-                [
-                    &summary.pending,
-                    summary.base_pending.as_ref().unwrap_or(&summary.pending),
-                ]
-                .into_iter()
-                .find(|counts| counts.covered_tx == frontier)
-                .map(|counts| (counts.pending_inserts as usize, counts.tombstones as usize))
-            },
-        }))
+        self.inspection_in_root(&root, generations, serving_covered)
+            .map(Some)
     }
 
     fn visit_identities(
         &self,
         before: &mut dyn FnMut() -> bool,
         visit: &mut dyn FnMut(RawVectorDirectoryEntry) -> Result<()>,
+        owner: &mut contextdb_vector::VectorCopyAdmission,
     ) -> Result<()> {
         let mut failed = None;
-        self.find(None, before, |record| {
-            if let Err(error) = visit(body_identity(record)) {
-                failed = Some(error);
-                return Some(());
-            }
-            None
-        })?;
+        self.find(
+            None,
+            before,
+            |record| {
+                if let Err(error) = visit(body_identity(record)) {
+                    failed = Some(error);
+                    return Some(());
+                }
+                None
+            },
+            owner,
+        )?;
         failed.map_or(Ok(()), Err)
     }
 
@@ -733,15 +1321,21 @@ impl RawVectorMembershipSource for DurableMembershipSource {
         row: RowId,
         before: &mut dyn FnMut() -> bool,
         visit: &mut dyn FnMut(RawVectorDirectoryEntry) -> Result<()>,
+        owner: &mut contextdb_vector::VectorCopyAdmission,
     ) -> Result<()> {
         let mut failed = None;
-        self.find(Some(row), before, |record| {
-            if let Err(error) = visit(body_identity(record)) {
-                failed = Some(error);
-                return Some(());
-            }
-            None
-        })?;
+        self.find(
+            Some(row),
+            before,
+            |record| {
+                if let Err(error) = visit(body_identity(record)) {
+                    failed = Some(error);
+                    return Some(());
+                }
+                None
+            },
+            owner,
+        )?;
         failed.map_or(Ok(()), Err)
     }
 
@@ -759,33 +1353,63 @@ impl RawVectorMembershipSource for DurableMembershipSource {
 /// A column's row-to-partition directory, read from the reverse companion
 /// at each operation's captured root.
 pub(crate) struct DurableReverseMembershipSource {
-    persistence: Arc<RedbPersistence>,
+    owner: MembershipOwner,
     index: VectorIndexRef,
     accountant: Arc<MemoryAccountant>,
+    _copy_owner: Option<Arc<contextdb_vector::VectorCopyAdmission>>,
 }
 
 impl DurableReverseMembershipSource {
-    pub(crate) fn new(
-        persistence: Arc<RedbPersistence>,
-        index: VectorIndexRef,
+    pub(crate) fn from_owner_admitted(
+        source_owner: MembershipOwner,
+        index: &VectorIndexRef,
+
         accountant: Arc<MemoryAccountant>,
-    ) -> Arc<Self> {
-        Arc::new(Self {
-            persistence,
-            index,
+        workspace: &mut contextdb_vector::VectorCopyAdmission,
+        mut retained: contextdb_vector::VectorCopyAdmission,
+    ) -> Result<Arc<Self>> {
+        workspace.reserve(
+            std::mem::size_of::<Self>()
+                .saturating_add(std::mem::size_of::<contextdb_vector::VectorCopyAdmission>())
+                .saturating_add(4 * std::mem::size_of::<usize>())
+                .saturating_add(index.table.len().saturating_add(index.column.len())),
+        )?;
+        retained.reserve(
+            std::mem::size_of::<Self>()
+                .saturating_add(std::mem::size_of::<contextdb_vector::VectorCopyAdmission>())
+                .saturating_add(4 * std::mem::size_of::<usize>())
+                .saturating_add(index.table.len().saturating_add(index.column.len())),
+        )?;
+        Ok(Arc::new(Self {
+            owner: source_owner,
+            index: index.clone(),
             accountant,
-        })
+            _copy_owner: Some(Arc::new(retained)),
+        }))
     }
 
-    fn cursor(&self, row: RowId) -> Result<ReverseCursor> {
-        let memory = OwnedMemoryReservation::try_new_for(
-            self.accountant.clone(),
-            (self.index.table.len() + self.index.column.len()).saturating_mul(32) + 4096,
-            "vector",
-            "membership_reverse_window",
-            "Raise MEMORY_LIMIT to read a reverse membership window.",
-        )?;
-        let root = MembershipRoot::capture(&self.persistence)?;
+    fn route_window_bytes(&self) -> usize {
+        (self.index.table.len() + self.index.column.len()).saturating_mul(32) + 4096
+    }
+
+    fn cursor_admitted(
+        &self,
+        row: RowId,
+        owner: &mut contextdb_vector::VectorCopyAdmission,
+    ) -> Result<ReverseCursor> {
+        let bytes = self.route_window_bytes();
+        let mut scratch = owner.scratch();
+        scratch.reserve(bytes)?;
+        self.cursor_reserved(row, bytes, scratch)
+    }
+
+    fn cursor_reserved(
+        &self,
+        row: RowId,
+        admitted_bytes: usize,
+        scratch: contextdb_vector::VectorCopyAdmission,
+    ) -> Result<ReverseCursor> {
+        let root = self.owner.capture()?;
         root.check_scope(&self.index.table)?;
         Ok(ReverseCursor {
             root,
@@ -794,7 +1418,8 @@ impl DurableReverseMembershipSource {
             prefix: vector_membership_pages::reverse_row_prefix(&self.index, row),
             before_key: None,
             done: false,
-            memory,
+            admitted_bytes,
+            scratch,
         })
     }
 }
@@ -806,12 +1431,12 @@ struct ReverseCursor {
     prefix: Vec<u8>,
     before_key: Option<Vec<u8>>,
     done: bool,
-    memory: OwnedMemoryReservation,
+    admitted_bytes: usize,
+    // Declared last so all cursor buffers and the captured root drop first.
+    scratch: contextdb_vector::VectorCopyAdmission,
 }
 
 impl ReverseCursor {
-    /// Newest row version first: reverse keys order a row's placements by
-    /// its row version, so the current placement is read before history.
     fn next_record(
         &mut self,
         before: &mut dyn FnMut() -> bool,
@@ -851,13 +1476,10 @@ impl ReverseCursor {
         let needed = (key.value().len() + value.value().len())
             .saturating_mul(3)
             .saturating_add(std::mem::size_of::<VectorPartitionMembershipRecord>());
-        if needed > self.memory.bytes() {
-            self.memory.try_grow_for(
-                needed - self.memory.bytes(),
-                "vector",
-                "membership_reverse_window",
-                "Raise MEMORY_LIMIT to decode the selected reverse membership.",
-            )?;
+        if needed > self.admitted_bytes {
+            let growth = needed - self.admitted_bytes;
+            self.scratch.reserve(growth)?;
+            self.admitted_bytes = needed;
         }
         #[cfg(feature = "test-seams")]
         crate::database::resident_history_test_seams::note(|work| {
@@ -882,33 +1504,76 @@ impl ReverseCursor {
 }
 
 impl RawVectorReverseMembershipCursor for ReverseCursor {
-    fn next(&mut self, before: &mut dyn FnMut() -> bool) -> Result<Option<VectorPartitionKey>> {
-        self.next_record(before)
-            .map(|record| record.map(|record| record.partition_key))
+    fn next(
+        &mut self,
+        before: &mut dyn FnMut() -> bool,
+        owner: &mut contextdb_vector::VectorCopyAdmission,
+    ) -> Result<Option<VectorPartitionKey>> {
+        let Some(record) = self.next_record(before)? else {
+            return Ok(None);
+        };
+        // A caller may retain several yielded keys while this cursor advances.
+        // Keep their owned storage funded separately from reusable decode scratch.
+        owner.reserve(record.partition_key.estimated_bytes())?;
+        Ok(Some(record.partition_key))
     }
 }
 
 impl RawVectorReverseMembershipSource for DurableReverseMembershipSource {
+    fn visit_retained_copy_credits(
+        &self,
+        caller: &dyn contextdb_vector::MemoryBudget,
+        visit: &mut dyn FnMut(usize, usize, bool),
+    ) {
+        if let Some(credit) = &self._copy_owner {
+            contextdb_vector::VectorCopyAdmission::visit_retained_copy_credit(
+                credit, caller, visit,
+            );
+        }
+    }
+
     fn for_renamed_index(
         &self,
         index: &VectorIndexRef,
-    ) -> Option<Arc<dyn RawVectorReverseMembershipSource>> {
-        Some(Self::new(
-            self.persistence.clone(),
-            index.clone(),
-            self.accountant.clone(),
-        ))
+        owner: &mut contextdb_vector::VectorCopyAdmission,
+        mut retained: contextdb_vector::VectorCopyAdmission,
+    ) -> Result<Arc<dyn RawVectorReverseMembershipSource>> {
+        let mut charge = owner.scratch();
+        charge.reserve(
+            std::mem::size_of::<Self>()
+                .saturating_add(std::mem::size_of::<contextdb_vector::VectorCopyAdmission>())
+                .saturating_add(4 * std::mem::size_of::<usize>())
+                .saturating_add(index.table.len())
+                .saturating_add(index.column.len()),
+        )?;
+        retained.reserve(
+            std::mem::size_of::<Self>()
+                .saturating_add(std::mem::size_of::<contextdb_vector::VectorCopyAdmission>())
+                .saturating_add(4 * std::mem::size_of::<usize>())
+                .saturating_add(index.table.len())
+                .saturating_add(index.column.len()),
+        )?;
+        Ok(Arc::new(Self {
+            owner: self.owner.clone(),
+            index: index.clone(),
+            accountant: self.accountant.clone(),
+            _copy_owner: Some(Arc::new(retained)),
+        }))
     }
 
-    fn visible_partition(
+    fn visible_partition_admitted(
         &self,
         row: RowId,
         snapshot: SnapshotId,
         before: &mut dyn FnMut() -> bool,
+        owner: &mut contextdb_vector::VectorCopyAdmission,
     ) -> Result<Option<VectorPartitionKey>> {
-        let mut cursor = self.cursor(row)?;
+        let mut cursor = self.cursor_admitted(row, owner)?;
         while let Some(record) = cursor.next_record(before)? {
             if visible(&record, snapshot) {
+                // The key escapes the cursor's reusable decode window.
+                // Admit its caller-held storage before moving it out.
+                owner.reserve(record.partition_key.estimated_bytes())?;
                 return Ok(Some(record.partition_key));
             }
         }
@@ -919,11 +1584,12 @@ impl RawVectorReverseMembershipSource for DurableReverseMembershipSource {
         &self,
         row: RowId,
         before: &mut dyn FnMut() -> bool,
+        owner: &mut contextdb_vector::VectorCopyAdmission,
     ) -> Result<Box<dyn RawVectorReverseMembershipCursor>> {
         if !before() {
             return Err(Error::ReadCancelled);
         }
-        Ok(Box::new(self.cursor(row)?))
+        Ok(Box::new(self.cursor_admitted(row, owner)?))
     }
 }
 
@@ -932,40 +1598,101 @@ pub(crate) struct DurablePartitionSourceFactory {
     pub(crate) published_root: PublishedMembershipRoot,
     pub(crate) persistence: Arc<RedbPersistence>,
     pub(crate) accountant: Arc<MemoryAccountant>,
-    pub(crate) loader:
-        Arc<dyn Fn(&VectorPartitionRef) -> Arc<dyn DormantRawVectorLoader> + Send + Sync>,
+    pub(crate) loader: Arc<
+        dyn Fn(
+                &VectorPartitionRef,
+                contextdb_vector::VectorCopyAdmission,
+                contextdb_vector::VectorCopyAdmission,
+            ) -> Result<Arc<dyn DormantRawVectorLoader>>
+            + Send
+            + Sync,
+    >,
+    // The layout captured by loader shares this retained construction owner.
+    _copy_owner: Arc<contextdb_vector::VectorCopyAdmission>,
 }
 
 impl contextdb_vector::store::DurableRawPartitionFactory for DurablePartitionSourceFactory {
+    fn visit_retained_copy_credits(
+        &self,
+        caller: &dyn contextdb_vector::MemoryBudget,
+        visit: &mut dyn FnMut(usize, usize, bool),
+    ) {
+        contextdb_vector::VectorCopyAdmission::visit_retained_copy_credit(
+            &self._copy_owner,
+            caller,
+            visit,
+        );
+    }
+
     fn create(
         &self,
         partition: &VectorPartitionRef,
-    ) -> (
+        mut workspace: contextdb_vector::VectorCopyAdmission,
+        mut owner: contextdb_vector::VectorCopyAdmission,
+    ) -> Result<(
         Arc<dyn RawVectorMembershipSource>,
         Arc<dyn DormantRawVectorLoader>,
-    ) {
-        (
-            DurableMembershipSource::new(
-                self.persistence.clone(),
-                partition.clone(),
-                RawVectorMembershipSummary::default(),
-                self.accountant.clone(),
-                self.published_root.clone(),
-            ),
-            (self.loader)(partition),
-        )
+    )> {
+        let loader_owner = owner.scratch();
+        let loader_workspace = workspace.scratch();
+        workspace.reserve(
+            std::mem::size_of::<DurableMembershipSource>()
+                .saturating_add(std::mem::size_of::<contextdb_vector::VectorCopyAdmission>())
+                .saturating_add(4 * std::mem::size_of::<usize>())
+                .saturating_add(partition.index.table.len())
+                .saturating_add(partition.index.column.len())
+                .saturating_add(partition.partition_key.estimated_bytes()),
+        )?;
+        owner.reserve(
+            std::mem::size_of::<DurableMembershipSource>()
+                .saturating_add(std::mem::size_of::<contextdb_vector::VectorCopyAdmission>())
+                .saturating_add(4 * std::mem::size_of::<usize>())
+                .saturating_add(partition.index.table.len())
+                .saturating_add(partition.index.column.len())
+                .saturating_add(partition.partition_key.estimated_bytes()),
+        )?;
+        let loader = (self.loader)(partition, loader_workspace, loader_owner)?;
+        let source = Arc::new(DurableMembershipSource {
+            owner: MembershipOwner::Writable(self.persistence.clone()),
+            published_root: Some(self.published_root.clone()),
+            partition: partition.clone(),
+            summary: RawVectorMembershipSummary::default(),
+            accountant: self.accountant.clone(),
+            _copy_owner: Some(Arc::new(owner)),
+        });
+        Ok((source, loader))
     }
 }
 
-/// Builds a raw-body loader for one partition of a declared layout.
+/// Builds an admitted raw-body loader for one partition of a declared layout.
 pub(crate) type DurableLoaderBuilder = Arc<
     dyn Fn(
             &VectorPartitionRef,
             &contextdb_vector::VectorIndexLayout,
-        ) -> Arc<dyn DormantRawVectorLoader>
+            contextdb_vector::VectorCopyAdmission,
+            contextdb_vector::VectorCopyAdmission,
+        ) -> Result<Arc<dyn DormantRawVectorLoader>>
         + Send
         + Sync,
 >;
+
+// Keep the complete captured layout alive before releasing its shared
+// construction charge, including when the loader closure is cloned alone.
+struct AdmittedLayoutLoader {
+    loader: DurableLoaderBuilder,
+    layout: contextdb_vector::VectorIndexLayout,
+    _owner: Arc<contextdb_vector::VectorCopyAdmission>,
+}
+impl AdmittedLayoutLoader {
+    fn load(
+        &self,
+        partition: &VectorPartitionRef,
+        workspace: contextdb_vector::VectorCopyAdmission,
+        owner: contextdb_vector::VectorCopyAdmission,
+    ) -> Result<Arc<dyn DormantRawVectorLoader>> {
+        (self.loader)(partition, &self.layout, workspace, owner)
+    }
+}
 
 /// Creates the durable sources of a vector column declared after open.
 pub(crate) struct DurableColumnSourceFactory {
@@ -973,6 +1700,7 @@ pub(crate) struct DurableColumnSourceFactory {
     pub(crate) persistence: Arc<RedbPersistence>,
     pub(crate) accountant: Arc<MemoryAccountant>,
     pub(crate) loader: DurableLoaderBuilder,
+    pub(crate) _copy_owner: Arc<contextdb_vector::VectorCopyAdmission>,
 }
 
 impl DurableColumnSourceFactory {
@@ -980,71 +1708,206 @@ impl DurableColumnSourceFactory {
         &self,
         index: &VectorIndexRef,
         layout: &contextdb_vector::VectorIndexLayout,
-    ) -> (
+        mut workspace: contextdb_vector::VectorCopyAdmission,
+        mut owner: contextdb_vector::VectorCopyAdmission,
+    ) -> Result<(
         Arc<dyn RawVectorReverseMembershipSource>,
         Arc<dyn contextdb_vector::store::DurableRawPartitionFactory>,
-    ) {
+    )> {
+        // The reverse source can be replaced independently of the factory
+        // and captured layout. Admit their distinct credits before any clone,
+        // so publishing a rename returns the old reverse source's funding.
+        let reverse_bytes = std::mem::size_of::<DurableReverseMembershipSource>()
+            .saturating_add(std::mem::size_of::<contextdb_vector::VectorCopyAdmission>())
+            .saturating_add(4 * std::mem::size_of::<usize>())
+            .saturating_add(index.table.len())
+            .saturating_add(index.column.len());
+        let factory_bytes = std::mem::size_of::<DurablePartitionSourceFactory>()
+            .saturating_add(std::mem::size_of::<contextdb_vector::VectorCopyAdmission>())
+            .saturating_add(6 * std::mem::size_of::<usize>())
+            .saturating_add(std::mem::size_of::<DurableLoaderBuilder>())
+            .saturating_add(layout.estimated_bytes().saturating_mul(2));
+        workspace.reserve(reverse_bytes.saturating_add(factory_bytes))?;
+        let mut reverse_owner = owner.scratch();
+        reverse_owner.reserve(reverse_bytes)?;
+        owner.reserve(factory_bytes)?;
         let loader = self.loader.clone();
         let layout = layout.clone();
-        (
-            DurableReverseMembershipSource::new(
-                self.persistence.clone(),
-                index.clone(),
-                self.accountant.clone(),
-            ),
-            Arc::new(DurablePartitionSourceFactory {
-                published_root: self.published_root.clone(),
-                persistence: self.persistence.clone(),
-                accountant: self.accountant.clone(),
-                loader: Arc::new(move |partition: &VectorPartitionRef| loader(partition, &layout)),
+        let copy_owner = Arc::new(owner);
+        let reverse = Arc::new(DurableReverseMembershipSource {
+            owner: MembershipOwner::Writable(self.persistence.clone()),
+            index: index.clone(),
+            accountant: self.accountant.clone(),
+            _copy_owner: Some(Arc::new(reverse_owner)),
+        });
+        let admitted_loader = AdmittedLayoutLoader {
+            loader,
+            layout,
+            _owner: copy_owner.clone(),
+        };
+        let partitions = Arc::new(DurablePartitionSourceFactory {
+            published_root: self.published_root.clone(),
+            persistence: self.persistence.clone(),
+            accountant: self.accountant.clone(),
+            loader: Arc::new(move |partition, workspace, owner| {
+                admitted_loader.load(partition, workspace, owner)
             }),
-        )
+            _copy_owner: copy_owner,
+        });
+        Ok((reverse, partitions))
     }
 }
 
 impl contextdb_vector::store::DurableRawColumnFactory for DurableColumnSourceFactory {
+    fn visit_retained_copy_credits(
+        &self,
+        caller: &dyn contextdb_vector::MemoryBudget,
+        visit: &mut dyn FnMut(usize, usize, bool),
+    ) {
+        contextdb_vector::VectorCopyAdmission::visit_retained_copy_credit(
+            &self._copy_owner,
+            caller,
+            visit,
+        );
+    }
+
     fn create(
         &self,
         index: &VectorIndexRef,
         layout: &contextdb_vector::VectorIndexLayout,
-    ) -> (
+        workspace: contextdb_vector::VectorCopyAdmission,
+        owner: contextdb_vector::VectorCopyAdmission,
+    ) -> Result<(
         Arc<dyn RawVectorReverseMembershipSource>,
         Arc<dyn contextdb_vector::store::DurableRawPartitionFactory>,
-    ) {
-        self.column_sources(index, layout)
+    )> {
+        self.column_sources(index, layout, workspace, owner)
     }
 }
 
+pub(super) fn membership_partitions_in_read(
+    read: &redb::ReadTransaction,
+    owner: &mut contextdb_vector::VectorCopyAdmission,
+) -> Result<Vec<(VectorPartitionRef, RawVectorMembershipSummary)>> {
+    vector_membership_pages::validate_in_read(read)?;
+    let summaries = match read.open_table(vector_membership_pages::SUMMARY) {
+        Ok(table) => table,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(error) => return Err(RedbPersistence::storage_error(error)),
+    };
+    let mut partitions = Vec::new();
+    for item in summaries.iter().map_err(RedbPersistence::storage_error)? {
+        let (key, value) = item.map_err(vector_membership_pages::metadata_error)?;
+        if key.value().is_empty() {
+            continue;
+        }
+        let mut scratch = owner.scratch();
+        scratch.reserve(value.value().len().saturating_mul(2).saturating_add(
+            std::mem::size_of::<vector_membership_pages::MembershipSummary>(),
+        ))?;
+        owner.reserve(std::mem::size_of::<(
+            VectorPartitionRef,
+            RawVectorMembershipSummary,
+        )>())?;
+        let summary = vector_membership_pages::decode_summary(key.value(), value.value())?;
+        partitions.reserve_exact(1);
+        partitions.push((
+            vector_membership_pages::partition_from_prefix_admitted(key.value(), owner)?,
+            summary_counts(&summary)?,
+        ));
+    }
+    Ok(partitions)
+}
+
 impl RedbPersistence {
-    /// Every partition with a maintained membership summary, with its counts
-    /// at the committed root. Reads one summary record per partition.
+    #[cfg(any(test, feature = "test-seams"))]
+    pub(crate) fn durable_vector_storage_inventory_for_test(
+        &self,
+        partition: &VectorPartitionRef,
+        owner: &mut contextdb_vector::VectorCopyAdmission,
+    ) -> Result<crate::database::DurableVectorStorageInventoryForTest> {
+        self.with_db(|db| {
+            let read = db.begin_read().map_err(Self::storage_error)?;
+            let count = |definition| -> Result<usize> {
+                let rows = match read.open_table(definition) {
+                    Ok(table) => table.len().map_err(Self::storage_error)?,
+                    Err(redb::TableError::TableDoesNotExist(_)) => 0,
+                    Err(error) => return Err(Self::storage_error(error)),
+                };
+                usize::try_from(rows).map_err(|_| Error::Other("vector inventory count overflow".into()))
+            };
+            let mut partition_summaries = 0usize;
+            let mut empty_partition_summaries = 0usize;
+            match read.open_table(vector_membership_pages::SUMMARY) {
+                Ok(summaries) => {
+                    for item in summaries.iter().map_err(Self::storage_error)? {
+                        let (key, value) = item.map_err(Self::storage_error)?;
+                        if key.value().is_empty() {
+                            continue;
+                        }
+                        let mut scratch = owner.scratch();
+                        scratch.reserve(value.value().len().saturating_mul(2).saturating_add(
+                            std::mem::size_of::<vector_membership_pages::MembershipSummary>(),
+                        ))?;
+                        let route = vector_membership_pages::partition_from_prefix_admitted(key.value(), &mut scratch)?;
+                        let summary = vector_membership_pages::decode_summary(key.value(), value.value())?;
+                        if !route.partition_key.is_unpartitioned() {
+                            partition_summaries += 1;
+                            empty_partition_summaries += usize::from(summary.entries == 0);
+                        }
+                        drop((route, summary));
+                    }
+                }
+                Err(redb::TableError::TableDoesNotExist(_)) => {}
+                Err(error) => return Err(Self::storage_error(error)),
+            }
+            owner.reserve(partition.index.table.len().saturating_add(partition.index.column.len())
+                .saturating_add(partition.partition_key.estimated_bytes()).saturating_mul(8).saturating_add(128))?;
+            let key = Self::vector_partition_catalog_key_from_parts(&partition.index, &partition.partition_key);
+            let catalog_frontiers = match read.open_table(VECTOR_PARTITION_GENERATION_CATALOG_TABLE) {
+                Ok(catalogs) => match catalogs.get_bounded(key.as_slice()).map_err(Self::storage_error)? {
+                    Some(value) => {
+                        let catalog: VectorPartitionGenerationCatalogRecord = self.decode_expected_vector_partition_metadata(
+                            VectorPartitionRecordKind::GenerationCatalog, value.value(), &partition.index, &partition.partition_key,
+                        )?;
+                        if Self::vector_partition_catalog_key(&catalog) != key {
+                            return Err(self.vector_partition_corruption("generation catalog key does not match its checksummed payload"));
+                        }
+                        Some((catalog.base.covered_tx, catalog.change.map(|change| change.covered_tx)))
+                    }
+                    None => None,
+                },
+                Err(redb::TableError::TableDoesNotExist(_)) => None,
+                Err(error) => return Err(Self::storage_error(error)),
+            };
+            let paged_cleanup_entries = match read.open_table(vector_paged::CLEANUP) {
+                Ok(table) => usize::try_from(table.len().map_err(Self::storage_error)?)
+                    .map_err(|_| Error::Other("physical table count does not fit usize".into()))?,
+                Err(redb::TableError::TableDoesNotExist(_)) => 0,
+                Err(error) => return Err(Self::storage_error(error)),
+            };
+            Ok(crate::database::DurableVectorStorageInventoryForTest {
+                partition_summaries,
+                empty_partition_summaries,
+                catalog_frontiers,
+                catalogs: count(VECTOR_PARTITION_GENERATION_CATALOG_TABLE)?,
+                base_generations: count(VECTOR_PARTITION_BASE_GENERATION_TABLE)?,
+                change_generations: count(VECTOR_PARTITION_CHANGE_GENERATION_TABLE)?,
+                graph_pages: count(VECTOR_PARTITION_GRAPH_PAGE_TABLE)?,
+                paged_pages: count(vector_paged::PAGES)?,
+                paged_restart_records: count(vector_paged::BUILDS)?,
+                paged_cleanup_entries,
+            })
+        })
+    }
+
     pub(crate) fn durable_membership_partitions(
         &self,
+        owner: &mut contextdb_vector::VectorCopyAdmission,
     ) -> Result<Vec<(VectorPartitionRef, RawVectorMembershipSummary)>> {
         self.with_db(|db| {
             let read = db.begin_read().map_err(Self::storage_error)?;
-            vector_membership_pages::validate_in_read(&read)?;
-            let summaries = match read.open_table(vector_membership_pages::SUMMARY) {
-                Ok(table) => table,
-                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-                Err(error) => return Err(Self::storage_error(error)),
-            };
-            let mut partitions = Vec::new();
-            for item in summaries.iter().map_err(Self::storage_error)? {
-                let (key, value) = item.map_err(Self::storage_error)?;
-                if key.value().is_empty() {
-                    continue;
-                }
-                let summary = vector_membership_pages::decode_summary(key.value(), value.value())?;
-                if summary.entries == 0 {
-                    continue;
-                }
-                partitions.push((
-                    vector_membership_pages::partition_from_prefix(key.value())?,
-                    summary_counts(&summary)?,
-                ));
-            }
-            Ok(partitions)
+            membership_partitions_in_read(&read, owner)
         })
     }
 }

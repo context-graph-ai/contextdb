@@ -1,11 +1,12 @@
 //! Ordered history selectors, maintained beside their primary log atomically.
 use super::*;
+use super::writer_source::SourceWindowOwner;
 
 pub(super) const WRITER_CHANGE_LOG_TABLE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("writer_change_log");
-const CHANGE_LOG_BY_TABLE: TableDefinition<&[u8], &[u8]> =
+pub(super) const CHANGE_LOG_BY_TABLE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("change_log_by_table");
-const CHANGE_LOG_LSN_COUNT: TableDefinition<u64, u64> =
+pub(super) const CHANGE_LOG_LSN_COUNT: TableDefinition<u64, u64> =
     TableDefinition::new("change_log_lsn_count");
 
 impl RedbPersistence {
@@ -151,13 +152,15 @@ impl RedbPersistence {
 impl super::writer_source::WriterSnapshot {
     pub(crate) fn ddl_history_cursor(
         self: &Arc<Self>,
+        owner: SourceWindowOwner,
         since: Lsn,
     ) -> Result<super::writer_source::WriterReadCursor> {
-        self.ddl_history_cursor_ordered(since, false)
+        self.ddl_history_cursor_ordered(owner, since, false)
     }
 
     pub(crate) fn ddl_history_cursor_ordered(
         self: &Arc<Self>,
+        owner: SourceWindowOwner,
         since: Lsn,
         reverse: bool,
     ) -> Result<super::writer_source::WriterReadCursor> {
@@ -174,6 +177,7 @@ impl super::writer_source::WriterSnapshot {
         let mut upper = [b';'; 21];
         upper[..20].copy_from_slice(&encode(self.lsn.0));
         self.cursor(
+            owner,
             "ddl_log",
             super::writer_source::WriterCursorFamily::Text,
             std::ops::Bound::Included(&lower),

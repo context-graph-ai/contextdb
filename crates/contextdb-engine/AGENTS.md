@@ -24,6 +24,24 @@ route, second read opener, duplicate refusal type, or consumer-specific executio
 Detailed reader, reclamation, vector generation, and maintenance mechanisms live in
 [architecture](../../docs/architecture.md); their guards are indexed below.
 
+## Cursor page ownership
+
+The public core CursorPage and Value::Json retain their embedding payloads. The
+engine's private OwnedCursorPage shares one immutable admitted row root, including
+JSON trees, across internal copies and slices. Its inline ReadCredit releases only
+after the last holder deallocates the root and rows; internal column copies admit
+their own native buffers. Owner-channel decoding and the bounded kernel admit the
+exact row-root header before allocation. ReadCursor first_page and fetch materialize
+public terminal pages at the boundary and release that private page credit there.
+Public terminal page copies do not extend engine working-memory ownership.
+
+The corrupt-store-only write_corrupt_store_vector_memberships_for_test seam is
+compiled solely for tests or test-seams. It installs checksummed membership records
+and authenticated companions while deliberately bypassing placement overlap
+validation, so producer rejection and loader defense can be proved independently.
+Ordinary publication always validates overlaps. The fixture caller supplies exact
+borrowed records and uses the persistence instance's existing writer proof funding.
+
 ## Writer working set
 
 A writable file store keeps a bounded working set however much durable history it holds. The
@@ -40,6 +58,22 @@ open needs. Redb's allocator metadata is paged (see the redb guide) and its reta
 charged against the writer budget (`memory_accounting.rs`). Vector partitions build, reload and
 search through paged tails and builders (see the vector guide). Cleanup, version pruning and
 compaction run in finite batches.
+
+`SHOW CONTENT_SIZE` reports a file-backed captured committed root's exact current row and
+canonical vector body value lengths. Superseded/deleted history is reported separately;
+membership, journal, and graph/index bytes are excluded, and disjoint placements count a
+canonical body once. `persistence/content_size.rs` maintains per-table totals alongside physical
+writes and current-head/membership publication in the same durable transaction. The Configuration
+root binds the totals table's physical root; compaction rebinds it, and readers refuse missing or
+incomplete totals. The shared bounded kernel charges each actual table-summary lookup before
+reading it and admits the ordinary result. Memory-only stores return the existing typed unsupported
+inspection refusal; they have no persisted committed values.
+
+Proof bindings awaiting independent execution: `tests/read/content_size_independent_contract.rs`
+(`memory_content_size_refuses_without_inventing_persisted_bytes`,
+`file_content_totals_match_persisted_values_through_replacement_delete_and_prune`, and
+`content_size_reads_one_total_per_table_at_fixed_table_count`). Restored disjoint placement and
+captured-cursor proofs remain required before qualification.
 
 ## Seams
 
@@ -65,6 +99,17 @@ physical roots through redb's `compact_step_with_hook` / `table_root_fingerprint
 unchanged raw vector bodies share bounded allocation ownership rather than growing once per scalar
 version. The finite memory limit remains a ceiling, so sharing does not promise unlimited history.
 <!-- enforced by: crates/contextdb-engine/tests/vector/vector_memory_ownership_reconciliation_contract.rs::retained_journey_scalar_publications_bound_unique_payloads_and_admit_a_small_write -->
+
+Blob public methods keep their embedding parameter lists. Each operation derives a
+child of the store's declared reader memory; serving and reclaim cycles use the
+same declared parent through its request provider. Hosts supplying an owner use
+resolve_blob_ref_with_read_memory and reclaim_unreferenced_with_read_memory;
+hosts supplying a provider use serve_on_with_read_budget_provider and
+spawn_reclaim_driver_with_read_budget_provider. serve_on returns Result.
+Captured ledger roots and output credits last through source use; refreshing a
+holder's mirror captures a new root after the await. Source refusals remain typed
+through ResolveError::LedgerRead, using a bounded control prefix on the same
+blob stream before Bao data; directory registration failures propagate.
 
 ## Invariants and their guards
 
@@ -170,6 +215,7 @@ Paths below are relative to this crate unless they start with `crates/` or `../.
 | Work-ledger state and delivery | `work_ledger.rs`; server owns polling and flags. |
 | Memory charges and append-work observation | `memory_accounting.rs`, `append_work.rs`; database and persistence call these at admission and durable publication. |
 | Writer reads at a pinned root, staged-overlay merge, durable history cursors, open bounds | `persistence/writer_source.rs`, `writer_adapters.rs`, `writer_history.rs`, `writer_commit_directory.rs`, `writer_recovery.rs`; statement scope in `database/writer_read.rs`; the store seams are in the relational, graph and tx guides. |
+| Maintained content-size totals and inspection | `persistence/content_size.rs`, `persistence/content_identity.rs`, physical mutation paths, `executor.rs`, `executor/bounded.rs`; query work is table-count bounded. |
 | Maintained count installation and query | `maintained_counts.rs`, `database.rs`, `persistence.rs`, `executor.rs`, `executor/bounded.rs`. |
 | Read image authentication and memory | `read_image.rs`, `read_image_memory.rs`, `direct_file_reader.rs`, `persistent_store.rs`; bounded execution remains in `executor/bounded.rs`. |
 | CLI rendering and status | `cli_render.rs`, `metadata_page.rs`; the CLI crate formats its own output. |

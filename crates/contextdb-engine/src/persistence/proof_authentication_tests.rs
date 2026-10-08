@@ -24,15 +24,18 @@ fn order_key_offset() -> usize {
     1 + 4 + TABLE.len() + 4 + INDEX.len() + 1
 }
 
-fn fixture(path: &std::path::Path, rows: u64) -> (redb::Database, Vec<ContentIdentityMutation>) {
-    let database = redb::Database::create(path).expect("create proof fixture");
+fn fixture(
+    path: &std::path::Path,
+    rows: u64,
+) -> (ProofFixtureDatabase, Vec<ContentIdentityMutation>) {
+    let database = ProofFixtureDatabase::create(path).expect("create proof fixture");
     let records = (0..rows).map(|row| posting(row, false)).collect::<Vec<_>>();
     let write = database.begin_write().unwrap();
     RedbPersistence::initialize_content_identity_in_write(&write).unwrap();
     RedbPersistence::apply_content_identity_mutations_in_write(
         &write,
         &records,
-        &mut ProofAdmission::unaccounted(),
+        &mut database.admission(None),
     )
     .unwrap();
     write.commit().unwrap();

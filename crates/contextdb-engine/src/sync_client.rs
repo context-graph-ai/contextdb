@@ -7,9 +7,10 @@ use crate::custody_types::{
 use crate::protocol::{
     DependencyCompletePullResponse, MessageType, PROTOCOL_VERSION, PullRequest, PullResponse,
     PushRequest, PushResponse, RefusedSchemaUnitOutcome, SchemaRecoveryRequest, SyncStatusResponse,
-    WireChangeSet, WirePurgeChange, WirePushError, decode_for_version, encode_for_version,
-    row_payload_bytes,
+    WireChangeSet, WirePurgeChange, WirePushError, row_payload_bytes,
 };
+#[cfg(test)]
+use crate::protocol::{decode_for_version, encode_for_version};
 use crate::subjects::{pull_subject, push_subject, status_subject};
 use crate::transfer_receipts::{TransferDirection, TransferLedger, TransferPlane, TransferReceipt};
 use crate::transport::{ClientTransport, LineageSigner, TransportError};
@@ -186,9 +187,41 @@ impl Drop for PostPushReplyEffectsPause {
     }
 }
 
+/// Decode an envelope under the actual requesting read's admitted image.
+pub(crate) fn decode_sync_envelope(
+    memory: &Arc<crate::read_image_memory::ImageMemory>,
+    data: &[u8],
+    expected: Option<u8>,
+) -> contextdb_core::Result<crate::protocol::Envelope> {
+    let envelope: crate::protocol::Envelope = memory.decode_msgpack(data)?;
+    let (oldest, newest) = if let Some(version) = expected {
+        (version, version)
+    } else {
+        (
+            crate::protocol::OLDEST_SUPPORTED_PROTOCOL_VERSION,
+            PROTOCOL_VERSION,
+        )
+    };
+    if !crate::protocol::supports_protocol_version(envelope.version)
+        || expected.is_some_and(|version| envelope.version != version)
+    {
+        return Err(Error::SyncError(
+            crate::error::SyncError::ProtocolVersionMismatch {
+                received: envelope.version,
+                oldest_supported: oldest,
+                newest_supported: newest,
+            }
+            .to_string(),
+        ));
+    }
+    Ok(envelope)
+}
+
 struct PullPage {
     ordinary: PullResponse,
     dependency_units: Vec<WireChangeSet>,
+    _read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    _image_memory: Arc<crate::read_image_memory::ImageMemory>,
 }
 
 struct AppliedPullPage {
@@ -498,6 +531,27 @@ impl SyncClient {
         &self,
         expectation: ApplicationTablePolicyExpectation,
     ) -> contextdb_core::Result<AuthenticatedTenantPolicyBinding> {
+        let read_memory = self.db.declared_reader_memory()?;
+        self.bind_application_table_policy_with_read_memory(expectation, read_memory)
+            .await
+    }
+
+    pub async fn bind_application_table_policy_with_read_memory(
+        &self,
+        expectation: ApplicationTablePolicyExpectation,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> contextdb_core::Result<AuthenticatedTenantPolicyBinding> {
+        let decoded_memory = crate::read_image_memory::ImageMemory::charging_reader_for(
+            self.db.bounded_read_accountant(),
+            read_memory.clone(),
+            "reader",
+            "decode_sync_response",
+            "Reduce the sync response or raise the declared reader memory limit.",
+        );
+
+        let mut retained_vector_copy = crate::vector_read_memory::admission(read_memory.clone());
+        let vector_copy_owner = &mut retained_vector_copy;
+
         use crate::protocol::*;
         let hub = self
             .transport
@@ -518,7 +572,7 @@ impl SyncClient {
             tenant_id: self.tenant_id.as_str().into(),
             edge_incarnation: self
                 .db
-                .existing_sync_incarnation(&self.tenant_id)?
+                .existing_sync_incarnation(&self.tenant_id, read_memory.clone())?
                 .unwrap_or_else(Incarnation::mint),
             request_nonce: *uuid::Uuid::new_v4().as_bytes(),
             expectation,
@@ -534,13 +588,12 @@ impl SyncClient {
             )
             .await
             .map_err(|e| Error::SyncError(e.to_string()))?;
-        let envelope =
-            crate::protocol::decode(&response).map_err(|e| Error::SyncError(e.to_string()))?;
+        let envelope = decode_sync_envelope(&decoded_memory, &response, None)?;
         if envelope.message_type != MessageType::BindApplicationTablePolicyResponse {
             return Err(crate::custody::canonical::invalid());
         }
-        let response: BindApplicationTablePolicyResponse = rmp_serde::from_slice(&envelope.payload)
-            .map_err(|e| Error::SyncError(e.to_string()))?;
+        let response: BindApplicationTablePolicyResponse =
+            decoded_memory.decode_msgpack(&envelope.payload)?;
         match response {
             BindApplicationTablePolicyResponse::Error(failure)
                 if failure.format == 1 && failure.request_nonce == request.request_nonce =>
@@ -570,8 +623,7 @@ impl SyncClient {
                     return Err(crate::custody::canonical::invalid());
                 }
                 let packet: crate::custody::preparation::SignedBindingPacket =
-                    rmp_serde::from_slice(&reply.binding)
-                        .map_err(|_| crate::custody::canonical::invalid())?;
+                    decoded_memory.decode_msgpack(&reply.binding)?;
                 if packet.binding.namespace.hub_incarnation != reply.hub_incarnation {
                     return Err(crate::custody::canonical::invalid());
                 }
@@ -582,6 +634,8 @@ impl SyncClient {
                         &hub,
                         &edge,
                         &packet,
+                        vector_copy_owner,
+                        read_memory.clone(),
                     )
                 })?;
                 Ok(crate::custody::policy::binding_projection(&packet.binding))
@@ -599,13 +653,34 @@ impl SyncClient {
         &self,
         since: Option<DeliveryOutcomeCursor>,
     ) -> contextdb_core::Result<Vec<DeliveryOutcome>> {
+        let read_memory = self.db.declared_reader_memory()?;
+        self.fetch_delivery_outcomes_with_read_memory(since, read_memory)
+            .await
+    }
+
+    pub async fn fetch_delivery_outcomes_with_read_memory(
+        &self,
+        since: Option<DeliveryOutcomeCursor>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> contextdb_core::Result<Vec<DeliveryOutcome>> {
+        let decoded_memory = crate::read_image_memory::ImageMemory::charging_reader_for(
+            self.db.bounded_read_accountant(),
+            read_memory.clone(),
+            "reader",
+            "decode_sync_response",
+            "Reduce the sync response or raise the declared reader memory limit.",
+        );
+
+        let mut retained_vector_copy = crate::vector_read_memory::admission(read_memory.clone());
+        let vector_copy_owner = &mut retained_vector_copy;
+
         use crate::protocol::*;
         let request = FetchDeliveryOutcomesRequest {
             format: 1,
             tenant_id: self.tenant_id.as_str().into(),
             edge_incarnation: self
                 .db
-                .existing_sync_incarnation(&self.tenant_id)?
+                .existing_sync_incarnation(&self.tenant_id, read_memory.clone())?
                 .unwrap_or_else(Incarnation::mint),
             request_nonce: *uuid::Uuid::new_v4().as_bytes(),
             since: since
@@ -624,13 +699,12 @@ impl SyncClient {
             )
             .await
             .map_err(|e| Error::SyncError(e.to_string()))?;
-        let envelope =
-            crate::protocol::decode(&response).map_err(|e| Error::SyncError(e.to_string()))?;
+        let envelope = decode_sync_envelope(&decoded_memory, &response, None)?;
         if envelope.message_type != MessageType::FetchDeliveryOutcomesResponse {
             return Err(crate::custody::canonical::invalid());
         }
-        let response: FetchDeliveryOutcomesResponse = rmp_serde::from_slice(&envelope.payload)
-            .map_err(|e| Error::SyncError(e.to_string()))?;
+        let response: FetchDeliveryOutcomesResponse =
+            decoded_memory.decode_msgpack(&envelope.payload)?;
         if response.format != 1 || response.request_nonce != request.request_nonce {
             return Err(crate::custody::canonical::invalid());
         }
@@ -658,7 +732,7 @@ impl SyncClient {
             let packets = page
                 .outcomes
                 .iter()
-                .map(crate::custody::delivery::read_packet)
+                .map(|wire| crate::custody::delivery::read_packet(wire, &decoded_memory))
                 .collect::<Result<Vec<_>, _>>()?;
             crate::custody::preparation::admit_terminals(
                 db,
@@ -666,6 +740,8 @@ impl SyncClient {
                 &hub,
                 &edge,
                 &packets,
+                vector_copy_owner,
+                read_memory.clone(),
             )?;
             Ok(packets
                 .iter()
@@ -679,7 +755,16 @@ impl SyncClient {
     pub async fn __seed_application_table_policy_binding_for_test(
         &self,
         expectation: ApplicationTablePolicyExpectation,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> contextdb_core::Result<()> {
+        let decoded_memory = crate::read_image_memory::ImageMemory::charging_reader_for(
+            self.db.bounded_read_accountant(),
+            read_memory.clone(),
+            "reader",
+            "decode_sync_response",
+            "Reduce the sync response or raise the declared reader memory limit.",
+        );
+
         let hub_node_id = self.transport.peer_node_id().ok_or_else(|| {
             Error::SyncError("fixture binding requires an authenticated hub".to_string())
         })?;
@@ -689,7 +774,9 @@ impl SyncClient {
         self.bind_authenticated_hub()?;
         let request = crate::custody::fixtures::FixtureBindingRequest {
             tenant_id: self.tenant_id.clone(),
-            edge_incarnation: self.db.sync_incarnation(&self.tenant_id)?,
+            edge_incarnation: self
+                .db
+                .sync_incarnation_with_read_memory(&self.tenant_id, read_memory.clone())?,
             expectation,
         };
         let bytes = rmp_serde::to_vec_named(&request)
@@ -704,8 +791,7 @@ impl SyncClient {
             .await
             .map_err(|error| Error::SyncError(error.to_string()))?;
         let binding: std::result::Result<crate::custody::fixtures::FixtureSignedBinding, String> =
-            rmp_serde::from_slice(&response)
-                .map_err(|error| Error::SyncError(error.to_string()))?;
+            decoded_memory.decode_msgpack(&response)?;
         let binding = binding.map_err(Error::SyncError)?;
         crate::custody::fixtures::install_fixture_binding(
             &self.db,
@@ -713,6 +799,8 @@ impl SyncClient {
             &hub_node_id,
             &edge_node_id,
             &binding,
+            &mut crate::vector_read_memory::admission(read_memory.clone()),
+            read_memory,
         )
     }
 
@@ -722,6 +810,7 @@ impl SyncClient {
         &self,
         tx: contextdb_core::TxId,
         manifest: crate::custody_types::DeliveryManifest<'_>,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> contextdb_core::Result<()> {
         let edge_node_id = self.transport.local_node_id().ok_or_else(|| {
             Error::SyncError("fixture manifest requires an authenticated edge".to_string())
@@ -748,6 +837,7 @@ impl SyncClient {
                     .collect(),
                 signer: signer.clone(),
             },
+            read_memory.clone(),
         )
     }
 
@@ -756,8 +846,22 @@ impl SyncClient {
     #[doc(hidden)]
     pub fn __ordinary_push_request_for_test(
         &self,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> contextdb_core::Result<crate::protocol::PushRequest> {
-        let (mut changes, _, _) = self.db.checked_changes_since_with_arrivals(Lsn(0))?;
+        let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
+        let mut selection_credit = contextdb_core::read_memory::ReadCredit::try_new(
+            read_memory.clone(),
+            0,
+            "reader",
+            "test_push_selection",
+            "Reduce the selected change window.",
+        )?;
+        let (mut changes, _, _) = self.db.checked_changes_since_with_arrivals(
+            Lsn(0),
+            &mut vector_copy_owner,
+            read_memory.clone(),
+            &mut selection_credit,
+        )?;
         changes.ddl.clear();
         changes.ddl_lsn.clear();
         let signer = self
@@ -768,13 +872,16 @@ impl SyncClient {
             .transport
             .local_node_id()
             .ok_or_else(crate::custody::canonical::invalid)?;
-        let incarnation = self.db.sync_incarnation(&self.tenant_id)?;
+        let incarnation = self
+            .db
+            .sync_incarnation_with_read_memory(&self.tenant_id, read_memory.clone())?;
         let lineages = self.db.outbound_row_lineages(
             &changes,
             &self.tenant_id,
             &node,
             incarnation,
             signer.as_ref(),
+            read_memory.clone(),
         )?;
         Ok(crate::protocol::PushRequest {
             changeset: crate::protocol::wire_changeset_with_arrivals_and_lineages(
@@ -793,12 +900,20 @@ impl SyncClient {
         &self,
         table: &str,
         key: &crate::sync_types::NaturalKey,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> contextdb_core::Result<crate::protocol::PushRequest> {
         let signer = self
             .lineage_signer
             .as_ref()
             .ok_or_else(|| Error::SyncError("authenticated source signer required".into()))?;
-        crate::custody::fixtures::manifested_request(&self.db, &self.tenant_id, table, key, signer)
+        crate::custody::fixtures::manifested_request(
+            &self.db,
+            &self.tenant_id,
+            table,
+            key,
+            signer,
+            read_memory.clone(),
+        )
     }
 
     #[cfg(feature = "test-seams")]
@@ -809,9 +924,17 @@ impl SyncClient {
         root_key: &crate::sync_types::NaturalKey,
         kind: crate::custody_types::DeliveryOutcomeKind,
         cause: Option<&str>,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> contextdb_core::Result<()> {
-        self.seed_delivery_outcome_for_test(root_table, root_key, kind, cause, true)
-            .await
+        self.seed_delivery_outcome_for_test(
+            root_table,
+            root_key,
+            kind,
+            cause,
+            true,
+            read_memory.clone(),
+        )
+        .await
     }
 
     #[cfg(feature = "test-seams")]
@@ -822,9 +945,17 @@ impl SyncClient {
         root_key: &crate::sync_types::NaturalKey,
         kind: crate::custody_types::DeliveryOutcomeKind,
         cause: Option<&str>,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> contextdb_core::Result<()> {
-        self.seed_delivery_outcome_for_test(root_table, root_key, kind, cause, false)
-            .await
+        self.seed_delivery_outcome_for_test(
+            root_table,
+            root_key,
+            kind,
+            cause,
+            false,
+            read_memory.clone(),
+        )
+        .await
     }
 
     /// Reconcile progress for a real hub-committed manifest whose terminal has
@@ -838,15 +969,20 @@ impl SyncClient {
         &self,
         root_table: &str,
         root_key: &crate::sync_types::NaturalKey,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> contextdb_core::Result<()> {
         let hub = self.transport.peer_node_id().ok_or_else(|| {
             Error::SyncError("progress reconciliation requires an authenticated hub".into())
         })?;
-        let manifest =
-            crate::custody::preparation::current_manifest(&self.db, root_table, root_key)?
-                .ok_or_else(|| Error::ManifestRequired {
-                    table: root_table.into(),
-                })?;
+        let manifest = crate::custody::preparation::current_manifest(
+            &self.db,
+            root_table,
+            root_key,
+            read_memory.clone(),
+        )?
+        .ok_or_else(|| Error::ManifestRequired {
+            table: root_table.into(),
+        })?;
         let rows = crate::custody::fixtures::manifest_rows(&self.db, &manifest)?;
         let batch = ChangeSet {
             rows,
@@ -864,6 +1000,7 @@ impl SyncClient {
             &node,
             manifest.edge_incarnation,
             signer.as_ref(),
+            read_memory.clone(),
         )?;
         self.finish_single_attempt_interrupted_push(
             Error::SyncError("the terminal acknowledgement was not admitted".into()),
@@ -876,6 +1013,7 @@ impl SyncClient {
             &batch,
             &lineages,
             false,
+            read_memory.clone(),
         )
         .await
     }
@@ -888,22 +1026,37 @@ impl SyncClient {
         kind: crate::custody_types::DeliveryOutcomeKind,
         cause: Option<&str>,
         install_on_edge: bool,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> contextdb_core::Result<()> {
+        let decoded_memory = crate::read_image_memory::ImageMemory::charging_reader_for(
+            self.db.bounded_read_accountant(),
+            read_memory.clone(),
+            "reader",
+            "decode_sync_response",
+            "Reduce the sync response or raise the declared reader memory limit.",
+        );
+
         let hub_node_id = self.transport.peer_node_id().ok_or_else(|| {
             Error::SyncError("fixture outcome requires an authenticated hub".to_string())
         })?;
         let edge_node_id = self.transport.local_node_id().ok_or_else(|| {
             Error::SyncError("fixture outcome requires an authenticated edge".to_string())
         })?;
-        let manifest =
-            crate::custody::preparation::current_manifest(&self.db, root_table, root_key)?
-                .ok_or_else(|| Error::ManifestRequired {
-                    table: root_table.into(),
-                })?;
+        let manifest = crate::custody::preparation::current_manifest(
+            &self.db,
+            root_table,
+            root_key,
+            read_memory.clone(),
+        )?
+        .ok_or_else(|| Error::ManifestRequired {
+            table: root_table.into(),
+        })?;
         let rows = crate::custody::fixtures::manifest_rows(&self.db, &manifest)?;
         let request = crate::custody::fixtures::FixtureOutcomeRequest {
             tenant_id: self.tenant_id.clone(),
-            edge_incarnation: self.db.sync_incarnation(&self.tenant_id)?,
+            edge_incarnation: self
+                .db
+                .sync_incarnation_with_read_memory(&self.tenant_id, read_memory.clone())?,
             manifest,
             rows,
             kind: match kind {
@@ -925,8 +1078,7 @@ impl SyncClient {
             .await
             .map_err(|error| Error::SyncError(error.to_string()))?;
         let outcome: std::result::Result<crate::custody::fixtures::FixtureSignedOutcome, String> =
-            rmp_serde::from_slice(&response)
-                .map_err(|error| Error::SyncError(error.to_string()))?;
+            decoded_memory.decode_msgpack(&response)?;
         let outcome = outcome.map_err(Error::SyncError)?;
         if !install_on_edge {
             return Ok(());
@@ -937,6 +1089,7 @@ impl SyncClient {
             &hub_node_id,
             &edge_node_id,
             &outcome,
+            read_memory,
         )
     }
 
@@ -945,8 +1098,10 @@ impl SyncClient {
     pub async fn __seed_hub_delivery_batch_for_test(
         &self,
         table: &str,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> contextdb_core::Result<usize> {
-        self.__seed_hub_delivery_roots_for_test(table, None).await
+        self.__seed_hub_delivery_roots_for_test(table, None, read_memory.clone())
+            .await
     }
 
     // Fixture: arrange a selected receipt cohort in one actual commit.
@@ -956,9 +1111,20 @@ impl SyncClient {
         &self,
         table: &str,
         roots: Option<&[crate::sync_types::NaturalKey]>,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> contextdb_core::Result<usize> {
+        let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
+
+        let decoded_memory = crate::read_image_memory::ImageMemory::charging_reader_for(
+            self.db.bounded_read_accountant(),
+            read_memory.clone(),
+            "reader",
+            "decode_sync_response",
+            "Reduce the sync response or raise the declared reader memory limit.",
+        );
+
         use crate::custody::{preparation::TerminalInput, records::Record};
-        let records = self.db.custody_records()?;
+        let records = custody_hold.retain(self.db.custody_records(read_memory.clone())?)?;
         let mut requests = Vec::new();
         for record in &records {
             let Record::Manifest(manifest) = record else {
@@ -989,13 +1155,23 @@ impl SyncClient {
             )
             .await
             .map_err(|e| Error::SyncError(e.to_string()))?;
-        let result: std::result::Result<(), String> =
-            rmp_serde::from_slice(&response).map_err(|e| Error::SyncError(e.to_string()))?;
+        let result: std::result::Result<(), String> = decoded_memory.decode_msgpack(&response)?;
         result.map_err(Error::SyncError)?;
         Ok(count)
     }
 
-    pub fn new(db: Arc<Database>, endpoint: &str, tenant_id: TenantId) -> Self {
+    pub fn new(db: Arc<Database>, endpoint: &str, tenant_id: TenantId) -> Result<Self, Error> {
+        let read_memory = db.declared_reader_memory()?;
+        Self::new_with_read_memory(db, endpoint, tenant_id, read_memory)
+    }
+
+    pub fn new_with_read_memory(
+        db: Arc<Database>,
+        endpoint: &str,
+        tenant_id: TenantId,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<Self, Error> {
+        let _calling_session_read_memory = read_memory.clone();
         #[cfg(feature = "test-seams")]
         crate::read_probe::note_sync_client_start();
         let (transport, lineage_signer) =
@@ -1009,6 +1185,7 @@ impl SyncClient {
             lineage_signer,
             endpoint.to_string(),
             tenant_id,
+            read_memory,
         )
     }
 
@@ -1018,7 +1195,9 @@ impl SyncClient {
         lineage_signer: Option<LineageSigner>,
         endpoint: String,
         tenant_id: TenantId,
-    ) -> Self {
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<Self, Error> {
+        let _calling_session_read_memory = read_memory.clone();
         assert!(
             !tenant_id.as_str().is_empty()
                 && tenant_id
@@ -1031,70 +1210,49 @@ impl SyncClient {
         if let (Some(node), Some(signer)) = (transport.local_node_id(), &lineage_signer) {
             db.set_custody_runtime(tenant_id.clone(), node, signer.clone());
         }
-        let (push_watermark, pull_watermark) = db
-            .persisted_sync_watermarks(&tenant_id)
-            .unwrap_or_else(|err| {
-                tracing::warn!(%tenant_id, error = %err, "failed to load persisted sync watermarks");
-                (Lsn(0), Lsn(0))
-        });
-        // Only the source half loads here. Construction resumes from the
-        // persisted `pull_watermark`, independently of the combined cursor's
-        // LSN. If no combined cursor exists, the next pull records its source.
+        let (push_watermark, pull_watermark) =
+            db.persisted_sync_watermarks_with_read_memory(&tenant_id, read_memory.clone())?;
+        // Only the source half loads here; the persisted watermark resumes pulls.
         let pull_source = db
-            .persisted_sync_pull_cursor(&tenant_id)
-            .unwrap_or_else(|err| {
-                tracing::warn!(%tenant_id, error = %err, "failed to load persisted pull cursor source");
-                None
-            })
+            .persisted_sync_pull_cursor_with_read_memory(&tenant_id, read_memory.clone())?
             .map(|(source, _lsn)| source);
         let pending_push_confirmation = db
-            .persisted_sync_pending_push_confirmation(&tenant_id)
-            .unwrap_or_else(|err| {
-                tracing::warn!(%tenant_id, error = %err, "failed to load pending sync push confirmation");
-                None
-            })
+            .persisted_sync_pending_push_confirmation_with_read_memory(
+                &tenant_id,
+                read_memory.clone(),
+            )?
             .unwrap_or(Lsn(0));
-        // Preserve construction-time binding for the ordinary first-use
-        // path, but never cache its result: an operator can explicitly move
-        // the durable destination on this same long-lived client. Push and
-        // pull repeat the authoritative durable read immediately before I/O.
+        // Preserve a refused binding at construction so status and explicit
+        // destination recovery remain reachable. Push and pull repeat the
+        // strict durable binding check immediately before I/O.
         if let Some(hub) = transport.peer_node_id() {
-            let _ = db.register_retention_sync_peer(&hub);
+            db.register_retention_sync_peer_for_client(&hub)?;
         }
-        let schema_sync_holdbacks = transport
-            .peer_node_id()
-            .and_then(|hub| {
-                db.persisted_outbound_schema_sync_holdback(&tenant_id, &hub)
-                    .unwrap_or_else(|err| {
-                        tracing::warn!(
-                            %tenant_id,
-                            %hub,
-                            error = %err,
-                            "failed to load persisted outbound schema compatibility holdback"
-                        );
-                        None
-                    })
-                    .map(|state| {
-                        (
-                            hub,
-                            OutboundSchemaSyncHoldbackState {
-                                capabilities: state.capabilities,
-                                compatible_through: state.through,
-                                held_through: state.held_through,
-                            },
-                        )
-                    })
-            })
-            .into_iter()
-            .collect();
-        Self {
+        let schema_sync_holdbacks = if let Some(hub) = transport.peer_node_id() {
+            db.persisted_outbound_schema_sync_holdback(&tenant_id, &hub, read_memory.clone())?
+                .map(|state| {
+                    (
+                        hub,
+                        OutboundSchemaSyncHoldbackState {
+                            capabilities: state.capabilities,
+                            compatible_through: state.through,
+                            held_through: state.held_through,
+                        },
+                    )
+                })
+        } else {
+            None
+        }
+        .into_iter()
+        .collect();
+        Ok(Self {
             db,
             transport,
             lineage_signer,
             endpoint,
             tenant_id,
             push_watermark: AtomicLsn::new(push_watermark),
-            refused_schema_units: Mutex::new(Vec::new()),
+            refused_schema_units: Mutex::new(Default::default()),
             pending_push_confirmation: AtomicLsn::new(pending_push_confirmation),
             pull_watermark: AtomicLsn::new(pull_watermark),
             pages_discarded_for_source_mismatch: AtomicUsize::new(0),
@@ -1109,7 +1267,7 @@ impl SyncClient {
             post_push_reply_effects_pause: Mutex::new(None),
             #[cfg(feature = "test-seams")]
             post_pull_response_pause: Mutex::new(None),
-        }
+        })
     }
 
     /// Test-only authenticated transport injection. The supplied transport
@@ -1120,13 +1278,32 @@ impl SyncClient {
         db: Arc<Database>,
         transport: Arc<dyn ClientTransport>,
         tenant_id: TenantId,
-    ) -> Self {
+    ) -> Result<Self, Error> {
+        let read_memory = db.declared_reader_memory()?;
+        Self::with_authenticated_transport_for_test_with_read_memory(
+            db,
+            transport,
+            tenant_id,
+            read_memory,
+        )
+    }
+
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn with_authenticated_transport_for_test_with_read_memory(
+        db: Arc<Database>,
+        transport: Arc<dyn ClientTransport>,
+        tenant_id: TenantId,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<Self, Error> {
+        let _calling_session_read_memory = read_memory.clone();
         Self::build(
             db,
             transport,
             None,
             "authenticated-test-transport".to_string(),
             tenant_id,
+            read_memory,
         )
     }
 
@@ -1140,7 +1317,27 @@ impl SyncClient {
         transport: Arc<dyn ClientTransport>,
         tenant_id: TenantId,
         identity: Arc<crate::identity::FabricIdentity>,
-    ) -> Self {
+    ) -> Result<Self, Error> {
+        let read_memory = db.declared_reader_memory()?;
+        Self::with_authenticated_transport_and_identity_for_test_with_read_memory(
+            db,
+            transport,
+            tenant_id,
+            identity,
+            read_memory,
+        )
+    }
+
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn with_authenticated_transport_and_identity_for_test_with_read_memory(
+        db: Arc<Database>,
+        transport: Arc<dyn ClientTransport>,
+        tenant_id: TenantId,
+        identity: Arc<crate::identity::FabricIdentity>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<Self, Error> {
+        let _calling_session_read_memory = read_memory.clone();
         let signer: LineageSigner = Arc::new(move |bytes| Ok(identity.sign_lineage(bytes)));
         Self::build(
             db,
@@ -1148,6 +1345,7 @@ impl SyncClient {
             Some(signer),
             "authenticated-test-transport".to_string(),
             tenant_id,
+            read_memory,
         )
     }
 
@@ -1334,24 +1532,73 @@ impl SyncClient {
     }
 
     pub fn has_pending_push_changes(&self) -> Result<bool, Error> {
-        Ok(!self.pending_push_changes()?.is_empty())
+        let read_memory = self.db.declared_reader_memory()?;
+        self.has_pending_push_changes_with_read_memory(read_memory)
+    }
+
+    pub fn has_pending_push_changes_with_read_memory(
+        &self,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<bool, Error> {
+        let mut selection_credit =
+            contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
+
+        let mut retained_vector_copy = crate::vector_read_memory::admission(read_memory.clone());
+        let vector_copy_owner = &mut retained_vector_copy;
+
+        Ok(!self
+            .pending_push_changes(
+                vector_copy_owner,
+                read_memory.clone(),
+                &mut selection_credit,
+            )?
+            .is_empty())
     }
 
     /// The exact number of entries this client currently considers eligible
     /// for push from its durable/in-memory push watermark.
     pub fn pending_push_change_count(&self) -> Result<usize, Error> {
-        let changes = self.pending_push_changes()?;
+        let read_memory = self.db.declared_reader_memory()?;
+        self.pending_push_change_count_with_read_memory(read_memory)
+    }
+
+    pub fn pending_push_change_count_with_read_memory(
+        &self,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<usize, Error> {
+        let mut selection_credit =
+            contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
+
+        let mut retained_vector_copy = crate::vector_read_memory::admission(read_memory.clone());
+        let vector_copy_owner = &mut retained_vector_copy;
+
+        let changes = self.pending_push_changes(
+            vector_copy_owner,
+            read_memory.clone(),
+            &mut selection_credit,
+        )?;
         Ok(changes.data_entry_count() + changes.ddl.len())
     }
 
     /// One local snapshot feeds both pending-work inspection APIs, so the
     /// boolean and exact count cannot diverge on direction or arrival policy.
-    fn pending_push_changes(&self) -> Result<ChangeSet, Error> {
+    fn pending_push_changes(
+        &self,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        selection_credit: &mut contextdb_core::read_memory::ReadCredit,
+    ) -> Result<ChangeSet, Error> {
         let _schema_read = self.db.enter_outbound_sync_schema_read();
         let since = self.push_watermark.load(Ordering::SeqCst);
-        let (changes, _, ddl_provenance_source) =
-            self.db.checked_changes_since_with_arrivals(since)?;
-        let history = self.db.try_sync_direction_history_for_changes(&changes)?;
+        let (changes, _, ddl_provenance_source) = self.db.checked_changes_since_with_arrivals(
+            since,
+            vector_copy_owner,
+            read_memory.clone(),
+            selection_credit,
+        )?;
+        let history = self
+            .db
+            .try_sync_direction_history_for_changes(&changes, read_memory.clone())?;
         let changes = changes
             .filter_by_direction_history(&history, &[SyncDirection::Push, SyncDirection::Both]);
         let reupload_epoch = self.destination_reupload_epoch()?;
@@ -1359,22 +1606,36 @@ impl SyncClient {
             changes,
             &ddl_provenance_source,
             reupload_epoch.map(|(through, _)| through),
+            read_memory.clone(),
         )?;
         let changes = crate::sync_server::without_hub_local_bookkeeping(changes);
         let changes = match reupload_epoch {
             Some((through, _)) => self
                 .db
-                .append_destination_reupload_deletes(changes, through)?,
+                .append_destination_reupload_deletes_with_read_memory(
+                    changes,
+                    through,
+                    read_memory.clone(),
+                )?,
             None => changes,
         };
         crate::custody::delivery::pending_changes(
             &self.db,
             match reupload_epoch {
-                Some((through, _)) => {
-                    checked_drop_rows_that_arrived_by_sync_after(&self.db, changes, Some(through))?
-                }
-                None => checked_drop_rows_that_arrived_by_sync_after(&self.db, changes, None)?,
+                Some((through, _)) => checked_drop_rows_that_arrived_by_sync_after(
+                    &self.db,
+                    changes,
+                    Some(through),
+                    read_memory.clone(),
+                )?,
+                None => checked_drop_rows_that_arrived_by_sync_after(
+                    &self.db,
+                    changes,
+                    None,
+                    read_memory.clone(),
+                )?,
             },
+            read_memory.clone(),
         )
     }
 
@@ -1391,12 +1652,20 @@ impl SyncClient {
         &self,
         encoded: Vec<u8>,
         require_reply: bool,
-    ) -> Result<Vec<u8>, TransportError> {
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> contextdb_core::Result<Vec<u8>> {
         let mut attempt = 0u32;
         loop {
             if attempt > 0 {
                 tokio::time::sleep(Duration::from_millis(500 * u64::from(attempt))).await;
             }
+            let _retry_credit = contextdb_core::read_memory::ReadCredit::try_new(
+                read_memory.clone(),
+                encoded.len() + crate::sync_types::held::ALLOCATION_BYTES,
+                "reader",
+                "retry_sync_status",
+                "Reduce the status request.",
+            )?;
             match self
                 .transport
                 .request_single_reply(
@@ -1415,7 +1684,7 @@ impl SyncClient {
                     tracing::debug!(attempt, "required sync status transport miss, retrying");
                     attempt += 1;
                 }
-                Err(error) => return Err(error),
+                Err(error) => return Err(Error::SyncError(error.to_string())),
             }
         }
     }
@@ -1427,7 +1696,18 @@ impl SyncClient {
         &self,
         incarnation: Incarnation,
         require_reply: bool,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Option<SyncStatusResponse>, Error> {
+        let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
+
+        let decoded_memory = crate::read_image_memory::ImageMemory::charging_reader_for(
+            self.db.bounded_read_accountant(),
+            read_memory.clone(),
+            "reader",
+            "decode_sync_response",
+            "Reduce the sync response or raise the declared reader memory limit.",
+        );
+
         // Suppression is scoped to a successfully authenticated status image.
         // If status is unavailable, stale knowledge of a prior hub life cannot
         // retire work belonging to the current destination.
@@ -1440,16 +1720,27 @@ impl SyncClient {
         };
         let edge = self.transport.local_node_id();
         let mut probe = if let Some(edge) = &edge {
-            crate::custody::incarnation::probe(&self.db, &self.tenant_id, &hub, edge, incarnation)?
+            crate::custody::incarnation::probe(
+                &self.db,
+                &self.tenant_id,
+                &hub,
+                edge,
+                incarnation,
+                read_memory.clone(),
+            )?
         } else {
             // A bound custody edge must identify itself before requesting status.
-            if self.db.custody_authority()?.iter().any(|record| {
-                matches!(record,
-                    crate::custody::records::Record::Binding(binding)
-                        if binding.namespace.tenant == self.tenant_id
-                            && binding.namespace.hub_node == hub
-                )
-            }) {
+            if custody_hold
+                .retain(self.db.custody_authority(read_memory.clone())?)?
+                .iter()
+                .any(|record| {
+                    matches!(record,
+                        crate::custody::records::Record::Binding(binding)
+                            if binding.namespace.tenant == self.tenant_id
+                                && binding.namespace.hub_node == hub
+                    )
+                })
+            {
                 return Err(Error::SyncError(
                     "restore status requires authenticated edge identity".into(),
                 ));
@@ -1462,34 +1753,48 @@ impl SyncClient {
         };
         probe.refused_schema_unit_digests.clear();
         let verification_required = probe.checkpoint.is_some();
-        let requests = probe
-            .pages()?
+        let pages = probe.pages(read_memory.clone())?;
+        let _request_queue_credit = contextdb_core::read_memory::ReadCredit::try_new(
+            read_memory.clone(),
+            pages
+                .len()
+                .saturating_mul(std::mem::size_of::<(
+                    u8,
+                    Vec<u8>,
+                    contextdb_core::read_memory::ReadCredit,
+                )>())
+                .saturating_add(crate::sync_types::held::ALLOCATION_BYTES),
+            "reader",
+            "queue_sync_status",
+            "Reduce the status request.",
+        )?;
+        let requests = pages
             .into_iter()
-            .map(|encoded| (PROTOCOL_VERSION, encoded));
+            .map(|(encoded, credit)| (PROTOCOL_VERSION, encoded, credit));
         let mut requests = requests.collect::<std::collections::VecDeque<_>>();
         let mut last: Option<SyncStatusResponse> = None;
         let refused = Vec::new();
-        while let Some((version, encoded)) = requests.pop_front() {
+        while let Some((version, encoded, _encoded_credit)) = requests.pop_front() {
             let exchange = async {
                 let reply = self
-                    .request_sync_status_reply(encoded, verification_required || require_reply)
-                    .await
-                    .map_err(|error| {
-                        Error::SyncError(format!("restore status exchange failed: {error}"))
-                    })?;
-                let envelope = decode_for_version(&reply, version)
-                    .map_err(|_| Error::SyncError("invalid restore status response".into()))?;
+                    .request_sync_status_reply(
+                        encoded,
+                        verification_required || require_reply,
+                        read_memory.clone(),
+                    )
+                    .await?;
+                let envelope = decode_sync_envelope(&decoded_memory, &reply, Some(version))?;
                 if !matches!(envelope.message_type, MessageType::StatusResponse) {
                     return Err(Error::SyncError(
                         "unexpected restore status response".into(),
                     ));
                 }
-                rmp_serde::from_slice::<SyncStatusResponse>(&envelope.payload)
-                    .map_err(|_| Error::SyncError("invalid restore status response".into()))
+                decoded_memory.decode_msgpack::<SyncStatusResponse>(&envelope.payload)
             }
             .await;
             let status = match exchange {
                 Ok(status) => status,
+                Err(error @ (Error::ReadFailure(_) | Error::ReadCancelled)) => return Err(error),
                 Err(error) if verification_required || require_reply => return Err(error),
                 Err(_) => return Ok(None),
             };
@@ -1509,7 +1814,8 @@ impl SyncClient {
                 ));
             }
             if let Some(current) = status.hub_incarnation {
-                let records = self.db.custody_authority()?;
+                let records =
+                    custody_hold.retain(self.db.custody_authority(read_memory.clone())?)?;
                 if let Some(binding) = records.iter().find_map(|r| match r {
                     crate::custody::records::Record::Binding(b)
                         if b.namespace.tenant == self.tenant_id
@@ -1528,12 +1834,17 @@ impl SyncClient {
                             .map(|p| (p.table.clone(), p.policy.clone()))
                             .collect(),
                     };
-                    self.bind_application_table_policy(expectation).await?;
+                    self.bind_application_table_policy_with_read_memory(
+                        expectation,
+                        read_memory.clone(),
+                    )
+                    .await?;
                 }
             }
             self.validate_refused_schema_units(
                 &status.refused_schema_units,
                 status.hub_incarnation,
+                read_memory.clone(),
             )?;
             if let Some(previous) = last.as_ref()
                 && previous.hub_incarnation != status.hub_incarnation
@@ -1562,7 +1873,16 @@ impl SyncClient {
         incarnation: Incarnation,
         prepared_batches: &[PreparedPushBatch],
         initial_status: Option<&SyncStatusResponse>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Incarnation, Error> {
+        let decoded_memory = crate::read_image_memory::ImageMemory::charging_reader_for(
+            self.db.bounded_read_accountant(),
+            read_memory.clone(),
+            "reader",
+            "decode_sync_response",
+            "Reduce the sync response or raise the declared reader memory limit.",
+        );
+
         let hub = self.hub_node_id().ok_or_else(|| {
             Error::SyncError("refused schema lookup requires authenticated hub identity".into())
         })?;
@@ -1572,7 +1892,7 @@ impl SyncClient {
         let status = match initial_status {
             Some(status) => status.clone(),
             None => self
-                .fetch_sync_status(incarnation, true)
+                .fetch_sync_status(incarnation, true, read_memory.clone())
                 .await
                 // A lost reply here is exactly the interrupted-push case:
                 // the schema-refusal probe couldn't confirm what the hub
@@ -1580,12 +1900,15 @@ impl SyncClient {
                 // bare transport error — the operator gets the distinct
                 // unconfirmed code and the reconcile guidance regardless of
                 // whether the push carried schema changes.
-                .map_err(|status_err| Error::SyncPushUnconfirmed {
-                    detail: format!(
-                        "the hub did not acknowledge the push (candidate-refusal status probe \
+                .map_err(|status_err| match status_err {
+                    error @ (Error::ReadFailure(_) | Error::ReadCancelled) => error,
+                    status_err => Error::SyncPushUnconfirmed {
+                        detail: format!(
+                            "the hub did not acknowledge the push (candidate-refusal status probe \
                          failed: {status_err}); the data may or may not have committed — run \
                          the push again to reconcile"
-                    ),
+                        ),
+                    },
                 })?
                 .ok_or_else(|| {
                     Error::SyncError("refused schema lookup requires authenticated status".into())
@@ -1648,8 +1971,13 @@ impl SyncClient {
                         &hub,
                         hub_incarnation,
                         &digests,
+                        read_memory.clone(),
                     )?;
-                    self.validate_refused_schema_units(&local, Some(hub_incarnation))?;
+                    self.validate_refused_schema_units(
+                        &local,
+                        Some(hub_incarnation),
+                        read_memory.clone(),
+                    )?;
                     if local
                         .iter()
                         .any(|outcome| !batch.contains(&AuthoredSchemaUnitKey::from(outcome)))
@@ -1676,8 +2004,9 @@ impl SyncClient {
                 &hub,
                 hub_incarnation,
                 &digests,
+                read_memory.clone(),
             )?;
-            self.validate_refused_schema_units(&local, Some(hub_incarnation))?;
+            self.validate_refused_schema_units(&local, Some(hub_incarnation), read_memory.clone())?;
             if local
                 .iter()
                 .any(|outcome| !batch.contains(&AuthoredSchemaUnitKey::from(outcome)))
@@ -1722,24 +2051,23 @@ impl SyncClient {
                 &hub,
                 &edge,
                 incarnation,
+                read_memory.clone(),
             )?;
             probe.refused_schema_unit_digests = requested.clone();
-            let encoded = probe.pages()?.pop().ok_or_else(|| {
-                Error::SyncError("refused schema lookup did not encode a request".into())
-            })?;
+            let (encoded, _encoded_credit) =
+                probe.pages(read_memory.clone())?.pop().ok_or_else(|| {
+                    Error::SyncError("refused schema lookup did not encode a request".into())
+                })?;
             let reply = self
-                .request_sync_status_reply(encoded, true)
-                .await
-                .map_err(|e| Error::SyncError(format!("refused schema lookup failed: {e}")))?;
-            let envelope = decode_for_version(&reply, PROTOCOL_VERSION)
-                .map_err(|e| Error::SyncError(e.to_string()))?;
+                .request_sync_status_reply(encoded, true, read_memory.clone())
+                .await?;
+            let envelope = decode_sync_envelope(&decoded_memory, &reply, Some(PROTOCOL_VERSION))?;
             if !matches!(envelope.message_type, MessageType::StatusResponse) {
                 return Err(Error::SyncError(
                     "unexpected refused schema lookup response".into(),
                 ));
             }
-            let status: SyncStatusResponse = rmp_serde::from_slice(&envelope.payload)
-                .map_err(|e| Error::SyncError(e.to_string()))?;
+            let status: SyncStatusResponse = decoded_memory.decode_msgpack(&envelope.payload)?;
             if status.refused_schema_unit_digests_ack.as_ref() != Some(&requested) {
                 return Err(Error::SyncError(
                     "hub did not acknowledge exact refused schema lookup".into(),
@@ -1753,6 +2081,7 @@ impl SyncClient {
             self.validate_refused_schema_units(
                 &status.refused_schema_units,
                 Some(hub_incarnation),
+                read_memory.clone(),
             )?;
             if status.refused_schema_units.iter().any(|outcome| {
                 !requested.contains(&outcome.unit_digest)
@@ -1834,8 +2163,11 @@ impl SyncClient {
         &self,
         outcomes: &[RefusedSchemaUnitOutcome],
         hub_incarnation: Option<Incarnation>,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<(), Error> {
-        let incarnation = self.db.sync_incarnation(&self.tenant_id)?;
+        let incarnation = self
+            .db
+            .sync_incarnation_with_read_memory(&self.tenant_id, read_memory.clone())?;
         let hub = self.hub_node_id();
         let edge = self.transport.local_node_id();
         if outcomes.iter().any(|outcome| {
@@ -1893,6 +2225,7 @@ impl SyncClient {
         &self,
         provenance: &[crate::protocol::WireDdlProvenance],
         hub_incarnation: Option<Incarnation>,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<HashSet<usize>, Error> {
         let mut units = Self::authored_ddl_units(provenance)?;
         let mut refused = HashSet::new();
@@ -1909,7 +2242,9 @@ impl SyncClient {
             .transport
             .local_node_id()
             .ok_or_else(|| Error::SyncError("missing edge identity".into()))?;
-        let incarnation = self.db.sync_incarnation(&self.tenant_id)?;
+        let incarnation = self
+            .db
+            .sync_incarnation_with_read_memory(&self.tenant_id, read_memory.clone())?;
         let keys = units.keys().cloned().collect::<Vec<_>>();
         for batch in keys.chunks(128) {
             let digests = batch.iter().map(|key| key.digest).collect::<Vec<_>>();
@@ -1920,8 +2255,9 @@ impl SyncClient {
                 &hub,
                 hub_life,
                 &digests,
+                read_memory.clone(),
             )?;
-            self.validate_refused_schema_units(&outcomes, Some(hub_life))?;
+            self.validate_refused_schema_units(&outcomes, Some(hub_life), read_memory.clone())?;
             for outcome in &outcomes {
                 if let Some(indexes) = units.remove(&AuthoredSchemaUnitKey::from(outcome)) {
                     refused.extend(indexes);
@@ -1948,14 +2284,28 @@ impl SyncClient {
         &self,
         reply: &[u8],
         protocol_version: u8,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<ApplyResult, PushReplyError> {
-        let envelope = decode_for_version(reply, protocol_version)
-            .map_err(|e| PushReplyError::Malformed(Error::SyncError(e.to_string())))?;
-        let response: PushResponse = rmp_serde::from_slice(&envelope.payload)
-            .map_err(|e| PushReplyError::Malformed(Error::SyncError(e.to_string())))?;
+        let decoded_memory = crate::read_image_memory::ImageMemory::charging_reader_for(
+            self.db.bounded_read_accountant(),
+            read_memory.clone(),
+            "reader",
+            "decode_sync_response",
+            "Reduce the sync response or raise the declared reader memory limit.",
+        );
+
+        let mut retained_vector_copy = crate::vector_read_memory::admission(read_memory.clone());
+        let vector_copy_owner = &mut retained_vector_copy;
+
+        let envelope = decode_sync_envelope(&decoded_memory, reply, Some(protocol_version))
+            .map_err(PushReplyError::Terminal)?;
+        let response: PushResponse = decoded_memory
+            .decode_msgpack(&envelope.payload)
+            .map_err(PushReplyError::Terminal)?;
         self.validate_refused_schema_units(
             &response.refused_schema_units,
             response.hub_incarnation,
+            read_memory.clone(),
         )
         .map_err(PushReplyError::Terminal)?;
         if !response.refused_schema_units.is_empty() {
@@ -1971,7 +2321,7 @@ impl SyncClient {
             })?;
             let incarnation = self
                 .db
-                .sync_incarnation(&self.tenant_id)
+                .sync_incarnation_with_read_memory(&self.tenant_id, read_memory.clone())
                 .map_err(PushReplyError::Terminal)?;
             let hub_life = response
                 .hub_incarnation
@@ -2017,7 +2367,7 @@ impl SyncClient {
                     let packets = response
                         .outcomes
                         .iter()
-                        .map(crate::custody::delivery::read_packet)
+                        .map(|wire| crate::custody::delivery::read_packet(wire, &decoded_memory))
                         .collect::<Result<Vec<_>, _>>()?;
                     crate::custody::preparation::admit_terminals(
                         db,
@@ -2025,11 +2375,13 @@ impl SyncClient {
                         &hub,
                         &edge,
                         &packets,
+                        vector_copy_owner,
+                        read_memory.clone(),
                     )
                 })
                 .map_err(PushReplyError::Terminal)?;
         }
-        decode_push_response(reply, protocol_version)
+        apply_from_push_response(response)
     }
 
     fn negotiated_protocol_version(&self) -> u8 {
@@ -2040,7 +2392,9 @@ impl SyncClient {
         &self,
         encoded: Vec<u8>,
         protocol_version: u8,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<ApplyResult, PushRequestError> {
+        let _calling_session_read_memory = read_memory.clone();
         let reply = self
             .transport
             .request(
@@ -2054,7 +2408,7 @@ impl SyncClient {
                     "single-attempt push failed: {err}"
                 )))
             })?;
-        self.decode_push_reply(&reply, protocol_version)
+        self.decode_push_reply(&reply, protocol_version, read_memory.clone())
             .map_err(PushReplyError::into_request_error)
     }
 
@@ -2063,7 +2417,9 @@ impl SyncClient {
         encoded: Vec<u8>,
         protocol_version: u8,
         retry_safety: Result<(), TransportError>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<ApplyResult, PushRequestError> {
+        let _calling_session_read_memory = read_memory.clone();
         match retry_safety {
             Ok(()) => {}
             Err(TransportError::RetryUnsafe(detail)) => {
@@ -2071,7 +2427,9 @@ impl SyncClient {
                     %detail,
                     "push request requires a single-attempt transport send"
                 );
-                return self.request_push_once(encoded, protocol_version).await;
+                return self
+                    .request_push_once(encoded, protocol_version, read_memory.clone())
+                    .await;
             }
             Err(err) => {
                 return Err(PushRequestError::Terminal(Error::SyncError(format!(
@@ -2086,6 +2444,14 @@ impl SyncClient {
                 tokio::time::sleep(Duration::from_millis(500 * u64::from(attempt))).await;
             }
 
+            let _retry_credit = contextdb_core::read_memory::ReadCredit::try_new(
+                read_memory.clone(),
+                encoded.len(),
+                "sync_push",
+                "retry_copy",
+                "Reduce the request or raise the executing session's memory limit.",
+            )
+            .map_err(PushRequestError::Terminal)?;
             match self
                 .transport
                 .request_single_reply(
@@ -2095,22 +2461,24 @@ impl SyncClient {
                 )
                 .await
             {
-                Ok(reply) => match self.decode_push_reply(&reply, protocol_version) {
-                    Ok(result) => {
-                        push_result = Some(result);
-                        break;
+                Ok(reply) => {
+                    match self.decode_push_reply(&reply, protocol_version, read_memory.clone()) {
+                        Ok(result) => {
+                            push_result = Some(result);
+                            break;
+                        }
+                        Err(PushReplyError::Malformed(err)) if attempt < 4 => {
+                            tracing::debug!(attempt, error = %err, "push got malformed reply, retrying");
+                            continue;
+                        }
+                        Err(PushReplyError::Malformed(err)) => {
+                            return Err(PushRequestError::Ambiguous(err));
+                        }
+                        Err(PushReplyError::Terminal(err)) => {
+                            return Err(PushRequestError::Terminal(err));
+                        }
                     }
-                    Err(PushReplyError::Malformed(err)) if attempt < 4 => {
-                        tracing::debug!(attempt, error = %err, "push got malformed reply, retrying");
-                        continue;
-                    }
-                    Err(PushReplyError::Malformed(err)) => {
-                        return Err(PushRequestError::Ambiguous(err));
-                    }
-                    Err(PushReplyError::Terminal(err)) => {
-                        return Err(PushRequestError::Terminal(err));
-                    }
-                },
+                }
                 Err(
                     TransportError::NoResponder
                     | TransportError::Status(_)
@@ -2138,16 +2506,39 @@ impl SyncClient {
         })
     }
 
-    async fn request_pull(&self, request: PullRequest) -> Result<PullPage, Error> {
+    async fn request_pull(
+        &self,
+        request: PullRequest,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<PullPage, Error> {
+        let decoded_memory = crate::read_image_memory::ImageMemory::charging_reader_for(
+            self.db.bounded_read_accountant(),
+            read_memory.clone(),
+            "reader",
+            "decode_sync_response",
+            "Reduce the sync response or raise the declared reader memory limit.",
+        );
+
         let protocol_version = self.negotiated_protocol_version();
-        let encoded = encode_for_version(protocol_version, MessageType::PullRequest, &request)
-            .map_err(|e| Error::SyncError(e.to_string()))?;
+        let (encoded, _encoded_credit) = crate::protocol::encode_for_version_with_read_owner(
+            protocol_version,
+            MessageType::PullRequest,
+            &request,
+            read_memory.clone(),
+        )?;
 
         let mut first_attempt_response = None;
         for attempt in 0..5u32 {
             if attempt > 0 {
                 tokio::time::sleep(Duration::from_millis(500 * u64::from(attempt))).await;
             }
+            let _retry_credit = contextdb_core::read_memory::ReadCredit::try_new(
+                read_memory.clone(),
+                encoded.len(),
+                "sync_pull",
+                "retry_copy",
+                "Reduce the request or raise the executing session's memory limit.",
+            )?;
             match self
                 .transport
                 .request(
@@ -2177,22 +2568,25 @@ impl SyncClient {
         let reply = first_attempt_response.ok_or_else(|| {
             Error::SyncError("pull request timed out waiting for response".to_string())
         })?;
-        let envelope = decode_for_version(&reply, protocol_version)
-            .map_err(|e| Error::SyncError(e.to_string()))?;
+        let envelope = decode_sync_envelope(&decoded_memory, &reply, Some(protocol_version))?;
         match envelope.message_type {
-            MessageType::PullResponse => rmp_serde::from_slice(&envelope.payload)
+            MessageType::PullResponse => decoded_memory
+                .decode_msgpack(&envelope.payload)
                 .map(|ordinary| PullPage {
                     ordinary,
                     dependency_units: Vec::new(),
+                    _read_memory: read_memory.clone(),
+                    _image_memory: decoded_memory.clone(),
                 })
                 .map_err(|e| Error::SyncError(e.to_string())),
             MessageType::DependencyCompletePullResponse => {
                 let response: DependencyCompletePullResponse =
-                    rmp_serde::from_slice(&envelope.payload)
-                        .map_err(|e| Error::SyncError(e.to_string()))?;
+                    decoded_memory.decode_msgpack(&envelope.payload)?;
                 Ok(PullPage {
                     ordinary: response.ordinary,
                     dependency_units: response.units,
+                    _read_memory: read_memory.clone(),
+                    _image_memory: decoded_memory.clone(),
                 })
             }
             _ => Err(Error::SyncError(
@@ -2202,6 +2596,21 @@ impl SyncClient {
     }
 
     pub async fn push(&self) -> Result<ApplyResult, Error> {
+        let read_memory = self.db.declared_reader_memory()?;
+        self.push_with_read_memory(read_memory).await
+    }
+
+    pub async fn push_with_read_memory(
+        &self,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<ApplyResult, Error> {
+        let _calling_session_read_memory = read_memory.clone();
+        let mut selection_credit =
+            contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
+
+        let mut retained_vector_copy = crate::vector_read_memory::admission(read_memory.clone());
+        let vector_copy_owner = &mut retained_vector_copy;
+
         self.bind_authenticated_hub()?;
         let authenticated_hub = self.hub_node_id().ok_or_else(|| {
             Error::SyncError(
@@ -2229,8 +2638,11 @@ impl SyncClient {
         // is never confirmed by the prior life's stale-high watermark.
         let incarnation = self
             .db
-            .sync_incarnation(&self.tenant_id)
-            .map_err(|err| Error::SyncError(err.to_string()))?;
+            .sync_incarnation_with_read_memory(&self.tenant_id, read_memory.clone())
+            .map_err(|err| match err {
+                error @ (Error::ReadFailure(_) | Error::ReadCancelled) => error,
+                err => Error::SyncError(err.to_string()),
+            })?;
 
         // Exchange status with the server before computing the changeset
         // — including when there is nothing locally new (contract item 2). A
@@ -2238,7 +2650,9 @@ impl SyncClient {
         // a stale artifact and silently lost acked commits; regress the local
         // push watermark so the changeset recomputation re-pushes them.
         let mut local = self.push_watermark.load(Ordering::SeqCst);
-        let pre_push_status = self.fetch_sync_status(incarnation, false).await?;
+        let pre_push_status = self
+            .fetch_sync_status(incarnation, false, read_memory.clone())
+            .await?;
         let pre_push_server_watermark = pre_push_status
             .as_ref()
             .and_then(|status| status.applied_push_watermark);
@@ -2257,7 +2671,10 @@ impl SyncClient {
             // lose to the restored hub's discarded order.
             self.db
                 .with_authoritative_hub_reply(&authenticated_hub, |db| {
-                    db.invalidate_accepted_local_ordering_after_hub_regression(server_applied)?;
+                    db.invalidate_accepted_local_ordering_after_hub_regression_with_read_memory(
+                        server_applied,
+                        read_memory.clone(),
+                    )?;
                     db.persist_sync_push_watermark_while_authoritative(
                         &self.tenant_id,
                         server_applied,
@@ -2265,7 +2682,10 @@ impl SyncClient {
                     self.push_watermark.store(server_applied, Ordering::SeqCst);
                     Ok(())
                 })
-                .map_err(|err| Error::SyncError(err.to_string()))?;
+                .map_err(|err| match err {
+                    error @ (Error::ReadFailure(_) | Error::ReadCancelled) => error,
+                    err => Error::SyncError(err.to_string()),
+                })?;
             local = server_applied;
         }
 
@@ -2277,7 +2697,10 @@ impl SyncClient {
         let mut recovered_result = None;
         if let Some(target) = self
             .db
-            .persisted_sync_pending_push_confirmation(&self.tenant_id)?
+            .persisted_sync_pending_push_confirmation_with_read_memory(
+                &self.tenant_id,
+                read_memory.clone(),
+            )?
         {
             let Some(server_applied) = pre_push_server_watermark else {
                 return Err(Error::SyncPushUnconfirmed {
@@ -2287,8 +2710,15 @@ impl SyncClient {
             if server_applied < target {
                 self.db
                     .with_authoritative_hub_reply(&authenticated_hub, |db| {
-                        db.invalidate_accepted_local_ordering_after_hub_regression(server_applied)?;
-                        db.mark_outbound_rows_pending(server_applied, None)?;
+                        db.invalidate_accepted_local_ordering_after_hub_regression_with_read_memory(
+                            server_applied,
+                            read_memory.clone(),
+                        )?;
+                        db.mark_outbound_rows_pending_with_read_memory(
+                            server_applied,
+                            None,
+                            read_memory.clone(),
+                        )?;
                         db.complete_sync_push_confirmation_while_authoritative(
                             &self.tenant_id,
                             server_applied,
@@ -2302,14 +2732,21 @@ impl SyncClient {
                 let result = self
                     .db
                     .persisted_sync_pending_push_result(&self.tenant_id)?;
-                self.pull_default_confirmed_pending().await.map_err(|err| {
-                    Error::SyncPushUnconfirmed {
+                self.pull_default_confirmed_pending(read_memory.clone())
+                    .await
+                    .map_err(|err| match err {
+                    error @ (Error::ReadFailure(_) | Error::ReadCancelled) => error,
+                    err => Error::SyncPushUnconfirmed {
                         detail: format!(
                             "the prior push reconciliation pull failed ({err}); no rows were resent"
                         ),
-                    }
+                    },
                 })?;
-                if result.is_none() && self.db.has_unconfirmed_push_rows(local, target) {
+                if result.is_none()
+                    && self
+                        .db
+                        .has_unconfirmed_push_rows(local, target, read_memory.clone())?
+                {
                     return Err(Error::SyncPushUnconfirmed {
                         detail: "the pending single-attempt push still lacks exact accepted row ordering; no rows were resent".to_string(),
                     });
@@ -2355,28 +2792,47 @@ impl SyncClient {
         }
         let schema_read = self.db.enter_outbound_sync_schema_read();
         refuse_keyless_tables_with_no_identity_fallback(&self.db, &HashMap::new())?;
-        let (changeset, _, ddl_provenance_source) =
-            self.db.checked_changes_since_with_arrivals(since)?;
-        let history = self.db.try_sync_direction_history_for_changes(&changeset)?;
+        let (changeset, _, ddl_provenance_source) = self.db.checked_changes_since_with_arrivals(
+            since,
+            vector_copy_owner,
+            read_memory.clone(),
+            &mut selection_credit,
+        )?;
+        let history = self
+            .db
+            .try_sync_direction_history_for_changes(&changeset, read_memory.clone())?;
         let changeset = changeset
             .filter_by_direction_history(&history, &[SyncDirection::Push, SyncDirection::Both]);
         let changeset = self.db.filter_outbound_received_ddl(
             changeset,
             &ddl_provenance_source,
             destination_reupload_epoch.map(|(through, _)| through),
+            read_memory.clone(),
         )?;
         let changeset = crate::sync_server::without_hub_local_bookkeeping(changeset);
         let changeset = match destination_reupload_epoch {
             Some((through, _)) => self
                 .db
-                .append_destination_reupload_deletes(changeset, through)?,
+                .append_destination_reupload_deletes_with_read_memory(
+                    changeset,
+                    through,
+                    read_memory.clone(),
+                )?,
             None => changeset,
         };
         let changeset = match destination_reupload_epoch {
-            Some((through, _)) => {
-                checked_drop_rows_that_arrived_by_sync_after(&self.db, changeset, Some(through))?
-            }
-            None => checked_drop_rows_that_arrived_by_sync_after(&self.db, changeset, None)?,
+            Some((through, _)) => checked_drop_rows_that_arrived_by_sync_after(
+                &self.db,
+                changeset,
+                Some(through),
+                read_memory.clone(),
+            )?,
+            None => checked_drop_rows_that_arrived_by_sync_after(
+                &self.db,
+                changeset,
+                None,
+                read_memory.clone(),
+            )?,
         };
         let mut recoverable_tables = HashSet::new();
         let mut remaining_capabilities = BTreeMap::new();
@@ -2386,6 +2842,7 @@ impl SyncClient {
                     &self.db,
                     table,
                     capabilities,
+                    read_memory.clone(),
                 )?;
                 if unsupported.is_empty() {
                     recoverable_tables.insert(table.clone());
@@ -2430,6 +2887,7 @@ impl SyncClient {
                     &self.db,
                     &changeset,
                     capabilities,
+                    read_memory.clone(),
                 )?
             {
                 state.capabilities.remove(&table);
@@ -2465,7 +2923,8 @@ impl SyncClient {
             changeset
         };
 
-        let changeset = crate::custody::delivery::pending_changes(&self.db, changeset)?;
+        let changeset =
+            crate::custody::delivery::pending_changes(&self.db, changeset, read_memory.clone())?;
 
         // The greatest LSN this push actually TRANSMITS, taken PRE-send from the
         // changeset computed under the directions read above. A lost-ack
@@ -2473,9 +2932,12 @@ impl SyncClient {
         // after the await would let a concurrent direction change (a delivering
         // table switched to SYNC OFF) drop the bound below what already shipped
         // and reject a batch the hub genuinely holds.
-        let units = self
-            .db
-            .dependency_complete_outbound_units(changeset, since)?;
+        let units = self.db.dependency_complete_outbound_units(
+            changeset,
+            since,
+            vector_copy_owner,
+            read_memory.clone(),
+        )?;
         let transmitted_ceiling = units
             .iter()
             .filter_map(|unit| unit.changes.max_lsn())
@@ -2595,7 +3057,9 @@ impl SyncClient {
             // Taken BEFORE the send, so the success path and the lost-ack
             // reconciliation below report the same transmitted set. Recomputing
             // them separately on each path is how the two would drift.
-            let arrivals = self.db.sync_arrivals_for_changes(&batch)?;
+            let arrivals = self
+                .db
+                .sync_arrivals_for_changes(&batch, read_memory.clone())?;
             let lineages = if batch.rows.is_empty() {
                 HashMap::new()
             } else {
@@ -2617,6 +3081,7 @@ impl SyncClient {
                     &node_id,
                     incarnation,
                     signer.as_ref(),
+                    read_memory.clone(),
                 )?
             };
             if batch.rows.iter().any(|row| row.deleted) {
@@ -2630,6 +3095,7 @@ impl SyncClient {
                     &batch.rows,
                     &author_node_id,
                     incarnation,
+                    read_memory.clone(),
                 )?;
             }
             let ddl_provenance = if batch.ddl.is_empty() {
@@ -2657,6 +3123,7 @@ impl SyncClient {
                     &node_id,
                     incarnation,
                     signer.as_ref(),
+                    read_memory.clone(),
                 )?
             };
             prepared_batches.push(PreparedPushBatch {
@@ -2690,6 +3157,7 @@ impl SyncClient {
                     incarnation,
                     &prepared_batches,
                     pre_push_status.as_ref(),
+                    read_memory.clone(),
                 )
                 .await?,
             )
@@ -2711,7 +3179,8 @@ impl SyncClient {
             ddl_provenance,
         } in prepared_batches
         {
-            let refused = self.refused_ddl_indexes(&ddl_provenance, refusal_hub_life)?;
+            let refused =
+                self.refused_ddl_indexes(&ddl_provenance, refusal_hub_life, read_memory.clone())?;
             let mut batch = batch;
             let mut ddl_provenance = ddl_provenance;
             if !refused.is_empty() {
@@ -2737,6 +3206,29 @@ impl SyncClient {
                 continue;
             }
             let batch_max_lsn = batch.max_lsn().unwrap_or(batch_max_lsn);
+            // The wire conversion owns a real copy while the raw batch is
+            // retained for acknowledgement and retry reconciliation. Charge
+            // the lists, hash buckets, names, bodies and lineage controls
+            // before either the clone or the conversion allocates them.
+            let lineage_copy_bytes = lineages.values().fold(0usize, |bytes, lineage| {
+                bytes
+                    .saturating_add(std::mem::size_of::<crate::protocol::WireRowLineage>())
+                    .saturating_add(lineage.author_node_id.len())
+                    .saturating_add(lineage.lineage_root.len())
+                    .saturating_add(lineage.attestation.len())
+                    .saturating_add(4 * std::mem::size_of::<usize>())
+            });
+            let request_copy_bytes = crate::database::change_set_held_bytes(&batch)
+                .saturating_mul(4)
+                .saturating_add(lineage_copy_bytes.saturating_mul(2))
+                .saturating_add(std::mem::size_of::<PushRequest>());
+            let _request_copy_credit = contextdb_core::read_memory::ReadCredit::try_new(
+                read_memory.clone(),
+                request_copy_bytes,
+                "sync_push",
+                "wire_request_copy",
+                "Reduce the request or raise the executing session's memory limit.",
+            )?;
             let mut request = PushRequest {
                 changeset:
                     crate::protocol::wire_changeset_with_arrivals_lineages_and_ddl_provenance(
@@ -2750,22 +3242,42 @@ impl SyncClient {
             // The existing ordinary push and oversized staging
             // paths carry manifests beside the actual application rows.
             if let Some(signer) = &self.lineage_signer {
-                request.changeset.manifests =
-                    crate::custody::delivery::attach(&self.db, &self.tenant_id, &batch, signer)?;
+                request.changeset.manifests = crate::custody::delivery::attach(
+                    &self.db,
+                    &self.tenant_id,
+                    &batch,
+                    signer,
+                    read_memory.clone(),
+                )?;
             }
             let message_type = if dependency_complete {
                 MessageType::DependencyCompletePushRequest
             } else {
                 MessageType::PushRequest
             };
-            let encoded = encode_for_version(protocol_version, message_type, &request)
-                .map_err(|e| Error::SyncError(e.to_string()))?;
+            let (encoded, _encoded_credit) = crate::protocol::encode_for_version_with_read_owner(
+                protocol_version,
+                message_type,
+                &request,
+                read_memory.clone(),
+            )?;
 
             let retry_safety = self.transport.ensure_single_reply_retry_safe(&encoded);
+            let _retry_credit = if retry_safety.is_ok() {
+                Some(contextdb_core::read_memory::ReadCredit::try_new(
+                    read_memory.clone(),
+                    encoded.len(),
+                    "sync_push",
+                    "retry_copy",
+                    "Reduce the request or raise the executing session's memory limit.",
+                )?)
+            } else {
+                None
+            };
             let interrupted_request = retry_safety.is_ok().then(|| encoded.clone());
             let mut recovered_reply = false;
             let result: ApplyResult = match self
-                .request_push(encoded, protocol_version, retry_safety)
+                .request_push(encoded, protocol_version, retry_safety, read_memory.clone())
                 .await
             {
                 Ok(result) => result,
@@ -2785,6 +3297,7 @@ impl SyncClient {
                             &batch,
                             &lineages,
                             !capabilities.supports_all() && next_schema_holdback.is_some(),
+                            read_memory.clone(),
                         )
                         .await?;
                         last_successful_lsn = last_successful_lsn.max(batch_max_lsn);
@@ -2798,12 +3311,17 @@ impl SyncClient {
                         incarnation,
                         encoded,
                         protocol_version,
+                        read_memory.clone(),
                     )
                     .await?
                 }
             };
             let policy_refused = !self
-                .refused_ddl_indexes(&request.changeset.ddl_provenance, refusal_hub_life)?
+                .refused_ddl_indexes(
+                    &request.changeset.ddl_provenance,
+                    refusal_hub_life,
+                    read_memory.clone(),
+                )?
                 .is_empty();
             let policy_held = result.conflicts.iter().any(|conflict| {
                 conflict
@@ -2981,13 +3499,17 @@ impl SyncClient {
                         result.new_lsn,
                         (!recovered_reply).then_some(through),
                         recovered_reply.then_some((batch_max_lsn, &result)),
+                        read_memory.clone(),
                     )
                 })?;
             if recovered_reply {
                 self.pending_push_confirmation
                     .store(batch_max_lsn, Ordering::SeqCst);
-                self.pull_default_confirmed_pending().await.map_err(|err| Error::SyncPushUnconfirmed {
+                self.pull_default_confirmed_pending(read_memory.clone()).await.map_err(|err| match err {
+                    error @ (Error::ReadFailure(_) | Error::ReadCancelled) => error,
+                    err => Error::SyncPushUnconfirmed {
                     detail: format!("the committed push outcome is durable but pull reconciliation failed ({err}); the push remains pending reconciliation"),
+                    },
                 })?;
                 self.db
                     .with_authoritative_hub_reply(&authenticated_hub, |db| {
@@ -3073,7 +3595,10 @@ impl SyncClient {
                 }
                 Ok(())
             })
-            .map_err(|err| Error::SyncError(err.to_string()))?;
+            .map_err(|err| match err {
+                error @ (Error::ReadFailure(_) | Error::ReadCancelled) => error,
+                err => Error::SyncError(err.to_string()),
+            })?;
         if !recovering_schema_holdback
             && !capabilities.supports_all()
             && let Some(state) = completed_schema_holdback.as_ref()
@@ -3111,16 +3636,21 @@ impl SyncClient {
         incarnation: Incarnation,
         encoded: Vec<u8>,
         protocol_version: u8,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<ApplyResult, Error> {
-        let status = self.fetch_sync_status(incarnation, false).await.map_err(
-            |verification_err| Error::SyncPushUnconfirmed {
+        let status = self
+            .fetch_sync_status(incarnation, false, read_memory.clone())
+            .await
+            .map_err(|verification_err| match verification_err {
+                    error @ (Error::ReadFailure(_) | Error::ReadCancelled) => error,
+                    verification_err => Error::SyncPushUnconfirmed {
                 detail: format!(
                     "the hub did not acknowledge the push ({transport_err}); status verification \
                      failed ({verification_err}); the data may or may not have committed — run \
                      the push again to reconcile"
                 ),
-            },
-        )?;
+                    },
+                })?;
         if !status.as_ref().is_some_and(|status| {
             interrupted_push_status_confirms(status, batch_max_lsn, transmitted_ceiling)
         }) {
@@ -3130,10 +3660,13 @@ impl SyncClient {
                 ),
             });
         }
-        self.request_push_once(encoded, protocol_version).await.map_err(|error| {
+        self.request_push_once(encoded, protocol_version, read_memory.clone()).await.map_err(|error| {
             let error = match error { PushRequestError::Terminal(error) | PushRequestError::Ambiguous(error) => error };
-            Error::SyncPushUnconfirmed {
-                detail: format!("the hub consumed the push but its exact outcome is unavailable ({error}); its watermark was not advanced"),
+            match error {
+                error @ (Error::ReadFailure(_) | Error::ReadCancelled) => error,
+                error => Error::SyncPushUnconfirmed {
+                    detail: format!("the hub consumed the push but its exact outcome is unavailable ({error}); its watermark was not advanced"),
+                },
             }
         })
     }
@@ -3153,6 +3686,7 @@ impl SyncClient {
         batch: &ChangeSet,
         lineages: &HashMap<(String, Vec<u8>, Lsn), crate::protocol::WireRowLineage>,
         keep_public_watermark: bool,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<(), Error> {
         // The hub answers this edge with the per-edge record it holds for THIS
         // life of the edge — keyed by (node_id, incarnation), stamped on the
@@ -3179,17 +3713,20 @@ impl SyncClient {
         // re-uploads — never opening the SYNC SAFE deletion gate on rows the hub
         // never received.
         let status = self
-            .fetch_sync_status(incarnation, false)
+            .fetch_sync_status(incarnation, false, read_memory.clone())
             .await
             // Failed verification cannot confirm a transmitted
             // batch, and must preserve the existing indeterminate-push contract.
-            .map_err(|verification_err| Error::SyncPushUnconfirmed {
+            .map_err(|verification_err| match verification_err {
+                    error @ (Error::ReadFailure(_) | Error::ReadCancelled) => error,
+                    verification_err => Error::SyncPushUnconfirmed {
                 detail: format!(
                     "the hub did not acknowledge the push ({transport_err}); status verification \
                      failed ({verification_err}); the data may or may not have committed — run \
                      the push again to reconcile"
                 ),
-            })?;
+                    },
+                })?;
         let confirmed = status.as_ref().is_some_and(|status| {
             interrupted_push_status_confirms(status, batch_max_lsn, transmitted_ceiling)
         });
@@ -3224,7 +3761,11 @@ impl SyncClient {
             let previous_push_watermark = self.push_watermark.load(Ordering::SeqCst);
             self.db
                 .with_authoritative_hub_reply(hub_node_id, |db| {
-                    db.mark_outbound_rows_pending(previous_push_watermark, Some(batch_max_lsn))?;
+                    db.mark_outbound_rows_pending_with_read_memory(
+                        previous_push_watermark,
+                        Some(batch_max_lsn),
+                        read_memory.clone(),
+                    )?;
                     // Record this before the pull. A crash or transport failure after
                     // status confirmation must survive restart as a no-send gate until
                     // the exact hub events are pulled.
@@ -3236,7 +3777,10 @@ impl SyncClient {
                         .store(batch_max_lsn, Ordering::SeqCst);
                     Ok(())
                 })
-                .map_err(|err| Error::SyncError(err.to_string()))?;
+                .map_err(|err| match err {
+                    error @ (Error::ReadFailure(_) | Error::ReadCancelled) => error,
+                    err => Error::SyncError(err.to_string()),
+                })?;
             // Never replay a stampless batch here. In particular, replaying a
             // previously accepted LatestWins write would look freshly authored
             // to the hub and could overwrite a newer hub edit. The original
@@ -3244,7 +3788,13 @@ impl SyncClient {
             // exact arrival; pulling it also orders any later hub edit after
             // that echo. If the pull cannot complete, the push watermark stays
             // put and a later call can safely reconcile again.
-            if let Err(pull_err) = self.pull_default_confirmed_pending().await {
+            if let Err(pull_err) = self
+                .pull_default_confirmed_pending(read_memory.clone())
+                .await
+            {
+                if matches!(&pull_err, Error::ReadFailure(_) | Error::ReadCancelled) {
+                    return Err(pull_err);
+                }
                 return Err(Error::SyncPushUnconfirmed {
                     detail: format!(
                         "the hub confirmed the push landed but the required pull reconciliation \
@@ -3255,7 +3805,7 @@ impl SyncClient {
             }
             if !self
                 .db
-                .reconciled_push_rows_have_arrivals(batch, lineages)?
+                .reconciled_push_rows_have_arrivals(batch, lineages, read_memory.clone())?
             {
                 return Err(Error::SyncPushUnconfirmed {
                     detail: "the hub consumed the push, but the lost reply and available pull history do not prove its row outcomes; the push remains unconfirmed and its watermark was not advanced".to_string(),
@@ -3279,7 +3829,10 @@ impl SyncClient {
                     self.advance_engine_sync_watermark(confirmed_source_through);
                     Ok(())
                 })
-                .map_err(|err| Error::SyncError(err.to_string()))?;
+                .map_err(|err| match err {
+                    error @ (Error::ReadFailure(_) | Error::ReadCancelled) => error,
+                    err => Error::SyncError(err.to_string()),
+                })?;
             // The batch is confirmed DELIVERED, so it is counted — recorded
             // here, beside the watermark advance, because this is the one place
             // that decides the push succeeded. Exactly once, with no
@@ -3309,7 +3862,10 @@ impl SyncClient {
 
     /// Status-confirmed recovery is the sole pull mode allowed to resolve a
     /// restored-hub Pending marker. It is private to the lost-ack path.
-    async fn pull_default_confirmed_pending(&self) -> Result<ApplyResult, Error> {
+    async fn pull_default_confirmed_pending(
+        &self,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<ApplyResult, Error> {
         // `finish_interrupted_push` just authenticated and bounded the hub's
         // per-edge watermark. Re-probing status here would add a second
         // independent status exchange after the lost reply without improving
@@ -3318,6 +3874,7 @@ impl SyncClient {
         self.pull_with_initial_adoption_and_status_probe(
             SyncAdoption::ConfirmedPendingReconciliation,
             false,
+            read_memory.clone(),
         )
         .await
     }
@@ -3325,16 +3882,26 @@ impl SyncClient {
     async fn pull_with_initial_adoption(
         &self,
         initial_adoption: SyncAdoption,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<ApplyResult, Error> {
-        self.pull_with_initial_adoption_and_status_probe(initial_adoption, true)
-            .await
+        let _calling_session_read_memory = read_memory.clone();
+        self.pull_with_initial_adoption_and_status_probe(
+            initial_adoption,
+            true,
+            read_memory.clone(),
+        )
+        .await
     }
 
     async fn pull_with_initial_adoption_and_status_probe(
         &self,
         initial_adoption: SyncAdoption,
         probe_status: bool,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<ApplyResult, Error> {
+        let mut retained_vector_copy = crate::vector_read_memory::admission(read_memory.clone());
+        let vector_copy_owner = &mut retained_vector_copy;
+
         self.pull_in_progress.store(true, Ordering::SeqCst);
         self.pull_pages_read_this_pull.store(0, Ordering::SeqCst);
         // Resets `pull_in_progress` to false on EVERY exit path -- success,
@@ -3361,10 +3928,15 @@ impl SyncClient {
         let local = self.pull_watermark.load(Ordering::SeqCst);
         let incarnation = self
             .db
-            .sync_incarnation(&self.tenant_id)
-            .map_err(|err| Error::SyncError(err.to_string()))?;
+            .sync_incarnation_with_read_memory(&self.tenant_id, read_memory.clone())
+            .map_err(|err| match err {
+                error @ (Error::ReadFailure(_) | Error::ReadCancelled) => error,
+                err => Error::SyncError(err.to_string()),
+            })?;
         if probe_status
-            && let Some(status) = self.fetch_sync_status(incarnation, false).await?
+            && let Some(status) = self
+                .fetch_sync_status(incarnation, false, read_memory.clone())
+                .await?
             && let Some(server_lsn) = status.server_current_lsn
             && server_lsn < local
         {
@@ -3380,7 +3952,10 @@ impl SyncClient {
                     self.pull_watermark.store(Lsn(0), Ordering::SeqCst);
                     Ok(())
                 })
-                .map_err(|err| Error::SyncError(err.to_string()))?;
+                .map_err(|err| match err {
+                    error @ (Error::ReadFailure(_) | Error::ReadCancelled) => error,
+                    err => Error::SyncError(err.to_string()),
+                })?;
         }
 
         let hub = Some(authenticated_hub.clone());
@@ -3392,7 +3967,7 @@ impl SyncClient {
                     generation: 0,
                 };
                 self.db
-                    .has_terminal_refusal_markers(&context)?
+                    .has_terminal_refusal_markers(&context, vector_copy_owner, read_memory.clone())?
                     .then_some(context)
             }
             None => None,
@@ -3473,7 +4048,9 @@ impl SyncClient {
             let PullPage {
                 ordinary: mut response,
                 dependency_units,
-            } = self.request_pull(request).await?;
+                _read_memory: _page_read_memory,
+                _image_memory: _page_image_memory,
+            } = self.request_pull(request, read_memory.clone()).await?;
             // Count the decoded reply once, before a source mismatch or a failed
             // apply can discard it. Both figures describe the same wire rows.
             let received_rows = std::iter::once(&response.changeset)
@@ -3695,6 +4272,7 @@ impl SyncClient {
                             .chain(changes.vectors.iter().map(|vector| vector.index.table.as_str()))
                             .chain(changes.ddl.iter().filter_map(Database::ddl_affected_table))
                     }),
+                read_memory.clone(),
             )?;
             let mut table_generations = HashMap::new();
             let mut prepared_dependency_units = Vec::new();
@@ -3712,7 +4290,7 @@ impl SyncClient {
                     served_source.map(|life| (&self.tenant_id, life)),
                     true,
                     &mut policy_projection,
-                )?;
+                 read_memory.clone())?;
                 db.advance_authenticated_pull_schema_projection(
                     &mut table_generations,
                     &mut directions,
@@ -3727,6 +4305,7 @@ impl SyncClient {
                         &changes,
                         &lineages,
                         &table_generations,
+                        read_memory.clone(),
                     )
                     .map_err(|err| match err {
                         Error::SyncError(detail) => Error::SyncError(format!(
@@ -3743,7 +4322,7 @@ impl SyncClient {
                         changes,
                         &lineages,
                         &table_generations,
-                    )?;
+                    read_memory.clone(),)?;
                 let held = std::mem::take(&mut policy.conflicts);
                 let changes = policy.restore_for_apply(suppression.changes);
                 if !changes.is_empty() || !held.is_empty() {
@@ -3764,7 +4343,7 @@ impl SyncClient {
                 served_source.map(|life| (&self.tenant_id, life)),
                 false,
                 &mut policy_projection,
-            )?;
+             read_memory.clone())?;
             db.advance_authenticated_pull_schema_projection(
                 &mut table_generations,
                 &mut directions,
@@ -3780,6 +4359,7 @@ impl SyncClient {
                     &ordinary,
                     &lineages,
                     &table_generations,
+                    read_memory.clone(),
                 )
                 .map_err(|err| match err {
                     Error::SyncError(detail) => {
@@ -3793,7 +4373,7 @@ impl SyncClient {
                     ordinary,
                     &lineages,
                     &table_generations,
-                )?;
+                read_memory.clone(),)?;
             let ordinary_suppressed_only = ordinary_suppression.suppressed_live_replay
                 && ordinary_suppression.changes.is_empty()
                 && ordinary_held.is_empty()
@@ -3817,6 +4397,8 @@ impl SyncClient {
                 .any(|(_, unit, _, _, _, _)| !unit.is_empty());
             db.preflight_incoming_authoritative_purge_batch_while_authoritative(
                 &authoritative_purges,
+                vector_copy_owner,
+                read_memory.clone(),
             )?;
                     let mut result = ApplyResult {
                         applied_rows: 0,
@@ -3849,7 +4431,7 @@ impl SyncClient {
                                 &unit_lineages,
                                 unit_ddl_context.as_ref(),
                                 true,
-                            )
+                             vector_copy_owner, read_memory.clone())
                         .map_err(|err| match err {
                             Error::SyncError(detail) => Error::SyncError(format!(
                                 "indexed dependency pull unit apply \
@@ -3862,7 +4444,7 @@ impl SyncClient {
                         result.conflicts.extend(unit_result.conflicts);
                         result.new_lsn = unit_result.new_lsn;
                         if let Some(rows) = pending_unit_rows {
-                            db.refresh_confirmed_pending_rows(&rows, &unit_arrivals)?;
+                            db.refresh_confirmed_pending_rows_with_read_memory(&rows, &unit_arrivals, read_memory.clone())?;
                         }
                     }
                     result.conflicts.extend(ordinary_held);
@@ -3877,7 +4459,7 @@ impl SyncClient {
                                 &lineages,
                                 ddl_context.as_ref(),
                                 false,
-                            )
+                             vector_copy_owner, read_memory.clone())
                         .map_err(|err| match err {
                             Error::SyncError(detail) => {
                                 Error::SyncError(format!("ordinary pull apply: {detail}"))
@@ -3890,7 +4472,7 @@ impl SyncClient {
                         result.new_lsn = ordinary_result.new_lsn;
                     }
                     if let Some(rows) = pending_refresh_rows {
-                        db.refresh_confirmed_pending_rows(&rows, &arrivals)?;
+                        db.refresh_confirmed_pending_rows_with_read_memory(&rows, &arrivals, read_memory.clone())?;
                     }
                     // The server ends a purge-bearing page at its earliest
                     // irreversible frontier, so every ordinary item in this
@@ -3901,7 +4483,7 @@ impl SyncClient {
                     // page entries.
                     db.apply_incoming_authoritative_purge_batch_while_authoritative(
                         &authoritative_purges,
-                    )?;
+                     vector_copy_owner, read_memory.clone())?;
                     result.new_lsn = db.current_lsn();
                     Ok(AppliedPullPage {
                         result,
@@ -4021,20 +4603,34 @@ impl SyncClient {
                 self.pull_watermark.store(final_cursor, Ordering::SeqCst);
                 Ok(())
             })
-            .map_err(|err| Error::SyncError(err.to_string()))?;
+            .map_err(|err| match err {
+                error @ (Error::ReadFailure(_) | Error::ReadCancelled) => error,
+                err => Error::SyncError(err.to_string()),
+            })?;
         Ok(total)
     }
 
     /// Pull using the durable table declarations.
     pub async fn pull_default(&self) -> Result<ApplyResult, Error> {
+        let read_memory = self.db.declared_reader_memory()?;
+        self.pull_default_with_read_memory(read_memory).await
+    }
+
+    pub async fn pull_default_with_read_memory(
+        &self,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<ApplyResult, Error> {
         // An offline local delete is owed to the hub.  Offer that durable
         // obligation before accepting a contradictory ordinary pull; otherwise
         // a close/open between delete and reconnect could resurrect the very
         // row the user removed.
-        if self.db.has_durable_pending_delete_obligations()? {
-            self.push().await?;
+        if self
+            .db
+            .has_durable_pending_delete_obligations(read_memory.clone())?
+        {
+            self.push_with_read_memory(read_memory.clone()).await?;
         }
-        self.pull_with_initial_adoption(SyncAdoption::Continuing)
+        self.pull_with_initial_adoption(SyncAdoption::Continuing, read_memory.clone())
             .await
     }
 
@@ -4171,6 +4767,7 @@ impl PushReplyError {
     }
 }
 
+#[cfg(test)]
 fn decode_push_response(reply: &[u8], protocol_version: u8) -> Result<ApplyResult, PushReplyError> {
     let envelope = decode_for_version(reply, protocol_version)
         .map_err(|e| PushReplyError::Malformed(Error::SyncError(e.to_string())))?;
@@ -4181,6 +4778,10 @@ fn decode_push_response(reply: &[u8], protocol_version: u8) -> Result<ApplyResul
     }
     let response: PushResponse = rmp_serde::from_slice(&envelope.payload)
         .map_err(|e| PushReplyError::Malformed(Error::SyncError(e.to_string())))?;
+    apply_from_push_response(response)
+}
+
+fn apply_from_push_response(response: PushResponse) -> Result<ApplyResult, PushReplyError> {
     if let Some(application_error) = response.application_error {
         return Err(PushReplyError::Terminal(match application_error {
             WirePushError::PurgeRequiresAuthoritativeHub { hub_node_id } => {
@@ -4284,8 +4885,14 @@ pub(crate) fn refuse_keyless_tables_with_no_identity_fallback(
 /// deleted, AcceptedLocal, or Pending owner remains outbound work.
 #[cfg(test)]
 pub(crate) fn drop_rows_that_arrived_by_sync(db: &Database, changes: ChangeSet) -> ChangeSet {
-    checked_drop_rows_that_arrived_by_sync_after(db, changes, None)
-        .expect("fixture vector provenance history")
+    checked_drop_rows_that_arrived_by_sync_after(
+        db,
+        changes,
+        None,
+        db.declared_reader_memory()
+            .expect("admit the sync fixture reader"),
+    )
+    .expect("fixture vector provenance history")
 }
 
 #[cfg(test)]
@@ -4294,8 +4901,14 @@ fn drop_rows_that_arrived_by_sync_after(
     changes: ChangeSet,
     reupload_through: Option<Lsn>,
 ) -> ChangeSet {
-    checked_drop_rows_that_arrived_by_sync_after(db, changes, reupload_through)
-        .expect("fixture vector provenance history")
+    checked_drop_rows_that_arrived_by_sync_after(
+        db,
+        changes,
+        reupload_through,
+        db.declared_reader_memory()
+            .expect("admit the sync fixture reader"),
+    )
+    .expect("fixture vector provenance history")
 }
 
 /// During an explicit destination move, retain only inherited mutations the
@@ -4306,6 +4919,8 @@ fn checked_drop_rows_that_arrived_by_sync_after(
     db: &Database,
     changes: ChangeSet,
     reupload_through: Option<Lsn>,
+
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<ChangeSet, Error> {
     let mut changes = changes;
     // A changeset can include the older local insert that preceded a pulled
@@ -4315,7 +4930,7 @@ fn checked_drop_rows_that_arrived_by_sync_after(
     let mut synced_delete_keys = std::collections::HashSet::new();
     for row in &changes.rows {
         if row.deleted
-            && db.checked_row_change_arrived_by_sync(row)?
+            && db.checked_row_change_arrived_by_sync(row, read_memory.clone())?
             && reupload_through.is_none_or(|through| row.lsn > through)
         {
             synced_delete_keys
@@ -4326,7 +4941,7 @@ fn checked_drop_rows_that_arrived_by_sync_after(
     for row in std::mem::take(&mut changes.rows) {
         if !synced_delete_keys
             .contains(&(row.table.clone(), format!("{:?}", row.natural_key.pairs())))
-            && (!db.checked_row_change_arrived_by_sync(&row)?
+            && (!db.checked_row_change_arrived_by_sync(&row, read_memory.clone())?
                 || reupload_through.is_some_and(|through| row.lsn <= through))
         {
             rows.push(row);
@@ -4335,7 +4950,7 @@ fn checked_drop_rows_that_arrived_by_sync_after(
     changes.rows = rows;
     let mut vectors = Vec::with_capacity(changes.vectors.len());
     for vector in std::mem::take(&mut changes.vectors) {
-        if !db.checked_vector_change_arrived_by_sync(&vector)?
+        if !db.checked_vector_change_arrived_by_sync(&vector, read_memory.clone())?
             || reupload_through.is_some_and(|through| vector.lsn <= through)
         {
             vectors.push(vector);
@@ -4370,17 +4985,16 @@ fn checked_drop_rows_that_arrived_by_sync_after(
         .into_values()
         .map(|(index, _, _)| index)
         .collect::<std::collections::HashSet<_>>();
-    changes.edges = changes
-        .edges
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, edge)| {
-            (selected_edge_indices.contains(&index)
-                && (!db.graph_change_arrived_by_sync(&edge)
-                    || reupload_through.is_some_and(|through| edge.lsn <= through)))
-            .then_some(edge)
-        })
-        .collect();
+    let mut edges = Vec::with_capacity(changes.edges.len());
+    for (index, edge) in std::mem::take(&mut changes.edges).into_iter().enumerate() {
+        if selected_edge_indices.contains(&index)
+            && (!db.graph_change_arrived_by_sync_with_read_memory(&edge, read_memory.clone())?
+                || reupload_through.is_some_and(|through| edge.lsn <= through))
+        {
+            edges.push(edge);
+        }
+    }
+    changes.edges = edges;
     Ok(changes)
 }
 
@@ -4541,7 +5155,6 @@ fn split_complete_lsn_groups(
 
     batches
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

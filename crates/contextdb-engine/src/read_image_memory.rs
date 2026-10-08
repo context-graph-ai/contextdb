@@ -65,18 +65,42 @@ impl ImageMemory {
     }
     /// A durable source window belongs to the requesting read when present.
     /// Internal writer operations continue to own their scratch directly.
-    pub(crate) fn charging_source(accountant: Arc<MemoryAccountant>) -> Arc<Self> {
-        let reader_budget = SOURCE_BUDGET.with(|slot| slot.borrow().clone());
+    pub(crate) fn charging_reader(
+        accountant: Arc<MemoryAccountant>,
+        reader_budget: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             accountant,
-            subsystem: "writer_source",
-            operation: "cursor_window",
-            hint: "Raise MEMORY_LIMIT to admit this writer cursor window.",
-            reader_budget,
+            subsystem: "reader",
+            operation: "materialize_answer",
+            hint: "Reduce the statement's output or raise the declared reader memory limit.",
+            reader_budget: Some(reader_budget),
             held: AtomicUsize::new(0),
             failure: parking_lot::Mutex::new(None),
         })
     }
+
+    /// Explicit reader funding with the source operation's existing labels.
+    /// The accountant is retained for image bridge identity only; funding
+    /// always uses the required reader capability.
+    pub(crate) fn charging_reader_for(
+        accountant: Arc<MemoryAccountant>,
+        reader_budget: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        subsystem: &'static str,
+        operation: &'static str,
+        hint: &'static str,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            accountant,
+            subsystem,
+            operation,
+            hint,
+            reader_budget: Some(reader_budget),
+            held: AtomicUsize::new(0),
+            failure: parking_lot::Mutex::new(None),
+        })
+    }
+
     pub(crate) fn reserve(&self, bytes: usize) -> Result<()> {
         match &self.reader_budget {
             Some(budget) => budget.try_reserve(bytes, self.subsystem, self.operation, self.hint)?,
@@ -90,6 +114,22 @@ impl ImageMemory {
         self.held.fetch_add(bytes, Ordering::SeqCst);
         Ok(())
     }
+    /// Observe this existing source-copy owner without allocating or cloning it.
+    pub(crate) fn visit_retained_copy_credit(
+        &self,
+        writer: &MemoryAccountant,
+        visit: &mut dyn FnMut(usize, usize, bool),
+    ) {
+        let bytes = self.held.load(Ordering::SeqCst);
+        if bytes != 0 {
+            if self.reader_budget.is_some() {
+                visit(self as *const Self as usize, bytes, false);
+            } else if std::ptr::eq(self.accountant.as_ref(), writer) {
+                visit(self as *const Self as usize, bytes, true);
+            }
+        }
+    }
+
     pub(crate) fn release(&self, bytes: usize) {
         self.held.fetch_sub(bytes, Ordering::SeqCst);
         match &self.reader_budget {
@@ -97,6 +137,85 @@ impl ImageMemory {
             None => self.accountant.release(bytes),
         }
     }
+    /// Detach only the caller's explicitly prepaid copy credit. No funding
+    /// is returned or admitted while the consuming bridge changes ownership.
+    pub(crate) fn vector_copy(self: &Arc<Self>, prepaid_bytes: usize) -> Result<ImageVectorCopy> {
+        self.held
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
+                held.checked_sub(prepaid_bytes)
+            })
+            .map_err(|_| Error::Other("vector copy exceeds its prepaid image credit".into()))?;
+        let accountant: Arc<dyn contextdb_vector::MemoryBudget> =
+            Arc::new(ImageVectorBudget(self.clone()));
+        let charge = ImageVectorCharge {
+            accountant: accountant.clone(),
+            image: self.clone(),
+            bytes: prepaid_bytes,
+        };
+        let owner =
+            contextdb_vector::VectorCopyAdmission::from_prepaid(accountant.clone(), charge)?;
+        Ok(ImageVectorCopy {
+            owner,
+            accountant,
+            image: self.clone(),
+        })
+    }
+
+    fn reserve_funding(&self, bytes: usize) -> Result<()> {
+        match &self.reader_budget {
+            Some(budget) => budget.try_reserve(bytes, self.subsystem, self.operation, self.hint),
+            None => {
+                self.accountant
+                    .try_allocate_for(bytes, self.subsystem, self.operation, self.hint)
+            }
+        }
+    }
+
+    fn release_funding(&self, bytes: usize) {
+        match &self.reader_budget {
+            Some(budget) => budget.release(bytes),
+            None => self.accountant.release(bytes),
+        }
+    }
+
+    pub(crate) fn adopt_reader_credit(
+        &self,
+        budget: &Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        bytes: usize,
+    ) -> Result<()> {
+        if !self
+            .reader_budget
+            .as_ref()
+            .is_some_and(|reader| Arc::ptr_eq(reader, budget))
+        {
+            return Err(Error::Other(
+                "answer credit has a different reader budget".into(),
+            ));
+        }
+        self.held
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
+                held.checked_add(bytes)
+            })
+            .map_err(|_| Error::Other("answer credit overflow".into()))?;
+        Ok(())
+    }
+
+    /// Decode under this already funded image owner. Any admission failure
+    /// remains the shared typed refusal instead of becoming a codec error.
+    pub(crate) fn decode_msgpack<T: de::DeserializeOwned>(
+        self: &Arc<Self>,
+        bytes: &[u8],
+    ) -> Result<T> {
+        let result = self.scope(|| {
+            let mut decoder = rmp_serde::Deserializer::from_read_ref(bytes);
+            Seed(PhantomData::<T>).deserialize(&mut decoder)
+        });
+        if let Some(error) = self.take_failure() {
+            return Err(error);
+        }
+        result.map_err(|error| Error::SyncError(format!("MessagePack decode error: {error}")))
+    }
+
     pub(crate) fn held(&self) -> usize {
         self.held.load(Ordering::SeqCst)
     }
@@ -117,25 +236,119 @@ impl ImageMemory {
         operation()
     }
 }
+// The already captured image/session charge is itself the required read
+// capability; callers do not reconstruct one from a vector-copy adapter.
+impl contextdb_core::read_memory::ReadMemoryBudget for ImageMemory {
+    fn try_reserve(
+        &self,
+        bytes: usize,
+        _subsystem: &'static str,
+        _operation: &'static str,
+        _hint: &'static str,
+    ) -> Result<()> {
+        self.reserve(bytes)
+    }
+    fn release(&self, bytes: usize) {
+        ImageMemory::release(self, bytes);
+    }
+}
+
 impl Drop for ImageMemory {
     fn drop(&mut self) {
         self.release(self.held.load(Ordering::SeqCst));
     }
 }
+#[derive(Debug)]
+struct ImageVectorBudget(Arc<ImageMemory>);
+impl contextdb_vector::MemoryBudget for ImageVectorBudget {
+    fn try_allocate_for(&self, bytes: usize, _: &str, _: &str, _: &str) -> Result<()> {
+        self.0.reserve_funding(bytes)
+    }
+    fn release(&self, bytes: usize) {
+        self.0.release_funding(bytes);
+    }
+}
+
+struct ImageVectorCharge {
+    accountant: Arc<dyn contextdb_vector::MemoryBudget>,
+    image: Arc<ImageMemory>,
+    bytes: usize,
+}
+impl contextdb_vector::PrepaidVectorCopyCharge for ImageVectorCharge {
+    fn accountant(&self) -> Arc<dyn contextdb_vector::MemoryBudget> {
+        self.accountant.clone()
+    }
+    fn retained_bytes(&self) -> usize {
+        self.bytes
+    }
+    fn transfer(mut self: Box<Self>) {
+        self.bytes = 0;
+    }
+}
+impl Drop for ImageVectorCharge {
+    fn drop(&mut self) {
+        self.image.release_funding(self.bytes);
+    }
+}
+
+pub(crate) struct ImageVectorCopy {
+    pub(crate) owner: contextdb_vector::VectorCopyAdmission,
+    accountant: Arc<dyn contextdb_vector::MemoryBudget>,
+    image: Arc<ImageMemory>,
+}
+impl ImageVectorCopy {
+    pub(crate) fn accountant(&self) -> &Arc<dyn contextdb_vector::MemoryBudget> {
+        &self.accountant
+    }
+    /// The returned answer's existing image owner adopts the complete charge
+    /// once. The bridge is consumed, and no budget admission occurs here.
+    pub(crate) fn into_image(self) {
+        self.image
+            .held
+            .fetch_add(self.owner.retained_bytes(), Ordering::SeqCst);
+        self.owner.transfer();
+    }
+}
+
 /// The memory an answer holds against its reader's limit for as long as the
 /// caller holds the answer: given back when its last copy is dropped. It is
 /// bookkeeping, not content, so it never makes two answers unequal.
 #[derive(Clone, Default)]
-pub(crate) struct AnswerCharge(Option<Arc<ImageMemory>>);
+pub(crate) struct AnswerCharge {
+    image: Option<Arc<ImageMemory>>,
+    reader: Option<Arc<contextdb_core::read_memory::ReadCredit>>,
+}
 
 impl AnswerCharge {
     pub(crate) fn holding(charge: Arc<ImageMemory>) -> Self {
-        Self(Some(charge))
+        Self {
+            image: Some(charge),
+            reader: None,
+        }
     }
 
-    /// The bytes this answer holds.
+    /// Consume the answer's existing credit. The shared credit allocation is
+    /// admitted before allocation and remains owned by every answer clone.
+    pub(crate) fn holding_reader(
+        mut credit: contextdb_core::read_memory::ReadCredit,
+    ) -> Result<Self> {
+        let control_bytes = std::mem::size_of::<contextdb_core::read_memory::ReadCredit>()
+            + 2 * std::mem::size_of::<usize>();
+        credit.try_grow_for(
+            control_bytes,
+            "bounded_read",
+            "retain_answer_credit",
+            "Reduce the statement's output or raise the declared reader memory limit.",
+        )?;
+        Ok(Self {
+            image: None,
+            reader: Some(Arc::new(credit)),
+        })
+    }
+
     pub(crate) fn held(&self) -> usize {
-        self.0.as_ref().map_or(0, |charge| charge.held())
+        self.image.as_ref().map_or(0, |charge| charge.held())
+            + self.reader.as_ref().map_or(0, |charge| charge.bytes())
     }
 }
 
@@ -152,24 +365,6 @@ impl PartialEq for AnswerCharge {
     fn eq(&self, _: &Self) -> bool {
         true
     }
-}
-
-thread_local! {
-    static SOURCE_BUDGET: RefCell<Option<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>>> = const { RefCell::new(None) };
-}
-
-pub(crate) fn with_source_budget<T>(
-    budget: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-    operation: impl FnOnce() -> T,
-) -> T {
-    struct Restore(Option<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            SOURCE_BUDGET.with(|slot| *slot.borrow_mut() = self.0.take());
-        }
-    }
-    let _restore = Restore(SOURCE_BUDGET.with(|slot| slot.replace(Some(budget))));
-    operation()
 }
 
 thread_local! { static ACTIVE: RefCell<Vec<Arc<ImageMemory>>> = const { RefCell::new(Vec::new()) }; }

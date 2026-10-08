@@ -20,13 +20,18 @@ pub(crate) fn lineage_roots(
     key: &crate::sync_types::NaturalKey,
     generation: u64,
     incumbent: &str,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<Vec<String>> {
+    let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
+
     let mut roots = BTreeSet::from([incumbent.to_owned()]);
     let reference = RowRef {
         table: table.into(),
         key: key.clone(),
     };
-    for record in db.custody_rows(std::slice::from_ref(&reference))? {
+    for record in custody_hold
+        .retain(db.custody_rows(std::slice::from_ref(&reference), read_memory.clone())?)?
+    {
         if let Record::Manifest(manifest) = record {
             for row in &manifest.rows {
                 if row.reference.table == table
@@ -41,8 +46,14 @@ pub(crate) fn lineage_roots(
     Ok(roots.into_iter().collect())
 }
 
-pub(crate) fn metadata_keys(db: &Database, selected: &[RowRef]) -> Result<Vec<String>> {
-    let records = db.custody_rows(selected)?;
+pub(crate) fn metadata_keys(
+    db: &Database,
+    selected: &[RowRef],
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<Vec<String>> {
+    let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
+
+    let records = custody_hold.retain(db.custody_rows(selected, read_memory.clone())?)?;
     let mut submissions = BTreeSet::new();
     for record in &records {
         match record {

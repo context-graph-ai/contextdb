@@ -1,8 +1,10 @@
+use crate::source::GraphCursor as _;
 use crate::source::{GraphCursorHandle, GraphQuery, GraphReadHandle, GraphSnapshot};
 use crate::store::GraphStore;
 use contextdb_core::*;
 use contextdb_tx::{TransactionManager, WriteSetApplicator};
 use std::collections::{HashSet, VecDeque};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 /// Production BFS visited-node ceiling. Public so the boundary test can
@@ -15,13 +17,21 @@ type AdjPair = (NodeId, NodeId);
 struct BoundedFrontierEntry {
     node: NodeId,
     depth: u32,
-    path: Vec<(NodeId, EdgeType)>,
+    path: Option<NonZeroUsize>,
     retained_bytes: usize,
     /// Whether this node's own adjacency is walked when it is reached. An
     /// edge arriving at a node the traversal has already expanded is still an
     /// edge and is still reported; walking that node a second time would
     /// repeat the work and, on a cycle, never end.
     expand: bool,
+}
+
+/// One shared predecessor; paths are rebuilt only for emitted rows.
+#[derive(Debug)]
+struct BoundedPathLink {
+    parent: Option<NonZeroUsize>,
+    node: NodeId,
+    edge_name: usize,
 }
 
 #[derive(Debug)]
@@ -146,6 +156,8 @@ pub struct BoundedBfsCursor {
     // Membership does not participate in traversal order. HashSet avoids
     // sorted-vector shifting while exposing its live element capacity.
     visited: HashSet<NodeId>,
+    paths: Vec<BoundedPathLink>,
+    path_edge_names: Vec<EdgeType>,
     queue_input: Option<Box<BoundedQueueEntry>>,
     queue_output: Option<Box<BoundedQueueEntry>>,
     current: Option<BoundedCurrentEntry>,
@@ -404,9 +416,134 @@ where
     Ok(())
 }
 
-fn bounded_graph_path<E>(
-    source: &[(NodeId, EdgeType)],
-    appended: Option<(NodeId, &str)>,
+/// Admit replacement storage before allocating it; move elements and destroy
+/// the previous allocation before returning its charge.
+fn grow_bounded_path_storage<T, E>(
+    storage: &mut Vec<T>,
+    retained_bytes: &mut usize,
+    before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
+    release_retained: &mut impl FnMut(usize),
+) -> std::result::Result<(), E>
+where
+    E: From<Error>,
+{
+    if storage.len() < storage.capacity() {
+        return Ok(());
+    }
+    let capacity = storage
+        .capacity()
+        .checked_mul(2)
+        .unwrap_or(usize::MAX)
+        .max(4);
+    let requested = checked_graph_add(
+        bounded_capacity_bytes::<T>(capacity, "predecessor storage").map_err(E::from)?,
+        16,
+        "predecessor allocation",
+    )
+    .map_err(E::from)?;
+    before_retain(requested)?;
+    let mut replacement = Vec::new();
+    if replacement.try_reserve_exact(capacity).is_err() {
+        drop(replacement);
+        release_retained(requested);
+        return Err(E::from(Error::Other(
+            "bounded graph predecessor allocation failed".into(),
+        )));
+    }
+    let actual = replacement.capacity() * std::mem::size_of::<T>() + 16;
+    if actual > requested {
+        if let Err(error) = before_retain(actual - requested) {
+            drop(replacement);
+            release_retained(requested);
+            return Err(error);
+        }
+    } else {
+        release_retained(requested - actual);
+    }
+    let previous = if storage.capacity() == 0 {
+        0
+    } else {
+        storage.capacity() * std::mem::size_of::<T>() + 16
+    };
+    let next = match checked_graph_add(*retained_bytes, actual, "predecessor state") {
+        Ok(next) => next - previous,
+        Err(error) => {
+            drop(replacement);
+            release_retained(actual);
+            return Err(E::from(error));
+        }
+    };
+    replacement.append(storage);
+    let old = std::mem::replace(storage, replacement);
+    drop(old);
+    release_retained(previous);
+    *retained_bytes = next;
+    Ok(())
+}
+
+fn append_bounded_path<E>(
+    cursor: &mut BoundedBfsCursor,
+    parent: Option<NonZeroUsize>,
+    node: NodeId,
+    edge_type: &str,
+    before_work: &mut impl FnMut() -> std::result::Result<(), E>,
+    before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
+    release_retained: &mut impl FnMut(usize),
+) -> std::result::Result<Option<NonZeroUsize>, E>
+where
+    E: From<Error>,
+{
+    let mut edge_name = None;
+    for (position, name) in cursor.path_edge_names.iter().enumerate() {
+        before_work()?;
+        if name == edge_type {
+            edge_name = Some(position);
+            break;
+        }
+    }
+    let edge_name = match edge_name {
+        Some(position) => position,
+        None => {
+            grow_bounded_path_storage(
+                &mut cursor.path_edge_names,
+                &mut cursor.retained_bytes,
+                before_retain,
+                release_retained,
+            )?;
+            let (name, bytes) = bounded_graph_string(edge_type, before_retain, release_retained)?;
+            let next = match checked_graph_add(cursor.retained_bytes, bytes, "predecessor names") {
+                Ok(next) => next,
+                Err(error) => {
+                    drop(name);
+                    release_retained(bytes);
+                    return Err(E::from(error));
+                }
+            };
+            let position = cursor.path_edge_names.len();
+            cursor.path_edge_names.push(name);
+            cursor.retained_bytes = next;
+            position
+        }
+    };
+    grow_bounded_path_storage(
+        &mut cursor.paths,
+        &mut cursor.retained_bytes,
+        before_retain,
+        release_retained,
+    )?;
+    before_work()?;
+    cursor.paths.push(BoundedPathLink {
+        parent,
+        node,
+        edge_name,
+    });
+    Ok(NonZeroUsize::new(cursor.paths.len()))
+}
+
+fn rebuild_bounded_path<E>(
+    cursor: &BoundedBfsCursor,
+    mut link: Option<NonZeroUsize>,
+    depth: usize,
     before_work: &mut impl FnMut() -> std::result::Result<(), E>,
     before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
     release_retained: &mut impl FnMut(usize),
@@ -414,92 +551,50 @@ fn bounded_graph_path<E>(
 where
     E: From<Error>,
 {
-    let length = source
-        .len()
-        .checked_add(usize::from(appended.is_some()))
-        .ok_or_else(|| {
-            E::from(Error::Other(
-                "bounded graph path length overflow".to_string(),
-            ))
-        })?;
     let requested =
-        bounded_capacity_bytes::<(NodeId, EdgeType)>(length, "path clone").map_err(E::from)?;
-    if requested != 0 {
-        before_retain(requested)?;
-    }
+        bounded_capacity_bytes::<(NodeId, EdgeType)>(depth, "emitted path").map_err(E::from)?;
+    before_retain(requested)?;
     let mut path = Vec::new();
-    if path.try_reserve_exact(length).is_err() {
+    if path.try_reserve_exact(depth).is_err() {
+        drop(path);
         release_retained(requested);
         return Err(E::from(Error::Other(
-            "bounded graph path allocation failed".to_string(),
+            "bounded graph output path allocation failed".into(),
         )));
     }
-    let actual_vec =
-        match bounded_capacity_bytes::<(NodeId, EdgeType)>(path.capacity(), "path clone") {
+    let actual = path.capacity() * std::mem::size_of::<(NodeId, EdgeType)>();
+    let mut retained =
+        match reconcile_graph_allocation(requested, actual, before_retain, release_retained) {
             Ok(bytes) => bytes,
             Err(error) => {
-                release_retained(requested);
-                return Err(E::from(error));
+                drop(path);
+                return Err(error);
             }
         };
-    if actual_vec < requested {
-        release_retained(requested);
-        return Err(E::from(Error::Other(
-            "bounded graph path capacity moved backwards".to_string(),
-        )));
-    }
-    let actual_vec =
-        reconcile_graph_allocation(requested, actual_vec, before_retain, release_retained)?;
-    let mut retained = actual_vec;
-    for (node, edge_type) in source {
-        // A path clone copies one element per traversal step, so each copy is
-        // charged before it happens rather than the whole path being copied
-        // between two controls.
+    while let Some(index) = link {
         if let Err(error) = before_work() {
+            drop(path);
             release_retained(retained);
             return Err(error);
         }
-        let (edge_type, string_bytes) =
-            match bounded_graph_string(edge_type, before_retain, release_retained) {
-                Ok(owned) => owned,
-                Err(error) => {
-                    release_retained(retained);
-                    return Err(error);
-                }
-            };
-        retained = match checked_graph_add(retained, string_bytes, "path") {
-            Ok(bytes) => bytes,
+        let predecessor = &cursor.paths[index.get() - 1];
+        let (name, bytes) = match bounded_graph_string(
+            &cursor.path_edge_names[predecessor.edge_name],
+            before_retain,
+            release_retained,
+        ) {
+            Ok(copy) => copy,
             Err(error) => {
-                release_retained(string_bytes);
+                drop(path);
                 release_retained(retained);
-                return Err(E::from(error));
+                return Err(error);
             }
         };
-        path.push((*node, edge_type));
+        retained += bytes;
+        path.push((predecessor.node, name));
+        link = predecessor.parent;
     }
-    if let Some((node, edge_type)) = appended {
-        if let Err(error) = before_work() {
-            release_retained(retained);
-            return Err(error);
-        }
-        let (edge_type, string_bytes) =
-            match bounded_graph_string(edge_type, before_retain, release_retained) {
-                Ok(owned) => owned,
-                Err(error) => {
-                    release_retained(retained);
-                    return Err(error);
-                }
-            };
-        retained = match checked_graph_add(retained, string_bytes, "path") {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                release_retained(string_bytes);
-                release_retained(retained);
-                return Err(E::from(error));
-            }
-        };
-        path.push((node, edge_type));
-    }
+    path.reverse();
     Ok((path, retained))
 }
 
@@ -787,9 +882,14 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
         *self.dag_edge_types.write() = prepared.edge_types;
     }
 
-    pub fn edge_count(&self, source: NodeId, edge_type: &str, snapshot: SnapshotId) -> usize {
-        self.try_edge_count(source, edge_type, snapshot)
-            .expect("graph source read failed; use try_edge_count for fallible reads")
+    pub fn edge_count(
+        &self,
+        source: NodeId,
+        edge_type: &str,
+        snapshot: SnapshotId,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<usize> {
+        self.try_edge_count(source, edge_type, snapshot, read_memory)
     }
 
     pub fn try_edge_count(
@@ -797,8 +897,9 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
         source: NodeId,
         edge_type: &str,
         snapshot: SnapshotId,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<usize> {
-        let root = self.store.capture_source(snapshot)?;
+        let root = self.store.capture_source(snapshot, read_memory)?;
         let mut count = 0;
         self.store.visit_edges(
             root.as_ref(),
@@ -861,6 +962,7 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
         start: NodeId,
         goal: NodeId,
         edge_type: &str,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<bool> {
         let mut visited = HashSet::new();
         let mut queue = VecDeque::new();
@@ -885,7 +987,7 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
             })?;
 
         let snapshot = self.tx_mgr.snapshot();
-        let root = self.store.capture_source(snapshot)?;
+        let root = self.store.capture_source(snapshot, read_memory)?;
 
         while let Some(current) = queue.pop_front() {
             let mut found = false;
@@ -943,13 +1045,17 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
         min_depth: u32,
         max_depth: u32,
         snapshot: SnapshotId,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
         release_retained: impl FnMut(usize),
     ) -> std::result::Result<BoundedBfsCursor, E>
     where
         E: From<Error>,
     {
-        let root = self.store.capture_source(snapshot).map_err(E::from)?;
+        let root = self
+            .store
+            .capture_source(snapshot, read_memory)
+            .map_err(E::from)?;
         self.bounded_bfs_cursor_at_source(
             start,
             edge_types,
@@ -997,7 +1103,7 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
                     return Err(error);
                 }
             };
-        let queue_bytes = std::mem::size_of::<BoundedQueueEntry>();
+        let queue_bytes = std::mem::size_of::<BoundedQueueEntry>() + 16;
         let retained_bytes =
             match checked_graph_add(visited_bytes, edge_types_bytes, "initial state")
                 .and_then(|bytes| checked_graph_add(bytes, queue_bytes, "initial frontier"))
@@ -1018,7 +1124,7 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
             frontier: BoundedFrontierEntry {
                 node: start,
                 depth: 0,
-                path: Vec::new(),
+                path: None,
                 retained_bytes: 0,
                 expand: true,
             },
@@ -1032,6 +1138,8 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
             snapshot,
             source_root,
             visited,
+            paths: Vec::new(),
+            path_edge_names: Vec::new(),
             queue_input,
             queue_output: None,
             current: None,
@@ -1133,7 +1241,7 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
                     cursor.source_root = None;
                     return Ok(None);
                 }
-                let queue_entry_bytes = std::mem::size_of::<BoundedQueueEntry>();
+                let queue_entry_bytes = std::mem::size_of::<BoundedQueueEntry>() + 16;
                 let next_retained = cursor
                     .retained_bytes
                     .checked_sub(queue_entry_bytes)
@@ -1174,14 +1282,15 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
                     && current.frontier.depth >= cursor.min_depth
             });
             if should_emit {
-                let current = cursor.current.as_mut().ok_or_else(|| {
+                let current = cursor.current.as_ref().ok_or_else(|| {
                     E::from(Error::Other(
                         "bounded graph continuation lost its current node".to_string(),
                     ))
                 })?;
-                let (path, output_bytes) = bounded_graph_path(
-                    &current.frontier.path,
-                    None,
+                let (path, output_bytes) = rebuild_bounded_path(
+                    cursor,
+                    current.frontier.path,
+                    current.frontier.depth as usize,
                     &mut before_path_element,
                     &mut before_retain,
                     &mut release_retained,
@@ -1191,7 +1300,11 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
                     depth: current.frontier.depth,
                     path,
                 };
-                current.emitted = true;
+                cursor
+                    .current
+                    .as_mut()
+                    .expect("current node was inspected above")
+                    .emitted = true;
                 return Ok(Some(BoundedTraversalNode {
                     node,
                     reserved_bytes: output_bytes,
@@ -1321,7 +1434,13 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
                 )?;
                 let neighbor = match phase {
                     AdjacencyPhase::StagedOutgoing if edge.source == node => Some(edge.target),
-                    AdjacencyPhase::StagedIncoming if edge.target == node => Some(edge.source),
+                    AdjacencyPhase::StagedIncoming
+                        if edge.target == node
+                            && !(matches!(cursor.direction, Direction::Both)
+                                && edge.source == edge.target) =>
+                    {
+                        Some(edge.source)
+                    }
                     _ => None,
                 };
                 // Counted on the same rule as a committed entry: an edge whose
@@ -1392,7 +1511,12 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
                     &entry.edge_type,
                     &mut before_edge,
                 )?;
-                if !entry.visible_at(cursor.snapshot) || !type_allowed {
+                if !entry.visible_at(cursor.snapshot)
+                    || !type_allowed
+                    || (matches!(cursor.direction, Direction::Both)
+                        && matches!(phase, AdjacencyPhase::Incoming)
+                        && entry.source == entry.target)
+                {
                     continue;
                 }
                 let neighbor = if matches!(phase, AdjacencyPhase::Incoming) {
@@ -1538,7 +1662,13 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
                 )?;
                 let neighbor = match phase {
                     AdjacencyPhase::Outgoing if entry.source == node => Some(entry.target),
-                    AdjacencyPhase::Incoming if entry.target == node => Some(entry.source),
+                    AdjacencyPhase::Incoming
+                        if entry.target == node
+                            && !(matches!(cursor.direction, Direction::Both)
+                                && entry.source == entry.target) =>
+                    {
+                        Some(entry.source)
+                    }
                     _ => None,
                 };
                 let source = entry.source;
@@ -1663,14 +1793,18 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
             .depth
             .checked_add(1)
             .ok_or_else(|| E::from(Error::Other("bounded graph depth overflow".to_string())))?;
-        let (path, path_bytes) = bounded_graph_path(
-            &current.frontier.path,
-            Some((node, edge_type)),
+        let parent = current.frontier.path;
+        let path = append_bounded_path(
+            cursor,
+            parent,
+            node,
+            edge_type,
             &mut *before_path_element,
             &mut *before_retain,
             &mut *release_retained,
         )?;
-        let queue_bytes = std::mem::size_of::<BoundedQueueEntry>();
+        let path_bytes = 0;
+        let queue_bytes = std::mem::size_of::<BoundedQueueEntry>() + 16;
         if let Err(error) = before_retain(queue_bytes) {
             release_retained(path_bytes);
             return Err(error);
@@ -1771,6 +1905,9 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
             && let Some(cap) = visited_cap
             && cursor.visited.len() > cap
         {
+            drop(prepared_queue);
+            release_retained(queue_bytes);
+            cursor.retained_bytes = next_retained - queue_bytes;
             return Err(E::from(Error::BfsVisitedExceeded(cap)));
         }
         prepared_queue.next = cursor.queue_input.take();
@@ -1790,56 +1927,118 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
         max_depth: u32,
         snapshot: SnapshotId,
         root: Option<Arc<dyn GraphSnapshot>>,
-    ) -> Result<TraversalResult> {
-        let mut visited = HashSet::new();
-        visited.insert(start);
-
-        type BfsEntry = (NodeId, u32, Vec<(NodeId, EdgeType)>);
-        let mut queue: VecDeque<BfsEntry> = VecDeque::new();
-        queue.push_back((start, 0, vec![]));
-
-        let mut result_nodes = Vec::new();
-
-        while let Some((current, depth, path)) = queue.pop_front() {
-            if depth > 0 && depth >= min_depth {
-                result_nodes.push(TraversalNode {
-                    id: current,
-                    depth,
-                    path: path.clone(),
-                });
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<(TraversalResult, contextdb_core::read_memory::ReadCredit)> {
+        use std::cell::RefCell;
+        let credit = RefCell::new(contextdb_core::read_memory::ReadCredit::new(read_memory));
+        let mut admit = |bytes| {
+            credit.borrow_mut().try_grow_for(
+                bytes,
+                "reader",
+                "graph_traversal",
+                "Raise the declared reader memory limit.",
+            )
+        };
+        let mut cursor = self.bounded_bfs_cursor_at_source::<Error>(
+            start,
+            edge_types,
+            direction,
+            min_depth,
+            max_depth,
+            snapshot,
+            root,
+            admit,
+            |bytes| {
+                credit
+                    .borrow_mut()
+                    .try_shrink(bytes)
+                    .expect("graph kernel releases only admitted storage")
+            },
+        )?;
+        let cap = self
+            .bfs_visited_cap
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let mut nodes = Vec::new();
+        let mut emitted = HashSet::new();
+        let mut emitted_bytes = 0;
+        let single_hop = min_depth == 1 && max_depth == 1;
+        while let Some(output) = self.bounded_bfs_next_including_staged::<Error>(
+            &mut cursor,
+            || Ok(()),
+            || Ok(()),
+            admit,
+            |bytes| {
+                credit
+                    .borrow_mut()
+                    .try_shrink(bytes)
+                    .expect("graph kernel releases only admitted storage")
+            },
+            |_, _, _, _| Ok(true),
+            |_, _, _| Ok(None),
+            || {},
+            Some(cap),
+        )? {
+            if !single_hop {
+                if emitted.contains(&output.node.id) {
+                    let bytes = output.reserved_bytes;
+                    drop(output);
+                    credit.borrow_mut().try_shrink(bytes)?;
+                    continue;
+                }
+                if let Some((replacement, actual, previous)) = prepare_graph_visited_growth(
+                    &emitted,
+                    output.node.id,
+                    &mut || Ok(()),
+                    &mut admit,
+                    &mut |bytes| {
+                        credit
+                            .borrow_mut()
+                            .try_shrink(bytes)
+                            .expect("graph dedupe releases admitted storage")
+                    },
+                )? {
+                    let old = std::mem::replace(&mut emitted, replacement);
+                    drop(old);
+                    credit.borrow_mut().try_shrink(previous)?;
+                    emitted_bytes = actual;
+                } else {
+                    emitted.insert(output.node.id);
+                }
             }
-
-            if depth >= max_depth {
-                continue;
+            if nodes.len() == nodes.capacity() {
+                let old = nodes.capacity() * std::mem::size_of::<TraversalNode>();
+                let capacity = nodes
+                    .len()
+                    .checked_add(1)
+                    .and_then(usize::checked_next_power_of_two)
+                    .ok_or_else(|| Error::Other("graph result capacity overflow".into()))?;
+                let requested = bounded_capacity_bytes::<TraversalNode>(capacity, "result")?;
+                admit(requested)?;
+                let mut replacement = Vec::new();
+                if replacement.try_reserve_exact(capacity).is_err() {
+                    drop(replacement);
+                    credit.borrow_mut().try_shrink(requested)?;
+                    return Err(Error::Other("graph result allocation failed".into()));
+                }
+                let actual = replacement.capacity() * std::mem::size_of::<TraversalNode>();
+                if actual > requested {
+                    admit(actual - requested)?;
+                } else {
+                    credit.borrow_mut().try_shrink(requested - actual)?;
+                }
+                replacement.append(&mut nodes);
+                let previous = std::mem::replace(&mut nodes, replacement);
+                drop(previous);
+                credit.borrow_mut().try_shrink(old)?;
             }
-
-            self.visit_neighbors(
-                root.as_ref(),
-                current,
-                edge_types,
-                direction,
-                snapshot,
-                |neighbor_id, entry| {
-                    if !visited.insert(neighbor_id) {
-                        return Ok(());
-                    }
-                    let cap = self
-                        .bfs_visited_cap
-                        .load(std::sync::atomic::Ordering::Relaxed);
-                    if visited.len() > cap {
-                        return Err(Error::BfsVisitedExceeded(cap));
-                    }
-                    let mut new_path = path.clone();
-                    new_path.push((current, entry.edge_type.clone()));
-                    queue.push_back((neighbor_id, depth + 1, new_path));
-                    Ok(())
-                },
-            )?;
+            nodes.push(output.node);
         }
-
-        Ok(TraversalResult {
-            nodes: result_nodes,
-        })
+        credit
+            .borrow_mut()
+            .try_shrink(cursor.into_retained_bytes())?;
+        drop(emitted);
+        credit.borrow_mut().try_shrink(emitted_bytes)?;
+        Ok((TraversalResult { nodes }, credit.into_inner()))
     }
 
     fn current_edge_properties(
@@ -1847,9 +2046,10 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
         source: NodeId,
         target: NodeId,
         edge_type: &str,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Option<std::collections::HashMap<String, Value>>> {
         let snapshot = self.tx_mgr.snapshot();
-        let root = self.store.capture_source(snapshot)?;
+        let root = self.store.capture_source(snapshot, read_memory)?;
         let mut existing = None;
         self.store.visit_edges(
             root.as_ref(),
@@ -1914,11 +2114,20 @@ impl<S: WriteSetApplicator> GraphExecutor for MemGraphExecutor<S> {
         min_depth: u32,
         max_depth: u32,
         snapshot: SnapshotId,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<TraversalResult> {
-        let root = self.store.capture_source(snapshot)?;
+        let root = self.store.capture_source(snapshot, read_memory.clone())?;
         self.bfs_at_source(
-            start, edge_types, direction, min_depth, max_depth, snapshot, root,
+            start,
+            edge_types,
+            direction,
+            min_depth,
+            max_depth,
+            snapshot,
+            root,
+            read_memory,
         )
+        .map(|(result, _credit)| result)
     }
 
     fn neighbors(
@@ -1927,8 +2136,9 @@ impl<S: WriteSetApplicator> GraphExecutor for MemGraphExecutor<S> {
         edge_types: Option<&[EdgeType]>,
         direction: Direction,
         snapshot: SnapshotId,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Vec<(NodeId, EdgeType, std::collections::HashMap<String, Value>)>> {
-        let root = self.store.capture_source(snapshot)?;
+        let root = self.store.capture_source(snapshot, read_memory)?;
         let mut results = Vec::new();
         self.visit_neighbors(
             root.as_ref(),
@@ -1952,6 +2162,7 @@ impl<S: WriteSetApplicator> GraphExecutor for MemGraphExecutor<S> {
         target: NodeId,
         edge_type: EdgeType,
         properties: std::collections::HashMap<String, Value>,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<bool> {
         let deleted_in_ws = self.tx_mgr.with_write_set(tx, |ws| {
             ws.adj_deletes
@@ -1960,7 +2171,8 @@ impl<S: WriteSetApplicator> GraphExecutor for MemGraphExecutor<S> {
         })?;
 
         {
-            let existing = self.current_edge_properties(source, target, &edge_type)?;
+            let existing =
+                self.current_edge_properties(source, target, &edge_type, read_memory.clone())?;
             if let Some(existing) = existing
                 && !deleted_in_ws
             {
@@ -2003,7 +2215,7 @@ impl<S: WriteSetApplicator> GraphExecutor for MemGraphExecutor<S> {
                 });
             }
 
-            if self.bfs_with_write_set(tx, target, source, &edge_type)? {
+            if self.bfs_with_write_set(tx, target, source, &edge_type, read_memory)? {
                 return Err(Error::CycleDetected {
                     edge_type: edge_type.clone(),
                     source_node: source,
@@ -2029,9 +2241,16 @@ impl<S: WriteSetApplicator> GraphExecutor for MemGraphExecutor<S> {
         Ok(true)
     }
 
-    fn delete_edge(&self, tx: TxId, source: NodeId, target: NodeId, edge_type: &str) -> Result<()> {
+    fn delete_edge(
+        &self,
+        tx: TxId,
+        source: NodeId,
+        target: NodeId,
+        edge_type: &str,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<()> {
         let snapshot = self.tx_mgr.snapshot();
-        let root = self.store.capture_source(snapshot)?;
+        let root = self.store.capture_source(snapshot, read_memory)?;
         let mut committed_edge_exists = false;
         self.store.visit_edges(
             root.as_ref(),

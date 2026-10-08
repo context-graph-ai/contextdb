@@ -575,7 +575,7 @@ pub fn durable_reader_cache_ceiling(
 
 /// A serving page one walk is reading, and the part of it still charged to
 /// that walk: nothing for a page the cache holds (its slot carries the
-/// charge), the page's bytes for a copy the cache did not keep. The walk's
+/// charge), the page's bytes and shared handle for a copy the cache did not keep. The walk's
 /// handle is dropped first and that charge given back after, so a copy
 /// stays charged for exactly as long as this walk keeps it allocated.
 struct ReadPage<'r, R: FnMut(HnswSearchScratchEvent)> {
@@ -1211,10 +1211,13 @@ impl PagedHnsw {
                 let page_len = self
                     .source_page_bytes
                     .min(self.graph_len.saturating_sub(page_offset));
+                let reserved = page_len.checked_add(SERVING_PAGE_HANDLE_BYTES).ok_or(
+                    HnswBoundedSearchError::CapacityOverflow("paged vector page handle"),
+                )?;
                 acquire(HnswSearchScratchEvent::Reserve {
                     container: HnswSearchScratchContainer::QueryBytes,
                     previous_capacity: 0,
-                    requested_capacity: page_len,
+                    requested_capacity: reserved,
                     element_bytes: 1,
                 })
                 .map_err(HnswBoundedSearchError::Callback)?;
@@ -1223,7 +1226,7 @@ impl PagedHnsw {
                     Err(error) => {
                         release(HnswSearchScratchEvent::Release {
                             container: HnswSearchScratchContainer::QueryBytes,
-                            capacity: page_len,
+                            capacity: reserved,
                             element_bytes: 1,
                         });
                         return Err(HnswBoundedSearchError::Callback(E::from(error)));
@@ -1232,21 +1235,36 @@ impl PagedHnsw {
                 contextdb_core::find_attribution::note_page_fill(page.len());
                 #[cfg(any(test, feature = "test-seams"))]
                 observe_paged_vector(|observer| observer.page_filled());
-                let actual = page.capacity();
+                let actual = match page.capacity().checked_add(SERVING_PAGE_HANDLE_BYTES) {
+                    Some(actual) => actual,
+                    None => {
+                        drop(page);
+                        release(HnswSearchScratchEvent::Release {
+                            container: HnswSearchScratchContainer::QueryBytes,
+                            capacity: reserved,
+                            element_bytes: 1,
+                        });
+                        return Err(HnswBoundedSearchError::CapacityOverflow(
+                            "paged vector page handle",
+                        ));
+                    }
+                };
                 if let Err(error) = acquire(HnswSearchScratchEvent::Reconcile {
                     container: HnswSearchScratchContainer::QueryBytes,
-                    requested_capacity: page_len,
+                    requested_capacity: reserved,
                     actual_capacity: actual,
                     element_bytes: 1,
                 }) {
+                    drop(page);
                     release(HnswSearchScratchEvent::Release {
                         container: HnswSearchScratchContainer::QueryBytes,
-                        capacity: page_len,
+                        capacity: reserved,
                         element_bytes: 1,
                     });
                     return Err(HnswBoundedSearchError::Callback(error));
                 }
                 if page.len() != page_len {
+                    drop(page);
                     release(HnswSearchScratchEvent::Release {
                         container: HnswSearchScratchContainer::QueryBytes,
                         capacity: actual,
@@ -1269,7 +1287,7 @@ impl PagedHnsw {
                 // A page the cache kept is carried by its slot's charge from
                 // here on. One it did not keep -- another walk installed the
                 // same page first, or every resident page is being read --
-                // is this walk's alone, and stays charged to it until the
+                // is this walk's alone, including its shared handle, and stays charged until the
                 // walk drops it.
                 if kept {
                     release(HnswSearchScratchEvent::Release {
@@ -1282,7 +1300,9 @@ impl PagedHnsw {
                     ReadPage::new(shared, actual, &mut *release)
                 }
             };
-            if let Some(shared) = page.page.as_ref() {
+            // A cache-rejected copy has no reusable strong owner after this
+            // read. Keep no Weak that could outlive its reader-owned handle charge.
+            if page.charged == 0 && let Some(shared) = page.page.as_ref() {
                 pages.hold(page_offset, shared, self.source_page_bytes);
             }
             let page_len = page.len();
@@ -3013,6 +3033,7 @@ std::thread_local! {
     static HNSW_CANDIDATE_OBSERVER: RefCell<Option<Arc<dyn HnswCandidateObserver>>> =
         RefCell::new(None);
     static HNSW_COMPLETED_CANDIDATES: Cell<u64> = const { Cell::new(0) };
+    static HNSW_INSERT_OBSERVER: RefCell<Option<Arc<dyn HnswInsertObserver>>> = RefCell::new(None);
     static HNSW_BUILD_OBSERVER: RefCell<Option<Arc<dyn HnswBuildObserver>>> = RefCell::new(None);
     static HNSW_QUERY_SELF_SCORE_OBSERVER: RefCell<Option<Arc<dyn HnswQuerySelfScoreObserver>>> =
         RefCell::new(None);
@@ -3045,6 +3066,76 @@ pub fn with_hnsw_build_observer<R>(
     action()
 }
 
+/// Observe a search without suppressing an enclosing proof observer.
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub fn with_additional_hnsw_build_observer<R>(
+    observer: Arc<dyn HnswBuildObserver>,
+    action: impl FnOnce() -> R,
+) -> R {
+    struct Combined {
+        observer: Arc<dyn HnswBuildObserver>,
+        prior: Option<Arc<dyn HnswBuildObserver>>,
+    }
+    impl HnswBuildObserver for Combined {
+        fn before_hnsw_build(&self) {
+            self.observer.before_hnsw_build();
+            if let Some(prior) = &self.prior {
+                prior.before_hnsw_build();
+            }
+        }
+    }
+    let prior = HNSW_BUILD_OBSERVER.with(|slot| slot.borrow().clone());
+    with_hnsw_build_observer(Arc::new(Combined { observer, prior }), action)
+}
+
+/// Proof-only observation of a completed mutable graph point insertion.
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub trait HnswInsertObserver: Send + Sync {
+    fn after_hnsw_insert(&self);
+}
+
+/// Chain an insertion observer for this worker's dynamic fetch extent.
+/// Restores the previous observer on return or unwind; stores no event history.
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub fn with_additional_hnsw_insert_observer<R>(
+    observer: Arc<dyn HnswInsertObserver>,
+    action: impl FnOnce() -> R,
+) -> R {
+    struct Combined {
+        observer: Arc<dyn HnswInsertObserver>,
+        prior: Option<Arc<dyn HnswInsertObserver>>,
+    }
+    impl HnswInsertObserver for Combined {
+        fn after_hnsw_insert(&self) {
+            self.observer.after_hnsw_insert();
+            if let Some(prior) = &self.prior {
+                prior.after_hnsw_insert();
+            }
+        }
+    }
+    struct Restore(Option<Arc<dyn HnswInsertObserver>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            HNSW_INSERT_OBSERVER.with(|slot| slot.replace(self.0.take()));
+        }
+    }
+    let prior = HNSW_INSERT_OBSERVER.with(|slot| slot.borrow().clone());
+    let combined = Arc::new(Combined { observer, prior });
+    let _restore = Restore(HNSW_INSERT_OBSERVER.with(|slot| slot.replace(Some(combined))));
+    action()
+}
+
+#[cfg(feature = "test-seams")]
+fn observe_hnsw_insert() {
+    let observer = HNSW_INSERT_OBSERVER.with(|slot| slot.borrow().clone());
+    if let Some(observer) = observer {
+        observer.after_hnsw_insert();
+    }
+}
+
 /// An engine-driven paged construction is a fresh graph build too.
 #[cfg(feature = "test-seams")]
 #[doc(hidden)]
@@ -3058,6 +3149,46 @@ fn observe_hnsw_build() {
     if let Some(observer) = observer {
         observer.before_hnsw_build();
     }
+}
+
+#[cfg(feature = "test-seams")]
+struct ParallelCandidateObserver {
+    caller: Arc<dyn HnswCandidateObserver>,
+    completed: std::sync::atomic::AtomicU64,
+}
+#[cfg(feature = "test-seams")]
+impl HnswCandidateObserver for ParallelCandidateObserver {
+    fn before_candidate_distance(&self, _: HnswCandidateDistanceEvent) {
+        let completed_candidates = self.completed.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| Some(n.saturating_add(1)))
+            .expect("candidate ordinal update cannot fail");
+        self.caller.before_candidate_distance(HnswCandidateDistanceEvent {
+            completed_candidates, _source_loop_provenance: (),
+        });
+    }
+    fn after_residual_rejection(&self, event: HnswResidualRejectionEvent) {
+        self.caller.after_residual_rejection(event);
+    }
+}
+#[cfg(feature = "test-seams")]
+struct ParallelCandidateObservation {
+    observer: Arc<ParallelCandidateObserver>,
+}
+#[cfg(feature = "test-seams")]
+impl ParallelCandidateObservation {
+    fn capture() -> Option<Self> {
+        let caller = HNSW_CANDIDATE_OBSERVER.with(|slot| slot.borrow().as_ref().map(Arc::clone))?;
+        let completed = HNSW_COMPLETED_CANDIDATES.with(Cell::get);
+        Some(Self { observer: Arc::new(ParallelCandidateObserver {
+            caller, completed: std::sync::atomic::AtomicU64::new(completed),
+        }) })
+    }
+    fn joined(&self) {
+        HNSW_COMPLETED_CANDIDATES.with(|slot| slot.set(self.observer.completed.load(Ordering::SeqCst)));
+    }
+}
+#[cfg(feature = "test-seams")]
+impl Drop for ParallelCandidateObservation {
+    fn drop(&mut self) { self.joined(); }
 }
 
 /// Install an observer only for the dynamic extent of one bounded vector
@@ -3303,6 +3434,66 @@ impl HnswIndex {
         dimension: usize,
         quantization: VectorQuantization,
         policy: crate::store::ResolvedVectorPolicy,
+        progress: impl FnMut(usize) -> Result<()>,
+    ) -> Result<Self> {
+        Self::new_with_policy_and_workers(entries, dimension, quantization, policy, 1, || false, progress)
+    }
+
+    /// Maintenance-only borrowed insertion pool. The caller admits the worker
+    /// bound before source materialization and holds it through every join.
+    #[doc(hidden)]
+    pub fn from_vector_entries_with_parallel_progress(
+        entries: &[VectorEntry],
+        dimension: usize,
+        quantization: VectorQuantization,
+        policy: crate::store::ResolvedVectorPolicy,
+        workers: usize,
+        cancelled: impl Fn() -> bool + Sync,
+        mut progress: impl FnMut(usize) -> Result<()>,
+    ) -> Result<Self> {
+        progress(0)?;
+        let stored = entries.iter()
+            .map(|entry| StoredVectorEntry::from_vector_entry_ref(entry, quantization))
+            .collect::<Vec<_>>();
+        Self::new_with_policy_and_workers(&stored, dimension, quantization, policy, workers, cancelled, progress)
+    }
+
+    pub const INSERTION_WORKER_STACK_BYTES: usize = 4 * 1024 * 1024;
+
+    /// Worker-local insertion scratch and join/job controls. The engine's
+    /// process-lifetime owner separately admits the requested native stacks
+    /// and the measured stack-cache/arena/TLS runtime retention.
+    #[doc(hidden)]
+    pub fn parallel_insertion_extra_bytes(points: usize, policy: crate::store::ResolvedVectorPolicy, workers: usize) -> Result<usize> {
+        if workers <= 1 { return Ok(0); }
+        let scratch = Hnsw::<f32, HnswF32Distance>::insertion_scratch_bound(points, policy.hnsw_ef_construction, policy.hnsw_m)
+            .ok_or_else(|| Error::Other("graph insertion scratch size overflow".into()))?;
+        // Stack, native TLS, allocator arenas and stack-cache retention are
+        // admitted once by the engine's process-lifetime runtime owner. This
+        // operation admits only insertion containers and borrowed job controls.
+        // The borrowed closure captures graph, chunk, stop/cancel references,
+        // offset and optional observer; its packet/control fits 32 words.
+        let controls = std::mem::size_of::<std::thread::ScopedJoinHandle<'_, usize>>() * 2
+            + 32 * std::mem::size_of::<usize>();
+        #[cfg(feature = "test-seams")]
+        let observer_bytes = std::mem::size_of::<ParallelCandidateObserver>() + 2 * std::mem::size_of::<usize>();
+        #[cfg(not(feature = "test-seams"))]
+        let observer_bytes = 0usize;
+        scratch.checked_add(controls)
+            .and_then(|n| n.checked_mul(workers))
+            .and_then(|n| n.checked_add(points.checked_mul(std::mem::size_of::<Option<PointId>>())?))
+            .and_then(|n| n.checked_add(observer_bytes))
+            .ok_or_else(|| Error::Other("graph worker size overflow".into()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_policy_and_workers(
+        entries: &[StoredVectorEntry],
+        dimension: usize,
+        quantization: VectorQuantization,
+        policy: crate::store::ResolvedVectorPolicy,
+        workers: usize,
+        cancelled: impl Fn() -> bool + Sync,
         mut progress: impl FnMut(usize) -> Result<()>,
     ) -> Result<Self> {
         progress(0)?;
@@ -3362,21 +3553,104 @@ impl HnswIndex {
 
         match &hnsw {
             HnswInner::F32Mutable(index) => {
-                for entry in &sorted_entries {
-                    let Some(vector) = entry.vector.as_f32_slice() else {
-                        continue;
-                    };
-                    let data_id = inserted_count;
-                    inserted_count += 1;
+                // External ids and row/exact directories belong to the serial
+                // valid-entry order. Physical ranks belong to insertion order.
+                sorted_entries.retain(|entry| entry.vector.as_f32_slice().is_some());
+                for (data_id, entry) in sorted_entries.iter().enumerate() {
                     id_to_row.insert(data_id, entry.row_id);
                     if let Some(key) = exact_key_for_stored_vector(&entry.vector) {
                         exact_rows.entry(key).or_default().push(entry.row_id);
                     }
-                    row_to_point.insert(
-                        entry.row_id,
-                        index.insert_slice_with_point_id((vector, data_id)),
-                    );
+                }
+                if workers > 1 && sorted_entries.len() > 1 {
+                    // Establish the sole initial entry before concurrent
+                    // insertions can observe an empty entry directory.
+                    index.insert_slice((sorted_entries[0].vector.as_f32_slice().expect("validated F32 entry"), 0));
+                    inserted_count = 1;
                     progress(inserted_count)?;
+                    let width = workers.min(sorted_entries.len());
+                    let stop = std::sync::atomic::AtomicBool::new(false);
+                    #[cfg(feature = "test-seams")]
+                    let observation = ParallelCandidateObservation::capture();
+                    // One finite wave, one scoped pool. Every started thread
+                    // joins on spawn failure, cancellation and unwinding too.
+                    for (wave_number, wave) in sorted_entries[1..].chunks(width * 32).enumerate() {
+                        progress(inserted_count)?;
+                        if cancelled() { return Err(Error::Other("graph build cancelled".into())); }
+                        let first = 1 + wave_number * width * 32;
+                        let done = std::thread::scope(|scope| -> Result<usize> {
+                            let mut handles = Vec::with_capacity(width);
+                            let mut failure = None;
+                            for (chunk_number, chunk) in wave.chunks(32).enumerate() {
+                                let stop = &stop;
+                                let cancelled = &cancelled;
+                                let offset = first + chunk_number * 32;
+                                #[cfg(feature = "test-seams")]
+                                let observer = observation.as_ref().map(|context| Arc::clone(&context.observer));
+                                match std::thread::Builder::new()
+                                    .stack_size(Self::INSERTION_WORKER_STACK_BYTES)
+                                    .spawn_scoped(scope, move || {
+                                        let insert = || {
+                                            let mut count = 0;
+                                            for (position, entry) in chunk.iter().enumerate() {
+                                                if stop.load(Ordering::Acquire) || cancelled() { break; }
+                                                index.insert_slice((entry.vector.as_f32_slice().expect("validated F32 entry"), offset + position));
+                                                count += 1;
+                                            }
+                                            count
+                                        };
+                                        #[cfg(feature = "test-seams")]
+                                        if let Some(observer) = observer {
+                                            return with_hnsw_candidate_observer(observer, insert);
+                                        }
+                                        insert()
+                                    }) {
+                                    Ok(handle) => handles.push(handle),
+                                    Err(error) => {
+                                        stop.store(true, Ordering::Release);
+                                        failure = Some(Error::Other(format!("cannot start graph worker: {error}")));
+                                        break;
+                                    }
+                                }
+                            }
+                            let mut done = 0;
+                            for handle in handles {
+                                match handle.join() {
+                                    Ok(count) => done += count,
+                                    Err(_) => {
+                                        stop.store(true, Ordering::Release);
+                                        failure = Some(Error::Other("graph insertion worker panicked".into()));
+                                    }
+                                }
+                            }
+                            if let Some(error) = failure { Err(error) } else { Ok(done) }
+                        })?;
+                        #[cfg(feature = "test-seams")]
+                        if let Some(observation) = &observation { observation.joined(); }
+                        inserted_count += done;
+                        progress(inserted_count)?;
+                        if done != wave.len() { return Err(Error::Other("graph build cancelled".into())); }
+                    }
+                    // No reinsertion: bind each stable origin to its actual
+                    // physical rank after all workers and stacks have died.
+                    let mut physical = vec![None; inserted_count];
+                    for point in index.get_point_indexation() {
+                        let slot = physical.get_mut(point.get_origin_id())
+                            .ok_or_else(|| Error::Other("graph worker emitted unknown origin".into()))?;
+                        if slot.replace(point.get_point_id()).is_some() {
+                            return Err(Error::Other("graph worker emitted duplicate origin".into()));
+                        }
+                    }
+                    for (origin, point) in physical.into_iter().enumerate() {
+                        let point = point.ok_or_else(|| Error::Other("graph worker origin coverage is incomplete".into()))?;
+                        row_to_point.insert(id_to_row[&origin], point);
+                    }
+                } else {
+                    for (data_id, entry) in sorted_entries.iter().enumerate() {
+                        row_to_point.insert(entry.row_id, index.insert_slice_with_point_id((entry.vector.as_f32_slice().expect("validated F32 entry"), data_id)));
+                        inserted_count += 1;
+                        progress(inserted_count)?;
+                    }
                 }
             }
             HnswInner::QuantizedMutable(index) => {
@@ -3424,6 +3698,189 @@ impl HnswIndex {
             ef_construction,
             ef_search,
         })
+    }
+
+    /// Copy one finite physical-point window of a completed resident build into
+    /// the native page codec. Links and data ids are exported unchanged; this
+    /// performs no insertion or graph search. The caller admits the retained
+    /// graph, borrowed row directory and transaction workspace before calling.
+    pub(crate) fn export_resident_paged_batch(
+        &self,
+        rows: &[&VectorEntry],
+        previous: &paged_builder::PagedVectorProgress,
+        plan: paged_builder::PagedVectorBatchPlan,
+        transaction: &mut dyn paged_builder::PagedGenerationTransaction,
+    ) -> Result<paged_builder::PagedVectorProgress> {
+        use paged_builder::{PagedEdge, PagedVectorIdentity, PagedVectorPhase, PagedVectorPoint};
+        #[allow(clippy::too_many_arguments)]
+        fn export<T: Clone + Send + Sync>(
+            points: &hnsw_rs::hnsw::PointIndexation<'_, T>,
+            id_to_row: &HashMap<usize, RowId>,
+            rows: &[&VectorEntry],
+            previous: &paged_builder::PagedVectorProgress,
+            plan: paged_builder::PagedVectorBatchPlan,
+            transaction: &mut dyn paged_builder::PagedGenerationTransaction,
+            wrap: impl Fn(hnsw_rs::paged::PagedPoint<T>) -> PagedVectorPoint,
+            exact_key: impl Fn(&[T]) -> Vec<u8>,
+        ) -> Result<paged_builder::PagedVectorProgress> {
+            let mut next = previous.clone();
+            next.phase = PagedVectorPhase::Encoding;
+            next.graph.entry_point = points.entry_point_id();
+            next.graph.points = points.get_nb_point();
+            // A published base is immutable (SealedPagedGeneration); it never
+            // consumes construction RNG state. Its mutable tail has its own
+            // independently seeded generation, as on the ordinary paged route.
+            for layer in 0..next.graph.layer_counts.len() {
+                next.graph.layer_counts[layer] = points.get_layer_nb_point(layer);
+            }
+            if next.graph.points != previous.total_points {
+                return Err(Error::Other(
+                    "resident export coverage differs from its frontier".into(),
+                ));
+            }
+            let mut exported = 0;
+            for (layer, count) in next.graph.layer_counts.into_iter().enumerate() {
+                let start = match previous.encoding_cursor {
+                    Some(cursor) if layer < cursor.0 as usize => continue,
+                    Some(cursor) if layer == cursor.0 as usize => cursor.1 as usize + 1,
+                    _ => 0,
+                };
+                for rank in start..count {
+                    let id = PointId(
+                        layer as u8,
+                        i32::try_from(rank).map_err(|_| {
+                            Error::Other(
+                                "resident export point rank exceeds the durable range".into(),
+                            )
+                        })?,
+                    );
+                    if exported == plan.max_points {
+                        return Ok(next);
+                    }
+                    transaction.checkpoint()?;
+                    let point = points.resident_point(&id).ok_or_else(|| {
+                        Error::Other("resident export lost a physical point".into())
+                    })?;
+                    let data_id = point.get_origin_id();
+                    let row_id = *id_to_row.get(&data_id).ok_or_else(|| {
+                        Error::Other("resident export lost a row identity".into())
+                    })?;
+                    let row = rows
+                        .binary_search_by_key(&row_id, |entry| entry.row_id)
+                        .map(|position| rows[position])
+                        .map_err(|_| {
+                            Error::Other(
+                                "resident export row is outside the captured frontier".into(),
+                            )
+                        })?;
+                    let neighbours = point
+                        .get_neighborhood_id()
+                        .into_iter()
+                        .map(|layer| {
+                            layer
+                                .into_iter()
+                                .map(|edge| PagedEdge {
+                                    point_id: edge.p_id,
+                                    origin_id: edge.d_id,
+                                    distance: edge.distance,
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .collect::<Vec<_>>();
+                    next.graph.layer0_edges = next
+                        .graph
+                        .layer0_edges
+                        .checked_add(neighbours.first().map_or(0, Vec::len))
+                        .ok_or_else(|| {
+                            Error::Other("resident export edge count overflow".into())
+                        })?;
+                    let identity = PagedVectorIdentity {
+                        point: id,
+                        data_id,
+                        row_id,
+                        lsn: row.lsn,
+                        created_tx: row.created_tx,
+                        deleted_tx: row.deleted_tx,
+                        exact_key: exact_key(point.get_v()),
+                    };
+                    let native = wrap(hnsw_rs::paged::PagedPoint {
+                        id,
+                        origin_id: data_id,
+                        values: point.get_v().to_vec(),
+                        neighbours,
+                    });
+                    let mut bytes = Vec::with_capacity(plan.max_node_bytes);
+                    match &native {
+                        PagedVectorPoint::F32(point) => {
+                            paged_builder::encode_paged_point_into(point, &mut bytes)
+                        }
+                        PagedVectorPoint::Quantized(point) => {
+                            paged_builder::encode_paged_point_into(point, &mut bytes)
+                        }
+                    }
+                    .map_err(|error| {
+                        Error::Other(format!("resident export point encoding failed: {error}"))
+                    })?;
+                    if bytes.len() > plan.max_node_bytes {
+                        return Err(Error::Other(
+                            "resident export exceeds its admitted point window".into(),
+                        ));
+                    }
+                    transaction.store_point(&native)?;
+                    transaction.store_identity(&identity)?;
+                    transaction.seal_point(id, &bytes)?;
+                    for byte in &bytes {
+                        next.encoding_digest =
+                            (next.encoding_digest ^ u64::from(*byte)).wrapping_mul(0x100000001b3);
+                    }
+                    next.encoding_bytes = next
+                        .encoding_bytes
+                        .checked_add(bytes.len() as u64)
+                        .ok_or_else(|| {
+                            Error::Other("resident export byte count overflow".into())
+                        })?;
+                    next.encoded_points += 1;
+                    next.encoding_cursor = Some(id);
+                    exported += 1;
+                }
+            }
+            if next.encoded_points != next.total_points {
+                return Err(Error::Other(
+                    "resident export ended before complete coverage".into(),
+                ));
+            }
+            next.phase = PagedVectorPhase::Complete;
+            // Partial exports cannot resume without their resident builder.
+            // Completion removes the engine's private source-cursor marker.
+            next.last_source_key = None;
+            Ok(next)
+        }
+        let rows_by_id = self.id_to_row.read();
+        match &self.hnsw {
+            HnswInner::F32Mutable(graph) => export(
+                graph.get_point_indexation(),
+                &rows_by_id,
+                rows,
+                previous,
+                plan,
+                transaction,
+                PagedVectorPoint::F32,
+                f32_exact_key,
+            ),
+            HnswInner::QuantizedMutable(graph) => export(
+                graph.get_point_indexation(),
+                &rows_by_id,
+                rows,
+                previous,
+                plan,
+                transaction,
+                PagedVectorPoint::Quantized,
+                <[u8]>::to_vec,
+            ),
+            _ => Err(Error::Other(
+                "resident export requires a completed fresh graph".into(),
+            )),
+        }
     }
 
     /// Validate and encode an insertion without changing the fresh graph.
@@ -3533,6 +3990,8 @@ impl HnswIndex {
             }
         }
         self.next_id.store(next_id, Ordering::Release);
+        #[cfg(feature = "test-seams")]
+        observe_hnsw_insert();
     }
 
     #[allow(dead_code)]
@@ -5653,6 +6112,7 @@ impl HnswIndex {
     fn paged_seed_directory<E, S, A, R, F, I>(
         &self,
         tail: &paged_builder::PagedVectorTail,
+        navigation: Option<&union::NavigationSession>,
         k: usize,
         mut required_results: usize,
         allowed_count: usize,
@@ -5672,7 +6132,9 @@ impl HnswIndex {
         R: FnMut(HnswSearchScratchEvent),
         F: FnMut(RowId) -> bool,
     {
-        let mut reader = tail.graph_reader().map_err(E::from)?;
+        let mut native_reader = tail.graph_reader().map_err(E::from)?;
+        let reclaim = || navigation.is_some_and(|session| session.reclaim());
+        let mut reader = paged_builder::AdmittedPagedReader::with_reclamation(native_reader.as_mut(), navigation.and_then(|session| session.owner()), &reclaim);
         before_source_entry()?;
         let bounds = reader.row_bounds().map_err(E::from)?;
         let count = bounds.map_or(0, |(_, _, count)| count);
@@ -5956,6 +6418,7 @@ impl HnswIndex {
         if let Some(tail) = self.paged_tail_snapshot() {
             return self.paged_seed_directory(
                 &tail,
+                None,
                 k,
                 required_results,
                 allowed_count,
@@ -7251,6 +7714,8 @@ mod tests {
         quantization: VectorQuantization,
     ) -> StoredVectorEntry {
         StoredVectorEntry {
+            membership: crate::store::VectorMembershipProvenance::new(tx, Lsn(tx.0), tx, None),
+            canonical_deleted_tx: None,
             row_id,
             vector: StoredVector::from_f32(vector, quantization),
             created_tx: tx,

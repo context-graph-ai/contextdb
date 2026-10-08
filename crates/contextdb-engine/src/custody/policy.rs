@@ -11,7 +11,10 @@ pub(crate) struct Runtime {
     pub signer: LineageSigner,
 }
 
-pub(crate) fn require_admin(db: &Database) -> Result<()> {
+pub(crate) fn require_admin(
+    db: &Database,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<()> {
     if db.contexts().is_some() || db.scope_labels().is_some() || db.principal().is_some() {
         use contextdb_core::read_contract::{ReadFailure, ReadFailureDetail, ReadFailureKind};
         return Err(Error::ReadFailure(
@@ -97,42 +100,60 @@ pub(crate) fn differing_clause(
 pub(crate) fn declare(
     db: &Database,
     p: &contextdb_parser::DeclareTenantTablePolicy,
+    vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<QueryResult> {
-    require_admin(db)?;
+    let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
+
+    require_admin(db, read_memory.clone())?;
     if let Some(hub_node_id) = db.retention_sync_peer() {
         return Err(Error::DeclareRequiresAuthoritativeHub { hub_node_id });
     }
     let policy = normalized(&p.table, from_declaration(p))?;
     let digest = policy_digest(&p.table, &policy)?;
-    db.commit_delivery_metadata(|_| {
-        let old = db.custody_authority()?.into_iter().find_map(|r| match r {
-            Record::Policy(past) if past.table == p.table => Some(past),
-            _ => None,
-        });
-        if old
-            .as_ref()
-            .is_some_and(|p| p.first_bound_position.is_some())
-        {
-            return Err(Error::TenantPolicyBound {
+    db.commit_delivery_metadata(
+        |_| {
+            let old = custody_hold
+                .retain(db.custody_authority(read_memory.clone())?)?
+                .into_iter()
+                .find_map(|r| match r {
+                    Record::Policy(past) if past.table == p.table => Some(past),
+                    _ => None,
+                });
+            if old
+                .as_ref()
+                .is_some_and(|p| p.first_bound_position.is_some())
+            {
+                return Err(Error::TenantPolicyBound {
+                    table: p.table.clone(),
+                });
+            }
+            Ok(vec![Record::Policy(PolicyRecord {
                 table: p.table.clone(),
-            });
-        }
-        Ok(vec![Record::Policy(PolicyRecord {
-            table: p.table.clone(),
-            policy,
-            digest,
-            version: old.map_or(Ok(1), |p| p.version.checked_add(1).ok_or_else(invalid))?,
-            tenant: db.custody_runtime().map(|r| r.tenant),
-            first_bound_at: None,
-            first_bound_position: None,
-        })])
-    })?;
+                policy,
+                digest,
+                version: old.map_or(Ok(1), |p| p.version.checked_add(1).ok_or_else(invalid))?,
+                tenant: db.custody_runtime().map(|r| r.tenant),
+                first_bound_at: None,
+                first_bound_position: None,
+            })])
+        },
+        vector_copy_owner,
+        read_memory.clone(),
+    )?;
     Ok(QueryResult::empty())
 }
 
-pub(crate) fn check_binding(db: &Database, table: &str, candidate: &TableMeta) -> Result<()> {
+pub(crate) fn check_binding(
+    db: &Database,
+    table: &str,
+    candidate: &TableMeta,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<()> {
+    let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
+
     let candidate = normalized(table, from_meta(candidate))?;
-    let records = db.custody_authority()?;
+    let records = custody_hold.retain(db.custody_authority(read_memory.clone())?)?;
     let destination = records.iter().find_map(|r| match r {
         Record::Destination(d) => Some(&d.namespace),
         _ => None,
@@ -156,9 +177,16 @@ pub(crate) fn check_binding(db: &Database, table: &str, candidate: &TableMeta) -
 }
 
 // DECLARE protects even a name not installed yet.
-pub(crate) fn check_declared(db: &Database, table: &str, candidate: &TableMeta) -> Result<()> {
+pub(crate) fn check_declared(
+    db: &Database,
+    table: &str,
+    candidate: &TableMeta,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<()> {
+    let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
+
     let candidate = normalized(table, from_meta(candidate))?;
-    for record in db.custody_authority()? {
+    for record in custody_hold.retain(db.custody_authority(read_memory.clone())?)? {
         if let Record::Policy(policy) = record
             && policy.table == table
             && let Some(clause) = differing_clause(&policy.policy, &candidate)
@@ -305,7 +333,7 @@ fn policy_cells(p: &ApplicationTablePolicy) -> Vec<Value> {
         ),
         p.manifest_tables
             .as_ref()
-            .map_or(Value::Null, |v| Value::Json(serde_json::json!(v))),
+            .map_or(Value::Null, |v| Value::Json((serde_json::json!(v)).into())),
         Value::Text(
             match p.edge_discard {
                 EdgeDiscardMode::Never => "never",
@@ -317,10 +345,16 @@ fn policy_cells(p: &ApplicationTablePolicy) -> Vec<Value> {
     ]
 }
 
-pub(crate) fn show_policy(db: &Database, table: Option<&str>) -> Result<QueryResult> {
-    require_admin(db)?;
+pub(crate) fn show_policy(
+    db: &Database,
+    table: Option<&str>,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<QueryResult> {
+    let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
+
+    require_admin(db, read_memory.clone())?;
     let mut result = empty_policy_inspection();
-    for record in db.custody_authority()? {
+    for record in custody_hold.retain(db.custody_authority(read_memory.clone())?)? {
         if let Record::Policy(p) = record {
             if table.is_some_and(|name| name != p.table) {
                 continue;
@@ -346,11 +380,16 @@ pub(crate) fn show_policy(db: &Database, table: Option<&str>) -> Result<QueryRes
     Ok(result)
 }
 
-pub(crate) fn show_bindings(db: &Database) -> Result<QueryResult> {
-    require_admin(db)?;
+pub(crate) fn show_bindings(
+    db: &Database,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<QueryResult> {
+    let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
+
+    require_admin(db, read_memory.clone())?;
     let mut result = empty_binding_inspection();
     let mut tables = BTreeMap::new();
-    let records = db.custody_authority()?;
+    let records = custody_hold.retain(db.custody_authority(read_memory.clone())?)?;
     let hub = db.retention_sync_peer();
     // Render the active binding, never an arbitrary former incarnation.
     let destination = records.iter().find_map(|r| match r {

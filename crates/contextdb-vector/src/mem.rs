@@ -2,7 +2,7 @@ use crate::hnsw::{
     BoundedHnswQuerySelfScores, HnswAllowedSearchIncomplete, HnswAllowedSearchLimits,
     HnswAllowedSearchStatus,
 };
-use crate::memory_budget::{MemoryBudget, unlimited_memory_budget};
+use crate::memory_budget::MemoryBudget;
 use crate::{
     HnswIndex,
     store::{VectorGraphLayerAvailability, VectorStore},
@@ -14,11 +14,11 @@ use hnsw_rs::hnsw::HnswSearchScratchEvent;
 use parking_lot::RwLock;
 use roaring::RoaringTreemap;
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 
 enum QuarantineAwarePreloadError<E> {
     Control(E),
+    RetainControl(E),
     Store(Error),
 }
 
@@ -249,16 +249,31 @@ pub fn with_selected_partition_prefixes<T>(
 /// or consumes them. Capacity is admitted before allocation and never grows
 /// through an uncharged `Vec::push`.
 #[doc(hidden)]
+#[derive(Debug)]
 pub struct SearchScores {
     rows: Vec<(RowId, f32)>,
-    credit: ScoreCredit,
     index: VectorIndexRef,
+    credit: ScoreCredit,
     exact_budget: bool,
 }
 
-struct ScoreCredit {
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct ScoreCredit {
     budget: Arc<dyn MemoryBudget>,
     bytes: usize,
+}
+
+impl crate::PrepaidVectorCopyCharge for ScoreCredit {
+    fn accountant(&self) -> Arc<dyn MemoryBudget> {
+        self.budget.clone()
+    }
+    fn retained_bytes(&self) -> usize {
+        self.bytes
+    }
+    fn transfer(mut self: Box<Self>) {
+        self.bytes = 0;
+    }
 }
 
 impl Drop for ScoreCredit {
@@ -268,13 +283,69 @@ impl Drop for ScoreCredit {
 }
 
 impl SearchScores {
-    pub fn new(index: VectorIndexRef, budget: Arc<dyn MemoryBudget>) -> Self {
-        Self {
-            rows: Vec::new(),
-            credit: ScoreCredit { budget, bytes: 0 },
+    pub fn new(index: &VectorIndexRef, budget: Arc<dyn MemoryBudget>) -> Result<Self> {
+        let (index, bytes) = allocate_vector_index(
             index,
+            &mut |bytes| {
+                budget.try_allocate_for(
+                    bytes,
+                    "vector_search",
+                    "score_identity",
+                    "Reduce query scope or raise MEMORY_LIMIT.",
+                )
+            },
+            &mut |bytes| budget.release(bytes),
+        )?;
+        Ok(Self {
+            rows: Vec::new(),
+            index,
+            credit: ScoreCredit { budget, bytes },
             exact_budget: false,
+        })
+    }
+
+    /// Consume the allocation and its actual charge together. The destination
+    /// must consume this charge through the matched prepaid admission bridge.
+    pub fn into_prepaid(
+        self,
+        destination: &Arc<dyn MemoryBudget>,
+    ) -> Result<(Vec<(RowId, f32)>, ScoreCredit)> {
+        if !Arc::ptr_eq(destination, &self.credit.budget) {
+            return Err(Error::Other(
+                "vector score destination has a different accountant".into(),
+            ));
         }
+        Ok((self.rows, self.credit))
+    }
+
+    fn from_charged(
+        rows: Vec<(RowId, f32)>,
+        index: &VectorIndexRef,
+        budget: Arc<dyn MemoryBudget>,
+        bytes: usize,
+    ) -> Result<Self> {
+        // Attach ownership before a fallible additional identity allocation.
+        let mut scores = Self {
+            rows,
+            index: VectorIndexRef::new("", ""),
+            credit: ScoreCredit { budget, bytes },
+            exact_budget: false,
+        };
+        let (index, index_bytes) = allocate_vector_index(
+            index,
+            &mut |bytes| {
+                scores.credit.budget.try_allocate_for(
+                    bytes,
+                    "vector_search",
+                    "score_identity",
+                    "Reduce query scope or raise MEMORY_LIMIT.",
+                )
+            },
+            &mut |bytes| scores.credit.budget.release(bytes),
+        )?;
+        scores.index = index;
+        scores.credit.bytes += index_bytes;
+        Ok(scores)
     }
 
     pub fn for_exact(mut self) -> Self {
@@ -294,7 +365,7 @@ impl SearchScores {
         let bytes = wanted
             .checked_mul(std::mem::size_of::<(RowId, f32)>())
             .ok_or_else(|| Error::Other("vector score capacity overflow".into()))?;
-        let mut replacement = Self::new(self.index.clone(), self.credit.budget.clone());
+        let mut replacement = Self::new(&self.index, self.credit.budget.clone())?;
         replacement.exact_budget = self.exact_budget;
         replacement.charge(bytes)?;
         replacement
@@ -302,8 +373,8 @@ impl SearchScores {
             .try_reserve_exact(wanted)
             .map_err(|_| Error::Other("vector score allocation failed".into()))?;
         let actual = replacement.rows.capacity() * std::mem::size_of::<(RowId, f32)>();
-        if actual > replacement.credit.bytes {
-            replacement.charge(actual - replacement.credit.bytes)?;
+        if actual > bytes {
+            replacement.charge(actual - bytes)?;
         }
         replacement.rows.extend_from_slice(&self.rows);
         let old = std::mem::replace(self, replacement);
@@ -358,12 +429,6 @@ impl SearchScores {
     }
     pub fn retain(&mut self, predicate: impl FnMut(&(RowId, f32)) -> bool) {
         self.rows.retain(predicate);
-    }
-
-    /// Transfer the result allocation out of engine ownership at a public API
-    /// boundary. Internal consumers keep `SearchScores` until consumption ends.
-    pub fn into_vec(self) -> Vec<(RowId, f32)> {
-        self.rows
     }
 }
 
@@ -531,12 +596,11 @@ fn bounded_exact_merge_durable<E>(
     before_distance: &mut impl FnMut() -> std::result::Result<(), E>,
     before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
     release_retained: &mut impl FnMut(usize),
+    owner: &mut crate::VectorCopyAdmission,
 ) -> std::result::Result<usize, E>
 where
     E: From<Error>,
 {
-    let mut session = crate::store::OnePassSession::default();
-    let _one_pass = state.one_pass_reads(&mut session);
     before_source_entry()?;
     let mut reserved = 0usize;
     let mut interrupted = None;
@@ -567,7 +631,7 @@ where
         loop {
             before_source_entry()?;
             let mut interrupted = None;
-            let next = cursor.next(&mut |_| {
+            let next = cursor.next_with_body_identity(&mut |_| {
                 if interrupted.is_some() {
                     return false;
                 }
@@ -582,7 +646,7 @@ where
             if let Some(error) = interrupted {
                 return Err(error);
             }
-            let Some(entry) = next.map_err(E::from)? else {
+            let Some((entry, body_identity)) = next.map_err(E::from)? else {
                 break;
             };
             if entry.created_tx.0 > snapshot.0
@@ -590,10 +654,13 @@ where
             {
                 continue;
             }
+            state
+                .bind_streamed_membership(&*cursor, bodies, owner)
+                .map_err(E::from)?;
             before_candidate()?;
-            let Some(score) = state.bounded_score_stored_body(
+            let Some(score) = state.bounded_score_streamed_body(
                 index,
-                entry.row_id,
+                body_identity,
                 snapshot,
                 query,
                 bodies,
@@ -601,6 +668,7 @@ where
                 before_distance,
                 before_retain,
                 release_retained,
+                owner,
             )?
             else {
                 continue;
@@ -638,6 +706,7 @@ fn bounded_exact_merge_state<E>(
     before_distance: &mut impl FnMut() -> std::result::Result<(), E>,
     before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
     release_retained: &mut impl FnMut(usize),
+    owner: &mut crate::VectorCopyAdmission,
 ) -> std::result::Result<usize, E>
 where
     E: From<Error>,
@@ -662,6 +731,7 @@ where
                 before_distance,
                 before_retain,
                 release_retained,
+                owner,
             )?
             else {
                 continue;
@@ -684,11 +754,11 @@ where
         return Ok(compared);
     }
     if let Some(memberships) = state.durable_membership_source()
-        && !state.try_cache_durable_bodies().map_err(E::from)?
+        && !state.try_cache_durable_bodies(owner).map_err(E::from)?
     {
         // Bodies that do not fit stream: the durable directory through one
         // admitted window, then each visible row's body point-read once.
-        let previous = bodies.set_one_pass(true);
+        let previous = bodies.set_one_pass(false);
         let compared = bounded_exact_merge_durable(
             index,
             state,
@@ -704,6 +774,7 @@ where
             before_distance,
             before_retain,
             release_retained,
+            owner,
         );
         bodies.set_one_pass(previous);
         return compared;
@@ -715,7 +786,7 @@ where
     // find the reader could not hold is answered rather than refused, and a
     // find it could hold does not re-read every body on every call.
     let stream = state.streams_raw_bodies()
-        && match state.ensure_raw_vectors_loaded() {
+        && match state.ensure_raw_vectors_loaded(owner) {
             Ok(()) => false,
             Err(Error::MemoryBudgetExceeded { .. }) => true,
             Err(error) => return Err(E::from(error)),
@@ -749,6 +820,7 @@ where
                 before_distance,
                 before_retain,
                 release_retained,
+                owner,
             )?
             else {
                 continue;
@@ -770,7 +842,7 @@ where
         }
         return Ok(compared);
     }
-    state.ensure_raw_vectors_loaded().map_err(E::from)?;
+    state.ensure_raw_vectors_loaded(owner).map_err(E::from)?;
     let entry_count = state.entry_count();
     let mut compared = 0usize;
     for position in 0..entry_count {
@@ -871,28 +943,178 @@ pub struct VectorSearchBudgetReceipt {
     pub budget_terminal: &'static str,
 }
 
-impl VectorSearchDebugTrace {
+/// Public materialized trace and the executing owner's retained charge.
+/// Borrowed observations cannot deep-clone the admitted trace.
+#[derive(Debug)]
+pub struct OwnedVectorSearchTrace {
+    trace: VectorSearchDebugTrace,
+    credit: ScoreCredit,
+    admission: Option<crate::VectorCopyAdmission>,
+}
+
+impl OwnedVectorSearchTrace {
+    pub fn hnsw_len(&self) -> Option<usize> {
+        self.trace.hnsw_len
+    }
+    pub fn hnsw_candidate_count(&self) -> usize {
+        self.trace.hnsw_candidate_count
+    }
+    pub fn hnsw_candidate_row_ids(&self) -> &[RowId] {
+        &self.trace.hnsw_candidate_row_ids
+    }
+    pub fn supplemented_row_count(&self) -> usize {
+        self.trace.supplemented_row_count
+    }
+    pub fn hnsw_ef_search(&self) -> Option<usize> {
+        self.trace.hnsw_ef_search
+    }
+    pub fn selected_generations(&self) -> &[crate::store::VectorGraphGeneration] {
+        &self.trace.selected_generations
+    }
+
+    #[doc(hidden)]
+    pub fn retained_credit_bytes_for_test(&self) -> usize {
+        self.credit.bytes
+            + self
+                .admission
+                .as_ref()
+                .map_or(0, crate::VectorCopyAdmission::retained_bytes)
+    }
+
+    #[doc(hidden)]
+    #[cfg(feature = "test-seams")]
+    pub fn debug_trace_for_test(&self) -> &VectorSearchDebugTrace {
+        &self.trace
+    }
     fn brute_force(
         index: &VectorIndexRef,
         rows: &[(RowId, f32)],
-        fallback_reason: &'static str,
+        reason: &'static str,
         hnsw_len: Option<usize>,
-        partition_routes: Vec<VectorPartitionSearchTrace>,
-    ) -> Self {
-        Self {
-            index: index.clone(),
+        routes: Vec<VectorPartitionSearchTrace>,
+        budget: Arc<dyn MemoryBudget>,
+    ) -> Result<Self> {
+        Self::brute_force_with_owner(
+            index,
+            rows,
+            reason,
+            hnsw_len,
+            routes,
+            crate::VectorCopyAdmission::new(budget),
+        )
+    }
+
+    fn brute_force_with_owner(
+        index: &VectorIndexRef,
+        rows: &[(RowId, f32)],
+        reason: &'static str,
+        hnsw_len: Option<usize>,
+        routes: Vec<VectorPartitionSearchTrace>,
+        admission: crate::VectorCopyAdmission,
+    ) -> Result<Self> {
+        let budget = admission.accountant().clone();
+        let admission = std::cell::RefCell::new(admission);
+        let (owned_index, _) = allocate_vector_index(
+            index,
+            &mut |bytes| admission.borrow_mut().reserve(bytes),
+            &mut |_bytes| {},
+        )?;
+        let (final_row_ids, _) = allocate_vector_row_ids(
+            rows,
+            "exact trace final rows",
+            &mut || Ok::<(), Error>(()),
+            &mut |bytes| admission.borrow_mut().reserve(bytes),
+            &mut |_bytes| {},
+        )?;
+        let admission = admission.into_inner();
+        let trace = VectorSearchDebugTrace {
+            index: owned_index,
             used_hnsw: false,
             hnsw_len,
             hnsw_candidate_count: 0,
             hnsw_candidate_row_ids: Vec::new(),
-            final_row_ids: rows.iter().map(|(row_id, _)| *row_id).collect(),
+            final_row_ids,
             supplemented_row_count: 0,
-            fallback_reason: Some(fallback_reason),
-            partition_routes,
+            fallback_reason: Some(reason),
+            partition_routes: routes,
             hnsw_ef_search: None,
             selected_generations: Vec::new(),
             budget_receipt: None,
+        };
+        Ok(Self {
+            trace,
+            credit: ScoreCredit { budget, bytes: 0 },
+            admission: Some(admission),
+        })
+    }
+
+    fn from_charged(trace: BoundedVectorSearchTrace, budget: Arc<dyn MemoryBudget>) -> Self {
+        let bytes = trace.retained_bytes();
+        Self {
+            trace: trace.into_trace(),
+            credit: ScoreCredit { budget, bytes },
+            admission: None,
         }
+    }
+
+    fn replace_final_rows(&mut self, rows: &[(RowId, f32)]) -> Result<()> {
+        let (ids, bytes) = allocate_vector_row_ids(
+            rows,
+            "exact trace final rows",
+            &mut || Ok::<(), Error>(()),
+            &mut |bytes| {
+                self.credit.budget.try_allocate_for(
+                    bytes,
+                    "vector_search",
+                    "trace",
+                    "Reduce query scope or raise MEMORY_LIMIT.",
+                )
+            },
+            &mut |bytes| self.credit.budget.release(bytes),
+        )?;
+        let old_bytes = self.trace.final_row_ids.capacity() * std::mem::size_of::<RowId>();
+        let old = std::mem::replace(&mut self.trace.final_row_ids, ids);
+        drop(old);
+        self.credit.budget.release(old_bytes);
+        self.credit.bytes = self.credit.bytes - old_bytes + bytes;
+        Ok(())
+    }
+
+    pub fn used_hnsw(&self) -> bool {
+        self.trace.used_hnsw
+    }
+    pub fn index(&self) -> &VectorIndexRef {
+        &self.trace.index
+    }
+    pub fn final_row_ids(&self) -> &[RowId] {
+        &self.trace.final_row_ids
+    }
+    pub fn partition_routes(&self) -> &[VectorPartitionSearchTrace] {
+        &self.trace.partition_routes
+    }
+    pub fn fallback_reason(&self) -> Option<&'static str> {
+        self.trace.fallback_reason
+    }
+    pub fn budget_receipt(&self) -> Option<VectorSearchBudgetReceipt> {
+        self.trace.budget_receipt
+    }
+
+    /// The destination consumes this charge via VectorCopyAdmission::from_prepaid
+    /// against its actual owner and adopts the charge exactly once before transfer.
+    pub fn into_prepaid(
+        mut self,
+        destination: &Arc<dyn MemoryBudget>,
+    ) -> Result<(VectorSearchDebugTrace, ScoreCredit)> {
+        if !Arc::ptr_eq(destination, &self.credit.budget) {
+            return Err(Error::Other(
+                "vector trace destination has a different accountant".into(),
+            ));
+        }
+        if let Some(admission) = self.admission.take() {
+            self.credit.bytes += admission.retained_bytes();
+            admission.transfer();
+        }
+        Ok((self.trace, self.credit))
     }
 }
 
@@ -938,7 +1160,10 @@ pub struct BoundedBruteForceCursor {
     streaming_source: bool,
     membership_cursor: Option<Box<dyn crate::store::RawVectorMembershipCursor>>,
     membership_reserved_bytes: usize,
-    pending_membership: Option<crate::store::RawVectorDirectoryEntry>,
+    pending_membership: Option<(
+        crate::store::RawVectorDirectoryEntry,
+        crate::store::RawVectorDirectoryEntry,
+    )>,
 }
 
 /// A store-owned entry source pinned when the cursor is opened. Exact stepping
@@ -950,11 +1175,39 @@ pub struct BoundedBruteForceCursor {
 struct BoundedSnapshotVectorSource {
     partition_key: VectorPartitionKey,
     state: Arc<crate::store::IndexState>,
+    serving_selection: Option<Arc<crate::store::CapturedVectorServingSelection>>,
     candidate_ids: Option<Vec<u64>>,
     point_load: bool,
     candidate_ids_cover_all_live: bool,
     allowed_count: usize,
     live_count: usize,
+}
+
+impl BoundedSnapshotVectorSource {
+    fn serving_policy(&self, snapshot: SnapshotId) -> Option<crate::store::VectorServingPolicy> {
+        match &self.serving_selection {
+            Some(selection) => selection.serving_policy(),
+            None => self.state.snapshot_serving_policy(snapshot),
+        }
+    }
+    fn dormant_layer_count(&self, snapshot: SnapshotId) -> usize {
+        self.serving_selection.as_ref().map_or_else(
+            || self.state.dormant_layer_count_for_snapshot(snapshot),
+            |selection| selection.dormant_layer_count(),
+        )
+    }
+    fn dormant_load_bytes(&self, snapshot: SnapshotId) -> usize {
+        self.serving_selection.as_ref().map_or_else(
+            || self.state.dormant_load_bytes_for_snapshot(snapshot),
+            |selection| selection.dormant_load_bytes(),
+        )
+    }
+    fn dormant_page_bytes(&self, snapshot: SnapshotId) -> usize {
+        self.serving_selection.as_ref().map_or_else(
+            || self.state.dormant_page_bytes_for_snapshot(snapshot),
+            |selection| selection.dormant_page_bytes(),
+        )
+    }
 }
 
 impl std::fmt::Debug for BoundedSnapshotVectorSource {
@@ -1030,7 +1283,7 @@ impl BoundedVectorCandidateGroups {
             visit(
                 source.allowed_count,
                 source.live_count,
-                source.state.snapshot_serving_policy(self.snapshot),
+                source.serving_policy(self.snapshot),
             )?;
         }
         Ok(())
@@ -1045,6 +1298,13 @@ impl BoundedVectorCandidateGroups {
             .iter()
             .filter(|source| source.allowed_count != 0)
         {
+            if let Some(selection) = &source.serving_selection {
+                let (has_base, has_change, has_suffix) = selection.layer_presence();
+                base |= has_base;
+                change |= has_change;
+                tail |= has_suffix;
+                continue;
+            }
             let status = source.state.graph_generation_status();
             let sealed_base = status.base.is_some() || status.dormant_base.is_some();
             base |= sealed_base
@@ -1072,8 +1332,8 @@ impl BoundedVectorCandidateGroups {
 /// A search trace whose row-id vectors and index names were admitted through
 /// the request's memory callbacks. It is deliberately not clonable: a copy
 /// would duplicate that retained payload outside the accounting that admitted
-/// it. Publish it by moving the payload out with [`BoundedVectorSearchTrace::into_trace`],
-/// which transfers the charged allocation instead of duplicating it.
+/// it. Publish it by consuming the actual caller's prepaid charge through
+/// [`BoundedVectorSearchTrace::into_owned`].
 #[derive(Debug)]
 pub struct BoundedVectorSearchTrace {
     trace: VectorSearchDebugTrace,
@@ -1112,12 +1372,39 @@ impl BoundedVectorSearchTrace {
         }
     }
 
-    /// Take the admitted payload. No borrowing view is offered: the inner
-    /// trace derives `Clone`, so a shared reference would let any caller
-    /// duplicate the admitted payload without a charge. The receiver owns the
-    /// charge from here on and settles it by releasing [`Self::retained_bytes`]
-    /// at the moment the payload leaves bounded accounting.
-    pub fn into_trace(self) -> VectorSearchDebugTrace {
+    /// Move the trace together with the actual caller's already held charge.
+    /// The prepaid bridge rejects another accountant and retains the complete
+    /// token until output drop or a consuming matched destination transfer.
+    pub fn into_owned<C: crate::PrepaidVectorCopyCharge + 'static>(
+        self,
+        executing_owner: Arc<dyn MemoryBudget>,
+        charge: C,
+    ) -> Result<OwnedVectorSearchTrace> {
+        if charge.retained_bytes() < self.retained_bytes {
+            return Err(Error::Other(
+                "vector trace prepaid charge is smaller than its retained allocation".into(),
+            ));
+        }
+        let admission = crate::VectorCopyAdmission::from_prepaid(executing_owner.clone(), charge)?;
+        Ok(OwnedVectorSearchTrace {
+            trace: self.trace,
+            credit: ScoreCredit {
+                budget: executing_owner,
+                bytes: 0,
+            },
+            admission: Some(admission),
+        })
+    }
+
+    // Only vector-internal consumers with the same callback-accounted owner
+    // may attach the charge directly. Public extraction requires a real token.
+    #[doc(hidden)]
+    #[cfg(feature = "test-seams")]
+    pub fn debug_trace_for_test(&self) -> &VectorSearchDebugTrace {
+        &self.trace
+    }
+
+    fn into_trace(self) -> VectorSearchDebugTrace {
         self.trace
     }
 }
@@ -1962,6 +2249,7 @@ where
         BoundedSnapshotVectorSource {
             partition_key: key.clone(),
             state,
+            serving_selection: None,
             candidate_ids: None,
             point_load: false,
             candidate_ids_cover_all_live: false,
@@ -2051,27 +2339,14 @@ pub struct MemVectorExecutor<S: WriteSetApplicator> {
 }
 
 impl<S: WriteSetApplicator> MemVectorExecutor<S> {
-    fn selected_partition_prefixes(
-        &self,
-        index: &VectorIndexRef,
-    ) -> Option<Vec<VectorPartitionKey>> {
-        PARTITION_SEARCH_SCOPES.with(|scopes| {
-            scopes
-                .borrow()
-                .iter()
-                .rev()
-                .find_map(|(scoped_index, prefixes)| {
-                    (scoped_index == index).then(|| prefixes.clone())
-                })
-        })
-    }
-
+    /// The accountant must belong to the actual executing statement.
     pub fn new(
         store: Arc<VectorStore>,
         tx_mgr: Arc<TransactionManager<S>>,
         hnsw: Arc<OnceLock<RwLock<Option<HnswIndex>>>>,
+        accountant: Arc<dyn MemoryBudget>,
     ) -> Self {
-        Self::new_with_accountant(store, tx_mgr, hnsw, unlimited_memory_budget())
+        Self::new_with_accountant(store, tx_mgr, hnsw, accountant)
     }
 
     pub fn new_with_accountant(
@@ -2200,6 +2475,22 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         })
     }
 
+    fn with_selected_partition_prefixes<T>(
+        &self,
+        index: &VectorIndexRef,
+        operation: impl FnOnce(Option<&[VectorPartitionKey]>) -> T,
+    ) -> T {
+        PARTITION_SEARCH_SCOPES.with(|scopes| {
+            let scopes = scopes.borrow();
+            let prefixes = scopes
+                .iter()
+                .rev()
+                .find(|(selected, _)| selected == index)
+                .map(|(_, prefixes)| prefixes.as_slice());
+            operation(prefixes)
+        })
+    }
+
     /// Resolve the physical states an unfiltered bounded query may need.
     /// Filtered execution uses `bounded_candidate_groups`, whose snapshot-aware
     /// row placement retains only the states that own admitted candidates.
@@ -2215,22 +2506,24 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     where
         E: From<Error>,
     {
-        if let Some(prefixes) = self.selected_partition_prefixes(index) {
-            return self.bounded_scoped_snapshot_sources(
+        self.with_selected_partition_prefixes(index, |prefixes| {
+            if let Some(prefixes) = prefixes {
+                return self.bounded_scoped_snapshot_sources(
+                    index,
+                    layout,
+                    prefixes,
+                    before_source_entry,
+                    before_retain,
+                    release_retained,
+                );
+            }
+            self.all_bounded_snapshot_sources(
                 index,
-                layout,
-                &prefixes,
                 before_source_entry,
                 before_retain,
                 release_retained,
-            );
-        }
-        self.all_bounded_snapshot_sources(
-            index,
-            before_source_entry,
-            before_retain,
-            release_retained,
-        )
+            )
+        })
     }
 
     /// Resolve every authorized candidate's snapshot-visible partition once,
@@ -2246,12 +2539,13 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         mut before_placement: impl FnMut() -> std::result::Result<(), E>,
         mut before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
         mut release_retained: impl FnMut(usize),
+        owner: &mut crate::VectorCopyAdmission,
     ) -> std::result::Result<BoundedVectorCandidateGroups, E>
     where
         E: From<Error>,
     {
         before_checkpoint()?;
-        let layout = self.store.index_layout(index).map_err(E::from)?;
+        let layout = self.store.scoped_index_layout(index, owner).map_err(E::from)?;
         let filtered = candidates.is_some();
         if candidates.is_some_and(<[u64]>::is_empty) {
             return Ok(BoundedVectorCandidateGroups {
@@ -2265,37 +2559,40 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             });
         }
 
-        let prefixes = self.selected_partition_prefixes(index);
-        let discover_sources = layout.is_partitioned() && filtered && prefixes.is_none();
-        let (mut sources, mut retained_bytes) = if let Some(prefixes) = prefixes.as_deref() {
-            self.bounded_scoped_snapshot_sources(
-                index,
-                &layout,
-                prefixes,
-                &mut before_checkpoint,
-                &mut before_retain,
-                &mut release_retained,
-            )?
-        } else if discover_sources {
-            allocate_snapshot_source_slots(
-                candidates.map_or(0, <[u64]>::len).min(
-                    layout
-                        .max_partitions
-                        .map_or(candidates.map_or(0, <[u64]>::len), |partitions| {
-                            partitions as usize
-                        }),
-                ),
-                &mut before_retain,
-                &mut release_retained,
-            )?
-        } else {
-            self.all_bounded_snapshot_sources(
-                index,
-                &mut before_checkpoint,
-                &mut before_retain,
-                &mut release_retained,
-            )?
-        };
+        let (discover_sources, mut sources, mut retained_bytes) = self
+            .with_selected_partition_prefixes(index, |prefixes| {
+                let discover_sources = layout.is_partitioned() && filtered && prefixes.is_none();
+                let (mut sources, mut retained_bytes) = if let Some(prefixes) = prefixes {
+                    self.bounded_scoped_snapshot_sources(
+                        index,
+                        &layout,
+                        prefixes,
+                        &mut before_checkpoint,
+                        &mut before_retain,
+                        &mut release_retained,
+                    )?
+                } else if discover_sources {
+                    allocate_snapshot_source_slots(
+                        candidates.map_or(0, <[u64]>::len).min(
+                            layout
+                                .max_partitions
+                                .map_or(candidates.map_or(0, <[u64]>::len), |partitions| {
+                                    partitions as usize
+                                }),
+                        ),
+                        &mut before_retain,
+                        &mut release_retained,
+                    )?
+                } else {
+                    self.all_bounded_snapshot_sources(
+                        index,
+                        &mut before_checkpoint,
+                        &mut before_retain,
+                        &mut release_retained,
+                    )?
+                };
+                Ok::<_, E>((discover_sources, sources, retained_bytes))
+            })?;
 
         let repeat_global_candidate_pass =
             bounded_candidate_grouping_repeats_global_pass_for_test();
@@ -2311,7 +2608,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                             row_id,
                             snapshot,
                             &mut before_checkpoint,
-                            |key, state, before_checkpoint| {
+                            |key, state, before_checkpoint, _owner| {
                                 let position = match sources
                                     .binary_search_by(|source| source.partition_key.cmp(key))
                                 {
@@ -2377,14 +2674,13 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                                     })?;
                                 Ok(Some(()))
                             },
+                            owner,
                         )?;
                 }
                 if repeat_global_candidate_pass {
                     let physical_partition_count = self
                         .store
-                        .partition_keys_including_historical(index)
-                        .map_err(E::from)?
-                        .len();
+                        .with_partition_sources(index, |sources| Ok::<usize, E>(sources.len()))?;
                     for _ in 1..physical_partition_count {
                         for raw_row_id in candidate_ids {
                             self.store
@@ -2393,7 +2689,8 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                                     RowId(*raw_row_id),
                                     snapshot,
                                     &mut before_checkpoint,
-                                    |_key, _state, _before_checkpoint| Ok(Some(())),
+                                    |_key, _state, _before_checkpoint, _owner| Ok(Some(())),
+                                    owner,
                                 )?;
                         }
                     }
@@ -2406,6 +2703,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                         snapshot,
                         None,
                         &mut before_checkpoint,
+                        owner,
                     )?;
                     source.live_count = live_count;
                     source.candidate_ids_cover_all_live = source.allowed_count != 0
@@ -2420,6 +2718,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     snapshot,
                     None,
                     &mut before_checkpoint,
+                    owner,
                 )?;
                 source.allowed_count = live_count;
                 source.live_count = live_count;
@@ -2435,6 +2734,16 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             drop(sources);
             release_retained(retained_bytes);
             return Err(error);
+        }
+        for source in &mut sources {
+            match source.state.capture_serving_selection(snapshot, owner) {
+                Ok(selection) => source.serving_selection = selection,
+                Err(error) => {
+                    drop(sources);
+                    release_retained(retained_bytes);
+                    return Err(E::from(error));
+                }
+            }
         }
         let aggregate_allowed_count = sources.iter().fold(0usize, |count, source| {
             count.saturating_add(source.allowed_count)
@@ -2469,6 +2778,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         mut before_source_entry: impl FnMut() -> std::result::Result<(), E>,
         mut before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
         mut release_retained: impl FnMut(usize),
+        owner: &mut crate::VectorCopyAdmission,
     ) -> std::result::Result<BoundedBruteForceCursor, E>
     where
         E: From<Error>,
@@ -2481,6 +2791,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             || Ok(()),
             &mut before_retain,
             &mut release_retained,
+            owner,
         )?;
         self.bounded_brute_force_cursor_grouped(
             index,
@@ -2490,6 +2801,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             before_source_entry,
             before_retain,
             release_retained,
+            owner,
         )
     }
 
@@ -2506,6 +2818,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         mut before_source_entry: impl FnMut() -> std::result::Result<(), E>,
         mut before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
         mut release_retained: impl FnMut(usize),
+        owner: &mut crate::VectorCopyAdmission,
     ) -> std::result::Result<BoundedBruteForceCursor, E>
     where
         E: From<Error>,
@@ -2519,7 +2832,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             release_retained(group_bytes);
             return Err(error);
         }
-        let layout = match self.store.index_layout(&index) {
+        let layout = match self.store.scoped_index_layout(&index, owner) {
             Ok(layout) => layout,
             Err(error) => {
                 release_retained(group_bytes);
@@ -2604,7 +2917,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             output_position: 0,
             prepared: false,
             retained_bytes,
-            body_reads: crate::store::RawVectorBodyReads::one_pass(),
+            body_reads: crate::store::RawVectorBodyReads::default(),
             stream_when_refused: false,
             streaming_source: false,
             membership_cursor: None,
@@ -2621,6 +2934,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         before_distance: impl FnMut() -> std::result::Result<(), E>,
         before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
         release_retained: impl FnMut(usize),
+        owner: &mut crate::VectorCopyAdmission,
     ) -> std::result::Result<BoundedVectorStep, E>
     where
         E: From<Error>,
@@ -2634,6 +2948,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             before_distance,
             before_retain,
             release_retained,
+            owner,
         )
     }
 
@@ -2649,6 +2964,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         mut before_distance: impl FnMut() -> std::result::Result<(), E>,
         mut before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
         mut release_retained: impl FnMut(usize),
+        owner: &mut crate::VectorCopyAdmission,
     ) -> std::result::Result<BoundedVectorStep, E>
     where
         E: From<Error>,
@@ -2669,7 +2985,9 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             .snapshot_sources
             .get(cursor.source_position)
             .map(|source| source.state.clone());
-        let _one_pass = state.and_then(|state| state.one_pass_reads(&mut cursor.one_pass));
+        let _one_pass = state
+            .filter(|state| state.durable_membership_source().is_none())
+            .and_then(|state| state.one_pass_reads(&mut cursor.one_pass));
 
         if let Some(candidate) = cursor.pending_score {
             // Score the complete authorized set while retaining only the
@@ -2732,6 +3050,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     &mut before_distance,
                     &mut before_retain,
                     &mut release_retained,
+                    owner,
                 )?
                 .map(|score| (row_id, score));
             cursor.position = cursor.position.checked_add(1).ok_or_else(|| {
@@ -2759,7 +3078,10 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             };
             before_source_entry()?;
             let durable_streams = source.state.durable_membership_source().is_some()
-                && !source.state.try_cache_durable_bodies().map_err(E::from)?;
+                && !source
+                    .state
+                    .try_cache_durable_bodies(owner)
+                    .map_err(E::from)?;
             if let Some(memberships) = source
                 .state
                 .durable_membership_source()
@@ -2816,7 +3138,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 cursor.streaming_source = true;
                 cursor.state_end = Some(usize::MAX);
             } else {
-                match source.state.ensure_raw_vectors_loaded() {
+                match source.state.ensure_raw_vectors_loaded(owner) {
                     Ok(()) => {
                         cursor.streaming_source = false;
                         cursor.state_end = Some(source.state.entry_count());
@@ -2859,25 +3181,45 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         before_source_entry()?;
         if cursor.streaming_source {
             let visible = if let Some(memberships) = cursor.membership_cursor.as_mut() {
+                let mut additional_reserved = 0usize;
+                let retained_before = cursor.retained_bytes;
+                let membership_before = cursor.membership_reserved_bytes;
                 let mut interrupted = None;
                 let next = if let Some(entry) = cursor.pending_membership.as_ref() {
                     Ok(Some(entry.clone()))
                 } else {
-                    memberships.next(&mut |request| {
-                    let result = match request {
-                        crate::store::DormantVectorLoadRequest::Reserve(_) => Err(E::from(Error::Other(
-                            "membership cursor must admit its bounded window before opening".to_string(),
-                        ))),
-                        _ => before_source_entry(),
-                    };
-                    if let Err(error) = result { interrupted = Some(error); false } else { true }
-                })
+                    memberships.next_with_body_identity(&mut |request| {
+                        let result = match request {
+                            crate::store::DormantVectorLoadRequest::Reserve(bytes) => {
+                                match additional_reserved.checked_add(bytes) {
+                                    Some(total)
+                                        if retained_before.checked_add(total).is_some()
+                                            && membership_before.checked_add(total).is_some() =>
+                                    {
+                                        before_retain(bytes).map(|()| additional_reserved = total)
+                                    }
+                                    _ => Err(E::from(Error::Other(
+                                        "membership window reservation overflow".into(),
+                                    ))),
+                                }
+                            }
+                            _ => before_source_entry(),
+                        };
+                        if let Err(error) = result {
+                            interrupted = Some(error);
+                            false
+                        } else {
+                            true
+                        }
+                    })
                 };
+                cursor.retained_bytes += additional_reserved;
+                cursor.membership_reserved_bytes += additional_reserved;
                 if let Some(error) = interrupted {
                     return Err(error);
                 }
                 cursor.pending_membership = next.map_err(E::from)?;
-                cursor.pending_membership.as_ref().map(|entry| {
+                cursor.pending_membership.as_ref().map(|(entry, _)| {
                     (entry.created_tx.0 <= cursor.snapshot.0
                         && entry.deleted_tx.is_none_or(|tx| tx.0 > cursor.snapshot.0))
                     .then_some(entry.row_id)
@@ -2907,6 +3249,21 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             // resident scan below; dead and future versions consume it too.
             before_exhaustive_candidate()?;
             cursor.pending_score = match visible {
+                Some(row_id) if cursor.pending_membership.is_some() => source
+                    .state
+                    .bounded_score_streamed_body(
+                        &cursor._index,
+                        cursor.pending_membership.as_ref().unwrap().1.clone(),
+                        cursor.snapshot,
+                        &cursor.query,
+                        &mut cursor.body_reads,
+                        &mut before_source_entry,
+                        &mut before_distance,
+                        &mut before_retain,
+                        &mut release_retained,
+                        owner,
+                    )?
+                    .map(|score| (row_id, score)),
                 Some(row_id) => source
                     .state
                     .bounded_score_stored_body(
@@ -2919,6 +3276,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                         &mut before_distance,
                         &mut before_retain,
                         &mut release_retained,
+                        owner,
                     )?
                     .map(|score| (row_id, score)),
                 None => None,
@@ -2974,12 +3332,13 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         mut before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
         mut release_retained: impl FnMut(usize),
         mut visit: impl FnMut(RowId) -> std::result::Result<(), E>,
+        owner: &mut crate::VectorCopyAdmission,
     ) -> std::result::Result<(), E>
     where
         E: From<Error>,
     {
         before_entry()?;
-        let layout = self.store.index_layout(index).map_err(E::from)?;
+        let layout = self.store.scoped_index_layout(index, owner).map_err(E::from)?;
         let (sources, bytes) = self.bounded_snapshot_sources(
             index,
             &layout,
@@ -2994,6 +3353,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 &mut before_retain,
                 &mut release_retained,
                 &mut visit,
+                owner,
             )
         });
         drop(sources);
@@ -3014,6 +3374,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         mut before_source_entry: impl FnMut() -> std::result::Result<(), E>,
         mut before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
         mut release_retained: impl FnMut(usize),
+        owner: &mut crate::VectorCopyAdmission,
     ) -> std::result::Result<usize, E>
     where
         E: From<Error>,
@@ -3026,6 +3387,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             || Ok(()),
             &mut before_retain,
             &mut release_retained,
+            owner,
         )?;
         let count = groups.aggregate_allowed_count();
         release_retained(groups.into_retained_bytes());
@@ -3051,6 +3413,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         mut before_distance: impl FnMut() -> std::result::Result<(), E>,
         mut before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
         mut release_retained: impl FnMut(usize),
+        owner: &mut crate::VectorCopyAdmission,
     ) -> std::result::Result<BoundedHnswOutcome, E>
     where
         E: From<Error>,
@@ -3063,6 +3426,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             || Ok(()),
             &mut before_retain,
             &mut release_retained,
+            owner,
         )?;
         let result = self.bounded_hnsw_search_grouped(
             index,
@@ -3076,6 +3440,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             &mut before_distance,
             &mut before_retain,
             &mut release_retained,
+            owner,
         );
         release_retained(groups.into_retained_bytes());
         result
@@ -3102,6 +3467,47 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         mut before_distance: impl FnMut() -> std::result::Result<(), E>,
         mut before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
         mut release_retained: impl FnMut(usize),
+        owner: &mut crate::VectorCopyAdmission,
+    ) -> std::result::Result<BoundedHnswOutcome, E>
+    where
+        E: From<Error>,
+    {
+        self.bounded_hnsw_search_grouped_with_reader_memory_refusal(
+            index,
+            query,
+            k,
+            groups,
+            mode,
+            |_| false,
+            allowed_search_limits,
+            &mut before_source_entry,
+            &mut before_exact_candidate,
+            &mut before_distance,
+            &mut before_retain,
+            &mut release_retained,
+            owner,
+        )
+    }
+
+    /// Workspace plumbing for the engine's typed reader-memory admission.
+    /// Existing public callers keep the original never-true classification.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn bounded_hnsw_search_grouped_with_reader_memory_refusal<E>(
+        &self,
+        index: &VectorIndexRef,
+        query: &[f32],
+        k: usize,
+        groups: &BoundedVectorCandidateGroups,
+        mode: VectorSearchMode,
+        is_reader_memory_refusal: impl Fn(&E) -> bool,
+        allowed_search_limits: HnswAllowedSearchLimits,
+        mut before_source_entry: impl FnMut() -> std::result::Result<(), E>,
+        mut before_exact_candidate: impl FnMut() -> std::result::Result<(), E>,
+        mut before_distance: impl FnMut() -> std::result::Result<(), E>,
+        mut before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
+        mut release_retained: impl FnMut(usize),
+        owner: &mut crate::VectorCopyAdmission,
     ) -> std::result::Result<BoundedHnswOutcome, E>
     where
         E: From<Error>,
@@ -3109,7 +3515,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         let snapshot = groups.snapshot;
         let aggregate_allowed_count = groups.aggregate_allowed_count();
         before_source_entry()?;
-        let layout = self.store.index_layout(index).map_err(E::from)?;
+        let layout = self.store.scoped_index_layout(index, owner).map_err(E::from)?;
         if query.len() != layout.dimension {
             return Err(E::from(Error::VectorIndexDimensionMismatch {
                 index: index.clone(),
@@ -3208,7 +3614,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 exhaustive_nanos = exhaustive_nanos.saturating_add(
                     (source.allowed_count as u128).saturating_mul(u128::from(comparison_nanos)),
                 );
-                let degree = source.state.snapshot_serving_policy(snapshot).map_or_else(
+                let degree = source.serving_policy(snapshot).map_or_else(
                     || {
                         layout
                             .resolve_policy(source.live_count, search_policy_limit(k))
@@ -3223,12 +3629,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                         degree,
                         hnsw_rs::hnsw::layer0_max_nb_connection(degree),
                     )
-                    .saturating_mul(
-                        source
-                            .state
-                            .dormant_layer_count_for_snapshot(snapshot)
-                            .max(1),
-                    ),
+                    .saturating_mul(source.dormant_layer_count(snapshot).max(1)),
                 );
             }
             let walk_budget =
@@ -3268,7 +3669,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         let _layers_to_load = {
             let dormant_bytes = snapshot_sources
                 .iter()
-                .map(|source| source.state.dormant_load_bytes_for_snapshot(snapshot))
+                .map(|source| source.dormant_load_bytes(snapshot))
                 .fold(0usize, usize::saturating_add);
             contextdb_core::find_attribution::count(
                 "graph_admission_priced_bytes",
@@ -3284,7 +3685,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             // re-read, never their topology.
             let dormant_pages = snapshot_sources
                 .iter()
-                .map(|source| source.state.dormant_page_bytes_for_snapshot(snapshot))
+                .map(|source| source.dormant_page_bytes(snapshot))
                 .fold(0usize, usize::saturating_add);
             if dormant_bytes != 0
                 && let Some(available) = self.store.memory_available_bytes()
@@ -3303,7 +3704,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             contextdb_core::serving_cache_share::declare_layers_to_load(
                 snapshot_sources
                     .iter()
-                    .map(|source| source.state.dormant_layer_count_for_snapshot(snapshot))
+                    .map(|source| source.dormant_layer_count(snapshot))
                     .fold(0usize, usize::saturating_add),
                 dormant_bytes,
                 dormant_pages,
@@ -3367,7 +3768,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 // materializes this partition's intersection once and reuses
                 // it for every graph layer below.
                 let eligibility =
-                    state.bounded_hnsw_eligibility(snapshot_tx, &mut before_source_entry)?;
+                    state.bounded_hnsw_eligibility(snapshot_tx, &mut before_source_entry, owner)?;
                 let ef_search = statement_policy.hnsw_ef_search;
                 let allowed_count = if groups.filtered {
                     allowed_count
@@ -3387,16 +3788,31 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 let mut preload_checkpoint =
                     || before_source_entry().map_err(QuarantineAwarePreloadError::Control);
                 let mut preload_retain =
-                    |bytes| before_retain(bytes).map_err(QuarantineAwarePreloadError::Control);
-                let preload = state.preload_snapshot_compatible_hnsw_layers_for_request(
-                    snapshot,
-                    &mut preload_checkpoint,
-                    &mut preload_retain,
-                    &mut release_retained,
-                );
+                    |bytes| before_retain(bytes).map_err(QuarantineAwarePreloadError::RetainControl);
+                let preload = match &source.serving_selection {
+                    Some(selection) => state.preload_captured_serving_selection(
+                        selection,
+                        &mut preload_checkpoint,
+                        &mut preload_retain,
+                        &mut release_retained,
+                    ),
+                    None => state.preload_snapshot_compatible_hnsw_layers_for_request(
+                        snapshot,
+                        &mut preload_checkpoint,
+                        &mut preload_retain,
+                        &mut release_retained,
+                    ),
+                };
+                let mut preload_memory_refused = false;
                 match preload {
                     Ok(_) => {}
-                    Err(QuarantineAwarePreloadError::Control(error)) => return Err(error),
+                    Err(QuarantineAwarePreloadError::RetainControl(error))
+                        if mode == VectorSearchMode::Auto && is_reader_memory_refusal(&error) =>
+                    {
+                        preload_memory_refused = true;
+                    }
+                    Err(QuarantineAwarePreloadError::Control(error)
+                        | QuarantineAwarePreloadError::RetainControl(error)) => return Err(error),
                     Err(QuarantineAwarePreloadError::Store(error @ Error::ReadCancelled)) => {
                         return Err(E::from(error));
                     }
@@ -3410,7 +3826,9 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     // graph over the whole scope and is refused, unchanged.
                     Err(QuarantineAwarePreloadError::Store(Error::MemoryBudgetExceeded {
                         ..
-                    })) if mode == VectorSearchMode::Auto => {}
+                    })) if mode == VectorSearchMode::Auto => {
+                        preload_memory_refused = true;
+                    }
                     Err(QuarantineAwarePreloadError::Store(error)) => {
                         return Err(E::from(error));
                     }
@@ -3428,7 +3846,12 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     crate::store::SnapshotCompatibleLayer<'_>,
                 >());
                 before_retain(admitted_layer_bytes)?;
-                let (availability, owned_layers) = state.snapshot_compatible_owned_layers(snapshot);
+                let (availability, owned_layers) = if preload_memory_refused {
+                    (VectorGraphLayerAvailability::Unavailable, Vec::new())
+                } else { match &source.serving_selection {
+                    Some(selection) => selection.owned_layers(),
+                    None => state.snapshot_compatible_owned_layers(snapshot),
+                }};
                 if availability == VectorGraphLayerAvailability::Ready && !owned_layers.is_empty() {
                     self.store.mark_sealed_graph_used(state);
                     let charged_bytes = std::mem::size_of::<UnionPartition<'_>>().saturating_add(
@@ -3475,7 +3898,9 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                         }
                     });
                 }
-                let reason = if graph_ready {
+                let reason = if preload_memory_refused {
+                    "maintained_graph_memory_refused"
+                } else if graph_ready {
                     "maintained_graph_incomplete"
                 } else {
                     "maintained_graph_unavailable"
@@ -3500,6 +3925,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     &mut before_distance,
                     &mut before_retain,
                     &mut release_retained,
+                    owner,
                 )?;
                 exact_candidate_count = exact_candidate_count.saturating_add(partition_compared);
                 note_partition_attribution(
@@ -3538,6 +3964,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     &mut before_distance,
                     &mut before_retain,
                     &mut release_retained,
+                    owner,
                 )?;
                 union_receipt = Some(outcome.receipt);
                 let resolved = match outcome.outcome {
@@ -3668,6 +4095,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                                             &mut before_distance,
                                             &mut before_retain,
                                             &mut release_retained,
+                                            owner,
                                         )?;
                                         exact_candidate_count = exact_candidate_count
                                             .saturating_add(partition_compared);
@@ -3792,6 +4220,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                                 &mut before_distance,
                                 &mut before_retain,
                                 &mut release_retained,
+                                owner,
                             )?;
                             exact_candidate_count =
                                 exact_candidate_count.saturating_add(partition_compared);
@@ -3947,6 +4376,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         before_distance: &mut impl FnMut() -> std::result::Result<(), E>,
         before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
         release_retained: &mut impl FnMut(usize),
+        owner: &mut crate::VectorCopyAdmission,
     ) -> std::result::Result<UnionSearchResult, E>
     where
         E: From<Error>,
@@ -4012,7 +4442,11 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         let started = std::time::Instant::now();
         let retained = std::cell::RefCell::new(&mut *before_retain);
         let released = std::cell::RefCell::new(&mut *release_retained);
-        let searched = crate::hnsw::search_union_allowed_bounded(
+        let navigation_session = crate::hnsw::union::NavigationSession::new(Some(owner.funder()));
+        let mut navigation_copy_owner = owner.scratch();
+        let admitted_owner = std::cell::RefCell::new(&mut navigation_copy_owner);
+        let membership_error = std::cell::RefCell::new(None);
+        let searched = crate::hnsw::union::search_union_allowed_bounded_with_navigation(
             &layers,
             query,
             k,
@@ -4030,14 +4464,28 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                         && sources
                             .get(partition.source_position)
                             .is_some_and(|source| {
-                                source.state.directory_has_visible_row(row_id, snapshot)
+                                if membership_error.borrow().is_some() {
+                                    return false;
+                                }
+                                match source.state.try_directory_has_visible_row_with_copy_admission(
+                                    row_id,
+                                    snapshot,
+                                    &mut **admitted_owner.borrow_mut(),
+                                    &mut |token, bytes, component, operation, hint| navigation_session.reserve_for(token, bytes, component, operation, hint),
+                                ) {
+                                    Ok(visible) => visible,
+                                    Err(error) => {
+                                        *membership_error.borrow_mut() = Some(error);
+                                        false
+                                    }
+                                }
                             })
                 })
             },
             |position, row_id, source_entry, distance| {
                 let partition = &partitions[position];
                 let state = &sources[partition.source_position].state;
-                state.bounded_score_visible_candidate(
+                state.bounded_score_visible_candidate_with_copy_admission(
                     index,
                     row_id,
                     snapshot,
@@ -4045,14 +4493,33 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     None,
                     source_entry,
                     distance,
-                    &mut |bytes| (*retained.borrow_mut())(bytes),
+                    &mut |bytes| {
+                        // Probe the same operation owner before the existing
+                        // retained callback admits and observes its charge.
+                        let mut admission = owner.scratch();
+                        navigation_session.reserve(&mut admission, bytes).map_err(E::from)?;
+                        drop(admission);
+                        (*retained.borrow_mut())(bytes)
+                    },
                     &mut |bytes| (*released.borrow_mut())(bytes),
+                    &mut **admitted_owner.borrow_mut(),
+                    &mut |token, bytes, component, operation, hint| navigation_session.reserve_for(token, bytes, component, operation, hint),
                 )
             },
             &mut *before_source_entry,
             &mut *before_distance,
-            |event| apply_hnsw_scratch_acquire(event, &mut |bytes| (*retained.borrow_mut())(bytes)),
+            |event| apply_hnsw_scratch_acquire(event, &mut |bytes| {
+                // Actual admission fails before LRU reclamation. The scoped
+                // probe releases before the original scratch callback reserves
+                // and observes its unchanged charge; no cache eviction merely
+                // for invoking a callback, and no double retained reservation.
+                let mut admission = owner.scratch();
+                navigation_session.reserve(&mut admission, bytes).map_err(E::from)?;
+                drop(admission);
+                (*retained.borrow_mut())(bytes)
+            }),
             |event| apply_hnsw_scratch_release(event, &mut |bytes| (*released.borrow_mut())(bytes)),
+            Some(&navigation_session),
         );
         drop(retained);
         drop(released);
@@ -4066,6 +4533,14 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             }
         }
         let partitions = &*partitions;
+        drop(admitted_owner);
+        drop(navigation_copy_owner);
+        drop(navigation_session);
+        if let Some(error) = membership_error.into_inner() {
+            drop(layer_owner);
+            release_retained(layer_bytes);
+            return Err(E::from(error));
+        }
         let searched = match searched {
             Ok(searched) => searched,
             Err(error) => {
@@ -4143,6 +4618,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             before_distance,
             before_retain,
             release_retained,
+            owner,
         );
         let result_bytes = searched.retained_bytes;
         drop(searched);
@@ -4185,6 +4661,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         before_distance: &mut impl FnMut() -> std::result::Result<(), E>,
         before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
         release_retained: &mut impl FnMut(usize),
+        owner: &mut crate::VectorCopyAdmission,
     ) -> std::result::Result<UnionOutcome, E>
     where
         E: From<Error>,
@@ -4197,9 +4674,8 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         // scored, and the page is the best of those scores.
         let walk_distance_is_score = matches!(
             self.store
-                .index_layout(index)
-                .map_err(E::from)?
-                .quantization,
+                .with_index_layout(index, |layout| layout.quantization)
+                .map_err(E::from)?,
             VectorQuantization::F32
         ) && partitions
             .iter()
@@ -4324,7 +4800,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 {
                     continue;
                 }
-                if !state.directory_has_visible_row(candidate.row_id, snapshot)
+                if !state.try_directory_has_visible_row(candidate.row_id, snapshot, owner)?
                     || partition.candidates.is_some_and(|candidates| {
                         candidates.binary_search(&candidate.row_id.0).is_err()
                     })
@@ -4358,6 +4834,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                         before_distance,
                         before_retain,
                         release_retained,
+                        owner,
                     )?,
                 };
                 let Some(score) = score else {
@@ -4422,173 +4899,131 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         })
     }
 
-    fn all_partition_states(
-        &self,
-        index: &VectorIndexRef,
-    ) -> Result<Vec<Arc<crate::store::IndexState>>> {
-        let layout = self.store.index_layout(index)?;
-        if !layout.is_partitioned() {
-            return Ok(vec![self.store.state(index)?]);
-        }
-        // A partition state is allowed to disappear when its last retained
-        // version is reclaimed. The column remains a valid vector index, so
-        // absence of one enumerated state is an empty state, not an unknown
-        // index. The enclosing bulk read keeps the returned Arc snapshots
-        // stable for the rest of this search.
-        Ok(self
-            .store
-            .partition_keys_including_historical(index)?
-            .into_iter()
-            .filter_map(|key| self.store.try_partition_state(index, &key))
-            .collect())
-    }
-
-    fn all_partition_sources(
-        &self,
-        index: &VectorIndexRef,
-    ) -> Result<Vec<BoundedSnapshotVectorSource>> {
-        let layout = self.store.index_layout(index)?;
-        if !layout.is_partitioned() {
-            return Ok(vec![BoundedSnapshotVectorSource {
-                partition_key: VectorPartitionKey::unpartitioned(),
-                state: self.store.state(index)?,
-                candidate_ids: None,
-                point_load: false,
-                candidate_ids_cover_all_live: false,
-                allowed_count: 0,
-                live_count: 0,
-            }]);
-        }
-        Ok(self
-            .store
-            .partition_keys_including_historical(index)?
-            .into_iter()
-            .filter_map(|partition_key| {
-                self.store
-                    .try_partition_state(index, &partition_key)
-                    .map(|state| BoundedSnapshotVectorSource {
-                        partition_key,
-                        state,
-                        candidate_ids: None,
-                        point_load: false,
-                        candidate_ids_cover_all_live: false,
-                        allowed_count: 0,
-                        live_count: 0,
-                    })
-            })
-            .collect())
-    }
-
-    /// Narrow by current membership only when every candidate proves that the
-    /// same state contains its visible version at this snapshot. A key move
-    /// after an old snapshot fails that proof and deliberately selects every
-    /// declared state rather than losing the retained source version.
+    /// Narrow only when each current route proves snapshot visibility.
     fn selected_partition_sources(
         &self,
         index: &VectorIndexRef,
         candidates: Option<&RoaringTreemap>,
         snapshot: SnapshotId,
+        owner: &mut crate::VectorCopyAdmission,
     ) -> Result<Vec<BoundedSnapshotVectorSource>> {
-        if candidates.is_some_and(|candidates| candidates.is_empty()) {
+        if candidates.is_some_and(|ids| ids.is_empty()) {
             return Ok(Vec::new());
         }
-        let layout = self.store.index_layout(index)?;
-        if !layout.is_partitioned() {
-            return Ok(vec![BoundedSnapshotVectorSource {
-                partition_key: VectorPartitionKey::unpartitioned(),
-                state: self.store.state(index)?,
-                candidate_ids: None,
-                point_load: false,
-                candidate_ids_cover_all_live: false,
-                allowed_count: 0,
-                live_count: 0,
-            }]);
-        }
-        if let Some(prefixes) = self.selected_partition_prefixes(index) {
-            return Ok(self
-                .store
-                .partition_keys_including_historical(index)?
-                .into_iter()
-                .filter(|key| {
+        let partitioned = self
+            .store
+            .with_index_layout(index, |layout| layout.is_partitioned())?;
+        PARTITION_SEARCH_SCOPES.with(|scopes| {
+            let scopes = scopes.borrow();
+            let prefixes = partitioned
+                .then(|| {
+                    scopes
+                        .iter()
+                        .rev()
+                        .find(|(scoped, _)| scoped == index)
+                        .map(|(_, prefixes)| prefixes)
+                })
+                .flatten();
+            let mut routes = Vec::<BoundedSnapshotVectorSource>::new();
+            let mut narrowed = false;
+            if partitioned
+                && prefixes.is_none()
+                && let Some(candidates) = candidates
+            {
+                let capacity = usize::try_from(candidates.len())
+                    .map_err(|_| Error::Other("vector candidate capacity overflow".into()))?;
+                owner.reserve(
+                    capacity
+                        .checked_mul(std::mem::size_of::<BoundedSnapshotVectorSource>())
+                        .ok_or_else(|| Error::Other("vector candidate capacity overflow".into()))?,
+                )?;
+                routes = Vec::with_capacity(capacity);
+                narrowed = true;
+                for id in candidates.iter() {
+                    let row = RowId(id);
+                    let Some(key) = self
+                        .store
+                        .try_current_partition_for_row(index, row, owner)?
+                    else {
+                        narrowed = false;
+                        break;
+                    };
+                    let Some(state) = self.store.try_partition_state(index, &key) else {
+                        narrowed = false;
+                        break;
+                    };
+                    if !state.try_directory_has_visible_row(row, snapshot, owner)? {
+                        narrowed = false;
+                        break;
+                    }
+                    routes.push(BoundedSnapshotVectorSource {
+                        partition_key: key,
+                        state,
+                        serving_selection: None,
+                        candidate_ids: None,
+                        point_load: false,
+                        candidate_ids_cover_all_live: false,
+                        allowed_count: 0,
+                        live_count: 0,
+                    });
+                }
+            }
+            if narrowed {
+                routes.sort_unstable_by(|a, b| a.partition_key.cmp(&b.partition_key));
+                routes.dedup_by(|a, b| a.partition_key == b.partition_key);
+                return Ok(routes);
+            }
+            drop(routes);
+            let selected = |key: &VectorPartitionKey| {
+                prefixes.is_none_or(|prefixes| {
                     prefixes
                         .iter()
                         .any(|prefix| partition_key_has_prefix(key, prefix))
                 })
-                .filter_map(|key| {
-                    self.store.try_partition_state(index, &key).map(|state| {
-                        BoundedSnapshotVectorSource {
-                            partition_key: key,
-                            state,
+            };
+            self.store.with_partition_sources(index, |sources| {
+                let mut count = 0usize;
+                sources.visit(|key, _| {
+                    if selected(key) {
+                        count = count.checked_add(1).ok_or_else(|| {
+                            Error::Other("vector source capacity overflow".into())
+                        })?;
+                    }
+                    Ok::<(), Error>(())
+                })?;
+                owner.reserve(
+                    count
+                        .checked_mul(std::mem::size_of::<BoundedSnapshotVectorSource>())
+                        .ok_or_else(|| Error::Other("vector source capacity overflow".into()))?,
+                )?;
+                let mut result = Vec::with_capacity(count);
+                sources.visit(|key, state| {
+                    if selected(key) {
+                        owner.reserve(key.estimated_bytes())?;
+                        result.push(BoundedSnapshotVectorSource {
+                            partition_key: key.clone(),
+                            state: state.clone(),
+                            serving_selection: None,
                             candidate_ids: None,
                             point_load: false,
                             candidate_ids_cover_all_live: false,
                             allowed_count: 0,
                             live_count: 0,
-                        }
-                    })
-                })
-                .collect());
-        }
-        let Some(candidates) = candidates else {
-            return Ok(self
-                .store
-                .partition_keys_including_historical(index)?
-                .into_iter()
-                .filter_map(|partition_key| {
-                    self.store
-                        .try_partition_state(index, &partition_key)
-                        .map(|state| BoundedSnapshotVectorSource {
-                            partition_key,
-                            state,
-                            candidate_ids: None,
-                            point_load: false,
-                            candidate_ids_cover_all_live: false,
-                            allowed_count: 0,
-                            live_count: 0,
-                        })
-                })
-                .collect());
-        };
-
-        let mut selected = BTreeMap::<VectorPartitionKey, Arc<crate::store::IndexState>>::new();
-        for raw_row_id in candidates.iter() {
-            let row_id = RowId(raw_row_id);
-            let Some(partition_key) = self.store.try_current_partition_for_row(index, row_id)?
-            else {
-                return self.all_partition_sources(index);
-            };
-            let Some(state) = self.store.try_partition_state(index, &partition_key) else {
-                // Membership can name a state whose final retained version
-                // was reclaimed. It cannot safely narrow this snapshot, so
-                // use every remaining state and keep the candidate bitmap as
-                // the row-level authorization/filter boundary.
-                return self.all_partition_sources(index);
-            };
-            if !state.try_directory_has_visible_row(row_id, snapshot)? {
-                return self.all_partition_sources(index);
-            }
-            selected.entry(partition_key).or_insert(state);
-        }
-
-        Ok(selected
-            .into_iter()
-            .map(|(partition_key, state)| BoundedSnapshotVectorSource {
-                partition_key,
-                state,
-                candidate_ids: None,
-                point_load: false,
-                candidate_ids_cover_all_live: false,
-                allowed_count: 0,
-                live_count: 0,
+                        });
+                    }
+                    Ok::<(), Error>(())
+                })?;
+                Ok(result)
             })
-            .collect())
+        })
     }
 
-    /// `stream_when_refused` is set for AUTO's exhaustive work: a partition
-    /// whose vectors the database's memory cannot hold whole is then compared
-    /// by reading each stored vector through its own point read, one at a
-    /// time, instead of being refused. An exhaustive search the caller asked
-    /// for outright keeps its whole-partition load and its typed refusal.
+    /// Borrow resident facts within the current prefix scope. Authorization
+    /// is applied by the visitor's resident directory counters.
+
+    /// Durable sources stream authenticated memberships and one admitted body
+    /// at a time. AUTO may also stream a resident loader when bulk admission
+    /// refuses; explicit EXACT preserves that loader's typed refusal.
     #[allow(clippy::too_many_arguments)]
     fn brute_force_search_sources(
         &self,
@@ -4599,15 +5034,12 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         candidates: Option<&RoaringTreemap>,
         snapshot: SnapshotId,
         stream_when_refused: bool,
-    ) -> Result<SearchScores> {
-        let mut scored = SearchScores::new(index.clone(), self._accountant.clone()).for_exact();
-        // Directory metadata is snapshot-visible and already narrowed to the
-        // selected partitions and authorized identities; unrelated data never
-        // contributes to this admission.
-        let capacity = k.min(Self::aggregate_authorized_source_count(
-            sources, candidates, snapshot,
-        )?);
-        scored.reserve(capacity)?;
+        owner: &mut crate::VectorCopyAdmission,
+    ) -> Result<(SearchScores, usize)> {
+        let mut scored = SearchScores::new(index, owner.accountant().clone())?.for_exact();
+        // Grow only for rows this pass actually authenticates. A historical
+        // snapshot needs no preliminary membership-count pass.
+        let capacity = k;
         // Evaluate every eligible vector, retaining only the requested best
         // scores. Ranking callers request their complete candidate set here.
         let mut consider = |score: (RowId, f32)| -> Result<()> {
@@ -4615,49 +5047,59 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 return Ok(());
             }
             if scored.len() < capacity {
+                if scored.len() == scored.rows.capacity() {
+                    let next_capacity = scored
+                        .rows
+                        .capacity()
+                        .checked_mul(2)
+                        .unwrap_or(capacity)
+                        .max(1)
+                        .min(capacity);
+                    scored.reserve(next_capacity - scored.len())?;
+                }
                 push_bounded_score_heap(&mut scored.rows, score)?;
             } else if vector_score_quality(&score, &scored[0]) == std::cmp::Ordering::Greater {
                 replace_bounded_score_heap_root(&mut scored.rows, score)?;
             }
             Ok(())
         };
-        if let Some(candidates) = candidates {
-            for id in candidates.iter() {
-                let row_id = RowId(id);
-                for source in sources.iter() {
-                    if !source
-                        .state
-                        .try_directory_has_visible_row(row_id, snapshot)?
-                    {
-                        continue;
-                    }
-                    if let Some(score) = source.state.score_visible_candidate(
-                        index, row_id, snapshot, query,
-                        // The exhaustive route reads each row's own body.
-                        None,
-                    )? {
-                        consider((row_id, score))?;
-                    }
-                    break;
-                }
-            }
-            sort_vector_scores(&mut scored);
-            scored.truncate(k);
-            return Ok(scored);
-        }
+        let mut partition_count = 0usize;
         for source in sources {
+            let mut source_has_rows = false;
+            let mut source_consider = |score| {
+                source_has_rows = true;
+                consider(score)
+            };
             if source.state.durable_membership_source().is_some()
-                && !source.state.try_cache_durable_bodies()?
+                && !source.state.try_cache_durable_bodies(owner)?
             {
-                self.stream_source_bodies(index, source, query, snapshot, &mut consider)?;
+                self.stream_source_bodies(
+                    index,
+                    source,
+                    query,
+                    snapshot,
+                    candidates,
+                    &mut source_consider,
+                    owner,
+                )?;
+                partition_count += usize::from(source_has_rows);
                 continue;
             }
-            match source.state.ensure_raw_vectors_loaded() {
+            match source.state.ensure_raw_vectors_loaded(owner) {
                 Ok(()) => {}
                 Err(Error::MemoryBudgetExceeded { .. })
                     if stream_when_refused && source.state.streams_raw_bodies() =>
                 {
-                    self.stream_source_bodies(index, source, query, snapshot, &mut consider)?;
+                    self.stream_source_bodies(
+                        index,
+                        source,
+                        query,
+                        snapshot,
+                        candidates,
+                        &mut source_consider,
+                        owner,
+                    )?;
+                    partition_count += usize::from(source_has_rows);
                     continue;
                 }
                 Err(error) => return Err(error),
@@ -4674,14 +5116,15 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     }
                     #[cfg(feature = "test-seams")]
                     observe_native_vector_score_for_test();
-                    consider((entry.row_id, entry.vector.cosine_similarity(query)))?;
+                    source_consider((entry.row_id, entry.vector.cosine_similarity(query)))?;
                 }
                 Ok::<(), Error>(())
             })?;
+            partition_count += usize::from(source_has_rows);
         }
         sort_vector_scores(&mut scored);
         scored.truncate(k);
-        Ok(scored)
+        Ok((scored, partition_count))
     }
 
     /// Compare every row one partition's snapshot shows by reading each
@@ -4694,9 +5137,11 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         source: &BoundedSnapshotVectorSource,
         query: &[f32],
         snapshot: SnapshotId,
+        candidates: Option<&RoaringTreemap>,
         consider: &mut impl FnMut((RowId, f32)) -> Result<()>,
+        owner: &mut crate::VectorCopyAdmission,
     ) -> Result<()> {
-        let accountant = self._accountant.clone();
+        let accountant = owner.accountant().clone();
         let mut before_retain = |bytes: usize| -> Result<()> {
             accountant.try_allocate_for(
                 bytes,
@@ -4706,39 +5151,84 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             )
         };
         let mut release_retained = |bytes: usize| accountant.release(bytes);
-        let mut bodies = crate::store::RawVectorBodyReads::one_pass();
+        let durable = source.state.durable_membership_source();
+        let mut bodies = if durable.is_some() {
+            crate::store::RawVectorBodyReads::default()
+        } else {
+            crate::store::RawVectorBodyReads::one_pass()
+        };
         let mut session = crate::store::OnePassSession::default();
-        let _one_pass = source.state.one_pass_reads(&mut session);
-        if source.state.durable_membership_source().is_some() {
-            return source.state.bounded_visit_visible_ids_charged(
-                snapshot,
-                || Ok::<(), Error>(()),
-                |bytes| {
-                    accountant.try_allocate_for(
-                        bytes,
-                        "vector_search",
-                        "membership_window",
-                        "Reduce the query scope, or raise MEMORY_LIMIT.",
-                    )
-                },
-                |bytes| accountant.release(bytes),
-                |row_id| {
-                    if let Some(score) = source.state.bounded_score_stored_body(
-                        index,
-                        row_id,
-                        snapshot,
-                        query,
-                        &mut bodies,
-                        &mut || Ok::<(), Error>(()),
-                        &mut || Ok(()),
-                        &mut before_retain,
-                        &mut release_retained,
-                    )? {
-                        consider((row_id, score))?;
+        let _one_pass = if durable.is_none() {
+            source.state.one_pass_reads(&mut session)
+        } else {
+            None
+        };
+        if let Some(memberships) = durable {
+            let mut window = owner.scratch();
+            let mut interrupted = None;
+            let opened = memberships.open(&mut |request| {
+                let result = match request {
+                    crate::store::DormantVectorLoadRequest::Reserve(bytes) => window.reserve(bytes),
+                    _ => Ok(()),
+                };
+                if let Err(error) = result {
+                    interrupted = Some(error);
+                    false
+                } else {
+                    true
+                }
+            });
+            if let Some(error) = interrupted {
+                return Err(error);
+            }
+            let mut cursor = opened?;
+            loop {
+                let mut interrupted = None;
+                let next = cursor.next_with_body_identity(&mut |request| {
+                    let result = match request {
+                        crate::store::DormantVectorLoadRequest::Reserve(bytes) => {
+                            window.reserve(bytes)
+                        }
+                        _ => Ok(()),
+                    };
+                    if let Err(error) = result {
+                        interrupted = Some(error);
+                        false
+                    } else {
+                        true
                     }
-                    Ok(())
-                },
-            );
+                });
+                if let Some(error) = interrupted {
+                    return Err(error);
+                }
+                let Some((visible, identity)) = next? else {
+                    break;
+                };
+                if candidates.is_some_and(|ids| !ids.contains(visible.row_id.0))
+                    || visible.created_tx.0 > snapshot.0
+                    || visible.deleted_tx.is_some_and(|tx| tx.0 <= snapshot.0)
+                {
+                    continue;
+                }
+                source
+                    .state
+                    .bind_streamed_membership(&*cursor, &mut bodies, owner)?;
+                if let Some(score) = source.state.bounded_score_streamed_body(
+                    index,
+                    identity,
+                    snapshot,
+                    query,
+                    &mut bodies,
+                    &mut || Ok::<(), Error>(()),
+                    &mut || Ok(()),
+                    &mut before_retain,
+                    &mut release_retained,
+                    owner,
+                )? {
+                    consider((visible.row_id, score))?;
+                }
+            }
+            return Ok(());
         }
         let mut position = 0usize;
         while let Some(visible) = source.state.visible_directory_row_at(position, snapshot) {
@@ -4748,6 +5238,9 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             let Some(row_id) = visible else {
                 continue;
             };
+            if candidates.is_some_and(|ids| !ids.contains(row_id.0)) {
+                continue;
+            }
             if let Some(score) = source.state.bounded_score_stored_body(
                 index,
                 row_id,
@@ -4758,6 +5251,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 &mut || Ok(()),
                 &mut before_retain,
                 &mut release_retained,
+                owner,
             )? {
                 consider((row_id, score))?;
             }
@@ -4765,34 +5259,11 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         Ok(())
     }
 
-    fn aggregate_resident_authorized_source_count(
-        sources: &[BoundedSnapshotVectorSource],
-        candidates: Option<&RoaringTreemap>,
-        snapshot: SnapshotId,
-    ) -> usize {
-        if let Some(candidates) = candidates {
-            return candidates
-                .iter()
-                .filter(|id| {
-                    sources
-                        .iter()
-                        .any(|source| source.state.directory_has_visible_row(RowId(*id), snapshot))
-                })
-                .count();
-        }
-        sources.iter().fold(0usize, |count, source| {
-            count.saturating_add(
-                source
-                    .state
-                    .directory_visible_entry_count(snapshot, candidates),
-            )
-        })
-    }
-
     fn aggregate_authorized_source_count(
         sources: &[BoundedSnapshotVectorSource],
         candidates: Option<&RoaringTreemap>,
         snapshot: SnapshotId,
+        owner: &mut crate::VectorCopyAdmission,
     ) -> Result<usize> {
         if let Some(candidates) = candidates {
             let mut count = 0usize;
@@ -4800,7 +5271,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 for source in sources {
                     if source
                         .state
-                        .try_directory_has_visible_row(RowId(id), snapshot)?
+                        .try_directory_has_visible_row(RowId(id), snapshot, owner)?
                     {
                         count += 1;
                         break;
@@ -4814,7 +5285,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 .checked_add(
                     source
                         .state
-                        .try_directory_visible_entry_count(snapshot, None)?,
+                        .try_directory_visible_entry_count(snapshot, None, owner)?,
                 )
                 .ok_or_else(|| Error::Other("vector authorized count overflow".into()))
         })
@@ -4829,10 +5300,142 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         index: &VectorIndexRef,
         candidates: Option<&RoaringTreemap>,
         snapshot: SnapshotId,
+        owner: &mut crate::VectorCopyAdmission,
     ) -> Result<usize> {
+        if candidates.is_some_and(|ids| ids.is_empty()) {
+            return Ok(0);
+        }
+        let partitioned = self
+            .store
+            .with_index_layout(index, |layout| layout.is_partitioned())?;
+        let mut metadata = owner.local_scratch();
         self.store.with_bulk_read(|| {
-            let sources = self.selected_partition_sources(index, candidates, snapshot)?;
-            Self::aggregate_authorized_source_count(&sources, candidates, snapshot)
+            PARTITION_SEARCH_SCOPES.with(|scopes| {
+                let scopes = scopes.borrow();
+                let prefixes = partitioned
+                    .then(|| {
+                        scopes
+                            .iter()
+                            .rev()
+                            .find(|(scoped, _)| scoped == index)
+                            .map(|(_, prefixes)| prefixes)
+                    })
+                    .flatten();
+                let selected = |key: &VectorPartitionKey| {
+                    prefixes.is_none_or(|prefixes| {
+                        prefixes
+                            .iter()
+                            .any(|prefix| partition_key_has_prefix(key, prefix))
+                    })
+                };
+                if partitioned && let Some(ids) = candidates {
+                    let mut count = 0usize;
+                    let mut fallback = false;
+                    for id in ids.iter() {
+                        let visible = match self.store.snapshot_visible_partition_matches(
+                            index,
+                            RowId(id),
+                            snapshot,
+                            selected,
+                            metadata.as_mut().unwrap_or(owner),
+                        )? {
+                            Some(visible) => visible,
+                            None => {
+                                fallback = true;
+                                break;
+                            }
+                        };
+                        count = count.checked_add(usize::from(visible)).ok_or_else(|| {
+                            Error::Other("vector authorized count overflow".into())
+                        })?;
+                    }
+                    if !fallback {
+                        return Ok(count);
+                    }
+                }
+                // Only handles are copied while the directory is guarded.
+                // All membership IO happens after with_partition_sources returns.
+                let states =
+                    crate::ScopedVectorCopy::new(metadata.as_mut().unwrap_or(owner), |copies| {
+                        let mut admitted_capacity = 0usize;
+                        loop {
+                            let capacity = self.store.with_partition_sources(index, |sources| {
+                                let mut count = 0usize;
+                                sources.visit(|key, _| {
+                                    if selected(key) {
+                                        count = count.checked_add(1).ok_or_else(|| {
+                                            Error::Other("vector source capacity overflow".into())
+                                        })?;
+                                    }
+                                    Ok::<(), Error>(())
+                                })?;
+                                Ok::<_, Error>(count)
+                            })?;
+                            if capacity > admitted_capacity {
+                                copies.reserve(
+                                    (capacity - admitted_capacity)
+                                        .checked_mul(std::mem::size_of::<
+                                            Arc<crate::store::IndexState>,
+                                        >())
+                                        .ok_or_else(|| {
+                                            Error::Other("vector source capacity overflow".into())
+                                        })?,
+                                )?;
+                                admitted_capacity = capacity;
+                            }
+                            let mut states = Vec::with_capacity(admitted_capacity);
+                            let complete = self.store.with_partition_sources(index, |sources| {
+                                let mut complete = true;
+                                sources.visit(|key, state| {
+                                    if selected(key) {
+                                        if states.len() == admitted_capacity {
+                                            complete = false;
+                                        } else {
+                                            states.push(Arc::clone(state));
+                                        }
+                                    }
+                                    Ok::<(), Error>(())
+                                })?;
+                                Ok::<_, Error>(complete)
+                            })?;
+                            if complete {
+                                return Ok(states);
+                            }
+                            // A concurrent partition insertion exceeded the quote.
+                            // Drop handles and admit the new quote outside the guard.
+                        }
+                    })?;
+                let mut count = 0usize;
+                if let Some(ids) = candidates {
+                    for id in ids.iter() {
+                        for state in states.iter() {
+                            if state.try_directory_has_visible_row(
+                                RowId(id),
+                                snapshot,
+                                metadata.as_mut().unwrap_or(owner),
+                            )? {
+                                count = count.checked_add(1).ok_or_else(|| {
+                                    Error::Other("vector authorized count overflow".into())
+                                })?;
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    for state in states.iter() {
+                        count = count
+                            .checked_add(state.try_directory_visible_entry_count(
+                                snapshot,
+                                None,
+                                metadata.as_mut().unwrap_or(owner),
+                            )?)
+                            .ok_or_else(|| {
+                                Error::Other("vector authorized count overflow".into())
+                            })?;
+                    }
+                }
+                Ok(count)
+            })
         })
     }
 
@@ -4848,6 +5451,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         mut before_source: impl FnMut() -> std::result::Result<(), E>,
         mut acquire: impl FnMut(usize) -> std::result::Result<(), E>,
         mut release: impl FnMut(usize),
+        owner: &mut crate::VectorCopyAdmission,
     ) -> std::result::Result<usize, E>
     where
         E: From<Error>,
@@ -4860,8 +5464,10 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             || Ok(()),
             &mut acquire,
             &mut release,
+            owner,
         )?;
-        let result = self.bounded_rank_candidate_k_grouped(index, limit, &groups, before_source);
+        let result =
+            self.bounded_rank_candidate_k_grouped(index, limit, &groups, before_source, owner);
         release(groups.into_retained_bytes());
         result
     }
@@ -4875,12 +5481,13 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         limit: usize,
         groups: &BoundedVectorCandidateGroups,
         mut before_source: impl FnMut() -> std::result::Result<(), E>,
+        owner: &mut crate::VectorCopyAdmission,
     ) -> std::result::Result<usize, E>
     where
         E: From<Error>,
     {
         before_source()?;
-        let layout = self.store.index_layout(index).map_err(E::from)?;
+        let layout = self.store.scoped_index_layout(index, owner).map_err(E::from)?;
         let mut breadth = limit;
         let mut allowed = 0usize;
         for source in &groups.sources {
@@ -4897,6 +5504,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                             groups.snapshot,
                             None,
                             &mut before_source,
+                            owner,
                         )?,
                         limit,
                     )
@@ -4914,9 +5522,9 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         candidates: Option<&RoaringTreemap>,
         snapshot: SnapshotId,
         mode: contextdb_core::VectorSearchMode,
-    ) -> Result<(Vec<(RowId, f32)>, VectorSearchDebugTrace)> {
-        self.search_with_mode_owned(index, query, k, candidates, snapshot, mode)
-            .map(|(rows, trace)| (rows.into_vec(), trace))
+        executing_owner: Arc<dyn MemoryBudget>,
+    ) -> Result<(SearchScores, OwnedVectorSearchTrace)> {
+        self.search_with_mode_owned(index, query, k, candidates, snapshot, mode, executing_owner)
     }
 
     pub fn search_with_mode_owned(
@@ -4927,21 +5535,24 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         candidates: Option<&RoaringTreemap>,
         snapshot: SnapshotId,
         mode: contextdb_core::VectorSearchMode,
-    ) -> Result<(SearchScores, VectorSearchDebugTrace)> {
+        executing_owner: Arc<dyn MemoryBudget>,
+    ) -> Result<(SearchScores, OwnedVectorSearchTrace)> {
         self.store.with_bulk_read(|| {
             if k == 0 {
                 return Ok((
-                    SearchScores::new(index.clone(), self._accountant.clone()),
-                    VectorSearchDebugTrace::brute_force(
+                    SearchScores::new(&index, executing_owner.clone())?,
+                    OwnedVectorSearchTrace::brute_force(
                         &index,
                         &[],
                         "empty_limit",
                         None,
                         Vec::new(),
-                    ),
+                        executing_owner.clone(),
+                    )?,
                 ));
             }
-            let layout = self.store.index_layout(&index)?;
+            let mut route_owner = crate::VectorCopyAdmission::new(executing_owner.clone());
+            let layout = self.store.scoped_index_layout(&index, &mut route_owner)?;
             if query.len() != layout.dimension {
                 return Err(Error::VectorIndexDimensionMismatch {
                     index: index.clone(),
@@ -4951,35 +5562,50 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             }
             if candidates.is_some_and(|candidates| candidates.is_empty()) {
                 return Ok((
-                    SearchScores::new(index.clone(), self._accountant.clone()),
-                    VectorSearchDebugTrace::brute_force(
+                    SearchScores::new(&index, executing_owner.clone())?,
+                    OwnedVectorSearchTrace::brute_force(
                         &index,
                         &[],
                         "empty_candidates",
                         None,
                         Vec::new(),
-                    ),
+                        executing_owner.clone(),
+                    )?,
                 ));
             }
-            let sources = self.selected_partition_sources(&index, candidates, snapshot)?;
+            let source_candidates = if mode == contextdb_core::VectorSearchMode::Exact {
+                // EXACT authenticates candidates during its one membership pass;
+                // route narrowing must not add per-row membership seeks first.
+                None
+            } else {
+                candidates
+            };
+            let sources = self.selected_partition_sources(
+                &index,
+                source_candidates,
+                snapshot,
+                &mut route_owner,
+            )?;
             if sources.is_empty() {
                 return Ok((
-                    SearchScores::new(index.clone(), self._accountant.clone()),
-                    VectorSearchDebugTrace::brute_force(
+                    SearchScores::new(&index, executing_owner.clone())?,
+                    OwnedVectorSearchTrace::brute_force(
                         &index,
                         &[],
                         "empty_index",
                         None,
                         Vec::new(),
-                    ),
+                        executing_owner.clone(),
+                    )?,
                 ));
             }
             let exact = |reason: &'static str,
-                         hnsw_len: Option<usize>|
-             -> Result<(SearchScores, VectorSearchDebugTrace)> {
-                // AUTO's exhaustive work streams what the database's memory
-                // cannot hold whole; EXACT keeps its whole-partition load.
-                let rows = self.brute_force_search_sources(
+                         hnsw_len: Option<usize>,
+                         owner: &mut crate::VectorCopyAdmission|
+             -> Result<(SearchScores, OwnedVectorSearchTrace)> {
+                // Durable EXACT and exhaustive AUTO share the authenticated
+                // membership/body stream; resident loader policy is preserved.
+                let (rows, partition_count) = self.brute_force_search_sources(
                     &index,
                     &sources,
                     query,
@@ -4987,30 +5613,29 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     candidates,
                     snapshot,
                     mode == contextdb_core::VectorSearchMode::Auto,
+                    owner,
                 )?;
-                let partition_routes = sources
-                    .iter()
-                    .map(|source| {
-                        Ok((source
-                            .state
-                            .try_directory_visible_entry_count(snapshot, candidates)?
-                            != 0)
-                            .then_some(VectorPartitionSearchTrace {
-                                route: VectorPartitionSearchRoute::Exact,
-                                reason,
-                            }))
-                    })
-                    .collect::<Result<Vec<_>>>()?
-                    .into_iter()
-                    .flatten()
-                    .collect();
-                let trace = VectorSearchDebugTrace::brute_force(
+                let mut trace_owner = crate::VectorCopyAdmission::new(executing_owner.clone());
+                trace_owner.reserve(
+                    partition_count
+                        .checked_mul(std::mem::size_of::<VectorPartitionSearchTrace>())
+                        .ok_or_else(|| Error::Other("vector trace capacity overflow".into()))?,
+                )?;
+                let partition_routes = vec![
+                    VectorPartitionSearchTrace {
+                        route: VectorPartitionSearchRoute::Exact,
+                        reason,
+                    };
+                    partition_count
+                ];
+                let trace = OwnedVectorSearchTrace::brute_force_with_owner(
                     &index,
                     &rows,
                     reason,
                     hnsw_len,
                     partition_routes,
-                );
+                    trace_owner,
+                )?;
                 #[cfg(feature = "test-seams")]
                 observe_exact_scores_for_test(
                     ExactScorePhaseForTest::Scored,
@@ -5020,7 +5645,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 Ok((rows, trace))
             };
             if mode == contextdb_core::VectorSearchMode::Exact {
-                return exact("exact_requested", None);
+                return exact("exact_requested", None, &mut route_owner);
             }
             if !query_has_positive_finite_norm(query) {
                 if mode == contextdb_core::VectorSearchMode::Indexed {
@@ -5028,12 +5653,16 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                         index: index.clone(),
                     });
                 }
-                return exact("non_positive_query_norm", None);
+                return exact("non_positive_query_norm", None, &mut route_owner);
             }
 
             if mode == contextdb_core::VectorSearchMode::Auto {
-                let authorized_count =
-                    Self::aggregate_authorized_source_count(&sources, candidates, snapshot)?;
+                let authorized_count = Self::aggregate_authorized_source_count(
+                    &sources,
+                    candidates,
+                    snapshot,
+                    &mut route_owner,
+                )?;
                 if authorized_count < layout.effective_auto_index_at() {
                     return exact(
                         if matches!(layout.quantization, VectorQuantization::F32) {
@@ -5042,6 +5671,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                             "quantized_exact_search"
                         },
                         None,
+                        &mut route_owner,
                     );
                 }
             }
@@ -5058,7 +5688,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             self.store
                 .pause_registry()
                 .maybe_pause(&index, crate::test_seam::PauseWindow::Search);
-            let accountant = self._accountant.clone();
+            let accountant = executing_owner.clone();
             let mut before_retain = |bytes: usize| -> Result<()> {
                 accountant.try_allocate_for(
                     bytes,
@@ -5097,6 +5727,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     || Ok(()),
                     &mut before_retain,
                     &mut release_retained,
+                    &mut route_owner,
                 )?;
                 let outcome = self.bounded_hnsw_search_grouped(
                     &index,
@@ -5113,6 +5744,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     || Ok(()),
                     &mut before_retain,
                     &mut release_retained,
+                    &mut route_owner,
                 );
                 release_retained(groups.into_retained_bytes());
                 outcome
@@ -5135,42 +5767,37 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             };
             match searched? {
                 BoundedHnswOutcome::CompleteEmpty => Ok((
-                    SearchScores::new(index.clone(), self._accountant.clone()),
-                    VectorSearchDebugTrace::brute_force(
+                    SearchScores::new(&index, executing_owner.clone())?,
+                    OwnedVectorSearchTrace::brute_force(
                         &index,
                         &[],
                         "empty_index",
                         None,
                         Vec::new(),
-                    ),
+                        executing_owner.clone(),
+                    )?,
                 )),
                 BoundedHnswOutcome::Complete(BoundedHnswResult {
                     mut rows,
                     trace,
                     retained_bytes,
                 }) => {
-                    // The rows keep their charge and carry it out; the trace
-                    // leaves bounded accounting here, as the SQL find's does.
                     let trace_bytes = trace.retained_bytes();
-                    let trace = trace.into_trace();
-                    release_retained(trace_bytes);
+                    let trace =
+                        OwnedVectorSearchTrace::from_charged(trace, executing_owner.clone());
                     rows.truncate(k);
-                    let scores = SearchScores {
+                    let scores = SearchScores::from_charged(
                         rows,
-                        credit: ScoreCredit {
-                            budget: self._accountant.clone(),
-                            bytes: retained_bytes.saturating_sub(trace_bytes),
-                        },
-                        index: index.clone(),
-                        exact_budget: false,
-                    };
+                        &index,
+                        executing_owner.clone(),
+                        retained_bytes.saturating_sub(trace_bytes),
+                    )?;
                     Ok((scores, trace))
                 }
                 BoundedHnswOutcome::ExactRequired { trace, .. } => {
-                    let trace_bytes = trace.retained_bytes();
-                    let mut trace = trace.into_trace();
-                    release_retained(trace_bytes);
-                    let rows = self.brute_force_search_sources(
+                    let mut trace =
+                        OwnedVectorSearchTrace::from_charged(trace, executing_owner.clone());
+                    let (rows, _) = self.brute_force_search_sources(
                         &index,
                         &sources,
                         query,
@@ -5178,8 +5805,9 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                         candidates,
                         snapshot,
                         mode == contextdb_core::VectorSearchMode::Auto,
+                        &mut route_owner,
                     )?;
-                    trace.final_row_ids = rows.iter().map(|(row_id, _)| *row_id).collect();
+                    trace.replace_final_rows(&rows)?;
                     #[cfg(feature = "test-seams")]
                     observe_exact_scores_for_test(
                         ExactScorePhaseForTest::Scored,
@@ -5192,13 +5820,13 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     if mode == contextdb_core::VectorSearchMode::Indexed {
                         return Err(unavailable(false));
                     }
-                    exact("maintained_graph_unavailable", None)
+                    exact("maintained_graph_unavailable", None, &mut route_owner)
                 }
                 BoundedHnswOutcome::Incomplete { .. } => {
                     if mode == contextdb_core::VectorSearchMode::Indexed {
                         return Err(unavailable(candidates.is_some()));
                     }
-                    exact("maintained_graph_incomplete", None)
+                    exact("maintained_graph_incomplete", None, &mut route_owner)
                 }
             }
         })
@@ -5214,7 +5842,8 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         k: usize,
         candidates: Option<&RoaringTreemap>,
         snapshot: SnapshotId,
-    ) -> Result<(Vec<(RowId, f32)>, VectorSearchDebugTrace)> {
+        executing_owner: Arc<dyn MemoryBudget>,
+    ) -> Result<(SearchScores, OwnedVectorSearchTrace)> {
         self.search_with_mode(
             index,
             query,
@@ -5222,6 +5851,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             candidates,
             snapshot,
             contextdb_core::VectorSearchMode::Auto,
+            executing_owner,
         )
     }
 
@@ -5233,22 +5863,28 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         k: usize,
         candidates: Option<&RoaringTreemap>,
         snapshot: SnapshotId,
-    ) -> Result<(Vec<(RowId, f32)>, VectorSearchDebugTrace)> {
-        self.search_with_strategy(index, query, k, candidates, snapshot)
+        executing_owner: Arc<dyn MemoryBudget>,
+    ) -> Result<(SearchScores, OwnedVectorSearchTrace)> {
+        self.search_with_strategy(index, query, k, candidates, snapshot, executing_owner)
     }
 
     /// Compatibility availability probe. Despite its retained name, this is
     /// now an observer: only explicit store maintenance may build a graph.
     pub fn ensure_hnsw_built(&self, index: &VectorIndexRef, snapshot: SnapshotId) -> Result<bool> {
         self.store.with_bulk_read(|| {
-            let states = self.all_partition_states(index)?;
             let snapshot_tx = TxId::from_snapshot(snapshot);
-            for state in states.iter().filter(|state| state.vector_count() != 0) {
-                if state.max_tx() > snapshot_tx || !state.has_complete_hnsw_route() {
-                    return Ok(false);
-                }
-            }
-            Ok(true)
+            let mut complete = true;
+            self.store.with_partition_sources(index, |sources| {
+                sources.visit(|_, state| {
+                    if state.vector_count() != 0
+                        && (state.max_tx() > snapshot_tx || !state.has_complete_hnsw_route())
+                    {
+                        complete = false;
+                    }
+                    Ok::<(), Error>(())
+                })
+            })?;
+            Ok(complete)
         })
     }
 
@@ -5257,26 +5893,12 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         index: &VectorIndexRef,
         candidates: Option<&RoaringTreemap>,
         snapshot: SnapshotId,
-    ) -> bool {
-        self.store.with_bulk_read(|| {
-            let Ok(sources) = self.selected_partition_sources(index, candidates, snapshot) else {
-                return false;
-            };
-            let aggregate_count =
-                Self::aggregate_resident_authorized_source_count(&sources, candidates, snapshot);
-            if aggregate_count == 0 {
-                return false;
-            }
-            sources
-                .iter()
-                .filter(|source| {
-                    source
-                        .state
-                        .directory_visible_entry_count(snapshot, candidates)
-                        != 0
-                })
-                .all(|source| source.state.has_complete_hnsw_route())
-        })
+    ) -> Result<bool> {
+        if !self.store.contains_index(index) {
+            return Ok(false);
+        }
+        let mut owner = crate::VectorCopyAdmission::new(self._accountant.clone());
+        self.try_hnsw_eligible_without_build(index, candidates, snapshot, &mut owner)
     }
 
     #[doc(hidden)]
@@ -5285,16 +5907,20 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         index: &VectorIndexRef,
         candidates: Option<&RoaringTreemap>,
         snapshot: SnapshotId,
+        owner: &mut crate::VectorCopyAdmission,
     ) -> Result<bool> {
+        let mut local_copy_admission = owner.local_scratch();
+        let owner = local_copy_admission.as_mut().unwrap_or(owner);
         self.store.with_bulk_read(|| {
-            let sources = self.selected_partition_sources(index, candidates, snapshot)?;
-            if Self::aggregate_authorized_source_count(&sources, candidates, snapshot)? == 0 {
+            let sources = self.selected_partition_sources(index, candidates, snapshot, owner)?;
+            if Self::aggregate_authorized_source_count(&sources, candidates, snapshot, owner)? == 0
+            {
                 return Ok(false);
             }
             for source in &sources {
                 if source
                     .state
-                    .try_directory_visible_entry_count(snapshot, candidates)?
+                    .try_directory_visible_entry_count(snapshot, candidates, owner)?
                     != 0
                     && !source.state.has_complete_hnsw_route()
                 {
@@ -5314,16 +5940,19 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         index: &VectorIndexRef,
         candidates: Option<&RoaringTreemap>,
         snapshot: SnapshotId,
+        owner: &mut crate::VectorCopyAdmission,
     ) -> Result<(bool, bool, bool)> {
+        let mut local_copy_admission = owner.local_scratch();
+        let owner = local_copy_admission.as_mut().unwrap_or(owner);
         self.store.with_bulk_read(|| {
-            let sources = self.selected_partition_sources(index, candidates, snapshot)?;
+            let sources = self.selected_partition_sources(index, candidates, snapshot, owner)?;
             let mut base = false;
             let mut change = false;
             let mut tail = false;
             for source in sources {
                 if source
                     .state
-                    .try_directory_visible_entry_count(snapshot, candidates)?
+                    .try_directory_visible_entry_count(snapshot, candidates, owner)?
                     == 0
                 {
                     continue;
@@ -5348,9 +5977,12 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         index: &VectorIndexRef,
         candidates: Option<&[u64]>,
         snapshot: SnapshotId,
+        owner: &mut crate::VectorCopyAdmission,
     ) -> Result<(bool, bool, bool)> {
+        let mut local_copy_admission = owner.local_scratch();
+        let owner = local_copy_admission.as_mut().unwrap_or(owner);
         self.store.with_bulk_read(|| {
-            let sources = self.selected_partition_sources(index, None, snapshot)?;
+            let sources = self.selected_partition_sources(index, None, snapshot, owner)?;
             let mut base = false;
             let mut change = false;
             let mut tail = false;
@@ -5359,6 +5991,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     snapshot,
                     candidates,
                     || Ok::<(), Error>(()),
+                    owner,
                 )? == 0
                 {
                     continue;
@@ -5381,22 +6014,25 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         k: usize,
         candidates: Option<&RoaringTreemap>,
         snapshot: SnapshotId,
+        owner: &mut crate::VectorCopyAdmission,
     ) -> Result<bool> {
+        let mut local_copy_admission = owner.local_scratch();
+        let owner = local_copy_admission.as_mut().unwrap_or(owner);
         self.store.with_bulk_read(|| {
-            let layout = self.store.index_layout(index)?;
-            let sources = self.selected_partition_sources(index, candidates, snapshot)?;
+            let layout = self.store.scoped_index_layout(index, owner)?;
+            let sources = self.selected_partition_sources(index, candidates, snapshot, owner)?;
             let mut nonempty = false;
             for source in sources {
                 let allowed = source
                     .state
-                    .try_directory_visible_entry_count(snapshot, candidates)?;
+                    .try_directory_visible_entry_count(snapshot, candidates, owner)?;
                 if allowed == 0 {
                     continue;
                 }
                 nonempty = true;
                 let count = source
                     .state
-                    .try_directory_visible_entry_count(snapshot, None)?;
+                    .try_directory_visible_entry_count(snapshot, None, owner)?;
                 let ef = layout
                     .resolve_policy(count, search_policy_limit(k))
                     .hnsw_ef_search;
@@ -5416,42 +6052,18 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         k: usize,
         candidates: Option<&RoaringTreemap>,
         snapshot: SnapshotId,
-    ) -> bool {
-        self.store.with_bulk_read(|| {
-            let Ok(layout) = self.store.index_layout(index) else {
-                return false;
-            };
-            let Ok(sources) = self.selected_partition_sources(index, candidates, snapshot) else {
-                return false;
-            };
-            let nonempty = sources
-                .iter()
-                .filter(|source| {
-                    source
-                        .state
-                        .directory_visible_entry_count(snapshot, candidates)
-                        != 0
-                })
-                .collect::<Vec<_>>();
-            !nonempty.is_empty()
-                && nonempty.into_iter().all(|source| {
-                    let visible_partition_count =
-                        source.state.directory_visible_entry_count(snapshot, None);
-                    let allowed_count = source
-                        .state
-                        .directory_visible_entry_count(snapshot, candidates);
-                    let ef_search = layout
-                        .resolve_policy(visible_partition_count, search_policy_limit(k))
-                        .hnsw_ef_search;
-                    source.state.has_complete_hnsw_route()
-                        && crate::hnsw::hnsw_search_candidate_cap_for_ef(ef_search, k)
-                            >= allowed_count
-                })
-        })
+    ) -> Result<bool> {
+        if !self.store.contains_index(index) {
+            return Ok(false);
+        }
+        let mut owner = crate::VectorCopyAdmission::new(self._accountant.clone());
+        self.try_hnsw_search_covers_all_without_build(index, k, candidates, snapshot, &mut owner)
     }
 }
 
 impl<S: WriteSetApplicator> VectorExecutor for MemVectorExecutor<S> {
+    type SearchOwner = Arc<dyn MemoryBudget>;
+    type SearchOutput = SearchScores;
     fn search(
         &self,
         index: VectorIndexRef,
@@ -5459,8 +6071,9 @@ impl<S: WriteSetApplicator> VectorExecutor for MemVectorExecutor<S> {
         k: usize,
         candidates: Option<&RoaringTreemap>,
         snapshot: SnapshotId,
-    ) -> Result<Vec<(RowId, f32)>> {
-        self.search_with_strategy(index, query, k, candidates, snapshot)
+        executing_owner: Self::SearchOwner,
+    ) -> Result<Self::SearchOutput> {
+        self.search_with_strategy(index, query, k, candidates, snapshot, executing_owner)
             .map(|(rows, _)| rows)
     }
 
@@ -5470,7 +6083,9 @@ impl<S: WriteSetApplicator> VectorExecutor for MemVectorExecutor<S> {
         index: VectorIndexRef,
         row_id: RowId,
         vector: Vec<f32>,
+        executing_owner: Self::SearchOwner,
     ) -> Result<()> {
+        let mut owner = crate::VectorCopyAdmission::new(executing_owner);
         self.store.validate_vector(&index, vector.len())?;
         let entry = VectorEntry {
             index: index.clone(),
@@ -5480,10 +6095,12 @@ impl<S: WriteSetApplicator> VectorExecutor for MemVectorExecutor<S> {
             deleted_tx: None,
             lsn: contextdb_core::Lsn(0),
         };
-        let existing_live = self
-            .store
-            .live_entry_for_row(&index, row_id, self.tx_mgr.snapshot())
-            .is_some();
+        let existing_live = self.store.has_live_entry_for_row(
+            &index,
+            row_id,
+            self.tx_mgr.snapshot(),
+            &mut owner,
+        )?;
 
         self.tx_mgr.with_write_set(tx, |ws| {
             ws.vector_inserts
@@ -5525,12 +6142,21 @@ impl<S: WriteSetApplicator> VectorExecutor for MemVectorExecutor<S> {
         Ok(())
     }
 
-    fn delete_vector(&self, tx: TxId, index: VectorIndexRef, row_id: RowId) -> Result<()> {
+    fn delete_vector(
+        &self,
+        tx: TxId,
+        index: VectorIndexRef,
+        row_id: RowId,
+        executing_owner: Self::SearchOwner,
+    ) -> Result<()> {
+        let mut owner = crate::VectorCopyAdmission::new(executing_owner);
         self.store.state(&index)?;
-        let existing_live = self
-            .store
-            .live_entry_for_row(&index, row_id, self.tx_mgr.snapshot())
-            .is_some();
+        let existing_live = self.store.has_live_entry_for_row(
+            &index,
+            row_id,
+            self.tx_mgr.snapshot(),
+            &mut owner,
+        )?;
         self.tx_mgr.with_write_set(tx, |ws| {
             let insert_count = ws.vector_inserts.len();
             ws.vector_inserts

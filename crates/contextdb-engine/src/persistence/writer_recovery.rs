@@ -1,5 +1,6 @@
 //! Writable-open bounds: end-key probes and non-derivable identity floors.
 use super::*;
+use super::writer_source::{SourceWindowCredit, SourceWindowOwner};
 
 pub(super) const RECOVERY_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("writer_recovery");
@@ -51,6 +52,7 @@ impl RedbPersistence {
 
     pub(crate) fn pruned_change_counts_at_root(
         root: &Arc<WriterSnapshot>,
+        owner: SourceWindowOwner,
         pruned: &HashMap<String, HashSet<(RowId, Lsn)>>,
     ) -> Result<(u64, HashMap<Lsn, u64>)> {
         let mut counts = HashMap::new();
@@ -61,7 +63,7 @@ impl RedbPersistence {
                 .map(|(_, lsn)| *lsn)
                 .collect::<HashSet<_>>();
             for lsn in lsns {
-                let mut cursor = root.table_change_cursor(table, lsn, lsn)?;
+                let mut cursor = root.table_change_cursor(owner.clone(), table, lsn, lsn)?;
                 while let Some(window) = cursor.next_table_change()? {
                     #[cfg(feature = "test-seams")]
                     crate::database::resident_history_test_seams::note(|work| {
@@ -90,7 +92,7 @@ impl RedbPersistence {
     ) -> Result<Vec<Lsn>> {
         let read = root.owner_read()?;
         let counts = read
-            .open_table(TableDefinition::<u64, u64>::new("change_log_lsn_count"))
+            .open_table(writer_history::CHANGE_LOG_LSN_COUNT)
             .map_err(Self::storage_error)?;
         let mut floor = None;
         for entry in counts.iter().map_err(Self::storage_error)? {
@@ -123,9 +125,10 @@ impl RedbPersistence {
 
     pub(crate) fn admit_retention_probe_key(
         root: &WriterSnapshot,
+        owner: &SourceWindowOwner,
         bytes: usize,
-    ) -> Result<crate::memory_accounting::OwnedMemoryReservation> {
-        root.adapter_control(bytes)
+    ) -> Result<SourceWindowCredit> {
+        root.adapter_control(owner, bytes)
     }
 
     /// A monotone upper bound can prove that no retained row is future-dated.
@@ -477,6 +480,7 @@ impl RedbPersistence {
         read: &redb::ReadTransaction,
         tables: impl IntoIterator<Item = &'a str>,
     ) -> Result<WriterOpenBounds> {
+        Self::validate_ddl_selectors_in_read(read)?;
         let record = read
             .open_table(RECOVERY_TABLE)
             .map_err(Self::storage_error)?;

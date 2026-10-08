@@ -2,6 +2,8 @@
 use super::*;
 use std::io::Write;
 
+static EMISSION: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
 impl Database {
     pub(super) fn writer_receipt_observer_for_maintenance(&self) -> Option<Arc<Database>> {
         std::env::var_os("CONTEXTDB_TEST_SEAMS_RECEIPT_PATH")?;
@@ -19,7 +21,6 @@ impl Database {
         };
         // No caller holds the commit boundary here. Serialize samples before
         // capturing their roots so concurrent commits cannot reorder the lines.
-        static EMISSION: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
         let _emission = EMISSION.lock();
         let (receipt, lsn) = self.with_writer_memory_ownership_receipt_for_test(|receipt| {
             (receipt, self.tx_mgr.capture_published_read().lsn)
@@ -48,6 +49,13 @@ impl Database {
                 "raw_vector_bodies": receipt.vector.raw_vector_bodies,
                 "raw_reverse_directory": receipt.vector.raw_reverse_directory,
                 "partition_vectors": receipt.vector.partition_vectors,
+                "vector_partition_controls": receipt.vector.vector_partition_controls,
+                "source_metadata": receipt.vector.source_metadata,
+                "reader_source_metadata": receipt.vector.reader_source_metadata,
+                "reader_last_query_trace": receipt.vector.reader_last_query_trace,
+                "reader_child_controls": receipt.vector.reader_child_controls,
+                "reader_acl_cache": receipt.vector.reader_acl_cache,
+                "reader_parent_total": receipt.vector.reader_parent_total,
                 "base_graph": receipt.vector.base_graph,
                 "change_graph": receipt.vector.change_graph,
                 "mutable_tail": receipt.vector.mutable_tail,
@@ -219,17 +227,7 @@ impl Database {
             "rss_bytes": rss_bytes,
             "receipt": owners,
         });
-        let bytes = serde_json::to_vec(&line).map(|mut bytes| {
-            bytes.push(b'\n');
-            bytes
-        });
-        let result = bytes.map_err(std::io::Error::other).and_then(|bytes| {
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .and_then(|mut file| file.write_all(&bytes))
-        });
+        let result = append_receipt(&path, &line);
         if let Err(error) = result {
             tracing::warn!(?path, %error, "test-seams writer receipt emission failed");
         }
@@ -248,4 +246,41 @@ fn current_process_rss_bytes() -> Option<u64> {
                 .ok()?
                 .checked_mul(1024)
         })
+}
+
+// The caller holds EMISSION; each writer/search sample is one complete line.
+fn append_receipt(path: &std::ffi::OsStr, line: &serde_json::Value) -> std::io::Result<()> {
+    let mut bytes = serde_json::to_vec(line).map_err(std::io::Error::other)?;
+    bytes.push(b'\n');
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?
+        .write_all(&bytes)
+}
+
+pub(crate) fn emit_vector_search_receipt(
+    ordinal: u64,
+    builds: u64,
+    inserts: u64,
+    candidates: u64,
+    elapsed_us: u128,
+) {
+    let Some(path) = std::env::var_os("CONTEXTDB_TEST_SEAMS_RECEIPT_PATH") else {
+        return;
+    };
+    let _emission = EMISSION.lock();
+    let line = serde_json::json!({
+        "kind": "vector_search",
+        "search_ordinal": ordinal,
+        "graph_builds_observed": builds,
+        "graph_insertions_observed": inserts,
+        "candidates": candidates,
+        "elapsed_us": elapsed_us,
+        "pid": std::process::id(),
+        "thread_id": format!("{:?}", std::thread::current().id()),
+    });
+    if let Err(error) = append_receipt(&path, &line) {
+        tracing::warn!(%error, "cannot append vector search test receipt");
+    }
 }

@@ -9,6 +9,138 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
+/// A selected metadata answer and the actual requesting read's allocation lease.
+/// Keep the lease through use; consuming the answer transfers it explicitly.
+pub(crate) struct AdmittedRecords {
+    records: Vec<Record>,
+    memory: Arc<crate::read_image_memory::ImageMemory>,
+}
+impl std::ops::Deref for AdmittedRecords {
+    type Target = [Record];
+    fn deref(&self) -> &Self::Target {
+        &self.records
+    }
+}
+impl AdmittedRecords {
+    pub(crate) fn memory(&self) -> Arc<crate::read_image_memory::ImageMemory> {
+        self.memory.clone()
+    }
+    pub(crate) fn into_parts(self) -> (Vec<Record>, Arc<crate::read_image_memory::ImageMemory>) {
+        (self.records, self.memory)
+    }
+}
+/// One executing custody operation retains every admitted selection until use ends.
+pub(crate) struct SelectionHold {
+    images: Vec<Arc<crate::read_image_memory::ImageMemory>>,
+    credit: contextdb_core::read_memory::ReadCredit,
+}
+impl SelectionHold {
+    pub(crate) fn new(read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>) -> Self {
+        Self {
+            images: Vec::new(),
+            credit: contextdb_core::read_memory::ReadCredit::new(read_memory),
+        }
+    }
+    pub(crate) fn retain(&mut self, selected: AdmittedRecords) -> Result<Vec<Record>> {
+        if self.images.len() == self.images.capacity() {
+            self.credit.try_grow_for(
+                std::mem::size_of::<Arc<crate::read_image_memory::ImageMemory>>()
+                    + if self.images.is_empty() {
+                        crate::sync_types::held::ALLOCATION_BYTES
+                    } else {
+                        0
+                    },
+                "reader",
+                "retain_custody_selection",
+                "Reduce custody metadata selected by this operation.",
+            )?;
+            self.images.reserve_exact(1);
+        }
+        let image = selected.memory();
+        let (records, _previous_image) = selected.into_parts();
+        self.images.push(image);
+        Ok(records)
+    }
+}
+
+struct KeyScratch {
+    memory: Arc<crate::read_image_memory::ImageMemory>,
+    bytes: usize,
+}
+impl KeyScratch {
+    fn new(memory: Arc<crate::read_image_memory::ImageMemory>, count: usize) -> Result<Self> {
+        let bytes = if count == 0 {
+            0
+        } else {
+            count
+                .checked_mul(std::mem::size_of::<&String>())
+                .and_then(|bytes| bytes.checked_add(crate::sync_types::held::ALLOCATION_BYTES))
+                .ok_or_else(invalid)?
+        };
+        memory.reserve(bytes)?;
+        Ok(Self { memory, bytes })
+    }
+}
+impl Drop for KeyScratch {
+    fn drop(&mut self) {
+        self.memory.release(self.bytes);
+    }
+}
+
+fn copy_records<'a>(
+    source: impl Iterator<Item = &'a Record> + Clone,
+    memory: Arc<crate::read_image_memory::ImageMemory>,
+) -> Result<AdmittedRecords> {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_add(bytes.len())
+                .ok_or_else(|| std::io::Error::other("custody record encoding size overflow"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let count = source.clone().count();
+    if count != 0 {
+        memory.reserve(
+            count
+                .checked_mul(std::mem::size_of::<Record>())
+                .and_then(|bytes| bytes.checked_add(crate::sync_types::held::ALLOCATION_BYTES))
+                .ok_or_else(invalid)?,
+        )?;
+    }
+    let mut records = Vec::with_capacity(count);
+    for record in source {
+        let mut count = Count(0);
+        serde::Serialize::serialize(
+            record,
+            &mut rmp_serde::Serializer::new(&mut count).with_struct_map(),
+        )
+        .map_err(|_| invalid())?;
+        let wire_bytes = count.0;
+        let credit = wire_bytes
+            .checked_add(crate::sync_types::held::ALLOCATION_BYTES)
+            .ok_or_else(invalid)?;
+        memory.reserve(credit)?;
+        let decoded = (|| {
+            let mut bytes = Vec::with_capacity(wire_bytes);
+            serde::Serialize::serialize(
+                record,
+                &mut rmp_serde::Serializer::new(&mut bytes).with_struct_map(),
+            )
+            .map_err(|_| invalid())?;
+            memory.decode_msgpack::<Record>(&bytes)
+        })();
+        memory.release(credit);
+        records.push(decoded?);
+    }
+    Ok(AdmittedRecords { records, memory })
+}
+
 #[derive(Default)]
 pub(crate) struct Store {
     pub records: BTreeMap<String, Record>,
@@ -195,53 +327,134 @@ impl Store {
             self.pending.insert(id);
         }
     }
-    pub fn pending(&self) -> Vec<Record> {
-        self.pending
-            .iter()
-            .filter_map(|id| {
-                self.records
-                    .get(&format!("delivery_manifest.v1.{}", id.simple()))
-                    .cloned()
-            })
-            .collect()
+    pub fn pending(
+        &self,
+        memory: Arc<crate::read_image_memory::ImageMemory>,
+    ) -> Result<AdmittedRecords> {
+        copy_records(
+            self.pending.iter().filter_map(|id| {
+                self.groups.get(&submission_group(*id)).and_then(|keys| {
+                    keys.iter()
+                        .filter_map(|key| self.records.get(key))
+                        .find(|record| matches!(record, Record::Manifest(_)))
+                })
+            }),
+            memory,
+        )
     }
-    pub fn select(&mut self, selectors: &[String]) -> Vec<Record> {
-        let keys = self.selected_keys(selectors);
-        self.selected_records += keys.len() as u64;
-        self.read_visits += keys.len() as u64;
-        keys.into_iter()
-            .filter_map(|k| self.records.get(&k).cloned())
-            .collect()
+    pub fn select(
+        &mut self,
+        selectors: &[String],
+        memory: Arc<crate::read_image_memory::ImageMemory>,
+    ) -> Result<AdmittedRecords> {
+        // A borrowed key directory avoids copying every selected key body.
+        let (count, answer) = {
+            let mut slots = 0usize;
+            for selector in selectors {
+                slots = slots
+                    .checked_add(if let Some(group) = selector.strip_prefix('@') {
+                        self.groups.get(group).map_or(0, BTreeSet::len)
+                    } else {
+                        self.records
+                            .range::<str, _>((
+                                std::ops::Bound::Included(selector.as_str()),
+                                std::ops::Bound::Unbounded,
+                            ))
+                            .take_while(|(key, _)| key.starts_with(selector))
+                            .count()
+                    })
+                    .ok_or_else(invalid)?;
+            }
+            let scratch = KeyScratch::new(memory.clone(), slots)?;
+            let mut keys = Vec::with_capacity(slots);
+            for selector in selectors {
+                if let Some(group) = selector.strip_prefix('@') {
+                    if let Some(found) = self.groups.get(group) {
+                        keys.extend(found.iter());
+                    }
+                } else {
+                    keys.extend(
+                        self.records
+                            .range::<str, _>((
+                                std::ops::Bound::Included(selector.as_str()),
+                                std::ops::Bound::Unbounded,
+                            ))
+                            .take_while(|(key, _)| key.starts_with(selector))
+                            .map(|(key, _)| key),
+                    );
+                }
+            }
+            keys.sort_unstable();
+            keys.dedup();
+            let count = keys.len();
+            let answer = copy_records(
+                keys.iter().filter_map(|key| self.records.get(*key)),
+                memory.clone(),
+            );
+            drop(keys);
+            drop(scratch);
+            (count, answer)
+        };
+        self.selected_records += count as u64;
+        self.read_visits += count as u64;
+        answer
     }
-    pub fn select_table(&mut self, table: &str) -> Vec<Record> {
-        let mut keys = BTreeSet::new();
-        for (group, members) in self
-            .groups
-            .range("submission:".to_owned()..)
-            .take_while(|(group, _)| group.starts_with("submission:"))
-        {
-            let _ = group;
-            self.read_visits += members.len() as u64;
-            if members.iter().any(|key| {
-                matches!(self.records.get(key),
-                    Some(Record::Manifest(m)) if m.seal.root.table == table)
-                    || matches!(self.records.get(key),
-                        Some(Record::Root { life, .. }) if life.original_table == table)
-                    || matches!(self.records.get(key),
-                        Some(Record::Terminal { record, .. }) if record.root.table == table)
-            }) {
-                keys.extend(members.iter().cloned());
+    pub fn select_table(
+        &mut self,
+        table: &str,
+        memory: Arc<crate::read_image_memory::ImageMemory>,
+    ) -> Result<AdmittedRecords> {
+        let relevant = |members: &BTreeSet<String>| {
+            members.iter().any(|key| {
+            matches!(self.records.get(key), Some(Record::Manifest(m)) if m.seal.root.table == table)
+                || matches!(self.records.get(key), Some(Record::Root { life, .. }) if life.original_table == table)
+                || matches!(self.records.get(key), Some(Record::Terminal { record, .. }) if record.root.table == table)
+        })
+        };
+        let groups = || {
+            self.groups
+                .range::<str, _>((
+                    std::ops::Bound::Included("submission:"),
+                    std::ops::Bound::Unbounded,
+                ))
+                .take_while(|(group, _)| group.starts_with("submission:"))
+        };
+        let mut slots = self.groups.get("authority").map_or(0, BTreeSet::len);
+        let mut visits = 0u64;
+        for (_, members) in groups() {
+            visits += members.len() as u64;
+            if relevant(members) {
+                slots = slots.checked_add(members.len()).ok_or_else(invalid)?;
+            }
+        }
+        let scratch = KeyScratch::new(memory.clone(), slots)?;
+        let mut keys = Vec::with_capacity(slots);
+        for (_, members) in groups() {
+            if relevant(members) {
+                keys.extend(members.iter());
             }
         }
         if let Some(authority) = self.groups.get("authority") {
-            keys.extend(authority.iter().cloned());
+            keys.extend(authority.iter());
         }
-        self.selected_records += keys.len() as u64;
-        keys.into_iter()
-            .filter_map(|key| self.records.get(&key).cloned())
-            .collect()
+        keys.sort_unstable();
+        keys.dedup();
+        let count = keys.len();
+        let answer = copy_records(
+            keys.iter().filter_map(|key| self.records.get(*key)),
+            memory.clone(),
+        );
+        drop(keys);
+        drop(scratch);
+        self.read_visits += visits;
+        self.selected_records += count as u64;
+        answer
     }
-    pub fn select_rows(&mut self, rows: &[RowRef]) -> Result<Vec<Record>> {
+    pub fn select_rows(
+        &mut self,
+        rows: &[RowRef],
+        memory: Arc<crate::read_image_memory::ImageMemory>,
+    ) -> Result<AdmittedRecords> {
         let mut keys = BTreeSet::new();
         for row in rows {
             for group in [root_group(row), format!("row:{}", hex(&row.bytes()))] {
@@ -266,15 +479,12 @@ impl Store {
                 keys.extend(found.iter().cloned());
             }
         }
-        let objects = keys
-            .iter()
-            .filter_map(|key| match self.records.get(key) {
-                Some(Record::Terminal { record, .. }) => {
-                    Some(object_digest(1, &record.bytes().ok()?, &record.signature))
-                }
-                _ => None,
-            })
-            .collect::<BTreeSet<_>>();
+        let mut objects = BTreeSet::new();
+        for key in &keys {
+            if let Some(Record::Terminal { record, .. }) = self.records.get(key) {
+                objects.insert(object_digest(1, &record.bytes()?, &record.signature));
+            }
+        }
         for object in objects {
             if let Some(found) = self.groups.get(&object_group(&object)) {
                 self.read_visits += found.len() as u64;
@@ -282,10 +492,7 @@ impl Store {
             }
         }
         self.selected_records += keys.len() as u64;
-        Ok(keys
-            .into_iter()
-            .filter_map(|key| self.records.get(&key).cloned())
-            .collect())
+        copy_records(keys.iter().filter_map(|key| self.records.get(key)), memory)
     }
     fn selected_keys(&self, selectors: &[String]) -> BTreeSet<String> {
         let mut keys = BTreeSet::new();

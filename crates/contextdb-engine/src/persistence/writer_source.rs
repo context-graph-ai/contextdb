@@ -56,11 +56,16 @@ struct WriterTableMeta {
 }
 
 impl WriterSnapshot {
-    pub(crate) fn row_body_bytes(&self, table: &str, row: &VersionedRow) -> Result<usize> {
+    pub(crate) fn row_body_bytes(
+        &self,
+        owner: &SourceWindowOwner,
+        table: &str,
+        row: &VersionedRow,
+    ) -> Result<usize> {
         let read = self.owner_read()?;
         #[cfg(test)]
         stored_relational_row_bytes_fault_for_test()?;
-        let _scratch = self.adapter_control(table.len().saturating_add(128))?;
+        let _scratch = self.adapter_control(owner, table.len().saturating_add(128))?;
         self.check_table_scope(table)?;
         let name = RedbPersistence::rel_table_name(table);
         let physical = read
@@ -263,6 +268,7 @@ impl RedbPersistence {
     /// their native image, but cannot decode erased families after publication.
     pub(crate) fn prepare_writer_erasure(
         &self,
+        writer: Arc<MemoryAccountant>,
         tables: &BTreeSet<String>,
         edges: &[AdjEntry],
     ) -> Result<PreparedWriterErasure> {
@@ -298,7 +304,13 @@ impl RedbPersistence {
                         .saturating_mul(2),
                 )
                 .saturating_add(std::mem::size_of::<WriterErasure>());
-            let memory = root.adapter_control(bytes)?;
+            let memory = OwnedMemoryReservation::try_new_for(
+                Arc::clone(&writer),
+                bytes,
+                "writer_source",
+                "store_adapter",
+                HINT,
+            )?;
             let mut next = WriterErasure {
                 tables: current.tables.clone(),
                 graph_keys: current.graph_keys.clone(),
@@ -467,27 +479,159 @@ pub(crate) enum WriterCursorFamily {
 /// Resume using the complete physical key, in the original captured root.
 /// A one-record window may outlive an advance only while its caller holds
 /// its admission owner. There is no decoded state on this cursor.
+/// Every operation receives its funding capability with its captured root.
+/// Read ownership cannot be recovered from the writer accountant.
+#[derive(Clone)]
+pub(crate) enum SourceWindowOwner {
+    Read(Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>),
+    Write(Arc<MemoryAccountant>),
+}
+
+pub(crate) enum SourceWindowCredit {
+    Read(contextdb_core::read_memory::ReadCredit),
+    Write(OwnedMemoryReservation),
+}
+
+impl SourceWindowOwner {
+    pub(super) fn reserve_box_credit(
+        &self,
+        bytes: usize,
+    ) -> Result<contextdb_core::read_memory::ReadCredit> {
+        let budget: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget> = match self {
+            Self::Read(read) => Arc::clone(read),
+            Self::Write(writer) => writer.clone(),
+        };
+        contextdb_core::read_memory::ReadCredit::try_new(
+            budget,
+            bytes,
+            "writer_source",
+            "store_adapter",
+            HINT,
+        )
+    }
+
+    pub(crate) fn reserve(
+        &self,
+        bytes: usize,
+        operation: &'static str,
+    ) -> Result<SourceWindowCredit> {
+        let mut credit = match self {
+            Self::Read(read) => SourceWindowCredit::Read(
+                contextdb_core::read_memory::ReadCredit::new(Arc::clone(read)),
+            ),
+            Self::Write(writer) => {
+                SourceWindowCredit::Write(OwnedMemoryReservation::new(Arc::clone(writer)))
+            }
+        };
+        match &mut credit {
+            SourceWindowCredit::Read(read) => {
+                read.try_grow_for(bytes, "writer_source", operation, HINT)?
+            }
+            SourceWindowCredit::Write(writer) => {
+                writer.try_grow_for(bytes, "writer_source", operation, HINT)?
+            }
+        }
+        Ok(credit)
+    }
+
+    pub(super) fn endpoint(
+        &self,
+        parts: &[&[u8]],
+        operation: &'static str,
+    ) -> Result<SourceResume> {
+        let len = parts.iter().try_fold(0usize, |len, part| {
+            len.checked_add(part.len())
+                .ok_or_else(|| Error::Other("source endpoint size overflow".into()))
+        })?;
+        let layout = std::alloc::Layout::array::<u8>(len)
+            .map_err(|_| Error::Other("source endpoint layout overflow".into()))?;
+        let credit = self.reserve(layout.size(), operation)?;
+        let mut key = Box::<[u8]>::new_uninit_slice(len);
+        for (slot, byte) in key
+            .iter_mut()
+            .zip(parts.iter().flat_map(|part| part.iter()))
+        {
+            slot.write(*byte);
+        }
+        // The checked length is exactly the concatenated iterator length;
+        // every element was initialized by the loop above.
+        let key = unsafe { key.assume_init() };
+        Ok(SourceResume {
+            key,
+            _credit: credit,
+        })
+    }
+
+    pub(super) fn prefix_end(
+        &self,
+        prefix: &[u8],
+        operation: &'static str,
+    ) -> Result<Option<SourceResume>> {
+        let Some(last) = prefix.iter().rposition(|byte| *byte != u8::MAX) else {
+            return Ok(None);
+        };
+        let mut endpoint = self.endpoint(&[&prefix[..=last]], operation)?;
+        endpoint.key[last] += 1;
+        Ok(Some(endpoint))
+    }
+
+    fn image(&self, root: &WriterSnapshot, operation: &'static str) -> Arc<ImageMemory> {
+        match self {
+            Self::Read(read) => ImageMemory::charging_reader_for(
+                Arc::clone(&root.accountant),
+                Arc::clone(read),
+                "writer_source",
+                operation,
+                HINT,
+            ),
+            Self::Write(writer) => {
+                ImageMemory::charging_for(Arc::clone(writer), "writer_source", operation, HINT)
+            }
+        }
+    }
+}
+
+// Each separately owned resume key carries its own credit. This composes a
+// move-only ReadCredit without a detach, readmission, or reader/writer transfer.
+pub(super) struct SourceResume {
+    pub(super) key: Box<[u8]>,
+    _credit: SourceWindowCredit,
+}
+
 pub(crate) struct WriterReadCursor {
     root: Arc<WriterSnapshot>,
-    table: String,
-    logical_table: Option<String>,
+    table: Box<str>,
+    logical_table: Option<Box<str>>,
     family: WriterCursorFamily,
-    lower: Bound<Vec<u8>>,
-    upper: Bound<Vec<u8>>,
-    after: Option<Vec<u8>>,
+    lower: Bound<Box<[u8]>>,
+    upper: Bound<Box<[u8]>>,
+    after: Option<SourceResume>,
     reverse: bool,
     finished: bool,
     examined: u64,
-    continuation: OwnedMemoryReservation,
+    owner: SourceWindowOwner,
+    _continuation: SourceWindowCredit,
+    _logical_credit: SourceWindowCredit,
 }
 
 pub(crate) struct WriterWindow<T> {
     pub(crate) value: T,
+    pub(super) position: Box<[u8]>,
+    _root: Arc<WriterSnapshot>,
     _memory: Arc<ImageMemory>,
-    pub(super) position: Vec<u8>,
 }
 
 impl<T> WriterWindow<T> {
+    /// Move the value while retaining its original source credit and root.
+    pub(crate) fn into_parts(self) -> (T, WriterWindow<()>) {
+        (self.value, WriterWindow {
+            value: (),
+            position: self.position,
+            _root: self._root,
+            _memory: self._memory,
+        })
+    }
+
     pub(crate) fn position(&self) -> &[u8] {
         &self.position
     }
@@ -495,24 +639,36 @@ impl<T> WriterWindow<T> {
     pub(super) fn map<U>(self, f: impl FnOnce(T) -> U) -> WriterWindow<U> {
         WriterWindow {
             value: f(self.value),
-            _memory: self._memory,
             position: self.position,
+            _root: self._root,
+            _memory: self._memory,
         }
     }
-    pub(super) fn boxed(self) -> Result<Box<Self>> {
-        self._memory.reserve(std::mem::size_of::<Self>())?;
-        Ok(Box::new(self))
-    }
-}
-impl WriterSnapshot {
-    pub(super) fn adapter_control(&self, bytes: usize) -> Result<OwnedMemoryReservation> {
-        OwnedMemoryReservation::try_new_for(
-            self.accountant.clone(),
-            bytes,
+    pub(super) fn boxed<U: ?Sized>(
+        self,
+        coerce: impl FnOnce(Box<Self>) -> Box<U>,
+    ) -> Result<contextdb_core::read_memory::OwnedReadBox<U>> {
+        let budget: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget> = self._memory.clone();
+        let credit = contextdb_core::read_memory::ReadCredit::try_new(
+            budget,
+            std::alloc::Layout::new::<Self>().size(),
             "writer_source",
             "store_adapter",
             HINT,
-        )
+        )?;
+        let payload = coerce(Box::new(self));
+        Ok(contextdb_core::read_memory::OwnedReadBox::new(
+            payload, credit,
+        ))
+    }
+}
+impl WriterSnapshot {
+    pub(super) fn adapter_control(
+        &self,
+        owner: &SourceWindowOwner,
+        bytes: usize,
+    ) -> Result<SourceWindowCredit> {
+        owner.reserve(bytes, "store_adapter")
     }
     #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn control_bytes(&self) -> usize {
@@ -534,6 +690,111 @@ impl WriterSnapshot {
                     .map_or(0, OwnedMemoryReservation::bytes),
             )
     }
+    pub(crate) fn content_size_totals(
+        &self,
+        memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        before_table: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<super::content_size::ContentSizeTotals> {
+        let read = self.owner_read()?;
+        super::content_size::read_totals(read.as_ref(), "writer source", memory, before_table)
+    }
+
+    /// Visit every maintained count this root stores for one column list
+    /// under one bound leading prefix, in stored key order, with the full
+    /// group key and its count. `false` means the table's counts are not ready
+    /// at this root and nothing was visited. Each record is decoded under its
+    /// own admission, released after `visit` returns, and checked against the
+    /// table, list and prefix it was asked for.
+    pub(crate) fn maintained_count_groups<E: From<Error>>(
+        &self,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        table: &str,
+        columns: &[(String, contextdb_core::SortDirection)],
+        prefix: &[DirectedValue],
+        before_touch: &mut dyn FnMut() -> std::result::Result<(), E>,
+        visit: &mut dyn FnMut(IndexKey, u64) -> std::result::Result<(), E>,
+    ) -> std::result::Result<bool, E> {
+        self.erasure
+            .read()
+            .check_scope(Some(table), RELATIONAL_INDEX_COUNT_TABLE.name())?;
+        let read = self.owner_read()?;
+        let ready = match read.open_table(RELATIONAL_INDEX_READY_TABLE) {
+            Ok(ready) => ready,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+            Err(error) => return Err(RedbPersistence::storage_error(error).into()),
+        };
+        if ready
+            .get(table)
+            .map_err(RedbPersistence::storage_error)?
+            .is_none_or(|version| version.value() != RELATIONAL_INDEX_READY_VERSION)
+        {
+            return Ok(false);
+        }
+        let counts = read
+            .open_table(RELATIONAL_INDEX_COUNT_TABLE)
+            .map_err(|error| match error {
+                redb::TableError::TableDoesNotExist(_) => Error::StoreCorrupted {
+                    path: "writer source".into(),
+                    reason: format!("maintained counts of ready table '{table}' are absent"),
+                },
+                other => RedbPersistence::storage_error(other),
+            })?;
+        let lower = RedbPersistence::relational_index_count_range_prefix(table, columns, prefix)?;
+        let upper = prefix_end(&lower);
+        let range = match upper.as_deref() {
+            Some(upper) => counts.range::<&[u8]>(lower.as_slice()..upper),
+            None => counts.range::<&[u8]>(lower.as_slice()..),
+        }
+        .map_err(RedbPersistence::storage_error)?;
+        let corrupt = |reason: &str| Error::StoreCorrupted {
+            path: "writer source".into(),
+            reason: format!("maintained count of '{table}': {reason}"),
+        };
+        for entry in range {
+            before_touch()?;
+            self.erasure
+                .read()
+                .check_scope(Some(table), RELATIONAL_INDEX_COUNT_TABLE.name())?;
+            let (key, count) = entry.map_err(RedbPersistence::storage_error)?;
+            let memory = ImageMemory::charging_reader_for(
+                Arc::clone(&self.accountant),
+                Arc::clone(&read_memory),
+                "writer_source",
+                "maintained_count_groups",
+                HINT,
+            );
+            let decoded: EncodedRelationalIndexCountKey =
+                memory.scope(|| decode_window_exact(key.value()))?;
+            if decoded.table != table
+                || decoded.columns.as_slice() != columns
+                || decoded.prefix.len() != columns.len()
+            {
+                return Err(corrupt("a record in its range names another column list").into());
+            }
+            let group: IndexKey = decoded
+                .prefix
+                .into_iter()
+                .map(|(descending, value)| {
+                    if descending {
+                        DirectedValue::Desc(TotalOrdDesc(value))
+                    } else {
+                        DirectedValue::Asc(TotalOrdAsc(value))
+                    }
+                })
+                .collect();
+            if group[..prefix.len()] != *prefix {
+                return Err(corrupt("a record in its range has another leading prefix").into());
+            }
+            let count = count.value();
+            if count == 0 {
+                return Err(corrupt("a stored count is zero").into());
+            }
+            visit(group, count)?;
+            drop(memory);
+        }
+        Ok(true)
+    }
+
     pub(super) fn owner_read(&self) -> Result<Arc<redb::ReadTransaction>> {
         self.read
             .read()
@@ -563,6 +824,7 @@ impl WriterSnapshot {
 
     pub(crate) fn cursor(
         self: &Arc<Self>,
+        owner: SourceWindowOwner,
         table: &str,
         family: WriterCursorFamily,
         lower: Bound<&[u8]>,
@@ -573,55 +835,64 @@ impl WriterSnapshot {
             Bound::Included(v) | Bound::Excluded(v) => v.len(),
             Bound::Unbounded => 0,
         };
-        let continuation = OwnedMemoryReservation::try_new_for(
-            Arc::clone(&self.accountant),
+        let logical = table.strip_prefix("rel_");
+        let continuation = owner.reserve(
             table
                 .len()
                 .saturating_add(bound_len(&lower))
-                .saturating_add(bound_len(&upper))
-                .saturating_add(std::mem::size_of::<WriterReadCursor>()),
-            "writer_source",
+                .saturating_add(bound_len(&upper)),
             "cursor_keys",
-            HINT,
         )?;
+        let logical_credit = owner.reserve(logical.map_or(0, str::len), "cursor_keys")?;
         Ok(WriterReadCursor {
             root: Arc::clone(self),
-            table: table.to_owned(),
-            logical_table: table.strip_prefix("rel_").map(str::to_owned),
+            table: Box::<str>::from(table),
+            logical_table: logical.map(Box::<str>::from),
             family,
-            lower: lower.map(<[u8]>::to_vec),
-            upper: upper.map(<[u8]>::to_vec),
+            lower: lower.map(Box::<[u8]>::from),
+            upper: upper.map(Box::<[u8]>::from),
             after: None,
             reverse,
             finished: false,
             examined: 0,
-            continuation,
+            owner,
+            _continuation: continuation,
+            _logical_credit: logical_credit,
         })
     }
 
     pub(crate) fn row_cursor(
         self: &Arc<Self>,
+        owner: SourceWindowOwner,
         table: &str,
         row_id: RowId,
     ) -> Result<WriterReadCursor> {
+        let physical = owner.endpoint(&[b"rel_", table.as_bytes()], "cursor_keys")?;
+        let name = std::str::from_utf8(&physical.key).expect("UTF-8 table name with ASCII prefix");
         let prefix = row_id.0.to_be_bytes();
-        let end = prefix_end(&prefix);
+        let end = owner.prefix_end(&prefix, "cursor_keys")?;
         self.cursor(
-            &RedbPersistence::rel_table_name(table),
+            owner,
+            name,
             WriterCursorFamily::Bytes,
             Bound::Included(&prefix),
-            end.as_deref().map_or(Bound::Unbounded, Bound::Excluded),
+            end.as_ref()
+                .map_or(Bound::Unbounded, |end| Bound::Excluded(end.key.as_ref())),
             true,
         )
     }
 
     pub(crate) fn exact_row(
         self: &Arc<Self>,
+        owner: SourceWindowOwner,
         table: &str,
         key: &[u8; 24],
     ) -> Result<WriterReadCursor> {
+        let physical = owner.endpoint(&[b"rel_", table.as_bytes()], "cursor_keys")?;
+        let name = std::str::from_utf8(&physical.key).expect("UTF-8 table name with ASCII prefix");
         self.cursor(
-            &RedbPersistence::rel_table_name(table),
+            owner,
+            name,
             WriterCursorFamily::Bytes,
             Bound::Included(key),
             Bound::Included(key),
@@ -631,27 +902,69 @@ impl WriterSnapshot {
 
     pub(crate) fn graph_cursor(
         self: &Arc<Self>,
+        owner: SourceWindowOwner,
         node: NodeId,
         reverse: bool,
     ) -> Result<WriterReadCursor> {
         let prefix = node.as_bytes();
-        let end = prefix_end(prefix);
+        let end = owner.prefix_end(prefix, "cursor_keys")?;
         self.cursor(
-            if reverse { "graph_rev" } else { "graph_fwd" },
+            owner,
+            if reverse { GRAPH_REV_TABLE.name() } else { GRAPH_FWD_TABLE.name() },
             WriterCursorFamily::Bytes,
             Bound::Included(prefix),
-            end.as_deref().map_or(Bound::Unbounded, Bound::Excluded),
+            end.as_ref()
+                .map_or(Bound::Unbounded, |end| Bound::Excluded(end.key.as_ref())),
             false,
         )
     }
 
+    /// Read the canonical body named by a placement in this exact root.
+    /// Placement lifetimes stay on the membership; the body keeps its own stamps.
+    pub(crate) fn export_vector_body(
+        self: &Arc<Self>,
+        owner: SourceWindowOwner,
+        membership: &VectorPartitionMembershipRecord,
+    ) -> Result<WriterWindow<VectorEntry>> {
+        let key_bytes = membership.index.table.len()
+            .checked_add(membership.index.column.len())
+            .and_then(|bytes| bytes.checked_add(34))
+            .ok_or_else(|| Error::Other("vector export key size overflow".into()))?;
+        let _key_credit = owner.reserve(key_bytes, "export_vector_identity")?;
+        let key = RedbPersistence::vector_identity_key(
+            &membership.index, membership.row_id,
+            membership.vector_created_tx, membership.vector_lsn);
+        let mut cursor = self.cursor(owner, VECTORS_TABLE.name(), WriterCursorFamily::Bytes,
+            Bound::Included(&key), Bound::Included(&key), false)?
+            .with_table_scope(&membership.index.table)?;
+        cursor.next(|physical_key, bytes| {
+            if physical_key != key.as_slice() {
+                return Err(Error::StoreCorrupted { path: "vectors".into(),
+                    reason: "export body key differs from source membership".into() });
+            }
+            let persisted: PersistedVectorEntry = decode_window_exact(bytes)?;
+            if persisted.index != membership.index || persisted.row_id != membership.row_id
+                || persisted.created_tx != membership.vector_created_tx
+                || persisted.lsn != membership.vector_lsn {
+                return Err(Error::StoreCorrupted { path: "vectors".into(),
+                    reason: "export body identity differs from source membership".into() });
+            }
+            crate::read_image_memory::reserve(persisted.vector.decoded_bytes())?;
+            Ok(VectorEntry { index: persisted.index, row_id: persisted.row_id,
+                vector: persisted.vector.to_f32(), created_tx: persisted.created_tx,
+                deleted_tx: persisted.deleted_tx, lsn: persisted.lsn })
+        })?.ok_or_else(|| Error::StoreCorrupted { path: "vectors".into(),
+            reason: "source membership export lost its canonical body".into() })
+    }
+
     pub(crate) fn membership_cursor(
         self: &Arc<Self>,
+        owner: SourceWindowOwner,
         index: &VectorIndexRef,
         partition: &VectorPartitionKey,
     ) -> Result<WriterReadCursor> {
-        let _scratch = OwnedMemoryReservation::try_new_for(
-            Arc::clone(&self.accountant),
+        // Legacy codec estimate: exact codec allocation sizing remains unresolved.
+        let _scratch = owner.reserve(
             partition
                 .estimated_bytes()
                 .saturating_mul(8)
@@ -663,17 +976,17 @@ impl WriterSnapshot {
                         .saturating_mul(4),
                 )
                 .saturating_add(256),
-            "writer_source",
             "membership_seek_keys",
-            HINT,
         )?;
         let prefix = RedbPersistence::vector_partition_prefix(index, partition);
-        let end = prefix_end(&prefix);
+        let end = owner.prefix_end(&prefix, "cursor_keys")?;
         self.cursor(
-            "vector_partition_membership",
+            owner,
+            VECTOR_PARTITION_MEMBERSHIP_TABLE.name(),
             WriterCursorFamily::Bytes,
             Bound::Included(&prefix),
-            end.as_deref().map_or(Bound::Unbounded, Bound::Excluded),
+            end.as_ref()
+                .map_or(Bound::Unbounded, |end| Bound::Excluded(end.key.as_ref())),
             false,
         )?
         .with_table_scope(&index.table)
@@ -683,6 +996,7 @@ impl WriterSnapshot {
     /// including complete row/version suffixes supplied by the query planner.
     pub(crate) fn index_cursor(
         self: &Arc<Self>,
+        owner: SourceWindowOwner,
         table: &str,
         index: &str,
         current: bool,
@@ -690,13 +1004,31 @@ impl WriterSnapshot {
         upper: Bound<&[u8]>,
         reverse: bool,
     ) -> Result<WriterReadCursor> {
-        let name = if current {
-            RedbPersistence::current_relational_index_table_name(table, index)
-        } else {
-            RedbPersistence::relational_index_table_name(table, index)
-        };
-        self.cursor(&name, WriterCursorFamily::Index, lower, upper, reverse)?
-            .with_table_scope(table)
+        // Same durable index-name codec: hash table, NUL, index, then
+        // format the fixed ASCII name. Both owned byte arrays are preadmitted.
+        let input = owner.endpoint(
+            &[table.as_bytes(), &[0], index.as_bytes()],
+            "index_seek_keys",
+        )?;
+        let hash = blake3::hash(&input.key).to_hex();
+        let physical = owner.endpoint(
+            &[
+                b"__rel_index_",
+                hash.as_bytes(),
+                if current { b"_current" } else { b"" },
+            ],
+            "index_seek_keys",
+        )?;
+        let name = std::str::from_utf8(&physical.key).expect("ASCII durable index table name");
+        self.cursor(
+            owner,
+            name,
+            WriterCursorFamily::Index,
+            lower,
+            upper,
+            reverse,
+        )?
+        .with_table_scope(table)
     }
 }
 
@@ -716,7 +1048,7 @@ impl WriterErasure {
     fn check_scope(&self, logical: Option<&str>, physical: &str) -> Result<()> {
         let affected = match logical {
             Some(table) => self.tables.contains(table),
-            None => !self.tables.is_empty() && !matches!(physical, "graph_fwd" | "graph_rev"),
+            None => !self.tables.is_empty() && physical != GRAPH_FWD_TABLE.name() && physical != GRAPH_REV_TABLE.name(),
         };
         if affected {
             Err(Self::refusal())
@@ -725,7 +1057,7 @@ impl WriterErasure {
         }
     }
     fn check_key(&self, physical: &str, key: &[u8]) -> Result<()> {
-        if matches!(physical, "graph_fwd" | "graph_rev") && self.graph_keys.contains(key) {
+        if (physical == GRAPH_FWD_TABLE.name() || physical == GRAPH_REV_TABLE.name()) && self.graph_keys.contains(key) {
             Err(Self::refusal())
         } else {
             Ok(())
@@ -735,9 +1067,11 @@ impl WriterErasure {
 
 impl WriterReadCursor {
     fn with_table_scope(mut self, table: &str) -> Result<Self> {
-        self.continuation
-            .try_grow_for(table.len(), "writer_source", "cursor_keys", HINT)?;
-        self.logical_table = Some(table.to_owned());
+        let credit = self.owner.reserve(table.len(), "cursor_keys")?;
+        let logical = Box::<str>::from(table);
+        let prior = self.logical_table.replace(logical);
+        drop(prior);
+        self._logical_credit = credit;
         Ok(self)
     }
     pub(crate) fn examined_entries(&self) -> u64 {
@@ -748,9 +1082,9 @@ impl WriterReadCursor {
     }
 
     fn bounds(&self) -> (Bound<&[u8]>, Bound<&[u8]>) {
-        let mut lower = self.lower.as_ref().map(|v| v.as_slice());
-        let mut upper = self.upper.as_ref().map(|v| v.as_slice());
-        if let Some(after) = self.after.as_deref() {
+        let mut lower = self.lower.as_ref().map(|v| v.as_ref());
+        let mut upper = self.upper.as_ref().map(|v| v.as_ref());
+        if let Some(after) = self.after.as_ref().map(|resume| resume.key.as_ref()) {
             if self.reverse {
                 upper = Bound::Excluded(after);
             } else {
@@ -774,34 +1108,50 @@ impl WriterReadCursor {
         before: &mut dyn FnMut() -> Result<()>,
         decode: impl FnOnce(&[u8], &[u8]) -> Result<T>,
     ) -> Result<Option<WriterWindow<T>>> {
+        self.next_before_handoff(before, decode, Ok)
+    }
+
+    fn next_before_handoff<T, H>(
+        &mut self,
+        before: &mut dyn FnMut() -> Result<()>,
+        decode: impl FnOnce(&[u8], &[u8]) -> Result<T>,
+        handoff: impl FnOnce(WriterWindow<T>) -> Result<H>,
+    ) -> Result<Option<H>> {
         if self.finished {
             return Ok(None);
         }
-        let memory = ImageMemory::charging_source(Arc::clone(&self.root.accountant));
-        let result = self.read_one(&memory, before, decode)?;
+        let memory = self.owner.image(&self.root, "cursor_window");
+        let mut found = false;
+        let result = self.read_one(
+            &memory,
+            &mut || {
+                found = true;
+                before()
+            },
+            decode,
+        );
+        if found {
+            self.examined = self.examined.saturating_add(1);
+        }
+        let result = result?;
         let Some((key, value)) = result else {
             self.finished = true;
-            if let Some(prior) = self.after.take() {
-                self.continuation.try_shrink(prior.capacity())?;
-            }
+            // Payload and its unique credit are destroyed together.
+            drop(self.after.take());
             return Ok(None);
         };
-        self.examined = self.examined.saturating_add(1);
-        // Admit both the new and old resume key while replacing, then release
-        // the old capacity. Window owns the decode; cursor owns only this key.
-        self.continuation
-            .try_grow_for(key.capacity(), "writer_source", "cursor_keys", HINT)?;
-        if let Some(prior) = self.after.replace(key) {
-            self.continuation.try_shrink(prior.capacity())?;
-        }
-        // The decode owner retains the copied physical position; the cursor
-        // separately owns and admits its resume key.
-        let position = self.after.as_ref().expect("resume key installed").clone();
-        Ok(Some(WriterWindow {
+        // read_one admitted the new resume before allocating it, while the
+        // old resume remains alive. Window position is a separate allocation.
+        memory.reserve(key.key.len())?;
+        let position = Box::<[u8]>::from(key.key.as_ref());
+        let delivered = handoff(WriterWindow {
             value,
             position,
+            _root: Arc::clone(&self.root),
             _memory: memory,
-        }))
+        })?;
+        drop(self.after.replace(key));
+        Ok(Some(delivered))
     }
 
     fn read_one<T>(
@@ -809,21 +1159,25 @@ impl WriterReadCursor {
         memory: &Arc<ImageMemory>,
         before: &mut dyn FnMut() -> Result<()>,
         decode: impl FnOnce(&[u8], &[u8]) -> Result<T>,
-    ) -> Result<Option<(Vec<u8>, T)>> {
+    ) -> Result<Option<(SourceResume, T)>> {
         let read = self.root.owner_read()?;
         self.root
             .erasure
             .read()
             .check_scope(self.logical_table.as_deref(), &self.table)?;
         let (lower, upper) = self.bounds();
-        let finish = |key: &[u8], value: &[u8]| -> Result<(Vec<u8>, T)> {
+        let finish = |key: &[u8], value: &[u8]| -> Result<(SourceResume, T)> {
             before()?;
             let erasure = self.root.erasure.read();
             erasure.check_scope(self.logical_table.as_deref(), &self.table)?;
             erasure.check_key(&self.table, key)?;
-            memory.reserve(key.len())?;
+            let credit = self.owner.reserve(key.len(), "cursor_keys")?;
+            let resume = SourceResume {
+                key: Box::<[u8]>::from(key),
+                _credit: credit,
+            };
             let decoded = memory.scope(|| decode(key, value))?;
-            Ok((key.to_vec(), decoded))
+            Ok((resume, decoded))
         };
         match self.family {
             WriterCursorFamily::Bytes => {
@@ -878,7 +1232,7 @@ impl WriterReadCursor {
                     Ok(table) => table,
                     Err(redb::TableError::TableDoesNotExist(_)) => {
                         return Err(Error::StoreCorrupted {
-                            path: self.table.clone(),
+                            path: self.table.as_ref().to_owned(),
                             reason: "missing durable posting family".into(),
                         });
                     }
@@ -941,6 +1295,13 @@ impl WriterReadCursor {
         &mut self,
         before: &mut dyn FnMut() -> Result<()>,
     ) -> Result<Option<WriterWindow<VersionedRow>>> {
+        self.next_row_before_handoff(before, Ok)
+    }
+    pub(super) fn next_row_before_handoff<H>(
+        &mut self,
+        before: &mut dyn FnMut() -> Result<()>,
+        handoff: impl FnOnce(WriterWindow<VersionedRow>) -> Result<H>,
+    ) -> Result<Option<H>> {
         #[cfg(feature = "test-seams")]
         self.root
             .note_read_source(crate::writer_query_test_seams::PhysicalFamily::Row);
@@ -951,16 +1312,20 @@ impl WriterReadCursor {
                 table,
             )
         });
-        self.next_before(before, |key, value| {
-            let row = RedbPersistence::decode_versioned_row(value, None)?;
-            if RedbPersistence::rel_row_key(&row) != key {
-                return Err(Error::StoreCorrupted {
-                    path: "relational row".into(),
-                    reason: "row cursor encountered a mismatched version key".into(),
-                });
-            }
-            Ok(row)
-        })
+        self.next_before_handoff(
+            before,
+            |key, value| {
+                let row = RedbPersistence::decode_versioned_row(value, None)?;
+                if RedbPersistence::rel_row_key(&row) != key {
+                    return Err(Error::StoreCorrupted {
+                        path: "relational row".into(),
+                        reason: "row cursor encountered a mismatched version key".into(),
+                    });
+                }
+                Ok(row)
+            },
+            handoff,
+        )
     }
 }
 
@@ -977,12 +1342,14 @@ pub(crate) struct WriterCommitCursor {
     upper: u64,
     after: Option<u64>,
     reverse: bool,
-    _control: OwnedMemoryReservation,
+    _owner: SourceWindowOwner,
+    _control: SourceWindowCredit,
 }
 
 impl WriterSnapshot {
     pub(crate) fn change_log_cursor(
         self: &Arc<Self>,
+        owner: SourceWindowOwner,
         first: Lsn,
         last: Lsn,
     ) -> Result<WriterReadCursor> {
@@ -991,7 +1358,8 @@ impl WriterSnapshot {
         let mut upper = [255; 16];
         upper[..8].copy_from_slice(&last.0.to_be_bytes());
         self.cursor(
-            "writer_change_log",
+            owner,
+            writer_history::WRITER_CHANGE_LOG_TABLE.name(),
             WriterCursorFamily::Bytes,
             Bound::Included(&lower),
             Bound::Included(&upper),
@@ -999,36 +1367,38 @@ impl WriterSnapshot {
         )
     }
 
-    pub(crate) fn config_cursor(self: &Arc<Self>, prefix: &str) -> Result<WriterReadCursor> {
-        let end = prefix_end(prefix.as_bytes());
+    pub(crate) fn config_cursor(
+        self: &Arc<Self>,
+        owner: SourceWindowOwner,
+        prefix: &str,
+    ) -> Result<WriterReadCursor> {
+        let end = owner.prefix_end(prefix.as_bytes(), "cursor_keys")?;
         self.cursor(
-            "config",
+            owner,
+            CONFIG_TABLE.name(),
             WriterCursorFamily::Text,
             Bound::Included(prefix.as_bytes()),
-            end.as_deref().map_or(Bound::Unbounded, Bound::Excluded),
+            end.as_ref()
+                .map_or(Bound::Unbounded, |end| Bound::Excluded(end.key.as_ref())),
             false,
         )
     }
 
     pub(crate) fn commit_cursor(
         self: &Arc<Self>,
+        owner: SourceWindowOwner,
         first: Lsn,
         last: Lsn,
         reverse: bool,
     ) -> Result<WriterCommitCursor> {
-        let control = OwnedMemoryReservation::try_new_for(
-            Arc::clone(&self.accountant),
-            std::mem::size_of::<WriterCommitCursor>(),
-            "writer_source",
-            "commit_cursor",
-            HINT,
-        )?;
+        let control = owner.reserve(std::mem::size_of::<WriterCommitCursor>(), "commit_cursor")?;
         Ok(WriterCommitCursor {
             root: Arc::clone(self),
             lower: first.0,
             upper: last.0,
             after: None,
             reverse,
+            _owner: owner,
             _control: control,
         })
     }
@@ -1053,25 +1423,23 @@ impl WriterSnapshot {
         ))
     }
 
-    pub(crate) fn sync_source(&self, table: &str, row_id: RowId) -> Result<Option<(Lsn, u8)>> {
+    pub(crate) fn sync_source(
+        &self,
+        owner: SourceWindowOwner,
+        table: &str,
+        row_id: RowId,
+    ) -> Result<Option<(Lsn, u8)>> {
         let read = self.owner_read()?;
         let erasure = self.erasure.read();
         erasure.check_scope(Some(table), "sync provenance")?;
-        let _scratch = OwnedMemoryReservation::try_new_for(
-            Arc::clone(&self.accountant),
-            table.len().saturating_add(8),
-            "writer_source",
-            "sync_point",
-            HINT,
-        )?;
-        let key = RedbPersistence::sync_row_source_lsn_key(table, row_id);
+        let key = owner.endpoint(&[table.as_bytes(), &row_id.0.to_be_bytes()], "sync_point")?;
         let lsns = match read.open_table(SYNC_ROW_SOURCE_LSN_TABLE) {
             Ok(table) => table,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
             Err(e) => return Err(RedbPersistence::storage_error(e)),
         };
         let Some(lsn) = lsns
-            .get(key.as_slice())
+            .get(key.key.as_ref())
             .map_err(RedbPersistence::storage_error)?
         else {
             return Ok(None);
@@ -1080,7 +1448,7 @@ impl WriterSnapshot {
             .open_table(SYNC_ROW_SOURCE_KIND_TABLE)
             .map_err(RedbPersistence::storage_error)?;
         let kind = kinds
-            .get(key.as_slice())
+            .get(key.key.as_ref())
             .map_err(RedbPersistence::storage_error)?
             .ok_or_else(|| Error::Other("sync source LSN has no source-kind sidecar".into()))?;
         Ok(Some((Lsn(lsn.value()), kind.value())))
@@ -1099,6 +1467,14 @@ impl WriterReadCursor {
         current: bool,
         before: &mut dyn FnMut() -> Result<()>,
     ) -> Result<Option<WriterWindow<WriterIndexPosting>>> {
+        self.next_index_before_handoff(current, before, Ok)
+    }
+    pub(super) fn next_index_before_handoff<H>(
+        &mut self,
+        current: bool,
+        before: &mut dyn FnMut() -> Result<()>,
+        handoff: impl FnOnce(WriterWindow<WriterIndexPosting>) -> Result<H>,
+    ) -> Result<Option<H>> {
         #[cfg(feature = "test-seams")]
         self.root
             .note_read_source(crate::writer_query_test_seams::PhysicalFamily::Posting);
@@ -1108,58 +1484,72 @@ impl WriterReadCursor {
                 let expected = DurableRelationalIndexKey::new(target.clone(), RowId(0), TxId(0));
                 expected.is_ok_and(|expected| {
                     matches!(&self.lower,
-                    Bound::Included(lower) if *lower == expected.0)
+                    Bound::Included(lower) if lower.as_ref() == expected.0.as_slice())
                 })
             })
         });
-        self.next_before(before, |key, value| {
-            let encoded = decode_window_exact::<EncodedRelationalIndexPosition>(key)?;
-            crate::read_image_memory::reserve(key.len().saturating_mul(2))?;
-            if RedbPersistence::encode(&encoded)? != key {
-                return Err(Error::StoreCorrupted {
-                    path: "relational index".into(),
-                    reason: "noncanonical posting key".into(),
-                });
-            }
-            let position: RelationalIndexPosition = encoded.into();
-            if current && position.created_tx != TxId(0) {
-                return Err(Error::StoreCorrupted {
-                    path: "current relational index".into(),
-                    reason: "current posting has a version suffix".into(),
-                });
-            }
-            let (created_tx, deleted_tx) = if current {
-                (decode_window_exact(value)?, None)
-            } else {
-                (position.created_tx, decode_window_exact(value)?)
-            };
-            Ok(WriterIndexPosting {
-                tuple: position.key,
-                row_id: position.row_id,
-                created_tx,
-                deleted_tx,
-            })
-        })
+        self.next_before_handoff(
+            before,
+            |key, value| {
+                let encoded = decode_window_exact::<EncodedRelationalIndexPosition>(key)?;
+                crate::read_image_memory::reserve(key.len().saturating_mul(2))?;
+                if RedbPersistence::encode(&encoded)? != key {
+                    return Err(Error::StoreCorrupted {
+                        path: "relational index".into(),
+                        reason: "noncanonical posting key".into(),
+                    });
+                }
+                let position: RelationalIndexPosition = encoded.into();
+                if current && position.created_tx != TxId(0) {
+                    return Err(Error::StoreCorrupted {
+                        path: "current relational index".into(),
+                        reason: "current posting has a version suffix".into(),
+                    });
+                }
+                let (created_tx, deleted_tx) = if current {
+                    (decode_window_exact(value)?, None)
+                } else {
+                    (position.created_tx, decode_window_exact(value)?)
+                };
+                Ok(WriterIndexPosting {
+                    tuple: position.key,
+                    row_id: position.row_id,
+                    created_tx,
+                    deleted_tx,
+                })
+            },
+            handoff,
+        )
     }
 
     pub(crate) fn next_edge(&mut self) -> Result<Option<WriterWindow<AdjEntry>>> {
-        let reverse = self.table == "graph_rev";
-        self.next(|key, value| {
-            let edge: AdjEntry = decode_window_exact(value)?;
-            crate::read_image_memory::reserve(key.len())?;
-            let expected = if reverse {
-                RedbPersistence::graph_rev_key(&edge)
-            } else {
-                RedbPersistence::graph_fwd_key(&edge)
-            };
-            if expected != key {
-                return Err(Error::StoreCorrupted {
-                    path: "graph adjacency".into(),
-                    reason: "edge key does not match its payload".into(),
-                });
-            }
-            Ok(edge)
-        })
+        self.next_edge_handoff(Ok)
+    }
+    pub(super) fn next_edge_handoff<H>(
+        &mut self,
+        handoff: impl FnOnce(WriterWindow<AdjEntry>) -> Result<H>,
+    ) -> Result<Option<H>> {
+        let reverse = self.table.as_ref() == GRAPH_REV_TABLE.name();
+        self.next_before_handoff(
+            &mut || Ok(()),
+            |key, value| {
+                let edge: AdjEntry = decode_window_exact(value)?;
+                crate::read_image_memory::reserve(key.len())?;
+                let expected = if reverse {
+                    RedbPersistence::graph_rev_key(&edge)
+                } else {
+                    RedbPersistence::graph_fwd_key(&edge)
+                };
+                if expected != key {
+                    return Err(Error::StoreCorrupted {
+                        path: "graph adjacency".into(),
+                        reason: "edge key does not match its payload".into(),
+                    });
+                }
+                Ok(edge)
+            },
+            handoff,
+        )
     }
 
     pub(crate) fn next_membership(
@@ -1233,32 +1623,35 @@ impl WriterCommitCursor {
 impl WriterSnapshot {
     pub(crate) fn table_change_cursor(
         self: &Arc<Self>,
+        owner: SourceWindowOwner,
         table: &str,
         first: Lsn,
         last: Lsn,
     ) -> Result<WriterReadCursor> {
-        let _scratch = OwnedMemoryReservation::try_new_for(
-            Arc::clone(&self.accountant),
-            table.len().saturating_mul(2).saturating_add(34),
-            "writer_source",
+        let lower = owner.endpoint(
+            &[
+                table.as_bytes(),
+                &[0],
+                &first.0.to_be_bytes(),
+                &0_u64.to_be_bytes(),
+            ],
             "history_seek_keys",
-            HINT,
         )?;
-        let mut lower = Vec::with_capacity(table.len() + 17);
-        lower.extend_from_slice(table.as_bytes());
-        lower.push(0);
-        lower.extend_from_slice(&first.0.to_be_bytes());
-        lower.extend_from_slice(&0_u64.to_be_bytes());
-        let mut upper = Vec::with_capacity(table.len() + 17);
-        upper.extend_from_slice(table.as_bytes());
-        upper.push(0);
-        upper.extend_from_slice(&last.0.to_be_bytes());
-        upper.extend_from_slice(&u64::MAX.to_be_bytes());
+        let upper = owner.endpoint(
+            &[
+                table.as_bytes(),
+                &[0],
+                &last.0.to_be_bytes(),
+                &u64::MAX.to_be_bytes(),
+            ],
+            "history_seek_keys",
+        )?;
         self.cursor(
-            "change_log_by_table",
+            owner,
+            writer_history::CHANGE_LOG_BY_TABLE.name(),
             WriterCursorFamily::Bytes,
-            Bound::Included(&lower),
-            Bound::Included(&upper),
+            Bound::Included(&lower.key),
+            Bound::Included(&upper.key),
             false,
         )?
         .with_table_scope(table)
@@ -1266,7 +1659,7 @@ impl WriterSnapshot {
 
     pub(crate) fn change_log_occurrences(&self, lsn: Lsn) -> Result<u64> {
         let read = self.owner_read()?;
-        let counts = match read.open_table(TableDefinition::<u64, u64>::new("change_log_lsn_count"))
+        let counts = match read.open_table(writer_history::CHANGE_LOG_LSN_COUNT)
         {
             Ok(table) => table,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
@@ -1279,12 +1672,13 @@ impl WriterSnapshot {
     }
 
     pub(crate) fn config_point<T: serde::de::DeserializeOwned>(
-        &self,
+        self: &Arc<Self>,
+        owner: SourceWindowOwner,
         key: &str,
     ) -> Result<Option<WriterWindow<T>>> {
         let read = self.owner_read()?;
         let erasure = self.erasure.read();
-        erasure.check_scope(None, "config")?;
+        erasure.check_scope(None, CONFIG_TABLE.name())?;
         let table = match read.open_table(CONFIG_TABLE) {
             Ok(table) => table,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
@@ -1293,16 +1687,12 @@ impl WriterSnapshot {
         let Some(value) = table.get(key).map_err(RedbPersistence::storage_error)? else {
             return Ok(None);
         };
-        let memory = ImageMemory::charging_for(
-            Arc::clone(&self.accountant),
-            "writer_source",
-            "sync_point",
-            HINT,
-        );
+        let memory = owner.image(self, "sync_point");
         let value = memory.scope(|| decode_window_exact(value.value()))?;
         Ok(Some(WriterWindow {
             value,
-            position: Vec::new(),
+            position: Box::default(),
+            _root: Arc::clone(self),
             _memory: memory,
         }))
     }
@@ -1348,11 +1738,14 @@ impl RedbPersistence {
 impl WriterSnapshot {
     pub(crate) fn exact_index_cursor(
         self: &Arc<Self>,
+        owner: SourceWindowOwner,
         table: &str,
         index: &str,
         current: bool,
         tuple: &IndexKey,
     ) -> Result<WriterReadCursor> {
+        // Codec clone/encode allocation sizing remains unresolved; this legacy
+        // admission does not prove actual allocation or excess capacity coverage.
         let tuple_bytes = tuple
             .iter()
             .map(|part| match part {
@@ -1360,16 +1753,14 @@ impl WriterSnapshot {
                 DirectedValue::Desc(value) => value.0.estimated_bytes(),
             })
             .fold(0usize, usize::saturating_add);
-        let _scratch = OwnedMemoryReservation::try_new_for(
-            Arc::clone(&self.accountant),
+        let _scratch = owner.reserve(
             tuple_bytes.saturating_mul(8).saturating_add(256),
-            "writer_source",
             "index_seek_keys",
-            HINT,
         )?;
         let lower = DurableRelationalIndexKey::new(tuple.clone(), RowId(0), TxId(0))?;
         let upper = DurableRelationalIndexKey::new(tuple.clone(), RowId(u64::MAX), TxId(u64::MAX))?;
         self.index_cursor(
+            owner,
             table,
             index,
             current,
@@ -1384,11 +1775,14 @@ impl WriterSnapshot {
     /// Build an admitted physical endpoint using the persistence codec. Query
     /// adapters need not duplicate its encoding or its row/version suffixes.
     pub(crate) fn index_position_key(
-        &self,
+        self: &Arc<Self>,
+        owner: SourceWindowOwner,
         tuple: &IndexKey,
         row_id: RowId,
         created_tx: TxId,
     ) -> Result<WriterWindow<Vec<u8>>> {
+        // Codec clone/encode allocation sizing remains unresolved; this legacy
+        // admission does not prove actual allocation or excess capacity coverage.
         let tuple_bytes = tuple
             .iter()
             .map(|part| match part {
@@ -1396,17 +1790,13 @@ impl WriterSnapshot {
                 DirectedValue::Desc(value) => value.0.estimated_bytes(),
             })
             .fold(0usize, usize::saturating_add);
-        let memory = ImageMemory::charging_for(
-            Arc::clone(&self.accountant),
-            "writer_source",
-            "index_seek_keys",
-            HINT,
-        );
+        let memory = owner.image(self, "index_seek_keys");
         memory.reserve(tuple_bytes.saturating_mul(8).saturating_add(256))?;
         let key = DurableRelationalIndexKey::new(tuple.clone(), row_id, created_tx)?;
         Ok(WriterWindow {
             value: key.0,
-            position: Vec::new(),
+            position: Box::default(),
+            _root: Arc::clone(self),
             _memory: memory,
         })
     }

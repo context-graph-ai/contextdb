@@ -1,4 +1,5 @@
 use crate::memory_budget::MemoryBudget;
+use crate::store::VectorMembershipProvenance;
 use contextdb_core::{Lsn, RowId, TxId, VectorEntry, VectorIndexRef, VectorQuantization};
 use parking_lot::Mutex;
 use std::ops::Deref;
@@ -9,6 +10,8 @@ const HNSW_HEADER_BYTES: usize = 12;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct StoredVectorEntry {
+    pub membership: VectorMembershipProvenance,
+    pub canonical_deleted_tx: Option<TxId>,
     pub row_id: RowId,
     pub vector: StoredVector,
     pub created_tx: TxId,
@@ -19,6 +22,13 @@ pub(crate) struct StoredVectorEntry {
 impl StoredVectorEntry {
     pub fn from_vector_entry(entry: VectorEntry, quantization: VectorQuantization) -> Self {
         Self {
+            membership: VectorMembershipProvenance::new(
+                entry.created_tx,
+                entry.lsn,
+                entry.created_tx,
+                entry.deleted_tx,
+            ),
+            canonical_deleted_tx: entry.deleted_tx,
             row_id: entry.row_id,
             vector: StoredVector::from_f32(&entry.vector, quantization),
             created_tx: entry.created_tx,
@@ -29,6 +39,13 @@ impl StoredVectorEntry {
 
     pub fn from_vector_entry_ref(entry: &VectorEntry, quantization: VectorQuantization) -> Self {
         Self {
+            membership: VectorMembershipProvenance::new(
+                entry.created_tx,
+                entry.lsn,
+                entry.created_tx,
+                entry.deleted_tx,
+            ),
+            canonical_deleted_tx: entry.deleted_tx,
             row_id: entry.row_id,
             vector: StoredVector::from_f32(&entry.vector, quantization),
             created_tx: entry.created_tx,
@@ -56,6 +73,8 @@ impl StoredVectorEntry {
     /// when their source was promoted by a previous fallible open.
     pub(crate) fn owned_copy(&self) -> Self {
         Self {
+            membership: self.membership,
+            canonical_deleted_tx: self.canonical_deleted_tx,
             row_id: self.row_id,
             vector: self.vector.owned_copy(),
             created_tx: self.created_tx,
@@ -65,7 +84,11 @@ impl StoredVectorEntry {
     }
 
     pub fn visible_at(&self, snapshot: contextdb_core::SnapshotId) -> bool {
-        self.created_tx.0 <= snapshot.0 && self.deleted_tx.is_none_or(|tx| tx.0 > snapshot.0)
+        self.membership.visible_from.0 <= snapshot.0
+            && self
+                .membership
+                .deleted_tx
+                .is_none_or(|tx| tx.0 > snapshot.0)
     }
 }
 

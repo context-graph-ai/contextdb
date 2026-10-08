@@ -23,8 +23,8 @@ fn committed(
     path: &std::path::Path,
     rows: u64,
     key_bytes: usize,
-) -> (redb::Database, Vec<ContentIdentityMutation>) {
-    let database = redb::Database::create(path).expect("create proof fixture");
+) -> (ProofFixtureDatabase, Vec<ContentIdentityMutation>) {
+    let database = ProofFixtureDatabase::create(path).expect("create proof fixture");
     let records = (0..rows)
         .map(|row| wide_posting(row, key_bytes))
         .collect::<Vec<_>>();
@@ -33,7 +33,7 @@ fn committed(
     RedbPersistence::apply_content_identity_mutations_in_write(
         &write,
         &records,
-        &mut ProofAdmission::unaccounted(),
+        &mut database.admission(None),
     )
     .unwrap();
     write.commit().unwrap();
@@ -157,7 +157,7 @@ fn a_wide_key_writer_transaction_holds_its_proof_path_not_its_postings() {
         RedbPersistence::apply_content_identity_mutations_in_write(
             &write,
             &replacements,
-            &mut ProofAdmission::unaccounted(),
+            &mut database.admission(None),
         )
         .unwrap();
         write.commit().unwrap();
@@ -256,7 +256,7 @@ fn a_refused_wide_key_transaction_returns_its_charge_and_changes_no_stored_byte(
     let budget = accountant(256 * 1024);
     let baseline = budget.usage().used;
     let write = database.begin_write().unwrap();
-    let mut admission = ProofAdmission::new(Some(Arc::clone(&budget)));
+    let mut admission = database.admission(Some(Arc::clone(&budget)));
     let failure = RedbPersistence::apply_content_identity_mutations_in_write(
         &write,
         &replacements(&records),
@@ -290,7 +290,7 @@ fn a_refused_wide_key_transaction_returns_its_charge_and_changes_no_stored_byte(
     // the budget and not the work.
     let generous = accountant(64 * 1024 * 1024);
     let write = database.begin_write().unwrap();
-    let mut admission = ProofAdmission::new(Some(Arc::clone(&generous)));
+    let mut admission = database.admission(Some(Arc::clone(&generous)));
     RedbPersistence::apply_content_identity_mutations_in_write(
         &write,
         &replacements(&records),
@@ -344,7 +344,7 @@ fn a_damaged_chunk_aborts_the_walk_and_changes_no_stored_byte() {
     let budget = accountant(64 * 1024 * 1024);
     let baseline = budget.usage().used;
     let write = database.begin_write().unwrap();
-    let mut admission = ProofAdmission::new(Some(Arc::clone(&budget)));
+    let mut admission = database.admission(Some(Arc::clone(&budget)));
     let failure = RedbPersistence::apply_content_identity_mutations_in_write(
         &write,
         &replacements(&records),
@@ -567,42 +567,145 @@ fn a_tight_reader_admits_every_transient_and_returns_all_of_it() {
     }
 }
 
-/// Every proof allocation is admitted before it is made. The record of having
-/// read a chunk is a map node in `seen`, and a refused admission must therefore
-/// leave that map exactly as it found it.
+/// Every writer record lives in the reusable admitted window. Refusing
+/// that window must leave the stored chunk records and bodies untouched.
 #[test]
 fn a_refused_chunk_record_is_never_inserted_before_it_is_admitted() {
+    use redb::ReadableTableMetadata;
+    let directory = tempfile::tempdir().unwrap();
+    let database =
+        ProofFixtureDatabase::create(directory.path().join("refused-window.db")).unwrap();
+    let write = database.begin_write().unwrap();
+    let mut table = write.open_table(CONTENT_IDENTITY_NODES_TABLE).unwrap();
     let accountant = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(1));
     accountant
         .try_allocate(1)
         .expect("consume the whole budget so nothing more can be admitted");
-    let mut admission = ProofAdmission::new(Some(Arc::clone(&accountant)));
-    let mut cache = ProofCache::new();
-    let key = node_storage_key(LogicalFamily::SchemaAndIndexes, &[7u8; 32]);
-    let node = Node {
-        level: 0,
-        entries: Vec::new(),
-        subtree_hash: [9u8; 32],
-    };
+    let mut admission = database.admission(Some(Arc::clone(&accountant)));
+    let family = LogicalFamily::SchemaAndIndexes;
+    let root = empty_root(family);
 
-    let refused = cache.admit(key, node, 0, &mut admission);
+    let refused = update_family(&mut table, &mut admission, family, &root, Vec::new(), 0);
 
     assert!(
         matches!(refused, Err(Error::MemoryBudgetExceeded { .. })),
-        "an unadmittable chunk record is refused: {}",
+        "an unadmittable chunk record window is refused: {}",
         refused
             .err()
             .map_or_else(|| "accepted".to_owned(), |error| error.to_string())
     );
-    assert!(
-        !cache.seen.contains_key(&key),
-        "the record of having read a chunk is admitted before the map node that holds it exists"
+    assert_eq!(
+        table.len().unwrap(),
+        0,
+        "no chunk record or body is published before its working storage is admitted"
     );
-    assert!(cache.body(&key).is_none(), "no body is retained either");
+    assert_eq!(admission.held(), 0, "no proof storage survives refusal");
     assert_eq!(
         accountant.usage().used,
         1,
         "the refusal admits nothing and returns everything"
+    );
+
+    drop(table);
+    drop(write);
+    drop(admission);
+
+    // Disposable record storage now lives in the real scratch backend. Its
+    // exact factory payload is admitted before creation; no heap record array
+    // grows as records are staged.
+    let (existing, records) = committed(&directory.path().join("scratch-control.db"), 8, 1024);
+    let before = stored_proof(&existing);
+    assert!(
+        !before.0.is_empty(),
+        "existing records exercise preservation"
+    );
+    let bytes = redb::scratch_backend_allocation_size();
+    assert!(bytes > 0, "the concrete factory has an owned payload");
+    let scratch_accountant = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(
+        bytes + 1,
+    ));
+    scratch_accountant.try_allocate(1).unwrap();
+    let mut scratch_admission = existing.admission(Some(Arc::clone(&scratch_accountant)));
+    let (backend, charge) = scratch_admission
+        .open_scratch()
+        .expect("the exact backend payload is admitted by the real factory");
+    assert_eq!(charge.bytes, bytes);
+    assert_eq!(scratch_admission.peak(), bytes);
+    assert_eq!(scratch_accountant.usage().used, bytes + 1);
+    drop(backend);
+    drop(charge);
+    assert_eq!(scratch_admission.held(), 0);
+    assert_eq!(
+        scratch_accountant.usage().used,
+        1,
+        "scratch drop returns its owner charge"
+    );
+
+    // Removing one byte of that exact headroom refuses the same real backend
+    // before a new proof record or body can be inserted.
+    scratch_accountant.try_allocate(1).unwrap();
+    let new_record = wide_posting(999, 1024);
+    let edits = vec![(
+        mutation_tree_key(&new_record).unwrap(),
+        Some(value_hash(
+            family,
+            new_record.logical_value.as_deref().unwrap(),
+        )),
+    )];
+    let stored_root = decode_root(family, before.1.get(&(family as u8)).unwrap()).unwrap();
+    let write = existing.begin_write().unwrap();
+    let mut table = write.open_table(CONTENT_IDENTITY_NODES_TABLE).unwrap();
+    let refused = update_family(
+        &mut table,
+        &mut scratch_admission,
+        family,
+        &stored_root,
+        edits,
+        0,
+    );
+    assert!(matches!(refused, Err(Error::MemoryBudgetExceeded { .. })));
+    let after = table
+        .iter()
+        .unwrap()
+        .map(|entry| {
+            let (key, value) = entry.unwrap();
+            (key.value().to_vec(), value.value().to_vec())
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        after, before.0,
+        "the refused record and body are never inserted"
+    );
+    assert_eq!(scratch_admission.held(), 0);
+    assert_eq!(
+        scratch_accountant.usage().used,
+        2,
+        "the refusal retains no scratch charge"
+    );
+    drop(table);
+    drop(write);
+    drop(scratch_admission);
+    assert_eq!(
+        stored_proof(&existing),
+        before,
+        "committed chunks and roots are byte-identical"
+    );
+    let read = existing.begin_read().unwrap();
+    let verifier = ContentIdentityReadVerifier::open(&read, directory.path(), None).unwrap();
+    for record in &records {
+        verifier
+            .verify(record)
+            .expect("all committed records remain authenticated");
+    }
+    assert!(
+        verifier.verify(&new_record).is_err(),
+        "the refused record is absent"
+    );
+    scratch_accountant.release(2);
+    assert_eq!(
+        scratch_accountant.usage().used,
+        0,
+        "all owners release their bytes"
     );
 }
 
@@ -622,7 +725,7 @@ fn repeated_writes_to_one_key_admit_one_entry_not_one_per_mutation() {
             256 * 1024 * 1024,
         ));
         let write = database.begin_write().unwrap();
-        let mut admission = ProofAdmission::new(Some(Arc::clone(&accountant)));
+        let mut admission = database.admission(Some(Arc::clone(&accountant)));
         RedbPersistence::apply_content_identity_mutations_in_write(
             &write,
             mutations,

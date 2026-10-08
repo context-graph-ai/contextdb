@@ -2,16 +2,18 @@
 use super::writer_source::*;
 use super::*;
 use contextdb_core::Direction;
+use contextdb_core::read_memory::OwnedReadBox;
 use contextdb_relational::source::{
-    RelationalCursor, RelationalIndexRange, RelationalPositionKey, RelationalPosting,
-    RelationalReadSource, RelationalWindow,
+    RelationalCursor, RelationalCursorOwner, RelationalIndexRange, RelationalPositionKey,
+    RelationalPosting, RelationalReadSource, RelationalWindow,
 };
 use contextdb_relational::store::{IndexEntry, SyncSourceKind};
 use std::ops::Bound;
 
 pub(crate) struct WriterRelationalSource {
     root: Arc<WriterSnapshot>,
-    _control: crate::memory_accounting::OwnedMemoryReservation,
+    owner: SourceWindowOwner,
+    _control: SourceWindowCredit,
 }
 impl WriterRelationalSource {
     pub(crate) fn row_head(&self, table: &str, row: RowId) -> Result<(Lsn, [u8; 24])> {
@@ -28,15 +30,31 @@ impl WriterRelationalSource {
     ) -> Result<super::writer_cleanup_progress::CurrencyCleanupProgress> {
         RedbPersistence::currency_cleanup_progress(&self.root, table, declaration)
     }
-    pub(crate) fn new(root: Arc<WriterSnapshot>) -> Result<Self> {
-        let control = root.adapter_control(std::mem::size_of::<Self>())?;
+    pub(crate) fn new_for_read(
+        root: Arc<WriterSnapshot>,
+        read: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<Self> {
+        Self::new_owned(root, SourceWindowOwner::Read(read))
+    }
+    pub(crate) fn new_for_write(
+        root: Arc<WriterSnapshot>,
+        writer: Arc<crate::memory_accounting::MemoryAccountant>,
+    ) -> Result<Self> {
+        Self::new_owned(root, SourceWindowOwner::Write(writer))
+    }
+    fn new_owned(root: Arc<WriterSnapshot>, owner: SourceWindowOwner) -> Result<Self> {
+        // Payload admission only. Standard Arc control allocation is unresolved.
+        let control = root.adapter_control(&owner, std::alloc::Layout::new::<Self>().size())?;
         Ok(Self {
             root,
+            owner,
             _control: control,
         })
     }
 }
-struct RowCursor(WriterReadCursor);
+struct RowCursor {
+    cursor: WriterReadCursor,
+}
 struct PostingCursor {
     cursor: WriterReadCursor,
     current: bool,
@@ -56,37 +74,33 @@ impl RelationalPositionKey for WriterWindow<Vec<u8>> {
     }
 }
 impl RelationalCursor<VersionedRow> for RowCursor {
-    fn next_window(&mut self) -> Result<Option<Box<dyn RelationalWindow<VersionedRow>>>> {
+    fn next_window(&mut self) -> Result<Option<OwnedReadBox<dyn RelationalWindow<VersionedRow>>>> {
         self.next_window_before(&mut || Ok(()))
     }
     fn next_window_before(
         &mut self,
         before: &mut dyn FnMut() -> Result<()>,
-    ) -> Result<Option<Box<dyn RelationalWindow<VersionedRow>>>> {
-        self.0
-            .next_row_before(before)?
-            .map(|window| {
-                window
-                    .boxed()
-                    .map(|boxed| boxed as Box<dyn RelationalWindow<VersionedRow>>)
-            })
-            .transpose()
+    ) -> Result<Option<OwnedReadBox<dyn RelationalWindow<VersionedRow>>>> {
+        self.cursor.next_row_before_handoff(before, |window| {
+            window.boxed(|boxed| boxed as Box<dyn RelationalWindow<VersionedRow>>)
+        })
     }
     fn examined_entries(&self) -> u64 {
-        self.0.examined_entries()
+        self.cursor.examined_entries()
     }
 }
 impl RelationalCursor<RelationalPosting> for PostingCursor {
-    fn next_window(&mut self) -> Result<Option<Box<dyn RelationalWindow<RelationalPosting>>>> {
+    fn next_window(
+        &mut self,
+    ) -> Result<Option<OwnedReadBox<dyn RelationalWindow<RelationalPosting>>>> {
         self.next_window_before(&mut || Ok(()))
     }
     fn next_window_before(
         &mut self,
         before: &mut dyn FnMut() -> Result<()>,
-    ) -> Result<Option<Box<dyn RelationalWindow<RelationalPosting>>>> {
+    ) -> Result<Option<OwnedReadBox<dyn RelationalWindow<RelationalPosting>>>> {
         self.cursor
-            .next_index_before(self.current, before)?
-            .map(|window| {
+            .next_index_before_handoff(self.current, before, |window| {
                 let window = window.map(|value| RelationalPosting {
                     key: value.tuple,
                     entry: IndexEntry {
@@ -95,11 +109,8 @@ impl RelationalCursor<RelationalPosting> for PostingCursor {
                         deleted_tx: value.deleted_tx,
                     },
                 });
-                window
-                    .boxed()
-                    .map(|boxed| boxed as Box<dyn RelationalWindow<RelationalPosting>>)
+                window.boxed(|boxed| boxed as Box<dyn RelationalWindow<RelationalPosting>>)
             })
-            .transpose()
     }
     fn examined_entries(&self) -> u64 {
         self.cursor.examined_entries()
@@ -124,22 +135,32 @@ impl RelationalReadSource for WriterRelationalSource {
         lower: Bound<&[u8]>,
         upper: Bound<&[u8]>,
         reverse: bool,
-    ) -> Result<Box<dyn RelationalCursor<VersionedRow>>> {
+    ) -> Result<RelationalCursorOwner<VersionedRow>> {
         self.validate_table(table)?;
-        Ok(Box::new(RowCursor(self.root.cursor(
-            &RedbPersistence::rel_table_name(table),
+        let control = self
+            .owner
+            .reserve_box_credit(std::alloc::Layout::new::<RowCursor>().size())?;
+        let physical = self
+            .owner
+            .endpoint(&[b"rel_", table.as_bytes()], "cursor_keys")?;
+        let name = std::str::from_utf8(&physical.key).expect("UTF-8 table name with ASCII prefix");
+        let cursor = self.root.cursor(
+            self.owner.clone(),
+            name,
             WriterCursorFamily::Bytes,
             lower,
             upper,
             reverse,
-        )?)))
+        )?;
+        let payload: Box<dyn RelationalCursor<VersionedRow>> = Box::new(RowCursor { cursor });
+        Ok(RelationalCursorOwner::new(payload, control))
     }
     fn row_id_cursor(
         &self,
         table: &str,
         row: RowId,
         snapshot: SnapshotId,
-    ) -> Result<Box<dyn RelationalCursor<VersionedRow>>> {
+    ) -> Result<RelationalCursorOwner<VersionedRow>> {
         let mut lower = [0u8; 24];
         lower[..8].copy_from_slice(&row.0.to_be_bytes());
         let mut upper = [255u8; 24];
@@ -156,19 +177,28 @@ impl RelationalReadSource for WriterRelationalSource {
         &self,
         table: &str,
         position: &[u8; 24],
-    ) -> Result<Option<Box<dyn RelationalWindow<VersionedRow>>>> {
+    ) -> Result<Option<OwnedReadBox<dyn RelationalWindow<VersionedRow>>>> {
         self.validate_table(table)?;
-        RowCursor(self.root.exact_row(table, position)?).next_window()
+        // This cursor is stack-owned; only its returned window is boxed.
+        self.root
+            .exact_row(self.owner.clone(), table, position)?
+            .next_row_before_handoff(&mut || Ok(()), |window| {
+                window.boxed(|boxed| boxed as Box<dyn RelationalWindow<VersionedRow>>)
+            })
     }
     fn index_cursor(
         &self,
         table: &str,
         index: &str,
         range: RelationalIndexRange<'_>,
-    ) -> Result<Box<dyn RelationalCursor<RelationalPosting>>> {
+    ) -> Result<RelationalCursorOwner<RelationalPosting>> {
         self.validate_table(table)?;
-        Ok(Box::new(PostingCursor {
+        let control = self
+            .owner
+            .reserve_box_credit(std::alloc::Layout::new::<PostingCursor>().size())?;
+        let payload: Box<dyn RelationalCursor<RelationalPosting>> = Box::new(PostingCursor {
             cursor: self.root.index_cursor(
+                self.owner.clone(),
                 table,
                 index,
                 range.current,
@@ -177,7 +207,8 @@ impl RelationalReadSource for WriterRelationalSource {
                 range.reverse,
             )?,
             current: range.current,
-        }))
+        });
+        Ok(RelationalCursorOwner::new(payload, control))
     }
     fn exact_index_cursor(
         &self,
@@ -185,12 +216,18 @@ impl RelationalReadSource for WriterRelationalSource {
         index: &str,
         current: bool,
         key: &IndexKey,
-    ) -> Result<Box<dyn RelationalCursor<RelationalPosting>>> {
+    ) -> Result<RelationalCursorOwner<RelationalPosting>> {
         self.validate_table(table)?;
-        Ok(Box::new(PostingCursor {
-            cursor: self.root.exact_index_cursor(table, index, current, key)?,
+        let control = self
+            .owner
+            .reserve_box_credit(std::alloc::Layout::new::<PostingCursor>().size())?;
+        let payload: Box<dyn RelationalCursor<RelationalPosting>> = Box::new(PostingCursor {
+            cursor: self
+                .root
+                .exact_index_cursor(self.owner.clone(), table, index, current, key)?,
             current,
-        }))
+        });
+        Ok(RelationalCursorOwner::new(payload, control))
     }
     fn index_position_key(
         &self,
@@ -198,17 +235,21 @@ impl RelationalReadSource for WriterRelationalSource {
         key: &IndexKey,
         row: RowId,
         created: TxId,
-    ) -> Result<Box<dyn RelationalPositionKey>> {
-        Ok(Box::new(self.root.index_position_key(
-            key,
-            row,
-            if current { TxId(0) } else { created },
-        )?))
+    ) -> Result<OwnedReadBox<dyn RelationalPositionKey>> {
+        Ok(self
+            .root
+            .index_position_key(
+                self.owner.clone(),
+                key,
+                row,
+                if current { TxId(0) } else { created },
+            )?
+            .boxed(|boxed| boxed as Box<dyn RelationalPositionKey>)?)
     }
     fn sync_source(&self, table: &str, row: RowId) -> Result<Option<(Lsn, SyncSourceKind)>> {
         self.validate_table(table)?;
         self.root
-            .sync_source(table, row)?
+            .sync_source(self.owner.clone(), table, row)?
             .map(|(lsn, kind)| match kind {
                 0 => Ok((lsn, SyncSourceKind::Pulled)),
                 1 => Ok((lsn, SyncSourceKind::AcceptedLocal)),
@@ -224,41 +265,54 @@ impl RelationalReadSource for WriterRelationalSource {
 
 pub(crate) struct WriterGraphSnapshot {
     root: Arc<WriterSnapshot>,
-    _control: crate::memory_accounting::OwnedMemoryReservation,
+    owner: SourceWindowOwner,
+    _control: SourceWindowCredit,
 }
 impl WriterGraphSnapshot {
-    pub(crate) fn new(root: Arc<WriterSnapshot>) -> Result<Self> {
-        let control =
-            root.adapter_control(std::mem::size_of::<Self>() + 2 * std::mem::size_of::<usize>())?;
+    pub(crate) fn new_for_read(
+        root: Arc<WriterSnapshot>,
+        read: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<Self> {
+        Self::new_owned(root, SourceWindowOwner::Read(read))
+    }
+    pub(crate) fn new_for_write(
+        root: Arc<WriterSnapshot>,
+        writer: Arc<crate::memory_accounting::MemoryAccountant>,
+    ) -> Result<Self> {
+        Self::new_owned(root, SourceWindowOwner::Write(writer))
+    }
+    fn new_owned(root: Arc<WriterSnapshot>, owner: SourceWindowOwner) -> Result<Self> {
+        // Payload admission only. No guessed standard Arc control layout.
+        let control = root.adapter_control(&owner, std::alloc::Layout::new::<Self>().size())?;
         Ok(Self {
             root,
+            owner,
             _control: control,
         })
     }
 }
-struct EdgeCursor(WriterReadCursor);
+struct EdgeCursor {
+    cursor: WriterReadCursor,
+}
 impl contextdb_graph::source::GraphEdgeWindow for WriterWindow<AdjEntry> {
     fn edge(&self) -> &AdjEntry {
         &self.value
     }
 }
 impl contextdb_graph::source::GraphCursor for EdgeCursor {
-    fn next_edge(&mut self) -> Result<Option<Box<dyn contextdb_graph::source::GraphEdgeWindow>>> {
-        self.0
-            .next_edge()?
-            .map(|window| {
-                window
-                    .boxed()
-                    .map(|window| window as Box<dyn contextdb_graph::source::GraphEdgeWindow>)
-            })
-            .transpose()
+    fn next_edge(
+        &mut self,
+    ) -> Result<Option<OwnedReadBox<dyn contextdb_graph::source::GraphEdgeWindow>>> {
+        self.cursor.next_edge_handoff(|window| {
+            window.boxed(|boxed| boxed as Box<dyn contextdb_graph::source::GraphEdgeWindow>)
+        })
     }
 }
 impl contextdb_graph::source::GraphSnapshot for WriterGraphSnapshot {
     fn cursor(
         &self,
         query: contextdb_graph::source::GraphQuery<'_>,
-    ) -> Result<Box<dyn contextdb_graph::source::GraphCursor>> {
+    ) -> Result<contextdb_graph::source::GraphCursorOwner> {
         let reverse = match query.direction {
             Direction::Outgoing => false,
             Direction::Incoming => true,
@@ -269,25 +323,36 @@ impl contextdb_graph::source::GraphSnapshot for WriterGraphSnapshot {
             }
         };
         let cursor = if let Some((other, edge_type)) = query.identity {
-            let _scratch = self
-                .root
-                .adapter_control((33 + edge_type.len()).saturating_mul(2))?;
-            let mut prefix = Vec::with_capacity(33 + edge_type.len());
-            prefix.extend_from_slice(query.node.as_bytes());
-            prefix.extend_from_slice(other.as_bytes());
-            prefix.extend_from_slice(edge_type.as_bytes());
-            prefix.push(0);
-            let end = prefix_end(&prefix);
+            let prefix = self.owner.endpoint(
+                &[
+                    query.node.as_bytes(),
+                    other.as_bytes(),
+                    edge_type.as_bytes(),
+                    &[0],
+                ],
+                "store_adapter",
+            )?;
+            let end = self.owner.prefix_end(&prefix.key, "store_adapter")?;
             self.root.cursor(
+                self.owner.clone(),
                 if reverse { "graph_rev" } else { "graph_fwd" },
                 WriterCursorFamily::Bytes,
-                Bound::Included(&prefix),
-                end.as_deref().map_or(Bound::Unbounded, Bound::Excluded),
+                Bound::Included(&prefix.key),
+                end.as_ref()
+                    .map_or(Bound::Unbounded, |end| Bound::Excluded(end.key.as_ref())),
                 false,
             )?
         } else {
-            self.root.graph_cursor(query.node, reverse)?
+            self.root
+                .graph_cursor(self.owner.clone(), query.node, reverse)?
         };
-        Ok(Box::new(EdgeCursor(cursor)))
+        let control = self
+            .owner
+            .reserve_box_credit(std::alloc::Layout::new::<EdgeCursor>().size())?;
+        let payload: Box<dyn contextdb_graph::source::GraphCursor> =
+            Box::new(EdgeCursor { cursor });
+        Ok(contextdb_graph::source::GraphCursorOwner::new(
+            payload, control,
+        ))
     }
 }

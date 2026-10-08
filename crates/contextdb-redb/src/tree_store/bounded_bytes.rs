@@ -150,7 +150,12 @@ fn get(
 }
 
 fn verify(page: &PageImpl, checksum: Checksum, hint: PageHint) -> Result<()> {
-    if hint.verifies_path() && page_checksum(page, None, None)? != checksum {
+    if hint.verifies_path()
+        && page
+            .to_arc()
+            .memoized_byte_node_checksum(|| page_checksum(page, None, None))?
+            != checksum
+    {
         return Err(StorageError::Corrupted(
             "retained byte-table page failed checksum verification".into(),
         ));
@@ -706,7 +711,7 @@ mod tests {
 
     #[derive(Clone, Debug)]
     struct DamagedNodeBackend {
-        inner: Arc<crate::backends::InMemoryBackend>,
+        inner: Arc<dyn crate::StorageBackend>,
         state: Arc<std::sync::Mutex<NodeDamageState>>,
     }
 
@@ -1376,7 +1381,8 @@ mod tests {
         let observation = observe_backend_reads(Arc::new(move |bytes| {
             observed.fetch_add(bytes, AtomicOrdering::SeqCst);
         }));
-        let separator_bytes = b"z:unrelated".len() + 128;
+        let separator_bytes =
+            super::super::page_store::PageMemory::admitted_bytes_for_test(b"z:unrelated".len());
         crate::with_read_page_charge(
             Arc::new(move |bytes| {
                 if bytes == separator_bytes || bytes > 64 * 1024 {
@@ -1849,5 +1855,127 @@ mod tests {
         let handle = table.cursor_bounded().next().unwrap().unwrap();
         assert!(handle.key_matches(b"z:unrelated").unwrap());
         assert_eq!(handle.materialize().unwrap().1.value(), vec![7; HUGE]);
+    }
+    #[test]
+    fn verified_bounded_lookup_memo_checks_every_expected_checksum_and_disk_corruption() {
+        use super::super::page_store::PageMemory;
+        use std::os::unix::fs::FileExt;
+        for cache_size in [0, 1024 * 1024] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("memo.db");
+            let db = Builder::new().set_cache_size(0).create(&path).unwrap();
+            let write = db.begin_write().unwrap();
+            write
+                .open_table(VALUES)
+                .unwrap()
+                .insert(b"key".as_slice(), b"original".as_slice())
+                .unwrap();
+            write.commit().unwrap();
+            drop(db);
+            let disk = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            let state = Arc::new(std::sync::Mutex::new(NodeDamageState::default()));
+            let backend = DamagedNodeBackend {
+                inner: Arc::new(
+                    crate::backends::FileBackend::new(disk.try_clone().unwrap()).unwrap(),
+                ),
+                state: state.clone(),
+            };
+            let roots = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let registered = roots.clone();
+            let db = Builder::new()
+                .set_cache_size(cache_size)
+                .open_with_backend_and_external_snapshots(
+                    backend,
+                    Arc::new(move || Ok(registered.lock().unwrap().clone())),
+                )
+                .unwrap();
+            let pin = db.begin_read().unwrap();
+            let snapshot = pin.storage_snapshot_identity();
+            roots.lock().unwrap().push(snapshot);
+            let external = db.begin_external_read(snapshot).unwrap();
+            let table = external.open_byte_table_bounded(VALUES).unwrap();
+            let cursor = table.cursor_bounded();
+            let (number, expected) = cursor.next.unwrap();
+            state.lock().unwrap().first_read = None;
+            let before = PageMemory::byte_checksum_counts_for_test();
+            assert_eq!(
+                table.get_bounded(b"key").unwrap().unwrap().value(),
+                b"original"
+            );
+            let computed = PageMemory::byte_checksum_counts_for_test();
+            assert_eq!(
+                computed[if cache_size == 0 { 2 } else { 0 }]
+                    - before[if cache_size == 0 { 2 } else { 0 }],
+                1
+            );
+            assert_eq!(
+                table.get_bounded(b"key").unwrap().unwrap().value(),
+                b"original"
+            );
+            let reused = PageMemory::byte_checksum_counts_for_test();
+            if cache_size != 0 {
+                assert_eq!(reused[0], computed[0]);
+                assert_eq!(reused[3] - computed[3], 1);
+            } else {
+                assert_eq!(reused[2] - computed[2], 1);
+            }
+            let page = cursor.mem.get_page(number, cursor.hint).unwrap();
+            assert_eq!(page.memory()[0], LEAF);
+            let disk_bytes = std::fs::read(&path).unwrap();
+            let offset = disk_bytes
+                .windows(page.memory().len())
+                .position(|bytes| bytes == page.memory())
+                .expect("captured page exists on disk") as u64;
+            validate_node(page.memory()).unwrap();
+            let leaf = LeafAccessor::new(page.memory(), None, None);
+            let (start, end) = leaf.value_range(0).unwrap();
+            let mut corrupt = page.memory().to_vec();
+            corrupt[start] ^= 1;
+            let corrupt_expected = super::super::page_store::xxh3_checksum(&corrupt[..end]);
+            assert_ne!(corrupt_expected, expected);
+            disk.write_all_at(&corrupt[start..start + 1], offset + start as u64)
+                .unwrap();
+            disk.sync_data().unwrap();
+            if cache_size == 0 {
+                // Fresh fault of the real changed disk page: original root
+                // expectation must yield typed corruption through public get.
+                assert_corrupted_without_panic(|| table.get_bounded(b"key"));
+            } else {
+                // Resident immutable bytes keep existing visibility semantics.
+                assert_eq!(
+                    table.get_bounded(b"key").unwrap().unwrap().value(),
+                    b"original"
+                );
+                let before_mismatch = PageMemory::byte_checksum_counts_for_test();
+                // The same production point walker visits its memoized page
+                // with the checksum a corrupt/new parent would supply.
+                assert_corrupted_without_panic(|| {
+                    get(
+                        Some(BtreeHeader::new(number, corrupt_expected, 0)),
+                        &cursor.mem,
+                        cursor.hint,
+                        b"key",
+                    )
+                });
+                let after_mismatch = PageMemory::byte_checksum_counts_for_test();
+                assert_eq!(after_mismatch[0], before_mismatch[0]);
+                assert_eq!(after_mismatch[3] - before_mismatch[3], 1);
+                assert_eq!(
+                    table.get_bounded(b"key").unwrap().unwrap().value(),
+                    b"original"
+                );
+                eprintln!(
+                    "production lookup: one Cached computation, repeated memo hits; corrupt/new expected checksum refused on memo hit"
+                );
+            }
+            // Restore this task-created store before redb close housekeeping.
+            disk.write_all_at(&page.memory()[start..start + 1], offset + start as u64)
+                .unwrap();
+            disk.sync_data().unwrap();
+        }
     }
 }

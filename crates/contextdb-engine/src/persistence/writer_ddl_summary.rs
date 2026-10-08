@@ -1,5 +1,6 @@
 //! Declaration reductions installed atomically beside their immutable history.
 use super::*;
+use super::writer_source::SourceWindowOwner;
 use crate::sync_types::SchemaSyncCapability;
 use contextdb_core::SyncDirection;
 
@@ -98,7 +99,6 @@ impl RedbPersistence {
                 .insert(event_key.as_str(), encoded.as_slice())
                 .map_err(Self::storage_error)?;
         }
-        #[cfg(feature = "sync-orchestration")]
         if let DdlChange::CreateTable {
             columns,
             constraints,
@@ -120,7 +120,7 @@ impl RedbPersistence {
                 .transpose()?
                 .unwrap_or_default();
             for (column, text) in columns {
-                union.extend(crate::sync_server::schema_capabilities_in_columns(&[
+                union.extend(crate::sync_types::schema_capabilities_in_columns(&[
                     crate::database::rough_sync_column_def(column, text),
                 ]));
             }
@@ -142,12 +142,13 @@ impl RedbPersistence {
 
     pub(crate) fn declared_direction_in_read(
         root: &WriterSnapshot,
+        owner: &SourceWindowOwner,
         table: &str,
         lsn: Option<Lsn>,
     ) -> Result<Option<SyncDirection>> {
         let lower = prefix(table);
         let upper = format!("{lower}{:020}", lsn.unwrap_or(Lsn(u64::MAX)).0);
-        let _key_charge = root.adapter_control(lower.len() + upper.len() + 256)?;
+        let _key_charge = root.adapter_control(owner, lower.len() + upper.len() + 256)?;
         let read = root.owner_read()?;
         let directions = match read.open_table(DIRECTIONS) {
             Ok(table) => table,
@@ -182,9 +183,10 @@ impl RedbPersistence {
     #[cfg(feature = "sync-orchestration")]
     pub(crate) fn authored_capabilities_in_read(
         root: &WriterSnapshot,
+        owner: &SourceWindowOwner,
         table: &str,
     ) -> Result<BTreeSet<SchemaSyncCapability>> {
-        let _charge = root.adapter_control(table.len() + 512)?;
+        let _charge = root.adapter_control(owner, table.len() + 512)?;
         let read = root.owner_read()?;
         let summaries = match read.open_table(CAPABILITIES) {
             Ok(table) => table,

@@ -5,12 +5,14 @@
 #![allow(clippy::type_complexity)] // Existing compatibility and test seam shape.
 #![allow(dead_code)] // Existing compatibility and test seam shape.
 pub(crate) mod content_identity;
+pub(crate) mod content_size;
 pub(crate) mod purge_publication;
 #[cfg(target_os = "linux")]
 mod reader_presence;
 #[cfg(feature = "test-seams")]
 mod resident_history_test_seams;
 mod transaction_repair;
+pub(crate) mod vector_identity_range;
 mod vector_membership_pages;
 pub(crate) mod vector_membership_source;
 pub(crate) mod vector_paged;
@@ -19,6 +21,7 @@ mod vector_streamed_frame_tests;
 pub(crate) mod writer_adapters;
 pub(crate) mod writer_cleanup_progress;
 mod writer_commit_directory;
+mod writer_ddl_occurrences;
 mod writer_ddl_summary;
 mod writer_export;
 mod writer_file;
@@ -471,7 +474,7 @@ const MAX_READER_SNAPSHOT_BYTES: u64 = 1024;
 struct DurableRelationalIndexKey(Vec<u8>);
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct RelationalIndexPosition {
+pub(crate) struct RelationalIndexPosition {
     key: IndexKey,
     row_id: RowId,
     created_tx: TxId,
@@ -5048,13 +5051,14 @@ pub(crate) struct RetainedReadSource {
     database_path: PathBuf,
     database: redb::ReadOnlyDatabase,
     snapshot: redb::StorageSnapshotIdentity,
+    /// Authenticated committed transaction frontier of this exact pinned root.
+    logical_frontier: SnapshotId,
     registration: Arc<ReadSnapshotRegistrationGuard>,
     content_identity: content_identity::ContentIdentityReadVerifier,
     /// Pages proved under this source's pinned root, shared by row and exact
     /// vector-body reads; retained bytes remain charged to the read session.
     content_proof: Mutex<content_identity::ReadAuthenticationNodes>,
     physical_rows: Mutex<Option<RetainedPhysicalRowScan>>,
-    raw_memberships: Mutex<HashMap<VectorPartitionRef, Arc<Vec<VectorPartitionMembershipRecord>>>>,
     image_config_cache: Mutex<HashMap<String, Option<Vec<u8>>>>,
     verified_ordered_runs: VerifiedOrderedRunCache,
     _source_memory: SourceMemoryReservation,
@@ -5076,16 +5080,14 @@ const RETAINED_CONTENT_PROOF_BYTES: usize = 8 * 1024 * 1024;
 
 /// One statement's open read of stored vector bodies on a retained image.
 pub(crate) struct RetainedRawVectorBodyScan {
+    producer_body_root: bool,
+    selected_stream_identity: Option<RawVectorDirectoryEntry>,
     source: Arc<RetainedReadSource>,
     memberships: Option<redb::ReadOnlyTable<&'static [u8], &'static [u8]>>,
     vectors: Option<redb::ReadOnlyTable<&'static [u8], &'static [u8]>>,
-    cached_partition: Option<(
-        VectorPartitionRef,
-        Arc<Vec<VectorPartitionMembershipRecord>>,
-    )>,
     // Declared last so the tables above close before the transaction that
     // pins them does.
-    _transaction: redb::ReadTransaction,
+    _transaction: Arc<redb::ReadTransaction>,
 }
 
 /// Keeps the exact retained root and physical table open while a bounded
@@ -5100,6 +5102,8 @@ struct RetainedPhysicalRowScan {
 /// content identity. Reusing the transaction and proof nodes makes exact
 /// fallback work proportional to the candidates actually compared.
 pub(crate) struct WritableRawVectorBodyScan {
+    producer_body_root: bool,
+    selected_stream_identity: Option<RawVectorDirectoryEntry>,
     source: Arc<RedbPersistence>,
     memberships: Option<redb::ReadOnlyTable<&'static [u8], &'static [u8]>>,
     vectors: Option<redb::ReadOnlyTable<&'static [u8], &'static [u8]>>,
@@ -5110,6 +5114,29 @@ pub(crate) struct WritableRawVectorBodyScan {
 }
 
 impl WritableRawVectorBodyScan {
+    pub(crate) fn bind_stream_selection(
+        &mut self,
+        partition: &VectorPartitionRef,
+        receipt: &dyn std::any::Any,
+    ) -> Result<()> {
+        self.selected_stream_identity = None;
+        let cursor = receipt
+            .downcast_ref::<vector_membership_source::MembershipCursor>()
+            .ok_or_else(|| {
+                vector_membership_source::damage("raw body stream received another receipt type")
+            })?;
+        let owner = vector_membership_source::MembershipOwner::Writable(self.source.clone());
+        self.selected_stream_identity =
+            Some(cursor.validate_selected(&owner, &self._transaction, partition)?);
+        Ok(())
+    }
+
+    pub(crate) fn consume_stream_selection(&mut self, identity: &RawVectorDirectoryEntry) -> bool {
+        self.selected_stream_identity
+            .take()
+            .is_some_and(|selected| selected == *identity)
+    }
+
     pub(crate) fn read_partition_body(
         &mut self,
         index: &VectorIndexRef,
@@ -5117,80 +5144,90 @@ impl WritableRawVectorBodyScan {
         identity: &RawVectorDirectoryEntry,
         expected_dimension: usize,
         quantization: VectorQuantization,
+        membership_authenticated: bool,
     ) -> Result<VectorEntry> {
         let source = &self.source;
-        let memberships = self.memberships.as_ref().ok_or_else(|| {
-            source.vector_partition_corruption(
-                "a raw-vector candidate has no partition membership table",
-            )
-        })?;
-        let row_prefix = RedbPersistence::vector_partition_membership_row_prefix(
-            index,
-            partition_key,
-            identity.row_id,
-        );
-        let mut matched = None;
-        let mut saw_vector_identity = false;
-        for item in memberships
-            .range(row_prefix.as_slice()..)
-            .map_err(RedbPersistence::storage_error)?
+        if let Some(root) = self
+            ._root
+            .as_ref()
+            .and_then(|root| root.downcast_ref::<WriterSnapshot>())
         {
-            let (key, value) = item.map_err(RedbPersistence::storage_error)?;
-            if !key.value().starts_with(&row_prefix) {
-                break;
-            }
-            let membership: VectorPartitionMembershipRecord = source
-                .decode_vector_partition_record(
-                    VectorPartitionRecordKind::Membership,
-                    value.value(),
-                )?;
-            if RedbPersistence::vector_partition_membership_key(&membership).as_slice()
-                != key.value()
-                || membership.index != *index
-                || membership.partition_key != *partition_key
-                || membership.row_id != identity.row_id
-            {
-                return Err(source.vector_partition_corruption(
-                    "a raw-vector candidate membership disagrees with its point key",
-                ));
-            }
-            if membership.vector_created_tx != identity.created_tx
-                || membership.vector_lsn != identity.lsn
-            {
-                continue;
-            }
-            saw_vector_identity = true;
-            if membership.deleted_tx != identity.deleted_tx {
-                continue;
-            }
-            if membership.visible_from
-                != TxId(
-                    membership
-                        .row_created_tx
-                        .0
-                        .max(membership.vector_created_tx.0),
-                )
-                || membership
-                    .deleted_tx
-                    .is_some_and(|deleted| deleted.0 <= membership.visible_from.0)
-            {
-                return Err(source.vector_partition_corruption(
-                    "a raw-vector candidate membership has an invalid lifecycle boundary",
-                ));
-            }
-            if matched.replace(membership).is_some() {
-                return Err(source.vector_partition_corruption(
-                    "a raw-vector candidate identity has duplicate partition memberships",
-                ));
-            }
+            root.check_table_scope(&index.table)?;
         }
-        let membership = matched.ok_or_else(|| {
-            source.vector_partition_corruption(if saw_vector_identity {
-                "a raw-vector candidate deletion transaction changed outside its directory"
-            } else {
-                "a raw-vector candidate identity has no durable partition membership"
-            })
-        })?;
+        if !membership_authenticated {
+            let memberships = self.memberships.as_ref().ok_or_else(|| {
+                source.vector_partition_corruption(
+                    "a raw-vector candidate has no partition membership table",
+                )
+            })?;
+            let row_prefix = RedbPersistence::vector_partition_membership_row_prefix(
+                index,
+                partition_key,
+                identity.row_id,
+            );
+            let mut matched = None;
+            let mut saw_vector_identity = false;
+            for item in memberships
+                .range(row_prefix.as_slice()..)
+                .map_err(vector_membership_pages::metadata_error)?
+            {
+                let (key, value) = item.map_err(vector_membership_pages::metadata_error)?;
+                if !key.value().starts_with(&row_prefix) {
+                    break;
+                }
+                let membership: VectorPartitionMembershipRecord = source
+                    .decode_vector_partition_record(
+                        VectorPartitionRecordKind::Membership,
+                        value.value(),
+                    )?;
+                if RedbPersistence::vector_partition_membership_key(&membership).as_slice()
+                    != key.value()
+                    || membership.index != *index
+                    || membership.partition_key != *partition_key
+                    || membership.row_id != identity.row_id
+                {
+                    return Err(source.vector_partition_corruption(
+                        "a raw-vector candidate membership disagrees with its point key",
+                    ));
+                }
+                if membership.vector_created_tx != identity.created_tx
+                    || membership.vector_lsn != identity.lsn
+                {
+                    continue;
+                }
+                saw_vector_identity = true;
+                if membership.deleted_tx != identity.deleted_tx {
+                    continue;
+                }
+                if membership.visible_from
+                    < TxId(
+                        membership
+                            .row_created_tx
+                            .0
+                            .max(membership.vector_created_tx.0),
+                    )
+                    || membership
+                        .deleted_tx
+                        .is_some_and(|deleted| deleted.0 <= membership.visible_from.0)
+                {
+                    return Err(source.vector_partition_corruption(
+                        "a raw-vector candidate membership has an invalid lifecycle boundary",
+                    ));
+                }
+                if matched.replace(membership).is_some() {
+                    return Err(source.vector_partition_corruption(
+                        "a raw-vector candidate identity has duplicate partition memberships",
+                    ));
+                }
+            }
+            matched.ok_or_else(|| {
+                source.vector_partition_corruption(if saw_vector_identity {
+                    "a raw-vector candidate deletion transaction changed outside its directory"
+                } else {
+                    "a raw-vector candidate identity has no durable partition membership"
+                })
+            })?;
+        }
         let vectors = self.vectors.as_ref().ok_or_else(|| {
             source.vector_partition_corruption(
                 "a raw-vector candidate membership has no vector body table",
@@ -5199,8 +5236,8 @@ impl WritableRawVectorBodyScan {
         let key = RedbPersistence::vector_identity_key(
             index,
             identity.row_id,
-            membership.vector_created_tx,
-            membership.vector_lsn,
+            identity.created_tx,
+            identity.lsn,
         );
         #[cfg(feature = "test-seams")]
         crate::writer_query_test_seams::note_physical_source(
@@ -5214,14 +5251,26 @@ impl WritableRawVectorBodyScan {
                 &index.table,
             );
             vectors
-                .get(key.as_slice())
-                .map_err(RedbPersistence::storage_error)?
+                .get_bounded(key.as_slice())
+                .map_err(vector_membership_pages::metadata_error)?
                 .ok_or_else(|| {
                     source.vector_partition_corruption(
                         "a raw-vector candidate identity has no durable body",
                     )
                 })?
         };
+        #[cfg(feature = "test-seams")]
+        {
+            crate::read_work_probe::note_vector_body_access();
+            crate::read_work_probe::note_decoded_vector();
+        }
+        contextdb_core::find_attribution::count("decoded_vectors", 1);
+        validate_raw_vector_entry_encoded_width(
+            stored.value(),
+            index,
+            expected_dimension,
+            |reason| source.vector_partition_corruption(reason),
+        )?;
         let mut entry = RedbPersistence::decode_vector_entry(stored.value()).map_err(|error| {
             source.vector_partition_corruption(format!(
                 "a raw-vector candidate body cannot be decoded: {error}"
@@ -5242,22 +5291,47 @@ impl WritableRawVectorBodyScan {
                 entry.vector.len()
             )));
         }
-        entry.deleted_tx = identity.deleted_tx;
-        self.verifier.verify_with_nodes(
-            &mut self.proof,
-            &content_identity::decoded_vector_version_mutation(&entry, quantization),
-        )?;
-        if entry.deleted_tx.is_none() {
+        if !self.producer_body_root {
             self.verifier.verify_with_nodes(
                 &mut self.proof,
-                &content_identity::decoded_vector_mutation(&entry, quantization),
+                &content_identity::decoded_vector_version_mutation(&entry, quantization),
             )?;
+            if entry.deleted_tx.is_none() {
+                self.verifier.verify_with_nodes(
+                    &mut self.proof,
+                    &content_identity::decoded_vector_mutation(&entry, quantization),
+                )?;
+            }
         }
+        entry.deleted_tx = identity.deleted_tx;
         Ok(entry)
     }
 }
 
 impl RetainedRawVectorBodyScan {
+    pub(crate) fn bind_stream_selection(
+        &mut self,
+        partition: &VectorPartitionRef,
+        receipt: &dyn std::any::Any,
+    ) -> Result<()> {
+        self.selected_stream_identity = None;
+        let cursor = receipt
+            .downcast_ref::<vector_membership_source::MembershipCursor>()
+            .ok_or_else(|| {
+                vector_membership_source::damage("raw body stream received another receipt type")
+            })?;
+        let owner = vector_membership_source::MembershipOwner::Retained(self.source.clone());
+        self.selected_stream_identity =
+            Some(cursor.validate_selected(&owner, &self._transaction, partition)?);
+        Ok(())
+    }
+
+    pub(crate) fn consume_stream_selection(&mut self, identity: &RawVectorDirectoryEntry) -> bool {
+        self.selected_stream_identity
+            .take()
+            .is_some_and(|selected| selected == *identity)
+    }
+
     pub(crate) fn read_partition_body(
         &mut self,
         index: &VectorIndexRef,
@@ -5265,73 +5339,47 @@ impl RetainedRawVectorBodyScan {
         identity: &RawVectorDirectoryEntry,
         expected_dimension: usize,
         quantization: VectorQuantization,
+        membership_authenticated: bool,
     ) -> Result<VectorEntry> {
         let source = &self.source;
-        let memberships = self.memberships.as_ref().ok_or_else(|| {
-            source.raw_vector_corruption("a raw-vector candidate has no partition membership table")
-        })?;
-        let partition = VectorPartitionRef::new(index.clone(), partition_key.clone());
-        if self
-            .cached_partition
-            .as_ref()
-            .is_none_or(|(cached, _)| cached != &partition)
-        {
-            let cached = source
-                .raw_memberships
-                .lock()
-                .map_err(|_| {
-                    source.raw_vector_corruption("raw membership directory lock poisoned")
-                })?
-                .get(&partition)
-                .cloned();
-            self.cached_partition = cached.map(|memberships| (partition, memberships));
+        if !membership_authenticated {
+            let memberships = self.memberships.as_ref().ok_or_else(|| {
+                source.raw_vector_corruption(
+                    "a raw-vector candidate has no partition membership table",
+                )
+            })?;
+            source.raw_vector_candidate_membership(memberships, index, partition_key, identity)?;
         }
-        let membership = match &self.cached_partition {
-            Some((_, cached)) => source.raw_vector_candidate_membership_cached(
-                cached,
-                index,
-                partition_key,
-                identity,
-            )?,
-            None => source.raw_vector_candidate_membership(
-                memberships,
-                index,
-                partition_key,
-                identity,
-            )?,
-        };
         let vectors = self.vectors.as_ref().ok_or_else(|| {
             source
                 .raw_vector_corruption("a raw-vector candidate membership has no vector body table")
         })?;
-        let entry = source.raw_vector_candidate_body(
-            vectors,
-            index,
-            identity,
-            &membership,
-            expected_dimension,
-        )?;
-        let mut proof = source
-            .content_proof
-            .lock()
-            .map_err(|_| source.content_identity_corruption("content proof lock poisoned"))?;
-        let verifier = &source.content_identity;
-        verifier
-            .verify_with_nodes(
-                &mut proof,
-                &content_identity::decoded_vector_version_mutation(&entry, quantization),
-            )
-            .map_err(|error| source.content_identity_error(error))?;
-        if entry.deleted_tx.is_none() {
+        let mut entry =
+            source.raw_vector_candidate_body(vectors, index, identity, expected_dimension)?;
+        if !self.producer_body_root {
+            let mut proof = source
+                .content_proof
+                .lock()
+                .map_err(|_| source.content_identity_corruption("content proof lock poisoned"))?;
+            let verifier = &source.content_identity;
             verifier
                 .verify_with_nodes(
                     &mut proof,
-                    &content_identity::decoded_vector_mutation(&entry, quantization),
+                    &content_identity::decoded_vector_version_mutation(&entry, quantization),
                 )
                 .map_err(|error| source.content_identity_error(error))?;
+            if entry.deleted_tx.is_none() {
+                verifier
+                    .verify_with_nodes(
+                        &mut proof,
+                        &content_identity::decoded_vector_mutation(&entry, quantization),
+                    )
+                    .map_err(|error| source.content_identity_error(error))?;
+            }
         }
         #[cfg(feature = "test-seams")]
         crate::read_work_probe::note_authoritative_body_verified();
+        entry.deleted_tx = identity.deleted_tx;
         Ok(entry)
     }
 }
@@ -5461,12 +5509,79 @@ struct VerifiedOrderedRunCacheState {
     bytes: usize,
 }
 
+/// The statement funds every proof page as it is admitted. A failed growth
+/// retains the original typed budget refusal instead of treating a partial
+/// authenticated descent as an empty group range.
+struct CommittedCountProofMemory {
+    memory: Arc<crate::read_image_memory::ImageMemory>,
+    refusal: Mutex<Option<Error>>,
+}
+impl content_identity::ProofPoolGrowth for CommittedCountProofMemory {
+    fn ceiling(&self) -> usize {
+        usize::MAX
+    }
+    fn grow(&self, bytes: usize) -> bool {
+        match self.memory.reserve(bytes) {
+            Ok(()) => true,
+            Err(error) => {
+                *self.refusal.lock().unwrap_or_else(|e| e.into_inner()) = Some(error);
+                false
+            }
+        }
+    }
+}
+
+/// Encode a transient leading-prefix boundary with exact prepaid storage.
+/// Borrowed components avoid copying the caller's strings just to seek.
+fn charged_count_group_boundary(
+    prefix: &[DirectedValue],
+    memory: &Arc<crate::read_image_memory::ImageMemory>,
+) -> Result<Vec<u8>> {
+    let slots = prefix
+        .len()
+        .checked_mul(std::mem::size_of::<(bool, &Value)>())
+        .ok_or_else(|| Error::Other("count boundary size overflow".into()))?;
+    memory.reserve(slots)?;
+    let parts: Vec<_> = prefix
+        .iter()
+        .map(|part| match part {
+            DirectedValue::Asc(TotalOrdAsc(value)) => (false, value),
+            DirectedValue::Desc(TotalOrdDesc(value)) => (true, value),
+        })
+        .collect();
+    struct ByteCount(usize);
+    impl std::io::Write for ByteCount {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_add(bytes.len())
+                .ok_or_else(|| std::io::Error::other("count boundary size overflow"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let value = (&parts, RowId(0), TxId(0));
+    let mut count = ByteCount(0);
+    bincode::serde::encode_into_std_write(value, &mut count, bincode::config::standard())
+        .map_err(|e| Error::Other(format!("count boundary encode: {e}")))?;
+    memory.reserve(count.0)?;
+    let mut encoded = Vec::with_capacity(count.0);
+    bincode::serde::encode_into_std_write(value, &mut encoded, bincode::config::standard())
+        .map_err(|e| Error::Other(format!("count boundary encode: {e}")))?;
+    drop(parts);
+    memory.release(slots);
+    Ok(encoded)
+}
+
 /// One bounded working window of proven postings. `more` says the authenticated
 /// range continues past the last posting here, so the cursor opens the next
 /// window from that posting rather than finishing its run.
 struct VerifiedOrderedRun {
     postings: Vec<VerifiedOrderedPosting>,
     more: bool,
+    quota_stopped: bool,
     _memory: Arc<VerifiedOrderedRunMemory>,
 }
 
@@ -5608,7 +5723,10 @@ impl VerifiedOrderedRunCache {
         self.epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
-    fn begin_build(&self) -> Option<Arc<VerifiedOrderedRunMemory>> {
+    fn begin_build(
+        &self,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Option<Arc<VerifiedOrderedRunMemory>> {
         #[cfg(feature = "test-seams")]
         if verified_ordered_run_test_seams::verified_run_memory_exhausted_for_test() {
             return None;
@@ -5621,7 +5739,10 @@ impl VerifiedOrderedRunCache {
             return None;
         }
         Some(Arc::new(VerifiedOrderedRunMemory {
-            memory: Arc::clone(&self.memory),
+            memory: crate::read_image_memory::ImageMemory::charging_reader(
+                self.memory.accountant.clone(),
+                read_memory,
+            ),
             cache: Arc::downgrade(&self.state),
             ceiling,
             bytes: std::sync::atomic::AtomicUsize::new(0),
@@ -5633,6 +5754,7 @@ impl VerifiedOrderedRunCache {
         key: [u8; 32],
         postings: Vec<VerifiedOrderedPosting>,
         more: bool,
+        quota_stopped: bool,
         memory: Arc<VerifiedOrderedRunMemory>,
         bytes: usize,
     ) -> Arc<VerifiedOrderedRun> {
@@ -5640,6 +5762,7 @@ impl VerifiedOrderedRunCache {
         let run = Arc::new(VerifiedOrderedRun {
             postings,
             more,
+            quota_stopped,
             _memory: memory,
         });
         let mut state = self
@@ -5667,6 +5790,7 @@ struct RetainedIndexRead {
     table: String,
     index: String,
     physical: redb::ReadOnlyTable<DurableRelationalIndexKey, &'static [u8]>,
+    current: Option<redb::ReadOnlyTable<DurableRelationalIndexKey, &'static [u8]>>,
     _read: redb::ReadTransaction,
 }
 
@@ -5873,6 +5997,112 @@ impl CheckpointReadSource {
         Ok((filled, admission))
     }
 
+    /// Resolve the canonical body through this exact row version's membership.
+    /// Row replacement stamps identify the placement, never the body version.
+    fn export_row_vector_identity(
+        &self,
+        index: &VectorIndexRef,
+        row: &VersionedRow,
+    ) -> Result<(TxId, Lsn)> {
+        let prefix_bytes = index
+            .table
+            .len()
+            .saturating_add(index.column.len())
+            .saturating_add(40);
+        let _prefix_memory = self
+            .accountant
+            .as_ref()
+            .map(|accountant| {
+                crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+                    Arc::clone(accountant),
+                    prefix_bytes,
+                    "checkpoint_export",
+                    "membership_identity",
+                    "Raise MEMORY_LIMIT to authenticate an exported vector placement.",
+                )
+            })
+            .transpose()?;
+        let mut prefix = Vec::with_capacity(prefix_bytes);
+        RedbPersistence::append_partition_key_component(&mut prefix, index.table.as_bytes());
+        RedbPersistence::append_partition_key_component(&mut prefix, index.column.as_bytes());
+        prefix.extend_from_slice(&row.row_id.0.to_be_bytes());
+        prefix.extend_from_slice(&row.created_tx.0.to_be_bytes());
+        prefix.extend_from_slice(&row.lsn.0.to_be_bytes());
+        let missing_membership = |error| match error {
+            redb::TableError::TableDoesNotExist(_) => self.content_identity_corruption(
+                "an exported vector row version has no durable membership table",
+            ),
+            other => RedbPersistence::storage_error(other),
+        };
+        let reverse = self
+            .read
+            .open_table(vector_membership_pages::REVERSE)
+            .map_err(&missing_membership)?;
+        let primary = self
+            .read
+            .open_table(VECTOR_PARTITION_MEMBERSHIP_TABLE)
+            .map_err(missing_membership)?;
+        let mut identity = None;
+        for item in reverse
+            .prefix_bounded(prefix.as_slice())
+            .map_err(RedbPersistence::storage_error)?
+        {
+            let (key, value) = item.map_err(RedbPersistence::storage_error)?;
+            let _window = self
+                .accountant
+                .as_ref()
+                .map(|accountant| {
+                    crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+                        Arc::clone(accountant),
+                        value.value().len().saturating_mul(16).saturating_add(4096),
+                        "checkpoint_export",
+                        "membership_identity",
+                        "Raise MEMORY_LIMIT to authenticate an exported vector placement.",
+                    )
+                })
+                .transpose()?;
+            let member: VectorPartitionMembershipRecord = decode_vector_partition_record_payload(
+                VectorPartitionRecordKind::Membership,
+                value.value(),
+            )
+            .map_err(|reason| self.content_identity_corruption(reason))?;
+            if member.index != *index
+                || member.row_id != row.row_id
+                || member.row_created_tx != row.created_tx
+                || member.row_lsn != row.lsn
+                || vector_membership_pages::reverse_key(&member).as_slice() != key.value()
+            {
+                return Err(self.content_identity_corruption(
+                    "exported row membership disagrees with its exact reverse key",
+                ));
+            }
+            let primary_key = RedbPersistence::vector_partition_membership_key(&member);
+            let companion = primary
+                .get_bounded(primary_key.as_slice())
+                .map_err(RedbPersistence::storage_error)?;
+            if companion
+                .as_ref()
+                .is_none_or(|stored| stored.value() != value.value())
+            {
+                return Err(self.content_identity_corruption(
+                    "exported row membership disagrees with its primary companion",
+                ));
+            }
+            let found = (member.vector_created_tx, member.vector_lsn);
+            if identity.is_some_and(|previous| previous != found) {
+                return Err(self.content_identity_corruption(
+                    "one exported row version names different canonical vector bodies",
+                ));
+            }
+            identity = Some(found);
+        }
+        identity.ok_or_else(|| {
+            self.content_identity_corruption(
+                "an exported vector row version has no exact durable membership",
+            )
+        })
+    }
+
     pub(crate) fn overlay_export_row_f32_projections(
         &self,
         name: &str,
@@ -5941,12 +6171,14 @@ impl CheckpointReadSource {
                             )));
                         }
                         let index = VectorIndexRef::new(name, *column);
+                        let (vector_created_tx, vector_lsn) =
+                            self.export_row_vector_identity(&index, &durable)?;
                         self.content_identity
                             .verify(&content_identity::decoded_vector_version_value_mutation(
                                 &index,
                                 durable.row_id,
-                                durable.created_tx,
-                                durable.lsn,
+                                vector_created_tx,
+                                vector_lsn,
                                 vector,
                                 VectorQuantization::F32,
                             ))
@@ -5977,21 +6209,51 @@ impl CheckpointReadSource {
 }
 
 impl RetainedReadSource {
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn cache_index_charge_for_test(&self) -> (usize, usize) {
+        (self.database.cache_index_bytes(), self._source_memory.bytes)
+    }
+
+    pub(crate) fn durable_membership_summary(
+        &self,
+        partition: &VectorPartitionRef,
+        owner: &mut contextdb_vector::VectorCopyAdmission,
+    ) -> Result<contextdb_vector::store::RawVectorMembershipSummary> {
+        let mut scratch = owner.scratch();
+        scratch.reserve(
+            partition
+                .index
+                .table
+                .len()
+                .saturating_add(partition.index.column.len())
+                .saturating_add(partition.partition_key.estimated_bytes())
+                .saturating_mul(32)
+                .saturating_add(4096),
+        )?;
+
+        self.with_read(|read| vector_membership_source::read_summary(read, partition))
+    }
+
+    pub(crate) fn ordered_prefix_snapshot_is_current(&self, snapshot: SnapshotId) -> bool {
+        snapshot == self.logical_frontier
+    }
+
+    pub(crate) fn durable_membership_partitions(
+        &self,
+        owner: &mut contextdb_vector::VectorCopyAdmission,
+    ) -> Result<
+        Vec<(
+            VectorPartitionRef,
+            contextdb_vector::store::RawVectorMembershipSummary,
+        )>,
+    > {
+        self.with_read(|read| vector_membership_source::membership_partitions_in_read(read, owner))
+    }
+
     pub(crate) fn storage_identity(&self) -> redb::StorageSnapshotIdentity {
         self.snapshot
     }
 
-    pub(crate) fn retain_raw_vector_memberships(
-        &self,
-        partition: VectorPartitionRef,
-        memberships: Vec<VectorPartitionMembershipRecord>,
-    ) -> Result<()> {
-        self.raw_memberships
-            .lock()
-            .map_err(|_| self.raw_vector_corruption("raw membership directory lock poisoned"))?
-            .insert(partition, Arc::new(memberships));
-        Ok(())
-    }
     pub(crate) fn registration(&self) -> &Arc<ReadSnapshotRegistrationGuard> {
         &self.registration
     }
@@ -6027,6 +6289,21 @@ impl RetainedReadSource {
             });
         }
         Ok(transaction)
+    }
+
+    pub(crate) fn content_size_totals(
+        &self,
+        memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        before_table: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<content_size::ContentSizeTotals> {
+        self.with_read(|read| {
+            content_size::read_totals(
+                read,
+                &self.database_path.display().to_string(),
+                memory,
+                before_table,
+            )
+        })
     }
 
     pub(crate) fn with_read<T>(
@@ -6625,69 +6902,225 @@ impl RetainedReadSource {
         })
     }
 
+    /// Enumerate current groups from authenticated ordered postings. Each
+    /// descent stops on the first member, then seeks to the upper edge of that
+    /// group's encoded leading prefix. Its exact count is separately proved by
+    /// point lookup; no posting population is scanned or counted.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn committed_maintained_count_groups<E: From<Error>>(
+        &self,
+        table: &str,
+        index: &str,
+        columns: &[(String, contextdb_core::SortDirection)],
+        prefix: &[DirectedValue],
+        snapshot: SnapshotId,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        before_touch: &mut dyn FnMut() -> std::result::Result<(), E>,
+        validate_position: &mut dyn FnMut(
+            &RelationalIndexPosition,
+        ) -> std::result::Result<(), String>,
+        visit: &mut dyn FnMut(IndexKey, u64) -> std::result::Result<(), E>,
+    ) -> std::result::Result<bool, E> {
+        if !self.ordered_prefix_snapshot_is_current(snapshot) {
+            return Ok(false);
+        }
+        if prefix.len() > columns.len() {
+            return Err(E::from(Error::Other(
+                "count prefix exceeds column list".into(),
+            )));
+        }
+        let make_memory = || {
+            crate::read_image_memory::ImageMemory::charging_reader_for(
+                self._source_memory.memory.accountant.clone(),
+                read_memory.clone(),
+                "committed_count",
+                "authenticated_groups",
+                "Raise the declared reader memory limit.",
+            )
+        };
+        let growth = Arc::new(CommittedCountProofMemory {
+            memory: make_memory(),
+            refusal: Mutex::new(None),
+        });
+        let proof = content_identity::ProofMemory::growable(
+            0,
+            growth.clone() as Arc<dyn content_identity::ProofPoolGrowth>,
+        );
+        let mut batch = content_identity::OrderedProofBatch::default();
+        let memory = make_memory();
+        let encoded = charged_count_group_boundary(prefix, &memory).map_err(E::from)?;
+        let mut boundary = (encoded, memory);
+        let mut after_group = false;
+        // The readiness probe belongs to the first seek, including an empty
+        // table. It cannot emit a group before the declared image is ready.
+        before_touch()?;
+        let ready = self
+            .with_read(|read| {
+                let ready = match read.open_table(RELATIONAL_INDEX_READY_TABLE) {
+                    Ok(ready) => ready,
+                    Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+                    Err(error) => return Err(RedbPersistence::storage_error(error)),
+                };
+                Ok(ready
+                    .get(table)
+                    .map_err(RedbPersistence::storage_error)?
+                    .is_some_and(|version| version.value() == RELATIONAL_INDEX_READY_VERSION))
+            })
+            .map_err(E::from)?;
+        if !ready {
+            return Ok(false);
+        }
+        self.authenticate_mutation(&content_identity::status_mutation(
+            RELATIONAL_INDEX_COUNT_READY_IDENTITY_NAMESPACE,
+            table.as_bytes(),
+            RELATIONAL_INDEX_READY_VERSION,
+        ))
+        .map_err(E::from)?;
+        loop {
+            let decoded_memory = make_memory();
+            let mut position = None;
+            self.content_identity
+                .visit_relational_index_group_first_in::<E>(
+                    table,
+                    index,
+                    &boundary.0,
+                    after_group,
+                    &proof,
+                    &mut batch,
+                    &mut |bytes| {
+                        // Fund the borrowed key's two concrete owned images before
+                        // copying: the durable key and its canonical re-encoding.
+                        decoded_memory
+                            .reserve(bytes.len().saturating_mul(2))
+                            .map_err(E::from)?;
+                        position = Some(
+                            decoded_memory
+                                .scope(|| {
+                                    DurableRelationalIndexKey(bytes.to_vec()).decode_canonical()
+                                })
+                                .map_err(E::from)?,
+                        );
+                        Ok(())
+                    },
+                )?;
+            if proof.exhausted() {
+                let error = growth
+                    .refusal
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take()
+                    .unwrap_or_else(|| Error::Other("committed count proof exhausted".into()));
+                return Err(E::from(error));
+            }
+            let Some(mut position) = position else {
+                return Ok(true);
+            };
+            validate_position(&position)
+                .map_err(|e| E::from(self.content_identity_corruption(e)))?;
+            if position.created_tx != TxId(0) {
+                return Err(E::from(self.content_identity_corruption(
+                    "logical count posting has transaction",
+                )));
+            }
+            if !position.key.starts_with(prefix) {
+                return Ok(true);
+            }
+            position.key.truncate(columns.len());
+            let next =
+                charged_count_group_boundary(&position.key, &decoded_memory).map_err(E::from)?;
+            before_touch()?;
+            let count = self
+                .authenticated_relational_index_prefix_count(
+                    table,
+                    columns,
+                    &position.key,
+                    read_memory.clone(),
+                )
+                .map_err(E::from)?
+                .filter(|count| *count > 0)
+                .ok_or_else(|| {
+                    E::from(self.content_identity_corruption(
+                        "a live maintained group has an absent or zero authenticated count",
+                    ))
+                })?;
+            visit(position.key, count)?;
+            boundary = (next, decoded_memory);
+            after_group = true;
+            before_touch()?;
+        }
+    }
+
     pub(crate) fn authenticated_relational_index_prefix_count(
         &self,
         table: &str,
         columns: &[(String, contextdb_core::SortDirection)],
         prefix: &IndexKey,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Option<u64>> {
-        let key = RedbPersistence::relational_index_count_key(table, columns, prefix)?;
-        let count = self.with_read(|read| {
-            let ready = match read.open_table(RELATIONAL_INDEX_READY_TABLE) {
-                Ok(ready) => ready,
-                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-                Err(error) => return Err(RedbPersistence::storage_error(error)),
-            };
-            let Some(version) = ready.get(table).map_err(RedbPersistence::storage_error)? else {
-                return Ok(None);
-            };
-            if version.value() != RELATIONAL_INDEX_READY_VERSION {
-                return Ok(None);
-            }
-            let counts =
-                read.open_table(RELATIONAL_INDEX_COUNT_TABLE)
+        let memory = crate::read_image_memory::ImageMemory::charging_reader(
+            self._source_memory.memory.accountant.clone(),
+            read_memory,
+        );
+        memory.scope(|| {
+            let key = RedbPersistence::relational_index_count_key(table, columns, prefix)?;
+            let count = self.with_read(|read| {
+                let ready = match read.open_table(RELATIONAL_INDEX_READY_TABLE) {
+                    Ok(ready) => ready,
+                    Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+                    Err(error) => return Err(RedbPersistence::storage_error(error)),
+                };
+                let Some(version) = ready.get(table).map_err(RedbPersistence::storage_error)?
+                else {
+                    return Ok(None);
+                };
+                if version.value() != RELATIONAL_INDEX_READY_VERSION {
+                    return Ok(None);
+                }
+                let counts = read
+                    .open_table(RELATIONAL_INDEX_COUNT_TABLE)
                     .map_err(|error| match error {
                         redb::TableError::TableDoesNotExist(_) => self.content_identity_corruption(
                             "authenticated relational index counts are absent",
                         ),
                         other => RedbPersistence::storage_error(other),
                     })?;
-            counts
-                .get(key.as_slice())
-                .map_err(RedbPersistence::storage_error)
-                .map(|count| Some(count.map(|count| count.value())))
-        })?;
-        let Some(count) = count else {
-            return Ok(None);
-        };
-        self.authenticate_mutation(&content_identity::status_mutation(
-            RELATIONAL_INDEX_COUNT_READY_IDENTITY_NAMESPACE,
-            table.as_bytes(),
-            RELATIONAL_INDEX_READY_VERSION,
-        ))?;
-        match count {
-            Some(count) => {
-                self.authenticate_mutation(&RedbPersistence::relational_index_count_mutation(
-                    &key, count,
-                ))?;
-                Ok(Some(count))
+                counts
+                    .get(key.as_slice())
+                    .map_err(RedbPersistence::storage_error)
+                    .map(|count| Some(count.map(|count| count.value())))
+            })?;
+            let Some(count) = count else {
+                return Ok(None);
+            };
+            self.authenticate_mutation(&content_identity::status_mutation(
+                RELATIONAL_INDEX_COUNT_READY_IDENTITY_NAMESPACE,
+                table.as_bytes(),
+                RELATIONAL_INDEX_READY_VERSION,
+            ))?;
+            match count {
+                Some(count) => {
+                    self.authenticate_mutation(&RedbPersistence::relational_index_count_mutation(
+                        &key, count,
+                    ))?;
+                    Ok(Some(count))
+                }
+                None => {
+                    self.authenticate_mutation(
+                        &RedbPersistence::remove_relational_index_count_mutation(&key),
+                    )?;
+                    // An absent record is the absence of a SHORTCUT, never the
+                    // number zero. Since the default is NONE, most prefixes have
+                    // no record at all, and
+                    // reading absence as zero answered `COUNT(*)` with 0 over a
+                    // prefix holding rows. A declared list whose count reaches
+                    // zero also has its record removed, so absence cannot tell
+                    // the two apart here; the caller falls through to the
+                    // ordinary index-range aggregate, which counts the live
+                    // postings and returns the true number either way.
+                    Ok(None)
+                }
             }
-            None => {
-                self.authenticate_mutation(
-                    &RedbPersistence::remove_relational_index_count_mutation(&key),
-                )?;
-                // An absent record is the absence of a SHORTCUT, never the
-                // number zero. Since the default is NONE, most prefixes have
-                // no record at all, and
-                // reading absence as zero answered `COUNT(*)` with 0 over a
-                // prefix holding rows. A declared list whose count reaches
-                // zero also has its record removed, so absence cannot tell
-                // the two apart here; the caller falls through to the
-                // ordinary index-range aggregate, which counts the live
-                // postings and returns the true number either way.
-                Ok(None)
-            }
-        }
+        })
     }
 
     fn authenticate_relational_row(
@@ -6921,6 +7354,22 @@ impl RetainedReadSource {
         expected_dimension: usize,
         quantization: VectorQuantization,
     ) -> Result<Vec<VectorEntry>> {
+        self.load_raw_vector_bodies_for_memberships_in_read(
+            read,
+            memberships,
+            expected_dimension,
+            quantization,
+        )
+        .map(|entries| entries.into_iter().map(|(entry, _)| entry).collect())
+    }
+
+    fn load_raw_vector_bodies_for_memberships_in_read(
+        &self,
+        read: &redb::ReadTransaction,
+        memberships: &[VectorPartitionMembershipRecord],
+        expected_dimension: usize,
+        quantization: VectorQuantization,
+    ) -> Result<Vec<(VectorEntry, Option<TxId>)>> {
         #[cfg(feature = "test-seams")]
         crate::writer_query_test_seams::note_physical_source(
             crate::writer_query_test_seams::PhysicalFamily::Vector,
@@ -6953,14 +7402,16 @@ impl RetainedReadSource {
             #[cfg(feature = "test-seams")]
             crate::read_work_probe::note_decoded_vector();
             contextdb_core::find_attribution::count("decoded_vectors", 1);
-            let entry = decode_retained_raw_vector_entry(
+            let mut entry = decode_retained_raw_vector_entry(
                 stored.value(),
                 membership,
                 expected_dimension,
                 |reason| self.raw_vector_corruption(reason),
             )?;
             self.authenticate_vector_entry(&entry, quantization)?;
-            entries.push(entry);
+            let canonical_deleted_tx = entry.deleted_tx;
+            entry.deleted_tx = membership.deleted_tx;
+            entries.push((entry, canonical_deleted_tx));
         }
         Ok(entries)
     }
@@ -6974,14 +7425,14 @@ impl RetainedReadSource {
         mut visit: impl FnMut(
             &mut T,
             VectorPartitionMembershipRecord,
-            &mut dyn FnMut(&VectorPartitionMembershipRecord) -> Result<VectorEntry>,
+            &mut dyn FnMut(&VectorPartitionMembershipRecord) -> Result<(VectorEntry, Option<TxId>)>,
         ) -> Result<()>,
     ) -> Result<T> {
         self.with_read(|read| {
             // Memberships and bodies share this pinned root. The callback must
             // never reacquire persistence ownership while close/recycle waits.
             let mut load_body = |membership: &VectorPartitionMembershipRecord| {
-                let mut entries = self.load_raw_vector_entries_for_memberships_in_read(
+                let mut entries = self.load_raw_vector_bodies_for_memberships_in_read(
                     read,
                     std::slice::from_ref(membership),
                     dimension,
@@ -7016,8 +7467,7 @@ impl RetainedReadSource {
                     other => RedbPersistence::storage_error(other),
                 },
             )?;
-            let membership =
-                self.raw_vector_candidate_membership(&memberships, index, partition_key, identity)?;
+            self.raw_vector_candidate_membership(&memberships, index, partition_key, identity)?;
             let vectors = read
                 .open_table(VECTORS_TABLE)
                 .map_err(|error| match error {
@@ -7026,14 +7476,10 @@ impl RetainedReadSource {
                     ),
                     other => RedbPersistence::storage_error(other),
                 })?;
-            let entry = self.raw_vector_candidate_body(
-                &vectors,
-                index,
-                identity,
-                &membership,
-                expected_dimension,
-            )?;
+            let mut entry =
+                self.raw_vector_candidate_body(&vectors, index, identity, expected_dimension)?;
             self.authenticate_vector_entry(&entry, quantization)?;
+            entry.deleted_tx = identity.deleted_tx;
             Ok(entry)
         })
     }
@@ -7043,22 +7489,36 @@ impl RetainedReadSource {
     /// the body table opened once. Authentication pages belong to that pinned
     /// source, so this scan reuses proofs from the preceding row walk.
     pub(crate) fn open_raw_vector_body_scan(self: &Arc<Self>) -> Result<RetainedRawVectorBodyScan> {
-        let transaction = self.begin_read()?;
+        self.open_raw_vector_body_scan_at(Arc::new(self.begin_read()?))
+    }
+
+    pub(crate) fn open_raw_vector_body_scan_at(
+        self: &Arc<Self>,
+        transaction: Arc<redb::ReadTransaction>,
+    ) -> Result<RetainedRawVectorBodyScan> {
+        if transaction.storage_snapshot_identity() != self.storage_identity() {
+            return Err(
+                self.raw_vector_corruption("raw body read escaped its retained physical root")
+            );
+        }
+        vector_membership_pages::validate_in_read(&transaction)?;
+        let producer_body_root = vector_scan_body_root_matches(&transaction)?;
         let memberships = match transaction.open_table(VECTOR_PARTITION_MEMBERSHIP_TABLE) {
             Ok(table) => Some(table),
             Err(redb::TableError::TableDoesNotExist(_)) => None,
-            Err(error) => return Err(RedbPersistence::storage_error(error)),
+            Err(error) => return Err(vector_membership_pages::metadata_error(error)),
         };
         let vectors = match transaction.open_table(VECTORS_TABLE) {
             Ok(table) => Some(table),
             Err(redb::TableError::TableDoesNotExist(_)) => None,
-            Err(error) => return Err(RedbPersistence::storage_error(error)),
+            Err(error) => return Err(vector_membership_pages::metadata_error(error)),
         };
         Ok(RetainedRawVectorBodyScan {
+            producer_body_root,
+            selected_stream_identity: None,
             source: Arc::clone(self),
             memberships,
             vectors,
-            cached_partition: None,
             _transaction: transaction,
         })
     }
@@ -7075,9 +7535,10 @@ impl RetainedReadSource {
             partition_key,
             identity.row_id,
         );
-        let mut records = Vec::new();
+        let mut matched = None;
+        let mut saw_vector_identity = false;
         for item in memberships
-            .range(row_prefix.as_slice()..)
+            .prefix_bounded(&row_prefix)
             .map_err(RedbPersistence::storage_error)?
         {
             let (key, value) = item.map_err(RedbPersistence::storage_error)?;
@@ -7097,25 +7558,6 @@ impl RetainedReadSource {
                     "a raw-vector candidate membership disagrees with its point key",
                 ));
             }
-            records.push(membership);
-        }
-        self.raw_vector_candidate_membership_cached(&records, index, partition_key, identity)
-    }
-
-    fn raw_vector_candidate_membership_cached(
-        &self,
-        memberships: &[VectorPartitionMembershipRecord],
-        index: &VectorIndexRef,
-        partition_key: &VectorPartitionKey,
-        identity: &RawVectorDirectoryEntry,
-    ) -> Result<VectorPartitionMembershipRecord> {
-        let start = memberships.partition_point(|membership| membership.row_id < identity.row_id);
-        let mut matched = None;
-        let mut saw_vector_identity = false;
-        for membership in memberships[start..]
-            .iter()
-            .take_while(|membership| membership.row_id == identity.row_id)
-        {
             if membership.index != *index || membership.partition_key != *partition_key {
                 return Err(self.raw_vector_corruption(
                     "a raw-vector candidate membership disagrees with its point key",
@@ -7131,7 +7573,7 @@ impl RetainedReadSource {
                 continue;
             }
             if membership.visible_from
-                != TxId(
+                < TxId(
                     membership
                         .row_created_tx
                         .0
@@ -7145,7 +7587,7 @@ impl RetainedReadSource {
                     "a raw-vector candidate membership has an invalid lifecycle boundary",
                 ));
             }
-            if matched.replace(membership.clone()).is_some() {
+            if matched.replace(membership).is_some() {
                 return Err(self.raw_vector_corruption(
                     "a raw-vector candidate identity has duplicate partition memberships",
                 ));
@@ -7165,25 +7607,30 @@ impl RetainedReadSource {
         vectors: &redb::ReadOnlyTable<&'static [u8], &'static [u8]>,
         index: &VectorIndexRef,
         identity: &RawVectorDirectoryEntry,
-        membership: &VectorPartitionMembershipRecord,
         expected_dimension: usize,
     ) -> Result<VectorEntry> {
         let key = RedbPersistence::vector_identity_key(
             index,
             identity.row_id,
-            membership.vector_created_tx,
-            membership.vector_lsn,
+            identity.created_tx,
+            identity.lsn,
         );
         let stored = vectors
-            .get(key.as_slice())
-            .map_err(RedbPersistence::storage_error)?
+            .get_bounded(key.as_slice())
+            .map_err(vector_membership_pages::metadata_error)?
             .ok_or_else(|| {
                 self.raw_vector_corruption("a raw-vector candidate identity has no durable body")
             })?;
         #[cfg(feature = "test-seams")]
         crate::read_work_probe::note_decoded_vector();
         contextdb_core::find_attribution::count("decoded_vectors", 1);
-        let mut entry = RedbPersistence::decode_vector_entry(stored.value()).map_err(|error| {
+        validate_raw_vector_entry_encoded_width(
+            stored.value(),
+            index,
+            expected_dimension,
+            |reason| self.raw_vector_corruption(reason),
+        )?;
+        let entry = RedbPersistence::decode_vector_entry(stored.value()).map_err(|error| {
             self.raw_vector_corruption(format!(
                 "a raw-vector candidate body cannot be decoded: {error}"
             ))
@@ -7203,7 +7650,6 @@ impl RetainedReadSource {
                 entry.vector.len()
             )));
         }
-        entry.deleted_tx = identity.deleted_tx;
         Ok(entry)
     }
 
@@ -7398,18 +7844,64 @@ impl RetainedReadSource {
         snapshot: SnapshotId,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), E>,
         before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), E>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<Option<VersionedRow>, E>
     where
         E: From<Error>,
     {
-        before_touch()?;
-        let row = self
-            .with_read(|read| self.row_by_id_in_read(read, table, meta, row_id, snapshot))
+        let read = self.begin_read().map_err(E::from)?;
+        let name = RedbPersistence::rel_table_name(table);
+        let definition: TableDefinition<&[u8], &[u8]> = TableDefinition::new(name.as_str());
+        let relation = read.open_table(definition).map_err(|error| {
+            E::from(match error {
+                redb::TableError::TableDoesNotExist(_) => self.content_identity_corruption(
+                    format!("relational table {table} is absent from the retained root"),
+                ),
+                other => RedbPersistence::storage_error(other),
+            })
+        })?;
+        let (lower, upper) = RedbPersistence::rel_row_key_range(row_id);
+        let mut versions = relation
+            .range(lower.as_slice()..upper.as_slice())
+            .map_err(RedbPersistence::storage_error)
             .map_err(E::from)?;
-        if let Some(row) = row.as_ref() {
+        loop {
+            // Charge each actual version/terminal probe before advancing.
+            // The caller's charge checks its cancellation and work boundary.
+            before_touch()?;
+            let Some(entry) = versions.next_back() else {
+                return Ok(None);
+            };
+            let (key, value) = entry
+                .map_err(RedbPersistence::storage_error)
+                .map_err(E::from)?;
+            #[cfg(feature = "test-seams")]
+            crate::writer_query_test_seams::note_target_entry(table);
+            // The admitted serde seed funds map/string/vector allocations as
+            // they are decoded against the active statement source budget.
+            // Retain that charge until the selected row's owner adopts it.
+            let memory = crate::read_image_memory::ImageMemory::charging_reader(
+                Arc::clone(&self.verified_ordered_runs.memory.accountant),
+                read_memory.clone(),
+            );
+            let row = memory
+                .scope(|| RedbPersistence::decode_relational_source_row(table, meta, value.value()))
+                .map_err(E::from)?;
+            self.authenticate_relational_physical_key(table, key.value(), &row)
+                .map_err(E::from)?;
+            if row.created_tx.0 > snapshot.0 {
+                continue;
+            }
+            if !self
+                .authenticate_relational_row(table, meta, &row)
+                .map_err(E::from)?
+            {
+                return Ok(None);
+            }
             before_clone(row.estimated_bytes())?;
+            drop(memory);
+            return Ok(Some(row));
         }
-        Ok(row)
     }
 
     pub(crate) fn bounded_visit_relational_rows<E>(
@@ -7418,72 +7910,79 @@ impl RetainedReadSource {
         meta: &TableMeta,
         snapshot: SnapshotId,
         mut visit: impl FnMut(&VersionedRow) -> std::result::Result<(), E>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<(), E>
     where
         E: From<Error>,
     {
-        let read = self.begin_read().map_err(E::from)?;
-        let name = RedbPersistence::rel_table_name(table);
-        let definition: TableDefinition<&[u8], &[u8]> = TableDefinition::new(name.as_str());
-        let relation = match read.open_table(definition) {
-            Ok(table) => table,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
-            Err(error) => return Err(E::from(RedbPersistence::storage_error(error))),
-        };
-        let mut candidate = None::<VersionedRow>;
-        let mut candidate_row_id = None::<RowId>;
-        let mut publish = |row: Option<VersionedRow>| -> std::result::Result<(), E> {
-            if let Some(row) = row
-                && self
-                    .authenticate_relational_row(table, meta, &row)
-                    .map_err(E::from)?
-            {
-                visit(&row)?;
-            }
-            Ok(())
-        };
-        let versions = {
-            #[cfg(feature = "test-seams")]
-            let _target_reads = crate::writer_query_test_seams::physical_operation(
-                crate::writer_query_test_seams::PhysicalFamily::Row,
-                table,
-            );
-            relation
-                .iter()
-                .map_err(RedbPersistence::storage_error)
-                .map_err(E::from)?
-        };
-        #[cfg(feature = "test-seams")]
-        let versions = {
-            let mut versions = versions;
-            std::iter::from_fn(move || {
+        let memory = crate::read_image_memory::ImageMemory::charging_reader(
+            self._source_memory.memory.accountant.clone(),
+            read_memory,
+        );
+        memory.scope(|| {
+            let read = self.begin_read().map_err(E::from)?;
+            let name = RedbPersistence::rel_table_name(table);
+            let definition: TableDefinition<&[u8], &[u8]> = TableDefinition::new(name.as_str());
+            let relation = match read.open_table(definition) {
+                Ok(table) => table,
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+                Err(error) => return Err(E::from(RedbPersistence::storage_error(error))),
+            };
+            let mut candidate = None::<VersionedRow>;
+            let mut candidate_row_id = None::<RowId>;
+            let mut publish = |row: Option<VersionedRow>| -> std::result::Result<(), E> {
+                if let Some(row) = row
+                    && self
+                        .authenticate_relational_row(table, meta, &row)
+                        .map_err(E::from)?
+                {
+                    visit(&row)?;
+                }
+                Ok(())
+            };
+            let versions = {
+                #[cfg(feature = "test-seams")]
                 let _target_reads = crate::writer_query_test_seams::physical_operation(
                     crate::writer_query_test_seams::PhysicalFamily::Row,
                     table,
                 );
-                versions.next()
-            })
-        };
-        for entry in versions {
-            let (key, value) = entry
-                .map_err(RedbPersistence::storage_error)
-                .map_err(E::from)?;
+                relation
+                    .iter()
+                    .map_err(RedbPersistence::storage_error)
+                    .map_err(E::from)?
+            };
             #[cfg(feature = "test-seams")]
-            crate::writer_query_test_seams::note_target_entry(table);
-            let row = RedbPersistence::decode_relational_source_row(table, meta, value.value())
-                .map_err(E::from)?;
-            self.authenticate_relational_physical_key(table, key.value(), &row)
-                .map_err(E::from)?;
-            if candidate_row_id.is_some_and(|row_id| row_id != row.row_id) {
-                publish(candidate.take())?;
+            let versions = {
+                let mut versions = versions;
+                std::iter::from_fn(move || {
+                    let _target_reads = crate::writer_query_test_seams::physical_operation(
+                        crate::writer_query_test_seams::PhysicalFamily::Row,
+                        table,
+                    );
+                    versions.next()
+                })
+            };
+            for entry in versions {
+                let (key, value) = entry
+                    .map_err(RedbPersistence::storage_error)
+                    .map_err(E::from)?;
+                #[cfg(feature = "test-seams")]
+                crate::writer_query_test_seams::note_target_entry(table);
+                let row = RedbPersistence::decode_relational_source_row(table, meta, value.value())
+                    .map_err(E::from)?;
+                self.authenticate_relational_physical_key(table, key.value(), &row)
+                    .map_err(E::from)?;
+                if candidate_row_id.is_some_and(|row_id| row_id != row.row_id) {
+                    publish(candidate.take())?;
+                }
+                candidate_row_id = Some(row.row_id);
+                if row.created_tx.0 <= snapshot.0 {
+                    candidate = Some(row);
+                }
             }
-            candidate_row_id = Some(row.row_id);
-            if row.created_tx.0 <= snapshot.0 {
-                candidate = Some(row);
-            }
-        }
-        publish(candidate)?;
-        Ok(())
+            publish(candidate)?;
+            Ok(())
+        })
     }
 
     /// The cache identity of one working WINDOW: the run it belongs to, plus
@@ -7507,28 +8006,92 @@ impl RetainedReadSource {
             hash.update(&(part.len() as u64).to_le_bytes());
             hash.update(part);
         }
+        struct HashWriter<'a>(&'a mut blake3::Hasher);
+        impl std::io::Write for HashWriter<'_> {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.update(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        // Hash borrowed typed endpoints without making temporary key/value
+        // clones or an unadmitted serialized byte vector.
         for bound in [start, end] {
-            let (tag, encoded) = match bound {
-                std::ops::Bound::Unbounded => (0u8, Vec::new()),
-                std::ops::Bound::Included(key) => (
-                    1,
-                    DurableRelationalIndexKey::new(key.clone(), RowId(0), TxId(0))?.0,
-                ),
-                std::ops::Bound::Excluded(key) => (
-                    2,
-                    DurableRelationalIndexKey::new(key.clone(), RowId(0), TxId(0))?.0,
-                ),
+            let (tag, key) = match bound {
+                std::ops::Bound::Unbounded => (0u8, None),
+                std::ops::Bound::Included(key) => (1, Some(key)),
+                std::ops::Bound::Excluded(key) => (2, Some(key)),
             };
             hash.update(&[tag]);
-            hash.update(&(encoded.len() as u64).to_le_bytes());
-            hash.update(&encoded);
+            if let Some(key) = key {
+                hash.update(&(key.len() as u64).to_le_bytes());
+                for component in key {
+                    let (direction, value) = match component {
+                        DirectedValue::Asc(TotalOrdAsc(value)) => (0u8, value),
+                        DirectedValue::Desc(TotalOrdDesc(value)) => (1u8, value),
+                    };
+                    hash.update(&[direction]);
+                    bincode::serde::encode_into_std_write(
+                        value,
+                        &mut HashWriter(&mut hash),
+                        bincode::config::standard(),
+                    )
+                    .map_err(|error| {
+                        Error::Other(format!("ordered endpoint cache identity: {error}"))
+                    })?;
+                }
+            }
         }
         hash.update(&(prefix_len as u64).to_le_bytes());
         hash.update(&[u8::from(cursor.source_reverse())]);
+        match cursor.source_prefix_quota() {
+            None => {
+                hash.update(&[0]);
+            }
+            Some(quota) => {
+                hash.update(&[1]);
+                hash.update(&quota.to_le_bytes());
+            }
+        }
+
         let after = cursor.source_position().unwrap_or_default();
         hash.update(&(after.len() as u64).to_le_bytes());
         hash.update(after);
         Ok(*hash.finalize().as_bytes())
+    }
+
+    /// A DESC NULL component is the first region in that component's
+    /// comparator domain. Excluding its short prefix does not exclude its
+    /// longer keys. Complete its high edge only where every omitted component
+    /// has the existing ASC NULL-high sentinel.
+    fn complete_ordered_seek(
+        declaration: &IndexDecl,
+        cursor: &contextdb_relational::mem::BoundedOrderedRowCursor,
+    ) -> std::ops::Bound<IndexKey> {
+        let seek = cursor.source_seek().map(|key| key.to_vec());
+        if cursor.source_reverse() {
+            return seek;
+        }
+        match seek {
+            std::ops::Bound::Excluded(mut key)
+                if key.len() < declaration.columns.len()
+                    && matches!(
+                        key.last(),
+                        Some(DirectedValue::Desc(TotalOrdDesc(Value::Null)))
+                    )
+                    && declaration.columns[key.len()..]
+                        .iter()
+                        .all(|(_, direction)| *direction == contextdb_core::SortDirection::Asc) =>
+            {
+                key.resize_with(declaration.columns.len(), || {
+                    DirectedValue::Asc(TotalOrdAsc(Value::Null))
+                });
+                std::ops::Bound::Excluded(key)
+            }
+            other => other,
+        }
     }
 
     fn verified_ordered_posting_bytes(posting: &VerifiedOrderedPosting) -> usize {
@@ -7545,12 +8108,17 @@ impl RetainedReadSource {
         cache_key: [u8; 32],
         check_boundary: &mut dyn FnMut() -> std::result::Result<(), E>,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), E>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<Option<Arc<VerifiedOrderedRun>>, E>
     where
         E: From<Error>,
     {
+        if cursor.source_prefix_quota() == Some(0) {
+            cursor.source_stop_prefix();
+            return Ok(None);
+        }
         let _attribution = contextdb_core::find_attribution::stage("window_build");
-        let Some(memory) = self.verified_ordered_runs.begin_build() else {
+        let Some(memory) = self.verified_ordered_runs.begin_build(read_memory.clone()) else {
             return Ok(None);
         };
         // The proof walk and the posting identities it produces draw from the
@@ -7586,7 +8154,9 @@ impl RetainedReadSource {
             }) {
             Some(state) => state,
             None => {
-                let Some(proof_memory) = self.verified_ordered_runs.begin_build() else {
+                let Some(proof_memory) =
+                    self.verified_ordered_runs.begin_build(read_memory.clone())
+                else {
                     return Ok(None);
                 };
                 // A small bounded share lets the first descent retain its
@@ -7624,7 +8194,36 @@ impl RetainedReadSource {
             batch.evict(proof);
         }
         let mut charged_payload = 0usize;
-        let seek = cursor.source_seek().map(|key| key.to_vec());
+        let bound_scratch = cursor.source_run_bounds();
+        let mut seek_bytes = declaration
+            .columns
+            .len()
+            .saturating_mul(std::mem::size_of::<DirectedValue>())
+            .saturating_mul(8);
+        for bound in [bound_scratch.0, bound_scratch.1] {
+            if let std::ops::Bound::Included(key) | std::ops::Bound::Excluded(key) = bound {
+                for component in key {
+                    let value = match component {
+                        DirectedValue::Asc(TotalOrdAsc(value))
+                        | DirectedValue::Desc(TotalOrdDesc(value)) => value,
+                    };
+                    seek_bytes =
+                        seek_bytes.saturating_add(value.estimated_bytes().saturating_mul(8));
+                }
+            }
+        }
+        seek_bytes = seek_bytes
+            .saturating_add(
+                cursor
+                    .source_position()
+                    .map_or(0, <[u8]>::len)
+                    .saturating_mul(4),
+            )
+            .saturating_add(256);
+        let Some(_seek_charge) = proof.charge_scratch(seek_bytes) else {
+            return Ok(None);
+        };
+        let seek = Self::complete_ordered_seek(declaration, cursor);
         let reverse = cursor.source_reverse();
         let mut postings = Vec::new();
         let mut payload_bytes = 0usize;
@@ -7661,10 +8260,14 @@ impl RetainedReadSource {
         // the range did. `complete` stays for the one case that is still a
         // refusal: a pool that cannot admit even one posting.
         let mut window_full = false;
+        let mut quota_stopped = false;
+        let quota = cursor.source_prefix_quota();
         let mut complete = true;
+        let boundary = std::cell::RefCell::new(&mut *check_boundary);
+        let touched = std::cell::RefCell::new(&mut *before_touch);
         let mut before_page = || {
-            check_boundary()?;
-            before_touch()
+            (boundary.borrow_mut())()?;
+            (touched.borrow_mut())()
         };
         let RetainedOrderedProof {
             proof: shared_proof,
@@ -7680,6 +8283,10 @@ impl RetainedReadSource {
             shared_batch,
             &mut before_page,
             &mut |logical_key| {
+                // A logical posting is actual examined work independently
+                // from the page authentication that delivered it.
+                (boundary.borrow_mut())()?;
+                (touched.borrow_mut())()?;
                 // This callback copies the delivered key, decodes it into an
                 // owned position and re-encodes a continuation key before it
                 // decides to keep anything. All three are live at once, so all
@@ -7745,33 +8352,35 @@ impl RetainedReadSource {
                 }
                 charged_payload = retained;
                 postings.push(posting);
+                // Stop on the callback retaining the final required posting:
+                // no next leaf callback may decode a key past this demand.
+                if quota.is_some_and(|quota| postings.len() as u64 >= quota) {
+                    quota_stopped = true;
+                    return Ok(false);
+                }
                 Ok(true)
             },
         )?;
+        drop(before_page);
+        drop(touched);
+        drop(boundary);
         // The window stops short of the range when it filled, or when the
         // descent itself ran out of pool part way. Either way the range
         // continues past its last posting.
-        let more = window_full || proof.exhausted() || shared_proof.exhausted();
-        if postings.is_empty() && more {
+        let more = quota_stopped || window_full || proof.exhausted() || shared_proof.exhausted();
+        if !complete || (postings.is_empty() && more) {
             // Not one posting fits beside the descent this range needs. That is
             // the one remaining budget refusal; everything else is a window.
             return Ok(None);
         }
         if postings.is_empty() {
-            // This authenticated window proves the range is finished, whether
-            // it was empty from the first key or follows a delivered window.
-            // Admit the cached completion marker before retaining it. An empty
-            // tail has no posting capacity to supply that charge.
+            // Empty canonical ranges still owe a physical-extra check below.
             if !proof.charge_payload(256) {
                 return Ok(None);
             }
             if after.is_none() {
                 contextdb_core::find_attribution::count("verified_runs_pruned_empty", 1);
             }
-            return Ok(Some(
-                self.verified_ordered_runs
-                    .insert(cache_key, postings, false, memory, 256),
-            ));
         }
         let bytes = payload_bytes
             .saturating_add(
@@ -7796,8 +8405,11 @@ impl RetainedReadSource {
         let physical = match cursor
             .source_read()
             .and_then(|slot| Arc::clone(&slot.0).downcast::<RetainedIndexRead>().ok())
-            .filter(|read| read.table == table && read.index == declaration.name)
-        {
+            .filter(|read| {
+                read.table == table
+                    && read.index == declaration.name
+                    && read.current.is_some() == self.ordered_prefix_snapshot_is_current(snapshot)
+            }) {
             Some(read) => read,
             None => {
                 let read = self.begin_read().map_err(E::from)?;
@@ -7818,10 +8430,29 @@ impl RetainedReadSource {
                 contextdb_core::find_attribution::count("window_reads_opened", 1);
                 #[cfg(feature = "test-seams")]
                 crate::read_work_probe::note_verified_read_opened();
+                // CURRENT is the logical set only at this root's proved
+                // committed frontier. Earlier snapshots keep historical reads.
+                let current = if self.ordered_prefix_snapshot_is_current(snapshot) {
+                    let name = RedbPersistence::current_relational_index_table_name(
+                        table,
+                        &declaration.name,
+                    );
+                    let definition: TableDefinition<DurableRelationalIndexKey, &[u8]> =
+                        TableDefinition::new(name.as_str());
+                    Some(read.open_table(definition).map_err(|error| {
+                        E::from(self.content_identity_corruption(format!(
+                            "cannot read current index {}: {error}",
+                            declaration.name
+                        )))
+                    })?)
+                } else {
+                    None
+                };
                 let opened = Arc::new(RetainedIndexRead {
                     table: table.to_owned(),
                     index: declaration.name.clone(),
                     physical: index,
+                    current,
                     _read: read,
                 });
                 cursor.set_source_read(contextdb_relational::mem::SourceReadSlot(
@@ -7839,9 +8470,10 @@ impl RetainedReadSource {
         // Transaction admission and catalog/table setup are observed separately.
         #[cfg(feature = "test-seams")]
         let _target_reads = crate::writer_query_test_seams::posting_operation(table, cursor);
-        let index = &physical.physical;
+        let index = physical.current.as_ref().unwrap_or(&physical.physical);
         use std::ops::Bound::{Excluded, Included, Unbounded};
-        let bounds = match (after.as_deref(), cursor.source_seek(), reverse) {
+        let completed_seek = Self::complete_ordered_seek(declaration, cursor);
+        let bounds = match (after.as_deref(), completed_seek, reverse) {
             (Some(after), _, true) => (
                 Unbounded,
                 Excluded(DurableRelationalIndexKey(after.to_vec())),
@@ -7853,30 +8485,22 @@ impl RetainedReadSource {
             (None, Included(key), true) => (
                 Unbounded,
                 Included(DurableRelationalIndexKey::new(
-                    key.to_vec(),
+                    key,
                     RowId(u64::MAX),
                     TxId(u64::MAX),
                 )?),
             ),
             (None, Excluded(key), true) => (
                 Unbounded,
-                Excluded(DurableRelationalIndexKey::new(
-                    key.to_vec(),
-                    RowId(0),
-                    TxId(0),
-                )?),
+                Excluded(DurableRelationalIndexKey::new(key, RowId(0), TxId(0))?),
             ),
             (None, Included(key), false) => (
-                Included(DurableRelationalIndexKey::new(
-                    key.to_vec(),
-                    RowId(0),
-                    TxId(0),
-                )?),
+                Included(DurableRelationalIndexKey::new(key, RowId(0), TxId(0))?),
                 Unbounded,
             ),
             (None, Excluded(key), false) => (
                 Excluded(DurableRelationalIndexKey::new(
-                    key.to_vec(),
+                    key,
                     RowId(u64::MAX),
                     TxId(u64::MAX),
                 )?),
@@ -7912,10 +8536,76 @@ impl RetainedReadSource {
                 .map_err(E::from)?;
             #[cfg(feature = "test-seams")]
             crate::writer_query_test_seams::note_target_entry(table);
-            let (_, position, deleted_tx) =
-                decode_relational_index_entry(&self.database_path, Some(entry))
+            let physical_scratch = entry
+                .0
+                .value()
+                .0
+                .len()
+                .saturating_mul(4)
+                .saturating_add(
+                    declaration
+                        .columns
+                        .len()
+                        .saturating_mul(std::mem::size_of::<DirectedValue>())
+                        .saturating_mul(3),
+                )
+                .saturating_add(256);
+            let Some(_physical_charge) = proof.charge_scratch(physical_scratch) else {
+                return Ok(None);
+            };
+            let (position, deleted_tx) = if physical.current.is_some() {
+                let (key, value) = entry;
+                let mut position = key
+                    .value()
+                    .decode_canonical()
+                    .map_err(|error| E::from(self.content_identity_error(error)))?;
+                if position.created_tx != TxId(0) {
+                    return Err(E::from(self.content_identity_corruption(
+                        "current posting has a nonzero key transaction",
+                    )));
+                }
+                let creating: TxId =
+                    RedbPersistence::decode_exact(value.value()).map_err(E::from)?;
+                if creating.0 > snapshot.0 {
+                    return Err(E::from(self.content_identity_corruption(
+                        "current posting was created past the pinned frontier",
+                    )));
+                }
+                // One exact creating-version probe, never a retired-history
+                // walk. The key can remain unchanged across later row versions.
+                check_boundary()?;
+                before_touch()?;
+                let historical_key = DurableRelationalIndexKey::new(
+                    position.key.clone(),
+                    position.row_id,
+                    creating,
+                )?;
+                let historical = physical
+                    .physical
+                    .get(&historical_key)
+                    .map_err(RedbPersistence::storage_error)
                     .map_err(E::from)?
-                    .expect("one physical posting");
+                    .ok_or_else(|| {
+                        E::from(self.content_identity_corruption(
+                            "current posting names a missing creating posting",
+                        ))
+                    })?;
+                let deleted: Option<TxId> =
+                    RedbPersistence::decode_exact(historical.value()).map_err(E::from)?;
+                if deleted.is_some() {
+                    return Err(E::from(self.content_identity_corruption(
+                        "current posting names a retired creating posting",
+                    )));
+                }
+                position.created_tx = creating;
+                (position, deleted)
+            } else {
+                let (_, position, deleted) =
+                    decode_relational_index_entry(&self.database_path, Some(entry))
+                        .map_err(E::from)?
+                        .expect("one physical posting");
+                (position, deleted)
+            };
             // The stored key is typed data this walk is about to compare and
             // deliver. Refuse a posting that disagrees with its declaration
             // before it can reach a row or an ordering.
@@ -7970,10 +8660,20 @@ impl RetainedReadSource {
                 proof.peak(),
             );
         }
-        Ok(Some(
-            self.verified_ordered_runs
-                .insert(cache_key, postings, more, memory, bytes),
-        ))
+        // The build scratch no longer owns any endpoint/iterator allocation
+        // when its reservation is reduced to the retained cache payload.
+        drop(entries);
+        drop(range);
+        drop(after);
+        drop(_seek_charge);
+        Ok(Some(self.verified_ordered_runs.insert(
+            cache_key,
+            postings,
+            more,
+            quota_stopped,
+            memory,
+            bytes,
+        )))
     }
 
     /// Whether the committed canonical index tree holds no posting under ANY
@@ -7995,12 +8695,13 @@ impl RetainedReadSource {
         prefixes: &[contextdb_core::IndexKey],
         check_boundary: &mut dyn FnMut() -> std::result::Result<(), E>,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), E>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<Option<bool>, E>
     where
         E: From<Error>,
     {
         let _attribution = contextdb_core::find_attribution::stage("window_probe");
-        let Some(memory) = self.verified_ordered_runs.begin_build() else {
+        let Some(memory) = self.verified_ordered_runs.begin_build(read_memory.clone()) else {
             return Ok(None);
         };
         let proof = content_identity::ProofMemory::growable(
@@ -8058,50 +8759,57 @@ impl RetainedReadSource {
         cursor: &mut contextdb_relational::mem::BoundedOrderedRowCursor,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), E>,
         visit: &mut dyn FnMut(RowId) -> std::result::Result<(), E>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<bool, E>
     where
         E: From<Error>,
     {
-        loop {
-            let cache_key = match cursor.source_cache_key() {
-                Some(key) => key,
-                None => self
-                    .verified_ordered_run_key(table, index, snapshot, cursor)
-                    .map_err(E::from)?,
-            };
-            // This drain only delivers windows the cache already holds; opening
-            // a new one is the full pull path's work, where a refusal can be
-            // typed and the build can be charged.
-            let Some(run) = self.verified_ordered_runs.get(&cache_key) else {
-                return Ok(false);
-            };
-            if cursor.source_cache_key().is_none() {
-                cursor.source_begin_cached_run(cache_key, false);
-            }
-            while let Some(posting) = run.postings.get(cursor.source_cached_position()) {
-                if !cursor.source_run_precharged() {
-                    before_touch()?;
-                }
-                cursor.source_advance_cached_position();
-                cursor.source_advance_cached_identity(&posting.source_key, posting.row_id);
-                visit(posting.row_id)?;
-                #[cfg(feature = "test-seams")]
-                if verified_ordered_run_test_seams::evict_after_cached_posting_for_test() {
-                    self.verified_ordered_runs.clear_for_test();
-                    self.clear_statement_proofs();
+        let memory = crate::read_image_memory::ImageMemory::charging_reader(
+            self._source_memory.memory.accountant.clone(),
+            read_memory,
+        );
+        memory.scope(|| {
+            loop {
+                let cache_key = match cursor.source_cache_key() {
+                    Some(key) => key,
+                    None => self
+                        .verified_ordered_run_key(table, index, snapshot, cursor)
+                        .map_err(E::from)?,
+                };
+                // This drain only delivers windows the cache already holds; opening
+                // a new one is the full pull path's work, where a refusal can be
+                // typed and the build can be charged.
+                let Some(run) = self.verified_ordered_runs.get(&cache_key) else {
                     return Ok(false);
+                };
+                if cursor.source_cache_key().is_none() {
+                    cursor.source_begin_cached_run(cache_key, false);
                 }
+                while let Some(posting) = run.postings.get(cursor.source_cached_position()) {
+                    if !cursor.source_run_precharged() {
+                        before_touch()?;
+                    }
+                    cursor.source_advance_cached_position();
+                    cursor.source_advance_cached_identity(&posting.source_key, posting.row_id);
+                    visit(posting.row_id)?;
+                    #[cfg(feature = "test-seams")]
+                    if verified_ordered_run_test_seams::evict_after_cached_posting_for_test() {
+                        self.verified_ordered_runs.clear_for_test();
+                        self.clear_statement_proofs();
+                        return Ok(false);
+                    }
+                }
+                if run.more || run.quota_stopped {
+                    // The window is drained and the range continues past it. The
+                    // cursor carries its last proved key, which is where the next
+                    // window begins.
+                    cursor.source_abandon_cached_run();
+                    continue;
+                }
+                cursor.source_finish_run();
+                return Ok(true);
             }
-            if run.more {
-                // The window is drained and the range continues past it. The
-                // cursor carries its last proved key, which is where the next
-                // window begins.
-                cursor.source_abandon_cached_run();
-                continue;
-            }
-            cursor.source_finish_run();
-            return Ok(true);
-        }
+        })
     }
 
     pub(crate) fn bounded_relational_physical_next<E>(
@@ -8111,6 +8819,7 @@ impl RetainedReadSource {
         snapshot: SnapshotId,
         cursor: &mut contextdb_relational::mem::BoundedPhysicalCursor,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), E>,
+        observed: &mut dyn FnMut(&VersionedRow) -> std::result::Result<(), E>,
         before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), E>,
     ) -> std::result::Result<Option<VersionedRow>, E>
     where
@@ -8177,6 +8886,7 @@ impl RetainedReadSource {
             drop((first_key_guard, first_value));
             self.authenticate_relational_physical_key(table, &first_key, &first_row)
                 .map_err(E::from)?;
+            observed(&first_row)?;
             let (_, group_upper) = RedbPersistence::rel_row_key_range(first_row.row_id);
             // The cursor resumes from the version it inspected last, which it
             // names by identity alone. Keeping that identity instead of a copy
@@ -8203,6 +8913,7 @@ impl RetainedReadSource {
                     .map_err(E::from)?;
                 self.authenticate_relational_physical_key(table, key.value(), &row)
                     .map_err(E::from)?;
+                observed(&row)?;
                 last_key = key.value().to_vec();
                 last_row = Self::physical_row_position(&row);
                 if row.created_tx.0 <= snapshot.0 {
@@ -8248,10 +8959,45 @@ impl RetainedReadSource {
         check_boundary: &mut dyn FnMut() -> std::result::Result<(), E>,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), E>,
         before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), E>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<Option<VersionedRow>, E>
     where
         E: From<Error>,
     {
+        self.bounded_relational_ordered_next_observed(
+            table,
+            meta,
+            declaration,
+            snapshot,
+            cursor,
+            check_boundary,
+            before_touch,
+            &mut |_, _| Ok(()),
+            before_clone,
+            read_memory,
+        )
+    }
+
+    pub(crate) fn bounded_relational_ordered_next_observed<E>(
+        &self,
+        table: &str,
+        meta: &TableMeta,
+        declaration: &IndexDecl,
+        snapshot: SnapshotId,
+        cursor: &mut contextdb_relational::mem::BoundedOrderedRowCursor,
+        check_boundary: &mut dyn FnMut() -> std::result::Result<(), E>,
+        before_touch: &mut dyn FnMut() -> std::result::Result<(), E>,
+        observed: &mut dyn FnMut(&IndexKey, RowId) -> std::result::Result<(), E>,
+        before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), E>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> std::result::Result<Option<VersionedRow>, E>
+    where
+        E: From<Error>,
+    {
+        if cursor.source_prefix_quota() == Some(0) {
+            cursor.source_stop_prefix();
+            return Ok(None);
+        }
         loop {
             if cursor.source_identities_only() {
                 loop {
@@ -8284,6 +9030,7 @@ impl RetainedReadSource {
                             cache_key,
                             check_boundary,
                             before_touch,
+                            read_memory.clone(),
                         )? {
                             cursor.source_begin_cached_run(cache_key, true);
                             cached = Some(run);
@@ -8336,7 +9083,7 @@ impl RetainedReadSource {
                         before_clone(identity.estimated_bytes())?;
                         return Ok(Some(identity));
                     }
-                    if run.more {
+                    if run.more || run.quota_stopped {
                         // Drained, and the range continues: open the next
                         // window at the key this cursor last proved.
                         cursor.source_abandon_cached_run();
@@ -8434,6 +9181,7 @@ impl RetainedReadSource {
                 cursor.source_finish_run();
                 return Ok(None);
             };
+            observed(&position.key, position.row_id)?;
             RedbPersistence::validated_index_position(declaration, meta, &position)
                 .map_err(|reason| E::from(self.content_identity_corruption(reason)))?;
             if !cursor.source_inside_run(&position.key) {
@@ -8659,7 +9407,7 @@ impl ReadImageSource {
     fn start(
         database_path: &Path,
         cache_bytes: usize,
-        source_memory: SourceMemoryReservation,
+        mut source_memory: SourceMemoryReservation,
         runtime_dir: Option<&Path>,
         registration: Option<ReadSnapshotRegistrationGuard>,
     ) -> std::result::Result<Self, LoadReadImageError> {
@@ -8701,6 +9449,22 @@ impl ReadImageSource {
                 ));
             }
         };
+        // The native index is separate from the retained page-cache reserve.
+        // Charge the actual opened handle and release it with the source.
+        let index_bytes = database.cache_index_bytes();
+        let total_source_bytes = source_memory
+            .bytes
+            .checked_add(index_bytes)
+            .ok_or_else(|| {
+                LoadReadImageError::Memory(Error::Other(
+                    "read source memory charge overflow".into(),
+                ))
+            })?;
+        source_memory
+            .memory
+            .reserve(index_bytes)
+            .map_err(LoadReadImageError::Memory)?;
+        source_memory.bytes = total_source_bytes;
         #[cfg(feature = "test-seams")]
         crate::read_probe::note_persistence_read_only_open();
         #[cfg(feature = "test-seams")]
@@ -8841,10 +9605,27 @@ impl ReadImageSource {
         // back before any proof admission is refused.
         content_identity.retain_proved_chunks_within(content_identity::RESIDENT_PROOF_CHUNK_BYTES);
         drop(identity_read);
+        let logical_frontier = SnapshotId(
+            image
+                .commit_index
+                .values()
+                .copied()
+                .max()
+                .unwrap_or(TxId(0))
+                .0
+                .max(
+                    image
+                        .history_on_request
+                        .as_ref()
+                        .and_then(|history| history.commit_index_last)
+                        .map_or(0, |(_, tx)| tx.0),
+                ),
+        );
         let source = Arc::new(RetainedReadSource {
             database_path: self.database_path.clone(),
             database,
             snapshot,
+            logical_frontier,
             registration,
             content_identity,
             content_proof: Mutex::new(content_identity::ReadAuthenticationNodes::new(
@@ -8852,7 +9633,6 @@ impl ReadImageSource {
                 Some(Arc::clone(&cache_memory.accountant)),
             )),
             physical_rows: Mutex::new(None),
-            raw_memberships: Mutex::new(HashMap::new()),
             image_config_cache: Mutex::new(HashMap::new()),
             verified_ordered_runs: VerifiedOrderedRunCache::new(cache_memory),
             _source_memory: self.source_memory.take().ok_or_else(|| {
@@ -9596,7 +10376,7 @@ fn decode_retained_raw_vector_entry(
         row_id: persisted.row_id,
         vector: persisted.vector.to_f32(),
         created_tx: persisted.created_tx,
-        deleted_tx: membership.deleted_tx,
+        deleted_tx: persisted.deleted_tx,
         lsn: persisted.lsn,
     })
 }
@@ -9774,6 +10554,22 @@ fn verify_open_index_commitment(
     Ok(())
 }
 
+fn vector_scan_body_root_matches(read: &redb::ReadTransaction) -> Result<bool> {
+    let actual = read
+        .table_root_fingerprint(VECTORS_TABLE)
+        .map_err(vector_membership_pages::metadata_error)?
+        .unwrap_or([0; 32]);
+    let metadata = match read.open_table(CONTENT_IDENTITY_METADATA_TABLE) {
+        Ok(table) => table,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+        Err(error) => return Err(vector_membership_pages::metadata_error(error)),
+    };
+    let expected = metadata
+        .get(VECTOR_BODY_ROOT_FINGERPRINT_KEY)
+        .map_err(vector_membership_pages::metadata_error)?;
+    Ok(expected.is_some_and(|expected| expected.value() == actual))
+}
+
 fn vector_body_root_matches(
     read_txn: &redb::ReadTransaction,
 ) -> std::result::Result<bool, LoadReadImageError> {
@@ -9798,13 +10594,13 @@ fn vector_body_root_matches(
 
 struct ReadRawVectorDirectory {
     ready: bool,
-    memberships: Vec<VectorPartitionMembershipRecord>,
 }
 
 /// Decode only vector membership identities and generation catalogs. Graph
 /// bodies and journal pages deliberately remain untouched during hydration.
 fn decode_read_vector_generation_catalog(
     read_txn: &redb::ReadTransaction,
+    memory: &Arc<crate::read_image_memory::ImageMemory>,
 ) -> std::result::Result<
     (
         LoadedVectorPartitionGenerationCatalog,
@@ -9812,9 +10608,8 @@ fn decode_read_vector_generation_catalog(
     ),
     LoadReadImageError,
 > {
+    vector_membership_pages::validate_in_read(read_txn).map_err(read_image_error)?;
     let mut known_by_key = HashMap::<Vec<u8>, VectorPartitionRef>::new();
-    let mut raw_memberships = Vec::new();
-    let mut raw_vector_keys = HashSet::<Vec<u8>>::new();
     let mut raw_ready = true;
     let memberships = match read_txn.open_table(VECTOR_PARTITION_MEMBERSHIP_TABLE) {
         Ok(table) => Some(table),
@@ -9929,14 +10724,6 @@ fn decode_read_vector_generation_catalog(
                 raw_ready = false;
                 continue;
             }
-            if !raw_vector_keys.insert(RedbPersistence::vector_identity_key(
-                &membership.index,
-                membership.row_id,
-                membership.vector_created_tx,
-                membership.vector_lsn,
-            )) {
-                raw_ready = false;
-            }
             let route =
                 VectorPartitionRef::new(membership.index.clone(), membership.partition_key.clone());
             known_by_key.insert(
@@ -9946,7 +10733,6 @@ fn decode_read_vector_generation_catalog(
                 ),
                 route,
             );
-            raw_memberships.push(membership);
         }
         membership_projection = Some(projection);
     }
@@ -9972,10 +10758,16 @@ fn decode_read_vector_generation_catalog(
             Err(redb::TableError::TableDoesNotExist(_)) => 0,
             Err(error) => return Err(read_table_error(error)),
         };
-        if vector_count != directory_count {
+        // A body may own several disjoint historical placements. The writer
+        // maintains the number of distinct referenced body identities and
+        // binds it with the membership set on the committed vector roots.
+        let referenced_body_count =
+            vector_membership_pages::referenced_body_count_in_read(read_txn)
+                .map_err(read_image_error)?;
+        if vector_count != referenced_body_count {
             return Err(read_image_corruption(
                 ReadImageCorruptionCause::MalformedRecord,
-                "compact vector directory count disagrees with vector bodies",
+                "compact vector directory distinct body count disagrees with vector bodies",
             ));
         }
         let committed = content_identity::vector_directory_projection_in_read(read_txn)
@@ -9983,7 +10775,7 @@ fn decode_read_vector_generation_catalog(
         if membership_projection
             .take()
             .expect("scanned memberships produce a directory projection")
-            .root()
+            .root_with_vector_body_count(referenced_body_count)
             != committed
         {
             return Err(read_image_corruption(
@@ -9997,25 +10789,90 @@ fn decode_read_vector_generation_catalog(
             // pages: only a healthy cold open has the dimension-independent
             // I/O promise. Payload-only damage remains a selected-body proof;
             // a changed physical key is structural damage at open.
-            let mut unmatched = raw_vector_keys.clone();
             let vectors = read_txn
                 .open_table(VECTORS_TABLE)
                 .map_err(read_table_error)?;
-            for entry in vectors.iter().map_err(read_storage_error)? {
-                let (key, _) = entry.map_err(read_storage_error)?;
-                if !unmatched.remove(key.value()) {
+            let memberships = read_txn
+                .open_table(VECTOR_PARTITION_MEMBERSHIP_TABLE)
+                .map_err(read_table_error)?;
+            for item in memberships.iter().map_err(read_storage_error)? {
+                let (_, value) = item.map_err(read_storage_error)?;
+                let member: VectorPartitionMembershipRecord =
+                    decode_vector_partition_record_payload(
+                        VectorPartitionRecordKind::Membership,
+                        value.value(),
+                    )
+                    .map_err(|reason| {
+                        read_image_corruption(ReadImageCorruptionCause::MalformedRecord, reason)
+                    })?;
+                let key = RedbPersistence::vector_identity_key(
+                    &member.index,
+                    member.row_id,
+                    member.vector_created_tx,
+                    member.vector_lsn,
+                );
+                if vectors
+                    .get_bounded(key.as_slice())
+                    .map_err(read_storage_error)?
+                    .is_none()
+                {
                     return Err(direct_read_requires_writer_for(
                         ReadImageRequiresWriterCause::InvalidVectorReference,
-                        "a vector body key is absent from the committed directory",
+                        "the committed directory names a missing vector body key",
                     ));
                 }
             }
-            if !unmatched.is_empty() {
-                return Err(direct_read_requires_writer_for(
+            let reverse = read_txn
+                .open_table(vector_membership_pages::REVERSE)
+                .map_err(read_table_error)?;
+            vector_identity_range::visit_table(
+                &vectors,
+                None,
+                memory.accountant.clone(),
+                &mut || Ok(()),
+                &mut |identity| {
+                    let prefix = vector_membership_pages::reverse_row_prefix(
+                        &identity.index,
+                        identity.row_id,
+                    );
+                    let mut found = false;
+                    for item in reverse
+                        .prefix_bounded(&prefix)
+                        .map_err(RedbPersistence::storage_error)?
+                    {
+                        let (_, value) = item.map_err(RedbPersistence::storage_error)?;
+                        let member: VectorPartitionMembershipRecord =
+                            decode_vector_partition_record_payload(
+                                VectorPartitionRecordKind::Membership,
+                                value.value(),
+                            )
+                            .map_err(Error::Other)?;
+                        if member.index == identity.index
+                            && member.row_id == identity.row_id
+                            && member.vector_created_tx == identity.created_tx
+                            && member.vector_lsn == identity.lsn
+                        {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
+                        return Err(Error::StoreCorrupted {
+                            path: "vector_entries".into(),
+                            reason: "a vector body key is absent from the committed directory"
+                                .into(),
+                        });
+                    }
+                    Ok(())
+                },
+            )
+            .map_err(|error| match error {
+                Error::StoreCorrupted { .. } => direct_read_requires_writer_for(
                     ReadImageRequiresWriterCause::InvalidVectorReference,
-                    "the committed directory names a missing vector body key",
-                ));
-            }
+                    "a vector body key is absent from the committed directory",
+                ),
+                other => read_image_error(other),
+            })?;
         }
     }
 
@@ -10031,10 +10888,7 @@ fn decode_read_vector_generation_catalog(
                     catalogs: Vec::new(),
                     quarantines: Vec::new(),
                 },
-                ReadRawVectorDirectory {
-                    ready: raw_ready,
-                    memberships: raw_memberships,
-                },
+                ReadRawVectorDirectory { ready: raw_ready },
             ));
         }
         Err(error) => return Err(read_table_error(error)),
@@ -10100,10 +10954,7 @@ fn decode_read_vector_generation_catalog(
             catalogs,
             quarantines,
         },
-        ReadRawVectorDirectory {
-            ready: raw_ready,
-            memberships: raw_memberships,
-        },
+        ReadRawVectorDirectory { ready: raw_ready },
     ))
 }
 
@@ -11467,7 +12318,7 @@ fn decode_complete_read_image(
     let table_meta = decode_read_table_meta(read_txn)?;
     note_open("table_meta");
     let (vector_generation_catalog, raw_vector_directory) =
-        decode_read_vector_generation_catalog(read_txn)?;
+        decode_read_vector_generation_catalog(read_txn, &memory)?;
     note_open("vector_catalog_and_raw_vector_directory");
     // Durable relational postings and the raw-vector membership directory
     // must both cover their complete body tables before the direct reader can
@@ -11636,11 +12487,7 @@ fn decode_complete_read_image(
         forward_edges,
         reverse_edges,
         vector_entries,
-        raw_vector_memberships: if lazy_relational {
-            raw_vector_directory.memberships
-        } else {
-            Default::default()
-        },
+        raw_vector_memberships: Vec::new(),
         current_vectors,
         sync_source_lsns,
         sync_source_kinds,
@@ -16312,7 +17159,16 @@ pub mod read_persistence_test_scaffold {
         path: &Path,
         damage: TombstoneCommitDamage,
     ) -> std::result::Result<(), String> {
-        let database = open_damage_fixture(path)?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|error| error.to_string())?;
+        let owner = super::writer_file::LockedWriterFile::lock(file, path.parent())
+            .map_err(|error| error.to_string())?;
+        let database = super::redb_builder()
+            .open_with_backend(owner.view())
+            .map_err(|error| error.to_string())?;
         let (lsn, tx) = {
             let read = database.begin_read().map_err(|error| error.to_string())?;
             let table = read
@@ -16351,7 +17207,8 @@ pub mod read_persistence_test_scaffold {
         super::RedbPersistence::apply_content_identity_mutations_in_write(
             &write,
             &[mutation],
-            &mut super::content_identity::ProofAdmission::new(None),
+            &mut super::content_identity::ProofAdmission::new(None)
+                .with_scratch_owner(Some(std::sync::Arc::downgrade(&owner))),
         )
         .map_err(|error| error.to_string())?;
         write.commit().map_err(|error| error.to_string())
@@ -16652,31 +17509,49 @@ pub mod read_persistence_test_scaffold {
             super::ColumnType::Vector(dimension) => dimension,
             _ => return Err(format!("fixture column is not a vector: {index}")),
         };
-        let membership = image
-            .raw_vector_memberships
-            .iter()
-            .filter(|membership| {
-                membership.index == *index
-                    && membership.row_id == row_id
-                    && membership.visible_from.0 <= snapshot.0
-                    && membership
-                        .deleted_tx
-                        .is_none_or(|deleted| deleted.0 > snapshot.0)
+        let membership = source
+            .with_read(|read| {
+                let table = read
+                    .open_table(super::VECTOR_PARTITION_MEMBERSHIP_TABLE)
+                    .map_err(super::RedbPersistence::storage_error)?;
+                let mut found = None;
+                for item in table
+                    .iter()
+                    .map_err(super::RedbPersistence::storage_error)?
+                {
+                    let (_, value) = item.map_err(super::RedbPersistence::storage_error)?;
+                    let member: super::VectorPartitionMembershipRecord =
+                        super::decode_vector_partition_record_payload(
+                            super::VectorPartitionRecordKind::Membership,
+                            value.value(),
+                        )
+                        .map_err(contextdb_core::Error::Other)?;
+                    if member.index == *index
+                        && member.row_id == row_id
+                        && member.visible_from.0 <= snapshot.0
+                        && member
+                            .deleted_tx
+                            .is_none_or(|deleted| deleted.0 > snapshot.0)
+                        && found.as_ref().is_none_or(
+                            |old: &super::VectorPartitionMembershipRecord| {
+                                (
+                                    member.visible_from,
+                                    member.vector_created_tx,
+                                    member.vector_lsn,
+                                ) > (old.visible_from, old.vector_created_tx, old.vector_lsn)
+                            },
+                        )
+                    {
+                        found = Some(member);
+                    }
+                }
+                found.ok_or_else(|| {
+                    contextdb_core::Error::Other(
+                        "fixture has no selected durable vector version".into(),
+                    )
+                })
             })
-            .max_by_key(|membership| {
-                (
-                    membership.visible_from,
-                    membership.vector_created_tx,
-                    membership.vector_lsn,
-                )
-            })
-            .cloned()
-            .ok_or_else(|| {
-                format!(
-                    "fixture has no durable {index} version for row {} at snapshot {}",
-                    row_id.0, snapshot.0
-                )
-            })?;
+            .map_err(|error| error.to_string())?;
         let mut loaded = source
             .load_raw_vector_entries_for_memberships(
                 std::slice::from_ref(&membership),
@@ -16751,6 +17626,16 @@ pub(crate) fn redb_writer_cache_bytes_for_limit(limit: Option<usize>) -> usize {
 #[cfg(feature = "test-seams")]
 pub fn redb_writer_cache_bytes_for_limit_for_test(limit: Option<usize>) -> usize {
     redb_writer_cache_bytes_for_limit(limit)
+}
+
+/// Exact existing page-cap and fixed source-reservation components.
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub fn read_source_cache_reservation_for_limit_for_test(limit: Option<usize>) -> (usize, usize) {
+    (
+        redb_cache_bytes_for_limit(limit),
+        64 * 1024 + content_identity::READ_VERIFIER_MEMORY_BYTES,
+    )
 }
 
 const STORAGE_MAINTENANCE_PAGE_BATCH: usize = 64;
@@ -16910,7 +17795,7 @@ const TRIGGER_AUDIT_STAMPS_TABLE: TableDefinition<&str, u64> =
 const GRAPH_FWD_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("graph_fwd");
 const GRAPH_REV_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("graph_rev");
 const VECTORS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("vector_entries");
-const VECTOR_PARTITION_MEMBERSHIP_TABLE: TableDefinition<&[u8], &[u8]> =
+pub(crate) const VECTOR_PARTITION_MEMBERSHIP_TABLE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("vector_partition_membership");
 /// Small per-membership witnesses, stored away from vector body pages.
 const VECTOR_OPEN_DIRECTORY_TABLE: TableDefinition<&[u8], &[u8]> =
@@ -16924,6 +17809,7 @@ const COMPACT_INDEX_SET_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("compact_index_set_commitments");
 const VECTOR_OPEN_DIRECTORY_COMMITMENT_KEY: &str = "vector_open_directory_root_v1";
 const VECTOR_BODY_ROOT_FINGERPRINT_KEY: &str = "vector_body_root_v1";
+const VECTOR_REFERENCED_BODY_COUNT_KEY: &str = "vector_referenced_body_count";
 const VECTOR_PARTITION_JOURNAL_TABLE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("vector_partition_journal");
 const VECTOR_PARTITION_TOMBSTONE_TABLE: TableDefinition<&[u8], &[u8]> =
@@ -17015,6 +17901,7 @@ pub struct RedbPersistence {
     /// Captures the writer's published root for paged generation readers.
     paged_root_capture: std::sync::OnceLock<vector_paged::PagedRootCapture>,
     scoped_vector_root_capture: std::sync::OnceLock<vector_paged::ScopedWriterRootCapture>,
+    vector_repair_audit: parking_lot::Mutex<Option<vector_paged::RepairAudit>>,
 }
 pub(crate) struct RawSyncApplyStateDigest {
     pub(crate) digest: String,
@@ -17678,6 +18565,47 @@ impl ReadOnlyVectorGraphPageReader for RetainedVectorGraphPageReader {
                 .to_vec()
         };
         Ok(encoded)
+    }
+}
+
+impl RetainedReadSource {
+    /// Committed-image twin of the writable bridge: the same read of this
+    /// pinned source, retained together with the source itself.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn captured_vector_serving_selection_in_read(
+        self: &Arc<Self>,
+        read: Arc<redb::ReadTransaction>,
+        writer: Option<Arc<WriterSnapshot>>,
+        retained: Option<Arc<RetainedReadSource>>,
+        partition: &VectorPartitionRef,
+        generations: Option<(
+            VectorPartitionGenerationDescriptor,
+            Option<VectorPartitionGenerationDescriptor>,
+        )>,
+        inspection: contextdb_vector::store::RawVectorInspectionSnapshot,
+        snapshot: SnapshotId,
+        owner: &mut contextdb_vector::VectorCopyAdmission,
+    ) -> Result<contextdb_vector::store::CapturedVectorServingSelection> {
+        if writer.is_some()
+            || !retained
+                .as_ref()
+                .is_some_and(|retained| Arc::ptr_eq(retained, self))
+        {
+            return Err(vector_membership_source::damage(
+                "committed-image vector serving escaped its retained source",
+            ));
+        }
+        crate::database::vector_captured_serving::captured_serving_selection(
+            crate::database::vector_captured_serving::CapturedVectorRootLease::retained(
+                read,
+                Arc::clone(self),
+            )?,
+            partition,
+            generations,
+            inspection,
+            snapshot,
+            owner,
+        )
     }
 }
 
@@ -18468,18 +19396,24 @@ pub(crate) struct SchemaDdlPersistence<'a> {
 }
 
 #[derive(Default)]
-pub(crate) struct FlushDataSnapshots {
-    pub(crate) table_meta: Option<HashMap<String, TableMeta>>,
+pub(crate) struct FlushDataSnapshots<'a> {
+    pub(crate) table_meta: Option<&'a HashMap<String, TableMeta>>,
     pub(crate) deleted_rows: Option<HashMap<String, HashMap<RowId, VersionedRow>>>,
 }
 
+pub(crate) struct LocalErasurePersistence<'a> {
+    pub(crate) projection: &'a AuthoritativePurgePersistenceProjection,
+    pub(crate) accountant: Arc<dyn contextdb_vector::MemoryBudget>,
+    pub(crate) operation: &'static str,
+}
+
 pub(crate) struct FlushDataOptions<'a> {
-    pub(crate) local_erasure: Option<&'a AuthoritativePurgePersistenceProjection>,
+    pub(crate) local_erasure: Option<LocalErasurePersistence<'a>>,
     pub(crate) sink_events: &'a [PreparedSinkEvent],
     pub(crate) trigger_audits: &'a [(u64, TriggerAuditEntry)],
     pub(crate) schema_ddl: SchemaDdlPersistence<'a>,
     pub(crate) max_sink_queue_depth: usize,
-    pub(crate) snapshots: FlushDataSnapshots,
+    pub(crate) snapshots: FlushDataSnapshots<'a>,
     /// A complete prepared received-schema image. When present, it replaces
     /// the ordinary incremental Redb writes in this same transaction; memory
     /// publication remains the transaction manager's after-apply work.
@@ -18518,7 +19452,9 @@ pub(crate) struct ReceivedSchemaPersistenceProjection {
     pub(crate) rows: HashMap<String, Vec<VersionedRow>>,
     pub(crate) sync_sources: Vec<(String, RowId, Lsn, SyncSourceKind)>,
     pub(crate) edges: Vec<AdjEntry>,
+    /// Canonical bodies and exact independent placements are supplied together.
     pub(crate) vectors: Vec<VectorEntry>,
+    pub(crate) vector_memberships: Vec<VectorPartitionMembershipRecord>,
     pub(crate) ddl_log: Vec<(Lsn, DdlChange)>,
     pub(crate) config_values: Vec<(String, Vec<u8>)>,
     pub(crate) config_max_u64_keys: Vec<String>,
@@ -18902,6 +19838,49 @@ fn sync_database_parent(path: &Path) -> Result<()> {
 }
 
 impl RedbPersistence {
+    /// Actual collection backing capacity retained by staged paged publications.
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn paged_publication_owners_for_test(&self) -> usize {
+        let publications = self.paged_publications.lock();
+        let pages_capacity = |pages: &PreencodedVectorPartitionGraphPages| {
+            pages.root_key.capacity()
+                + pages.manifest_bytes.capacity()
+                + pages.graph_bytes.capacity()
+        };
+        publications.capacity()
+            * (std::mem::size_of::<(Vec<u8>, vector_paged::PagedPublication)>() + 1)
+            + publications
+                .iter()
+                .map(|(key, publication)| {
+                    let prepared = &publication.prepared;
+                    key.capacity()
+                        + prepared.base_key.capacity()
+                        + prepared.base_bytes.capacity()
+                        + pages_capacity(&prepared.base_pages)
+                        + prepared
+                            .change
+                            .as_ref()
+                            .map_or(0, |(key, bytes)| key.capacity() + bytes.capacity())
+                        + prepared.change_pages.as_ref().map_or(0, pages_capacity)
+                        + prepared.catalog_key.capacity()
+                        + prepared.catalog_bytes.capacity()
+                        + prepared.catalog_route.index.table.capacity()
+                        + prepared.catalog_route.index.column.capacity()
+                        // This accessor counts component Vec and TEXT capacities
+                        // plus the inline key, already included in the map slot.
+                        + (prepared.catalog_route.partition_key.estimated_bytes()
+                            - std::mem::size_of::<VectorPartitionKey>())
+                        + prepared.attributable_stale_catalog_keys.capacity()
+                            * std::mem::size_of::<Vec<u8>>()
+                        + prepared
+                            .attributable_stale_catalog_keys
+                            .iter()
+                            .map(Vec::capacity)
+                            .sum::<usize>()
+                })
+                .sum::<usize>()
+    }
+
     /// Publish a completed checkpoint as a fresh physical database
     /// incarnation. The checkpoint bytes are a snapshot of the source, but
     /// its adjacent companion and authoritative-erasure fence belong only to
@@ -19406,7 +20385,8 @@ impl RedbPersistence {
         };
         if let Err(error) = Self::write_format_marker(
             &replacement_db,
-            &mut content_identity::ProofAdmission::unaccounted(),
+            &mut content_identity::ProofAdmission::unaccounted()
+                .with_scratch_owner(Some(Arc::downgrade(&replacement_owner))),
         ) {
             drop(replacement_db);
             drop(replacement_owner);
@@ -19460,6 +20440,7 @@ impl RedbPersistence {
             paged_publications: Default::default(),
             paged_root_capture: std::sync::OnceLock::new(),
             scoped_vector_root_capture: std::sync::OnceLock::new(),
+            vector_repair_audit: parking_lot::Mutex::new(None),
         })
     }
 
@@ -19502,7 +20483,8 @@ impl RedbPersistence {
         match create_result {
             Ok(db) => match Self::write_format_marker(
                 &db,
-                &mut content_identity::ProofAdmission::new(accountant.clone()),
+                &mut content_identity::ProofAdmission::new(accountant.clone())
+                    .with_scratch_owner(Some(Arc::downgrade(&owner))),
             )
             .and_then(|()| lock_file.publish_writer_run(path, true))
             {
@@ -19528,6 +20510,7 @@ impl RedbPersistence {
                         paged_publications: Default::default(),
                         paged_root_capture: std::sync::OnceLock::new(),
                         scoped_vector_root_capture: std::sync::OnceLock::new(),
+            vector_repair_audit: parking_lot::Mutex::new(None),
                     })
                 }
                 Err(err) => {
@@ -19559,6 +20542,11 @@ impl RedbPersistence {
     }
 
     /// Record what the owning database charged for this store's page cache.
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn cache_index_bytes_for_test(&self) -> Result<usize> {
+        self.with_db(|db| Ok(db.cache_index_bytes()))
+    }
+
     pub(crate) fn record_cache_charge(&self, bytes: usize) {
         let _ = self.cache_charge_bytes.set(bytes);
     }
@@ -19715,6 +20703,7 @@ impl RedbPersistence {
                     paged_publications: Default::default(),
                     paged_root_capture: std::sync::OnceLock::new(),
                     scoped_vector_root_capture: std::sync::OnceLock::new(),
+            vector_repair_audit: parking_lot::Mutex::new(None),
                 };
                 persistence.recover_authoritative_purge_publication()?;
                 persistence.truncate_uncommitted_commit_index_tail()?;
@@ -20271,136 +21260,189 @@ impl RedbPersistence {
     }
 
     fn prepare_complete_vector_partition_image(
+        &self,
         stage: &ReceivedSchemaPersistenceProjection,
         publication_lsn: Lsn,
     ) -> Result<CompleteVectorPartitionImage> {
-        // Price every possible row/vector pairing while borrowing the accepted
-        // image. No route, dictionary or cloned record exists before admission.
-        // The bound includes all simultaneously held route copies, geometric
-        // collection growth and temporary canonical key encodings.
-        let mut bytes = 0usize;
+        // Admission precedes indexes and route copies. Each placement names one
+        // exact row version and one canonical body, never a row/body cross product.
+        let row_count = stage.rows.values().map(Vec::len).sum::<usize>();
         let record_slots = std::mem::size_of::<VectorPartitionMembershipRecord>()
             .saturating_mul(4)
             .saturating_add(std::mem::size_of::<VectorPartitionJournalRecord>().saturating_mul(8))
             .saturating_add(std::mem::size_of::<VectorPartitionTombstoneRecord>().saturating_mul(4))
             .saturating_add(1024);
-        for vector in &stage.vectors {
-            let declaration = stage.table_meta.get(&vector.index.table).and_then(|meta| {
-                meta.columns
-                    .iter()
-                    .find(|column| column.name == vector.index.column)
-            });
-            if let Some(rows) = stage.rows.get(&vector.index.table) {
-                for row in rows.iter().filter(|row| row.row_id == vector.row_id) {
-                    let partition_bytes = declaration
-                        .and_then(|column| column.partition_key_columns.as_ref())
-                        .map_or(0usize, |columns| {
-                            columns.iter().fold(0usize, |bytes, column| {
-                                bytes
-                                    .saturating_add(
-                                        std::mem::size_of::<VectorPartitionComponent>()
-                                            .saturating_mul(2)
-                                            .saturating_add(16),
-                                    )
-                                    .saturating_add(
-                                        row.values
-                                            .get(column)
-                                            .map_or(0, |value| value.estimated_bytes()),
-                                    )
-                            })
-                        });
-                    let route_bytes = vector
-                        .index
-                        .table
-                        .len()
-                        .saturating_add(vector.index.column.len())
-                        .saturating_add(partition_bytes)
-                        .saturating_add(128);
-                    bytes = bytes
-                        .saturating_add(record_slots)
-                        .saturating_add(route_bytes.saturating_mul(16));
-                }
-            }
+        let mut bytes =
+            row_count
+                .saturating_mul(std::mem::size_of::<(&str, &VersionedRow)>())
+                .saturating_add(stage.vectors.len().saturating_mul(
+                    std::mem::size_of::<&VectorEntry>() + std::mem::size_of::<bool>(),
+                ));
+        for membership in &stage.vector_memberships {
+            let route_bytes = membership
+                .index
+                .table
+                .len()
+                .saturating_add(membership.index.column.len())
+                .saturating_add(membership.partition_key.estimated_bytes())
+                .saturating_add(128);
+            bytes = bytes
+                .saturating_add(record_slots)
+                .saturating_add(route_bytes.saturating_mul(16));
         }
-        if !stage.vectors.is_empty() {
-            // The smallest Vec/HashMap allocations still have spare slots.
+        if !stage.vector_memberships.is_empty() {
             bytes = bytes.saturating_add(record_slots.saturating_mul(4));
         }
         stage.vector_image_memory.reserve(bytes)?;
+        let mut rows = Vec::with_capacity(row_count);
+        for (table, versions) in &stage.rows {
+            rows.extend(versions.iter().map(|row| (table.as_str(), row)));
+        }
+        rows.sort_unstable_by_key(|(table, row)| (*table, row.row_id, row.created_tx, row.lsn));
+        let mut bodies = stage.vectors.iter().collect::<Vec<_>>();
+        bodies.sort_unstable_by_key(|body| {
+            (
+                body.index.table.as_str(),
+                body.index.column.as_str(),
+                body.row_id,
+                body.created_tx,
+                body.lsn,
+            )
+        });
+        for pair in bodies.windows(2) {
+            let same_identity = pair[0].index == pair[1].index
+                && pair[0].row_id == pair[1].row_id
+                && pair[0].created_tx == pair[1].created_tx
+                && pair[0].lsn == pair[1].lsn;
+            if same_identity
+                && (pair[0].deleted_tx != pair[1].deleted_tx
+                    || pair[0].vector.len() != pair[1].vector.len()
+                    || pair[0]
+                        .vector
+                        .iter()
+                        .zip(&pair[1].vector)
+                        .any(|(a, b)| a.to_bits() != b.to_bits()))
+            {
+                return Err(self.vector_partition_corruption(
+                    "received placements disagree on their canonical body",
+                ));
+            }
+        }
+        bodies.dedup_by_key(|body| {
+            (
+                body.index.table.as_str(),
+                body.index.column.as_str(),
+                body.row_id,
+                body.created_tx,
+                body.lsn,
+            )
+        });
+        let mut body_has_placement = vec![false; bodies.len()];
         let mut memberships_by_key = BTreeMap::<Vec<u8>, VectorPartitionMembershipRecord>::new();
         let mut occupied = HashMap::<VectorIndexRef, HashSet<VectorPartitionKey>>::new();
         let mut caps = HashMap::<VectorIndexRef, Option<u32>>::new();
-
-        for vector in &stage.vectors {
+        for membership in &stage.vector_memberships {
             let (meta, declaration) = stage
                 .table_meta
-                .get(&vector.index.table)
+                .get(&membership.index.table)
                 .and_then(|meta| {
                     meta.columns
                         .iter()
-                        .find(|column| column.name == vector.index.column)
-                        .map(|declaration| (meta, declaration))
+                        .find(|column| column.name == membership.index.column)
+                        .map(|column| (meta, column))
                 })
                 .filter(|(_, column)| matches!(&column.column_type, ColumnType::Vector(_)))
                 .ok_or_else(|| Error::UnknownVectorIndex {
-                    index: vector.index.clone(),
+                    index: membership.index.clone(),
                 })?;
-            caps.entry(vector.index.clone())
+            let row_position = rows
+                .binary_search_by_key(
+                    &(
+                        membership.index.table.as_str(),
+                        membership.row_id,
+                        membership.row_created_tx,
+                        membership.row_lsn,
+                    ),
+                    |(table, row)| (*table, row.row_id, row.created_tx, row.lsn),
+                )
+                .map_err(|_| {
+                    self.vector_partition_corruption(
+                        "received placement has no exact accepted row owner",
+                    )
+                })?;
+            let row = rows[row_position].1;
+            let body_position = bodies
+                .binary_search_by_key(
+                    &(
+                        membership.index.table.as_str(),
+                        membership.index.column.as_str(),
+                        membership.row_id,
+                        membership.vector_created_tx,
+                        membership.vector_lsn,
+                    ),
+                    |body| {
+                        (
+                            body.index.table.as_str(),
+                            body.index.column.as_str(),
+                            body.row_id,
+                            body.created_tx,
+                            body.lsn,
+                        )
+                    },
+                )
+                .map_err(|_| {
+                    self.vector_partition_corruption(
+                        "received placement has no exact canonical body",
+                    )
+                })?;
+            let body = bodies[body_position];
+            body_has_placement[body_position] = true;
+            if membership.visible_from < TxId(row.created_tx.0.max(body.created_tx.0))
+                || membership
+                    .deleted_tx
+                    .is_some_and(|deleted| deleted <= membership.visible_from)
+                || [row.deleted_tx, body.deleted_tx]
+                    .into_iter()
+                    .flatten()
+                    .any(|deleted| {
+                        membership
+                            .deleted_tx
+                            .is_none_or(|placement_end| placement_end > deleted)
+                    })
+            {
+                return Err(self.vector_partition_corruption(
+                    "received placement exceeds its exact row or body lifecycle",
+                ));
+            }
+            let partition_key =
+                vector_partition_key_for_row(&membership.index, meta, declaration, row)?;
+            if partition_key != membership.partition_key {
+                return Err(self.vector_partition_corruption(
+                    "received placement partition disagrees with its exact row owner",
+                ));
+            }
+            caps.entry(membership.index.clone())
                 .or_insert_with(|| declaration.effective_max_partitions());
-            let rows = stage.rows.get(&vector.index.table).ok_or_else(|| {
-                Error::Other(format!(
-                    "complete received image has no rows for vector index {}.{}",
-                    vector.index.table, vector.index.column
-                ))
-            })?;
-            let mut matched = false;
-            for row in rows.iter().filter(|row| row.row_id == vector.row_id) {
-                let visible_from = TxId(row.created_tx.0.max(vector.created_tx.0));
-                let deleted_tx = match (row.deleted_tx, vector.deleted_tx) {
-                    (Some(row_deleted), Some(vector_deleted)) => {
-                        Some(TxId(row_deleted.0.min(vector_deleted.0)))
-                    }
-                    (Some(row_deleted), None) => Some(row_deleted),
-                    (None, Some(vector_deleted)) => Some(vector_deleted),
-                    (None, None) => None,
-                };
-                if deleted_tx.is_some_and(|deleted| deleted.0 <= visible_from.0) {
-                    continue;
-                }
-                let partition_key =
-                    vector_partition_key_for_row(&vector.index, meta, declaration, row)?;
-                let membership = VectorPartitionMembershipRecord {
-                    index: vector.index.clone(),
-                    partition_key: partition_key.clone(),
-                    row_id: row.row_id,
-                    row_created_tx: row.created_tx,
-                    row_lsn: row.lsn,
-                    vector_created_tx: vector.created_tx,
-                    vector_lsn: vector.lsn,
-                    visible_from,
-                    deleted_tx,
-                };
-                let key = Self::vector_partition_membership_key(&membership);
-                if let Some(existing) = memberships_by_key.insert(key, membership.clone())
-                    && existing != membership
-                {
-                    return Err(Error::Other(
-                        "complete received image contains conflicting vector memberships"
-                            .to_string(),
-                    ));
-                }
-                occupied
-                    .entry(vector.index.clone())
-                    .or_default()
-                    .insert(partition_key);
-                matched = true;
+            let key = Self::vector_partition_membership_key(membership);
+            if let Some(existing) = memberships_by_key.insert(key, membership.clone())
+                && existing != *membership
+            {
+                return Err(self.vector_partition_corruption(
+                    "complete received image contains conflicting vector memberships",
+                ));
             }
-            if !matched {
-                return Err(Error::Other(format!(
-                    "complete received image cannot pair a vector with an accepted row on {}.{}",
-                    vector.index.table, vector.index.column
-                )));
-            }
+            occupied
+                .entry(membership.index.clone())
+                .or_default()
+                .insert(partition_key);
+        }
+        if body_has_placement
+            .iter()
+            .any(|has_placement| !has_placement)
+        {
+            return Err(self.vector_partition_corruption(
+                "received canonical body has no exact accepted placement",
+            ));
         }
 
         for (index, partitions) in occupied {
@@ -20716,9 +21758,13 @@ impl RedbPersistence {
                 max_sink_queue_depth,
             );
         }
+        let loaded_table_meta;
         let table_meta = match options.snapshots.table_meta {
             Some(table_meta) => table_meta,
-            None => self.load_all_table_meta()?,
+            None => {
+                loaded_table_meta = self.load_all_table_meta()?;
+                &loaded_table_meta
+            }
         };
         let write_set_has_vector_changes = !ws.vector_deletes.is_empty()
             || !ws.vector_inserts.is_empty()
@@ -20763,7 +21809,8 @@ impl RedbPersistence {
         }
         let prepared_local_erasure_vector_generations = options
             .local_erasure
-            .map(|projection| self.prepare_authoritative_purge_vector_generations(projection))
+            .as_ref()
+            .map(|erasure| self.prepare_authoritative_purge_vector_generations(erasure.projection))
             .transpose()?
             .unwrap_or_default();
         self.with_db(|db| {
@@ -20839,8 +21886,7 @@ impl RedbPersistence {
                                 lsn: batch.commit_lsn,
                             };
                             if let PreparedVectorPartitionMutation::Move { before, .. } = mutation {
-                                let vectors = write_txn
-                                    .open_table(VECTORS_TABLE)
+                                let vectors = content_size::open_vectors(&write_txn)
                                     .map_err(Self::storage_error)?;
                                 let source_key = Self::vector_identity_key(
                                     index,
@@ -20874,8 +21920,7 @@ impl RedbPersistence {
             // exact already-durable body, so preserve that witness on both
             // the retired row occurrence and any moved successor.
             if let Some(batch) = partition_mutations {
-                let vectors = write_txn
-                    .open_table(VECTORS_TABLE)
+                let vectors = content_size::open_vectors(&write_txn)
                     .map_err(Self::storage_error)?;
                 for mutation in &batch.mutations {
                     let (index, before, after) = match mutation {
@@ -20945,8 +21990,7 @@ impl RedbPersistence {
                 let table_name = Self::rel_table_name(table);
                 let table_def: TableDefinition<&[u8], &[u8]> =
                     TableDefinition::new(table_name.as_str());
-                let mut redb_table = write_txn
-                    .open_table(table_def)
+                let mut redb_table = content_size::open_rows(&write_txn, table_def)
                     .map_err(Self::storage_error)?;
                 let mut encoded = Vec::new();
                 for (row_id, deleted_tx) in deletes {
@@ -21042,8 +22086,7 @@ impl RedbPersistence {
                 let table_name = Self::rel_table_name(table);
                 let table_def: TableDefinition<&[u8], &[u8]> =
                     TableDefinition::new(table_name.as_str());
-                let mut redb_table = write_txn
-                    .open_table(table_def)
+                let mut redb_table = content_size::open_rows(&write_txn, table_def)
                     .map_err(Self::storage_error)?;
                 let mut encoded = Vec::new();
                 for row in rows {
@@ -21076,6 +22119,15 @@ impl RedbPersistence {
                     } else {
                         HashMap::new()
                     };
+                    // A clear removes the prior body's witness from this
+                    // successor. A replacement may stage a new body below.
+                    overlay.retain(|column, _| {
+                        !ws.vector_deletes.iter().any(|(index, deleted_row, _)| {
+                            index.table == table
+                                && *deleted_row == row.row_id
+                                && index.column == *column
+                        })
+                    });
                     if let Some(staged) = f32_row_vectors.get(&(
                         table.to_owned(),
                         row.row_id,
@@ -21248,8 +22300,7 @@ impl RedbPersistence {
             }
 
             if has_vector_changes {
-                let mut vectors_table = write_txn
-                    .open_table(VECTORS_TABLE)
+                let mut vectors_table = content_size::open_vectors(&write_txn)
                     .map_err(Self::storage_error)?;
 
                 if let Some(batch) = partition_mutations {
@@ -21722,12 +22773,14 @@ impl RedbPersistence {
                 }
             }
 
-            if let Some(erasure) = options.local_erasure {
+            if let Some(erasure) = options.local_erasure.as_ref() {
                 self.apply_local_erasure(
                     &write_txn,
-                    erasure,
+                    erasure.projection,
                     &prepared_local_erasure_vector_generations,
                     None,
+                    erasure.accountant.clone(),
+                    erasure.operation,
                 )?;
             }
             #[cfg(feature = "test-seams")]
@@ -21820,7 +22873,7 @@ impl RedbPersistence {
             let table_name = Self::rel_table_name(table);
             let table_def: TableDefinition<&[u8], &[u8]> =
                 TableDefinition::new(table_name.as_str());
-            let relation = match write_txn.open_table(table_def) {
+            let relation = match content_size::open_rows(write_txn, table_def) {
                 Ok(relation) => relation,
                 Err(redb::TableError::TableTypeMismatch { .. }) => continue,
                 Err(error) => return Err(Self::storage_error(error)),
@@ -21975,7 +23028,7 @@ impl RedbPersistence {
         }
 
         if stage.replace_vectors {
-            match write_txn.open_table(VECTORS_TABLE) {
+            match content_size::open_vectors(write_txn) {
                 Ok(vectors) => {
                     for item in vectors.iter().map_err(Self::storage_error)? {
                         let (_, value) = item.map_err(Self::storage_error)?;
@@ -22037,10 +23090,7 @@ impl RedbPersistence {
         let partition_image = stage
             .replace_vectors
             .then(|| {
-                Self::prepare_complete_vector_partition_image(
-                    stage,
-                    ws.commit_lsn.unwrap_or(Lsn(0)),
-                )
+                self.prepare_complete_vector_partition_image(stage, ws.commit_lsn.unwrap_or(Lsn(0)))
             })
             .transpose()?;
         let vector_quantization = Self::vector_quantization_map(&stage.table_meta);
@@ -22148,6 +23198,7 @@ impl RedbPersistence {
                 let table_name = Self::rel_table_name(&table);
                 let table_def: TableDefinition<&[u8], &[u8]> =
                     TableDefinition::new(table_name.as_str());
+                content_size::reset_rows(&write_txn, &table)?;
                 match write_txn.delete_table(table_def) {
                     Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
                     Err(redb::TableError::TableTypeMismatch { .. }) => {}
@@ -22165,9 +23216,8 @@ impl RedbPersistence {
                 let table_name = Self::rel_table_name(table);
                 let table_def: TableDefinition<&[u8], &[u8]> =
                     TableDefinition::new(table_name.as_str());
-                let mut redb_table = write_txn
-                    .open_table(table_def)
-                    .map_err(Self::storage_error)?;
+                let mut redb_table =
+                    content_size::open_rows(&write_txn, table_def).map_err(Self::storage_error)?;
                 for row in rows {
                     #[cfg(feature = "test-seams")]
                     crate::database::record_received_schema_durable_row_rewrite_for_test();
@@ -22282,9 +23332,8 @@ impl RedbPersistence {
                 self.remove_vector_entries_matching_in_write(&write_txn, &|index| {
                     stage.affected_tables.contains(&index.table)
                 })?;
-                let mut vectors = write_txn
-                    .open_table(VECTORS_TABLE)
-                    .map_err(Self::storage_error)?;
+                let mut vectors =
+                    content_size::open_vectors(&write_txn).map_err(Self::storage_error)?;
                 for entry in &stage.vectors {
                     let quantization = vector_quantization
                         .get(&entry.index)
@@ -22833,9 +23882,8 @@ impl RedbPersistence {
             let table_name = Self::rel_table_name(table);
             let definition: TableDefinition<&[u8], &[u8]> =
                 TableDefinition::new(table_name.as_str());
-            let mut relation = write_txn
-                .open_table(definition)
-                .map_err(Self::storage_error)?;
+            let mut relation =
+                content_size::open_rows(write_txn, definition).map_err(Self::storage_error)?;
             let key = Self::rel_row_key(&deleted);
             let encoded =
                 Self::encode_versioned_row(&deleted, stage.operational_table_meta.get(table))?;
@@ -22847,9 +23895,8 @@ impl RedbPersistence {
             let table_name = Self::rel_table_name(table);
             let definition: TableDefinition<&[u8], &[u8]> =
                 TableDefinition::new(table_name.as_str());
-            let mut relation = write_txn
-                .open_table(definition)
-                .map_err(Self::storage_error)?;
+            let mut relation =
+                content_size::open_rows(write_txn, definition).map_err(Self::storage_error)?;
             let key = Self::rel_row_key(row);
             let encoded = Self::encode_versioned_row(row, stage.operational_table_meta.get(table))?;
             relation
@@ -23107,9 +24154,8 @@ impl RedbPersistence {
                 let table_name = Self::rel_table_name(table);
                 let table_def: TableDefinition<&[u8], &[u8]> =
                     TableDefinition::new(table_name.as_str());
-                let _relation = write_txn
-                    .open_table(table_def)
-                    .map_err(Self::storage_error)?;
+                let _relation =
+                    content_size::open_rows(&write_txn, table_def).map_err(Self::storage_error)?;
             }
             for (table, meta) in &stage.affected_table_meta {
                 Self::rebuild_relational_indexes_in_write(
@@ -23438,7 +24484,8 @@ impl RedbPersistence {
                 &content_identity::config_mutations(key, encoded.as_deref()),
                 &mut content_identity::ProofAdmission::fixed_refusal_control(
                     self.proof_accountant(),
-                ),
+                )
+                .with_scratch_owner(self.proof_scratch_owner()),
             )?;
             if let Some(encoded) = &encoded {
                 Self::raise_config_identity_floors_in_write(&write_txn, key, encoded)?;
@@ -24030,6 +25077,7 @@ impl RedbPersistence {
             let table_name = Self::rel_table_name(name);
             let table_def: TableDefinition<&[u8], &[u8]> =
                 TableDefinition::new(table_name.as_str());
+            content_size::reset_rows(&write_txn, name)?;
             match write_txn.delete_table(table_def) {
                 Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
                 Err(redb::TableError::TableTypeMismatch { .. }) => {}
@@ -24105,6 +25153,7 @@ impl RedbPersistence {
             let table_name = Self::rel_table_name(name);
             let table_def: TableDefinition<&[u8], &[u8]> =
                 TableDefinition::new(table_name.as_str());
+            content_size::reset_rows(&write_txn, name)?;
             match write_txn.delete_table(table_def) {
                 Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
                 Err(redb::TableError::TableTypeMismatch { .. }) => {}
@@ -24229,6 +25278,7 @@ impl RedbPersistence {
             let table_name = Self::rel_table_name(name);
             let table_def: TableDefinition<&[u8], &[u8]> =
                 TableDefinition::new(table_name.as_str());
+            content_size::reset_rows(&write_txn, name)?;
             match write_txn.delete_table(table_def) {
                 Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
                 Err(redb::TableError::TableTypeMismatch { .. }) => {}
@@ -24244,8 +25294,14 @@ impl RedbPersistence {
             Self::remove_sync_source_provenance_for_table(&write_txn, name)?;
             Self::remove_retention_expiries_for_table(&write_txn, name)?;
 
-            let _ = write_txn.delete_table(GRAPH_FWD_TABLE);
-            let _ = write_txn.delete_table(GRAPH_REV_TABLE);
+            match write_txn.delete_table(GRAPH_FWD_TABLE) {
+                Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
+                Err(err) => return Err(Self::storage_error(err)),
+            }
+            match write_txn.delete_table(GRAPH_REV_TABLE) {
+                Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
+                Err(err) => return Err(Self::storage_error(err)),
+            }
             {
                 let mut fwd_table = write_txn
                     .open_table(GRAPH_FWD_TABLE)
@@ -24328,13 +25384,17 @@ impl RedbPersistence {
                 let table_name = Self::rel_table_name(name);
                 let table_def: TableDefinition<&[u8], &[u8]> =
                     TableDefinition::new(table_name.as_str());
-                let _ = write_txn.delete_table(table_def);
+                content_size::reset_rows(&write_txn, name)?;
+                write_txn
+                    .delete_table(table_def)
+                    .map_err(Self::storage_error)?;
                 let legacy_table_def: TableDefinition<u64, &[u8]> =
                     TableDefinition::new(table_name.as_str());
-                let _ = write_txn.delete_table(legacy_table_def);
-                let mut redb_table = write_txn
-                    .open_table(table_def)
+                write_txn
+                    .delete_table(legacy_table_def)
                     .map_err(Self::storage_error)?;
+                let mut redb_table =
+                    content_size::open_rows(&write_txn, table_def).map_err(Self::storage_error)?;
                 for row in rows {
                     let encoded = Self::encode_versioned_row(row, table_meta.get(name))?;
                     let key = Self::rel_row_key(row);
@@ -24415,11 +25475,13 @@ impl RedbPersistence {
         let previous_vectors = self.load_vectors()?;
         self.with_db(|db| {
             let write_txn = db.begin_write().map_err(Self::storage_error)?;
-            let _ = write_txn.delete_table(VECTORS_TABLE);
+            content_size::reset_vector_bytes(&write_txn)?;
+            write_txn
+                .delete_table(VECTORS_TABLE)
+                .map_err(Self::storage_error)?;
             {
-                let mut table = write_txn
-                    .open_table(VECTORS_TABLE)
-                    .map_err(Self::storage_error)?;
+                let mut table =
+                    content_size::open_vectors(&write_txn).map_err(Self::storage_error)?;
                 for entry in vectors {
                     let quantization = vector_quantization
                         .get(&entry.index)
@@ -24645,13 +25707,17 @@ impl RedbPersistence {
                 let table_name = Self::rel_table_name(name);
                 let table_def: TableDefinition<&[u8], &[u8]> =
                     TableDefinition::new(table_name.as_str());
-                let _ = write_txn.delete_table(table_def);
+                content_size::reset_rows(&write_txn, name)?;
+                write_txn
+                    .delete_table(table_def)
+                    .map_err(Self::storage_error)?;
                 let legacy_table_def: TableDefinition<u64, &[u8]> =
                     TableDefinition::new(table_name.as_str());
-                let _ = write_txn.delete_table(legacy_table_def);
-                let mut redb_table = write_txn
-                    .open_table(table_def)
+                write_txn
+                    .delete_table(legacy_table_def)
                     .map_err(Self::storage_error)?;
+                let mut redb_table =
+                    content_size::open_rows(&write_txn, table_def).map_err(Self::storage_error)?;
                 for row in rows {
                     let encoded = Self::encode_versioned_row(row, Some(meta))?;
                     let key = Self::rel_row_key(row);
@@ -24747,8 +25813,12 @@ impl RedbPersistence {
     pub fn rewrite_graph_edges(&self, edges: &[AdjEntry]) -> Result<()> {
         self.with_db(|db| {
             let write_txn = db.begin_write().map_err(Self::storage_error)?;
-            let _ = write_txn.delete_table(GRAPH_FWD_TABLE);
-            let _ = write_txn.delete_table(GRAPH_REV_TABLE);
+            write_txn
+                .delete_table(GRAPH_FWD_TABLE)
+                .map_err(Self::storage_error)?;
+            write_txn
+                .delete_table(GRAPH_REV_TABLE)
+                .map_err(Self::storage_error)?;
             {
                 let mut fwd_table = write_txn
                     .open_table(GRAPH_FWD_TABLE)
@@ -25869,7 +26939,7 @@ impl RedbPersistence {
         mut visit: impl FnMut(
             &mut T,
             VectorPartitionMembershipRecord,
-            &mut dyn FnMut(&VectorPartitionMembershipRecord) -> Result<VectorEntry>,
+            &mut dyn FnMut(&VectorPartitionMembershipRecord) -> Result<(VectorEntry, Option<TxId>)>,
         ) -> Result<()>,
     ) -> Result<T> {
         self.with_db(|db| {
@@ -25877,7 +26947,7 @@ impl RedbPersistence {
             // Memberships and bodies share this pinned root. The callback must
             // never reacquire persistence ownership while close/recycle waits.
             let mut load_body = |membership: &VectorPartitionMembershipRecord| {
-                let mut entries = self.load_vector_entries_for_memberships_in_read(
+                let mut entries = self.load_vector_bodies_for_memberships_in_read(
                     &read,
                     std::slice::from_ref(membership),
                     dimension,
@@ -26020,6 +27090,22 @@ impl RedbPersistence {
         expected_dimension: usize,
         quantization: Option<VectorQuantization>,
     ) -> Result<Vec<VectorEntry>> {
+        self.load_vector_bodies_for_memberships_in_read(
+            read_txn,
+            memberships,
+            expected_dimension,
+            quantization,
+        )
+        .map(|entries| entries.into_iter().map(|(entry, _)| entry).collect())
+    }
+
+    fn load_vector_bodies_for_memberships_in_read(
+        &self,
+        read_txn: &redb::ReadTransaction,
+        memberships: &[VectorPartitionMembershipRecord],
+        expected_dimension: usize,
+        quantization: Option<VectorQuantization>,
+    ) -> Result<Vec<(VectorEntry, Option<TxId>)>> {
         #[cfg(feature = "test-seams")]
         crate::writer_query_test_seams::note_physical_source(
             crate::writer_query_test_seams::PhysicalFamily::Vector,
@@ -26112,7 +27198,6 @@ impl RedbPersistence {
             // make the occurrence unavailable before the body receives
             // its own tombstone, so the effective partition visibility is
             // the checksummed membership value.
-            entry.deleted_tx = membership.deleted_tx;
             if let (Some(verifier), Some(quantization)) = (&verifier, quantization) {
                 verifier.verify_with_nodes(
                     &mut proof,
@@ -26125,7 +27210,9 @@ impl RedbPersistence {
                     )?;
                 }
             }
-            entries.push(entry);
+            let canonical_deleted_tx = entry.deleted_tx;
+            entry.deleted_tx = membership.deleted_tx;
+            entries.push((entry, canonical_deleted_tx));
         }
         Ok(entries)
     }
@@ -26148,55 +27235,101 @@ impl RedbPersistence {
         self.with_db(|db| {
             let (transaction, root) = match self.paged_root_capture.get() {
                 Some(capture) => {
-                    let (read, root) = capture()?;
-                    (read, Some(root))
+                    let (_read, root) = capture()?;
+                    let writer = root.downcast_ref::<WriterSnapshot>().ok_or_else(|| {
+                        self.vector_partition_corruption(
+                            "raw body root capture returned another owner",
+                        )
+                    })?;
+                    writer.check_table_scope(&index.table)?;
+                    let identity = writer.storage_identity();
+                    let verified = db
+                        .begin_external_read(identity)
+                        .map_err(vector_membership_pages::metadata_error)?;
+                    if verified.storage_snapshot_identity() != identity {
+                        return Err(self.vector_partition_corruption(
+                            "raw body read escaped its captured physical root",
+                        ));
+                    }
+                    (Arc::new(verified), Some(root))
                 }
                 None => (
-                    Arc::new(db.begin_read().map_err(Self::storage_error)?),
+                    Arc::new(
+                        db.begin_read()
+                            .map_err(vector_membership_pages::metadata_error)?,
+                    ),
                     None,
                 ),
             };
-            let memberships = match transaction.open_table(VECTOR_PARTITION_MEMBERSHIP_TABLE) {
+            self.open_raw_vector_body_scan_at(index, transaction, root)
+        })
+    }
+
+    pub(crate) fn open_raw_vector_body_scan_at(
+        self: &Arc<Self>,
+        index: &VectorIndexRef,
+        transaction: Arc<redb::ReadTransaction>,
+        root: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    ) -> Result<WritableRawVectorBodyScan> {
+        if let Some(root) = &root {
+            let writer = root.downcast_ref::<WriterSnapshot>().ok_or_else(|| {
+                self.vector_partition_corruption("raw body read has another root owner")
+            })?;
+            writer.check_table_scope(&index.table)?;
+            if transaction.storage_snapshot_identity() != writer.storage_identity() {
+                return Err(self.vector_partition_corruption(
+                    "raw body read escaped its captured physical root",
+                ));
+            }
+        }
+        let producer_body_root = if root.is_some() {
+            vector_membership_pages::validate_in_read(&transaction)?;
+            vector_scan_body_root_matches(&transaction)?
+        } else {
+            false
+        };
+        let memberships = match transaction.open_table(VECTOR_PARTITION_MEMBERSHIP_TABLE) {
+            Ok(table) => Some(table),
+            Err(redb::TableError::TableDoesNotExist(_)) => None,
+            Err(error) => return Err(vector_membership_pages::metadata_error(error)),
+        };
+        let vectors = {
+            #[cfg(feature = "test-seams")]
+            crate::writer_query_test_seams::note_physical_source(
+                crate::writer_query_test_seams::PhysicalFamily::Vector,
+                &transaction,
+            );
+            #[cfg(feature = "test-seams")]
+            let _body_reads = crate::writer_query_test_seams::physical_operation(
+                crate::writer_query_test_seams::PhysicalFamily::Vector,
+                &index.table,
+            );
+            #[cfg(not(feature = "test-seams"))]
+            let _ = index;
+            match transaction.open_table(VECTORS_TABLE) {
                 Ok(table) => Some(table),
                 Err(redb::TableError::TableDoesNotExist(_)) => None,
-                Err(error) => return Err(Self::storage_error(error)),
-            };
-            let vectors = {
-                #[cfg(feature = "test-seams")]
-                crate::writer_query_test_seams::note_physical_source(
-                    crate::writer_query_test_seams::PhysicalFamily::Vector,
-                    &transaction,
-                );
-                #[cfg(feature = "test-seams")]
-                let _body_reads = crate::writer_query_test_seams::physical_operation(
-                    crate::writer_query_test_seams::PhysicalFamily::Vector,
-                    &index.table,
-                );
-                #[cfg(not(feature = "test-seams"))]
-                let _ = index;
-                match transaction.open_table(VECTORS_TABLE) {
-                    Ok(table) => Some(table),
-                    Err(redb::TableError::TableDoesNotExist(_)) => None,
-                    Err(error) => return Err(Self::storage_error(error)),
-                }
-            };
-            let verifier = content_identity::ContentIdentityReadVerifier::open(
-                &transaction,
-                &self.path,
+                Err(error) => return Err(vector_membership_pages::metadata_error(error)),
+            }
+        };
+        let verifier = content_identity::ContentIdentityReadVerifier::open(
+            &transaction,
+            &self.path,
+            self.proof_accountant(),
+        )?;
+        Ok(WritableRawVectorBodyScan {
+            producer_body_root,
+            selected_stream_identity: None,
+            source: Arc::clone(self),
+            memberships,
+            vectors,
+            verifier,
+            proof: content_identity::ReadAuthenticationNodes::new(
+                RAW_VECTOR_BODY_SCAN_PROOF_BYTES,
                 self.proof_accountant(),
-            )?;
-            Ok(WritableRawVectorBodyScan {
-                source: Arc::clone(self),
-                memberships,
-                vectors,
-                verifier,
-                proof: content_identity::ReadAuthenticationNodes::new(
-                    RAW_VECTOR_BODY_SCAN_PROOF_BYTES,
-                    self.proof_accountant(),
-                ),
-                _transaction: transaction,
-                _root: root,
-            })
+            ),
+            _transaction: transaction,
+            _root: root,
         })
     }
 
@@ -26218,6 +27351,7 @@ impl RedbPersistence {
             identity,
             expected_dimension,
             quantization,
+            false,
         )
     }
 
@@ -26486,14 +27620,13 @@ impl RedbPersistence {
     > {
         self.with_db(|db| {
             let read = db.begin_read().map_err(Self::storage_error)?;
-            self.vector_partition_generation_descriptors_in_read(&read, index, partition_key)
+            Self::vector_partition_generation_descriptors_in_read(&read, index, partition_key)
         })
     }
 
     /// The fixed catalog suffix at an already-authorized root. No fresh read,
     /// owned route decode, catalog scan or graph body load is performed.
     pub(super) fn vector_partition_generation_descriptors_in_read(
-        &self,
         read: &redb::ReadTransaction,
         index: &VectorIndexRef,
         partition_key: &VectorPartitionKey,
@@ -26521,9 +27654,9 @@ impl RedbPersistence {
             index,
             partition_key,
         )
-        .map_err(|reason| self.vector_partition_corruption(reason))?;
+        .map_err(|reason| vector_membership_source::damage(&reason))?;
         let route_end = vector_partition_expected_route_prefix(payload, index, partition_key)
-            .map_err(|reason| self.vector_partition_corruption(reason))?;
+            .map_err(|reason| vector_membership_source::damage(&reason))?;
         // The descriptor suffix contains only fixed scalars. Pricing a
         // frontier must not clone its route or allocate a graph body.
         let (base, change, _, _): (
@@ -26532,7 +27665,7 @@ impl RedbPersistence {
             TxId,
             Lsn,
         ) = Self::decode_exact(&payload[route_end..]).map_err(|error| {
-            self.vector_partition_corruption(format!("payload decode failed: {error}"))
+            vector_membership_source::damage(&format!("payload decode failed: {error}"))
         })?;
         Ok(Some((base, change)))
     }
@@ -27093,6 +28226,9 @@ impl RedbPersistence {
         covered_lsn: Lsn,
         mut admit_identities: impl FnMut(usize) -> Result<()>,
     ) -> Result<usize> {
+        if after_lsn >= covered_lsn {
+            return Ok(0);
+        }
         let prefix = Self::vector_partition_prefix(&partition.index, &partition.partition_key);
         self.with_db(|db| {
             let read = db.begin_read().map_err(Self::storage_error)?;
@@ -27101,9 +28237,20 @@ impl RedbPersistence {
                 Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
                 Err(error) => return Err(Self::storage_error(error)),
             };
+            let mut lower = prefix.clone();
+            lower.extend_from_slice(&(after_lsn.0 + 1).to_be_bytes());
+            let upper = if let Some(next) = covered_lsn.0.checked_add(1) {
+                let mut key = prefix.clone();
+                key.extend_from_slice(&next.to_be_bytes());
+                key
+            } else {
+                writer_source::prefix_end(&prefix).ok_or_else(|| {
+                    self.vector_partition_corruption("journal prefix has no upper bound")
+                })?
+            };
             let mut identities = BTreeSet::new();
             for entry in table
-                .prefix_bounded(prefix.as_slice())
+                .range(lower.as_slice()..upper.as_slice())
                 .map_err(Self::storage_error)?
             {
                 let (key, value) = entry.map_err(Self::storage_error)?;
@@ -27148,11 +28295,14 @@ impl RedbPersistence {
         &self,
         catalog: &VectorPartitionGenerationCatalogRecord,
         retained_chains: &[(u64, Option<u64>)],
+        mut checkpoint: impl FnMut() -> Result<()>,
     ) -> Result<(usize, u64)> {
         self.with_db(|db| {
+            checkpoint()?;
             let write = db.begin_write().map_err(Self::storage_error)?;
             let result =
-                self.reclaim_vector_generations_in_write(&write, catalog, retained_chains)?;
+                self.reclaim_vector_generations_in_write_with_checkpoint(&write, catalog, retained_chains, true, &mut checkpoint)?;
+            checkpoint()?;
             write.commit().map_err(Self::storage_error)?;
             Ok(result)
         })
@@ -27164,146 +28314,147 @@ impl RedbPersistence {
         catalog: &VectorPartitionGenerationCatalogRecord,
         retained_chains: &[(u64, Option<u64>)],
     ) -> Result<(usize, u64)> {
+        // These legacy write transactions do not pass a decode workspace.
+        // Own their fixed route-inspection scratch locally, never attach it
+        // to a caller token that survives this helper's copies.
+        let _inspection = self.proof_accountant.get().cloned().map(|accountant| {
+            crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+                accountant, (64usize * 1024).saturating_add(
+                    Self::vector_partition_physical_key_bound(&catalog.index, &catalog.partition_key, 32)
+                        .saturating_mul(8)), "vector", "reclaim_vector_generation_metadata",
+                "Free writer memory before reclaiming vector generation metadata.",
+            )
+        }).transpose()?;
+        self.reclaim_vector_generations_in_write_with_checkpoint(write, catalog, retained_chains, false, || Ok(()))
+    }
+
+    fn reclaim_vector_generations_in_write_with_checkpoint(
+        &self, write: &redb::WriteTransaction,
+        catalog: &VectorPartitionGenerationCatalogRecord,
+        retained_chains: &[(u64, Option<u64>)],
+        retire_damage: bool,
+        mut checkpoint: impl FnMut() -> Result<()>,
+    ) -> Result<(usize, u64)> {
+        // Current and pinned identities are physical protection decisions.
+        // Never decode a broken retired graph merely to decide its identity.
+        const KEYS: usize = 64;
         let prefix = Self::vector_partition_prefix(&catalog.index, &catalog.partition_key);
         let has_membership = {
-            let table = write
-                .open_table(VECTOR_PARTITION_MEMBERSHIP_TABLE)
-                .map_err(Self::storage_error)?;
-            let mut entries = table
-                .prefix_bounded(prefix.as_slice())
-                .map_err(Self::storage_error)?;
-            match entries.next() {
-                Some(entry) => entry
-                    .map_err(Self::storage_error)?
-                    .0
-                    .value()
-                    .starts_with(&prefix),
-                None => false,
-            }
+            let table = write.open_table(VECTOR_PARTITION_MEMBERSHIP_TABLE).map_err(Self::storage_error)?;
+            table.prefix_bounded(prefix.as_slice()).map_err(Self::storage_error)?
+                .next().transpose().map_err(Self::storage_error)?
+                .is_some_and(|(key, _)| key.value().starts_with(&prefix))
         };
-        // A pinned retired chain also retains the catalog. Keep its current
-        // targets readable until the catalog can be removed in this transaction.
         let retain_catalog = has_membership || !retained_chains.is_empty();
-        let selected_base = Self::vector_partition_base_generation_key_from_parts(
-            &catalog.index,
-            &catalog.partition_key,
-            catalog.base.generation_id,
-        );
-        let selected_change = catalog.change.map(|change| {
-            Self::vector_partition_change_generation_key_from_parts(
-                &catalog.index,
-                &catalog.partition_key,
-                catalog.base.generation_id,
-                change.generation_id,
-            )
-        });
-        let mut reclaimed = 0usize;
+        let mut remaining = KEYS;
+        let mut reclaimed = 0;
         let mut bytes = 0u64;
-        for (definition, kind, selected) in [
-            (
-                VECTOR_PARTITION_BASE_GENERATION_TABLE,
-                VectorPartitionRecordKind::BaseGeneration,
-                retain_catalog.then_some(selected_base.as_slice()),
-            ),
-            (
-                VECTOR_PARTITION_CHANGE_GENERATION_TABLE,
-                VectorPartitionRecordKind::ChangeGeneration,
-                selected_change.as_deref().filter(|_| retain_catalog),
-            ),
+        for (definition, is_base) in [
+            (VECTOR_PARTITION_BASE_GENERATION_TABLE, true),
+            (VECTOR_PARTITION_CHANGE_GENERATION_TABLE, false),
         ] {
-            let mut table = match write.open_table(definition) {
-                Ok(table) => table,
-                Err(redb::TableError::TableDoesNotExist(_)) => continue,
-                Err(error) => return Err(Self::storage_error(error)),
-            };
-            let mut removed = Vec::new();
-            for entry in table
-                .prefix_bounded(prefix.as_slice())
-                .map_err(Self::storage_error)?
-            {
-                let (key, value) = entry.map_err(Self::storage_error)?;
-                if !key.value().starts_with(&prefix) {
+            let mut table = write.open_table(definition).map_err(Self::storage_error)?;
+            while remaining != 0 {
+                let mut candidate = None;
+                // There are at most two protected keys per held chain. Each
+                // completed iteration removes a key or advances its page cleanup.
+                for entry in table.prefix_bounded(prefix.as_slice()).map_err(Self::storage_error)? {
+                    let (key, value) = entry.map_err(Self::storage_error)?;
+                    if !key.value().starts_with(&prefix) { break; }
+                    let suffix = &key.value()[prefix.len()..];
+                    let expected = if is_base { 8 } else { 16 };
+                    if suffix.len() != expected {
+                        return Err(self.vector_partition_corruption("retired generation physical key is malformed"));
+                    }
+                    let base = u64::from_be_bytes(suffix[..8].try_into().unwrap());
+                    let change = (!is_base).then(|| u64::from_be_bytes(suffix[8..].try_into().unwrap()));
+                    let selected = retain_catalog && if is_base {
+                        base == catalog.base.generation_id
+                    } else {
+                        base == catalog.base.generation_id && change == catalog.change.map(|c| c.generation_id)
+                    };
+                    let pinned = retained_chains.iter().any(|(b, c)| *b == base && (is_base || *c == change));
+                    if selected || pinned { continue; }
+                    // Authenticate both envelopes before a native storage id
+                    // becomes deletion authority. Failure only leaves orphan
+                    // discovery to the durable fence, never to guessed bytes.
+                    checkpoint()?;
+                    let native = match Self::authenticated_generation_storage(value.value(), key.value(), is_base) {
+                        Ok(native) => native,
+                        Err(error) => {
+                            // Pruning/currency transactions keep their prior
+                            // refusal; damaged retirement belongs to the
+                            // cancellable repair/catalog maintenance path.
+                            if !retire_damage { return Err(error); }
+                            // This also covers fitting resident repair, not
+                            // only the retirement-to-paged branch.
+                            Self::raise_repair_fence_in_write(write)?;
+                            None
+                        }
+                    };
+                    candidate = Some((key.value().to_vec(), value.value().len() as u64, native));
                     break;
                 }
-                if selected.is_some_and(|selected| selected == key.value()) {
-                    continue;
-                }
-                match kind {
-                    VectorPartitionRecordKind::BaseGeneration => {
-                        let record: VectorPartitionBaseGenerationRecord =
-                            self.decode_vector_partition_record(kind, value.value())?;
-                        if Self::vector_partition_base_generation_key(&record).as_slice()
-                            != key.value()
-                        {
-                            return Err(self.vector_partition_corruption(
-                                "superseded base generation key mismatch",
-                            ));
-                        }
-                        if retained_chains
-                            .iter()
-                            .any(|(base, _)| *base == record.generation_id)
-                        {
-                            continue;
-                        }
-                        // A retired paged base's pages are reclaimed in finite
-                        // cleanup transactions; queue them with this removal.
-                        if record.graph_format_version
-                            == vector_paged::VECTOR_GRAPH_PAGED_FORMAT_VERSION
-                        {
-                            Self::queue_paged_generation_cleanup_in_write(
-                                write,
-                                &record.graph.bytes,
-                            )?;
-                        }
-                    }
-                    VectorPartitionRecordKind::ChangeGeneration => {
-                        let record: VectorPartitionChangeGenerationRecord =
-                            self.decode_vector_partition_record(kind, value.value())?;
-                        if Self::vector_partition_change_generation_key(&record).as_slice()
-                            != key.value()
-                        {
-                            return Err(self.vector_partition_corruption(
-                                "superseded change generation key mismatch",
-                            ));
-                        }
-                        if retained_chains.iter().any(|(base, change)| {
-                            *base == record.base_generation_id
-                                && *change == Some(record.change_generation_id)
-                        }) {
-                            continue;
-                        }
-                    }
-                    _ => unreachable!("generation reclamation names only generation tables"),
-                }
-                bytes = bytes.saturating_add(value.value().len() as u64);
-                removed.push(key.value().to_vec());
-            }
-            for key in &removed {
-                table.remove(key.as_slice()).map_err(Self::storage_error)?;
-                reclaimed = reclaimed.saturating_add(1);
-            }
-            drop(table);
-            let is_base = kind == VectorPartitionRecordKind::BaseGeneration;
-            for key in removed {
-                let (page_records, page_bytes) =
-                    Self::remove_vector_partition_graph_pages_in_write(write, &key, is_base)?;
-                reclaimed = reclaimed.saturating_add(page_records);
+                let Some((key, value_bytes, native)) = candidate else { break; };
+                let (complete, count, page_bytes) = Self::remove_retired_graph_pages_step_in_write(write, &key, is_base, remaining)?;
+                remaining = remaining.saturating_sub(count);
+                reclaimed += count;
                 bytes = bytes.saturating_add(page_bytes);
+                if !complete || remaining == 0 { return Ok((reclaimed, bytes)); }
+                if let Some(id) = native {
+                    Self::queue_authenticated_native_storage_in_write(write, id)?;
+                }
+                checkpoint()?;
+                table.remove(key.as_slice()).map_err(Self::storage_error)?;
+                remaining -= 1;
+                reclaimed += 1;
+                bytes = bytes.saturating_add(value_bytes);
             }
         }
+        // A last-membership removal may only drop the catalog after both
+        // generation tables are empty; partial page cleanup keeps the parent.
         if !retain_catalog {
-            let key = Self::vector_partition_catalog_key(catalog);
-            write
-                .open_table(VECTOR_PARTITION_GENERATION_CATALOG_TABLE)
-                .map_err(Self::storage_error)?
-                .remove(key.as_slice())
-                .map_err(Self::storage_error)?;
-            vector_membership_pages::reset_pending_frontier(
-                write,
-                &VectorPartitionRef::new(catalog.index.clone(), catalog.partition_key.clone()),
-            )?;
+            let any = [VECTOR_PARTITION_BASE_GENERATION_TABLE, VECTOR_PARTITION_CHANGE_GENERATION_TABLE]
+                .into_iter().try_fold(false, |found, definition| -> Result<bool> {
+                    let table = write.open_table(definition).map_err(Self::storage_error)?;
+                    Ok(found || table.prefix_bounded(prefix.as_slice()).map_err(Self::storage_error)?
+                        .next().transpose().map_err(Self::storage_error)?.is_some_and(|(key, _)| key.value().starts_with(&prefix)))
+                })?;
+            if !any {
+                write.open_table(VECTOR_PARTITION_GENERATION_CATALOG_TABLE).map_err(Self::storage_error)?
+                    .remove(prefix.as_slice()).map_err(Self::storage_error)?;
+                vector_membership_pages::reset_pending_frontier(write,
+                    &VectorPartitionRef::new(catalog.index.clone(), catalog.partition_key.clone()))?;
+            }
         }
         Ok((reclaimed, bytes))
+    }
+
+    fn remove_retired_graph_pages_step_in_write(
+        write: &redb::WriteTransaction, generation_key: &[u8], is_base: bool, limit: usize,
+    ) -> Result<(bool, usize, u64)> {
+        let root = Self::vector_partition_graph_page_root_key(generation_key, is_base);
+        let mut pages = write.open_table(VECTOR_PARTITION_GRAPH_PAGE_TABLE).map_err(Self::storage_error)?;
+        let mut count = 0;
+        let mut bytes = 0u64;
+        while count != limit {
+            let key = {
+                let next = pages.prefix_bounded(root.as_slice()).map_err(Self::storage_error)?
+                    .next().transpose().map_err(Self::storage_error)?;
+                let Some((key, value)) = next else { return Ok((true, count, bytes)); };
+                if !key.value().starts_with(&root) { return Ok((true, count, bytes)); }
+                if key.value().len() != root.len() && key.value().len() != root.len() + 4 {
+                    return Err(vector_paged::corruption("retired graph page physical key is malformed"));
+                }
+                let key = key.value().to_vec();
+                bytes = bytes.saturating_add(value.value().len() as u64);
+                drop(value);
+                key
+            };
+            pages.remove(key.as_slice()).map_err(Self::storage_error)?;
+            count += 1;
+        }
+        Ok((false, count, bytes))
     }
 
     #[cfg(any(test, feature = "test-seams"))]
@@ -27362,6 +28513,82 @@ impl RedbPersistence {
         })
     }
 
+    /// Inspect only the fixed generation prefix. This is format selection,
+    /// not graph authentication: the normal loader still verifies the full
+    /// envelope and graph digests. No graph body is copied, hashed or decoded.
+    pub(crate) fn vector_partition_base_graph_format(
+        &self,
+        partition: &VectorPartitionRef,
+        generation_id: u64,
+    ) -> Result<u16> {
+        self.with_db(|db| {
+            let read = db.begin_read().map_err(Self::storage_error)?;
+            let table = read
+                .open_table(VECTOR_PARTITION_BASE_GENERATION_TABLE)
+                .map_err(Self::storage_error)?;
+            let key = Self::vector_partition_base_generation_key_from_parts(
+                &partition.index,
+                &partition.partition_key,
+                generation_id,
+            );
+            let value = table
+                .get_bounded(key.as_slice())
+                .map_err(Self::storage_error)?
+                .ok_or_else(|| {
+                    Error::Other("catalog points to a missing base generation".into())
+                })?;
+            let encoded = value.value();
+            let header = VECTOR_PARTITION_RECORD_MAGIC.len() + 2 + 1 + 8;
+            if encoded.len() < header + 32 || !encoded.starts_with(VECTOR_PARTITION_RECORD_MAGIC) {
+                return Err(Error::Other(
+                    "invalid base generation format metadata".into(),
+                ));
+            }
+            let version = VECTOR_PARTITION_RECORD_MAGIC.len();
+            if u16::from_be_bytes([encoded[version], encoded[version + 1]])
+                != VECTOR_PARTITION_RECORD_VERSION
+                || encoded[version + 2] != VectorPartitionRecordKind::BaseGeneration as u8
+            {
+                return Err(Error::Other(
+                    "unsupported base generation format metadata".into(),
+                ));
+            }
+            let length = u64::from_be_bytes(
+                encoded[version + 3..header]
+                    .try_into()
+                    .map_err(|_| Error::Other("invalid base generation metadata length".into()))?,
+            );
+            if usize::try_from(length).ok() != Some(encoded.len() - header - 32) {
+                return Err(Error::Other(
+                    "invalid base generation metadata length".into(),
+                ));
+            }
+            let payload = &encoded[header..encoded.len() - 32];
+            let route = vector_partition_expected_route_prefix(
+                payload,
+                &partition.index,
+                &partition.partition_key,
+            )
+            .map_err(Error::Other)?;
+            type Prefix = (u64, TxId, Lsn, TxId, Lsn, u32, VectorQuantization, u16, u16);
+            let (prefix, _): (Prefix, usize) =
+                bincode::serde::decode_from_slice(&payload[route..], bincode::config::standard())
+                    .map_err(|error| {
+                    Error::Other(format!("invalid base generation prefix: {error}"))
+                })?;
+            if prefix.0 != generation_id
+                || prefix.5 == 0
+                || prefix.3 < prefix.1
+                || prefix.4 < prefix.2
+            {
+                return Err(Error::Other(
+                    "invalid base generation inclusion metadata".into(),
+                ));
+            }
+            Ok(prefix.8)
+        })
+    }
+
     pub(crate) fn vector_generation_record_bytes(
         &self,
         index: &VectorIndexRef,
@@ -27394,7 +28621,7 @@ impl RedbPersistence {
         })
     }
 
-    fn generation_record_bytes_in_read(
+    pub(crate) fn generation_record_bytes_in_read(
         read: &redb::ReadTransaction,
         index: &VectorIndexRef,
         key: &VectorPartitionKey,
@@ -27425,6 +28652,355 @@ impl RedbPersistence {
             bytes = bytes.saturating_add(value.value().len());
         }
         Ok(bytes)
+    }
+
+    fn captured_generation_corruption(reason: impl Into<String>) -> Error {
+        Error::StoreCorrupted {
+            path: "vector_partition_generations".into(),
+            reason: format!(
+                "vector partition durability record is corrupt: {}",
+                reason.into()
+            ),
+        }
+    }
+
+    fn captured_generation_table(
+        read: &redb::ReadTransaction,
+        table: redb::TableDefinition<'static, &'static [u8], &'static [u8]>,
+        missing: &str,
+    ) -> Result<redb::ReadOnlyTable<&'static [u8], &'static [u8]>> {
+        read.open_byte_table_bounded(table)
+            .map_err(|error| match error {
+                redb::TableError::Storage(error) => Self::storage_error(error),
+                error => Self::captured_generation_corruption(format!("{missing}: {error}")),
+            })
+    }
+
+    /// Read one immutable base body from an operation's already captured
+    /// root. The caller holds that root for the whole decode; this never opens
+    /// another read.
+    pub(crate) fn load_vector_partition_base_generation_in_read(
+        read: &redb::ReadTransaction,
+        index: &VectorIndexRef,
+        partition_key: &VectorPartitionKey,
+        generation_id: u64,
+    ) -> Result<VectorPartitionBaseGenerationRecord> {
+        let key = Self::vector_partition_base_generation_key_from_parts(
+            index,
+            partition_key,
+            generation_id,
+        );
+        #[cfg(feature = "test-seams")]
+        crate::writer_query_test_seams::note_physical_source(
+            crate::writer_query_test_seams::PhysicalFamily::Graph,
+            read,
+        );
+        #[cfg(feature = "test-seams")]
+        let _graph_reads = crate::writer_query_test_seams::physical_operation(
+            crate::writer_query_test_seams::PhysicalFamily::Graph,
+            &index.table,
+        );
+        let table = Self::captured_generation_table(
+            read,
+            VECTOR_PARTITION_BASE_GENERATION_TABLE,
+            "catalog points to a missing base-generation table",
+        )?;
+        let value = table
+            .get_bounded(key.as_slice())
+            .map_err(Self::storage_error)?
+            .ok_or_else(|| {
+                Self::captured_generation_corruption("catalog points to a missing base generation")
+            })?;
+        drop(key);
+        let record = borrow_vector_partition_base(
+            value.value(),
+            index,
+            partition_key,
+            generation_id,
+            |reason| Self::captured_generation_corruption(reason),
+        )?;
+        Ok(record.into_owned())
+    }
+
+    /// Read one immutable sealed-change body, and authenticate it against its
+    /// base, from an operation's already captured root.
+    pub(crate) fn load_vector_partition_change_generation_in_read(
+        read: &redb::ReadTransaction,
+        index: &VectorIndexRef,
+        partition_key: &VectorPartitionKey,
+        base_generation_id: u64,
+        change_generation_id: u64,
+    ) -> Result<VectorPartitionChangeGenerationRecord> {
+        #[cfg(feature = "test-seams")]
+        crate::writer_query_test_seams::note_physical_source(
+            crate::writer_query_test_seams::PhysicalFamily::Graph,
+            read,
+        );
+        #[cfg(feature = "test-seams")]
+        let _graph_reads = crate::writer_query_test_seams::physical_operation(
+            crate::writer_query_test_seams::PhysicalFamily::Graph,
+            &index.table,
+        );
+        let base_key = Self::vector_partition_base_generation_key_from_parts(
+            index,
+            partition_key,
+            base_generation_id,
+        );
+        let base_table = Self::captured_generation_table(
+            read,
+            VECTOR_PARTITION_BASE_GENERATION_TABLE,
+            "catalog points to a missing base-generation table",
+        )?;
+        let base_value = base_table
+            .get_bounded(base_key.as_slice())
+            .map_err(Self::storage_error)?
+            .ok_or_else(|| {
+                Self::captured_generation_corruption(
+                    "change generation points to a missing base generation",
+                )
+            })?;
+        let base = borrow_vector_partition_base(
+            base_value.value(),
+            index,
+            partition_key,
+            base_generation_id,
+            |reason| Self::captured_generation_corruption(reason),
+        )?;
+        let key = Self::vector_partition_change_generation_key_from_parts(
+            index,
+            partition_key,
+            base_generation_id,
+            change_generation_id,
+        );
+        let table = Self::captured_generation_table(
+            read,
+            VECTOR_PARTITION_CHANGE_GENERATION_TABLE,
+            "catalog points to a missing change-generation table",
+        )?;
+        let value = table
+            .get_bounded(key.as_slice())
+            .map_err(Self::storage_error)?
+            .ok_or_else(|| {
+                Self::captured_generation_corruption(
+                    "catalog points to a missing sealed change generation",
+                )
+            })?;
+        let record = borrow_vector_partition_change(
+            value.value(),
+            index,
+            partition_key,
+            &base,
+            change_generation_id,
+            |reason| Self::captured_generation_corruption(reason),
+        )?;
+        Ok(record.into_owned())
+    }
+
+    /// Walk one route's journal suffix in an operation's captured root,
+    /// streaming one authenticated record at a time. `admit_identities` is
+    /// asked before each distinct upsert identity is retained, and
+    /// `admit_bodies` once before the immutable vector bodies are read, so
+    /// the caller funds growth past its saved minimum before it exists.
+    pub(crate) fn load_vector_partition_tail_entries_in_read(
+        read: &redb::ReadTransaction,
+        index: &VectorIndexRef,
+        partition_key: &VectorPartitionKey,
+        covered_lsn: Lsn,
+        through_lsn: Option<Lsn>,
+        mut checkpoint: impl FnMut() -> Result<()>,
+        admit_bodies: impl FnOnce(usize) -> Result<()>,
+    ) -> Result<(Vec<VectorEntry>, Lsn)> {
+        let catalog =
+            Self::vector_partition_generation_descriptors_in_read(read, index, partition_key)?;
+        let floor = catalog.map_or(Lsn(0), |(base, change)| change.unwrap_or(base).covered_lsn);
+        if covered_lsn < floor {
+            return Err(Self::captured_generation_corruption(
+                "captured suffix replay starts below the journal truncation floor",
+            ));
+        }
+        let prefix = Self::vector_partition_prefix(index, partition_key);
+        let journal = match read.open_byte_table_bounded(VECTOR_PARTITION_JOURNAL_TABLE) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok((Vec::new(), covered_lsn)),
+            Err(error) => return Err(Self::storage_error(error)),
+        };
+        let mut identities = BTreeSet::new();
+        let mut replayed_through_lsn = covered_lsn;
+        for entry in journal
+            .prefix_bounded(prefix.as_slice())
+            .map_err(Self::storage_error)?
+        {
+            checkpoint()?;
+            let (key, value) = entry.map_err(Self::storage_error)?;
+            if !key.value().starts_with(&prefix) {
+                break;
+            }
+            let record: VectorPartitionJournalRecord = decode_vector_partition_record_payload(
+                VectorPartitionRecordKind::Journal,
+                value.value(),
+            )
+            .map_err(|reason| Self::captured_generation_corruption(reason))?;
+            if record.index != *index
+                || record.partition_key != *partition_key
+                || Self::vector_partition_journal_key(&record).as_slice() != key.value()
+            {
+                return Err(Self::captured_generation_corruption(
+                    "journal selection encountered a mismatched route or physical key",
+                ));
+            }
+            if record.lsn <= covered_lsn || through_lsn.is_some_and(|through| record.lsn > through)
+            {
+                continue;
+            }
+            #[cfg(feature = "test-seams")]
+            crate::vector_observations::emit(
+                index,
+                partition_key,
+                covered_lsn,
+                crate::vector_observations::VectorJournalReplayWork::Record { lsn: record.lsn },
+            );
+            replayed_through_lsn = replayed_through_lsn.max(record.lsn);
+            if let VectorPartitionJournalChange::Upsert(membership) = record.change {
+                identities.insert((
+                    membership.row_id,
+                    membership.vector_created_tx,
+                    membership.vector_lsn,
+                ));
+            }
+        }
+        drop(journal);
+        admit_bodies(identities.len())?;
+        if identities.is_empty() {
+            return Ok((Vec::new(), replayed_through_lsn));
+        }
+        let vectors = read
+            .open_byte_table_bounded(VECTORS_TABLE)
+            .map_err(Self::storage_error)?;
+        let mut tail = Vec::with_capacity(identities.len());
+        for (row_id, created_tx, lsn) in identities {
+            checkpoint()?;
+            let key = Self::vector_identity_key(index, row_id, created_tx, lsn);
+            let value = vectors
+                .get_bounded(key.as_slice())
+                .map_err(Self::storage_error)?
+                .ok_or_else(|| {
+                    Self::captured_generation_corruption(
+                        "journal tail points to a missing immutable vector",
+                    )
+                })?;
+            let entry = Self::decode_vector_entry(value.value())?;
+            if entry.index != *index
+                || entry.row_id != row_id
+                || entry.created_tx != created_tx
+                || entry.lsn != lsn
+            {
+                return Err(Self::captured_generation_corruption(
+                    "journal tail vector key disagrees with its payload",
+                ));
+            }
+            #[cfg(feature = "test-seams")]
+            crate::vector_observations::emit(
+                index,
+                partition_key,
+                covered_lsn,
+                crate::vector_observations::VectorJournalReplayWork::Vector {
+                    row_id,
+                    created_tx,
+                    lsn,
+                },
+            );
+            tail.push(entry);
+        }
+        Ok((tail, replayed_through_lsn))
+    }
+
+    /// Saved suffix admission for one serving frontier at an operation's
+    /// captured root: the live inserts after `frontier` as the membership
+    /// summary committed them with the catalog. Reads one summary key; it
+    /// never walks the journal or the membership directory. A frontier the
+    /// root's summary does not represent is refused, never estimated.
+    pub(crate) fn vector_suffix_saved_inserts_in_read(
+        read: &redb::ReadTransaction,
+        partition: &VectorPartitionRef,
+        frontier: TxId,
+    ) -> Result<usize> {
+        let summary = vector_membership_pages::read_partition_summary(read, partition)?;
+        if !partition.partition_key.is_unpartitioned()
+            && summary == vector_membership_pages::MembershipSummary::default()
+        {
+            // Missing summary beside a pinned partition catalog is validated
+            // empty membership, not a missing suffix. There are no inserts.
+            return Ok(0);
+        }
+        let counts = std::iter::once(&summary.pending)
+            .chain(summary.base_pending.iter())
+            .chain(summary.candidate_pending.iter())
+            .find(|counts| counts.covered_tx == frontier)
+            .ok_or_else(|| {
+                vector_membership_source::damage(
+                    "captured pending summary does not represent the serving frontier",
+                )
+            })?;
+        usize::try_from(counts.pending_inserts)
+            .map_err(|_| vector_membership_source::damage("pending insert count overflow"))
+    }
+
+    /// The column declaration in force at an operation's captured root.
+    pub(crate) fn vector_layout_in_read(
+        read: &redb::ReadTransaction,
+        index: &VectorIndexRef,
+    ) -> Result<contextdb_vector::store::VectorIndexLayout> {
+        Self::load_table_meta_in_read_txn(read, &index.table)?
+            .and_then(|meta| {
+                meta.columns
+                    .iter()
+                    .find(|column| column.name == index.column)
+                    .and_then(crate::database::vector_index_layout_from_column)
+            })
+            .ok_or_else(|| {
+                vector_membership_source::damage(
+                    "captured serving root does not declare this vector column",
+                )
+            })
+    }
+
+    /// Bind one operation's already captured writable root to the engine's
+    /// root-owned serving supplier. The membership bridge authenticated this
+    /// exact read and writer; nothing here opens, recaptures or republishes a
+    /// root, and nothing reads a graph payload.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn captured_vector_serving_selection_in_read(
+        self: &Arc<Self>,
+        read: Arc<redb::ReadTransaction>,
+        writer: Option<Arc<WriterSnapshot>>,
+        retained: Option<Arc<RetainedReadSource>>,
+        partition: &VectorPartitionRef,
+        generations: Option<(
+            VectorPartitionGenerationDescriptor,
+            Option<VectorPartitionGenerationDescriptor>,
+        )>,
+        inspection: contextdb_vector::store::RawVectorInspectionSnapshot,
+        snapshot: SnapshotId,
+        owner: &mut contextdb_vector::VectorCopyAdmission,
+    ) -> Result<contextdb_vector::store::CapturedVectorServingSelection> {
+        let writer = writer.ok_or_else(|| {
+            vector_membership_source::damage("writable vector serving has no operation-scoped root")
+        })?;
+        if retained.is_some() {
+            return Err(vector_membership_source::damage(
+                "writable vector serving received a committed-image root",
+            ));
+        }
+        crate::database::vector_captured_serving::captured_serving_selection(
+            crate::database::vector_captured_serving::CapturedVectorRootLease::writable(
+                read, writer,
+            )?,
+            partition,
+            generations,
+            inspection,
+            snapshot,
+            owner,
+        )
     }
 
     /// Read one immutable base body named by an already validated lightweight
@@ -28462,6 +30038,35 @@ impl RedbPersistence {
                 Self::resize_vector_cleanup_workspace(workspace, fixed_owned, OPERATION)?;
             }
 
+            if Self::repair_fence_in_write(&write_txn)? {
+                Self::resize_vector_cleanup_workspace(workspace,
+                    fixed_owned.saturating_add(physical_key_bound.saturating_mul(2)), OPERATION)?;
+                let mut journal = write_txn.open_table(VECTOR_PARTITION_JOURNAL_TABLE).map_err(Self::storage_error)?;
+                let mut complete = false;
+                for _ in 0..64 {
+                    checkpoint()?;
+                    let key = {
+                        let next = journal.prefix_bounded(prefix.as_slice()).map_err(Self::storage_error)?
+                            .next().transpose().map_err(Self::storage_error)?;
+                        let Some((key, value)) = next else { complete = true; break; };
+                        if !key.value().starts_with(&prefix) { complete = true; break; }
+                        let tail = &key.value()[prefix.len()..];
+                        if tail.len() != 16 { return Err(self.vector_partition_corruption("covered journal physical key is malformed")); }
+                        let lsn = u64::from_be_bytes(tail[..8].try_into().unwrap());
+                        if lsn > covered_lsn.0 { complete = true; break; }
+                        let key = key.value().to_vec();
+                        drop(value);
+                        key
+                    };
+                    journal.remove(key.as_slice()).map_err(Self::storage_error)?;
+                }
+                drop(journal);
+                Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
+                checkpoint()?;
+                write_txn.commit().map_err(Self::storage_error)?;
+                return Ok(complete);
+            }
+
             // Opening a table in a Redb write transaction creates an empty
             // table when none exists. Keeping that handle in this scope also
             // makes the transaction lifetime unambiguous through commit.
@@ -28589,307 +30194,89 @@ impl RedbPersistence {
     }
 
     /// Complete a quarantined route's durable repair after its replacement
-    /// catalog is already committed. Corrupt payloads are deliberately not
-    /// decoded here: the physical route prefix and journal LSN key are enough
-    /// to remove the covered bad evidence while preserving writes newer than
-    /// the replacement's sampled frontier.
+    /// catalog is already committed. Physical keys select covered evidence;
+    /// bounded authenticated ownership metadata may name native cleanup, and
+    /// an unusable ownership reference raises the durable erasure fence.
+    /// Writes newer than the replacement's sampled frontier are preserved.
+    /// The healthy replacement is already published. Retire only one finite
+    /// batch of covered evidence; normal catalog/journal reclamation resumes
+    /// the remaining batches, without rebuilding the healthy replacement.
     pub(crate) fn finalize_repaired_vector_partition(
         &self,
         expected_catalog: &VectorPartitionGenerationCatalogRecord,
         retained_chains: &[(u64, Option<u64>)],
         repair_context_owned: usize,
         workspace: &mut VectorWorkspaceReservation,
+        mut checkpoint: impl FnMut() -> Result<()>,
     ) -> Result<(bool, usize)> {
         const OPERATION: &str = "finalize_repaired_vector_partition";
         let catalog_owned = Self::vector_partition_catalog_heap_bytes(expected_catalog);
-        let physical_key_bound = Self::vector_partition_physical_key_bound(
-            &expected_catalog.index,
-            &expected_catalog.partition_key,
-            16,
+        let key_bound = Self::vector_partition_physical_key_bound(
+            &expected_catalog.index, &expected_catalog.partition_key, 16,
         );
-        let retained_key_count = retained_chains.len().saturating_mul(2).saturating_add(2);
-        // Catalog/prefix, every retained generation key, selected base/change,
-        // and one canonical-key construction buffer coexist at the repair
-        // transition. Vec slots are admitted separately from key payloads.
-        let initial_owned = catalog_owned
-            .saturating_add(repair_context_owned)
-            .saturating_add(physical_key_bound.saturating_mul(retained_key_count.saturating_add(3)))
-            .saturating_add(
-                retained_key_count
-                    .saturating_mul(4)
-                    .saturating_mul(std::mem::size_of::<Vec<u8>>()),
-            );
-        Self::resize_vector_cleanup_workspace(workspace, initial_owned, OPERATION)?;
+        let fixed = catalog_owned.saturating_add(repair_context_owned)
+            .saturating_add(key_bound.saturating_mul(8)).saturating_add(64 * 1024);
+        Self::resize_vector_cleanup_workspace(workspace, fixed, OPERATION)?;
         let catalog_key = Self::vector_partition_catalog_key(expected_catalog);
-        let prefix =
-            Self::vector_partition_prefix(&expected_catalog.index, &expected_catalog.partition_key);
-        let covered_lsn = expected_catalog
-            .change
-            .map(|change| change.covered_lsn)
+        let prefix = Self::vector_partition_prefix(&expected_catalog.index, &expected_catalog.partition_key);
+        let covered_lsn = expected_catalog.change.map(|c| c.covered_lsn)
             .unwrap_or(expected_catalog.base.covered_lsn);
-        let mut retained_bases = retained_chains
-            .iter()
-            .map(|(base, _)| {
-                Self::vector_partition_base_generation_key_from_parts(
-                    &expected_catalog.index,
-                    &expected_catalog.partition_key,
-                    *base,
-                )
-            })
-            .collect::<Vec<_>>();
-        retained_bases.push(Self::vector_partition_base_generation_key_from_parts(
-            &expected_catalog.index,
-            &expected_catalog.partition_key,
-            expected_catalog.base.generation_id,
-        ));
-        retained_bases.sort_unstable();
-        retained_bases.dedup();
-        let mut retained_changes = retained_chains
-            .iter()
-            .filter_map(|(base, change)| {
-                change.map(|change| {
-                    Self::vector_partition_change_generation_key_from_parts(
-                        &expected_catalog.index,
-                        &expected_catalog.partition_key,
-                        *base,
-                        change,
-                    )
-                })
-            })
-            .collect::<Vec<_>>();
-        if let Some(change) = expected_catalog.change {
-            retained_changes.push(Self::vector_partition_change_generation_key_from_parts(
-                &expected_catalog.index,
-                &expected_catalog.partition_key,
-                expected_catalog.base.generation_id,
-                change.generation_id,
-            ));
-        }
-        retained_changes.sort_unstable();
-        retained_changes.dedup();
-        let fixed_owned = catalog_owned
-            .saturating_add(repair_context_owned)
-            .saturating_add(catalog_key.capacity())
-            .saturating_add(prefix.capacity())
-            .saturating_add(Self::vector_key_collection_bytes(
-                retained_bases.capacity(),
-                &retained_bases,
-            ))
-            .saturating_add(Self::vector_key_collection_bytes(
-                retained_changes.capacity(),
-                &retained_changes,
-            ));
-        debug_assert!(fixed_owned <= initial_owned);
-        Self::resize_vector_cleanup_workspace(workspace, fixed_owned, OPERATION)?;
-
-        let result = self.with_db(|db| {
+        let finalized = self.with_db(|db| {
+            checkpoint()?;
             let write = db.begin_write().map_err(Self::storage_error)?;
             {
-                let catalogs = write
-                    .open_table(VECTOR_PARTITION_GENERATION_CATALOG_TABLE)
-                    .map_err(Self::storage_error)?;
-                let Some(value) = catalogs
-                    .get_bounded(catalog_key.as_slice())
-                    .map_err(Self::storage_error)?
-                else {
+                let catalogs = write.open_table(VECTOR_PARTITION_GENERATION_CATALOG_TABLE).map_err(Self::storage_error)?;
+                let Some(value) = catalogs.get_bounded(catalog_key.as_slice()).map_err(Self::storage_error)? else {
                     return Ok(false);
                 };
-                let decode_bound = Self::vector_partition_record_decode_bound(
-                    value.value().len(),
-                    std::mem::size_of::<VectorPartitionGenerationCatalogRecord>(),
-                );
-                Self::resize_vector_cleanup_workspace(
-                    workspace,
-                    fixed_owned.saturating_add(decode_bound),
-                    OPERATION,
+                let decode = Self::vector_partition_record_decode_bound(value.value().len(),
+                    std::mem::size_of::<VectorPartitionGenerationCatalogRecord>());
+                Self::resize_vector_cleanup_workspace(workspace, fixed.saturating_add(decode), OPERATION)?;
+                let actual: VectorPartitionGenerationCatalogRecord = self.decode_expected_vector_partition_metadata(
+                    VectorPartitionRecordKind::GenerationCatalog, value.value(),
+                    &expected_catalog.index, &expected_catalog.partition_key,
                 )?;
-                let actual: VectorPartitionGenerationCatalogRecord = self
-                    .decode_expected_vector_partition_metadata(
-                        VectorPartitionRecordKind::GenerationCatalog,
-                        value.value(),
-                        &expected_catalog.index,
-                        &expected_catalog.partition_key,
-                    )?;
-                let actual_owned = Self::vector_partition_catalog_heap_bytes(&actual);
-                debug_assert!(actual_owned <= decode_bound);
-                Self::resize_vector_cleanup_workspace(
-                    workspace,
-                    fixed_owned.saturating_add(actual_owned),
-                    OPERATION,
-                )?;
-                if actual != *expected_catalog {
-                    return Ok(false);
-                }
-                drop(actual);
-                Self::resize_vector_cleanup_workspace(workspace, fixed_owned, OPERATION)?;
+                if actual != *expected_catalog { return Ok(false); }
             }
-
-            let mut journal = write
-                .open_table(VECTOR_PARTITION_JOURNAL_TABLE)
-                .map_err(Self::storage_error)?;
-            let mut covered_key_count = 0usize;
-            let mut covered_key_bytes = 0usize;
-            for entry in journal
-                .prefix_bounded(prefix.as_slice())
-                .map_err(Self::storage_error)?
+            Self::resize_vector_cleanup_workspace(workspace, fixed, OPERATION)?;
             {
-                let (key, _) = entry.map_err(Self::storage_error)?;
-                let key = key.value();
-                if !key.starts_with(&prefix) {
-                    break;
-                }
-                let lsn_end = prefix.len().saturating_add(8);
-                let covered = key
-                    .get(prefix.len()..lsn_end)
-                    .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
-                    .map(u64::from_be_bytes)
-                    .is_none_or(|lsn| lsn <= covered_lsn.0);
-                if covered {
-                    covered_key_count = covered_key_count.saturating_add(1);
-                    covered_key_bytes = covered_key_bytes.saturating_add(key.len());
-                }
-            }
-            let collection_bound =
-                Self::vector_cleanup_collection_bound(covered_key_count, covered_key_bytes);
-            Self::resize_vector_cleanup_workspace(
-                workspace,
-                fixed_owned.saturating_add(collection_bound),
-                OPERATION,
-            )?;
-            let mut covered_keys = Vec::<Box<[u8]>>::with_capacity(covered_key_count);
-            for entry in journal
-                .prefix_bounded(prefix.as_slice())
-                .map_err(Self::storage_error)?
-            {
-                let (key, _) = entry.map_err(Self::storage_error)?;
-                let key = key.value();
-                if !key.starts_with(&prefix) {
-                    break;
-                }
-                let lsn_end = prefix.len().saturating_add(8);
-                let covered = key
-                    .get(prefix.len()..lsn_end)
-                    .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
-                    .map(u64::from_be_bytes)
-                    .is_none_or(|lsn| lsn <= covered_lsn.0);
-                if covered {
-                    covered_keys.push(Box::<[u8]>::from(key));
-                }
-            }
-            let collection_owned =
-                Self::boxed_vector_key_collection_bytes(covered_keys.capacity(), &covered_keys);
-            debug_assert!(collection_owned <= collection_bound);
-            Self::resize_vector_cleanup_workspace(
-                workspace,
-                fixed_owned.saturating_add(collection_owned),
-                OPERATION,
-            )?;
-            #[cfg(any(test, feature = "test-seams"))]
-            if !covered_keys.is_empty() {
-                crate::database::maybe_pause_vector_journal_cleanup_for_test();
-            }
-            for key in &covered_keys {
-                journal.remove(key.as_ref()).map_err(Self::storage_error)?;
-            }
-            drop(covered_keys);
-            Self::resize_vector_cleanup_workspace(workspace, fixed_owned, OPERATION)?;
-            drop(journal);
-
-            for (definition, retained, is_base) in [
-                (
-                    VECTOR_PARTITION_BASE_GENERATION_TABLE,
-                    &retained_bases,
-                    true,
-                ),
-                (
-                    VECTOR_PARTITION_CHANGE_GENERATION_TABLE,
-                    &retained_changes,
-                    false,
-                ),
-            ] {
-                let mut table = write.open_table(definition).map_err(Self::storage_error)?;
-                let mut stale_key_count = 0usize;
-                let mut stale_key_bytes = 0usize;
-                for entry in table
-                    .prefix_bounded(prefix.as_slice())
-                    .map_err(Self::storage_error)?
-                {
-                    let (key, _) = entry.map_err(Self::storage_error)?;
-                    if !key.value().starts_with(&prefix) {
-                        break;
-                    }
-                    if retained
-                        .binary_search_by(|candidate| candidate.as_slice().cmp(key.value()))
-                        .is_err()
-                    {
-                        stale_key_count = stale_key_count.saturating_add(1);
-                        stale_key_bytes = stale_key_bytes.saturating_add(key.value().len());
-                    }
-                }
-                let collection_bound =
-                    Self::vector_cleanup_collection_bound(stale_key_count, stale_key_bytes);
-                Self::resize_vector_cleanup_workspace(
-                    workspace,
-                    fixed_owned.saturating_add(collection_bound),
-                    OPERATION,
-                )?;
-                let mut stale_keys = Vec::<Box<[u8]>>::with_capacity(stale_key_count);
-                for entry in table
-                    .prefix_bounded(prefix.as_slice())
-                    .map_err(Self::storage_error)?
-                {
-                    let (key, _) = entry.map_err(Self::storage_error)?;
-                    if !key.value().starts_with(&prefix) {
-                        break;
-                    }
-                    if retained
-                        .binary_search_by(|candidate| candidate.as_slice().cmp(key.value()))
-                        .is_err()
-                    {
-                        stale_keys.push(Box::<[u8]>::from(key.value()));
-                    }
-                }
-                let collection_owned =
-                    Self::boxed_vector_key_collection_bytes(stale_keys.capacity(), &stale_keys);
-                debug_assert!(collection_owned <= collection_bound);
-                Self::resize_vector_cleanup_workspace(
-                    workspace,
-                    fixed_owned.saturating_add(collection_owned),
-                    OPERATION,
-                )?;
-                #[cfg(any(test, feature = "test-seams"))]
-                if !stale_keys.is_empty() {
+                let mut journal = write.open_table(VECTOR_PARTITION_JOURNAL_TABLE).map_err(Self::storage_error)?;
+                for _ in 0..64 {
+                    checkpoint()?;
+                    let key = {
+                        let next = journal.prefix_bounded(prefix.as_slice()).map_err(Self::storage_error)?
+                            .next().transpose().map_err(Self::storage_error)?;
+                        let Some((key, value)) = next else { break; };
+                        if !key.value().starts_with(&prefix) { break; }
+                        let suffix = &key.value()[prefix.len()..];
+                        if suffix.len() != 16 { return Err(vector_paged::corruption("covered journal key is malformed")); }
+                        let lsn = u64::from_be_bytes(suffix[..8].try_into().unwrap());
+                        if lsn > covered_lsn.0 { break; }
+                        let key = key.value().to_vec();
+                        drop(value);
+                        key
+                    };
+                    #[cfg(any(test, feature = "test-seams"))]
                     crate::database::maybe_pause_vector_journal_cleanup_for_test();
+                    checkpoint()?;
+                    journal.remove(key.as_slice()).map_err(Self::storage_error)?;
                 }
-                for key in &stale_keys {
-                    table.remove(key.as_ref()).map_err(Self::storage_error)?;
-                }
-                drop(table);
-                for key in &stale_keys {
-                    Self::remove_vector_partition_graph_pages_in_write(
-                        &write,
-                        key.as_ref(),
-                        is_base,
-                    )?;
-                }
-                drop(stale_keys);
-                Self::resize_vector_cleanup_workspace(workspace, fixed_owned, OPERATION)?;
             }
-            write.commit().map_err(Self::storage_error)?;
-            Ok(true)
-        });
-        if result.is_ok() {
-            drop(retained_changes);
-            drop(retained_bases);
-            drop(prefix);
-            drop(catalog_key);
-            Self::resize_vector_cleanup_workspace(
-                workspace,
-                catalog_owned.saturating_add(repair_context_owned),
-                OPERATION,
+            self.reclaim_vector_generations_in_write_with_checkpoint(
+                &write, expected_catalog, retained_chains, true, &mut checkpoint,
             )?;
-        }
-        result.map(|finalized| (finalized, catalog_owned))
+            Self::write_writer_recovery_bounds_in_write(&write, None)?;
+            checkpoint()?;
+            write.commit().map_err(Self::storage_error)?;
+            // True means the expected repaired catalog remains authoritative,
+            // not that all historical cleanup batches have already drained.
+            Ok(true)
+        })?;
+        drop(prefix);
+        drop(catalog_key);
+        Self::resize_vector_cleanup_workspace(workspace,
+            catalog_owned.saturating_add(repair_context_owned), OPERATION)?;
+        Ok((finalized, catalog_owned))
     }
 
     fn insert_preencoded_vector_partition_generation_objects_in_write(
@@ -28897,6 +30284,15 @@ impl RedbPersistence {
         write_txn: &redb::WriteTransaction,
         prepared: &PreencodedVectorPartitionGenerationCandidate,
     ) -> Result<()> {
+        // All callers insert immutable objects before publishing the catalog.
+        // An emptied partitioned route must insert neither generations nor pages:
+        // without a catalog, reclamation cannot discover those objects.
+        if vector_membership_pages::is_empty_partitioned_route_in_write(
+            write_txn,
+            &prepared.catalog_route,
+        )? {
+            return Ok(());
+        }
         let mut bases = write_txn
             .open_table(VECTOR_PARTITION_BASE_GENERATION_TABLE)
             .map_err(Self::storage_error)?;
@@ -28968,6 +30364,14 @@ impl RedbPersistence {
         write_txn: &redb::WriteTransaction,
         prepared: &PreencodedVectorPartitionGenerationCandidate,
     ) -> Result<Option<(usize, usize)>> {
+        if vector_membership_pages::is_empty_partitioned_route_in_write(
+            write_txn,
+            &prepared.catalog_route,
+        )? {
+            // A pinned retired chain may still need the current catalog.
+            // Only reclaim removes it; a late candidate cannot replace it.
+            return Ok(None);
+        }
         let mut catalogs = write_txn
             .open_table(VECTOR_PARTITION_GENERATION_CATALOG_TABLE)
             .map_err(Self::storage_error)?;
@@ -29095,9 +30499,9 @@ impl RedbPersistence {
             let mut source_lsns = HashMap::new();
             for entry in table.iter().map_err(Self::storage_error)? {
                 let (key, value) = entry.map_err(Self::storage_error)?;
-                if let Some((table, row_id)) = Self::decode_sync_row_source_lsn_key(key.value()) {
-                    source_lsns.insert((table, row_id), Lsn(value.value()));
-                }
+                let key = Self::decode_sync_row_source_lsn_key(key.value())
+                    .ok_or_else(|| Error::Other("sync provenance has an invalid row key".into()))?;
+                source_lsns.insert(key, Lsn(value.value()));
             }
             Ok(source_lsns)
         })
@@ -29114,9 +30518,10 @@ impl RedbPersistence {
             let mut kinds = HashMap::new();
             for entry in table.iter().map_err(Self::storage_error)? {
                 let (key, value) = entry.map_err(Self::storage_error)?;
-                if let Some((table, row_id)) = Self::decode_sync_row_source_lsn_key(key.value()) {
-                    kinds.insert((table, row_id), value.value());
-                }
+                let key = Self::decode_sync_row_source_lsn_key(key.value()).ok_or_else(|| {
+                    Error::Other("sync provenance kind has an invalid row key".into())
+                })?;
+                kinds.insert(key, value.value());
             }
             Ok(kinds)
         })
@@ -29316,13 +30721,16 @@ impl RedbPersistence {
             let expired = {
                 let read_txn = db.begin_read().map_err(Self::storage_error)?;
                 match read_txn.open_table(TRIGGER_AUDIT_STAMPS_TABLE) {
-                    Ok(stamps) => stamps
-                        .iter()
-                        .map_err(Self::storage_error)?
-                        .filter_map(|entry| entry.ok())
-                        .filter(|(_, stamped_at)| stamped_at.value() < cutoff_millis)
-                        .map(|(key, _)| key.value().to_string())
-                        .collect::<Vec<_>>(),
+                    Ok(stamps) => {
+                        let mut expired = Vec::new();
+                        for entry in stamps.iter().map_err(Self::storage_error)? {
+                            let (key, stamped_at) = entry.map_err(Self::storage_error)?;
+                            if stamped_at.value() < cutoff_millis {
+                                expired.push(key.value().to_string());
+                            }
+                        }
+                        expired
+                    }
                     Err(redb::TableError::TableDoesNotExist(_)) => Vec::new(),
                     Err(err) => return Err(Self::storage_error(err)),
                 }
@@ -29523,6 +30931,7 @@ impl RedbPersistence {
                 let table_name = Self::rel_table_name(name);
                 let table_def: TableDefinition<&[u8], &[u8]> =
                     TableDefinition::new(table_name.as_str());
+                content_size::reset_rows(&write_txn, name)?;
                 match write_txn.delete_table(table_def) {
                     Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
                     Err(redb::TableError::TableTypeMismatch { .. }) => {}
@@ -29548,14 +30957,14 @@ impl RedbPersistence {
                 Self::retain_sync_source_provenance_for_table_rows(&write_txn, name, rows)?;
             }
 
+            content_size::reset_vector_bytes(&write_txn)?;
             match write_txn.delete_table(VECTORS_TABLE) {
                 Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
                 Err(err) => return Err(Self::storage_error(err)),
             }
             {
-                let mut table = write_txn
-                    .open_table(VECTORS_TABLE)
-                    .map_err(Self::storage_error)?;
+                let mut table =
+                    content_size::open_vectors(&write_txn).map_err(Self::storage_error)?;
                 for entry in vectors {
                     let quantization = vector_quantization
                         .get(&entry.index)
@@ -29680,7 +31089,9 @@ impl RedbPersistence {
         let previous = self.load_commit_index()?;
         self.with_db(|db| {
             let write_txn = db.begin_write().map_err(Self::storage_error)?;
-            let _ = write_txn.delete_table(COMMIT_INDEX_TABLE);
+            write_txn
+                .delete_table(COMMIT_INDEX_TABLE)
+                .map_err(Self::storage_error)?;
             {
                 let mut table = write_txn
                     .open_table(COMMIT_INDEX_TABLE)
@@ -30036,13 +31447,13 @@ impl RedbPersistence {
             }
         }
 
-        let mut opened_rel_tables: HashMap<String, redb::Table<'_, &[u8], &[u8]>> = HashMap::new();
+        let mut opened_rel_tables: HashMap<String, content_size::ContentTable<'_>> = HashMap::new();
         for (table, row_id, created_tx, lsn) in row_keys {
             if !opened_rel_tables.contains_key(table) {
                 let table_name = Self::rel_table_name(table);
                 let table_def: TableDefinition<&[u8], &[u8]> =
                     TableDefinition::new(table_name.as_str());
-                match write_txn.open_table(table_def) {
+                match content_size::open_rows(write_txn, table_def) {
                     Ok(redb_table) => {
                         opened_rel_tables.insert(table.clone(), redb_table);
                     }
@@ -30279,31 +31690,9 @@ impl RedbPersistence {
                 })
             })
         };
-        match run(&mut self.proof_admission()) {
-            Ok(stats) => Ok(stats),
-            Err(error) if durable.get() => Err(error),
-            Err(
-                error @ (Error::MemoryBudgetExceeded { .. } | Error::DiskBudgetExceeded { .. }),
-            ) => {
-                // This pass's own content-identity proof-maintenance walk is
-                // transient bookkeeping overhead on top of a net memory-
-                // reducing removal: the same tight budget that makes the
-                // walk look too expensive is exactly the pressure this
-                // reclaim exists to relieve. Nothing committed above (the
-                // failed write transaction was dropped, never committed), so
-                // retrying from a fresh transaction is exactly-once. The
-                // accounted attempt is always tried first and the charge
-                // itself is never removed -- only this one already-refused
-                // pass is retried unaccounted, so the durable and in-memory
-                // removal still lands, with the refusal it recovered from
-                // carried back to the caller's maintenance receipt.
-                let details = contextdb_vector::VectorMaintenanceFailureDetails::from_error(&error);
-                let mut stats = run(&mut content_identity::ProofAdmission::unaccounted())?;
-                stats.proof_admission_refused = Some(details);
-                Ok(stats)
-            }
-            Err(other) => Err(other),
-        }
+        // A refused proof leaves the transaction uncommitted and the selected
+        // identities available for a later accounted maintenance attempt.
+        run(&mut self.proof_admission())
     }
 
     /// Apply the durable half of one authoritative purge in exactly one Redb
@@ -30315,12 +31704,27 @@ impl RedbPersistence {
         projection: &AuthoritativePurgePersistenceProjection,
         marker: Option<purge_publication::DurableMarker>,
         frontier: Lsn,
+        accountant: Arc<dyn contextdb_vector::MemoryBudget>,
+        operation: &str,
     ) -> Result<()> {
+        // Presence, including a malformed fence, is sufficient to refuse.
+        // The write-transaction check below closes a concurrent retirement.
+        if self.has_vector_repair_fence()? || self.has_paged_cleanup()? {
+            return Err(vector_paged::corruption("vector ownership cleanup is incomplete before authoritative erasure"));
+        }
         let prepared_vector_generations =
             self.prepare_authoritative_purge_vector_generations(projection)?;
         self.with_db(|db| {
             let write_txn = db.begin_write().map_err(Self::storage_error)?;
-            self.apply_local_erasure(&write_txn, projection, &prepared_vector_generations, marker)?;
+            Self::refuse_unresolved_vector_erasure_in_write(&write_txn)?;
+            self.apply_local_erasure(
+                &write_txn,
+                projection,
+                &prepared_vector_generations,
+                marker,
+                accountant.clone(),
+                operation,
+            )?;
             Self::raise_noncanonical_writer_floors_in_write(
                 &write_txn,
                 TxId(0),
@@ -30621,6 +32025,8 @@ impl RedbPersistence {
         projection: &AuthoritativePurgePersistenceProjection,
         prepared_vector_generations: &[PreencodedVectorPartitionGenerationCandidate],
         marker: Option<purge_publication::DurableMarker>,
+        accountant: Arc<dyn contextdb_vector::MemoryBudget>,
+        operation: &str,
     ) -> Result<()> {
         let mut identity_mutations = Vec::new();
         // A selected change-log occurrence is identified by its full
@@ -30705,7 +32111,7 @@ impl RedbPersistence {
             }
         }
 
-        let mut relational_tables: HashMap<String, redb::Table<'_, &[u8], &[u8]>> = HashMap::new();
+        let mut relational_tables: HashMap<String, content_size::ContentTable<'_>> = HashMap::new();
         #[cfg(feature = "test-seams")]
         let first_table_end = projection.row_versions.first().and_then(|first| {
             projection
@@ -30725,9 +32131,7 @@ impl RedbPersistence {
                 let definition: TableDefinition<&[u8], &[u8]> = TableDefinition::new(name.as_str());
                 relational_tables.insert(
                     table.clone(),
-                    write_txn
-                        .open_table(definition)
-                        .map_err(Self::storage_error)?,
+                    content_size::open_rows(write_txn, definition).map_err(Self::storage_error)?,
                 );
             }
             let key = Self::rel_row_key_from_parts(*row_id, *created_tx, *lsn);
@@ -30829,12 +32233,12 @@ impl RedbPersistence {
         self.purge_vector_partition_generation_identities_in_write(
             write_txn,
             &projection.vector_partition_identities,
+            accountant,
+            operation,
         )?;
 
         if !projection.vectors.is_empty() {
-            let mut vectors = write_txn
-                .open_table(VECTORS_TABLE)
-                .map_err(Self::storage_error)?;
+            let mut vectors = content_size::open_vectors(write_txn).map_err(Self::storage_error)?;
             for entry in &projection.vectors {
                 let key = Self::vector_key(entry);
                 let removed = vectors
@@ -31093,7 +32497,7 @@ impl RedbPersistence {
             }),
             workspace,
         )?;
-        match write_txn.open_table(VECTORS_TABLE) {
+        match content_size::open_vectors(write_txn) {
             Ok(mut table) => {
                 for version in versions {
                     let key = Self::vector_identity_key(
@@ -31204,7 +32608,7 @@ impl RedbPersistence {
             None,
         )?;
         if !vectors.is_empty() {
-            match write_txn.open_table(VECTORS_TABLE) {
+            match content_size::open_vectors(write_txn) {
                 Ok(mut table) => {
                     for entry in vectors {
                         let key = Self::vector_key(entry);
@@ -31738,6 +33142,7 @@ impl RedbPersistence {
             .3
             .as_ref()
             .map_or(0, |memory| memory.bytes())
+            .saturating_add(self.vector_repair_audit.lock().as_ref().map_or(0, |audit| audit._memory.bytes()))
     }
 
     /// One bounded durable relocation batch. Only a position survives the
@@ -31842,6 +33247,7 @@ impl RedbPersistence {
                     Self::write_vector_body_root_fingerprint(txn)
                         .and_then(|()| Self::write_commit_directory_root_in_write(txn))
                         .and_then(|()| Self::write_row_heads_root(txn))
+                        .and_then(|()| Self::rebind_ddl_selector_roots_in_write(txn))
                         .and_then(|()| {
                             let (phase, table, advance, position, active) = successor.checkpoint();
                             if active {
@@ -32408,9 +33814,8 @@ impl RedbPersistence {
                 let table_name = Self::rel_table_name(name);
                 let table_def: TableDefinition<&[u8], &[u8]> =
                     TableDefinition::new(table_name.as_str());
-                let mut redb_table = write_txn
-                    .open_table(table_def)
-                    .map_err(Self::storage_error)?;
+                let mut redb_table =
+                    content_size::open_rows(&write_txn, table_def).map_err(Self::storage_error)?;
                 let mut encoded = Vec::new();
                 for row in rows {
                     Self::encode_versioned_row_into(row, meta, &mut encoded)?;
@@ -32625,9 +34030,8 @@ impl RedbPersistence {
         self.with_db(|db| {
             let write_txn = db.begin_write().map_err(Self::storage_error)?;
             {
-                let mut table = write_txn
-                    .open_table(VECTORS_TABLE)
-                    .map_err(Self::storage_error)?;
+                let mut table =
+                    content_size::open_vectors(&write_txn).map_err(Self::storage_error)?;
                 for entry in entries {
                     let quantization = quantization.get(&entry.index).copied().unwrap_or_default();
                     let encoded = Self::encode_vector_entry(entry, quantization)?;
@@ -32695,6 +34099,51 @@ impl RedbPersistence {
                     .map_err(Self::storage_error)?;
                 for record in records {
                     self.insert_vector_partition_membership(&write_txn, &mut table, record)?;
+                }
+            }
+            Self::apply_content_identity_mutations_in_write(
+                &write_txn,
+                &[],
+                &mut self.proof_admission(),
+            )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
+            write_txn.commit().map_err(Self::storage_error)?;
+            Ok(())
+        })
+    }
+
+    /// Corrupt-store-only fixture seam. This writes valid checksummed records
+    /// and authenticated directory companions, deliberately bypassing placement
+    /// overlap validation so loader corruption detection can be tested separately.
+    #[cfg(any(test, feature = "test-seams"))]
+    pub(crate) fn write_corrupt_store_vector_memberships_for_test(
+        &self,
+        records: &[VectorPartitionMembershipRecord],
+    ) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        self.with_db(|db| {
+            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            {
+                let mut table = write_txn
+                    .open_table(VECTOR_PARTITION_MEMBERSHIP_TABLE)
+                    .map_err(Self::storage_error)?;
+                for record in records {
+                    let key = Self::vector_partition_membership_key(record);
+                    let encoded = Self::encode_vector_partition_record(
+                        VectorPartitionRecordKind::Membership,
+                        record,
+                    )?;
+                    table
+                        .insert(key.as_slice(), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                    self.write_open_directory_entry_impl::<true>(
+                        &write_txn,
+                        &key,
+                        Some(&encoded),
+                        true,
+                    )?;
                 }
             }
             Self::apply_content_identity_mutations_in_write(
@@ -33115,7 +34564,7 @@ impl RedbPersistence {
     /// is supposed to have written it. A stored key that disagrees with the
     /// declaration cannot be ordered against its siblings, so it is refused
     /// before it can contribute a row.
-    fn validated_index_position(
+    pub(crate) fn validated_index_position(
         declaration: &IndexDecl,
         meta: &TableMeta,
         position: &RelationalIndexPosition,
@@ -33202,6 +34651,54 @@ impl RedbPersistence {
                 })
                 .collect(),
         })
+    }
+
+    /// The stored-key prefix shared by every maintained count of one column
+    /// list whose leading values are `prefix`, and by no other record. A count
+    /// key is the bincode of `EncodedRelationalIndexCountKey`, which writes the
+    /// table, the list, the full prefix's length and then each value in order,
+    /// so those form a byte prefix of every such key. Checked against one
+    /// encoded full key, so a change to that layout fails here instead of
+    /// reading the wrong range.
+    fn relational_index_count_range_prefix(
+        table: &str,
+        columns: &[(String, contextdb_core::SortDirection)],
+        prefix: &[DirectedValue],
+    ) -> Result<Vec<u8>> {
+        if prefix.len() > columns.len() {
+            return Err(Error::Other(
+                "a maintained count prefix is longer than its column list".to_owned(),
+            ));
+        }
+        let mut encoded = Self::encode(&(table, columns))?;
+        encoded.extend_from_slice(&Self::encode(&(columns.len() as u64))?);
+        for part in prefix {
+            let (descending, value) = match part {
+                DirectedValue::Asc(TotalOrdAsc(value)) => (false, value),
+                DirectedValue::Desc(TotalOrdDesc(value)) => (true, value),
+            };
+            encoded.extend_from_slice(&Self::encode(&(descending, value))?);
+        }
+        let mut full = prefix.to_vec();
+        full.extend(
+            columns[prefix.len()..]
+                .iter()
+                .map(|(_, direction)| match direction {
+                    contextdb_core::SortDirection::Asc => {
+                        DirectedValue::Asc(TotalOrdAsc(Value::Null))
+                    }
+                    contextdb_core::SortDirection::Desc => {
+                        DirectedValue::Desc(TotalOrdDesc(Value::Null))
+                    }
+                }),
+        );
+        if !Self::relational_index_count_key(table, columns, &full)?.starts_with(&encoded) {
+            return Err(Error::Other(
+                "the maintained count key layout no longer begins with its leading values"
+                    .to_owned(),
+            ));
+        }
+        Ok(encoded)
     }
 
     fn relational_index_count_mutation(
@@ -34089,7 +35586,7 @@ impl RedbPersistence {
     ) -> Result<content_identity::ContentIdentityMutation> {
         let redb_name = Self::rel_table_name(table_name);
         let table_def: TableDefinition<&[u8], &[u8]> = TableDefinition::new(redb_name.as_str());
-        let table = match write_txn.open_table(table_def) {
+        let table = match content_size::open_rows(write_txn, table_def) {
             Ok(table) => table,
             Err(redb::TableError::TableDoesNotExist(_)) => {
                 return Ok(content_identity::remove_row_mutation(table_name, row_id));
@@ -34144,7 +35641,7 @@ impl RedbPersistence {
         row_id: RowId,
         quantization: VectorQuantization,
     ) -> Result<content_identity::ContentIdentityMutation> {
-        let table = match write_txn.open_table(VECTORS_TABLE) {
+        let table = match content_size::open_vectors(write_txn) {
             Ok(table) => table,
             Err(redb::TableError::TableDoesNotExist(_)) => {
                 return Ok(content_identity::remove_vector_mutation(
@@ -34787,7 +36284,7 @@ impl RedbPersistence {
         write_txn: &redb::WriteTransaction,
         matches: &impl Fn(&VectorIndexRef) -> bool,
     ) -> Result<()> {
-        let mut table = match write_txn.open_table(VECTORS_TABLE) {
+        let mut table = match content_size::open_vectors(write_txn) {
             Ok(table) => table,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
             Err(error) => return Err(Self::storage_error(error)),
@@ -34820,7 +36317,7 @@ impl RedbPersistence {
         if renames.is_empty() && dropped_columns.is_empty() {
             return Ok(());
         }
-        let mut table = match write_txn.open_table(VECTORS_TABLE) {
+        let mut table = match content_size::open_vectors(write_txn) {
             Ok(table) => table,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
             Err(error) => return Err(Self::storage_error(error)),
@@ -35214,6 +36711,8 @@ impl RedbPersistence {
         &self,
         write_txn: &redb::WriteTransaction,
         identities: &[VectorPartitionVersionIdentity],
+        accountant: Arc<dyn contextdb_vector::MemoryBudget>,
+        operation: &str,
     ) -> Result<()> {
         if identities.is_empty() {
             return Ok(());
@@ -35350,7 +36849,12 @@ impl RedbPersistence {
             let prefix = Self::vector_partition_prefix(&index, &partition_key);
             // Erasure covers native paged generations and unpublished paged
             // builds too: their pages hold copies of the erased vectors.
-            self.erase_partition_paged_storage_in_write(write_txn, &prefix)?;
+            self.erase_partition_paged_storage_in_write(
+                write_txn,
+                &prefix,
+                accountant.clone(),
+                operation,
+            )?;
             self.remove_vector_partition_graph_pages_for_partition_in_write(
                 write_txn,
                 &index,
@@ -35646,13 +37150,40 @@ impl RedbPersistence {
         membership: Option<&[u8]>,
         pending_transition: bool,
     ) -> Result<()> {
-        vector_membership_pages::publish_membership(
+        self.write_open_directory_entry_impl::<false>(
             write_txn,
             key,
             membership,
-            self.proof_accountant(),
             pending_transition,
-        )?;
+        )
+    }
+
+    fn write_open_directory_entry_impl<const CORRUPT_STORE: bool>(
+        &self,
+        write_txn: &redb::WriteTransaction,
+        key: &[u8],
+        membership: Option<&[u8]>,
+        pending_transition: bool,
+    ) -> Result<()> {
+        #[cfg(any(test, feature = "test-seams"))]
+        if CORRUPT_STORE {
+            vector_membership_pages::publish_corrupt_store_membership_for_test(
+                write_txn,
+                key,
+                membership,
+                self.proof_accountant(),
+                pending_transition,
+            )?;
+        }
+        if !CORRUPT_STORE {
+            vector_membership_pages::publish_membership(
+                write_txn,
+                key,
+                membership,
+                self.proof_accountant(),
+                pending_transition,
+            )?;
+        }
         let mut directory = write_txn
             .open_table(VECTOR_OPEN_DIRECTORY_TABLE)
             .map_err(Self::storage_error)?;
@@ -37325,3 +38856,7 @@ impl RedbPersistence {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "persistence/body_placement_publication_tests.rs"]
+mod body_placement_publication_tests;

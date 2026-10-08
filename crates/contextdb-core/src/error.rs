@@ -176,6 +176,17 @@ pub enum Error {
         expected: usize,
         actual: usize,
     },
+    #[error(
+        "vector source identity mismatch on {index} row {row_id}: expected created {expected_created_tx}/LSN {expected_lsn}, got created {actual_created_tx:?}/LSN {actual_lsn:?}"
+    )]
+    VectorSourceIdentityMismatch {
+        index: VectorIndexRef,
+        row_id: RowId,
+        expected_created_tx: TxId,
+        expected_lsn: crate::types::Lsn,
+        actual_created_tx: Option<TxId>,
+        actual_lsn: Option<crate::types::Lsn>,
+    },
     #[error("unknown vector index {index}")]
     UnknownVectorIndex { index: VectorIndexRef },
     #[error("invalid vector partition declaration on {index}: {issue}")]
@@ -345,8 +356,8 @@ pub enum Error {
     },
     #[error("recursive CTEs are not supported")]
     RecursiveCteNotSupported,
-    #[error("window functions are not supported")]
-    WindowFunctionNotSupported,
+    #[error("window form is not supported: {form}")]
+    WindowFunctionNotSupported { form: String },
     #[error("stored procedures/functions are not supported")]
     StoredProcNotSupported,
     #[error("graph traversal requires explicit depth bound")]
@@ -496,6 +507,14 @@ pub enum Error {
         current_bytes: u64,
         budget_limit_bytes: u64,
         hint: String,
+    },
+    /// Scratch working storage could not complete `create`, `read`, or `write`.
+    /// This is an I/O failure, not a refusal of the store's configured disk
+    /// budget. Retain the kind without exposing a scratch path or error source.
+    #[error("scratch working storage unavailable during {operation}: {io_kind}")]
+    ScratchWorkingStorageUnavailable {
+        operation: String,
+        io_kind: std::io::ErrorKind,
     },
     #[error("column type mismatch: {table}.{column} expected {expected}, got {actual}")]
     ColumnTypeMismatch {

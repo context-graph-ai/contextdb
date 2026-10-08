@@ -36,6 +36,331 @@ use std::cell::RefCell;
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::BinaryHeap;
 
+/// Optional statement-local decoded navigation, under the same reader funder
+/// as mandatory scratch. Layer ordinals namespace captured readers: no entry
+/// can escape this invocation or refer to a later root of the same graph.
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+enum NavigationKey {
+    Point(usize, PointId),
+    Identity(usize, usize),
+}
+struct NavigationPoint {
+    origin: usize,
+    neighbours: Vec<Vec<(PointId, usize)>>,
+    // Already decoded bodies are optional and admit only from the headroom
+    // remaining while the native source/decode window is still charged.
+    values: Option<Vec<f32>>,
+}
+struct NavigationIdentity {
+    row: RowId,
+    _point: PointId,
+    _lsn: contextdb_core::Lsn,
+    _created_tx: contextdb_core::TxId,
+    _deleted_tx: Option<contextdb_core::TxId>,
+}
+enum NavigationValue {
+    Point(NavigationPoint),
+    Identity(NavigationIdentity),
+}
+struct NavigationEntry {
+    value: NavigationValue,
+    bytes: usize,
+    last_used: usize,
+}
+struct NavigationCache {
+    accountant: Option<Arc<dyn crate::memory_budget::MemoryBudget>>,
+    entries: HashMap<NavigationKey, NavigationEntry>,
+    tick: usize,
+    table_bytes: usize,
+    payload_bytes: usize,
+}
+impl NavigationCache {
+    fn new(accountant: Option<Arc<dyn crate::memory_budget::MemoryBudget>>) -> Self {
+        Self {
+            accountant,
+            entries: HashMap::new(),
+            tick: 0,
+            table_bytes: 0,
+            payload_bytes: 0,
+        }
+    }
+    fn clear(&mut self) {
+        // Drop allocations first, then their real operation charge. Removing
+        // entries alone would retain the map's buckets and is insufficient.
+        let entries = std::mem::take(&mut self.entries);
+        drop(entries);
+        if let Some(owner) = &self.accountant {
+            owner.release(
+                self.table_bytes
+                    .checked_add(self.payload_bytes)
+                    .expect("admitted navigation total"),
+            );
+        }
+        self.table_bytes = 0;
+        self.payload_bytes = 0;
+    }
+    fn evict_lru(&mut self) -> bool {
+        let Some(key) = self
+            .entries
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_used)
+            .map(|(key, _)| *key)
+        else {
+            return false;
+        };
+        let entry = self.entries.remove(&key).expect("LRU entry");
+        let bytes = entry.bytes;
+        drop(entry);
+        self.payload_bytes -= bytes;
+        if let Some(owner) = &self.accountant {
+            owner.release(bytes);
+        }
+        if self.entries.is_empty() {
+            let entries = std::mem::take(&mut self.entries);
+            drop(entries);
+            if let Some(owner) = &self.accountant {
+                owner.release(self.table_bytes);
+            }
+            self.table_bytes = 0;
+        }
+        true
+    }
+    fn next_tick(&mut self) -> usize {
+        if self.tick == usize::MAX {
+            let mut previous = 0usize;
+            let mut rank = 0usize;
+            while let Some((key, stamp)) = self.entries.iter()
+                .filter(|(_, entry)| entry.last_used > previous)
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, entry)| (*key, entry.last_used))
+            {
+                rank += 1;
+                self.entries.get_mut(&key).expect("navigation recency entry").last_used = rank;
+                previous = stamp;
+            }
+            self.tick = rank;
+        }
+        self.tick += 1;
+        self.tick
+    }
+    fn touch(&mut self, key: NavigationKey) -> Option<&NavigationValue> {
+        let tick = self.next_tick();
+        let entry = self.entries.get_mut(&key)?;
+        entry.last_used = tick;
+        Some(&entry.value)
+    }
+    fn insert(&mut self, key: NavigationKey, value: NavigationValue, bytes: usize) {
+        let last_used = self.next_tick();
+        self.entries.insert(key, NavigationEntry { value, bytes, last_used });
+    }
+    fn reserve(&mut self, bytes: usize) -> bool {
+        let Some(owner) = &self.accountant else {
+            return false;
+        };
+        owner.try_allocate_for(bytes, "vector_navigation", "retain_authenticated_navigation", "Optional navigation retention.").is_ok()
+    }
+
+    fn table_slot(&mut self) -> bool {
+        if self.entries.len() < self.entries.capacity() {
+            return true;
+        }
+        let Some(wanted) = self.entries.capacity().checked_mul(2).map(|n| n.max(4)) else {
+            return false;
+        };
+        let Some(buckets) = wanted
+            .checked_mul(8)
+            .map(|n| n.div_ceil(7))
+            .and_then(|n| n.checked_next_power_of_two())
+        else {
+            return false;
+        };
+        let Some(bytes) = buckets
+            .checked_mul(std::mem::size_of::<(NavigationKey, NavigationEntry)>() + 1)
+            .and_then(|n| n.checked_add(16))
+        else {
+            return false;
+        };
+        // New and old table coexist during rehash. Admit the complete new
+        // capacity, not merely its delta; payload allocations remain charged.
+        if !self.reserve(bytes) {
+            return false;
+        }
+        if self
+            .entries
+            .try_reserve(wanted.saturating_sub(self.entries.len()))
+            .is_err()
+        {
+            self.accountant
+                .as_ref()
+                .expect("optional funder")
+                .release(bytes);
+            return false;
+        }
+        self.accountant
+            .as_ref()
+            .expect("optional funder")
+            .release(self.table_bytes);
+        self.table_bytes = bytes;
+        true
+    }
+    fn row(&mut self, layer: usize, origin: usize) -> Option<RowId> {
+        match self.touch(NavigationKey::Identity(layer, origin)) {
+            Some(NavigationValue::Identity(identity)) => Some(identity.row),
+            _ => None,
+        }
+    }
+    fn remember_identity(
+        &mut self,
+        layer: usize,
+        origin: usize,
+        identity: &paged_builder::PagedVectorIdentity,
+    ) {
+        let key = NavigationKey::Identity(layer, origin);
+        if self.touch(key).is_some() {
+            return;
+        }
+        if self.table_slot() {
+            self.insert(
+                key,
+                NavigationValue::Identity(NavigationIdentity {
+                    row: identity.row_id,
+                    _point: identity.point,
+                    _lsn: identity.lsn,
+                    _created_tx: identity.created_tx,
+                    _deleted_tx: identity.deleted_tx,
+                }),
+                0,
+            );
+        }
+    }
+    fn point(&mut self, layer: usize, point: PointId) -> Option<&NavigationPoint> {
+        match self.touch(NavigationKey::Point(layer, point)) {
+            Some(NavigationValue::Point(point)) => Some(point),
+            _ => None,
+        }
+    }
+    fn remember_point(
+        &mut self,
+        layer: usize,
+        id: PointId,
+        value: &paged_builder::PagedVectorPoint,
+    ) {
+        if self.point(layer, id).is_some() {
+            return;
+        }
+        let (origin, neighbours) = match value {
+            paged_builder::PagedVectorPoint::F32(point) => (point.origin_id, &point.neighbours),
+            paged_builder::PagedVectorPoint::Quantized(point) => {
+                (point.origin_id, &point.neighbours)
+            }
+        };
+        let Some(headers) = neighbours
+            .len()
+            .checked_mul(std::mem::size_of::<Vec<(PointId, usize)>>())
+        else {
+            return;
+        };
+        let Some(bytes) = neighbours.iter().try_fold(headers, |sum, edges| {
+            sum.checked_add(
+                edges
+                    .len()
+                    .checked_mul(std::mem::size_of::<(PointId, usize)>())?,
+            )
+        }) else {
+            return;
+        };
+        if self.payload_bytes.checked_add(bytes).is_none()
+            || !self.reserve(bytes)
+        {
+            return;
+        }
+        if !self.table_slot() {
+            self.accountant.as_ref().expect("optional funder").release(bytes);
+            return;
+        }
+        let mut compact = Vec::with_capacity(neighbours.len());
+        for edges in neighbours {
+            let mut copied = Vec::with_capacity(edges.len());
+            copied.extend(edges.iter().map(|edge| (edge.point_id, edge.origin_id)));
+            compact.push(copied);
+        }
+        self.payload_bytes = self.payload_bytes.checked_add(bytes).expect("admitted navigation payload");
+        let mut cached = NavigationPoint { origin, neighbours: compact, values: None };
+        // Upper-layer bodies remain optional. Do not evict the admitted new
+        // table while this entry is pending insertion; refusal is a body miss.
+        if id.0 != 0
+            && let paged_builder::PagedVectorPoint::F32(point) = value
+            && let Some(body_bytes) = point.values.len().checked_mul(std::mem::size_of::<f32>())
+            && self.payload_bytes.checked_add(body_bytes).is_some()
+            && self.accountant.as_ref().is_some_and(|owner| owner.try_allocate_for(body_bytes, "vector_navigation", "retain_authenticated_navigation", "Optional navigation body.").is_ok())
+        {
+            cached.values = Some(point.values.clone());
+            self.payload_bytes += body_bytes;
+        }
+        let retained = bytes.checked_add(cached.values.as_ref().map_or(0, |v| v.len() * std::mem::size_of::<f32>())).expect("admitted navigation entry");
+        self.insert(
+            NavigationKey::Point(layer, id),
+            NavigationValue::Point(cached),
+            retained,
+        );
+    }
+}
+impl Drop for NavigationCache {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
+pub(super) fn navigation_memory_refusal(error: &Error) -> bool {
+    use contextdb_core::read_contract::{ReadFailureDetail, ReadFailureLimit};
+    match error {
+        Error::MemoryBudgetExceeded { .. } => true,
+        Error::ReadFailure(failure) => matches!(failure.detail(),
+            ReadFailureDetail::OwnerLimitExceeded(detail)
+                if detail.limit == ReadFailureLimit::Memory),
+        _ => false,
+    }
+}
+// Stack controls need no optional heap charge. Only retained navigation
+// allocations compete with mandatory work, and all are reclaimable.
+pub(crate) struct NavigationSession {
+    navigation: parking_lot::Mutex<NavigationCache>,
+}
+impl NavigationSession {
+    pub(crate) fn new(owner: Option<Arc<dyn crate::memory_budget::MemoryBudget>>) -> Self {
+        Self { navigation: parking_lot::Mutex::new(NavigationCache::new(owner)) }
+    }
+    fn lock(&self) -> parking_lot::MutexGuard<'_, NavigationCache> {
+        self.navigation.lock()
+    }
+    pub(crate) fn owner(&self) -> Option<Arc<dyn crate::memory_budget::MemoryBudget>> {
+        self.lock().accountant.clone()
+    }
+    pub(crate) fn reclaim(&self) -> bool {
+        // Never evict underneath an active navigation borrow.
+        self.navigation.try_lock().is_some_and(|mut cache| cache.evict_lru())
+    }
+    pub(crate) fn reserve_for(
+        &self,
+        token: &mut crate::memory_budget::VectorCopyAdmission,
+        bytes: usize,
+        component: &str,
+        operation: &str,
+        hint: &str,
+    ) -> contextdb_core::Result<()> {
+        loop {
+            match token.reserve_for(bytes, component, operation, hint) {
+                Ok(()) => return Ok(()),
+                Err(error) if navigation_memory_refusal(&error) && self.reclaim() => {},
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    pub(crate) fn reserve(&self, token: &mut crate::memory_budget::VectorCopyAdmission, bytes: usize) -> contextdb_core::Result<()> {
+        self.reserve_for(token, bytes, "vector_copy", "materialize", "Reduce the selected copy or raise the executing statement's memory limit.")
+    }
+}
+
 /// One graph layer a union search admits: a generation or mutable tail of one
 /// partition, the statement's position for that partition, the rows the
 /// partition may admit, and -- for a filtered scope -- the partition's sorted
@@ -333,6 +658,7 @@ struct OpenLayer<'a> {
     partition: usize,
     /// This layer's position in the caller's layer list.
     source_layer: usize,
+    navigation: &'a NavigationSession,
     /// Where this layer's points start in the statement's reached-point bits,
     /// where each of its levels starts within them, and how many points each
     /// level held when the layer was opened. A point a concurrent insertion
@@ -370,12 +696,20 @@ impl<'a> OpenLayer<'a> {
     ) -> std::result::Result<Option<usize>, E> {
         Ok(match &self.graph {
             LayerGraph::Durable { reader, .. } => {
-                before_source()?;
-                let value = reader.borrow_mut().load_point(point).map_err(E::from)?;
-                Some(match value {
-                    paged_builder::PagedVectorPoint::F32(p) => p.origin_id,
-                    paged_builder::PagedVectorPoint::Quantized(p) => p.origin_id,
-                })
+                (|| -> std::result::Result<Option<usize>, E> {
+                    before_source()?;
+                    if let Some(cached) = self.navigation.lock().point(self.source_layer, point) {
+                        return Ok(Some(cached.origin));
+                    }
+                    let value = paged_builder::AdmittedPagedReader::with_reclamation(reader.borrow_mut().as_mut(), self.navigation.owner(), &|| self.navigation.reclaim()).load_point(point).map_err(E::from)?;
+                    self.navigation
+                        .lock()
+                        .remember_point(self.source_layer, point, &value);
+                    Ok(Some(match &*value {
+                        paged_builder::PagedVectorPoint::F32(p) => p.origin_id,
+                        paged_builder::PagedVectorPoint::Quantized(p) => p.origin_id,
+                    }))
+                })()?
             }
             LayerGraph::Paged { paged, .. } => paged.point(point).map(|point| point.origin_id),
             LayerGraph::ResidentF32 { points, .. } => points
@@ -393,14 +727,18 @@ impl<'a> OpenLayer<'a> {
     ) -> std::result::Result<Option<RowId>, E> {
         match &self.graph {
             LayerGraph::Durable { reader, .. } => {
-                before_source()?;
-                Ok(Some(
-                    reader
-                        .borrow_mut()
-                        .identity(origin)
-                        .map_err(E::from)?
-                        .row_id,
-                ))
+                (|| {
+                    before_source()?;
+                    if let Some(row) = self.navigation.lock().row(self.source_layer, origin) {
+                        return Ok(Some(row));
+                    }
+                    let identity = paged_builder::AdmittedPagedReader::with_reclamation(reader.borrow_mut().as_mut(), self.navigation.owner(), &|| self.navigation.reclaim()).identity(origin).map_err(E::from)?;
+                    let row = identity.row_id;
+                    self.navigation
+                        .lock()
+                        .remember_identity(self.source_layer, origin, &identity);
+                    Ok(Some(row))
+                })()
             }
             _ => Ok(self.id_to_row.get(&origin).copied()),
         }
@@ -424,39 +762,60 @@ impl<'a> OpenLayer<'a> {
     {
         match &self.graph {
             LayerGraph::Durable { tail, reader } => {
-                // The node decode belongs to the captured-root reader's finite
-                // admitted workspace; only this one neighbour list is copied.
-                let wanted = tail.definition().2.hnsw_m * 2;
-                if wanted > scratch.charged {
-                    acquire(HnswSearchScratchEvent::Reserve {
-                        container: HnswSearchScratchContainer::Result,
-                        previous_capacity: scratch.charged,
-                        requested_capacity: wanted,
-                        element_bytes: HopScratch::ELEMENT_BYTES,
-                    })?;
-                    scratch.charged = wanted;
+                {
+                    // Scratch and the native per-value decode each keep
+                    // separate admission while their allocations coexist.
+                    let wanted = tail.definition().2.hnsw_m * 2;
+                    if wanted > scratch.charged {
+                        acquire(HnswSearchScratchEvent::Reserve {
+                            container: HnswSearchScratchContainer::Result,
+                            previous_capacity: scratch.charged,
+                            requested_capacity: wanted,
+                            element_bytes: HopScratch::ELEMENT_BYTES,
+                        })?;
+                        scratch.charged = wanted;
+                        scratch.ids.clear();
+                        scratch.ids.reserve_exact(wanted);
+                    }
+                    before_source()?;
+                    {
+                        let mut navigation = self.navigation.lock();
+                        if let Some(cached) = navigation.point(self.source_layer, point) {
+                            let Some(edges) = cached.neighbours.get(level) else {
+                                return Ok(None);
+                            };
+                            if edges.len() > wanted {
+                                return Err(E::from(Error::Other(
+                                    "paged graph degree exceeds its policy".into(),
+                                )));
+                            }
+                            scratch.ids.clear();
+                            scratch.ids.extend_from_slice(edges);
+                            return Ok(Some(Hops::Copied(&scratch.ids)));
+                        }
+                    }
+                    let value = paged_builder::AdmittedPagedReader::with_reclamation(reader.borrow_mut().as_mut(), self.navigation.owner(), &|| self.navigation.reclaim()).load_point(point).map_err(E::from)?;
+                    self.navigation
+                        .lock()
+                        .remember_point(self.source_layer, point, &value);
+                    let neighbours = match &*value {
+                        paged_builder::PagedVectorPoint::F32(p) => &p.neighbours,
+                        paged_builder::PagedVectorPoint::Quantized(p) => &p.neighbours,
+                    };
+                    let Some(edges) = neighbours.get(level) else {
+                        return Ok(None);
+                    };
+                    if edges.len() > wanted {
+                        return Err(E::from(Error::Other(
+                            "paged graph degree exceeds its policy".into(),
+                        )));
+                    }
                     scratch.ids.clear();
-                    scratch.ids.reserve_exact(wanted);
+                    scratch
+                        .ids
+                        .extend(edges.iter().map(|edge| (edge.point_id, edge.origin_id)));
+                    Ok(Some(Hops::Copied(&scratch.ids)))
                 }
-                before_source()?;
-                let value = reader.borrow_mut().load_point(point).map_err(E::from)?;
-                let neighbours = match &value {
-                    paged_builder::PagedVectorPoint::F32(p) => &p.neighbours,
-                    paged_builder::PagedVectorPoint::Quantized(p) => &p.neighbours,
-                };
-                let Some(edges) = neighbours.get(level) else {
-                    return Ok(None);
-                };
-                if edges.len() > wanted {
-                    return Err(E::from(Error::Other(
-                        "paged graph degree exceeds its policy".into(),
-                    )));
-                }
-                scratch.ids.clear();
-                scratch
-                    .ids
-                    .extend(edges.iter().map(|edge| (edge.point_id, edge.origin_id)));
-                Ok(Some(Hops::Copied(&scratch.ids)))
             }
             LayerGraph::Paged { paged, .. } => {
                 let paged: &'a PagedHnsw = paged;
@@ -504,29 +863,59 @@ impl<'a> OpenLayer<'a> {
     {
         match &mut self.graph {
             LayerGraph::Durable { tail, reader } => {
-                before_source_entry()?;
-                let value = reader.borrow_mut().load_point(point).map_err(E::from)?;
-                before_distance()?;
-                let distance = match value {
-                    paged_builder::PagedVectorPoint::F32(point) => {
-                        hnsw_f32_distance().eval(query.values, &point.values)
+                (|| {
+                    before_source_entry()?;
+                    let cached = {
+                        let mut navigation = self.navigation.lock();
+                        navigation
+                            .point(self.source_layer, point)
+                            .and_then(|point| point.values.as_ref())
+                            .is_some()
+                    };
+                    if cached {
+                        before_distance()?;
+                        let mut navigation = self.navigation.lock();
+                        if let Some(values) = navigation
+                            .point(self.source_layer, point)
+                            .and_then(|point| point.values.as_ref())
+                        {
+                            let distance = hnsw_f32_distance().eval(query.values, values);
+                            if !distance.is_finite() {
+                                return Err(E::from(Error::Other(
+                                    "invalid paged graph distance".into(),
+                                )));
+                            }
+                            return Ok(Some(distance));
+                        }
                     }
-                    paged_builder::PagedVectorPoint::Quantized(point) => DistQuantizedCosine {
-                        quantization: tail.definition().1,
+                    let value = paged_builder::AdmittedPagedReader::with_reclamation(reader.borrow_mut().as_mut(), self.navigation.owner(), &|| self.navigation.reclaim()).load_point(point).map_err(E::from)?;
+                    self.navigation
+                        .lock()
+                        .remember_point(self.source_layer, point, &value);
+                    if !cached {
+                        before_distance()?;
                     }
-                    .eval(
-                        query.encoded.ok_or_else(|| {
-                            E::from(Error::Other(
-                                "paged quantized graph requires an encoded query".into(),
-                            ))
-                        })?,
-                        &point.values,
-                    ),
-                };
-                if !distance.is_finite() {
-                    return Err(E::from(Error::Other("invalid paged graph distance".into())));
-                }
-                Ok(Some(distance))
+                    let distance = match &*value {
+                        paged_builder::PagedVectorPoint::F32(point) => {
+                            hnsw_f32_distance().eval(query.values, &point.values)
+                        }
+                        paged_builder::PagedVectorPoint::Quantized(point) => DistQuantizedCosine {
+                            quantization: tail.definition().1,
+                        }
+                        .eval(
+                            query.encoded.ok_or_else(|| {
+                                E::from(Error::Other(
+                                    "paged quantized graph requires an encoded query".into(),
+                                ))
+                            })?,
+                            &point.values,
+                        ),
+                    };
+                    if !distance.is_finite() {
+                        return Err(E::from(Error::Other("invalid paged graph distance".into())));
+                    }
+                    Ok(Some(distance))
+                })()
             }
             LayerGraph::Paged { paged, reader } => {
                 let Some(stored) = paged.point(point) else {
@@ -937,12 +1326,12 @@ pub(crate) fn search_union_allowed_bounded<E, S, D, A, R, F, V>(
     graph_scores_are_current: bool,
     can_certify_resolved_scores: bool,
     query_self_scores: &mut BoundedHnswQuerySelfScores<'_>,
-    mut is_allowed: F,
-    mut resolve_score: V,
-    mut before_source_entry: S,
-    mut before_distance: D,
-    mut acquire: A,
-    mut release: R,
+    is_allowed: F,
+    resolve_score: V,
+    before_source_entry: S,
+    before_distance: D,
+    acquire: A,
+    release: R,
 ) -> std::result::Result<HnswUnionSearchResult, E>
 where
     E: From<Error>,
@@ -953,6 +1342,56 @@ where
     F: FnMut(usize, RowId) -> bool,
     V: FnMut(usize, RowId, &mut S, &mut D) -> std::result::Result<Option<f32>, E>,
 {
+    search_union_allowed_bounded_with_navigation(
+        layers,
+        query,
+        k,
+        ef_search,
+        budget,
+        limits,
+        graph_scores_are_current,
+        can_certify_resolved_scores,
+        query_self_scores,
+        is_allowed,
+        resolve_score,
+        before_source_entry,
+        before_distance,
+        acquire,
+        release,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn search_union_allowed_bounded_with_navigation<E, S, D, A, R, F, V>(
+    layers: &[HnswUnionLayer<'_>],
+    query: &[f32],
+    k: usize,
+    ef_search: usize,
+    budget: usize,
+    limits: HnswAllowedSearchLimits,
+    graph_scores_are_current: bool,
+    can_certify_resolved_scores: bool,
+    query_self_scores: &mut BoundedHnswQuerySelfScores<'_>,
+    mut is_allowed: F,
+    mut resolve_score: V,
+    mut before_source_entry: S,
+    mut before_distance: D,
+    mut acquire: A,
+    mut release: R,
+    navigation_session: Option<&NavigationSession>,
+) -> std::result::Result<HnswUnionSearchResult, E>
+where
+    E: From<Error>,
+    S: FnMut() -> std::result::Result<(), E>,
+    D: FnMut() -> std::result::Result<(), E>,
+    A: FnMut(HnswSearchScratchEvent) -> std::result::Result<(), E>,
+    R: FnMut(HnswSearchScratchEvent),
+    F: FnMut(usize, RowId) -> bool,
+    V: FnMut(usize, RowId, &mut S, &mut D) -> std::result::Result<Option<f32>, E>,
+{
+    let fallback = NavigationSession::new(None);
+    let navigation = navigation_session.unwrap_or(&fallback);
     let mut total_allowed = 0usize;
     let mut total_live = 0usize;
     let mut counted_partitions = Vec::<usize>::new();
@@ -1034,19 +1473,22 @@ where
                 continue;
             };
             let directory = match &graph {
-                LayerGraph::Durable { tail, .. } => layer.graph.paged_seed_directory(
-                    tail,
-                    k,
-                    required_results.min(layer.allowed_count),
-                    layer.allowed_count,
-                    ef,
-                    &seed_rows,
-                    seed_all,
-                    &mut layer_allowed,
-                    &mut before_source_entry,
-                    &mut acquire,
-                    &mut release,
-                )?,
+                LayerGraph::Durable { tail, .. } => {
+                    layer.graph.paged_seed_directory(
+                        tail,
+                        Some(navigation),
+                        k,
+                        required_results.min(layer.allowed_count),
+                        layer.allowed_count,
+                        ef,
+                        &seed_rows,
+                        seed_all,
+                        &mut layer_allowed,
+                        &mut before_source_entry,
+                        &mut acquire,
+                        &mut release,
+                    )?
+                }
                 _ => layer.graph.allowed_seed_directory(
                     k,
                     required_results.min(layer.allowed_count),
@@ -1095,6 +1537,7 @@ where
             }
             max_degree = max_degree.max(degree);
             open.push(OpenLayer {
+                navigation,
                 graph,
                 id_to_row: layer.graph.id_to_row.read(),
                 partition,
@@ -1126,12 +1569,17 @@ where
             });
         }
     };
-    let release_encoded = |acquire: &mut A, release: &mut R, encoded: Option<Vec<u8>>| {
+    fn release_encoded<E, A, R>(acquire: &mut A, release: &mut R, encoded: Option<Vec<u8>>)
+    where
+        E: From<Error>,
+        A: FnMut(HnswSearchScratchEvent) -> std::result::Result<(), E>,
+        R: FnMut(HnswSearchScratchEvent),
+    {
         if let Some(encoded) = encoded {
             VectorSearchScratch { acquire, release }
                 .free_vec(encoded, HnswSearchScratchContainer::QueryBytes);
         }
-    };
+    }
     if let Err(error) = opened {
         drop(open);
         release(HnswSearchScratchEvent::Release {
@@ -1399,8 +1847,7 @@ where
                 for open_layer in &open {
                     if let LayerGraph::Durable { reader, .. } = &open_layer.graph {
                         before_source_entry()?;
-                        if reader
-                            .borrow_mut()
+                        if paged_builder::AdmittedPagedReader::with_reclamation(reader.borrow_mut().as_mut(), navigation.owner(), &|| navigation.reclaim())
                             .exact_graph_row_after(key, None)
                             .map_err(E::from)?
                             .is_some()
@@ -1500,8 +1947,7 @@ where
                     let mut after = None;
                     loop {
                         before_source_entry()?;
-                        let Some(row_id) = reader
-                            .borrow_mut()
+                        let Some(row_id) = paged_builder::AdmittedPagedReader::with_reclamation(reader.borrow_mut().as_mut(), navigation.owner(), &|| navigation.reclaim())
                             .exact_graph_row_after(key, after)
                             .map_err(E::from)?
                         else {

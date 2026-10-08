@@ -1140,16 +1140,22 @@ a product-level "erase this person" operation.
 - **Ingest** on the holder node: `ingest_bytes(&[u8]) -> BlobHash` or
   `ingest_file(&Path) -> BlobHash`. The returned `BlobHash` is the hash of the
   bytes, so ingesting the same content twice is idempotent.
-- **Serve** on the holder: `serve_on(&IrohServer)` registers the serving
+- **Serve** on the holder: `serve_on(&IrohServer) -> Result<()>` registers the serving
   handler. It checks the requesting peer's authorization against the ledger
   *before* any payload bytes move — the check is the gate, not an
-  after-the-fact audit.
+  after-the-fact audit. Each request obtains its own child of the store's declared reader memory.
+  Hosts supplying their existing provider use `serve_on_with_read_budget_provider`. Directory registration failures propagate.
 - **Fetch** on the consumer: `resolve_blob_ref(&BlobHash, holder_ticket, sink)`
   is async, fetches node-to-node, and is hash-verified — only bytes that hash
   to the requested `BlobHash` ever reach the sink. Errors are a matchable
   `ResolveError`: `Unentitled`, `PolicyForbidden`, `HashMismatch`,
   `HolderUnreachable`, `LocalStoreUnavailable`, `BlobNotFound`,
-  `TransferAborted`, `SinkWrite`, `FetchTimedOut`.
+  `TransferAborted`, `SinkWrite`, `FetchTimedOut`, `LedgerRead(Error)`.
+  The default creates an operation child internally; hosts supplying their actual
+  READ owner use `resolve_blob_ref_with_read_memory`. Ledger source refusals retain
+  their typed core error, including when returned by the holder on the same
+  blob stream before Bao payload data. A malformed or oversized control frame
+  returns a typed protocol refusal.
 - **Fetch deadline**: the whole `resolve_blob_ref` attempt — dial, the
   holder's tag bookkeeping, and the verified transfer loop — is bounded by a
   declared `BlobFetchPolicy { fetch_deadline_ms }` (documented default:
@@ -1176,7 +1182,11 @@ a product-level "erase this person" operation.
 - **Reclaim**: `reclaim_unreferenced(now_ms, grace_ms)` frees a blob once every
   job referencing it is terminal past the grace window (or once no job
   references it at all). A later resolve attempt against a reclaimed blob
-  returns `BlobNotFound`, even from an otherwise-entitled caller.
+  returns `BlobNotFound`, even from an otherwise-entitled caller. The captured ledger root stays funded by the operation child throughout
+  the sweep. `spawn_reclaim_driver(grace_ms)` obtains a child of the declared
+  reader parent for each cycle. Explicit host variants are
+  `reclaim_unreferenced_with_read_memory` and
+  `spawn_reclaim_driver_with_read_budget_provider`.
 - **Direct vs. relay**: whether a transfer goes direct or via a relay is a
   serve-time choice on the holder's endpoint spec. By default it's direct
   only — contextdb contacts no relay unless asked. The operator opts into the
@@ -1212,7 +1222,7 @@ install_work_ledger_schema(&db)?;
 
 let bytes = std::fs::read("frame.jpg")?;
 let blob_hash = blob_store.ingest_bytes(&bytes)?;
-blob_store.serve_on(&iroh_server);
+blob_store.serve_on_with_read_budget_provider(&iroh_server, read_budgets.clone())?;
 
 let spec = JobSpec::builder("job-1", "describe-image", "once", "node-a")
     .input_refs(vec![InputRef::blob_ref(blob_hash.clone())])
@@ -1225,7 +1235,7 @@ submit_job(&db, &spec, &no_direct_inputs)?;
 let claim = claim_job(&sync_client, "job-1", 1, "node-b", lease_deadline_ms, now_ms).await?;
 let mut sink = Vec::new();
 let bytes_written = blob_store
-    .resolve_blob_ref(&blob_hash, &holder_ticket, &mut sink)
+    .resolve_blob_ref_with_read_memory(read_memory.clone(), &blob_hash, &holder_ticket, &mut sink)
     .await?;
 ```
 

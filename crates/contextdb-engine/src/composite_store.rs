@@ -104,6 +104,9 @@ pub(crate) struct PreparedVectorPartitionMutationBatch {
     vector_publication: Option<PreparedPartitionedVectorBatch>,
     memberships: contextdb_relational::store::PreparedMembershipBatch,
     retention_expiries: Vec<contextdb_relational::store::PreparedRetentionExpiry>,
+    // The engine projection can outlive vector publication within apply.
+    // Keep its copied inputs funded until every projection payload is gone.
+    _vector_copy_owner: contextdb_vector::VectorCopyAdmission,
 }
 
 impl PreparedVectorPartitionMutationBatch {
@@ -793,6 +796,7 @@ impl CompositeStore {
         &self,
         index: &VectorIndexRef,
         declaration: &ColumnDef,
+        _vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
     ) -> Result<()> {
         let expected =
             crate::database::vector_index_layout_from_column(declaration).ok_or_else(|| {
@@ -801,7 +805,7 @@ impl CompositeStore {
                     issue: VectorPartitionDeclarationIssue::RequiresVectorColumn,
                 }
             })?;
-        if self.vector.index_layout(index)? != expected {
+        if !self.vector.with_index_layout(index, |layout| layout == &expected)? {
             return Err(Error::Other(format!(
                 "registered vector layout does not match the durable declaration for {}.{}",
                 index.table, index.column
@@ -828,8 +832,13 @@ impl CompositeStore {
         index: &VectorIndexRef,
         partition_key: &VectorPartitionKey,
         row_id: RowId,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Option<contextdb_core::VectorEntry>> {
-        let Some(current_key) = self.vector.current_partition_for_row(index, row_id) else {
+        let Some(current_key) =
+            self.vector
+                .current_partition_for_row(index, row_id, vector_copy_owner)?
+        else {
             return Ok(None);
         };
         if &current_key != partition_key {
@@ -843,6 +852,7 @@ impl CompositeStore {
             partition_key,
             row_id,
             SnapshotId::from_raw_wire(u64::MAX),
+            vector_copy_owner,
         )
     }
 
@@ -874,6 +884,8 @@ impl CompositeStore {
         ws: &WriteSet,
         table_meta: &HashMap<String, TableMeta>,
         deleted_rows: Option<&HashMap<String, HashMap<RowId, VersionedRow>>>,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<PreparedVectorPartitionMutationBatch> {
         self.prepare_vector_partition_mutations_with_reclamation(
             ws,
@@ -882,6 +894,8 @@ impl CompositeStore {
             HashSet::new(),
             None,
             false,
+            vector_copy_owner,
+            read_memory.clone(),
         )
     }
 
@@ -894,6 +908,8 @@ impl CompositeStore {
         table_meta: &HashMap<String, TableMeta>,
         deleted_rows: Option<&HashMap<String, HashMap<RowId, VersionedRow>>>,
         reclaimable_partitions: HashSet<contextdb_vector::VectorPartitionRef>,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<PreparedVectorPartitionMutationBatch> {
         self.prepare_vector_partition_mutations_with_reclamation(
             ws,
@@ -902,6 +918,8 @@ impl CompositeStore {
             reclaimable_partitions,
             None,
             false,
+            vector_copy_owner,
+            read_memory.clone(),
         )
     }
 
@@ -911,6 +929,8 @@ impl CompositeStore {
         table_meta: &HashMap<String, TableMeta>,
         deleted_rows: Option<&HashMap<String, HashMap<RowId, VersionedRow>>>,
         registered_snapshots: &[SnapshotId],
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<PreparedVectorPartitionMutationBatch> {
         self.prepare_vector_partition_mutations_with_reclamation(
             ws,
@@ -919,6 +939,8 @@ impl CompositeStore {
             HashSet::new(),
             Some(registered_snapshots),
             false,
+            vector_copy_owner,
+            read_memory.clone(),
         )
     }
 
@@ -951,7 +973,10 @@ impl CompositeStore {
         reclaimable_partitions: HashSet<contextdb_vector::VectorPartitionRef>,
         registered_snapshots: Option<&[SnapshotId]>,
         resolving_staged_arrival: bool,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<PreparedVectorPartitionMutationBatch> {
+        let mut vector_copy_owner = vector_copy_owner.scratch();
         let commit_lsn = ws.commit_lsn.unwrap_or(Lsn(0));
         let new_rows = ws
             .relational_inserts
@@ -986,7 +1011,11 @@ impl CompositeStore {
             // ran this exact check against the arriving shape, so this is a
             // re-check against not-yet-published state, not a missing one.
             if !resolving_staged_arrival && checked_declarations.insert(index.clone()) {
-                self.validate_registered_vector_declaration(index, &declaration)?;
+                self.validate_registered_vector_declaration(
+                    index,
+                    &declaration,
+                    &mut vector_copy_owner,
+                )?;
             }
             let row = self
                 .old_accepted_row(&index.table, *row_id, deleted_rows)
@@ -998,7 +1027,13 @@ impl CompositeStore {
                 })?;
             let partition_key = vector_partition_key_for_row(index, meta, &declaration, &row)?;
             let vector = self
-                .current_vector_for_partition(index, &partition_key, *row_id)?
+                .current_vector_for_partition(
+                    index,
+                    &partition_key,
+                    *row_id,
+                    &mut vector_copy_owner,
+                    read_memory.clone(),
+                )?
                 .ok_or_else(|| Error::NotFound(format!("vector row {row_id}")))?;
             let before = Self::prepared_binding(
                 index,
@@ -1013,6 +1048,8 @@ impl CompositeStore {
                 before.partition_key.clone(),
                 *row_id,
                 *deleted_tx,
+                before.vector_created_tx,
+                before.vector_lsn,
             ));
             mutations.push(PreparedVectorPartitionMutation::Delete {
                 index: index.clone(),
@@ -1026,7 +1063,11 @@ impl CompositeStore {
             let meta = Self::vector_table_meta(table_meta, &entry.index)?;
             let declaration = Self::vector_declaration(table_meta, &entry.index)?;
             if !resolving_staged_arrival && checked_declarations.insert(entry.index.clone()) {
-                self.validate_registered_vector_declaration(&entry.index, &declaration)?;
+                self.validate_registered_vector_declaration(
+                    &entry.index,
+                    &declaration,
+                    &mut vector_copy_owner,
+                )?;
             }
             let row = accepted_new_row(&entry.index.table, entry.row_id).ok_or_else(|| {
                 Error::Other(format!(
@@ -1042,9 +1083,29 @@ impl CompositeStore {
                 entry.created_tx,
                 entry.lsn,
             )?;
-            keyed_inserts.push(PartitionedVectorEntry::new(
+            let copied_body_bytes = entry
+                .vector
+                .len()
+                .checked_mul(std::mem::size_of::<f32>())
+                .and_then(|bytes| bytes.checked_add(entry.index.table.len()))
+                .and_then(|bytes| bytes.checked_add(entry.index.column.len()))
+                .and_then(|bytes| {
+                    bytes.checked_add(std::mem::size_of::<contextdb_core::VectorEntry>())
+                })
+                .and_then(|bytes| bytes.checked_mul(2))
+                .and_then(|bytes| bytes.checked_add(after.partition_key.estimated_bytes()))
+                .ok_or_else(|| Error::Other("vector input copy size overflow".into()))?;
+            vector_copy_owner.reserve(copied_body_bytes)?;
+            keyed_inserts.push(PartitionedVectorEntry::with_membership(
                 after.partition_key.clone(),
                 entry.clone(),
+                contextdb_vector::store::VectorMembershipProvenance::new(
+                    after.row.created_tx,
+                    after.row.lsn,
+                    contextdb_core::TxId(after.row.created_tx.0.max(entry.created_tx.0)),
+                    after.row.deleted_tx.or(entry.deleted_tx),
+                ),
+                entry.deleted_tx,
             ));
             mutations.push(PreparedVectorPartitionMutation::Insert {
                 index: entry.index.clone(),
@@ -1058,7 +1119,11 @@ impl CompositeStore {
             let meta = Self::vector_table_meta(table_meta, index)?;
             let declaration = Self::vector_declaration(table_meta, index)?;
             if !resolving_staged_arrival && checked_declarations.insert(index.clone()) {
-                self.validate_registered_vector_declaration(index, &declaration)?;
+                self.validate_registered_vector_declaration(
+                    index,
+                    &declaration,
+                    &mut vector_copy_owner,
+                )?;
             }
             let old_row = self
                 .old_accepted_row(&index.table, *old_row_id, deleted_rows)
@@ -1076,7 +1141,13 @@ impl CompositeStore {
             })?;
             let source_key = vector_partition_key_for_row(index, meta, &declaration, &old_row)?;
             let vector = self
-                .current_vector_for_partition(index, &source_key, *old_row_id)?
+                .current_vector_for_partition(
+                    index,
+                    &source_key,
+                    *old_row_id,
+                    &mut vector_copy_owner,
+                    read_memory.clone(),
+                )?
                 .ok_or_else(|| Error::NotFound(format!("vector row {old_row_id}")))?;
             let before = Self::prepared_binding(
                 index,
@@ -1095,7 +1166,14 @@ impl CompositeStore {
                 *old_row_id,
                 *new_row_id,
                 *moved_tx,
-            ));
+                before.vector_created_tx,
+                before.vector_lsn,
+            ).with_target_membership(contextdb_vector::store::VectorMembershipProvenance::new(
+                after.row.created_tx,
+                after.row.lsn,
+                *moved_tx,
+                after.row.deleted_tx,
+            )));
             mutations.push(PreparedVectorPartitionMutation::Move {
                 index: index.clone(),
                 before,
@@ -1139,10 +1217,19 @@ impl CompositeStore {
                     continue;
                 }
                 if !resolving_staged_arrival && checked_declarations.insert(index.clone()) {
-                    self.validate_registered_vector_declaration(&index, declaration)?;
+                    self.validate_registered_vector_declaration(
+                        &index,
+                        declaration,
+                        &mut vector_copy_owner,
+                    )?;
                 }
-                let Some(vector) =
-                    self.current_vector_for_partition(&index, &old_key, new_row.row_id)?
+                let Some(vector) = self.current_vector_for_partition(
+                    &index,
+                    &old_key,
+                    new_row.row_id,
+                    &mut vector_copy_owner,
+                    read_memory.clone(),
+                )?
                 else {
                     continue;
                 };
@@ -1173,8 +1260,16 @@ impl CompositeStore {
                         new_row.row_id,
                         new_row.row_id,
                         new_row.created_tx,
+                        before.vector_created_tx,
+                        before.vector_lsn,
                     )
-                    .replacing_row_version(),
+                    .replacing_row_version()
+                    .with_target_membership(contextdb_vector::store::VectorMembershipProvenance::new(
+                        after.row.created_tx,
+                        after.row.lsn,
+                        new_row.created_tx,
+                        after.row.deleted_tx,
+                    )),
                 );
                 mutations.push(PreparedVectorPartitionMutation::Move {
                     index,
@@ -1202,12 +1297,14 @@ impl CompositeStore {
                         keyed_inserts,
                         keyed_moves,
                         registered_snapshots,
+                        vector_copy_owner.scratch(),
                     )?,
                 None => self.vector.prepare_partitioned_batch(
                     keyed_deletes,
                     keyed_inserts,
                     keyed_moves,
                     reclaimable_partitions,
+                    vector_copy_owner.scratch(),
                 )?,
             };
             if prepared.valid_move_count() != expected_moves {
@@ -1232,10 +1329,11 @@ impl CompositeStore {
             commit_lsn,
             mutations,
             vector_publication,
+            _vector_copy_owner: vector_copy_owner,
         })
     }
 
-    pub(crate) fn apply_exact(&self, ws: &WriteSet) -> Result<()> {
+    pub(crate) fn apply_exact(&self, ws: &WriteSet, read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>) -> Result<()> {
         let registered_snapshots = self.take_vector_partition_snapshot_stage(ws.commit_lsn);
         // A received unit that declares a table in the same delivery that
         // carries that table's rows/vectors has not published its schema
@@ -1249,10 +1347,8 @@ impl CompositeStore {
         // not-yet-published state.
         let arriving = self.take_received_arriving_table_meta(ws.commit_lsn);
         let resolving_staged_arrival = arriving.is_some();
-        let table_meta = match arriving {
-            Some(arriving) => (*arriving).clone(),
-            None => self.relational.table_meta.read().clone(),
-        };
+        let live_table_meta = self.relational.table_meta.read();
+        let table_meta = arriving.as_deref().unwrap_or(&live_table_meta);
         let deleted_rows = self.deleted_rows_snapshot_for_write_set(ws);
         // One publication owner per affected state, and the change log's owner
         // for a received unit's commit is its stage: the stage already built
@@ -1271,6 +1367,7 @@ impl CompositeStore {
                 deleted_rows.as_ref(),
             )
         };
+        let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
         let partition_mutations = self.prepare_vector_partition_mutations_with_reclamation(
             ws,
             &table_meta,
@@ -1278,7 +1375,10 @@ impl CompositeStore {
             HashSet::new(),
             registered_snapshots.as_deref(),
             resolving_staged_arrival,
+            &mut vector_copy_owner,
+            read_memory,
         )?;
+        drop(live_table_meta);
         self.apply_exact_with_log_entries(ws, log_entries, partition_mutations)
     }
 
@@ -1404,8 +1504,12 @@ pub(crate) fn sync_source_lsn_updates(
 }
 
 impl WriteSetApplicator for CompositeStore {
-    fn apply(&self, ws: &WriteSet) -> Result<()> {
-        self.apply_exact(ws)
+    fn apply(
+        &self,
+        ws: &WriteSet,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<()> {
+        self.apply_exact(ws, read_memory)
     }
 
     fn new_row_id(&self) -> RowId {

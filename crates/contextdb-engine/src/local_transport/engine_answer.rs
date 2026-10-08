@@ -334,7 +334,9 @@ pub enum ReadChannelError {
         message: String,
     },
     RecursiveCteNotSupported,
-    WindowFunctionNotSupported,
+    WindowFunctionNotSupported {
+        form: String,
+    },
     StoredProcNotSupported,
     SubqueryNotSupported,
     FullTextSearchNotSupported,
@@ -506,7 +508,7 @@ impl ReadChannelError {
             Self::IndexNotFound { .. } => TAG_INDEX_NOT_FOUND,
             Self::NotFound { .. } => TAG_NOT_FOUND,
             Self::RecursiveCteNotSupported => TAG_RECURSIVE_CTE_NOT_SUPPORTED,
-            Self::WindowFunctionNotSupported => TAG_WINDOW_FUNCTION_NOT_SUPPORTED,
+            Self::WindowFunctionNotSupported { .. } => TAG_WINDOW_FUNCTION_NOT_SUPPORTED,
             Self::StoredProcNotSupported => TAG_STORED_PROC_NOT_SUPPORTED,
             Self::SubqueryNotSupported => TAG_SUBQUERY_NOT_SUPPORTED,
             Self::FullTextSearchNotSupported => TAG_FULL_TEXT_SEARCH_NOT_SUPPORTED,
@@ -669,7 +671,9 @@ impl From<&contextdb_core::Error> for ReadChannelError {
                 message: message.clone(),
             },
             Engine::RecursiveCteNotSupported => Self::RecursiveCteNotSupported,
-            Engine::WindowFunctionNotSupported => Self::WindowFunctionNotSupported,
+            Engine::WindowFunctionNotSupported { form } => {
+                Self::WindowFunctionNotSupported { form: form.clone() }
+            }
             Engine::StoredProcNotSupported => Self::StoredProcNotSupported,
             Engine::SubqueryNotSupported => Self::SubqueryNotSupported,
             Engine::FullTextSearchNotSupported => Self::FullTextSearchNotSupported,
@@ -940,7 +944,9 @@ impl From<ReadChannelError> for contextdb_core::Error {
             }
             ReadChannelError::NotFound { message } => Self::NotFound(message),
             ReadChannelError::RecursiveCteNotSupported => Self::RecursiveCteNotSupported,
-            ReadChannelError::WindowFunctionNotSupported => Self::WindowFunctionNotSupported,
+            ReadChannelError::WindowFunctionNotSupported { form } => {
+                Self::WindowFunctionNotSupported { form }
+            }
             ReadChannelError::StoredProcNotSupported => Self::StoredProcNotSupported,
             ReadChannelError::SubqueryNotSupported => Self::SubqueryNotSupported,
             ReadChannelError::FullTextSearchNotSupported => Self::FullTextSearchNotSupported,
@@ -1166,6 +1172,159 @@ impl From<ReadChannelError> for contextdb_core::Error {
     }
 }
 
+/// The same-stream blob control document is bounded independently of Bao data.
+pub(crate) const BLOB_SOURCE_REFUSAL_MAX_BYTES: usize = 4096;
+
+/// Encode the existing read-channel error grammar directly from borrowed
+/// source fields. No intermediate owned error document or field copy exists.
+pub(crate) fn encode_read_error_into_slice(
+    error: &contextdb_core::Error,
+    output: &mut [u8],
+) -> Result<usize, super::LocalTransportError> {
+    use contextdb_core::Error as E;
+    use super::{LocalTransportError, PayloadViolation};
+    struct Sink<'a> { bytes: &'a mut [u8], offset: usize }
+    impl Sink<'_> {
+        fn field<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), LocalTransportError> {
+            let written = bincode::serde::encode_into_slice(value, &mut self.bytes[self.offset..], bincode::config::standard())
+                .map_err(|_| LocalTransportError::Payload(PayloadViolation::Malformed))?;
+            self.offset += written;
+            Ok(())
+        }
+        fn display(&mut self, value: impl fmt::Display) -> Result<(), LocalTransportError> {
+            struct Count(usize);
+            impl fmt::Write for Count {
+                fn write_str(&mut self, text: &str) -> fmt::Result {
+                    self.0 = self.0.checked_add(text.len()).ok_or(fmt::Error)?;
+                    Ok(())
+                }
+            }
+            let mut count = Count(0);
+            fmt::write(&mut count, format_args!("{value}"))
+                .map_err(|_| LocalTransportError::Payload(PayloadViolation::Malformed))?;
+            self.field(&(count.0 as u64))?;
+            if count.0 > self.bytes.len() - self.offset {
+                return Err(LocalTransportError::Payload(PayloadViolation::Malformed));
+            }
+            struct Text<'a> { bytes: &'a mut [u8], offset: usize }
+            impl fmt::Write for Text<'_> {
+                fn write_str(&mut self, text: &str) -> fmt::Result {
+                    let end = self.offset.checked_add(text.len()).ok_or(fmt::Error)?;
+                    let destination = self.bytes.get_mut(self.offset..end).ok_or(fmt::Error)?;
+                    destination.copy_from_slice(text.as_bytes()); self.offset = end; Ok(())
+                }
+            }
+            let mut text = Text { bytes: &mut self.bytes[self.offset..self.offset + count.0], offset: 0 };
+            fmt::write(&mut text, format_args!("{value}"))
+                .map_err(|_| LocalTransportError::Payload(PayloadViolation::Malformed))?;
+            if text.offset != count.0 { return Err(LocalTransportError::Payload(PayloadViolation::Malformed)); }
+            self.offset += count.0; Ok(())
+        }
+    }
+    struct Class<'a>(&'a contextdb_core::Error);
+    impl fmt::Display for Class<'_> {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            struct Prefix<'a, 'b> { out: &'a mut fmt::Formatter<'b>, stopped: bool }
+            impl fmt::Write for Prefix<'_, '_> {
+                fn write_str(&mut self, text: &str) -> fmt::Result {
+                    for ch in text.chars() {
+                        if self.stopped { break; }
+                        if ch.is_alphanumeric() || ch == '_' { self.out.write_str(ch.encode_utf8(&mut [0; 4]))?; }
+                        else { self.stopped = true; }
+                    }
+                    Ok(())
+                }
+            }
+            fmt::write(&mut Prefix { out: formatter, stopped: false }, format_args!("{:?}", self.0))
+        }
+    }
+    let length = output.len().min(BLOB_SOURCE_REFUSAL_MAX_BYTES);
+    let mut sink = Sink { bytes: &mut output[..length], offset: 0 };
+    macro_rules! body { ($tag:expr, $body:expr) => {{ sink.field(&$tag)?; sink.field(&$body)?; }}; }
+    macro_rules! index { ($tag:expr, $index:expr) => { body!($tag, (&$index.table, &$index.column)) }; }
+    match error {
+        E::ReadSessionNotImplemented => body!(TAG_READ_SESSION_NOT_IMPLEMENTED, ()),
+        E::OwnerReadDrainTimeout => body!(TAG_OWNER_READ_DRAIN_TIMEOUT, ()),
+        E::ReadCancelled => body!(TAG_READ_CANCELLED, ()),
+        E::ReadFailure(failure) => body!(TAG_READ_FAILURE, failure),
+        E::ParseError(message) => body!(TAG_PARSE_ERROR, message),
+        E::PlanError(message) => body!(TAG_PLAN_ERROR, message),
+        E::SchemaInvalid { reason } => body!(TAG_SCHEMA_INVALID, reason),
+        E::TableNotFound(table) => body!(TAG_TABLE_NOT_FOUND, table),
+        E::ColumnNotFound { table, column } => body!(TAG_COLUMN_NOT_FOUND, (table, column)),
+        E::ColumnTypeMismatch { table, column, expected, actual } => {
+            sink.field(&TAG_COLUMN_TYPE_MISMATCH)?; sink.field(&(table, column))?;
+            sink.display(expected)?; sink.display(actual)?;
+        }
+        E::IndexNotFound { table, index } => body!(TAG_INDEX_NOT_FOUND, (table, index)),
+        E::NotFound(message) => body!(TAG_NOT_FOUND, message),
+        E::RecursiveCteNotSupported => body!(TAG_RECURSIVE_CTE_NOT_SUPPORTED, ()),
+        E::WindowFunctionNotSupported { form } => body!(TAG_WINDOW_FUNCTION_NOT_SUPPORTED, form),
+        E::StoredProcNotSupported => body!(TAG_STORED_PROC_NOT_SUPPORTED, ()),
+        E::SubqueryNotSupported => body!(TAG_SUBQUERY_NOT_SUPPORTED, ()),
+        E::FullTextSearchNotSupported => body!(TAG_FULL_TEXT_SEARCH_NOT_SUPPORTED, ()),
+        E::OrderByExpressionNotSupported => body!(TAG_ORDER_BY_EXPRESSION_NOT_SUPPORTED, ()),
+        E::UnboundedTraversal => body!(TAG_UNBOUNDED_TRAVERSAL, ()),
+        E::UnboundedVectorSearch => body!(TAG_UNBOUNDED_VECTOR_SEARCH, ()),
+        E::BfsDepthExceeded(maximum) => body!(TAG_BFS_DEPTH_EXCEEDED, maximum),
+        E::BfsVisitedExceeded(limit) => body!(TAG_BFS_VISITED_EXCEEDED, *limit as u64),
+        E::UnknownVectorIndex { index: i } => index!(TAG_UNKNOWN_VECTOR_INDEX, i),
+        E::VectorIndexDimensionMismatch { index: i, expected, actual } => body!(TAG_VECTOR_INDEX_DIMENSION_MISMATCH, (&i.table, &i.column, *expected as u64, *actual as u64)),
+        E::PersistedRowVectorRowMissing { index: i, key } => body!(TAG_PERSISTED_ROW_VECTOR_ROW_MISSING, (&i.table, &i.column, key)),
+        E::PersistedRowVectorCellNull { index: i, key } => body!(TAG_PERSISTED_ROW_VECTOR_CELL_NULL, (&i.table, &i.column, key)),
+        E::UseRankRequiresVectorOrder => body!(TAG_USE_RANK_REQUIRES_VECTOR_ORDER, ()),
+        E::UseRankRequiresLimit => body!(TAG_USE_RANK_REQUIRES_LIMIT, ()),
+        E::UseVectorRequiresVectorOrder => body!(TAG_USE_VECTOR_REQUIRES_VECTOR_ORDER, ()),
+        E::InvalidVectorPartitionDeclaration { index: i, issue } => {
+            if let Some(issue) = vector_declaration_issue_code(*issue) { body!(TAG_INVALID_VECTOR_PARTITION_DECLARATION, (&i.table, &i.column, issue)); }
+            else { sink.field(&TAG_UNKNOWN)?; sink.display(Class(error))?; sink.display(error)?; }
+        }
+        E::VectorPartitionLimitExceeded { index: i, max_partitions } => body!(TAG_VECTOR_PARTITION_LIMIT_EXCEEDED, (&i.table, &i.column, max_partitions)),
+        E::VectorExactSearchBudgetExceeded { index: i, required_bytes, available_bytes } => body!(TAG_VECTOR_EXACT_SEARCH_BUDGET_EXCEEDED, (&i.table, &i.column, required_bytes, available_bytes)),
+        E::VectorIndexedRouteUnavailable { index: i } => index!(TAG_VECTOR_INDEXED_ROUTE_UNAVAILABLE, i),
+        E::VectorFilteredRouteUnavailable { index: i, predicate_columns } => body!(TAG_VECTOR_FILTERED_ROUTE_UNAVAILABLE, (&i.table, &i.column, predicate_columns)),
+        E::VectorWholeIndexInspectionDenied => body!(TAG_VECTOR_WHOLE_INDEX_INSPECTION_DENIED, ()),
+        E::RankPolicyNotFound { index, sort_key } => body!(TAG_RANK_POLICY_NOT_FOUND, (index, sort_key)),
+        E::RankPolicyColumnUnknown { index, column } => body!(TAG_RANK_POLICY_COLUMN_UNKNOWN, (index, column)),
+        E::RankPolicyColumnAmbiguous { index, column } => body!(TAG_RANK_POLICY_COLUMN_AMBIGUOUS, (index, column)),
+        E::RankPolicyColumnType { index, column, expected, actual } => body!(TAG_RANK_POLICY_COLUMN_TYPE, (index, column, expected, actual)),
+        E::RankPolicyJoinTableUnknown { index, table } => body!(TAG_RANK_POLICY_JOIN_TABLE_UNKNOWN, (index, table)),
+        E::RankPolicyJoinColumnUnknown { index, table, column } => body!(TAG_RANK_POLICY_JOIN_COLUMN_UNKNOWN, (index, table, column)),
+        E::RankPolicyJoinColumnUnindexed { index, joined_table, column } => body!(TAG_RANK_POLICY_JOIN_COLUMN_UNINDEXED, (index, joined_table, column)),
+        E::RankPolicyFormulaParse { index, position, reason } => body!(TAG_RANK_POLICY_FORMULA_PARSE, (index, *position as u64, reason)),
+        E::PrincipalRequired { table } => body!(TAG_PRINCIPAL_REQUIRED, table),
+        E::AclDenied { table, row_id, principal } => {
+            let (kind, id) = match principal {
+                contextdb_core::types::Principal::System => (PRINCIPAL_KIND_SYSTEM, ""),
+                contextdb_core::types::Principal::Agent(id) => (PRINCIPAL_KIND_AGENT, id.as_str()),
+                contextdb_core::types::Principal::Human(id) => (PRINCIPAL_KIND_HUMAN, id.as_str()),
+            };
+            body!(TAG_ACL_DENIED, (table, row_id.0, kind, id));
+        }
+        E::ContextScopeViolation { requested, allowed } => {
+            sink.field(&TAG_CONTEXT_SCOPE_VIOLATION)?; sink.display(requested.0)?;
+            sink.field(&(allowed.len() as u64))?;
+            for item in allowed { sink.display(item.0)?; }
+        }
+        E::ScopeLabelViolation { requested, allowed } => {
+            sink.field(&TAG_SCOPE_LABEL_VIOLATION)?; sink.field(&requested.0)?;
+            sink.field(&(allowed.len() as u64))?;
+            for item in allowed { sink.field(&item.0)?; }
+        }
+        E::StoreCorrupted { path, reason } => body!(TAG_STORE_CORRUPTED, (path, reason)),
+        E::StoreIdentityUnprovable { path } => body!(TAG_STORE_IDENTITY_UNPROVABLE, path),
+        E::LegacyVectorStoreDetected { found_format_marker, expected_release } => body!(TAG_LEGACY_VECTOR_STORE_DETECTED, (found_format_marker, expected_release)),
+        E::DatabaseLocked { holder_pid, path } => {
+            sink.field(&TAG_DATABASE_LOCKED)?; sink.field(holder_pid)?; sink.display(path.display())?;
+        }
+        E::MemoryBudgetExceeded { subsystem, operation, requested_bytes, available_bytes, budget_limit_bytes, hint } => body!(TAG_MEMORY_BUDGET_EXCEEDED, (subsystem, operation, *requested_bytes as u64, *available_bytes as u64, *budget_limit_bytes as u64, hint)),
+        E::DiskBudgetExceeded { operation, current_bytes, budget_limit_bytes, hint } => body!(TAG_DISK_BUDGET_EXCEEDED, (operation, current_bytes, budget_limit_bytes, hint)),
+        E::Other(message) => body!(TAG_OTHER, message),
+        _ => { sink.field(&TAG_UNKNOWN)?; sink.display(Class(error))?; sink.display(error)?; }
+    }
+    Ok(sink.offset)
+}
+
 impl Serialize for ReadChannelError {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut document = serializer.serialize_tuple(2)?;
@@ -1175,7 +1334,6 @@ impl Serialize for ReadChannelError {
             | Self::OwnerReadDrainTimeout
             | Self::ReadCancelled
             | Self::RecursiveCteNotSupported
-            | Self::WindowFunctionNotSupported
             | Self::StoredProcNotSupported
             | Self::SubqueryNotSupported
             | Self::FullTextSearchNotSupported
@@ -1187,6 +1345,7 @@ impl Serialize for ReadChannelError {
             | Self::UseVectorRequiresVectorOrder
             | Self::VectorWholeIndexInspectionDenied => document.serialize_element(&())?,
             Self::ReadFailure(failure) => document.serialize_element(failure)?,
+            Self::WindowFunctionNotSupported { form } => document.serialize_element(form)?,
             Self::ParseError { message }
             | Self::PlanError { message }
             | Self::NotFound { message }
@@ -1364,10 +1523,9 @@ impl<'de> Visitor<'de> for ReadChannelErrorVisitor {
                 body::<A, ()>(&mut sequence)?;
                 ReadChannelError::RecursiveCteNotSupported
             }
-            TAG_WINDOW_FUNCTION_NOT_SUPPORTED => {
-                body::<A, ()>(&mut sequence)?;
-                ReadChannelError::WindowFunctionNotSupported
-            }
+            TAG_WINDOW_FUNCTION_NOT_SUPPORTED => ReadChannelError::WindowFunctionNotSupported {
+                form: body::<A, String>(&mut sequence)?,
+            },
             TAG_STORED_PROC_NOT_SUPPORTED => {
                 body::<A, ()>(&mut sequence)?;
                 ReadChannelError::StoredProcNotSupported

@@ -1,4 +1,4 @@
-use crate::source::{GraphQuery, GraphReadSource, GraphSnapshot};
+use crate::source::{GraphCursor, GraphQuery, GraphReadSource, GraphSnapshot};
 use contextdb_core::{AdjEntry, Direction, EdgeType, NodeId, Result, SnapshotId, TxId};
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -45,10 +45,14 @@ impl GraphStore {
         self.source.is_some()
     }
 
-    pub fn capture_source(&self, snapshot: SnapshotId) -> Result<Option<Arc<dyn GraphSnapshot>>> {
+    pub fn capture_source(
+        &self,
+        snapshot: SnapshotId,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<Option<Arc<dyn GraphSnapshot>>> {
         self.source
             .as_ref()
-            .map(|source| source.capture(snapshot))
+            .map(|source| source.capture(snapshot, read_memory))
             .transpose()
     }
 

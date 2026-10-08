@@ -735,6 +735,7 @@ dependencies = [
  "contextdb-parser",
  "contextdb-server",
  "rustyline",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

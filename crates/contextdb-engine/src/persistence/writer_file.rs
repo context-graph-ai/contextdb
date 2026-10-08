@@ -131,6 +131,16 @@ impl LockedWriterFile {
         }
     }
 
+    /// Invocation-local working storage has the same directory provenance as
+    /// allocator scratch. It carries no published root or recovery authority.
+    pub(super) fn scratch_backend(&self) -> io::Result<Box<dyn redb::ScratchBackend>> {
+        let path = self.file_path();
+        let directory = path.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "writer file has no directory")
+        })?;
+        redb::scratch_backend_in_directory(directory)
+    }
+
     #[cfg(unix)]
     pub(super) fn identity(&self) -> (u64, u64) {
         self.identity
@@ -436,12 +446,7 @@ impl Drop for WriterFileView {
 
 impl redb::StorageBackend for WriterFileView {
     fn scratch_backend(&self) -> io::Result<Option<Box<dyn redb::ScratchBackend>>> {
-        let owner = self.owner()?;
-        let path = owner.file_path();
-        let directory = path.parent().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "writer file has no directory")
-        })?;
-        redb::scratch_backend_in_directory(directory).map(Some)
+        self.owner()?.scratch_backend().map(Some)
     }
 
     fn len(&self) -> io::Result<u64> {

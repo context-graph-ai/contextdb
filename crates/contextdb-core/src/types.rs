@@ -304,7 +304,8 @@ mod json_as_string {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<serde_json::Value, D::Error> {
         let s = String::deserialize(de)?;
-        serde_json::from_str(&s).map_err(serde::de::Error::custom)
+        serde_json::from_str::<serde_json::Value>(&s)
+            .map_err(serde::de::Error::custom)
     }
 }
 

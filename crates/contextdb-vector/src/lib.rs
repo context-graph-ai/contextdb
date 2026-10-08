@@ -13,30 +13,35 @@ pub mod test_seam;
 pub use cosine::cosine_similarity;
 pub use hnsw::{HnswGraphStats, HnswIndex};
 pub use mem::{
-    MemVectorExecutor, VectorPartitionSearchRoute, VectorPartitionSearchTrace,
-    VectorSearchDebugTrace,
+    MemVectorExecutor, OwnedVectorSearchTrace, VectorPartitionSearchRoute,
+    VectorPartitionSearchTrace, VectorSearchDebugTrace,
 };
 #[doc(hidden)]
-pub use memory_budget::MemoryBudget;
-#[doc(hidden)]
 pub use memory_budget::VectorWorkspaceReservation;
+#[doc(hidden)]
+pub use memory_budget::{MemoryBudget, PrepaidVectorCopyCharge, VectorCopyAdmission};
+#[doc(hidden)]
+pub use memory_budget::{ScopedVectorCopy, scoped_index_layout};
 pub use quantized::{stored_vector_resident_bytes, stored_vector_value};
 #[doc(hidden)]
 pub use store::VectorPartitionSourceMaintenanceMetadata;
 pub use store::{
-    PartitionedVectorDelete, PartitionedVectorEntry, PartitionedVectorMove,
-    PreparedPartitionedVectorBatch, PreparedVectorPublication, VectorIndexInfo, VectorIndexLayout,
+    OwnedPartitionedVectorEntries, PartitionedVectorDelete, PartitionedVectorEntry,
+    PartitionedVectorMove, PreparedLoadedVectorReplacement, PreparedPartitionedVectorBatch,
+    PreparedVectorPublication, PreparedVectorTablePublication, VectorIndexInfo, VectorIndexLayout,
     VectorIndexLayoutInfo, VectorMaintenanceFailure, VectorMaintenanceFailureDetails,
-    VectorMaintenanceNeed, VectorMaintenanceReport, VectorPartitionInfo, VectorPartitionRef,
-    VectorRouteQuarantineReason, VectorStore, VectorVersionIdentity,
+    VectorMaintenanceNeed, VectorMaintenanceReport, VectorMembershipProvenance,
+    VectorPartitionInfo, VectorPartitionRef, VectorRouteQuarantineReason, VectorStore,
+    VectorTeardownReceipt, VectorVersionIdentity,
 };
+#[doc(hidden)]
+pub use store::VectorMemoryOwnershipSnapshot;
 #[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub use store::{
     VectorGraphCallbackPhaseForTest, VectorJournalTruncationFaultHandle,
     VectorJournalTruncationPhaseForTest, VectorLifecyclePauseHandle,
-    VectorMaintenancePreparationPhaseForTest, VectorMemoryOwnershipSnapshot,
-    VectorMemoryWorkspacePhaseForTest,
+    VectorMaintenancePreparationPhaseForTest, VectorMemoryWorkspacePhaseForTest,
 };
 #[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]

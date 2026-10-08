@@ -84,6 +84,7 @@ pub use engine_answer::{
     TAG_VECTOR_INDEXED_ROUTE_UNAVAILABLE, TAG_VECTOR_PARTITION_LIMIT_EXCEEDED,
     TAG_VECTOR_WHOLE_INDEX_INSPECTION_DENIED, TAG_WINDOW_FUNCTION_NOT_SUPPORTED, body_grammar,
 };
+pub(crate) use engine_answer::{BLOB_SOURCE_REFUSAL_MAX_BYTES, encode_read_error_into_slice};
 pub use framing::{
     AssembledOrdinaryResult, CursorCloseAcknowledgement, CursorOpenedResponse, CursorPageResponse,
     FrameBufferAllocator, FrameReader, FrameViolation, LocalConfigurationSource,
@@ -98,8 +99,10 @@ pub use framing::{
     split_canonical_result, split_payload_answer, validate_handshake,
 };
 pub(crate) use framing::{
+    decode_read_error_under_memory_ceiling, observed_cursor_page_allocation_bytes,
     preflight_canonical_query_result, preflight_cursor_page_payload,
-    preflight_metadata_page_payload, response_is_encodable,
+    preflight_metadata_page_payload, preflight_observed_cursor_page_payload,
+    query_result_allocation_bytes, response_is_encodable,
 };
 pub use runtime::RuntimeDirectory;
 #[cfg(target_os = "linux")]
@@ -209,11 +212,16 @@ pub(crate) fn response_decode_refusal(error: LocalTransportError) -> LocalTransp
 /// already says "a read went past a ceiling it declared", so no new refusal
 /// kind is invented here: this one names MEMORY and the number that was in
 /// force, which is what a caller has to know to raise it.
-pub(crate) fn memory_ceiling_read_failure(ceiling: u64) -> ReadFailure {
+pub(crate) fn memory_ceiling_read_failure(ceiling: u64, required: Option<u64>) -> ReadFailure {
     ReadFailure::owner_limit_exceeded(OwnerLimitExceededDetail {
         limit: ReadFailureLimit::Memory,
         value: ceiling,
-        required: None,
+        required: required.map(|required_bytes| {
+            contextdb_core::read_contract::RequiredBytesSetting {
+                required_bytes,
+                required_setting: "reader memory".into(),
+            }
+        }),
         statement: None,
     })
 }

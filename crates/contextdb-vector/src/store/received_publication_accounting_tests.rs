@@ -56,20 +56,15 @@ fn install_received(
     budget: &Arc<Budget>,
     whole_registry: bool,
 ) {
-    let publication = VectorStore::prepare_partitioned_received_schema_publication(
-        vec![(index.clone(), layout)],
-        vec![PartitionedVectorEntry::new(
-            key,
-            entry(index, RowId(1), TxId(1)),
-        )],
-    )
-    .unwrap();
-    budget
-        .try_allocate_for(
-            publication.memory_swap_vector_bytes(),
-            "test",
-            "received_image_swap",
-            "test",
+    let publication = store
+        .prepare_partitioned_received_schema_publication(
+            vec![(index.clone(), layout)],
+            vec![PartitionedVectorEntry::new(
+                key,
+                entry(index, RowId(1), TxId(1)),
+            )],
+            budget.clone(),
+            VectorCopyAdmission::new(budget.clone()),
         )
         .unwrap();
     if whole_registry {
@@ -85,6 +80,9 @@ fn install_received(
 
 #[test]
 fn received_publication_prepares_next_insert_and_releases_its_last_holder() {
+    let executing_accountant = Arc::new(super::tests::CountingMemoryBudget::default());
+    let mut executing_admission = VectorCopyAdmission::new(executing_accountant.clone());
+
     for whole_registry in [false, true] {
         for quantization in [
             VectorQuantization::F32,
@@ -116,7 +114,13 @@ fn received_publication_prepares_next_insert_and_releases_its_last_holder() {
                 entry(&index, RowId(2), TxId(2)),
             )];
             let prepared = store
-                .prepare_partitioned_batch(vec![], inserts.clone(), vec![], HashSet::new())
+                .prepare_partitioned_batch(
+                    vec![],
+                    inserts.clone(),
+                    vec![],
+                    HashSet::new(),
+                    VectorCopyAdmission::new(executing_accountant.clone()),
+                )
                 .unwrap();
             assert!(budget.used.load(Ordering::SeqCst) > before + body_bytes);
             drop(prepared);
@@ -125,14 +129,20 @@ fn received_publication_prepares_next_insert_and_releases_its_last_holder() {
 
             budget.refuse.store(true, Ordering::SeqCst);
             assert!(matches!(
-                store.prepare_partitioned_batch(vec![], inserts.clone(), vec![], HashSet::new()),
+                store.prepare_partitioned_batch(vec![], inserts.clone(), vec![], HashSet::new(), VectorCopyAdmission::new(executing_accountant.clone())),
                 Err(Error::MemoryBudgetExceeded { ref operation, .. }) if operation == "prepare_vector_directory_growth"
             ));
             assert_eq!(budget.used.load(Ordering::SeqCst), before + body_bytes);
             assert_eq!(state.entry_count(), 1);
             budget.refuse.store(false, Ordering::SeqCst);
             let prepared = store
-                .prepare_partitioned_batch(vec![], inserts, vec![], HashSet::new())
+                .prepare_partitioned_batch(
+                    vec![],
+                    inserts,
+                    vec![],
+                    HashSet::new(),
+                    VectorCopyAdmission::new(executing_accountant.clone()),
+                )
                 .unwrap();
             store.publish_prepared_partitioned_batch(prepared, Lsn(2), Some(budget.as_ref()));
             assert_eq!(state.entry_count(), 2);
@@ -166,9 +176,20 @@ fn received_publication_prepares_next_insert_and_releases_its_last_holder() {
 
 #[test]
 fn received_columns_keep_distinct_funders_and_legacy_columns_in_a_mixed_batch() {
+    let executing_accountant = Arc::new(super::tests::CountingMemoryBudget::default());
+    let mut executing_admission = VectorCopyAdmission::new(executing_accountant.clone());
+
     let store = VectorStore::default();
     let legacy = VectorIndexRef::new("legacy", "embedding");
-    store.register_index(legacy.clone(), 768, VectorQuantization::F32);
+    let legacy_column_owner = Arc::new(Budget::default());
+    store
+        .register_index(
+            legacy.clone(),
+            768,
+            VectorQuantization::F32,
+            legacy_column_owner.clone(),
+        )
+        .unwrap();
     store.apply_inserts(vec![entry(&legacy, RowId(1), TxId(1))]);
     let source =
         VectorPartitionKey::from_values(&[contextdb_core::Value::Text("a".into())]).unwrap();
@@ -217,11 +238,16 @@ fn received_columns_keep_distinct_funders_and_legacy_columns_in_a_mixed_batch() 
             )],
             movements,
             HashSet::new(),
+            VectorCopyAdmission::new(executing_accountant.clone()),
         )
         .unwrap();
     store.publish_prepared_partitioned_batch(prepared, Lsn(2), None);
     let legacy_column = store.try_column(&legacy).unwrap();
-    assert!(legacy_column.directory_accounting.lock().is_none());
+    let declared: Arc<dyn MemoryBudget> = legacy_column_owner.clone();
+    assert!(Arc::ptr_eq(
+        &legacy_column.directory_accounting.lock().accountant,
+        &declared
+    ));
     let legacy_state = store.state(&legacy).unwrap();
     assert!(!legacy_state.raw_residency_is_accounted());
     assert_eq!(legacy_state.entry_count(), 2);

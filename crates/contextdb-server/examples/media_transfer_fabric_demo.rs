@@ -228,7 +228,11 @@ fn open_node(
         db.clone(),
         &endpoint,
         contextdb_core::TenantId::from(tenant),
-    );
+    )
+    .unwrap_or_else(|err| {
+        eprintln!("cannot construct sync client: {err}");
+        std::process::exit(EXIT_ERROR);
+    });
     (db, client, node_id, identity_path)
 }
 
@@ -414,7 +418,10 @@ async fn run_holder(
         std::process::exit(EXIT_ERROR);
     });
     eprintln!("[holder] serving endpoint bound (relay={relay})");
-    holder.serve_on(&serve_endpoint);
+    holder.serve_on(&serve_endpoint).unwrap_or_else(|err| {
+        eprintln!("cannot serve blobs: {err}");
+        std::process::exit(EXIT_ERROR);
+    });
     let serve_ticket = serve_endpoint.ticket();
 
     // serve_on already registers this node's OWN ticket in the peer

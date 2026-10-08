@@ -24,7 +24,7 @@ use bao_tree::io::outboard::PreOrderOutboard;
 use bao_tree::io::sync::{CreateOutboard, ReadAt, WriteAt};
 use bao_tree::io::{BaoContentItem, EncodeError, Leaf};
 use bao_tree::{BaoTree, ChunkNum, ChunkRanges};
-use contextdb_core::{Error, Result};
+use contextdb_core::{Error, Result, read_memory::{ReadCredit, ReadMemoryBudget}};
 use iroh::endpoint::VarInt;
 use iroh_blobs::api::Store;
 use iroh_blobs::api::blobs::BlobStatus;
@@ -72,9 +72,10 @@ const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The ledger's answer for one authenticated fetch request, produced by the
 /// resolver (the adapter never reads the ledger itself).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) enum FetchVerdict {
-    Allow,
+    Allow(Arc<dyn ReadMemoryBudget>),
+    SourceError(Error),
     Unentitled,
     PolicyForbidden,
     /// Reserved for a future ledger-derived "does not exist" verdict; today
@@ -89,6 +90,7 @@ pub(crate) enum FetchVerdict {
 /// public error contract.
 #[derive(Debug)]
 pub(crate) enum FetchFailure {
+    SourceError(Error),
     Unentitled,
     PolicyForbidden,
     NotFound,
@@ -123,14 +125,138 @@ pub(crate) type VerdictFn = Arc<
         + Sync,
 >;
 
-/// Stream-reset codes for the blob-ALPN serving side (defense for callers
-/// that skip the preflight). The honest consumer never parses these; it
-/// learns refusals from the preflight.
+/// Stream-reset codes for policy and existence refusals on the blob door.
+/// Source errors instead use the same-stream typed control prefix; no
+/// separate authorization channel is opened.
 const RESET_UNENTITLED: u32 = 7001;
 const RESET_POLICY: u32 = 7002;
 const RESET_NOT_FOUND: u32 = 7003;
 /// The drop-after-N harness seam resets with this code mid-payload.
 const RESET_DROPPED: u32 = 7100;
+
+// One bounded response prefix lives on the blob stream itself, before Bao.
+const SOURCE_CONTROL_BYTES: usize = crate::local_transport::BLOB_SOURCE_REFUSAL_MAX_BYTES;
+
+fn malformed_source_control() -> Error {
+    use contextdb_core::read_contract::{ReadFailure, ReadFailureDetail, ReadFailureKind};
+    Error::ReadFailure(
+        ReadFailure::new(ReadFailureKind::LocalProtocolMismatch, ReadFailureDetail::None)
+            .expect("bare protocol refusal is valid"),
+    )
+}
+
+async fn send_source_error<W: SendStream>(send: &mut W, error: &Error) -> std::result::Result<(), ()> {
+    let mut payload = [0u8; SOURCE_CONTROL_BYTES];
+    let length = crate::local_transport::encode_read_error_into_slice(error, &mut payload)
+        .or_else(|_| crate::local_transport::encode_read_error_into_slice(
+            &malformed_source_control(), &mut payload,
+        ))
+        .map_err(|_| ())?;
+    let mut header = [1u8, 0, 0, 0, 0];
+    header[1..].copy_from_slice(&(length as u32).to_be_bytes());
+    send.send(&header).await.map_err(|_| ())?;
+    send.send(&payload[..length]).await.map_err(|_| ())?;
+    send.sync().await.map_err(|_| ())
+}
+
+struct ControlledGetStreams {
+    connection: iroh::endpoint::Connection,
+    read_memory: Arc<dyn ReadMemoryBudget>,
+    failure: Arc<Mutex<Option<Error>>>,
+}
+
+impl iroh_blobs::api::remote::GetStreamPair for ControlledGetStreams {
+    async fn open_stream_pair(
+        self,
+    ) -> std::io::Result<iroh_blobs::get::StreamPair<impl RecvStream, impl SendStream>> {
+        let connection_id = self.connection.stable_id() as u64;
+        let (send, recv) = self.connection.open_bi().await?;
+        Ok(iroh_blobs::get::StreamPair::new(
+            connection_id,
+            ControlledRecv {
+                inner: recv,
+                read_memory: self.read_memory,
+                failure: self.failure,
+                checked: false,
+            },
+            send,
+        ))
+    }
+}
+
+struct ControlledRecv<R> {
+    inner: R,
+    read_memory: Arc<dyn ReadMemoryBudget>,
+    failure: Arc<Mutex<Option<Error>>>,
+    checked: bool,
+}
+
+impl<R: RecvStream> ControlledRecv<R> {
+    async fn check_control(&mut self) -> std::io::Result<()> {
+        if self.checked {
+            return Ok(());
+        }
+        self.checked = true;
+        let mut header = [0u8; 5];
+        if let Err(error) = self.inner.recv_exact(&mut header).await {
+            if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                *self.failure.lock().expect("control failure lock") = Some(malformed_source_control());
+            }
+            return Err(error);
+        }
+        let length = u32::from_be_bytes(header[1..].try_into().expect("four-byte length")) as usize;
+        if header[0] == 0 && length == 0 {
+            return Ok(());
+        }
+        let error = if header[0] != 1 || length == 0 || length > SOURCE_CONTROL_BYTES {
+            malformed_source_control()
+        } else {
+            // Admit this frame for the existing grammar preflight and decode.
+            // The fixed ceiling bounds the terminal error representation; its
+            // frame credit releases when conversion to the core error finishes.
+            let credit = ReadCredit::try_new(
+                self.read_memory.clone(), length,
+                "blob", "source_refusal", "Raise the requesting reader's memory limit.",
+            );
+            match credit {
+                Err(error) => error,
+                Ok(_credit) => {
+                    let mut payload = [0u8; SOURCE_CONTROL_BYTES];
+                    if let Err(error) = self.inner.recv_exact(&mut payload[..length]).await {
+                        *self.failure.lock().expect("control failure lock") = Some(malformed_source_control());
+                        return Err(error);
+                    }
+                    crate::local_transport::decode_read_error_under_memory_ceiling(
+                        &payload[..length], SOURCE_CONTROL_BYTES as u64,
+                    ).unwrap_or_else(|_| malformed_source_control())
+                }
+            }
+        };
+        *self.failure.lock().expect("control failure lock") = Some(error);
+        Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "blob source refusal"))
+    }
+}
+
+impl<R: RecvStream> RecvStream for ControlledRecv<R> {
+    async fn recv_bytes(&mut self, len: usize) -> std::io::Result<bytes::Bytes> {
+        self.check_control().await?;
+        self.inner.recv_bytes(len).await
+    }
+    async fn recv_bytes_exact(&mut self, len: usize) -> std::io::Result<bytes::Bytes> {
+        self.check_control().await?;
+        self.inner.recv_bytes_exact(len).await
+    }
+    async fn recv_exact(&mut self, target: &mut [u8]) -> std::io::Result<()> {
+        self.check_control().await?;
+        self.inner.recv_exact(target).await
+    }
+    fn stop(&mut self, code: VarInt) -> std::io::Result<()> {
+        self.inner.stop(code)
+    }
+    fn id(&self) -> u64 {
+        self.inner.id()
+    }
+}
 
 /// Adapts Iroh's public actor channel to Bao's public validated traversal.
 /// Keeping this one-line wire bridge here avoids requiring a workspace-only
@@ -2059,9 +2185,9 @@ impl BlobStoreHandle {
     /// enforcing `verdict` against the transport-authenticated caller BEFORE
     /// any payload bytes move. There is no separate preflight door — an
     /// honest consumer dials the blob door directly, and a refusal arrives
-    /// as a typed stream-reset code (see [`classify_get_error`]). A
-    /// preflight would double-count requests against the two test counters
-    /// below, since every dial is exactly one authorization decision.
+    /// as either a policy reset or a bounded typed source-error prefix before
+    /// Bao (see [`classify_get_error`]). Each GET counts exactly one
+    /// authorization decision.
     pub(crate) fn serve_on(
         &self,
         endpoint: &IrohServer,
@@ -2278,8 +2404,12 @@ where
     // wire.
     let answer = verdict(remote_node_id, &requested).await;
     let mut send = send;
-    match answer {
-        FetchVerdict::Allow => {}
+    let _read_memory = match answer {
+        FetchVerdict::Allow(memory) => memory,
+        FetchVerdict::SourceError(error) => {
+            send_source_error(&mut send, &error).await?;
+            return Err(());
+        }
         FetchVerdict::Unentitled => {
             let _ = send.reset(RESET_UNENTITLED.into());
             return Err(());
@@ -2292,15 +2422,26 @@ where
             let _ = send.reset(RESET_NOT_FOUND.into());
             return Err(());
         }
-    }
-    let provider_guard = repository.open_read(requested).ok().flatten();
-    let servable = repository
-        .has_tag_role(&requested, BlobTagRole::Servable)
-        .unwrap_or(false);
+    };
+    let provider_guard = match repository.open_read(requested) {
+        Ok(guard) => guard,
+        Err(error) => {
+            send_source_error(&mut send, &error).await?;
+            return Err(());
+        }
+    };
+    let servable = match repository.has_tag_role(&requested, BlobTagRole::Servable) {
+        Ok(servable) => servable,
+        Err(error) => {
+            send_source_error(&mut send, &error).await?;
+            return Err(());
+        }
+    };
     if provider_guard.is_none() || !servable {
         let _ = send.reset(RESET_NOT_FOUND.into());
         return Err(());
     }
+    send.send(&[0, 0, 0, 0, 0]).await.map_err(|_| ())?;
     // Keep the requested blob's genuine Bao proof, replacing only its leaf
     // payload in the test seam. Authorization and generation guards still apply.
     let replacement = tamper.lock().expect("tamper lock").get(&requested).cloned();
@@ -2363,7 +2504,7 @@ fn served_bytes_for_request(ranges: &ChunkRangesSeq, size: u64) -> u64 {
     }
 }
 
-/// The consumer half: preflight, fetch (verified, resumable), export.
+/// The consumer half: authorize and fetch on one stream (verified, resumable), export.
 pub(crate) struct FetchOutcome {
     pub bytes_written: u64,
 }
@@ -2378,11 +2519,12 @@ async fn fetch_into_local_store(
     identity_path: &Path,
     ticket: &str,
     hash: &[u8; 32],
+    read_memory: Arc<dyn ReadMemoryBudget>,
 ) -> std::result::Result<LocalFetchOutcome, FetchFailure> {
     // Fetch over the blob door, verified into the local store. There is no
     // separate preflight: the consumer dials the blob door directly, and a
-    // refusal arrives as a typed stream-reset code the holder sends BEFORE
-    // any payload byte (see `classify_get_error`). Upstream fetches only
+    // policy refusal arrives as a typed reset; a source error arrives in the
+    // bounded control prefix BEFORE Bao bytes (see `classify_get_error`). Upstream fetches only
     // what the local partial state is missing, so a retry after an abort
     // moves the tail, not the blob.
     let backend = to_backend_hash(hash);
@@ -2390,7 +2532,7 @@ async fn fetch_into_local_store(
         .await
         .map_err(|_| FetchFailure::Unreachable)?;
     let holder_node_id = peer.remote_node_id.clone();
-    let moved = run_verified_fetch(store, &peer, backend, hash).await;
+    let moved = run_verified_fetch(store, &peer, backend, hash, read_memory).await;
     if matches!(
         &moved,
         Err(FetchFailure::Aborted | FetchFailure::HashMismatch { .. })
@@ -2431,8 +2573,9 @@ pub(crate) async fn fetch_verified_into_local_store(
     identity_path: PathBuf,
     ticket: String,
     hash: [u8; 32],
+    read_memory: Arc<dyn ReadMemoryBudget>,
 ) -> std::result::Result<LocalFetchOutcome, FetchFailure> {
-    fetch_into_local_store(&store, &identity_path, &ticket, &hash).await
+    fetch_into_local_store(&store, &identity_path, &ticket, &hash, read_memory).await
 }
 
 /// Release the consumer-side fetch-protection tag for `hash` once its bytes
@@ -2476,7 +2619,7 @@ pub(crate) async fn release_complete_cache_ownership(
     Ok(())
 }
 
-/// Preflight + fetch + export `hash` from the holder at `ticket` into
+/// Fetch + export `hash` from the holder at `ticket` into
 /// `sink`. `payload_moved` (when given) receives the wire payload bytes this
 /// call actually transferred (the resume-leg counter); `holder_node_id` (when
 /// given) receives the holder's transport-authenticated identity, so a caller
@@ -2489,12 +2632,13 @@ pub(crate) async fn fetch_into_sink(
     identity_path: &Path,
     ticket: &str,
     hash: &[u8; 32],
+    read_memory: Arc<dyn ReadMemoryBudget>,
     sink: &mut (dyn Write + Send),
     payload_moved: Option<&mut u64>,
     holder_node_id: Option<&mut String>,
     export_offset: u64,
 ) -> std::result::Result<FetchOutcome, FetchFailure> {
-    let outcome = match fetch_into_local_store(store, identity_path, ticket, hash).await {
+    let outcome = match fetch_into_local_store(store, identity_path, ticket, hash, read_memory).await {
         Ok(outcome) => outcome,
         Err(failure) => {
             if matches!(failure, FetchFailure::Aborted) {
@@ -2531,6 +2675,7 @@ async fn run_verified_fetch(
     peer: &PeerConnection,
     backend: Hash,
     hash: &[u8; 32],
+    read_memory: Arc<dyn ReadMemoryBudget>,
 ) -> std::result::Result<u64, FetchFailure> {
     // Protect this hash from the store's GC sweep for as long as this node
     // might still be mid-transfer OR resuming later: an unprotected partial
@@ -2550,7 +2695,18 @@ async fn run_verified_fetch(
         .await;
     let remote = store.inner.store.remote();
     let content = HashAndFormat::new(backend, BlobFormat::Raw);
-    let progress = remote.fetch(peer.connection.clone(), content);
+    let _control_owner = ReadCredit::try_new(
+        read_memory.clone(),
+        std::mem::size_of::<Mutex<Option<Error>>>() + 2 * std::mem::size_of::<usize>(),
+        "blob", "source_control_owner", "Raise the requesting reader's memory limit.",
+    ).map_err(FetchFailure::SourceError)?;
+    let control_failure = Arc::new(Mutex::new(None));
+    let streams = ControlledGetStreams {
+        connection: peer.connection.clone(),
+        read_memory,
+        failure: control_failure.clone(),
+    };
+    let progress = remote.fetch(streams, content);
     let mut progress = Box::pin(progress.stream());
     let mut last_payload: u64 = 0;
     loop {
@@ -2566,6 +2722,9 @@ async fn run_verified_fetch(
                 return Ok(stats.payload_bytes_read.max(last_payload));
             }
             GetProgressItem::Error(err) => {
+                if let Some(failure) = control_failure.lock().expect("control failure lock").take() {
+                    return Err(FetchFailure::SourceError(failure));
+                }
                 return Err(classify_get_error(err, hash));
             }
         }
@@ -2584,7 +2743,7 @@ where
 /// Map an upstream fetch error onto the adapter-neutral failure kinds, by
 /// VARIANT: a Bao hash-verification failure is a HashMismatch (wrong bytes
 /// were caught before any verified handoff); an adapter reset code carries
-/// the serving side's refusal for a caller that skipped the preflight; every
+/// the serving side's policy or existence refusal; every
 /// other mid-transfer failure is an Aborted (retryable).
 fn classify_get_error(err: iroh_blobs::get::GetError, expected: &[u8; 32]) -> FetchFailure {
     use iroh_blobs::get::GetError;
@@ -2736,6 +2895,7 @@ pub(crate) async fn resume_into_sink(
     identity_path: &Path,
     ticket: &str,
     hash: &[u8; 32],
+    read_memory: Arc<dyn ReadMemoryBudget>,
     sink: &mut Vec<u8>,
 ) -> std::result::Result<u64, FetchFailure> {
     let local_session = store
@@ -2769,7 +2929,7 @@ pub(crate) async fn resume_into_sink(
     let peer = peer_connect(identity_path, ticket, iroh_blobs::protocol::ALPN)
         .await
         .map_err(|_| FetchFailure::Unreachable)?;
-    let moved = run_verified_fetch(store, &peer, backend, hash).await;
+    let moved = run_verified_fetch(store, &peer, backend, hash, read_memory).await;
     let moved = match moved {
         Ok(moved) => moved,
         Err(failure) => {

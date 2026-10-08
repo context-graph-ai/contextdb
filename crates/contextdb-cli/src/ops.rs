@@ -7,11 +7,12 @@
 //! only a first argument that names one of those commands
 //! is intercepted here.
 
-use crate::{EXIT_ERROR, EXIT_OK, EXIT_USAGE};
+use crate::{EXIT_ERROR, EXIT_OK, EXIT_USAGE, ErrorClass, OutputOptions};
 use contextdb_engine::Database;
 use contextdb_engine::database::SnapshotInspector;
 use contextdb_engine::persistence::RedbPersistence;
 use contextdb_engine::sync_types::NaturalKey;
+use contextdb_engine::vector_read_memory::DeclaredReadMemory;
 use contextdb_engine::work_ledger::BlobHash;
 use std::path::Path;
 
@@ -19,9 +20,15 @@ use std::path::Path;
 /// handler and return the process exit code to use. `None` means "not one
 /// of these" — the caller falls through to the existing REPL entry point
 /// unchanged.
-pub fn dispatch_if_subcommand(raw_args: &[String]) -> Option<i32> {
+pub fn dispatch_if_subcommand<F>(raw_args: &[String], read_memory_factory: F) -> Option<i32>
+where
+    F: FnOnce() -> contextdb_core::Result<(
+        std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        std::sync::Arc<DeclaredReadMemory>,
+    )>,
+{
     let name = raw_args.get(1)?;
-    run_operational(name, &raw_args[2..])
+    run_operational(name, &raw_args[2..], read_memory_factory)
 }
 
 /// Run the operational command `name` with its own argument tail, exactly as
@@ -29,12 +36,18 @@ pub fn dispatch_if_subcommand(raw_args: &[String]) -> Option<i32> {
 ///
 /// The command tree in the binary resolves the spelling and hands the tail
 /// here, so the two surfaces cannot disagree about which words exist.
-pub fn run_operational(name: &str, args: &[String]) -> Option<i32> {
+pub fn run_operational<F>(name: &str, args: &[String], read_memory_factory: F) -> Option<i32>
+where
+    F: FnOnce() -> contextdb_core::Result<(
+        std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        std::sync::Arc<DeclaredReadMemory>,
+    )>,
+{
     match name {
         "reset" => Some(run_reset(args)),
         "diagnose" => Some(run_diagnose(args)),
-        "snapshot" => Some(run_snapshot(args)),
-        "inspect" => Some(run_inspect(args)),
+        "snapshot" => Some(run_snapshot(args, read_memory_factory)),
+        "inspect" => Some(run_inspect(args, read_memory_factory)),
         "purge" => Some(run_purge(args)),
         _ => None,
     }
@@ -45,7 +58,13 @@ pub fn run_operational(name: &str, args: &[String]) -> Option<i32> {
 /// ever opening the caller-supplied path directly. The engine copies it into
 /// a private disposable copy first, opens only that copy, and exposes only
 /// bounded key/blob DTOs.
-fn run_inspect(args: &[String]) -> i32 {
+fn run_inspect<F>(args: &[String], read_memory_factory: F) -> i32
+where
+    F: FnOnce() -> contextdb_core::Result<(
+        std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        std::sync::Arc<DeclaredReadMemory>,
+    )>,
+{
     enum Request {
         Key {
             table: String,
@@ -207,20 +226,41 @@ fn run_inspect(args: &[String]) -> i32 {
             return EXIT_USAGE;
         }
     };
-    let inspector = match SnapshotInspector::open(artifact) {
-        Ok(inspector) => inspector,
+    let output = OutputOptions {
+        json: args.iter().any(|arg| arg == "--json"),
+    };
+    let (read_memory, declared_read_memory) = match read_memory_factory() {
+        Ok(read_memory) => read_memory,
         Err(err) => {
-            eprintln!("Error: snapshot inspection failed: {err}");
+            match &err {
+                contextdb_core::Error::ReadFailure(failure) => {
+                    output.report_read_failure(failure, None);
+                }
+                _ => output.report_error(ErrorClass::of(&err), &err.to_string()),
+            }
             return EXIT_ERROR;
         }
     };
+    let inspector =
+        match SnapshotInspector::open(artifact, read_memory.clone(), declared_read_memory) {
+            Ok(inspector) => inspector,
+            Err(err) => {
+                match &err {
+                    contextdb_core::Error::ReadFailure(failure) => {
+                        output.report_read_failure(failure, None);
+                    }
+                    _ => output.report_error(ErrorClass::of(&err), &err.to_string()),
+                }
+                return EXIT_ERROR;
+            }
+        };
     let result = match request {
         Request::Key {
             table,
             key,
             columns,
         } => inspector
-            .inspect_key(&table, &key, &columns)
+            .inspect_key(&table, &key, &columns, std::sync::Arc::clone(&read_memory))
             .and_then(|report| {
                 serde_json::to_value(report).map_err(|err| {
                     contextdb_core::Error::Other(format!("failed to encode key inspection: {err}"))
@@ -243,12 +283,22 @@ fn run_inspect(args: &[String]) -> i32 {
     let report = match result {
         Ok(report) => report,
         Err(err) => {
-            eprintln!("Error: snapshot inspection failed: {err}");
+            match &err {
+                contextdb_core::Error::ReadFailure(failure) => {
+                    output.report_read_failure(failure, None);
+                }
+                _ => eprintln!("Error: snapshot inspection failed: {err}"),
+            }
             return EXIT_ERROR;
         }
     };
     if let Err(err) = close {
-        eprintln!("Error: snapshot inspection copy did not close cleanly: {err}");
+        match &err {
+            contextdb_core::Error::ReadFailure(failure) => {
+                output.report_read_failure(failure, None);
+            }
+            _ => eprintln!("Error: snapshot inspection copy did not close cleanly: {err}"),
+        }
         return EXIT_ERROR;
     }
     if args.iter().any(|arg| arg == "--json") {
@@ -259,13 +309,21 @@ fn run_inspect(args: &[String]) -> i32 {
             serde_json::to_string_pretty(&report).expect("inspection report is serializable")
         );
     }
+    drop(report);
+    drop(read_memory);
     EXIT_OK
 }
 
 /// `contextdb snapshot export <database> <artifact> [--json]` — publish a
 /// transactionally consistent, purge-fenced backup through the engine's
 /// production snapshot path. The destination must not already exist.
-fn run_snapshot(args: &[String]) -> i32 {
+fn run_snapshot<F>(args: &[String], read_memory_factory: F) -> i32
+where
+    F: FnOnce() -> contextdb_core::Result<(
+        std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        std::sync::Arc<DeclaredReadMemory>,
+    )>,
+{
     if args.first().map(String::as_str) != Some("export") {
         eprintln!("Error: snapshot requires `export <database> <artifact>`");
         return EXIT_USAGE;
@@ -279,6 +337,13 @@ fn run_snapshot(args: &[String]) -> i32 {
         eprintln!("Error: snapshot export requires a database path and a new artifact path");
         return EXIT_USAGE;
     };
+    let (read_memory, _declared_parent) = match read_memory_factory() {
+        Ok(owner) => owner,
+        Err(err) => {
+            OutputOptions { json }.report_error(ErrorClass::of(&err), &err.to_string());
+            return EXIT_ERROR;
+        }
+    };
     let db = match Database::open(source) {
         Ok(db) => db,
         Err(err) => {
@@ -286,7 +351,7 @@ fn run_snapshot(args: &[String]) -> i32 {
             return EXIT_ERROR;
         }
     };
-    let report = db.export_snapshot(destination);
+    let report = db.export_snapshot_with_read_memory(destination, read_memory);
     let close = db.close();
     let report = match report {
         Ok(report) => report,
@@ -556,10 +621,17 @@ fn run_purge(args: &[String]) -> i32 {
             return EXIT_ERROR;
         }
     };
-    let result = db.execute(
-        &format!("PURGE FROM {table}"),
-        &std::collections::HashMap::new(),
-    );
+    // This invocation owns the read working set through execution, result
+    // rendering, and source close, independently of the store's writer funding.
+    let read_memory =
+        DeclaredReadMemory::from_reader_limit(db.owner_read_config().limits.limits.memory);
+    let result = read_memory.child().and_then(|request_memory| {
+        db.execute_with_read_memory(
+            &format!("PURGE FROM {table}"),
+            &std::collections::HashMap::new(),
+            request_memory,
+        )
+    });
     let close_result = db.close();
     match result {
         Ok(outcome) => {

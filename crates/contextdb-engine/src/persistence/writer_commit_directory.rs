@@ -52,7 +52,13 @@ impl CommitDirectoryCursor for DurableCommitCursor {
             .next()
             .transpose()
             .map_err(RedbPersistence::storage_error)?
-            .map(|(lsn, tx)| (Lsn(lsn.value()), TxId(tx.value())));
+            .map(|(lsn, tx)| {
+                #[cfg(feature = "test-seams")]
+                crate::writer_query_test_seams::note_history(
+                    crate::writer_query_test_seams::HistoryFamily::CommitIndex,
+                );
+                (Lsn(lsn.value()), TxId(tx.value()))
+            });
         if let Some((lsn, _)) = next {
             self.after = Some(lsn.0);
         } else {
@@ -129,7 +135,13 @@ impl CommitDirectory for RedbPersistence {
                 .next_back()
                 .transpose()
                 .map_err(Self::storage_error)?
-                .map(|(lsn, tx)| (Lsn(lsn.value()), TxId(tx.value()))))
+                .map(|(lsn, tx)| {
+                    #[cfg(feature = "test-seams")]
+                    crate::writer_query_test_seams::note_history(
+                        crate::writer_query_test_seams::HistoryFamily::CommitIndex,
+                    );
+                    (Lsn(lsn.value()), TxId(tx.value()))
+                }))
         })
     }
 
@@ -145,7 +157,13 @@ impl CommitDirectory for RedbPersistence {
             let first = table
                 .first()
                 .map_err(Self::storage_error)?
-                .map_or(Lsn(0), |(lsn, _)| Lsn(lsn.value()));
+                .map_or(Lsn(0), |(lsn, _)| {
+                    #[cfg(feature = "test-seams")]
+                    crate::writer_query_test_seams::note_history(
+                        crate::writer_query_test_seams::HistoryFamily::CommitIndex,
+                    );
+                    Lsn(lsn.value())
+                });
             Ok((count, first))
         })
     }
@@ -157,7 +175,14 @@ impl CommitDirectory for RedbPersistence {
             let table = read
                 .open_table(COMMIT_INDEX_TABLE)
                 .map_err(Self::storage_error)?;
-            Ok(table.get(lsn.0).map_err(Self::storage_error)?.is_some())
+            let present = table.get(lsn.0).map_err(Self::storage_error)?.is_some();
+            #[cfg(feature = "test-seams")]
+            if present {
+                crate::writer_query_test_seams::note_history(
+                    crate::writer_query_test_seams::HistoryFamily::CommitIndex,
+                );
+            }
+            Ok(present)
         })
     }
 

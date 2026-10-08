@@ -11,10 +11,10 @@ use super::vector_maintenance_inventory::MaintenanceBuildCandidate;
 use super::*;
 use crate::persistence::vector_paged::{
     NativePagedGeneration, PagedBuildHooks, PagedBuildReason, PagedBuildRecord, PagedDeclaration,
-    PagedPublication, VECTOR_GRAPH_PAGED_FORMAT_VERSION,
+    PagedPublication, RESIDENT_EXPORT_MARKER, VECTOR_GRAPH_PAGED_FORMAT_VERSION,
 };
 use contextdb_vector::hnsw::paged_builder::{
-    PagedEdge, PagedVectorBatchPlan, PagedVectorPhase, PagedVectorPoint, PagedVectorProgress,
+    PagedEdge, PagedGenerationPersistence, PagedVectorBatchPlan, PagedVectorPhase, PagedVectorPoint, PagedVectorProgress,
 };
 
 /// Source points one construction batch may take. A batch's working set does
@@ -72,7 +72,7 @@ pub(super) fn paged_batch_plan(declaration: &PagedDeclaration) -> Result<PagedVe
     })
 }
 
-fn declaration_for(
+pub(super) fn declaration_for(
     layout: &VectorIndexLayout,
     policy: &contextdb_vector::store::ResolvedVectorPolicy,
 ) -> Result<PagedDeclaration> {
@@ -99,21 +99,16 @@ fn progress_state(reason: PagedBuildReason) -> &'static str {
 
 /// Engine hooks shared by every batch of one registered build.
 pub(super) fn paged_build_hooks(
-    vector: &Arc<VectorStore>,
+    _vector: &Arc<VectorStore>,
     tx_mgr: &Arc<TransactionManager<DynStore>>,
     resource_closed: &Arc<AtomicBool>,
     publication_interrupted: &Arc<AtomicBool>,
-    partition: &VectorPartitionRef,
+    _partition: &VectorPartitionRef,
     record: &PagedBuildRecord,
 ) -> Result<PagedBuildHooks> {
-    let progress = record.progress()?;
+    record.progress()?;
     let closed = Arc::clone(resource_closed);
     let interrupted = Arc::clone(publication_interrupted);
-    let report_vector = Arc::downgrade(vector);
-    let report_partition = partition.clone();
-    let reason = record.reason;
-    let total = progress.total_points;
-    let frontier = progress.frontier_tx;
     let gate_manager = Arc::downgrade(tx_mgr);
     Ok(PagedBuildHooks {
         checkpoint: Arc::new(move || {
@@ -125,23 +120,22 @@ pub(super) fn paged_build_hooks(
             }
             Ok(())
         }),
-        inserted: Arc::new(move |done| {
-            if let Some(vector) = report_vector.upgrade() {
-                vector.report_partition_paged_build_progress(
-                    &report_partition,
-                    progress_state(reason),
-                    reason.as_str(),
-                    total,
-                    done,
-                    frontier,
-                );
-            }
-        }),
+        // A failed batch rolls back its inserted points. Report only the
+        // committed restart record in advance_paged_vector_build, so a retry
+        // cannot make this build's reported completed count move backward.
+        inserted: Arc::new(|_| {}),
         gate: Arc::new(move |work| {
             let manager = gate_manager
                 .upgrade()
                 .ok_or_else(|| Error::Other("vector build outlived its writer".into()))?;
-            manager.with_commit_lock(work)
+            // Publication already owns this manager's commit boundary on this
+            // thread. Inherit that guard instead of locking its mutex twice;
+            // ordinary construction batches still acquire their own guard.
+            if manager.commit_boundary_held_by_current_thread() {
+                work()
+            } else {
+                manager.with_commit_lock(work)
+            }
         }),
     })
 }
@@ -157,6 +151,7 @@ pub(super) fn register_paged_build(
     publication_interrupted: &Arc<AtomicBool>,
     partition: &VectorPartitionRef,
     record: &PagedBuildRecord,
+    copy_owner: &mut contextdb_vector::VectorCopyAdmission,
 ) -> Result<()> {
     let progress = record.progress()?;
     let hooks = paged_build_hooks(
@@ -180,6 +175,7 @@ pub(super) fn register_paged_build(
         native,
         plan,
         accountant.clone(),
+        copy_owner,
     )?;
     report_durable_progress(vector, partition, record.reason, &progress);
     Ok(())
@@ -204,7 +200,10 @@ fn report_durable_progress(
 impl Database {
     /// Restore every unpublished paged build: its construction floor first,
     /// then its restartable builder. Runs during open, before any cleanup.
-    pub(super) fn restore_paged_vector_builds(&self) -> Result<()> {
+    pub(super) fn restore_paged_vector_builds(
+        &self,
+        copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+    ) -> Result<()> {
         let Some(persistence) = self.persistence.as_ref() else {
             return Ok(());
         };
@@ -214,13 +213,24 @@ impl Database {
                 .hold_construction_floor(&partition, SnapshotId::from_tx(frontier));
         }
         for (partition, record) in persistence.load_paged_build_records()? {
+            let mut record_copy_owner = copy_owner.scratch();
+            let copy_owner = &mut record_copy_owner;
             let progress = record.progress()?;
+            if progress.last_source_key.as_deref() == Some(RESIDENT_EXPORT_MARKER) {
+                // The resident graph died with its process. Partial export
+                // links may name not-yet-exported points, so never register
+                // this as a resumable paged construction or serving graph.
+                persistence.discard_paged_build(&partition)?;
+                persistence.clear_construction_floor(&partition)?;
+                self.snapshot_registry.release_construction_floor(&partition);
+                continue;
+            }
             self.snapshot_registry
                 .hold_construction_floor(&partition, SnapshotId::from_tx(progress.frontier_tx));
             let registered = self.vector_store.contains_index(&partition.index)
                 && self
                     .vector_store
-                    .try_partition_info(&partition.index, &partition.partition_key)?
+                    .try_partition_info(&partition.index, &partition.partition_key, copy_owner)?
                     .is_some();
             if !registered {
                 // The route no longer exists; nothing can publish this build.
@@ -240,6 +250,7 @@ impl Database {
                 &self.publication_interrupted,
                 &partition,
                 &record,
+                copy_owner,
             )?;
         }
         Ok(())
@@ -276,16 +287,155 @@ pub(super) fn install_paged_root_capture(
 }
 
 impl MaintenanceContext {
+    /// Peak of a whole generation load, including the encoded record and
+    /// decoder/route workspace. Inputs are authenticated metadata or the
+    /// existing codec capacity bound; this never visits vector bodies.
+    fn whole_reader_load_bytes(
+        partition: &VectorPartitionRef,
+        resident: usize,
+        durable: usize,
+    ) -> Result<usize> {
+        let metadata = vector_route_metadata_workspace(partition)?.max(64 * 1024);
+        Ok(resident
+            .saturating_add(durable.saturating_add(metadata).saturating_mul(2))
+            .saturating_add(metadata))
+    }
+
+    pub(super) fn captured_whole_reader_serving_fits(
+        &self,
+        partition: &VectorPartitionRef,
+        count: usize,
+        layout: &VectorIndexLayout,
+        policy: contextdb_vector::store::ResolvedVectorPolicy,
+        prior_base: Option<&crate::persistence::VectorPartitionGenerationDescriptor>,
+    ) -> Result<bool> {
+        let resident = HnswIndex::estimated_resident_bytes_with_m(
+            count,
+            layout.dimension,
+            layout.quantization,
+            policy.hnsw_m,
+        )
+        .saturating_add(prior_base.map_or(0, |base| base.resident_bytes as usize));
+        let durable = HnswIndex::durable_generation_capacity_bound(
+            count,
+            layout.dimension,
+            layout.quantization,
+            policy.hnsw_m,
+        )?
+        .saturating_add(prior_base.map_or(0, |base| base.durable_bytes as usize));
+        Ok(
+            Self::whole_reader_load_bytes(partition, resident, durable)? as u128
+                <= self.reader_memory_limit as u128,
+        )
+    }
+
+    pub(super) fn whole_reader_serving_fits(
+        &self,
+        partition: &VectorPartitionRef,
+        info: &contextdb_vector::store::VectorPartitionInfo,
+        layout: &VectorIndexLayout,
+    ) -> Result<bool> {
+        // Live and retained rows already cover the raw identities. Pending
+        // inserts and tombstones describe work on those same identities, not
+        // additional vector payloads. The captured-frontier check separately
+        // prices the actual selected graph and any retained base or carriers.
+        let count = info.live_rows.saturating_add(info.retained_rows);
+        let policy = layout.resolve_policy(info.live_rows, 1);
+        let resident = HnswIndex::estimated_resident_bytes_with_m(
+            count,
+            layout.dimension,
+            layout.quantization,
+            policy.hnsw_m,
+        );
+        let durable = HnswIndex::durable_generation_capacity_bound(
+            count,
+            layout.dimension,
+            layout.quantization,
+            policy.hnsw_m,
+        )?;
+        if Self::whole_reader_load_bytes(partition, resident, durable)? as u128
+            > self.reader_memory_limit as u128
+        {
+            return Ok(false);
+        }
+        // An oversized selected base must be replaced, rather than retaining
+        // it underneath a small sealed change that would still be unservable.
+        let catalog = match self.persistence.as_ref() {
+            Some(persistence) => persistence.load_vector_partition_generation_catalog_for(
+                &partition.index,
+                &partition.partition_key,
+            )?,
+            None => None,
+        };
+        Ok(!self.reader_serving_replacement_needed(partition, catalog.as_ref())?)
+    }
+
+    /// A selected whole base/change that exceeds the store's reader declaration
+    /// is a replacement need even when ordinary consolidation is not due.
+    /// Native paged catalogs have only their small serving metadata here.
+    pub(super) fn reader_serving_replacement_needed(
+        &self,
+        partition: &VectorPartitionRef,
+        catalog: Option<&VectorPartitionGenerationCatalogRecord>,
+    ) -> Result<bool> {
+        let Some(catalog) = catalog else {
+            return Ok(false);
+        };
+        let Some(persistence) = self.persistence.as_ref() else {
+            return Ok(false);
+        };
+        // Metadata only, under an admitted route workspace. A native base
+        // stays native regardless of a small reader's per-request limit:
+        // it is never repeatedly rebuilt for whole-graph serving feasibility.
+        let _metadata = self.vector.reserve_workspace(
+            self.accountant.clone(),
+            vector_route_metadata_workspace(partition)?.max(64 * 1024),
+            "prepare_vector_generation",
+            "Raise MEMORY_LIMIT before inspecting generation format.",
+        )?;
+        if persistence.vector_partition_base_graph_format(partition, catalog.base.generation_id)?
+            == VECTOR_GRAPH_PAGED_FORMAT_VERSION
+        {
+            return Ok(false);
+        }
+        let mut resident = catalog.base.resident_bytes;
+        let mut durable = catalog.base.durable_bytes;
+        if let Some(change) = catalog.change {
+            resident = resident.saturating_add(change.resident_bytes);
+            durable = durable.saturating_add(change.durable_bytes);
+        }
+        let resident = DurableVectorGenerationLoader::descriptor_usize(
+            resident,
+            "reader serving resident declaration",
+        )?;
+        let durable = DurableVectorGenerationLoader::descriptor_usize(
+            durable,
+            "reader serving durable declaration",
+        )?;
+        Ok(
+            Self::whole_reader_load_bytes(partition, resident, durable)? as u128
+                > self.reader_memory_limit as u128,
+        )
+    }
     /// Advance this partition's paged base build, starting one when the
     /// maintained route needs a new base. `None` leaves the partition to the
     /// existing sealed-change and repair paths.
     pub(super) fn advance_paged_vector_build(
         &self,
         partition: &VectorPartitionRef,
+        copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        force_paged: bool,
     ) -> Result<Option<VectorPartitionPublicationOutcome>> {
         let Some(persistence) = self.persistence.as_ref() else {
             return Ok(None);
         };
+        let retired_without_catalog = match persistence.retired_vector_rebuild_pending(partition) {
+            Ok(pending) => pending,
+            Err(Error::StoreCorrupted { .. }) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let force_paged = force_paged || retired_without_catalog;
         if self.vector.partition_route_quarantine(partition).is_some() {
             return Ok(None);
         }
@@ -306,22 +456,36 @@ impl MaintenanceContext {
                 "Raise MEMORY_LIMIT before inspecting this maintained route.",
             )?;
             install_paged_root_capture(persistence, &self.tx_mgr);
-            let recorded = persistence.load_paged_build_record(partition)?;
-            let applies =
-                recorded.is_some() || self.paged_base_build_applies(partition, persistence)?;
+            let mut recorded = persistence.load_paged_build_record(partition)?;
+            if recorded.as_ref().map(|record| record.progress()).transpose()?
+                .is_some_and(|progress| progress.last_source_key.as_deref() == Some(RESIDENT_EXPORT_MARKER))
+            {
+                self.publish_direct_metadata(|| persistence.discard_paged_build(partition))?;
+                self.vector.forget_partition_paged_build(partition);
+                self.snapshot_registry.release_construction_floor(partition);
+                self.vector.clear_partition_paged_build_progress(partition);
+                recorded = None;
+            }
+            let applies = force_paged
+                || recorded.is_some()
+                || self.paged_base_build_applies(partition, persistence, copy_owner)?;
             (recorded, applies)
         };
-        if recorded.is_none() && (!base_build_applies || self.whole_build_fits(partition)?) {
+        if recorded.is_none()
+            && !force_paged
+            && (!base_build_applies || self.whole_build_fits(partition, persistence, copy_owner)?)
+        {
             return Ok(None);
         }
         // Admission first: a budget that cannot fund one construction batch
         // refuses with the established typed generation refusal before any
         // durable build record, floor or registration exists.
         {
-            let layout = self.vector.index_layout(&partition.index)?;
+            let layout =
+                contextdb_vector::scoped_index_layout(&self.vector, &partition.index, copy_owner)?;
             let live = self
                 .vector
-                .try_partition_info(&partition.index, &partition.partition_key)?
+                .try_partition_info(&partition.index, &partition.partition_key, copy_owner)?
                 .map(|info| info.live_rows)
                 .unwrap_or(0);
             let declaration = declaration_for(&layout, &layout.resolve_policy(live.max(1), 1))?;
@@ -361,17 +525,24 @@ impl MaintenanceContext {
                         &self.publication_interrupted,
                         partition,
                         &record,
+                        copy_owner,
                     )?;
                 }
                 record
             }
-            None => match self.start_paged_vector_build(partition, persistence)? {
+            None => match self.start_paged_vector_build(
+                partition,
+                persistence,
+                copy_owner,
+                force_paged,
+            )? {
                 Some(record) => record,
                 None => return Ok(None),
             },
         };
         // A changed declaration cannot finish this frontier.
-        let layout = self.vector.index_layout(&partition.index)?;
+        let layout =
+            contextdb_vector::scoped_index_layout(&self.vector, &partition.index, copy_owner)?;
         let progress = record.progress()?;
         let current = declaration_for(&layout, &layout.resolve_policy(progress.total_points, 1))?;
         if current != record.declaration {
@@ -425,6 +596,7 @@ impl MaintenanceContext {
                             &record,
                             &progress,
                             plan,
+                            read_memory.clone(),
                         )
                         .map(Some);
                 }
@@ -445,17 +617,21 @@ impl MaintenanceContext {
         &self,
         partition: &VectorPartitionRef,
         persistence: &Arc<RedbPersistence>,
+        copy_owner: &mut contextdb_vector::VectorCopyAdmission,
     ) -> Result<bool> {
-        let Some(info) = self
-            .vector
-            .try_partition_info(&partition.index, &partition.partition_key)?
+        let Some(info) = self.vector.try_partition_info(
+            &partition.index,
+            &partition.partition_key,
+            copy_owner,
+        )?
         else {
             return Ok(false);
         };
         if info.live_rows == 0 {
             return Ok(false);
         }
-        let layout = self.vector.index_layout(&partition.index)?;
+        let layout =
+            contextdb_vector::scoped_index_layout(&self.vector, &partition.index, copy_owner)?;
         let policy = layout.resolve_policy(info.live_rows, 1);
         let topology_replacement = info.graph_available
             && info.serving_policy.is_none_or(|serving| {
@@ -470,20 +646,35 @@ impl MaintenanceContext {
             .is_some_and(|catalog| catalog.change.is_none())
             && !self.vector.partition_has_paged_storage(partition)
             && !topology_replacement;
-        Ok(!publish_change)
+        Ok(!self.whole_reader_serving_fits(partition, &info, &layout)?
+            || !publish_change
+            || !self.change_build_fits(partition, persistence, copy_owner)?)
     }
 
     /// Whether the resident whole build's complete construction workspace fits
     /// the writer's current headroom. Only a build that cannot be funded whole
     /// moves to finite paged batches.
-    fn whole_build_fits(&self, partition: &VectorPartitionRef) -> Result<bool> {
-        let Some(info) = self
-            .vector
-            .try_partition_info(&partition.index, &partition.partition_key)?
+    fn whole_build_fits(
+        &self,
+        partition: &VectorPartitionRef,
+        persistence: &Arc<RedbPersistence>,
+        copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+    ) -> Result<bool> {
+        let Some(info) = self.vector.try_partition_info(
+            &partition.index,
+            &partition.partition_key,
+            copy_owner,
+        )?
         else {
             return Ok(true);
         };
-        let layout = self.vector.index_layout(&partition.index)?;
+        let layout =
+            contextdb_vector::scoped_index_layout(&self.vector, &partition.index, copy_owner)?;
+        if self.whole_reader_serving_fits(partition, &info, &layout)?
+            && let Some(plan) = self.change_build_plan(partition, persistence, copy_owner)?
+        {
+            return Ok(self.workspace_plan_fits(plan));
+        }
         let policy = layout.resolve_policy(info.live_rows, 1);
         let mut plan = VectorGenerationWorkspacePlan::new(
             info.live_rows,
@@ -494,29 +685,152 @@ impl MaintenanceContext {
             0,
         )?;
         plan.assign_raw_decode_owner(true, false);
-        let needed = plan.build_phase_bytes();
-        Ok(self
-            .accountant
+        let mut needed = plan.complete_peak_bytes();
+        if !self.captured_whole_reader_serving_fits(
+            partition, info.live_rows, &layout, policy, None,
+        )? {
+            let declaration = declaration_for(&layout, &policy)?;
+            let export_bytes = paged_batch_plan(&declaration)?.workspace_bytes()?;
+            needed = needed.max(plan.resident_export_phase_bytes(export_bytes));
+        }
+        Ok(self.accountant.usage().available.is_none_or(|available| available >= needed))
+    }
+
+    /// Price the same suffix and prior-base owners as resident publication.
+    /// A base larger than free headroom must not make every suffix retry fail.
+    fn change_build_plan(
+        &self,
+        partition: &VectorPartitionRef,
+        persistence: &Arc<RedbPersistence>,
+        copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+    ) -> Result<Option<VectorGenerationWorkspacePlan>> {
+        let Some(info) = self.vector.try_partition_info(
+            &partition.index,
+            &partition.partition_key,
+            copy_owner,
+        )?
+        else {
+            return Ok(None);
+        };
+        let Some((base, change)) = persistence.load_vector_partition_generation_descriptors_for(
+            &partition.index,
+            &partition.partition_key,
+        )?
+        else {
+            return Ok(None);
+        };
+        let layout =
+            contextdb_vector::scoped_index_layout(&self.vector, &partition.index, copy_owner)?;
+        let policy = layout.resolve_policy(info.live_rows, 1);
+        let topology_replacement = info.graph_available
+            && info.serving_policy.is_none_or(|serving| {
+                serving.hnsw_m != policy.hnsw_m
+                    || serving.hnsw_ef_construction != policy.hnsw_ef_construction
+            });
+        if change.is_some()
+            || self.vector.partition_has_paged_storage(partition)
+            || topology_replacement
+        {
+            return Ok(None);
+        }
+        let (raw_count, mut graph_count) = self.vector.partition_generation_entry_counts(
+            &partition.index,
+            &partition.partition_key,
+            SnapshotId(self.tx_mgr.current_tx_max().0),
+            Some(base.covered_lsn),
+            copy_owner,
+        )?;
+        let delete_carriers = graph_count == 0;
+        if delete_carriers {
+            let mut identities = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+                self.accountant.clone(),
+                0,
+                "vector",
+                "prepare_vector_generation",
+                "Raise MEMORY_LIMIT before counting delete-only graph carriers.",
+            )?;
+            let count = persistence.vector_partition_uncovered_tombstone_entry_count(
+                partition,
+                base.covered_lsn,
+                self.tx_mgr.current_lsn(),
+                |count| {
+                    let needed = count.saturating_mul(128);
+                    identities.try_grow_for(
+                        needed.saturating_sub(identities.bytes()),
+                        "vector",
+                        "prepare_vector_generation",
+                        "Raise MEMORY_LIMIT before counting delete-only graph carriers.",
+                    )
+                },
+            )?;
+            graph_count = if count == 1 { 2 } else { count };
+        }
+        let mut plan = VectorGenerationWorkspacePlan::new(
+            if delete_carriers {
+                raw_count
+            } else {
+                graph_count
+            },
+            graph_count,
+            &layout,
+            partition,
+            policy,
+            usize::try_from(base.durable_bytes)
+                .map_err(|_| Error::Other("vector base byte count exceeds address space".into()))?,
+        )?;
+        plan.assign_raw_decode_owner(true, delete_carriers);
+        if delete_carriers {
+            plan.carrier_metadata_bytes = graph_count.saturating_mul(
+                partition
+                    .partition_key
+                    .estimated_bytes()
+                    .saturating_add(partition.index.table.len())
+                    .saturating_add(partition.index.column.len())
+                    .saturating_add(512),
+            );
+        }
+        Ok(Some(plan))
+    }
+
+    pub(super) fn workspace_plan_fits(&self, plan: VectorGenerationWorkspacePlan) -> bool {
+        let needed = plan.complete_peak_bytes();
+        self.accountant
             .usage()
             .available
-            .is_none_or(|available| available >= needed))
+            .is_none_or(|available| available >= needed)
+    }
+
+    fn change_build_fits(
+        &self,
+        partition: &VectorPartitionRef,
+        persistence: &Arc<RedbPersistence>,
+        copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+    ) -> Result<bool> {
+        Ok(self
+            .change_build_plan(partition, persistence, copy_owner)?
+            .is_none_or(|plan| self.workspace_plan_fits(plan)))
     }
 
     /// Persist a new frontier record and hold its floor, under the commit
     /// gate. Returns `None` when the existing sealed-change path owns this
     /// partition's next publication.
-    fn start_paged_vector_build(
+    pub(super) fn start_paged_vector_build(
         &self,
         partition: &VectorPartitionRef,
         persistence: &Arc<RedbPersistence>,
+        copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        force_paged: bool,
     ) -> Result<Option<PagedBuildRecord>> {
-        let Some(info) = self
-            .vector
-            .try_partition_info(&partition.index, &partition.partition_key)?
+        let Some(info) = self.vector.try_partition_info(
+            &partition.index,
+            &partition.partition_key,
+            copy_owner,
+        )?
         else {
             return Ok(None);
         };
-        let layout = self.vector.index_layout(&partition.index)?;
+        let layout =
+            contextdb_vector::scoped_index_layout(&self.vector, &partition.index, copy_owner)?;
         let current = persistence.load_vector_partition_generation_catalog_for(
             &partition.index,
             &partition.partition_key,
@@ -532,7 +846,11 @@ impl MaintenanceContext {
             .is_some_and(|catalog| catalog.change.is_none())
             && !self.vector.partition_has_paged_storage(partition)
             && !topology_replacement;
-        if publish_change {
+        if publish_change
+            && !force_paged
+            && self.whole_reader_serving_fits(partition, &info, &layout)?
+            && self.change_build_fits(partition, persistence, copy_owner)?
+        {
             return Ok(None);
         }
         let reason = if current.is_none() {
@@ -552,11 +870,13 @@ impl MaintenanceContext {
                 .max(catalog.base.generation_id),
             None => 0,
         };
-        let highest = persistence.highest_vector_partition_generation_id(
-            &partition.index,
-            &partition.partition_key,
-            |_| Ok(()),
-        )?;
+        let highest = if current.is_none() && persistence.has_vector_repair_fence()? {
+            persistence.highest_retired_vector_generation_key(partition)?
+        } else {
+            persistence.highest_vector_partition_generation_id(
+                &partition.index, &partition.partition_key, |_| Ok(()),
+            )?
+        };
         let generation_id = previous_generation
             .max(highest)
             .checked_add(1)
@@ -603,18 +923,170 @@ impl MaintenanceContext {
             &self.publication_interrupted,
             partition,
             &record,
+            copy_owner,
         )?;
         Ok(Some(record))
     }
 
-    fn publish_paged_vector_build(
+    /// Export a funded whole build into unpublished native storage, then use
+    /// the ordinary native publication and writer-root installation. The
+    /// frontier/floor were captured by the caller before any body was copied.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn publish_resident_paged_generation(
+        &self,
+        partition: &VectorPartitionRef,
+        persistence: &Arc<RedbPersistence>,
+        layout: &VectorIndexLayout,
+        policy: contextdb_vector::store::ResolvedVectorPolicy,
+        reason: PagedBuildReason,
+        generation_id: u64,
+        previous_generation_id: u64,
+        covered_tx: TxId,
+        covered_lsn: Lsn,
+        graph: HnswIndex,
+        entries: Vec<VectorEntry>,
+        workspace: &mut contextdb_vector::VectorWorkspaceReservation,
+        workspace_plan: VectorGenerationWorkspacePlan,
+        copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<VectorPartitionPublicationOutcome> {
+        let declaration = declaration_for(layout, &policy)?;
+        let plan = paged_batch_plan(&declaration)?;
+        workspace.resize(
+            workspace_plan.resident_export_phase_bytes(plan.workspace_bytes()?),
+            "prepare_vector_generation",
+            "Free writer memory before exporting this graph.",
+        )?;
+        self.build_checkpoint()?;
+        let row_count = entries.iter().filter(|entry| entry.deleted_tx.is_none()).count();
+        if row_count != graph.len() {
+            return Err(Error::Other("resident export row count differs from its graph".into()));
+        }
+        let mut rows = Vec::with_capacity(row_count);
+        rows.extend(entries.iter().filter(|entry| entry.deleted_tx.is_none()));
+        rows.sort_unstable_by_key(|entry| entry.row_id);
+        if rows.windows(2).any(|pair| pair[0].row_id == pair[1].row_id) {
+            return Err(Error::Other(
+                "resident export has duplicate frontier rows".into(),
+            ));
+        }
+        let record = self
+            .tx_mgr
+            .with_commit_lock(|| -> Result<Option<PagedBuildRecord>> {
+                self.build_checkpoint()?;
+                let current_layout = contextdb_vector::scoped_index_layout(
+                    &self.vector,
+                    &partition.index,
+                    copy_owner,
+                )?;
+                if declaration_for(
+                    &current_layout,
+                    &current_layout.resolve_policy(rows.len(), 1),
+                )? != declaration
+                {
+                    return Ok(None);
+                }
+                // The existing publication transaction rechecks predecessor and
+                // empty-route/erasure validity; every export batch CASes this record.
+                persistence
+                    .begin_resident_paged_export(
+                        partition,
+                        declaration.clone(),
+                        reason,
+                        generation_id,
+                        previous_generation_id,
+                        covered_tx,
+                        covered_lsn,
+                        rows.len(),
+                    )
+                    .map(Some)
+            })?;
+        let Some(record) = record else {
+            return Ok(VectorPartitionPublicationOutcome::default());
+        };
+        let hooks = paged_build_hooks(
+            &self.vector,
+            &self.tx_mgr,
+            &self.resource_closed,
+            &self.publication_interrupted,
+            partition,
+            &record,
+        )?;
+        let native =
+            NativePagedGeneration::new(Arc::clone(persistence), partition.clone(), &record, hooks);
+        // Export streams one point at a time without navigation scratch.
+        // A larger finite transaction amortizes commits; its admitted byte
+        // workspace and the writer's fixed dirty-page cache stay unchanged.
+        let export_plan = PagedVectorBatchPlan {
+            max_points: 256,
+            max_node_writes: 256usize.saturating_mul(1 + 2 * policy.hnsw_m * 16),
+            ..plan
+        };
+        let mut progress = record.progress()?;
+        while progress.phase != PagedVectorPhase::Complete {
+            self.build_checkpoint()?;
+            let next =
+                native.commit_generation_batch(&progress, export_plan, &mut |transaction| {
+                    self.build_checkpoint()?;
+                    self.vector.export_resident_paged_batch(
+                        &graph, &rows, &progress, export_plan, transaction,
+                    )
+                })?;
+            progress = next;
+            self.build_checkpoint()?;
+        }
+        drop(rows);
+        drop(entries);
+        drop(graph);
+        drop(native);
+        // There is no complete graph left while serving controls and candidate
+        // copies are prepared. Keep metadata admitted until registration ends.
+        workspace.resize(
+            workspace_plan
+                .durable_metadata_bytes
+                .saturating_add(64 * 1024),
+            "prepare_vector_generation",
+            "Free writer memory before publishing this graph.",
+        )?;
+        let completed = persistence
+            .load_paged_build_record(partition)?
+            .ok_or_else(|| Error::Other("resident export lost its complete build record".into()))?;
+        register_paged_build(
+            &self.vector,
+            &self.tx_mgr,
+            persistence,
+            &self.accountant,
+            &self.resource_closed,
+            &self.publication_interrupted,
+            partition,
+            &completed,
+            copy_owner,
+        )?;
+        self.publish_paged_vector_build(
+            partition,
+            persistence,
+            &completed,
+            &progress,
+            plan,
+            read_memory,
+        )
+    }
+
+    pub(super) fn publish_paged_vector_build(
         &self,
         partition: &VectorPartitionRef,
         persistence: &Arc<RedbPersistence>,
         record: &PagedBuildRecord,
         progress: &PagedVectorProgress,
         plan: PagedVectorBatchPlan,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<VectorPartitionPublicationOutcome> {
+        let metadata_bytes = vector_route_metadata_workspace(partition)?.saturating_mul(8)
+            .saturating_add(64 * 1024);
+        let mut candidate_workspace = self.vector.reserve_workspace(
+            self.accountant.clone(), metadata_bytes, "prepare_vector_generation",
+            "Free writer memory before preparing paged publication metadata.",
+        )?;
         let meta = RedbPersistence::encode_paged_generation_meta(
             record.storage_id,
             &record.declaration,
@@ -659,7 +1131,14 @@ impl MaintenanceContext {
                 published_lsn: progress.frontier_lsn,
             },
         };
-        let prepared = persistence.prepare_vector_partition_generation_candidate(&candidate)?;
+        let prepared = persistence.prepare_vector_partition_generation_candidate_with_admission(
+            &candidate, |scan_bytes| candidate_workspace.resize(
+                metadata_bytes.saturating_add(scan_bytes), "prepare_vector_generation",
+                "Free writer memory before preparing paged publication metadata.",
+            ),
+        )?;
+        candidate_workspace.resize(metadata_bytes.saturating_add(prepared.stale_metadata_bytes()),
+            "prepare_vector_generation", "Free writer memory before publishing paged metadata.")?;
         self.admit_generation_disk(prepared.write_reservation_bytes())?;
         #[cfg(feature = "test-seams")]
         let published_pending = Arc::new(parking_lot::Mutex::new(None));
@@ -673,14 +1152,38 @@ impl MaintenanceContext {
             },
         );
         let mut checkpoint = || self.build_checkpoint();
-        let published = self.vector.publish_partition_paged_build_with_plan(
-            partition,
-            progress.frontier_lsn,
-            plan,
-            &mut checkpoint,
-        );
+        let mut publication_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
+        let published = self.publish_direct_metadata(|| {
+            self.vector.with_partition_generation_publication(partition, || -> Result<_> {
+                let current_layout = contextdb_vector::scoped_index_layout(
+                    &self.vector, &partition.index, &mut publication_copy_owner,
+                )?;
+                if declaration_for(&current_layout, &current_layout.resolve_policy(progress.total_points, 1))?
+                    != record.declaration
+                {
+                    return Ok(None);
+                }
+                self.vector.publish_partition_paged_build_with_plan(
+                    partition, progress.frontier_lsn, plan, &mut checkpoint,
+                ).map(Some)
+            })
+        });
         persistence.clear_paged_publication(partition);
-        published?;
+        let Some(published) = published? else {
+            // Abandon outside the commit/partition gates: it can wait for a
+            // finite in-flight operation before acquiring the abandon CAS.
+            self.vector.abandon_partition_paged_build(partition, &mut checkpoint)?;
+            self.snapshot_registry.release_construction_floor(partition);
+            self.vector.clear_partition_paged_build_progress(partition);
+            return Ok(VectorPartitionPublicationOutcome::default());
+        };
+        if published.phase == PagedVectorPhase::Abandoned {
+            self.snapshot_registry.release_construction_floor(partition);
+            self.vector.clear_partition_paged_build_progress(partition);
+            // No catalog was installed. Its journal and retained generation
+            // must not be changed or reported as a successful publication.
+            return Ok(VectorPartitionPublicationOutcome::default());
+        }
         #[cfg(feature = "test-seams")]
         crate::writer_commit_test_seams::reached(
             crate::writer_commit_test_seams::CommitBoundary::GenerationAfterRedb,
@@ -704,12 +1207,13 @@ impl MaintenanceContext {
             "truncate_vector_partition_journal",
             "Raise MEMORY_LIMIT before cleaning this maintained route.",
         )?;
-        let truncated = match persistence
-            .truncate_vector_partition_journal_through_catalog_with_checkpoint(
+        let truncated = match self.publish_direct_metadata(|| {
+            persistence.truncate_vector_partition_journal_through_catalog_with_checkpoint(
                 &published_catalog,
                 &mut workspace,
                 || self.build_checkpoint(),
-            ) {
+            )
+        }) {
             Ok(truncated) => truncated,
             Err(error @ (Error::ReadCancelled | Error::PublicationInterrupted)) => {
                 return Err(error);
@@ -720,13 +1224,13 @@ impl MaintenanceContext {
         };
         drop(workspace);
         if !truncated {
-            let cleanup_retry = self.retry_vector_journal_truncations()?;
+            let cleanup_retry = self.retry_vector_journal_truncations(read_memory.clone())?;
             return Ok(VectorPartitionPublicationOutcome {
                 published: true,
                 cleanup_failure: cleanup_retry.first_failure_details,
             });
         }
-        match self.install_published_vector_catalog(&published_catalog) {
+        match self.install_published_vector_catalog(&published_catalog, read_memory) {
             Ok(()) => {}
             Err(
                 error @ (Error::MemoryBudgetExceeded { .. } | Error::DiskBudgetExceeded { .. }),
@@ -740,28 +1244,86 @@ impl MaintenanceContext {
 
     /// Finite page cleanup for retired or abandoned paged generations.
     pub(super) fn reclaim_paged_vector_storage(&self) -> Result<()> {
-        let Some(persistence) = self.persistence.as_ref() else {
-            return Ok(());
-        };
-        if !persistence.has_paged_cleanup()? {
-            return Ok(());
+        let Some(persistence) = self.persistence.as_ref() else { return Ok(()); };
+        // One exit guard starts before the first fallible read/admission.
+        // An intentional UNKNOWN result retains its admitted progress; every
+        // unexpected error/cancellation, including early reads, releases it.
+        struct CursorExit<'a> {
+            persistence: &'a crate::persistence::RedbPersistence,
+            keep: bool,
         }
-        let mut workspace = self.vector.reserve_workspace(
-            self.accountant.clone(),
-            0,
-            "reclaim_paged_vector_generation",
-            "Raise MEMORY_LIMIT before reclaiming retired vector pages.",
-        )?;
+        impl Drop for CursorExit<'_> {
+            fn drop(&mut self) {
+                if !self.keep { self.persistence.abandon_vector_repair_audit_cursor(); }
+            }
+        }
+        let mut cursor_exit = CursorExit { persistence, keep: false };
         self.build_checkpoint()?;
-        persistence.paged_cleanup_step(PAGED_CLEANUP_KEYS, |bytes| {
-            workspace.resize(
-                bytes,
-                "reclaim_paged_vector_generation",
-                "Raise MEMORY_LIMIT before reclaiming retired vector pages.",
-            )
+        let work_pending = vector_source_page_admission::with_preparation_source_page_admission(self.accountant.clone(), || {
+            Ok(persistence.has_vector_repair_fence()? || persistence.has_paged_cleanup()?)
         })?;
+        if !work_pending { return Ok(()); }
+        let has_fence = vector_source_page_admission::with_preparation_source_page_admission(self.accountant.clone(), || {
+            persistence.has_vector_repair_fence()
+        })?;
+        let audit_scratch = if has_fence { 256 * 1024 } else { 0 };
+        let mut workspace = self.vector.reserve_workspace(
+            self.accountant.clone(), audit_scratch, "reclaim_paged_vector_generation",
+            "Free writer memory before reclaiming retired vector pages.",
+        )?;
+        let attempt = (|| -> Result<_> {
+        self.build_checkpoint()?;
+        self.tx_mgr.with_maintenance_publication(|publication| {
+            self.build_checkpoint()?;
+            vector_source_page_admission::with_preparation_source_page_admission(self.accountant.clone(), || {
+                publication.reserve()?;
+                let status = persistence.repair_orphan_audit_step(|| self.build_checkpoint())?;
+                publication.complete();
+                if persistence.has_paged_cleanup()? {
+                    publication.reserve()?;
+                    persistence.paged_cleanup_step(PAGED_CLEANUP_KEYS, |bytes| {
+                        workspace.resize(audit_scratch + bytes, "reclaim_paged_vector_generation",
+                            "Free writer memory before reclaiming retired vector pages.")
+                    }, || self.build_checkpoint())?;
+                    publication.complete();
+                }
+                Ok(status)
+            })
+        })
+        })();
+        let status = match attempt {
+            Ok(status) => status,
+            Err(error) => return Err(error),
+        };
+        cursor_exit.keep = true;
+        if matches!(status, crate::persistence::vector_paged::RepairAuditStatus::Blocked) {
+            return Err(Error::Other("vector page ownership reclamation is stalled by an unauthenticated retained reference; inspect the damaged index".into()));
+        }
         Ok(())
     }
+    pub(super) fn prepare_vector_authoritative_erasure(&self) -> Result<()> {
+        match self.reclaim_paged_vector_storage() {
+            Ok(()) => {},
+            Err(error @ (Error::ReadCancelled | Error::PublicationInterrupted)) => return Err(error),
+            Err(error) => {
+                if !self.persistence.as_ref().is_some_and(|p| p.repair_orphan_audit_blocked()) {
+                    return Err(error);
+                }
+                // UNKNOWN ownership is still a durable erasure fence. The
+                // existing typed fence refusal below is the PURGE answer.
+            }
+        }
+        let Some(persistence) = self.persistence.as_ref() else { return Ok(()); };
+        vector_source_page_admission::with_preparation_source_page_admission(self.accountant.clone(), || {
+            if persistence.has_vector_repair_fence()? || persistence.has_paged_cleanup()? {
+                return Err(crate::persistence::vector_paged::corruption(
+                    "vector ownership proof or page cleanup is incomplete; run maintenance before authoritative erasure",
+                ));
+            }
+            Ok(())
+        })
+    }
+
 }
 
 /// Pages one cleanup transaction removes.

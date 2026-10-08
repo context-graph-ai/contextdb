@@ -78,39 +78,49 @@ pub trait ScratchBackend: Debug + Send + Sync {
     fn set_len(&self, len: u64) -> io::Result<()>;
 }
 
+#[derive(Debug)]
+struct TemporaryScratch(std::sync::Mutex<File>);
+
+impl ScratchBackend for TemporaryScratch {
+    fn len(&self) -> io::Result<u64> {
+        Ok(self.0.lock().unwrap().metadata()?.len())
+    }
+
+    fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let mut file = self.0.lock().unwrap();
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(out)
+    }
+
+    fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let mut file = self.0.lock().unwrap();
+        file.seek(SeekFrom::Start(offset))?;
+        file.write_all(data)
+    }
+
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        self.0.lock().unwrap().set_len(len)
+    }
+}
+
+/// Exact requested heap bytes for the concrete boxed backend returned by
+/// [`scratch_backend_in_directory`]. This does not create a file or allocate.
+/// File contents and operating-system file resources are not heap payload bytes.
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub fn scratch_backend_allocation_size() -> usize {
+    std::mem::size_of::<TemporaryScratch>()
+}
+
 /// Create an allocator scratch file in the database file's directory.
 /// The directory entry is removed immediately. An open handle keeps the
 /// scratch usable, and process death cannot leave a named orphan behind.
 pub fn scratch_backend_in_directory(directory: &Path) -> io::Result<Box<dyn ScratchBackend>> {
-    use std::io::{Read, Seek, SeekFrom, Write};
-    use std::sync::Mutex;
-
-    #[derive(Debug)]
-    struct TemporaryScratch(Mutex<std::fs::File>);
-
-    impl ScratchBackend for TemporaryScratch {
-        fn len(&self) -> io::Result<u64> {
-            Ok(self.0.lock().unwrap().metadata()?.len())
-        }
-
-        fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
-            let mut file = self.0.lock().unwrap();
-            file.seek(SeekFrom::Start(offset))?;
-            file.read_exact(out)
-        }
-
-        fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
-            let mut file = self.0.lock().unwrap();
-            file.seek(SeekFrom::Start(offset))?;
-            file.write_all(data)
-        }
-
-        fn set_len(&self, len: u64) -> io::Result<()> {
-            self.0.lock().unwrap().set_len(len)
-        }
-    }
-
-    Ok(Box::new(TemporaryScratch(Mutex::new(
+    Ok(Box::new(TemporaryScratch(std::sync::Mutex::new(
         tempfile::tempfile_in(directory)?,
     ))))
 }
@@ -484,6 +494,12 @@ impl ReadableDatabase for ReadOnlyDatabase {
 }
 
 impl ReadOnlyDatabase {
+    /// Exact fixed cache-index allocation, separate from the configured page cap.
+    #[doc(hidden)]
+    pub fn cache_index_bytes(&self) -> usize {
+        self.mem.cache_index_bytes()
+    }
+
     /// Opens an existing redb database.
     pub fn open(path: impl AsRef<Path>) -> Result<ReadOnlyDatabase, DatabaseError> {
         Builder::new().open_read_only(path)
@@ -631,6 +647,12 @@ impl ReadableDatabase for Database {
 }
 
 impl Database {
+    /// Exact fixed cache-index allocation, separate from the configured page cap.
+    #[doc(hidden)]
+    pub fn cache_index_bytes(&self) -> usize {
+        self.mem.cache_index_bytes()
+    }
+
     /// Settle a writer cache share before exposing its first reader root.
     /// The caller must exclude concurrent database operations during startup.
     /// The returned reserve covers the capacity and any still-held pages.

@@ -22,6 +22,7 @@ pub(super) struct MaintenanceFrontier<'a> {
     retention_cohort_phase: Option<String>,
     cohort_discovered: parking_lot::Mutex<Vec<(String, [u8; 24])>>,
     cohort_clock: parking_lot::Mutex<Option<(Wallclock, Lsn)>>,
+    owner: crate::persistence::writer_source::SourceWindowOwner,
 }
 
 /// Rows of one cross-window expiry cohort that a pass carries forward. The
@@ -54,9 +55,20 @@ impl<'a> MaintenanceFrontier<'a> {
     pub(super) fn capture(
         store: &'a RelationalStore,
         manager: &TransactionManager<DynStore>,
+        owner: crate::persistence::writer_source::SourceWindowOwner,
     ) -> Result<Self> {
         let root = writer_read::durable_root(manager.capture_published_read().handle)?;
-        let source = root.clone().map(WriterRelationalSource::new).transpose()?;
+        let source = root
+            .clone()
+            .map(|root| match &owner {
+                crate::persistence::writer_source::SourceWindowOwner::Read(read_memory) => {
+                    WriterRelationalSource::new_for_read(root, read_memory.clone())
+                }
+                crate::persistence::writer_source::SourceWindowOwner::Write(accountant) => {
+                    WriterRelationalSource::new_for_write(root, accountant.clone())
+                }
+            })
+            .transpose()?;
         if store.uses_disk_backed_committed_bodies() && source.is_none() {
             return Err(Error::Other(
                 "maintenance has no committed durable root".into(),
@@ -75,6 +87,7 @@ impl<'a> MaintenanceFrontier<'a> {
             retention_cohort_phase: None,
             cohort_discovered: parking_lot::Mutex::new(Vec::new()),
             cohort_clock: parking_lot::Mutex::new(None),
+            owner,
         })
     }
 
@@ -111,7 +124,9 @@ impl<'a> MaintenanceFrontier<'a> {
             "Raise MEMORY_LIMIT to admit retention selection controls.",
         )?;
         let cohort_key = format!("retention_cohort/{phase}");
-        if let Some(queued) = root.config_point::<Vec<(String, [u8; 24])>>(&cohort_key)? {
+        if let Some(queued) =
+            root.config_point::<Vec<(String, [u8; 24])>>(self.owner.clone(), &cohort_key)?
+        {
             workspace.try_grow_for(
                 queued
                     .value
@@ -141,7 +156,7 @@ impl<'a> MaintenanceFrontier<'a> {
             .collect::<Vec<_>>();
         tables.sort_unstable_by_key(|(name, _)| *name);
         let rotation_key = format!("retention_selection/{phase}/");
-        if let Some(after) = root.config_point::<String>(&rotation_key)? {
+        if let Some(after) = root.config_point::<String>(self.owner.clone(), &rotation_key)? {
             let start = tables.partition_point(|(name, _)| name.as_str() <= after.value.as_str());
             if start < tables.len() {
                 tables.rotate_left(start);
@@ -175,7 +190,7 @@ impl<'a> MaintenanceFrontier<'a> {
         for (table, meta) in tables {
             let key = format!("retention_selection/{phase}/{table}");
             let declaration = RedbPersistence::currency_cleanup_declaration(meta)?;
-            let saved = root.config_point::<RetentionPosition>(&key)?;
+            let saved = root.config_point::<RetentionPosition>(self.owner.clone(), &key)?;
             let saved = saved
                 .as_ref()
                 .filter(|saved| saved.value.declaration == declaration);
@@ -388,7 +403,7 @@ impl<'a> MaintenanceFrontier<'a> {
         };
         let key = format!("retention_future/{table}");
         let declaration = RedbPersistence::currency_cleanup_declaration(meta)?;
-        let saved = root.config_point::<FutureStampScan>(&key)?;
+        let saved = root.config_point::<FutureStampScan>(self.owner.clone(), &key)?;
         let mut scan = saved
             .as_ref()
             .filter(|saved| saved.value.declaration == declaration)
@@ -531,6 +546,7 @@ impl<'a> MaintenanceFrontier<'a> {
             }) {
                 let _key_memory = RedbPersistence::admit_retention_probe_key(
                     self.root.as_ref().expect("durable reference root"),
+                    &self.owner,
                     128usize.saturating_add(
                         values
                             .iter()

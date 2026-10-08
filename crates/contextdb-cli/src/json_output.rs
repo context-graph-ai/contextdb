@@ -75,6 +75,8 @@ impl ErrorClass {
             | Error::ReceivedSchemaAuthorshipUnavailable { .. } => ErrorClass::Sync,
             Error::StoreCorrupted { .. }
             | Error::ReaderCoordinationUnavailable { .. }
+            | Error::ScratchWorkingStorageUnavailable { .. }
+            | Error::VectorMetadataIo { .. }
             | Error::LegacyVectorStoreDetected { .. }
             | Error::DatabaseLocked { .. }
             | Error::ExportIo { .. }

@@ -302,6 +302,49 @@ impl<K: Key + 'static, V: MutInPlaceValue + 'static> Table<'_, K, V> {
     }
 }
 
+#[cfg(feature = "contextdb-internal")]
+impl<K: Key + 'static> Table<'_, K, &'static [u8]> {
+    /// Reserve a zero-filled byte value without a value-sized temporary buffer.
+    ///
+    /// Replaces any existing value, with the same size limits and borrowed mutable
+    /// destination as `insert_reserve`. The reservation changes the transaction;
+    /// a caller that fails while filling it must abort the transaction.
+    #[doc(hidden)]
+    pub fn insert_zeroed_reserve<'a>(
+        &mut self,
+        key: impl Borrow<K::SelfType<'a>>,
+        value_length: usize,
+    ) -> Result<AccessGuardMutInPlace<'_, &'static [u8]>> {
+        if value_length > MAX_VALUE_LENGTH {
+            return Err(StorageError::ValueTooLarge(value_length));
+        }
+        let key_len = K::as_bytes(key.borrow()).as_ref().len();
+        if key_len > MAX_VALUE_LENGTH {
+            return Err(StorageError::ValueTooLarge(key_len));
+        }
+        if value_length + key_len > MAX_PAIR_LENGTH {
+            return Err(StorageError::ValueTooLarge(value_length + key_len));
+        }
+        #[cfg(not(feature = "test-seams"))]
+        {
+            self.tree.insert_zeroed_reserve(key.borrow(), value_length)
+        }
+        #[cfg(feature = "test-seams")]
+        {
+            let result = self.tree.insert_zeroed_reserve(key.borrow(), value_length);
+            if result.is_ok() {
+                self.transaction.record_table_write_for_test(
+                    &self.name,
+                    crate::TableWriteOperationForTest::Insert,
+                    K::as_bytes(key.borrow()).as_ref(),
+                    value_length,
+                );
+            }
+            result
+        }
+    }
+}
+
 impl<K: Key + 'static, V: Value + 'static> ReadableTableMetadata for Table<'_, K, V> {
     fn stats(&self) -> Result<TableStats> {
         let tree_stats = self.tree.stats()?;

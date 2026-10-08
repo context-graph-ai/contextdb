@@ -308,7 +308,7 @@
      /// Release any resources held by the backend
      ///
      /// Note: redb will not access the backend after calling this method and will call it exactly
-@@ -56,6 +65,54 @@
+@@ -56,6 +65,64 @@
      fn close(&self) -> std::result::Result<(), io::Error> {
          Ok(())
      }
@@ -325,45 +325,55 @@
 +    fn set_len(&self, len: u64) -> io::Result<()>;
 +}
 +
++#[derive(Debug)]
++struct TemporaryScratch(std::sync::Mutex<File>);
++
++impl ScratchBackend for TemporaryScratch {
++    fn len(&self) -> io::Result<u64> {
++        Ok(self.0.lock().unwrap().metadata()?.len())
++    }
++
++    fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
++        use std::io::{Read, Seek, SeekFrom};
++
++        let mut file = self.0.lock().unwrap();
++        file.seek(SeekFrom::Start(offset))?;
++        file.read_exact(out)
++    }
++
++    fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
++        use std::io::{Seek, SeekFrom, Write};
++
++        let mut file = self.0.lock().unwrap();
++        file.seek(SeekFrom::Start(offset))?;
++        file.write_all(data)
++    }
++
++    fn set_len(&self, len: u64) -> io::Result<()> {
++        self.0.lock().unwrap().set_len(len)
++    }
++}
++
++/// Exact requested heap bytes for the concrete boxed backend returned by
++/// [`scratch_backend_in_directory`]. This does not create a file or allocate.
++/// File contents and operating-system file resources are not heap payload bytes.
++#[cfg(feature = "contextdb-internal")]
++#[doc(hidden)]
++pub fn scratch_backend_allocation_size() -> usize {
++    std::mem::size_of::<TemporaryScratch>()
++}
++
 +/// Create an allocator scratch file in the database file's directory.
 +/// The directory entry is removed immediately. An open handle keeps the
 +/// scratch usable, and process death cannot leave a named orphan behind.
 +pub fn scratch_backend_in_directory(directory: &Path) -> io::Result<Box<dyn ScratchBackend>> {
-+    use std::io::{Read, Seek, SeekFrom, Write};
-+    use std::sync::Mutex;
-+
-+    #[derive(Debug)]
-+    struct TemporaryScratch(Mutex<std::fs::File>);
-+
-+    impl ScratchBackend for TemporaryScratch {
-+        fn len(&self) -> io::Result<u64> {
-+            Ok(self.0.lock().unwrap().metadata()?.len())
-+        }
-+
-+        fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
-+            let mut file = self.0.lock().unwrap();
-+            file.seek(SeekFrom::Start(offset))?;
-+            file.read_exact(out)
-+        }
-+
-+        fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
-+            let mut file = self.0.lock().unwrap();
-+            file.seek(SeekFrom::Start(offset))?;
-+            file.write_all(data)
-+        }
-+
-+        fn set_len(&self, len: u64) -> io::Result<()> {
-+            self.0.lock().unwrap().set_len(len)
-+        }
-+    }
-+
-+    Ok(Box::new(TemporaryScratch(Mutex::new(
++    Ok(Box::new(TemporaryScratch(std::sync::Mutex::new(
 +        tempfile::tempfile_in(directory)?,
 +    ))))
  }
  
  pub trait TableHandle: Sealed {
-@@ -305,6 +362,14 @@
+@@ -305,6 +372,14 @@
          Self {
              transaction_tracker: None,
              transaction_id: None,
@@ -378,10 +388,21 @@
              write_transaction: false,
          }
      }
-@@ -424,11 +489,53 @@
-         Builder::new().open_read_only(path)
-     }
+@@ -419,9 +494,47 @@
+ }
  
+ impl ReadOnlyDatabase {
++    /// Exact fixed cache-index allocation, separate from the configured page cap.
++    #[doc(hidden)]
++    pub fn cache_index_bytes(&self) -> usize {
++        self.mem.cache_index_bytes()
++    }
++
+     /// Opens an existing redb database.
+     pub fn open(path: impl AsRef<Path>) -> Result<ReadOnlyDatabase, DatabaseError> {
+         Builder::new().open_read_only(path)
++    }
++
 +    /// Begin a checksum-verifying read at the exact user root captured when
 +    /// this read-only database was established. The backend may be an open
 +    /// descriptor whose pathname has since been replaced; this method never
@@ -412,10 +433,10 @@
 +        snapshot: crate::StorageSnapshotIdentity,
 +    ) -> Result<ReadTransaction, TransactionError> {
 +        ReadTransaction::new_external(self.mem.clone(), snapshot)
-+    }
-+
+     }
+ 
      fn new(
-         file: Box<dyn StorageBackend>,
+@@ -429,6 +542,16 @@
          page_size: usize,
          region_size: Option<u64>,
          cache_size: usize,
@@ -432,7 +453,7 @@
      ) -> Result<Self, DatabaseError> {
          #[cfg(feature = "logging")]
          let file_path = format!("{:?}", &file);
-@@ -441,21 +548,24 @@
+@@ -441,21 +564,24 @@
              region_size,
              cache_size,
              true,
@@ -470,7 +491,7 @@
          let next_transaction_id = mem.get_last_committed_transaction_id()?.next();
          let db = Self {
              mem,
-@@ -502,6 +612,9 @@
+@@ -502,6 +628,9 @@
  pub struct Database {
      mem: Arc<TransactionalMemory>,
      transaction_tracker: Arc<TransactionTracker>,
@@ -480,10 +501,16 @@
  }
  
  impl ReadableDatabase for Database {
-@@ -518,6 +631,26 @@
+@@ -518,6 +647,32 @@
  }
  
  impl Database {
++    /// Exact fixed cache-index allocation, separate from the configured page cap.
++    #[doc(hidden)]
++    pub fn cache_index_bytes(&self) -> usize {
++        self.mem.cache_index_bytes()
++    }
++
 +    /// Settle a writer cache share before exposing its first reader root.
 +    /// The caller must exclude concurrent database operations during startup.
 +    /// The returned reserve covers the capacity and any still-held pages.
@@ -507,7 +534,7 @@
      /// Opens the specified file as a redb database.
      /// * if the file does not exist, or is an empty file, a new database will be initialized in it
      /// * if the file is a valid redb database, it will be opened
-@@ -571,9 +704,17 @@
+@@ -571,9 +726,17 @@
      /// Returns [`DatabaseError::TransactionInProgress`] if any read or write transaction is still
      /// alive when this method is called.
      pub fn check_integrity(&mut self) -> Result<bool, DatabaseError> {
@@ -526,7 +553,7 @@
  
          let old_roots = [self.mem.get_data_root(), self.mem.get_system_root()];
  
-@@ -619,6 +760,7 @@
+@@ -619,6 +782,7 @@
          // Once https://github.com/cberner/redb/issues/829 is fixed, we should upgrade this to use quick-repair -- that way the user
          // can cancel the compaction without requiring a full repair afterwards
          let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -534,7 +561,7 @@
          if txn.list_persistent_savepoints()?.next().is_some() {
              return Err(CompactionError::PersistentSavepointExists);
          }
-@@ -629,6 +771,7 @@
+@@ -629,6 +793,7 @@
          txn.commit().map_err(|e| e.into_storage_error())?;
          // Repeat, just in case executing list_persistent_savepoints() created a new table
          let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -542,7 +569,7 @@
          txn.set_two_phase_commit(true);
          txn.commit().map_err(|e| e.into_storage_error())?;
          // There can't be any outstanding transactions because we have a `&mut self`, so all pending free pages
-@@ -643,6 +786,7 @@
+@@ -643,6 +808,7 @@
              let mut progress = false;
  
              let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -550,7 +577,7 @@
              if txn.compact_pages()? {
                  progress = true;
                  txn.commit().map_err(|e| e.into_storage_error())?;
-@@ -652,6 +796,7 @@
+@@ -652,6 +818,7 @@
  
              // Double commit to free up the relocated pages for reuse
              let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -558,7 +585,7 @@
              txn.set_two_phase_commit(true);
              // Also shrink the database file by the maximum amount
              txn.set_shrink_policy(ShrinkPolicy::Maximum);
-@@ -660,6 +805,7 @@
+@@ -660,6 +827,7 @@
              // TODO: this really shouldn't be necessary, but the data freed tree is a system table
              // and so free'ing up its pages causes more deletes from the system tree
              let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -566,7 +593,7 @@
              txn.set_two_phase_commit(true);
              // Also shrink the database file by the maximum amount
              txn.set_shrink_policy(ShrinkPolicy::Maximum);
-@@ -676,6 +822,218 @@
+@@ -676,6 +844,218 @@
          }
  
          Ok(compacted)
@@ -785,7 +812,7 @@
      }
  
      #[cfg_attr(not(debug_assertions), expect(dead_code))]
-@@ -891,6 +1249,7 @@
+@@ -891,6 +1271,7 @@
          Ok([data_root, system_root])
      }
  
@@ -793,7 +820,7 @@
      fn new(
          file: Box<dyn StorageBackend>,
          allow_initialize: bool,
-@@ -898,6 +1257,8 @@
+@@ -898,6 +1279,8 @@
          region_size: Option<u64>,
          cache_size: usize,
          repair_callback: &(dyn Fn(&mut RepairSession) + 'static),
@@ -802,7 +829,7 @@
      ) -> Result<Self, DatabaseError> {
          #[cfg(feature = "logging")]
          let file_path = format!("{:?}", &file);
-@@ -910,6 +1271,7 @@
+@@ -910,6 +1293,7 @@
              region_size,
              cache_size,
              false,
@@ -810,7 +837,7 @@
          )?;
          let mut mem = Arc::new(mem);
          // If the last transaction used 2-phase commit and updated the allocator state table, then
-@@ -919,7 +1281,12 @@
+@@ -919,7 +1303,12 @@
              info!("Found valid allocator state, full repair not needed");
              mem.load_allocator_state(&tree)?;
              #[cfg(debug_assertions)]
@@ -824,7 +851,7 @@
          } else {
              #[cfg(feature = "logging")]
              warn!("Database {:?} not shutdown cleanly. Repairing", &file_path);
-@@ -944,8 +1311,20 @@
+@@ -944,8 +1333,20 @@
  
          let db = Database {
              mem,
@@ -846,7 +873,7 @@
  
          // Restore the tracker state for any persistent savepoints
          let txn = db.begin_write().map_err(|e| e.into_storage_error())?;
-@@ -1035,12 +1414,21 @@
+@@ -1035,12 +1436,21 @@
      /// write may be in progress at a time. If a write is in progress, this function will block
      /// until it completes.
      pub fn begin_write(&self) -> Result<WriteTransaction, TransactionError> {
@@ -868,7 +895,7 @@
          WriteTransaction::new(guard, self.transaction_tracker.clone(), self.mem.clone())
              .map_err(|e| e.into())
      }
-@@ -1056,16 +1444,74 @@
+@@ -1056,16 +1466,74 @@
  
          Ok(())
      }
@@ -945,7 +972,7 @@
              #[cfg(feature = "logging")]
              warn!("Failed to flush database file. Repair may be required at restart.");
          }
-@@ -1106,6 +1552,7 @@
+@@ -1106,6 +1574,7 @@
      region_size: Option<u64>,
      cache_size: usize,
      repair_callback: Box<dyn Fn(&mut RepairSession)>,
@@ -953,7 +980,7 @@
  }
  
  impl Builder {
-@@ -1125,6 +1572,7 @@
+@@ -1125,6 +1594,7 @@
              // TODO: Default should probably take into account the total system memory
              cache_size: 1024 * 1024 * 1024,
              repair_callback: Box::new(|_| {}),
@@ -961,7 +988,7 @@
          }
      }
  
-@@ -1157,13 +1605,27 @@
+@@ -1157,13 +1627,27 @@
          self
      }
  
@@ -990,7 +1017,7 @@
      pub fn set_region_size(&mut self, size: u64) -> &mut Self {
          assert!(size.is_power_of_two());
          self.region_size = Some(size);
-@@ -1175,6 +1637,7 @@
+@@ -1175,6 +1659,7 @@
      /// * if the file is a valid redb database, it will be opened
      /// * otherwise this function will return an error
      pub fn create(&self, path: impl AsRef<Path>) -> Result<Database, DatabaseError> {
@@ -998,7 +1025,7 @@
          let file = OpenOptions::new()
              .read(true)
              .write(true)
-@@ -1183,26 +1646,71 @@
+@@ -1183,26 +1668,71 @@
              .open(path)?;
  
          Database::new(
@@ -1072,7 +1099,7 @@
          )
      }
  
-@@ -1222,6 +1730,36 @@
+@@ -1222,6 +1752,36 @@
              self.page_size,
              None,
              self.cache_size,
@@ -1109,7 +1136,7 @@
          )
      }
  
-@@ -1236,6 +1774,29 @@
+@@ -1236,6 +1796,29 @@
              self.region_size,
              self.cache_size,
              &self.repair_callback,
@@ -1139,7 +1166,7 @@
          )
      }
  
-@@ -1251,6 +1812,8 @@
+@@ -1251,6 +1834,8 @@
              self.region_size,
              self.cache_size,
              &self.repair_callback,
@@ -1148,7 +1175,7 @@
          )
      }
  }
-@@ -1260,18 +1823,215 @@
+@@ -1260,18 +1845,215 @@
          f.debug_struct("Database").finish()
      }
  }
@@ -1368,8 +1395,13 @@
      struct FailingBackend {
 --- a/src/lib.rs
 +++ b/src/lib.rs
-@@ -64,8 +64,8 @@
+@@ -62,10 +62,13 @@
+ //! [lmdb]: https://www.lmdb.tech/doc/
+ //! [design]: https://github.com/cberner/redb/blob/master/docs/design.md
  
++#[cfg(feature = "contextdb-internal")]
++#[doc(hidden)]
++pub use db::scratch_backend_allocation_size;
  pub use db::{
      Builder, CacheStats, Database, MultimapTableDefinition, MultimapTableHandle, ReadOnlyDatabase,
 -    ReadableDatabase, RepairSession, StorageBackend, TableDefinition, TableHandle,
@@ -1379,7 +1411,7 @@
  };
  pub use error::{
      CommitError, CompactionError, DatabaseError, Error, SavepointError, SetDurabilityError,
-@@ -79,19 +79,40 @@
+@@ -79,19 +82,40 @@
      ExtractIf, Range, ReadOnlyTable, ReadOnlyUntypedTable, ReadableTable, ReadableTableMetadata,
      Table, TableStats,
  };
@@ -1420,7 +1452,7 @@
  mod transaction_tracker;
  mod transactions;
  mod tree_store;
-@@ -106,3 +127,16 @@
+@@ -106,3 +130,16 @@
          tempfile::NamedTempFile::new().unwrap()
      }
  }
@@ -1811,7 +1843,7 @@
      }
  }
  
-@@ -250,7 +282,23 @@
+@@ -250,7 +282,66 @@
          if value_length + key_len > MAX_PAIR_LENGTH {
              return Err(StorageError::ValueTooLarge(value_length + key_len));
          }
@@ -1833,10 +1865,53 @@
 +            }
 +            result
 +        }
++    }
++}
++
++#[cfg(feature = "contextdb-internal")]
++impl<K: Key + 'static> Table<'_, K, &'static [u8]> {
++    /// Reserve a zero-filled byte value without a value-sized temporary buffer.
++    ///
++    /// Replaces any existing value, with the same size limits and borrowed mutable
++    /// destination as `insert_reserve`. The reservation changes the transaction;
++    /// a caller that fails while filling it must abort the transaction.
++    #[doc(hidden)]
++    pub fn insert_zeroed_reserve<'a>(
++        &mut self,
++        key: impl Borrow<K::SelfType<'a>>,
++        value_length: usize,
++    ) -> Result<AccessGuardMutInPlace<'_, &'static [u8]>> {
++        if value_length > MAX_VALUE_LENGTH {
++            return Err(StorageError::ValueTooLarge(value_length));
++        }
++        let key_len = K::as_bytes(key.borrow()).as_ref().len();
++        if key_len > MAX_VALUE_LENGTH {
++            return Err(StorageError::ValueTooLarge(key_len));
++        }
++        if value_length + key_len > MAX_PAIR_LENGTH {
++            return Err(StorageError::ValueTooLarge(value_length + key_len));
++        }
++        #[cfg(not(feature = "test-seams"))]
++        {
++            self.tree.insert_zeroed_reserve(key.borrow(), value_length)
++        }
++        #[cfg(feature = "test-seams")]
++        {
++            let result = self.tree.insert_zeroed_reserve(key.borrow(), value_length);
++            if result.is_ok() {
++                self.transaction.record_table_write_for_test(
++                    &self.name,
++                    crate::TableWriteOperationForTest::Insert,
++                    K::as_bytes(key.borrow()).as_ref(),
++                    value_length,
++                );
++            }
++            result
++        }
      }
  }
  
-@@ -668,3 +716,73 @@
+@@ -668,3 +759,73 @@
          })
      }
  }
@@ -4170,7 +4245,7 @@
 +}
 --- /dev/null
 +++ b/src/tree_store/bounded_bytes.rs
-@@ -0,0 +1,1853 @@
+@@ -0,0 +1,1981 @@
 +//! Reject-only inspection for byte tables. Selected records use ordinary pages.
 +use super::btree::page_checksum;
 +use super::page_store::{Page, PageImpl};
@@ -4323,7 +4398,12 @@
 +}
 +
 +fn verify(page: &PageImpl, checksum: Checksum, hint: PageHint) -> Result<()> {
-+    if hint.verifies_path() && page_checksum(page, None, None)? != checksum {
++    if hint.verifies_path()
++        && page
++            .to_arc()
++            .memoized_byte_node_checksum(|| page_checksum(page, None, None))?
++            != checksum
++    {
 +        return Err(StorageError::Corrupted(
 +            "retained byte-table page failed checksum verification".into(),
 +        ));
@@ -4879,7 +4959,7 @@
 +
 +    #[derive(Clone, Debug)]
 +    struct DamagedNodeBackend {
-+        inner: Arc<crate::backends::InMemoryBackend>,
++        inner: Arc<dyn crate::StorageBackend>,
 +        state: Arc<std::sync::Mutex<NodeDamageState>>,
 +    }
 +
@@ -5549,7 +5629,8 @@
 +        let observation = observe_backend_reads(Arc::new(move |bytes| {
 +            observed.fetch_add(bytes, AtomicOrdering::SeqCst);
 +        }));
-+        let separator_bytes = b"z:unrelated".len() + 128;
++        let separator_bytes =
++            super::super::page_store::PageMemory::admitted_bytes_for_test(b"z:unrelated".len());
 +        crate::with_read_page_charge(
 +            Arc::new(move |bytes| {
 +                if bytes == separator_bytes || bytes > 64 * 1024 {
@@ -6023,10 +6104,132 @@
 +        assert!(handle.key_matches(b"z:unrelated").unwrap());
 +        assert_eq!(handle.materialize().unwrap().1.value(), vec![7; HUGE]);
 +    }
++    #[test]
++    fn verified_bounded_lookup_memo_checks_every_expected_checksum_and_disk_corruption() {
++        use super::super::page_store::PageMemory;
++        use std::os::unix::fs::FileExt;
++        for cache_size in [0, 1024 * 1024] {
++            let directory = tempfile::tempdir().unwrap();
++            let path = directory.path().join("memo.db");
++            let db = Builder::new().set_cache_size(0).create(&path).unwrap();
++            let write = db.begin_write().unwrap();
++            write
++                .open_table(VALUES)
++                .unwrap()
++                .insert(b"key".as_slice(), b"original".as_slice())
++                .unwrap();
++            write.commit().unwrap();
++            drop(db);
++            let disk = std::fs::OpenOptions::new()
++                .read(true)
++                .write(true)
++                .open(&path)
++                .unwrap();
++            let state = Arc::new(std::sync::Mutex::new(NodeDamageState::default()));
++            let backend = DamagedNodeBackend {
++                inner: Arc::new(
++                    crate::backends::FileBackend::new(disk.try_clone().unwrap()).unwrap(),
++                ),
++                state: state.clone(),
++            };
++            let roots = Arc::new(std::sync::Mutex::new(Vec::new()));
++            let registered = roots.clone();
++            let db = Builder::new()
++                .set_cache_size(cache_size)
++                .open_with_backend_and_external_snapshots(
++                    backend,
++                    Arc::new(move || Ok(registered.lock().unwrap().clone())),
++                )
++                .unwrap();
++            let pin = db.begin_read().unwrap();
++            let snapshot = pin.storage_snapshot_identity();
++            roots.lock().unwrap().push(snapshot);
++            let external = db.begin_external_read(snapshot).unwrap();
++            let table = external.open_byte_table_bounded(VALUES).unwrap();
++            let cursor = table.cursor_bounded();
++            let (number, expected) = cursor.next.unwrap();
++            state.lock().unwrap().first_read = None;
++            let before = PageMemory::byte_checksum_counts_for_test();
++            assert_eq!(
++                table.get_bounded(b"key").unwrap().unwrap().value(),
++                b"original"
++            );
++            let computed = PageMemory::byte_checksum_counts_for_test();
++            assert_eq!(
++                computed[if cache_size == 0 { 2 } else { 0 }]
++                    - before[if cache_size == 0 { 2 } else { 0 }],
++                1
++            );
++            assert_eq!(
++                table.get_bounded(b"key").unwrap().unwrap().value(),
++                b"original"
++            );
++            let reused = PageMemory::byte_checksum_counts_for_test();
++            if cache_size != 0 {
++                assert_eq!(reused[0], computed[0]);
++                assert_eq!(reused[3] - computed[3], 1);
++            } else {
++                assert_eq!(reused[2] - computed[2], 1);
++            }
++            let page = cursor.mem.get_page(number, cursor.hint).unwrap();
++            assert_eq!(page.memory()[0], LEAF);
++            let disk_bytes = std::fs::read(&path).unwrap();
++            let offset = disk_bytes
++                .windows(page.memory().len())
++                .position(|bytes| bytes == page.memory())
++                .expect("captured page exists on disk") as u64;
++            validate_node(page.memory()).unwrap();
++            let leaf = LeafAccessor::new(page.memory(), None, None);
++            let (start, end) = leaf.value_range(0).unwrap();
++            let mut corrupt = page.memory().to_vec();
++            corrupt[start] ^= 1;
++            let corrupt_expected = super::super::page_store::xxh3_checksum(&corrupt[..end]);
++            assert_ne!(corrupt_expected, expected);
++            disk.write_all_at(&corrupt[start..start + 1], offset + start as u64)
++                .unwrap();
++            disk.sync_data().unwrap();
++            if cache_size == 0 {
++                // Fresh fault of the real changed disk page: original root
++                // expectation must yield typed corruption through public get.
++                assert_corrupted_without_panic(|| table.get_bounded(b"key"));
++            } else {
++                // Resident immutable bytes keep existing visibility semantics.
++                assert_eq!(
++                    table.get_bounded(b"key").unwrap().unwrap().value(),
++                    b"original"
++                );
++                let before_mismatch = PageMemory::byte_checksum_counts_for_test();
++                // The same production point walker visits its memoized page
++                // with the checksum a corrupt/new parent would supply.
++                assert_corrupted_without_panic(|| {
++                    get(
++                        Some(BtreeHeader::new(number, corrupt_expected, 0)),
++                        &cursor.mem,
++                        cursor.hint,
++                        b"key",
++                    )
++                });
++                let after_mismatch = PageMemory::byte_checksum_counts_for_test();
++                assert_eq!(after_mismatch[0], before_mismatch[0]);
++                assert_eq!(after_mismatch[3] - before_mismatch[3], 1);
++                assert_eq!(
++                    table.get_bounded(b"key").unwrap().unwrap().value(),
++                    b"original"
++                );
++                eprintln!(
++                    "production lookup: one Cached computation, repeated memo hits; corrupt/new expected checksum refused on memo hit"
++                );
++            }
++            // Restore this task-created store before redb close housekeeping.
++            disk.write_all_at(&page.memory()[start..start + 1], offset + start as u64)
++                .unwrap();
++            disk.sync_data().unwrap();
++        }
++    }
 +}
 --- a/src/tree_store/btree.rs
 +++ b/src/tree_store/btree.rs
-@@ -21,6 +21,117 @@
+@@ -21,6 +21,119 @@
  use std::ops::RangeBounds;
  use std::sync::{Arc, Mutex};
  
@@ -6076,10 +6279,12 @@
 +            // allocator payload enters the page cache during navigation.
 +            let keys_start = 4 + count * 4;
 +            let values_start = keys_start + count * width;
-+            let extent = header
-+                .root
-+                .page_size_bytes(mem.get_page_size().try_into().unwrap())
-+                as usize;
++            let extent = usize::try_from(
++                header
++                    .root
++                    .page_size_bytes(mem.get_page_size().try_into().unwrap()),
++            )
++            .map_err(|_| corrupt())?;
 +            if values_start > extent {
 +                return Err(corrupt());
 +            }
@@ -6144,7 +6349,7 @@
  pub(crate) struct BtreeStats {
      pub(crate) tree_height: u32,
      pub(crate) leaf_pages: u64,
-@@ -68,7 +179,7 @@
+@@ -68,7 +181,7 @@
      root: Option<BtreeHeader>,
      hint: PageHint,
      key_width: Option<usize>,
@@ -6153,7 +6358,7 @@
  }
  
  impl UntypedBtree {
-@@ -84,7 +195,7 @@
+@@ -84,7 +197,7 @@
              root,
              hint,
              key_width,
@@ -6162,7 +6367,7 @@
          }
      }
  
-@@ -100,6 +211,106 @@
+@@ -100,6 +213,106 @@
          Ok(())
      }
  
@@ -6269,7 +6474,7 @@
      fn visit_pages_helper<F>(&self, path: PagePath, visitor: &mut F) -> Result
      where
          F: FnMut(&PagePath) -> Result,
-@@ -124,6 +335,14 @@
+@@ -124,6 +337,14 @@
  
          Ok(())
      }
@@ -6284,7 +6489,7 @@
  }
  
  pub(crate) struct UntypedBtreeMut {
-@@ -281,12 +500,12 @@
+@@ -281,12 +502,12 @@
          page_number: PageNumber,
          relocation_map: &HashMap<PageNumber, PageNumber>,
      ) -> Result<Option<(PageNumber, Checksum)>> {
@@ -6298,7 +6503,7 @@
          new_page.memory_mut().copy_from_slice(old_page.memory());
  
          let node_mem = old_page.memory();
-@@ -315,6 +534,8 @@
+@@ -315,6 +536,8 @@
          let mut ignore = PageTrackerPolicy::Ignore;
          if !self.mem.free_if_uncommitted(page_number, &mut ignore) {
              freed_pages.push(page_number);
@@ -6307,7 +6512,7 @@
          }
  
          Ok(Some((new_page.get_page_number(), DEFERRED)))
-@@ -322,7 +543,7 @@
+@@ -322,7 +545,7 @@
  }
  
  pub(crate) struct BtreeMut<'a, K: Key + 'static, V: Value + 'static> {
@@ -6316,7 +6521,7 @@
      transaction_guard: Arc<TransactionGuard>,
      root: Option<BtreeHeader>,
      freed_pages: Arc<Mutex<Vec<PageNumber>>>,
-@@ -522,6 +743,8 @@
+@@ -522,6 +745,8 @@
                  new_page.memory_mut().copy_from_slice(old_page.memory());
                  drop(old_page);
                  freed_pages.push(root.root);
@@ -6325,7 +6530,7 @@
  
                  root.root = new_page.get_page_number();
                  root.checksum = DEFERRED;
-@@ -582,6 +805,8 @@
+@@ -582,6 +807,8 @@
                          .copy_from_slice(old_child_page.memory());
                      drop(old_child_page);
                      freed_pages.push(child_page);
@@ -6334,7 +6539,7 @@
  
                      let mut mutator = BranchMutator::new(page.memory_mut());
                      mutator.write_child_page(child_index, new_page.get_page_number(), DEFERRED);
-@@ -672,6 +897,8 @@
+@@ -672,6 +899,8 @@
          for page in freed {
              if !self.mem.free_if_uncommitted(page, &mut allocated_pages) {
                  freed_pages.push(page);
@@ -6343,7 +6548,7 @@
              }
          }
  
-@@ -711,6 +938,28 @@
+@@ -711,6 +940,28 @@
      }
  }
  
@@ -6372,7 +6577,7 @@
  pub(crate) struct RawBtree {
      mem: Arc<TransactionalMemory>,
      root: Option<BtreeHeader>,
-@@ -760,6 +1009,22 @@
+@@ -760,6 +1011,22 @@
          } else {
              Ok(true)
          }
@@ -6395,7 +6600,7 @@
      }
  
      fn verify_checksum_helper(
-@@ -804,12 +1069,12 @@
+@@ -804,12 +1071,12 @@
  }
  
  pub(crate) struct Btree<K: Key + 'static, V: Value + 'static> {
@@ -6410,7 +6615,7 @@
      _key_type: PhantomData<K>,
      _value_type: PhantomData<V>,
  }
-@@ -822,7 +1087,16 @@
+@@ -822,7 +1089,16 @@
          mem: Arc<TransactionalMemory>,
      ) -> Result<Self> {
          let cached_root = if let Some(header) = root {
@@ -6428,7 +6633,7 @@
          } else {
              None
          };
-@@ -837,6 +1111,24 @@
+@@ -837,6 +1113,24 @@
          })
      }
  
@@ -6453,7 +6658,7 @@
      pub(crate) fn transaction_guard(&self) -> &Arc<TransactionGuard> {
          &self.transaction_guard
      }
-@@ -858,6 +1150,17 @@
+@@ -858,6 +1152,17 @@
              self.hint,
          )
          .verify_checksum()
@@ -6471,7 +6676,7 @@
      }
  
      pub(crate) fn visit_all_pages<F>(&self, visitor: F) -> Result
-@@ -877,6 +1180,10 @@
+@@ -877,6 +1182,10 @@
      pub(crate) fn get(&self, key: &K::SelfType<'_>) -> Result<Option<AccessGuard<'static, V>>> {
          if let Some(ref root_page) = self.cached_root {
              self.get_helper(root_page, K::as_bytes(key).as_ref())
@@ -6482,7 +6687,7 @@
          } else {
              Ok(None)
          }
-@@ -898,8 +1205,10 @@
+@@ -898,8 +1207,10 @@
              }
              BRANCH => {
                  let accessor = BranchAccessor::new(page, K::fixed_width());
@@ -6494,7 +6699,7 @@
                  self.get_helper(&child_page, query)
              }
              _ => unreachable!(),
-@@ -911,6 +1220,10 @@
+@@ -911,6 +1222,10 @@
      ) -> Result<Option<(AccessGuard<'static, K>, AccessGuard<'static, V>)>> {
          if let Some(ref root) = self.cached_root {
              self.first_helper(root.clone())
@@ -6505,7 +6710,7 @@
          } else {
              Ok(None)
          }
-@@ -932,7 +1245,10 @@
+@@ -932,7 +1247,10 @@
              BRANCH => {
                  let accessor = BranchAccessor::new(&page, K::fixed_width());
                  let child_page = accessor.child_page(0).unwrap();
@@ -6517,7 +6722,7 @@
              }
              _ => unreachable!(),
          }
-@@ -943,6 +1259,10 @@
+@@ -943,6 +1261,10 @@
      ) -> Result<Option<(AccessGuard<'static, K>, AccessGuard<'static, V>)>> {
          if let Some(ref root) = self.cached_root {
              self.last_helper(root.clone())
@@ -6528,7 +6733,7 @@
          } else {
              Ok(None)
          }
-@@ -964,8 +1284,12 @@
+@@ -964,8 +1286,12 @@
              }
              BRANCH => {
                  let accessor = BranchAccessor::new(&page, K::fixed_width());
@@ -6543,7 +6748,7 @@
              }
              _ => unreachable!(),
          }
-@@ -975,12 +1299,35 @@
+@@ -975,12 +1301,35 @@
          &self,
          range: &'_ T,
      ) -> Result<BtreeRangeIter<K, V>> {
@@ -6609,7 +6814,24 @@
          Self {
              page: EitherPage::ArcMemory(page),
              offset: range.start,
-@@ -306,7 +308,7 @@
+@@ -222,6 +224,16 @@
+         }
+     }
+ 
++    /// Bytes in the complete backing allocation retained by this guard.
++    /// Fork-only accounting quote; inspecting it neither allocates nor reads IO.
++    #[doc(hidden)]
++    pub fn retained_page_bytes(&self) -> usize {
++        match &self.page {
++            EitherPage::OwnedMemory(value) => value.capacity(),
++            _ => self.page.memory().len(),
++        }
++    }
++
+     /// Access the stored value
+     pub fn value(&self) -> V::SelfType<'_> {
+         V::from_bytes(&self.page.memory()[self.offset..(self.offset + self.len)])
+@@ -306,7 +318,7 @@
              self.entry_index,
              self.key_width,
              V::fixed_width(),
@@ -6618,7 +6840,7 @@
          ) {
              let mut mutator =
                  LeafMutator::new(self.page.memory_mut(), self.key_width, V::fixed_width());
-@@ -358,6 +360,12 @@
+@@ -358,6 +370,12 @@
          self.len = new_end - new_start;
  
          Ok(())
@@ -6631,7 +6853,7 @@
      }
  }
  
-@@ -618,8 +626,32 @@
+@@ -618,8 +636,32 @@
      }
  }
  
@@ -6665,7 +6887,7 @@
      fixed_key_size: Option<usize>,
      fixed_value_size: Option<usize>,
      total_key_bytes: usize,
-@@ -657,6 +689,10 @@
+@@ -657,6 +699,10 @@
      }
  
      pub(super) fn push(&mut self, key: &'a [u8], value: &'a [u8]) {
@@ -6676,7 +6898,7 @@
          self.total_key_bytes += key.len();
          self.total_value_bytes += value.len();
          self.pairs.push((key, value));
-@@ -712,7 +748,7 @@
+@@ -712,7 +758,7 @@
              first_split_key_bytes,
          );
          for (key, value) in self.pairs.iter().take(division) {
@@ -6685,7 +6907,7 @@
          }
          drop(builder);
  
-@@ -731,7 +767,7 @@
+@@ -731,7 +777,7 @@
              self.total_key_bytes - first_split_key_bytes,
          );
          for (key, value) in &self.pairs[division..] {
@@ -6694,7 +6916,7 @@
          }
          drop(builder);
  
-@@ -753,7 +789,7 @@
+@@ -753,7 +799,7 @@
              self.total_key_bytes,
          );
          for (key, value) in self.pairs {
@@ -6703,7 +6925,7 @@
          }
          drop(builder);
          Ok(page)
-@@ -877,6 +913,10 @@
+@@ -877,6 +923,10 @@
      }
  
      pub(crate) fn append(&mut self, key: &[u8], value: &[u8]) {
@@ -6714,7 +6936,7 @@
          if let Some(key_width) = self.fixed_key_size {
              assert_eq!(key_width, key.len());
          }
-@@ -915,7 +955,7 @@
+@@ -915,7 +965,7 @@
                      .to_le_bytes(),
              );
          }
@@ -6723,7 +6945,7 @@
          self.pairs_written += 1;
      }
  }
-@@ -959,7 +999,7 @@
+@@ -959,7 +1009,7 @@
          position: usize,
          fixed_key_size: Option<usize>,
          fixed_value_size: Option<usize>,
@@ -6732,7 +6954,7 @@
      ) -> bool {
          let accessor = LeafAccessor::new(page.memory(), fixed_key_size, fixed_value_size);
          let remaining = page.memory().len() - accessor.total_length();
-@@ -967,7 +1007,7 @@
+@@ -967,7 +1017,7 @@
              .value_range(position)
              .map(|(s, e)| e - s)
              .unwrap_or_default();
@@ -6741,7 +6963,7 @@
              - isize::try_from(existing_value_len).unwrap();
          required_delta <= isize::try_from(remaining).unwrap()
      }
-@@ -978,7 +1018,7 @@
+@@ -978,7 +1028,7 @@
          fixed_key_size: Option<usize>,
          fixed_value_size: Option<usize>,
          new_key: &[u8],
@@ -6750,7 +6972,7 @@
      ) -> bool {
          let accessor = LeafAccessor::new(page.memory(), fixed_key_size, fixed_value_size);
          // If this is a large page, only allow in-place appending to avoid write amplification
-@@ -989,7 +1029,7 @@
+@@ -989,7 +1039,7 @@
              return false;
          }
          let remaining = page.memory().len() - accessor.total_length();
@@ -6759,7 +6981,7 @@
          if fixed_key_size.is_none() {
              required_delta += size_of::<u32>();
          }
-@@ -1001,6 +1041,10 @@
+@@ -1001,6 +1051,10 @@
  
      // Replace the value at index `i` with `value`, leaving the key unchanged.
      pub(crate) fn replace(&mut self, i: usize, value: &[u8]) {
@@ -6770,7 +6992,7 @@
          let accessor = LeafAccessor::new(self.page, self.fixed_key_size, self.fixed_value_size);
          let num_pairs = accessor.num_pairs();
          let last_value_end = accessor.value_end(num_pairs - 1).unwrap();
-@@ -1031,11 +1075,11 @@
+@@ -1031,11 +1085,11 @@
  
          // Write the new value
          dest -= value.len();
@@ -6784,7 +7006,7 @@
          let accessor = LeafAccessor::new(self.page, self.fixed_key_size, self.fixed_value_size);
          let required_delta = {
              let mut delta = key.len() + value.len();
-@@ -1093,7 +1137,7 @@
+@@ -1093,7 +1147,7 @@
          // Insert the value
          let inserted_value_end: u32 = dest.try_into().unwrap();
          dest -= value.len();
@@ -7948,7 +8170,16 @@
          self.mem.clone()
      }
  }
-@@ -210,7 +215,7 @@
+@@ -204,13 +209,16 @@
+         *value -= 1;
+         if *value == 0 {
+             open_pages.remove(&self.page_number);
++            if open_pages.is_empty() {
++                *open_pages = HashMap::new();
++            }
+         }
+     }
+ }
  
  impl Page for PageImpl {
      fn memory(&self) -> &[u8] {
@@ -7957,11 +8188,25 @@
      }
  
      fn get_page_number(&self) -> PageNumber {
-@@ -271,10 +276,20 @@
-     }
- }
- 
+@@ -267,14 +275,30 @@
+ impl Drop for PageMut<'_> {
+     fn drop(&mut self) {
+         #[cfg(debug_assertions)]
+-        assert!(self.open_pages.lock().unwrap().remove(&self.page_number));
+-    }
+-}
+-
 -#[derive(Copy, Clone)]
++        {
++            let mut open_pages = self.open_pages.lock().unwrap();
++            assert!(open_pages.remove(&self.page_number));
++            if open_pages.is_empty() {
++                *open_pages = HashSet::new();
++            }
++        }
++    }
++}
++
 +#[derive(Copy, Clone, PartialEq, Eq)]
  pub(crate) enum PageHint {
      None,
@@ -8639,7 +8884,15 @@
              allocator.clear(page_number);
 --- a/src/tree_store/page_store/cached_file.rs
 +++ b/src/tree_store/page_store/cached_file.rs
-@@ -15,6 +15,79 @@
+@@ -1,5 +1,6 @@
+ use crate::tree_store::page_store::base::PageHint;
+-use crate::tree_store::page_store::lru_cache::LRUCache;
++use crate::tree_store::page_store::header::DB_HEADER_SIZE;
++use crate::tree_store::page_store::lru_cache::{EntryArena, LRUCache, WriteCache};
+ use crate::{CacheStats, DatabaseError, Result, StorageBackend, StorageError};
+ use std::ops::{Index, IndexMut};
+ use std::slice::SliceIndex;
+@@ -15,6 +16,178 @@
      std::iter::repeat_n(0u8, len).collect()
  }
  
@@ -8666,14 +8919,16 @@
 +pub(crate) struct CachedPage {
 +    bytes: Arc<[u8]>,
 +    counted: Arc<AtomicUsize>,
++    byte_node_checksum: Mutex<Option<u128>>,
 +}
 +
 +impl CachedPage {
-+    /// `counted` must already include this page's length.
++    /// `counted` must already include payload and immutable owner controls.
 +    fn admitted(bytes: Arc<[u8]>, counted: &Arc<AtomicUsize>) -> Arc<Self> {
 +        Arc::new(Self {
 +            bytes,
 +            counted: Arc::clone(counted),
++            byte_node_checksum: Mutex::new(None),
 +        })
 +    }
 +
@@ -8684,13 +8939,110 @@
 +
 +impl Drop for CachedPage {
 +    fn drop(&mut self) {
-+        self.counted.fetch_sub(self.bytes.len(), Ordering::AcqRel);
++        self.counted
++            .fetch_sub(cached_page_bytes(self.bytes.len()), Ordering::AcqRel);
 +    }
 +}
 +
 +pub(crate) struct ChargedPage {
 +    bytes: Arc<[u8]>,
 +    _charge: crate::read_admission::ReadPageCharge,
++    byte_node_checksum: Mutex<Option<u128>>,
++}
++
++// Arc's two reference counters precede its aligned inline value. The byte
++// allocation has the same two counters; the slot itself allocates no heap.
++const fn arc_control_bytes<T>() -> usize {
++    let header = 2 * size_of::<usize>();
++    let alignment = align_of::<T>();
++    header.next_multiple_of(alignment) + size_of::<T>()
++}
++
++const fn cached_page_bytes(len: usize) -> usize {
++    len.saturating_add(2 * size_of::<usize>())
++        .saturating_add(arc_control_bytes::<CachedPage>())
++}
++
++const fn admitted_page_bytes(len: usize) -> usize {
++    // Preserve the pre-existing directory/window allowance independently of
++    // the actual immutable wrapper and Arc controls; it never funds the memo.
++    let controls = if arc_control_bytes::<CachedPage>() > arc_control_bytes::<ChargedPage>() {
++        arc_control_bytes::<CachedPage>()
++    } else {
++        arc_control_bytes::<ChargedPage>()
++    };
++    len.saturating_add(128)
++        .saturating_add(2 * size_of::<usize>())
++        .saturating_add(controls)
++}
++
++#[cfg(test)]
++thread_local! {
++    // Computations for Cached/Charged/Plain, followed by Cached/Charged hits.
++    static BYTE_CHECKSUM_COUNTS: std::cell::Cell<[usize; 5]> = const { std::cell::Cell::new([0; 5]) };
++}
++
++impl PageMemory {
++    #[cfg(test)]
++    pub(crate) fn admitted_bytes_for_test(len: usize) -> usize {
++        admitted_page_bytes(len)
++    }
++
++    #[cfg(test)]
++    pub(crate) fn byte_checksum_counts_for_test() -> [usize; 5] {
++        BYTE_CHECKSUM_COUNTS.with(std::cell::Cell::get)
++    }
++
++    /// Cache only the computation for variable-width byte nodes. The caller
++    /// must validate their layout first and compare its expected checksum on
++    /// every visit. This slot grants no authentication or root authority.
++    pub(crate) fn memoized_byte_node_checksum(
++        &self,
++        compute: impl FnOnce() -> Result<u128>,
++    ) -> Result<u128> {
++        let slot = match self {
++            Self::Cached(page) => &page.byte_node_checksum,
++            Self::Charged(page) => &page.byte_node_checksum,
++            Self::Plain(_) => {
++                #[cfg(test)]
++                BYTE_CHECKSUM_COUNTS.with(|counts| {
++                    let mut value = counts.get();
++                    value[2] += 1;
++                    counts.set(value);
++                });
++                return compute();
++            }
++        };
++        // Only immutable bytes are read by compute; no cache, admission, or
++        // page-manager callback runs under this object-local mutex.
++        let mut stored = slot.lock().unwrap();
++        if let Some(checksum) = *stored {
++            #[cfg(test)]
++            BYTE_CHECKSUM_COUNTS.with(|counts| {
++                let mut value = counts.get();
++                value[if matches!(self, Self::Cached(_)) {
++                    3
++                } else {
++                    4
++                }] += 1;
++                counts.set(value);
++            });
++            return Ok(checksum);
++        }
++        #[cfg(test)]
++        BYTE_CHECKSUM_COUNTS.with(|counts| {
++            let mut value = counts.get();
++            value[if matches!(self, Self::Cached(_)) {
++                0
++            } else {
++                1
++            }] += 1;
++            counts.set(value);
++        });
++        let checksum = compute()?;
++        *stored = Some(checksum);
++        Ok(checksum)
++    }
 +}
 +
 +impl std::fmt::Debug for PageMemory {
@@ -8719,7 +9071,16 @@
  pub(super) struct WritablePage {
      buffer: Arc<Mutex<LRUWriteCache>>,
      offset: u64,
-@@ -165,6 +238,8 @@
+@@ -56,7 +229,7 @@
+ 
+ #[derive(Default)]
+ struct LRUWriteCache {
+-    cache: LRUCache<Option<Arc<[u8]>>>,
++    cache: WriteCache<Option<Arc<[u8]>>>,
+ }
+ 
+ impl LRUWriteCache {
+@@ -165,6 +338,8 @@
          let result = self.file.read(offset, out);
          if result.is_err() {
              self.io_failed.store(true, Ordering::Release);
@@ -8728,7 +9089,7 @@
          }
          result.map_err(StorageError::from)
      }
-@@ -172,7 +247,13 @@
+@@ -172,7 +347,13 @@
      fn set_len(&self, len: u64) -> Result<()> {
          self.check_failure()?;
          let result = self.file.set_len(len);
@@ -8743,7 +9104,7 @@
              self.io_failed.store(true, Ordering::Release);
          }
          result.map_err(StorageError::from)
-@@ -218,9 +299,13 @@
+@@ -218,9 +399,13 @@
      // soft limit and momentary over-/under-counting by one page is harmless.
      // A third "total" counter would add contention on every insert/remove for
      // negligible accuracy gain.
@@ -8759,16 +9120,24 @@
      // Rotates the starting stripe for read-cache eviction
      next_eviction_stripe: AtomicUsize,
      #[cfg(feature = "cache_metrics")]
-@@ -233,7 +318,7 @@
+@@ -233,7 +418,7 @@
      writes_hits: AtomicU64,
      #[cfg(feature = "cache_metrics")]
      evictions: AtomicU64,
 -    read_cache: Vec<RwLock<LRUCache<Arc<[u8]>>>>,
-+    read_cache: Vec<RwLock<LRUCache<Arc<CachedPage>>>>,
++    read_cache: Box<[RwLock<LRUCache<Arc<CachedPage>>>]>,
      // TODO: maybe move this cache to WriteTransaction?
      write_buffer: Arc<Mutex<LRUWriteCache>>,
  }
-@@ -251,9 +336,9 @@
+@@ -244,16 +429,14 @@
+         page_size: u64,
+         max_cache_size: usize,
+     ) -> Result<Self, DatabaseError> {
+-        let read_cache = (0..Self::lock_stripes())
+-            .map(|_| RwLock::new(LRUCache::new()))
+-            .collect();
++        let read_cache = Self::new_read_index(max_cache_size, page_size as usize, 0);
+ 
          Ok(Self {
              file: CheckedBackend::new(file),
              page_size,
@@ -8780,7 +9149,59 @@
              next_eviction_stripe: AtomicUsize::new(0),
              #[cfg(feature = "cache_metrics")]
              reads_total: Default::default(),
-@@ -301,6 +386,24 @@
+@@ -268,6 +451,51 @@
+             read_cache,
+             write_buffer: Arc::new(Mutex::new(LRUWriteCache::new())),
+         })
++    }
++
++    fn read_index_entries(bytes: usize, page_size: usize, held_entries: usize) -> usize {
++        // Only the database header can be smaller than a full page, and its
++        // offset-zero key occupies at most one slot across all stripes.
++        (bytes / cached_page_bytes(page_size))
++            .saturating_add(1)
++            .max(held_entries)
++    }
++
++    fn new_read_index(
++        bytes: usize,
++        page_size: usize,
++        held_entries: usize,
++    ) -> Box<[RwLock<LRUCache<Arc<CachedPage>>>]> {
++        let entries = Self::read_index_entries(bytes, page_size, held_entries);
++        let arena = EntryArena::new(entries);
++        let heads = entries
++            .div_ceil(Self::lock_stripes() as usize)
++            .next_power_of_two();
++        (0..Self::lock_stripes())
++            .map(|_| RwLock::new(LRUCache::new(arena.clone(), heads)))
++            .collect::<Vec<_>>()
++            .into_boxed_slice()
++    }
++
++    fn uncached(
++        buffer: Arc<[u8]>,
++        charge: Option<crate::read_admission::ReadPageCharge>,
++    ) -> PageMemory {
++        match charge {
++            Some(charge) => PageMemory::Charged(Arc::new(ChargedPage {
++                bytes: buffer,
++                _charge: charge,
++                byte_node_checksum: Mutex::new(None),
++            })),
++            None => PageMemory::Plain(buffer),
++        }
++    }
++
++    pub(crate) fn index_bytes(&self) -> usize {
++        let read = self.read_cache[0].read().unwrap();
++        read.arena_index_bytes()
++            + read.index_bytes() * self.read_cache.len()
++            + self.read_cache.len() * size_of::<RwLock<LRUCache<Arc<CachedPage>>>>()
+     }
+ 
+     #[allow(clippy::unused_self)]
+@@ -301,6 +529,42 @@
                  used_bytes: read_bytes + write_bytes,
              }
          }
@@ -8793,38 +9214,70 @@
 +    pub(crate) fn settle_startup_cache_budget(&self, bytes: usize) -> Result<usize> {
 +        if self.max_cache_size.load(Ordering::Acquire) != bytes {
 +            self.flush_write_buffer()?;
-+            let lock = self.write_buffer.lock().unwrap();
-+            self.max_cache_size.store(bytes, Ordering::Release);
-+            let retained = self.read_cache_bytes.load(Ordering::Acquire);
-+            self.evict_from_read_cache(retained.saturating_sub(bytes), &lock);
 +        }
++        let write = self.write_buffer.lock().unwrap();
++        self.max_cache_size.store(bytes, Ordering::Release);
++        let retained = self.read_cache_bytes.load(Ordering::Acquire);
++        self.evict_from_read_cache(retained.saturating_sub(bytes), &write);
++        let mut locks = self
++            .read_cache
++            .iter()
++            .map(|stripe| stripe.write().unwrap())
++            .collect::<Vec<_>>();
++        let held_entries = locks.iter().map(|stripe| stripe.len()).sum();
++        let required_entries =
++            Self::read_index_entries(bytes, self.page_size as usize, held_entries);
++        if locks[0].arena_capacity() != required_entries {
++            let next = Self::new_read_index(bytes, self.page_size as usize, held_entries);
++            for (old, replacement) in locks.iter_mut().zip(next.iter()) {
++                let mut replacement = replacement.write().unwrap();
++                old.transfer_to(&mut replacement);
++                std::mem::swap(&mut **old, &mut *replacement);
++            }
++        }
++        drop(locks);
++        drop(write);
 +        Ok(bytes.max(
 +            self.read_cache_bytes.load(Ordering::Acquire)
 +                + self.write_buffer_bytes.load(Ordering::Acquire),
-+        ))
++        ) + self.index_bytes())
      }
  
      pub(crate) fn close(&self) -> Result {
-@@ -344,8 +447,11 @@
+@@ -339,13 +603,17 @@
+             let stripe = (start + i) % num_stripes;
+             let mut lock = self.read_cache[stripe].write().unwrap();
+             while freed < bytes_needed {
+-                if let Some((_, v)) = lock.pop_lowest_priority() {
++                if let Some((_, v)) =
++                    lock.pop_lowest_priority_where(|page| Arc::strong_count(page) == 1)
++                {
+                     #[cfg(feature = "cache_metrics")]
                      {
                          self.evictions.fetch_add(1, Ordering::Relaxed);
                      }
 -                    freed += v.len();
 -                    self.read_cache_bytes.fetch_sub(v.len(), Ordering::AcqRel);
-+                    // A page a reader still holds is not freed by leaving the
-+                    // cache; it stays counted until that reader drops it.
-+                    if Arc::strong_count(&v) == 1 {
-+                        freed += v.len();
-+                    }
++                    // The stripe write lock prevents a new cache holder from
++                    // appearing after victim selection. Pinned entries stay
++                    // linked, so their later release cannot leave a cache hole.
++                    freed += cached_page_bytes(v.len());
                  } else {
                      break;
                  }
-@@ -368,14 +474,15 @@
+@@ -364,21 +632,27 @@
+         // drained, so the total check only considers the read cache size.
+         for (offset, buffer) in write_buffer.cache.iter_mut() {
+             let buffer = buffer.take().unwrap();
++            let page_bytes = cached_page_bytes(buffer.len());
+             let cache_size = self
                  .read_cache_bytes
-                 .fetch_add(buffer.len(), Ordering::AcqRel);
- 
+-                .fetch_add(buffer.len(), Ordering::AcqRel);
+-
 -            if cache_size + buffer.len() <= self.max_cache_size {
-+            if cache_size + buffer.len() <= self.max_cache_size.load(Ordering::Acquire) {
++                .fetch_add(page_bytes, Ordering::AcqRel);
++
++            if cache_size + page_bytes <= self.max_cache_size.load(Ordering::Acquire) {
                  let cache_slot: usize = (offset % Self::lock_stripes()).try_into().unwrap();
                  let mut lock = self.read_cache[cache_slot].write().unwrap();
 -                if let Some(replaced) = lock.insert(*offset, buffer) {
@@ -8834,14 +9287,22 @@
 -                }
 +                // A race could replace an existing buffer; dropping it gives
 +                // back its count once no reader holds it.
-+                drop(lock.insert(
++                debug_assert!(
++                    buffer.len() >= self.page_size as usize
++                        || (*offset == 0 && buffer.len() == DB_HEADER_SIZE)
++                );
++                drop(lock.try_insert(
 +                    *offset,
 +                    CachedPage::admitted(buffer, &self.read_cache_bytes),
 +                ));
              } else {
                  self.read_cache_bytes
-                     .fetch_sub(buffer.len(), Ordering::AcqRel);
-@@ -390,10 +497,28 @@
+-                    .fetch_sub(buffer.len(), Ordering::AcqRel);
++                    .fetch_sub(page_bytes, Ordering::AcqRel);
+                 break;
+             }
+         }
+@@ -390,10 +664,28 @@
  
      // Caller should invalidate all cached pages that are no longer valid
      pub(super) fn resize(&self, len: u64) -> Result {
@@ -8861,8 +9322,8 @@
 +            loop {
 +                let stale = lock
 +                    .iter()
-+                    .find(|(offset, page)| **offset + page.len() as u64 > len)
-+                    .map(|(offset, _)| *offset);
++                    .find(|(offset, page)| *offset + page.len() as u64 > len)
++                    .map(|(offset, _)| offset);
 +                let Some(offset) = stale else {
 +                    break;
 +                };
@@ -8872,7 +9333,7 @@
      }
  
      pub(super) fn flush(&self) -> Result {
-@@ -419,15 +544,22 @@
+@@ -419,15 +711,22 @@
      // Like `read_direct`, but writes directly into an `Arc<[u8]>` instead of a
      // `Vec<u8>` that is then copied into an `Arc`. The buffer is zero-filled
      // because `StorageBackend::read` takes `&mut [u8]`.
@@ -8884,7 +9345,7 @@
 +    ) -> Result<(Arc<[u8]>, Option<crate::read_admission::ReadPageCharge>)> {
 +        // The page and its cache entry must be admitted before allocation,
 +        // including a single value larger than the configured cache.
-+        let charge = crate::read_admission::admit_read_memory(len.saturating_add(128))?;
++        let charge = crate::read_admission::admit_read_memory(admitted_page_bytes(len))?;
          let mut arc = zero_filled_arc(len);
          self.file.read(offset, Arc::get_mut(&mut arc).unwrap())?;
 -        Ok(arc)
@@ -8898,7 +9359,7 @@
          debug_assert_eq!(0, offset % self.page_size);
          #[cfg(feature = "cache_metrics")]
          self.reads_total.fetch_add(1, Ordering::AcqRel);
-@@ -438,7 +570,7 @@
+@@ -438,7 +737,7 @@
                  #[cfg(feature = "cache_metrics")]
                  self.reads_hits.fetch_add(1, Ordering::Release);
                  debug_assert_eq!(cached.len(), len);
@@ -8907,7 +9368,7 @@
              }
          }
  
-@@ -449,45 +581,137 @@
+@@ -449,45 +748,163 @@
                  #[cfg(feature = "cache_metrics")]
                  self.reads_hits.fetch_add(1, Ordering::Release);
                  debug_assert_eq!(cached.len(), len);
@@ -8920,22 +9381,14 @@
 -        let mut write_lock = self.read_cache[cache_slot].write().unwrap();
 -        let cache_size = if let Some(replaced) = write_lock.insert(offset, buffer.clone()) {
 -            // A race could cause us to replace an existing buffer
--            self.read_cache_bytes
--                .fetch_sub(replaced.len(), Ordering::AcqRel)
--        } else {
--            cache_size
--        };
--
--        // Rule 3: evict from this read-cache slot if the total exceeds the
--        // budget.  We evict exactly `len` bytes (one page) per miss to avoid
--        // over-eviction spikes.
 +                return Ok(PageMemory::Cached(cached.clone()));
 +            }
 +        }
 +
 +        let (buffer, charge) = self.read_direct_into_arc(offset, len)?;
++        let page_bytes = cached_page_bytes(len);
 +        if crate::read_admission::scan_reads_active()
-+            && !crate::read_admission::take_scan_growth(len)
++            && !crate::read_admission::take_scan_growth(page_bytes)
 +        {
 +            // Past its growth allowance a scan's miss replaces evictable
 +            // cached bytes and never grows the cache. When nothing evictable
@@ -8944,35 +9397,57 @@
 +            let before = self.read_cache_bytes.load(Ordering::Acquire);
 +            {
 +                let lock = self.write_buffer.lock().unwrap();
-+                self.evict_from_read_cache(len, &lock);
++                self.evict_from_read_cache(page_bytes, &lock);
 +            }
 +            let after = self.read_cache_bytes.load(Ordering::Acquire);
-+            if before.saturating_sub(after) < len {
++            if before.saturating_sub(after) < page_bytes {
 +                return Ok(match charge {
 +                    Some(charge) => PageMemory::Charged(Arc::new(ChargedPage {
 +                        bytes: buffer,
 +                        _charge: charge,
++                        byte_node_checksum: Mutex::new(None),
 +                    })),
 +                    None => PageMemory::Plain(buffer),
 +                });
 +            }
 +            // Installed at lowest priority: the scan's next miss replaces it
 +            // unless it is read again, leaving the warm working set in place.
-+            let previous = self.read_cache_bytes.fetch_add(len, Ordering::AcqRel);
++            let previous = self
++                .read_cache_bytes
++                .fetch_add(page_bytes, Ordering::AcqRel);
 +            let write_bytes = self.write_buffer_bytes.load(Ordering::Acquire);
-+            if previous + len + write_bytes <= self.max_cache_size.load(Ordering::Acquire) {
-+                let page = CachedPage::admitted(buffer, &self.read_cache_bytes);
++            if previous + page_bytes + write_bytes <= self.max_cache_size.load(Ordering::Acquire) {
++                debug_assert!(
++                    len >= self.page_size as usize || (offset == 0 && len == DB_HEADER_SIZE)
++                );
++                let page = CachedPage::admitted(buffer.clone(), &self.read_cache_bytes);
 +                let mut write_lock = self.read_cache[cache_slot].write().unwrap();
-+                drop(write_lock.insert_lowest_priority(offset, page.clone()));
++                let inserted = write_lock
++                    .try_insert_lowest_priority(offset, page.clone())
++                    .is_ok();
 +                drop(write_lock);
-+                drop(charge);
-+                return Ok(PageMemory::Cached(page));
++                if inserted {
++                    drop(charge);
++                    return Ok(PageMemory::Cached(page));
++                }
++                drop(page);
++                return Ok(Self::uncached(buffer, charge));
 +            }
-+            self.read_cache_bytes.fetch_sub(len, Ordering::AcqRel);
+             self.read_cache_bytes
+-                .fetch_sub(replaced.len(), Ordering::AcqRel)
+-        } else {
+-            cache_size
+-        };
+-
+-        // Rule 3: evict from this read-cache slot if the total exceeds the
+-        // budget.  We evict exactly `len` bytes (one page) per miss to avoid
+-        // over-eviction spikes.
++                .fetch_sub(page_bytes, Ordering::AcqRel);
 +            return Ok(match charge {
 +                Some(charge) => PageMemory::Charged(Arc::new(ChargedPage {
 +                    bytes: buffer,
 +                    _charge: charge,
++                    byte_node_checksum: Mutex::new(None),
 +                })),
 +                None => PageMemory::Plain(buffer),
 +            });
@@ -9003,35 +9478,45 @@
 -
 -        Ok(buffer)
 +        let cache_size = self.read_cache_bytes.load(Ordering::Acquire);
-+        if cache_size + len + write_bytes > self.max_cache_size.load(Ordering::Acquire) {
++        if cache_size + page_bytes + write_bytes > self.max_cache_size.load(Ordering::Acquire) {
 +            let lock = self.write_buffer.lock().unwrap();
 +            self.evict_from_read_cache(
-+                cache_size + len + write_bytes - self.max_cache_size.load(Ordering::Acquire),
++                cache_size + page_bytes + write_bytes - self.max_cache_size.load(Ordering::Acquire),
 +                &lock,
 +            );
 +        }
 +
 +        // Admit the page to the cache only if its count still fits the
 +        // budget, so every page the cache's count covers stays inside it.
-+        let previous = self.read_cache_bytes.fetch_add(len, Ordering::AcqRel);
++        let previous = self
++            .read_cache_bytes
++            .fetch_add(page_bytes, Ordering::AcqRel);
 +        let write_bytes = self.write_buffer_bytes.load(Ordering::Acquire);
-+        if previous + len + write_bytes <= self.max_cache_size.load(Ordering::Acquire) {
-+            let page = CachedPage::admitted(buffer, &self.read_cache_bytes);
++        if previous + page_bytes + write_bytes <= self.max_cache_size.load(Ordering::Acquire) {
++            debug_assert!(
++                len >= self.page_size as usize || (offset == 0 && len == DB_HEADER_SIZE)
++            );
++            let page = CachedPage::admitted(buffer.clone(), &self.read_cache_bytes);
 +            let mut write_lock = self.read_cache[cache_slot].write().unwrap();
 +            // A race could replace an existing buffer; dropping it gives back
 +            // its count once no reader holds it.
-+            drop(write_lock.insert(offset, page.clone()));
++            let inserted = write_lock.try_insert(offset, page.clone()).is_ok();
 +            drop(write_lock);
-+            // The cache's budget pays for the page from here on, so any
-+            // reader charge is given back at once.
-+            drop(charge);
-+            return Ok(PageMemory::Cached(page));
++            if inserted {
++                // The native reserve owns a page only after index insertion.
++                drop(charge);
++                return Ok(PageMemory::Cached(page));
++            }
++            drop(page);
++            return Ok(Self::uncached(buffer, charge));
 +        }
-+        self.read_cache_bytes.fetch_sub(len, Ordering::AcqRel);
++        self.read_cache_bytes
++            .fetch_sub(page_bytes, Ordering::AcqRel);
 +        Ok(match charge {
 +            Some(charge) => PageMemory::Charged(Arc::new(ChargedPage {
 +                bytes: buffer,
 +                _charge: charge,
++                byte_node_checksum: Mutex::new(None),
 +            })),
 +            None => PageMemory::Plain(buffer),
 +        })
@@ -9051,7 +9536,7 @@
 +                "page window exceeds allocation".into(),
 +            ));
 +        }
-+        let charge = crate::read_admission::admit_read_memory(range.len().saturating_add(128))?;
++        let charge = crate::read_admission::admit_read_memory(admitted_page_bytes(range.len()))?;
 +        let mut bytes = zero_filled_arc(range.len());
 +        let output = Arc::get_mut(&mut bytes).unwrap();
 +        let mut copied = false;
@@ -9077,13 +9562,14 @@
 +            Some(charge) => PageMemory::Charged(Arc::new(ChargedPage {
 +                bytes,
 +                _charge: charge,
++                byte_node_checksum: Mutex::new(None),
 +            })),
 +            None => PageMemory::Plain(bytes),
 +        })
      }
  
      // Discard pending writes to the given range
-@@ -507,18 +731,13 @@
+@@ -507,18 +924,13 @@
          let mut lock = self.read_cache[cache_slot].write().unwrap();
          if let Some(removed) = lock.remove(offset) {
              assert_eq!(len, removed.len());
@@ -9103,7 +9589,7 @@
          }
      }
  
-@@ -539,9 +758,9 @@
+@@ -539,9 +951,9 @@
                      "cache inconsistency {len} != {} for offset {offset}",
                      removed.len()
                  );
@@ -9116,7 +9602,7 @@
              } else {
                  None
              }
-@@ -554,7 +773,7 @@
+@@ -554,7 +966,7 @@
          } else {
              let previous = self.write_buffer_bytes.fetch_add(len, Ordering::AcqRel);
              let mut write_bytes = previous + len;
@@ -9125,7 +9611,7 @@
  
              // Rule 1: write buffer NEVER exceeds 50%.  Flush excess to disk.
              if write_bytes > half {
-@@ -586,8 +805,11 @@
+@@ -586,8 +998,11 @@
              // exceeds the budget then read must be > 50%, so evict from the
              // read cache (fairness: we only take from read when read > 50%).
              let read_bytes = self.read_cache_bytes.load(Ordering::Acquire);
@@ -9139,7 +9625,7 @@
              }
              let result = if let Some(data) = existing {
                  #[cfg(feature = "cache_metrics")]
-@@ -598,7 +820,9 @@
+@@ -598,7 +1013,9 @@
                  self.writes_hits.fetch_add(1, Ordering::AcqRel);
                  zero_filled_arc(len)
              } else {
@@ -9150,7 +9636,7 @@
              };
              lock.insert(offset, result);
              lock.take_value(offset).unwrap()
-@@ -618,9 +842,97 @@
+@@ -618,9 +1035,103 @@
      use crate::StorageBackend;
      use crate::backends::InMemoryBackend;
      use crate::tree_store::PageHint;
@@ -9229,7 +9715,10 @@
 +        cached_file.invalidate_cache(384, 128);
 +        assert_eq!(cached_file.read_cache_bytes.load(Ordering::Acquire), 0);
 +        cached_file.read(128, 128, PageHint::None).unwrap();
-+        assert_eq!(cached_file.read_cache_bytes.load(Ordering::Acquire), 128);
++        assert_eq!(
++            cached_file.read_cache_bytes.load(Ordering::Acquire),
++            super::cached_page_bytes(128)
++        );
 +        // A hit is served from the cache.
 +        let hit = crate::read_admission::with_scan_reads(|| {
 +            cached_file.read(128, 128, PageHint::None).unwrap()
@@ -9245,11 +9734,175 @@
 +            cached_file.read(256, 128, PageHint::None).unwrap()
 +        });
 +        assert!(matches!(replaced, super::PageMemory::Cached(_)));
-+        assert_eq!(cached_file.read_cache_bytes.load(Ordering::Acquire), 128);
++        assert_eq!(
++            cached_file.read_cache_bytes.load(Ordering::Acquire),
++            super::cached_page_bytes(128)
++        );
 +    }
  
      #[test]
      fn cache_leak() {
+@@ -653,4 +1164,159 @@
+         cached_file.invalidate_cache(0, 128);
+         assert_eq!(cached_file.read_cache_bytes.load(Ordering::Acquire), 0);
+     }
+-}
++    #[test]
++    fn immutable_byte_checksum_owners_are_charged_and_release_at_final_holder() {
++        struct Charge(Arc<std::sync::atomic::AtomicUsize>, usize);
++        impl Drop for Charge {
++            fn drop(&mut self) {
++                self.0.fetch_sub(self.1, Ordering::SeqCst);
++            }
++        }
++        let backend = InMemoryBackend::new();
++        backend.set_len(1024).unwrap();
++        let bytes = super::cached_page_bytes(128);
++        let file = PagedCachedFile::new(Box::new(backend), 128, bytes).unwrap();
++        let page = file.read(0, 128, PageHint::Clean).unwrap();
++        assert!(matches!(page, super::PageMemory::Cached(_)));
++        assert_eq!(file.read_cache_bytes.load(Ordering::SeqCst), bytes);
++        let clone = page.clone();
++        file.invalidate_cache(0, 128);
++        assert_eq!(file.read_cache_bytes.load(Ordering::SeqCst), bytes);
++        let charged_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
++        let charged = charged_bytes.clone();
++        let held = crate::with_read_page_charge(
++            Arc::new(move |size| {
++                assert_eq!(size, super::admitted_page_bytes(128));
++                charged.fetch_add(size, Ordering::SeqCst);
++                Ok(Box::new(Charge(charged.clone(), size)))
++            }),
++            || file.read(128, 128, PageHint::Clean).unwrap(),
++        );
++        assert!(matches!(held, super::PageMemory::Charged(_)));
++        let held_clone = held.clone();
++        drop(held);
++        assert_eq!(
++            charged_bytes.load(Ordering::SeqCst),
++            super::admitted_page_bytes(128)
++        );
++        drop(held_clone);
++        assert_eq!(charged_bytes.load(Ordering::SeqCst), 0);
++        drop(page);
++        assert_eq!(file.read_cache_bytes.load(Ordering::SeqCst), bytes);
++        drop(clone);
++        assert_eq!(file.read_cache_bytes.load(Ordering::SeqCst), 0);
++        let replacement = file.read(0, 128, PageHint::Clean).unwrap();
++        assert!(matches!(replacement, super::PageMemory::Cached(_)));
++        #[cfg(feature = "cache_metrics")]
++        assert_eq!(file.cache_stats().used_bytes, bytes);
++        eprintln!(
++            "owner controls: CachedPage={} ChargedPage={} slot={} cached128={} admission128={}",
++            size_of::<super::CachedPage>(),
++            size_of::<super::ChargedPage>(),
++            size_of::<std::sync::Mutex<Option<u128>>>(),
++            bytes,
++            super::admitted_page_bytes(128)
++        );
++    }
++
++    #[test]
++    fn immutable_byte_checksum_memo_lifecycle_and_plain_exclusion() {
++        let backend = InMemoryBackend::new();
++        backend.set_len(1024).unwrap();
++        let file = PagedCachedFile::new(Box::new(backend), 128, 1024).unwrap();
++        let before = super::PageMemory::byte_checksum_counts_for_test();
++        let cached = file.read(0, 128, PageHint::Clean).unwrap();
++        assert!(
++            cached
++                .memoized_byte_node_checksum(|| Err(crate::StorageError::Corrupted(
++                    "failed layout".into()
++                )))
++                .is_err()
++        );
++        assert_eq!(cached.memoized_byte_node_checksum(|| Ok(41)).unwrap(), 41);
++        assert_eq!(
++            cached
++                .clone()
++                .memoized_byte_node_checksum(|| panic!("cached computation repeated"))
++                .unwrap(),
++            41
++        );
++        file.invalidate_cache(0, 128);
++        // Reusing the offset constructs a fresh object, while the old holder
++        // retains its bytes, memo, and original native charge.
++        let new = file.read(0, 128, PageHint::Clean).unwrap();
++        assert_eq!(new.memoized_byte_node_checksum(|| Ok(42)).unwrap(), 42);
++        assert_eq!(
++            cached
++                .memoized_byte_node_checksum(|| panic!("old owner lost its memo"))
++                .unwrap(),
++            41
++        );
++        let charged = crate::with_read_page_charge(Arc::new(|_| Ok(Box::new(()))), || {
++            let backend = InMemoryBackend::new();
++            backend.set_len(128).unwrap();
++            PagedCachedFile::new(Box::new(backend), 128, 0)
++                .unwrap()
++                .read(0, 128, PageHint::Clean)
++                .unwrap()
++        });
++        assert!(matches!(charged, super::PageMemory::Charged(_)));
++        assert_eq!(charged.memoized_byte_node_checksum(|| Ok(43)).unwrap(), 43);
++        assert_eq!(
++            charged
++                .clone()
++                .memoized_byte_node_checksum(|| panic!("charged computation repeated"))
++                .unwrap(),
++            43
++        );
++        let synchronized = file.read(384, 128, PageHint::Clean).unwrap();
++        let starts = Arc::new(std::sync::Barrier::new(8));
++        let computations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
++        std::thread::scope(|scope| {
++            for _ in 0..8 {
++                let page = synchronized.clone();
++                let starts = starts.clone();
++                let computations = computations.clone();
++                scope.spawn(move || {
++                    starts.wait();
++                    assert_eq!(
++                        page.memoized_byte_node_checksum(|| {
++                            computations.fetch_add(1, Ordering::SeqCst);
++                            Ok(47)
++                        })
++                        .unwrap(),
++                        47
++                    );
++                });
++            }
++        });
++        assert_eq!(computations.load(Ordering::SeqCst), 1);
++        let plain = super::PageMemory::Plain(super::zero_filled_arc(128));
++        assert_eq!(plain.memoized_byte_node_checksum(|| Ok(44)).unwrap(), 44);
++        assert_eq!(plain.memoized_byte_node_checksum(|| Ok(45)).unwrap(), 45);
++        let after = super::PageMemory::byte_checksum_counts_for_test();
++        assert_eq!(
++            std::array::from_fn::<_, 5, _>(|i| after[i] - before[i]),
++            [3, 1, 2, 2, 1]
++        );
++        eprintln!(
++            "memo lifecycle deltas Cached/Charged/Plain computations, Cached/Charged hits: [3,1,2,2,1]"
++        );
++        // Flushed mutable bytes become a new immutable wrapper, empty memo.
++        drop(new);
++        drop(cached);
++        let mut writable = file.write(256, 128, true).unwrap();
++        writable.mem_mut()[0] = 9;
++        drop(writable);
++        let plain = file.read(256, 128, PageHint::None).unwrap();
++        assert!(matches!(plain, super::PageMemory::Plain(_)));
++        drop(plain);
++        file.write_barrier().unwrap();
++        let transferred = file.read(256, 128, PageHint::Clean).unwrap();
++        assert!(matches!(transferred, super::PageMemory::Cached(_)));
++        assert_eq!(
++            transferred.memoized_byte_node_checksum(|| Ok(46)).unwrap(),
++            46
++        );
++    }
++}
 --- a/src/tree_store/page_store/file_backend/fallback.rs
 +++ b/src/tree_store/page_store/file_backend/fallback.rs
 @@ -1,13 +1,15 @@
@@ -9479,27 +10132,552 @@
  
 --- a/src/tree_store/page_store/lru_cache.rs
 +++ b/src/tree_store/page_store/lru_cache.rs
-@@ -28,6 +28,20 @@
-             .map(|(x, _)| x);
-         if result.is_none() {
-             self.lru_queue.push_back(key);
-+        }
-+        result
+@@ -1,19 +1,354 @@
+ use crate::tree_store::page_store::fast_hash::FastHashMapU64;
+-use std::collections::VecDeque;
+-use std::sync::atomic::{AtomicBool, Ordering};
+-
+-#[derive(Default)]
++use crate::tree_store::page_store::fast_hash::FastHasher64;
++use std::hash::Hasher;
++use std::ops::Deref;
++use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
++use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
++
++const NONE: u32 = u32::MAX;
++
++struct Entry<T> {
++    key: AtomicU64,
++    second_chance: AtomicBool,
++    previous: AtomicU32,
++    next: AtomicU32,
++    chain: AtomicU32,
++    value: RwLock<Option<T>>,
++}
++
++struct FreeSlots {
++    slots: Box<[u32]>,
++    len: usize,
++}
++
++pub(crate) struct EntryArena<T> {
++    entries: Box<[Entry<T>]>,
++    free: Mutex<FreeSlots>,
++}
++
++impl<T> EntryArena<T> {
++    pub(crate) fn new(capacity: usize) -> Arc<Self> {
++        assert!(capacity < NONE as usize);
++        let entries = (0..capacity)
++            .map(|_| Entry {
++                key: AtomicU64::new(0),
++                second_chance: AtomicBool::new(false),
++                previous: AtomicU32::new(NONE),
++                next: AtomicU32::new(NONE),
++                chain: AtomicU32::new(NONE),
++                value: RwLock::new(None),
++            })
++            .collect::<Vec<_>>()
++            .into_boxed_slice();
++        let slots = (0..capacity as u32)
++            .rev()
++            .collect::<Vec<_>>()
++            .into_boxed_slice();
++        Arc::new(Self {
++            entries,
++            free: Mutex::new(FreeSlots {
++                slots,
++                len: capacity,
++            }),
++        })
 +    }
 +
-+    /// Insert at the front of the eviction order, without a second chance:
-+    /// a page a one-pass scan read is the next one evicted unless it is read
-+    /// again first, so a scan replaces its own pages rather than hot ones.
-+    pub(crate) fn insert_lowest_priority(&mut self, key: u64, value: T) -> Option<T> {
-+        let result = self
-+            .cache
-+            .insert(key, (value, AtomicBool::new(false)))
-+            .map(|(x, _)| x);
-+        if result.is_none() {
-+            self.lru_queue.push_front(key);
++    pub(crate) fn index_bytes(&self) -> usize {
++        let header = 2 * size_of::<usize>();
++        header.next_multiple_of(align_of::<Self>())
++            + size_of::<Self>()
++            + self.entries.len() * size_of::<Entry<T>>()
++            + self.entries.len() * size_of::<u32>()
++    }
++
++    fn take(&self) -> Option<u32> {
++        let mut free = self.free.lock().unwrap();
++        if free.len == 0 {
++            return None;
++        }
++        free.len -= 1;
++        Some(free.slots[free.len])
++    }
++
++    fn release(&self, slot: u32) {
++        let mut free = self.free.lock().unwrap();
++        let index = free.len;
++        free.slots[index] = slot;
++        free.len += 1;
++    }
++}
++
++pub(crate) struct ValueRef<'a, T>(RwLockReadGuard<'a, Option<T>>);
++impl<T> Deref for ValueRef<'_, T> {
++    type Target = T;
++    fn deref(&self) -> &T {
++        self.0.as_ref().unwrap()
++    }
++}
++// Each stripe owns its chain heads and CLOCK order; slots are lent globally.
+ pub struct LRUCache<T> {
+-    // AtomicBool is the second chance flag
+-    cache: FastHashMapU64<(T, AtomicBool)>,
+-    lru_queue: VecDeque<u64>,
++    arena: Arc<EntryArena<T>>,
++    heads: Box<[u32]>,
++    first: u32,
++    last: u32,
++    len: usize,
+ }
+ 
+ impl<T> LRUCache<T> {
++    pub(crate) fn new(arena: Arc<EntryArena<T>>, head_count: usize) -> Self {
++        assert!(head_count.is_power_of_two());
++        Self {
++            arena,
++            heads: vec![NONE; head_count].into_boxed_slice(),
++            first: NONE,
++            last: NONE,
++            len: 0,
++        }
++    }
++
++    pub(crate) fn arena_capacity(&self) -> usize {
++        self.arena.entries.len()
++    }
++
++    pub(crate) fn arena_index_bytes(&self) -> usize {
++        self.arena.index_bytes()
++    }
++    pub(crate) fn index_bytes(&self) -> usize {
++        self.heads.len() * size_of::<u32>()
++    }
++    pub(crate) fn len(&self) -> usize {
++        self.len
++    }
++
++    fn bucket(&self, key: u64) -> usize {
++        let mut hasher = FastHasher64::default();
++        hasher.write_u64(key);
++        hasher.finish() as usize & (self.heads.len() - 1)
++    }
++
++    fn find(&self, key: u64) -> Option<u32> {
++        let mut slot = self.heads[self.bucket(key)];
++        while slot != NONE {
++            let entry = &self.arena.entries[slot as usize];
++            if entry.key.load(Ordering::Relaxed) == key {
++                return Some(slot);
++            }
++            slot = entry.chain.load(Ordering::Relaxed);
++        }
++        None
++    }
++
++    fn insert_at(&mut self, key: u64, value: T, lowest: bool) -> Result<Option<T>, T> {
++        if let Some(slot) = self.find(key) {
++            let entry = &self.arena.entries[slot as usize];
++            entry.second_chance.store(false, Ordering::Release);
++            return Ok(entry.value.write().unwrap().replace(value));
++        }
++        let Some(slot) = self.arena.take() else {
++            return Err(value);
++        };
++        let bucket = self.bucket(key);
++        let (previous, next) = if lowest {
++            (NONE, self.first)
++        } else {
++            (self.last, NONE)
++        };
++        let entry = &self.arena.entries[slot as usize];
++        entry.key.store(key, Ordering::Relaxed);
++        entry.second_chance.store(false, Ordering::Release);
++        entry.previous.store(previous, Ordering::Relaxed);
++        entry.next.store(next, Ordering::Relaxed);
++        entry.chain.store(self.heads[bucket], Ordering::Relaxed);
++        *entry.value.write().unwrap() = Some(value);
++        self.heads[bucket] = slot;
++        if previous != NONE {
++            self.arena.entries[previous as usize]
++                .next
++                .store(slot, Ordering::Relaxed);
++        } else {
++            self.first = slot;
++        }
++        if next != NONE {
++            self.arena.entries[next as usize]
++                .previous
++                .store(slot, Ordering::Relaxed);
++        } else {
++            self.last = slot;
++        }
++        self.len += 1;
++        Ok(None)
++    }
++
++    pub(crate) fn try_insert(&mut self, key: u64, value: T) -> Result<Option<T>, T> {
++        self.insert_at(key, value, false)
++    }
++    pub(crate) fn try_insert_lowest_priority(
++        &mut self,
++        key: u64,
++        value: T,
++    ) -> Result<Option<T>, T> {
++        self.insert_at(key, value, true)
++    }
++    #[cfg(test)]
++    pub(crate) fn insert(&mut self, key: u64, value: T) -> Option<T> {
++        match self.try_insert(key, value) {
++            Ok(old) => old,
++            Err(_) => panic!("fixed read index capacity exceeded"),
++        }
++    }
++
++    pub(crate) fn remove(&mut self, key: u64) -> Option<T> {
++        let bucket = self.bucket(key);
++        let mut slot = self.heads[bucket];
++        let mut chain_previous = NONE;
++        while slot != NONE {
++            let entry = &self.arena.entries[slot as usize];
++            if entry.key.load(Ordering::Relaxed) == key {
++                break;
++            }
++            chain_previous = slot;
++            slot = entry.chain.load(Ordering::Relaxed);
++        }
++        if slot == NONE {
++            return None;
++        }
++        let entry = &self.arena.entries[slot as usize];
++        let chain = entry.chain.load(Ordering::Relaxed);
++        if chain_previous == NONE {
++            self.heads[bucket] = chain;
++        } else {
++            self.arena.entries[chain_previous as usize]
++                .chain
++                .store(chain, Ordering::Relaxed);
++        }
++        let previous = entry.previous.load(Ordering::Relaxed);
++        let next = entry.next.load(Ordering::Relaxed);
++        if previous != NONE {
++            self.arena.entries[previous as usize]
++                .next
++                .store(next, Ordering::Relaxed);
++        } else {
++            self.first = next;
++        }
++        if next != NONE {
++            self.arena.entries[next as usize]
++                .previous
++                .store(previous, Ordering::Relaxed);
++        } else {
++            self.last = previous;
++        }
++        let value = entry.value.write().unwrap().take().unwrap();
++        self.len -= 1;
++        self.arena.release(slot);
++        Some(value)
++    }
++
++    pub(crate) fn get(&self, key: u64) -> Option<ValueRef<'_, T>> {
++        let entry = &self.arena.entries[self.find(key)? as usize];
++        entry.second_chance.store(true, Ordering::Release);
++        Some(ValueRef(entry.value.read().unwrap()))
++    }
++    pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = (u64, ValueRef<'_, T>)> {
++        let mut slot = self.first;
++        let arena = &self.arena;
++        (0..self.len).map(move |_| {
++            let entry = &arena.entries[slot as usize];
++            slot = entry.next.load(Ordering::Relaxed);
++            (
++                entry.key.load(Ordering::Relaxed),
++                ValueRef(entry.value.read().unwrap()),
++            )
++        })
++    }
++    pub(crate) fn pop_lowest_priority(&mut self) -> Option<(u64, T)> {
++        self.pop_lowest_priority_where(|_| true)
++    }
++    pub(crate) fn pop_lowest_priority_where(
++        &mut self,
++        mut eligible: impl FnMut(&T) -> bool,
++    ) -> Option<(u64, T)> {
++        for _ in 0..self.len.saturating_mul(2) {
++            if self.first == NONE {
++                return None;
++            }
++            let slot = self.first;
++            let entry = &self.arena.entries[slot as usize];
++            let key = entry.key.load(Ordering::Relaxed);
++            if !entry.second_chance.swap(false, Ordering::AcqRel)
++                && eligible(entry.value.read().unwrap().as_ref().unwrap())
++            {
++                return self.remove(key).map(|value| (key, value));
++            }
++            let next = entry.next.load(Ordering::Relaxed);
++            if next != NONE {
++                self.arena.entries[next as usize]
++                    .previous
++                    .store(NONE, Ordering::Relaxed);
++                self.arena.entries[self.last as usize]
++                    .next
++                    .store(slot, Ordering::Relaxed);
++                entry.previous.store(self.last, Ordering::Relaxed);
++                entry.next.store(NONE, Ordering::Relaxed);
++                self.first = next;
++                self.last = slot;
++            }
++        }
++        None
++    }
++    pub(crate) fn transfer_to(&mut self, destination: &mut Self) {
++        while self.first != NONE {
++            let entry = &self.arena.entries[self.first as usize];
++            let key = entry.key.load(Ordering::Relaxed);
++            let chance = entry.second_chance.load(Ordering::Acquire);
++            let value = self.remove(key).unwrap();
++            assert!(destination.try_insert(key, value).is_ok());
++            let slot = destination.find(key).unwrap();
++            destination.arena.entries[slot as usize]
++                .second_chance
++                .store(chance, Ordering::Release);
++        }
++    }
++
++    pub(crate) fn clear(&mut self) {
++        while self.first != NONE {
++            let key = self.arena.entries[self.first as usize]
++                .key
++                .load(Ordering::Relaxed);
++            drop(self.remove(key));
++        }
++    }
++}
++impl<T> Drop for LRUCache<T> {
++    fn drop(&mut self) {
++        self.clear();
++    }
++}
++
++struct WriteEntry<T> {
++    value: T,
++    second_chance: AtomicBool,
++    previous: Option<u64>,
++    next: Option<u64>,
++}
++
++pub struct WriteCache<T> {
++    cache: FastHashMapU64<WriteEntry<T>>,
++    first: Option<u64>,
++    last: Option<u64>,
++}
++
++impl<T> Default for WriteCache<T> {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++impl<T> WriteCache<T> {
+     pub(crate) fn new() -> Self {
+         Self {
+             cache: Default::default(),
+-            lru_queue: Default::default(),
++            first: None,
++            last: None,
          }
-         result
      }
+ 
+@@ -21,83 +356,127 @@
+         self.cache.len()
+     }
+ 
++    fn insert_at(&mut self, key: u64, value: T, lowest: bool) -> Option<T> {
++        if let Some(entry) = self.cache.get_mut(&key) {
++            entry.second_chance.store(false, Ordering::Release);
++            return Some(std::mem::replace(&mut entry.value, value));
++        }
++        let (previous, next) = if lowest {
++            (None, self.first)
++        } else {
++            (self.last, None)
++        };
++        self.cache.insert(
++            key,
++            WriteEntry {
++                value,
++                second_chance: AtomicBool::new(false),
++                previous,
++                next,
++            },
++        );
++        if let Some(previous) = previous {
++            self.cache.get_mut(&previous).unwrap().next = Some(key);
++        } else {
++            self.first = Some(key);
++        }
++        if let Some(next) = next {
++            self.cache.get_mut(&next).unwrap().previous = Some(key);
++        } else {
++            self.last = Some(key);
++        }
++        None
++    }
++
+     pub(crate) fn insert(&mut self, key: u64, value: T) -> Option<T> {
+-        let result = self
+-            .cache
+-            .insert(key, (value, AtomicBool::new(false)))
+-            .map(|(x, _)| x);
+-        if result.is_none() {
+-            self.lru_queue.push_back(key);
+-        }
+-        result
++        self.insert_at(key, value, false)
++    }
++
++    /// A one-pass page has lowest priority until another access grants a second chance.
++    #[expect(
++        dead_code,
++        reason = "the write buffer retains the original cache implementation"
++    )]
++    pub(crate) fn insert_lowest_priority(&mut self, key: u64, value: T) -> Option<T> {
++        self.insert_at(key, value, true)
+     }
+ 
+     pub(crate) fn remove(&mut self, key: u64) -> Option<T> {
+-        if let Some((value, _)) = self.cache.remove(&key) {
+-            if self.lru_queue.len() > 2 * self.cache.len() {
+-                // Cycle two elements of the LRU queue to ensure it doesn't grow without bound
+-                for _ in 0..2 {
+-                    if let Some(removed_key) = self.lru_queue.pop_front()
+-                        && let Some((_, second_chance)) = self.cache.get(&removed_key)
+-                    {
+-                        second_chance.store(false, Ordering::Release);
+-                        self.lru_queue.push_back(removed_key);
+-                    }
+-                }
+-            }
+-            Some(value)
+-        } else {
+-            None
+-        }
++        let entry = self.cache.remove(&key)?;
++        if let Some(previous) = entry.previous {
++            self.cache.get_mut(&previous).unwrap().next = entry.next;
++        } else {
++            self.first = entry.next;
++        }
++        if let Some(next) = entry.next {
++            self.cache.get_mut(&next).unwrap().previous = entry.previous;
++        } else {
++            self.last = entry.previous;
++        }
++        // Geometric reclamation keeps metadata proportional to live cache entries
++        // without reallocating the queue or rehashing on each page replacement.
++        if self.cache.is_empty() {
++            self.cache = Default::default();
++        } else if self.cache.capacity() > self.cache.len().saturating_mul(4) {
++            self.cache.shrink_to_fit();
++        }
++        Some(entry.value)
+     }
+ 
+     pub(crate) fn get(&self, key: u64) -> Option<&T> {
+-        if let Some((value, second_chance)) = self.cache.get(&key) {
+-            second_chance.store(true, Ordering::Release);
+-            Some(value)
+-        } else {
+-            None
+-        }
++        let entry = self.cache.get(&key)?;
++        entry.second_chance.store(true, Ordering::Release);
++        Some(&entry.value)
+     }
+ 
+     pub(crate) fn get_mut(&mut self, key: u64) -> Option<&mut T> {
+-        if let Some((value, second_chance)) = self.cache.get_mut(&key) {
+-            second_chance.store(true, Ordering::Release);
+-            Some(value)
+-        } else {
+-            None
+-        }
++        let entry = self.cache.get_mut(&key)?;
++        entry.second_chance.store(true, Ordering::Release);
++        Some(&mut entry.value)
+     }
+ 
+     pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = (&u64, &T)> {
+-        self.cache.iter().map(|(k, (v, _))| (k, v))
++        self.cache.iter().map(|(key, entry)| (key, &entry.value))
+     }
+ 
+     pub(crate) fn iter_mut(&mut self) -> impl ExactSizeIterator<Item = (&u64, &mut T)> {
+-        self.cache.iter_mut().map(|(k, (v, _))| (k, v))
++        self.cache
++            .iter_mut()
++            .map(|(key, entry)| (key, &mut entry.value))
+     }
+ 
+     pub(crate) fn pop_lowest_priority(&mut self) -> Option<(u64, T)> {
+-        while let Some(key) = self.lru_queue.pop_front() {
+-            if let Some((_, second_chance)) = self.cache.get(&key) {
+-                if second_chance
+-                    .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+-                    .is_ok()
+-                {
+-                    self.lru_queue.push_back(key);
+-                } else {
+-                    let (value, _) = self.cache.remove(&key).unwrap();
+-                    return Some((key, value));
+-                }
++        self.pop_lowest_priority_where(|_| true)
++    }
++
++    /// Keep ineligible entries linked while looking for a CLOCK victim. Two
++    /// passes let each eligible entry spend its second chance without looping
++    /// forever when every entry is held by a reader.
++    pub(crate) fn pop_lowest_priority_where(
++        &mut self,
++        mut eligible: impl FnMut(&T) -> bool,
++    ) -> Option<(u64, T)> {
++        for _ in 0..self.cache.len().saturating_mul(2) {
++            let key = self.first?;
++            let entry = self.cache.get(&key).unwrap();
++            if !entry.second_chance.swap(false, Ordering::AcqRel) && eligible(&entry.value) {
++                return self.remove(key).map(|value| (key, value));
++            }
++            if let Some(next) = entry.next {
++                let last = self.last.unwrap();
++                self.cache.get_mut(&next).unwrap().previous = None;
++                self.cache.get_mut(&last).unwrap().next = Some(key);
++                let entry = self.cache.get_mut(&key).unwrap();
++                entry.previous = Some(last);
++                entry.next = None;
++                self.first = Some(next);
++                self.last = Some(key);
+             }
+         }
+         None
+     }
+ 
+     pub(crate) fn clear(&mut self) {
+-        self.cache.shrink_to_fit();
+-        self.cache.clear();
+-        self.lru_queue.shrink_to_fit();
+-        self.lru_queue.clear();
+-    }
+-}
++        *self = Self::new();
++    }
++}
 --- a/src/tree_store/page_store/mod.rs
 +++ b/src/tree_store/page_store/mod.rs
 @@ -1,3 +1,4 @@
@@ -9776,13 +10954,17 @@
  
          assert!(page_size >= DB_HEADER_SIZE);
  
-@@ -280,12 +431,62 @@
+@@ -280,12 +431,66 @@
          })
      }
  
 +    #[cfg(feature = "contextdb-internal")]
 +    pub(crate) fn settle_startup_cache_budget(&self, bytes: usize) -> Result<usize> {
 +        self.storage.settle_startup_cache_budget(bytes)
++    }
++
++    pub(crate) fn cache_index_bytes(&self) -> usize {
++        self.storage.index_bytes()
 +    }
 +
      pub(crate) fn cache_stats(&self) -> CacheStats {
@@ -9839,7 +11021,7 @@
      }
  
      #[cfg(debug_assertions)]
-@@ -295,23 +496,30 @@
+@@ -295,23 +500,30 @@
  
      #[cfg(debug_assertions)]
      pub(crate) fn all_allocated_pages(&self) -> Vec<PageNumber> {
@@ -9876,7 +11058,7 @@
          }
      }
  
-@@ -346,7 +554,9 @@
+@@ -346,7 +558,9 @@
  
          self.needs_recovery
              .store(header.recovery_required, Ordering::Release);
@@ -9887,7 +11069,7 @@
  
          Ok(was_clean)
      }
-@@ -379,7 +589,8 @@
+@@ -379,7 +593,8 @@
  
      pub(crate) fn begin_repair(&self) -> Result<()> {
          let mut state = self.state.lock().unwrap();
@@ -9897,7 +11079,7 @@
          #[cfg(debug_assertions)]
          self.allocated_pages.lock().unwrap().clear();
  
-@@ -392,7 +603,9 @@
+@@ -392,7 +607,9 @@
          let allocator = state.get_region_mut(region_index);
          allocator.record_alloc(page_number.page_index, page_number.page_order);
          #[cfg(debug_assertions)]
@@ -9908,7 +11090,7 @@
      }
  
      fn write_header(&self, header: &DatabaseHeader) -> Result {
-@@ -405,6 +618,7 @@
+@@ -405,6 +622,7 @@
      }
  
      pub(crate) fn end_repair(&self) -> Result<()> {
@@ -9916,7 +11098,7 @@
          let mut state = self.state.lock().unwrap();
          state.header.recovery_required = false;
          self.write_header(&state.header)?;
-@@ -419,30 +633,25 @@
+@@ -419,30 +637,25 @@
          tree: &mut AllocatorStateTreeMut,
          transaction_id: TransactionId,
      ) -> Result<u32> {
@@ -9960,7 +11142,7 @@
  
          tree.insert(
              &AllocatorStateKey::TransactionId,
-@@ -458,43 +667,43 @@
+@@ -458,43 +671,43 @@
          tree: &mut AllocatorStateTreeMut,
          num_regions: u32,
      ) -> Result<bool> {
@@ -10030,7 +11212,7 @@
          Ok(true)
      }
  
-@@ -519,12 +728,58 @@
+@@ -519,12 +732,58 @@
      pub(crate) fn load_allocator_state(&self, tree: &AllocatorStateTree) -> Result {
          assert!(self.is_valid_allocator_state(tree)?);
  
@@ -10091,7 +11273,7 @@
          }
  
          let region_tracker = RegionTracker::from_bytes(
-@@ -536,12 +791,13 @@
+@@ -536,12 +795,13 @@
          let mut state = self.state.lock().unwrap();
          state.allocators = Allocators {
              region_tracker,
@@ -10107,7 +11289,7 @@
          drop(state);
  
          self.state.lock().unwrap().header.recovery_required = false;
-@@ -554,8 +810,15 @@
+@@ -554,8 +814,15 @@
      pub(crate) fn is_allocated(&self, page: PageNumber) -> bool {
          #[cfg(debug_assertions)]
          {
@@ -10125,7 +11307,7 @@
          }
          #[cfg(not(debug_assertions))]
          {
-@@ -612,6 +875,7 @@
+@@ -612,6 +879,7 @@
          // Copy the header so that we can release the state lock, while we flush the file
          let mut header = state.header.clone();
          drop(state);
@@ -10133,7 +11315,7 @@
  
          let old_transaction_id = header.secondary_slot().transaction_id;
          let secondary = header.secondary_slot_mut();
-@@ -678,6 +942,7 @@
+@@ -678,6 +946,7 @@
          #[cfg(debug_assertions)]
          debug_assert!(self.open_dirty_pages.lock().unwrap().is_empty());
          assert!(!self.needs_recovery.load(Ordering::Acquire));
@@ -10141,7 +11323,7 @@
  
          let mut unpersisted = self.unpersisted.lock().unwrap();
          let mut allocated_since_commit = self.allocated_since_commit.lock().unwrap();
-@@ -726,7 +991,9 @@
+@@ -726,7 +995,9 @@
                  .get_region_mut(region_index)
                  .free(page_number.page_index, page_number.page_order);
              #[cfg(debug_assertions)]
@@ -10152,7 +11334,7 @@
  
              let address = page_number.address_range(
                  self.page_size.into(),
-@@ -774,6 +1041,23 @@
+@@ -774,6 +1045,23 @@
              #[cfg(debug_assertions)]
              open_pages: self.read_page_ref_counts.clone(),
          })
@@ -10176,7 +11358,7 @@
      }
  
      // NOTE: the caller must ensure that the read cache has been invalidated or stale reads my occur
-@@ -871,7 +1155,9 @@
+@@ -871,7 +1159,9 @@
                      .unwrap()
                      .contains_key(&page)
              );
@@ -10187,7 +11369,7 @@
              assert!(!self.open_dirty_pages.lock().unwrap().contains(&page));
          }
          allocated.remove(page);
-@@ -953,12 +1239,32 @@
+@@ -953,12 +1243,32 @@
              page_number
          } else {
              self.grow(&mut state, required_order)?;
@@ -10222,7 +11404,7 @@
              assert!(
                  !self
                      .read_page_ref_counts
-@@ -1024,7 +1330,27 @@
+@@ -1024,7 +1334,27 @@
              } else {
                  region.alloc(required_order)
              };
@@ -10250,7 +11432,7 @@
                  return Ok(Some(PageNumber::new(
                      candidate_region,
                      page,
-@@ -1061,7 +1387,7 @@
+@@ -1061,7 +1391,7 @@
  
          let mut new_layout = layout;
          new_layout.reduce_last_region(reduce_by);
@@ -10259,7 +11441,7 @@
          assert!(new_layout.len() <= layout.len());
          state.header.set_layout(new_layout);
  
-@@ -1107,13 +1433,20 @@
+@@ -1107,13 +1437,20 @@
  
          let result = self.storage.resize(new_layout.len());
          if result.is_err() {
@@ -10281,7 +11463,7 @@
          state.header.set_layout(new_layout);
          Ok(())
      }
-@@ -1135,7 +1468,7 @@
+@@ -1135,7 +1472,7 @@
      }
  
      pub(crate) fn count_allocated_pages(&self) -> Result<u64> {
@@ -10290,7 +11472,7 @@
          let mut count = 0u64;
          for i in 0..state.header.layout().num_regions() {
              count += u64::from(state.get_region(i).count_allocated_pages());
-@@ -1145,7 +1478,7 @@
+@@ -1145,7 +1482,7 @@
      }
  
      pub(crate) fn count_free_pages(&self) -> Result<u64> {
@@ -10299,7 +11481,7 @@
          let mut count = 0u64;
          for i in 0..state.header.layout().num_regions() {
              count += u64::from(state.get_region(i).count_free_pages());
-@@ -1158,8 +1491,41 @@
+@@ -1158,8 +1495,41 @@
          self.page_size.try_into().unwrap()
      }
  

@@ -3,7 +3,8 @@ use crate::database::event_bus::{EventBusState, MAX_SINK_QUEUE_DEPTH};
 use crate::database::trigger::TriggerState;
 use crate::database::{LocalSchemaStageRegistry, ReceivedSchemaStageRegistry};
 use crate::persistence::{
-    FlushDataOptions, FlushDataSnapshots, RedbPersistence, SchemaDdlPersistence,
+    FlushDataOptions, FlushDataSnapshots, LocalErasurePersistence, RedbPersistence,
+    SchemaDdlPersistence,
 };
 use contextdb_core::{Error, Result, RowId, SnapshotId};
 use contextdb_tx::{WriteSet, WriteSetApplicator};
@@ -86,6 +87,7 @@ impl PersistentCompositeStore {
         ws: &WriteSet,
         reclaimable_partitions: HashSet<VectorPartitionRef>,
         registered_snapshots: Option<&[SnapshotId]>,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<()> {
         if let Some(lsn) = ws.commit_lsn {
             let mut local_stages = self.local_schema_stages.lock();
@@ -148,7 +150,7 @@ impl PersistentCompositeStore {
             .unwrap_or_default();
         #[cfg(feature = "test-seams")]
         let mut stage_started = std::time::Instant::now();
-        let table_meta = self.inner.relational.table_meta.read().clone();
+        let table_meta = self.inner.relational.table_meta.read();
         #[cfg(feature = "test-seams")]
         crate::persistence::observe_append_stage(
             crate::persistence::AppendStage::TableMetaClone,
@@ -157,12 +159,13 @@ impl PersistentCompositeStore {
         let mut accepted_row_memory =
             crate::memory_accounting::OwnedMemoryReservation::new(self.inner.accountant.clone());
         let deleted_rows =
-            self.deleted_rows_snapshot_for_write_set(ws, &mut accepted_row_memory)?;
+            self.deleted_rows_snapshot_for_write_set(ws, &mut accepted_row_memory, read_memory.clone())?;
         let log_entries = self.inner.build_change_log_entries_with_snapshots(
             ws,
             Some(&table_meta),
             deleted_rows.as_ref(),
         );
+        let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
         let partition_mutations = match registered_snapshots {
             Some(registered_snapshots) => self
                 .inner
@@ -171,6 +174,8 @@ impl PersistentCompositeStore {
                     &table_meta,
                     deleted_rows.as_ref(),
                     registered_snapshots,
+                    &mut vector_copy_owner,
+                    read_memory.clone(),
                 )?,
             None => self
                 .inner
@@ -179,6 +184,8 @@ impl PersistentCompositeStore {
                     &table_meta,
                     deleted_rows.as_ref(),
                     reclaimable_partitions,
+                    &mut vector_copy_owner,
+                    read_memory.clone(),
                 )?,
         };
         let erasure_stages = self.inner.local_erasure_stages.lock();
@@ -192,7 +199,11 @@ impl PersistentCompositeStore {
             ws,
             &log_entries,
             FlushDataOptions {
-                local_erasure: erasure.map(|stage| &stage.durable),
+                local_erasure: erasure.map(|stage| LocalErasurePersistence {
+                    projection: &stage.durable,
+                    accountant: stage._vector_workspace.accountant().clone(),
+                    operation: "discard",
+                }),
                 sink_events: sink_events.as_deref().map(Vec::as_slice).unwrap_or(&[]),
                 trigger_audits: &trigger_audits,
                 schema_ddl: SchemaDdlPersistence {
@@ -201,7 +212,7 @@ impl PersistentCompositeStore {
                 },
                 max_sink_queue_depth: MAX_SINK_QUEUE_DEPTH,
                 snapshots: FlushDataSnapshots {
-                    table_meta: Some(table_meta),
+                    table_meta: Some(&table_meta),
                     deleted_rows,
                 },
                 received_schema: None,
@@ -209,6 +220,7 @@ impl PersistentCompositeStore {
             },
         )?;
         drop(erasure_stages);
+        drop(table_meta);
         #[cfg(feature = "in-process-test-seams")]
         crate::writer_commit_test_seams::reached(
             crate::writer_commit_test_seams::CommitBoundary::BeforeMemoryPublication,
@@ -224,6 +236,7 @@ impl PersistentCompositeStore {
         &self,
         ws: &WriteSet,
         memory: &mut crate::memory_accounting::OwnedMemoryReservation,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<
         Option<
             std::collections::HashMap<
@@ -244,12 +257,16 @@ impl PersistentCompositeStore {
         let root = self.precommit_source.lock().upgrade().ok_or_else(|| {
             Error::Other("writer publication no longer owns its commit source".into())
         })?;
-        let source = crate::persistence::writer_adapters::WriterRelationalSource::new(root)?;
+        let source = crate::persistence::writer_adapters::WriterRelationalSource::new_for_read(root, read_memory)?;
         let mut rows = std::collections::HashMap::<
             String,
             std::collections::HashMap<RowId, contextdb_core::VersionedRow>,
         >::new();
-        let mut retain = |table: &str, row_id: RowId| -> Result<()> {
+        let mut retain = |table: &str,
+                          row_id: RowId,
+                          subsystem: &'static str,
+                          operation: &'static str|
+         -> Result<()> {
             if rows
                 .get(table)
                 .is_some_and(|by_id| by_id.contains_key(&row_id))
@@ -272,8 +289,8 @@ impl PersistentCompositeStore {
                     after
                         .saturating_sub(before)
                         .saturating_add(held::text(table)),
-                    "vector",
-                    "accepted_row_source",
+                    subsystem,
+                    operation,
                     "Reduce changed identities or raise MEMORY_LIMIT.",
                 )?;
                 rows.try_reserve(1)
@@ -288,8 +305,8 @@ impl PersistentCompositeStore {
                 after
                     .saturating_sub(before)
                     .saturating_add(held::values(&window.value().values)),
-                "vector",
-                "accepted_row_source",
+                subsystem,
+                operation,
                 "Reduce changed row bodies or raise MEMORY_LIMIT.",
             )?;
             by_id
@@ -299,17 +316,22 @@ impl PersistentCompositeStore {
             Ok(())
         };
         for (table, row, _) in &ws.relational_deletes {
-            retain(table, *row)?;
+            retain(table, *row, "relational", "delete_pre_image")?;
         }
         for entry in &ws.vector_inserts {
-            retain(&entry.index.table, entry.row_id)?;
+            retain(
+                &entry.index.table,
+                entry.row_id,
+                "vector",
+                "accepted_row_source",
+            )?;
         }
         for (index, row, _) in &ws.vector_deletes {
-            retain(&index.table, *row)?;
+            retain(&index.table, *row, "vector", "accepted_row_source")?;
         }
         for (index, from, to, _) in &ws.vector_moves {
-            retain(&index.table, *from)?;
-            retain(&index.table, *to)?;
+            retain(&index.table, *from, "vector", "accepted_row_source")?;
+            retain(&index.table, *to, "vector", "accepted_row_source")?;
         }
         Ok((!rows.is_empty()).then_some(rows))
     }
@@ -361,7 +383,11 @@ impl WriteSetApplicator for PersistentCompositeStore {
             .map(|root| root as Arc<dyn std::any::Any + Send + Sync>)
     }
 
-    fn apply(&self, ws: &WriteSet) -> Result<()> {
+    fn apply(
+        &self,
+        ws: &WriteSet,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<()> {
         #[cfg(any(test, feature = "test-seams"))]
         if FAIL_NEXT_LOCAL_APPLY.with(|armed| armed.replace(false)) {
             return Err(Error::Other(
@@ -380,7 +406,7 @@ impl WriteSetApplicator for PersistentCompositeStore {
             contextdb_core::Error::Other("durable commit has no finalized LSN".into())
         })?;
         let control = self.persistence.reserve_writer_snapshot()?;
-        self.apply_with_vector_reclamation(ws, HashSet::new(), registered_snapshots.as_deref())?;
+        self.apply_with_vector_reclamation(ws, HashSet::new(), registered_snapshots.as_deref(), read_memory)?;
         self.prepare_publication(control, snapshot, lsn);
         Ok(())
     }

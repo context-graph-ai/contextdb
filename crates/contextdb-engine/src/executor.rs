@@ -1,17 +1,19 @@
 #![allow(clippy::too_many_arguments)] // Existing compatibility and test seam shape.
 use crate::database::{
-    Database, InsertRowResult, MaintenancePolicy, QueryResult, QueryTrace,
+    Database, InsertRowResult, MaintenancePolicy, OwnedQueryResult, QueryResult, QueryTrace,
     UpdateReplacementContext, UpsertIntentDetails, VectorSearchDisclosure, rank_index_name,
 };
+pub(crate) use crate::memory_accounting::VectorLoadReservationTransfer;
+use crate::owned_cursor_page::OwnedCursorPage as CursorPage;
 use crate::rank_formula::RankFormula;
 use crate::sync_types::{DdlChange, natural_key_from_row_values};
 use contextdb_core::read_contract::{
-    CursorPage, DeadlineClock, OwnerReadCancellation, ReadFailure, ReadLimits,
+    DeadlineClock, OwnerReadCancellation, ReadFailure, ReadLimits,
 };
 use contextdb_core::*;
 use contextdb_parser::ast::{
     AlterAction, BinOp, ColumnRef, Cte, DataType, Expr, Literal, SelectStatement,
-    SetDiskLimitValue, SetMemoryLimitValue, SortDirection, Statement, UnaryOp,
+    SetDiskLimitValue, SetMemoryLimitValue, SortDirection, Statement, UnaryOp, WindowBindingId,
 };
 use contextdb_planner::{
     DeletePlan, GraphStepPlan, InsertPlan, OnConflictPlan, PhysicalPlan, PurgePlan, UpdatePlan,
@@ -55,6 +57,9 @@ pub(crate) type BoundedReadSnapshotPin = (
 pub(crate) struct ReadPublicationScope {
     pub(crate) snapshot_lsn: Lsn,
     pub(crate) tables: BTreeSet<String>,
+    // Committed operator state does not need the maintenance commit mutex.
+    // Purge publication and lineage validation still enclose its response.
+    pub(crate) inspection: bool,
     pub(crate) budget: ReadPublicationBudget,
 }
 
@@ -143,6 +148,7 @@ impl ReadPublicationScope {
         Self {
             snapshot_lsn,
             tables,
+            inspection: false,
             budget: ReadPublicationBudget {
                 clock,
                 cancellation,
@@ -218,7 +224,7 @@ pub(crate) struct TransactionTableOverlay {
     /// Capturing a statement clones the owner; later write-set mutations
     /// reserve their replacement controls before detaching from it.
     pub(crate) staged_rows: Option<Arc<contextdb_tx::StatementRows>>,
-    pub(crate) _memory: Option<crate::memory_accounting::OwnedMemoryReservation>,
+    pub(crate) _memory: Option<contextdb_core::read_memory::ReadCredit>,
     /// What holding the above costs.
     pub(crate) bytes: usize,
 }
@@ -280,6 +286,41 @@ impl TransactionVectorOverlay {
     }
 }
 
+fn content_size_result(
+    totals: crate::persistence::content_size::ContentSizeTotals,
+) -> Result<OwnedQueryResult> {
+    let values = [
+        totals.live_row_bytes,
+        totals.live_vector_bytes,
+        totals.live_content_bytes()?,
+        totals.retained_row_bytes,
+        totals.retained_vector_bytes,
+    ]
+    .into_iter()
+    .map(|value| {
+        i64::try_from(value)
+            .map(Value::Int64)
+            .map_err(|_| Error::Other("content size exceeds SQL integer range".into()))
+    })
+    .collect::<Result<Vec<_>>>()?;
+    Ok(OwnedQueryResult::new(QueryResult {
+        columns: [
+            "live_row_bytes",
+            "live_vector_bytes",
+            "live_content_bytes",
+            "retained_row_bytes",
+            "retained_vector_bytes",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
+        rows: vec![values],
+        rows_affected: 0,
+        trace: crate::database::QueryTrace::scan(),
+        cascade: None,
+    }))
+}
+
 pub(crate) trait ReadExecutionTarget: Send + Sync {
     fn register_writer_cursor(&self, _cursor: &Arc<BoundedCursorExecutionState>) -> Result<()> {
         Ok(())
@@ -288,6 +329,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
     fn enter_writer_read(
         &self,
         _root: Option<Arc<crate::persistence::WriterSnapshot>>,
+        _read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Option<crate::database::writer_read::WriterReadScope> {
         None
     }
@@ -303,6 +345,8 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         row_id: RowId,
         lsn: Lsn,
         snapshot: SnapshotId,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Option<Vec<f32>>>;
 
     #[allow(clippy::too_many_arguments)]
@@ -316,6 +360,9 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         before_distance: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         release_retained: &mut dyn FnMut(usize),
+
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<Option<f32>, BoundedExecutionError>;
 
     /// Which of a table's vector columns keep their value in the store alone.
@@ -334,15 +381,23 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         key_col: &str,
         key_value: &Value,
         snapshot: SnapshotId,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Option<RowId>>;
 
     fn prepare_bounded_read_plan(
         &self,
         parsed: &Statement,
         params: &HashMap<String, Value>,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<(Statement, PhysicalPlan)>;
 
     fn bounded_read_accountant(&self) -> Arc<crate::memory_accounting::MemoryAccountant>;
+
+    fn declared_read_request_provider(
+        &self,
+    ) -> Arc<dyn crate::vector_read_memory::ReadRequestBudgetProvider>;
 
     /// Whether this target's single-column automatic indexes are ordered
     /// trees a bounded cursor can walk. A durable store keeps every posting in
@@ -368,6 +423,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
     fn delivery_metadata(
         &self,
         request: crate::direct_file_reader::DirectMetadataRequest,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<crate::direct_file_reader::DirectMetadataBody>;
 
     /// `checkpoint` is the asking request's own cancellation and active-time
@@ -378,7 +434,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
     fn committed_change_state(
         &self,
         _checkpoint: &dyn Fn() -> Result<()>,
-        _charge: &crate::read_image_memory::ImageMemory,
+        _charge: &Arc<crate::read_image_memory::ImageMemory>,
     ) -> std::result::Result<
         crate::direct_file_reader::DirectChangeState,
         crate::direct_file_reader::DirectFileReaderError,
@@ -392,7 +448,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
     fn committed_sync_state(
         &self,
         _checkpoint: &dyn Fn() -> Result<()>,
-        _charge: &crate::read_image_memory::ImageMemory,
+        _charge: &Arc<crate::read_image_memory::ImageMemory>,
     ) -> std::result::Result<
         crate::direct_file_reader::DirectSyncState,
         crate::direct_file_reader::DirectFileReaderError,
@@ -403,8 +459,24 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         ))
     }
 
-    fn store_state_answer(&self, plan: &PhysicalPlan) -> Result<QueryResult> {
-        let _ = plan;
+    fn content_size_answer(
+        &self,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        before_table: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<OwnedQueryResult> {
+        let _ = (read_memory, before_table);
+        Err(Error::PlanError(
+            "content-size inspection is unavailable on this execution target".into(),
+        ))
+    }
+
+    fn store_state_answer(
+        &self,
+        plan: &PhysicalPlan,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<OwnedQueryResult> {
+        let _ = (plan, vector_copy_owner, read_memory);
         Err(Error::PlanError(
             "bounded execution accepts read-only SELECT plans".to_string(),
         ))
@@ -413,7 +485,12 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
     /// The plan the engine WOULD run for this statement, rendered without
     /// running it. Executed-route facts are exposed by the query trace, not by
     /// this metadata operation.
-    fn explain_plan_without_running_it(&self, sql: &str) -> Result<String> {
+    fn explain_plan_without_running_it(
+        &self,
+        sql: &str,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<String> {
         let _ = sql;
         Err(Error::PlanError(
             "bounded execution accepts read-only SELECT plans".to_string(),
@@ -427,9 +504,11 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         &self,
         sql: &str,
         params: &HashMap<String, Value>,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<crate::database::ExplainOutput> {
         let _ = params;
-        self.explain_plan_without_running_it(sql)
+        self.explain_plan_without_running_it(sql, vector_copy_owner, read_memory)
             .map(|physical_plan| crate::database::ExplainOutput {
                 physical_plan,
                 index_used: None,
@@ -452,8 +531,13 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
     }
 
     /// What that transaction changes about what a read of one table sees.
-    fn transaction_table_overlay(&self, tx: TxId, table: &str) -> Result<TransactionTableOverlay> {
-        let _ = (tx, table);
+    fn transaction_table_overlay(
+        &self,
+        tx: TxId,
+        table: &str,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<TransactionTableOverlay> {
+        let _ = (tx, table, read_memory);
         Ok(TransactionTableOverlay::default())
     }
 
@@ -527,8 +611,9 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         table: &str,
         columns: &[(String, contextdb_core::SortDirection)],
         prefix: &IndexKey,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Option<u64>> {
-        let _ = (table, columns, prefix);
+        let _ = (table, columns, prefix, read_memory);
         Ok(None)
     }
 
@@ -537,6 +622,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         needs_vector_graph: bool,
         budget: &crate::database::ReadRegistrationBudget,
         withdrawn: &OwnerReadCancellation,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Option<BoundedReadSnapshotPin>>;
 
     fn bounded_cursor_snapshot_registration(
@@ -546,6 +632,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         idle_ms: u64,
         budget: &crate::database::ReadRegistrationBudget,
         withdrawn: &OwnerReadCancellation,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Option<BoundedCursorSnapshotPin>>;
 
     fn assert_table_read_allowed(&self, table: &str) -> Result<()>;
@@ -567,6 +654,9 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         release_retained: &mut dyn FnMut(usize),
         visit: &mut dyn FnMut(RowId) -> std::result::Result<(), BoundedExecutionError>,
+
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<(), BoundedExecutionError>;
 
     fn bounded_read_allowed_for_row(
@@ -577,6 +667,8 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         row: &VersionedRow,
         snapshot: SnapshotId,
         before_access_row: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<bool, BoundedExecutionError>;
 
     /// Whether this index pick PINS the row it is asking about -- an equality
@@ -627,6 +719,8 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         row: &VersionedRow,
         snapshot: SnapshotId,
         before_access_row: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<Option<Error>, BoundedExecutionError>;
 
     /// One row named by its identity, read the bounded way.
@@ -637,6 +731,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
     /// of every row, inspected and discarded, for each row published.
     fn bounded_row_by_identity(
         &self,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         tx: Option<TxId>,
         table: &str,
         row_id: RowId,
@@ -652,16 +747,28 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
 
     fn bounded_physical_table_row_next(
         &self,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         table: &str,
         snapshot: SnapshotId,
         cursor: &mut contextdb_relational::mem::BoundedPhysicalCursor,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        observed: &mut dyn FnMut(&VersionedRow) -> std::result::Result<(), BoundedExecutionError>,
         before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
     ) -> std::result::Result<Option<VersionedRow>, BoundedExecutionError>;
 
-    #[allow(clippy::too_many_arguments)]
-    fn bounded_ordered_table_row_next(
+    /// Exact correspondence with this statement's captured source root.
+    fn ordered_prefix_snapshot_is_current(
         &self,
+        _snapshot: SnapshotId,
+        _read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bounded_ordered_table_row_next_observed(
+        &self,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         table: &str,
         column: &str,
         direction: contextdb_core::SortDirection,
@@ -669,6 +776,10 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         cursor: &mut contextdb_relational::mem::BoundedOrderedRowCursor,
         check_boundary: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        observed: &mut dyn FnMut(
+            &IndexKey,
+            RowId,
+        ) -> std::result::Result<(), BoundedExecutionError>,
         before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
     ) -> std::result::Result<Option<VersionedRow>, BoundedExecutionError>;
 
@@ -680,6 +791,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         cursor: &mut contextdb_relational::mem::BoundedOrderedRowCursor,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         visit: &mut dyn FnMut(RowId) -> std::result::Result<(), BoundedExecutionError>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<bool, BoundedExecutionError> {
         let _ = (table, index, snapshot, cursor, before_touch, visit);
         Ok(false)
@@ -694,6 +806,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         prefixes: &[IndexKey],
         check_boundary: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<Option<bool>, BoundedExecutionError> {
         let _ = (table, index, prefixes, check_boundary, before_touch);
         Ok(None)
@@ -704,6 +817,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
     #[allow(clippy::too_many_arguments)]
     fn bounded_exact_index_row_next(
         &self,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         table: &str,
         index: &str,
         snapshot: SnapshotId,
@@ -737,6 +851,9 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         before_placement: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         release_retained: &mut dyn FnMut(usize),
+
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<
         contextdb_vector::mem::BoundedVectorCandidateGroups,
         BoundedExecutionError,
@@ -750,9 +867,17 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         sort_key: Option<&str>,
         groups: &contextdb_vector::mem::BoundedVectorCandidateGroups,
         before_source: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<usize, BoundedExecutionError>;
 
-    fn bounded_vector_entry_count(&self, index: &VectorIndexRef, snapshot: SnapshotId) -> usize;
+    fn bounded_vector_entry_count(
+        &self,
+        index: &VectorIndexRef,
+        snapshot: SnapshotId,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+    ) -> Result<usize>;
 
     /// The structural account of the route this vector read actually used.
     /// Values and authorization decisions have no representation in it, so a
@@ -774,9 +899,12 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         used_hnsw: bool,
         fallback_reason: Option<&'static str>,
         budget_receipt: Option<contextdb_vector::mem::VectorSearchBudgetReceipt>,
+
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<VectorSearchDisclosure>;
 
-    fn publish_vector_search_trace(&self, trace: contextdb_vector::VectorSearchDebugTrace);
+    fn publish_vector_search_trace(&self, trace: contextdb_vector::OwnedVectorSearchTrace);
 
     /// The copy the caller makes while the row is still borrowed under the
     /// schema read, reported with the bytes it charged for.
@@ -793,6 +921,8 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
             BoundedRowVectorClone,
             BoundedExecutionError,
         >,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<Option<BoundedRowVectorClone>, BoundedExecutionError>;
 
     #[allow(clippy::too_many_arguments)]
@@ -805,6 +935,9 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         before_source_entry: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         release_retained: &mut dyn FnMut(usize),
+
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<contextdb_vector::mem::BoundedBruteForceCursor, BoundedExecutionError>;
 
     fn bounded_brute_force_vector_step(
@@ -822,6 +955,9 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         before_distance: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         release_retained: &mut dyn FnMut(usize),
+
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<contextdb_vector::mem::BoundedVectorStep, BoundedExecutionError>;
 
     #[allow(clippy::too_many_arguments)]
@@ -832,12 +968,17 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         k: usize,
         groups: &contextdb_vector::mem::BoundedVectorCandidateGroups,
         mode: VectorSearchMode,
+        is_reader_memory_refusal: &dyn Fn(&BoundedExecutionError) -> bool,
         allowed_search_limits: contextdb_vector::hnsw::HnswAllowedSearchLimits,
         before_source_entry: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_exact_candidate: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_distance: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         release_retained: &mut dyn FnMut(usize),
+
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        load_transfer: crate::memory_accounting::VectorLoadReservationTransfer,
     ) -> std::result::Result<BoundedVectorSearchOutcome, BoundedExecutionError>;
 
     /// The standing visited ceiling a traversal keeps when the caller declared
@@ -851,6 +992,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
     #[allow(clippy::too_many_arguments)]
     fn bounded_rank_candidate(
         &self,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         index: &VectorIndexRef,
         sort_key: &str,
         anchor_row_id: RowId,
@@ -889,6 +1031,8 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         release_retained: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         entry_read: &mut dyn FnMut(),
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<
         Option<crate::database::gate::CountedGraphScanEdge>,
         BoundedExecutionError,
@@ -907,6 +1051,8 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         before_access: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         release_retained: &mut dyn FnMut(usize),
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<Option<contextdb_graph::mem::BoundedBfsCursor>, BoundedExecutionError>;
 
     #[allow(clippy::too_many_arguments)]
@@ -924,6 +1070,8 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         entry_read: &mut dyn FnMut(),
         visited_cap: Option<usize>,
         tx: Option<TxId>,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<
         Option<contextdb_graph::mem::BoundedTraversalNode>,
         BoundedExecutionError,
@@ -940,6 +1088,8 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         tx: Option<TxId>,
         snapshot: SnapshotId,
         ctes: &[Cte],
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Expr>;
 
     /// The in-process store, when this target is one. A subquery has to be
@@ -962,6 +1112,8 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         tx: Option<TxId>,
         snapshot: SnapshotId,
         start_alias: &str,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<GraphStartResolution>;
 
     #[allow(clippy::too_many_arguments)]
@@ -973,6 +1125,8 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         snapshot: SnapshotId,
         bindings: &HashMap<String, uuid::Uuid>,
         work: &mut dyn FnMut(GraphPredicateWork) -> Result<()>,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<bool>;
 
     fn coerce_into_column(
@@ -999,11 +1153,12 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         &self,
         sql: &str,
         params: &HashMap<String, Value>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         limits: ReadLimits,
         clock: Arc<dyn DeadlineClock>,
         cancellation: &OwnerReadCancellation,
     ) -> std::result::Result<
-        (QueryResult, Vec<u8>, ReadPublicationScope),
+        (OwnedQueryResult, Vec<u8>, ReadPublicationScope),
         crate::direct_file_reader::DirectFileReaderError,
     >;
 
@@ -1022,6 +1177,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         self: Arc<Self>,
         sql: &str,
         params: &HashMap<String, Value>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         limits: ReadLimits,
         clock: Arc<dyn DeadlineClock>,
         cancellation: &OwnerReadCancellation,
@@ -1051,6 +1207,15 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         crate::direct_file_reader::DirectFileReaderError,
     >;
 
+    fn read_cursor_observation(
+        &self,
+    ) -> std::result::Result<
+        Option<CursorObservation>,
+        crate::direct_file_reader::DirectFileReaderError,
+    > {
+        Ok(None)
+    }
+
     /// Whether the suspended read behind this target is still there.
     ///
     /// A refusal that answered the REQUEST -- an explicit page count above the
@@ -1073,6 +1238,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
     /// second description of it.
     fn read_metadata(
         &self,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         request: crate::direct_file_reader::DirectMetadataRequest,
         image: &crate::direct_file_reader::DirectOwnedImage,
         limits: ReadLimits,
@@ -1088,18 +1254,41 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
 /// One page, as a reading route publishes it.
 fn published_page(
     page: CursorPage,
+    observation: CursorObservation,
     snapshot: crate::direct_file_reader::DirectSnapshot,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> std::result::Result<
     crate::direct_file_reader::DirectCursorPage,
     crate::direct_file_reader::DirectFileReaderError,
 > {
-    let canonical_bytes = crate::read_contract::encode_cursor_page(&page).map_err(|error| {
-        crate::direct_file_reader::DirectFileReaderError::Engine(error.to_string())
-    })?;
+    let body =
+        crate::read_contract::cursor_observation::BorrowedObservedPage::new(&page, &observation);
+    let size = read_answer(bounded::serialized_size(&body))?;
+    let canonical_credit = contextdb_core::read_memory::ReadCredit::try_new(
+        read_memory,
+        size,
+        "read_channel",
+        "encode_cursor_page",
+        "Reduce the page or raise the reader memory limit.",
+    )
+    .map_err(crate::read_image::history_answer_error)?;
+    let mut canonical_bytes = vec![0u8; size];
+    let written =
+        bincode::serde::encode_into_slice(&body, &mut canonical_bytes, bincode::config::standard())
+            .map_err(|error| {
+                crate::direct_file_reader::DirectFileReaderError::Engine(error.to_string())
+            })?;
+    if written != size {
+        return Err(crate::direct_file_reader::DirectFileReaderError::Engine(
+            "cursor page encoding size changed".into(),
+        ));
+    }
     Ok(crate::direct_file_reader::DirectCursorPage {
         page,
+        observation,
         canonical_bytes,
         snapshot,
+        canonical_credit: Some(canonical_credit),
     })
 }
 
@@ -1107,6 +1296,7 @@ fn published_page(
 /// there is still more to come.
 fn drained_page(
     published: &crate::direct_file_reader::DirectCursorPage,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> std::result::Result<
     Option<crate::direct_file_reader::DirectCursorPage>,
     crate::direct_file_reader::DirectFileReaderError,
@@ -1115,12 +1305,11 @@ fn drained_page(
         return Ok(None);
     }
     published_page(
-        CursorPage {
-            columns: published.page.columns.clone(),
-            rows: Vec::new(),
-            has_more: false,
-        },
+        CursorPage::try_empty(&published.page.columns, read_memory.clone())
+            .map_err(crate::read_image::history_answer_error)?,
+        published.observation.clone(),
         published.snapshot,
+        read_memory,
     )
     .map(Some)
 }
@@ -1151,6 +1340,7 @@ pub(crate) fn read_answer<T>(
 /// reading route retains one shape rather than two.
 pub(crate) struct BoundedCursorTarget {
     store: Arc<dyn ReadExecutionTarget>,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     cursor: std::sync::Mutex<BoundedCursorHandle>,
     /// What the engine actually reserved to keep this read suspended, and
     /// therefore what is returned when it ends. It drops to zero on the
@@ -1167,6 +1357,7 @@ impl BoundedCursorTarget {
         cursor: BoundedCursorHandle,
         retained: u64,
         snapshot: crate::direct_file_reader::DirectSnapshot,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Arc<Self> {
         #[cfg(feature = "test-seams")]
         {
@@ -1175,6 +1366,7 @@ impl BoundedCursorTarget {
         }
         Arc::new(Self {
             store,
+            read_memory,
             cursor: std::sync::Mutex::new(cursor),
             retained: std::sync::atomic::AtomicU64::new(retained),
             released: std::sync::atomic::AtomicBool::new(false),
@@ -1226,8 +1418,9 @@ impl ReadExecutionTarget for Database {
     fn enter_writer_read(
         &self,
         root: Option<Arc<crate::persistence::WriterSnapshot>>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Option<crate::database::writer_read::WriterReadScope> {
-        Some(Database::enter_writer_read(self, root))
+        Some(Database::enter_writer_read(self, root, read_memory))
     }
 
     fn load_row_vector_for_column(
@@ -1238,8 +1431,19 @@ impl ReadExecutionTarget for Database {
         row_id: RowId,
         lsn: Lsn,
         snapshot: SnapshotId,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Option<Vec<f32>>> {
-        self.load_row_vector_for_column_identity(tx, table, column, row_id, lsn, snapshot)
+        self.load_row_vector_for_column_identity(
+            tx,
+            table,
+            column,
+            row_id,
+            lsn,
+            snapshot,
+            vector_copy_owner,
+            read_memory.clone(),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1253,6 +1457,9 @@ impl ReadExecutionTarget for Database {
         before_distance: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         release_retained: &mut dyn FnMut(usize),
+
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<Option<f32>, BoundedExecutionError> {
         Database::bounded_score_committed_vector_row(
             self,
@@ -1264,6 +1471,8 @@ impl ReadExecutionTarget for Database {
             before_distance,
             before_retain,
             release_retained,
+            vector_copy_owner,
+            read_memory.clone(),
         )
     }
 
@@ -1290,20 +1499,44 @@ impl ReadExecutionTarget for Database {
         key_col: &str,
         key_value: &Value,
         snapshot: SnapshotId,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Option<RowId>> {
-        Database::row_id_for_natural_key_in_tx(self, tx, table, key_col, key_value, snapshot)
+        Database::row_id_for_natural_key_in_tx(
+            self,
+            tx,
+            table,
+            key_col,
+            key_value,
+            snapshot,
+            read_memory.clone(),
+        )
     }
 
     fn prepare_bounded_read_plan(
         &self,
         parsed: &Statement,
         params: &HashMap<String, Value>,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<(Statement, PhysicalPlan)> {
-        Database::prepare_bounded_read_plan(self, parsed, params)
+        Database::prepare_bounded_read_plan(
+            self,
+            parsed,
+            params,
+            vector_copy_owner,
+            read_memory.clone(),
+        )
     }
 
     fn automatic_indexes_are_ordered(&self) -> bool {
         Database::automatic_indexes_are_ordered(self)
+    }
+
+    fn declared_read_request_provider(
+        &self,
+    ) -> Arc<dyn crate::vector_read_memory::ReadRequestBudgetProvider> {
+        Database::declared_read_request_provider(self)
     }
 
     fn bounded_read_accountant(&self) -> Arc<crate::memory_accounting::MemoryAccountant> {
@@ -1317,14 +1550,15 @@ impl ReadExecutionTarget for Database {
     fn delivery_metadata(
         &self,
         request: crate::direct_file_reader::DirectMetadataRequest,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<crate::direct_file_reader::DirectMetadataBody> {
-        crate::custody::inspection::metadata(self, request)
+        crate::custody::inspection::metadata(self, request, read_memory)
     }
 
     fn committed_change_state(
         &self,
         checkpoint: &dyn Fn() -> Result<()>,
-        charge: &crate::read_image_memory::ImageMemory,
+        charge: &Arc<crate::read_image_memory::ImageMemory>,
     ) -> std::result::Result<
         crate::direct_file_reader::DirectChangeState,
         crate::direct_file_reader::DirectFileReaderError,
@@ -1335,7 +1569,7 @@ impl ReadExecutionTarget for Database {
     fn committed_sync_state(
         &self,
         checkpoint: &dyn Fn() -> Result<()>,
-        charge: &crate::read_image_memory::ImageMemory,
+        charge: &Arc<crate::read_image_memory::ImageMemory>,
     ) -> std::result::Result<
         crate::direct_file_reader::DirectSyncState,
         crate::direct_file_reader::DirectFileReaderError,
@@ -1343,31 +1577,63 @@ impl ReadExecutionTarget for Database {
         crate::read_image::project_sync_state(self, checkpoint, charge)
     }
 
-    fn store_state_answer(&self, plan: &PhysicalPlan) -> Result<QueryResult> {
+    fn content_size_answer(
+        &self,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        before_table: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<OwnedQueryResult> {
+        content_size_result(self.content_size_totals(read_memory, before_table)?)
+    }
+
+    fn store_state_answer(
+        &self,
+        plan: &PhysicalPlan,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<OwnedQueryResult> {
         // The same arms the uncapped path runs, asked of the same handle:
         // one implementation, so a budget read over a channel and the same
         // read against the file cannot drift apart.
-        execute_plan(self, plan, &HashMap::new(), None)
+        execute_plan(
+            self,
+            plan,
+            &HashMap::new(),
+            None,
+            vector_copy_owner,
+            read_memory.clone(),
+        )
     }
 
-    fn explain_plan_without_running_it(&self, sql: &str) -> Result<String> {
-        Database::explain(self, sql)
+    fn explain_plan_without_running_it(
+        &self,
+        sql: &str,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<String> {
+        Database::explain_with_read_memory(self, sql, vector_copy_owner, read_memory)
     }
 
     fn explain_output_without_running_it(
         &self,
         sql: &str,
         params: &HashMap<String, Value>,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<crate::database::ExplainOutput> {
-        Database::explain_output_with_params(self, sql, params)
+        Database::explain_output_with_params(self, sql, params, vector_copy_owner, read_memory)
     }
 
     fn active_read_transaction(&self) -> Option<TxId> {
         Database::active_read_transaction(self)
     }
 
-    fn transaction_table_overlay(&self, tx: TxId, table: &str) -> Result<TransactionTableOverlay> {
-        Database::transaction_table_overlay(self, tx, table)
+    fn transaction_table_overlay(
+        &self,
+        tx: TxId,
+        table: &str,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<TransactionTableOverlay> {
+        Database::transaction_table_overlay(self, tx, table, read_memory)
     }
 
     fn transaction_vector_overlay(
@@ -1439,8 +1705,15 @@ impl ReadExecutionTarget for Database {
         table: &str,
         columns: &[(String, contextdb_core::SortDirection)],
         prefix: &IndexKey,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Option<u64>> {
-        Database::authenticated_relational_index_prefix_count(self, table, columns, prefix)
+        Database::authenticated_relational_index_prefix_count(
+            self,
+            table,
+            columns,
+            prefix,
+            read_memory,
+        )
     }
 
     fn bounded_read_snapshot_registration(
@@ -1448,12 +1721,14 @@ impl ReadExecutionTarget for Database {
         needs_vector_graph: bool,
         budget: &crate::database::ReadRegistrationBudget,
         withdrawn: &OwnerReadCancellation,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Option<BoundedReadSnapshotPin>> {
         Database::bounded_read_snapshot_registration_with_root(
             self,
             needs_vector_graph,
             budget,
             withdrawn,
+            read_memory,
         )
     }
 
@@ -1464,6 +1739,7 @@ impl ReadExecutionTarget for Database {
         idle_ms: u64,
         budget: &crate::database::ReadRegistrationBudget,
         withdrawn: &OwnerReadCancellation,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Option<BoundedCursorSnapshotPin>> {
         Database::bounded_cursor_snapshot_registration_with_root(
             self,
@@ -1472,6 +1748,7 @@ impl ReadExecutionTarget for Database {
             idle_ms,
             budget,
             withdrawn,
+            read_memory,
         )
     }
 
@@ -1499,6 +1776,9 @@ impl ReadExecutionTarget for Database {
         before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         release_retained: &mut dyn FnMut(usize),
         visit: &mut dyn FnMut(RowId) -> std::result::Result<(), BoundedExecutionError>,
+
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<(), BoundedExecutionError> {
         Database::bounded_vector_visit_visible_ids(
             self,
@@ -1508,6 +1788,8 @@ impl ReadExecutionTarget for Database {
             before_retain,
             release_retained,
             visit,
+            vector_copy_owner,
+            read_memory.clone(),
         )
     }
 
@@ -1519,6 +1801,8 @@ impl ReadExecutionTarget for Database {
         row: &VersionedRow,
         snapshot: SnapshotId,
         before_access_row: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<bool, BoundedExecutionError> {
         Database::bounded_read_allowed_for_row(
             self,
@@ -1528,6 +1812,7 @@ impl ReadExecutionTarget for Database {
             row,
             snapshot,
             before_access_row,
+            read_memory.clone(),
         )
     }
 
@@ -1539,6 +1824,8 @@ impl ReadExecutionTarget for Database {
         row: &VersionedRow,
         snapshot: SnapshotId,
         before_access_row: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<Option<Error>, BoundedExecutionError> {
         Database::bounded_read_denial_for_row(
             self,
@@ -1548,6 +1835,7 @@ impl ReadExecutionTarget for Database {
             row,
             snapshot,
             before_access_row,
+            read_memory.clone(),
         )
     }
 
@@ -1599,6 +1887,7 @@ impl ReadExecutionTarget for Database {
 
     fn bounded_row_by_identity(
         &self,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         tx: Option<TxId>,
         table: &str,
         row_id: RowId,
@@ -1608,6 +1897,7 @@ impl ReadExecutionTarget for Database {
     ) -> std::result::Result<Option<VersionedRow>, BoundedExecutionError> {
         Database::bounded_row_by_identity(
             self,
+            read_memory,
             tx,
             table,
             row_id,
@@ -1626,24 +1916,32 @@ impl ReadExecutionTarget for Database {
 
     fn bounded_physical_table_row_next(
         &self,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         table: &str,
         snapshot: SnapshotId,
         cursor: &mut contextdb_relational::mem::BoundedPhysicalCursor,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        observed: &mut dyn FnMut(&VersionedRow) -> std::result::Result<(), BoundedExecutionError>,
         before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
     ) -> std::result::Result<Option<VersionedRow>, BoundedExecutionError> {
-        Database::bounded_physical_table_row_next(
+        let row = Database::bounded_physical_table_row_next(
             self,
+            read_memory,
             table,
             snapshot,
             cursor,
             before_touch,
             before_clone,
-        )
+        )?;
+        if let Some(row) = &row {
+            observed(row)?;
+        }
+        Ok(row)
     }
 
     fn bounded_exact_index_row_next(
         &self,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         table: &str,
         index: &str,
         snapshot: SnapshotId,
@@ -1655,6 +1953,7 @@ impl ReadExecutionTarget for Database {
     ) -> std::result::Result<Option<VersionedRow>, BoundedExecutionError> {
         Database::bounded_exact_index_row_next(
             self,
+            read_memory,
             table,
             index,
             snapshot,
@@ -1666,8 +1965,17 @@ impl ReadExecutionTarget for Database {
         )
     }
 
-    fn bounded_ordered_table_row_next(
+    fn ordered_prefix_snapshot_is_current(
         &self,
+        snapshot: SnapshotId,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<bool> {
+        Database::ordered_prefix_snapshot_is_current(self, snapshot, read_memory)
+    }
+
+    fn bounded_ordered_table_row_next_observed(
+        &self,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         table: &str,
         column: &str,
         direction: contextdb_core::SortDirection,
@@ -1675,10 +1983,15 @@ impl ReadExecutionTarget for Database {
         cursor: &mut contextdb_relational::mem::BoundedOrderedRowCursor,
         check_boundary: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        observed: &mut dyn FnMut(
+            &IndexKey,
+            RowId,
+        ) -> std::result::Result<(), BoundedExecutionError>,
         before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
     ) -> std::result::Result<Option<VersionedRow>, BoundedExecutionError> {
-        Database::bounded_ordered_table_row_next(
+        Database::bounded_ordered_table_row_next_observed(
             self,
+            read_memory,
             table,
             column,
             direction,
@@ -1686,6 +1999,7 @@ impl ReadExecutionTarget for Database {
             cursor,
             check_boundary,
             before_touch,
+            observed,
             before_clone,
         )
     }
@@ -1698,6 +2012,7 @@ impl ReadExecutionTarget for Database {
         cursor: &mut contextdb_relational::mem::BoundedOrderedRowCursor,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         visit: &mut dyn FnMut(RowId) -> std::result::Result<(), BoundedExecutionError>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<bool, BoundedExecutionError> {
         Database::bounded_visit_verified_ordered_identities(
             self,
@@ -1707,6 +2022,7 @@ impl ReadExecutionTarget for Database {
             cursor,
             before_touch,
             visit,
+            read_memory,
         )
     }
 
@@ -1717,6 +2033,7 @@ impl ReadExecutionTarget for Database {
         prefixes: &[IndexKey],
         check_boundary: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<Option<bool>, BoundedExecutionError> {
         Database::bounded_verified_index_prefixes_are_empty(
             self,
@@ -1725,6 +2042,7 @@ impl ReadExecutionTarget for Database {
             prefixes,
             check_boundary,
             before_touch,
+            read_memory,
         )
     }
 
@@ -1756,6 +2074,9 @@ impl ReadExecutionTarget for Database {
         before_placement: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         release_retained: &mut dyn FnMut(usize),
+
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<
         contextdb_vector::mem::BoundedVectorCandidateGroups,
         BoundedExecutionError,
@@ -1769,6 +2090,8 @@ impl ReadExecutionTarget for Database {
             before_placement,
             before_retain,
             release_retained,
+            vector_copy_owner,
+            read_memory.clone(),
         )
     }
 
@@ -1780,6 +2103,9 @@ impl ReadExecutionTarget for Database {
         sort_key: Option<&str>,
         groups: &contextdb_vector::mem::BoundedVectorCandidateGroups,
         before_source: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<usize, BoundedExecutionError> {
         Database::bounded_vector_candidate_k(
             self,
@@ -1788,11 +2114,18 @@ impl ReadExecutionTarget for Database {
             sort_key,
             groups,
             before_source,
+            vector_copy_owner,
+            read_memory.clone(),
         )
     }
 
-    fn bounded_vector_entry_count(&self, index: &VectorIndexRef, snapshot: SnapshotId) -> usize {
-        Database::vector_entry_count(self, index, snapshot)
+    fn bounded_vector_entry_count(
+        &self,
+        index: &VectorIndexRef,
+        snapshot: SnapshotId,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+    ) -> Result<usize> {
+        Database::vector_entry_count(self, index, snapshot, vector_copy_owner)
     }
 
     fn completed_vector_search_disclosure(
@@ -1811,6 +2144,9 @@ impl ReadExecutionTarget for Database {
         used_hnsw: bool,
         fallback_reason: Option<&'static str>,
         budget_receipt: Option<contextdb_vector::mem::VectorSearchBudgetReceipt>,
+
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<VectorSearchDisclosure> {
         Database::completed_vector_search_disclosure(
             self,
@@ -1828,10 +2164,12 @@ impl ReadExecutionTarget for Database {
             used_hnsw,
             fallback_reason,
             budget_receipt,
+            vector_copy_owner,
+            read_memory.clone(),
         )
     }
 
-    fn publish_vector_search_trace(&self, trace: contextdb_vector::VectorSearchDebugTrace) {
+    fn publish_vector_search_trace(&self, trace: contextdb_vector::OwnedVectorSearchTrace) {
         Database::publish_vector_search_trace(self, trace);
     }
 
@@ -1848,6 +2186,8 @@ impl ReadExecutionTarget for Database {
             BoundedRowVectorClone,
             BoundedExecutionError,
         >,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<Option<BoundedRowVectorClone>, BoundedExecutionError> {
         Database::with_row_vector_source(
             self,
@@ -1856,7 +2196,9 @@ impl ReadExecutionTarget for Database {
             snapshot,
             tx,
             before_access_row,
-            |vector| use_vector(vector),
+            |vector| use_vector(&vector),
+            vector_copy_owner,
+            read_memory.clone(),
         )
     }
 
@@ -1869,6 +2211,9 @@ impl ReadExecutionTarget for Database {
         before_source_entry: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         release_retained: &mut dyn FnMut(usize),
+
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<contextdb_vector::mem::BoundedBruteForceCursor, BoundedExecutionError>
     {
         Database::bounded_brute_force_vector_cursor(
@@ -1880,6 +2225,8 @@ impl ReadExecutionTarget for Database {
             before_source_entry,
             before_retain,
             release_retained,
+            vector_copy_owner,
+            read_memory.clone(),
         )
     }
 
@@ -1898,6 +2245,9 @@ impl ReadExecutionTarget for Database {
         before_distance: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         release_retained: &mut dyn FnMut(usize),
+
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<contextdb_vector::mem::BoundedVectorStep, BoundedExecutionError> {
         Database::bounded_brute_force_vector_step(
             self,
@@ -1908,6 +2258,8 @@ impl ReadExecutionTarget for Database {
             before_distance,
             before_retain,
             release_retained,
+            vector_copy_owner,
+            read_memory.clone(),
         )
     }
 
@@ -1918,12 +2270,17 @@ impl ReadExecutionTarget for Database {
         k: usize,
         groups: &contextdb_vector::mem::BoundedVectorCandidateGroups,
         mode: VectorSearchMode,
+        is_reader_memory_refusal: &dyn Fn(&BoundedExecutionError) -> bool,
         allowed_search_limits: contextdb_vector::hnsw::HnswAllowedSearchLimits,
         before_source_entry: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_exact_candidate: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_distance: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         release_retained: &mut dyn FnMut(usize),
+
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        load_transfer: crate::memory_accounting::VectorLoadReservationTransfer,
     ) -> std::result::Result<BoundedVectorSearchOutcome, BoundedExecutionError> {
         Database::bounded_hnsw_vector_search(
             self,
@@ -1932,12 +2289,16 @@ impl ReadExecutionTarget for Database {
             k,
             groups,
             mode,
+            is_reader_memory_refusal,
             allowed_search_limits,
             before_source_entry,
             before_exact_candidate,
             before_distance,
             before_retain,
             release_retained,
+            vector_copy_owner,
+            read_memory.clone(),
+            load_transfer,
         )
     }
 
@@ -1947,6 +2308,7 @@ impl ReadExecutionTarget for Database {
 
     fn bounded_rank_candidate(
         &self,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         index: &VectorIndexRef,
         sort_key: &str,
         anchor_row_id: RowId,
@@ -1967,6 +2329,7 @@ impl ReadExecutionTarget for Database {
     ) -> std::result::Result<(Option<f32>, usize), BoundedExecutionError> {
         Database::bounded_rank_candidate(
             self,
+            read_memory,
             index,
             sort_key,
             anchor_row_id,
@@ -2008,6 +2371,8 @@ impl ReadExecutionTarget for Database {
         before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         release_retained: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         entry_read: &mut dyn FnMut(),
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<
         Option<crate::database::gate::CountedGraphScanEdge>,
         BoundedExecutionError,
@@ -2022,6 +2387,7 @@ impl ReadExecutionTarget for Database {
             before_retain,
             release_retained,
             entry_read,
+            read_memory.clone(),
         )
     }
 
@@ -2037,6 +2403,8 @@ impl ReadExecutionTarget for Database {
         before_access: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         release_retained: &mut dyn FnMut(usize),
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<Option<contextdb_graph::mem::BoundedBfsCursor>, BoundedExecutionError>
     {
         Database::bounded_graph_bfs_cursor(
@@ -2051,6 +2419,7 @@ impl ReadExecutionTarget for Database {
             before_access,
             before_retain,
             release_retained,
+            read_memory.clone(),
         )
     }
 
@@ -2068,6 +2437,8 @@ impl ReadExecutionTarget for Database {
         entry_read: &mut dyn FnMut(),
         visited_cap: Option<usize>,
         tx: Option<TxId>,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<
         Option<contextdb_graph::mem::BoundedTraversalNode>,
         BoundedExecutionError,
@@ -2086,6 +2457,7 @@ impl ReadExecutionTarget for Database {
             entry_read,
             visited_cap,
             tx,
+            read_memory.clone(),
         )
     }
 
@@ -2096,8 +2468,19 @@ impl ReadExecutionTarget for Database {
         tx: Option<TxId>,
         snapshot: SnapshotId,
         ctes: &[Cte],
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Expr> {
-        resolve_graph_filter_at_snapshot(self, expr, params, tx, snapshot, ctes)
+        resolve_graph_filter_at_snapshot(
+            self,
+            expr,
+            params,
+            tx,
+            snapshot,
+            ctes,
+            vector_copy_owner,
+            read_memory.clone(),
+        )
     }
 
     fn as_database_for_subquery_plan(&self) -> Option<&Database> {
@@ -2111,8 +2494,19 @@ impl ReadExecutionTarget for Database {
         tx: Option<TxId>,
         snapshot: SnapshotId,
         start_alias: &str,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<GraphStartResolution> {
-        resolve_graph_start_nodes_from_filter(self, filter, params, tx, snapshot, start_alias)
+        resolve_graph_start_nodes_from_filter(
+            self,
+            filter,
+            params,
+            tx,
+            snapshot,
+            start_alias,
+            vector_copy_owner,
+            read_memory.clone(),
+        )
     }
 
     fn graph_filter_matches_bindings_with_work(
@@ -2123,8 +2517,19 @@ impl ReadExecutionTarget for Database {
         snapshot: SnapshotId,
         bindings: &HashMap<String, uuid::Uuid>,
         work: &mut dyn FnMut(GraphPredicateWork) -> Result<()>,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<bool> {
-        graph_filter_matches_bindings_with_work(self, filter, params, tx, snapshot, bindings, work)
+        graph_filter_matches_bindings_with_work(
+            self,
+            filter,
+            params,
+            tx,
+            snapshot,
+            bindings,
+            work,
+            read_memory.clone(),
+        )
     }
 
     fn coerce_into_column(
@@ -2146,11 +2551,12 @@ impl ReadExecutionTarget for Database {
         &self,
         sql: &str,
         params: &HashMap<String, Value>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         limits: ReadLimits,
         clock: Arc<dyn DeadlineClock>,
         cancellation: &OwnerReadCancellation,
     ) -> std::result::Result<
-        (QueryResult, Vec<u8>, ReadPublicationScope),
+        (OwnedQueryResult, Vec<u8>, ReadPublicationScope),
         crate::direct_file_reader::DirectFileReaderError,
     > {
         #[cfg(feature = "test-seams")]
@@ -2159,6 +2565,7 @@ impl ReadExecutionTarget for Database {
             self,
             sql,
             params,
+            read_memory.clone(),
             limits,
             clock,
             cancellation.clone(),
@@ -2176,6 +2583,7 @@ impl ReadExecutionTarget for Database {
         self: Arc<Self>,
         sql: &str,
         params: &HashMap<String, Value>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         limits: ReadLimits,
         clock: Arc<dyn DeadlineClock>,
         cancellation: &OwnerReadCancellation,
@@ -2195,26 +2603,42 @@ impl ReadExecutionTarget for Database {
             cancellation,
         );
         let store: Arc<dyn ReadExecutionTarget> = self;
-        let accountant = store.bounded_read_accountant();
-        let before = accountant.usage().used;
         let opened = read_answer(bounded::open_cursor(
             Arc::clone(&store),
             sql,
             params,
+            read_memory.clone(),
             limits,
             clock,
             cancellation.clone(),
             #[cfg(feature = "test-seams")]
             crate::read_session::session_kernel_probe_for_test(),
         ))?;
-        // What the suspended read holds is what the engine's own accounting
-        // says it holds; a page that reserved nothing measurable still costs
-        // the continuation itself, so the floor is one byte rather than none.
-        let retained = accountant.usage().used.saturating_sub(before).max(1);
-        let continuation =
-            BoundedCursorTarget::new(store, opened.cursor, retained as u64, snapshot);
-        let published = published_page(opened.first_page, snapshot)?;
-        let drained = drained_page(&published)?;
+        let retained = opened.cursor.retained_read_bytes();
+        let continuation = BoundedCursorTarget::new(
+            store,
+            opened.cursor,
+            retained as u64,
+            snapshot,
+            read_memory.clone(),
+        );
+        let constructed = (|| {
+            let published = published_page(
+                opened.first_page,
+                opened.observation,
+                snapshot,
+                read_memory.clone(),
+            )?;
+            let drained = drained_page(&published, read_memory.clone())?;
+            Ok((published, drained))
+        })();
+        let (published, drained) = match constructed {
+            Ok(pages) => pages,
+            Err(error) => {
+                continuation.close_read_cursor()?;
+                return Err(error);
+            }
+        };
         if drained.is_some() {
             continuation.close_read_cursor()?;
         }
@@ -2253,6 +2677,7 @@ impl ReadExecutionTarget for Database {
 
     fn read_metadata(
         &self,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         request: crate::direct_file_reader::DirectMetadataRequest,
         image: &crate::direct_file_reader::DirectOwnedImage,
         limits: ReadLimits,
@@ -2265,6 +2690,7 @@ impl ReadExecutionTarget for Database {
     > {
         crate::read_image::project_metadata(
             self,
+            read_memory,
             request,
             image,
             limits,
@@ -2282,13 +2708,74 @@ fn schema_snapshot_matches(db: &Database, expected: &HashMap<TableName, TableMet
     *db.relational_store().table_meta.read() == *expected
 }
 
+fn plan_contains_window(plan: &PhysicalPlan) -> bool {
+    match plan {
+        PhysicalPlan::WindowRank { .. } => true,
+        PhysicalPlan::Filter { input, .. }
+        | PhysicalPlan::Project { input, .. }
+        | PhysicalPlan::Sort { input, .. }
+        | PhysicalPlan::Limit { input, .. }
+        | PhysicalPlan::Distinct { input }
+        | PhysicalPlan::MaterializeCte { input, .. } => plan_contains_window(input),
+        PhysicalPlan::Join { left, right, .. } => {
+            plan_contains_window(left) || plan_contains_window(right)
+        }
+        PhysicalPlan::Union { inputs, .. } | PhysicalPlan::Pipeline(inputs) => {
+            inputs.iter().any(plan_contains_window)
+        }
+        _ => false,
+    }
+}
+
+fn execute_kernel_plan(
+    db: &Database,
+    plan: &PhysicalPlan,
+    params: &HashMap<String, Value>,
+    tx: Option<TxId>,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<OwnedQueryResult> {
+    bounded::drain_chosen_plan(
+        db,
+        plan,
+        params,
+        tx,
+        db.snapshot_for_read(),
+        Arc::new(crate::local_transport::MonotonicDeadlineClock::new()),
+        #[cfg(feature = "test-seams")]
+        None,
+        read_memory,
+    )
+    .map_err(|error| match error {
+        BoundedExecutionError::Engine(error) => error,
+        BoundedExecutionError::Refused(failure) => Error::ReadFailure(failure),
+        BoundedExecutionError::Cancelled => Error::ReadCancelled,
+        BoundedExecutionError::Unimplemented => {
+            Error::PlanError("window plan has no read source".into())
+        }
+    })
+}
+
 pub(crate) fn execute_plan(
     db: &Database,
     plan: &PhysicalPlan,
     params: &HashMap<String, Value>,
     tx: Option<TxId>,
-) -> Result<QueryResult> {
-    execute_plan_with_materialized_columns(db, plan, params, tx, None, None)
+    vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<OwnedQueryResult> {
+    if plan_contains_window(plan) {
+        return execute_kernel_plan(db, plan, params, tx, read_memory);
+    }
+    execute_plan_with_materialized_columns(
+        db,
+        plan,
+        params,
+        tx,
+        None,
+        None,
+        vector_copy_owner,
+        read_memory.clone(),
+    )
 }
 
 fn execute_plan_with_materialized_columns(
@@ -2298,7 +2785,9 @@ fn execute_plan_with_materialized_columns(
     tx: Option<TxId>,
     materialized_columns: Option<&[String]>,
     pending_sort_keys: Option<&[contextdb_planner::SortKey]>,
-) -> Result<QueryResult> {
+    vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<OwnedQueryResult> {
     loop {
         match execute_plan_once(
             db,
@@ -2307,6 +2796,8 @@ fn execute_plan_with_materialized_columns(
             tx,
             materialized_columns,
             pending_sort_keys,
+            vector_copy_owner,
+            read_memory.clone(),
         ) {
             Err(Error::Other(message)) if message == RETRY_LOCAL_SCHEMA_PROJECTION => continue,
             result => return result,
@@ -2325,6 +2816,7 @@ pub(crate) fn execute_bounded(
     db: &Database,
     sql: &str,
     params: &HashMap<String, Value>,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     limits: ReadLimits,
     clock: Arc<dyn DeadlineClock>,
     cancellation: OwnerReadCancellation,
@@ -2334,6 +2826,7 @@ pub(crate) fn execute_bounded(
         db,
         sql,
         params,
+        read_memory,
         limits,
         clock,
         cancellation,
@@ -2353,6 +2846,7 @@ pub(crate) fn execute_bounded_on_target(
     db: &dyn ReadExecutionTarget,
     sql: &str,
     params: &HashMap<String, Value>,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     limits: ReadLimits,
     clock: Arc<dyn DeadlineClock>,
     cancellation: OwnerReadCancellation,
@@ -2362,6 +2856,7 @@ pub(crate) fn execute_bounded_on_target(
         db,
         sql,
         params,
+        read_memory,
         limits,
         clock,
         cancellation,
@@ -2378,6 +2873,7 @@ pub(crate) fn open_bounded_cursor(
     db: Arc<Database>,
     sql: &str,
     params: &HashMap<String, Value>,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     limits: ReadLimits,
     clock: Arc<dyn DeadlineClock>,
     cancellation: OwnerReadCancellation,
@@ -2387,6 +2883,7 @@ pub(crate) fn open_bounded_cursor(
         db,
         sql,
         params,
+        read_memory,
         limits,
         clock,
         cancellation,
@@ -2515,13 +3012,14 @@ pub(crate) struct BoundedExecutionTelemetry {
     pub(crate) source_work: BTreeMap<BoundedWorkSource, u64>,
     pub(crate) source_peak_temporary_bytes: BTreeMap<BoundedWorkSource, u64>,
     pub(crate) encoded_bytes: u64,
+    pub(crate) encoded_trace_bytes: u64,
     pub(crate) peak_temporary_bytes: u64,
     pub(crate) cancellation_observed: bool,
 }
 
 #[derive(Debug)]
 pub(crate) struct BoundedExecutionResult {
-    pub(crate) result: QueryResult,
+    pub(crate) result: OwnedQueryResult,
     pub(crate) publication: ReadPublicationScope,
     #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
     pub(crate) telemetry: BoundedExecutionTelemetry,
@@ -2539,10 +3037,43 @@ pub(crate) struct BoundedCursorHandle {
     _state: Arc<BoundedCursorExecutionState>,
 }
 
+/// Actual kernel work and shared immutable plan metadata at a publication boundary.
+#[derive(Clone)]
+pub(crate) struct CursorObservation {
+    pub(crate) trace: Arc<QueryTrace>,
+    pub(crate) rows_examined: u64,
+    pub(crate) charge: Option<Arc<bounded::SourcePageCharge>>,
+    pub(crate) group_page_returns: Option<Arc<bounded::GroupPageReturns>>,
+}
+impl CursorObservation {
+    pub(crate) fn groups_published_through(
+        &self,
+        offset: usize,
+    ) -> std::result::Result<Self, BoundedExecutionError> {
+        bounded::groups_published_through(self, offset)
+    }
+
+    pub(crate) fn unpublished_groups_withdrawn(
+        &self,
+    ) -> std::result::Result<Self, BoundedExecutionError> {
+        bounded::unpublished_groups_withdrawn(self)
+    }
+}
+
+impl std::fmt::Debug for CursorObservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CursorObservation")
+            .field("trace", &self.trace)
+            .field("rows_examined", &self.rows_examined)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct BoundedCursorOpen {
     pub(crate) cursor: BoundedCursorHandle,
     pub(crate) first_page: CursorPage,
+    pub(crate) observation: CursorObservation,
     pub(crate) storage_snapshot: Option<redb::StorageSnapshotIdentity>,
     pub(crate) publication: ReadPublicationScope,
     #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
@@ -2552,8 +3083,17 @@ pub(crate) struct BoundedCursorOpen {
 #[derive(Debug)]
 pub(crate) struct BoundedCursorFetch {
     pub(crate) page: CursorPage,
+    pub(crate) observation: CursorObservation,
     pub(crate) publication: ReadPublicationScope,
     pub(crate) telemetry: BoundedExecutionTelemetry,
+}
+
+impl BoundedCursorHandle {
+    pub(crate) fn work_observation(
+        &mut self,
+    ) -> std::result::Result<Option<CursorObservation>, BoundedExecutionError> {
+        bounded::cursor_observation(self)
+    }
 }
 
 #[cfg(feature = "test-seams")]
@@ -2570,7 +3110,7 @@ impl BoundedCursorHandle {
         };
         match &*lifecycle {
             BoundedCursorLifecycle::Open(state) => state.continuation_bytes(),
-            BoundedCursorLifecycle::Exhausted(_) | BoundedCursorLifecycle::Released(_) => {
+            BoundedCursorLifecycle::Exhausted(_, _) | BoundedCursorLifecycle::Released(_, _, _) => {
                 Ok(bounded::ContinuationBytes::default())
             }
         }
@@ -2586,6 +3126,7 @@ impl std::fmt::Debug for BoundedCursorHandle {
 }
 
 pub(crate) struct BoundedCursorExecutionState {
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     lifecycle: std::sync::Mutex<BoundedCursorLifecycle>,
     pub(crate) publication: ReadPublicationScope,
     erased: std::sync::atomic::AtomicBool,
@@ -2625,7 +3166,7 @@ impl BoundedCursorExecutionState {
             .clone();
         cancellation.cancel();
         let mut lifecycle = self.lifecycle.lock().unwrap_or_else(|p| p.into_inner());
-        *lifecycle = BoundedCursorLifecycle::Released(BoundedCursorTerminalReason::Erased);
+        bounded::release_cursor_lifecycle(&mut lifecycle, BoundedCursorTerminalReason::Erased);
         drop(lifecycle);
         self.retire_expiry();
     }
@@ -2640,8 +3181,8 @@ impl Drop for BoundedCursorExecutionState {
 #[allow(clippy::large_enum_variant)]
 enum BoundedCursorLifecycle {
     Open(bounded::CursorState),
-    Exhausted(Vec<String>),
-    Released(BoundedCursorTerminalReason),
+    Exhausted(CursorPage, CursorObservation),
+    Released(BoundedCursorTerminalReason, Option<CursorObservation>, bool),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2705,6 +3246,10 @@ pub(crate) trait BoundedExecutionProbe: Send + Sync {
         held_temporary_bytes: u64,
     );
     fn cancellation_observed(&self, completed_work: u64);
+    /// One cold vector graph load's credit move, observed on the real
+    /// transfer before the destination admits, after it admits, and after
+    /// this read's credit is split off.
+    fn graph_credit_transfer(&self, _cut: bounded::GraphCreditTransferCut) {}
 }
 
 #[cfg(feature = "test-seams")]
@@ -2865,7 +3410,7 @@ fn vector_partition_key_json(columns: &[String], key: &VectorPartitionKey) -> Re
     for (column, component) in columns.iter().zip(key.components()) {
         object.insert(column.clone(), vector_partition_component_json(component));
     }
-    Ok(Value::Json(serde_json::Value::Object(object)))
+    Ok(Value::Json(serde_json::Value::Object(object).into()))
 }
 
 fn vector_partition_query_state(
@@ -3114,7 +3659,7 @@ fn vector_partition_inspection_lifecycle(
     let maintenance_need = layout.maintenance_need(partition);
     let maintenance_failure = partition
         .maintenance_failure
-        .filter(|_| maintenance_need.is_some());
+        .filter(|_| maintenance_need.is_some() || partition.maintenance_progress.is_some());
     let availability_reason = if let Some(reason) = partition.quarantine_reason {
         reason.as_str()
     } else if partition.graph_available || partition.live_rows == 0 {
@@ -3124,6 +3669,23 @@ fn vector_partition_inspection_lifecycle(
     } else {
         "initial_build"
     };
+    // A registered build retains committed progress even when its last batch
+    // failed. Report that failure before progress, without hiding its checkpoint.
+    if let Some(progress) = partition.maintenance_progress
+        && let Some(failure) = partition.maintenance_failure
+    {
+        let mut lifecycle = vector_maintenance_failure_lifecycle(
+            failure,
+            partition.graph_available,
+            Some(progress.checkpoint_tx),
+        );
+        lifecycle.availability_reason = availability_reason;
+        lifecycle.vectors_total = Some(progress.vectors_total);
+        lifecycle.vectors_done = Some(progress.vectors_done);
+        lifecycle.vectors_remaining =
+            Some(progress.vectors_total.saturating_sub(progress.vectors_done));
+        return lifecycle;
+    }
     if let Some(progress) = partition.maintenance_progress {
         let reason = published_vector_maintenance_reason(progress.reason);
         return VectorInspectionLifecycle {
@@ -3367,7 +3929,7 @@ fn vector_index_inspection_row(
         Value::Text(info.layout.quantization.as_str().to_owned()),
         vector_inspection_usize(vector_count, "vector_count")?,
         vector_inspection_usize(bytes, "bytes")?,
-        Value::Json(partition_key_columns),
+        Value::Json(partition_key_columns.into()),
         declaration
             .max_partitions
             .map(|value| Value::Int64(i64::from(value)))
@@ -3578,7 +4140,9 @@ fn vector_partition_inspection_row(
 fn execute_create_table_plan(
     db: &Database,
     p: &contextdb_planner::plan::CreateTablePlan,
-) -> Result<QueryResult> {
+    vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<OwnedQueryResult> {
     require_admin_for_create_table(db)?;
     db.check_disk_budget("CREATE TABLE")?;
     // Foreign-key and duplicate-table validation below reads the
@@ -3604,7 +4168,7 @@ fn execute_create_table_plan(
     // answers ok.
     if validated_schema.contains_key(&p.name) {
         if p.if_not_exists {
-            return Ok(QueryResult::empty_with_affected(0));
+            return Ok(OwnedQueryResult::empty_with_affected(0));
         }
         return Err(Error::SchemaInvalid {
             reason: format!(
@@ -3759,7 +4323,7 @@ fn execute_create_table_plan(
     // still tolerated for an undeclared table, as constructed by this file's
     // reconciliation tests.
     // Validate before publishing any local CREATE.
-    crate::custody::policy::check_binding(db, &p.name, &meta)?;
+    crate::custody::policy::check_binding(db, &p.name, &meta, read_memory.clone())?;
     refuse_engine_owned_policy_axes(&p.name, &meta)?;
     // The narrower SYNC-CONFLICT-only counterpart of the axis door
     // above, for the five hub-refereed work-ledger tables that door
@@ -3813,7 +4377,8 @@ fn execute_create_table_plan(
             }
             // A generation belongs to the CREATE that actually won
             // the schema lock, never to a stale validation attempt.
-            let table_generation = db.next_table_generation_for_create(&p.name)?;
+            let table_generation =
+                db.next_table_generation_for_create(&p.name, read_memory.clone())?;
             db.accountant().try_allocate_for(
                 metadata_bytes,
                 "ddl",
@@ -3839,7 +4404,12 @@ fn execute_create_table_plan(
             // schema, rather than the statement's pre-DDL read descriptor.
             if let Some(table_meta) = db.relational_store().table_meta(&p.name) {
                 for column in &table_meta.columns {
-                    db.register_vector_index_for_column(&p.name, column)?;
+                    db.register_vector_index_for_column(
+                        &p.name,
+                        column,
+                        vector_copy_owner,
+                        read_memory.clone(),
+                    )?;
                 }
             }
             for (column, resolved) in resolved_policies {
@@ -3849,13 +4419,14 @@ fn execute_create_table_plan(
         })?;
         db.clear_statement_cache();
         db.reconcile_maintenance_thread();
-        return Ok(QueryResult::empty_with_affected(0));
+        return Ok(OwnedQueryResult::empty_with_affected(0));
     } else {
         db.allocate_ddl_lsn(|lsn| {
             if !schema_snapshot_matches(db, &validated_schema) {
                 return Err(Error::Other(RETRY_LOCAL_SCHEMA_PROJECTION.to_string()));
             }
-            let table_generation = db.next_table_generation_for_create(&p.name)?;
+            let table_generation =
+                db.next_table_generation_for_create(&p.name, read_memory.clone())?;
             db.accountant().try_allocate_for(
                 metadata_bytes,
                 "ddl",
@@ -3882,7 +4453,7 @@ fn execute_create_table_plan(
     }
     db.clear_statement_cache();
     db.reconcile_maintenance_thread();
-    Ok(QueryResult::empty_with_affected(0))
+    Ok(OwnedQueryResult::empty_with_affected(0))
 }
 
 /// `ALTER TABLE`, off the recursing executor's own stack frame. See
@@ -3891,7 +4462,9 @@ fn execute_create_table_plan(
 fn execute_alter_table_plan(
     db: &Database,
     p: &contextdb_planner::plan::AlterTablePlan,
-) -> Result<QueryResult> {
+    vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<OwnedQueryResult> {
     require_admin_for_ddl(db)?;
     db.check_disk_budget("ALTER TABLE")?;
     let store = db.relational_store();
@@ -4025,6 +4598,7 @@ fn execute_alter_table_plan(
                     &projected_rows,
                     lsn,
                     &ddl,
+                    read_memory.clone(),
                 )?;
                 db.publish_local_table_projection_and_ddl(
                     &p.table,
@@ -4036,7 +4610,12 @@ fn execute_alter_table_plan(
                 )?;
                 memory_swap.commit_after_swap();
                 if added_vector {
-                    db.register_vector_index_for_column(&p.table, &core_col)?;
+                    db.register_vector_index_for_column(
+                        &p.table,
+                        &core_col,
+                        vector_copy_owner,
+                        read_memory.clone(),
+                    )?;
                 }
                 if let Some(resolved) = &resolved_policy {
                     db.register_rank_formula(&p.table, &col.name, resolved.formula.clone());
@@ -4044,7 +4623,7 @@ fn execute_alter_table_plan(
                 Ok(())
             })?;
             db.clear_statement_cache();
-            return Ok(QueryResult::empty_with_affected(0));
+            return Ok(OwnedQueryResult::empty_with_affected(0));
         }
         AlterAction::DropColumn {
             column: name,
@@ -4140,7 +4719,7 @@ fn execute_alter_table_plan(
             let _vector_schema = dropped_vector_column
                 .then(|| {
                     let index = VectorIndexRef::new(&p.table, name.clone());
-                    db.drain_vector_index_maintenance_for_ddl(&index);
+                    db.drain_vector_index_maintenance_for_ddl(&index, vector_copy_owner)?;
                     db.vector_schema_write(&index)
                 })
                 .transpose()?;
@@ -4206,6 +4785,7 @@ fn execute_alter_table_plan(
                     &projected_rows,
                     lsn,
                     &ddl,
+                    read_memory.clone(),
                 )?;
                 db.publish_local_table_projection_and_ddl(
                     &p.table,
@@ -4223,7 +4803,7 @@ fn execute_alter_table_plan(
                 Ok(())
             })?;
             db.clear_statement_cache();
-            return Ok(QueryResult {
+            return Ok(OwnedQueryResult::new(QueryResult {
                 columns: vec![],
                 rows: vec![],
                 rows_affected: 0,
@@ -4235,7 +4815,7 @@ fn execute_alter_table_plan(
                 } else {
                     None
                 },
-            });
+            }));
         }
         AlterAction::RenameColumn { from, to } => {
             // Existence first -- see `AddColumn`'s own comment above.
@@ -4297,10 +4877,22 @@ fn execute_alter_table_plan(
                 )));
             }
             let _vector_schema = if renamed_vector_column {
+                vector_copy_owner.reserve(
+                    2 * std::mem::size_of::<VectorIndexRef>()
+                        + 2 * p.table.len()
+                        + from.len()
+                        + to.len(),
+                )?;
                 let old_index = VectorIndexRef::new(&p.table, from.clone());
                 let new_index = VectorIndexRef::new(&p.table, to.clone());
-                db.validate_vector_index_rename_for_ddl(&p.table, from, to)?;
-                db.drain_vector_index_maintenance_for_ddl(&old_index);
+                db.validate_vector_index_rename_for_ddl(
+                    &p.table,
+                    from,
+                    to,
+                    vector_copy_owner,
+                    read_memory.clone(),
+                )?;
+                db.drain_vector_index_maintenance_for_ddl(&old_index, vector_copy_owner)?;
                 Some(db.vector_schema_write_many([old_index, new_index])?)
             } else {
                 None
@@ -4371,13 +4963,34 @@ fn execute_alter_table_plan(
                 )?;
                 let projected_indexes =
                     db.prepare_local_index_projection(&projected_meta, &projected_rows)?;
+                // Finish vector-consuming preparation before the token takes
+                // the registry gates. The executing DDL owner funds both refs
+                // and the complete replacement registry/source handles.
+                let prepared_vector_rename = if renamed_vector_column {
+                    let mut rename_owner = vector_copy_owner.scratch();
+                    rename_owner.reserve(
+                        2 * std::mem::size_of::<VectorIndexRef>()
+                            + 2 * p.table.len()
+                            + from.len()
+                            + to.len(),
+                    )?;
+                    let old_index = VectorIndexRef::new(&p.table, from.clone());
+                    let new_index = VectorIndexRef::new(&p.table, to.clone());
+                    Some(db.prepare_vector_index_rename(&old_index, &new_index, rename_owner)?)
+                } else {
+                    None
+                };
                 db.persist_local_table_projection_and_ddl(
                     &p.table,
                     &projected_meta,
                     &projected_rows,
                     lsn,
                     &ddl,
+                    read_memory.clone(),
                 )?;
+                if let Some(prepared) = prepared_vector_rename {
+                    prepared.publish();
+                }
                 db.publish_local_table_projection_and_ddl(
                     &p.table,
                     projected_meta.clone(),
@@ -4387,13 +5000,10 @@ fn execute_alter_table_plan(
                     projected_indexes,
                 )?;
                 memory_swap.commit_after_swap();
-                if renamed_vector_column {
-                    db.rename_vector_index(&p.table, from, to)?;
-                }
                 Ok(())
             })?;
             db.clear_statement_cache();
-            return Ok(QueryResult::empty_with_affected(0));
+            return Ok(OwnedQueryResult::empty_with_affected(0));
         }
         AlterAction::SetVectorMaxPartitions {
             column,
@@ -4651,7 +5261,7 @@ fn execute_alter_table_plan(
     }
     if let Some((old_meta, projected_meta)) = metadata_only_projection {
         // ALTER must retain every bound clause.
-        crate::custody::policy::check_binding(db, &p.table, &projected_meta)?;
+        crate::custody::policy::check_binding(db, &p.table, &projected_meta, read_memory.clone())?;
         let _vector_schema = vector_layout_update
             .as_ref()
             .map(|index| db.vector_schema_write(index))
@@ -4670,7 +5280,12 @@ fn execute_alter_table_plan(
                     .ok_or_else(|| Error::UnknownVectorIndex {
                         index: index.clone(),
                     })?;
-                db.validate_vector_layout_policy_for_ddl(index, column)?;
+                db.validate_vector_layout_policy_for_ddl(
+                    index,
+                    column,
+                    vector_copy_owner,
+                    read_memory.clone(),
+                )?;
             }
             let projected_rows = db.table_versions_for_projection(&p.table)?;
             let ddl = vec![db.alter_table_ddl_for_meta(&p.table, &projected_meta, Vec::new())];
@@ -4688,6 +5303,7 @@ fn execute_alter_table_plan(
                 &projected_rows,
                 lsn,
                 &ddl,
+                read_memory.clone(),
             )?;
             db.publish_local_table_projection_and_ddl(
                 &p.table,
@@ -4706,14 +5322,19 @@ fn execute_alter_table_plan(
                     .ok_or_else(|| Error::UnknownVectorIndex {
                         index: index.clone(),
                     })?;
-                db.register_vector_index_for_column(&p.table, column)?;
+                db.register_vector_index_for_column(
+                    &p.table,
+                    column,
+                    vector_copy_owner,
+                    read_memory.clone(),
+                )?;
             }
             Ok(())
         })?;
     }
     db.clear_statement_cache();
     db.reconcile_maintenance_thread();
-    Ok(QueryResult::empty_with_affected(0))
+    Ok(OwnedQueryResult::empty_with_affected(0))
 }
 
 /// What ONE layer of the eager executor's recursion costs in stack, pinned.
@@ -4891,20 +5512,31 @@ fn execute_plan_once(
     tx: Option<TxId>,
     materialized_columns: Option<&[String]>,
     pending_sort_keys: Option<&[contextdb_planner::SortKey]>,
-) -> Result<QueryResult> {
+    vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<OwnedQueryResult> {
     #[cfg(test)]
     let __frame_probe = 0u8;
     #[cfg(test)]
     let _layer = eager_plan_layer_frame::Layer::enter(&__frame_probe as *const u8 as usize);
     match plan {
+        PhysicalPlan::WindowRank { .. } => execute_kernel_plan(db, plan, params, tx, read_memory),
         // The SQL doors read and write the canonical authority journal.
-        PhysicalPlan::DeclareTenantTablePolicy(p) => {
-            crate::custody::policy::declare(db, &p.declaration)
-        }
+        PhysicalPlan::DeclareTenantTablePolicy(p) => crate::custody::policy::declare(
+            db,
+            &p.declaration,
+            vector_copy_owner,
+            read_memory.clone(),
+        )
+        .map(OwnedQueryResult::new),
         PhysicalPlan::ShowTenantTablePolicy { table } => {
-            crate::custody::policy::show_policy(db, table.as_deref())
+            crate::custody::policy::show_policy(db, table.as_deref(), read_memory.clone())
+                .map(OwnedQueryResult::new)
         }
-        PhysicalPlan::ShowSyncBindings => crate::custody::policy::show_bindings(db),
+        PhysicalPlan::ShowSyncBindings => {
+            crate::custody::policy::show_bindings(db, read_memory.clone())
+                .map(OwnedQueryResult::new)
+        }
         PhysicalPlan::ShowDeliveryOutcomes(p) => crate::custody::inspection::show(
             db,
             &p.query.table,
@@ -4912,9 +5544,15 @@ fn execute_plan_once(
             p.query.limit.map(|n| n as usize),
             p.query.offset as usize,
             params,
-        ),
-        PhysicalPlan::Discard(p) => exec_discard(db, p, params, tx),
-        PhysicalPlan::CreateTable(p) => execute_create_table_plan(db, p),
+            read_memory.clone(),
+        )
+        .map(OwnedQueryResult::new),
+        PhysicalPlan::Discard(p) => {
+            exec_discard(db, p, params, tx, vector_copy_owner, read_memory.clone())
+        }
+        PhysicalPlan::CreateTable(p) => {
+            execute_create_table_plan(db, p, vector_copy_owner, read_memory.clone())
+        }
         PhysicalPlan::DropTable(name) => {
             require_admin_for_ddl(db)?;
             let validated_schema = db.relational_store().table_meta.read().clone();
@@ -4922,33 +5560,42 @@ fn execute_plan_once(
                 return Err(block);
             }
             validate_projected_foreign_keys_after_drop_table(db, name)?;
-            let bytes_to_release = estimate_drop_table_bytes(db, name);
-            db.drain_vector_table_maintenance_for_ddl(name);
+            let bytes_to_release =
+                estimate_drop_table_bytes(db, name, vector_copy_owner, read_memory.clone())?;
+            db.drain_vector_table_maintenance_for_ddl(name, vector_copy_owner)?;
             let _vector_schema = db.vector_schema_write_table(name)?;
             db.allocate_ddl_lsn(|lsn| {
                 if !schema_snapshot_matches(db, &validated_schema) {
                     return Err(Error::Other(RETRY_LOCAL_SCHEMA_PROJECTION.to_string()));
                 }
-                db.log_drop_table_ddl_and_remove_triggers(name, lsn)
+                db.log_drop_table_ddl_and_remove_triggers(name, lsn, read_memory.clone())
             })?;
             db.accountant().release(bytes_to_release);
             db.clear_statement_cache();
-            Ok(QueryResult::empty_with_affected(0))
+            Ok(OwnedQueryResult::empty_with_affected(0))
         }
-        PhysicalPlan::AlterTable(p) => execute_alter_table_plan(db, p),
-        PhysicalPlan::Insert(p) => exec_insert(db, p, params, tx),
-        PhysicalPlan::Purge(p) => exec_purge(db, p, params, tx),
-        PhysicalPlan::Delete(p) => exec_delete(db, p, params, tx),
-        PhysicalPlan::Update(p) => exec_update(db, p, params, tx),
+        PhysicalPlan::AlterTable(p) => {
+            execute_alter_table_plan(db, p, vector_copy_owner, read_memory.clone())
+        }
+        PhysicalPlan::Insert(p) => exec_insert(db, p, params, tx, read_memory.clone()),
+        PhysicalPlan::Purge(p) => {
+            exec_purge(db, p, params, tx, vector_copy_owner, read_memory.clone())
+        }
+        PhysicalPlan::Delete(p) => {
+            exec_delete(db, p, params, tx, vector_copy_owner, read_memory.clone())
+        }
+        PhysicalPlan::Update(p) => {
+            exec_update(db, p, params, tx, vector_copy_owner, read_memory.clone())
+        }
         PhysicalPlan::Scan { table, filter, .. } => {
             if table == "dual" {
-                return Ok(QueryResult {
+                return Ok(OwnedQueryResult::new(QueryResult {
                     columns: vec![],
                     rows: vec![vec![]],
                     rows_affected: 0,
                     trace: crate::database::QueryTrace::scan(),
                     cascade: None,
-                });
+                }));
             }
             let snapshot = db.snapshot_for_read();
             let schema_columns = db.table_meta(table).map(|meta| {
@@ -4959,7 +5606,16 @@ fn execute_plan_once(
             });
             let resolved_filter = filter
                 .as_ref()
-                .map(|expr| resolve_in_subqueries(db, expr, params, tx))
+                .map(|expr| {
+                    resolve_in_subqueries(
+                        db,
+                        expr,
+                        params,
+                        tx,
+                        vector_copy_owner,
+                        read_memory.clone(),
+                    )
+                })
                 .transpose()?;
             let scan_materialized_columns =
                 merge_expression_columns(materialized_columns, resolved_filter.iter());
@@ -5005,6 +5661,8 @@ fn execute_plan_once(
                         scan_materialized_columns.as_deref(),
                         resolved_filter.as_ref(),
                         params,
+                        vector_copy_owner,
+                        read_memory.clone(),
                     )?;
                     db.__bump_rows_examined(examined);
                     let mut result = materialize_rows(
@@ -5037,11 +5695,19 @@ fn execute_plan_once(
                         vector_search: None,
                         rows_examined: 0,
                         maintained_count: None,
+                        groups: Box::new([]),
                     };
                     return Ok(result);
                 } else {
                     // Scan with rejection trace.
-                    let rows = scan_rows_for_select(db, table, snapshot, tx)?;
+                    let rows = scan_rows_for_select(
+                        db,
+                        table,
+                        snapshot,
+                        tx,
+                        vector_copy_owner,
+                        read_memory.clone(),
+                    )?;
                     db.__bump_rows_examined(rows.len() as u64);
                     let mut result = materialize_rows(
                         rows,
@@ -5061,12 +5727,20 @@ fn execute_plan_once(
                         vector_search: None,
                         rows_examined: 0,
                         maintained_count: None,
+                        groups: Box::new([]),
                     };
                     return Ok(result);
                 }
             }
 
-            let rows = scan_rows_for_select(db, table, snapshot, tx)?;
+            let rows = scan_rows_for_select(
+                db,
+                table,
+                snapshot,
+                tx,
+                vector_copy_owner,
+                read_memory.clone(),
+            )?;
             db.__bump_rows_examined(rows.len() as u64);
             let mut result = materialize_rows(
                 rows,
@@ -5077,7 +5751,9 @@ fn execute_plan_once(
             result.trace = crate::database::QueryTrace::scan();
             Ok(result)
         }
-        PhysicalPlan::GraphBfs { .. } => execute_graph_bfs(db, plan, params, tx),
+        PhysicalPlan::GraphBfs { .. } => {
+            execute_kernel_plan(db, plan, params, tx, read_memory.clone())
+        }
         PhysicalPlan::VectorSearch {
             table,
             column,
@@ -5131,10 +5807,10 @@ fn execute_plan_once(
                 && !complete_relational_route
             {
                 let exact_score_bytes = db
-                    .vector_entry_count(&index, snapshot)
+                    .vector_entry_count(&index, snapshot, vector_copy_owner)?
                     .saturating_mul(std::mem::size_of::<(contextdb_core::RowId, f32)>());
-                if crate::memory_accounting::ScopedMemoryReservation::try_new_for(
-                    db.accountant(),
+                if contextdb_core::read_memory::ReadCredit::try_new(
+                    read_memory.clone(),
                     exact_score_bytes,
                     "vector_search",
                     "preflight_filtered_exact_scores",
@@ -5181,10 +5857,19 @@ fn execute_plan_once(
                     filter,
                     params,
                     partition_scope.as_ref(),
+                    vector_copy_owner,
+                    read_memory.clone(),
                 )?)
             } else if let Some(cands_plan) = access_candidates.as_ref() {
                 let qr = db.with_snapshot_override(snapshot, || {
-                    execute_plan(db, cands_plan, params, tx)
+                    execute_plan(
+                        db,
+                        cands_plan,
+                        params,
+                        tx,
+                        vector_copy_owner,
+                        read_memory.clone(),
+                    )
                 })?;
                 candidate_trace = Some(qr.trace.clone());
                 #[cfg(any(test, feature = "test-seams"))]
@@ -5199,14 +5884,21 @@ fn execute_plan_once(
                     .position(|column| column == "id" || column.rsplit('.').next() == Some("id"));
 
                 if let Some(idx) = row_id_idx {
-                    for row in qr.rows {
+                    for row in qr.result.rows {
                         if let Some(Value::Int64(id)) = row.get(idx) {
                             bm.insert(*id as u64);
                         }
                     }
                 } else if let Some(idx) = id_idx {
-                    let uuid_to_row_id = uuid_to_row_id_map(db, table, snapshot, tx)?;
-                    for row in qr.rows {
+                    let uuid_to_row_id = uuid_to_row_id_map(
+                        db,
+                        table,
+                        snapshot,
+                        tx,
+                        vector_copy_owner,
+                        read_memory.clone(),
+                    )?;
+                    for row in qr.result.rows {
                         if let Some(Value::Uuid(uuid)) = row.get(idx)
                             && let Some(row_id) = uuid_to_row_id.get(uuid)
                         {
@@ -5225,11 +5917,18 @@ fn execute_plan_once(
             }
             let _vector_schema = db.vector_schema_read_many(vector_schema_refs);
             db.assert_vector_index_exists_under_schema_read(&index)?;
-            let (query_vec, query_vector_source) =
-                resolve_query_vector_from_expr(db, query_expr, params, tx, snapshot)?;
+            let (query_vec, query_vector_source) = resolve_query_vector_from_expr(
+                db,
+                query_expr,
+                params,
+                tx,
+                snapshot,
+                vector_copy_owner,
+                read_memory.clone(),
+            )?;
             let vector_bytes = estimate_vector_search_bytes(query_vec.len(), *k as usize);
-            let _vector_memory = crate::memory_accounting::ScopedMemoryReservation::try_new_for(
-                db.accountant(),
+            let _vector_memory = contextdb_core::read_memory::ReadCredit::try_new(
+                read_memory.clone(),
                 vector_bytes,
                 "vector_search",
                 "search",
@@ -5250,6 +5949,9 @@ fn execute_plan_once(
                             tx,
                             semantic_query,
                             candidate_bitmap,
+                            vector_copy_owner,
+                            read_memory.clone(),
+                            Arc::new(bounded::TraceMemoryOwner(read_memory.clone())),
                         )
                     })
                 };
@@ -5322,16 +6024,18 @@ fn execute_plan_once(
                         snapshot,
                         params,
                         &route_trace,
+                        vector_copy_owner,
+                        read_memory.clone(),
                     )?);
-                return Ok(QueryResult {
+                return Ok(OwnedQueryResult::new(QueryResult {
                     columns,
                     rows,
                     rows_affected: 0,
                     trace,
                     cascade: None,
-                });
+                }));
             }
-            let search = || {
+            let mut search = || {
                 db.query_vector_strict_in_tx_with_strategy(
                     tx,
                     index.clone(),
@@ -5340,6 +6044,9 @@ fn execute_plan_once(
                     candidate_bitmap.as_ref(),
                     snapshot,
                     resolved_search_mode,
+                    vector_copy_owner,
+                    read_memory.clone(),
+                    Arc::new(bounded::TraceMemoryOwner(read_memory.clone())),
                 )
             };
             let res = if let Some(prefixes) = partition_scope
@@ -5370,6 +6077,8 @@ fn execute_plan_once(
                 snapshot,
                 tx,
                 materialized_columns.as_deref(),
+                vector_copy_owner,
+                read_memory.clone(),
             )?;
             let schema_columns = db.table_meta(table).map(|meta| {
                 meta.columns
@@ -5432,19 +6141,26 @@ fn execute_plan_once(
                     snapshot,
                     params,
                     &route_trace,
+                    vector_copy_owner,
+                    read_memory.clone(),
                 )?,
             );
-            Ok(QueryResult {
+            Ok(OwnedQueryResult::new(QueryResult {
                 columns,
                 rows,
                 rows_affected: 0,
                 trace,
                 cascade: None,
-            })
+            }))
         }
-        PhysicalPlan::MaterializeCte { input, .. } => {
-            execute_materialized_cte(db, input, params, tx)
-        }
+        PhysicalPlan::MaterializeCte { input, .. } => execute_materialized_cte(
+            db,
+            input,
+            params,
+            tx,
+            vector_copy_owner,
+            read_memory.clone(),
+        ),
         PhysicalPlan::Project { input, columns } => {
             let projected_columns = expression_columns(columns.iter().map(|column| &column.expr));
             let input_result = execute_plan_with_materialized_columns(
@@ -5454,6 +6170,8 @@ fn execute_plan_once(
                 tx,
                 Some(&projected_columns),
                 pending_sort_keys,
+                vector_copy_owner,
+                read_memory.clone(),
             )?;
             if projection_aggregates(columns) {
                 let mut running = Vec::with_capacity(columns.len());
@@ -5490,13 +6208,13 @@ fn execute_plan_once(
                     .map(AggregateState::finish)
                     .collect::<Result<Vec<_>>>()?;
 
-                return Ok(QueryResult {
+                return Ok(OwnedQueryResult::new(QueryResult {
                     columns: project_output_columns(columns),
                     rows: vec![aggregate_row],
                     rows_affected: 0,
                     trace: input_result.trace.clone(),
                     cascade: None,
-                });
+                }));
             }
 
             let output_columns = project_output_columns(columns);
@@ -5515,13 +6233,13 @@ fn execute_plan_once(
                 output_rows.push(projected);
             }
 
-            Ok(QueryResult {
+            Ok(OwnedQueryResult::new(QueryResult {
                 columns: output_columns,
                 rows: output_rows,
                 rows_affected: 0,
                 trace: input_result.trace.clone(),
                 cascade: None,
-            })
+            }))
         }
         PhysicalPlan::Sort { input, keys } => {
             let sort_columns =
@@ -5529,7 +6247,16 @@ fn execute_plan_once(
             // Sort elision path A: input is a Scan and an index's direction
             // prefix matches `keys`. We rewrite the input into an IndexScan
             // and skip the re-sort.
-            let elided = try_elide_sort(db, input, keys, params, tx, sort_columns.as_deref())?;
+            let elided = try_elide_sort(
+                db,
+                input,
+                keys,
+                params,
+                tx,
+                sort_columns.as_deref(),
+                vector_copy_owner,
+                read_memory.clone(),
+            )?;
             if let Some(mut result) = elided {
                 result.trace.sort_elided = true;
                 return Ok(result);
@@ -5541,6 +6268,8 @@ fn execute_plan_once(
                 tx,
                 sort_columns.as_deref(),
                 Some(keys.as_slice()),
+                vector_copy_owner,
+                read_memory.clone(),
             )?;
 
             // Sort elision path B: the input already used an IndexScan whose
@@ -5587,7 +6316,7 @@ fn execute_plan_once(
                 }
                 Ordering::Equal
             });
-            let unsorted_rows = input_result.rows;
+            let unsorted_rows = std::mem::take(&mut input_result.result.rows);
             input_result.rows = order
                 .into_iter()
                 .map(|i| unsorted_rows[i].clone())
@@ -5609,6 +6338,8 @@ fn execute_plan_once(
                 tx,
                 materialized_columns,
                 pending_sort_keys,
+                vector_copy_owner,
+                read_memory.clone(),
             )?;
             input_result.rows.truncate(*count as usize);
             Ok(input_result)
@@ -5623,6 +6354,8 @@ fn execute_plan_once(
                 tx,
                 filter_columns.as_deref(),
                 pending_sort_keys,
+                vector_copy_owner,
+                read_memory.clone(),
             )?;
             // A genuine evaluation error (e.g. dividing by zero, negating a
             // non-numeric value) must fail the statement, never be treated
@@ -5633,7 +6366,7 @@ fn execute_plan_once(
             // `Filter` node over an arbitrary input), so it goes through a
             // fallible loop rather than `Vec::retain`, which cannot propagate
             // an `Err`.
-            let unfiltered_rows = input_result.rows;
+            let unfiltered_rows = std::mem::take(&mut input_result.result.rows);
             let mut kept = Vec::with_capacity(unfiltered_rows.len());
             for row in unfiltered_rows {
                 if query_result_row_matches(&row, &input_result.columns, predicate, params)? {
@@ -5644,27 +6377,24 @@ fn execute_plan_once(
             Ok(input_result)
         }
         PhysicalPlan::Distinct { input } => {
-            let input_result = execute_plan_with_materialized_columns(
+            let mut input_result = execute_plan_with_materialized_columns(
                 db,
                 input,
                 params,
                 tx,
                 materialized_columns,
                 pending_sort_keys,
+                vector_copy_owner,
+                read_memory.clone(),
             )?;
             let mut seen = HashSet::<Vec<u8>>::new();
-            let rows = input_result
-                .rows
+            let rows = std::mem::take(&mut input_result.result.rows)
                 .into_iter()
                 .filter(|row| seen.insert(distinct_row_key(row)))
                 .collect();
-            Ok(QueryResult {
-                columns: input_result.columns,
-                rows,
-                rows_affected: input_result.rows_affected,
-                trace: input_result.trace,
-                cascade: None,
-            })
+            input_result.rows = rows;
+            input_result.cascade = None;
+            Ok(input_result)
         }
         PhysicalPlan::Join {
             left,
@@ -5674,8 +6404,16 @@ fn execute_plan_once(
             left_alias,
             right_alias,
         } => {
-            let left_result = execute_plan(db, left, params, tx)?;
-            let right_result = execute_plan(db, right, params, tx)?;
+            let left_result =
+                execute_plan(db, left, params, tx, vector_copy_owner, read_memory.clone())?;
+            let right_result = execute_plan(
+                db,
+                right,
+                params,
+                tx,
+                vector_copy_owner,
+                read_memory.clone(),
+            )?;
             let right_duplicate_names =
                 duplicate_column_names(&left_result.columns, &right_result.columns);
             let right_prefix = right_alias
@@ -5722,21 +6460,21 @@ fn execute_plan_once(
                 &right_prefix,
             );
 
-            Ok(QueryResult {
+            Ok(OwnedQueryResult::new(QueryResult {
                 columns: output_columns,
                 rows,
                 rows_affected: 0,
                 trace: crate::database::QueryTrace::scan(),
                 cascade: None,
-            })
+            }))
         }
         PhysicalPlan::CreateIndex(p) => {
             require_admin_for_ddl(db)?;
-            exec_create_index(db, p)
+            exec_create_index(db, p, read_memory.clone())
         }
         PhysicalPlan::DropIndex(p) => {
             require_admin_for_ddl(db)?;
-            exec_drop_index(db, p)
+            exec_drop_index(db, p, read_memory.clone())
         }
         PhysicalPlan::IndexScan {
             table,
@@ -5747,7 +6485,7 @@ fn execute_plan_once(
             // must walk the BTreeMap at the named index, apply visibility,
             // materialize rows, and populate the trace fully.
             let _ = (table, index);
-            Ok(QueryResult {
+            Ok(OwnedQueryResult::new(QueryResult {
                 columns: vec![],
                 rows: vec![],
                 rows_affected: 0,
@@ -5757,7 +6495,7 @@ fn execute_plan_once(
                     ..crate::database::QueryTrace::default()
                 },
                 cascade: None,
-            })
+            }))
         }
         PhysicalPlan::SetMemoryLimit(val) => {
             let limit = match val {
@@ -5765,11 +6503,11 @@ fn execute_plan_once(
                 SetMemoryLimitValue::None => None,
             };
             db.set_memory_limit(limit)?;
-            Ok(QueryResult::empty())
+            Ok(OwnedQueryResult::empty())
         }
         PhysicalPlan::ShowMemoryLimit => {
             let usage = db.accountant().usage();
-            Ok(QueryResult {
+            Ok(OwnedQueryResult::new(QueryResult {
                 columns: vec![
                     "limit".to_string(),
                     "used".to_string(),
@@ -5794,7 +6532,7 @@ fn execute_plan_once(
                 rows_affected: 0,
                 trace: crate::database::QueryTrace::scan(),
                 cascade: None,
-            })
+            }))
         }
         PhysicalPlan::SetDiskLimit(val) => {
             let limit = match val {
@@ -5802,13 +6540,16 @@ fn execute_plan_once(
                 SetDiskLimitValue::None => None,
             };
             db.set_disk_limit(limit)?;
-            Ok(QueryResult::empty())
+            Ok(OwnedQueryResult::empty())
+        }
+        PhysicalPlan::ShowContentSize => {
+            content_size_result(db.content_size_totals(read_memory.clone(), &mut || Ok(()))?)
         }
         PhysicalPlan::ShowDiskLimit => {
             let limit = db.disk_limit();
             let used = db.disk_file_size();
             let startup_ceiling = db.disk_limit_startup_ceiling();
-            Ok(QueryResult {
+            Ok(OwnedQueryResult::new(QueryResult {
                 columns: vec![
                     "limit".to_string(),
                     "used".to_string(),
@@ -5834,17 +6575,17 @@ fn execute_plan_once(
                 rows_affected: 0,
                 trace: crate::database::QueryTrace::scan(),
                 cascade: None,
-            })
+            }))
         }
         PhysicalPlan::SetMaintenancePollInterval(milliseconds) => {
             db.set_maintenance_poll_interval(std::time::Duration::from_millis(*milliseconds))?;
-            Ok(QueryResult::empty())
+            Ok(OwnedQueryResult::empty())
         }
         PhysicalPlan::SetVectorServingCache(bytes) => {
             db.set_vector_serving_cache_bytes(bytes.map(|bytes| bytes as usize))?;
-            Ok(QueryResult::empty())
+            Ok(OwnedQueryResult::empty())
         }
-        PhysicalPlan::ShowVectorServingCache => Ok(QueryResult {
+        PhysicalPlan::ShowVectorServingCache => Ok(OwnedQueryResult::new(QueryResult {
             columns: vec!["bytes".to_string()],
             rows: vec![vec![match db.vector_serving_cache_bytes() {
                 Some(bytes) => Value::Int64(i64::try_from(bytes).unwrap_or(i64::MAX)),
@@ -5853,8 +6594,8 @@ fn execute_plan_once(
             rows_affected: 0,
             trace: crate::database::QueryTrace::scan(),
             cascade: None,
-        }),
-        PhysicalPlan::ShowMaintenancePollInterval => Ok(QueryResult {
+        })),
+        PhysicalPlan::ShowMaintenancePollInterval => Ok(OwnedQueryResult::new(QueryResult {
             columns: vec!["milliseconds".to_string()],
             rows: vec![vec![Value::Int64(
                 i64::try_from(db.maintenance_poll_interval().as_millis()).unwrap_or(i64::MAX),
@@ -5862,7 +6603,7 @@ fn execute_plan_once(
             rows_affected: 0,
             trace: crate::database::QueryTrace::scan(),
             cascade: None,
-        }),
+        })),
         PhysicalPlan::ShowSyncConflictPolicy => {
             // The per-table policy is DECLARED on each table's meta (via
             // `CREATE ... SYNC CONFLICT ...`), which is what the sync apply
@@ -5923,30 +6664,30 @@ fn execute_plan_once(
                     rows.push(vec![Value::Text(format!("{table}={word} (engine-owned)"))]);
                 }
             }
-            Ok(QueryResult {
+            Ok(OwnedQueryResult::new(QueryResult {
                 columns: vec!["policy".to_string()],
                 rows,
                 rows_affected: 0,
                 trace: crate::database::QueryTrace::scan(),
                 cascade: None,
-            })
+            }))
         }
         PhysicalPlan::ShowVectorIndexes => {
             let maintenance_policy = db.maintenance_policy();
             let rows = db
-                .vector_inspection_infos(None)?
+                .vector_inspection_infos(None, vector_copy_owner, read_memory.clone())?
                 .into_iter()
                 .map(|(declaration, info, partitions)| {
                     vector_index_inspection_row(&declaration, info, &partitions, maintenance_policy)
                 })
                 .collect::<Result<Vec<_>>>()?;
-            Ok(QueryResult {
+            Ok(OwnedQueryResult::new(QueryResult {
                 columns: vector_inspection_columns(VECTOR_INDEX_INSPECTION_COLUMNS),
                 rows,
                 rows_affected: 0,
                 trace: crate::database::QueryTrace::scan(),
                 cascade: None,
-            })
+            }))
         }
         PhysicalPlan::ShowVectorPartitions {
             table,
@@ -5966,7 +6707,9 @@ fn execute_plan_once(
             };
             let maintenance_policy = db.maintenance_policy();
             let mut rows = Vec::new();
-            for (declaration, info, partitions) in db.vector_inspection_infos(target.as_ref())? {
+            for (declaration, info, partitions) in
+                db.vector_inspection_infos(target.as_ref(), vector_copy_owner, read_memory.clone())?
+            {
                 if table
                     .as_deref()
                     .is_some_and(|table| info.index.table != table)
@@ -5995,18 +6738,18 @@ fn execute_plan_once(
                 None => usize::MAX,
             };
             let rows = rows.into_iter().skip(offset).take(limit).collect();
-            Ok(QueryResult {
+            Ok(OwnedQueryResult::new(QueryResult {
                 columns: vector_inspection_columns(VECTOR_PARTITION_INSPECTION_COLUMNS),
                 rows,
                 rows_affected: 0,
                 trace: crate::database::QueryTrace::scan(),
                 cascade: None,
-            })
+            }))
         }
         PhysicalPlan::Pipeline(plans) => {
-            let mut last = QueryResult::empty();
+            let mut last = OwnedQueryResult::empty();
             for p in plans {
-                last = execute_plan(db, p, params, tx)?;
+                last = execute_plan(db, p, params, tx, vector_copy_owner, read_memory.clone())?;
             }
             Ok(last)
         }
@@ -6017,400 +6760,51 @@ fn execute_plan_once(
 }
 
 #[inline(never)]
-fn execute_graph_bfs(
-    db: &Database,
-    plan: &PhysicalPlan,
-    params: &HashMap<String, Value>,
-    tx: Option<TxId>,
-) -> Result<QueryResult> {
-    let PhysicalPlan::GraphBfs {
-        start_alias,
-        start_expr,
-        start_candidates,
-        filter_ctes,
-        steps,
-        filter,
-    } = plan
-    else {
-        unreachable!("graph executor called for a non-graph plan");
-    };
 
-    // GRAPH_TABLE must use this captured read snapshot throughout this arm.
-    // Calling db.snapshot() from here would leak live graph state into execute_at_snapshot.
-    let snapshot = db.snapshot_for_read();
-    let mut predicates_pushed: smallvec::SmallVec<[Cow<'static, str>; 4]> =
-        smallvec::SmallVec::new();
-    let mut unpinned_start = false;
-    let first_step = steps
-        .first()
-        .ok_or_else(|| Error::PlanError("graph plan missing traversal step".to_string()))?;
-    let single_step = steps.len() == 1 && first_step.min_depth == 1 && first_step.max_depth == 1;
-    let resolved_filter = filter
-        .as_ref()
-        .map(|filter_expr| {
-            resolve_graph_filter_at_snapshot(db, filter_expr, params, tx, snapshot, filter_ctes)
-        })
-        .transpose()?;
-    let start_uuids = match resolve_uuid(start_expr, params) {
-        Ok(start) => {
-            let starts = vec![start];
-            db.assert_graph_anchor_nodes_readable_in_tx(tx, &starts, snapshot)?;
-            predicates_pushed.push(Cow::Owned(format!("{start_alias}.id")));
-            starts
-        }
-        Err(Error::PlanError(_))
-            if matches!(
-                start_expr,
-                Expr::Column(contextdb_parser::ast::ColumnRef { table: None, .. })
-            ) =>
-        {
-            // Start node not directly specified — check if a subquery or filter can help.
-            if let Some(candidate_plan) = start_candidates {
-                predicates_pushed.push(Cow::Owned(format!("{start_alias}.id")));
-                let starts =
-                    resolve_graph_start_nodes_from_plan(db, candidate_plan, params, tx, snapshot)?;
-                db.assert_graph_anchor_nodes_readable_in_tx(tx, &starts, snapshot)?;
-                starts
-            } else if let Some(resolved_filter) = resolved_filter.as_ref() {
-                let resolution = resolve_graph_start_nodes_from_filter(
-                    db,
-                    resolved_filter,
-                    params,
-                    tx,
-                    snapshot,
-                    start_alias,
-                )?;
-                predicates_pushed.extend(resolution.predicates_pushed);
-                if resolution.pinned {
-                    resolution.ids
-                } else {
-                    unpinned_start = true;
-                    let edge_types_ref = (!first_step.edge_types.is_empty())
-                        .then_some(first_step.edge_types.as_slice());
-                    if single_step {
-                        Vec::new()
-                    } else {
-                        let (starts, examined) = db.graph_start_nodes_for_match_counted(
-                            tx,
-                            edge_types_ref,
-                            first_step.direction,
-                            snapshot,
-                        )?;
-                        db.__bump_rows_examined(examined);
-                        starts
-                    }
-                }
-            } else {
-                unpinned_start = true;
-                let edge_types_ref =
-                    (!first_step.edge_types.is_empty()).then_some(first_step.edge_types.as_slice());
-                if single_step {
-                    Vec::new()
-                } else {
-                    let (starts, examined) = db.graph_start_nodes_for_match_counted(
-                        tx,
-                        edge_types_ref,
-                        first_step.direction,
-                        snapshot,
-                    )?;
-                    db.__bump_rows_examined(examined);
-                    starts
-                }
-            }
-        }
-        Err(err) => return Err(err),
-    };
-    let target_residual = if single_step {
-        resolved_filter
-            .as_ref()
-            .map(|expr| resolve_graph_target_id_residual(expr, params, &steps[0].target_alias))
-            .transpose()?
-            .flatten()
-    } else {
-        None
-    };
-    let target_probe_direction = if single_step && unpinned_start && target_residual.is_some() {
-        Some(reverse_graph_probe_direction(first_step.direction))
-    } else {
-        None
-    };
-    let trace_shape = if let Some(direction) = target_probe_direction {
-        GraphTraceShape::AdjacencyProbe {
-            index: graph_adjacency_index_label(direction),
-        }
-    } else {
-        graph_trace_shape(
-            single_step,
-            unpinned_start,
-            steps.first().map(|step| step.direction),
-        )
-    };
-    let start_id_predicate = format!("{start_alias}.id");
-    if target_residual.is_some()
-        && predicates_pushed
-            .iter()
-            .any(|predicate| predicate.as_ref() == start_id_predicate)
-    {
-        predicates_pushed.push(Cow::Owned(format!("{}.id", steps[0].target_alias)));
-    }
-    if let (Some(target_id), Some(direction)) = (target_residual, target_probe_direction) {
-        predicates_pushed.push(Cow::Owned(format!("{}.id", first_step.target_alias)));
-        let edge_types_ref =
-            (!first_step.edge_types.is_empty()).then_some(first_step.edge_types.as_slice());
-        let (res, examined) =
-            db.graph_adjacency_probe_counted(tx, target_id, edge_types_ref, direction, snapshot)?;
-        db.__bump_rows_examined(examined);
-        let mut frontier = Vec::with_capacity(res.nodes.len());
-        for node in res.nodes {
-            frontier.push((
-                HashMap::from([
-                    (start_alias.clone(), node.id),
-                    (first_step.target_alias.clone(), target_id),
-                ]),
-                target_id,
-                1_u32,
-            ));
-        }
-        let frontier = filter_graph_frontier(
-            db,
-            dedupe_graph_frontier(frontier, steps),
-            resolved_filter.as_ref(),
-            params,
-            tx,
-            snapshot,
-        )?;
-        let bfs_bytes = estimate_bfs_working_bytes(&frontier, steps);
-        db.accountant().try_allocate_for(
-            bfs_bytes,
-            "bfs_frontier",
-            "graph_bfs",
-            "Reduce traversal depth/fan-out or raise MEMORY_LIMIT before running BFS.",
-        )?;
-        let rows = project_graph_frontier_rows(frontier, start_alias, steps);
-        db.accountant().release(bfs_bytes);
-        return Ok(graph_query_result(
-            steps,
-            start_alias,
-            rows?,
-            trace_shape,
-            predicates_pushed,
-        ));
-    }
-    if single_step && unpinned_start {
-        let edge_types_ref =
-            (!first_step.edge_types.is_empty()).then_some(first_step.edge_types.as_slice());
-        let (mut edges, examined) =
-            db.graph_edges_scan_counted(tx, edge_types_ref, first_step.direction, snapshot)?;
-        db.__bump_rows_examined(examined);
-        edges.sort_unstable();
-        let mut frontier = Vec::with_capacity(edges.len());
-        for (start, target) in edges {
-            if let Some(target_id) = target_residual
-                && target != target_id
-            {
-                continue;
-            }
-            frontier.push((
-                HashMap::from([
-                    (start_alias.clone(), start),
-                    (first_step.target_alias.clone(), target),
-                ]),
-                target,
-                1_u32,
-            ));
-        }
-        let frontier = filter_graph_frontier(
-            db,
-            dedupe_graph_frontier(frontier, steps),
-            resolved_filter.as_ref(),
-            params,
-            tx,
-            snapshot,
-        )?;
-        let bfs_bytes = estimate_bfs_working_bytes(&frontier, steps);
-        db.accountant().try_allocate_for(
-            bfs_bytes,
-            "bfs_frontier",
-            "graph_bfs",
-            "Reduce traversal depth/fan-out or raise MEMORY_LIMIT before running BFS.",
-        )?;
-        let rows = project_graph_frontier_rows(frontier, start_alias, steps);
-        db.accountant().release(bfs_bytes);
-        return Ok(graph_query_result(
-            steps,
-            start_alias,
-            rows?,
-            trace_shape,
-            predicates_pushed,
-        ));
-    }
-    if start_uuids.is_empty() {
-        db.__bump_rows_examined(0);
-        return Ok(QueryResult {
-            columns: vec!["id".to_string(), "depth".to_string()],
-            rows: vec![],
-            rows_affected: 0,
-            trace: graph_query_trace(trace_shape, predicates_pushed),
-            cascade: None,
-        });
-    }
-    let mut frontier = start_uuids
-        .into_iter()
-        .map(|id| (HashMap::from([(start_alias.clone(), id)]), id, 0_u32))
-        .collect::<Vec<_>>();
-    let bfs_bytes = estimate_bfs_working_bytes(&frontier, steps);
-    db.accountant().try_allocate_for(
-        bfs_bytes,
-        "bfs_frontier",
-        "graph_bfs",
-        "Reduce traversal depth/fan-out or raise MEMORY_LIMIT before running BFS.",
-    )?;
-
-    let result = execute_graph_bfs_steps(
-        GraphBfsStepExecution {
-            db,
-            steps,
-            start_alias,
-            target_residual,
-            single_step,
-            resolved_filter: resolved_filter.as_ref(),
-            params,
-            tx,
-            snapshot,
-            trace_shape,
-            predicates_pushed,
-        },
-        &mut frontier,
-    );
-    db.accountant().release(bfs_bytes);
-    result
-}
-
-#[inline(never)]
-fn execute_graph_bfs_steps(
-    execution: GraphBfsStepExecution<'_>,
-    frontier: &mut Vec<(HashMap<String, uuid::Uuid>, uuid::Uuid, u32)>,
-) -> Result<QueryResult> {
-    let GraphBfsStepExecution {
-        db,
-        steps,
-        start_alias,
-        target_residual,
-        single_step,
-        resolved_filter,
-        params,
-        tx,
-        snapshot,
-        trace_shape,
-        predicates_pushed,
-    } = execution;
-    for step in steps {
-        let edge_types_ref = (!step.edge_types.is_empty()).then_some(step.edge_types.as_slice());
-        let mut next: Vec<(HashMap<String, uuid::Uuid>, uuid::Uuid, u32)> = Vec::new();
-
-        for (bindings, start, base_depth) in frontier.iter() {
-            let (res, examined) = if single_step {
-                db.graph_adjacency_probe_counted(
-                    tx,
-                    *start,
-                    edge_types_ref,
-                    step.direction,
-                    snapshot,
-                )?
-            } else {
-                db.graph_bfs_counted(
-                    tx,
-                    *start,
-                    edge_types_ref,
-                    step.direction,
-                    step.min_depth..=step.max_depth,
-                    snapshot,
-                )?
-            };
-            db.__bump_rows_examined(examined);
-            for node in res.nodes {
-                if let Some(target_id) = target_residual
-                    && node.id != target_id
-                {
-                    continue;
-                }
-                let total_depth = (*base_depth).saturating_add(node.depth);
-                let mut next_bindings = bindings.clone();
-                next_bindings.insert(step.target_alias.clone(), node.id);
-                next.push((next_bindings, node.id, total_depth));
-            }
-        }
-
-        *frontier = dedupe_graph_frontier(next, steps);
-        if frontier.is_empty() {
-            break;
-        }
-    }
-
-    let filtered = filter_graph_frontier(
-        db,
-        std::mem::take(frontier),
-        resolved_filter,
-        params,
-        tx,
-        snapshot,
-    )?;
-    let rows = project_graph_frontier_rows(filtered, start_alias, steps)?;
-    Ok(graph_query_result(
-        steps,
-        start_alias,
-        rows,
-        trace_shape,
-        predicates_pushed,
-    ))
-}
-
-struct GraphBfsStepExecution<'a> {
-    db: &'a Database,
-    steps: &'a [contextdb_planner::GraphStepPlan],
-    start_alias: &'a str,
-    target_residual: Option<uuid::Uuid>,
-    single_step: bool,
-    resolved_filter: Option<&'a Expr>,
-    params: &'a HashMap<String, Value>,
-    tx: Option<TxId>,
-    snapshot: SnapshotId,
-    trace_shape: GraphTraceShape,
-    predicates_pushed: smallvec::SmallVec<[Cow<'static, str>; 4]>,
-}
-
-fn graph_query_result(
-    steps: &[contextdb_planner::GraphStepPlan],
-    start_alias: &str,
-    rows: Vec<Vec<Value>>,
-    trace_shape: GraphTraceShape,
-    predicates_pushed: smallvec::SmallVec<[Cow<'static, str>; 4]>,
-) -> QueryResult {
-    let mut columns = steps
-        .iter()
-        .fold(vec![format!("{start_alias}.id")], |mut cols, step| {
-            cols.push(format!("{}.id", step.target_alias));
-            cols
-        });
-    columns.push("id".to_string());
-    columns.push("depth".to_string());
-    QueryResult {
-        columns,
-        rows,
-        rows_affected: 0,
-        trace: graph_query_trace(trace_shape, predicates_pushed),
-        cascade: None,
-    }
-}
-
-#[inline(never)]
 fn execute_materialized_cte(
     db: &Database,
     input: &PhysicalPlan,
     params: &HashMap<String, Value>,
     tx: Option<TxId>,
-) -> Result<QueryResult> {
-    execute_plan(db, input, params, tx)
+    vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<OwnedQueryResult> {
+    execute_plan(
+        db,
+        input,
+        params,
+        tx,
+        vector_copy_owner,
+        read_memory.clone(),
+    )
+}
+
+/// The one typed binding and its private value storage in a SELECT scope.
+/// Named columns never share this position namespace.
+#[derive(Clone, Copy)]
+struct WindowRankValues {
+    binding: (WindowBindingId, usize),
+    values: [i64; 1],
+}
+
+impl WindowRankValues {
+    fn new(binding: WindowBindingId, rank: i64) -> Self {
+        Self {
+            binding: (binding, 0),
+            values: [rank],
+        }
+    }
+
+    fn get(self, binding: WindowBindingId) -> Result<Value> {
+        if binding == self.binding.0 {
+            if let Some(rank) = self.values.get(self.binding.1) {
+                return Ok(Value::Int64(*rank));
+            }
+        }
+        Err(Error::PlanError(
+            "window rank binding is outside its scope".to_string(),
+        ))
+    }
 }
 
 fn eval_project_expr(
@@ -6419,7 +6813,32 @@ fn eval_project_expr(
     input_columns: &[String],
     params: &HashMap<String, Value>,
 ) -> Result<Value> {
+    eval_project_expr_with_window(expr, row, input_columns, params, None)
+}
+
+fn eval_query_result_expr(
+    expr: &Expr,
+    row: &[Value],
+    input_columns: &[String],
+    params: &HashMap<String, Value>,
+) -> Result<Value> {
+    eval_query_result_expr_with_window(expr, row, input_columns, params, None)
+}
+
+fn eval_project_expr_with_window(
+    expr: &Expr,
+    row: &[Value],
+    input_columns: &[String],
+    params: &HashMap<String, Value>,
+    window: Option<WindowRankValues>,
+) -> Result<Value> {
     match expr {
+        Expr::WindowRank(binding) => match window {
+            Some(values) => values.get(*binding),
+            _ => Err(Error::PlanError(
+                "window rank binding is outside its scope".to_string(),
+            )),
+        },
         Expr::Column(c) => lookup_query_result_column(row, input_columns, c),
         Expr::Literal(lit) => resolve_expr(&Expr::Literal(lit.clone()), params),
         Expr::Parameter(name) => params
@@ -6427,14 +6846,21 @@ fn eval_project_expr(
             .cloned()
             .ok_or_else(|| Error::NotFound(format!("missing parameter: {}", name))),
         Expr::BinaryOp { left, op, right } => {
-            let left = eval_query_result_expr(left, row, input_columns, params)?;
-            let right = eval_query_result_expr(right, row, input_columns, params)?;
+            let left =
+                eval_query_result_expr_with_window(left, row, input_columns, params, window)?;
+            let right =
+                eval_query_result_expr_with_window(right, row, input_columns, params, window)?;
             eval_binary_op(op, &left, &right)
         }
         Expr::UnaryOp { op, operand } => {
-            let value = eval_query_result_expr(operand, row, input_columns, params)?;
+            let value =
+                eval_query_result_expr_with_window(operand, row, input_columns, params, window)?;
             match op {
-                UnaryOp::Not => Ok(Value::Bool(!value_to_bool(&value))),
+                UnaryOp::Not => Ok(if value == Value::Null {
+                    Value::Null
+                } else {
+                    Value::Bool(!value_to_bool(&value))
+                }),
                 UnaryOp::Neg => match value {
                     Value::Int64(v) => checked_neg_i64(v),
                     Value::Float64(v) => Ok(Value::Float64(-v)),
@@ -6447,12 +6873,16 @@ fn eval_project_expr(
         Expr::FunctionCall { name, args } => {
             let values = args
                 .iter()
-                .map(|arg| eval_query_result_expr(arg, row, input_columns, params))
+                .map(|arg| {
+                    eval_query_result_expr_with_window(arg, row, input_columns, params, window)
+                })
                 .collect::<Result<Vec<_>>>()?;
             eval_function(name, &values)
         }
         Expr::IsNull { expr, negated } => {
-            let is_null = eval_query_result_expr(expr, row, input_columns, params)? == Value::Null;
+            let is_null =
+                eval_query_result_expr_with_window(expr, row, input_columns, params, window)?
+                    == Value::Null;
             Ok(Value::Bool(if *negated { !is_null } else { is_null }))
         }
         Expr::InList {
@@ -6461,7 +6891,7 @@ fn eval_project_expr(
             negated,
         } if matches!(expr.as_ref(), Expr::Row(_)) => Ok(
             match row_value_in_list(expr, list, &|inner| {
-                eval_query_result_expr(inner, row, input_columns, params)
+                eval_query_result_expr_with_window(inner, row, input_columns, params, window)
             })? {
                 Some(matched) => Value::Bool(matched != *negated),
                 None => Value::Null,
@@ -6472,21 +6902,28 @@ fn eval_project_expr(
             list,
             negated,
         } => {
-            let needle = eval_query_result_expr(expr, row, input_columns, params)?;
-            let matched = list.iter().try_fold(false, |found, item| -> Result<bool> {
-                if found {
-                    Ok(true)
-                } else {
-                    let candidate = eval_query_result_expr(item, row, input_columns, params)?;
-                    Ok(
-                        matches!(compare_values(&needle, &candidate), Some(Ordering::Equal))
-                            || (needle != Value::Null
-                                && candidate != Value::Null
-                                && needle == candidate),
-                    )
+            let needle =
+                eval_query_result_expr_with_window(expr, row, input_columns, params, window)?;
+            if needle == Value::Null {
+                return Ok(Value::Null);
+            }
+            let mut saw_unknown = false;
+            for item in list {
+                let candidate =
+                    eval_query_result_expr_with_window(item, row, input_columns, params, window)?;
+                if candidate == Value::Null {
+                    saw_unknown = true;
+                } else if matches!(compare_values(&needle, &candidate), Some(Ordering::Equal))
+                    || needle == candidate
+                {
+                    return Ok(Value::Bool(!*negated));
                 }
-            })?;
-            Ok(Value::Bool(if *negated { !matched } else { matched }))
+            }
+            Ok(if saw_unknown {
+                Value::Null
+            } else {
+                Value::Bool(*negated)
+            })
         }
         Expr::Like {
             expr,
@@ -6494,9 +6931,10 @@ fn eval_project_expr(
             negated,
         } => {
             let matches = match (
-                eval_query_result_expr(expr, row, input_columns, params)?,
-                eval_query_result_expr(pattern, row, input_columns, params)?,
+                eval_query_result_expr_with_window(expr, row, input_columns, params, window)?,
+                eval_query_result_expr_with_window(pattern, row, input_columns, params, window)?,
             ) {
+                (Value::Null, _) | (_, Value::Null) => return Ok(Value::Null),
                 (Value::Text(value), Value::Text(pattern)) => like_matches(&value, &pattern),
                 _ => false,
             };
@@ -6506,13 +6944,20 @@ fn eval_project_expr(
     }
 }
 
-fn eval_query_result_expr(
+fn eval_query_result_expr_with_window(
     expr: &Expr,
     row: &[Value],
     input_columns: &[String],
     params: &HashMap<String, Value>,
+    window: Option<WindowRankValues>,
 ) -> Result<Value> {
     match expr {
+        Expr::WindowRank(binding) => match window {
+            Some(values) => values.get(*binding),
+            _ => Err(Error::PlanError(
+                "window rank binding is outside its scope".to_string(),
+            )),
+        },
         Expr::Column(c) => lookup_query_result_column(row, input_columns, c),
         Expr::Literal(lit) => resolve_expr(&Expr::Literal(lit.clone()), params),
         Expr::Parameter(name) => params
@@ -6522,9 +6967,18 @@ fn eval_query_result_expr(
         Expr::FunctionCall { name, args } => {
             let values = args
                 .iter()
-                .map(|arg| eval_query_result_expr(arg, row, input_columns, params))
+                .map(|arg| {
+                    eval_query_result_expr_with_window(arg, row, input_columns, params, window)
+                })
                 .collect::<Result<Vec<_>>>()?;
             eval_function(name, &values)
+        }
+        Expr::BinaryOp { .. }
+        | Expr::UnaryOp { .. }
+        | Expr::IsNull { .. }
+        | Expr::InList { .. }
+        | Expr::Like { .. } => {
+            eval_project_expr_with_window(expr, row, input_columns, params, window)
         }
         _ => resolve_expr(expr, params),
     }
@@ -6553,7 +7007,11 @@ fn exec_insert(
     p: &InsertPlan,
     params: &HashMap<String, Value>,
     tx: Option<TxId>,
-) -> Result<QueryResult> {
+
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<OwnedQueryResult> {
+    let mut vector_admission = crate::vector_read_memory::admission(read_memory.clone());
+    let vector_copy_owner = &mut vector_admission;
     db.check_disk_budget("INSERT")?;
     let txid = tx.ok_or_else(|| Error::Other("missing tx for insert".to_string()))?;
 
@@ -6699,6 +7157,7 @@ fn exec_insert(
                 &on_conflict.columns,
                 &conflict_values,
                 db.snapshot_for_read(),
+                read_memory.clone(),
             ) {
                 Ok(existing) => existing,
                 Err(err) => {
@@ -6728,7 +7187,13 @@ fn exec_insert(
             match existing {
                 None => {
                     let intent_insert_values = upsert_values.clone();
-                    match db.insert_row_prepaid(txid, &p.table, upsert_values) {
+                    match db.insert_row_prepaid(
+                        txid,
+                        &p.table,
+                        upsert_values,
+                        vector_copy_owner,
+                        read_memory.clone(),
+                    ) {
                         Ok(row_id) => {
                             if let Err(err) = db.record_upsert_intent(
                                 txid,
@@ -6768,15 +7233,24 @@ fn exec_insert(
                             let _ = db.restore_write_set_checkpoint(txid, checkpoint);
                             return Err(err);
                         }
-                        if db.has_live_vector(existing_row.row_id, db.snapshot_for_read()) {
+                        if db.has_live_vector_with_read_memory(
+                            existing_row.row_id,
+                            db.snapshot_for_read(),
+                            read_memory.clone(),
+                        )? {
                             for index in vector_indexes_for_table(db, &p.table) {
                                 if db.vector_store_has_live_entry_for_row(
                                     &index,
                                     existing_row.row_id,
                                     db.snapshot_for_read(),
-                                ) && let Err(err) =
-                                    db.delete_vector(txid, index, existing_row.row_id)
-                                {
+                                    vector_copy_owner,
+                                )? && let Err(err) = db.delete_vector_with_read_memory(
+                                    txid,
+                                    index,
+                                    existing_row.row_id,
+                                    vector_copy_owner,
+                                    read_memory.clone(),
+                                ) {
                                     let _ = db.restore_write_set_checkpoint(txid, checkpoint);
                                     return Err(err);
                                 }
@@ -6795,6 +7269,8 @@ fn exec_insert(
                             upsert_values,
                             existing_row.row_id,
                             true,
+                            vector_copy_owner,
+                            read_memory.clone(),
                         ) {
                             Ok(row_id) => row_id,
                             Err(err) => {
@@ -6814,6 +7290,8 @@ fn exec_insert(
                                 &p.table,
                                 Some(uuid),
                                 Some(state),
+                                vector_copy_owner,
+                                read_memory.clone(),
                             )
                         {
                             let _ = db.restore_write_set_checkpoint(txid, checkpoint);
@@ -6824,7 +7302,13 @@ fn exec_insert(
                 }
             }
         } else {
-            match db.insert_row_with_unique_noop(txid, &p.table, values) {
+            match db.insert_row_with_unique_noop(
+                txid,
+                &p.table,
+                values,
+                vector_copy_owner,
+                read_memory.clone(),
+            ) {
                 Ok(InsertRowResult::Inserted(row_id)) => row_id,
                 Ok(InsertRowResult::NoOp) => {
                     continue;
@@ -6845,7 +7329,14 @@ fn exec_insert(
         }
 
         if let Some((source, target, edge_type)) = graph_edge {
-            match db.insert_edge(txid, source, target, edge_type, HashMap::new()) {
+            match db.insert_edge_with_read_memory(
+                txid,
+                source,
+                target,
+                edge_type,
+                HashMap::new(),
+                read_memory.clone(),
+            ) {
                 Ok(true) => {}
                 Ok(false) => {
                     let _ = db.restore_write_set_checkpoint(txid, checkpoint);
@@ -6861,7 +7352,7 @@ fn exec_insert(
         rows_affected += 1;
     }
 
-    Ok(QueryResult::empty_with_affected(rows_affected))
+    Ok(OwnedQueryResult::empty_with_affected(rows_affected))
 }
 
 // Mode and direction refusal precede all selection sources.
@@ -6870,7 +7361,9 @@ fn exec_discard(
     p: &contextdb_planner::DiscardPlan,
     params: &HashMap<String, Value>,
     tx: Option<TxId>,
-) -> Result<QueryResult> {
+    vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<OwnedQueryResult> {
     let txid = tx.ok_or_else(|| Error::Other("missing transaction for discard".into()))?;
     let mut names = BTreeSet::new();
     for selection in &p.selections {
@@ -6879,7 +7372,7 @@ fn exec_discard(
                 reason: format!("table {} is listed twice", selection.table),
             });
         }
-        db.discard_policy(&selection.table)?;
+        db.discard_policy(&selection.table, read_memory.clone())?;
         let meta = db
             .table_meta(&selection.table)
             .ok_or_else(|| Error::TableNotFound(selection.table.clone()))?;
@@ -6893,12 +7386,21 @@ fn exec_discard(
     let snapshot = db.snapshot_for_read();
     let mut tables = Vec::new();
     for selection in &p.selections {
-        let rows = db.scan_in_tx_raw(txid, &selection.table, snapshot)?;
-        let rows = db.filter_rows_for_read(&selection.table, rows, snapshot)?;
+        let rows = db.scan_in_tx_raw(
+            txid,
+            &selection.table,
+            snapshot,
+            vector_copy_owner,
+            read_memory.clone(),
+        )?;
+        let rows =
+            db.filter_rows_for_read(&selection.table, rows, snapshot, read_memory.clone())?;
         let predicate = selection
             .where_clause
             .as_ref()
-            .map(|e| resolve_in_subqueries(db, e, params, tx))
+            .map(|e| {
+                resolve_in_subqueries(db, e, params, tx, vector_copy_owner, read_memory.clone())
+            })
             .transpose()?;
         let matched = filter_rows_by_predicate(rows, predicate.as_ref(), params)?;
         let meta = db
@@ -6906,7 +7408,13 @@ fn exec_discard(
             .ok_or_else(|| Error::TableNotFound(selection.table.clone()))?;
         let mut pinned = Vec::new();
         for row in matched {
-            db.assert_row_write_allowed(&selection.table, row.row_id, &row.values, snapshot)?;
+            db.assert_row_write_allowed(
+                &selection.table,
+                row.row_id,
+                &row.values,
+                snapshot,
+                read_memory.clone(),
+            )?;
             pinned.push((
                 natural_key_from_row_values(&meta, &row.values)
                     .ok_or_else(|| Error::NotSyncEligible(selection.table.clone()))?,
@@ -6915,7 +7423,8 @@ fn exec_discard(
         }
         tables.push((selection.table.clone(), pinned));
     }
-    db.stage_discard(txid, &tables)
+    db.stage_discard(txid, &tables, read_memory.clone())
+        .map(OwnedQueryResult::new)
 }
 
 fn exec_purge(
@@ -6923,7 +7432,9 @@ fn exec_purge(
     p: &PurgePlan,
     params: &HashMap<String, Value>,
     tx: Option<TxId>,
-) -> Result<QueryResult> {
+    vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<OwnedQueryResult> {
     // The authority refusal must precede every read, including subquery
     // evaluation, so an edge never learns predicate-selected hub rows.
     if let Some(hub_node_id) = db.retention_sync_peer() {
@@ -6966,11 +7477,25 @@ fn exec_purge(
     let snapshot = db.snapshot_for_read();
     let mut tables = Vec::new();
     for selection in &p.selections {
-        let rows = db.scan(&selection.table, snapshot)?;
+        let rows = db.scan_with_read_memory(
+            &selection.table,
+            snapshot,
+            vector_copy_owner,
+            read_memory.clone(),
+        )?;
         let resolved = selection
             .where_clause
             .as_ref()
-            .map(|expr| resolve_in_subqueries(db, expr, params, None))
+            .map(|expr| {
+                resolve_in_subqueries(
+                    db,
+                    expr,
+                    params,
+                    None,
+                    vector_copy_owner,
+                    read_memory.clone(),
+                )
+            })
             .transpose()?;
         let matched = filter_rows_by_predicate(rows, resolved.as_ref(), params)?;
         let meta = db
@@ -6978,7 +7503,13 @@ fn exec_purge(
             .ok_or_else(|| Error::TableNotFound(selection.table.clone()))?;
         let mut pinned = Vec::new();
         for row in matched {
-            db.assert_row_write_allowed(&selection.table, row.row_id, &row.values, snapshot)?;
+            db.assert_row_write_allowed(
+                &selection.table,
+                row.row_id,
+                &row.values,
+                snapshot,
+                read_memory.clone(),
+            )?;
             pinned.push((
                 natural_key_from_row_values(&meta, &row.values)
                     .ok_or_else(|| Error::NotSyncEligible(selection.table.clone()))?,
@@ -6987,7 +7518,12 @@ fn exec_purge(
         }
         tables.push((selection.table.clone(), pinned));
     }
-    db.commit_authoritative_purge_tables(&tables, &node_local)
+    db.commit_authoritative_purge_tables(
+        &tables,
+        &node_local,
+        vector_copy_owner,
+        read_memory.clone(),
+    )
 }
 
 fn exec_delete(
@@ -6995,14 +7531,18 @@ fn exec_delete(
     p: &DeletePlan,
     params: &HashMap<String, Value>,
     tx: Option<TxId>,
-) -> Result<QueryResult> {
+    vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<OwnedQueryResult> {
     let txid = tx.ok_or_else(|| Error::Other("missing tx for delete".to_string()))?;
     let _vector_schema = db.vector_schema_read_table(&p.table);
     let snapshot = db.snapshot_for_read();
     let resolved_where = p
         .where_clause
         .as_ref()
-        .map(|expr| resolve_in_subqueries(db, expr, params, tx))
+        .map(|expr| {
+            resolve_in_subqueries(db, expr, params, tx, vector_copy_owner, read_memory.clone())
+        })
         .transpose()?;
     let delete_predicates = resolved_where
         .as_ref()
@@ -7028,6 +7568,8 @@ fn exec_delete(
                     None,
                     resolved_where.as_ref(),
                     params,
+                    vector_copy_owner,
+                    read_memory.clone(),
                 )
             })
             .transpose()?;
@@ -7035,29 +7577,64 @@ fn exec_delete(
             db.__bump_rows_examined(examined);
             rows
         } else {
-            db.scan_in_tx_raw(txid, &p.table, snapshot)?
+            db.scan_in_tx_raw(
+                txid,
+                &p.table,
+                snapshot,
+                vector_copy_owner,
+                read_memory.clone(),
+            )?
         }
     } else {
-        db.scan_in_tx_raw(txid, &p.table, snapshot)?
+        db.scan_in_tx_raw(
+            txid,
+            &p.table,
+            snapshot,
+            vector_copy_owner,
+            read_memory.clone(),
+        )?
     };
-    let rows = db.filter_rows_for_read(&p.table, rows, snapshot)?;
+    let rows = db.filter_rows_for_read(&p.table, rows, snapshot, read_memory.clone())?;
     let matched = filter_rows_by_predicate(rows, resolved_where.as_ref(), params)?;
 
     for row in &matched {
-        db.assert_row_write_allowed(&p.table, row.row_id, &row.values, snapshot)?;
+        db.assert_row_write_allowed(
+            &p.table,
+            row.row_id,
+            &row.values,
+            snapshot,
+            read_memory.clone(),
+        )?;
     }
 
     for row in &matched {
         for index in vector_indexes_for_table(db, &p.table) {
-            if db.vector_store_has_live_entry_for_row(&index, row.row_id, snapshot) {
-                db.delete_vector(txid, index, row.row_id)?;
+            if db.vector_store_has_live_entry_for_row(
+                &index,
+                row.row_id,
+                snapshot,
+                vector_copy_owner,
+            )? {
+                db.delete_vector_with_read_memory(
+                    txid,
+                    index,
+                    row.row_id,
+                    vector_copy_owner,
+                    read_memory.clone(),
+                )?;
             }
         }
         // The row and its durable owed-to-hub delete record commit together.
         // A later close/open may have no delete history left to reconstruct,
         // so staging this after the row is gone would lose the obligation.
-        db.stage_local_delete_obligation(txid, &p.table, row)?;
-        db.delete_row(txid, &p.table, row.row_id)?;
+        db.stage_local_delete_obligation(txid, &p.table, row, read_memory.clone())?;
+        db.delete_row_with_read_memory(
+            txid,
+            &p.table,
+            row.row_id,
+            vector_copy_owner,
+            read_memory.clone(),
+        )?;
     }
     if !matched.is_empty()
         && let Some(predicates) = delete_predicates
@@ -7065,7 +7642,7 @@ fn exec_delete(
         db.record_relational_delete_predicate(txid, p.table.clone(), predicates)?;
     }
 
-    Ok(QueryResult::empty_with_affected(matched.len() as u64))
+    Ok(OwnedQueryResult::empty_with_affected(matched.len() as u64))
 }
 
 fn collect_conditional_update_predicates(
@@ -7173,6 +7750,8 @@ fn trigger_bound_unique_update_rows(
     db: &Database,
     txid: TxId,
     lookup: TriggerUniqueUpdateLookup<'_>,
+
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<Option<Vec<VersionedRow>>> {
     let (Some(meta), Some(_where_clause), Some(predicates)) = (
         lookup.table_meta,
@@ -7184,8 +7763,14 @@ fn trigger_bound_unique_update_rows(
     let Some((columns, values)) = unique_update_lookup_from_predicates(meta, predicates) else {
         return Ok(None);
     };
-    let Some(row) =
-        db.unique_row_lookup_in_tx(txid, lookup.table, &columns, &values, lookup.snapshot)?
+    let Some(row) = db.unique_row_lookup_in_tx(
+        txid,
+        lookup.table,
+        &columns,
+        &values,
+        lookup.snapshot,
+        read_memory.clone(),
+    )?
     else {
         return Ok(Some(Vec::new()));
     };
@@ -7197,7 +7782,9 @@ fn exec_update(
     p: &UpdatePlan,
     params: &HashMap<String, Value>,
     tx: Option<TxId>,
-) -> Result<QueryResult> {
+    vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<OwnedQueryResult> {
     db.check_disk_budget("UPDATE")?;
     let txid = tx.ok_or_else(|| Error::Other("missing tx for update".to_string()))?;
     let table_meta = db.table_meta(&p.table);
@@ -7220,7 +7807,9 @@ fn exec_update(
     let resolved_where = p
         .where_clause
         .as_ref()
-        .map(|expr| resolve_in_subqueries(db, expr, params, tx))
+        .map(|expr| {
+            resolve_in_subqueries(db, expr, params, tx, vector_copy_owner, read_memory.clone())
+        })
         .transpose()?;
     let current_tx_max = Some(db.committed_watermark());
     let conditional_predicates = resolved_where
@@ -7261,6 +7850,7 @@ fn exec_update(
                 resolved_where: resolved_where.as_ref(),
                 conditional_predicates: conditional_predicates.as_deref(),
             },
+            read_memory.clone(),
         )?
     } else {
         None
@@ -7302,6 +7892,8 @@ fn exec_update(
                     None,
                     resolved_where.as_ref(),
                     params,
+                    vector_copy_owner,
+                    read_memory.clone(),
                 )
             })
             .transpose()?;
@@ -7311,12 +7903,24 @@ fn exec_update(
         } else {
             // Use in-tx scan so prior statements in a BEGIN/COMMIT block are
             // visible: the old row must not shadow a previously-updated row.
-            let rows = db.scan_in_tx_raw(txid, &p.table, snapshot)?;
-            db.filter_rows_for_read(&p.table, rows, snapshot)?
+            let rows = db.scan_in_tx_raw(
+                txid,
+                &p.table,
+                snapshot,
+                vector_copy_owner,
+                read_memory.clone(),
+            )?;
+            db.filter_rows_for_read(&p.table, rows, snapshot, read_memory.clone())?
         }
     } else {
-        let rows = db.scan_in_tx_raw(txid, &p.table, snapshot)?;
-        db.filter_rows_for_read(&p.table, rows, snapshot)?
+        let rows = db.scan_in_tx_raw(
+            txid,
+            &p.table,
+            snapshot,
+            vector_copy_owner,
+            read_memory.clone(),
+        )?;
+        db.filter_rows_for_read(&p.table, rows, snapshot, read_memory.clone())?
     };
     let matched: Vec<_> = if direct_unique_lookup_exhausts_where {
         rows
@@ -7328,7 +7932,13 @@ fn exec_update(
         let mut affected = 0_u64;
         for row in matched {
             if !skip_trigger_access_checks {
-                db.assert_row_write_allowed(&p.table, row.row_id, &row.values, snapshot)?;
+                db.assert_row_write_allowed(
+                    &p.table,
+                    row.row_id,
+                    &row.values,
+                    snapshot,
+                    read_memory.clone(),
+                )?;
             }
             let mut values = row.values.clone();
             for (k, vexpr) in &p.assignments {
@@ -7349,7 +7959,13 @@ fn exec_update(
                 .and_then(Value::as_text)
                 .map(std::borrow::ToOwned::to_owned);
             if !skip_trigger_access_checks {
-                db.assert_row_write_allowed(&p.table, row.row_id, &values, snapshot)?;
+                db.assert_row_write_allowed(
+                    &p.table,
+                    row.row_id,
+                    &values,
+                    snapshot,
+                    read_memory.clone(),
+                )?;
             }
             let row_admission = admit_table_row_bytes(
                 db,
@@ -7369,7 +7985,7 @@ fn exec_update(
                 };
                 let committed_row_exists = row.created_tx != txid
                     || db
-                        .committed_row_at(&p.table, row.row_id, snapshot)?
+                        .committed_row_at(&p.table, row.row_id, snapshot, read_memory.clone())?
                         .is_some();
                 let (new_row_id, before_counts, after_counts) = match db
                     .replace_row_after_update_validation_counted(
@@ -7410,9 +8026,14 @@ fn exec_update(
                 }
             };
             let before_counts = db.write_set_counts(txid)?;
-            let new_row_id = match db
-                .replace_row_after_update_validation(txid, &p.table, row.row_id, values, snapshot)
-            {
+            let new_row_id = match db.replace_row_after_update_validation(
+                txid,
+                &p.table,
+                row.row_id,
+                values,
+                snapshot,
+                read_memory.clone(),
+            ) {
                 Ok(row_id) => row_id,
                 Err(err) => {
                     let _ = db.restore_write_set_checkpoint(txid, checkpoint);
@@ -7420,9 +8041,14 @@ fn exec_update(
                 }
             };
             db.record_owned_row_admission(txid, &p.table, new_row_id, row_admission);
-            if let Err(err) =
-                db.propagate_state_change_if_needed(txid, &p.table, row_uuid, new_state.as_deref())
-            {
+            if let Err(err) = db.propagate_state_change_if_needed(
+                txid,
+                &p.table,
+                row_uuid,
+                new_state.as_deref(),
+                vector_copy_owner,
+                read_memory.clone(),
+            ) {
                 let _ = db.restore_write_set_checkpoint(txid, checkpoint);
                 return Err(err);
             }
@@ -7440,7 +8066,7 @@ fn exec_update(
             }
             affected = affected.saturating_add(1);
         }
-        return Ok(QueryResult::empty_with_affected(affected));
+        return Ok(OwnedQueryResult::empty_with_affected(affected));
     }
 
     struct PlannedUpdate {
@@ -7460,7 +8086,13 @@ fn exec_update(
     let mut planned = Vec::with_capacity(matched.len());
     for row in &matched {
         if !skip_trigger_access_checks {
-            db.assert_row_write_allowed(&p.table, row.row_id, &row.values, snapshot)?;
+            db.assert_row_write_allowed(
+                &p.table,
+                row.row_id,
+                &row.values,
+                snapshot,
+                read_memory.clone(),
+            )?;
         }
         let mut values = row.values.clone();
         for (k, vexpr) in &p.assignments {
@@ -7485,7 +8117,13 @@ fn exec_update(
             validate_vector_columns(db, &p.table, &values)?;
         }
         if !skip_trigger_access_checks {
-            db.assert_row_write_allowed(&p.table, row.row_id, &values, snapshot)?;
+            db.assert_row_write_allowed(
+                &p.table,
+                row.row_id,
+                &values,
+                snapshot,
+                read_memory.clone(),
+            )?;
         }
         let assigned_vector_columns: Vec<String> = if has_vector_columns {
             let mut assigned = Vec::new();
@@ -7545,9 +8183,14 @@ fn exec_update(
             && assigned_vector_columns.is_empty()
             && vector_indexes.is_empty();
         let new_row_id = if vector_free_trigger_update {
-            match db
-                .replace_row_after_update_validation(txid, &p.table, row.row_id, values, snapshot)
-            {
+            match db.replace_row_after_update_validation(
+                txid,
+                &p.table,
+                row.row_id,
+                values,
+                snapshot,
+                read_memory.clone(),
+            ) {
                 Ok(row_id) => row_id,
                 Err(err) => {
                     let _ = db.restore_write_set_checkpoint(txid, checkpoint);
@@ -7556,18 +8199,25 @@ fn exec_update(
             }
         } else {
             for column in &assigned_vector_columns {
-                if let Err(err) = db.delete_vector(
+                if let Err(err) = db.delete_vector_with_read_memory(
                     txid,
                     contextdb_core::VectorIndexRef::new(&p.table, column.clone()),
                     row.row_id,
+                    vector_copy_owner,
+                    read_memory.clone(),
                 ) {
                     let _ = db.restore_write_set_checkpoint(txid, checkpoint);
                     return Err(err);
                 }
             }
-            let new_row_id = match db
-                .replace_row_after_update_validation(txid, &p.table, row.row_id, values, snapshot)
-            {
+            let new_row_id = match db.replace_row_after_update_validation(
+                txid,
+                &p.table,
+                row.row_id,
+                values,
+                snapshot,
+                read_memory.clone(),
+            ) {
                 Ok(row_id) => row_id,
                 Err(err) => {
                     let _ = db.restore_write_set_checkpoint(txid, checkpoint);
@@ -7578,7 +8228,14 @@ fn exec_update(
                 if assigned_vector_columns.contains(&index.column) {
                     continue;
                 }
-                if let Err(err) = db.move_vector(txid, index.clone(), row.row_id, new_row_id) {
+                if let Err(err) = db.move_vector(
+                    txid,
+                    index.clone(),
+                    row.row_id,
+                    new_row_id,
+                    vector_copy_owner,
+                    read_memory.clone(),
+                ) {
                     let _ = db.restore_write_set_checkpoint(txid, checkpoint);
                     return Err(err);
                 }
@@ -7588,14 +8245,26 @@ fn exec_update(
         db.record_owned_row_admission(txid, &p.table, new_row_id, row_admission);
         for (column, vector) in assigned_vector_values {
             let index = contextdb_core::VectorIndexRef::new(&p.table, column);
-            if let Err(err) = db.insert_vector_strict(txid, index, new_row_id, vector) {
+            if let Err(err) = db.insert_vector_strict(
+                txid,
+                index,
+                new_row_id,
+                vector,
+                vector_copy_owner,
+                read_memory.clone(),
+            ) {
                 let _ = db.restore_write_set_checkpoint(txid, checkpoint);
                 return Err(err);
             }
         }
-        if let Err(err) =
-            db.propagate_state_change_if_needed(txid, &p.table, row_uuid, new_state.as_deref())
-        {
+        if let Err(err) = db.propagate_state_change_if_needed(
+            txid,
+            &p.table,
+            row_uuid,
+            new_state.as_deref(),
+            vector_copy_owner,
+            read_memory.clone(),
+        ) {
             let _ = db.restore_write_set_checkpoint(txid, checkpoint);
             return Err(err);
         }
@@ -7613,7 +8282,7 @@ fn exec_update(
         }
     }
 
-    Ok(QueryResult::empty_with_affected(matched.len() as u64))
+    Ok(OwnedQueryResult::empty_with_affected(matched.len() as u64))
 }
 
 /// The one pseudo-column a predicate may name without it being declared on the
@@ -7686,6 +8355,16 @@ fn walk_predicate_columns(
     check: &mut dyn FnMut(&ColumnRef) -> Result<()>,
 ) -> Result<()> {
     match expr {
+        Expr::RowNumber(window) => {
+            for column in &window.partition_by {
+                check(column)?;
+            }
+            for order in &window.order_by {
+                check(&order.column)?;
+            }
+            Ok(())
+        }
+        Expr::WindowRank(_) => Ok(()),
         Expr::Column(column_ref) => check(column_ref),
         Expr::Row(elements) => {
             for element in elements {
@@ -7765,6 +8444,22 @@ fn merge_expression_columns<'a>(
 /// the deliberate bare-name/qualifier semantics are untouched.
 pub(crate) fn validate_plan_columns(db: &Database, plan: &PhysicalPlan) -> Result<()> {
     match plan {
+        PhysicalPlan::WindowRank { input, window, .. } => {
+            validate_plan_columns(db, input)?;
+            if let Some(columns) = plan_output_columns(db, input) {
+                for column in window
+                    .partition_by
+                    .iter()
+                    .chain(window.order_by.iter().map(|key| &key.column))
+                {
+                    validate_filter_predicate_columns(
+                        &columns,
+                        input,
+                        &Expr::Column(column.clone()),
+                    )?;
+                }
+            }
+        }
         PhysicalPlan::Scan {
             table,
             alias,
@@ -7878,7 +8573,7 @@ pub(crate) fn validate_plan_columns(db: &Database, plan: &PhysicalPlan) -> Resul
 /// forms). Any other shape stays a typed refusal rather than a silent
 /// no-op sort.
 fn sort_key_expr_supported(expr: &Expr) -> bool {
-    matches!(expr, Expr::Column(_))
+    matches!(expr, Expr::Column(_) | Expr::WindowRank(_))
         || matches!(expr, Expr::FunctionCall { name, .. } if is_known_scalar_function(name))
 }
 
@@ -7945,6 +8640,7 @@ fn plan_output_columns(db: &Database, plan: &PhysicalPlan) -> Option<Vec<String>
         | PhysicalPlan::Distinct { input }
         | PhysicalPlan::Limit { input, .. }
         | PhysicalPlan::Sort { input, .. }
+        | PhysicalPlan::WindowRank { input, .. }
         | PhysicalPlan::MaterializeCte { input, .. } => plan_output_columns(db, input),
         PhysicalPlan::Project { columns, .. } => Some(project_output_columns(columns)),
         PhysicalPlan::Join { .. } => Some(join_column_lists(db, plan)?.output),
@@ -8202,6 +8898,7 @@ fn plan_anchor_table(plan: &PhysicalPlan) -> Option<String> {
         | PhysicalPlan::Distinct { input }
         | PhysicalPlan::Limit { input, .. }
         | PhysicalPlan::Sort { input, .. }
+        | PhysicalPlan::WindowRank { input, .. }
         | PhysicalPlan::MaterializeCte { input, .. } => plan_anchor_table(input),
         PhysicalPlan::Join { left, .. } => plan_anchor_table(left),
         _ => None,
@@ -8221,6 +8918,7 @@ fn is_predicate_pseudo_column(name: &str) -> bool {
 /// skips the check entirely rather than reaching here.
 fn known_relation_names(plan: &PhysicalPlan) -> Vec<String> {
     match plan {
+        PhysicalPlan::MaterializeCte { name, .. } => vec![name.clone()],
         PhysicalPlan::Scan { table, alias, .. } => {
             vec![alias.clone().unwrap_or_else(|| table.clone())]
         }
@@ -8264,7 +8962,7 @@ fn known_relation_names(plan: &PhysicalPlan) -> Vec<String> {
         | PhysicalPlan::Distinct { input }
         | PhysicalPlan::Limit { input, .. }
         | PhysicalPlan::Sort { input, .. }
-        | PhysicalPlan::MaterializeCte { input, .. }
+        | PhysicalPlan::WindowRank { input, .. }
         | PhysicalPlan::Project { input, .. } => known_relation_names(input),
         PhysicalPlan::CteRef { name } => vec![name.clone()],
         PhysicalPlan::Union { inputs, .. } => {
@@ -8285,6 +8983,7 @@ fn plan_contains_graph_bfs(plan: &PhysicalPlan) -> bool {
         | PhysicalPlan::Distinct { input }
         | PhysicalPlan::Limit { input, .. }
         | PhysicalPlan::Sort { input, .. }
+        | PhysicalPlan::WindowRank { input, .. }
         | PhysicalPlan::MaterializeCte { input, .. }
         | PhysicalPlan::Project { input, .. } => plan_contains_graph_bfs(input),
         PhysicalPlan::Join { left, right, .. } => {
@@ -8354,7 +9053,8 @@ fn validate_filter_predicate_columns(
 fn exec_create_index(
     db: &Database,
     plan: &contextdb_planner::CreateIndexPlan,
-) -> Result<QueryResult> {
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<OwnedQueryResult> {
     let validated_schema = db.relational_store().table_meta.read().clone();
     // Reserved-prefix guard: user-declared indexes must not collide with the
     // auto-index namespace used for PRIMARY KEY / UNIQUE backing indexes.
@@ -8445,6 +9145,7 @@ fn exec_create_index(
             &projected_rows,
             lsn,
             &ddl,
+            read_memory.clone(),
         )?;
         db.publish_local_table_projection_and_ddl(
             &plan.table,
@@ -8459,10 +9160,14 @@ fn exec_create_index(
     })?;
 
     db.clear_statement_cache();
-    Ok(QueryResult::empty_with_affected(0))
+    Ok(OwnedQueryResult::empty_with_affected(0))
 }
 
-fn exec_drop_index(db: &Database, plan: &contextdb_planner::DropIndexPlan) -> Result<QueryResult> {
+fn exec_drop_index(
+    db: &Database,
+    plan: &contextdb_planner::DropIndexPlan,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<OwnedQueryResult> {
     let validated_schema = db.relational_store().table_meta.read().clone();
     let meta = db
         .table_meta(&plan.table)
@@ -8470,7 +9175,7 @@ fn exec_drop_index(db: &Database, plan: &contextdb_planner::DropIndexPlan) -> Re
     let exists = meta.indexes.iter().any(|i| i.name == plan.name);
     if !exists {
         if plan.if_exists {
-            return Ok(QueryResult::empty_with_affected(0));
+            return Ok(OwnedQueryResult::empty_with_affected(0));
         }
         return Err(Error::IndexNotFound {
             table: plan.table.clone(),
@@ -8518,6 +9223,7 @@ fn exec_drop_index(db: &Database, plan: &contextdb_planner::DropIndexPlan) -> Re
             &projected_rows,
             lsn,
             &ddl,
+            read_memory.clone(),
         )?;
         db.publish_local_table_projection_and_ddl(
             &plan.table,
@@ -8531,7 +9237,7 @@ fn exec_drop_index(db: &Database, plan: &contextdb_planner::DropIndexPlan) -> Re
         Ok(())
     })?;
     db.clear_statement_cache();
-    Ok(QueryResult::empty_with_affected(0))
+    Ok(OwnedQueryResult::empty_with_affected(0))
 }
 
 pub(crate) fn reserved_index_prefix(name: &str) -> Option<&'static str> {
@@ -10170,11 +10876,22 @@ pub fn execute_eager_for_test(
     db: &Database,
     sql: &str,
     params: &HashMap<String, Value>,
+
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<QueryResult> {
     let statement = contextdb_parser::parse(sql)?;
     let plan = contextdb_planner::plan(&statement)?;
     validate_plan_columns(db, &plan)?;
-    execute_plan(db, &plan, params, db.active_read_transaction())
+    let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
+    execute_plan(
+        db,
+        &plan,
+        params,
+        db.active_read_transaction(),
+        &mut vector_copy_owner,
+        read_memory.clone(),
+    )
+    .map(OwnedQueryResult::into_public)
 }
 
 #[cfg(feature = "test-seams")]
@@ -11067,6 +11784,8 @@ fn execute_index_scan(
     materialized_columns: Option<&[String]>,
     residual_filter: Option<&Expr>,
     params: &HashMap<String, Value>,
+    vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<(Vec<VersionedRow>, u64)> {
     use contextdb_core::{DirectedValue, SortDirection, TotalOrdAsc, TotalOrdDesc};
     use std::ops::Bound;
@@ -11086,6 +11805,8 @@ fn execute_index_scan(
             materialized_columns,
             residual_filter,
             params,
+            vector_copy_owner,
+            read_memory.clone(),
         );
     }
 
@@ -11100,7 +11821,14 @@ fn execute_index_scan(
         .is_none()
     {
         drop(indexes);
-        let rows = scan_rows_for_select(db, table, snapshot, tx)?;
+        let rows = scan_rows_for_select(
+            db,
+            table,
+            snapshot,
+            tx,
+            vector_copy_owner,
+            read_memory.clone(),
+        )?;
         let rows_examined = rows.len() as u64;
         return Ok((rows, rows_examined));
     }
@@ -11130,7 +11858,14 @@ fn execute_index_scan(
         Some(s) => s,
         None => {
             drop(indexes);
-            let rows = scan_rows_for_select(db, table, snapshot, tx)?;
+            let rows = scan_rows_for_select(
+                db,
+                table,
+                snapshot,
+                tx,
+                vector_copy_owner,
+                read_memory.clone(),
+            )?;
             let rows_examined = rows.len() as u64;
             return Ok((rows, rows_examined));
         }
@@ -11229,9 +11964,8 @@ fn execute_index_scan(
         // the bounded kernel so the two paths cannot disagree about which
         // index answers a query.
         let planned_runs = planned_index_run_construction_bytes(pick)?;
-        let run_accountant = db.bounded_read_accountant();
-        let _run_memory = crate::memory_accounting::ScopedMemoryReservation::try_new_for(
-            &run_accountant,
+        let _run_memory = contextdb_core::read_memory::ReadCredit::try_new(
+            read_memory.clone(),
             planned_runs,
             "query",
             "expand_index_tuple_runs",
@@ -11239,7 +11973,14 @@ fn execute_index_scan(
         )?;
         let Some(keys) = exact_probe_keys(storage.columns.len(), pick) else {
             drop(indexes);
-            let rows = scan_rows_for_select(db, table, snapshot, tx)?;
+            let rows = scan_rows_for_select(
+                db,
+                table,
+                snapshot,
+                tx,
+                vector_copy_owner,
+                read_memory.clone(),
+            )?;
             let rows_examined = rows.len() as u64;
             return Ok((rows, rows_examined));
         };
@@ -11259,9 +12000,8 @@ fn execute_index_scan(
             | IndexPredicateShape::InList(_)
             | IndexPredicateShape::IsNull => {
                 let planned_runs = planned_index_run_construction_bytes(pick)?;
-                let run_accountant = db.bounded_read_accountant();
-                let _run_memory = crate::memory_accounting::ScopedMemoryReservation::try_new_for(
-                    &run_accountant,
+                let _run_memory = contextdb_core::read_memory::ReadCredit::try_new(
+                    read_memory.clone(),
                     planned_runs,
                     "query",
                     "expand_index_tuple_runs",
@@ -11399,7 +12139,7 @@ fn execute_index_scan(
     let mut out: Vec<VersionedRow> = Vec::with_capacity(row_ids.len());
     if !row_ids.is_empty() {
         for rid in &row_ids {
-            if let Some(row) = db.committed_row_at(table, *rid, snapshot)? {
+            if let Some(row) = db.committed_row_at(table, *rid, snapshot, read_memory.clone())? {
                 out.push(row);
             }
         }
@@ -11412,7 +12152,13 @@ fn execute_index_scan(
     // Layer tx-scoped inserts / deletes on top, matching the semantics of
     // scan_with_tx.
     if let Some(tx_id) = tx {
-        let overlay = db.index_scan_tx_overlay(tx_id, table, &pick.pushed_column, &pick.shape)?;
+        let overlay = db.index_scan_tx_overlay(
+            tx_id,
+            table,
+            &pick.pushed_column,
+            &pick.shape,
+            read_memory.clone(),
+        )?;
         let deleted_row_ids = overlay.deleted_row_ids;
         out.retain(|row| !deleted_row_ids.contains(&row.row_id));
         if exact_only {
@@ -11426,16 +12172,25 @@ fn execute_index_scan(
     // relational body, while quantized vectors remain in their declared
     // vector store. Fill those exact-snapshot vector values before residual
     // predicates or an UPDATE replacement can observe a false NULL.
-    db.supplement_selected_vector_columns(table, snapshot, tx, materialized_columns, &mut out)?;
+    db.supplement_selected_vector_columns(
+        table,
+        snapshot,
+        tx,
+        materialized_columns,
+        &mut out,
+        vector_copy_owner,
+        read_memory.clone(),
+    )?;
     let anchor_shape = access_mode == IndexScanAccessMode::Select
         && residual_filter
             .map(|filter| is_anchor_shape_index_pick(db, table, pick, filter, params))
             .unwrap_or(false);
     if anchor_shape {
         out = filter_rows_by_predicate(out, residual_filter, params)?;
-        out = db.filter_rows_for_anchor_read_in_tx(tx, table, out, snapshot)?;
+        out =
+            db.filter_rows_for_anchor_read_in_tx(tx, table, out, snapshot, read_memory.clone())?;
     } else {
-        out = db.filter_rows_for_read_in_tx(tx, table, out, snapshot)?;
+        out = db.filter_rows_for_read_in_tx(tx, table, out, snapshot, read_memory.clone())?;
     }
     Ok((out, rows_examined))
 }
@@ -11451,6 +12206,8 @@ fn execute_writer_index_scan(
     materialized_columns: Option<&[String]>,
     residual_filter: Option<&Expr>,
     params: &HashMap<String, Value>,
+    vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<(Vec<VersionedRow>, u64)> {
     let pick = match coerce_pick_shape_to_column_type(db, table, pick) {
         Ok(pick) => pick,
@@ -11463,7 +12220,14 @@ fn execute_writer_index_scan(
         return Err(Error::TableNotFound(table.into()));
     };
     if !meta.indexes.iter().any(|decl| decl.name == pick.name) {
-        let rows = scan_rows_for_select(db, table, snapshot, tx)?;
+        let rows = scan_rows_for_select(
+            db,
+            table,
+            snapshot,
+            tx,
+            vector_copy_owner,
+            read_memory.clone(),
+        )?;
         let examined = rows.len() as u64;
         return Ok((rows, examined));
     }
@@ -11472,8 +12236,8 @@ fn execute_writer_index_scan(
         .first()
         .cloned()
         .ok_or_else(|| Error::Other("index has no leading column".into()))?;
-    let mut admission = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
-        db.bounded_read_accountant(),
+    let mut admission = contextdb_core::read_memory::ReadCredit::try_new(
+        read_memory.clone(),
         planned_index_run_construction_bytes(&pick)?,
         "query",
         "eager_index_output",
@@ -11496,6 +12260,7 @@ fn execute_writer_index_scan(
     let mut examined = 0u64;
     let mut out = Vec::new();
     while let Some(row) = db.bounded_ordered_table_row_next(
+        read_memory.clone(),
         table,
         &column,
         direction,
@@ -11518,19 +12283,34 @@ fn execute_writer_index_scan(
         out.push(row);
     }
     if let Some(tx) = tx {
-        let overlay = db.index_scan_tx_overlay(tx, table, &pick.pushed_column, &pick.shape)?;
+        let overlay = db.index_scan_tx_overlay(
+            tx,
+            table,
+            &pick.pushed_column,
+            &pick.shape,
+            read_memory.clone(),
+        )?;
         out.retain(|row| !overlay.deleted_row_ids.contains(&row.row_id));
         out = merge_staged_rows_in_index_order(out, overlay.matching_inserts, &pick.columns);
     }
-    db.supplement_selected_vector_columns(table, snapshot, tx, materialized_columns, &mut out)?;
+    db.supplement_selected_vector_columns(
+        table,
+        snapshot,
+        tx,
+        materialized_columns,
+        &mut out,
+        vector_copy_owner,
+        read_memory.clone(),
+    )?;
     let anchor = access_mode == IndexScanAccessMode::Select
         && residual_filter
             .is_some_and(|filter| is_anchor_shape_index_pick(db, table, &pick, filter, params));
     if anchor {
         out = filter_rows_by_predicate(out, residual_filter, params)?;
-        out = db.filter_rows_for_anchor_read_in_tx(tx, table, out, snapshot)?;
+        out =
+            db.filter_rows_for_anchor_read_in_tx(tx, table, out, snapshot, read_memory.clone())?;
     } else {
-        out = db.filter_rows_for_read_in_tx(tx, table, out, snapshot)?;
+        out = db.filter_rows_for_read_in_tx(tx, table, out, snapshot, read_memory.clone())?;
     }
     db.retain_writer_output(admission);
     Ok((out, examined))
@@ -11617,7 +12397,9 @@ fn try_elide_sort(
     params: &HashMap<String, Value>,
     tx: Option<TxId>,
     materialized_columns: Option<&[String]>,
-) -> Result<Option<QueryResult>> {
+    vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<Option<OwnedQueryResult>> {
     fn find_scan(plan: &PhysicalPlan) -> Option<(&String, &Option<String>, &Option<Expr>)> {
         match plan {
             PhysicalPlan::Scan {
@@ -11646,6 +12428,8 @@ fn try_elide_sort(
         params,
         tx,
         materialized_columns,
+        vector_copy_owner,
+        read_memory.clone(),
     )
 }
 
@@ -11733,7 +12517,9 @@ fn run_index_scan_with_order(
     params: &HashMap<String, Value>,
     tx: Option<TxId>,
     materialized_columns: Option<&[String]>,
-) -> Result<Option<QueryResult>> {
+    vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<Option<OwnedQueryResult>> {
     use std::borrow::Cow;
     let snapshot = db.snapshot_for_read();
     let schema_columns = db.table_meta(table).map(|meta| {
@@ -11743,7 +12529,9 @@ fn run_index_scan_with_order(
             .collect::<Vec<_>>()
     });
     let resolved_filter = filter
-        .map(|expr| resolve_in_subqueries(db, expr, params, tx))
+        .map(|expr| {
+            resolve_in_subqueries(db, expr, params, tx, vector_copy_owner, read_memory.clone())
+        })
         .transpose()?;
     let ordered_materialized_columns =
         merge_expression_columns(materialized_columns, resolved_filter.iter());
@@ -11775,6 +12563,8 @@ fn run_index_scan_with_order(
         ordered_materialized_columns.as_deref(),
         resolved_filter.as_ref(),
         params,
+        vector_copy_owner,
+        read_memory.clone(),
     )?;
     db.__bump_rows_examined(examined);
     let mut result = materialize_rows(
@@ -11795,6 +12585,7 @@ fn run_index_scan_with_order(
         vector_search: None,
         rows_examined: 0,
         maintained_count: None,
+        groups: Box::new([]),
     };
     Ok(Some(result))
 }
@@ -11988,6 +12779,10 @@ fn count_equality_prefix(
                     matches!(right.as_ref(), Expr::Literal(_) | Expr::Parameter(_));
                 left_is_col && right_is_simple
             }
+            Expr::IsNull {
+                expr,
+                negated: false,
+            } => matches!(expr.as_ref(), Expr::Column(reference) if reference.column == *col),
             _ => false,
         });
         if has_eq {
@@ -12062,47 +12857,12 @@ pub(crate) fn estimate_vector_search_bytes(dimension: usize, k: usize) -> usize 
         .saturating_mul(std::mem::size_of::<f32>())
 }
 
-pub(crate) fn estimate_bfs_working_bytes<T>(
-    frontier: &[T],
-    steps: &[contextdb_planner::GraphStepPlan],
-) -> usize {
-    let max_hops = steps.iter().fold(0usize, |acc, step| {
-        acc.saturating_add(step.max_depth as usize)
-    });
-    frontier
-        .len()
-        .saturating_mul(2048)
-        .saturating_mul(max_hops.max(1))
-}
-
-fn dedupe_graph_frontier(
-    frontier: Vec<(HashMap<String, uuid::Uuid>, uuid::Uuid, u32)>,
-    steps: &[contextdb_planner::GraphStepPlan],
-) -> Vec<(HashMap<String, uuid::Uuid>, uuid::Uuid, u32)> {
-    let mut best =
-        HashMap::<Vec<uuid::Uuid>, (HashMap<String, uuid::Uuid>, uuid::Uuid, u32)>::new();
-
-    for (bindings, current_id, depth) in frontier {
-        let mut key = Vec::with_capacity(steps.len());
-        for step in steps {
-            if let Some(id) = bindings.get(&step.target_alias) {
-                key.push(*id);
-            }
-        }
-
-        best.entry(key)
-            .and_modify(|existing| {
-                if depth < existing.2 {
-                    *existing = (bindings.clone(), current_id, depth);
-                }
-            })
-            .or_insert((bindings, current_id, depth));
-    }
-
-    best.into_values().collect()
-}
-
-pub(crate) fn estimate_drop_table_bytes(db: &Database, table: &str) -> usize {
+pub(crate) fn estimate_drop_table_bytes(
+    db: &Database,
+    table: &str,
+    vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<usize> {
     let meta = db.table_meta(table);
     let metadata_bytes = meta
         .as_ref()
@@ -12133,7 +12893,7 @@ pub(crate) fn estimate_drop_table_bytes(db: &Database, table: &str) -> usize {
                     ))
                 })
         });
-    let rows = db.scan(table, snapshot).unwrap_or_default();
+    let rows = db.scan_with_read_memory(table, snapshot, vector_copy_owner, read_memory.clone())?;
     let edge_bytes = if meta.as_ref().is_some_and(has_edge_columns) {
         rows.iter().fold(0usize, |acc, row| {
             match (
@@ -12161,9 +12921,9 @@ pub(crate) fn estimate_drop_table_bytes(db: &Database, table: &str) -> usize {
     } else {
         0
     };
-    metadata_bytes
+    Ok(metadata_bytes
         .saturating_add(row_bytes)
-        .saturating_add(edge_bytes)
+        .saturating_add(edge_bytes))
 }
 
 fn materialize_rows(
@@ -12171,7 +12931,7 @@ fn materialize_rows(
     filter: Option<&Expr>,
     params: &HashMap<String, Value>,
     schema_columns: Option<&[String]>,
-) -> Result<QueryResult> {
+) -> Result<OwnedQueryResult> {
     let filtered = filter_rows_by_predicate(rows, filter, params)?;
 
     let keys = if let Some(schema_columns) = schema_columns {
@@ -12200,13 +12960,13 @@ fn materialize_rows(
         })
         .collect();
 
-    Ok(QueryResult {
+    Ok(OwnedQueryResult::new(QueryResult {
         columns,
         rows,
         rows_affected: 0,
         trace: crate::database::QueryTrace::scan(),
         cascade: None,
-    })
+    }))
 }
 
 fn scan_rows_for_select(
@@ -12214,14 +12974,23 @@ fn scan_rows_for_select(
     table: &str,
     snapshot: SnapshotId,
     tx: Option<TxId>,
+    vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<Vec<VersionedRow>> {
     let mut rows = if let Some(tx) = tx {
-        let rows = db.scan_in_tx_raw(tx, table, snapshot)?;
-        db.filter_rows_for_read_in_tx(Some(tx), table, rows, snapshot)?
+        let rows =
+            db.scan_in_tx_raw(tx, table, snapshot, vector_copy_owner, read_memory.clone())?;
+        db.filter_rows_for_read_in_tx(Some(tx), table, rows, snapshot, read_memory.clone())?
     } else {
-        db.scan(table, snapshot)?
+        db.scan_with_read_memory(table, snapshot, vector_copy_owner, read_memory.clone())?
     };
-    db.supplement_quantized_vectors(table, snapshot, &mut rows)?;
+    db.supplement_quantized_vectors(
+        table,
+        snapshot,
+        &mut rows,
+        vector_copy_owner,
+        read_memory.clone(),
+    )?;
     Ok(rows)
 }
 
@@ -12232,6 +13001,8 @@ fn rows_by_row_id(
     snapshot: SnapshotId,
     tx: Option<TxId>,
     materialized_columns: Option<&[String]>,
+    vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<Vec<VersionedRow>> {
     if row_ids.is_empty() {
         return Ok(Vec::new());
@@ -12239,11 +13010,18 @@ fn rows_by_row_id(
 
     let mut rows = Vec::with_capacity(row_ids.len());
     for row_id in row_ids {
-        if let Ok(row) = db.find_row_by_id_in_tx(tx, table, *row_id, snapshot) {
-            rows.push(row);
-        }
+        let row = db.find_row_by_id_in_tx(tx, table, *row_id, snapshot, read_memory.clone())?;
+        rows.push(row);
     }
-    db.supplement_selected_vector_columns(table, snapshot, tx, materialized_columns, &mut rows)?;
+    db.supplement_selected_vector_columns(
+        table,
+        snapshot,
+        tx,
+        materialized_columns,
+        &mut rows,
+        vector_copy_owner,
+        read_memory.clone(),
+    )?;
     Ok(rows)
 }
 
@@ -12252,8 +13030,17 @@ fn uuid_to_row_id_map(
     table: &str,
     snapshot: SnapshotId,
     tx: Option<TxId>,
+    vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<HashMap<uuid::Uuid, RowId>> {
-    let rows = scan_rows_for_select(db, table, snapshot, tx)?;
+    let rows = scan_rows_for_select(
+        db,
+        table,
+        snapshot,
+        tx,
+        vector_copy_owner,
+        read_memory.clone(),
+    )?;
     Ok(rows
         .iter()
         .filter_map(|row| match row.values.get("id") {
@@ -12300,13 +13087,8 @@ fn vector_search_trace_with_source(
     trace
 }
 
-fn mark_filtered_exact_route(trace: &mut contextdb_vector::VectorSearchDebugTrace) {
-    trace.fallback_reason = Some("filtered_route_exact");
-    for partition in &mut trace.partition_routes {
-        if partition.route == contextdb_vector::VectorPartitionSearchRoute::Exact {
-            partition.reason = "filtered_route_exact";
-        }
-    }
+fn mark_filtered_exact_route(trace: &mut crate::database::RetainedVectorSearchTrace) {
+    trace.mark_filtered_exact_route();
 }
 
 fn row_vector_source_ref(expr: &Expr) -> Option<contextdb_core::VectorIndexRef> {
@@ -12621,6 +13403,7 @@ fn first_unbound_plan_parameter<'a>(
 fn first_unbound_parameter<'a>(expr: &'a Expr, params: &HashMap<String, Value>) -> Option<&'a str> {
     let unbound = |expr: &'a Expr| first_unbound_parameter(expr, params);
     match expr {
+        Expr::RowNumber(_) | Expr::WindowRank(_) => None,
         Expr::Parameter(name) => (!params.contains_key(name)).then_some(name.as_str()),
         Expr::Row(elements) => elements.iter().find_map(unbound),
         Expr::Column(_) | Expr::Literal(_) => None,
@@ -13179,7 +13962,11 @@ fn eval_expr_value(
         Expr::UnaryOp { op, operand } => {
             let value = eval_expr_value(row, operand, params)?;
             match op {
-                UnaryOp::Not => Ok(Value::Bool(!value_to_bool(&value))),
+                UnaryOp::Not => Ok(if value == Value::Null {
+                    Value::Null
+                } else {
+                    Value::Bool(!value_to_bool(&value))
+                }),
                 UnaryOp::Neg => match value {
                     Value::Int64(v) => checked_neg_i64(v),
                     Value::Float64(v) => Ok(Value::Float64(-v)),
@@ -13210,20 +13997,25 @@ fn eval_expr_value(
             negated,
         } => {
             let needle = eval_expr_value(row, expr, params)?;
-            let matched = list.iter().try_fold(false, |found, item| -> Result<bool> {
-                if found {
-                    Ok(true)
-                } else {
-                    let candidate = eval_expr_value(row, item, params)?;
-                    Ok(
-                        matches!(compare_values(&needle, &candidate), Some(Ordering::Equal))
-                            || (needle != Value::Null
-                                && candidate != Value::Null
-                                && needle == candidate),
-                    )
+            if needle == Value::Null {
+                return Ok(Value::Null);
+            }
+            let mut saw_unknown = false;
+            for item in list {
+                let candidate = eval_expr_value(row, item, params)?;
+                if candidate == Value::Null {
+                    saw_unknown = true;
+                } else if matches!(compare_values(&needle, &candidate), Some(Ordering::Equal))
+                    || needle == candidate
+                {
+                    return Ok(Value::Bool(!*negated));
                 }
-            })?;
-            Ok(Value::Bool(if *negated { !matched } else { matched }))
+            }
+            Ok(if saw_unknown {
+                Value::Null
+            } else {
+                Value::Bool(*negated)
+            })
         }
         Expr::Like {
             expr,
@@ -13234,6 +14026,7 @@ fn eval_expr_value(
                 eval_expr_value(row, expr, params)?,
                 eval_expr_value(row, pattern, params)?,
             ) {
+                (Value::Null, _) | (_, Value::Null) => return Ok(Value::Null),
                 (Value::Text(value), Value::Text(pattern)) => like_matches(&value, &pattern),
                 _ => false,
             };
@@ -13245,6 +14038,9 @@ fn eval_expr_value(
 
 pub fn resolve_expr(expr: &Expr, params: &HashMap<String, Value>) -> Result<Value> {
     match expr {
+        Expr::RowNumber(_) | Expr::WindowRank(_) => Err(Error::WindowFunctionNotSupported {
+            form: "ROW_NUMBER execution pending".to_string(),
+        }),
         Expr::Literal(l) => Ok(match l {
             Literal::Null => Value::Null,
             Literal::Bool(v) => Value::Bool(*v),
@@ -13555,15 +14351,16 @@ fn eval_bool_expr(
                 return Ok(None);
             }
 
-            let matched = list.iter().try_fold(false, |found, item| -> Result<bool> {
-                if found {
-                    Ok(true)
-                } else {
-                    let candidate = eval_value(item)?;
-                    Ok(candidate != Value::Null && values_sql_equal(&needle, &candidate))
+            let mut saw_unknown = false;
+            for item in list {
+                let candidate = eval_value(item)?;
+                if candidate == Value::Null {
+                    saw_unknown = true;
+                } else if values_sql_equal(&needle, &candidate) {
+                    return Ok(Some(!*negated));
                 }
-            })?;
-            Ok(Some(if *negated { !matched } else { matched }))
+            }
+            Ok(if saw_unknown { None } else { Some(*negated) })
         }
         Expr::InSubquery { .. } => Err(Error::PlanError(
             "IN (subquery) must be resolved before execution".to_string(),
@@ -13576,10 +14373,11 @@ fn eval_bool_expr(
             let left = eval_value(expr)?;
             let right = eval_value(pattern)?;
             let matched = match (left, right) {
-                (Value::Text(value), Value::Text(pattern)) => like_matches(&value, &pattern),
-                _ => false,
+                (Value::Null, _) | (_, Value::Null) => None,
+                (Value::Text(value), Value::Text(pattern)) => Some(like_matches(&value, &pattern)),
+                _ => Some(false),
             };
-            Ok(Some(if *negated { !matched } else { matched }))
+            Ok(matched.map(|matched| matched != *negated))
         }
         Expr::IsNull { expr, negated } => {
             let is_null = eval_value(expr)? == Value::Null;
@@ -13614,6 +14412,35 @@ fn eval_bool_expr(
 }
 
 fn eval_binary_op(op: &BinOp, left: &Value, right: &Value) -> Result<Value> {
+    if matches!(op, BinOp::And | BinOp::Or) {
+        let left = if left == &Value::Null {
+            None
+        } else {
+            Some(value_to_bool(left))
+        };
+        let right = if right == &Value::Null {
+            None
+        } else {
+            Some(value_to_bool(right))
+        };
+        let truth = match op {
+            BinOp::And => match (left, right) {
+                (Some(false), _) | (_, Some(false)) => Some(false),
+                (Some(true), Some(true)) => Some(true),
+                _ => None,
+            },
+            BinOp::Or => match (left, right) {
+                (Some(true), _) | (_, Some(true)) => Some(true),
+                (Some(false), Some(false)) => Some(false),
+                _ => None,
+            },
+            _ => unreachable!(),
+        };
+        return Ok(truth.map(Value::Bool).unwrap_or(Value::Null));
+    }
+    if left == &Value::Null || right == &Value::Null {
+        return Ok(Value::Null);
+    }
     let bool_value = match op {
         BinOp::Eq => {
             if left == &Value::Null || right == &Value::Null {
@@ -13961,8 +14788,18 @@ fn resolve_in_subqueries(
     expr: &Expr,
     params: &HashMap<String, Value>,
     tx: Option<TxId>,
+    vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<Expr> {
-    resolve_in_subqueries_with_ctes(db, expr, params, tx, &[])
+    resolve_in_subqueries_with_ctes(
+        db,
+        expr,
+        params,
+        tx,
+        &[],
+        vector_copy_owner,
+        read_memory.clone(),
+    )
 }
 
 fn resolve_graph_filter_at_snapshot(
@@ -13972,9 +14809,19 @@ fn resolve_graph_filter_at_snapshot(
     tx: Option<TxId>,
     snapshot: SnapshotId,
     ctes: &[Cte],
+    vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<Expr> {
     db.with_snapshot_override(snapshot, || {
-        resolve_in_subqueries_with_ctes(db, expr, params, tx, ctes)
+        resolve_in_subqueries_with_ctes(
+            db,
+            expr,
+            params,
+            tx,
+            ctes,
+            vector_copy_owner,
+            read_memory.clone(),
+        )
     })
 }
 
@@ -13985,12 +14832,14 @@ pub(crate) fn resolve_in_subqueries_with_ctes(
     params: &HashMap<String, Value>,
     tx: Option<TxId>,
     ctes: &[Cte],
+    vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<Expr> {
     // The eager door reads the inner answer the eager way: the whole result at
     // once, with no ceiling over it, which is exactly what it promises its
     // callers.
     let mut drain = |plan: &PhysicalPlan, select: &Expr| -> Result<Vec<Value>> {
-        let result = execute_plan(db, plan, params, tx)?;
+        let result = execute_plan(db, plan, params, tx, vector_copy_owner, read_memory.clone())?;
         result
             .rows
             .iter()
@@ -14338,11 +15187,10 @@ fn qualify_join_columns(
         .enumerate()
         .map(|(idx, column)| {
             if idx < left_columns.len() {
-                if let Some(prefix) = left_prefix {
-                    format!(
-                        "{prefix}.{}",
-                        left_columns[idx].rsplit('.').next().unwrap_or(column)
-                    )
+                if left_columns[idx].contains('.') {
+                    left_columns[idx].clone()
+                } else if let Some(prefix) = left_prefix {
+                    format!("{prefix}.{}", left_columns[idx])
                 } else {
                     left_columns[idx].clone()
                 }
@@ -14403,8 +15251,6 @@ pub(crate) struct GraphStartResolution {
     #[allow(dead_code)]
     pub(crate) examined: u64,
 }
-
-type GraphFrontierRow = (HashMap<String, uuid::Uuid>, uuid::Uuid, u32);
 
 fn graph_trace_shape(
     single_step: bool,
@@ -14481,6 +15327,8 @@ pub(crate) fn resolve_graph_start_nodes_from_filter(
     tx: Option<TxId>,
     snapshot: contextdb_core::SnapshotId,
     start_alias: &str,
+    vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<GraphStartResolution> {
     let mut graph_materialized_columns = expression_columns(std::iter::once(filter));
     if !graph_materialized_columns
@@ -14503,9 +15351,18 @@ pub(crate) fn resolve_graph_start_nodes_from_filter(
                 Some(&graph_materialized_columns),
                 None,
                 params,
+                vector_copy_owner,
+                read_memory.clone(),
             )?,
             None => {
-                let rows = scan_rows_for_select(db, table, snapshot, tx)?;
+                let rows = scan_rows_for_select(
+                    db,
+                    table,
+                    snapshot,
+                    tx,
+                    vector_copy_owner,
+                    read_memory.clone(),
+                )?;
                 let scanned = rows.len() as u64;
                 (rows, scanned)
             }
@@ -14521,7 +15378,16 @@ pub(crate) fn resolve_graph_start_nodes_from_filter(
             scanned,
         ))
     };
-    resolve_graph_start_nodes_with_reader(db, filter, params, tx, snapshot, start_alias, &mut read)
+    resolve_graph_start_nodes_with_reader(
+        db,
+        filter,
+        params,
+        tx,
+        snapshot,
+        start_alias,
+        &mut read,
+        read_memory.clone(),
+    )
 }
 
 /// The shape of start resolution both doors share: which filter names a start,
@@ -14541,6 +15407,8 @@ pub(crate) fn resolve_graph_start_nodes_with_reader<E>(
         &str,
         Option<&IndexPick>,
     ) -> std::result::Result<(Vec<uuid::Uuid>, u64), E>,
+
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> std::result::Result<GraphStartResolution, E>
 where
     E: From<Error>,
@@ -14557,9 +15425,16 @@ where
             examined,
         });
     };
-    if let Some(ids) =
-        resolve_graph_start_ids_from_filter(db, &start_filter, params, tx, snapshot, start_alias)
-            .map_err(E::from)?
+    if let Some(ids) = resolve_graph_start_ids_from_filter(
+        db,
+        &start_filter,
+        params,
+        tx,
+        snapshot,
+        start_alias,
+        read_memory.clone(),
+    )
+    .map_err(E::from)?
     {
         predicates_pushed.push(Cow::Owned(format!("{start_alias}.id")));
         return Ok(GraphStartResolution {
@@ -14611,13 +15486,21 @@ where
     let mut ids = Vec::new();
     for id in candidate_ids {
         let bindings = HashMap::from([(start_alias.to_string(), id)]);
-        if graph_filter_matches_bindings(db, &start_filter, params, tx, snapshot, &bindings)
-            .map_err(E::from)?
+        if graph_filter_matches_bindings(
+            db,
+            &start_filter,
+            params,
+            tx,
+            snapshot,
+            &bindings,
+            read_memory.clone(),
+        )
+        .map_err(E::from)?
         {
             ids.push(id);
         }
     }
-    db.assert_graph_anchor_nodes_readable_in_tx(tx, &ids, snapshot)
+    db.assert_graph_anchor_nodes_readable_in_tx(tx, &ids, snapshot, read_memory.clone())
         .map_err(E::from)?;
     Ok(GraphStartResolution {
         ids,
@@ -14633,9 +15516,14 @@ fn resolve_graph_start_nodes_from_plan(
     params: &HashMap<String, Value>,
     tx: Option<TxId>,
     snapshot: contextdb_core::SnapshotId,
+    vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<Vec<uuid::Uuid>> {
-    let result = db.with_snapshot_override(snapshot, || execute_plan(db, plan, params, tx))?;
+    let result = db.with_snapshot_override(snapshot, || {
+        execute_plan(db, plan, params, tx, vector_copy_owner, read_memory.clone())
+    })?;
     result
+        .result
         .rows
         .into_iter()
         .filter_map(|row| row.into_iter().next())
@@ -14657,6 +15545,8 @@ fn resolve_graph_start_ids_from_filter(
     tx: Option<TxId>,
     snapshot: contextdb_core::SnapshotId,
     start_alias: &str,
+
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<Option<Vec<uuid::Uuid>>> {
     match filter {
         Expr::BinaryOp {
@@ -14675,7 +15565,7 @@ fn resolve_graph_start_ids_from_filter(
                 return Ok(None);
             };
             let ids = vec![id];
-            db.assert_graph_anchor_nodes_readable_in_tx(tx, &ids, snapshot)?;
+            db.assert_graph_anchor_nodes_readable_in_tx(tx, &ids, snapshot, read_memory.clone())?;
             Ok(Some(ids))
         }
         Expr::InList {
@@ -14695,7 +15585,7 @@ fn resolve_graph_start_ids_from_filter(
                 };
                 ids.push(id);
             }
-            db.assert_graph_anchor_nodes_readable_in_tx(tx, &ids, snapshot)?;
+            db.assert_graph_anchor_nodes_readable_in_tx(tx, &ids, snapshot, read_memory.clone())?;
             Ok(Some(ids))
         }
         Expr::BinaryOp {
@@ -14703,10 +15593,24 @@ fn resolve_graph_start_ids_from_filter(
             op: BinOp::And,
             right,
         } => {
-            let left_ids =
-                resolve_graph_start_ids_from_filter(db, left, params, tx, snapshot, start_alias)?;
-            let right_ids =
-                resolve_graph_start_ids_from_filter(db, right, params, tx, snapshot, start_alias)?;
+            let left_ids = resolve_graph_start_ids_from_filter(
+                db,
+                left,
+                params,
+                tx,
+                snapshot,
+                start_alias,
+                read_memory.clone(),
+            )?;
+            let right_ids = resolve_graph_start_ids_from_filter(
+                db,
+                right,
+                params,
+                tx,
+                snapshot,
+                start_alias,
+                read_memory.clone(),
+            )?;
             match (left_ids, right_ids) {
                 (Some(left_ids), Some(right_ids)) => {
                     let right_ids = right_ids.into_iter().collect::<BTreeSet<_>>();
@@ -14714,7 +15618,12 @@ fn resolve_graph_start_ids_from_filter(
                         .into_iter()
                         .filter(|id| right_ids.contains(id))
                         .collect::<Vec<_>>();
-                    db.assert_graph_anchor_nodes_readable_in_tx(tx, &ids, snapshot)?;
+                    db.assert_graph_anchor_nodes_readable_in_tx(
+                        tx,
+                        &ids,
+                        snapshot,
+                        read_memory.clone(),
+                    )?;
                     Ok(Some(ids))
                 }
                 (Some(_), None) | (None, Some(_)) | (None, None) => Ok(None),
@@ -14725,10 +15634,24 @@ fn resolve_graph_start_ids_from_filter(
             op: BinOp::Or,
             right,
         } => {
-            let left_ids =
-                resolve_graph_start_ids_from_filter(db, left, params, tx, snapshot, start_alias)?;
-            let right_ids =
-                resolve_graph_start_ids_from_filter(db, right, params, tx, snapshot, start_alias)?;
+            let left_ids = resolve_graph_start_ids_from_filter(
+                db,
+                left,
+                params,
+                tx,
+                snapshot,
+                start_alias,
+                read_memory.clone(),
+            )?;
+            let right_ids = resolve_graph_start_ids_from_filter(
+                db,
+                right,
+                params,
+                tx,
+                snapshot,
+                start_alias,
+                read_memory.clone(),
+            )?;
             match (left_ids, right_ids) {
                 (Some(left_ids), Some(right_ids)) => {
                     let ids = left_ids
@@ -14737,7 +15660,12 @@ fn resolve_graph_start_ids_from_filter(
                         .collect::<BTreeSet<_>>()
                         .into_iter()
                         .collect::<Vec<_>>();
-                    db.assert_graph_anchor_nodes_readable_in_tx(tx, &ids, snapshot)?;
+                    db.assert_graph_anchor_nodes_readable_in_tx(
+                        tx,
+                        &ids,
+                        snapshot,
+                        read_memory.clone(),
+                    )?;
                     Ok(Some(ids))
                 }
                 (Some(_), None) | (None, Some(_)) | (None, None) => Ok(None),
@@ -14782,50 +15710,27 @@ fn resolve_graph_target_id_residual(
 #[derive(Clone, Copy)]
 pub(crate) enum GraphPredicateWork {
     Checkpoint,
-    ReserveValues(usize),
-    ReserveRows(usize),
     AccessRow(usize),
-    ReleaseRows,
 }
 
 struct GraphValueCache<'a> {
     values: HashMap<(uuid::Uuid, String), Vec<Value>>,
-    memory: crate::memory_accounting::OwnedMemoryReservation,
+    memory: contextdb_core::read_memory::ReadCredit,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     work: &'a mut dyn FnMut(GraphPredicateWork) -> Result<()>,
 }
 impl<'a> GraphValueCache<'a> {
-    fn new(db: &Database, work: &'a mut dyn FnMut(GraphPredicateWork) -> Result<()>) -> Self {
+    fn new(
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        work: &'a mut dyn FnMut(GraphPredicateWork) -> Result<()>,
+    ) -> Self {
         Self {
             values: HashMap::new(),
-            memory: db.graph_predicate_memory(),
+            memory: contextdb_core::read_memory::ReadCredit::new(read_memory.clone()),
+            read_memory,
             work,
         }
     }
-}
-
-fn filter_graph_frontier(
-    db: &Database,
-    frontier: Vec<GraphFrontierRow>,
-    filter: Option<&Expr>,
-    params: &HashMap<String, Value>,
-    tx: Option<TxId>,
-    snapshot: contextdb_core::SnapshotId,
-) -> Result<Vec<GraphFrontierRow>> {
-    let Some(filter) = filter else {
-        return Ok(frontier);
-    };
-
-    let mut filtered = Vec::with_capacity(frontier.len());
-    for (bindings, current, depth) in frontier {
-        let mut noop = |_| Ok(());
-        let mut cache = GraphValueCache::new(db, &mut noop);
-        if graph_eval_bool_expr(db, filter, params, tx, snapshot, &bindings, &mut cache)?
-            .unwrap_or(false)
-        {
-            filtered.push((bindings, current, depth));
-        }
-    }
-    Ok(filtered)
 }
 
 fn graph_filter_matches_bindings(
@@ -14835,10 +15740,19 @@ fn graph_filter_matches_bindings(
     tx: Option<TxId>,
     snapshot: contextdb_core::SnapshotId,
     bindings: &HashMap<String, uuid::Uuid>,
+
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<bool> {
-    graph_filter_matches_bindings_with_work(db, filter, params, tx, snapshot, bindings, &mut |_| {
-        Ok(())
-    })
+    graph_filter_matches_bindings_with_work(
+        db,
+        filter,
+        params,
+        tx,
+        snapshot,
+        bindings,
+        &mut |_| Ok(()),
+        read_memory.clone(),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -14850,12 +15764,21 @@ fn graph_filter_matches_bindings_with_work(
     snapshot: contextdb_core::SnapshotId,
     bindings: &HashMap<String, uuid::Uuid>,
     work: &mut dyn FnMut(GraphPredicateWork) -> Result<()>,
+
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<bool> {
-    let mut cache = GraphValueCache::new(db, work);
-    Ok(
-        graph_eval_bool_expr(db, filter, params, tx, snapshot, bindings, &mut cache)?
-            .unwrap_or(false),
-    )
+    let mut cache = GraphValueCache::new(read_memory.clone(), work);
+    Ok(graph_eval_bool_expr(
+        db,
+        filter,
+        params,
+        tx,
+        snapshot,
+        bindings,
+        &mut cache,
+        read_memory.clone(),
+    )?
+    .unwrap_or(false))
 }
 
 fn graph_eval_bool_expr(
@@ -14866,21 +15789,59 @@ fn graph_eval_bool_expr(
     snapshot: contextdb_core::SnapshotId,
     bindings: &HashMap<String, uuid::Uuid>,
     cache: &mut GraphValueCache<'_>,
+
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<Option<bool>> {
     (cache.work)(GraphPredicateWork::Checkpoint)?;
     match expr {
         Expr::BinaryOp { left, op, right } => match op {
             BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Lte | BinOp::Gt | BinOp::Gte => {
-                let left = graph_eval_values(db, left, params, tx, snapshot, bindings, cache)?;
-                let right = graph_eval_values(db, right, params, tx, snapshot, bindings, cache)?;
-                graph_compare_any(&left, &right, *op)
+                let left = graph_eval_values(
+                    db,
+                    left,
+                    params,
+                    tx,
+                    snapshot,
+                    bindings,
+                    cache,
+                    read_memory.clone(),
+                )?;
+                let right = graph_eval_values(
+                    db,
+                    right,
+                    params,
+                    tx,
+                    snapshot,
+                    bindings,
+                    cache,
+                    read_memory.clone(),
+                )?;
+                graph_compare_any(&left, &right, *op, cache.work)
             }
             BinOp::And => {
-                let left = graph_eval_bool_expr(db, left, params, tx, snapshot, bindings, cache)?;
+                let left = graph_eval_bool_expr(
+                    db,
+                    left,
+                    params,
+                    tx,
+                    snapshot,
+                    bindings,
+                    cache,
+                    read_memory.clone(),
+                )?;
                 if left == Some(false) {
                     return Ok(Some(false));
                 }
-                let right = graph_eval_bool_expr(db, right, params, tx, snapshot, bindings, cache)?;
+                let right = graph_eval_bool_expr(
+                    db,
+                    right,
+                    params,
+                    tx,
+                    snapshot,
+                    bindings,
+                    cache,
+                    read_memory.clone(),
+                )?;
                 Ok(match (left, right) {
                     (Some(true), Some(true)) => Some(true),
                     (Some(true), other) => other,
@@ -14890,11 +15851,29 @@ fn graph_eval_bool_expr(
                 })
             }
             BinOp::Or => {
-                let left = graph_eval_bool_expr(db, left, params, tx, snapshot, bindings, cache)?;
+                let left = graph_eval_bool_expr(
+                    db,
+                    left,
+                    params,
+                    tx,
+                    snapshot,
+                    bindings,
+                    cache,
+                    read_memory.clone(),
+                )?;
                 if left == Some(true) {
                     return Ok(Some(true));
                 }
-                let right = graph_eval_bool_expr(db, right, params, tx, snapshot, bindings, cache)?;
+                let right = graph_eval_bool_expr(
+                    db,
+                    right,
+                    params,
+                    tx,
+                    snapshot,
+                    bindings,
+                    cache,
+                    read_memory.clone(),
+                )?;
                 Ok(match (left, right) {
                     (Some(false), Some(false)) => Some(false),
                     (Some(false), other) => other,
@@ -14907,57 +15886,120 @@ fn graph_eval_bool_expr(
         Expr::UnaryOp {
             op: UnaryOp::Not,
             operand,
-        } => Ok(
-            graph_eval_bool_expr(db, operand, params, tx, snapshot, bindings, cache)?
-                .map(|value| !value),
-        ),
+        } => Ok(graph_eval_bool_expr(
+            db,
+            operand,
+            params,
+            tx,
+            snapshot,
+            bindings,
+            cache,
+            read_memory.clone(),
+        )?
+        .map(|value| !value)),
         Expr::InList {
             expr,
             list,
             negated,
         } => {
-            let needles = graph_eval_values(db, expr, params, tx, snapshot, bindings, cache)?;
+            let needles = graph_eval_values(
+                db,
+                expr,
+                params,
+                tx,
+                snapshot,
+                bindings,
+                cache,
+                read_memory.clone(),
+            )?;
             let mut candidates = Vec::new();
             for item in list {
                 candidates.extend(graph_eval_values(
-                    db, item, params, tx, snapshot, bindings, cache,
+                    db,
+                    item,
+                    params,
+                    tx,
+                    snapshot,
+                    bindings,
+                    cache,
+                    read_memory.clone(),
                 )?);
             }
-            let matched = needles.iter().any(|needle| {
-                *needle != Value::Null
-                    && candidates.iter().any(|candidate| {
-                        *candidate != Value::Null
-                            && (matches!(compare_values(needle, candidate), Some(Ordering::Equal))
-                                || needle == candidate)
-                    })
-            });
-            Ok(Some(if *negated { !matched } else { matched }))
+            Ok(
+                graph_compare_any(&needles, &candidates, BinOp::Eq, cache.work)?
+                    .map(|matched| matched != *negated),
+            )
         }
         Expr::Like {
             expr,
             pattern,
             negated,
         } => {
-            let values = graph_eval_values(db, expr, params, tx, snapshot, bindings, cache)?;
-            let patterns = graph_eval_values(db, pattern, params, tx, snapshot, bindings, cache)?;
-            let matched = values.iter().any(|value| {
-                patterns.iter().any(|pattern| match (value, pattern) {
-                    (Value::Text(value), Value::Text(pattern)) => like_matches(value, pattern),
-                    _ => false,
-                })
-            });
-            Ok(Some(if *negated { !matched } else { matched }))
+            let values = graph_eval_values(
+                db,
+                expr,
+                params,
+                tx,
+                snapshot,
+                bindings,
+                cache,
+                read_memory.clone(),
+            )?;
+            let patterns = graph_eval_values(
+                db,
+                pattern,
+                params,
+                tx,
+                snapshot,
+                bindings,
+                cache,
+                read_memory.clone(),
+            )?;
+            let mut saw_unknown = false;
+            for value in &values {
+                for pattern in &patterns {
+                    (cache.work)(GraphPredicateWork::Checkpoint)?;
+                    match (value, pattern) {
+                        (Value::Null, _) | (_, Value::Null) => saw_unknown = true,
+                        (Value::Text(value), Value::Text(pattern))
+                            if like_matches(value, pattern) =>
+                        {
+                            return Ok(Some(!*negated));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Ok(if saw_unknown { None } else { Some(*negated) })
         }
         Expr::IsNull { expr, negated } => {
-            let values = graph_eval_values(db, expr, params, tx, snapshot, bindings, cache)?;
+            let values = graph_eval_values(
+                db,
+                expr,
+                params,
+                tx,
+                snapshot,
+                bindings,
+                cache,
+                read_memory.clone(),
+            )?;
             let is_null = values.iter().all(|value| *value == Value::Null);
             Ok(Some(if *negated { !is_null } else { is_null }))
         }
         Expr::FunctionCall { .. } => {
-            match graph_eval_values(db, expr, params, tx, snapshot, bindings, cache)?
-                .into_iter()
-                .next()
-                .unwrap_or(Value::Null)
+            match graph_eval_values(
+                db,
+                expr,
+                params,
+                tx,
+                snapshot,
+                bindings,
+                cache,
+                read_memory.clone(),
+            )?
+            .into_iter()
+            .next()
+            .unwrap_or(Value::Null)
             {
                 Value::Bool(value) => Ok(Some(value)),
                 Value::Null => Ok(None),
@@ -14985,17 +16027,49 @@ fn graph_eval_values(
     snapshot: contextdb_core::SnapshotId,
     bindings: &HashMap<String, uuid::Uuid>,
     cache: &mut GraphValueCache<'_>,
+
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<Vec<Value>> {
     (cache.work)(GraphPredicateWork::Checkpoint)?;
     match expr {
+        Expr::RowNumber(_) | Expr::WindowRank(_) => Err(Error::WindowFunctionNotSupported {
+            form: "window in graph predicate".to_string(),
+        }),
         Expr::Literal(_) | Expr::Parameter(_) => Ok(vec![resolve_expr(expr, params)?]),
-        Expr::Column(column) => graph_column_values(db, column, tx, snapshot, bindings, cache),
+        Expr::Column(column) => graph_column_values(
+            db,
+            column,
+            tx,
+            snapshot,
+            bindings,
+            cache,
+            read_memory.clone(),
+        ),
         Expr::BinaryOp { left, op, right } => {
-            let left = graph_eval_values(db, left, params, tx, snapshot, bindings, cache)?;
-            let right = graph_eval_values(db, right, params, tx, snapshot, bindings, cache)?;
+            let left = graph_eval_values(
+                db,
+                left,
+                params,
+                tx,
+                snapshot,
+                bindings,
+                cache,
+                read_memory.clone(),
+            )?;
+            let right = graph_eval_values(
+                db,
+                right,
+                params,
+                tx,
+                snapshot,
+                bindings,
+                cache,
+                read_memory.clone(),
+            )?;
             let mut values = Vec::new();
             for left in &left {
                 for right in &right {
+                    (cache.work)(GraphPredicateWork::Checkpoint)?;
                     values.push(eval_binary_op(op, left, right)?);
                 }
             }
@@ -15006,11 +16080,24 @@ fn graph_eval_values(
             })
         }
         Expr::UnaryOp { op, operand } => {
-            let values = graph_eval_values(db, operand, params, tx, snapshot, bindings, cache)?;
+            let values = graph_eval_values(
+                db,
+                operand,
+                params,
+                tx,
+                snapshot,
+                bindings,
+                cache,
+                read_memory.clone(),
+            )?;
             values
                 .into_iter()
                 .map(|value| match op {
-                    UnaryOp::Not => Ok(Value::Bool(!value_to_bool(&value))),
+                    UnaryOp::Not => Ok(if value == Value::Null {
+                        Value::Null
+                    } else {
+                        Value::Bool(!value_to_bool(&value))
+                    }),
                     UnaryOp::Neg => match value {
                         Value::Int64(v) => checked_neg_i64(v),
                         Value::Float64(v) => Ok(Value::Float64(-v)),
@@ -15024,15 +16111,35 @@ fn graph_eval_values(
         Expr::FunctionCall { name, args } => {
             let mut values = Vec::with_capacity(args.len());
             for arg in args {
-                let mut arg_values =
-                    graph_eval_values(db, arg, params, tx, snapshot, bindings, cache)?;
+                let mut arg_values = graph_eval_values(
+                    db,
+                    arg,
+                    params,
+                    tx,
+                    snapshot,
+                    bindings,
+                    cache,
+                    read_memory.clone(),
+                )?;
                 values.push(arg_values.pop().unwrap_or(Value::Null));
             }
             Ok(vec![eval_function(name, &values)?])
         }
-        Expr::InList { .. } | Expr::Like { .. } | Expr::IsNull { .. } => Ok(vec![Value::Bool(
-            graph_eval_bool_expr(db, expr, params, tx, snapshot, bindings, cache)?.unwrap_or(false),
-        )]),
+        Expr::InList { .. } | Expr::Like { .. } | Expr::IsNull { .. } => {
+            Ok(vec![match graph_eval_bool_expr(
+                db,
+                expr,
+                params,
+                tx,
+                snapshot,
+                bindings,
+                cache,
+                read_memory.clone(),
+            )? {
+                Some(value) => Value::Bool(value),
+                None => Value::Null,
+            }])
+        }
         Expr::InSubquery { .. } => Err(Error::PlanError(
             "IN (subquery) must be resolved before graph execution".to_string(),
         )),
@@ -15052,12 +16159,22 @@ fn graph_column_values(
     snapshot: contextdb_core::SnapshotId,
     bindings: &HashMap<String, uuid::Uuid>,
     cache: &mut GraphValueCache<'_>,
+
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<Vec<Value>> {
     if let Some(alias) = column.table.as_ref() {
         let Some(node) = bindings.get(alias) else {
             return Ok(vec![Value::Null]);
         };
-        return graph_node_column_values(db, *node, &column.column, tx, snapshot, cache);
+        return graph_node_column_values(
+            db,
+            *node,
+            &column.column,
+            tx,
+            snapshot,
+            cache,
+            read_memory.clone(),
+        );
     }
 
     if column.column == "id" {
@@ -15075,7 +16192,15 @@ fn graph_column_values(
 
     if bindings.len() == 1 {
         let node = *bindings.values().next().expect("length checked above");
-        return graph_node_column_values(db, node, &column.column, tx, snapshot, cache);
+        return graph_node_column_values(
+            db,
+            node,
+            &column.column,
+            tx,
+            snapshot,
+            cache,
+            read_memory.clone(),
+        );
     }
 
     Ok(vec![Value::Null])
@@ -15088,6 +16213,8 @@ fn graph_node_column_values(
     tx: Option<TxId>,
     snapshot: contextdb_core::SnapshotId,
     cache: &mut GraphValueCache<'_>,
+
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<Vec<Value>> {
     if column == "id" {
         return Ok(vec![Value::Uuid(node)]);
@@ -15105,6 +16232,7 @@ fn graph_node_column_values(
         snapshot,
         cache.work,
         &mut cache.memory,
+        cache.read_memory.clone(),
     )?;
     let values = if values.is_empty() {
         vec![Value::Null]
@@ -15115,10 +16243,16 @@ fn graph_node_column_values(
     Ok(values)
 }
 
-fn graph_compare_any(left: &[Value], right: &[Value], op: BinOp) -> Result<Option<bool>> {
+fn graph_compare_any(
+    left: &[Value],
+    right: &[Value],
+    op: BinOp,
+    work: &mut dyn FnMut(GraphPredicateWork) -> Result<()>,
+) -> Result<Option<bool>> {
     let mut saw_unknown = false;
     for left in left {
         for right in right {
+            work(GraphPredicateWork::Checkpoint)?;
             if *left == Value::Null || *right == Value::Null {
                 saw_unknown = true;
                 continue;
@@ -15207,6 +16341,7 @@ fn graph_start_resolution_filter(filter: &Expr, start_alias: &str) -> Option<Exp
 fn graph_start_columns(expr: &Expr, start_alias: &str) -> BTreeSet<String> {
     fn walk(expr: &Expr, start_alias: &str, columns: &mut BTreeSet<String>) {
         match expr {
+            Expr::RowNumber(_) | Expr::WindowRank(_) => {}
             Expr::Column(contextdb_parser::ast::ColumnRef {
                 table: Some(table),
                 column,
@@ -15262,6 +16397,7 @@ fn graph_start_columns(expr: &Expr, start_alias: &str) -> BTreeSet<String> {
 fn graph_start_filter_needs_unpinned_null_semantics(expr: &Expr, start_alias: &str) -> bool {
     fn walk(expr: &Expr, start_alias: &str, not_parity: bool) -> bool {
         match expr {
+            Expr::RowNumber(_) | Expr::WindowRank(_) => false,
             Expr::IsNull { expr, negated } => {
                 let matches_missing_metadata = !(*negated ^ not_parity);
                 matches_missing_metadata
@@ -15302,6 +16438,7 @@ fn graph_start_filter_needs_unpinned_null_semantics(expr: &Expr, start_alias: &s
 fn graph_expr_refs_only_start_alias(expr: &Expr, start_alias: &str) -> bool {
     fn walk(expr: &Expr, start_alias: &str, saw_start: &mut bool, saw_other: &mut bool) {
         match expr {
+            Expr::RowNumber(_) | Expr::WindowRank(_) => *saw_other = true,
             Expr::Column(contextdb_parser::ast::ColumnRef { table, .. }) => {
                 match table.as_deref() {
                     Some(alias) if alias == start_alias => *saw_start = true,
@@ -15389,11 +16526,22 @@ fn resolve_query_vector_from_expr(
     params: &HashMap<String, Value>,
     tx: Option<TxId>,
     snapshot: SnapshotId,
+    vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<(Vec<f32>, Option<contextdb_core::VectorIndexRef>)> {
     match expr {
         Expr::RowVectorSource { table, column, key } => {
             let index = contextdb_core::VectorIndexRef::new(table.clone(), column.clone());
-            let vector = resolve_row_vector_source(db, &index, key, params, tx, snapshot)?;
+            let vector = resolve_row_vector_source(
+                db,
+                &index,
+                key,
+                params,
+                tx,
+                snapshot,
+                vector_copy_owner,
+                read_memory.clone(),
+            )?;
             Ok((vector, Some(index)))
         }
         _ => Ok((resolve_vector_from_expr(expr, params)?, None)),
@@ -15407,6 +16555,8 @@ fn resolve_row_vector_source(
     params: &HashMap<String, Value>,
     tx: Option<TxId>,
     snapshot: SnapshotId,
+    vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<Vec<f32>> {
     let meta = db
         .table_meta(&index.table)
@@ -15449,7 +16599,14 @@ fn resolve_row_vector_source(
     }
     let key_label = row_vector_key_label(&key);
     let row_id = db
-        .row_id_for_natural_key_in_tx(tx, &index.table, &key_column, &key, snapshot)?
+        .row_id_for_natural_key_in_tx(
+            tx,
+            &index.table,
+            &key_column,
+            &key,
+            snapshot,
+            read_memory.clone(),
+        )?
         .ok_or_else(|| Error::PersistedRowVectorRowMissing {
             index: index.clone(),
             key: key_label.clone(),
@@ -15461,7 +16618,9 @@ fn resolve_row_vector_source(
             snapshot,
             tx,
             |_| Ok::<(), Error>(()),
-            |vector| Ok::<Vec<f32>, Error>(vector.to_vec()),
+            |vector| Ok::<Vec<f32>, Error>(vector),
+            vector_copy_owner,
+            read_memory.clone(),
         )?
         .ok_or_else(|| Error::PersistedRowVectorCellNull {
             index: index.clone(),
@@ -18959,6 +20118,7 @@ fn declared_conflict_policy_to_string(p: contextdb_core::ConflictPolicy) -> Stri
     }
 }
 
+#[cfg(test)]
 fn project_graph_frontier_rows(
     frontier: Vec<(HashMap<String, uuid::Uuid>, uuid::Uuid, u32)>,
     start_alias: &str,
@@ -18999,9 +20159,19 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         row_id: RowId,
         lsn: Lsn,
         snapshot: SnapshotId,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Option<Vec<f32>>> {
-        self.store
-            .load_row_vector_for_column(tx, table, column, row_id, lsn, snapshot)
+        self.store.load_row_vector_for_column(
+            tx,
+            table,
+            column,
+            row_id,
+            lsn,
+            snapshot,
+            vector_copy_owner,
+            read_memory.clone(),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -19015,6 +20185,9 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         before_distance: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         release_retained: &mut dyn FnMut(usize),
+
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<Option<f32>, BoundedExecutionError> {
         self.store.bounded_score_committed_vector_row(
             index,
@@ -19025,6 +20198,8 @@ impl ReadExecutionTarget for BoundedCursorTarget {
             before_distance,
             before_retain,
             release_retained,
+            vector_copy_owner,
+            read_memory.clone(),
         )
     }
 
@@ -19035,14 +20210,15 @@ impl ReadExecutionTarget for BoundedCursorTarget {
     fn delivery_metadata(
         &self,
         request: crate::direct_file_reader::DirectMetadataRequest,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<crate::direct_file_reader::DirectMetadataBody> {
-        self.store.delivery_metadata(request)
+        self.store.delivery_metadata(request, read_memory)
     }
 
     fn committed_change_state(
         &self,
         checkpoint: &dyn Fn() -> Result<()>,
-        charge: &crate::read_image_memory::ImageMemory,
+        charge: &Arc<crate::read_image_memory::ImageMemory>,
     ) -> std::result::Result<
         crate::direct_file_reader::DirectChangeState,
         crate::direct_file_reader::DirectFileReaderError,
@@ -19053,7 +20229,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
     fn committed_sync_state(
         &self,
         checkpoint: &dyn Fn() -> Result<()>,
-        charge: &crate::read_image_memory::ImageMemory,
+        charge: &Arc<crate::read_image_memory::ImageMemory>,
     ) -> std::result::Result<
         crate::direct_file_reader::DirectSyncState,
         crate::direct_file_reader::DirectFileReaderError,
@@ -19061,20 +20237,43 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         self.store.committed_sync_state(checkpoint, charge)
     }
 
-    fn store_state_answer(&self, plan: &PhysicalPlan) -> Result<QueryResult> {
-        self.store.store_state_answer(plan)
+    fn content_size_answer(
+        &self,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        before_table: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<OwnedQueryResult> {
+        self.store.content_size_answer(read_memory, before_table)
     }
 
-    fn explain_plan_without_running_it(&self, sql: &str) -> Result<String> {
-        self.store.explain_plan_without_running_it(sql)
+    fn store_state_answer(
+        &self,
+        plan: &PhysicalPlan,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<OwnedQueryResult> {
+        self.store
+            .store_state_answer(plan, vector_copy_owner, read_memory.clone())
+    }
+
+    fn explain_plan_without_running_it(
+        &self,
+        sql: &str,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<String> {
+        self.store
+            .explain_plan_without_running_it(sql, vector_copy_owner, read_memory)
     }
 
     fn explain_output_without_running_it(
         &self,
         sql: &str,
         params: &HashMap<String, Value>,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<crate::database::ExplainOutput> {
-        self.store.explain_output_without_running_it(sql, params)
+        self.store
+            .explain_output_without_running_it(sql, params, vector_copy_owner, read_memory)
     }
 
     fn plugin(&self) -> &dyn crate::plugin::DatabasePlugin {
@@ -19096,17 +20295,34 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         key_col: &str,
         key_value: &Value,
         snapshot: SnapshotId,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Option<RowId>> {
-        self.store
-            .row_id_for_natural_key_in_tx(tx, table, key_col, key_value, snapshot)
+        self.store.row_id_for_natural_key_in_tx(
+            tx,
+            table,
+            key_col,
+            key_value,
+            snapshot,
+            read_memory.clone(),
+        )
     }
 
     fn prepare_bounded_read_plan(
         &self,
         parsed: &Statement,
         params: &HashMap<String, Value>,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<(Statement, PhysicalPlan)> {
-        self.store.prepare_bounded_read_plan(parsed, params)
+        self.store
+            .prepare_bounded_read_plan(parsed, params, vector_copy_owner, read_memory.clone())
+    }
+
+    fn declared_read_request_provider(
+        &self,
+    ) -> Arc<dyn crate::vector_read_memory::ReadRequestBudgetProvider> {
+        self.store.declared_read_request_provider()
     }
 
     fn bounded_read_accountant(&self) -> Arc<crate::memory_accounting::MemoryAccountant> {
@@ -19161,8 +20377,9 @@ impl ReadExecutionTarget for BoundedCursorTarget {
     fn enter_writer_read(
         &self,
         root: Option<Arc<crate::persistence::WriterSnapshot>>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Option<crate::database::writer_read::WriterReadScope> {
-        self.store.enter_writer_read(root)
+        self.store.enter_writer_read(root, read_memory)
     }
 
     fn retained_relational_membership_source(&self) -> bool {
@@ -19178,9 +20395,10 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         table: &str,
         columns: &[(String, contextdb_core::SortDirection)],
         prefix: &IndexKey,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Option<u64>> {
         self.store
-            .authenticated_relational_index_prefix_count(table, columns, prefix)
+            .authenticated_relational_index_prefix_count(table, columns, prefix, read_memory)
     }
 
     fn bounded_read_snapshot_registration(
@@ -19188,9 +20406,14 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         needs_vector_graph: bool,
         budget: &crate::database::ReadRegistrationBudget,
         withdrawn: &OwnerReadCancellation,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Option<BoundedReadSnapshotPin>> {
-        self.store
-            .bounded_read_snapshot_registration(needs_vector_graph, budget, withdrawn)
+        self.store.bounded_read_snapshot_registration(
+            needs_vector_graph,
+            budget,
+            withdrawn,
+            read_memory,
+        )
     }
 
     fn bounded_cursor_snapshot_registration(
@@ -19200,6 +20423,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         idle_ms: u64,
         budget: &crate::database::ReadRegistrationBudget,
         withdrawn: &OwnerReadCancellation,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Option<BoundedCursorSnapshotPin>> {
         self.store.bounded_cursor_snapshot_registration(
             needs_vector_graph,
@@ -19207,6 +20431,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
             idle_ms,
             budget,
             withdrawn,
+            read_memory,
         )
     }
 
@@ -19234,6 +20459,9 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         release_retained: &mut dyn FnMut(usize),
         visit: &mut dyn FnMut(RowId) -> std::result::Result<(), BoundedExecutionError>,
+
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<(), BoundedExecutionError> {
         self.store.bounded_vector_visit_visible_ids(
             index,
@@ -19242,6 +20470,8 @@ impl ReadExecutionTarget for BoundedCursorTarget {
             before_retain,
             release_retained,
             visit,
+            vector_copy_owner,
+            read_memory.clone(),
         )
     }
 
@@ -19253,9 +20483,18 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         row: &VersionedRow,
         snapshot: SnapshotId,
         before_access_row: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<bool, BoundedExecutionError> {
-        self.store
-            .bounded_read_allowed_for_row(tx, table, meta, row, snapshot, before_access_row)
+        self.store.bounded_read_allowed_for_row(
+            tx,
+            table,
+            meta,
+            row,
+            snapshot,
+            before_access_row,
+            read_memory.clone(),
+        )
     }
 
     fn bounded_read_denial_for_row(
@@ -19266,13 +20505,23 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         row: &VersionedRow,
         snapshot: SnapshotId,
         before_access_row: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<Option<Error>, BoundedExecutionError> {
-        self.store
-            .bounded_read_denial_for_row(tx, table, meta, row, snapshot, before_access_row)
+        self.store.bounded_read_denial_for_row(
+            tx,
+            table,
+            meta,
+            row,
+            snapshot,
+            before_access_row,
+            read_memory.clone(),
+        )
     }
 
     fn bounded_row_by_identity(
         &self,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         tx: Option<TxId>,
         table: &str,
         row_id: RowId,
@@ -19280,8 +20529,15 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
     ) -> std::result::Result<Option<VersionedRow>, BoundedExecutionError> {
-        self.store
-            .bounded_row_by_identity(tx, table, row_id, snapshot, before_touch, before_clone)
+        self.store.bounded_row_by_identity(
+            read_memory,
+            tx,
+            table,
+            row_id,
+            snapshot,
+            before_touch,
+            before_clone,
+        )
     }
 
     fn bounded_physical_table_cursor(
@@ -19293,23 +20549,28 @@ impl ReadExecutionTarget for BoundedCursorTarget {
 
     fn bounded_physical_table_row_next(
         &self,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         table: &str,
         snapshot: SnapshotId,
         cursor: &mut contextdb_relational::mem::BoundedPhysicalCursor,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        observed: &mut dyn FnMut(&VersionedRow) -> std::result::Result<(), BoundedExecutionError>,
         before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
     ) -> std::result::Result<Option<VersionedRow>, BoundedExecutionError> {
         self.store.bounded_physical_table_row_next(
+            read_memory,
             table,
             snapshot,
             cursor,
             before_touch,
+            observed,
             before_clone,
         )
     }
 
     fn bounded_exact_index_row_next(
         &self,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         table: &str,
         index: &str,
         snapshot: SnapshotId,
@@ -19320,6 +20581,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
     ) -> std::result::Result<Option<VersionedRow>, BoundedExecutionError> {
         self.store.bounded_exact_index_row_next(
+            read_memory,
             table,
             index,
             snapshot,
@@ -19331,8 +20593,18 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         )
     }
 
-    fn bounded_ordered_table_row_next(
+    fn ordered_prefix_snapshot_is_current(
         &self,
+        snapshot: SnapshotId,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<bool> {
+        self.store
+            .ordered_prefix_snapshot_is_current(snapshot, read_memory)
+    }
+
+    fn bounded_ordered_table_row_next_observed(
+        &self,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         table: &str,
         column: &str,
         direction: contextdb_core::SortDirection,
@@ -19340,9 +20612,14 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         cursor: &mut contextdb_relational::mem::BoundedOrderedRowCursor,
         check_boundary: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        observed: &mut dyn FnMut(
+            &IndexKey,
+            RowId,
+        ) -> std::result::Result<(), BoundedExecutionError>,
         before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
     ) -> std::result::Result<Option<VersionedRow>, BoundedExecutionError> {
-        self.store.bounded_ordered_table_row_next(
+        self.store.bounded_ordered_table_row_next_observed(
+            read_memory,
             table,
             column,
             direction,
@@ -19350,6 +20627,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
             cursor,
             check_boundary,
             before_touch,
+            observed,
             before_clone,
         )
     }
@@ -19362,6 +20640,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         cursor: &mut contextdb_relational::mem::BoundedOrderedRowCursor,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         visit: &mut dyn FnMut(RowId) -> std::result::Result<(), BoundedExecutionError>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<bool, BoundedExecutionError> {
         self.store.bounded_visit_verified_ordered_identities(
             table,
@@ -19370,6 +20649,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
             cursor,
             before_touch,
             visit,
+            read_memory,
         )
     }
 
@@ -19380,6 +20660,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         prefixes: &[IndexKey],
         check_boundary: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<Option<bool>, BoundedExecutionError> {
         self.store.bounded_verified_index_prefixes_are_empty(
             table,
@@ -19387,6 +20668,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
             prefixes,
             check_boundary,
             before_touch,
+            read_memory,
         )
     }
 
@@ -19419,6 +20701,9 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         before_placement: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         release_retained: &mut dyn FnMut(usize),
+
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<
         contextdb_vector::mem::BoundedVectorCandidateGroups,
         BoundedExecutionError,
@@ -19431,6 +20716,8 @@ impl ReadExecutionTarget for BoundedCursorTarget {
             before_placement,
             before_retain,
             release_retained,
+            vector_copy_owner,
+            read_memory.clone(),
         )
     }
 
@@ -19442,13 +20729,29 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         sort_key: Option<&str>,
         groups: &contextdb_vector::mem::BoundedVectorCandidateGroups,
         before_source: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<usize, BoundedExecutionError> {
-        self.store
-            .bounded_vector_candidate_k(index, requested, sort_key, groups, before_source)
+        self.store.bounded_vector_candidate_k(
+            index,
+            requested,
+            sort_key,
+            groups,
+            before_source,
+            vector_copy_owner,
+            read_memory,
+        )
     }
 
-    fn bounded_vector_entry_count(&self, index: &VectorIndexRef, snapshot: SnapshotId) -> usize {
-        self.store.bounded_vector_entry_count(index, snapshot)
+    fn bounded_vector_entry_count(
+        &self,
+        index: &VectorIndexRef,
+        snapshot: SnapshotId,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+    ) -> Result<usize> {
+        self.store
+            .bounded_vector_entry_count(index, snapshot, vector_copy_owner)
     }
 
     fn completed_vector_search_disclosure(
@@ -19467,6 +20770,9 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         used_hnsw: bool,
         fallback_reason: Option<&'static str>,
         budget_receipt: Option<contextdb_vector::mem::VectorSearchBudgetReceipt>,
+
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<VectorSearchDisclosure> {
         self.store.completed_vector_search_disclosure(
             index,
@@ -19483,10 +20789,12 @@ impl ReadExecutionTarget for BoundedCursorTarget {
             used_hnsw,
             fallback_reason,
             budget_receipt,
+            vector_copy_owner,
+            read_memory.clone(),
         )
     }
 
-    fn publish_vector_search_trace(&self, trace: contextdb_vector::VectorSearchDebugTrace) {
+    fn publish_vector_search_trace(&self, trace: contextdb_vector::OwnedVectorSearchTrace) {
         self.store.publish_vector_search_trace(trace);
     }
 
@@ -19503,6 +20811,8 @@ impl ReadExecutionTarget for BoundedCursorTarget {
             BoundedRowVectorClone,
             BoundedExecutionError,
         >,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<Option<BoundedRowVectorClone>, BoundedExecutionError> {
         self.store.with_bounded_row_vector(
             index,
@@ -19511,6 +20821,8 @@ impl ReadExecutionTarget for BoundedCursorTarget {
             tx,
             before_access_row,
             use_vector,
+            vector_copy_owner,
+            read_memory.clone(),
         )
     }
 
@@ -19523,6 +20835,9 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         before_source_entry: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         release_retained: &mut dyn FnMut(usize),
+
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<contextdb_vector::mem::BoundedBruteForceCursor, BoundedExecutionError>
     {
         self.store.bounded_brute_force_vector_cursor(
@@ -19533,6 +20848,8 @@ impl ReadExecutionTarget for BoundedCursorTarget {
             before_source_entry,
             before_retain,
             release_retained,
+            vector_copy_owner,
+            read_memory.clone(),
         )
     }
 
@@ -19551,6 +20868,9 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         before_distance: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         release_retained: &mut dyn FnMut(usize),
+
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<contextdb_vector::mem::BoundedVectorStep, BoundedExecutionError> {
         self.store.bounded_brute_force_vector_step(
             cursor,
@@ -19560,6 +20880,8 @@ impl ReadExecutionTarget for BoundedCursorTarget {
             before_distance,
             before_retain,
             release_retained,
+            vector_copy_owner,
+            read_memory.clone(),
         )
     }
 
@@ -19570,12 +20892,17 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         k: usize,
         groups: &contextdb_vector::mem::BoundedVectorCandidateGroups,
         mode: VectorSearchMode,
+        is_reader_memory_refusal: &dyn Fn(&BoundedExecutionError) -> bool,
         allowed_search_limits: contextdb_vector::hnsw::HnswAllowedSearchLimits,
         before_source_entry: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_exact_candidate: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_distance: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         release_retained: &mut dyn FnMut(usize),
+
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        load_transfer: crate::memory_accounting::VectorLoadReservationTransfer,
     ) -> std::result::Result<BoundedVectorSearchOutcome, BoundedExecutionError> {
         self.store.bounded_hnsw_vector_search(
             index,
@@ -19583,17 +20910,22 @@ impl ReadExecutionTarget for BoundedCursorTarget {
             k,
             groups,
             mode,
+            is_reader_memory_refusal,
             allowed_search_limits,
             before_source_entry,
             before_exact_candidate,
             before_distance,
             before_retain,
             release_retained,
+            vector_copy_owner,
+            read_memory.clone(),
+            load_transfer,
         )
     }
 
     fn bounded_rank_candidate(
         &self,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         index: &VectorIndexRef,
         sort_key: &str,
         anchor_row_id: RowId,
@@ -19613,6 +20945,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
             -> std::result::Result<(), BoundedExecutionError>,
     ) -> std::result::Result<(Option<f32>, usize), BoundedExecutionError> {
         self.store.bounded_rank_candidate(
+            read_memory,
             index,
             sort_key,
             anchor_row_id,
@@ -19649,6 +20982,8 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         release_retained: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         entry_read: &mut dyn FnMut(),
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<
         Option<crate::database::gate::CountedGraphScanEdge>,
         BoundedExecutionError,
@@ -19662,6 +20997,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
             before_retain,
             release_retained,
             entry_read,
+            read_memory.clone(),
         )
     }
 
@@ -19677,6 +21013,8 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         before_access: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         release_retained: &mut dyn FnMut(usize),
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<Option<contextdb_graph::mem::BoundedBfsCursor>, BoundedExecutionError>
     {
         self.store.bounded_graph_bfs_cursor(
@@ -19690,6 +21028,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
             before_access,
             before_retain,
             release_retained,
+            read_memory.clone(),
         )
     }
 
@@ -19707,6 +21046,8 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         entry_read: &mut dyn FnMut(),
         visited_cap: Option<usize>,
         tx: Option<TxId>,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<
         Option<contextdb_graph::mem::BoundedTraversalNode>,
         BoundedExecutionError,
@@ -19724,6 +21065,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
             entry_read,
             visited_cap,
             tx,
+            read_memory.clone(),
         )
     }
 
@@ -19734,9 +21076,18 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         tx: Option<TxId>,
         snapshot: SnapshotId,
         ctes: &[Cte],
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Expr> {
-        self.store
-            .resolve_graph_filter_at_snapshot(expr, params, tx, snapshot, ctes)
+        self.store.resolve_graph_filter_at_snapshot(
+            expr,
+            params,
+            tx,
+            snapshot,
+            ctes,
+            vector_copy_owner,
+            read_memory.clone(),
+        )
     }
 
     fn as_database_for_subquery_plan(&self) -> Option<&Database> {
@@ -19750,9 +21101,18 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         tx: Option<TxId>,
         snapshot: SnapshotId,
         start_alias: &str,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<GraphStartResolution> {
-        self.store
-            .resolve_graph_start_nodes_from_filter(filter, params, tx, snapshot, start_alias)
+        self.store.resolve_graph_start_nodes_from_filter(
+            filter,
+            params,
+            tx,
+            snapshot,
+            start_alias,
+            vector_copy_owner,
+            read_memory.clone(),
+        )
     }
 
     fn graph_filter_matches_bindings_with_work(
@@ -19763,9 +21123,18 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         snapshot: SnapshotId,
         bindings: &HashMap<String, uuid::Uuid>,
         work: &mut dyn FnMut(GraphPredicateWork) -> Result<()>,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<bool> {
-        self.store
-            .graph_filter_matches_bindings_with_work(filter, params, tx, snapshot, bindings, work)
+        self.store.graph_filter_matches_bindings_with_work(
+            filter,
+            params,
+            tx,
+            snapshot,
+            bindings,
+            work,
+            read_memory.clone(),
+        )
     }
 
     fn coerce_into_column(
@@ -19788,21 +21157,23 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         &self,
         sql: &str,
         params: &HashMap<String, Value>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         limits: ReadLimits,
         clock: Arc<dyn DeadlineClock>,
         cancellation: &OwnerReadCancellation,
     ) -> std::result::Result<
-        (QueryResult, Vec<u8>, ReadPublicationScope),
+        (OwnedQueryResult, Vec<u8>, ReadPublicationScope),
         crate::direct_file_reader::DirectFileReaderError,
     > {
         self.store
-            .read_query(sql, params, limits, clock, cancellation)
+            .read_query(sql, params, read_memory, limits, clock, cancellation)
     }
 
     fn open_read_cursor(
         self: Arc<Self>,
         sql: &str,
         params: &HashMap<String, Value>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         limits: ReadLimits,
         clock: Arc<dyn DeadlineClock>,
         cancellation: &OwnerReadCancellation,
@@ -19816,7 +21187,15 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         ),
         crate::direct_file_reader::DirectFileReaderError,
     > {
-        Arc::clone(&self.store).open_read_cursor(sql, params, limits, clock, cancellation, snapshot)
+        Arc::clone(&self.store).open_read_cursor(
+            sql,
+            params,
+            read_memory,
+            limits,
+            clock,
+            cancellation,
+            snapshot,
+        )
     }
 
     fn read_cursor_pages(
@@ -19865,12 +21244,40 @@ impl ReadExecutionTarget for BoundedCursorTarget {
                 return Err(error);
             }
         };
-        let published = published_page(fetched.page, self.snapshot)?;
-        let drained = drained_page(&published)?;
+        let constructed = (|| {
+            let published = published_page(
+                fetched.page,
+                fetched.observation,
+                self.snapshot,
+                self.read_memory.clone(),
+            )?;
+            let drained = drained_page(&published, self.read_memory.clone())?;
+            Ok((published, drained))
+        })();
+        let (published, drained) = match constructed {
+            Ok(pages) => pages,
+            Err(error) => {
+                self.release()?;
+                return Err(error);
+            }
+        };
         if drained.is_some() {
             self.release()?;
         }
         Ok((published, drained, fetched.publication))
+    }
+
+    fn read_cursor_observation(
+        &self,
+    ) -> std::result::Result<
+        Option<CursorObservation>,
+        crate::direct_file_reader::DirectFileReaderError,
+    > {
+        let observation = self.with_cursor(bounded::cursor_observation);
+        if observation.is_err() || matches!(&observation, Ok(None)) {
+            self.release()?;
+        }
+        observation
     }
 
     fn read_cursor_retains_continuation(&self) -> bool {
@@ -19889,6 +21296,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
 
     fn read_metadata(
         &self,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         request: crate::direct_file_reader::DirectMetadataRequest,
         image: &crate::direct_file_reader::DirectOwnedImage,
         limits: ReadLimits,
@@ -19899,8 +21307,15 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         crate::direct_file_reader::DirectMetadataResponse,
         crate::direct_file_reader::DirectFileReaderError,
     > {
-        self.store
-            .read_metadata(request, image, limits, clock, continuation, cancellation)
+        self.store.read_metadata(
+            read_memory,
+            request,
+            image,
+            limits,
+            clock,
+            continuation,
+            cancellation,
+        )
     }
 }
 

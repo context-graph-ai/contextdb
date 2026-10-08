@@ -159,6 +159,18 @@ pub trait PagedPointStorage<T> {
     fn pop_search_candidate(&mut self) -> Result<Option<Option<PagedEdge>>, Self::Error> {
         Ok(None)
     }
+    /// Run one finite selection window. Providers admit its retained point
+    /// capacity before the callback allocates and release it after return.
+    fn with_selection_window<R>(
+        &mut self,
+        _points: usize,
+        select: impl FnOnce(&mut Self) -> Result<R, PagedGraphError<Self::Error>>,
+    ) -> Result<R, PagedGraphError<Self::Error>>
+    where
+        Self: Sized,
+    {
+        select(self)
+    }
     /// Allowed-set admission affects retained results, while navigation may
     /// pass through excluded nodes. Construction uses unfiltered traversal.
     fn is_allowed(&mut self, _origin: usize) -> Result<bool, Self::Error> {
@@ -475,6 +487,24 @@ fn search_layer<T: Send + Sync, S: PagedPointStorage<T>, D: Distance<T>>(
     Ok(())
 }
 
+// The window owns each loaded body once; comparisons borrow it in place.
+fn selection_point<T, S: PagedPointStorage<T>>(
+    storage: &mut S,
+    points: &mut Vec<PagedPoint<T>>,
+    id: PointId,
+    policy: PagedGraphPolicy,
+) -> Result<usize, PagedGraphError<S::Error>> {
+    if let Some(index) = points.iter().position(|point| point.id == id) {
+        storage.checkpoint()?;
+        return Ok(index);
+    }
+    let point = load(storage, id, policy)?;
+    let index = points.len();
+    debug_assert!(index < points.capacity());
+    points.push(point);
+    Ok(index)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn select<T: Send + Sync, S: PagedPointStorage<T>, D: Distance<T>>(
     storage: &mut S,
@@ -486,88 +516,108 @@ fn select<T: Send + Sync, S: PagedPointStorage<T>, D: Distance<T>>(
     extend: bool,
     metric: &D,
 ) -> Result<(), PagedGraphError<S::Error>> {
-    workspace.selected.clear();
-    workspace.discarded.clear();
-    workspace.extension.clear();
     if workspace.candidates.len() <= cap && !extend {
+        workspace.selected.clear();
+        workspace.discarded.clear();
+        workspace.extension.clear();
         while let Some(edge) = workspace.candidates.pop() {
             PagedGraphWorkspace::grow_vec(&mut workspace.selected, workspace.capacity);
             workspace.selected.push(edge.reversed());
         }
         return Ok(());
     }
-    if workspace.candidates.len() <= cap && extend {
-        for candidate in workspace.candidates.iter() {
-            let point = load(storage, candidate.point_id, policy)?;
-            for edge in point.neighbours.get(layer).into_iter().flatten() {
-                if workspace
-                    .candidates
-                    .iter()
-                    .any(|c| c.point_id == edge.point_id)
-                    || workspace.extension.contains(&edge.point_id)
-                {
-                    continue;
+    let count = workspace.candidates.len();
+    let body_bound = if count <= cap && extend {
+        count
+            .checked_mul(1 + policy.degree(layer))
+            .ok_or(PagedGraphError::ScratchExhausted)?
+    } else {
+        count
+    };
+    storage.with_selection_window(body_bound, |storage| {
+        let mut points = Vec::with_capacity(body_bound);
+        workspace.selected.clear();
+        workspace.discarded.clear();
+        workspace.extension.clear();
+        if workspace.candidates.len() <= cap && extend {
+            for candidate in workspace.candidates.iter() {
+                let index = selection_point(storage, &mut points, candidate.point_id, policy)?;
+                let point = &points[index];
+                for edge in point.neighbours.get(layer).into_iter().flatten() {
+                    if workspace
+                        .candidates
+                        .iter()
+                        .any(|c| c.point_id == edge.point_id)
+                        || workspace.extension.contains(&edge.point_id)
+                    {
+                        continue;
+                    }
+                    if workspace.extension.len() >= workspace.capacity {
+                        return Err(PagedGraphError::ScratchExhausted);
+                    }
+                    PagedGraphWorkspace::grow_vec(&mut workspace.extension, workspace.capacity);
+                    workspace.extension.push(edge.point_id);
                 }
-                if workspace.extension.len() >= workspace.capacity {
-                    return Err(PagedGraphError::ScratchExhausted);
-                }
-                PagedGraphWorkspace::grow_vec(&mut workspace.extension, workspace.capacity);
-                workspace.extension.push(edge.point_id);
+            }
+            workspace.extension.sort_unstable();
+            for id in &workspace.extension {
+                let index = selection_point(storage, &mut points, *id, policy)?;
+                let point = &points[index];
+                let score = measured_distance(storage, metric, values, &point.values)?;
+                PagedGraphWorkspace::push(
+                    workspace.capacity,
+                    &mut workspace.candidates,
+                    PagedEdge {
+                        point_id: *id,
+                        origin_id: point.origin_id,
+                        distance: -score,
+                    },
+                )?;
             }
         }
-        workspace.extension.sort_unstable();
-        for id in &workspace.extension {
-            let point = load(storage, *id, policy)?;
-            let score = measured_distance(storage, metric, values, &point.values)?;
-            PagedGraphWorkspace::push(
-                workspace.capacity,
-                &mut workspace.candidates,
-                PagedEdge {
-                    point_id: *id,
-                    origin_id: point.origin_id,
-                    distance: -score,
-                },
-            )?;
-        }
-    }
-    while workspace.selected.len() < cap {
-        let Some(candidate) = workspace.candidates.pop() else {
-            break;
-        };
-        let point = load(storage, candidate.point_id, policy)?;
-        let mut accepted = true;
-        for prior in &workspace.selected {
-            let previous = load(storage, prior.point_id, policy)?;
-            if measured_distance(storage, metric, &point.values, &previous.values)?
-                <= -candidate.distance
-            {
-                accepted = false;
-                break;
-            }
-        }
-        if accepted {
-            if workspace.selected.len() >= workspace.capacity {
-                return Err(PagedGraphError::ScratchExhausted);
-            }
-            PagedGraphWorkspace::grow_vec(&mut workspace.selected, workspace.capacity);
-            workspace.selected.push(candidate.reversed());
-        } else if policy.keep_pruned {
-            PagedGraphWorkspace::push(workspace.capacity, &mut workspace.discarded, candidate)?;
-        }
-    }
-    if policy.keep_pruned {
         while workspace.selected.len() < cap {
-            let Some(candidate) = workspace.discarded.pop() else {
+            let Some(candidate) = workspace.candidates.pop() else {
                 break;
             };
-            if workspace.selected.len() >= workspace.capacity {
-                return Err(PagedGraphError::ScratchExhausted);
+            let index = selection_point(storage, &mut points, candidate.point_id, policy)?;
+            let mut accepted = true;
+            for prior in &workspace.selected {
+                let previous = selection_point(storage, &mut points, prior.point_id, policy)?;
+                if measured_distance(
+                    storage,
+                    metric,
+                    &points[index].values,
+                    &points[previous].values,
+                )? <= -candidate.distance
+                {
+                    accepted = false;
+                    break;
+                }
             }
-            PagedGraphWorkspace::grow_vec(&mut workspace.selected, workspace.capacity);
-            workspace.selected.push(candidate.reversed());
+            if accepted {
+                if workspace.selected.len() >= workspace.capacity {
+                    return Err(PagedGraphError::ScratchExhausted);
+                }
+                PagedGraphWorkspace::grow_vec(&mut workspace.selected, workspace.capacity);
+                workspace.selected.push(candidate.reversed());
+            } else if policy.keep_pruned {
+                PagedGraphWorkspace::push(workspace.capacity, &mut workspace.discarded, candidate)?;
+            }
         }
-    }
-    Ok(())
+        if policy.keep_pruned {
+            while workspace.selected.len() < cap {
+                let Some(candidate) = workspace.discarded.pop() else {
+                    break;
+                };
+                if workspace.selected.len() >= workspace.capacity {
+                    return Err(PagedGraphError::ScratchExhausted);
+                }
+                PagedGraphWorkspace::grow_vec(&mut workspace.selected, workspace.capacity);
+                workspace.selected.push(candidate.reversed());
+            }
+        }
+        Ok(())
+    })
 }
 
 /// Insert one point using the same descent, diversity selection, reciprocal

@@ -7,9 +7,9 @@ use super::{
     DeadlineOperationWait, FrameViolation, LivenessEvidence, LocalDeadlineOperation,
     LocalHandshake, LocalInboundKind, LocalInboundMessage, LocalOutboundMessage,
     LocalProtocolBoundary, LocalRequestEnvelope, LocalResponse, LocalResponseExpectation,
-    LocalTransportError, MAX_FRAME_BYTES, StaleChannelAction, StaleChannelEvidence,
-    StaleFilesystemEvidence, StaleIdentityEvidence, connect_with_deadline, frame_read_refusal,
-    invalid_channel_data, owner_disconnected, receive_response_with_deadline,
+    LocalTransportError, MAX_FRAME_BYTES, PayloadViolation, StaleChannelAction,
+    StaleChannelEvidence, StaleFilesystemEvidence, StaleIdentityEvidence, connect_with_deadline,
+    frame_read_refusal, invalid_channel_data, owner_disconnected, receive_response_with_deadline,
     response_decode_refusal, retry_route_with_deadline, write_request_with_deadline,
 };
 #[cfg(unix)]
@@ -229,7 +229,10 @@ impl UnixLocalCarrier {
             boundary,
             expectation == LocalResponseExpectation::OrdinaryResult,
         );
-        let operation: LocalDeadlineOperation<'a, LocalResponse> = match frame_readiness(stream) {
+        let reader = boundary
+            .cursor_frame_allowance()
+            .and_then(|memory| frame_readiness_with_memory(stream, memory));
+        let operation: LocalDeadlineOperation<'a, LocalResponse> = match reader {
             Ok(reader) => Box::pin(async move {
                 let mut admission_reset = admission_reset;
                 let payload = reader.await.map_err(frame_read_refusal)?;
@@ -582,6 +585,14 @@ fn cloned_blocking_streams(
 pub(crate) fn frame_readiness(
     stream: &std::os::unix::net::UnixStream,
 ) -> Result<UnixReadiness<Vec<u8>>, LocalTransportError> {
+    frame_readiness_with_memory(stream, None)
+}
+
+#[cfg(unix)]
+fn frame_readiness_with_memory(
+    stream: &std::os::unix::net::UnixStream,
+    memory: Option<u64>,
+) -> Result<UnixReadiness<Vec<u8>>, LocalTransportError> {
     let (mut worker_stream, cancellation) = cloned_blocking_streams(stream)?;
     #[cfg(feature = "test-seams")]
     FRAME_READINESS_CREATIONS.with(|creations| {
@@ -600,6 +611,18 @@ pub(crate) fn frame_readiness(
         if length > MAX_FRAME_BYTES {
             return Err(LocalTransportError::Frame(
                 FrameViolation::LengthExceedsMaximum,
+            ));
+        }
+        // The prefix is the only response allocation needed to refuse a
+        // cursor frame that cannot coexist with its retained state.
+        if let Some(ceiling) = memory
+            && length as u64 > ceiling
+        {
+            return Err(LocalTransportError::Payload(
+                PayloadViolation::MemoryCeilingExceeded {
+                    ceiling,
+                    required: Some(length as u64),
+                },
             ));
         }
         let mut payload = vec![0_u8; length];
