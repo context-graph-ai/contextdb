@@ -1,12 +1,16 @@
 use std::cell::RefCell;
-use std::sync::{Arc, OnceLock};
+use std::ptr::NonNull;
+use std::alloc::Layout;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::{Arc, OnceLock};
 
 // Ordinary writer mutations share this gate. Runtime activation alone takes
 // its exclusive side. The build lease is independent and never an admission gate.
 #[derive(Debug)]
-struct ProcessNativeReservation { bytes: usize }
+struct ProcessNativeReservation {
+    bytes: usize,
+}
 #[derive(Debug)]
 struct ResidentInsertionRuntime {
     width: usize,
@@ -15,9 +19,16 @@ struct ResidentInsertionRuntime {
 }
 #[derive(Debug)]
 struct WriterRegistration {
-    identity: usize,
+    stable_identity: usize,
+    epoch: usize,
+    users: usize,
     limit: Arc<AtomicUsize>,
     used: Arc<AtomicUsize>,
+    // Attribution is retained in every profile; only the test-seam observer
+    // reads it. It has no admission or last-use authority.
+    #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
+    engine_backing_bytes: AtomicUsize,
+    adapter_control_bytes: AtomicUsize,
     next: Option<Box<WriterRegistration>>,
 }
 #[derive(Debug)]
@@ -26,64 +37,289 @@ struct ProcessWriterBudgetDomain {
     writers: Option<Box<WriterRegistration>>,
     next_identity: usize,
 }
-static PROCESS_WRITER_BUDGET_DOMAIN: parking_lot::RwLock<ProcessWriterBudgetDomain> =
-    parking_lot::RwLock::new(ProcessWriterBudgetDomain {
-        native: None, writers: None, next_identity: 1,
-    });
-pub(crate) static RESIDENT_INSERTION_BUILD_LEASE: parking_lot::Mutex<()> =
-    parking_lot::Mutex::new(());
-
-// The only conversion from a supplied accountant is this domain factory. Its
-// association is installed once, cannot be removed, and is retained by every
-// reservation holding the accountant. Private writable assembly accepts this
-// opaque handle, never a reader/standalone accountant.
-#[derive(Debug, Clone)]
-pub(crate) struct WriterBudget { accountant: Arc<MemoryAccountant> }
-impl WriterBudget {
-    pub(crate) fn from_accountant(accountant: Arc<MemoryAccountant>) -> contextdb_core::Result<Self> {
-        let mut domain = PROCESS_WRITER_BUDGET_DOMAIN.write();
-        if accountant.writer_identity.get().is_none() {
-            let identity = domain.next_identity;
-            let next_identity = identity.checked_add(1)
-                .ok_or_else(|| contextdb_core::Error::Other("writer identity overflow".into()))?;
-            // Fixed registration ownership: the linked node and the two shared
-            // counter allocations. No unpriced growable registration directory.
-            let registration_bytes = std::mem::size_of::<WriterRegistration>()
-                + 2 * (2 * std::mem::size_of::<usize>() + std::mem::size_of::<AtomicUsize>());
-            let used = accountant.used.load(Ordering::SeqCst);
-            used.checked_add(registration_bytes)
-                .ok_or_else(|| contextdb_core::Error::Other("writer registration size overflow".into()))?;
-            // Like startup cache ownership this allocation is unavoidable on
-            // open. A narrowed limit retains its ownership; future growth refuses.
-            accountant.charge_retained_under_admission(registration_bytes);
-            accountant.writer_identity.set(identity)
-                .expect("writer association is installed exactly once under the gate");
-            domain.next_identity = next_identity;
-            let registration = WriterRegistration {
-                identity, limit: Arc::clone(&accountant.limit), used: Arc::clone(&accountant.used),
-                next: domain.writers.take(),
-            };
-            domain.writers = Some(Box::new(registration));
+impl ProcessWriterBudgetDomain {
+    fn lookup_in(&self, stable_identity: usize) -> Option<&WriterRegistration> {
+        let mut next = self.writers.as_deref();
+        while let Some(record) = next {
+            if record.stable_identity == stable_identity { return Some(record); }
+            next = record.next.as_deref();
         }
-        drop(domain);
-        Ok(Self { accountant })
+        None
     }
-    pub(crate) fn accountant(&self) -> Arc<MemoryAccountant> { Arc::clone(&self.accountant) }
-}
-impl Drop for MemoryAccountant {
-    fn drop(&mut self) {
-        let Some(identity) = self.writer_identity.get().copied() else { return; };
-        let mut domain = PROCESS_WRITER_BUDGET_DOMAIN.write();
-        let mut slot = &mut domain.writers;
+    fn lookup_mut_in(&mut self, stable_identity: usize) -> Option<&mut WriterRegistration> {
+        let mut next = self.writers.as_deref_mut();
+        while let Some(record) = next {
+            if record.stable_identity == stable_identity { return Some(record); }
+            next = record.next.as_deref_mut();
+        }
+        None
+    }
+    fn retain_in(&mut self, stable_identity: usize, epoch: usize) {
+        let record = self.lookup_mut_in(stable_identity).expect("live use has its registration");
+        assert_eq!(record.epoch, epoch, "live use cannot change epoch");
+        record.users = record.users.checked_add(1).expect("writer use count overflow");
+    }
+    fn release_in(&mut self, accountant: &MemoryAccountant, stable_identity: usize, epoch: usize) {
+        let mut slot = &mut self.writers;
         while slot.is_some() {
-            if slot.as_ref().is_some_and(|record| record.identity == identity) {
-                let mut record = slot.take().expect("registration exists");
+            if slot.as_ref().is_some_and(|record| record.stable_identity == stable_identity) {
+                let record = slot.as_mut().expect("live registration");
+                assert_eq!(record.epoch, epoch, "live use cannot change epoch");
+                record.users = record.users.checked_sub(1).expect("writer use underflow");
+                if record.users != 0 { return; }
+                let mut record = slot.take().expect("last-use registration");
                 *slot = record.next.take();
+                // Only counter handles and inert receipt state remain in the
+                // detached record. No payload destructor runs under this gate.
+                drop(record);
+                accountant.release_under_exclusive_gate(Layout::new::<WriterRegistration>().size());
                 return;
             }
             slot = &mut slot.as_mut().expect("registration exists").next;
         }
+        panic!("live writer use lost its registration");
     }
+}
+static PROCESS_WRITER_BUDGET_DOMAIN: parking_lot::RwLock<ProcessWriterBudgetDomain> =
+    parking_lot::RwLock::new(ProcessWriterBudgetDomain {
+        native: None,
+        writers: None,
+        next_identity: 1,
+    });
+pub(crate) static RESIDENT_INSERTION_BUILD_LEASE: parking_lot::Mutex<()> =
+    parking_lot::Mutex::new(());
+
+// Explicit engine custody. The accountant's OnceLock is a stable association
+// key; the active epoch and count live only in the admitted domain record.
+#[derive(Debug)]
+pub(crate) struct WriterUse {
+    accountant: Arc<MemoryAccountant>,
+    stable_identity: usize,
+    epoch: usize,
+}
+impl WriterUse {
+    pub(crate) fn retain_if_writer(accountant: &Arc<MemoryAccountant>) -> Option<Self> {
+        let mut domain = PROCESS_WRITER_BUDGET_DOMAIN.write();
+        let stable_identity = accountant.writer_identity.get().copied()?;
+        let epoch = domain.lookup_in(stable_identity)?.epoch;
+        domain.retain_in(stable_identity, epoch);
+        Some(Self { accountant: accountant.clone(), stable_identity, epoch })
+    }
+}
+impl Clone for WriterUse {
+    fn clone(&self) -> Self {
+        let mut domain = PROCESS_WRITER_BUDGET_DOMAIN.write();
+        domain.retain_in(self.stable_identity, self.epoch);
+        Self { accountant: self.accountant.clone(), stable_identity: self.stable_identity, epoch: self.epoch }
+    }
+}
+impl Drop for WriterUse {
+    fn drop(&mut self) {
+        PROCESS_WRITER_BUDGET_DOMAIN.write().release_in(&self.accountant, self.stable_identity, self.epoch);
+    }
+}
+
+// A provenance-preserving one-word strong Arc projection. A tagged handle
+// contributes exactly one active engine use; an untagged handle never acquires
+// one on clone, even if a writer subsequently registers the same accountant.
+#[derive(Debug)]
+#[repr(transparent)]
+pub(crate) struct StoreAccountantHandle(NonNull<MemoryAccountant>);
+const _: () = assert!(std::mem::align_of::<MemoryAccountant>() >= 2);
+impl StoreAccountantHandle {
+    fn decoded(&self) -> NonNull<MemoryAccountant> {
+        self.0.map_addr(|address| std::num::NonZeroUsize::new(address.get() & !1).expect("Arc pointer is non-null"))
+    }
+    pub(crate) fn is_writer(&self) -> bool { self.0.addr().get() & 1 != 0 }
+    pub(crate) fn retain_if_writer(accountant: &Arc<MemoryAccountant>) -> Option<Self> {
+        // Construct and check the tag from the same exclusive-gate snapshot.
+        let handle = Self::new(Arc::clone(accountant));
+        handle.is_writer().then_some(handle)
+    }
+    pub(crate) fn same_allocation(&self, other: &Self) -> bool {
+        self.decoded() == other.decoded()
+    }
+    pub(crate) fn new(accountant: Arc<MemoryAccountant>) -> Self {
+        let mut domain = PROCESS_WRITER_BUDGET_DOMAIN.write();
+        let active = accountant.writer_identity.get().copied()
+            .and_then(|key| domain.lookup_in(key).map(|record| (key, record.epoch)));
+        if let Some((key, epoch)) = active { domain.retain_in(key, epoch); }
+        let raw = NonNull::new(Arc::into_raw(accountant).cast_mut()).expect("Arc pointer is non-null");
+        Self(if active.is_some() {
+            raw.map_addr(|address| std::num::NonZeroUsize::new(address.get() | 1).expect("tagged Arc pointer is non-null"))
+        } else { raw })
+    }
+    // CDB127 returned-loader slot projection. The raw word owns this exact
+    // handle's Arc/use; moving it preserves the attach-time role without a
+    // second discovery, allocation, or writer count.
+    pub(crate) fn into_owned_raw(self) -> *mut MemoryAccountant {
+        let handle = std::mem::ManuallyDrop::new(self);
+        handle.0.as_ptr()
+    }
+    /// Consume exactly one original tagged strong/use ownership.
+    /// The caller must remove any enclosing slot-state bits first.
+    pub(crate) unsafe fn from_owned_raw(raw: *mut MemoryAccountant) -> Self {
+        Self(NonNull::new(raw).expect("owned accountant pointer is non-null"))
+    }
+    /// Borrow one immutable raw role while its source slot or ready winner
+    /// keeps the same accountant and (for a writer) original epoch live.
+    pub(crate) unsafe fn borrow_owned_raw(raw: *mut MemoryAccountant) -> Self {
+        // This stack projection never consumes the slot's ownership. Clone
+        // increments the Arc first; checked-retain panic rolls that Arc back.
+        let original = std::mem::ManuallyDrop::new(unsafe { Self::from_owned_raw(raw) });
+        Self::clone(&original)
+    }
+    // A resident cache carries this original role in its existing word;
+    // admission and escaping chunk clones must never rediscover a later role.
+    pub(crate) fn try_allocate_for_original(&self, bytes: usize, subsystem: &str,
+        operation: &str, hint: &str) -> contextdb_core::Result<()> {
+        self.try_allocate_for_provenance(bytes, subsystem, operation, hint, Some(self))
+    }
+    pub(crate) fn same_accountant(&self, accountant: &Arc<MemoryAccountant>) -> bool {
+        std::ptr::eq(self.decoded().as_ptr(), Arc::as_ptr(accountant))
+    }
+    pub(crate) fn as_arc(&self) -> Arc<MemoryAccountant> {
+        let raw = self.decoded().as_ptr();
+        // SAFETY: this handle owns a live strong Arc count on the decoded
+        // allocation. Increment before reconstructing the additional owner.
+        unsafe { Arc::increment_strong_count(raw); Arc::from_raw(raw) }
+    }
+    pub(crate) fn vector_budget(
+        &self,
+    ) -> contextdb_core::Result<Arc<dyn contextdb_vector::MemoryBudget>> {
+        let accountant = self.as_arc();
+        if !self.is_writer() {
+            // An untagged derived owner stays a reader even after a writer
+            // later registers this same accountant.
+            return Ok(accountant);
+        }
+        let writer_use = {
+            let mut domain = PROCESS_WRITER_BUDGET_DOMAIN.write();
+            let stable_identity = *accountant
+                .writer_identity
+                .get()
+                .expect("tagged handle has a stable key");
+            let epoch = domain
+                .lookup_in(stable_identity)
+                .expect("tagged handle pins its record")
+                .epoch;
+            domain.retain_in(stable_identity, epoch);
+            WriterUse {
+                accountant: accountant.clone(),
+                stable_identity,
+                epoch,
+            }
+        };
+        Ok(accountant.budget_adapter(writer_use, false)?)
+    }
+}
+impl std::ops::Deref for StoreAccountantHandle {
+    type Target = MemoryAccountant;
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: tags are removed without changing provenance; the handle's
+        // strong count keeps this immutable shared value live.
+        unsafe { self.decoded().as_ref() }
+    }
+}
+impl Clone for StoreAccountantHandle {
+    fn clone(&self) -> Self {
+        // The stack Arc rolls its added count back if checked count retention
+        // panics. No operation that can panic follows successful retention.
+        let accountant = self.as_arc();
+        if self.is_writer() {
+            let mut domain = PROCESS_WRITER_BUDGET_DOMAIN.write();
+            let key = *accountant.writer_identity.get().expect("tagged handle has a stable key");
+            let epoch = domain.lookup_in(key).expect("tagged handle pins its record").epoch;
+            domain.retain_in(key, epoch);
+        }
+        let raw = NonNull::new(Arc::into_raw(accountant).cast_mut()).expect("Arc pointer is non-null");
+        Self(if self.is_writer() {
+            raw.map_addr(|address| std::num::NonZeroUsize::new(address.get() | 1).expect("tagged Arc pointer is non-null"))
+        } else { raw })
+    }
+}
+impl Drop for StoreAccountantHandle {
+    fn drop(&mut self) {
+        // SAFETY: exactly one into_raw ownership is consumed per handle and
+        // only the decoded pointer is passed to Arc's ownership operations.
+        let accountant = unsafe { Arc::from_raw(self.decoded().as_ptr()) };
+        if self.is_writer() {
+            let mut domain = PROCESS_WRITER_BUDGET_DOMAIN.write();
+            let key = *accountant.writer_identity.get().expect("tagged handle has a stable key");
+            let epoch = domain.lookup_in(key).expect("tagged handle pins its record").epoch;
+            domain.release_in(&accountant, key, epoch);
+        }
+        drop(accountant);
+    }
+}
+// SAFETY: the pointee has Arc<MemoryAccountant>'s Send/Sync bounds. The tag is
+// immutable per handle; every mutable registration operation uses the one
+// exclusive process-domain gate. No raw mutable pointee access is provided.
+unsafe impl Send for StoreAccountantHandle {}
+unsafe impl Sync for StoreAccountantHandle {}
+
+#[derive(Debug, Clone)]
+pub(crate) struct WriterBudget {
+    accountant: Arc<MemoryAccountant>,
+    writer_use: WriterUse,
+    vector_accountant: Arc<dyn contextdb_vector::MemoryBudget>,
+}
+impl WriterBudget {
+    pub(crate) fn from_accountant(accountant: Arc<MemoryAccountant>) -> contextdb_core::Result<Self> {
+        Self::from_accountant_with_backing(accountant, 0)
+    }
+    fn from_accountant_with_backing(accountant: Arc<MemoryAccountant>, engine_backing_bytes: usize) -> contextdb_core::Result<Self> {
+        let mut domain = PROCESS_WRITER_BUDGET_DOMAIN.write();
+        let stable_identity = if let Some(key) = accountant.writer_identity.get() { *key } else {
+            let key = domain.next_identity;
+            domain.next_identity = key.checked_add(1)
+                .ok_or_else(|| contextdb_core::Error::Other("writer identity overflow".into()))?;
+            accountant.writer_identity.set(key).expect("association published under the exclusive gate");
+            key
+        };
+        let epoch = if let Some(record) = domain.lookup_in(stable_identity) {
+            let epoch = record.epoch;
+            assert_eq!(engine_backing_bytes, 0, "existing writer backing has one origin");
+            domain.retain_in(stable_identity, epoch);
+            epoch
+        } else {
+            let epoch = domain.next_identity;
+            let next_identity = epoch.checked_add(1)
+                .ok_or_else(|| contextdb_core::Error::Other("writer identity overflow".into()))?;
+            let registration_bytes = Layout::new::<WriterRegistration>().size();
+            accountant.used.load(Ordering::SeqCst).checked_add(registration_bytes)
+                .ok_or_else(|| contextdb_core::Error::Other("writer registration size overflow".into()))?;
+            accountant.charge_retained_under_admission(registration_bytes);
+            let registration = Box::new(WriterRegistration {
+                stable_identity, epoch, users: 1,
+                limit: accountant.limit.clone(), used: accountant.used.clone(),
+                engine_backing_bytes: AtomicUsize::new(engine_backing_bytes),
+                adapter_control_bytes: AtomicUsize::new(0), next: domain.writers.take(),
+            });
+            domain.writers = Some(registration);
+            domain.next_identity = next_identity;
+            epoch
+        };
+        drop(domain);
+        let writer_use = WriterUse { accountant: accountant.clone(), stable_identity, epoch };
+        let vector_accountant = accountant.vector_budget_for_startup()?;
+        Ok(Self { accountant, writer_use, vector_accountant })
+    }
+    pub(crate) fn accountant(&self) -> Arc<MemoryAccountant> { self.accountant.clone() }
+    pub(crate) fn into_parts(self) -> (Arc<MemoryAccountant>, WriterUse, Arc<dyn contextdb_vector::MemoryBudget>) { (self.accountant, self.writer_use, self.vector_accountant) }
+    pub(crate) fn vector_accountant(&self) -> Arc<dyn contextdb_vector::MemoryBudget> { self.vector_accountant.clone() }
+}
+
+// Exact pinned Rust 1.94.1 alloc::sync ArcInner repr(C) layout, sync.rs
+// sync.rs:377-400: #[repr(C, align(2))] ArcInner has two Atomic<usize>
+// header fields and data: T; arcinner_layout_for_value_layout extends and pads. Existing GlobalAlloc witness verifies the request.
+pub(crate) fn writer_adapter_layout<T>(adapter: &T) -> Layout {
+    Layout::new::<[AtomicUsize; 2]>().extend(Layout::for_value(adapter))
+        .expect("adapter Arc layout overflow").0.pad_to_align()
+}
+pub(crate) fn writer_adapter_type_layout<T>() -> Layout {
+    Layout::new::<[AtomicUsize; 2]>().extend(Layout::new::<T>())
+        .expect("adapter Arc layout overflow").0.pad_to_align()
 }
 
 // The complete workspace transition is the only operation permitted to use
@@ -94,7 +330,9 @@ thread_local! {
 }
 struct ActivationScope(Option<(usize, usize)>);
 impl Drop for ActivationScope {
-    fn drop(&mut self) { ACTIVATING_WRITER.with(|slot| slot.set(self.0)); }
+    fn drop(&mut self) {
+        ACTIVATING_WRITER.with(|slot| slot.set(self.0));
+    }
 }
 struct WriterAdmission {
     _gate: Option<parking_lot::RwLockReadGuard<'static, ProcessWriterBudgetDomain>>,
@@ -109,22 +347,42 @@ struct WriterHeadroom {
     combined_used: Option<usize>,
     within_limit: bool,
 }
-fn writer_headroom(limit: usize, used: usize, releasing: usize, private: usize, native: usize) -> WriterHeadroom {
-    let occupied = used.checked_sub(releasing)
+fn writer_headroom(
+    limit: usize,
+    used: usize,
+    releasing: usize,
+    private: usize,
+    native: usize,
+) -> WriterHeadroom {
+    let occupied = used
+        .checked_sub(releasing)
         .expect("replacement credit must be owned by this accountant");
     let combined_used = occupied.checked_add(native);
     let effective = limit.checked_add(private).unwrap_or(usize::MAX);
     WriterHeadroom {
-        available: (limit != 0).then(|| effective.checked_sub(native)
-            .and_then(|n| n.checked_sub(occupied)).unwrap_or(0)),
+        available: (limit != 0).then(|| {
+            effective
+                .checked_sub(native)
+                .and_then(|n| n.checked_sub(occupied))
+                .unwrap_or(0)
+        }),
         combined_used,
         within_limit: limit == 0 || combined_used.is_some_and(|bytes| bytes <= effective),
     }
 }
 
 pub(crate) fn resident_insertion_runtime_snapshot() -> Option<(usize, usize, usize)> {
-    PROCESS_WRITER_BUDGET_DOMAIN.read().native.as_ref()
-        .map(|runtime| (runtime.width, runtime.reservation.bytes, runtime.funder_identity))
+    PROCESS_WRITER_BUDGET_DOMAIN
+        .read()
+        .native
+        .as_ref()
+        .map(|runtime| {
+            (
+                runtime.width,
+                runtime.reservation.bytes,
+                runtime.funder_identity,
+            )
+        })
 }
 
 pub(crate) type VectorLoadReservationTransfer =
@@ -354,6 +612,8 @@ pub(crate) struct SchemaUnitReservation {
     /// Owned here rather than pooled on the accountant, so a second unit's
     /// reservation can neither be spent by this one nor released by it.
     remaining: std::cell::Cell<usize>,
+
+    _writer_use: Option<crate::memory_accounting::WriterUse>,
 }
 
 impl Drop for SchemaUnitReservation {
@@ -421,11 +681,144 @@ fn note_budget_ledger(what: &str, bytes: usize, used_after: usize) {
 
 #[derive(Debug, Clone)]
 pub struct MemoryUsage {
+    /// Largest live-byte charge of one file-reader child (zero for a writer).
+    #[cfg(feature = "test-seams")]
+    pub reader_file_high_water: u64,
     pub limit: Option<usize>,
     pub used: usize,
     pub available: Option<usize>,
     pub startup_ceiling: Option<usize>,
 }
+
+// The allocator oracle must not count a disabled ledger's formatting as a
+// control allocation. Construct the identical observation only for a live
+// explicitly scoped ledger; this seam is absent without test-seams.
+#[cfg(feature = "test-seams")]
+fn note_budget_admission(subsystem: &str, operation: &str, bytes: usize, used_after: usize) {
+    BUDGET_LEDGER.with(|ledger| {
+        if let Some(entries) = ledger.borrow_mut().as_mut() {
+            entries.push(BudgetLedgerEntry {
+                what: format!("{subsystem}/{operation}"), bytes, used_after,
+            });
+        }
+    });
+}
+
+// One complete fixed-control liability, separate from payload credit.
+// Its final owner extracts the bounded refund capability before dropping
+// payload/use fields; PendingControlRefund is then the last local destroyed.
+#[derive(Debug)]
+pub(crate) struct ControlCredit {
+    accountant: Option<Arc<MemoryAccountant>>,
+    bytes: usize,
+    registration: Option<(usize, usize)>,
+}
+impl ControlCredit {
+    // CDB127 private static-map extension: registry controls inherit the
+    // creating handle's provenance and the existing family's refusal door.
+    // An untagged reader never acquires a later writer's receipt/epoch.
+    pub(crate) fn admit_from_handle(
+        accountant: &StoreAccountantHandle, bytes: usize,
+        subsystem: &str, operation: &str, hint: &str,
+    ) -> contextdb_core::Result<Self> {
+        accountant.try_allocate_for_provenance(bytes, subsystem, operation, hint, Some(accountant))?;
+        let registration = if accountant.is_writer() {
+            let domain = PROCESS_WRITER_BUDGET_DOMAIN.read();
+            let key = *accountant.writer_identity.get().expect("tagged handle has its original key");
+            let record = domain.lookup_in(key).expect("tagged handle pins its original epoch");
+            record.adapter_control_bytes.fetch_update(Ordering::SeqCst, Ordering::SeqCst,
+                |current| current.checked_add(bytes)).expect("control receipt arithmetic must be owned");
+            Some((key, record.epoch))
+        } else { None };
+        Ok(Self { accountant: Some(accountant.as_arc()), bytes, registration })
+    }
+    pub(crate) fn admit(accountant: &Arc<MemoryAccountant>, bytes: usize, operation: &str) -> contextdb_core::Result<Self> {
+        accountant.admit_box_control(bytes, operation, "Raise MEMORY_LIMIT for this fixed writer control.")?;
+        Ok(Self { accountant: Some(accountant.clone()), bytes, registration: accountant.prepare_control_refund().1 })
+    }
+    pub(crate) fn from_admitted(accountant: &Arc<MemoryAccountant>, bytes: usize) -> Self {
+        // Transfer a named portion of an existing control reservation. No
+        // admission, refund or payer substitution happens at this handoff.
+        accountant.change_adapter_control_receipt(bytes, true);
+        Self { accountant: Some(Arc::clone(accountant)), bytes, registration: accountant.prepare_control_refund().1 }
+    }
+    pub(crate) fn retained_startup(accountant: &Arc<MemoryAccountant>, bytes: usize) -> Self {
+        // Preserve the existing captured-schema startup floor: accounted
+        // before allocation, but never refused solely by a persisted limit.
+        accountant.charge_retained(bytes);
+        accountant.change_adapter_control_receipt(bytes, true);
+        Self { accountant: Some(Arc::clone(accountant)), bytes, registration: accountant.prepare_control_refund().1 }
+    }
+    pub(crate) fn prepare(mut self) -> PendingControlRefund {
+        let accountant = self.accountant.take().expect("live control credit has its original funder");
+        let bytes = std::mem::take(&mut self.bytes);
+        let counter = accountant.original_control_counter();
+        let registration = self.registration.take();
+        drop(accountant);
+        PendingControlRefund { counter, bytes, registration }
+    }
+}
+impl Drop for ControlCredit {
+    fn drop(&mut self) {
+        if let Some(accountant) = self.accountant.take() {
+            let counter = accountant.original_control_counter();
+            let registration = self.registration.take();
+            drop(accountant);
+            drop(PendingControlRefund { counter, bytes: std::mem::take(&mut self.bytes), registration });
+        }
+    }
+}
+pub(crate) struct PendingControlRefund {
+    counter: Arc<AtomicUsize>,
+    bytes: usize,
+    registration: Option<(usize, usize)>,
+}
+impl Drop for PendingControlRefund {
+    fn drop(&mut self) {
+        // Receipt ownership lasts through every child/use cleanup. A retired
+        // original epoch has no record; a reopened epoch must never lose this
+        // old control's price. The bounded counter retains its original funder.
+        let domain = PROCESS_WRITER_BUDGET_DOMAIN.read();
+        if let Some((key, epoch)) = self.registration
+            && let Some(record) = domain.lookup_in(key).filter(|record| record.epoch == epoch)
+        {
+            record.adapter_control_bytes.fetch_update(Ordering::SeqCst, Ordering::SeqCst,
+                |used| used.checked_sub(self.bytes)).expect("final control receipt is owned");
+        }
+        self.counter.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| used.checked_sub(self.bytes))
+            .expect("final control refund is owned");
+    }
+}
+
+/// Stack-only final control cleanup. All automatic accountant/use children
+/// are moved here before any fallible invariant destructor can unwind. The
+/// index advances before each operation; a live guard resumes at the next one.
+pub(crate) struct ReservationCleanup {
+    accountant: Option<Arc<MemoryAccountant>>,
+    writer_use: Option<WriterUse>,
+    payload: usize,
+    refund: Option<PendingControlRefund>,
+    next: u8,
+}
+impl ReservationCleanup {
+    pub(crate) fn new(accountant: Option<Arc<MemoryAccountant>>, writer_use: Option<WriterUse>,
+        payload: usize, refund: Option<PendingControlRefund>) -> Self {
+        Self { accountant, writer_use, payload, refund, next: 0 }
+    }
+    pub(crate) fn finish(&mut self) {
+        while self.next < 4 {
+            let step = self.next; self.next += 1;
+            match step {
+                0 => if let Some(accountant) = &self.accountant { accountant.release(std::mem::take(&mut self.payload)); },
+                1 => drop(self.writer_use.take()),
+                2 => drop(self.accountant.take()),
+                3 => drop(self.refund.take()),
+                _ => unreachable!(),
+            }
+        }
+    }
+}
+impl Drop for ReservationCleanup { fn drop(&mut self) { self.finish(); } }
 
 /// An owned database-accountant charge used by suspendable read operations.
 ///
@@ -435,38 +828,73 @@ pub struct MemoryUsage {
 /// complete charge exactly once.
 #[derive(Debug)]
 pub(crate) struct OwnedMemoryReservation {
+    accountant: Option<Arc<MemoryAccountant>>,
+    bytes: usize,
+
+    _writer_use: Option<crate::memory_accounting::WriterUse>,
+    own_control: Option<ControlCredit>,
+}
+
+/// Pre2-shaped credit for values whose existing enclosing owner retains the
+/// writer use through payload destruction. Conversion transfers admitted
+/// bytes exactly once; it never releases and readmits them.
+pub(crate) struct ContainedMemoryReservation {
     accountant: Arc<MemoryAccountant>,
     bytes: usize,
+}
+impl ContainedMemoryReservation {
+    pub(crate) fn from_owned(mut reservation: OwnedMemoryReservation) -> Self {
+        let bytes = std::mem::take(&mut reservation.bytes);
+        Self { accountant: reservation.accountant().clone(), bytes }
+    }
+    #[cfg(any(test, feature = "test-seams"))]
+    pub(crate) fn bytes(&self) -> usize { self.bytes }
+}
+impl Drop for ContainedMemoryReservation {
+    fn drop(&mut self) { self.accountant.release(self.bytes); }
 }
 
 /// Admission transferred from a displaced ordinary write into mutation undo.
 #[derive(Debug)]
 pub(crate) struct TransferredRowReservation {
-    accountant: Arc<MemoryAccountant>,
+    accountant: Option<Arc<MemoryAccountant>>,
     bytes: AtomicUsize,
+    _writer_use: Option<crate::memory_accounting::WriterUse>,
+    own_control: Option<ControlCredit>,
 }
 impl TransferredRowReservation {
     pub(crate) fn adopt(&self, bytes: usize) {
         self.bytes.store(bytes, Ordering::Relaxed);
     }
-    pub(crate) fn from_admitted(accountant: Arc<MemoryAccountant>, bytes: usize) -> Self {
-        Self {
-            accountant,
-            bytes: AtomicUsize::new(bytes),
-        }
+    pub(crate) fn prepare_control(accountant: &Arc<MemoryAccountant>) -> contextdb_core::Result<ControlCredit> {
+        ControlCredit::admit(accountant, writer_adapter_type_layout::<Self>().size(), "transferred_row_control")
+    }
+    pub(crate) fn from_admitted_with_control(
+        accountant: Arc<MemoryAccountant>, bytes: usize, control: ControlCredit,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            _writer_use: crate::memory_accounting::WriterUse::retain_if_writer(&accountant),
+            accountant: Some(accountant), bytes: AtomicUsize::new(bytes),
+            own_control: Some(control),
+        })
+    }
+    pub(crate) fn try_from_admitted(accountant: Arc<MemoryAccountant>, bytes: usize) -> contextdb_core::Result<Arc<Self>> {
+        // Admission failure leaves the original payload's credit untouched.
+        let control = Self::prepare_control(&accountant)?;
+        Ok(Self::from_admitted_with_control(accountant, bytes, control))
     }
 }
 impl contextdb_tx::StagedPostingCharge for TransferredRowReservation {
-    fn retained_bytes(&self) -> usize {
-        self.bytes.load(Ordering::Relaxed)
-    }
-    fn transfer_back(&self) -> usize {
-        self.bytes.swap(0, Ordering::Relaxed)
-    }
+    fn retained_bytes(&self) -> usize { self.bytes.load(Ordering::Relaxed) }
+    fn transfer_back(&self) -> usize { self.bytes.swap(0, Ordering::Relaxed) }
 }
 impl Drop for TransferredRowReservation {
     fn drop(&mut self) {
-        self.accountant.release(self.bytes.load(Ordering::Relaxed));
+        let refund = self.own_control.take().map(ControlCredit::prepare);
+        let mut cleanup = ReservationCleanup::new(
+            self.accountant.take(), self._writer_use.take(), self.bytes.swap(0, Ordering::Relaxed), refund,
+        );
+        cleanup.finish();
     }
 }
 
@@ -507,19 +935,42 @@ impl contextdb_tx::StagedPostingCharge for OwnedMemoryReservation {
         &self,
         bytes: usize,
     ) -> contextdb_core::Result<Arc<dyn contextdb_tx::StagedPostingCharge>> {
-        Ok(Arc::new(Self::try_new_for(
-            self.accountant.clone(),
-            bytes,
-            "relational",
-            "statement_overlay",
+        Self::try_new_for(
+            self.accountant().clone(), bytes, "relational", "statement_overlay",
             "Reduce staged rows or raise MEMORY_LIMIT.",
-        )?))
+        )?.into_admitted_arc().map(|owner| owner as Arc<dyn contextdb_tx::StagedPostingCharge>)
     }
 }
 
 impl OwnedMemoryReservation {
+    fn accountant(&self) -> &Arc<MemoryAccountant> {
+        self.accountant.as_ref().expect("live reservation has its accountant")
+    }
+    pub(crate) fn with_enclosing_arc_control<T>(mut self, retained_startup: bool) -> contextdb_core::Result<Self> {
+        assert!(self.own_control.is_none(), "one reservation owns one enclosing control");
+        let bytes = writer_adapter_type_layout::<T>().size();
+        self.own_control = Some(if retained_startup {
+            ControlCredit::retained_startup(self.accountant(), bytes)
+        } else {
+            ControlCredit::admit(self.accountant(), bytes, "captured_schema_control")?
+        });
+        Ok(self)
+    }
+    pub(crate) fn into_admitted_arc(mut self) -> contextdb_core::Result<Arc<Self>> {
+        let layout = writer_adapter_layout(&self);
+        self.own_control = Some(ControlCredit::admit(self.accountant(), layout.size(), "reservation_control")?);
+        Ok(Arc::new(self))
+    }
+    pub(crate) fn into_admitted_mutex_arc(self) -> contextdb_core::Result<Arc<parking_lot::Mutex<Self>>> {
+        let mut value = parking_lot::Mutex::new(self);
+        let layout = writer_adapter_layout(&value);
+        let reservation = value.get_mut();
+        reservation.own_control = Some(ControlCredit::admit(reservation.accountant(), layout.size(), "reservation_mutex_control")?);
+        Ok(Arc::new(value))
+    }
     pub(crate) fn from_admitted(accountant: Arc<MemoryAccountant>, bytes: usize) -> Self {
-        Self { accountant, bytes }
+        Self { _writer_use: crate::memory_accounting::WriterUse::retain_if_writer(&(accountant)),
+accountant: Some(accountant), bytes, own_control: None }
     }
     pub(crate) fn transfer_to_staged(mut self) {
         self.bytes = 0;
@@ -527,8 +978,10 @@ impl OwnedMemoryReservation {
 
     pub(crate) fn new(accountant: Arc<MemoryAccountant>) -> Self {
         Self {
-            accountant,
+            _writer_use: crate::memory_accounting::WriterUse::retain_if_writer(&(accountant)),
+accountant: Some(accountant),
             bytes: 0,
+            own_control: None,
         }
     }
 
@@ -554,7 +1007,7 @@ impl OwnedMemoryReservation {
                 hint: hint.to_string(),
             }
         })?;
-        self.accountant
+        self.accountant()
             .try_allocate_for(bytes, subsystem, operation, hint)?;
         self.bytes = next;
         Ok(())
@@ -575,7 +1028,7 @@ impl OwnedMemoryReservation {
                 hint: "The read gave back more memory than it was holding.".to_string(),
             }
         })?;
-        self.accountant.release(bytes);
+        self.accountant().release(bytes);
         self.bytes = remaining;
         Ok(())
     }
@@ -616,14 +1069,18 @@ impl OwnedMemoryReservation {
         hint: &str,
     ) -> contextdb_core::Result<Self> {
         accountant.try_allocate_for(bytes, subsystem, operation, hint)?;
-        Ok(Self { accountant, bytes })
+        Ok(Self { _writer_use: crate::memory_accounting::WriterUse::retain_if_writer(&(accountant)),
+accountant: Some(accountant), bytes, own_control: None })
     }
 }
 
 impl Drop for OwnedMemoryReservation {
     fn drop(&mut self) {
-        self.accountant.release(self.bytes);
-        self.bytes = 0;
+        let refund = self.own_control.take().map(ControlCredit::prepare);
+        let mut cleanup = ReservationCleanup::new(
+            self.accountant.take(), self._writer_use.take(), std::mem::take(&mut self.bytes), refund,
+        );
+        cleanup.finish();
     }
 }
 
@@ -758,21 +1215,89 @@ impl MemoryAccountant {
     }
 
     pub(crate) fn writer_budget(bytes: usize) -> contextdb_core::Result<WriterBudget> {
-        WriterBudget::from_accountant(Arc::new(Self::with_budget(bytes)))
+        Self::new_engine_writer(Self::with_budget(bytes))
     }
     pub(crate) fn writer_no_limit() -> contextdb_core::Result<WriterBudget> {
-        WriterBudget::from_accountant(Arc::new(Self::no_limit()))
+        Self::new_engine_writer(Self::no_limit())
+    }
+    fn new_engine_writer(accountant: Self) -> contextdb_core::Result<WriterBudget> {
+        let bytes = writer_adapter_layout(&accountant).size()
+            + 2 * writer_adapter_layout(&AtomicUsize::new(0)).size();
+        accountant.charge_retained_under_admission(bytes);
+        WriterBudget::from_accountant_with_backing(Arc::new(accountant), bytes)
+    }
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn writer_fixed_ownership(&self) -> (usize, usize, usize) {
+        let domain = PROCESS_WRITER_BUDGET_DOMAIN.read();
+        self.writer_identity.get().and_then(|key| domain.lookup_in(*key)).map_or((0, 0, 0), |record| (
+            Layout::new::<WriterRegistration>().size(),
+            record.engine_backing_bytes.load(Ordering::Relaxed),
+            record.adapter_control_bytes.load(Ordering::Relaxed),
+        ))
+    }
+    fn change_adapter_control_receipt(&self, bytes: usize, adding: bool) {
+        assert!(self.exclusive_activation().is_none(), "control allocation is outside borrowed activation");
+        let domain = PROCESS_WRITER_BUDGET_DOMAIN.read();
+        if let Some(record) = self.writer_identity.get().and_then(|key| domain.lookup_in(*key)) {
+            record.adapter_control_bytes.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                if adding { current.checked_add(bytes) } else { current.checked_sub(bytes) }
+            }).expect("adapter control receipt arithmetic must be owned");
+        }
+    }
+    // A ControlCredit already captured its original registration. Refund
+    // custody needs only that accountant's source counter, never a new epoch.
+    fn original_control_counter(&self) -> Arc<AtomicUsize> {
+        assert!(self.exclusive_activation().is_none(), "control cleanup is outside borrowed activation");
+        self.used.clone()
+    }
+    fn prepare_control_refund(&self) -> (Arc<AtomicUsize>, Option<(usize, usize)>) {
+        assert!(self.exclusive_activation().is_none(), "control cleanup is outside borrowed activation");
+        let domain = PROCESS_WRITER_BUDGET_DOMAIN.read();
+        let registration = self.writer_identity.get().and_then(|key|
+            domain.lookup_in(*key).map(|record| (*key, record.epoch)));
+        (self.used.clone(), registration)
+    }
+    pub(crate) fn retain_box_control_refund(&self, bytes: usize) -> Arc<AtomicUsize> {
+        self.change_adapter_control_receipt(bytes, false);
+        self.used.clone()
+    }
+    pub(crate) fn admit_box_control(&self, bytes: usize, operation: &str, hint: &str) -> contextdb_core::Result<()> {
+        self.try_allocate_for(bytes, "vector_maintenance", operation, hint)?;
+        self.change_adapter_control_receipt(bytes, true);
+        Ok(())
+    }
+    fn release_under_exclusive_gate(&self, bytes: usize) {
+        self.used.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| used.checked_sub(bytes))
+            .expect("exclusive lifecycle refund must be owned");
     }
     fn exclusive_activation(&self) -> Option<usize> {
-        let identity = self.writer_identity.get().copied()?;
-        ACTIVATING_WRITER.with(|slot| slot.get().filter(|(id, _)| *id == identity).map(|(_, bytes)| bytes))
+        let address = self as *const Self as usize;
+        ACTIVATING_WRITER.with(|slot| slot.get().filter(|(id, _)| *id == address).map(|(_, bytes)| bytes))
+    }
+    // Private admissions derived from counted custody must use its original
+    // tag. The retained tagged handle prevents epoch replacement; a reader
+    // handle intentionally ignores any later association of this accountant.
+    fn writer_admission_for_provenance(&self, provenance: Option<&StoreAccountantHandle>) -> WriterAdmission {
+        let Some(handle) = provenance else { return self.writer_admission(); };
+        assert!(std::ptr::eq(self, &**handle), "admission retains its original accountant");
+        assert!(self.exclusive_activation().is_none(), "registry admission is outside borrowed activation");
+        let gate = PROCESS_WRITER_BUDGET_DOMAIN.read();
+        let native_bytes = if handle.is_writer() {
+            let key = *self.writer_identity.get().expect("tagged handle has its original key");
+            gate.lookup_in(key).expect("tagged handle pins its original epoch");
+            gate.native.as_ref().map_or(0, |runtime| runtime.reservation.bytes)
+        } else { 0 };
+        WriterAdmission { _gate: Some(gate), native_bytes }
     }
     fn writer_admission(&self) -> WriterAdmission {
         if let Some(native_bytes) = self.exclusive_activation() {
-            return WriterAdmission { _gate: None, native_bytes };
+            return WriterAdmission {
+                _gate: None,
+                native_bytes,
+            };
         }
         let gate = PROCESS_WRITER_BUDGET_DOMAIN.read();
-        let native_bytes = if self.writer_identity.get().is_some() {
+        let native_bytes = if self.writer_identity.get().is_some_and(|key| gate.lookup_in(*key).is_some()) {
             gate.native.as_ref().map_or(0, |runtime| runtime.reservation.bytes)
         } else { 0 };
         WriterAdmission { _gate: Some(gate), native_bytes }
@@ -781,36 +1306,46 @@ impl MemoryAccountant {
     // build's complete local peak before publishing the one permanent owner.
     // The closure only changes the existing workspace token/counters.
     pub(crate) fn activate_resident_insertion_runtime(
-        &self, width: usize, native_bytes: usize, old_workspace: usize, complete_peak: usize,
+        &self,
+        width: usize,
+        native_bytes: usize,
+        old_workspace: usize,
+        complete_peak: usize,
         admit_workspace: impl FnOnce() -> contextdb_core::Result<()>,
     ) -> contextdb_core::Result<bool> {
-        let identity = self.writer_identity.get().copied()
-            .expect("resident insertion requires a writer budget");
         let mut domain = PROCESS_WRITER_BUDGET_DOMAIN.write();
+        let identity = *self.writer_identity.get().expect("resident insertion requires a stable association");
+        domain.lookup_in(identity).expect("resident insertion requires a retained writer use");
         if domain.native.is_some() { return Ok(false); }
         let mut next = domain.writers.as_deref();
         while let Some(record) = next {
             let limit = record.limit.load(Ordering::SeqCst);
             let used = record.used.load(Ordering::SeqCst);
             // Activation has no private transition allowance on other writers.
-            let releasing = if record.identity == identity { old_workspace } else { 0 };
-            let requested = if record.identity == identity { complete_peak } else { 0 };
+            let releasing = if record.stable_identity == identity { old_workspace } else { 0 };
+            let requested = if record.stable_identity == identity { complete_peak } else { 0 };
             let local = used.checked_sub(releasing)
                 .and_then(|bytes| bytes.checked_add(requested))
-                .ok_or_else(|| contextdb_core::Error::Other("runtime activation envelope overflow".into()))?;
+                .ok_or_else(|| {
+                    contextdb_core::Error::Other("runtime activation envelope overflow".into())
+                })?;
             let envelope = writer_headroom(limit, local, 0, 0, native_bytes);
             if envelope.combined_used.is_none() {
-                return Err(contextdb_core::Error::Other("runtime activation combined size overflow".into()));
+                return Err(contextdb_core::Error::Other(
+                    "runtime activation combined size overflow".into(),
+                ));
             }
-            if !envelope.within_limit { return Ok(false); }
+            if !envelope.within_limit {
+                return Ok(false);
+            }
             next = record.next.as_deref();
         }
-        let previous = ACTIVATING_WRITER.with(|slot| slot.replace(Some((identity, native_bytes))));
+        let previous = ACTIVATING_WRITER.with(|slot| slot.replace(Some((self as *const Self as usize, native_bytes))));
         let scope = ActivationScope(previous);
         admit_workspace()?;
         drop(scope);
         domain.native = Some(ResidentInsertionRuntime {
-            width, funder_identity: identity,
+            width, funder_identity: Arc::as_ptr(&self.used) as usize,
             reservation: ProcessNativeReservation { bytes: native_bytes },
         });
         // Drop the exclusive gate before bodies, spawn, joins, export or callbacks.
@@ -822,17 +1357,26 @@ impl MemoryAccountant {
     /// retained process debit after returning only that workspace's credit.
     pub(crate) fn available_after_releasing(&self, bytes: usize) -> Option<usize> {
         let admission = self.writer_admission();
-        writer_headroom(self.limit.load(Ordering::SeqCst), self.used.load(Ordering::SeqCst),
-            bytes, self.private_transition_headroom(), admission.native_bytes).available
+        writer_headroom(
+            self.limit.load(Ordering::SeqCst),
+            self.used.load(Ordering::SeqCst),
+            bytes,
+            self.private_transition_headroom(),
+            admission.native_bytes,
+        )
+        .available
     }
 
     /// Attempt to allocate bytes. CAS-based, no TOCTOU.
     pub fn try_allocate(&self, bytes: usize) -> contextdb_core::Result<()> {
+        self.try_allocate_with_provenance(bytes, None)
+    }
+    fn try_allocate_with_provenance(&self, bytes: usize, provenance: Option<&StoreAccountantHandle>) -> contextdb_core::Result<()> {
         if bytes == 0 {
             return Ok(());
         }
 
-        let admission = self.writer_admission();
+        let admission = self.writer_admission_for_provenance(provenance);
         #[cfg(test)]
         let mut admission = admission;
         loop {
@@ -841,17 +1385,20 @@ impl MemoryAccountant {
             let limit = if published == 0 {
                 0
             } else {
-                published.checked_add(self.private_transition_headroom()).unwrap_or(usize::MAX)
+                published
+                    .saturating_add(self.private_transition_headroom())
             };
             if limit != 0 {
-                let available = writer_headroom(limit, used, 0, 0, admission.native_bytes).available.unwrap_or(usize::MAX - used);
+                let available = writer_headroom(limit, used, 0, 0, admission.native_bytes)
+                    .available
+                    .unwrap_or(usize::MAX - used);
                 if bytes > available {
                     // TOCTOU window: `limit` was loaded above; a concurrent
                     // `set_budget(None)` may have cleared it since. The re-check
                     // below closes that window. In test builds a hook lets a
                     // unit test land exactly that interleaving deterministically.
                     #[cfg(test)]
-                    if self.fire_accounting_hook_without_gate(&mut admission, false) { continue; }
+                    if self.fire_accounting_hook_without_gate_for_provenance(&mut admission, provenance, false) { continue; }
                     if self.limit.load(Ordering::SeqCst) != published {
                         continue;
                     }
@@ -884,7 +1431,7 @@ impl MemoryAccountant {
             // here, and the CAS below still runs. In test builds a hook lands
             // exactly that order deterministically.
             #[cfg(test)]
-            if self.fire_accounting_hook_without_gate(&mut admission, true) { continue; }
+            if self.fire_accounting_hook_without_gate_for_provenance(&mut admission, provenance, true) { continue; }
             if self
                 .used
                 .compare_exchange(used, next, Ordering::SeqCst, Ordering::SeqCst)
@@ -905,9 +1452,13 @@ impl MemoryAccountant {
                 let admissible = if current == 0 {
                     0
                 } else {
-                    current.checked_add(self.private_transition_headroom()).unwrap_or(usize::MAX)
+                    current
+                        .saturating_add(self.private_transition_headroom())
                 };
-                if writer_headroom(admissible, used, 0, 0, admission.native_bytes).available.is_some_and(|available| bytes > available) {
+                if writer_headroom(admissible, used, 0, 0, admission.native_bytes)
+                    .available
+                    .is_some_and(|available| bytes > available)
+                {
                     self.release_under_admission(bytes);
                     continue;
                 }
@@ -944,15 +1495,19 @@ impl MemoryAccountant {
             let limit = if published == 0 {
                 0
             } else {
-                published.checked_add(self.private_transition_headroom()).unwrap_or(usize::MAX)
+                published
+                    .saturating_add(self.private_transition_headroom())
             };
-            let available = writer_headroom(limit, used, old_bytes, 0, admission.native_bytes).available
+            let available = writer_headroom(limit, used, old_bytes, 0, admission.native_bytes)
+                .available
                 .unwrap_or(usize::MAX - others);
             // A shrinking phase always remains admitted, including after a
             // budget is narrowed below already-retained ownership.
             if new_bytes > old_bytes && new_bytes > available {
                 #[cfg(test)]
-                if self.fire_accounting_hook_without_gate(&mut admission, false) { continue; }
+                if self.fire_accounting_hook_without_gate(&mut admission, false) {
+                    continue;
+                }
                 if self.limit.load(Ordering::SeqCst) != published {
                     continue;
                 }
@@ -960,7 +1515,8 @@ impl MemoryAccountant {
                     subsystem: subsystem.to_owned(),
                     operation: operation.to_owned(),
                     requested_bytes: new_bytes - old_bytes,
-                    available_bytes: writer_headroom(limit, used, 0, 0, admission.native_bytes).available
+                    available_bytes: writer_headroom(limit, used, 0, 0, admission.native_bytes)
+                        .available
                         .unwrap_or(usize::MAX - used),
                     budget_limit_bytes: if limit == 0 { usize::MAX } else { limit },
                     hint: hint.to_owned(),
@@ -977,7 +1533,9 @@ impl MemoryAccountant {
                 }
             })?;
             #[cfg(test)]
-            if self.fire_accounting_hook_without_gate(&mut admission, true) { continue; }
+            if self.fire_accounting_hook_without_gate(&mut admission, true) {
+                continue;
+            }
             if self
                 .used
                 .compare_exchange(used, next, Ordering::SeqCst, Ordering::SeqCst)
@@ -992,9 +1550,14 @@ impl MemoryAccountant {
             let admissible = if current == 0 {
                 0
             } else {
-                current.checked_add(self.private_transition_headroom()).unwrap_or(usize::MAX)
+                current
+                    .saturating_add(self.private_transition_headroom())
             };
-            if new_bytes > old_bytes && writer_headroom(admissible, used, old_bytes, 0, admission.native_bytes).available.is_some_and(|available| new_bytes > available) {
+            if new_bytes > old_bytes
+                && writer_headroom(admissible, used, old_bytes, 0, admission.native_bytes)
+                    .available
+                    .is_some_and(|available| new_bytes > available)
+            {
                 self.release_under_admission(new_bytes - old_bytes);
                 continue;
             }
@@ -1006,11 +1569,7 @@ impl MemoryAccountant {
                 if new_bytes < old_bytes {
                     note_budget_ledger("release", old_bytes - new_bytes, next);
                 } else {
-                    note_budget_ledger(
-                        &format!("{subsystem}/{operation}"),
-                        new_bytes - old_bytes,
-                        next,
-                    );
+                    note_budget_admission(subsystem, operation, new_bytes - old_bytes, next);
                 }
             }
             return Ok(());
@@ -1032,8 +1591,13 @@ impl MemoryAccountant {
         self.charge_retained_under_admission(bytes);
     }
     fn charge_retained_under_admission(&self, bytes: usize) {
-        if bytes == 0 { return; }
-        self.used.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| used.checked_add(bytes))
+        if bytes == 0 {
+            return;
+        }
+        self.used
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
+                used.checked_add(bytes)
+            })
             .expect("retained ownership cannot overflow its counter");
         #[cfg(feature = "test-seams")]
         {
@@ -1064,7 +1628,8 @@ impl MemoryAccountant {
     ) -> contextdb_core::Result<SchemaUnitReservation> {
         self.try_allocate_for(bytes, subsystem, operation, hint)?;
         Ok(SchemaUnitReservation {
-            accountant: Arc::clone(self),
+            _writer_use: crate::memory_accounting::WriterUse::retain_if_writer(&(Arc::clone(self))),
+accountant: Arc::clone(self),
             remaining: std::cell::Cell::new(bytes),
         })
     }
@@ -1206,9 +1771,16 @@ impl MemoryAccountant {
     pub(crate) fn writer_envelope_usage(&self) -> contextdb_core::Result<(usize, usize, usize)> {
         let admission = self.writer_admission();
         let used = self.used.load(Ordering::SeqCst);
-        let envelope = writer_headroom(self.limit.load(Ordering::SeqCst), used, 0, 0, admission.native_bytes);
-        let combined = envelope.combined_used
-            .ok_or_else(|| contextdb_core::Error::Other("writer report combined size overflow".into()))?;
+        let envelope = writer_headroom(
+            self.limit.load(Ordering::SeqCst),
+            used,
+            0,
+            0,
+            admission.native_bytes,
+        );
+        let combined = envelope.combined_used.ok_or_else(|| {
+            contextdb_core::Error::Other("writer report combined size overflow".into())
+        })?;
         Ok((used, admission.native_bytes, combined))
     }
 
@@ -1225,9 +1797,12 @@ impl MemoryAccountant {
             .load(Ordering::SeqCst)
             .then(|| self.startup_ceiling.load(Ordering::SeqCst));
         MemoryUsage {
+            #[cfg(feature = "test-seams")]
+            reader_file_high_water: 0,
             limit,
             used,
-            available: writer_headroom(limit.unwrap_or(0), used, 0, 0, admission.native_bytes).available,
+            available: writer_headroom(limit.unwrap_or(0), used, 0, 0, admission.native_bytes)
+                .available,
             startup_ceiling,
         }
     }
@@ -1266,6 +1841,17 @@ impl MemoryAccountant {
         operation: &str,
         hint: &str,
     ) -> contextdb_core::Result<()> {
+        self.try_allocate_for_provenance(bytes, subsystem, operation, hint, None)
+    }
+    fn available_for_provenance(&self, provenance: Option<&StoreAccountantHandle>) -> Option<usize> {
+        let admission = self.writer_admission_for_provenance(provenance);
+        writer_headroom(self.limit.load(Ordering::SeqCst), self.used.load(Ordering::SeqCst),
+            0, 0, admission.native_bytes).available
+    }
+    fn try_allocate_for_provenance(
+        &self, bytes: usize, subsystem: &str, operation: &str, hint: &str,
+        provenance: Option<&StoreAccountantHandle>,
+    ) -> contextdb_core::Result<()> {
         #[cfg(any(test, feature = "test-seams"))]
         if operation == "prepare_hnsw_tail"
             && self
@@ -1282,14 +1868,10 @@ impl MemoryAccountant {
                 hint: "Injected fresh-tail admission exhaustion.".to_owned(),
             });
         }
-        let mut allocation = self.try_allocate(bytes);
+        let mut allocation = self.try_allocate_with_provenance(bytes, provenance);
         #[cfg(feature = "test-seams")]
         if allocation.is_ok() {
-            note_budget_ledger(
-                &format!("{subsystem}/{operation}"),
-                bytes,
-                self.used.load(Ordering::SeqCst),
-            );
+            note_budget_admission(subsystem, operation, bytes, self.used.load(Ordering::SeqCst));
         }
         // A saved graph whose topology does not fit is admitted once the
         // serving pages already resident give way to it: they are re-readable,
@@ -1303,12 +1885,12 @@ impl MemoryAccountant {
                 .as_ref()
                 .and_then(std::sync::Weak::upgrade);
             if let Some(vector) = vector {
-                let short = || bytes.saturating_sub(self.usage().available.unwrap_or(usize::MAX));
+                let short = || bytes.saturating_sub(self.available_for_provenance(provenance).unwrap_or(usize::MAX));
                 if vector.make_room_for_graph_load(short()) != 0 {
-                    allocation = self.try_allocate(bytes);
+                    allocation = self.try_allocate_with_provenance(bytes, provenance);
                 }
                 if allocation.is_err() && vector.give_back_serving_pages(short()) != 0 {
-                    allocation = self.try_allocate(bytes);
+                    allocation = self.try_allocate_with_provenance(bytes, provenance);
                 }
             }
         }
@@ -1322,9 +1904,9 @@ impl MemoryAccountant {
                 .lock()
                 .as_ref()
                 .and_then(std::sync::Weak::upgrade);
-            let short = bytes.saturating_sub(self.usage().available.unwrap_or(usize::MAX));
+            let short = bytes.saturating_sub(self.available_for_provenance(provenance).unwrap_or(usize::MAX));
             if vector.is_some_and(|vector| vector.give_back_serving_pages(short) != 0) {
-                allocation = self.try_allocate(bytes);
+                allocation = self.try_allocate_with_provenance(bytes, provenance);
             }
         }
         if allocation.is_err() && matches!(operation, "read/table_scan" | "read/index_range") {
@@ -1337,7 +1919,7 @@ impl MemoryAccountant {
                 .as_ref()
                 .map_or(0, |vector| vector.evict_idle_graphs());
             if graphs != 0 {
-                allocation = self.try_allocate(bytes);
+                allocation = self.try_allocate_with_provenance(bytes, provenance);
             }
         }
         // A received schema unit that was already ADMITTED AS A WHOLE is
@@ -1383,6 +1965,114 @@ impl MemoryAccountant {
     }
 }
 
+// No Weak is created for this private adapter. Its sole factory returns an
+// ordinary Arc; clones/coercions retain the same control allocation.
+#[derive(Debug)]
+pub(crate) struct WriterVectorBudget {
+    accountant: Option<Arc<MemoryAccountant>>,
+    layout: Layout,
+    _writer_use: Option<WriterUse>,
+}
+impl WriterVectorBudget {
+    fn accountant(&self) -> &Arc<MemoryAccountant> {
+        self.accountant.as_ref().expect("live adapter has its accountant")
+    }
+}
+impl Drop for WriterVectorBudget {
+    fn drop(&mut self) {
+        let accountant = self.accountant.take().expect("adapter has its accountant");
+        if self.layout.size() == 0 {
+            drop(self._writer_use.take());
+            return;
+        }
+        let refund = accountant.retain_box_control_refund(self.layout.size());
+        // Registration/payload cleanup and accountant destruction finish before
+        // the fixed ArcInner refund. No Weak exists for this allocation.
+        drop(self._writer_use.take());
+        drop(accountant);
+        refund.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| used.checked_sub(self.layout.size()))
+            .expect("adapter control refund is owned");
+        // Only std's AtomicUsize Arc destruction and ArcInner deallocation
+        // follow; all payload fields are empty or Copy.
+    }
+}
+impl contextdb_core::read_memory::ReadMemoryBudget for WriterVectorBudget {
+    fn try_reserve(&self, bytes: usize, subsystem: &'static str, operation: &'static str, hint: &'static str) -> contextdb_core::Result<()> {
+        self.accountant().try_allocate_for(bytes, subsystem, operation, hint)
+    }
+    fn release(&self, bytes: usize) { self.accountant().release(bytes); }
+}
+impl contextdb_vector::MemoryBudget for WriterVectorBudget {
+    fn stable_funder_identity(&self) -> usize {
+        Arc::as_ptr(self.accountant()) as usize
+    }
+    fn transition_reservation_for(&self, old: usize, new: usize, subsystem: &str, operation: &str, hint: &str) -> contextdb_core::Result<()> {
+        contextdb_vector::MemoryBudget::transition_reservation_for(&**self.accountant(), old, new, subsystem, operation, hint)
+    }
+    fn try_allocate_for(&self, bytes: usize, subsystem: &str, operation: &str, hint: &str) -> contextdb_core::Result<()> {
+        self.accountant().try_allocate_for(bytes, subsystem, operation, hint)
+    }
+    fn release(&self, bytes: usize) { self.accountant().release(bytes); }
+    fn available_bytes(&self) -> Option<usize> { self.accountant().usage().available }
+    fn adopt_caller_reservation(&self, bytes: usize) -> contextdb_core::Result<bool> { adopt_vector_load_reservation(self.accountant(), bytes) }
+}
+impl MemoryAccountant {
+    #[cfg(all(test, feature = "test-seams"))]
+    pub(crate) fn writer_registration_observation_for_test(&self) -> (usize, usize, usize, usize, usize) {
+        let domain = PROCESS_WRITER_BUDGET_DOMAIN.read();
+        if let Some(record) = self.writer_identity.get().and_then(|key| domain.lookup_in(*key)) {
+            return (record as *const WriterRegistration as usize, Layout::new::<WriterRegistration>().size(), record.epoch, record.users, Arc::as_ptr(&self.used) as usize);
+        }
+        (0, 0, 0, 0, Arc::as_ptr(&self.used) as usize)
+    }
+    #[cfg(all(test, feature = "test-seams"))]
+    pub(crate) fn writer_vector_adapter_type_layout_for_test() -> Layout {
+        writer_adapter_type_layout::<WriterVectorBudget>()
+    }
+    #[cfg(all(test, feature = "test-seams"))]
+    pub(crate) fn writer_vector_adapter_layout_for_test(self: &Arc<Self>) -> Layout {
+        crate::persistence::returned_loader_rows_for_test();
+        crate::persistence::content_identity::proof_allocation_oracle_tests::r1_mapped_control_rows();
+        let adapter = WriterVectorBudget { accountant: Some(self.clone()), layout: Layout::new::<()>(), _writer_use: WriterUse::retain_if_writer(self) };
+        writer_adapter_layout(&adapter)
+    }
+    fn budget_adapter(self: &Arc<Self>, writer_use: WriterUse, retained_startup: bool) -> contextdb_core::Result<Arc<WriterVectorBudget>> {
+        let mut adapter = WriterVectorBudget {
+            accountant: Some(self.clone()), layout: Layout::new::<()>(),
+            _writer_use: Some(writer_use),
+        };
+        let layout = writer_adapter_layout(&adapter);
+        if retained_startup {
+            // The construction root is unavoidable retained startup ownership,
+            // like the registration and private accountant backing. Its actual
+            // fixed layout is charged before allocation; later growth refuses.
+            self.charge_retained(layout.size());
+        } else {
+            self.try_allocate_for(layout.size(), "writer", "adapter_control", "Raise MEMORY_LIMIT for the writer adapter.")?;
+        }
+        adapter.layout = layout;
+        self.change_adapter_control_receipt(layout.size(), true);
+        Ok(Arc::new(adapter))
+    }
+    fn vector_budget_for_startup(self: &Arc<Self>) -> contextdb_core::Result<Arc<dyn contextdb_vector::MemoryBudget>> {
+        let writer_use = WriterUse::retain_if_writer(self).expect("construction root retains the writer epoch");
+        Ok(self.budget_adapter(writer_use, true)?)
+    }
+    pub(crate) fn vector_budget(self: &Arc<Self>) -> contextdb_core::Result<Arc<dyn contextdb_vector::MemoryBudget>> {
+        match WriterUse::retain_if_writer(self) {
+            Some(writer_use) => Ok(self.budget_adapter(writer_use, false)?),
+            None => Ok(self.clone()),
+        }
+    }
+    pub(crate) fn read_budget(self: &Arc<Self>) -> contextdb_core::Result<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>> {
+        match WriterUse::retain_if_writer(self) {
+            Some(writer_use) => Ok(self.budget_adapter(writer_use, false)?),
+            None => Ok(self.clone()),
+        }
+    }
+
+}
+
 impl contextdb_vector::MemoryBudget for MemoryAccountant {
     fn transition_reservation_for(
         &self,
@@ -1395,7 +2085,9 @@ impl contextdb_vector::MemoryBudget for MemoryAccountant {
         let mut transition =
             self.transition_reservation(old_bytes, new_bytes, subsystem, operation, hint);
         // Activation's short exclusive scope never invokes a reclaimer.
-        if self.exclusive_activation().is_some() { return transition; }
+        if self.exclusive_activation().is_some() {
+            return transition;
+        }
         // Workspace growth preserves ordinary admission's cache give-back:
         // these pages can be filled again and their release is independent
         // of the caller's still-held old reservation.
@@ -1462,11 +2154,17 @@ impl MemoryAccountant {
     // Exclusive activation performs only the counter/token transition and
     // never calls these arbitrary test callbacks while holding its gate.
     fn fire_accounting_hook_without_gate(&self, admission: &mut WriterAdmission, success: bool) -> bool {
+        self.fire_accounting_hook_without_gate_for_provenance(admission, None, success)
+    }
+    #[cfg(test)]
+    fn fire_accounting_hook_without_gate_for_provenance(
+        &self, admission: &mut WriterAdmission, provenance: Option<&StoreAccountantHandle>, success: bool,
+    ) -> bool {
         if self.exclusive_activation().is_some() { return false; }
         let native_before = admission.native_bytes;
         drop(admission._gate.take());
         if success { self.fire_admission_race_hook(); } else { self.fire_alloc_race_hook(); }
-        *admission = self.writer_admission();
+        *admission = self.writer_admission_for_provenance(provenance);
         admission.native_bytes != native_before
     }
 

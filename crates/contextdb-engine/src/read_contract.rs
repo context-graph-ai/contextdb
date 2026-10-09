@@ -16,7 +16,6 @@ use crate::{
     VectorSearchRouteEvidence, VectorSearchScopeShape, VectorSearchTailState,
 };
 use bincode::config::standard;
-use bincode::serde::decode_from_slice;
 use contextdb_core::read_contract::{CursorPage, MetadataPage, ReadLimits};
 use contextdb_core::{Value, VectorIndexRef, VectorSearchMode};
 use serde::de::DeserializeOwned;
@@ -85,19 +84,18 @@ fn canonical_count_columns(
 fn restored_count_columns(
     columns: Vec<(String, bool)>,
 ) -> Vec<(String, contextdb_core::SortDirection)> {
-    columns
-        .into_iter()
-        .map(|(column, descending)| {
-            (
-                column,
-                if descending {
-                    contextdb_core::SortDirection::Desc
-                } else {
-                    contextdb_core::SortDirection::Asc
-                },
-            )
-        })
-        .collect()
+    let mut restored = Vec::with_capacity(columns.len());
+    for (column, descending) in columns {
+        restored.push((
+            column,
+            if descending {
+                contextdb_core::SortDirection::Desc
+            } else {
+                contextdb_core::SortDirection::Asc
+            },
+        ));
+    }
+    restored
 }
 
 impl CanonicalMaintainedCountDisclosure {
@@ -117,11 +115,13 @@ impl CanonicalMaintainedCountDisclosure {
             (false, false) => MaintainedCountDisclosure::NotDeclared {
                 table: self.table,
                 columns,
-                already_declared: self
-                    .already_declared
-                    .into_iter()
-                    .map(restored_count_columns)
-                    .collect(),
+                already_declared: {
+                    let mut lists = Vec::with_capacity(self.already_declared.len());
+                    for columns in self.already_declared {
+                        lists.push(restored_count_columns(columns));
+                    }
+                    lists
+                },
             },
         }
     }
@@ -313,11 +313,10 @@ impl TryFrom<CanonicalVectorSearchDisclosure> for VectorSearchDisclosure {
                 .transpose()
                 .map_err(|_| ())?,
             budget_terminal: disclosure.budget_terminal,
-            partition_hnsw: disclosure
-                .partition_hnsw
-                .into_iter()
-                .map(|partition| {
-                    Ok(VectorPartitionHnswDisclosure {
+            partition_hnsw: {
+                let mut partitions = Vec::with_capacity(disclosure.partition_hnsw.len());
+                for partition in disclosure.partition_hnsw {
+                    partitions.push(VectorPartitionHnswDisclosure {
                         partition: partition.partition,
                         route: partition
                             .route
@@ -337,10 +336,30 @@ impl TryFrom<CanonicalVectorSearchDisclosure> for VectorSearchDisclosure {
                             .map_err(|_| ())?,
                         ef_search_source: partition.ef_search_source,
                         policy_revision: partition.policy_revision,
-                    })
-                })
-                .collect::<Result<Vec<_>, ()>>()?,
+                    });
+                }
+                partitions
+            },
         })
+    }
+}
+
+impl CanonicalQueryTrace {
+    /// Empty inline trace for measuring a moved result's row buffers through
+    /// the existing shared native-capacity walker.
+    pub(crate) fn empty() -> Self {
+        Self {
+            physical_plan: String::new(),
+            index_used: None,
+            predicates_pushed: Vec::new(),
+            indexes_considered: Vec::new(),
+            sort_elided: false,
+            query_vector_source: None,
+            vector_search: None,
+            rows_examined: 0,
+            maintained_count: None,
+            groups: Vec::new(),
+        }
     }
 }
 
@@ -525,7 +544,9 @@ pub fn decode_query_result_under_memory_ceiling(
         bytes,
     );
     preflight_canonical_query_result(bytes, memory_ceiling)?;
-    let result = decode_exact(bytes)?;
+    let memory = decoder_memory(memory_ceiling)
+        .map_err(|error| encoding_error_from_core(error, memory_ceiling))?;
+    let result = decode_exact_with_memory(bytes, &memory, memory_ceiling)?;
     validate_query_result(&result)?;
     Ok(result)
 }
@@ -666,10 +687,44 @@ impl CanonicalWriter {
 pub fn decode_metadata_body(
     bytes: &[u8],
 ) -> Result<crate::direct_file_reader::DirectMetadataBody, ReadEncodingError> {
-    let mut reader = CanonicalReader::new(bytes);
-    let body = crate::read_image::read_metadata_body(&mut reader)?;
-    reader.finish()?;
-    Ok(body)
+    let memory = decoder_memory(ReadLimits::SHIPPED_MEMORY)
+        .map_err(|error| encoding_error_from_core(error, ReadLimits::SHIPPED_MEMORY))?;
+    decode_metadata_body_with_memory(bytes, &memory, ReadLimits::SHIPPED_MEMORY)
+}
+
+pub(crate) fn decode_metadata_body_with_memory(
+    bytes: &[u8],
+    memory: &std::sync::Arc<crate::read_image_memory::ImageMemory>,
+    ceiling: u64,
+) -> Result<crate::direct_file_reader::DirectMetadataBody, ReadEncodingError> {
+    let bound = bytes
+        .len()
+        .checked_mul(4)
+        .and_then(|n| n.checked_add(4096))
+        .ok_or(ReadEncodingError::MemoryCeilingExceeded { ceiling })?;
+    let transient = contextdb_core::read_memory::ReadCredit::try_new(
+        memory.clone(),
+        bound,
+        "reader",
+        "metadata_body",
+        "Raise reader memory to decode this metadata body.",
+    )
+    .map_err(|error| encoding_error_from_core(error, ceiling))?;
+    let result = memory.scope(|| {
+        let mut reader = CanonicalReader::new(bytes);
+        let body = crate::read_image::read_metadata_body(&mut reader)?;
+        reader.finish()?;
+        Ok(body)
+    });
+    // The body keeps its admitted JSON payload on this same owner; its
+    // construction-only input/container upper bound ends here.
+    drop(transient);
+    result.map_err(|error| match error {
+        ReadEncodingError::MemoryCeilingExceeded { .. } => {
+            ReadEncodingError::MemoryCeilingExceeded { ceiling }
+        }
+        error => error,
+    })
 }
 
 /// A cursor over canonical bytes, reading exactly what [`CanonicalWriter`]
@@ -784,7 +839,9 @@ pub fn decode_cursor_page_under_memory_ceiling(
     memory_ceiling: u64,
 ) -> Result<CursorPage, ReadEncodingError> {
     preflight_cursor_page_payload(bytes, memory_ceiling).map_err(encoding_error_from_transport)?;
-    let page: CursorPage = decode_exact(bytes)?;
+    let memory = decoder_memory(memory_ceiling)
+        .map_err(|error| encoding_error_from_core(error, memory_ceiling))?;
+    let page: CursorPage = decode_exact_with_memory(bytes, &memory, memory_ceiling)?;
     page.validate()
         .map_err(|_| ReadEncodingError::InvalidPayload)?;
     Ok(page)
@@ -814,7 +871,9 @@ pub fn decode_metadata_page_under_memory_ceiling(
 ) -> Result<MetadataPage, ReadEncodingError> {
     preflight_metadata_page_payload(bytes, memory_ceiling)
         .map_err(encoding_error_from_transport)?;
-    let page: MetadataPage = decode_exact(bytes)?;
+    let memory = decoder_memory(memory_ceiling)
+        .map_err(|error| encoding_error_from_core(error, memory_ceiling))?;
+    let page: MetadataPage = decode_exact_with_memory(bytes, &memory, memory_ceiling)?;
     page.validate()
         .map_err(|_| ReadEncodingError::InvalidPayload)?;
     Ok(page)
@@ -846,19 +905,92 @@ fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, ReadEncodingError> {
     Ok(encoded)
 }
 
-/// The decoder's own limit counts wire reads, and counts each integer field at
-/// its fixed width rather than the shorter form actually consumed, so it is
-/// stated at the decoder's worst case per admitted wire byte. What the decoded
-/// form costs in live memory is charged by the preflight each caller runs
-/// above, before the decoder is entered.
-const DECODE_WIRE_CLAIM_CEILING: usize = crate::local_transport::MAX_FRAME_BYTES * 8;
+/// Use the existing declared reader root as the standalone codec's host
+/// capability boundary. Every engine-created native control is admitted to
+/// its operation child before the corresponding Arc allocations.
+pub(crate) fn decoder_memory(
+    memory_ceiling: u64,
+) -> contextdb_core::Result<std::sync::Arc<crate::read_image_memory::ImageMemory>> {
+    let root = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(memory_ceiling);
+    let child = root.child()?;
+    let controls = std::mem::size_of::<crate::memory_accounting::MemoryAccountant>()
+        + 2 * std::mem::size_of::<usize>()
+        + 2 * (std::mem::size_of::<std::sync::atomic::AtomicUsize>()
+            + 2 * std::mem::size_of::<usize>());
+    child.try_reserve(
+        controls,
+        "reader",
+        "decode_accountant",
+        "Reduce the payload or raise the declared reader memory limit.",
+    )?;
+    let accountant = std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(
+        usize::try_from(memory_ceiling).unwrap_or(usize::MAX),
+    ));
+    let memory =
+        match crate::read_image_memory::ImageMemory::operation_reader(accountant, child.clone()) {
+            Ok(memory) => memory,
+            Err(error) => {
+                child.release(controls);
+                return Err(error);
+            }
+        };
+    memory.adopt_reader_credit(&child, controls)?;
+    Ok(memory)
+}
 
-fn decode_exact<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, ReadEncodingError> {
-    let configuration = standard().with_limit::<DECODE_WIRE_CLAIM_CEILING>();
-    let (value, consumed) =
-        decode_from_slice(bytes, configuration).map_err(|_| ReadEncodingError::InvalidPayload)?;
+pub(crate) fn encoding_error_from_core(
+    error: contextdb_core::Error,
+    memory_ceiling: u64,
+) -> ReadEncodingError {
+    match error {
+        error if crate::read_image_memory::is_memory_refusal(&error) => {
+            ReadEncodingError::MemoryCeilingExceeded {
+                ceiling: memory_ceiling,
+            }
+        }
+        _ => ReadEncodingError::InvalidPayload,
+    }
+}
+
+/// Borrowed wire input coexists with all decoded buffers. This credit is
+/// temporary; payload credit stays on the same owner until its DTO boundary.
+pub(crate) fn decode_exact_with_memory<T: DeserializeOwned>(
+    bytes: &[u8],
+    memory: &std::sync::Arc<crate::read_image_memory::ImageMemory>,
+    memory_ceiling: u64,
+) -> Result<T, ReadEncodingError> {
+    let input = contextdb_core::read_memory::ReadCredit::try_new(
+        memory.clone(),
+        bytes.len(),
+        "reader",
+        "decode_input",
+        "Reduce the payload or raise the declared reader memory limit.",
+    )
+    .map_err(|error| encoding_error_from_core(error, memory_ceiling))?;
+    let before = memory.held();
+    let (value, consumed) = memory
+        .scope(|| crate::read_image_memory::decode(bytes))
+        .map_err(|error| encoding_error_from_core(error, memory_ceiling))?;
     if consumed != bytes.len() {
+        drop(value);
+        memory.release(memory.held() - before);
         return Err(ReadEncodingError::InvalidPayload);
     }
+    drop(input);
     Ok(value)
+}
+
+pub(crate) fn decode_query_result_with_memory(
+    bytes: &[u8],
+    memory: &std::sync::Arc<crate::read_image_memory::ImageMemory>,
+    memory_ceiling: u64,
+) -> Result<CanonicalQueryResult, ReadEncodingError> {
+    #[cfg(feature = "test-seams")]
+    crate::local_transport::OrdinaryResultReceiver::observe_actual_canonical_decode_entry_for_test(
+        bytes,
+    );
+    preflight_canonical_query_result(bytes, memory_ceiling)?;
+    let result = decode_exact_with_memory(bytes, memory, memory_ceiling)?;
+    validate_query_result(&result)?;
+    Ok(result)
 }

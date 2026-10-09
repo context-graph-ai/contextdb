@@ -11,10 +11,12 @@ fn fixture() -> (
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("streamed-raw.db");
     let database = crate::Database::open(&path).unwrap();
-    database.execute(
-        "CREATE TABLE items (id INTEGER PRIMARY KEY, embedding VECTOR(1))",
-        &HashMap::new(),
-    ).expect("declare the physical vector fixture table and its maintained totals");
+    database
+        .execute(
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, embedding VECTOR(1))",
+            &HashMap::new(),
+        )
+        .expect("declare the physical vector fixture table and its maintained totals");
     database.close().unwrap();
     let persistence = Arc::new(RedbPersistence::open(&path).unwrap());
     let partition = VectorPartitionRef::new(

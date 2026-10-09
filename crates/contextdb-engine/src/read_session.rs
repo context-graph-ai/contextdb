@@ -7,16 +7,16 @@
 
 #![forbid(unsafe_code)]
 
-use crate::owned_cursor_page::OwnedCursorPage;
+use crate::database::OwnedQueryResult;
 use crate::direct_file_reader::{
     DirectMetadataBody as MetadataBody, DirectMetadataRequest as MetadataRequest,
 };
 #[cfg(feature = "test-seams")]
 use crate::executor::bounded_read_test_support::{ExecutionProbe, TestSourceTouch, TestWorkSource};
+use crate::owned_cursor_page::OwnedCursorPage;
 use crate::plugin::{CorePlugin, DatabasePlugin};
 use crate::read_progress::{ReadProgressObserver, with_progress_observer};
 use crate::{Database, QueryResult};
-use crate::database::OwnedQueryResult;
 use contextdb_core::read_contract::ChannelAddress;
 #[cfg(feature = "test-seams")]
 use contextdb_core::read_contract::DeadlineClock;
@@ -316,6 +316,8 @@ mod route_observation {
     #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct ReadKernelSourceEvent {
+        pub funding_owner: Option<usize>,
+        pub control_reservation_bytes: Option<usize>,
         pub operation: ReadSessionOperation,
         pub route: ReadRoute,
         pub source: ReadKernelSource,
@@ -605,6 +607,8 @@ impl ExecutionProbe for SessionKernelProbe {
     fn before_source_touch(&self, source: TestSourceTouch, completed_items: u64) {
         self.observer.before_source_touch(
             ReadKernelSourceEvent {
+                funding_owner: crate::read_work_probe::observed_funding_identity(),
+                control_reservation_bytes: crate::read_work_probe::observed_funding().map(|v| v.1),
                 operation: self.operation,
                 route: self.route,
                 source: source.into(),
@@ -868,6 +872,7 @@ fn direct_error(path: &Path, error: crate::direct_file_reader::DirectFileReaderE
         Direct::ReadFailure(failure)
         | Direct::StoreNotFound { failure }
         | Direct::DirectReadRequiresWriter { failure, .. } => Error::ReadFailure(failure),
+
         Direct::Cancelled => Error::ReadCancelled,
         Direct::Engine(prose) => Error::Other(prose),
         Direct::MemoryBudget {
@@ -1820,7 +1825,7 @@ impl ReadSession {
     }
 }
 
-fn read_clock() -> Arc<dyn contextdb_core::read_contract::DeadlineClock> {
+pub(crate) fn read_clock() -> Arc<dyn contextdb_core::read_contract::DeadlineClock> {
     #[cfg(feature = "test-seams")]
     if let Some(clock) = ROUTE_SELECTION_CLOCK.with(|slot| slot.borrow().clone()) {
         return clock;
@@ -2298,8 +2303,9 @@ impl ReadSession {
     #[doc(hidden)]
     pub fn file_cache_index_charge_for_test(&self) -> Option<(usize, usize)> {
         match self.state.as_ref() {
-            ReadSessionState::DirectFile(reader) => Some(
-                crate::direct_file_reader::test_seams::cache_index_charge_for_test(reader)),
+            ReadSessionState::DirectFile(reader) => {
+                Some(crate::direct_file_reader::test_seams::cache_index_charge_for_test(reader))
+            }
             _ => None,
         }
     }
@@ -2738,11 +2744,13 @@ impl ReadSession {
                 reader.publish_bounded_result(&executed.publication, executed.result)
             }
             ReadSessionState::OwnerChannel(owner) => {
-                let receiving_memory = crate::read_image_memory::ImageMemory::new(Some(
-                    usize::try_from(self.options.limits.memory)
-                        .unwrap_or(usize::MAX)
-                        .min(self.options.memory_limit.unwrap_or(usize::MAX)),
-                ));
+                let receiving_memory = crate::read_contract::decoder_memory(
+                    self.options.limits.memory.min(
+                        self.options
+                            .memory_limit
+                            .map_or(u64::MAX, |bytes| bytes as u64),
+                    ),
+                )?;
                 let responses = owner.ask(
                     self.options.limits,
                     crate::local_transport::LocalRequest::Query {
@@ -2923,6 +2931,12 @@ impl ReadSession {
                 return Err(crate::read_image::image_state_is_a_file_question());
             }
         };
+        let receiving_limit = limits.memory.min(
+            self.options
+                .memory_limit
+                .map_or(u64::MAX, |bytes| bytes as u64),
+        );
+        let receiving_memory = crate::read_contract::decoder_memory(receiving_limit)?;
         let responses = owner.ask(
             limits,
             crate::local_transport::LocalRequest::Metadata { request: local },
@@ -2931,7 +2945,9 @@ impl ReadSession {
             self.observer.as_ref(),
         )?;
         let payload = published_metadata_payload(responses, limits.memory)?;
-        promoted_metadata_answer(&request, &payload, limits)
+        let mut receiving_limits = limits;
+        receiving_limits.memory = receiving_limit;
+        promoted_metadata_answer(&request, &payload, receiving_limits, receiving_memory)
     }
 
     /// Ask the owner to plan a statement against the caller's own binding
@@ -3028,11 +3044,13 @@ impl ReadSession {
                 if let Some(observer) = self.observer.as_ref() {
                     observer.observe_event(ReadSessionEvent::OwnerCursorHandoffStarted);
                 }
-                let retained_memory = crate::read_image_memory::ImageMemory::new(Some(
-                    usize::try_from(self.options.limits.memory)
-                        .unwrap_or(usize::MAX)
-                        .min(self.options.memory_limit.unwrap_or(usize::MAX)),
-                ));
+                let retained_memory = crate::read_contract::decoder_memory(
+                    self.options.limits.memory.min(
+                        self.options
+                            .memory_limit
+                            .map_or(u64::MAX, |bytes| bytes as u64),
+                    ),
+                )?;
                 // The request owns a statement clone throughout the reply.
                 // Admit it into this same owner before making that clone.
                 let request_bytes = crate::executor::bounded::cursor_statement_bytes(sql, params)
@@ -3904,18 +3922,23 @@ fn promoted_metadata_answer(
     request: &MetadataRequest,
     payload: &[u8],
     limits: ReadLimits,
+    receiving_memory: Arc<crate::read_image_memory::ImageMemory>,
 ) -> Result<MetadataAnswer> {
     match request {
         MetadataRequest::Schema { .. }
         | MetadataRequest::MaintenanceStatus
         | MetadataRequest::DeliveryStatus { .. }
         | MetadataRequest::DeliveryOutcome { .. } => {
-            let body = crate::read_contract::decode_metadata_body(payload)
-                .map_err(|error| Error::Other(error.to_string()))?;
+            let body = crate::read_contract::decode_metadata_body_with_memory(
+                payload,
+                &receiving_memory,
+                limits.memory,
+            )
+            .map_err(read_encoding_error)?;
             Ok(MetadataAnswer {
                 body,
                 continuation: None,
-                charge: Default::default(),
+                charge: crate::read_image_memory::AnswerCharge::holding(receiving_memory.clone()),
             })
         }
         MetadataRequest::Tables => {
@@ -3977,6 +4000,7 @@ fn read_encoding_error(error: crate::read_contract::ReadEncodingError) -> Error 
             ReadFailure::new(ReadFailureKind::InvalidChannelData, ReadFailureDetail::None)
                 .expect("invalid channel data accepts canonical empty detail"),
         ),
+
         crate::read_contract::ReadEncodingError::Unimplemented => Error::ReadSessionNotImplemented,
     }
 }
@@ -3987,11 +4011,12 @@ fn published_query_result(
     receiving_memory: Arc<crate::read_image_memory::ImageMemory>,
 ) -> Result<OwnedQueryResult> {
     use crate::local_transport::{OrdinaryResultReceiver, ResultReceiveOutcome};
-    let mut receiver =
-        OrdinaryResultReceiver::with_effective_ceilings(limits.result_bytes, limits.memory)
-            .map_err(|error| {
-                owner_error(crate::owner_read::OwnerReadScaffoldError::from_local(error))
-            })?;
+    let mut receiver = OrdinaryResultReceiver::with_receiving_memory(
+        limits.result_bytes,
+        limits.memory,
+        receiving_memory.clone(),
+    )
+    .map_err(|error| owner_error(crate::owner_read::OwnerReadScaffoldError::from_local(error)))?;
     let mut published = None;
     for response in responses {
         match crate::owner_read::OwnerClient::receive_ordinary(&mut receiver, response)
@@ -4009,31 +4034,14 @@ fn published_query_result(
         }
     }
     let bytes = published.ok_or_else(|| Error::ReadFailure(owner_disconnected()))?;
-    let available = cursor_receive_allowance(limits.memory, &receiving_memory)
-        .saturating_sub(bytes.len() as u64);
-    let (decoded_bytes, trace_bytes) =
-        crate::local_transport::query_result_allocation_bytes(&bytes, available)
-            .map_err(read_encoding_error)?;
-    let admitted = decoded_bytes
-        .checked_add(
-            trace_bytes
-                .checked_mul(2)
-                .ok_or_else(|| Error::Other("query trace memory overflow".into()))?,
-        )
-        .and_then(|bytes| bytes.checked_add(2 * std::mem::size_of::<crate::QueryTrace>()))
-        .ok_or_else(|| Error::Other("query answer memory overflow".into()))?;
-    if admitted as u64 > available {
-        return Err(read_encoding_error(
-            crate::read_contract::ReadEncodingError::MemoryCeilingExceeded {
-                ceiling: limits.memory,
-            },
-        ));
-    }
-    receiving_memory.reserve(admitted)?;
-    let canonical =
-        crate::read_contract::decode_query_result_under_memory_ceiling(&bytes, available)
-            .map_err(read_encoding_error)?;
-    restored_query_result(canonical, receiving_memory)
+    let baseline = receiving_memory.held();
+    let canonical = crate::read_contract::decode_query_result_with_memory(
+        &bytes,
+        &receiving_memory,
+        limits.memory,
+    )
+    .map_err(read_encoding_error)?;
+    restored_query_result(canonical, receiving_memory, baseline)
 }
 
 /// Turn the owner's canonical answer back into the same value an in-process
@@ -4046,14 +4054,49 @@ fn published_query_result(
 fn restored_query_result(
     canonical: crate::read_contract::CanonicalQueryResult,
     receiving_memory: Arc<crate::read_image_memory::ImageMemory>,
+    baseline: usize,
 ) -> Result<OwnedQueryResult> {
+    let mut canonical = canonical;
+    let trace = std::mem::replace(
+        &mut canonical.trace,
+        crate::read_contract::CanonicalQueryTrace::empty(),
+    );
+    drop(canonical.cascade.take());
+    let row_bytes = crate::executor::bounded::canonical_query_capacity_bytes(&canonical)
+        .map_err(read_error)?
+        .checked_sub(std::mem::size_of::<
+            crate::read_contract::CanonicalQueryResult,
+        >())
+        .ok_or_else(|| Error::Other("canonical answer size underflow".into()))?;
+    let copies = trace_restoration_bytes(&trace)?;
+    receiving_memory.reserve(copies)?;
+    let trace = restored_query_trace(trace)?;
+    drop(canonical.cascade.take());
+    let trace_bytes =
+        crate::executor::bounded::query_trace_capacity_bytes(&trace).map_err(read_error)?;
+    let retained = row_bytes
+        .checked_add(trace_bytes)
+        .ok_or_else(|| Error::Other("query answer size overflow".into()))?;
+    // The decoding owner also contains fixed native controls. All payload
+    // credit stays on this owner; excess container/temporary charges return
+    // only after restoration destroys their source buffers.
+    let payload_admitted = receiving_memory
+        .held()
+        .checked_sub(baseline)
+        .ok_or_else(|| Error::Other("query answer admission underflow".into()))?;
+    if retained > payload_admitted {
+        return Err(Error::Other(
+            "query answer exceeded prepaid native credit".into(),
+        ));
+    }
+    receiving_memory.release(payload_admitted - retained);
     Ok(OwnedQueryResult {
         result: QueryResult {
-        columns: canonical.columns,
-        rows: canonical.rows,
-        rows_affected: canonical.rows_affected,
-        trace: restored_query_trace(canonical.trace)?,
-        cascade: None,
+            columns: canonical.columns,
+            rows: canonical.rows,
+            rows_affected: canonical.rows_affected,
+            trace,
+            cascade: None,
         },
         answer_charge: crate::read_image_memory::AnswerCharge::holding(receiving_memory.clone()),
         vector_copy_charge: crate::read_image_memory::AnswerCharge::holding(
@@ -4061,6 +4104,73 @@ fn restored_query_result(
         ),
         retained_read_memory: Some(receiving_memory),
     })
+}
+
+/// Only native containers newly allocated during the canonical-to-engine
+/// move. Existing strings, vectors and JSON payloads keep their prepaid credit.
+fn trace_restoration_bytes(trace: &crate::read_contract::CanonicalQueryTrace) -> Result<usize> {
+    let add = |bytes: usize, count: usize, width: usize| {
+        count
+            .checked_mul(width)
+            .and_then(|n| bytes.checked_add(n))
+            .ok_or_else(|| Error::Other("trace restoration size overflow".into()))
+    };
+    let mut bytes = 0;
+    if trace.predicates_pushed.len() > 4 {
+        bytes = add(
+            bytes,
+            trace.predicates_pushed.len(),
+            std::mem::size_of::<std::borrow::Cow<'static, str>>(),
+        )?;
+    }
+    if trace.indexes_considered.len() > 4 {
+        bytes = add(
+            bytes,
+            trace.indexes_considered.len(),
+            std::mem::size_of::<crate::database::IndexCandidate>(),
+        )?;
+    }
+    if trace.groups.capacity() != trace.groups.len() {
+        bytes = add(
+            bytes,
+            trace.groups.len(),
+            std::mem::size_of::<crate::database::GroupDisclosure>(),
+        )?;
+    }
+    if let Some(vector) = &trace.vector_search {
+        bytes = add(
+            bytes,
+            vector.partition_hnsw.len(),
+            std::mem::size_of::<crate::VectorPartitionHnswDisclosure>(),
+        )?;
+    }
+    if let Some(count) = &trace.maintained_count {
+        bytes = add(
+            bytes,
+            1,
+            std::mem::size_of::<crate::maintained_counts::MaintainedCountDisclosure>(),
+        )?;
+        bytes = add(
+            bytes,
+            count.columns.len(),
+            std::mem::size_of::<(String, contextdb_core::SortDirection)>(),
+        )?;
+        if !count.used && !count.declared {
+            bytes = add(
+                bytes,
+                count.already_declared.len(),
+                std::mem::size_of::<Vec<(String, contextdb_core::SortDirection)>>(),
+            )?;
+            for columns in &count.already_declared {
+                bytes = add(
+                    bytes,
+                    columns.len(),
+                    std::mem::size_of::<(String, contextdb_core::SortDirection)>(),
+                )?;
+            }
+        }
+    }
+    Ok(bytes)
 }
 
 fn restored_query_trace(
@@ -4091,19 +4201,25 @@ fn restored_query_trace(
     Ok(crate::database::QueryTrace {
         physical_plan,
         index_used: canonical.index_used,
-        predicates_pushed: canonical
-            .predicates_pushed
-            .into_iter()
-            .map(std::borrow::Cow::Owned)
-            .collect(),
-        indexes_considered: canonical
-            .indexes_considered
-            .into_iter()
-            .map(|candidate| crate::database::IndexCandidate {
-                name: candidate.name,
-                rejected_reason: std::borrow::Cow::Owned(candidate.rejected_reason),
-            })
-            .collect(),
+        predicates_pushed: {
+            let mut predicates =
+                smallvec::SmallVec::with_capacity(canonical.predicates_pushed.len());
+            for predicate in canonical.predicates_pushed {
+                predicates.push(std::borrow::Cow::Owned(predicate));
+            }
+            predicates
+        },
+        indexes_considered: {
+            let mut candidates =
+                smallvec::SmallVec::with_capacity(canonical.indexes_considered.len());
+            for candidate in canonical.indexes_considered {
+                candidates.push(crate::database::IndexCandidate {
+                    name: candidate.name,
+                    rejected_reason: std::borrow::Cow::Owned(candidate.rejected_reason),
+                });
+            }
+            candidates
+        },
         sort_elided: canonical.sort_elided,
         query_vector_source: canonical.query_vector_source,
         vector_search,
@@ -4349,7 +4465,12 @@ fn decode_observed_page(
     credit.transfer();
     Ok(ObservedCursorPage {
         cancelled: false,
-        page: decoded.page.with_credit(page_credit),
+        page: OwnedCursorPage::from_parts(
+            decoded.page.columns,
+            decoded.page.rows,
+            decoded.page.has_more,
+        )
+        .with_credit(page_credit),
         observation: crate::executor::CursorObservation {
             trace: Arc::new(trace),
             rows_examined,
@@ -4429,7 +4550,10 @@ impl OwnerGroupBaseline {
             .cloned()
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        let ordinals = trace.groups.iter().map(|group| group.ordinal)
+        let ordinals = trace
+            .groups
+            .iter()
+            .map(|group| group.ordinal)
             .collect::<Vec<_>>()
             .into_boxed_slice();
         Ok(Self {
@@ -4518,25 +4642,27 @@ impl OwnerCursorContinuation {
                 .limits
                 .cursor_page_rows
                 .min(self.delivered.max(1) as u64);
-            let reader = crate::direct_file_reader::DirectFileReader::from_owner_snapshot(
+            let reader = crate::direct_file_reader::DirectFileReader::from_owner_snapshot_with_cancellation(
                 &self.path,
                 config,
                 registration,
+                cancellation,
             )
             .map_err(|error| direct_error(&self.path, error))?;
-            let (opened, examined, open_observation) = crate::executor::bounded::with_cursor_open_work(|| {
-                reader.open_cursor_with_cancellation(
-                    &self.sql,
-                    &self.params,
-                    NonZeroUsize::new(
-                        self.delivered
-                            .max(1)
-                            .min(self.config.limits.cursor_page_rows as usize),
+            let (opened, examined, open_observation) =
+                crate::executor::bounded::with_cursor_open_work(|| {
+                    reader.open_cursor_with_cancellation(
+                        &self.sql,
+                        &self.params,
+                        NonZeroUsize::new(
+                            self.delivered
+                                .max(1)
+                                .min(self.config.limits.cursor_page_rows as usize),
+                        )
+                        .unwrap(),
+                        cancellation,
                     )
-                    .unwrap(),
-                    cancellation,
-                )
-            });
+                });
             let opened = match opened {
                 Ok(opened) => opened,
                 Err(error) => {
@@ -4667,16 +4793,26 @@ impl OwnerCursorExecution {
             },
         );
         if fetched.is_err() {
-            let failed = self.continuation.as_mut().unwrap().failed_open_observation.take();
+            let failed = self
+                .continuation
+                .as_mut()
+                .unwrap()
+                .failed_open_observation
+                .take();
             if let Some(observation) = failed {
                 // Alignment is checked before merging or updating the durable
                 // replay baseline. The failed open published no rows.
                 let mut observation = self.merge_replay_groups(observation)?;
-                for (baseline, merged) in self.owner_groups.groups.iter_mut()
-                    .zip(observation.trace.groups.iter()) {
+                for (baseline, merged) in self
+                    .owner_groups
+                    .groups
+                    .iter_mut()
+                    .zip(observation.trace.groups.iter())
+                {
                     baseline.examined_entries = merged.examined_entries;
                 }
-                observation.rows_examined = self.owner_rows_examined
+                observation.rows_examined = self
+                    .owner_rows_examined
                     .checked_add(self.continuation.as_ref().unwrap().discarded_rows_examined)
                     .ok_or_else(|| Error::Other("cursor rows-examined counter overflow".into()))?;
                 // Move the admitted carrier to the outer observation path;
@@ -5429,5 +5565,27 @@ pub(crate) fn owner_read_not_implemented_status() -> OwnerReadStatus {
                 "owner reads are not implemented".to_owned(),
             ),
         ),
+    }
+}
+
+#[cfg(feature = "test-seams")]
+impl ReadSession {
+    /// Use the Database already installed behind this session's execution
+    /// target, preserving its captured root and fallible history capability.
+    #[doc(hidden)]
+    pub fn __with_resident_history_for_test<T>(
+        &self,
+        operation: impl FnOnce(&Database) -> Result<T>,
+    ) -> Result<T> {
+        match self.state.as_ref() {
+            ReadSessionState::LiveDatabase(database) => operation(database.as_ref()),
+            ReadSessionState::DirectFile(reader) => {
+                let target = reader.execution_target();
+                operation(target.resident_history_database_for_test()?)
+            }
+            ReadSessionState::OwnerChannel(_) => Err(Error::PlanError(
+                "owner-channel session has no local installed history database".into(),
+            )),
+        }
     }
 }

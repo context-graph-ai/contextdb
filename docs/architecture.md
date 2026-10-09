@@ -185,6 +185,20 @@ when no platform root exists. The filesystem must support Linux OFD locks. Other
 without a common platform root retain a conservative floor and refuse these operations when
 the inventory cannot be proved complete.
 
+**Holder presence.** A process that owns background work beside a store, and keeps working while
+its `Database` handle is closed, proves it is alive with `persistence::holder_presence::hold`: an
+exclusive Linux OFD lock on one byte of the store's empty `<store>.holders` companion, chosen from
+the work's 16-byte token. The lock lasts as long as the returned guard, independent of any
+`Database` handle, and the kernel releases it when the holder exits for any reason, a kill or a
+crash included; a stopped or suspended process keeps it. `probe` asks whether a token's holder is
+alive without changing a byte or creating the companion, and `wait_released` blocks in the kernel
+until the holder releases or exits, with no polling and no timeout. A filesystem that cannot take
+the lock refuses with `HolderPresenceUnavailable` before anything is written, and so does any
+platform without OFD locks. Holder locks never touch the data file or the `.lock` companion, so
+they neither hide nor impersonate a reader or the writer. Presence reports liveness only: a
+consumer that publishes work under a claim still fences that publication on its own token inside
+the publishing transaction, because a holder can lose its lock without exiting.
+
 Once a file reader has captured its committed image, it publishes an authenticated registration
 for that physical store incarnation and exact storage root for the lifetime of the shared session
 target. A later writer validates the pre-writer registrations before it can allocate or reclaim

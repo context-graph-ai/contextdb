@@ -1,6 +1,7 @@
 pub mod companion;
 pub mod error;
 pub mod find_attribution;
+mod json_read_builder;
 pub mod memory;
 #[doc(hidden)]
 pub mod read_contract;
@@ -11,7 +12,7 @@ pub mod table_meta;
 pub mod traits;
 pub mod types;
 
-pub use companion::store_companion_path;
+pub use companion::{store_companion_path, store_holders_path};
 pub use error::{
     CallbackKind, Error, Result, VectorPartitionDeclarationIssue, VectorPolicyDeclarationIssue,
 };

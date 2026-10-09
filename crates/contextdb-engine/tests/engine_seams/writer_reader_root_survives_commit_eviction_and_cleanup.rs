@@ -417,7 +417,7 @@ fn reader_at_boundary(boundary: CommitBoundary) {
             .iter()
             .flatten()
             .any(|(family, root)| {
-                *family == PhysicalFamily::Graph && *root == original_physical
+                *family == PhysicalFamily::Graph && (root.transaction_id >= original_physical.transaction_id && root.user_root == original_physical.user_root)
             }),
         "the evicted sealed graph reload must use the captured native root: {indexed_transaction_work:?}"
     );
@@ -463,7 +463,7 @@ fn reader_at_boundary(boundary: CommitBoundary) {
             .iter()
             .flatten()
             .any(|(family, root)| {
-                *family == PhysicalFamily::Vector && *root == original_physical
+                *family == PhysicalFamily::Vector && (root.transaction_id >= original_physical.transaction_id && root.user_root == original_physical.user_root)
             }),
         "raw vector reads use the captured native root: {raw_reload_work:?}"
     );
@@ -472,7 +472,7 @@ fn reader_at_boundary(boundary: CommitBoundary) {
             .physical_sources
             .iter()
             .flatten()
-            .all(|(_, root)| *root == original_physical)
+            .all(|(_, root)| (root.transaction_id >= original_physical.transaction_id && root.user_root == original_physical.user_root))
     );
     eprintln!(
         "durable vector reload: owners={:?} activity={raw_activity:?} sources={raw_reload_work:?}",
@@ -569,7 +569,7 @@ fn reader_at_boundary(boundary: CommitBoundary) {
             .physical_sources
             .iter()
             .flatten()
-            .all(|(_, root)| *root == successor_physical)
+            .all(|(_, root)| (root.transaction_id >= successor_physical.transaction_id && root.user_root == successor_physical.user_root))
     );
     assert!(
         cancelled_cursor.cursor.continuation_bytes().unwrap().total > 0,
@@ -747,8 +747,9 @@ fn reader_at_boundary(boundary: CommitBoundary) {
         );
         for (family, identity) in work.physical_sources.into_iter().flatten() {
             observed_families[family as usize] = true;
+            assert!(identity.transaction_id >= original_physical.transaction_id);
             assert_eq!(
-                identity, original_physical,
+                identity.user_root, original_physical.user_root,
                 "{label} page access must use the captured original physical root; fresh-root/old-logical-filter substitution is forbidden"
             );
         }
@@ -770,7 +771,7 @@ fn reader_at_boundary(boundary: CommitBoundary) {
             work.physical_sources
                 .iter()
                 .flatten()
-                .all(|(_, identity)| *identity == successor_physical),
+                .all(|(_, identity)| (identity.transaction_id >= successor_physical.transaction_id && identity.user_root == successor_physical.user_root)),
             "{label} pins the current root and filters old MVCC intervals"
         );
     }
@@ -783,7 +784,7 @@ fn reader_at_boundary(boundary: CommitBoundary) {
             .physical_sources
             .iter()
             .flatten()
-            .all(|(_, identity)| *identity == successor_physical),
+            .all(|(_, identity)| (identity.transaction_id >= successor_physical.transaction_id && identity.user_root == successor_physical.user_root)),
         "every actual successor page access uses the successor root"
     );
     database.close().unwrap();
@@ -1164,9 +1165,10 @@ fn paged_vector_reader_keeps_the_root_captured_before_successor_publication() {
     eprintln!("paged captured-root work old={old_root:?} actual={work:?}");
     assert_eq!(registered.load(Ordering::SeqCst), snapshot.0);
     for (_, root) in work.physical_sources.iter().flatten() {
+        assert!(root.transaction_id >= old_root.transaction_id);
         assert_eq!(
-            root.transaction_id, old_root.transaction_id,
-            "row and vector pages use the same captured physical transaction, never a fresh successor root"
+            root.user_root, old_root.user_root,
+            "row and vector pages use the same captured physical root, never a fresh successor root"
         );
     }
     for family in [

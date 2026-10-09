@@ -6,15 +6,32 @@ use crate::memory_accounting::MemoryAccountant;
 use contextdb_core::Error;
 use contextdb_core::Result;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 struct SourcePageCharge {
-    accountant: Arc<MemoryAccountant>,
+    accountant: Option<Arc<MemoryAccountant>>,
     bytes: usize,
+    own_layout: std::alloc::Layout,
+
+    _writer_use: Option<crate::memory_accounting::WriterUse>,
 }
 
 impl Drop for SourcePageCharge {
     fn drop(&mut self) {
-        self.accountant.release(self.bytes);
+        let Some(accountant) = self.accountant.take() else { return; };
+        accountant.release(self.bytes);
+        if self.own_layout.size() == 0 {
+            drop(self._writer_use.take());
+            return;
+        }
+        let refund = accountant.retain_box_control_refund(self.own_layout.size());
+        // All engine cleanup precedes the narrowly authorized own-Box refund.
+        drop(self._writer_use.take());
+        drop(accountant);
+        refund.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| used.checked_sub(self.own_layout.size()))
+            .expect("source charge control refund is owned");
+        // Remaining fields are empty or Copy; refund's Arc drop runs only std
+        // counter cleanup before std deallocates this uniquely owned Box.
     }
 }
 
@@ -87,19 +104,20 @@ fn with_source_page_admission_for<T>(
     read: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
     let admission = Arc::new(move |bytes: usize| {
-        accountant
-            .try_allocate_for(bytes, "vector_maintenance", operation, hint)
-            .map(|()| {
-                Box::new(SourcePageCharge {
-                    accountant: Arc::clone(&accountant),
-                    bytes,
-                }) as redb::ReadPageCharge
-            })
-            .map_err(|error| redb::StorageError::AdmissionRefused(Box::new(error)))
+        let admit = || -> Result<redb::ReadPageCharge> {
+            accountant.try_allocate_for(bytes, "vector_maintenance", operation, hint)?;
+            let mut charge = SourcePageCharge {
+                _writer_use: crate::memory_accounting::WriterUse::retain_if_writer(&accountant),
+                accountant: Some(Arc::clone(&accountant)), bytes,
+                own_layout: std::alloc::Layout::new::<()>(),
+            };
+            let layout = std::alloc::Layout::for_value(&charge);
+            accountant.admit_box_control(layout.size(), operation, hint)?;
+            charge.own_layout = layout;
+            Ok(Box::new(charge) as redb::ReadPageCharge)
+        };
+        admit().map_err(|error| redb::StorageError::AdmissionRefused(Box::new(error)))
     });
-    // A caller may classify a post-publication refusal as deferred cleanup.
-    // The scoped callback preserves that successful result and restores an
-    // enclosing callback on return or unwind.
     redb::with_read_page_charge_storage(admission, read)
 }
 

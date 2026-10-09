@@ -147,7 +147,12 @@ pub(super) fn is_empty_partitioned_route_in_write(
     write: &redb::WriteTransaction,
     partition: &VectorPartitionRef,
 ) -> Result<bool> {
-    if partition.partition_key.is_unpartitioned() {
+    if partition.partition_key.is_unpartitioned()
+        || RedbPersistence::vector_schema_binding_in_write(write, &partition.index)?
+            == VectorSchemaBinding::UNBOUND
+    {
+        // Undeclared raw generation carriers have no authoritative membership
+        // directory. Only a declared partition can be retired by that directory.
         return Ok(false);
     }
     let key = RedbPersistence::vector_partition_prefix(&partition.index, &partition.partition_key);
@@ -423,6 +428,7 @@ fn encode_summary(key: &[u8], summary: &MembershipSummary) -> Result<Vec<u8>> {
 }
 
 pub(super) fn decode_summary(key: &[u8], bytes: &[u8]) -> Result<MembershipSummary> {
+    let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
     if bytes.len() < MAGIC.len() + 32 || !bytes.starts_with(MAGIC) {
         return Err(corruption(
             "membership summary envelope is missing or truncated",
@@ -1305,4 +1311,41 @@ pub(super) fn partition_live_entries(
 ) -> Result<usize> {
     let summary = read_partition_summary(read, partition)?;
     usize::try_from(summary.live_entries).map_err(|_| corruption("membership live count overflow"))
+}
+
+/// Check one maintained summary against its complete captured source prefix.
+/// The high-water max_tx may exceed the remaining members after retirement.
+pub(super) fn verify_summary_projection(
+    read: &redb::ReadTransaction,
+    prefix: &[u8],
+    encoded: &[u8],
+    owner: &mut contextdb_vector::VectorCopyAdmission,
+    before: &mut dyn FnMut() -> Result<()>,
+) -> Result<()> {
+    before()?;
+    let expected = decode_summary(prefix, encoded)?;
+    let mut actual = MembershipSummary::default();
+    let source = open_optional_read_table(read, SOURCE)?;
+    let mut cursor = source.as_ref().map(|table| table.prefix_bounded(prefix).map_err(metadata_error)).transpose()?;
+    loop {
+        before()?;
+        let Some(item) = cursor.as_mut().and_then(Iterator::next) else { break; };
+        let (key, value) = item.map_err(metadata_error)?;
+        let mut window = owner.scratch();
+        window.reserve(key.value().len().checked_add(value.value().len())
+            .and_then(|n| n.checked_mul(6)).and_then(|n| n.checked_add(std::mem::size_of::<VectorPartitionMembershipRecord>()))
+            .ok_or_else(|| corruption("summary projection window overflow"))?)?;
+        let payload = vector_partition_record_payload(VectorPartitionRecordKind::Membership, value.value())
+            .map_err(|reason| corruption(&reason))?;
+        window.reserve(vector_partition_route_native_capacity(payload).map_err(|reason| corruption(&reason))?
+            .checked_mul(3).ok_or_else(|| corruption("summary route native capacity overflow"))?)?;
+        let record = decode_source_member(key.value(), value.value())?;
+        adjust(&mut actual, key.value(), value.value(), &record, true)?;
+    }
+    if expected.entries != actual.entries || expected.live_entries != actual.live_entries
+        || expected.digest != actual.digest || expected.max_tx < actual.max_tx {
+        return Err(corruption("summary disagrees with its complete captured source projection"));
+    }
+    before()?;
+    Ok(())
 }

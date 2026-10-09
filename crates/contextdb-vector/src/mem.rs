@@ -310,7 +310,7 @@ impl SearchScores {
         self,
         destination: &Arc<dyn MemoryBudget>,
     ) -> Result<(Vec<(RowId, f32)>, ScoreCredit)> {
-        if !Arc::ptr_eq(destination, &self.credit.budget) {
+        if !crate::memory_budget::same_funder(destination.as_ref(), self.credit.budget.as_ref()) {
             return Err(Error::Other(
                 "vector score destination has a different accountant".into(),
             ));
@@ -780,12 +780,35 @@ where
         return compared;
     }
     before_source_entry()?;
+    let historical_stream = match state.historical_partition(owner) {
+        Ok(Some(partition)) => {
+            let mut compared = 0usize;
+            for position in 0..partition.len() {
+                before_source_entry()?;
+                before_candidate()?;
+                if partition.entry(position).is_some_and(|entry|
+                    entry.membership.visible_from.0 <= snapshot.0
+                        && entry.membership.deleted_tx.is_none_or(|tx| tx.0 > snapshot.0)) {
+                    before_distance()?;
+                }
+                if let Some(score) = state.historical_partition_score(&partition, position, snapshot, query).map_err(E::from)? {
+                    compared = compared.checked_add(1).ok_or_else(|| E::from(Error::Other("bounded exact vector count overflow".into())))?;
+                    merge_bounded_vector_score(scores, retained_bytes, score, k,
+                        before_source_entry, before_retain, release_retained)?;
+                }
+            }
+            return Ok(compared);
+        }
+        Ok(None) => false,
+        Err(Error::MemoryBudgetExceeded { .. }) if state.streams_raw_bodies() => true,
+        Err(error) => return Err(E::from(error)),
+    };
     // A partition whose vectors fit is loaded once and compared from memory,
     // which every later find reuses. Only when the memory to hold it is
     // refused does the comparison read the bodies one at a time instead, so a
     // find the reader could not hold is answered rather than refused, and a
     // find it could hold does not re-read every body on every call.
-    let stream = state.streams_raw_bodies()
+    let stream = historical_stream || state.streams_raw_bodies()
         && match state.ensure_raw_vectors_loaded(owner) {
             Ok(()) => false,
             Err(Error::MemoryBudgetExceeded { .. }) => true,
@@ -1105,7 +1128,7 @@ impl OwnedVectorSearchTrace {
         mut self,
         destination: &Arc<dyn MemoryBudget>,
     ) -> Result<(VectorSearchDebugTrace, ScoreCredit)> {
-        if !Arc::ptr_eq(destination, &self.credit.budget) {
+        if !crate::memory_budget::same_funder(destination.as_ref(), self.credit.budget.as_ref()) {
             return Err(Error::Other(
                 "vector trace destination has a different accountant".into(),
             ));
@@ -1158,6 +1181,7 @@ pub struct BoundedBruteForceCursor {
     stream_when_refused: bool,
     /// The current partition is being compared one stored body at a time.
     streaming_source: bool,
+    historical_partition: Option<crate::store::HistoricalRawVectorPartition>,
     membership_cursor: Option<Box<dyn crate::store::RawVectorMembershipCursor>>,
     membership_reserved_bytes: usize,
     pending_membership: Option<(
@@ -2920,6 +2944,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             body_reads: crate::store::RawVectorBodyReads::default(),
             stream_when_refused: false,
             streaming_source: false,
+            historical_partition: None,
             membership_cursor: None,
             membership_reserved_bytes: 0,
             pending_membership: None,
@@ -3077,6 +3102,20 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 )));
             };
             before_source_entry()?;
+            match source.state.historical_partition(owner) {
+                Ok(Some(partition)) => {
+                    cursor.state_end = Some(partition.len());
+                    cursor.streaming_source = false;
+                    cursor.historical_partition = Some(partition);
+                }
+                Ok(None) => {}
+                Err(Error::MemoryBudgetExceeded { .. })
+                    if cursor.stream_when_refused && source.state.streams_raw_bodies() => {
+                    cursor.streaming_source = true;
+                    cursor.state_end = Some(usize::MAX);
+                }
+                Err(error) => return Err(E::from(error)),
+            }
             let durable_streams = source.state.durable_membership_source().is_some()
                 && !source
                     .state
@@ -3137,7 +3176,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 cursor.membership_cursor = Some(opened);
                 cursor.streaming_source = true;
                 cursor.state_end = Some(usize::MAX);
-            } else {
+            } else if cursor.state_end.is_none() {
                 match source.state.ensure_raw_vectors_loaded(owner) {
                     Ok(()) => {
                         cursor.streaming_source = false;
@@ -3155,6 +3194,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             }
         }
         if cursor.position >= cursor.state_end.unwrap_or_default() {
+            cursor.historical_partition.take();
             cursor.source_position = cursor.source_position.checked_add(1).ok_or_else(|| {
                 E::from(Error::Other(
                     "bounded vector partition position overflow".to_string(),
@@ -3293,9 +3333,15 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         // to be read. Visibility is deliberately checked afterwards: dead or
         // future versions still consumed this physical scan step.
         before_exhaustive_candidate()?;
-        let scored = source
-            .state
-            .with_entries(|entries| -> std::result::Result<Option<_>, E> {
+        let scored = if let Some(partition) = cursor.historical_partition.as_ref() {
+            if partition.entry(position).is_some_and(|entry|
+                entry.membership.visible_from.0 <= cursor.snapshot.0
+                    && entry.membership.deleted_tx.is_none_or(|tx| tx.0 > cursor.snapshot.0)) {
+                before_distance()?;
+            }
+            source.state.historical_partition_score(partition, position, cursor.snapshot, &cursor.query).map_err(E::from)?
+        } else {
+            source.state.with_entries(|entries| -> std::result::Result<Option<_>, E> {
                 let entry = entries.get(position).ok_or_else(|| {
                     E::from(Error::ReadFailure(ReadFailure::invalid_continuation(
                         "the candidate this read left off at was removed while it was suspended"
@@ -3312,7 +3358,8 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     entry.row_id,
                     entry.vector.cosine_similarity(&cursor.query),
                 )))
-            })?;
+            })?
+        };
         cursor.position = cursor.position.checked_add(1).ok_or_else(|| {
             E::from(Error::Other(
                 "bounded vector candidate position overflow".to_string(),
@@ -4813,7 +4860,8 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 }) {
                     continue;
                 }
-                if page_scoring.is_none() && candidate.resolved_score.is_none() {
+                let resolved_score = if owner.historical_durable_reads() { None } else { candidate.resolved_score };
+                if !owner.historical_durable_reads() && page_scoring.is_none() && resolved_score.is_none() {
                     *page_scoring = Some(state.sealed_page_scoring(
                         snapshot,
                         query,
@@ -4822,7 +4870,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                         release_retained,
                     )?);
                 }
-                let score = match candidate.resolved_score {
+                let score = match resolved_score {
                     Some(score) => Some(score),
                     None => state.bounded_score_visible_candidate(
                         index,
@@ -4899,7 +4947,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         })
     }
 
-    /// Narrow only when each current route proves snapshot visibility.
+    /// Narrow through the captured reverse and forward membership at this snapshot.
     fn selected_partition_sources(
         &self,
         index: &VectorIndexRef,
@@ -4941,21 +4989,16 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 narrowed = true;
                 for id in candidates.iter() {
                     let row = RowId(id);
-                    let Some(key) = self
-                        .store
-                        .try_current_partition_for_row(index, row, owner)?
-                    else {
+                    let selected = self.store.with_snapshot_visible_partition_for_row(
+                        index, row, snapshot, &mut || Ok::<(), Error>(()),
+                        |key, state, _, owner| {
+                            owner.reserve(key.estimated_bytes())?;
+                            Ok(Some((key.clone(), state.clone())))
+                        }, owner)?;
+                    let Some((key, state)) = selected else {
                         narrowed = false;
                         break;
                     };
-                    let Some(state) = self.store.try_partition_state(index, &key) else {
-                        narrowed = false;
-                        break;
-                    };
-                    if !state.try_directory_has_visible_row(row, snapshot, owner)? {
-                        narrowed = false;
-                        break;
-                    }
                     routes.push(BoundedSnapshotVectorSource {
                         partition_key: key,
                         state,
@@ -5070,6 +5113,29 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 source_has_rows = true;
                 consider(score)
             };
+            match source.state.historical_partition(owner) {
+                Ok(Some(partition)) => {
+                    for position in 0..partition.len() {
+                        if candidates.is_some_and(|candidates|
+                            partition.entry(position).is_none_or(|entry| !candidates.contains(entry.entry.row_id.0))) {
+                            continue;
+                        }
+                        if let Some(score) = source.state.historical_partition_score(&partition, position, snapshot, query)? {
+                            source_consider(score)?;
+                        }
+                    }
+                    partition_count += usize::from(source_has_rows);
+                    continue;
+                }
+                Ok(None) => {}
+                Err(Error::MemoryBudgetExceeded { .. })
+                    if stream_when_refused && source.state.streams_raw_bodies() => {
+                    self.stream_source_bodies(index, source, query, snapshot, candidates, &mut source_consider, owner)?;
+                    partition_count += usize::from(source_has_rows);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
             if source.state.durable_membership_source().is_some()
                 && !source.state.try_cache_durable_bodies(owner)?
             {
@@ -5537,6 +5603,40 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         mode: contextdb_core::VectorSearchMode,
         executing_owner: Arc<dyn MemoryBudget>,
     ) -> Result<(SearchScores, OwnedVectorSearchTrace)> {
+        let route_owner = crate::VectorCopyAdmission::new(executing_owner.clone());
+        self.search_with_mode_route(
+            index, query, k, candidates, (snapshot, mode), (executing_owner, route_owner),
+        )
+    }
+
+    /// Preserve the search ladder while inheriting the executing route's
+    /// durable-read preference and its actual temporary-capacity funder.
+    #[doc(hidden)]
+    pub fn search_with_mode_admission(
+        &self,
+        index: VectorIndexRef,
+        query: &[f32],
+        k: usize,
+        candidates: Option<&RoaringTreemap>,
+        snapshot_mode: (SnapshotId, contextdb_core::VectorSearchMode),
+        owner: &mut crate::VectorCopyAdmission,
+    ) -> Result<(SearchScores, OwnedVectorSearchTrace)> {
+        self.search_with_mode_route(
+            index, query, k, candidates, snapshot_mode, (owner.funder(), owner.scratch()),
+        )
+    }
+
+    fn search_with_mode_route(
+        &self,
+        index: VectorIndexRef,
+        query: &[f32],
+        k: usize,
+        candidates: Option<&RoaringTreemap>,
+        snapshot_mode: (SnapshotId, contextdb_core::VectorSearchMode),
+        owners: (Arc<dyn MemoryBudget>, crate::VectorCopyAdmission),
+    ) -> Result<(SearchScores, OwnedVectorSearchTrace)> {
+        let (snapshot, mode) = snapshot_mode;
+        let (executing_owner, mut route_owner) = owners;
         self.store.with_bulk_read(|| {
             if k == 0 {
                 return Ok((
@@ -5551,7 +5651,6 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     )?,
                 ));
             }
-            let mut route_owner = crate::VectorCopyAdmission::new(executing_owner.clone());
             let layout = self.store.scoped_index_layout(&index, &mut route_owner)?;
             if query.len() != layout.dimension {
                 return Err(Error::VectorIndexDimensionMismatch {

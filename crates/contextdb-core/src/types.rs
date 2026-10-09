@@ -7,6 +7,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
+#[doc(hidden)]
+pub use crate::json_read_builder::{
+    JsonReadAdmissionGuard, deserialize_json_in_read_scope, json_retained_heap_bytes,
+};
+
 pub type NodeId = Uuid;
 pub type EdgeType = String;
 pub type TableName = String;
@@ -304,8 +309,15 @@ mod json_as_string {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<serde_json::Value, D::Error> {
         let s = String::deserialize(de)?;
-        serde_json::from_str::<serde_json::Value>(&s)
-            .map_err(serde::de::Error::custom)
+        if crate::json_read_builder::in_scope() {
+            let result = super::deserialize_json_in_read_scope(&s);
+            // The engine's outer String visitor separately admitted this
+            // serialized input. Return its credit only after native drop.
+            crate::json_read_builder::release_serialized_input(s);
+            result.map_err(serde::de::Error::custom)
+        } else {
+            serde_json::from_str::<serde_json::Value>(&s).map_err(serde::de::Error::custom)
+        }
     }
 }
 
@@ -491,32 +503,7 @@ pub fn estimate_value_key_bytes(key: &str) -> usize {
 /// leaves an operator's limit holding a thirty-second of the documents it
 /// says it will.
 fn json_heap_bytes(value: &serde_json::Value) -> usize {
-    /// One node's own slot: what a `serde_json::Value` occupies inside its
-    /// parent's storage.
-    const NODE: usize = std::mem::size_of::<serde_json::Value>();
-    /// A map entry carries its key's own header beside the value's slot, in a
-    /// tree node that is not densely packed.
-    const MAP_ENTRY: usize = 48;
-    /// The allocator rounds, and a container reserves slots rather than
-    /// filling them exactly.
-    const SLACK: usize = 8;
-
-    match value {
-        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => 0,
-        serde_json::Value::String(text) => text.capacity().saturating_add(SLACK),
-        serde_json::Value::Array(items) => items
-            .capacity()
-            .saturating_mul(NODE)
-            .saturating_add(items.len().saturating_mul(SLACK))
-            .saturating_add(items.iter().fold(0usize, |acc, item| {
-                acc.saturating_add(json_heap_bytes(item))
-            })),
-        serde_json::Value::Object(members) => members.iter().fold(0usize, |acc, (name, member)| {
-            acc.saturating_add(NODE + MAP_ENTRY + SLACK)
-                .saturating_add(name.capacity())
-                .saturating_add(json_heap_bytes(member))
-        }),
-    }
+    json_retained_heap_bytes(value)
 }
 
 impl Value {

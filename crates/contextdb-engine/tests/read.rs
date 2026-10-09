@@ -10,6 +10,9 @@ pub(crate) fn child_test_filter(module_path: &str, fn_name: &str) -> String {
 #[cfg(unix)]
 #[path = "read/a_budget_refusal_is_never_reported_as_a_corrupt_store.rs"]
 mod a_budget_refusal_is_never_reported_as_a_corrupt_store;
+#[cfg(unix)]
+#[path = "read/json_decode_admission_contract.rs"]
+mod json_decode_admission_contract;
 #[path = "read/a_damaged_edge_tombstone_keeps_its_typed_diagnosis.rs"]
 mod a_damaged_edge_tombstone_keeps_its_typed_diagnosis;
 #[path = "read/a_local_drop_leaves_the_remaining_history_readable.rs"]

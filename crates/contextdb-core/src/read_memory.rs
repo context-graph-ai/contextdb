@@ -15,6 +15,13 @@ pub trait ReadMemoryBudget: Debug + Send + Sync {
         hint: &'static str,
     ) -> Result<()>;
     fn release(&self, bytes: usize);
+
+    /// Test observations name a forwarding capability's actual funder.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    fn funding_owner_for_test(&self) -> Option<&Arc<dyn ReadMemoryBudget>> {
+        None
+    }
 }
 
 /// A charge moves with its allocation and returns exactly once. Owners place
@@ -29,6 +36,14 @@ pub struct ReadCredit {
 impl ReadCredit {
     pub fn new(budget: Arc<dyn ReadMemoryBudget>) -> Self {
         Self { budget, bytes: 0 }
+    }
+
+    /// Adopt funding already held by this exact budget capability. The
+    /// transferring owner removes these bytes without releasing them first.
+    /// This constructor neither reserves nor refunds nor allocates.
+    #[doc(hidden)]
+    pub fn from_prepaid(budget: Arc<dyn ReadMemoryBudget>, bytes: usize) -> Self {
+        Self { budget, bytes }
     }
 
     pub fn bytes(&self) -> usize {
@@ -62,9 +77,31 @@ impl ReadCredit {
     }
 
     pub fn try_split_off(&mut self, bytes: usize) -> Result<Self> {
-        self.bytes = self.bytes.checked_sub(bytes)
+        self.bytes = self
+            .bytes
+            .checked_sub(bytes)
             .ok_or_else(|| crate::Error::Other("reader split exceeds credit".into()))?;
-        Ok(Self { budget: self.budget.clone(), bytes })
+        Ok(Self {
+            budget: self.budget.clone(),
+            bytes,
+        })
+    }
+
+    /// Combine a producer's already admitted charge from this exact capability.
+    #[doc(hidden)]
+    pub fn try_merge_prepaid(&mut self, mut producer: Self) -> Result<()> {
+        if !Arc::ptr_eq(&self.budget, &producer.budget) {
+            return Err(crate::Error::Other(
+                "reader prepaid merge has a different capability".into(),
+            ));
+        }
+        let bytes = self
+            .bytes
+            .checked_add(producer.bytes)
+            .ok_or_else(|| crate::Error::Other("reader prepaid merge overflow".into()))?;
+        self.bytes = bytes;
+        producer.bytes = 0;
+        Ok(())
     }
 
     pub fn transfer(mut self) {

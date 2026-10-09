@@ -101,8 +101,7 @@ pub use framing::{
 pub(crate) use framing::{
     decode_read_error_under_memory_ceiling, observed_cursor_page_allocation_bytes,
     preflight_canonical_query_result, preflight_cursor_page_payload,
-    preflight_metadata_page_payload, preflight_observed_cursor_page_payload,
-    query_result_allocation_bytes, response_is_encodable,
+    preflight_metadata_page_payload, preflight_observed_cursor_page_payload, response_is_encodable,
 };
 pub use runtime::RuntimeDirectory;
 #[cfg(target_os = "linux")]

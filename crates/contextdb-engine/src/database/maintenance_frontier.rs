@@ -64,7 +64,7 @@ impl<'a> MaintenanceFrontier<'a> {
                 crate::persistence::writer_source::SourceWindowOwner::Read(read_memory) => {
                     WriterRelationalSource::new_for_read(root, read_memory.clone())
                 }
-                crate::persistence::writer_source::SourceWindowOwner::Write(accountant) => {
+                crate::persistence::writer_source::SourceWindowOwner::Write(accountant, _) => {
                     WriterRelationalSource::new_for_write(root, accountant.clone())
                 }
             })

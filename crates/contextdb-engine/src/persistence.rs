@@ -4,21 +4,83 @@
 #![allow(clippy::too_many_arguments)] // Existing compatibility and test seam shape.
 #![allow(clippy::type_complexity)] // Existing compatibility and test seam shape.
 #![allow(dead_code)] // Existing compatibility and test seam shape.
+#[cfg(any(test, feature = "test-seams"))]
+fn observed_graph_storage_key<K: AsRef<[u8]>>(
+    family: &str,
+    operation: &str,
+    key: K,
+    boundary: u8,
+) -> Result<K> {
+    graph_observation_checkpoint(boundary)?;
+    Ok(crate::read_work_probe::graph_storage_key(
+        family, operation, key,
+    ))
+}
+#[cfg(any(test, feature = "test-seams"))]
+macro_rules! observed_graph_key {
+    ("commit_index", "get", $key:expr, $role:expr) => {{
+        let key: u64 = $key;
+        crate::read_work_probe::note_graph(
+            "commit_index",
+            "get",
+            &key.to_be_bytes(),
+            Some(key),
+            Some($role),
+        );
+        key
+    }};
+    ($family:expr, $operation:expr, $key:expr, $boundary:expr) => {
+        observed_graph_storage_key($family, $operation, $key, $boundary)?
+    };
+    ($family:expr, "get", $key:expr) => {
+        crate::read_work_probe::graph_storage_key($family, "get", $key)
+    };
+    ($family:expr, $operation:expr, $key:expr) => {{
+        if matches!($operation, "insert" | "remove") {
+            let boundary = match $family {
+                "graph_fwd" | "graph_rev" => 5,
+                "graph_lifecycle" => 6,
+                "graph_location" => 7,
+                "history" => 8,
+                _ => 4,
+            };
+            retention_reclaim_checkpoint_for_test(boundary);
+        }
+        crate::read_work_probe::graph_storage_key($family, $operation, $key)
+    }};
+}
+#[cfg(not(any(test, feature = "test-seams")))]
+macro_rules! observed_graph_key {
+    ($family:expr, $operation:expr, $key:expr, $boundary:expr) => {
+        $key
+    };
+    ($family:expr, $operation:expr, $key:expr) => {
+        $key
+    };
+}
 pub(crate) mod content_identity;
 pub(crate) mod content_size;
+mod graph_history_read;
+mod graph_history_record;
+mod graph_history_writer;
+pub(crate) mod graph_read;
+pub mod holder_presence;
 pub(crate) mod purge_publication;
+pub(crate) mod read_commit_directory;
 #[cfg(target_os = "linux")]
 mod reader_presence;
+mod relational_version_manifest;
 #[cfg(feature = "test-seams")]
 mod resident_history_test_seams;
+mod schema_binding;
 mod transaction_repair;
 pub(crate) mod vector_identity_range;
 mod vector_membership_pages;
 pub(crate) mod vector_membership_source;
 pub(crate) mod vector_paged;
 mod vector_saved;
-mod schema_binding;
 pub(crate) use schema_binding::VectorSchemaBinding;
+mod history_root_witness;
 #[cfg(test)]
 mod vector_streamed_frame_tests;
 pub(crate) mod writer_adapters;
@@ -546,7 +608,12 @@ impl DurableRelationalIndexKey {
     }
 
     fn decode(&self) -> Result<RelationalIndexPosition> {
-        RedbPersistence::decode::<EncodedRelationalIndexPosition>(&self.0).map(Into::into)
+        let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
+        let position = RedbPersistence::decode::<EncodedRelationalIndexPosition>(&self.0)?;
+        crate::read_image_memory::reserve(
+            position.key.len().saturating_mul(std::mem::size_of::<DirectedValue>()),
+        )?;
+        Ok(position.into())
     }
 
     /// The only decode a stored posting key is allowed to go through.
@@ -560,18 +627,32 @@ impl DurableRelationalIndexKey {
     /// store wrote. Both are reported as corruption before the posting can
     /// order, compare, advance a cursor or reach an answer.
     fn decode_canonical(&self) -> Result<RelationalIndexPosition> {
+        let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
         let position = RedbPersistence::decode_exact::<EncodedRelationalIndexPosition>(&self.0)
             .map_err(|error| {
-                Error::Other(format!(
-                    "durable index position is not an exactly decodable key: {error}"
-                ))
+                match error {
+                    Error::Other(reason) => Error::Other(format!(
+                        "durable index position is not an exactly decodable key: {reason}"
+                    )),
+                    other => other,
+                }
             })?;
-        let canonical = RedbPersistence::encode(&position)?;
+        // Count without allocating, then fund an exact buffer before re-encoding.
+        let mut size = bincode::enc::write::SizeWriter::default();
+        bincode::serde::encode_into_writer(&position, &mut size, bincode::config::standard())
+            .map_err(|error| Error::Other(format!("bincode encode error: {error}")))?;
+        crate::read_image_memory::reserve(size.bytes_written)?;
+        let mut canonical = vec![0; size.bytes_written];
+        bincode::serde::encode_into_slice(&position, &mut canonical, bincode::config::standard())
+            .map_err(|error| Error::Other(format!("bincode encode error: {error}")))?;
         if canonical != self.0 {
             return Err(Error::Other(
                 "durable index position is not canonically encoded".to_owned(),
             ));
         }
+        crate::read_image_memory::reserve(
+            position.key.len().saturating_mul(std::mem::size_of::<DirectedValue>()),
+        )?;
         Ok(position.into())
     }
 }
@@ -1758,14 +1839,15 @@ pub(crate) struct SinkQueueExtent {
 }
 
 /// What a page-on-demand open keeps of history instead of the history
-/// itself: the maxima the open needs, and the deleted graph edges whose
-/// tombstones are cross-checked against the commit index when history is
-/// first read.
+/// itself: the authenticated maxima the open needs. Graph versions remain
+/// in the pinned root and are validated by the querying operation.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ReadHistoryOnRequest {
+    open_control: Option<content_identity::ValidatedHistoryOpenControl>,
     pub(crate) commit_index_last: Option<(Lsn, TxId)>,
+    pub(crate) commit_index_first: Option<(Lsn, TxId)>,
+    pub(crate) commit_index_count: usize,
     pub(crate) ddl_last_lsn: Option<Lsn>,
-    pub(crate) deleted_edges: Vec<AdjEntry>,
 }
 
 /// History read from the retained snapshot on request, with the charge that
@@ -1773,16 +1855,59 @@ pub(crate) struct ReadHistoryOnRequest {
 pub(crate) struct LoadedReadHistory {
     pub(crate) change_log: Vec<ChangeLogEntry>,
     pub(crate) ddl_log: Vec<(Lsn, DdlChange)>,
-    pub(crate) commit_index: BTreeMap<Lsn, TxId>,
     pub(crate) charge: ReadHistoryCharge,
 }
 
-/// What a loaded history holds against the session's memory limit: the slots
+/// What a loaded history holds against the operation's memory limit: the slots
 /// its collections keep, and every allocation its records were decoded into,
 /// admitted as each was made. Both are given back when this is dropped.
 pub(crate) struct ReadHistoryCharge {
-    _slots: crate::memory_accounting::OwnedMemoryReservation,
+    _slots: contextdb_core::read_memory::ReadCredit,
     _decoded: Arc<crate::read_image_memory::ImageMemory>,
+}
+
+/// An operation-funded proof pool grows only as the authenticated walk needs
+/// room. A refused growth keeps its original typed diagnosis.
+struct ReadHistoryProofOwner {
+    credit: parking_lot::Mutex<contextdb_core::read_memory::ReadCredit>,
+    refusal: parking_lot::Mutex<Option<Error>>,
+}
+
+impl ReadHistoryProofOwner {
+    fn new(memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>) -> Result<Arc<Self>> {
+        let control = contextdb_core::read_memory::ReadCredit::try_new(
+            memory,
+            std::mem::size_of::<Self>() + 2 * std::mem::size_of::<usize>(),
+            "reader",
+            "history_proof_controls",
+            "Reduce the requested history or raise the declared reader memory limit.",
+        )?;
+        Ok(Arc::new(Self {
+            credit: parking_lot::Mutex::new(control),
+            refusal: parking_lot::Mutex::new(None),
+        }))
+    }
+}
+
+impl content_identity::ProofPoolGrowth for ReadHistoryProofOwner {
+    fn grow(&self, bytes: usize) -> bool {
+        match self.credit.lock().try_grow_for(
+            bytes,
+            "reader",
+            "authenticated_history_range",
+            "Reduce the requested history or raise the declared reader memory limit.",
+        ) {
+            Ok(()) => true,
+            Err(error) => {
+                *self.refusal.lock() = Some(error);
+                false
+            }
+        }
+    }
+
+    fn ceiling(&self) -> usize {
+        READ_HISTORY_PROOF_POOL_BYTES
+    }
 }
 
 /// The most one history walk may hold to prove its committed range: the
@@ -1790,12 +1915,12 @@ pub(crate) struct ReadHistoryCharge {
 const READ_HISTORY_PROOF_POOL_BYTES: usize = 4 * 1024 * 1024;
 
 pub(crate) struct ReadPersistenceImage {
+    open_context: crate::executor::bounded::ReadOpenContext,
     content_identity: DirectTypedImageDigest,
     table_meta: HashMap<String, TableMeta>,
     relational_tables: HashMap<String, Vec<VersionedRow>>,
     lazy_relational: bool,
-    forward_edges: Vec<AdjEntry>,
-    reverse_edges: Vec<AdjEntry>,
+    read_bounds: WriterRecoveryBounds,
     vector_entries: Vec<VectorEntry>,
     /// Checksummed placement and visibility identities for lazy raw-vector
     /// point loads. Empty on the complete-hydration fallback.
@@ -1841,12 +1966,12 @@ pub(crate) struct ReadPersistenceImage {
 /// registered storage root.
 #[allow(dead_code)]
 pub(crate) struct ReadPersistenceImageParts {
+    pub(crate) open_context: crate::executor::bounded::ReadOpenContext,
     pub(crate) content_identity: DirectTypedImageDigest,
     pub(crate) table_meta: HashMap<String, TableMeta>,
     pub(crate) relational_tables: HashMap<String, Vec<VersionedRow>>,
     pub(crate) lazy_relational: bool,
-    pub(crate) forward_edges: Vec<AdjEntry>,
-    pub(crate) reverse_edges: Vec<AdjEntry>,
+    pub(crate) read_bounds: WriterRecoveryBounds,
     pub(crate) vector_entries: Vec<VectorEntry>,
     pub(crate) raw_vector_memberships: Vec<VectorPartitionMembershipRecord>,
     pub(crate) current_vectors: HashMap<(VectorIndexRef, RowId), Vec<f32>>,
@@ -1895,13 +2020,28 @@ impl ReadPersistenceImage {
         // History an open leaves in the store, read through the same
         // admitted, authenticated on-request path a reader uses.
         if self.history_on_request.is_some() {
+            let checkpoint = || self.open_context.checkpoint();
+            let read_memory = self.open_context.read_memory();
             let history = retained_source.load_history(
                 &Arc::new(crate::memory_accounting::MemoryAccountant::no_limit()),
-                &|| Ok(()),
+                &checkpoint,
+                read_memory.clone(),
             )?;
             self.change_log = history.change_log;
             self.ddl_log = history.ddl_log;
-            self.commit_index = history.commit_index;
+            let mut lower = std::ops::Bound::Unbounded;
+            self.commit_index.clear();
+            while let Some((lsn, tx)) =
+                retained_source.commit_entry_from(lower, false, read_memory.clone(), &checkpoint)?
+            {
+                self.memory.reserve(
+                    2 * (11 * std::mem::size_of::<(Lsn, TxId)>()
+                        + 16 * std::mem::size_of::<usize>()
+                        + crate::sync_types::held::ALLOCATION_BYTES),
+                )?;
+                self.commit_index.insert(lsn, tx);
+                lower = std::ops::Bound::Excluded(lsn);
+            }
         }
         if self.lazy_relational {
             let (tables, vector_entries, current_vectors) = retained_source
@@ -1937,13 +2077,13 @@ impl ReadPersistenceImage {
         retained_source: Arc<RetainedReadSource>,
     ) -> ReadPersistenceImageParts {
         ReadPersistenceImageParts {
+            open_context: self.open_context,
             content_identity: self.content_identity,
             memory: self.memory,
             table_meta: self.table_meta,
             relational_tables: self.relational_tables,
             lazy_relational: self.lazy_relational,
-            forward_edges: self.forward_edges,
-            reverse_edges: self.reverse_edges,
+            read_bounds: self.read_bounds,
             vector_entries: self.vector_entries,
             raw_vector_memberships: self.raw_vector_memberships,
             current_vectors: self.current_vectors,
@@ -2172,7 +2312,11 @@ impl LoadReadImageError {
                 budget_limit_bytes,
                 hint,
             },
-            Self::Memory(error) => DirectFileReaderError::Engine(error.to_string()),
+            Self::Memory(Error::ReadCancelled) => DirectFileReaderError::Cancelled,
+            Self::Memory(Error::ReadFailure(failure)) => {
+                DirectFileReaderError::ReadFailure(failure)
+            }
+            Self::Memory(error) => crate::read_image::history_answer_error(error),
             Self::Corrupt {
                 cause: ReadImageCorruptionCause::MalformedRecord,
                 ..
@@ -2236,12 +2380,9 @@ impl LoadReadImageError {
     }
 }
 
-/// Sole persistence entry point for direct-file hydration. Its implementation
-/// must create the runtime breadcrumb, acquire a real `redb::ReadOnlyDatabase`
-/// over the retained descriptor, decode one complete committed image, retain
-/// that exact database/root for later bounded reads, release load-only
-/// protection, and remove the load breadcrumb. The test adapter below
-/// delegates only to this function and never supplies a decoder fallback.
+/// Test adapters resolve the established session limits and clock here;
+/// production callers must supply their active open context.
+#[cfg(any(test, feature = "test-seams"))]
 #[allow(dead_code)]
 pub(crate) fn load_read_image(
     path: &Path,
@@ -2249,27 +2390,36 @@ pub(crate) fn load_read_image(
     load_read_image_with_memory(path, None)
 }
 
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn load_read_image_with_memory(
     path: &Path,
     limit: Option<usize>,
 ) -> std::result::Result<ReadPersistenceLoad, LoadReadImageError> {
-    load_read_image_with_memory_in_runtime_dir(path, limit, None)
+    let limits = crate::read_session::ReadSessionOptions::default().limits;
+    let declared = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(limits.memory);
+    let open_context = crate::executor::bounded::ReadOpenContext::new(
+        declared.child().map_err(LoadReadImageError::Memory)?,
+        limits,
+        crate::read_session::read_clock(),
+        OwnerReadCancellation::new(),
+    )
+    .map_err(LoadReadImageError::Memory)?;
+    load_read_image_at_registration_with_context(path, limit, None, None, open_context)
 }
 
-pub(crate) fn load_read_image_with_memory_in_runtime_dir(
-    path: &Path,
-    limit: Option<usize>,
-    runtime_dir: Option<&Path>,
-) -> std::result::Result<ReadPersistenceLoad, LoadReadImageError> {
-    load_read_image_at_registration(path, limit, runtime_dir, None)
-}
-
-pub(crate) fn load_read_image_at_registration(
+/// Production hydration retains the supplied active context through target
+/// construction. Storage pages use its existing declared reader child.
+pub(crate) fn load_read_image_at_registration_with_context(
     path: &Path,
     limit: Option<usize>,
     runtime_dir: Option<&Path>,
     registration: Option<ReadSnapshotRegistrationGuard>,
+    open_context: crate::executor::bounded::ReadOpenContext,
 ) -> std::result::Result<ReadPersistenceLoad, LoadReadImageError> {
+    open_context
+        .checkpoint()
+        .map_err(LoadReadImageError::Memory)?;
+    let read_memory = open_context.read_memory();
     let memory = crate::read_image_memory::ImageMemory::new(limit);
     // The persistence cache coexists with decoded records and later lazy page
     // reads. Admit its fixed ceiling before Redb opens and retain that charge
@@ -2277,15 +2427,36 @@ pub(crate) fn load_read_image_at_registration(
     let cache_bytes = redb_cache_bytes_for_limit(limit);
     let source_bytes = cache_bytes
         .saturating_add(64 * 1024)
-        .saturating_add(content_identity::READ_VERIFIER_MEMORY_BYTES);
+        .saturating_add(content_identity::READ_VERIFIER_MEMORY_BYTES)
+        .saturating_add(std::mem::size_of::<Lsn>())
+        .saturating_add(std::mem::size_of::<
+            content_identity::ValidatedHistoryOpenControl,
+        >());
     let source_memory = SourceMemoryReservation::new(memory.clone(), source_bytes)
         .map_err(LoadReadImageError::Memory)?;
     let result = memory.scope(|| {
         let mut source =
             ReadImageSource::start(path, cache_bytes, source_memory, runtime_dir, registration)?;
-        let image = source
-            .with_read_transaction(|tx| decode_complete_read_image(tx, path, memory.clone()))?;
-        source.finish(image)
+        open_context
+            .checkpoint()
+            .map_err(LoadReadImageError::Memory)?;
+        let image = graph_read::with_pages_result(
+            read_memory.clone(),
+            || {
+                source.with_read_transaction(|tx| {
+                    decode_complete_read_image(tx, path, memory.clone(), open_context.clone())
+                })
+            },
+            LoadReadImageError::Memory,
+        )?;
+        open_context
+            .checkpoint()
+            .map_err(LoadReadImageError::Memory)?;
+        graph_read::with_pages_result(
+            read_memory,
+            || source.finish(image),
+            LoadReadImageError::Memory,
+        )
     });
     if let Some(error) = memory.take_failure() {
         return Err(LoadReadImageError::Memory(error));
@@ -3063,7 +3234,14 @@ impl ReaderBreadcrumbGuard {
         &self.path
     }
 
-    fn release(mut self) -> std::io::Result<PathBuf> {
+    /// No caller may read through the handoff after this release begins.
+    /// Removal and unlock signal departure; a failed handoff closes its
+    /// retained handles before the breadcrumb descriptor itself is closed.
+    fn release<T>(
+        mut self,
+        retained: T,
+        on_handoff_settled: impl FnOnce(),
+    ) -> std::io::Result<(PathBuf, T)> {
         let removal = match std::fs::symlink_metadata(&self.path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error),
@@ -3074,18 +3252,24 @@ impl ReaderBreadcrumbGuard {
                 "reader breadcrumb path no longer names the published inode",
             )),
         };
-        let unlock = if let Some(file) = self.file.take() {
-            let result = fs2::FileExt::unlock(&file);
-            drop(file);
-            result
+        let unlock = if let Some(file) = self.file.as_ref() {
+            fs2::FileExt::unlock(file)
         } else {
             Ok(())
         };
-        removal?;
-        unlock?;
+        // Preserve removal-first error precedence without closing the
+        // descriptor until a failed retained handoff has released its handles.
+        if let Err(error) = removal.and(unlock) {
+            drop(retained);
+            on_handoff_settled();
+            drop(self.file.take());
+            return Err(error);
+        }
+        on_handoff_settled();
+        drop(self.file.take());
         remove_empty_breadcrumb_directories(&self.path);
         self.removed = true;
-        Ok(self.path.clone())
+        Ok((self.path.clone(), retained))
     }
 }
 
@@ -5025,24 +5209,39 @@ struct ReadImageSource {
     /// reader gives about disk usage is the same measurement of the same file
     /// a writer gives.
     store_file_bytes: Option<u64>,
-    source_memory: Option<SourceMemoryReservation>,
+    // This final field keeps the one admitted charge alive until every
+    // hydration handle, hold and breadcrumb descriptor above has closed.
+    source_memory: Option<Arc<SourceMemoryReservation>>,
+    #[cfg(feature = "test-seams")]
+    source_handles_dropped_for_test: bool,
+    #[cfg(feature = "test-seams")]
+    source_released_for_test: bool,
 }
 
 struct SourceMemoryReservation {
     memory: Arc<crate::read_image_memory::ImageMemory>,
-    bytes: usize,
+    bytes: std::sync::atomic::AtomicUsize,
 }
 
 impl SourceMemoryReservation {
     fn new(memory: Arc<crate::read_image_memory::ImageMemory>, bytes: usize) -> Result<Self> {
         memory.reserve(bytes)?;
-        Ok(Self { memory, bytes })
+        Ok(Self { memory, bytes: std::sync::atomic::AtomicUsize::new(bytes) })
     }
+    fn detach_control(&self, bytes: usize) -> Result<crate::memory_accounting::ControlCredit> {
+        self.bytes.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| held.checked_sub(bytes))
+            .map_err(|_| Error::Other("source control exceeds its existing fixed reservation".into()))?;
+        match self.memory.detach_direct_source_credit(bytes) {
+            Ok(credit) => Ok(credit),
+            Err(error) => { self.bytes.fetch_add(bytes, Ordering::SeqCst); Err(error) }
+        }
+    }
+
 }
 
 impl Drop for SourceMemoryReservation {
     fn drop(&mut self) {
-        self.memory.release(self.bytes);
+        self.memory.release(self.bytes.load(Ordering::SeqCst));
     }
 }
 
@@ -5056,15 +5255,22 @@ pub(crate) struct RetainedReadSource {
     snapshot: redb::StorageSnapshotIdentity,
     /// Authenticated committed transaction frontier of this exact pinned root.
     logical_frontier: SnapshotId,
+    graph_lsn_frontier: Lsn,
+    graph_retirement_frontier: u64,
+    graph_occurrence_id_floor: u64,
     registration: Arc<ReadSnapshotRegistrationGuard>,
     content_identity: content_identity::ContentIdentityReadVerifier,
+    history_open_control: content_identity::ValidatedHistoryOpenControl,
+    /// The existing reader child that admitted this exact source capture.
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     /// Pages proved under this source's pinned root, shared by row and exact
     /// vector-body reads; retained bytes remain charged to the read session.
     content_proof: Mutex<content_identity::ReadAuthenticationNodes>,
     physical_rows: Mutex<Option<RetainedPhysicalRowScan>>,
     image_config_cache: Mutex<HashMap<String, Option<Vec<u8>>>>,
     verified_ordered_runs: VerifiedOrderedRunCache,
-    _source_memory: SourceMemoryReservation,
+    _source_memory: Arc<SourceMemoryReservation>,
+    _own_control: crate::memory_accounting::ControlCredit,
 }
 
 /// The most proof pages one statement's open body read keeps between the
@@ -5149,6 +5355,68 @@ impl WritableRawVectorBodyScan {
         quantization: VectorQuantization,
         membership_authenticated: bool,
     ) -> Result<VectorEntry> {
+        self.read_partition_body_before(
+            index,
+            partition_key,
+            identity,
+            expected_dimension,
+            quantization,
+            membership_authenticated,
+            &mut || Ok(()),
+        )
+    }
+    pub(crate) fn read_partition_body_before(
+        &mut self,
+        index: &VectorIndexRef,
+        partition_key: &VectorPartitionKey,
+        identity: &RawVectorDirectoryEntry,
+        expected_dimension: usize,
+        quantization: VectorQuantization,
+        membership_authenticated: bool,
+        before: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<VectorEntry> {
+        let owner = vector_membership_source::MembershipOwner::Writable(self.source.clone());
+        let historical_memory =
+            vector_membership_source::historical_operation_memory(&owner, &self._transaction)?;
+        let mut body = || {
+            let mut checkpoint = || {
+                vector_membership_source::operation_checkpoint()?;
+                before()
+            };
+            let before: &mut dyn FnMut() -> Result<()> = &mut checkpoint;
+            vector_membership_source::authenticate_body_schema(
+                &owner,
+                &self._transaction,
+                index,
+                expected_dimension,
+                quantization,
+            )?;
+            self.read_partition_body_in_capture(
+                index,
+                partition_key,
+                identity,
+                expected_dimension,
+                quantization,
+                membership_authenticated,
+                before,
+            )
+        };
+        match historical_memory {
+            Some(memory) => graph_read::with_pages(memory, body),
+            None => body(),
+        }
+    }
+    fn read_partition_body_in_capture(
+        &mut self,
+        index: &VectorIndexRef,
+        partition_key: &VectorPartitionKey,
+        identity: &RawVectorDirectoryEntry,
+        expected_dimension: usize,
+        quantization: VectorQuantization,
+        membership_authenticated: bool,
+        before: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<VectorEntry> {
+        before()?;
         let source = &self.source;
         if let Some(root) = self
             ._root
@@ -5174,6 +5442,7 @@ impl WritableRawVectorBodyScan {
                 .range(row_prefix.as_slice()..)
                 .map_err(vector_membership_pages::metadata_error)?
             {
+                vector_membership_source::operation_checkpoint()?;
                 let (key, value) = item.map_err(vector_membership_pages::metadata_error)?;
                 if !key.value().starts_with(&row_prefix) {
                     break;
@@ -5201,6 +5470,11 @@ impl WritableRawVectorBodyScan {
                 saw_vector_identity = true;
                 if membership.deleted_tx != identity.deleted_tx {
                     continue;
+                }
+                if vector_membership_source::body_identity_for_record(&membership) != *identity {
+                    return Err(vector_membership_source::damage(
+                        "candidate provenance differs from its captured membership",
+                    ));
                 }
                 if membership.visible_from
                     < TxId(
@@ -5294,7 +5568,44 @@ impl WritableRawVectorBodyScan {
                 entry.vector.len()
             )));
         }
-        if !self.producer_body_root {
+        let owner = vector_membership_source::MembershipOwner::Writable(self.source.clone());
+        let historical_memory =
+            vector_membership_source::historical_operation_memory(&owner, &self._transaction)?;
+        if let Some(memory) = historical_memory {
+            let _controls = contextdb_core::read_memory::ReadCredit::try_new(
+                memory.clone(),
+                std::mem::size_of::<content_identity::ContentIdentityReadVerifier>()
+                    .checked_add(std::mem::size_of::<content_identity::ContentIdentityMutation>())
+                    .and_then(|n| n.checked_add(entry.vector.len().checked_mul(4)?))
+                    .and_then(|n| n.checked_add(8 + 32 + 256))
+                    .ok_or_else(|| {
+                        vector_membership_source::damage(
+                            "historical vector proof capacity overflow",
+                        )
+                    })?,
+                "reader",
+                "historical_vector_body_proof",
+                "Raise the declared reader memory limit.",
+            )?;
+            let verifier = content_identity::ContentIdentityReadVerifier::open(
+                &self._transaction,
+                Path::new("historical vector body"),
+                None,
+            )?;
+            verifier.verify_with_read_memory_before(
+                &content_identity::decoded_vector_version_mutation(&entry, quantization),
+                memory,
+                before,
+            )?;
+            vector_membership_source::authenticate_owning_row(
+                &owner,
+                &self._transaction,
+                index,
+                identity,
+                Some(entry.deleted_tx),
+                before,
+            )?;
+        } else if !self.producer_body_root {
             self.verifier.verify_with_nodes(
                 &mut self.proof,
                 &content_identity::decoded_vector_version_mutation(&entry, quantization),
@@ -5306,6 +5617,7 @@ impl WritableRawVectorBodyScan {
                 )?;
             }
         }
+        before()?;
         entry.deleted_tx = identity.deleted_tx;
         Ok(entry)
     }
@@ -5344,6 +5656,68 @@ impl RetainedRawVectorBodyScan {
         quantization: VectorQuantization,
         membership_authenticated: bool,
     ) -> Result<VectorEntry> {
+        self.read_partition_body_before(
+            index,
+            partition_key,
+            identity,
+            expected_dimension,
+            quantization,
+            membership_authenticated,
+            &mut || Ok(()),
+        )
+    }
+    pub(crate) fn read_partition_body_before(
+        &mut self,
+        index: &VectorIndexRef,
+        partition_key: &VectorPartitionKey,
+        identity: &RawVectorDirectoryEntry,
+        expected_dimension: usize,
+        quantization: VectorQuantization,
+        membership_authenticated: bool,
+        before: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<VectorEntry> {
+        let owner = vector_membership_source::MembershipOwner::Retained(self.source.clone());
+        let historical_memory =
+            vector_membership_source::historical_operation_memory(&owner, &self._transaction)?;
+        let mut body = || {
+            let mut checkpoint = || {
+                vector_membership_source::operation_checkpoint()?;
+                before()
+            };
+            let before: &mut dyn FnMut() -> Result<()> = &mut checkpoint;
+            vector_membership_source::authenticate_body_schema(
+                &owner,
+                &self._transaction,
+                index,
+                expected_dimension,
+                quantization,
+            )?;
+            self.read_partition_body_in_capture(
+                index,
+                partition_key,
+                identity,
+                expected_dimension,
+                quantization,
+                membership_authenticated,
+                before,
+            )
+        };
+        match historical_memory {
+            Some(memory) => graph_read::with_pages(memory, body),
+            None => body(),
+        }
+    }
+    fn read_partition_body_in_capture(
+        &mut self,
+        index: &VectorIndexRef,
+        partition_key: &VectorPartitionKey,
+        identity: &RawVectorDirectoryEntry,
+        expected_dimension: usize,
+        quantization: VectorQuantization,
+        membership_authenticated: bool,
+        before: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<VectorEntry> {
+        before()?;
         let source = &self.source;
         if !membership_authenticated {
             let memberships = self.memberships.as_ref().ok_or_else(|| {
@@ -5359,7 +5733,44 @@ impl RetainedRawVectorBodyScan {
         })?;
         let mut entry =
             source.raw_vector_candidate_body(vectors, index, identity, expected_dimension)?;
-        if !self.producer_body_root {
+        let owner = vector_membership_source::MembershipOwner::Retained(self.source.clone());
+        let historical_memory =
+            vector_membership_source::historical_operation_memory(&owner, &self._transaction)?;
+        if let Some(memory) = historical_memory {
+            let _controls = contextdb_core::read_memory::ReadCredit::try_new(
+                memory.clone(),
+                std::mem::size_of::<content_identity::ContentIdentityReadVerifier>()
+                    .checked_add(std::mem::size_of::<content_identity::ContentIdentityMutation>())
+                    .and_then(|n| n.checked_add(entry.vector.len().checked_mul(4)?))
+                    .and_then(|n| n.checked_add(8 + 32 + 256))
+                    .ok_or_else(|| {
+                        vector_membership_source::damage(
+                            "historical vector proof capacity overflow",
+                        )
+                    })?,
+                "reader",
+                "historical_vector_body_proof",
+                "Raise the declared reader memory limit.",
+            )?;
+            let verifier = content_identity::ContentIdentityReadVerifier::open(
+                &self._transaction,
+                Path::new("historical vector body"),
+                None,
+            )?;
+            verifier.verify_with_read_memory_before(
+                &content_identity::decoded_vector_version_mutation(&entry, quantization),
+                memory,
+                before,
+            )?;
+            vector_membership_source::authenticate_owning_row(
+                &owner,
+                &self._transaction,
+                index,
+                identity,
+                Some(entry.deleted_tx),
+                before,
+            )?;
+        } else if !self.producer_body_root {
             let mut proof = source
                 .content_proof
                 .lock()
@@ -5382,6 +5793,7 @@ impl RetainedRawVectorBodyScan {
         }
         #[cfg(feature = "test-seams")]
         crate::read_work_probe::note_authoritative_body_verified();
+        before()?;
         entry.deleted_tx = identity.deleted_tx;
         Ok(entry)
     }
@@ -5823,62 +6235,24 @@ pub(crate) struct CheckpointReadSource {
     /// bodies the directory no longer carries is bounded by the same budget
     /// the rest of the database answers to.
     accountant: Option<Arc<crate::memory_accounting::MemoryAccountant>>,
+    decode_memory: Arc<crate::read_image_memory::ImageMemory>,
+
+    _writer_use: Option<crate::memory_accounting::WriterUse>,
 }
 
-/// What one run of exported bodies is holding while they are in memory.
-///
-/// The bodies are copied out of the store and live in the caller's batch until
-/// the artifact has written them, so the admission has to live that long too.
-/// It is released when this is dropped, which the caller does once the run is
-/// on disk and its values have been let go.
+/// A run holds exactly its decoder/copy owner through caller serialization.
 pub(crate) struct ExportBodyAdmission {
-    accountant: Option<Arc<crate::memory_accounting::MemoryAccountant>>,
-    bytes: usize,
+    memory: Arc<crate::read_image_memory::ImageMemory>,
+    decoded: Option<Arc<crate::read_image_memory::ImageMemory>>,
+    decoded_controls: Option<contextdb_core::read_memory::ReadCredit>,
 }
 
 impl ExportBodyAdmission {
-    fn empty(accountant: Option<Arc<crate::memory_accounting::MemoryAccountant>>) -> Self {
+    fn empty(memory: Arc<crate::read_image_memory::ImageMemory>) -> Self {
         Self {
-            accountant,
-            bytes: 0,
-        }
-    }
-
-    /// Admit one body before it is copied or decoded. `false` when the
-    /// admission is already holding as much as the budget allows, which is
-    /// the caller's signal to write out what it has and come back for the
-    /// rest.
-    fn admit(&mut self, bytes: usize, path: &Path) -> Result<bool> {
-        let Some(accountant) = self.accountant.as_ref() else {
-            self.bytes = self.bytes.saturating_add(bytes);
-            return Ok(true);
-        };
-        match accountant.try_allocate_for(
-            bytes,
-            "checkpoint_export",
-            "copy_committed_row_body",
-            "Raise MEMORY_LIMIT to export a row body this large.",
-        ) {
-            Ok(()) => {
-                self.bytes = self.bytes.saturating_add(bytes);
-                Ok(true)
-            }
-            // Nothing admitted so far is holding the budget, so there is no
-            // smaller amount to fall back to: this one body does not fit, and
-            // saying so is the honest answer.
-            Err(error) if self.bytes == 0 => {
-                let _ = path;
-                Err(error)
-            }
-            Err(_) => Ok(false),
-        }
-    }
-}
-
-impl Drop for ExportBodyAdmission {
-    fn drop(&mut self) {
-        if let Some(accountant) = &self.accountant {
-            accountant.release(self.bytes);
+            memory,
+            decoded: None,
+            decoded_controls: None,
         }
     }
 }
@@ -5890,7 +6264,13 @@ impl CheckpointReadSource {
     /// to raise, not a store to distrust.
     fn content_identity_error(&self, error: Error) -> Error {
         match error {
-            Error::StoreCorrupted { .. } | Error::MemoryBudgetExceeded { .. } => error,
+            Error::StoreCorrupted { .. } | Error::ReadCancelled | Error::ReadFailure(_) => error,
+            error
+                if crate::read_image_memory::is_memory_refusal(&error)
+                    || crate::read_image_memory::is_missing_decode_owner(&error) =>
+            {
+                error
+            }
             other => self.content_identity_corruption(other),
         }
     }
@@ -5928,13 +6308,40 @@ impl CheckpointReadSource {
     /// exported in admitted runs rather than one whole-batch copy; a single
     /// body that does not fit on its own is the typed memory refusal, because
     /// there is no smaller run left to try.
+    pub(crate) fn load_export_row_values_with_read_memory(
+        &self,
+        name: &str,
+        meta: &TableMeta,
+        rows: &mut [VersionedRow],
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<(usize, ExportBodyAdmission)> {
+        let controls = contextdb_core::read_memory::ReadCredit::try_new(
+            read_memory.clone(),
+            std::mem::size_of::<crate::read_image_memory::ImageMemory>()
+                + 2 * std::mem::size_of::<usize>(),
+            "reader",
+            "export_decode_owner",
+            "Raise the declared reader memory limit.",
+        )?;
+        let bridge = self
+            .accountant
+            .clone()
+            .unwrap_or_else(|| Arc::new(crate::memory_accounting::MemoryAccountant::no_limit()));
+        let decoded = crate::read_image_memory::ImageMemory::charging_reader(bridge, read_memory);
+        let (filled, mut admission) =
+            decoded.scope(|| self.load_export_row_values(name, meta, rows))?;
+        admission.decoded = Some(decoded);
+        admission.decoded_controls = Some(controls);
+        Ok((filled, admission))
+    }
+
     pub(crate) fn load_export_row_values(
         &self,
         name: &str,
         meta: &TableMeta,
         rows: &mut [VersionedRow],
     ) -> Result<(usize, ExportBodyAdmission)> {
-        let mut admission = ExportBodyAdmission::empty(self.accountant.clone());
+        let admission = ExportBodyAdmission::empty(self.decode_memory.row_owner()?);
         if rows.is_empty() {
             return Ok((0, admission));
         }
@@ -5951,51 +6358,61 @@ impl CheckpointReadSource {
                 other => RedbPersistence::storage_error(other),
             })?;
         let mut filled = 0usize;
-        for row in rows.iter_mut() {
-            let key = RedbPersistence::rel_row_key(row);
-            let stored = relation
-                .get(key.as_slice())
-                .map_err(RedbPersistence::storage_error)?
-                .ok_or_else(|| Error::StoreCorrupted {
-                    path: self.database_path.display().to_string(),
-                    reason: format!(
-                        "checkpoint source lost relational table {name} row {} at tx {} lsn {}",
-                        row.row_id.0, row.created_tx.0, row.lsn.0
-                    ),
-                })?;
-            // The stored length is known from the leaf before the value is
-            // mapped, and the decoded copy is charged alongside it, so nothing
-            // of this body is held before it has been admitted.
-            let stored_bytes = stored.value().len();
-            if !admission.admit(
-                stored_bytes.saturating_mul(2).saturating_add(256),
-                &self.database_path,
-            )? {
-                break;
+        let loaded = (|| -> Result<()> {
+            for row in rows.iter_mut() {
+                let key = RedbPersistence::rel_row_key(row);
+                let stored = relation
+                    .get(key.as_slice())
+                    .map_err(RedbPersistence::storage_error)?
+                    .ok_or_else(|| Error::StoreCorrupted {
+                        path: self.database_path.display().to_string(),
+                        reason: format!(
+                            "checkpoint source lost relational table {name} row {} at tx {} lsn {}",
+                            row.row_id.0, row.created_tx.0, row.lsn.0
+                        ),
+                    })?;
+                let durable = match admission.memory.scope(|| {
+                    RedbPersistence::decode_relational_source_row(name, meta, stored.value())
+                }) {
+                    Ok(row) => row,
+                    Err(error)
+                        if filled != 0 && crate::read_image_memory::is_memory_refusal(&error) =>
+                    {
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                };
+                if RedbPersistence::rel_row_key(&durable) != key {
+                    return Err(self.content_identity_corruption(format!(
+                        "relational table {name} row body disagrees with its physical key"
+                    )));
+                }
+                // The committed root carries one record per LOGICAL row, so it is
+                // the live version of a row that it can prove. A superseded
+                // version carries the transaction that replaced it and is history
+                // the root says nothing about; its physical key is still checked,
+                // and the artifact's own restore reads the live body.
+                if durable.deleted_tx.is_none() {
+                    let mutation = content_identity::row_mutation(name, &durable, Some(meta))
+                        .map_err(|error| self.content_identity_error(error))?;
+                    self.content_identity
+                        .verify(&mutation)
+                        .map_err(|error| self.content_identity_error(error))?;
+                }
+                // Only the values come from the source. Visibility stays what the
+                // export's own watermark already decided for this row.
+                row.values = durable.values;
+                filled += 1;
             }
-            let durable =
-                RedbPersistence::decode_relational_source_row(name, meta, stored.value())?;
-            if RedbPersistence::rel_row_key(&durable) != key {
-                return Err(self.content_identity_corruption(format!(
-                    "relational table {name} row body disagrees with its physical key"
-                )));
+            Ok(())
+        })();
+        if let Err(error) = loaded {
+            // Payloads already adopted into the mutable batch must die before
+            // the failed run returns its credit, including authentication errors.
+            for row in &mut rows[..filled] {
+                row.values.clear();
             }
-            // The committed root carries one record per LOGICAL row, so it is
-            // the live version of a row that it can prove. A superseded
-            // version carries the transaction that replaced it and is history
-            // the root says nothing about; its physical key is still checked,
-            // and the artifact's own restore reads the live body.
-            if durable.deleted_tx.is_none() {
-                let mutation = content_identity::row_mutation(name, &durable, Some(meta))
-                    .map_err(|error| self.content_identity_error(error))?;
-                self.content_identity
-                    .verify(&mutation)
-                    .map_err(|error| self.content_identity_error(error))?;
-            }
-            // Only the values come from the source. Visibility stays what the
-            // export's own watermark already decided for this row.
-            row.values = durable.values;
-            filled += 1;
+            return Err(error);
         }
         Ok((filled, admission))
     }
@@ -6106,29 +6523,87 @@ impl CheckpointReadSource {
         })
     }
 
+    pub(crate) fn overlay_export_row_f32_projections_with_read_memory(
+        &self,
+        name: &str,
+        meta: &TableMeta,
+        rows: &mut [VersionedRow],
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<(
+        Arc<crate::read_image_memory::ImageMemory>,
+        contextdb_core::read_memory::ReadCredit,
+    )> {
+        let controls = contextdb_core::read_memory::ReadCredit::try_new(
+            read_memory.clone(),
+            std::mem::size_of::<crate::read_image_memory::ImageMemory>()
+                + 2 * std::mem::size_of::<usize>(),
+            "reader",
+            "export_decode_owner",
+            "Raise the declared reader memory limit.",
+        )?;
+        let bridge = self
+            .accountant
+            .clone()
+            .unwrap_or_else(|| Arc::new(crate::memory_accounting::MemoryAccountant::no_limit()));
+        let decoded = crate::read_image_memory::ImageMemory::charging_reader(bridge, read_memory);
+        decoded.scope(|| self.overlay_export_row_f32_projections(name, meta, rows))?;
+        Ok((decoded, controls))
+    }
+
     pub(crate) fn overlay_export_row_f32_projections(
         &self,
         name: &str,
         meta: &TableMeta,
         rows: &mut [VersionedRow],
+    ) -> Result<ExportBodyAdmission> {
+        let admission = ExportBodyAdmission::empty(self.decode_memory.row_owner()?);
+        if let Err(error) = self
+            .overlay_export_row_f32_projections_with_admission(name, meta, rows, &admission, false)
+        {
+            for row in rows {
+                row.values.clear();
+            }
+            return Err(error);
+        }
+        Ok(admission)
+    }
+
+    pub(crate) fn overlay_export_row_f32_projections_with_admission(
+        &self,
+        name: &str,
+        meta: &TableMeta,
+        rows: &mut [VersionedRow],
+        admission: &ExportBodyAdmission,
+        replace_prepaid: bool,
     ) -> Result<()> {
         if rows.is_empty() {
             return Ok(());
         }
-        let f32_columns = meta
+        let f32_count = meta
             .columns
             .iter()
-            .filter_map(|column| {
-                let ColumnType::Vector(dimension) = column.column_type else {
-                    return None;
-                };
-                matches!(column.quantization, VectorQuantization::F32).then_some((
-                    column.name.as_str(),
-                    dimension,
-                    column.nullable,
-                ))
+            .filter(|column| {
+                matches!(column.column_type, ColumnType::Vector(_))
+                    && matches!(column.quantization, VectorQuantization::F32)
             })
-            .collect::<Vec<_>>();
+            .count();
+        let _columns_credit = contextdb_core::read_memory::ReadCredit::try_new(
+            admission.memory.clone(),
+            f32_count
+                .checked_mul(std::mem::size_of::<(&str, usize, bool)>())
+                .ok_or_else(|| Error::Other("export vector columns size overflow".into()))?,
+            "checkpoint_export",
+            "vector_columns",
+            "Raise the reader memory limit to inspect exported vector columns.",
+        )?;
+        let mut f32_columns = Vec::with_capacity(f32_count);
+        for column in &meta.columns {
+            if let ColumnType::Vector(dimension) = column.column_type
+                && matches!(column.quantization, VectorQuantization::F32)
+            {
+                f32_columns.push((column.name.as_str(), dimension, column.nullable));
+            }
+        }
         if f32_columns.is_empty() {
             return Ok(());
         }
@@ -6156,8 +6631,10 @@ impl CheckpointReadSource {
                         row.row_id.0, row.created_tx.0, row.lsn.0
                     ),
                 })?;
-            let durable =
-                RedbPersistence::decode_relational_source_row(name, meta, stored.value())?;
+            let row_memory = self.decode_memory.row_owner()?;
+            let durable = row_memory.scope(|| {
+                RedbPersistence::decode_relational_source_row(name, meta, stored.value())
+            })?;
             if RedbPersistence::rel_row_key(&durable) != key {
                 return Err(self.content_identity_corruption(format!(
                     "relational table {name} row body disagrees with its physical key"
@@ -6186,8 +6663,38 @@ impl CheckpointReadSource {
                                 VectorQuantization::F32,
                             ))
                             .map_err(|error| self.content_identity_error(error))?;
-                        row.values
+                        let copied_bytes = vector
+                            .len()
+                            .checked_mul(std::mem::size_of::<f32>())
+                            .ok_or_else(|| {
+                                Error::Other("export vector copy size overflow".into())
+                            })?;
+                        admission.memory.reserve(copied_bytes)?;
+                        let incoming_key = contextdb_core::read_memory::ReadCredit::try_new(
+                            admission.memory.clone(),
+                            column.len(),
+                            "checkpoint_export",
+                            "vector_overlay_key",
+                            "Raise the reader memory limit to export this vector column.",
+                        )?;
+                        let existing_key = row.values.contains_key(*column);
+                        let prior = row
+                            .values
                             .insert((*column).to_owned(), Value::Vector(vector.clone()));
+                        let prior_bytes = prior.as_ref().map_or(0, |value| match value {
+                            Value::Vector(vector) => vector.capacity() * std::mem::size_of::<f32>(),
+                            _ => 0,
+                        });
+                        drop(prior);
+                        if replace_prepaid {
+                            admission.memory.release(prior_bytes);
+                        }
+                        // The existing key stays in the map on replacement.
+                        if existing_key {
+                            drop(incoming_key);
+                        } else {
+                            incoming_key.transfer();
+                        }
                     }
                     None | Some(Value::Null) if *nullable => {
                         row.values.remove(*column);
@@ -6214,7 +6721,7 @@ impl CheckpointReadSource {
 impl RetainedReadSource {
     #[cfg(feature = "test-seams")]
     pub(crate) fn cache_index_charge_for_test(&self) -> (usize, usize) {
-        (self.database.cache_index_bytes(), self._source_memory.bytes)
+        (self.database.cache_index_bytes(), self._source_memory.bytes.load(Ordering::SeqCst))
     }
 
     pub(crate) fn durable_membership_summary(
@@ -6284,7 +6791,13 @@ impl RetainedReadSource {
         let transaction = self
             .database
             .begin_external_read(self.snapshot)
-            .map_err(RedbPersistence::storage_error)?;
+            .map_err(|error| {
+                crate::database::ImageHistoryError::Store {
+                    path: self.database_path.display().to_string(),
+                    diagnosis: Box::new(read_transaction_error(error)),
+                }
+                .into_engine_error()
+            })?;
         if transaction.storage_snapshot_identity() != self.snapshot {
             return Err(Error::StoreCorrupted {
                 path: self.database_path.display().to_string(),
@@ -6313,6 +6826,7 @@ impl RetainedReadSource {
         &self,
         read: impl FnOnce(&redb::ReadTransaction) -> Result<T>,
     ) -> Result<T> {
+        let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
         let transaction = self.begin_read()?;
         read(&transaction)
     }
@@ -6456,9 +6970,26 @@ impl RetainedReadSource {
     /// operator to a restore when what they have is a ceiling to raise.
     fn content_identity_error(&self, error: Error) -> Error {
         match error {
-            Error::StoreCorrupted { .. } | Error::MemoryBudgetExceeded { .. } => error,
+            Error::StoreCorrupted { .. } | Error::ReadCancelled | Error::ReadFailure(_) => error,
+            error
+                if crate::read_image_memory::is_memory_refusal(&error)
+                    || crate::read_image_memory::is_missing_decode_owner(&error) =>
+            {
+                error
+            }
             other => self.content_identity_corruption(other),
         }
+    }
+
+    fn verify_history_root_in_read(
+        &self,
+        read: &redb::ReadTransaction,
+        name: &str,
+    ) -> Result<()> {
+        RedbPersistence::verify_history_root(read, name).map_err(|error| match error {
+            Error::StoreCorrupted { reason, .. } => self.content_identity_corruption(reason),
+            other => other,
+        })
     }
 
     fn content_identity_corruption(&self, reason: impl std::fmt::Display) -> Error {
@@ -6496,60 +7027,91 @@ impl RetainedReadSource {
     /// must meet the stored record at its exact position with its committed
     /// value, and the table may hold nothing else. A missing, extra or moved
     /// record -- or a missing table -- is damage, never a shorter or
-    /// reordered answer. Each record's bytes are admitted against
-    /// `accountant` before it is decoded, straight from the stored page.
+    /// reordered answer. Pages, collection slots, proof scratch and record
+    /// decodes are admitted against `read_memory` before acquisition. The
+    /// accountant is retained only as the image decoder's bridge identity.
     pub(crate) fn load_history(
         &self,
         accountant: &Arc<crate::memory_accounting::MemoryAccountant>,
         checkpoint: &dyn Fn() -> Result<()>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<LoadedReadHistory> {
-        let mut reservation =
-            crate::memory_accounting::OwnedMemoryReservation::new(Arc::clone(accountant));
-        let decoded = crate::read_image_memory::ImageMemory::charging(Arc::clone(accountant));
-        self.with_read(|read| {
-            let mut change_log = Vec::new();
-            self.walk_stored_history::<ChangeLogEntry>(
-                read,
-                CHANGE_LOG_TABLE,
-                OpenHistoryClass::ChangeLog,
-                accountant,
-                &mut reservation,
-                &decoded,
-                checkpoint,
-                &mut |_, entry| {
-                    change_log.push(entry);
-                    Ok(())
-                },
-            )?;
-            let mut ddl_log = Vec::new();
-            self.walk_stored_history::<DdlChange>(
-                read,
-                DDL_LOG_TABLE,
-                OpenHistoryClass::DdlLog,
-                accountant,
-                &mut reservation,
-                &decoded,
-                checkpoint,
-                &mut |key, change| {
-                    let raw_lsn = key.split_once(':').map(|(lsn, _)| lsn).unwrap_or(key);
-                    let lsn = raw_lsn
-                        .parse::<u64>()
-                        .map(Lsn)
-                        .map_err(|error| self.content_identity_corruption(error))?;
-                    ddl_log.push((lsn, change));
-                    Ok(())
-                },
-            )?;
-            let commit_index =
-                self.walk_stored_commit_index(read, accountant, &mut reservation, checkpoint)?;
-            Ok(LoadedReadHistory {
-                change_log,
-                ddl_log,
-                commit_index,
-                charge: ReadHistoryCharge {
-                    _slots: reservation,
-                    _decoded: decoded,
-                },
+        checkpoint()?;
+        let mut reservation = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
+        reservation.try_grow_for(
+            std::mem::size_of::<LoadedReadHistory>()
+                .saturating_add(std::mem::size_of::<crate::read_image_memory::ImageMemory>())
+                .saturating_add(2 * std::mem::size_of::<usize>())
+                .saturating_add(std::mem::size_of::<redb::ReadOnlyTable<&str, &[u8]>>())
+                .saturating_add(std::mem::size_of::<redb::Range<'_, &str, &[u8]>>())
+                .saturating_add(std::mem::size_of::<redb::ReadOnlyTable<u64, u64>>())
+                .saturating_add(std::mem::size_of::<redb::Range<'_, u64, u64>>()),
+            "reader",
+            "read_history_controls",
+            "Reduce the requested history or raise the declared reader memory limit.",
+        )?;
+        let decoded = crate::read_image_memory::ImageMemory::charging_reader(
+            Arc::clone(accountant),
+            read_memory.clone(),
+        );
+        graph_read::with_pages(read_memory.clone(), || {
+            self.with_read(|read| {
+                self.check_history_directory_in_read(read, read_memory.clone(), checkpoint)?;
+                self.history_open_control.check_ddl(read)?;
+                checkpoint()?;
+                let mut change_log = Vec::new();
+                self.walk_stored_history::<graph_history_record::StoredChangeLogEntry>(
+                    read,
+                    CHANGE_LOG_TABLE,
+                    OpenHistoryClass::ChangeLog,
+                    read_memory.clone(),
+                    &mut reservation,
+                    &decoded,
+                    checkpoint,
+                    &|key, raw| {
+                        self.verify_stored_graph_history_in_read(
+                            read,
+                            key,
+                            raw,
+                            read_memory.clone(),
+                        )?;
+                        RedbPersistence::decode_stored_change_log(raw)
+                    },
+                    &|_, raw| RedbPersistence::stored_change_log_value_hash(raw),
+                    &mut |_, entry| {
+                        change_log.push(entry.entry);
+                        Ok(())
+                    },
+                )?;
+                let mut ddl_log = Vec::new();
+                self.walk_stored_history::<DdlChange>(
+                    read,
+                    DDL_LOG_TABLE,
+                    OpenHistoryClass::DdlLog,
+                    read_memory.clone(),
+                    &mut reservation,
+                    &decoded,
+                    checkpoint,
+                    &|_, raw| RedbPersistence::decode(raw),
+                    &|record, _| content_identity::history_record_value_hash(record),
+                    &mut |key, change| {
+                        let raw_lsn = key.split_once(':').map(|(lsn, _)| lsn).unwrap_or(key);
+                        let lsn = raw_lsn
+                            .parse::<u64>()
+                            .map(Lsn)
+                            .map_err(|error| self.content_identity_corruption(error))?;
+                        ddl_log.push((lsn, change));
+                        Ok(())
+                    },
+                )?;
+                Ok(LoadedReadHistory {
+                    change_log,
+                    ddl_log,
+                    charge: ReadHistoryCharge {
+                        _slots: reservation,
+                        _decoded: decoded,
+                    },
+                })
             })
         })
     }
@@ -6592,26 +7154,55 @@ impl RetainedReadSource {
         read: &redb::ReadTransaction,
         definition: TableDefinition<&'static str, &'static [u8]>,
         class: OpenHistoryClass,
-        accountant: &Arc<crate::memory_accounting::MemoryAccountant>,
-        reservation: &mut crate::memory_accounting::OwnedMemoryReservation,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        reservation: &mut contextdb_core::read_memory::ReadCredit,
         decoded: &Arc<crate::read_image_memory::ImageMemory>,
         checkpoint: &dyn Fn() -> Result<()>,
+        decode_record: &dyn Fn(&str, &[u8]) -> Result<T>,
+        value_hash: &dyn Fn(&T, &[u8]) -> Result<[u8; 32]>,
         keep: &mut dyn FnMut(&str, T) -> Result<()>,
     ) -> Result<()>
     where
-        T: content_identity::HistoryRecord + serde::de::DeserializeOwned,
+        T: content_identity::HistoryRecord,
     {
         const HINT: &str = "Raise MEMORY_LIMIT so this reader can hold the store's change history.";
         let kind = <T as content_identity::HistoryRecord>::KIND;
         let table = open_optional_read_table(read, definition)?;
         let mut stored = match &table {
-            Some(table) => Some(table.iter().map_err(RedbPersistence::storage_error)?),
+            Some(table) => Some(
+                table
+                    .iter()
+                    .map_err(RedbPersistence::storage_error)?
+                    .inspect(|_entry| {
+                        #[cfg(any(test, feature = "test-seams"))]
+                        if let Ok((key, _)) = _entry {
+                            crate::read_work_probe::note_graph(
+                                "history",
+                                "iteration_step",
+                                key.value().as_bytes(),
+                                None,
+                                Some("complete_history"),
+                            );
+                        }
+                    }),
+            ),
             None => None,
         };
-        let proof = content_identity::ProofMemory::admitted(
-            Some(Arc::clone(accountant)),
-            READ_HISTORY_PROOF_POOL_BYTES,
-        );
+        let mut ddl_last = None;
+        let _ddl_controls = if kind == content_identity::HistoryKind::DdlLog {
+            Some(contextdb_core::read_memory::ReadCredit::try_new(
+                read_memory.clone(),
+                std::mem::size_of::<Option<(u64, Lsn, [u8; 32], [u8; 32])>>()
+                    + std::mem::size_of::<blake3::Hasher>(),
+                "reader",
+                "ddl_complete_controls",
+                "Raise the declared reader memory limit.",
+            )?)
+        } else {
+            None
+        };
+        let proof_owner = ReadHistoryProofOwner::new(read_memory.clone())?;
+        let proof = content_identity::ProofMemory::growable(0, proof_owner.clone());
         let complete = self.content_identity.visit_history::<Error>(
             kind,
             false,
@@ -6652,18 +7243,23 @@ impl RetainedReadSource {
                 )?;
                 note_open_history(class, raw.len());
                 let before = decoded.held();
-                let record: T = decoded.scope(|| RedbPersistence::decode(raw)).map_err(
-                    |error| match error {
-                        Error::MemoryBudgetExceeded { .. } => error,
-                        other => self.history_damage(format_args!("{key}: {other}")),
-                    },
-                )?;
+                let record: T =
+                    decoded
+                        .scope(|| decode_record(key, raw))
+                        .map_err(|error| match error {
+                            Error::Other(ref reason)
+                                if reason.starts_with("bincode decode error:") =>
+                            {
+                                self.history_damage(format_args!("{key}: {reason}"))
+                            }
+                            other => other,
+                        })?;
                 // The canonical form the committed hash is taken over is
                 // transient: a value tree no larger than a few times the
                 // decoded record, and its text. Admitted before it is built,
                 // given back once it is hashed.
                 let mut canonical =
-                    crate::memory_accounting::OwnedMemoryReservation::new(Arc::clone(accountant));
+                    contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
                 canonical.try_grow_for(
                     decoded
                         .held()
@@ -6675,18 +7271,42 @@ impl RetainedReadSource {
                     "read_history",
                     HINT,
                 )?;
-                if content_identity::history_record_value_hash(&record)? != committed {
+                // Hashing private history validates its codec again; that
+                // transient decode shares this operation and releases here.
+                let hash_decode = crate::read_image_memory::ImageMemory::charging_reader(
+                    Arc::clone(&decoded.accountant),
+                    read_memory.clone(),
+                );
+                let actual = hash_decode.scope(|| value_hash(&record, raw))?;
+                drop(hash_decode);
+                if actual != committed {
                     return Err(self.history_damage(format_args!(
                         "stored {kind:?} record {key} is not the committed record at its position"
                     )));
+                }
+                if kind == content_identity::HistoryKind::DdlLog {
+                    ddl_last = Some((
+                        u64::try_from(key.len())
+                            .map_err(|_| self.history_damage("DDL coordinate length overflow"))?,
+                        RedbPersistence::ddl_lsn_from_key(key)?,
+                        content_identity::history_open_control::ddl_coordinate_digest(
+                            key.as_bytes(),
+                            Some(checkpoint),
+                        )?,
+                        actual,
+                    ));
                 }
                 drop(canonical);
                 keep(key, record)?;
                 Ok(true)
             },
-        )?;
+        );
+        if let Some(error) = proof_owner.refusal.lock().take() {
+            return Err(error);
+        }
+        let complete = complete?;
         if !complete {
-            return Err(self.unprovable_history(accountant, kind));
+            return Err(self.unprovable_history(&self._source_memory.memory.accountant, kind));
         }
         if let Some(entry) = stored.as_mut().and_then(Iterator::next) {
             let (key, _) = entry.map_err(RedbPersistence::storage_error)?;
@@ -6695,103 +7315,25 @@ impl RetainedReadSource {
                 key.value()
             )));
         }
+        if kind == content_identity::HistoryKind::DdlLog {
+            self.history_open_control.check_complete_ddl(ddl_last)?;
+        }
+        checkpoint()?;
         Ok(())
-    }
-
-    fn walk_stored_commit_index(
-        &self,
-        read: &redb::ReadTransaction,
-        accountant: &Arc<crate::memory_accounting::MemoryAccountant>,
-        reservation: &mut crate::memory_accounting::OwnedMemoryReservation,
-        checkpoint: &dyn Fn() -> Result<()>,
-    ) -> Result<BTreeMap<Lsn, TxId>> {
-        const HINT: &str = "Raise MEMORY_LIMIT so this reader can hold the store's change history.";
-        let kind = content_identity::HistoryKind::CommitIndex;
-        let table = open_optional_read_table(read, COMMIT_INDEX_TABLE)?;
-        let mut stored = match &table {
-            Some(table) => Some(table.iter().map_err(RedbPersistence::storage_error)?),
-            None => None,
-        };
-        let proof = content_identity::ProofMemory::admitted(
-            Some(Arc::clone(accountant)),
-            READ_HISTORY_PROOF_POOL_BYTES,
-        );
-        let mut commit_index = BTreeMap::new();
-        let mut previous = TxId(0);
-        let complete = self.content_identity.visit_history::<Error>(
-            kind,
-            false,
-            &proof,
-            &mut || checkpoint(),
-            &mut |coordinate, committed| {
-                let committed_lsn = <[u8; 8]>::try_from(coordinate)
-                    .map(u64::from_be_bytes)
-                    .map_err(|_| self.history_damage("a committed commit-index key is not an LSN"))?;
-                let Some(entry) = stored.as_mut().and_then(Iterator::next) else {
-                    return Err(self.history_damage(format_args!(
-                        "committed commit-index entry {committed_lsn} is missing from the store"
-                    )));
-                };
-                let (lsn, tx) = entry.map_err(RedbPersistence::storage_error)?;
-                let (lsn, tx) = (lsn.value(), tx.value());
-                match lsn.cmp(&committed_lsn) {
-                    std::cmp::Ordering::Less => {
-                        return Err(self.history_damage(format_args!(
-                            "stored commit-index entry {lsn} is not in the committed history"
-                        )));
-                    }
-                    std::cmp::Ordering::Greater => {
-                        return Err(self.history_damage(format_args!(
-                            "committed commit-index entry {committed_lsn} is missing from the store"
-                        )));
-                    }
-                    std::cmp::Ordering::Equal => {}
-                }
-                if content_identity::commit_index_value_hash(TxId(tx)) != committed {
-                    return Err(self.history_damage(format_args!(
-                        "stored commit-index entry {lsn} names transaction {tx}, not the committed one"
-                    )));
-                }
-                if TxId(tx) < previous {
-                    return Err(self.history_damage(format_args!(
-                        "commit-index transaction order decreases at LSN {lsn}"
-                    )));
-                }
-                previous = TxId(tx);
-                reservation.try_grow_for(
-                    2 * std::mem::size_of::<u64>() + 32,
-                    "direct_read",
-                    "read_history",
-                    HINT,
-                )?;
-                note_open_history(
-                    OpenHistoryClass::CommitIndex,
-                    2 * std::mem::size_of::<u64>(),
-                );
-                commit_index.insert(Lsn(lsn), TxId(tx));
-                Ok(true)
-            },
-        )?;
-        if !complete {
-            return Err(self.unprovable_history(accountant, kind));
-        }
-        if let Some(entry) = stored.as_mut().and_then(Iterator::next) {
-            let (lsn, _) = entry.map_err(RedbPersistence::storage_error)?;
-            return Err(self.history_damage(format_args!(
-                "stored commit-index entry {} is not in the committed history",
-                lsn.value()
-            )));
-        }
-        Ok(commit_index)
     }
 
     fn authenticate_mutation(
         &self,
         mutation: &content_identity::ContentIdentityMutation,
     ) -> Result<()> {
-        self.content_identity
-            .verify(mutation)
-            .map_err(|error| self.content_identity_error(error))
+        if let Some(memory) = crate::read_image_memory::current_reader_budget() {
+            self.content_identity
+                .verify_with_read_memory(mutation, memory)
+        } else {
+            self.content_identity
+                .verify(mutation)
+                .map_err(|error| self.content_identity_error(error))
+        }
     }
 
     /// The authenticated chunks this pinned snapshot is holding, their bytes,
@@ -6887,6 +7429,7 @@ impl RetainedReadSource {
         table: &str,
         columns: &[(String, contextdb_core::SortDirection)],
     ) -> Result<u64> {
+        let _decode_scope = self.verified_ordered_runs.memory.enter();
         self.with_read(|read| {
             let counts = match read.open_table(RELATIONAL_INDEX_COUNT_TABLE) {
                 Ok(counts) => counts,
@@ -6957,8 +7500,26 @@ impl RetainedReadSource {
         // The readiness probe belongs to the first seek, including an empty
         // table. It cannot emit a group before the declared image is ready.
         before_touch()?;
+        boundary
+            .1
+            .reserve(
+                table
+                    .len()
+                    .saturating_add(index.len())
+                    .saturating_mul(2)
+                    .saturating_add(256),
+            )
+            .map_err(E::from)?;
         let ready = self
             .with_read(|read| {
+                self.verify_history_root_in_read(
+                    read,
+                    &RedbPersistence::rel_table_name(table),
+                )?;
+                self.verify_history_root_in_read(
+                    read,
+                    &RedbPersistence::relational_index_table_name(table, index),
+                )?;
                 let ready = match read.open_table(RELATIONAL_INDEX_READY_TABLE) {
                     Ok(ready) => ready,
                     Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
@@ -7035,6 +7596,7 @@ impl RetainedReadSource {
             let count = self
                 .authenticated_relational_index_prefix_count(
                     table,
+                    index,
                     columns,
                     &position.key,
                     read_memory.clone(),
@@ -7056,10 +7618,12 @@ impl RetainedReadSource {
     pub(crate) fn authenticated_relational_index_prefix_count(
         &self,
         table: &str,
+        index: &str,
         columns: &[(String, contextdb_core::SortDirection)],
         prefix: &IndexKey,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Option<u64>> {
+        self.verify_relational_source_roots(table, index, read_memory.clone())?;
         let memory = crate::read_image_memory::ImageMemory::charging_reader(
             self._source_memory.memory.accountant.clone(),
             read_memory,
@@ -7123,6 +7687,48 @@ impl RetainedReadSource {
                     Ok(None)
                 }
             }
+        })
+    }
+
+    pub(crate) fn authenticate_selected_vector(
+        &self,
+        index: &VectorIndexRef,
+        row_id: RowId,
+        vector: &[f32],
+        quantization: VectorQuantization,
+    ) -> Result<()> {
+        self.authenticate_mutation(&content_identity::decoded_vector_value_mutation(
+            index,
+            row_id,
+            vector,
+            quantization,
+        ))
+    }
+
+    fn authenticate_version_bounds(
+        &self,
+        table: &str,
+        lsn: Lsn,
+        created: TxId,
+        deleted: Option<TxId>,
+    ) -> Result<()> {
+        self.with_read(|read| {
+            validate_read_version_bounds(
+                read,
+                table,
+                lsn,
+                created,
+                deleted,
+                TxId(self.logical_frontier.0),
+                self.graph_lsn_frontier,
+            )
+            .map_err(|error| {
+                crate::database::ImageHistoryError::Store {
+                    path: self.database_path.display().to_string(),
+                    diagnosis: Box::new(error),
+                }
+                .into_engine_error()
+            })
         })
     }
 
@@ -7213,92 +7819,6 @@ impl RetainedReadSource {
         Ok(true)
     }
 
-    fn authenticate_relational_identity(
-        &self,
-        table: &str,
-        meta: &TableMeta,
-        row: &VersionedRow,
-    ) -> Result<bool> {
-        self.authenticate_mutation(
-            &content_identity::row_mutation(table, row, Some(meta))
-                .map_err(|error| self.content_identity_error(error))?,
-        )?;
-        if row.deleted_tx.is_some() {
-            return Ok(false);
-        }
-        Ok(true)
-    }
-
-    fn authenticate_relational_vectors(
-        &self,
-        table: &str,
-        meta: &TableMeta,
-        row: &VersionedRow,
-    ) -> Result<()> {
-        for column in &meta.columns {
-            let contextdb_core::ColumnType::Vector(dimension) = column.column_type else {
-                continue;
-            };
-            if !matches!(column.quantization, VectorQuantization::F32) {
-                continue;
-            }
-            let index = VectorIndexRef::new(table, &column.name);
-            match row.values.get(&column.name) {
-                Some(Value::Vector(vector)) => {
-                    if vector.len() != dimension {
-                        return Err(self.content_identity_corruption(format!(
-                            "{table}.{} row {} has vector dimension {} instead of {dimension}",
-                            column.name,
-                            row.row_id.0,
-                            vector.len()
-                        )));
-                    }
-                    self.authenticate_mutation(&content_identity::decoded_vector_value_mutation(
-                        &index,
-                        row.row_id,
-                        vector,
-                        column.quantization,
-                    ))?;
-                }
-                None | Some(Value::Null) if column.nullable => {
-                    self.authenticate_mutation(&content_identity::remove_vector_mutation(
-                        &index,
-                        row.row_id,
-                        column.quantization,
-                    ))?;
-                }
-                None | Some(Value::Null) => {
-                    return Err(self.content_identity_corruption(format!(
-                        "{table}.{} row {} is NULL although the vector column is required",
-                        column.name, row.row_id.0
-                    )));
-                }
-                Some(_) => {
-                    return Err(self.content_identity_corruption(format!(
-                        "{table}.{} row {} contains a non-vector value",
-                        column.name, row.row_id.0
-                    )));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn authenticate_selected_vector(
-        &self,
-        index: &VectorIndexRef,
-        row_id: RowId,
-        vector: &[f32],
-        quantization: VectorQuantization,
-    ) -> Result<()> {
-        self.authenticate_mutation(&content_identity::decoded_vector_value_mutation(
-            index,
-            row_id,
-            vector,
-            quantization,
-        ))
-    }
-
     fn authenticate_relational_physical_key(
         &self,
         table: &str,
@@ -7310,7 +7830,7 @@ impl RetainedReadSource {
                 "relational table {table} row body disagrees with its physical key"
             )));
         }
-        Ok(())
+        self.authenticate_version_bounds(table, row.lsn, row.created_tx, row.deleted_tx)
     }
 
     fn authenticate_vector_entry(
@@ -7318,6 +7838,12 @@ impl RetainedReadSource {
         entry: &VectorEntry,
         quantization: VectorQuantization,
     ) -> Result<()> {
+        self.authenticate_version_bounds(
+            &entry.index.table,
+            entry.lsn,
+            entry.created_tx,
+            entry.deleted_tx,
+        )?;
         self.authenticate_mutation(&content_identity::decoded_vector_version_mutation(
             entry,
             quantization,
@@ -7340,14 +7866,19 @@ impl RetainedReadSource {
         if memberships.is_empty() {
             return Ok(Vec::new());
         }
-        self.with_read(|read| {
+        let captured = vector_membership_source::operation_read_for_retained(self);
+        let load = |read: &redb::ReadTransaction| {
             self.load_raw_vector_entries_for_memberships_in_read(
                 read,
                 memberships,
                 expected_dimension,
                 quantization,
             )
-        })
+        };
+        match captured {
+            Some(read) => load(&read),
+            None => self.with_read(load),
+        }
     }
 
     fn load_raw_vector_entries_for_memberships_in_read(
@@ -7388,6 +7919,15 @@ impl RetainedReadSource {
             })?;
         let mut entries = Vec::with_capacity(memberships.len());
         for membership in memberships {
+            vector_membership_source::operation_checkpoint()?;
+            vector_membership_source::authenticate_retained_historical_body(
+                self,
+                read,
+                None,
+                membership,
+                expected_dimension,
+                quantization,
+            )?;
             let key = RedbPersistence::vector_identity_key(
                 &membership.index,
                 membership.row_id,
@@ -7411,7 +7951,16 @@ impl RetainedReadSource {
                 expected_dimension,
                 |reason| self.raw_vector_corruption(reason),
             )?;
-            self.authenticate_vector_entry(&entry, quantization)?;
+            if !vector_membership_source::authenticate_retained_historical_body(
+                self,
+                read,
+                Some(&entry),
+                membership,
+                expected_dimension,
+                quantization,
+            )? {
+                self.authenticate_vector_entry(&entry, quantization)?;
+            }
             let canonical_deleted_tx = entry.deleted_tx;
             entry.deleted_tx = membership.deleted_tx;
             entries.push((entry, canonical_deleted_tx));
@@ -7431,7 +7980,8 @@ impl RetainedReadSource {
             &mut dyn FnMut(&VectorPartitionMembershipRecord) -> Result<(VectorEntry, Option<TxId>)>,
         ) -> Result<()>,
     ) -> Result<T> {
-        self.with_read(|read| {
+        let captured = vector_membership_source::operation_read_for_retained(self);
+        let stream = |read: &redb::ReadTransaction| {
             // Memberships and bodies share this pinned root. The callback must
             // never reacquire persistence ownership while close/recycle waits.
             let mut load_body = |membership: &VectorPartitionMembershipRecord| {
@@ -7450,7 +8000,11 @@ impl RetainedReadSource {
                 |state, membership| visit(state, membership, &mut load_body),
                 |reason| self.raw_vector_corruption(reason),
             )
-        })
+        };
+        match captured {
+            Some(read) => stream(&read),
+            None => self.with_read(stream),
+        }
     }
 
     pub(crate) fn load_raw_vector_entry_for_partition_identity(
@@ -7492,38 +8046,52 @@ impl RetainedReadSource {
     /// the body table opened once. Authentication pages belong to that pinned
     /// source, so this scan reuses proofs from the preceding row walk.
     pub(crate) fn open_raw_vector_body_scan(self: &Arc<Self>) -> Result<RetainedRawVectorBodyScan> {
-        self.open_raw_vector_body_scan_at(Arc::new(self.begin_read()?))
+        let owner = vector_membership_source::MembershipOwner::Retained(self.clone());
+        let read = match vector_membership_source::operation_read(&owner) {
+            Some(read) => read,
+            None => Arc::new(self.begin_read()?),
+        };
+        self.open_raw_vector_body_scan_at(read)
     }
 
     pub(crate) fn open_raw_vector_body_scan_at(
         self: &Arc<Self>,
         transaction: Arc<redb::ReadTransaction>,
     ) -> Result<RetainedRawVectorBodyScan> {
-        if transaction.storage_snapshot_identity() != self.storage_identity() {
-            return Err(
-                self.raw_vector_corruption("raw body read escaped its retained physical root")
-            );
+        let owner = vector_membership_source::MembershipOwner::Retained(self.clone());
+        let memory = vector_membership_source::historical_operation_memory(&owner, &transaction)?;
+        let open = || {
+            vector_membership_source::operation_checkpoint()?;
+            if transaction.storage_snapshot_identity() != self.storage_identity() {
+                return Err(
+                    self.raw_vector_corruption("raw body read escaped its retained physical root")
+                );
+            }
+            vector_membership_pages::validate_in_read(&transaction)?;
+            let producer_body_root = vector_scan_body_root_matches(&transaction)?;
+            let memberships = match transaction.open_table(VECTOR_PARTITION_MEMBERSHIP_TABLE) {
+                Ok(table) => Some(table),
+                Err(redb::TableError::TableDoesNotExist(_)) => None,
+                Err(error) => return Err(vector_membership_pages::metadata_error(error)),
+            };
+            let vectors = match transaction.open_table(VECTORS_TABLE) {
+                Ok(table) => Some(table),
+                Err(redb::TableError::TableDoesNotExist(_)) => None,
+                Err(error) => return Err(vector_membership_pages::metadata_error(error)),
+            };
+            Ok(RetainedRawVectorBodyScan {
+                producer_body_root,
+                selected_stream_identity: None,
+                source: Arc::clone(self),
+                memberships,
+                vectors,
+                _transaction: transaction,
+            })
+        };
+        match memory {
+            Some(memory) => graph_read::with_pages(memory, open),
+            None => open(),
         }
-        vector_membership_pages::validate_in_read(&transaction)?;
-        let producer_body_root = vector_scan_body_root_matches(&transaction)?;
-        let memberships = match transaction.open_table(VECTOR_PARTITION_MEMBERSHIP_TABLE) {
-            Ok(table) => Some(table),
-            Err(redb::TableError::TableDoesNotExist(_)) => None,
-            Err(error) => return Err(vector_membership_pages::metadata_error(error)),
-        };
-        let vectors = match transaction.open_table(VECTORS_TABLE) {
-            Ok(table) => Some(table),
-            Err(redb::TableError::TableDoesNotExist(_)) => None,
-            Err(error) => return Err(vector_membership_pages::metadata_error(error)),
-        };
-        Ok(RetainedRawVectorBodyScan {
-            producer_body_root,
-            selected_stream_identity: None,
-            source: Arc::clone(self),
-            memberships,
-            vectors,
-            _transaction: transaction,
-        })
     }
 
     fn raw_vector_candidate_membership(
@@ -7544,6 +8112,7 @@ impl RetainedReadSource {
             .prefix_bounded(&row_prefix)
             .map_err(RedbPersistence::storage_error)?
         {
+            vector_membership_source::operation_checkpoint()?;
             let (key, value) = item.map_err(RedbPersistence::storage_error)?;
             if !key.value().starts_with(&row_prefix) {
                 break;
@@ -7574,6 +8143,11 @@ impl RetainedReadSource {
             saw_vector_identity = true;
             if membership.deleted_tx != identity.deleted_tx {
                 continue;
+            }
+            if vector_membership_source::body_identity_for_record(&membership) != *identity {
+                return Err(vector_membership_source::damage(
+                    "candidate provenance differs from its captured membership",
+                ));
             }
             if membership.visible_from
                 < TxId(
@@ -7638,6 +8212,12 @@ impl RetainedReadSource {
                 "a raw-vector candidate body cannot be decoded: {error}"
             ))
         })?;
+        self.authenticate_version_bounds(
+            &entry.index.table,
+            entry.lsn,
+            entry.created_tx,
+            identity.deleted_tx,
+        )?;
         if entry.index != *index
             || entry.row_id != identity.row_id
             || entry.created_tx != identity.created_tx
@@ -7700,52 +8280,89 @@ impl RetainedReadSource {
         meta: &TableMeta,
         row_id: RowId,
         snapshot: SnapshotId,
-    ) -> Result<Option<VersionedRow>> {
-        #[cfg(feature = "test-seams")]
-        crate::writer_query_test_seams::note_physical_source(
-            crate::writer_query_test_seams::PhysicalFamily::Row,
+    ) -> Result<Option<(VersionedRow, Arc<crate::read_image_memory::ImageMemory>)>> {
+        let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
+        self.reconciled_row_with_owner(
             read,
-        );
-        let name = RedbPersistence::rel_table_name(table);
-        let definition: TableDefinition<&[u8], &[u8]> = TableDefinition::new(name.as_str());
-        let relation = read.open_table(definition).map_err(|error| match error {
-            redb::TableError::TableDoesNotExist(_) => Error::StoreCorrupted {
-                path: self.database_path.display().to_string(),
-                reason: format!("relational table {table} is absent from the retained root"),
-            },
-            other => RedbPersistence::storage_error(other),
-        })?;
-        let (lower, upper) = RedbPersistence::rel_row_key_range(row_id);
-        let mut versions = {
-            #[cfg(feature = "test-seams")]
-            let _target_reads = crate::writer_query_test_seams::physical_operation(
-                crate::writer_query_test_seams::PhysicalFamily::Row,
-                table,
-            );
-            relation
-                .range(lower.as_slice()..upper.as_slice())
-                .map_err(RedbPersistence::storage_error)?
+            table,
+            meta,
+            row_id,
+            snapshot,
+            self.read_memory.clone(),
+            true,
+        )
+    }
+
+    fn reconciled_row_with_owner(
+        &self,
+        read: &redb::ReadTransaction,
+        table: &str,
+        meta: &TableMeta,
+        row_id: RowId,
+        snapshot: SnapshotId,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        addressed: bool,
+    ) -> Result<Option<(VersionedRow, Arc<crate::read_image_memory::ImageMemory>)>> {
+        let memory = crate::read_image_memory::ImageMemory::operation_reader(
+            self._source_memory.memory.accountant.clone(),
+            read_memory.clone(),
+        )?;
+        let mut credit = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
+        let mut last = None;
+        let mut adopt = |admission: crate::read_image_memory::RowReadAdmission<'_>| {
+            admission.retain_into(
+                &mut credit,
+                "reader",
+                "selected_row",
+                "Raise the declared reader memory limit.",
+            )
         };
-        while let Some(entry) = {
-            #[cfg(feature = "test-seams")]
-            let _target_reads = crate::writer_query_test_seams::physical_operation(
-                crate::writer_query_test_seams::PhysicalFamily::Row,
+        let row = if addressed {
+            graph_read::with_pages(read_memory.clone(), || {
+                self.reconcile_addressed_relational_group::<Error>(
+                    read,
+                    table,
+                    meta,
+                    row_id,
+                    snapshot,
+                    None,
+                    read_memory.clone(),
+                    &mut || Ok(()),
+                    None,
+                    &mut adopt,
+                    &mut last,
+                )
+            })?
+        } else {
+            self.reconcile_relational_group::<Error>(
+                read,
                 table,
-            );
-            versions.next_back()
-        } {
-            let (key, value) = entry.map_err(RedbPersistence::storage_error)?;
-            #[cfg(feature = "test-seams")]
-            crate::writer_query_test_seams::note_target_entry(table);
-            let row = RedbPersistence::decode_relational_source_row(table, meta, value.value())?;
-            self.authenticate_relational_physical_key(table, key.value(), &row)?;
-            if row.created_tx.0 > snapshot.0 {
-                continue;
-            }
-            let visible = self.authenticate_relational_row(table, meta, &row)?;
-            return Ok(visible.then_some(row));
-        }
-        Ok(None)
+                meta,
+                row_id,
+                snapshot,
+                None,
+                read_memory.clone(),
+                &mut || Ok(()),
+                None,
+                &mut adopt,
+                &mut last,
+            )?
+        };
+        memory.adopt_reader_credit(&read_memory, credit.bytes())?;
+        credit.transfer();
+        Ok(row.map(|row| (row, memory)))
+    }
+
+    fn row_by_id_in_read_with_read_memory(
+        &self,
+        read: &redb::ReadTransaction,
+        table: &str,
+        meta: &TableMeta,
+        row_id: RowId,
+        snapshot: SnapshotId,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<Option<(VersionedRow, Arc<crate::read_image_memory::ImageMemory>)>> {
+        self.reconciled_row_with_owner(read, table, meta, row_id, snapshot, read_memory, false)
     }
 
     fn row_identity_by_id_in_read(
@@ -7755,62 +8372,31 @@ impl RetainedReadSource {
         meta: &TableMeta,
         row_id: RowId,
         snapshot: SnapshotId,
-        mut authentication: Option<&mut content_identity::ReadAuthenticationBatch<'_>>,
-    ) -> Result<Option<VersionedRow>> {
-        #[cfg(feature = "test-seams")]
-        crate::writer_query_test_seams::note_physical_source(
-            crate::writer_query_test_seams::PhysicalFamily::Row,
+        _authentication: Option<&mut content_identity::ReadAuthenticationBatch<'_>>,
+    ) -> Result<Option<(VersionedRow, Arc<crate::read_image_memory::ImageMemory>)>> {
+        let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
+        self.reconciled_row_with_owner(
             read,
-        );
-        let name = RedbPersistence::rel_table_name(table);
-        let definition: TableDefinition<&[u8], &[u8]> = TableDefinition::new(name.as_str());
-        let relation = read.open_table(definition).map_err(|error| match error {
-            redb::TableError::TableDoesNotExist(_) => Error::StoreCorrupted {
-                path: self.database_path.display().to_string(),
-                reason: format!("relational table {table} is absent from the retained root"),
-            },
-            other => RedbPersistence::storage_error(other),
-        })?;
-        let (lower, upper) = RedbPersistence::rel_row_key_range(row_id);
-        let mut versions = {
-            #[cfg(feature = "test-seams")]
-            let _target_reads = crate::writer_query_test_seams::physical_operation(
-                crate::writer_query_test_seams::PhysicalFamily::Row,
-                table,
-            );
-            relation
-                .range(lower.as_slice()..upper.as_slice())
-                .map_err(RedbPersistence::storage_error)?
-        };
-        while let Some(entry) = {
-            #[cfg(feature = "test-seams")]
-            let _target_reads = crate::writer_query_test_seams::physical_operation(
-                crate::writer_query_test_seams::PhysicalFamily::Row,
-                table,
-            );
-            versions.next_back()
-        } {
-            let (key, value) = entry.map_err(RedbPersistence::storage_error)?;
-            #[cfg(feature = "test-seams")]
-            crate::writer_query_test_seams::note_target_entry(table);
-            let row = RedbPersistence::decode_relational_source_row(table, meta, value.value())?;
-            self.authenticate_relational_physical_key(table, key.value(), &row)?;
-            if row.created_tx.0 > snapshot.0 {
-                continue;
-            }
-            let visible = if let Some(batch) = authentication.as_deref_mut() {
-                let mutation = content_identity::row_mutation(table, &row, Some(meta))
-                    .map_err(|error| self.content_identity_error(error))?;
-                batch
-                    .verify(&mutation)
-                    .map_err(|error| self.content_identity_error(error))?;
-                row.deleted_tx.is_none()
-            } else {
-                self.authenticate_relational_identity(table, meta, &row)?
-            };
-            return Ok(visible.then_some(row));
-        }
-        Ok(None)
+            table,
+            meta,
+            row_id,
+            snapshot,
+            self.read_memory.clone(),
+            true,
+        )
+    }
+
+    fn row_identity_by_id_in_read_with_read_memory(
+        &self,
+        read: &redb::ReadTransaction,
+        table: &str,
+        meta: &TableMeta,
+        row_id: RowId,
+        snapshot: SnapshotId,
+        _authentication: Option<&mut content_identity::ReadAuthenticationBatch<'_>>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<Option<(VersionedRow, Arc<crate::read_image_memory::ImageMemory>)>> {
+        self.reconciled_row_with_owner(read, table, meta, row_id, snapshot, read_memory, false)
     }
 
     pub(crate) fn relational_row_by_id_lsn(
@@ -7820,91 +8406,99 @@ impl RetainedReadSource {
         row_id: RowId,
         lsn: Lsn,
     ) -> Result<Option<VersionedRow>> {
-        self.with_read(|read| {
-            let row = RedbPersistence::relational_row_by_id_lsn_in_read(
-                &self.database_path,
-                "retained",
-                read,
-                table,
-                meta,
-                row_id,
-                lsn,
-            )?;
-            if let Some(row) = row.as_ref()
-                && row.deleted_tx.is_none()
-            {
-                let _ = self.authenticate_relational_row(table, meta, row)?;
-            }
-            Ok(row)
+        let read_memory = self.read_memory.clone();
+        graph_read::with_pages(read_memory.clone(), || {
+            self.relational_row_by_id_lsn_with_read_memory(table, meta, row_id, lsn, read_memory)
         })
     }
 
-    pub(crate) fn bounded_relational_row_by_identity<E>(
+    pub(crate) fn relational_row_by_id_lsn_with_read_memory(
+        &self,
+        table: &str,
+        meta: &TableMeta,
+        row_id: RowId,
+        lsn: Lsn,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<Option<VersionedRow>> {
+        self.relational_row_by_id_lsn_with_checkpoint(
+            table,
+            meta,
+            row_id,
+            lsn,
+            read_memory,
+            &mut || Ok(()),
+        )
+    }
+
+    pub(crate) fn relational_row_by_id_lsn_with_checkpoint(
+        &self,
+        table: &str,
+        meta: &TableMeta,
+        row_id: RowId,
+        lsn: Lsn,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        checkpoint: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Option<VersionedRow>> {
+        graph_read::with_pages(read_memory.clone(), || {
+            self.with_read(|read| {
+                let mut last = None;
+                self.reconcile_addressed_relational_group::<Error>(
+                    read,
+                    table,
+                    meta,
+                    row_id,
+                    self.logical_frontier,
+                    Some(lsn),
+                    read_memory.clone(),
+                    checkpoint,
+                    None,
+                    &mut |admission: crate::read_image_memory::RowReadAdmission<'_>| {
+                        admission
+                            .retain_into_image(crate::read_image_memory::active_owner()?.as_ref())
+                    },
+                    &mut last,
+                )
+            })
+        })
+    }
+
+    pub(crate) fn bounded_relational_row_by_identity_admitted<E>(
         &self,
         table: &str,
         meta: &TableMeta,
         row_id: RowId,
         snapshot: SnapshotId,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), E>,
-        before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), E>,
+        before_clone: &mut dyn FnMut(
+            crate::read_image_memory::RowReadAdmission<'_>,
+        ) -> std::result::Result<(), E>,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<Option<VersionedRow>, E>
     where
         E: From<Error>,
     {
+        let operation = crate::read_image_memory::ImageMemory::operation_reader(
+            self.verified_ordered_runs.memory.accountant.clone(),
+            read_memory.clone(),
+        )
+        .map_err(E::from)?;
+        let _scope = operation.enter();
+
         let read = self.begin_read().map_err(E::from)?;
-        let name = RedbPersistence::rel_table_name(table);
-        let definition: TableDefinition<&[u8], &[u8]> = TableDefinition::new(name.as_str());
-        let relation = read.open_table(definition).map_err(|error| {
-            E::from(match error {
-                redb::TableError::TableDoesNotExist(_) => self.content_identity_corruption(
-                    format!("relational table {table} is absent from the retained root"),
-                ),
-                other => RedbPersistence::storage_error(other),
-            })
-        })?;
-        let (lower, upper) = RedbPersistence::rel_row_key_range(row_id);
-        let mut versions = relation
-            .range(lower.as_slice()..upper.as_slice())
-            .map_err(RedbPersistence::storage_error)
-            .map_err(E::from)?;
-        loop {
-            // Charge each actual version/terminal probe before advancing.
-            // The caller's charge checks its cancellation and work boundary.
-            before_touch()?;
-            let Some(entry) = versions.next_back() else {
-                return Ok(None);
-            };
-            let (key, value) = entry
-                .map_err(RedbPersistence::storage_error)
-                .map_err(E::from)?;
-            #[cfg(feature = "test-seams")]
-            crate::writer_query_test_seams::note_target_entry(table);
-            // The admitted serde seed funds map/string/vector allocations as
-            // they are decoded against the active statement source budget.
-            // Retain that charge until the selected row's owner adopts it.
-            let memory = crate::read_image_memory::ImageMemory::charging_reader(
-                Arc::clone(&self.verified_ordered_runs.memory.accountant),
-                read_memory.clone(),
-            );
-            let row = memory
-                .scope(|| RedbPersistence::decode_relational_source_row(table, meta, value.value()))
-                .map_err(E::from)?;
-            self.authenticate_relational_physical_key(table, key.value(), &row)
-                .map_err(E::from)?;
-            if row.created_tx.0 > snapshot.0 {
-                continue;
-            }
-            if !self
-                .authenticate_relational_row(table, meta, &row)
-                .map_err(E::from)?
-            {
-                return Ok(None);
-            }
-            before_clone(row.estimated_bytes())?;
-            drop(memory);
-            return Ok(Some(row));
-        }
+        let mut last = None;
+        self.reconcile_relational_group(
+            &read,
+            table,
+            meta,
+            row_id,
+            snapshot,
+            None,
+            read_memory,
+            before_touch,
+            None,
+            before_clone,
+            &mut last,
+        )
     }
 
     pub(crate) fn bounded_visit_relational_rows<E>(
@@ -7918,74 +8512,31 @@ impl RetainedReadSource {
     where
         E: From<Error>,
     {
-        let memory = crate::read_image_memory::ImageMemory::charging_reader(
-            self._source_memory.memory.accountant.clone(),
-            read_memory,
-        );
-        memory.scope(|| {
-            let read = self.begin_read().map_err(E::from)?;
-            let name = RedbPersistence::rel_table_name(table);
-            let definition: TableDefinition<&[u8], &[u8]> = TableDefinition::new(name.as_str());
-            let relation = match read.open_table(definition) {
-                Ok(table) => table,
-                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
-                Err(error) => return Err(E::from(RedbPersistence::storage_error(error))),
-            };
-            let mut candidate = None::<VersionedRow>;
-            let mut candidate_row_id = None::<RowId>;
-            let mut publish = |row: Option<VersionedRow>| -> std::result::Result<(), E> {
-                if let Some(row) = row
-                    && self
-                        .authenticate_relational_row(table, meta, &row)
-                        .map_err(E::from)?
-                {
-                    visit(&row)?;
-                }
-                Ok(())
-            };
-            let versions = {
-                #[cfg(feature = "test-seams")]
-                let _target_reads = crate::writer_query_test_seams::physical_operation(
-                    crate::writer_query_test_seams::PhysicalFamily::Row,
-                    table,
-                );
-                relation
-                    .iter()
-                    .map_err(RedbPersistence::storage_error)
-                    .map_err(E::from)?
-            };
-            #[cfg(feature = "test-seams")]
-            let versions = {
-                let mut versions = versions;
-                std::iter::from_fn(move || {
-                    let _target_reads = crate::writer_query_test_seams::physical_operation(
-                        crate::writer_query_test_seams::PhysicalFamily::Row,
-                        table,
-                    );
-                    versions.next()
-                })
-            };
-            for entry in versions {
-                let (key, value) = entry
-                    .map_err(RedbPersistence::storage_error)
-                    .map_err(E::from)?;
-                #[cfg(feature = "test-seams")]
-                crate::writer_query_test_seams::note_target_entry(table);
-                let row = RedbPersistence::decode_relational_source_row(table, meta, value.value())
-                    .map_err(E::from)?;
-                self.authenticate_relational_physical_key(table, key.value(), &row)
-                    .map_err(E::from)?;
-                if candidate_row_id.is_some_and(|row_id| row_id != row.row_id) {
-                    publish(candidate.take())?;
-                }
-                candidate_row_id = Some(row.row_id);
-                if row.created_tx.0 <= snapshot.0 {
-                    candidate = Some(row);
-                }
-            }
-            publish(candidate)?;
-            Ok(())
-        })
+        let mut cursor = contextdb_relational::mem::BoundedPhysicalCursor::default();
+        loop {
+            let mut output = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
+            let row = self.bounded_relational_physical_next_admitted(
+                table,
+                meta,
+                snapshot,
+                &mut cursor,
+                &mut || Ok(()),
+                &mut |_| Ok(()),
+                &mut |admission: crate::read_image_memory::RowReadAdmission<'_>| {
+                    admission
+                        .retain_into(
+                            &mut output,
+                            "reader",
+                            "version_visit_output",
+                            "Raise the declared reader memory limit.",
+                        )
+                        .map_err(E::from)
+                },
+                read_memory.clone(),
+            )?;
+            let Some(row) = row else { return Ok(()) };
+            visit(&row)?;
+        }
     }
 
     /// The cache identity of one working WINDOW: the run it belongs to, plus
@@ -8417,6 +8968,12 @@ impl RetainedReadSource {
             None => {
                 let read = self.begin_read().map_err(E::from)?;
                 let name = RedbPersistence::relational_index_table_name(table, &declaration.name);
+                self.verify_history_root_in_read(&read, &name).map_err(E::from)?;
+                self.verify_history_root_in_read(
+                    &read,
+                    &RedbPersistence::rel_table_name(table),
+                )
+                .map_err(E::from)?;
                 let definition: TableDefinition<DurableRelationalIndexKey, &[u8]> =
                     TableDefinition::new(name.as_str());
                 #[cfg(feature = "test-seams")]
@@ -8691,6 +9248,32 @@ impl RetainedReadSource {
     /// are proved against, so an empty answer here means no window over these
     /// prefixes could deliver an identity; the physical index is not consulted
     /// because nothing is read from it.
+    fn verify_relational_source_roots(
+        &self,
+        table: &str,
+        index: &str,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<()> {
+        let memory = crate::read_image_memory::ImageMemory::charging_reader(
+            self._source_memory.memory.accountant.clone(),
+            read_memory,
+        );
+        memory.reserve(
+            table
+                .len()
+                .saturating_add(index.len())
+                .saturating_mul(2)
+                .saturating_add(256),
+        )?;
+        self.with_read(|read| {
+            self.verify_history_root_in_read(read, &RedbPersistence::rel_table_name(table))?;
+            self.verify_history_root_in_read(
+                read,
+                &RedbPersistence::relational_index_table_name(table, index),
+            )
+        })
+    }
+
     pub(crate) fn verified_index_prefixes_are_empty<E>(
         &self,
         table: &str,
@@ -8703,6 +9286,10 @@ impl RetainedReadSource {
     where
         E: From<Error>,
     {
+        check_boundary()?;
+        before_touch()?;
+        self.verify_relational_source_roots(table, &declaration.name, read_memory.clone())
+            .map_err(E::from)?;
         let _attribution = contextdb_core::find_attribution::stage("window_probe");
         let Some(memory) = self.verified_ordered_runs.begin_build(read_memory.clone()) else {
             return Ok(None);
@@ -8767,6 +9354,30 @@ impl RetainedReadSource {
     where
         E: From<Error>,
     {
+        if snapshot != self.logical_frontier {
+            let meta = self
+                .with_read(|read| RedbPersistence::load_table_meta_in_read_txn(read, table))
+                .map_err(E::from)?
+                .ok_or_else(|| E::from(Error::TableNotFound(table.into())))?;
+            let declaration = meta
+                .indexes
+                .iter()
+                .find(|declaration| declaration.name == index)
+                .ok_or_else(|| {
+                    E::from(Error::IndexNotFound {
+                        table: table.into(),
+                        index: index.into(),
+                    })
+                })?;
+            self.historical_index_preflight(
+                table,
+                &meta,
+                declaration,
+                snapshot,
+                read_memory.clone(),
+                before_touch,
+            )?;
+        }
         let memory = crate::read_image_memory::ImageMemory::charging_reader(
             self._source_memory.memory.accountant.clone(),
             read_memory,
@@ -8823,11 +9434,62 @@ impl RetainedReadSource {
         cursor: &mut contextdb_relational::mem::BoundedPhysicalCursor,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), E>,
         observed: &mut dyn FnMut(&VersionedRow) -> std::result::Result<(), E>,
-        before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), E>,
+        before_clone: &mut dyn FnMut(
+            usize,
+        ) -> std::result::Result<(), E>,
     ) -> std::result::Result<Option<VersionedRow>, E>
     where
         E: From<Error>,
     {
+        let read_memory = self.read_memory.clone();
+        graph_read::with_pages_result(
+            read_memory.clone(),
+            || {
+                self.bounded_relational_physical_next_admitted(
+                    table,
+                    meta,
+                    snapshot,
+                    cursor,
+                    before_touch,
+                    observed,
+                    &mut |admission: crate::read_image_memory::RowReadAdmission<'_>| before_clone(match admission { crate::read_image_memory::RowReadAdmission::Copy(bytes) => bytes, crate::read_image_memory::RowReadAdmission::Move(memory) => memory.retained_payload_bytes() }),
+                    read_memory,
+                )
+            },
+            E::from,
+        )
+    }
+
+    pub(crate) fn bounded_relational_physical_next_admitted<E>(
+        &self,
+        table: &str,
+        meta: &TableMeta,
+        snapshot: SnapshotId,
+        cursor: &mut contextdb_relational::mem::BoundedPhysicalCursor,
+        before_touch: &mut dyn FnMut() -> std::result::Result<(), E>,
+        observed: &mut dyn FnMut(&VersionedRow) -> std::result::Result<(), E>,
+        before_clone: &mut dyn FnMut(
+            crate::read_image_memory::RowReadAdmission<'_>,
+        ) -> std::result::Result<(), E>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> std::result::Result<Option<VersionedRow>, E>
+    where
+        E: From<Error>,
+    {
+        let witness_memory = crate::read_image_memory::ImageMemory::charging_reader(
+            self._source_memory.memory.accountant.clone(),
+            read_memory.clone(),
+        );
+        witness_memory
+            .reserve(table.len().saturating_add(64))
+            .map_err(E::from)?;
+        self.with_read(|read| {
+            self.verify_history_root_in_read(read, &RedbPersistence::rel_table_name(table))
+        })
+        .map_err(E::from)?;
+        if cursor.is_exhausted() {
+            return Ok(None);
+        }
         let mut physical_rows = self.physical_rows.lock().map_err(|_| {
             E::from(self.content_identity_corruption("physical row scan lock poisoned"))
         })?;
@@ -8838,103 +9500,212 @@ impl RetainedReadSource {
             let read = self.begin_read().map_err(E::from)?;
             let name = RedbPersistence::rel_table_name(table);
             let definition: TableDefinition<&[u8], &[u8]> = TableDefinition::new(name.as_str());
-            let relation = match read.open_table(definition) {
-                Ok(relation) => relation,
-                Err(redb::TableError::TableDoesNotExist(_)) => {
-                    return Err(E::from(Error::StoreCorrupted {
-                        path: self.database_path.display().to_string(),
-                        reason: format!(
-                            "relational table {table} is absent from the retained root"
-                        ),
-                    }));
-                }
-                Err(error) => return Err(E::from(RedbPersistence::storage_error(error))),
-            };
+            let relation = read
+                .open_table(definition)
+                .map_err(|error| RedbPersistence::relational_table_error(table, error))
+                .map_err(E::from)?;
             *physical_rows = Some(RetainedPhysicalRowScan {
                 table_name: table.to_owned(),
                 relation,
                 _transaction: read,
             });
         }
-        let relation = &physical_rows.as_ref().expect("scan opened above").relation;
+        let scan = physical_rows.as_ref().expect("scan opened");
         loop {
-            let after = cursor.source_position().map(ToOwned::to_owned);
-            let first = match after.as_deref() {
-                Some(after) => relation
+            if snapshot == self.logical_frontier {
+                // Native CURRENT enumeration never consults the historical
+                // row universe. The held transaction is this source's root.
+                before_touch()?;
+                let first = match cursor.source_position() {
+                    Some(after) => scan
+                        .relation
+                        .range::<&[u8]>((
+                            std::ops::Bound::Excluded(after),
+                            std::ops::Bound::Unbounded,
+                        ))
+                        .map_err(|error| RedbPersistence::relational_storage_error(table, error))
+                        .map_err(E::from)?
+                        .next()
+                        .transpose()
+                        .map_err(|error| RedbPersistence::relational_storage_error(table, error))
+                        .map_err(E::from)?,
+                    None => scan
+                        .relation
+                        .first()
+                        .map_err(|error| RedbPersistence::relational_storage_error(table, error))
+                        .map_err(E::from)?,
+                };
+                let Some((key, body)) = first else {
+                    cursor.source_exhaust();
+                    return Ok(None);
+                };
+                let identity: [u8; 24] = key.value().try_into().map_err(|_| {
+                    E::from(self.content_identity_corruption("current scan key has invalid width"))
+                })?;
+                let row_id = RowId(u64::from_be_bytes(
+                    identity[..8].try_into().expect("row identity"),
+                ));
+                drop((key, body));
+                let mut last = None;
+                let row = self.current_relational_group(
+                    &scan._transaction,
+                    table,
+                    meta,
+                    row_id,
+                    snapshot,
+                    read_memory.clone(),
+                    before_touch,
+                    Some(&mut *observed),
+                    before_clone,
+                    &mut last,
+                )?;
+                let last = last.ok_or_else(|| {
+                    E::from(self.content_identity_corruption("current row group disappeared"))
+                })?;
+                let position = VersionedRow {
+                    row_id,
+                    values: HashMap::new(),
+                    created_tx: TxId(u64::from_be_bytes(last[8..16].try_into().expect("created"))),
+                    deleted_tx: None,
+                    lsn: Lsn(u64::from_be_bytes(last[16..].try_into().expect("lsn"))),
+                    created_at: None,
+                };
+                let bytes = last.len().checked_add(contextdb_relational::mem::BoundedPhysicalCursor::source_position_owner_bytes())
+                    .ok_or_else(|| E::from(self.content_identity_corruption("cursor layout overflow")))?;
+                let credit = contextdb_core::read_memory::ReadCredit::try_new(
+                    read_memory.clone(),
+                    bytes,
+                    "reader",
+                    "current_scan_position",
+                    "Raise the declared reader memory limit.",
+                )
+                .map_err(E::from)?;
+                cursor.source_advance_with_credit(
+                    last.to_vec(),
+                    &Self::physical_row_position(&position),
+                    credit,
+                );
+                if row.is_some() {
+                    return Ok(row);
+                }
+                continue;
+            }
+            let bound_credit = contextdb_core::read_memory::ReadCredit::try_new(
+                read_memory.clone(),
+                table.len().checked_add(72).ok_or_else(|| {
+                    E::from(self.content_identity_corruption("manifest bound overflow"))
+                })?,
+                "reader",
+                "version_scan_bound",
+                "Raise the declared reader memory limit.",
+            )
+            .map_err(E::from)?;
+            let mut start =
+                content_identity::version_manifest::manifest_prefix(table).map_err(E::from)?;
+            if let Some(after) = cursor.source_position() {
+                if after.len() != 24 {
+                    return Err(E::from(
+                        self.content_identity_corruption("invalid physical cursor position"),
+                    ));
+                }
+                start.extend_from_slice(&after[..8]);
+                start.extend_from_slice(&[255; 57]);
+            }
+            let next = self.manifest_next(start, read_memory.clone(), before_touch)?;
+            before_touch()?;
+            let physical = match cursor.source_position() {
+                Some(after) => scan
+                    .relation
                     .range::<&[u8]>((std::ops::Bound::Excluded(after), std::ops::Bound::Unbounded))
-                    .map_err(RedbPersistence::storage_error)
+                    .map_err(|error| RedbPersistence::relational_storage_error(table, error))
                     .map_err(E::from)?
                     .next()
                     .transpose()
-                    .map_err(RedbPersistence::storage_error)
+                    .map_err(|error| RedbPersistence::relational_storage_error(table, error))
                     .map_err(E::from)?,
-                None => relation
+                None => scan
+                    .relation
                     .first()
-                    .map_err(RedbPersistence::storage_error)
+                    .map_err(|error| RedbPersistence::relational_storage_error(table, error))
                     .map_err(E::from)?,
             };
-            let Some((first_key_guard, first_value)) = first else {
+            let witness = next
+                .as_ref()
+                .map(|next| content_identity::version_manifest::parse_manifest(&next.coordinate))
+                .transpose()
+                .map_err(|e| E::from(self.content_identity_error(e)))?;
+            let witness = witness.filter(|witness| witness.table == table);
+            let Some(witness) = witness else {
+                if physical.is_some() {
+                    return Err(E::from(
+                        self.content_identity_corruption("unwitnessed physical table suffix"),
+                    ));
+                }
                 cursor.source_exhaust();
                 return Ok(None);
             };
-            before_touch()?;
-            let first_key = first_key_guard.value().to_vec();
-            let first_row =
-                RedbPersistence::decode_relational_source_row(table, meta, first_value.value())
-                    .map_err(E::from)?;
-            // The guards hold the storage page the first version was read
-            // from; the rest of the row group is read below through its own
-            // range, so the page is let go here instead of being held beside
-            // a second read of it.
-            drop((first_key_guard, first_value));
-            self.authenticate_relational_physical_key(table, &first_key, &first_row)
-                .map_err(E::from)?;
-            observed(&first_row)?;
-            let (_, group_upper) = RedbPersistence::rel_row_key_range(first_row.row_id);
-            // The cursor resumes from the version it inspected last, which it
-            // names by identity alone. Keeping that identity instead of a copy
-            // of the version means a row's values exist once however many
-            // versions are inspected: a version the snapshot cannot see is
-            // dropped as soon as it has been checked, and the one it can see
-            // is the only copy kept.
-            let mut last_key = first_key.clone();
-            let mut last_row = Self::physical_row_position(&first_row);
-            let mut selected = (first_row.created_tx.0 <= snapshot.0).then_some(first_row);
-            for entry in relation
-                .range::<&[u8]>((
-                    std::ops::Bound::Excluded(first_key.as_slice()),
-                    std::ops::Bound::Excluded(group_upper.as_slice()),
-                ))
-                .map_err(RedbPersistence::storage_error)
-                .map_err(E::from)?
+            if physical
+                .as_ref()
+                .is_none_or(|(key, _)| key.value() != witness.identity)
             {
-                before_touch()?;
-                let (key, value) = entry
-                    .map_err(RedbPersistence::storage_error)
-                    .map_err(E::from)?;
-                let row = RedbPersistence::decode_relational_source_row(table, meta, value.value())
-                    .map_err(E::from)?;
-                self.authenticate_relational_physical_key(table, key.value(), &row)
-                    .map_err(E::from)?;
-                observed(&row)?;
-                last_key = key.value().to_vec();
-                last_row = Self::physical_row_position(&row);
-                if row.created_tx.0 <= snapshot.0 {
-                    selected = Some(row);
-                }
+                return Err(E::from(self.content_identity_corruption(
+                    "physical scan gap disagrees with independent manifest expectation",
+                )));
             }
-            cursor.source_advance(last_key, &last_row);
-            let Some(row) = selected else {
-                continue;
+            drop(physical);
+            let row_id = RowId(u64::from_be_bytes(
+                witness.identity[..8].try_into().expect("row id"),
+            ));
+            let mut last = None;
+            let row = self.reconcile_relational_group(
+                &scan._transaction,
+                table,
+                meta,
+                row_id,
+                snapshot,
+                None,
+                read_memory.clone(),
+                before_touch,
+                Some(&mut *observed),
+                before_clone,
+                &mut last,
+            )?;
+            let last = last.ok_or_else(|| {
+                E::from(self.content_identity_corruption("expected row group had no members"))
+            })?;
+            let position = VersionedRow {
+                row_id,
+                values: HashMap::new(),
+                created_tx: TxId(u64::from_be_bytes(last[8..16].try_into().expect("created"))),
+                deleted_tx: None,
+                lsn: Lsn(u64::from_be_bytes(last[16..].try_into().expect("lsn"))),
+                created_at: None,
             };
-            if !self
-                .authenticate_relational_row(table, meta, &row)
-                .map_err(E::from)?
-            {
-                continue;
+            let position_bytes = last
+                .len()
+                .checked_add(
+                    contextdb_relational::mem::BoundedPhysicalCursor::source_position_owner_bytes(),
+                )
+                .ok_or_else(|| {
+                    E::from(self.content_identity_corruption("cursor position layout overflow"))
+                })?;
+            let position_credit = contextdb_core::read_memory::ReadCredit::try_new(
+                read_memory.clone(),
+                position_bytes,
+                "reader",
+                "version_scan_position",
+                "Raise the declared reader memory limit.",
+            )
+            .map_err(E::from)?;
+            cursor.source_advance_with_credit(
+                last.to_vec(),
+                &Self::physical_row_position(&position),
+                position_credit,
+            );
+            drop(bound_credit);
+            if row.is_some() {
+                return Ok(row);
             }
-            before_clone(row.estimated_bytes())?;
-            return Ok(Some(row));
         }
     }
 
@@ -8961,7 +9732,9 @@ impl RetainedReadSource {
         cursor: &mut contextdb_relational::mem::BoundedOrderedRowCursor,
         check_boundary: &mut dyn FnMut() -> std::result::Result<(), E>,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), E>,
-        before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), E>,
+        before_clone: &mut dyn FnMut(
+            crate::read_image_memory::RowReadAdmission<'_>,
+        ) -> std::result::Result<(), E>,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<Option<VersionedRow>, E>
     where
@@ -8991,12 +9764,31 @@ impl RetainedReadSource {
         check_boundary: &mut dyn FnMut() -> std::result::Result<(), E>,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), E>,
         observed: &mut dyn FnMut(&IndexKey, RowId) -> std::result::Result<(), E>,
-        before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), E>,
+        before_clone: &mut dyn FnMut(
+            crate::read_image_memory::RowReadAdmission<'_>,
+        ) -> std::result::Result<(), E>,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<Option<VersionedRow>, E>
     where
         E: From<Error>,
     {
+        check_boundary()?;
+        self.verify_relational_source_roots(table, &declaration.name, read_memory.clone())
+            .map_err(E::from)?;
+        self.historical_index_preflight(
+            table,
+            meta,
+            declaration,
+            snapshot,
+            read_memory.clone(),
+            before_touch,
+        )?;
+        let operation = crate::read_image_memory::ImageMemory::operation_reader(
+            self.verified_ordered_runs.memory.accountant.clone(),
+            read_memory.clone(),
+        )
+        .map_err(E::from)?;
+        let _scope = operation.enter();
         if cursor.source_prefix_quota() == Some(0) {
             cursor.source_stop_prefix();
             return Ok(None);
@@ -9083,7 +9875,9 @@ impl RetainedReadSource {
                             lsn: Lsn(0),
                             created_at: None,
                         };
-                        before_clone(identity.estimated_bytes())?;
+                        before_clone(crate::read_image_memory::RowReadAdmission::Copy(
+                            identity.estimated_bytes(),
+                        ))?;
                         return Ok(Some(identity));
                     }
                     if run.more || run.quota_stopped {
@@ -9200,17 +9994,18 @@ impl RetainedReadSource {
             if cursor.source_identities_only() {
                 let row = self
                     .with_read(|read| {
-                        self.row_identity_by_id_in_read(
+                        self.row_identity_by_id_in_read_with_read_memory(
                             read,
                             table,
                             meta,
                             position.row_id,
                             snapshot,
                             None,
+                            read_memory.clone(),
                         )
                     })
                     .map_err(E::from)?;
-                let Some(row) = row else {
+                let Some((row, memory)) = row else {
                     return Err(E::from(self.content_identity_corruption(format!(
                         "durable relational index {} names a missing visible row {}",
                         declaration.name, position.row_id.0
@@ -9232,15 +10027,26 @@ impl RetainedReadSource {
                     lsn: row.lsn,
                     created_at: row.created_at,
                 };
-                before_clone(identity.estimated_bytes())?;
+                drop(row);
+                drop(memory);
+                before_clone(crate::read_image_memory::RowReadAdmission::Copy(
+                    identity.estimated_bytes(),
+                ))?;
                 return Ok(Some(identity));
             }
             let row = self
                 .with_read(|read| {
-                    self.row_by_id_in_read(read, table, meta, position.row_id, snapshot)
+                    self.row_by_id_in_read_with_read_memory(
+                        read,
+                        table,
+                        meta,
+                        position.row_id,
+                        snapshot,
+                        read_memory.clone(),
+                    )
                 })
                 .map_err(E::from)?;
-            let Some(row) = row else {
+            let Some((row, memory)) = row else {
                 return Err(E::from(self.content_identity_corruption(format!(
                     "durable relational index {} names a missing visible row {}",
                     declaration.name, position.row_id.0
@@ -9256,7 +10062,7 @@ impl RetainedReadSource {
                     ),
                 }));
             }
-            before_clone(row.estimated_bytes())?;
+            before_clone(crate::read_image_memory::RowReadAdmission::Move(&memory))?;
             return Ok(Some(row));
         }
     }
@@ -9270,12 +10076,28 @@ impl RetainedReadSource {
         snapshot: SnapshotId,
         cursor: &mut contextdb_relational::mem::BoundedExactIndexCursor,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), E>,
-        before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), E>,
+        before_clone: &mut dyn FnMut(
+            crate::read_image_memory::RowReadAdmission<'_>,
+        ) -> std::result::Result<(), E>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<Option<VersionedRow>, E>
     where
         E: From<Error>,
     {
+        self.historical_index_preflight(
+            table,
+            meta,
+            declaration,
+            snapshot,
+            read_memory.clone(),
+            before_touch,
+        )?;
         loop {
+            let decode_owner = crate::read_image_memory::ImageMemory::operation_reader(
+                self._source_memory.memory.accountant.clone(),
+                read_memory.clone(),
+            ).map_err(E::from)?;
+            let _decode_scope = decode_owner.enter();
             let Some(probe) = cursor.source_probe().cloned() else {
                 return Ok(None);
             };
@@ -9346,15 +10168,24 @@ impl RetainedReadSource {
                     lsn: Lsn(0),
                     created_at: None,
                 };
-                before_clone(row.estimated_bytes())?;
+                before_clone(crate::read_image_memory::RowReadAdmission::Copy(
+                    row.estimated_bytes(),
+                ))?;
                 return Ok(Some(row));
             }
             let row = self
                 .with_read(|read| {
-                    self.row_by_id_in_read(read, table, meta, position.row_id, snapshot)
+                    self.row_by_id_in_read_with_read_memory(
+                        read,
+                        table,
+                        meta,
+                        position.row_id,
+                        snapshot,
+                        read_memory.clone(),
+                    )
                 })
                 .map_err(E::from)?;
-            let Some(row) = row else {
+            let Some((row, memory)) = row else {
                 return Err(E::from(self.content_identity_corruption(format!(
                     "durable relational index {} names a missing visible row {}",
                     declaration.name, position.row_id.0
@@ -9369,7 +10200,7 @@ impl RetainedReadSource {
                     ),
                 }));
             }
-            before_clone(row.estimated_bytes())?;
+            before_clone(crate::read_image_memory::RowReadAdmission::Move(&memory))?;
             return Ok(Some(row));
         }
     }
@@ -9386,6 +10217,7 @@ fn decode_relational_index_entry(
         redb::AccessGuard<'_, &[u8]>,
     )>,
 ) -> Result<Option<(Vec<u8>, RelationalIndexPosition, Option<TxId>)>> {
+    let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
     let Some((key, value)) = entry else {
         return Ok(None);
     };
@@ -9396,12 +10228,18 @@ fn decode_relational_index_entry(
     let key = key.value();
     let position = key
         .decode_canonical()
-        .map_err(|error| corrupt(error.to_string()))?;
+        .map_err(|error| match error {
+            Error::Other(reason) => corrupt(reason),
+            other => other,
+        })?;
     let deleted_tx =
         RedbPersistence::decode_exact::<Option<TxId>>(value.value()).map_err(|error| {
-            corrupt(format!(
-                "durable index visibility record is damaged: {error}"
-            ))
+            match error {
+                Error::Other(reason) => corrupt(format!(
+                    "durable index visibility record is damaged: {reason}"
+                )),
+                other => other,
+            }
         })?;
     Ok(Some((key.0, position, deleted_tx)))
 }
@@ -9410,7 +10248,7 @@ impl ReadImageSource {
     fn start(
         database_path: &Path,
         cache_bytes: usize,
-        mut source_memory: SourceMemoryReservation,
+        source_memory: SourceMemoryReservation,
         runtime_dir: Option<&Path>,
         registration: Option<ReadSnapshotRegistrationGuard>,
     ) -> std::result::Result<Self, LoadReadImageError> {
@@ -9456,7 +10294,7 @@ impl ReadImageSource {
         // Charge the actual opened handle and release it with the source.
         let index_bytes = database.cache_index_bytes();
         let total_source_bytes = source_memory
-            .bytes
+            .bytes.load(Ordering::SeqCst)
             .checked_add(index_bytes)
             .ok_or_else(|| {
                 LoadReadImageError::Memory(Error::Other(
@@ -9467,7 +10305,7 @@ impl ReadImageSource {
             .memory
             .reserve(index_bytes)
             .map_err(LoadReadImageError::Memory)?;
-        source_memory.bytes = total_source_bytes;
+        source_memory.bytes.store(total_source_bytes, Ordering::SeqCst);
         #[cfg(feature = "test-seams")]
         crate::read_probe::note_persistence_read_only_open();
         #[cfg(feature = "test-seams")]
@@ -9499,7 +10337,11 @@ impl ReadImageSource {
             // nothing, and creates nothing, which is what a direct read is
             // allowed to do.
             store_file_bytes,
-            source_memory: Some(source_memory),
+            source_memory: Some(Arc::new(source_memory)),
+            #[cfg(feature = "test-seams")]
+            source_handles_dropped_for_test: false,
+            #[cfg(feature = "test-seams")]
+            source_released_for_test: false,
         })
     }
 
@@ -9624,13 +10466,34 @@ impl ReadImageSource {
                         .map_or(0, |(_, tx)| tx.0),
                 ),
         );
+        let logical_frontier =
+            logical_frontier.max(SnapshotId(image.read_bounds.identity_tx_floor));
+        let history_open_control = image
+            .history_on_request
+            .as_ref()
+            .and_then(|history| history.open_control)
+            .ok_or_else(|| {
+                invalid_read_image_state("validated history control disappeared before handoff")
+            })?;
+        history_open_control
+            .check_snapshot(snapshot)
+            .map_err(read_image_error)?;
+        let own_control = self.source_memory.as_mut().ok_or_else(|| {
+            invalid_read_image_state("reader source memory reservation disappeared")
+        })?.detach_control(crate::memory_accounting::writer_adapter_type_layout::<RetainedReadSource>().size())
+            .map_err(read_image_error)?;
         let source = Arc::new(RetainedReadSource {
             database_path: self.database_path.clone(),
             database,
             snapshot,
             logical_frontier,
+            graph_lsn_frontier: Lsn(image.read_bounds.source_lsn_floor),
+            graph_retirement_frontier: image.read_bounds.graph_retirement_frontier,
+            graph_occurrence_id_floor: image.read_bounds.graph_occurrence_id_floor,
             registration,
             content_identity,
+            history_open_control,
+            read_memory: image.open_context.read_memory(),
             content_proof: Mutex::new(content_identity::ReadAuthenticationNodes::new(
                 RETAINED_CONTENT_PROOF_BYTES,
                 Some(Arc::clone(&cache_memory.accountant)),
@@ -9638,9 +10501,10 @@ impl ReadImageSource {
             physical_rows: Mutex::new(None),
             image_config_cache: Mutex::new(HashMap::new()),
             verified_ordered_runs: VerifiedOrderedRunCache::new(cache_memory),
-            _source_memory: self.source_memory.take().ok_or_else(|| {
+            _source_memory: Arc::clone(self.source_memory.as_ref().ok_or_else(|| {
                 invalid_read_image_state("reader source memory reservation disappeared")
-            })?,
+            })?),
+            _own_control: own_control,
         });
         source
             .authenticate_open_config(&image.config_values)
@@ -9651,17 +10515,30 @@ impl ReadImageSource {
         // take it is woken here. The session keeps only the unlocked exact
         // descriptor/database/root and its authenticated registration.
         drop(self.hold.take());
+        let breadcrumb = self.breadcrumb.take();
         #[cfg(feature = "test-seams")]
-        read_persistence_test_scaffold::note_read_image_source_handles_dropped_for_test(
-            &self.database_path,
-        );
-        let breadcrumb_path = match self.breadcrumb.take() {
-            Some(breadcrumb) => Some(
-                breadcrumb
-                    .release()
-                    .map_err(|error| LoadReadImageError::Release(error.to_string()))?,
-            ),
-            None => None,
+        let mut note_handles_released = || {
+            read_persistence_test_scaffold::note_read_image_source_handles_dropped_for_test(
+                &self.database_path,
+            );
+            self.source_handles_dropped_for_test = true;
+        };
+        #[cfg(not(feature = "test-seams"))]
+        let note_handles_released = || {};
+        // All authentication and proof reads are complete before removal
+        // begins. On refusal the staged release consumes and drops the only
+        // retained source; no source alias has been published to a caller.
+        let (breadcrumb_path, source) = match breadcrumb {
+            Some(breadcrumb) => {
+                let (path, source) = breadcrumb
+                    .release(source, note_handles_released)
+                    .map_err(|error| LoadReadImageError::Release(error.to_string()))?;
+                (Some(path), source)
+            }
+            None => {
+                note_handles_released();
+                (None, source)
+            }
         };
         #[cfg(feature = "test-seams")]
         crate::read_probe::note_persistence_release_receipt();
@@ -9670,6 +10547,10 @@ impl ReadImageSource {
             &self.database_path,
             breadcrumb_path.as_deref(),
         );
+        #[cfg(feature = "test-seams")]
+        {
+            self.source_released_for_test = true;
+        }
         Ok(ReadPersistenceLoad {
             image,
             release_receipt: ReadPersistenceReleaseReceipt {
@@ -9682,6 +10563,35 @@ impl ReadImageSource {
     }
 }
 
+#[cfg(feature = "test-seams")]
+impl Drop for ReadImageSource {
+    fn drop(&mut self) {
+        if self.source_released_for_test {
+            return;
+        }
+        // Match the native field-drop order on every failed hydration. The
+        // events witness physical cleanup; they do not create a success receipt.
+        drop(self.database.take());
+        drop(self.snapshot_registration.take());
+        drop(self.hold.take());
+        if !self.source_handles_dropped_for_test {
+            read_persistence_test_scaffold::note_read_image_source_handles_dropped_for_test(
+                &self.database_path,
+            );
+        }
+        let breadcrumb_path = self
+            .breadcrumb
+            .as_ref()
+            .map(|guard| guard.path().to_path_buf());
+        drop(self.breadcrumb.take());
+        drop(self.source_memory.take());
+        read_persistence_test_scaffold::note_read_image_source_release_for_test(
+            &self.database_path,
+            breadcrumb_path.as_deref(),
+        );
+    }
+}
+
 fn read_image_corruption(
     cause: ReadImageCorruptionCause,
     reason: impl std::fmt::Display,
@@ -9691,8 +10601,15 @@ fn read_image_corruption(
 }
 
 fn read_image_error(error: Error) -> LoadReadImageError {
-    if matches!(error, Error::MemoryBudgetExceeded { .. }) {
+    if matches!(
+        error,
+        Error::MemoryBudgetExceeded { .. } | Error::ReadFailure(_) | Error::ReadCancelled
+    ) {
         LoadReadImageError::Memory(error)
+    } else if crate::read_image_memory::is_missing_decode_owner(&error) {
+        // The existing public direct-file vocabulary cannot yet preserve
+        // the additive typed configuration answer. Never call it corruption.
+        invalid_read_image_state(error)
     } else {
         read_image_corruption(ReadImageCorruptionCause::MalformedRecord, error)
     }
@@ -9820,6 +10737,7 @@ fn read_database_open_error(error: redb::DatabaseError) -> LoadReadImageError {
 fn decode_read_table_meta(
     read_txn: &redb::ReadTransaction,
 ) -> std::result::Result<HashMap<String, TableMeta>, LoadReadImageError> {
+    let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call().map_err(read_image_error)?;
     let meta_table = match read_txn.open_table(META_TABLE) {
         Ok(table) => table,
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(HashMap::new()),
@@ -9843,11 +10761,46 @@ fn decode_read_table_meta(
     Ok(table_meta)
 }
 
+/// Both hydration and paged reads use the schema maximum from the pinned,
+/// authenticated bounds root; no population scan or retained bound map.
+fn validate_read_version_bounds(
+    read: &redb::ReadTransaction,
+    table: &str,
+    lsn: Lsn,
+    created: TxId,
+    deleted: Option<TxId>,
+    tx_frontier: TxId,
+    lsn_frontier: Lsn,
+) -> std::result::Result<(), LoadReadImageError> {
+    let table_max = RedbPersistence::table_read_lsn_in_read(read, table)?;
+    if lsn > table_max
+        || lsn > lsn_frontier
+        || created > tx_frontier
+        || deleted.is_some_and(|tx| tx > tx_frontier)
+    {
+        return Err(read_image_corruption(
+            ReadImageCorruptionCause::MalformedRecord,
+            format!("{table} version exceeds its authenticated committed bounds"),
+        ));
+    }
+    Ok(())
+}
+
 fn decode_read_relational_table(
     read_txn: &redb::ReadTransaction,
     name: &str,
     meta: &TableMeta,
 ) -> std::result::Result<Vec<VersionedRow>, LoadReadImageError> {
+    decode_read_relational_table_with_bounds(read_txn, name, meta, None)
+}
+
+fn decode_read_relational_table_with_bounds(
+    read_txn: &redb::ReadTransaction,
+    name: &str,
+    meta: &TableMeta,
+    authenticated: Option<&writer_recovery::AuthenticatedReadBounds<'_>>,
+) -> std::result::Result<Vec<VersionedRow>, LoadReadImageError> {
+        let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call().map_err(read_image_error)?;
     let table_name = RedbPersistence::rel_table_name(name);
     let definition: TableDefinition<&[u8], &[u8]> = TableDefinition::new(table_name.as_str());
     let table = match read_txn.open_table(definition) {
@@ -9859,6 +10812,11 @@ fn decode_read_relational_table(
             )));
         }
         Err(error) => return Err(read_table_error(error)),
+    };
+    let bounds = match authenticated {
+        Some(proof) if std::ptr::eq(proof.read(), read_txn) => *proof.bounds(),
+        _ => RedbPersistence::read_authenticated_bounds_in_read(read_txn)
+            .map_err(read_image_error)?,
     };
     let mut rows = Vec::new();
     for entry in table.iter().map_err(read_storage_error)? {
@@ -9872,6 +10830,15 @@ fn decode_read_relational_table(
         contextdb_core::find_attribution::count("decoded_rows", 1);
         let row = RedbPersistence::decode_versioned_row(value.value(), Some(meta))
             .map_err(read_image_error)?;
+        validate_read_version_bounds(
+            read_txn,
+            name,
+            row.lsn,
+            row.created_tx,
+            row.deleted_tx,
+            TxId(bounds.identity_tx_floor),
+            Lsn(bounds.source_lsn_floor),
+        )?;
         validate_read_row(name, &row, meta)?;
         rows.push(row);
     }
@@ -9938,31 +10905,26 @@ fn remove_quantized_placeholders(row: &mut VersionedRow, meta: &TableMeta) {
     }
 }
 
-fn decode_read_graph_table(
-    read_txn: &redb::ReadTransaction,
-    definition: TableDefinition<&[u8], &[u8]>,
-) -> std::result::Result<Vec<AdjEntry>, LoadReadImageError> {
-    let table = match read_txn.open_table(definition) {
-        Ok(table) => table,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-        Err(error) => return Err(read_table_error(error)),
-    };
-    let mut entries = Vec::new();
-    for entry in table.iter().map_err(read_storage_error)? {
-        let (_, value) = entry.map_err(read_storage_error)?;
-        crate::read_progress::note_hydrated_bytes(value.value().len() as u64);
-        entries.push(RedbPersistence::decode(value.value()).map_err(read_image_error)?);
-    }
-    Ok(entries)
-}
-
 fn decode_read_vectors(
     read_txn: &redb::ReadTransaction,
 ) -> std::result::Result<Vec<VectorEntry>, LoadReadImageError> {
+    decode_read_vectors_with_bounds(read_txn, None)
+}
+
+fn decode_read_vectors_with_bounds(
+    read_txn: &redb::ReadTransaction,
+    authenticated: Option<&writer_recovery::AuthenticatedReadBounds<'_>>,
+) -> std::result::Result<Vec<VectorEntry>, LoadReadImageError> {
+        let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call().map_err(read_image_error)?;
     let table = match read_txn.open_table(VECTORS_TABLE) {
         Ok(table) => table,
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
         Err(error) => return Err(read_table_error(error)),
+    };
+    let bounds = match authenticated {
+        Some(proof) if std::ptr::eq(proof.read(), read_txn) => *proof.bounds(),
+        _ => RedbPersistence::read_authenticated_bounds_in_read(read_txn)
+            .map_err(read_image_error)?,
     };
     let mut vectors = Vec::new();
     for entry in table.iter().map_err(read_storage_error)? {
@@ -9971,8 +10933,18 @@ fn decode_read_vectors(
         #[cfg(feature = "test-seams")]
         crate::read_work_probe::note_decoded_vector();
         contextdb_core::find_attribution::count("decoded_vectors", 1);
-        vectors
-            .push(RedbPersistence::decode_vector_entry(value.value()).map_err(read_image_error)?);
+        let vector =
+            RedbPersistence::decode_vector_entry(value.value()).map_err(read_image_error)?;
+        validate_read_version_bounds(
+            read_txn,
+            &vector.index.table,
+            vector.lsn,
+            vector.created_tx,
+            vector.deleted_tx,
+            TxId(bounds.identity_tx_floor),
+            Lsn(bounds.source_lsn_floor),
+        )?;
+        vectors.push(vector);
     }
     Ok(vectors)
 }
@@ -9981,6 +10953,8 @@ fn decode_vector_partition_record_payload<T: serde::de::DeserializeOwned>(
     expected_kind: VectorPartitionRecordKind,
     encoded: &[u8],
 ) -> std::result::Result<T, String> {
+    let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()
+        .map_err(|error| format!("payload decode failed: {error}"))?;
     let payload = vector_partition_record_payload(expected_kind, encoded)?;
     RedbPersistence::decode_exact(payload)
         .map_err(|error| format!("payload decode failed: {error}"))
@@ -10069,7 +11043,10 @@ enum InspectedVectorPartitionComponent<'a> {
     TxId(TxId),
 }
 
-struct InspectedVectorPartitionComponents;
+struct InspectedVectorPartitionComponents {
+    count: usize,
+    text_bytes: usize,
+}
 
 impl<'de> Deserialize<'de> for InspectedVectorPartitionComponents {
     fn deserialize<D: serde::Deserializer<'de>>(
@@ -10085,11 +11062,21 @@ impl<'de> Deserialize<'de> for InspectedVectorPartitionComponents {
                 self,
                 mut sequence: A,
             ) -> std::result::Result<Self::Value, A::Error> {
-                while sequence
-                    .next_element::<InspectedVectorPartitionComponent<'de>>()?
-                    .is_some()
-                {}
-                Ok(InspectedVectorPartitionComponents)
+                let mut count = 0usize;
+                let mut text_bytes = 0usize;
+                while let Some(component) =
+                    sequence.next_element::<InspectedVectorPartitionComponent<'de>>()?
+                {
+                    count = count.checked_add(1).ok_or_else(|| {
+                        serde::de::Error::custom("partition component count overflow")
+                    })?;
+                    if let InspectedVectorPartitionComponent::Text(text) = component {
+                        text_bytes = text_bytes.checked_add(text.len()).ok_or_else(|| {
+                            serde::de::Error::custom("partition component text overflow")
+                        })?;
+                    }
+                }
+                Ok(InspectedVectorPartitionComponents { count, text_bytes })
             }
         }
         deserializer.deserialize_seq(ComponentsVisitor)
@@ -10191,6 +11178,7 @@ fn prevalidate_persisted_vector_entry(bytes: &[u8], dimension: usize) -> Result<
 }
 
 fn decode_image_vector_entry(bytes: &[u8], dimension: usize) -> Result<PersistedVectorEntry> {
+    let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
     prevalidate_persisted_vector_entry(bytes, dimension)?;
     RedbPersistence::decode_exact(bytes)
         .map_err(|_| vector_paged::corruption("fixed vector body cannot be decoded"))
@@ -10203,6 +11191,33 @@ fn inspect_vector_partition_metadata_route(payload: &[u8]) -> std::result::Resul
     bincode::serde::borrow_decode_from_slice::<Route<'_>, _>(payload, bincode::config::standard())
         .map(|(_, consumed)| consumed)
         .map_err(|_| "metadata route is truncated or invalid".to_owned())
+}
+
+/// Inspect native route capacity using borrowed fields before its owning
+/// serde decoder or any route/key clones can allocate. Vec growth is admitted
+/// through the next power-of-two capacity, including short scalar components.
+fn vector_partition_route_native_capacity(payload: &[u8]) -> std::result::Result<usize, String> {
+    type Route<'a> = (&'a str, &'a str, InspectedVectorPartitionComponents);
+    let ((table, column, components), _) =
+        bincode::serde::borrow_decode_from_slice::<Route<'_>, _>(
+            payload,
+            bincode::config::standard(),
+        )
+        .map_err(|_| "metadata route is truncated or invalid".to_owned())?;
+    let capacity = if components.count == 0 {
+        0
+    } else {
+        components
+            .count
+            .checked_next_power_of_two()
+            .ok_or_else(|| "partition native capacity overflow".to_owned())?
+    };
+    capacity
+        .checked_mul(std::mem::size_of::<contextdb_core::VectorPartitionComponent>())
+        .and_then(|n| n.checked_add(components.text_bytes))
+        .and_then(|n| n.checked_add(table.len()))
+        .and_then(|n| n.checked_add(column.len()))
+        .ok_or_else(|| "partition native route bytes overflow".to_owned())
 }
 
 fn prevalidate_vector_partition_metadata_routes(
@@ -10346,6 +11361,7 @@ fn decode_retained_raw_vector_entry(
     expected_dimension: usize,
     corruption: impl Fn(String) -> Error,
 ) -> Result<VectorEntry> {
+        let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
     validate_raw_vector_entry_encoded_width(
         bytes,
         &membership.index,
@@ -10397,6 +11413,7 @@ fn stream_raw_partition_memberships<T>(
     mut visit: impl FnMut(&mut T, VectorPartitionMembershipRecord) -> Result<()>,
     corruption: impl Fn(String) -> Error,
 ) -> Result<T> {
+    vector_membership_source::operation_checkpoint()?;
     let prefix =
         RedbPersistence::vector_partition_prefix(&partition.index, &partition.partition_key);
     let table = match read.open_byte_table_bounded(VECTOR_PARTITION_MEMBERSHIP_TABLE) {
@@ -10409,6 +11426,7 @@ fn stream_raw_partition_memberships<T>(
         .prefix_bounded(prefix.as_slice())
         .map_err(RedbPersistence::storage_error)?
     {
+        vector_membership_source::operation_checkpoint()?;
         let (key, _) = item.map_err(RedbPersistence::storage_error)?;
         #[cfg(feature = "test-seams")]
         crate::database::resident_history_test_seams::note(|work| {
@@ -10426,6 +11444,7 @@ fn stream_raw_partition_memberships<T>(
         .prefix_bounded(prefix.as_slice())
         .map_err(RedbPersistence::storage_error)?
     {
+        vector_membership_source::operation_checkpoint()?;
         let (key, value) = item.map_err(RedbPersistence::storage_error)?;
         #[cfg(feature = "test-seams")]
         crate::database::resident_history_test_seams::note(|work| {
@@ -10450,8 +11469,10 @@ fn stream_raw_partition_memberships<T>(
                 "raw-vector membership key disagrees with its checksummed payload".into(),
             ));
         }
+        vector_membership_source::operation_checkpoint()?;
         visit(&mut state, membership)?;
     }
+    vector_membership_source::operation_checkpoint()?;
     Ok(state)
 }
 
@@ -10615,6 +11636,7 @@ fn decode_read_vector_generation_catalog(
     ),
     LoadReadImageError,
 > {
+    let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call().map_err(read_image_error)?;
     vector_membership_pages::validate_in_read(read_txn).map_err(read_image_error)?;
     let mut known_by_key = HashMap::<Vec<u8>, VectorPartitionRef>::new();
     let mut raw_ready = true;
@@ -11390,6 +12412,7 @@ fn ensure_required_quantized_vectors_are_present(
 fn decode_read_sync_source_lsns(
     read_txn: &redb::ReadTransaction,
 ) -> std::result::Result<HashMap<(String, RowId), Lsn>, LoadReadImageError> {
+    let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call().map_err(read_image_error)?;
     let table = match read_txn.open_table(SYNC_ROW_SOURCE_LSN_TABLE) {
         Ok(table) => table,
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(HashMap::new()),
@@ -11411,6 +12434,7 @@ fn decode_read_sync_source_lsns(
 fn decode_read_sync_source_kinds(
     read_txn: &redb::ReadTransaction,
 ) -> std::result::Result<HashMap<(String, RowId), u8>, LoadReadImageError> {
+    let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call().map_err(read_image_error)?;
     let table = match read_txn.open_table(SYNC_ROW_SOURCE_KIND_TABLE) {
         Ok(table) => table,
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(HashMap::new()),
@@ -11465,17 +12489,27 @@ fn note_open_history(class: OpenHistoryClass, bytes: usize) {
 fn decode_read_change_log(
     read_txn: &redb::ReadTransaction,
 ) -> std::result::Result<Vec<ChangeLogEntry>, LoadReadImageError> {
+    let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call().map_err(read_image_error)?;
     let table = match read_txn.open_table(CHANGE_LOG_TABLE) {
         Ok(table) => table,
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
         Err(error) => return Err(read_table_error(error)),
     };
     let mut entries = Vec::new();
-    for entry in table.iter().map_err(read_storage_error)? {
+    for entry in table.iter().map_err(read_storage_error)?.inspect(|_entry| {
+        #[cfg(any(test, feature = "test-seams"))]
+        if let Ok((key, _)) = _entry {
+            crate::read_work_probe::graph_storage_key("history", "iteration_step", key.value());
+        }
+    }) {
         let (_, value) = entry.map_err(read_storage_error)?;
         crate::read_progress::note_hydrated_bytes(value.value().len() as u64);
         note_open_history(OpenHistoryClass::ChangeLog, value.value().len());
-        entries.push(RedbPersistence::decode(value.value()).map_err(read_image_error)?);
+        entries.push(
+            RedbPersistence::decode_stored_change_log(value.value())
+                .map(|record| record.entry)
+                .map_err(read_image_error)?,
+        );
     }
     Ok(entries)
 }
@@ -11483,6 +12517,7 @@ fn decode_read_change_log(
 fn decode_read_ddl_log(
     read_txn: &redb::ReadTransaction,
 ) -> std::result::Result<Vec<(Lsn, DdlChange)>, LoadReadImageError> {
+    let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call().map_err(read_image_error)?;
     let table = match read_txn.open_table(DDL_LOG_TABLE) {
         Ok(table) => table,
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
@@ -11509,45 +12544,21 @@ fn decode_read_ddl_log(
     Ok(entries)
 }
 
-fn decode_read_commit_index(
-    read_txn: &redb::ReadTransaction,
-) -> std::result::Result<BTreeMap<Lsn, TxId>, LoadReadImageError> {
-    let table = match read_txn.open_table(COMMIT_INDEX_TABLE) {
-        Ok(table) => table,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(BTreeMap::new()),
-        Err(error) => return Err(read_table_error(error)),
-    };
-    let mut values = BTreeMap::new();
-    let mut previous = TxId(0);
-    for entry in table.iter().map_err(read_storage_error)? {
-        let (lsn, tx) = entry.map_err(read_storage_error)?;
-        note_open_history(
-            OpenHistoryClass::CommitIndex,
-            2 * std::mem::size_of::<u64>(),
-        );
-        let tx = TxId(tx.value());
-        if tx < previous {
-            return Err(direct_read_requires_writer_for(
-                ReadImageRequiresWriterCause::NonMonotonicCommitIndex,
-                "commit-index transaction order needs writable repair",
-            ));
-        }
-        previous = tx;
-        values.insert(Lsn(lsn.value()), tx);
-    }
-    Ok(values)
-}
-
-/// Diagnose what the stored commit index holds past its last committed entry.
-///
-/// A healthy store holds nothing there, so this reads nothing but one seek.
-/// Anything there was never committed. A writable open truncates that suffix;
-/// a direct reader asks for recovery instead of calling it corruption. The
-/// work is proportional to the suffix, never to the committed history.
 fn diagnose_commit_index_past_committed_frontier(
     read_txn: &redb::ReadTransaction,
     committed_last: Option<(Lsn, TxId)>,
+    context: &contextdb_tx::ReadCommitContext<'_>,
 ) -> std::result::Result<(), LoadReadImageError> {
+    context.checkpoint().map_err(read_image_error)?;
+    let _controls = contextdb_core::read_memory::ReadCredit::try_new(
+        context.read_memory.clone(),
+        std::mem::size_of::<redb::ReadOnlyTable<u64, u64>>()
+            + std::mem::size_of::<redb::Range<'_, u64, u64>>(),
+        "reader",
+        "commit_repair_probe",
+        "Raise the declared reader memory limit.",
+    )
+    .map_err(LoadReadImageError::Memory)?;
     let table = match read_txn.open_table(COMMIT_INDEX_TABLE) {
         Ok(table) => table,
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
@@ -11562,11 +12573,38 @@ fn diagnose_commit_index_past_committed_frontier(
     };
     let mut previous = committed_last.map_or(TxId(0), |(_, tx)| tx);
     let mut uncommitted = 0u64;
-    for entry in table.range(start..).map_err(read_storage_error)? {
-        let (_, tx) = entry.map_err(read_storage_error)?;
+    let mut lower = std::ops::Bound::Included(start);
+    loop {
+        context.checkpoint().map_err(read_image_error)?;
+        let pair = {
+            let mut range = table
+                .range((lower, std::ops::Bound::Unbounded))
+                .map_err(read_storage_error)?;
+            range
+                .next()
+                .transpose()
+                .map_err(read_storage_error)?
+                .map(|(key, tx)| (key.value(), tx.value()))
+        };
+        let Some((lsn, tx)) = pair else {
+            break;
+        };
+        #[cfg(any(test, feature = "test-seams"))]
+        crate::read_work_probe::note_graph(
+            "commit_index",
+            "iteration_step",
+            &lsn.to_be_bytes(),
+            Some(lsn),
+            None,
+        );
         note_open_history(OpenHistoryClass::CommitIndexScanned, 0);
-        uncommitted += 1;
-        let tx = TxId(tx.value());
+        uncommitted = uncommitted.checked_add(1).ok_or_else(|| {
+            read_image_corruption(
+                ReadImageCorruptionCause::MalformedRecord,
+                "uncommitted commit-index count overflow",
+            )
+        })?;
+        let tx = TxId(tx);
         if tx < previous {
             return Err(direct_read_requires_writer_for(
                 ReadImageRequiresWriterCause::NonMonotonicCommitIndex,
@@ -11574,6 +12612,7 @@ fn diagnose_commit_index_past_committed_frontier(
             ));
         }
         previous = tx;
+        lower = std::ops::Bound::Excluded(lsn);
     }
     if uncommitted > 0 {
         return Err(direct_read_requires_writer_for(
@@ -11621,123 +12660,117 @@ fn validate_read_commit_index_in_store(
 /// from the committed history rather than from whatever the stored tables
 /// end with.
 struct AuthenticatedHistoryFrontiers {
+    control: content_identity::ValidatedHistoryOpenControl,
     commit_last: Option<(Lsn, TxId)>,
     ddl_last_lsn: Option<Lsn>,
 }
 
 /// Read the last committed commit-index entry and the last committed
-/// schema-change position from the pinned root -- one proof path each, never
-/// a walk of the history -- and require the stored tables to end exactly
-/// there with the committed values.
+/// schema-change position from authenticated fixed controls, without reading
+/// history proof bodies. Require the physical endpoint facts used by open to
+/// agree; ordinary operations separately check directory agreement and paths.
 fn read_authenticated_history_frontiers(
     read_txn: &redb::ReadTransaction,
-    path: &Path,
-    memory: &crate::read_image_memory::ImageMemory,
+    _path: &Path,
+    _memory: &Arc<crate::read_image_memory::ImageMemory>,
+    context: &contextdb_tx::ReadCommitContext<'_>,
 ) -> std::result::Result<AuthenticatedHistoryFrontiers, LoadReadImageError> {
-    let corrupt = |reason: String| {
-        read_image_corruption(
-            ReadImageCorruptionCause::MalformedRecord,
-            format!("the stored history is not the committed history: {reason}"),
-        )
-    };
-    let verifier = content_identity::ContentIdentityReadVerifier::open(read_txn, path, None)
-        .map_err(read_image_error)?;
-    let last_committed = |kind: content_identity::HistoryKind| {
-        let proof = content_identity::ProofMemory::admitted(
-            Some(Arc::clone(&memory.accountant)),
-            READ_HISTORY_PROOF_POOL_BYTES,
-        );
-        let mut last = None;
-        let complete = verifier.visit_history::<Error>(
-            kind,
-            true,
-            &proof,
-            &mut || Ok(()),
-            &mut |coordinate, value_hash| {
-                last = Some((coordinate.to_vec(), value_hash));
-                Ok(false)
-            },
-        )?;
-        if !complete {
-            return Err(Error::MemoryBudgetExceeded {
-                subsystem: "content_identity".to_owned(),
-                operation: "authenticated_history_frontier".to_owned(),
-                requested_bytes: READ_HISTORY_PROOF_POOL_BYTES,
-                available_bytes: memory.accountant.usage().available.unwrap_or(0),
-                budget_limit_bytes: memory.accountant.usage().limit.unwrap_or(0),
-                hint: "Raise MEMORY_LIMIT so the committed history frontier can be proved."
-                    .to_owned(),
-            });
-        }
-        Ok(last)
-    };
+    read_authenticated_history_frontiers_with_bounds(read_txn, context, None)
+}
 
-    let commit_last = match last_committed(content_identity::HistoryKind::CommitIndex)
-        .map_err(read_image_error)?
-    {
+fn read_authenticated_history_frontiers_with_bounds(
+    read_txn: &redb::ReadTransaction,
+    context: &contextdb_tx::ReadCommitContext<'_>,
+    authenticated: Option<&writer_recovery::AuthenticatedReadBounds<'_>>,
+) -> std::result::Result<AuthenticatedHistoryFrontiers, LoadReadImageError> {
+    context.checkpoint().map_err(read_image_error)?;
+    let _credit = contextdb_core::read_memory::ReadCredit::try_new(
+        context.read_memory.clone(),
+        content_identity::history_open_control::OPEN_CONTROL_SCRATCH_BYTES,
+        "reader",
+        "history_open_controls",
+        "Raise the declared reader memory limit.",
+    )
+    .map_err(LoadReadImageError::Memory)?;
+    let standalone;
+    let authenticated = match authenticated {
+        Some(proof) if std::ptr::eq(proof.read(), read_txn) => proof,
+        _ => {
+            standalone =
+                RedbPersistence::authenticate_read_bounds(read_txn).map_err(read_image_error)?;
+            &standalone
+        }
+    };
+    let control = content_identity::history_open_control::acquire_authenticated(
+        authenticated,
+        authenticated.bounds().commit_count,
+    )
+    .map_err(read_image_error)?;
+    let fixed = control.control();
+    let corrupt =
+        |reason: &str| read_image_corruption(ReadImageCorruptionCause::MalformedRecord, reason);
+    let commits = read_txn
+        .open_table(COMMIT_INDEX_TABLE)
+        .map_err(read_table_error)?;
+    let first = commits
+        .first()
+        .map_err(read_storage_error)?
+        .map(|(lsn, tx)| (Lsn(lsn.value()), TxId(tx.value())));
+    let last = match fixed.last {
         None => None,
-        Some((coordinate, value_hash)) => {
-            let lsn = <[u8; 8]>::try_from(coordinate.as_slice())
-                .map(u64::from_be_bytes)
-                .map_err(|_| corrupt("a committed commit-index key is not an LSN".to_owned()))?;
-            let stored = open_optional_read_table(read_txn, COMMIT_INDEX_TABLE)
-                .map_err(read_image_error)?
-                .map(|table| {
-                    table
-                        .get(lsn)
-                        .map(|tx| tx.map(|tx| tx.value()))
-                        .map_err(read_storage_error)
-                })
-                .transpose()?
-                .flatten()
-                .ok_or_else(|| {
-                    corrupt(format!(
-                        "the last committed commit-index entry {lsn} is missing from the store"
-                    ))
-                })?;
-            if content_identity::commit_index_value_hash(TxId(stored)) != value_hash {
-                return Err(corrupt(format!(
-                    "the last commit-index entry {lsn} names transaction {stored}, not the committed one"
-                )));
+        Some((lsn, expected)) => {
+            let tx = commits
+                .get(lsn.0)
+                .map_err(read_storage_error)?
+                .map(|tx| TxId(tx.value()))
+                .ok_or_else(|| corrupt("the last committed commit-index entry is missing"))?;
+            if content_identity::commit_index_value_hash(tx) != expected {
+                return Err(corrupt(
+                    "the last commit-index entry names another transaction",
+                ));
             }
-            Some((Lsn(lsn), TxId(stored)))
+            Some((lsn, tx))
         }
     };
-
-    let ddl_committed = last_committed(content_identity::HistoryKind::DdlLog)
-        .map_err(read_image_error)?
-        .map(|(coordinate, _)| coordinate);
-    let ddl_stored = match read_txn.open_table(DDL_LOG_TABLE) {
-        Ok(table) => table
-            .last()
-            .map_err(read_storage_error)?
-            .map(|(key, _)| key.value().as_bytes().to_vec()),
-        Err(redb::TableError::TableDoesNotExist(_)) => None,
-        Err(error) => return Err(read_table_error(error)),
-    };
-    if ddl_stored != ddl_committed {
-        let shown = |key: &Option<Vec<u8>>| {
-            key.as_deref()
-                .map(|key| String::from_utf8_lossy(key).into_owned())
-        };
-        return Err(corrupt(format!(
-            "the stored schema history ends at {:?}, the committed one at {:?}",
-            shown(&ddl_stored),
-            shown(&ddl_committed)
-        )));
+    // With no committed frontier every physical entry is a repair suffix.
+    // Leave its refusal to suffix diagnosis before directory disagreement.
+    if fixed.first.is_some() && first.map(|pair| pair.0) != fixed.first.map(|pair| pair.0) {
+        return Err(corrupt(
+            "physical first commit coordinate differs from control",
+        ));
     }
-    let ddl_last_lsn = ddl_committed
-        .map(|key| {
-            let key = String::from_utf8_lossy(&key).into_owned();
-            let raw = key.split_once(':').map(|(lsn, _)| lsn).unwrap_or(&key);
-            raw.parse::<u64>()
-                .map(Lsn)
-                .map_err(|error| corrupt(format!("schema history key {key}: {error}")))
-        })
-        .transpose()?;
+    let ddl = read_txn
+        .open_table(DDL_LOG_TABLE)
+        .map_err(read_table_error)?;
+    match (fixed.ddl, ddl.last().map_err(read_storage_error)?) {
+        (None, None) => {}
+        (Some((len, lsn, expected, _)), Some((key, _))) => {
+            let key = key.value();
+            if u64::try_from(key.len()).ok() != Some(len)
+                || content_identity::history_open_control::ddl_coordinate_digest(
+                    key.as_bytes(),
+                    Some(&|| context.checkpoint()),
+                )
+                .map_err(read_image_error)?
+                    != expected
+                || RedbPersistence::ddl_lsn_from_key(key).map_err(read_image_error)? != lsn
+            {
+                return Err(corrupt(
+                    "stored schema history final coordinate differs from control",
+                ));
+            }
+        }
+        _ => {
+            return Err(corrupt(
+                "stored schema history final coordinate differs from control",
+            ));
+        }
+    }
+    context.checkpoint().map_err(read_image_error)?;
     Ok(AuthenticatedHistoryFrontiers {
-        commit_last,
-        ddl_last_lsn,
+        control,
+        commit_last: last,
+        ddl_last_lsn: fixed.ddl.map(|(_, lsn, _, _)| lsn),
     })
 }
 
@@ -11746,6 +12779,7 @@ fn decode_read_raw_string_table(
     definition: TableDefinition<&str, &[u8]>,
     history: Option<OpenHistoryClass>,
 ) -> std::result::Result<Vec<(String, Vec<u8>)>, LoadReadImageError> {
+    let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call().map_err(read_image_error)?;
     let table = match read_txn.open_table(definition) {
         Ok(table) => table,
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
@@ -11806,6 +12840,7 @@ pub(crate) fn read_image_open_config_key(key: &str) -> bool {
 fn decode_read_open_config(
     read_txn: &redb::ReadTransaction,
 ) -> std::result::Result<Vec<(String, Vec<u8>)>, LoadReadImageError> {
+    let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call().map_err(read_image_error)?;
     let table = read_txn
         .open_table(READ_OPEN_CONFIG_TABLE)
         .map_err(read_table_error)?;
@@ -11864,6 +12899,7 @@ fn decode_read_open_config(
 fn decode_read_trigger_audit_stamps(
     read_txn: &redb::ReadTransaction,
 ) -> std::result::Result<Vec<(String, u64)>, LoadReadImageError> {
+    let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call().map_err(read_image_error)?;
     let table = match read_txn.open_table(TRIGGER_AUDIT_STAMPS_TABLE) {
         Ok(table) => table,
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
@@ -11903,6 +12939,7 @@ fn read_sink_queue_names(
 fn decode_read_sink_queue_extents(
     read_txn: &redb::ReadTransaction,
 ) -> std::result::Result<BTreeMap<String, SinkQueueExtent>, LoadReadImageError> {
+    let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call().map_err(read_image_error)?;
     let mut extents = BTreeMap::new();
     for name in read_sink_queue_names(read_txn)? {
         let table_name = RedbPersistence::sink_queue_table_name(&name);
@@ -11924,6 +12961,7 @@ fn decode_read_sink_queue_extents(
 fn decode_read_sink_queues(
     read_txn: &redb::ReadTransaction,
 ) -> std::result::Result<BTreeMap<String, Vec<(u64, Vec<u8>)>>, LoadReadImageError> {
+    let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call().map_err(read_image_error)?;
     let mut queues = BTreeMap::new();
     for name in read_sink_queue_names(read_txn)? {
         let table_name = RedbPersistence::sink_queue_table_name(&name);
@@ -11941,57 +12979,6 @@ fn decode_read_sink_queues(
         queues.insert(name, entries);
     }
     Ok(queues)
-}
-
-fn validate_reverse_graph_projection(
-    forward_edges: &[AdjEntry],
-    reverse_edges: &[AdjEntry],
-) -> std::result::Result<(), LoadReadImageError> {
-    /// What an edge IS, independent of the order anything happened to store
-    /// it in.
-    ///
-    /// The two projections hold the same edges, so the question here is
-    /// whether they hold the same CONTENT. An edge's properties are a map,
-    /// and the durable encoder writes a map in iteration order, so comparing
-    /// encoded bytes asks a second question nobody meant to ask -- whether
-    /// two separately decoded copies happened to walk their keys the same
-    /// way. Rendering the properties through an ordered map fixes one order
-    /// for equal content, so equal edges render equal -- and it stays on the
-    /// durable encoder, which can carry every value an edge may hold.
-    fn content(edge: &AdjEntry) -> std::result::Result<Vec<u8>, LoadReadImageError> {
-        let properties = edge
-            .properties
-            .iter()
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect::<BTreeMap<_, _>>();
-        RedbPersistence::encode(&(
-            edge.source,
-            edge.target,
-            edge.edge_type.as_str(),
-            properties,
-            edge.created_tx,
-            edge.deleted_tx,
-            edge.lsn,
-        ))
-        .map_err(read_image_error)
-    }
-
-    fn multiset(
-        edges: &[AdjEntry],
-    ) -> std::result::Result<BTreeMap<Vec<u8>, u64>, LoadReadImageError> {
-        let mut values = BTreeMap::new();
-        for edge in edges {
-            *values.entry(content(edge)?).or_insert(0) += 1;
-        }
-        Ok(values)
-    }
-
-    if multiset(forward_edges)? != multiset(reverse_edges)? {
-        return Err(direct_read_requires_writer(
-            "forward and reverse graph projections need writable reconciliation",
-        ));
-    }
-    Ok(())
 }
 
 fn resolve_read_tombstone(versions: &mut [(Lsn, TxId)], threshold: Lsn) -> Option<TxId> {
@@ -12084,21 +13071,6 @@ fn reconstruct_read_commit_index(
         }
     }
     index
-}
-
-/// The part of the open-time commit-index cross-check a page-on-demand open
-/// defers: each deleted edge's tombstone, whose LSN only the change log
-/// carries, must be in the commit index with the tombstone's transaction.
-/// The refusal is the same typed diagnosis an open that checks everything
-/// gives for the same damage.
-pub(crate) fn validate_read_history_tombstones(
-    deleted_edges: &[AdjEntry],
-    change_log: &[ChangeLogEntry],
-    commit_index: &BTreeMap<Lsn, TxId>,
-) -> std::result::Result<(), LoadReadImageError> {
-    let reconstructed =
-        reconstruct_read_commit_index(&HashMap::new(), deleted_edges, &[], change_log);
-    validate_read_commit_index(commit_index, &reconstructed)
 }
 
 fn validate_read_commit_index(
@@ -12258,9 +13230,11 @@ fn compatibility_read_vector_projection(
 
 fn decode_complete_read_image(
     read_txn: &redb::ReadTransaction,
-    path: &Path,
+    _path: &Path,
     memory: Arc<crate::read_image_memory::ImageMemory>,
+    open_context: crate::executor::bounded::ReadOpenContext,
 ) -> std::result::Result<ReadPersistenceImage, LoadReadImageError> {
+    let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call().map_err(read_image_error)?;
     // What each step of the open holds, for the attribution sink only.
     let open_started = std::time::Instant::now();
     let note_open = |step: &str| {
@@ -12307,6 +13281,7 @@ fn decode_complete_read_image(
         )));
     }
     drop(format_table);
+    RedbPersistence::check_history_witness_schema(read_txn).map_err(read_image_error)?;
 
     match read_txn.open_table(CONTENT_IDENTITY_METADATA_TABLE) {
         Ok(table) => drop(table),
@@ -12322,7 +13297,36 @@ fn decode_complete_read_image(
         RedbPersistence::load_content_identity_from_read(read_txn).map_err(read_image_error)?;
     note_open("content_identity");
 
+    memory
+        .reserve(std::mem::size_of::<WriterRecoveryBounds>())
+        .map_err(read_image_error)?;
+    // The bounds remain charged as retained image state. The borrowed capture
+    // pointer is fixed open scratch and releases on every success/error exit.
+    let _bounds_capture_credit = contextdb_core::read_memory::ReadCredit::try_new(
+        open_context.read_memory(),
+        std::mem::size_of::<writer_recovery::AuthenticatedReadBounds<'_>>()
+            - std::mem::size_of::<WriterRecoveryBounds>(),
+        "reader",
+        "authenticated_bounds_capture",
+        "Raise the declared reader memory limit.",
+    )
+    .map_err(LoadReadImageError::Memory)?;
+    let authenticated_bounds =
+        RedbPersistence::authenticate_read_bounds(read_txn).map_err(read_image_error)?;
+    let read_bounds = authenticated_bounds.bounds();
     let table_meta = decode_read_table_meta(read_txn)?;
+    // Both image loading paths consume the authenticated schema facts at
+    // open. Bodies are compared with these same values when admitted below
+    // or on demand; no schema-bound map is retained beside the source.
+    for table in table_meta.keys() {
+        let maximum = RedbPersistence::table_read_lsn_in_read(read_txn, table)?;
+        if maximum.0 > read_bounds.source_lsn_floor {
+            return Err(read_image_corruption(
+                ReadImageCorruptionCause::MalformedRecord,
+                format!("{table} maximum exceeds the committed cross-subsystem bound"),
+            ));
+        }
+    }
     note_open("table_meta");
     let (vector_generation_catalog, raw_vector_directory) =
         decode_read_vector_generation_catalog(read_txn, &memory)?;
@@ -12344,30 +13348,29 @@ fn decode_complete_read_image(
             })?;
             relational_tables.insert(
                 name.clone(),
-                decode_read_relational_table(read_txn, &name, meta)?,
+                decode_read_relational_table_with_bounds(
+                    read_txn,
+                    &name,
+                    meta,
+                    Some(&authenticated_bounds),
+                )?,
             );
         }
     }
     note_open("relational_tables");
-    let forward_edges = decode_read_graph_table(read_txn, GRAPH_FWD_TABLE)?;
-    note_open("graph_forward_edges");
-    let reverse_edges = decode_read_graph_table(read_txn, GRAPH_REV_TABLE)?;
-    note_open("graph_reverse_edges");
-    validate_reverse_graph_projection(&forward_edges, &reverse_edges)?;
+    // Graph bodies, projection checks and creation proofs belong to the
+    // querying operation on this root, including the hydration fallback.
     let vector_entries = if lazy_relational {
         Vec::new()
     } else {
-        decode_read_vectors(read_txn)?
+        decode_read_vectors_with_bounds(read_txn, Some(&authenticated_bounds))?
     };
     // A page-on-demand open leaves history in the store; the complete
     // fallback decodes it, as it decodes everything else.
     let (change_log, ddl_log) = if lazy_relational {
         (Vec::new(), Vec::new())
     } else {
-        (
-            decode_read_change_log(read_txn)?,
-            decode_read_ddl_log(read_txn)?,
-        )
+        (Vec::new(), decode_read_ddl_log(read_txn)?)
     };
     note_open("change_log");
     note_open("ddl_log");
@@ -12423,47 +13426,54 @@ fn decode_complete_read_image(
             persisted_sync_kinds,
         )
     };
-    let (commit_index, history_on_request) = if lazy_relational {
-        // Open touches no history: the frontiers it exposes are the last
-        // committed entries, proved from the pinned root, and the stored
-        // tables must end exactly there. Every committed commit-index entry
-        // is proved, in order, whenever anything reads history, so the only
-        // order damage open itself can see is entries stored past the
-        // committed ones -- which a healthy store never holds. The rows and
-        // vectors whose versions the index must cover stay in the store and
-        // are proved when read; edges are loaded, so their creation entries
-        // are checked here by point lookups. Edge tombstones live in the
-        // change log and are checked when history is first read.
-        let reconstructed =
-            reconstruct_read_commit_index(&relational_tables, &forward_edges, &vector_entries, &[]);
-        validate_read_commit_index_in_store(read_txn, &reconstructed)?;
-        note_open("commit_index_reconstructed");
-        let frontiers = read_authenticated_history_frontiers(read_txn, path, &memory)?;
-        diagnose_commit_index_past_committed_frontier(read_txn, frontiers.commit_last)?;
-        note_open("commit_index");
-        let history = ReadHistoryOnRequest {
-            commit_index_last: frontiers.commit_last,
-            ddl_last_lsn: frontiers.ddl_last_lsn,
-            deleted_edges: forward_edges
-                .iter()
-                .filter(|edge| edge.deleted_tx.is_some())
-                .cloned()
-                .collect(),
-        };
-        (BTreeMap::new(), Some(history))
-    } else {
-        let commit_index = decode_read_commit_index(read_txn)?;
-        note_open("commit_index");
-        let reconstructed_commit_index = reconstruct_read_commit_index(
-            &relational_tables,
-            &forward_edges,
-            &vector_entries,
-            &change_log,
-        );
-        validate_read_commit_index(&commit_index, &reconstructed_commit_index)?;
-        note_open("commit_index_reconstructed");
-        (commit_index, None)
-    };
+    // Both hydration paths capture the same scalar directory descriptor.
+    // A detected repair suffix is diagnosed before root/count disagreement.
+    let open_checkpoint = || open_context.checkpoint();
+    let directory_context =
+        contextdb_tx::ReadCommitContext::new(open_context.read_memory(), &open_checkpoint);
+    let frontiers = read_authenticated_history_frontiers_with_bounds(
+        read_txn,
+        &directory_context,
+        Some(&authenticated_bounds),
+    )?;
+    diagnose_commit_index_past_committed_frontier(
+        read_txn,
+        frontiers.commit_last,
+        &directory_context,
+    )?;
+    let fixed = frontiers.control.control();
+    let count = usize::try_from(fixed.commit_count).map_err(|_| {
+        read_image_corruption(
+            ReadImageCorruptionCause::MalformedRecord,
+            "commit directory cardinality exceeds usize",
+        )
+    })?;
+    let commits = read_txn
+        .open_table(COMMIT_INDEX_TABLE)
+        .map_err(read_table_error)?;
+    let first = commits
+        .first()
+        .map_err(read_storage_error)?
+        .map(|(lsn, tx)| (Lsn(lsn.value()), TxId(tx.value())));
+    let last = commits
+        .last()
+        .map_err(read_storage_error)?
+        .map(|(lsn, tx)| (Lsn(lsn.value()), TxId(tx.value())));
+    if last != frontiers.commit_last {
+        return Err(read_image_corruption(
+            ReadImageCorruptionCause::MalformedRecord,
+            "commit directory endpoint differs from authenticated history",
+        ));
+    }
+    note_open("commit_index");
+    let commit_index = BTreeMap::new();
+    let history_on_request = Some(ReadHistoryOnRequest {
+        open_control: Some(frontiers.control),
+        commit_index_last: last,
+        commit_index_first: first,
+        commit_index_count: count,
+        ddl_last_lsn: frontiers.ddl_last_lsn,
+    });
     let config_values = decode_read_open_config(read_txn)?;
     note_open("config");
     // Audit records and queued payloads are history no query asks for at
@@ -12486,13 +13496,13 @@ fn decode_complete_read_image(
     let sink_queue_extents = decode_read_sink_queue_extents(read_txn)?;
     note_open("sink_queues");
     Ok(ReadPersistenceImage {
+        open_context,
         content_identity,
         memory,
         table_meta,
         relational_tables,
         lazy_relational,
-        forward_edges,
-        reverse_edges,
+        read_bounds: authenticated_bounds.into_bounds(),
         vector_entries,
         raw_vector_memberships: Vec::new(),
         current_vectors,
@@ -16376,6 +17386,9 @@ pub mod read_persistence_test_scaffold {
         bytes: &[u8],
     ) -> std::result::Result<(), String> {
         let write = database.begin_write().map_err(|error| error.to_string())?;
+        #[cfg(any(test, feature = "test-seams"))]
+        let mut graph_publication_attempt =
+            crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write);
         {
             let mut table = write
                 .open_table(super::FORMAT_METADATA_TABLE)
@@ -16384,7 +17397,16 @@ pub mod read_persistence_test_scaffold {
                 .insert(super::FORMAT_VERSION_KEY, bytes)
                 .map_err(|error| error.to_string())?;
         }
-        write.commit().map_err(|error| error.to_string())
+        {
+            #[cfg(any(test, feature = "test-seams"))]
+            let graph_commit_result = write.commit();
+            #[cfg(any(test, feature = "test-seams"))]
+            if graph_commit_result.is_ok() {
+                graph_publication_attempt.committed();
+            }
+            graph_commit_result
+        }
+        .map_err(|error| error.to_string())
     }
 
     fn damage_commit_index(database: &redb::Database) -> std::result::Result<(), String> {
@@ -16414,6 +17436,9 @@ pub mod read_persistence_test_scaffold {
             .checked_add(1)
             .ok_or_else(|| "fixture transaction overflow".to_owned())?;
         let write = database.begin_write().map_err(|error| error.to_string())?;
+        #[cfg(any(test, feature = "test-seams"))]
+        let mut graph_publication_attempt =
+            crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write);
         {
             let mut table = write
                 .open_table(super::COMMIT_INDEX_TABLE)
@@ -16425,7 +17450,16 @@ pub mod read_persistence_test_scaffold {
                 .insert(second_lsn, second_tx)
                 .map_err(|error| error.to_string())?;
         }
-        write.commit().map_err(|error| error.to_string())
+        {
+            #[cfg(any(test, feature = "test-seams"))]
+            let graph_commit_result = write.commit();
+            #[cfg(any(test, feature = "test-seams"))]
+            if graph_commit_result.is_ok() {
+                graph_publication_attempt.committed();
+            }
+            graph_commit_result
+        }
+        .map_err(|error| error.to_string())
     }
 
     fn first_vector_entry(
@@ -16462,6 +17496,9 @@ pub mod read_persistence_test_scaffold {
         let encoded = super::RedbPersistence::encode_vector_entry(&vector, quantization)
             .map_err(|error| error.to_string())?;
         let write = database.begin_write().map_err(|error| error.to_string())?;
+        #[cfg(any(test, feature = "test-seams"))]
+        let mut graph_publication_attempt =
+            crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write);
         {
             let mut table = write
                 .open_table(super::VECTORS_TABLE)
@@ -16473,7 +17510,16 @@ pub mod read_persistence_test_scaffold {
                 .insert(new_key.as_slice(), encoded.as_slice())
                 .map_err(|error| error.to_string())?;
         }
-        write.commit().map_err(|error| error.to_string())
+        {
+            #[cfg(any(test, feature = "test-seams"))]
+            let graph_commit_result = write.commit();
+            #[cfg(any(test, feature = "test-seams"))]
+            if graph_commit_result.is_ok() {
+                graph_publication_attempt.committed();
+            }
+            graph_commit_result
+        }
+        .map_err(|error| error.to_string())
     }
 
     /// Removes the stored vector entry of a required quantized column from the
@@ -16517,6 +17563,9 @@ pub mod read_persistence_test_scaffold {
             "fixture holds no embedding for a quantized vector column declared NOT NULL".to_owned()
         })?;
         let write = database.begin_write().map_err(|error| error.to_string())?;
+        #[cfg(any(test, feature = "test-seams"))]
+        let mut graph_publication_attempt =
+            crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write);
         {
             let mut table = write
                 .open_table(super::VECTORS_TABLE)
@@ -16525,7 +17574,16 @@ pub mod read_persistence_test_scaffold {
                 .remove(key.as_slice())
                 .map_err(|error| error.to_string())?;
         }
-        write.commit().map_err(|error| error.to_string())
+        {
+            #[cfg(any(test, feature = "test-seams"))]
+            let graph_commit_result = write.commit();
+            #[cfg(any(test, feature = "test-seams"))]
+            if graph_commit_result.is_ok() {
+                graph_publication_attempt.committed();
+            }
+            graph_commit_result
+        }
+        .map_err(|error| error.to_string())
     }
 
     fn damage_vector_divergence(
@@ -16546,6 +17604,9 @@ pub mod read_persistence_test_scaffold {
         let encoded = super::RedbPersistence::encode_vector_entry(&vector, quantization)
             .map_err(|error| error.to_string())?;
         let write = database.begin_write().map_err(|error| error.to_string())?;
+        #[cfg(any(test, feature = "test-seams"))]
+        let mut graph_publication_attempt =
+            crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write);
         {
             let mut table = write
                 .open_table(super::VECTORS_TABLE)
@@ -16554,7 +17615,16 @@ pub mod read_persistence_test_scaffold {
                 .insert(key.as_slice(), encoded.as_slice())
                 .map_err(|error| error.to_string())?;
         }
-        write.commit().map_err(|error| error.to_string())
+        {
+            #[cfg(any(test, feature = "test-seams"))]
+            let graph_commit_result = write.commit();
+            #[cfg(any(test, feature = "test-seams"))]
+            if graph_commit_result.is_ok() {
+                graph_publication_attempt.committed();
+            }
+            graph_commit_result
+        }
+        .map_err(|error| error.to_string())
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -16577,6 +17647,9 @@ pub mod read_persistence_test_scaffold {
         }
         let (key, _, _) = first_vector_entry(&database, Some(super::VectorQuantization::F32))?;
         let write = database.begin_write().map_err(|error| error.to_string())?;
+        #[cfg(any(test, feature = "test-seams"))]
+        let mut graph_publication_attempt =
+            crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write);
         {
             let mut table = write
                 .open_table(super::VECTORS_TABLE)
@@ -16595,7 +17668,16 @@ pub mod read_persistence_test_scaffold {
                 ExactVectorBodyDamage::MismatchedLeaf => unreachable!(),
             }
         }
-        write.commit().map_err(|error| error.to_string())
+        {
+            #[cfg(any(test, feature = "test-seams"))]
+            let graph_commit_result = write.commit();
+            #[cfg(any(test, feature = "test-seams"))]
+            if graph_commit_result.is_ok() {
+                graph_publication_attempt.committed();
+            }
+            graph_commit_result
+        }
+        .map_err(|error| error.to_string())
     }
 
     fn damage_row_visibility_suppression(
@@ -16686,6 +17768,9 @@ pub mod read_persistence_test_scaffold {
         let definition: TableDefinition<super::DurableRelationalIndexKey, &[u8]> =
             TableDefinition::new(redb_name.as_str());
         let write = database.begin_write().map_err(|error| error.to_string())?;
+        #[cfg(any(test, feature = "test-seams"))]
+        let mut graph_publication_attempt =
+            crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write);
         {
             let mut table = write
                 .open_table(definition)
@@ -16694,7 +17779,16 @@ pub mod read_persistence_test_scaffold {
                 .insert(&key, visibility.as_slice())
                 .map_err(|error| error.to_string())?;
         }
-        write.commit().map_err(|error| error.to_string())
+        {
+            #[cfg(any(test, feature = "test-seams"))]
+            let graph_commit_result = write.commit();
+            #[cfg(any(test, feature = "test-seams"))]
+            if graph_commit_result.is_ok() {
+                graph_publication_attempt.committed();
+            }
+            graph_commit_result
+        }
+        .map_err(|error| error.to_string())
     }
 
     /// The declared relational index holding the most live postings, and the
@@ -16782,6 +17876,9 @@ pub mod read_persistence_test_scaffold {
         let definition: TableDefinition<super::DurableRelationalIndexKey, &[u8]> =
             TableDefinition::new(redb_name.as_str());
         let write = database.begin_write().map_err(|error| error.to_string())?;
+        #[cfg(any(test, feature = "test-seams"))]
+        let mut graph_publication_attempt =
+            crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write);
         {
             let mut table = write
                 .open_table(definition)
@@ -16790,7 +17887,16 @@ pub mod read_persistence_test_scaffold {
                 .remove(&super::DurableRelationalIndexKey(key))
                 .map_err(|error| error.to_string())?;
         }
-        write.commit().map_err(|error| error.to_string())
+        {
+            #[cfg(any(test, feature = "test-seams"))]
+            let graph_commit_result = write.commit();
+            #[cfg(any(test, feature = "test-seams"))]
+            if graph_commit_result.is_ok() {
+                graph_publication_attempt.committed();
+            }
+            graph_commit_result
+        }
+        .map_err(|error| error.to_string())
     }
 
     fn first_relational_row(
@@ -16838,6 +17944,9 @@ pub mod read_persistence_test_scaffold {
         let redb_name = super::RedbPersistence::rel_table_name(table_name);
         let definition: TableDefinition<&[u8], &[u8]> = TableDefinition::new(redb_name.as_str());
         let write = database.begin_write().map_err(|error| error.to_string())?;
+        #[cfg(any(test, feature = "test-seams"))]
+        let mut graph_publication_attempt =
+            crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write);
         {
             let mut table = write
                 .open_table(definition)
@@ -16846,7 +17955,16 @@ pub mod read_persistence_test_scaffold {
                 .insert(key, encoded.as_slice())
                 .map_err(|error| error.to_string())?;
         }
-        write.commit().map_err(|error| error.to_string())
+        {
+            #[cfg(any(test, feature = "test-seams"))]
+            let graph_commit_result = write.commit();
+            #[cfg(any(test, feature = "test-seams"))]
+            if graph_commit_result.is_ok() {
+                graph_publication_attempt.committed();
+            }
+            graph_commit_result
+        }
+        .map_err(|error| error.to_string())
     }
 
     /// Plants `planted` in the vector cell of the first stored row whose table
@@ -16984,6 +18102,9 @@ pub mod read_persistence_test_scaffold {
         let redb_name = super::RedbPersistence::rel_table_name(&table_name);
         let definition: TableDefinition<&[u8], &[u8]> = TableDefinition::new(redb_name.as_str());
         let write = database.begin_write().map_err(|error| error.to_string())?;
+        #[cfg(any(test, feature = "test-seams"))]
+        let mut graph_publication_attempt =
+            crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write);
         {
             let mut table = write
                 .open_table(definition)
@@ -16992,7 +18113,16 @@ pub mod read_persistence_test_scaffold {
                 .insert(key.as_slice(), encoded.as_slice())
                 .map_err(|error| error.to_string())?;
         }
-        write.commit().map_err(|error| error.to_string())
+        {
+            #[cfg(any(test, feature = "test-seams"))]
+            let graph_commit_result = write.commit();
+            #[cfg(any(test, feature = "test-seams"))]
+            if graph_commit_result.is_ok() {
+                graph_publication_attempt.committed();
+            }
+            graph_commit_result
+        }
+        .map_err(|error| error.to_string())
     }
 
     /// Which relational index a posting-removal defect will act on: the one
@@ -17134,6 +18264,9 @@ pub mod read_persistence_test_scaffold {
         )
         .map_err(|error| error.to_string())?;
         let write = database.begin_write().map_err(|error| error.to_string())?;
+        #[cfg(any(test, feature = "test-seams"))]
+        let mut graph_publication_attempt =
+            crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write);
         {
             let mut table = write
                 .open_table(definition)
@@ -17145,7 +18278,16 @@ pub mod read_persistence_test_scaffold {
                 .insert(&misfiled, visibility.as_slice())
                 .map_err(|error| error.to_string())?;
         }
-        write.commit().map_err(|error| error.to_string())
+        {
+            #[cfg(any(test, feature = "test-seams"))]
+            let graph_commit_result = write.commit();
+            #[cfg(any(test, feature = "test-seams"))]
+            if graph_commit_result.is_ok() {
+                graph_publication_attempt.committed();
+            }
+            graph_commit_result
+        }
+        .map_err(|error| error.to_string())
     }
 
     /// How the commit-index entry of a store's last commit disagrees with the
@@ -17188,6 +18330,9 @@ pub mod read_persistence_test_scaffold {
             (lsn.value(), tx.value())
         };
         let write = database.begin_write().map_err(|error| error.to_string())?;
+        #[cfg(any(test, feature = "test-seams"))]
+        let mut graph_publication_attempt =
+            crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write);
         let mutation = {
             let mut table = write
                 .open_table(super::COMMIT_INDEX_TABLE)
@@ -17218,7 +18363,16 @@ pub mod read_persistence_test_scaffold {
                 .with_scratch_owner(Some(std::sync::Arc::downgrade(&owner))),
         )
         .map_err(|error| error.to_string())?;
-        write.commit().map_err(|error| error.to_string())
+        {
+            #[cfg(any(test, feature = "test-seams"))]
+            let graph_commit_result = write.commit();
+            #[cfg(any(test, feature = "test-seams"))]
+            if graph_commit_result.is_ok() {
+                graph_publication_attempt.committed();
+            }
+            graph_commit_result
+        }
+        .map_err(|error| error.to_string())
     }
 
     /// Creates the requested defect in Redb itself. No marker, sidecar, or
@@ -17377,6 +18531,9 @@ pub mod read_persistence_test_scaffold {
                 .map(|pair| (pair[0].clone(), pair[1].clone()))
         };
         let write = database.begin_write().map_err(|e| text(&e))?;
+        #[cfg(any(test, feature = "test-seams"))]
+        let mut graph_publication_attempt =
+            crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write);
         match damage {
             HistoryDamage::RemovedRowInsertRecord => {
                 let (key, _) = changes
@@ -17384,7 +18541,8 @@ pub mod read_persistence_test_scaffold {
                     .rev()
                     .find(|(_, value)| {
                         matches!(
-                            super::RedbPersistence::decode::<super::ChangeLogEntry>(value),
+                            super::RedbPersistence::decode_stored_change_log(value)
+                                .map(|record| record.entry),
                             Ok(super::ChangeLogEntry::RowInsert { .. })
                         )
                     })
@@ -17488,7 +18646,16 @@ pub mod read_persistence_test_scaffold {
                     .map_err(|e| text(&e))?;
             }
         }
-        write.commit().map_err(|e| text(&e))
+        {
+            #[cfg(any(test, feature = "test-seams"))]
+            let graph_commit_result = write.commit();
+            #[cfg(any(test, feature = "test-seams"))]
+            if graph_commit_result.is_ok() {
+                graph_publication_attempt.committed();
+            }
+            graph_commit_result
+        }
+        .map_err(|e| text(&e))
     }
 
     pub fn load_vector_version_at_snapshot_for_test(
@@ -17868,6 +19035,206 @@ fn sync_source_kind_to_u8(kind: SyncSourceKind) -> u8 {
     }
 }
 
+/// A pre2-sized persistence-owned reservation. Its accountant/use custody
+/// is enclosed by PersistenceProofOwner until all persistence fields are freed.
+struct PersistenceBytes {
+    accountant: Arc<crate::memory_accounting::MemoryAccountant>,
+    bytes: usize,
+}
+impl PersistenceBytes {
+    fn try_new_for(accountant: Arc<crate::memory_accounting::MemoryAccountant>,
+        bytes: usize, component: &str, operation: &str, hint: &str) -> Result<Self> {
+        accountant.try_allocate_for(bytes, component, operation, hint)?;
+        Ok(Self { accountant, bytes })
+    }
+    #[cfg(any(test, feature = "test-seams"))]
+    fn bytes(&self) -> usize { self.bytes }
+}
+impl Drop for PersistenceBytes {
+    fn drop(&mut self) { self.accountant.release(self.bytes); }
+}
+
+/// Only this private Arc owns persistence-wide writer custody. It has no
+/// incoming Weak and no edge back to persistence or schema.
+struct PersistenceProofOwner {
+    accountant: Option<crate::memory_accounting::StoreAccountantHandle>,
+    writer_use: Option<crate::memory_accounting::WriterUse>,
+    control: Option<crate::memory_accounting::ControlCredit>,
+}
+impl PersistenceProofOwner {
+    fn prepare(accountant: crate::memory_accounting::StoreAccountantHandle) -> Result<Arc<Self>> {
+        debug_assert!(accountant.is_writer(), "only raw writers prepare an owner");
+        let mut owner = Self {
+            // The original tagged handle is the sole counted custody. Keep
+            // the existing field/layout without a duplicate writer use.
+            writer_use: None,
+            accountant: Some(accountant),
+            control: None,
+        };
+        let bytes = crate::memory_accounting::writer_adapter_layout(&owner).size();
+        owner.control = Some(crate::memory_accounting::ControlCredit::admit_from_handle(
+            owner.accountant.as_ref().expect("prepared owner has its funder"),
+            bytes, "vector_maintenance", "persistence_proof_control",
+            "Raise MEMORY_LIMIT for this fixed writer control.",
+        )?);
+        Ok(Arc::new(owner))
+    }
+}
+impl Drop for PersistenceProofOwner {
+    fn drop(&mut self) {
+        struct Cleanup<'a> { owner: &'a mut PersistenceProofOwner, next: u8,
+            refund: Option<crate::memory_accounting::PendingControlRefund> }
+        impl Cleanup<'_> {
+            fn finish(&mut self) {
+                while self.next < 3 {
+                    let step = self.next;
+                    self.next += 1;
+                    match step {
+                        0 => {
+                            drop(self.owner.accountant.take());
+                            #[cfg(all(test, feature = "test-seams"))]
+                            RETURNED_LOADER_OWNER_DROP_PANIC_FOR_TEST.with(|flag| {
+                                if flag.replace(false) { panic!("CDB127 original-owner cleanup unwind"); }
+                            });
+                        },
+                        1 => drop(self.owner.writer_use.take()),
+                        2 => drop(self.refund.take()),
+                        _ => unreachable!(),
+                    }
+                }
+            }
+        }
+        impl Drop for Cleanup<'_> { fn drop(&mut self) { self.finish(); } }
+        let refund = self.control.take().map(crate::memory_accounting::ControlCredit::prepare);
+        let mut cleanup = Cleanup { owner: self, next: 0, refund };
+        cleanup.finish();
+    }
+}
+
+/// One atomic word owns either an attach-time accountant Arc/use or an
+/// admitted writer owner. The enclosing OnceLock remains the existing layout;
+/// raw readers are immutable and preparation never allocates for them.
+#[repr(transparent)]
+struct ProofAccountantSlot(std::sync::atomic::AtomicPtr<()>);
+const _: () = assert!(std::mem::align_of::<crate::memory_accounting::MemoryAccountant>() >= 4);
+const _: () = assert!(std::mem::align_of::<PersistenceProofOwner>() >= 4);
+impl ProofAccountantSlot {
+    const MASK: usize = 0b11;
+    const RAW_READER: usize = 0;
+    const RAW_WRITER: usize = 1;
+    const READY_WRITER: usize = 2;
+
+    fn attached(accountant: Arc<crate::memory_accounting::MemoryAccountant>) -> Self {
+        // Role discovery and checked retention are one exclusive-domain-gate
+        // snapshot. Into-raw moves that exact Arc/use into the slot. A rejected
+        // OnceLock set drops only this attempted slot after the gate is gone.
+        let handle = crate::memory_accounting::StoreAccountantHandle::new(accountant);
+        Self(std::sync::atomic::AtomicPtr::new(handle.into_owned_raw().cast()))
+    }
+
+    fn raw_handle_pointer(pointer: *mut ()) -> *mut crate::memory_accounting::MemoryAccountant {
+        debug_assert!(matches!(pointer.addr() & Self::MASK, Self::RAW_READER | Self::RAW_WRITER));
+        // Bits 0/1 already match StoreAccountantHandle's immutable role tag.
+        pointer.cast()
+    }
+
+    fn ready_pointer(pointer: *mut ()) -> *mut PersistenceProofOwner {
+        debug_assert_eq!(pointer.addr() & Self::MASK, Self::READY_WRITER);
+        pointer.map_addr(|address| address & !Self::MASK).cast()
+    }
+
+    fn accountant(&self) -> Arc<crate::memory_accounting::MemoryAccountant> {
+        let pointer = self.0.load(Ordering::Acquire);
+        match pointer.addr() & Self::MASK {
+            Self::READY_WRITER => {
+                // Ready is terminal. Borrowing self keeps this owner live.
+                unsafe { (&*Self::ready_pointer(pointer)).accountant.as_ref()
+                    .expect("ready owner has its funder").as_arc() }
+            }
+            Self::RAW_READER | Self::RAW_WRITER => {
+                let raw = pointer.map_addr(|address| address & !Self::MASK)
+                    .cast::<crate::memory_accounting::MemoryAccountant>();
+                // A writer winner owns this same accountant before publishing
+                // and consuming raw custody. A reader never transitions.
+                unsafe { Arc::increment_strong_count(raw); Arc::from_raw(raw) }
+            }
+            _ => unreachable!("invalid proof-accountant slot state"),
+        }
+    }
+
+    fn original_handle_for(
+        &self,
+        accountant: &Arc<crate::memory_accounting::MemoryAccountant>,
+    ) -> Option<crate::memory_accounting::StoreAccountantHandle> {
+        let pointer = self.0.load(Ordering::Acquire);
+        match pointer.addr() & Self::MASK {
+            Self::READY_WRITER => {
+                let handle = unsafe { (&*Self::ready_pointer(pointer)).accountant.as_ref()
+                    .expect("ready owner has its funder") };
+                handle.same_accountant(accountant).then(|| handle.clone())
+            }
+            Self::RAW_READER | Self::RAW_WRITER => {
+                let decoded = pointer.map_addr(|address| address & !Self::MASK)
+                    .cast::<crate::memory_accounting::MemoryAccountant>();
+                if !std::ptr::eq(decoded, Arc::as_ptr(accountant)) { return None; }
+                // Even a delayed observation after publication is pinned by
+                // the winner's same-accountant, same-original-epoch chain.
+                Some(unsafe { crate::memory_accounting::StoreAccountantHandle::borrow_owned_raw(
+                    Self::raw_handle_pointer(pointer)) })
+            }
+            _ => unreachable!("invalid proof-accountant slot state"),
+        }
+    }
+
+    fn prepare(&self) -> Result<()> {
+        let old = self.0.load(Ordering::Acquire);
+        match old.addr() & Self::MASK {
+            Self::RAW_READER | Self::READY_WRITER => return Ok(()),
+            Self::RAW_WRITER => {}
+            _ => unreachable!("invalid proof-accountant slot state"),
+        }
+        #[cfg(all(test, feature = "test-seams"))]
+        RETURNED_LOADER_AFTER_RAW_OBSERVATION_FOR_TEST.with(|hook| {
+            let callback = hook.borrow_mut().take();
+            if let Some(callback) = callback { callback(); }
+        });
+        // Clone precisely the observed role; never rediscover a current
+        // writer association. The domain gate ends before control admission.
+        let attempt = unsafe { crate::memory_accounting::StoreAccountantHandle::borrow_owned_raw(
+            Self::raw_handle_pointer(old)) };
+        let owner = PersistenceProofOwner::prepare(attempt)?;
+        let raw = Arc::into_raw(owner).cast_mut().cast::<()>();
+        let tagged = raw.map_addr(|address| address | Self::READY_WRITER);
+        match self.0.compare_exchange(old, tagged, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => {
+                // The published winner already owns the same original Arc
+                // and counted epoch. Consume exactly the former raw ownership.
+                unsafe { drop(crate::memory_accounting::StoreAccountantHandle::from_owned_raw(
+                    Self::raw_handle_pointer(old))); }
+            }
+            Err(_) => {
+                // Lose only the admitted attempt. The old raw ownership was
+                // consumed by its winner and is never consumed by a loser.
+                unsafe { drop(Arc::from_raw(raw.cast::<PersistenceProofOwner>())); }
+            }
+        }
+        Ok(())
+    }
+}
+impl Drop for ProofAccountantSlot {
+    fn drop(&mut self) {
+        let pointer = *self.0.get_mut();
+        match pointer.addr() & Self::MASK {
+            Self::READY_WRITER => unsafe { drop(Arc::from_raw(Self::ready_pointer(pointer))); },
+            Self::RAW_READER | Self::RAW_WRITER => unsafe {
+                drop(crate::memory_accounting::StoreAccountantHandle::from_owned_raw(
+                    Self::raw_handle_pointer(pointer)));
+            },
+            _ => unreachable!("invalid proof-accountant slot state"),
+        }
+    }
+}
+
 pub struct RedbPersistence {
     path: std::path::PathBuf,
     /// An explicit runtime-state root; `None` selects the platform default.
@@ -17880,15 +19247,11 @@ pub struct RedbPersistence {
         redb::CompactionCursor,
         redb::CompactionProgress,
         f64,
-        Option<crate::memory_accounting::OwnedMemoryReservation>,
+        Option<PersistenceBytes>,
     )>,
     #[cfg(feature = "test-seams")]
     handoff_prepare_io_fault: AtomicBool,
-    /// The database's own memory accountant, attached once the owning
-    /// `Database` has built it. Proof maintenance admits what it allocates
-    /// through this, so a write that cannot fit the configured budget receives
-    /// the existing typed refusal instead of allocating anyway.
-    proof_accountant: std::sync::OnceLock<Arc<crate::memory_accounting::MemoryAccountant>>,
+
     writer_snapshots: Arc<parking_lot::Mutex<Vec<std::sync::Weak<WriterSnapshot>>>>,
     writer_schema: parking_lot::Mutex<Option<Arc<writer_source::WriterSchema>>>,
     /// What the owning database charged its accountant for this store's Redb
@@ -17911,6 +19274,12 @@ pub struct RedbPersistence {
     vector_repair_audit: parking_lot::Mutex<Option<vector_paged::RepairAudit>>,
     saved_export_recovery_cutoff: std::sync::OnceLock<u64>,
     saved_export_abandonment_error: Arc<parking_lot::Mutex<Option<String>>>,
+    /// The database's own memory accountant, attached once the owning
+    /// `Database` has built it. Proof maintenance admits what it allocates
+    /// through this, so a write that cannot fit the configured budget receives
+    /// the existing typed refusal instead of allocating anyway.
+    proof_accountant: std::sync::OnceLock<ProofAccountantSlot>,
+
 }
 pub(crate) struct RawSyncApplyStateDigest {
     pub(crate) digest: String,
@@ -18622,8 +19991,12 @@ impl RetainedReadSource {
 
 impl ReadOnlyVectorGenerationSource {
     pub(crate) fn new(source: Arc<RetainedReadSource>, snapshot_lsn: Lsn) -> Result<Self> {
-        let read=Arc::new(source.begin_read()?);
-        Ok(Self { read, source, snapshot_lsn })
+        let read = Arc::new(source.begin_read()?);
+        Ok(Self {
+            read,
+            source,
+            snapshot_lsn,
+        })
     }
 
     fn corruption(&self, reason: impl Into<String>) -> Error {
@@ -18655,7 +20028,12 @@ impl ReadOnlyVectorGenerationSource {
     pub(crate) fn paged_root_capture(&self) -> vector_paged::PagedRootCapture {
         let source = Arc::clone(&self.source);
         let read = Arc::clone(&self.read);
-        Arc::new(move || Ok((Arc::clone(&read), Arc::clone(&source) as Arc<dyn std::any::Any + Send + Sync>)))
+        Arc::new(move || {
+            Ok((
+                Arc::clone(&read),
+                Arc::clone(&source) as Arc<dyn std::any::Any + Send + Sync>,
+            ))
+        })
     }
 
     pub(crate) fn generation_record_bytes(
@@ -18707,7 +20085,11 @@ impl ReadOnlyVectorGenerationSource {
                 value.value(),
             )
             .map_err(|reason| self.corruption(reason))?;
-        RedbPersistence::validate_vector_schema_binding_in_read(read, index, manifest.schema_binding)?;
+        RedbPersistence::validate_vector_schema_binding_in_read(
+            read,
+            index,
+            manifest.schema_binding,
+        )?;
         let page_bytes = manifest.page_bytes as usize;
         let bounded_page_bytes = VECTOR_PARTITION_GRAPH_PAGE_RECORD_BYTES.checked_sub(
             VECTOR_PARTITION_GRAPH_PAGE_LEAF_FRAME_BYTES
@@ -19371,8 +20753,10 @@ impl VectorPartitionRecordIndex for VectorPartitionBaseGenerationRecord {
         &self.index
     }
     fn native_paged_graph(&self) -> Option<&[u8]> {
-        (self.graph_format_version == vector_paged::VECTOR_GRAPH_PAGED_FORMAT_VERSION || (self.graph_format_version == 1 && self.graph.bytes.starts_with(&vector_paged::META_MAGIC)))
-            .then_some(self.graph.bytes.as_slice())
+        (self.graph_format_version == vector_paged::VECTOR_GRAPH_PAGED_FORMAT_VERSION
+            || (self.graph_format_version == 1
+                && self.graph.bytes.starts_with(&vector_paged::META_MAGIC)))
+        .then_some(self.graph.bytes.as_slice())
     }
 }
 impl VectorPartitionRecordIndex for VectorPartitionChangeGenerationRecord {
@@ -19380,8 +20764,10 @@ impl VectorPartitionRecordIndex for VectorPartitionChangeGenerationRecord {
         &self.index
     }
     fn native_paged_graph(&self) -> Option<&[u8]> {
-        (self.graph_format_version == vector_paged::VECTOR_GRAPH_PAGED_FORMAT_VERSION || (self.graph_format_version == 1 && self.graph.bytes.starts_with(&vector_paged::META_MAGIC)))
-            .then_some(self.graph.bytes.as_slice())
+        (self.graph_format_version == vector_paged::VECTOR_GRAPH_PAGED_FORMAT_VERSION
+            || (self.graph_format_version == 1
+                && self.graph.bytes.starts_with(&vector_paged::META_MAGIC)))
+        .then_some(self.graph.bytes.as_slice())
     }
 }
 impl VectorPartitionRecordIndex for VectorPartitionGenerationCatalogRecord {
@@ -19446,10 +20832,13 @@ pub(crate) struct ReceivedSchemaPersistenceProjection {
     /// Payload-copy charges have already transferred to their own destinations.
     pub(crate) vector_image_memory: Arc<crate::read_image_memory::ImageMemory>,
     /// Transaction-local cancellation receipts, consumed only after durability.
+    /// The pre2-sized debit is contained by ReceivedSchemaStage's existing
+    /// final `_vector_copy_owner`: its counted writer adapter outlives these
+    /// entries and their backing, including drained-but-retained capacity.
     pub(crate) retired_vector_construction: parking_lot::Mutex<
         Vec<(
             VectorPartitionRef,
-            Option<crate::memory_accounting::OwnedMemoryReservation>,
+            Option<crate::memory_accounting::ContainedMemoryReservation>,
         )>,
     >,
     pub(crate) table_meta: HashMap<String, TableMeta>,
@@ -20234,7 +21623,9 @@ impl RedbPersistence {
     /// retained read or savepoint leaves protected entries for a later owner.
     pub(crate) fn drain_deferred_frees_before_handoff(&self) -> Result<()> {
         if let Some(error) = self.saved_export_abandonment_error.lock().as_ref() {
-            return Err(Error::Other(format!("saved generation abandonment failed: {error}")));
+            return Err(Error::Other(format!(
+                "saved generation abandonment failed: {error}"
+            )));
         }
         let companion = self.lock_file.read().map_err(Self::storage_error)?;
         if companion.is_none() {
@@ -20301,10 +21692,6 @@ impl RedbPersistence {
             Ok(Some(false)) | Ok(None) => claim_error,
             Err(classification) => classification,
         }
-    }
-
-    pub fn create(path: &Path) -> Result<Self> {
-        Self::create_with_accountant(path, None, REDB_CACHE_BYTES)
     }
 
     /// Create a store whose very first artifact writes - the format marker and
@@ -20433,27 +21820,101 @@ impl RedbPersistence {
         // survived every replacement and publication boundary. Only now may
         // the unlinked old-store inode be released.
         drop(old_db);
-        Ok(Self {
-            path: path.to_path_buf(),
-            runtime_dir: None,
-            lock_file: Arc::new(std::sync::RwLock::new(Some(lock_file))),
-            db: Arc::new(std::sync::RwLock::new(Some(replacement_db))),
-            writer_file: std::sync::RwLock::new(Some(replacement_owner)),
-            storage_compaction: Mutex::new(Default::default()),
+        Ok({
+        let mut storage = std::mem::MaybeUninit::<Self>::uninit();
+        let mut construction = PersistenceConstruction {
+            source: storage.as_mut_ptr(), initialized: [false; 18],
+        };
+        // SAFETY: each field is written once and marked only after its
+        // initializer succeeds. The stack guard owns exactly marked fields.
+        unsafe {
+
+            {
+                std::ptr::addr_of_mut!((*construction.source).path).write(path.to_path_buf());
+                construction.initialized[0] = true;
+            }
+
+            {
+                std::ptr::addr_of_mut!((*construction.source).runtime_dir).write(None);
+                construction.initialized[1] = true;
+            }
+
+            {
+                std::ptr::addr_of_mut!((*construction.source).lock_file).write(Arc::new(std::sync::RwLock::new(Some(lock_file))));
+                construction.initialized[4] = true;
+            }
+
+            {
+                std::ptr::addr_of_mut!((*construction.source).db).write(Arc::new(std::sync::RwLock::new(Some(replacement_db))));
+                construction.initialized[2] = true;
+            }
+
+            {
+                std::ptr::addr_of_mut!((*construction.source).writer_file).write(std::sync::RwLock::new(Some(replacement_owner)));
+                construction.initialized[3] = true;
+            }
+
+            {
+                std::ptr::addr_of_mut!((*construction.source).storage_compaction).write(Mutex::new(Default::default()));
+                construction.initialized[5] = true;
+            }
+
             #[cfg(feature = "test-seams")]
-            handoff_prepare_io_fault: AtomicBool::new(false),
-            proof_accountant: std::sync::OnceLock::new(),
-            writer_snapshots: Arc::new(parking_lot::Mutex::new(Vec::new())),
-            writer_schema: parking_lot::Mutex::new(None),
-            cache_charge_bytes: std::sync::OnceLock::new(),
-            used_legacy_table_meta_layout: AtomicBool::new(false),
-            paged_publications: Default::default(),
-            paged_root_capture: std::sync::OnceLock::new(),
-            scoped_vector_root_capture: std::sync::OnceLock::new(),
-            vector_repair_audit: parking_lot::Mutex::new(None),
-            saved_export_recovery_cutoff: std::sync::OnceLock::new(),
-            saved_export_abandonment_error: Arc::new(parking_lot::Mutex::new(None)),
-        })
+            {
+                std::ptr::addr_of_mut!((*construction.source).handoff_prepare_io_fault).write(AtomicBool::new(false));
+                construction.initialized[6] = true;
+            }
+
+            {
+                std::ptr::addr_of_mut!((*construction.source).proof_accountant).write(std::sync::OnceLock::new());
+                construction.initialized[15] = true;
+            }
+
+            {
+                std::ptr::addr_of_mut!((*construction.source).writer_snapshots).write(Arc::new(parking_lot::Mutex::new(Vec::new())));
+                construction.initialized[7] = true;
+            }
+
+            {
+                std::ptr::addr_of_mut!((*construction.source).writer_schema).write(parking_lot::Mutex::new(None));
+                construction.initialized[8] = true;
+            }
+
+            {
+                std::ptr::addr_of_mut!((*construction.source).cache_charge_bytes).write(std::sync::OnceLock::new());
+                construction.initialized[9] = true;
+            }
+
+            {
+                std::ptr::addr_of_mut!((*construction.source).used_legacy_table_meta_layout).write(AtomicBool::new(false));
+                construction.initialized[10] = true;
+            }
+
+            {
+                std::ptr::addr_of_mut!((*construction.source).paged_publications).write(Default::default());
+                construction.initialized[11] = true;
+            }
+
+            {
+                std::ptr::addr_of_mut!((*construction.source).paged_root_capture).write(std::sync::OnceLock::new());
+                construction.initialized[12] = true;
+            }
+
+            {
+                std::ptr::addr_of_mut!((*construction.source).scoped_vector_root_capture).write(std::sync::OnceLock::new());
+                construction.initialized[13] = true;
+            }
+
+            {
+                std::ptr::addr_of_mut!((*construction.source).vector_repair_audit).write(parking_lot::Mutex::new(None));
+                construction.initialized[14] = true;
+            }
+{ std::ptr::addr_of_mut!((*construction.source).saved_export_recovery_cutoff).write(std::sync::OnceLock::new()); construction.initialized[16] = true; }
+{ std::ptr::addr_of_mut!((*construction.source).saved_export_abandonment_error).write(Arc::new(parking_lot::Mutex::new(None))); construction.initialized[17] = true; }
+        }
+        construction.initialized.fill(false);
+        unsafe { storage.assume_init() }
+    })
     }
 
     fn create_with_lock(
@@ -20502,30 +21963,105 @@ impl RedbPersistence {
             {
                 Ok(()) => {
                     let proof_accountant = std::sync::OnceLock::new();
+
                     if let Some(accountant) = accountant {
-                        let _ = proof_accountant.set(accountant);
+                        let _ = proof_accountant.set(ProofAccountantSlot::attached(accountant));
                     }
-                    Ok(Self {
-                        path: path.to_path_buf(),
-                        runtime_dir: runtime_dir.map(Path::to_path_buf),
-                        lock_file: Arc::new(std::sync::RwLock::new(Some(lock_file))),
-                        db: Arc::new(std::sync::RwLock::new(Some(db))),
-                        writer_file: std::sync::RwLock::new(Some(owner)),
-                        storage_compaction: Mutex::new(Default::default()),
-                        #[cfg(feature = "test-seams")]
-                        handoff_prepare_io_fault: AtomicBool::new(false),
-                        proof_accountant,
-                        writer_snapshots: Arc::new(parking_lot::Mutex::new(Vec::new())),
-                        writer_schema: parking_lot::Mutex::new(None),
-                        cache_charge_bytes: std::sync::OnceLock::new(),
-                        used_legacy_table_meta_layout: AtomicBool::new(false),
-                        paged_publications: Default::default(),
-                        paged_root_capture: std::sync::OnceLock::new(),
-                        scoped_vector_root_capture: std::sync::OnceLock::new(),
-            vector_repair_audit: parking_lot::Mutex::new(None),
-            saved_export_recovery_cutoff: std::sync::OnceLock::new(),
-            saved_export_abandonment_error: Arc::new(parking_lot::Mutex::new(None)),
-                    })
+                    Ok({
+        let mut storage = std::mem::MaybeUninit::<Self>::uninit();
+        let mut construction = PersistenceConstruction {
+            source: storage.as_mut_ptr(), initialized: [false; 18],
+        };
+        // SAFETY: each field is written once and marked only after its
+        // initializer succeeds. The stack guard owns exactly marked fields.
+        unsafe {
+
+            {
+                std::ptr::addr_of_mut!((*construction.source).path).write(path.to_path_buf());
+                construction.initialized[0] = true;
+            }
+
+            {
+                std::ptr::addr_of_mut!((*construction.source).runtime_dir).write(runtime_dir.map(Path::to_path_buf));
+                construction.initialized[1] = true;
+            }
+
+            {
+                std::ptr::addr_of_mut!((*construction.source).lock_file).write(Arc::new(std::sync::RwLock::new(Some(lock_file))));
+                construction.initialized[4] = true;
+            }
+
+            {
+                std::ptr::addr_of_mut!((*construction.source).db).write(Arc::new(std::sync::RwLock::new(Some(db))));
+                construction.initialized[2] = true;
+            }
+
+            {
+                std::ptr::addr_of_mut!((*construction.source).writer_file).write(std::sync::RwLock::new(Some(owner)));
+                construction.initialized[3] = true;
+            }
+
+            {
+                std::ptr::addr_of_mut!((*construction.source).storage_compaction).write(Mutex::new(Default::default()));
+                construction.initialized[5] = true;
+            }
+
+            #[cfg(feature = "test-seams")]
+            {
+                std::ptr::addr_of_mut!((*construction.source).handoff_prepare_io_fault).write(AtomicBool::new(false));
+                construction.initialized[6] = true;
+            }
+
+            {
+                std::ptr::addr_of_mut!((*construction.source).proof_accountant).write(proof_accountant);
+                construction.initialized[15] = true;
+            }
+
+            {
+                std::ptr::addr_of_mut!((*construction.source).writer_snapshots).write(Arc::new(parking_lot::Mutex::new(Vec::new())));
+                construction.initialized[7] = true;
+            }
+
+            {
+                std::ptr::addr_of_mut!((*construction.source).writer_schema).write(parking_lot::Mutex::new(None));
+                construction.initialized[8] = true;
+            }
+
+            {
+                std::ptr::addr_of_mut!((*construction.source).cache_charge_bytes).write(std::sync::OnceLock::new());
+                construction.initialized[9] = true;
+            }
+
+            {
+                std::ptr::addr_of_mut!((*construction.source).used_legacy_table_meta_layout).write(AtomicBool::new(false));
+                construction.initialized[10] = true;
+            }
+
+            {
+                std::ptr::addr_of_mut!((*construction.source).paged_publications).write(Default::default());
+                construction.initialized[11] = true;
+            }
+
+            {
+                std::ptr::addr_of_mut!((*construction.source).paged_root_capture).write(std::sync::OnceLock::new());
+                construction.initialized[12] = true;
+            }
+
+            {
+                std::ptr::addr_of_mut!((*construction.source).scoped_vector_root_capture).write(std::sync::OnceLock::new());
+                construction.initialized[13] = true;
+            }
+
+            {
+                std::ptr::addr_of_mut!((*construction.source).vector_repair_audit).write(parking_lot::Mutex::new(None));
+                construction.initialized[14] = true;
+            }
+{ std::ptr::addr_of_mut!((*construction.source).saved_export_recovery_cutoff).write(std::sync::OnceLock::new()); construction.initialized[16] = true; }
+{ std::ptr::addr_of_mut!((*construction.source).saved_export_abandonment_error).write(Arc::new(parking_lot::Mutex::new(None))); construction.initialized[17] = true; }
+        }
+        construction.initialized.fill(false);
+        unsafe { storage.assume_init() }
+    })
                 }
                 Err(err) => {
                     drop(db);
@@ -20540,10 +22076,6 @@ impl RedbPersistence {
                 Err(err)
             }
         }
-    }
-
-    pub fn open(path: &Path) -> Result<Self> {
-        Self::open_with_cache(path, REDB_CACHE_BYTES)
     }
 
     /// Settle the native capacity after the effective persisted limit is known,
@@ -20580,18 +22112,6 @@ impl RedbPersistence {
         runtime_dir: Option<&Path>,
     ) -> Result<Self> {
         Self::open_inner(path, AbsentStoreAnswer::Taxonomy, cache_bytes, runtime_dir)
-    }
-
-    /// Open a store that must already be there, creating nothing.
-    ///
-    /// There is no existence question here and no second door: the ordinary
-    /// open is attempted, and the attempt's own "nothing at this path" becomes
-    /// [`Error::StoreMissing`] naming the store. Every refusal on this road
-    /// leaves the directory as it found it -- including the companion this
-    /// open takes for itself while it is still deciding, which is taken back
-    /// before the refusal is returned.
-    pub fn open_existing_only(path: &Path) -> Result<Self> {
-        Self::open_existing_only_with_cache(path, REDB_CACHE_BYTES)
     }
 
     pub(crate) fn open_existing_only_with_cache(path: &Path, cache_bytes: usize) -> Result<Self> {
@@ -20700,27 +22220,101 @@ impl RedbPersistence {
         };
         match publish {
             Ok(()) => {
-                let persistence = Self {
-                    path: path.to_path_buf(),
-                    runtime_dir: runtime_dir.map(Path::to_path_buf),
-                    lock_file: Arc::new(std::sync::RwLock::new(Some(lock_file))),
-                    db: Arc::new(std::sync::RwLock::new(Some(db.database))),
-                    writer_file: std::sync::RwLock::new(Some(db.owner)),
-                    storage_compaction: Mutex::new(Default::default()),
-                    #[cfg(feature = "test-seams")]
-                    handoff_prepare_io_fault: AtomicBool::new(false),
-                    proof_accountant: std::sync::OnceLock::new(),
-                    writer_snapshots: Arc::new(parking_lot::Mutex::new(Vec::new())),
-                    writer_schema: parking_lot::Mutex::new(None),
-                    cache_charge_bytes: std::sync::OnceLock::new(),
-                    used_legacy_table_meta_layout: AtomicBool::new(false),
-                    paged_publications: Default::default(),
-                    paged_root_capture: std::sync::OnceLock::new(),
-                    scoped_vector_root_capture: std::sync::OnceLock::new(),
-            vector_repair_audit: parking_lot::Mutex::new(None),
-            saved_export_recovery_cutoff: std::sync::OnceLock::new(),
-            saved_export_abandonment_error: Arc::new(parking_lot::Mutex::new(None)),
-                };
+                let persistence = {
+        let mut storage = std::mem::MaybeUninit::<Self>::uninit();
+        let mut construction = PersistenceConstruction {
+            source: storage.as_mut_ptr(), initialized: [false; 18],
+        };
+        // SAFETY: each field is written once and marked only after its
+        // initializer succeeds. The stack guard owns exactly marked fields.
+        unsafe {
+
+            {
+                std::ptr::addr_of_mut!((*construction.source).path).write(path.to_path_buf());
+                construction.initialized[0] = true;
+            }
+
+            {
+                std::ptr::addr_of_mut!((*construction.source).runtime_dir).write(runtime_dir.map(Path::to_path_buf));
+                construction.initialized[1] = true;
+            }
+
+            {
+                std::ptr::addr_of_mut!((*construction.source).lock_file).write(Arc::new(std::sync::RwLock::new(Some(lock_file))));
+                construction.initialized[4] = true;
+            }
+
+            {
+                std::ptr::addr_of_mut!((*construction.source).db).write(Arc::new(std::sync::RwLock::new(Some(db.database))));
+                construction.initialized[2] = true;
+            }
+
+            {
+                std::ptr::addr_of_mut!((*construction.source).writer_file).write(std::sync::RwLock::new(Some(db.owner)));
+                construction.initialized[3] = true;
+            }
+
+            {
+                std::ptr::addr_of_mut!((*construction.source).storage_compaction).write(Mutex::new(Default::default()));
+                construction.initialized[5] = true;
+            }
+
+            #[cfg(feature = "test-seams")]
+            {
+                std::ptr::addr_of_mut!((*construction.source).handoff_prepare_io_fault).write(AtomicBool::new(false));
+                construction.initialized[6] = true;
+            }
+
+            {
+                std::ptr::addr_of_mut!((*construction.source).proof_accountant).write(std::sync::OnceLock::new());
+                construction.initialized[15] = true;
+            }
+
+            {
+                std::ptr::addr_of_mut!((*construction.source).writer_snapshots).write(Arc::new(parking_lot::Mutex::new(Vec::new())));
+                construction.initialized[7] = true;
+            }
+
+            {
+                std::ptr::addr_of_mut!((*construction.source).writer_schema).write(parking_lot::Mutex::new(None));
+                construction.initialized[8] = true;
+            }
+
+            {
+                std::ptr::addr_of_mut!((*construction.source).cache_charge_bytes).write(std::sync::OnceLock::new());
+                construction.initialized[9] = true;
+            }
+
+            {
+                std::ptr::addr_of_mut!((*construction.source).used_legacy_table_meta_layout).write(AtomicBool::new(false));
+                construction.initialized[10] = true;
+            }
+
+            {
+                std::ptr::addr_of_mut!((*construction.source).paged_publications).write(Default::default());
+                construction.initialized[11] = true;
+            }
+
+            {
+                std::ptr::addr_of_mut!((*construction.source).paged_root_capture).write(std::sync::OnceLock::new());
+                construction.initialized[12] = true;
+            }
+
+            {
+                std::ptr::addr_of_mut!((*construction.source).scoped_vector_root_capture).write(std::sync::OnceLock::new());
+                construction.initialized[13] = true;
+            }
+
+            {
+                std::ptr::addr_of_mut!((*construction.source).vector_repair_audit).write(parking_lot::Mutex::new(None));
+                construction.initialized[14] = true;
+            }
+{ std::ptr::addr_of_mut!((*construction.source).saved_export_recovery_cutoff).write(std::sync::OnceLock::new()); construction.initialized[16] = true; }
+{ std::ptr::addr_of_mut!((*construction.source).saved_export_abandonment_error).write(Arc::new(parking_lot::Mutex::new(None))); construction.initialized[17] = true; }
+        }
+        construction.initialized.fill(false);
+        unsafe { storage.assume_init() }
+    };
                 persistence.recover_authoritative_purge_publication()?;
                 persistence.truncate_uncommitted_commit_index_tail()?;
                 Ok(persistence)
@@ -21166,6 +22760,11 @@ impl RedbPersistence {
         admission: &mut content_identity::ProofAdmission,
     ) -> Result<()> {
         let write_txn = db.begin_write().map_err(Self::storage_error)?;
+        Self::initialize_history_witnesses(&write_txn)?;
+        let write_txn = write_txn.with_table_root_hook(Self::historical_root_event);
+        #[cfg(any(test, feature = "test-seams"))]
+        let mut graph_publication_attempt =
+            crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
         {
             let mut table = write_txn
                 .open_table(FORMAT_METADATA_TABLE)
@@ -21175,6 +22774,7 @@ impl RedbPersistence {
                 .insert(FORMAT_VERSION_KEY, encoded.as_slice())
                 .map_err(Self::storage_error)?;
         }
+        Self::initialize_graph_proof_tables_in_write(&write_txn)?;
         Self::initialize_content_identity_in_write_admitted(&write_txn, admission)?;
         write_txn
             .open_table(VECTOR_OPEN_DIRECTORY_TABLE)
@@ -21212,7 +22812,18 @@ impl RedbPersistence {
         Self::write_vector_body_root_fingerprint(&write_txn)?;
         Self::apply_content_identity_mutations_in_write(&write_txn, &[], admission)?;
         Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-        write_txn.commit().map_err(Self::storage_error)?;
+        {
+            #[cfg(any(test, feature = "test-seams"))]
+            graph_observation_checkpoint(10)?;
+            let graph_commit_result = write_txn.commit();
+            #[cfg(any(test, feature = "test-seams"))]
+            if graph_commit_result.is_ok() {
+                graph_publication_attempt.committed();
+                graph_observation_checkpoint(11)?;
+            }
+            graph_commit_result
+        }
+        .map_err(Self::storage_error)?;
         Ok(())
     }
 
@@ -21266,7 +22877,21 @@ impl RedbPersistence {
             ),
         })?;
         if marker == CURRENT_FORMAT_VERSION {
-            Ok(())
+            for definition in [
+                GRAPH_FWD_TABLE,
+                GRAPH_REV_TABLE,
+                graph_history_record::GRAPH_CONTRIBUTIONS,
+                graph_history_record::GRAPH_OCCURRENCE_LOCATIONS,
+                graph_history_record::GRAPH_PREDECESSOR_LIFECYCLE,
+            ] {
+                read_txn
+                    .open_table(definition)
+                    .map_err(|error| Error::StoreCorrupted {
+                        path: path.display().to_string(),
+                        reason: format!("required graph proof table is unavailable: {error}"),
+                    })?;
+            }
+            Self::check_history_witness_schema(&read_txn)
         } else {
             Err(Error::LegacyVectorStoreDetected {
                 found_format_marker: marker,
@@ -21521,6 +23146,7 @@ impl RedbPersistence {
         affected_tables: &HashSet<String>,
         accountant: Arc<crate::memory_accounting::MemoryAccountant>,
     ) -> Result<()> {
+        self.prepare_proof_owner()?;
         let matches = |index: &VectorIndexRef| affected_tables.contains(&index.table);
         self.remove_vector_partition_records_matching_in_write::<VectorPartitionMembershipRecord>(
             write_txn,
@@ -21758,6 +23384,8 @@ impl RedbPersistence {
         change_log: &[ChangeLogEntry],
         options: FlushDataOptions<'_>,
     ) -> Result<()> {
+        let _decode_scope = self.writer_decode_scope()?;
+        self.prepare_proof_owner()?;
         let deleted_rows_snapshot = options.snapshots.deleted_rows;
         let sink_events = options.sink_events;
         let trigger_audits = options.trigger_audits;
@@ -21830,7 +23458,10 @@ impl RedbPersistence {
             .transpose()?
             .unwrap_or_default();
         self.with_db(|db| {
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            let write_txn = Self::begin_history_write(db)?;
+#[cfg(any(test, feature = "test-seams"))]
+let mut graph_publication_attempt = crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
+            let graph_commit_support=Self::capture_graph_commit_support(&write_txn,ws.commit_lsn)?;
             #[cfg(feature = "test-seams")]
             let mut stage_started = std::time::Instant::now();
             let mut identity_mutations = Vec::new();
@@ -22010,6 +23641,8 @@ impl RedbPersistence {
                     .map_err(Self::storage_error)?;
                 let mut encoded = Vec::new();
                 for (row_id, deleted_tx) in deletes {
+                    self.verify_relational_group_in_write(&write_txn, table, row_id, &*redb_table)?;
+                    let _row_scope = crate::read_image_memory::active_owner()?.row_owner()?.enter();
                     if let Some(row) = deleted_rows_snapshot
                         .as_ref()
                         .and_then(|by_table| by_table.get(table))
@@ -22045,6 +23678,10 @@ impl RedbPersistence {
                             Some(&overlay),
                             &mut encoded,
                         )?;
+                        {
+                            let predecessor = redb_table.get(key.as_slice()).map_err(Self::storage_error)?;
+                            self.replace_relational_manifest_in_write(&write_txn, table, key.as_slice(), predecessor.as_ref().map(|body| body.value()), Some(encoded.as_slice()))?;
+                        }
                         redb_table
                             .insert(key.as_slice(), encoded.as_slice())
                             .map_err(Self::storage_error)?;
@@ -22076,6 +23713,10 @@ impl RedbPersistence {
                     }
                     row.deleted_tx = Some(deleted_tx);
                     Self::encode_versioned_row_into(&row, table_meta.get(table), &mut encoded)?;
+                    {
+                        let predecessor = redb_table.get(key.as_slice()).map_err(Self::storage_error)?;
+                        self.replace_relational_manifest_in_write(&write_txn, table, key.as_slice(), predecessor.as_ref().map(|body| body.value()), Some(encoded.as_slice()))?;
+                    }
                     redb_table
                         .insert(key.as_slice(), encoded.as_slice())
                         .map_err(Self::storage_error)?;
@@ -22106,6 +23747,7 @@ impl RedbPersistence {
                     .map_err(Self::storage_error)?;
                 let mut encoded = Vec::new();
                 for row in rows {
+                    let _row_scope = crate::read_image_memory::active_owner()?.row_owner()?.enter();
                     // An ordinary update reopens with body-free runtime rows
                     // and need not stage an unchanged vector again. Carry the
                     // independent F32 witness from the exact prior row id into
@@ -22160,6 +23802,10 @@ impl RedbPersistence {
                         &mut encoded,
                     )?;
                     let key = Self::rel_row_key(row);
+                    {
+                        let predecessor = redb_table.get(key.as_slice()).map_err(Self::storage_error)?;
+                        self.replace_relational_manifest_in_write(&write_txn, table, key.as_slice(), predecessor.as_ref().map(|body| body.value()), Some(encoded.as_slice()))?;
+                    }
                     redb_table
                         .insert(key.as_slice(), encoded.as_slice())
                         .map_err(Self::storage_error)?;
@@ -22212,6 +23858,21 @@ impl RedbPersistence {
                 }
             }
 
+            // Retain only this write set's actually tombstoned predecessors,
+            // independently of older imported tombstones or retired receipts.
+            let selected_deletion_memory = match self.proof_accountant() {
+                Some(accountant) => crate::read_image_memory::ImageMemory::charging_for(
+                    accountant, "writer_source", "graph_selected_deletions",
+                    "Raise MEMORY_LIMIT to retain this commit's selected graph versions.",
+                ),
+                None => crate::read_image_memory::ImageMemory::new(None),
+            };
+            type SelectedDeletion = Option<(Vec<u8>, TxId, (Lsn, TxId))>;
+            selected_deletion_memory.reserve(
+                ws.adj_deletes.len().saturating_mul(std::mem::size_of::<SelectedDeletion>()),
+            )?;
+            let mut selected_deletions: Vec<SelectedDeletion> =
+                (0..ws.adj_deletes.len()).map(|_| None).collect();
             if !ws.adj_deletes.is_empty() || !ws.adj_inserts.is_empty() {
                 let mut fwd_table = write_txn
                     .open_table(GRAPH_FWD_TABLE)
@@ -22221,7 +23882,9 @@ impl RedbPersistence {
                     .map_err(Self::storage_error)?;
 
                 let mut encoded = Vec::new();
-                for (source, edge_type, target, deleted_tx) in &ws.adj_deletes {
+                for (delete_index, (source, edge_type, target, deleted_tx)) in
+                    ws.adj_deletes.iter().enumerate()
+                {
                     let mut key_charge = self.proof_accountant().map(|accountant| {
                         crate::memory_accounting::OwnedMemoryReservation::try_new_for(
                             accountant, (33 + edge_type.len()).saturating_mul(2), "writer_source",
@@ -22253,7 +23916,7 @@ impl RedbPersistence {
                         });
                         let next = {
                             let mut range = fwd_table.range::<&[u8]>((lower, upper))
-                                .map_err(Self::storage_error)?;
+                                .map_err(Self::storage_error)?.inspect(|_entry| { #[cfg(any(test, feature = "test-seams"))] if let Ok((key, _)) = _entry { crate::read_work_probe::graph_storage_key("graph_fwd", "iteration_step", key.value()); } });
                             range.next().transpose().map_err(Self::storage_error)?
                                 .map(|(key, value)| {
                                     if let Some(memory) = &memory {
@@ -22262,6 +23925,8 @@ impl RedbPersistence {
                                     }
                                     #[cfg(feature = "test-seams")]
                                     crate::writer_query_test_seams::note_graph_delete_decode();
+                                    #[cfg(any(test, feature = "test-seams"))]
+                                    crate::read_work_probe::note_graph("graph_payload", "payload_decode", key.value(), None, Some("ordinary_deletion"));
                                     let edge: AdjEntry = match &memory {
                                         Some(memory) => memory.scope(|| Self::decode(value.value())),
                                         None => Self::decode(value.value()),
@@ -22279,14 +23944,33 @@ impl RedbPersistence {
                         }
                         if edge.deleted_tx.is_none() {
                             found = true;
+                            let order = (edge.lsn, edge.created_tx);
+                            let selected = &mut selected_deletions[delete_index];
+                            if selected.as_ref().is_none_or(|(_, _, prior)| order > *prior) {
+                                if let Some((p, d, prior)) = selected {
+                                    if p.len() != key.len() {
+                                        return Err(Error::StoreCorrupted {
+                                            path: self.path.display().to_string(),
+                                            reason: "selected graph predecessor width changed".into(),
+                                        });
+                                    }
+                                    p.copy_from_slice(&key);
+                                    *d = *deleted_tx;
+                                    *prior = order;
+                                } else {
+                                    selected_deletion_memory.reserve(key.len())?;
+                                    *selected = Some((key.clone(), *deleted_tx, order));
+                                }
+                            }
                             edge.deleted_tx = Some(*deleted_tx);
                             let mut encoded = Vec::new();
                             Self::encode_into(&edge, &mut encoded)?;
                             let rev_key = Self::graph_rev_key(&edge);
-                            fwd_table.insert(key.as_slice(), encoded.as_slice())
+                            fwd_table.insert(observed_graph_key!("graph_fwd", "insert", key.as_slice(), 5), encoded.as_slice())
                                 .map_err(Self::storage_error)?;
-                            rev_table.insert(rev_key.as_slice(), encoded.as_slice())
+                            rev_table.insert(observed_graph_key!("graph_rev", "insert", rev_key.as_slice(), 5), encoded.as_slice())
                                 .map_err(Self::storage_error)?;
+                            self.graph_writer_window(||Self::install_graph_creation_in_write(&write_txn, &edge, &encoded))?;
                         }
                         if let Some(charge) = &mut key_charge {
                             charge.try_grow_for(key.capacity(), "writer_source", "graph_delete_keys",
@@ -22307,10 +23991,11 @@ impl RedbPersistence {
                     let fwd_key = Self::graph_fwd_key(entry);
                     let rev_key = Self::graph_rev_key(entry);
                     fwd_table
-                        .insert(fwd_key.as_slice(), encoded.as_slice())
+                        .insert(observed_graph_key!("graph_fwd", "insert", fwd_key.as_slice(), 5), encoded.as_slice())
                         .map_err(Self::storage_error)?;
+                    self.graph_writer_window(||Self::install_graph_creation_in_write(&write_txn, entry, &encoded))?;
                     rev_table
-                        .insert(rev_key.as_slice(), encoded.as_slice())
+                        .insert(observed_graph_key!("graph_rev", "insert", rev_key.as_slice(), 5), encoded.as_slice())
                         .map_err(Self::storage_error)?;
                 }
             }
@@ -22516,6 +24201,7 @@ impl RedbPersistence {
                 identity_mutations.push(content_identity::commit_index_mutation(lsn, tx));
             }
 
+            Self::stage_graph_commit_support(&write_txn,graph_commit_support)?;
             if !change_log.is_empty() {
                 let mut table = write_txn
                     .open_table(CHANGE_LOG_TABLE)
@@ -22525,14 +24211,29 @@ impl RedbPersistence {
                 let mut key = String::with_capacity(Self::change_log_entry_key_len());
                 for (index, entry) in change_log.iter().enumerate() {
                     Self::write_change_log_entry_key(lsn, index, &mut key);
-                    Self::encode_into(entry, &mut encoded)?;
+                    if let ChangeLogEntry::EdgeDelete { source, target, edge_type, .. } = entry {
+                        let selected_index = ws.adj_deletes.iter().position(|(s, k, t, _)|
+                            s == source && t == target && k == edge_type
+                        ).ok_or_else(|| Error::StoreCorrupted {
+                            path: self.path.display().to_string(),
+                            reason: "ordinary graph deletion has no selected write-set predecessor".into(),
+                        })?;
+                        let (p, d, _) = selected_deletions[selected_index].as_ref()
+                            .ok_or_else(|| Error::StoreCorrupted {
+                                path: self.path.display().to_string(),
+                                reason: "ordinary graph deletion selected predecessor is missing".into(),
+                            })?;
+                        self.encode_change_log_with_selected_predecessor_in_write(
+                            &write_txn, entry, Some((p.as_slice(), *d)), &mut encoded,
+                        )?;
+                    } else {
+                        self.encode_change_log_into_in_write(&write_txn, entry, &mut encoded)?;
+                    }
                     table
-                        .insert(key.as_str(), encoded.as_slice())
+                        .insert(observed_graph_key!("history", "insert", key.as_str(), 8), encoded.as_slice())
                         .map_err(Self::storage_error)?;
-                    Self::write_change_log_selectors_in_write(&write_txn, key.as_str(), encoded.as_slice())?;
-                    identity_mutations.push(content_identity::encoded_history_mutation(
-                        &key, entry,
-                    )?);
+                    self.graph_writer_window(||Self::write_change_log_selectors_in_write(&write_txn, key.as_str(), encoded.as_slice()))?;
+                    identity_mutations.push(Self::stored_change_log_mutation_in_write(&write_txn, &key)?);
                 }
             }
 
@@ -22825,10 +24526,16 @@ impl RedbPersistence {
             {
                 stage_started = std::time::Instant::now();
             }
+            self.preserve_graph_commit_support(&write_txn,graph_commit_support,ws.commit_lsn.zip(Self::write_set_visibility_tx(ws)))?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, Some(ws))?;
             #[cfg(feature = "in-process-test-seams")]
             crate::writer_commit_test_seams::reached(crate::writer_commit_test_seams::CommitBoundary::BeforeRedb);
-            write_txn.commit().map_err(Self::storage_error)?;
+            { #[cfg(any(test, feature = "test-seams"))]
+            graph_observation_checkpoint(10)?;
+            let graph_commit_result = write_txn.commit();
+#[cfg(any(test, feature = "test-seams"))]
+if graph_commit_result.is_ok() { graph_publication_attempt.committed(); graph_observation_checkpoint(11)?; }
+graph_commit_result }.map_err(Self::storage_error)?;
             #[cfg(feature = "in-process-test-seams")]
             crate::writer_commit_test_seams::reached(crate::writer_commit_test_seams::CommitBoundary::AfterRedb);
             #[cfg(feature = "test-seams")]
@@ -22859,6 +24566,7 @@ impl RedbPersistence {
         write_txn: &redb::WriteTransaction,
         stage: &ReceivedSchemaPersistenceProjection,
     ) -> Result<Vec<content_identity::ContentIdentityMutation>> {
+        let _decode_scope = self.writer_decode_scope()?;
         let mut mutations = Vec::new();
         let mut affected = stage.affected_tables.iter().collect::<Vec<_>>();
         affected.sort();
@@ -23076,8 +24784,29 @@ impl RedbPersistence {
             let forward = write_txn
                 .open_table(GRAPH_FWD_TABLE)
                 .map_err(Self::storage_error)?;
-            for item in forward.iter().map_err(Self::storage_error)? {
-                let (_, value) = item.map_err(Self::storage_error)?;
+            for item in forward
+                .iter()
+                .map_err(Self::storage_error)?
+                .inspect(|_entry| {
+                    #[cfg(any(test, feature = "test-seams"))]
+                    if let Ok((key, _)) = _entry {
+                        crate::read_work_probe::graph_storage_key(
+                            "graph_fwd",
+                            "iteration_step",
+                            key.value(),
+                        );
+                    }
+                })
+            {
+                let (_key, value) = item.map_err(Self::storage_error)?;
+                #[cfg(any(test, feature = "test-seams"))]
+                crate::read_work_probe::note_graph(
+                    "graph_payload",
+                    "payload_decode",
+                    _key.value(),
+                    None,
+                    Some("received_schema_identity_preparation"),
+                );
                 let edge = Self::decode::<AdjEntry>(value.value())?;
                 if stage.affected_graph_edge_types.contains(&edge.edge_type) {
                     mutations.push(content_identity::remove_edge_mutation(
@@ -23100,6 +24829,8 @@ impl RedbPersistence {
         trigger_audits: &[(u64, TriggerAuditEntry)],
         max_sink_queue_depth: usize,
     ) -> Result<()> {
+        let _decode_scope = self.writer_decode_scope()?;
+        self.prepare_proof_owner()?;
         if stage.schema_noop {
             return self.flush_received_schema_noop(ws, change_log, stage);
         }
@@ -23122,7 +24853,12 @@ impl RedbPersistence {
                 .map(|(name, meta)| (name.as_str(), meta)),
         )?;
         self.with_db(|db| {
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            let write_txn = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
+            let graph_commit_support =
+                Self::capture_graph_commit_support(&write_txn, ws.commit_lsn)?;
             let indexes_to_rebuild = {
                 let stored_meta = write_txn
                     .open_table(META_TABLE)
@@ -23135,7 +24871,9 @@ impl RedbPersistence {
                     let previous = stored_meta
                         .get(Self::meta_key(table).as_str())
                         .map_err(Self::storage_error)?
-                        .map(|encoded| Self::decode_table_meta_versioned(encoded.value()).map(|(meta, _)| meta))
+                        .map(|encoded| {
+                            Self::decode_table_meta_versioned(encoded.value()).map(|(meta, _)| meta)
+                        })
                         .transpose()?;
                     let unchanged_declarations = previous.as_ref().is_some_and(|previous| {
                         if previous.maintained_counts != next.maintained_counts {
@@ -23184,11 +24922,19 @@ impl RedbPersistence {
                 let mut meta_table = write_txn
                     .open_table(META_TABLE)
                     .map_err(Self::storage_error)?;
-                let encoded_schemas = stage.table_meta.iter().map(|(table, meta)| {
-                    let encoded = self.schema_update_in_table(&meta_table, table, meta,
-                        stage.ddl_log.iter().map(|(_, change)| change))?;
-                    Ok((table.clone(), encoded))
-                }).collect::<Result<HashMap<_, _>>>()?;
+                let encoded_schemas = stage
+                    .table_meta
+                    .iter()
+                    .map(|(table, meta)| {
+                        let encoded = self.schema_update_in_table(
+                            &meta_table,
+                            table,
+                            meta,
+                            stage.ddl_log.iter().map(|(_, change)| change),
+                        )?;
+                        Ok((table.clone(), encoded))
+                    })
+                    .collect::<Result<HashMap<_, _>>>()?;
                 for table in &stage.affected_tables {
                     let key = Self::meta_key(table);
                     meta_table
@@ -23219,6 +24965,7 @@ impl RedbPersistence {
                 let table_name = Self::rel_table_name(&table);
                 let table_def: TableDefinition<&[u8], &[u8]> =
                     TableDefinition::new(table_name.as_str());
+                self.retire_relational_manifests_in_write(&write_txn, &table)?;
                 content_size::reset_rows(&write_txn, &table)?;
                 match write_txn.delete_table(table_def) {
                     Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
@@ -23244,6 +24991,18 @@ impl RedbPersistence {
                     crate::database::record_received_schema_durable_row_rewrite_for_test();
                     let encoded = Self::encode_versioned_row(row, stage.table_meta.get(table))?;
                     let key = Self::rel_row_key(row);
+                    {
+                        let predecessor = redb_table
+                            .get(key.as_slice())
+                            .map_err(Self::storage_error)?;
+                        self.replace_relational_manifest_in_write(
+                            &write_txn,
+                            table,
+                            key.as_slice(),
+                            predecessor.as_ref().map(|body| body.value()),
+                            Some(encoded.as_slice()),
+                        )?;
+                    }
                     redb_table
                         .insert(key.as_slice(), encoded.as_slice())
                         .map_err(Self::storage_error)?;
@@ -23263,7 +25022,7 @@ impl RedbPersistence {
                 )?;
             }
             let operational_index_identity_mutations =
-                Self::flush_received_schema_operational_rows_in_write(&write_txn, stage)?;
+                self.flush_received_schema_operational_rows_in_write(&write_txn, stage)?;
 
             {
                 let mut lsn_table = write_txn
@@ -23301,6 +25060,11 @@ impl RedbPersistence {
             }
 
             if stage.replace_graph {
+                self.retire_graph_replacement_in_write(
+                    &write_txn,
+                    &stage.edges,
+                    Some(&stage.affected_graph_edge_types),
+                )?;
                 let mut fwd = write_txn
                     .open_table(GRAPH_FWD_TABLE)
                     .map_err(Self::storage_error)?;
@@ -23308,35 +25072,114 @@ impl RedbPersistence {
                     .open_table(GRAPH_REV_TABLE)
                     .map_err(Self::storage_error)?;
                 let mut fwd_retired = Vec::new();
-                for item in fwd.iter().map_err(Self::storage_error)? {
+                for item in {
+                    #[cfg(any(test, feature = "test-seams"))]
+                    crate::read_work_probe::note_graph(
+                        "graph_fwd",
+                        "population_walk",
+                        &[],
+                        None,
+                        None,
+                    );
+                    fwd.iter()
+                }
+                .map_err(Self::storage_error)?
+                .inspect(|_entry| {
+                    #[cfg(any(test, feature = "test-seams"))]
+                    if let Ok((key, _)) = _entry {
+                        crate::read_work_probe::graph_storage_key(
+                            "graph_fwd",
+                            "iteration_step",
+                            key.value(),
+                        );
+                    }
+                }) {
                     let (key, value) = item.map_err(Self::storage_error)?;
+                    #[cfg(any(test, feature = "test-seams"))]
+                    crate::read_work_probe::note_graph(
+                        "graph_payload",
+                        "payload_decode",
+                        key.value(),
+                        None,
+                        Some("received_schema_forward_selection"),
+                    );
                     let edge = Self::decode::<AdjEntry>(value.value())?;
                     if stage.affected_graph_edge_types.contains(&edge.edge_type) {
                         fwd_retired.push(key.value().to_vec());
                     }
                 }
                 let mut rev_retired = Vec::new();
-                for item in rev.iter().map_err(Self::storage_error)? {
+                for item in {
+                    #[cfg(any(test, feature = "test-seams"))]
+                    crate::read_work_probe::note_graph(
+                        "graph_rev",
+                        "population_walk",
+                        &[],
+                        None,
+                        None,
+                    );
+                    rev.iter()
+                }
+                .map_err(Self::storage_error)?
+                .inspect(|_entry| {
+                    #[cfg(any(test, feature = "test-seams"))]
+                    if let Ok((key, _)) = _entry {
+                        crate::read_work_probe::graph_storage_key(
+                            "graph_rev",
+                            "iteration_step",
+                            key.value(),
+                        );
+                    }
+                }) {
                     let (key, value) = item.map_err(Self::storage_error)?;
+                    #[cfg(any(test, feature = "test-seams"))]
+                    crate::read_work_probe::note_graph(
+                        "graph_payload",
+                        "payload_decode",
+                        key.value(),
+                        None,
+                        Some("received_schema_reverse_selection"),
+                    );
                     let edge = Self::decode::<AdjEntry>(value.value())?;
                     if stage.affected_graph_edge_types.contains(&edge.edge_type) {
                         rev_retired.push(key.value().to_vec());
                     }
                 }
                 for key in fwd_retired {
-                    fwd.remove(key.as_slice()).map_err(Self::storage_error)?;
+                    fwd.remove(observed_graph_key!(
+                        "graph_fwd",
+                        "remove",
+                        key.as_slice(),
+                        5
+                    ))
+                    .map_err(Self::storage_error)?;
                 }
                 for key in rev_retired {
-                    rev.remove(key.as_slice()).map_err(Self::storage_error)?;
+                    rev.remove(observed_graph_key!(
+                        "graph_rev",
+                        "remove",
+                        key.as_slice(),
+                        5
+                    ))
+                    .map_err(Self::storage_error)?;
                 }
                 for edge in &stage.edges {
                     let encoded = Self::encode(edge)?;
                     let fwd_key = Self::graph_fwd_key(edge);
                     let rev_key = Self::graph_rev_key(edge);
-                    fwd.insert(fwd_key.as_slice(), encoded.as_slice())
-                        .map_err(Self::storage_error)?;
-                    rev.insert(rev_key.as_slice(), encoded.as_slice())
-                        .map_err(Self::storage_error)?;
+                    fwd.insert(
+                        observed_graph_key!("graph_fwd", "insert", fwd_key.as_slice(), 5),
+                        encoded.as_slice(),
+                    )
+                    .map_err(Self::storage_error)?;
+                    self.graph_writer_window(|| {
+                        Self::install_graph_creation_in_write(&write_txn, edge, &encoded)
+                    })?;
+                    rev.insert(
+                        observed_graph_key!("graph_rev", "insert", rev_key.as_slice(), 5),
+                        encoded.as_slice(),
+                    )
+                    .map_err(Self::storage_error)?;
                 }
             }
 
@@ -23422,9 +25265,30 @@ impl RedbPersistence {
                     .open_table(CHANGE_LOG_TABLE)
                     .map_err(Self::storage_error)?;
                 let mut affected_lsns = BTreeSet::new();
-                for item in log.iter().map_err(Self::storage_error)? {
+                for item in {
+                    #[cfg(any(test, feature = "test-seams"))]
+                    crate::read_work_probe::note_graph(
+                        "history",
+                        "population_walk",
+                        &[],
+                        None,
+                        None,
+                    );
+                    log.iter()
+                }
+                .map_err(Self::storage_error)?
+                .inspect(|_entry| {
+                    #[cfg(any(test, feature = "test-seams"))]
+                    if let Ok((key, _)) = _entry {
+                        crate::read_work_probe::graph_storage_key(
+                            "history",
+                            "iteration_step",
+                            key.value(),
+                        );
+                    }
+                }) {
                     let (_, value) = item.map_err(Self::storage_error)?;
-                    let entry = Self::decode::<ChangeLogEntry>(value.value())?;
+                    let entry = Self::decode_stored_change_log(value.value())?.entry;
                     if Self::change_log_entry_references_any_table(
                         &entry,
                         &stage.structurally_dropped_tables,
@@ -23436,7 +25300,20 @@ impl RedbPersistence {
                 for lsn in affected_lsns {
                     let prefix = format!("{:020}:", lsn.0);
                     let mut group = Vec::new();
-                    for item in log.range(prefix.as_str()..).map_err(Self::storage_error)? {
+                    for item in log
+                        .range(prefix.as_str()..)
+                        .map_err(Self::storage_error)?
+                        .inspect(|_entry| {
+                            #[cfg(any(test, feature = "test-seams"))]
+                            if let Ok((key, _)) = _entry {
+                                crate::read_work_probe::graph_storage_key(
+                                    "history",
+                                    "iteration_step",
+                                    key.value(),
+                                );
+                            }
+                        })
+                    {
                         let (key, value) = item.map_err(Self::storage_error)?;
                         if !key.value().starts_with(prefix.as_str()) {
                             break;
@@ -23445,9 +25322,18 @@ impl RedbPersistence {
                     }
                     let mut survivors = Vec::with_capacity(group.len());
                     for (key, bytes) in group {
-                        let entry = Self::decode::<ChangeLogEntry>(&bytes)?;
-                        log.remove(key.as_str()).map_err(Self::storage_error)?;
-                        Self::remove_change_log_selectors_in_write(&write_txn, key.as_str())?;
+                        let entry = Self::decode_stored_change_log(&bytes)?.entry;
+                        log.remove(observed_graph_key!("history", "remove", key.as_str(), 8))
+                            .map_err(Self::storage_error)?;
+                        let carried = !Self::change_log_entry_references_any_table(
+                            &entry,
+                            &stage.structurally_dropped_tables,
+                        );
+                        Self::detach_change_log_selectors_in_write(
+                            &write_txn,
+                            key.as_str(),
+                            carried,
+                        )?;
                         change_log_identity.push(
                             content_identity::remove_encoded_history_mutation(&key, &entry)?,
                         );
@@ -23458,22 +25344,26 @@ impl RedbPersistence {
                             survivors.push((bytes, entry));
                         }
                     }
-                    for (index, (bytes, entry)) in survivors.into_iter().enumerate() {
+                    for (index, (bytes, _entry)) in survivors.into_iter().enumerate() {
                         Self::write_change_log_entry_key(lsn, index, &mut key_buf);
-                        log.insert(key_buf.as_str(), bytes.as_slice())
-                            .map_err(Self::storage_error)?;
-                        Self::write_change_log_selectors_in_write(
-                            &write_txn,
-                            key_buf.as_str(),
+                        log.insert(
+                            observed_graph_key!("history", "insert", key_buf.as_str(), 8),
                             bytes.as_slice(),
-                        )?;
-                        change_log_identity.push(content_identity::encoded_history_mutation(
-                            key_buf.as_str(),
-                            &entry,
-                        )?);
+                        )
+                        .map_err(Self::storage_error)?;
+                        self.graph_writer_window(|| {
+                            Self::write_carried_change_log_selectors_in_write(
+                                &write_txn,
+                                key_buf.as_str(),
+                                bytes.as_slice(),
+                            )
+                        })?;
+                        change_log_identity
+                            .push(Self::stored_change_log_mutation(&key_buf, &bytes)?);
                     }
                 }
             }
+            Self::stage_graph_commit_support(&write_txn, graph_commit_support)?;
             if !change_log.is_empty() {
                 let mut log = write_txn
                     .open_table(CHANGE_LOG_TABLE)
@@ -23483,14 +25373,19 @@ impl RedbPersistence {
                 let mut encoded = Vec::new();
                 for (index, entry) in change_log.iter().enumerate() {
                     Self::write_change_log_entry_key(lsn, index, &mut key);
-                    Self::encode_into(entry, &mut encoded)?;
-                    log.insert(key.as_str(), encoded.as_slice())
-                        .map_err(Self::storage_error)?;
-                    Self::write_change_log_selectors_in_write(
-                        &write_txn,
-                        key.as_str(),
+                    self.encode_change_log_into_in_write(&write_txn, entry, &mut encoded)?;
+                    log.insert(
+                        observed_graph_key!("history", "insert", key.as_str(), 8),
                         encoded.as_slice(),
-                    )?;
+                    )
+                    .map_err(Self::storage_error)?;
+                    self.graph_writer_window(|| {
+                        Self::write_change_log_selectors_in_write(
+                            &write_txn,
+                            key.as_str(),
+                            encoded.as_slice(),
+                        )
+                    })?;
                 }
             }
             let mut committed_config_values = Vec::new();
@@ -23767,11 +25662,11 @@ impl RedbPersistence {
             }
             let lsn = ws.commit_lsn.unwrap_or(Lsn(0));
             let mut change_key = String::with_capacity(Self::change_log_entry_key_len());
-            for (index, entry) in change_log.iter().enumerate() {
+            for (index, _entry) in change_log.iter().enumerate() {
                 Self::write_change_log_entry_key(lsn, index, &mut change_key);
-                identity_mutations.push(content_identity::encoded_history_mutation(
+                identity_mutations.push(Self::stored_change_log_mutation_in_write(
+                    &write_txn,
                     &change_key,
-                    entry,
                 )?);
             }
             let mut grouped_ddl = BTreeMap::<Lsn, Vec<&DdlChange>>::new();
@@ -23871,8 +25766,44 @@ impl RedbPersistence {
             {
                 crate::custody::durability::before_custody_commit(&write_txn)?;
             }
+            for (table, rows) in &stage.rows {
+                for row in rows {
+                    Self::raise_table_read_lsn_in_write(&write_txn, table, row.lsn)?;
+                    Self::raise_noncanonical_writer_floors_in_write(
+                        &write_txn,
+                        row.created_tx.max(row.deleted_tx.unwrap_or(TxId(0))),
+                        row.lsn,
+                        row.row_id,
+                    )?;
+                }
+            }
+            for entry in &stage.vectors {
+                Self::raise_table_read_lsn_in_write(&write_txn, &entry.index.table, entry.lsn)?;
+                Self::raise_noncanonical_writer_floors_in_write(
+                    &write_txn,
+                    entry.created_tx.max(entry.deleted_tx.unwrap_or(TxId(0))),
+                    entry.lsn,
+                    entry.row_id,
+                )?;
+            }
+            self.preserve_graph_commit_support(
+                &write_txn,
+                graph_commit_support,
+                ws.commit_lsn.zip(Self::write_set_visibility_tx(ws)),
+            )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, Some(ws))?;
-            write_txn.commit().map_err(Self::storage_error)?;
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)?;
             self.complete_writer_schema_change(schema);
             Ok(())
         })
@@ -23883,6 +25814,7 @@ impl RedbPersistence {
     /// share one Redb transaction while every logical data artifact remains
     /// byte-for-byte untouched.
     fn flush_received_schema_operational_rows_in_write(
+        &self,
         write_txn: &redb::WriteTransaction,
         stage: &ReceivedSchemaPersistenceProjection,
     ) -> Result<Vec<content_identity::ContentIdentityMutation>> {
@@ -23905,9 +25837,20 @@ impl RedbPersistence {
                 TableDefinition::new(table_name.as_str());
             let mut relation =
                 content_size::open_rows(write_txn, definition).map_err(Self::storage_error)?;
+            self.verify_relational_group_in_write(write_txn, table, *row_id, &*relation)?;
             let key = Self::rel_row_key(&deleted);
             let encoded =
                 Self::encode_versioned_row(&deleted, stage.operational_table_meta.get(table))?;
+            {
+                let predecessor = relation.get(key.as_slice()).map_err(Self::storage_error)?;
+                self.replace_relational_manifest_in_write(
+                    write_txn,
+                    table,
+                    key.as_slice(),
+                    predecessor.as_ref().map(|body| body.value()),
+                    Some(encoded.as_slice()),
+                )?;
+            }
             relation
                 .insert(key.as_slice(), encoded.as_slice())
                 .map_err(Self::storage_error)?;
@@ -23920,6 +25863,16 @@ impl RedbPersistence {
                 content_size::open_rows(write_txn, definition).map_err(Self::storage_error)?;
             let key = Self::rel_row_key(row);
             let encoded = Self::encode_versioned_row(row, stage.operational_table_meta.get(table))?;
+            {
+                let predecessor = relation.get(key.as_slice()).map_err(Self::storage_error)?;
+                self.replace_relational_manifest_in_write(
+                    write_txn,
+                    table,
+                    key.as_slice(),
+                    predecessor.as_ref().map(|body| body.value()),
+                    Some(encoded.as_slice()),
+                )?;
+            }
             relation
                 .insert(key.as_slice(), encoded.as_slice())
                 .map_err(Self::storage_error)?;
@@ -23938,6 +25891,8 @@ impl RedbPersistence {
         change_log: &[ChangeLogEntry],
         stage: &ReceivedSchemaPersistenceProjection,
     ) -> Result<()> {
+        let _decode_scope = self.writer_decode_scope()?;
+        self.prepare_proof_owner()?;
         #[cfg(feature = "test-seams")]
         let flush_started = std::time::Instant::now();
         #[cfg(feature = "test-seams")]
@@ -23970,14 +25925,19 @@ impl RedbPersistence {
         self.with_db(|db| {
             #[cfg(feature = "test-seams")]
             let begin_started = std::time::Instant::now();
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            let write_txn = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
+            let graph_commit_support =
+                Self::capture_graph_commit_support(&write_txn, ws.commit_lsn)?;
             #[cfg(feature = "test-seams")]
             crate::database::record_received_schema_persistence_profile_for_test(
                 "noop-begin-write",
                 begin_started,
             );
             let operational_index_identity_mutations =
-                Self::flush_received_schema_operational_rows_in_write(&write_txn, stage)?;
+                self.flush_received_schema_operational_rows_in_write(&write_txn, stage)?;
             if !stage.ddl_log.is_empty() {
                 let mut ddl = write_txn
                     .open_table(DDL_LOG_TABLE)
@@ -24032,6 +25992,7 @@ impl RedbPersistence {
                     .map_err(Self::storage_error)?;
                 index.insert(lsn.0, tx.0).map_err(Self::storage_error)?;
             }
+            Self::stage_graph_commit_support(&write_txn, graph_commit_support)?;
             if !change_log.is_empty() {
                 let mut log = write_txn
                     .open_table(CHANGE_LOG_TABLE)
@@ -24041,14 +26002,19 @@ impl RedbPersistence {
                 let mut encoded = Vec::new();
                 for (index, entry) in change_log.iter().enumerate() {
                     Self::write_change_log_entry_key(lsn, index, &mut key);
-                    Self::encode_into(entry, &mut encoded)?;
-                    log.insert(key.as_str(), encoded.as_slice())
-                        .map_err(Self::storage_error)?;
-                    Self::write_change_log_selectors_in_write(
-                        &write_txn,
-                        key.as_str(),
+                    self.encode_change_log_into_in_write(&write_txn, entry, &mut encoded)?;
+                    log.insert(
+                        observed_graph_key!("history", "insert", key.as_str(), 8),
                         encoded.as_slice(),
-                    )?;
+                    )
+                    .map_err(Self::storage_error)?;
+                    self.graph_writer_window(|| {
+                        Self::write_change_log_selectors_in_write(
+                            &write_txn,
+                            key.as_str(),
+                            encoded.as_slice(),
+                        )
+                    })?;
                 }
             }
             let mut identity_mutations = operational_index_identity_mutations;
@@ -24081,11 +26047,11 @@ impl RedbPersistence {
             }
             let lsn = ws.commit_lsn.unwrap_or(Lsn(0));
             let mut change_key = String::with_capacity(Self::change_log_entry_key_len());
-            for (index, entry) in change_log.iter().enumerate() {
+            for (index, _entry) in change_log.iter().enumerate() {
                 Self::write_change_log_entry_key(lsn, index, &mut change_key);
-                identity_mutations.push(content_identity::encoded_history_mutation(
+                identity_mutations.push(Self::stored_change_log_mutation_in_write(
+                    &write_txn,
                     &change_key,
-                    entry,
                 )?);
             }
             if let (Some(commit_lsn), Some(tx)) = (ws.commit_lsn, ws.visibility_floor) {
@@ -24105,8 +26071,24 @@ impl RedbPersistence {
             }
             #[cfg(feature = "test-seams")]
             let durable_commit_started = std::time::Instant::now();
+            self.preserve_graph_commit_support(
+                &write_txn,
+                graph_commit_support,
+                ws.commit_lsn.zip(ws.visibility_floor),
+            )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, Some(ws))?;
-            write_txn.commit().map_err(Self::storage_error)?;
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)?;
             #[cfg(feature = "test-seams")]
             crate::database::record_received_schema_persistence_profile_for_test(
                 "noop-durable-commit",
@@ -24131,6 +26113,8 @@ impl RedbPersistence {
         ws: &WriteSet,
         stage: &LocalSchemaPersistenceProjection,
     ) -> Result<()> {
+        let _decode_scope = self.writer_decode_scope()?;
+        self.prepare_proof_owner()?;
         let lsn = ws.commit_lsn.ok_or_else(|| {
             Error::Other("local schema stage is missing its commit LSN".to_string())
         })?;
@@ -24147,7 +26131,11 @@ impl RedbPersistence {
                 .map(|(name, meta)| (name.as_str(), meta)),
         )?;
         self.with_db(|db| {
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            let write_txn = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
+            let graph_commit_support = Self::capture_graph_commit_support(&write_txn, Some(lsn))?;
 
             {
                 let mut meta_table = write_txn
@@ -24155,8 +26143,9 @@ impl RedbPersistence {
                     .map_err(Self::storage_error)?;
                 for (table, meta) in &stage.affected_table_meta {
                     let key = Self::meta_key(table);
-                    let encoded_schema = self.schema_update_in_table(&meta_table, table, meta, &stage.ddl)?;
-                let encoded = &encoded_schema.bytes;
+                    let encoded_schema =
+                        self.schema_update_in_table(&meta_table, table, meta, &stage.ddl)?;
+                    let encoded = &encoded_schema.bytes;
                     meta_table
                         .insert(key.as_str(), encoded.as_slice())
                         .map_err(Self::storage_error)?;
@@ -24262,8 +26251,24 @@ impl RedbPersistence {
                     "injected received-schema Redb pre-commit failure".to_string(),
                 ));
             }
+            self.preserve_graph_commit_support(
+                &write_txn,
+                graph_commit_support,
+                Some((lsn, stage.commit_index_tx)),
+            )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, Some(ws))?;
-            write_txn.commit().map_err(Self::storage_error)?;
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)?;
             self.complete_writer_schema_change(schema);
             Ok(())
         })
@@ -24283,10 +26288,15 @@ impl RedbPersistence {
         }
     }
     pub fn flush_table_meta(&self, name: &str, meta: &TableMeta) -> Result<()> {
+        let _decode_scope = self.writer_decode_scope()?;
+        self.prepare_proof_owner()?;
         let schema =
             self.prepare_writer_schema_change(std::iter::empty(), std::iter::once((name, meta)))?;
         self.with_db(|db| {
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            let write_txn = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
             {
                 let mut meta_table = write_txn
                     .open_table(META_TABLE)
@@ -24318,7 +26328,18 @@ impl RedbPersistence {
                 &mut self.proof_admission(),
             )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-            write_txn.commit().map_err(Self::storage_error)?;
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)?;
             self.complete_writer_schema_change(schema);
             Ok(())
         })
@@ -24336,17 +26357,27 @@ impl RedbPersistence {
         lsn: Lsn,
         ddl: &DdlChange,
     ) -> Result<()> {
+        let _decode_scope = self.writer_decode_scope()?;
+        self.prepare_proof_owner()?;
         let schema =
             self.prepare_writer_schema_change(std::iter::empty(), std::iter::once((name, meta)))?;
         self.with_db(|db| {
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            let write_txn = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
             let mut identity_mutations = content_identity::schema_mutations(name, meta)?;
             {
                 let mut meta_table = write_txn
                     .open_table(META_TABLE)
                     .map_err(Self::storage_error)?;
                 let key = Self::meta_key(name);
-                let encoded_schema = self.schema_update_in_table(&meta_table, name, meta, std::slice::from_ref(ddl))?;
+                let encoded_schema = self.schema_update_in_table(
+                    &meta_table,
+                    name,
+                    meta,
+                    std::slice::from_ref(ddl),
+                )?;
                 let encoded = &encoded_schema.bytes;
                 meta_table
                     .insert(key.as_str(), encoded.as_slice())
@@ -24404,17 +26435,32 @@ impl RedbPersistence {
                 RowId(0),
             )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-            write_txn.commit().map_err(Self::storage_error)?;
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)?;
             self.complete_writer_schema_change(schema);
             Ok(())
         })
     }
 
     pub fn remove_table_meta(&self, name: &str) -> Result<()> {
+        self.prepare_proof_owner()?;
         let schema =
             self.prepare_writer_schema_change(std::iter::once(name), std::iter::empty())?;
         self.with_db(|db| {
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            let write_txn = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
             {
                 let mut meta_table = write_txn
                     .open_table(META_TABLE)
@@ -24430,13 +26476,25 @@ impl RedbPersistence {
                 &mut self.proof_admission(),
             )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-            write_txn.commit().map_err(Self::storage_error)?;
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)?;
             self.complete_writer_schema_change(schema);
             Ok(())
         })
     }
 
     pub fn flush_config_value<T: serde::Serialize>(&self, key: &str, value: &T) -> Result<()> {
+        self.prepare_proof_owner()?;
         #[cfg(feature = "test-seams")]
         if verified_ordered_run_test_seams::config_write_refused_for_test() {
             return Err(Error::Other(format!(
@@ -24444,7 +26502,10 @@ impl RedbPersistence {
             )));
         }
         self.with_db(|db| {
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            let write_txn = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
             Self::update_policy_hold_release_index(&write_txn, key, true)?;
             let encoded;
             {
@@ -24463,7 +26524,18 @@ impl RedbPersistence {
             )?;
             Self::raise_config_identity_floors_in_write(&write_txn, key, &encoded)?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-            write_txn.commit().map_err(Self::storage_error)?;
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)?;
             Ok(())
         })
     }
@@ -24476,6 +26548,7 @@ impl RedbPersistence {
         key: &str,
         state: Option<&crate::sync_types::DurableSchemaSyncHoldback>,
     ) -> Result<()> {
+        self.prepare_proof_owner()?;
         #[cfg(feature = "test-seams")]
         if verified_ordered_run_test_seams::config_write_refused_for_test() {
             return Err(Error::Other(format!(
@@ -24483,7 +26556,10 @@ impl RedbPersistence {
             )));
         }
         self.with_db(|db| {
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            let write_txn = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
             Self::update_policy_hold_release_index(&write_txn, key, state.is_some())?;
             let encoded = {
                 let mut config_table = write_txn
@@ -24515,7 +26591,18 @@ impl RedbPersistence {
                 Self::raise_config_identity_floors_in_write(&write_txn, key, encoded)?;
             }
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-            write_txn.commit().map_err(Self::storage_error)
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)
         })
     }
 
@@ -24527,8 +26614,12 @@ impl RedbPersistence {
         key: &str,
         value: &T,
     ) -> Result<()> {
+        self.prepare_proof_owner()?;
         self.with_db(|db| {
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            let write_txn = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
             Self::update_policy_hold_release_index(&write_txn, key, true)?;
             let encoded = Self::encode(value)?;
             {
@@ -24545,7 +26636,18 @@ impl RedbPersistence {
                 &mut self.proof_admission(),
             )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-            write_txn.commit().map_err(Self::storage_error)
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)
         })
     }
 
@@ -24572,8 +26674,12 @@ impl RedbPersistence {
         lsn: Lsn,
         ddl: &[DdlChange],
     ) -> Result<()> {
+        self.prepare_proof_owner()?;
         self.with_db(|db| {
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            let write_txn = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
             let mut identity_mutations = Vec::new();
             {
                 let mut config_table = write_txn
@@ -24616,14 +26722,29 @@ impl RedbPersistence {
                 RowId(0),
             )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-            write_txn.commit().map_err(Self::storage_error)?;
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)?;
             Ok(())
         })
     }
 
     pub fn flush_encoded_config_values(&self, config_values: Vec<(&str, Vec<u8>)>) -> Result<()> {
+        self.prepare_proof_owner()?;
         self.with_db(|db| {
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            let write_txn = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
             let mut identity_mutations = Vec::new();
             {
                 let mut config_table = write_txn
@@ -24645,7 +26766,18 @@ impl RedbPersistence {
                 &mut self.proof_admission(),
             )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-            write_txn.commit().map_err(Self::storage_error)?;
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)?;
             Ok(())
         })
     }
@@ -24686,6 +26818,7 @@ impl RedbPersistence {
         puts: &[(String, Vec<u8>)],
         removes: &[String],
     ) -> Result<()> {
+        self.prepare_proof_owner()?;
         #[cfg(feature = "test-seams")]
         if verified_ordered_run_test_seams::config_write_refused_for_test() {
             return Err(Error::Other(
@@ -24693,7 +26826,10 @@ impl RedbPersistence {
             ));
         }
         self.with_db(|db| {
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            let write_txn = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
             let mut mutations = Vec::new();
             {
                 let mut table = write_txn
@@ -24729,11 +26865,23 @@ impl RedbPersistence {
                 &mut self.proof_admission(),
             )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-            write_txn.commit().map_err(Self::storage_error)
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)
         })
     }
 
     pub fn remove_config_value(&self, key: &str) -> Result<()> {
+        self.prepare_proof_owner()?;
         #[cfg(feature = "test-seams")]
         if verified_ordered_run_test_seams::config_write_refused_for_test() {
             return Err(Error::Other(format!(
@@ -24741,7 +26889,10 @@ impl RedbPersistence {
             )));
         }
         self.with_db(|db| {
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            let write_txn = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
             Self::update_policy_hold_release_index(&write_txn, key, false)?;
             {
                 let mut config_table = write_txn
@@ -24755,12 +26906,24 @@ impl RedbPersistence {
                 &mut self.proof_admission(),
             )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-            write_txn.commit().map_err(Self::storage_error)?;
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)?;
             Ok(())
         })
     }
 
     pub fn load_sink_queue<T: serde::de::DeserializeOwned>(&self, sink: &str) -> Result<Vec<T>> {
+        let _decode_scope = self.writer_decode_scope()?;
         self.with_db(|db| {
             let read_txn = db.begin_read().map_err(Self::storage_error)?;
             let table_name = Self::sink_queue_table_name(sink);
@@ -24787,11 +26950,16 @@ impl RedbPersistence {
         uncertain: bool,
         unconfirmed_delta: i8,
     ) -> Result<()> {
+        let _decode_scope = self.writer_decode_scope()?;
+        self.prepare_proof_owner()?;
         if remove_id.is_none() && put.is_none() {
             return Ok(());
         }
         self.with_db(|db| {
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            let write_txn = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
             let mut identity_mutations = Vec::new();
             {
                 let table_name = Self::sink_queue_table_name(sink);
@@ -24871,7 +27039,18 @@ impl RedbPersistence {
                 &mut self.proof_admission(),
             )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-            write_txn.commit().map_err(Self::storage_error)?;
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)?;
             Ok(())
         })
     }
@@ -24882,11 +27061,16 @@ impl RedbPersistence {
         remove_ids: &[u64],
         unconfirmed: u64,
     ) -> Result<()> {
+        let _decode_scope = self.writer_decode_scope()?;
+        self.prepare_proof_owner()?;
         if remove_ids.is_empty() {
             return Ok(());
         }
         self.with_db(|db| {
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            let write_txn = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
             let mut identity_mutations = Vec::new();
             {
                 let table_name = Self::sink_queue_table_name(sink);
@@ -24932,53 +27116,64 @@ impl RedbPersistence {
                 &mut self.proof_admission(),
             )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-            write_txn.commit().map_err(Self::storage_error)?;
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)?;
             Ok(())
         })
     }
 
     pub fn append_change_log(&self, lsn: Lsn, entries: &[ChangeLogEntry]) -> Result<()> {
+        let _decode_scope = self.writer_decode_scope()?;
+        self.prepare_proof_owner()?;
         if entries.is_empty() {
             return Ok(());
         }
         self.with_db(|db| {
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
-            let mut identity_mutations = Vec::new();
-            {
-                let mut table = write_txn
-                    .open_table(CHANGE_LOG_TABLE)
-                    .map_err(Self::storage_error)?;
-                let mut encoded = Vec::new();
-                let mut key = String::with_capacity(Self::change_log_entry_key_len());
-                for (index, entry) in entries.iter().enumerate() {
-                    Self::write_change_log_entry_key(lsn, index, &mut key);
-                    Self::encode_into(entry, &mut encoded)?;
-                    table
-                        .insert(key.as_str(), encoded.as_slice())
-                        .map_err(Self::storage_error)?;
-                    Self::write_change_log_selectors_in_write(
-                        &write_txn,
-                        key.as_str(),
-                        encoded.as_slice(),
-                    )?;
-                    identity_mutations
-                        .push(content_identity::encoded_history_mutation(&key, entry)?);
-                }
-            }
-            Self::apply_content_identity_mutations_in_write(
-                &write_txn,
-                &identity_mutations,
-                &mut self.proof_admission(),
+            let previous_root = db.begin_read().map_err(Self::storage_error)?;
+            let write = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write);
+            self.publish_public_change_log_in_write(
+                &write,
+                &previous_root,
+                false,
+                entries.iter().enumerate().map(|(i, entry)| (lsn, i, entry)),
             )?;
-            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-            write_txn.commit().map_err(Self::storage_error)?;
+            Self::write_writer_recovery_bounds_in_write(&write, None)?;
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)?;
             Ok(())
         })
     }
 
     pub fn append_ddl_log(&self, lsn: Lsn, change: &DdlChange) -> Result<()> {
+        self.prepare_proof_owner()?;
         self.with_db(|db| {
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            let write_txn = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
             let key = Self::ddl_log_key(lsn);
             Self::append_ddl_summary_in_write(&write_txn, &key, change)?;
             let encoded = Self::encode(change)?;
@@ -25002,14 +27197,30 @@ impl RedbPersistence {
                 RowId(0),
             )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-            write_txn.commit().map_err(Self::storage_error)?;
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)?;
             Ok(())
         })
     }
 
     pub fn append_trigger_audit(&self, index: u64, entry: &TriggerAuditEntry) -> Result<()> {
+        let _decode_scope = self.writer_decode_scope()?;
+        self.prepare_proof_owner()?;
         self.with_db(|db| {
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            let write_txn = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
             let mut identity_mutations = Vec::new();
             {
                 let mut table = write_txn
@@ -25088,407 +27299,18 @@ impl RedbPersistence {
                 &mut self.proof_admission(),
             )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-            write_txn.commit().map_err(Self::storage_error)?;
-            Ok(())
-        })
-    }
-
-    pub fn remove_table_data(&self, name: &str) -> Result<()> {
-        let rows = self.load_relational_table(name)?;
-        let sources = self.load_sync_source_lsns()?;
-        self.with_db(|db| {
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
-            let table_name = Self::rel_table_name(name);
-            let table_def: TableDefinition<&[u8], &[u8]> =
-                TableDefinition::new(table_name.as_str());
-            content_size::reset_rows(&write_txn, name)?;
-            match write_txn.delete_table(table_def) {
-                Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
-                Err(redb::TableError::TableTypeMismatch { .. }) => {}
-                Err(err) => return Err(Self::storage_error(err)),
-            }
-            let legacy_table_def: TableDefinition<u64, &[u8]> =
-                TableDefinition::new(table_name.as_str());
-            match write_txn.delete_table(legacy_table_def) {
-                Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
-                Err(redb::TableError::TableTypeMismatch { .. }) => {}
-                Err(err) => return Err(Self::storage_error(err)),
-            }
-            Self::remove_sync_source_provenance_for_table(&write_txn, name)?;
-            Self::remove_retention_expiries_for_table(&write_txn, name)?;
-            let mut mutations = rows
-                .iter()
-                .map(|row| content_identity::remove_row_mutation(name, row.row_id))
-                .collect::<Vec<_>>();
-            for row in &rows {
-                let key =
-                    crate::composite_store::retention_expiry_key(name, row.row_id, row.created_tx);
-                mutations.extend(content_identity::config_mutations(&key, None));
-            }
-            mutations.extend(sources.keys().filter(|(table, _)| table == name).map(
-                |(table, row_id)| content_identity::remove_sync_source_mutation(table, *row_id),
-            ));
-            Self::apply_content_identity_mutations_in_write(
-                &write_txn,
-                &mutations,
-                &mut self.proof_admission(),
-            )?;
-            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-            write_txn.commit().map_err(Self::storage_error)?;
-            Ok(())
-        })
-    }
-
-    pub fn remove_table_with_config_values_and_ddl_log(
-        &self,
-        name: &str,
-        config_values: Vec<(&str, Vec<u8>)>,
-        lsn: Lsn,
-        ddl: &[DdlChange],
-    ) -> Result<()> {
-        let rows = self.load_relational_table(name)?;
-        let sources = self.load_sync_source_lsns()?;
-        let schema =
-            self.prepare_writer_schema_change(std::iter::once(name), std::iter::empty())?;
-        self.with_db(|db| {
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
-            let mut identity_mutations = content_identity::remove_schema_mutations(name);
-            identity_mutations.extend(
-                rows.iter()
-                    .map(|row| content_identity::remove_row_mutation(name, row.row_id)),
-            );
-            identity_mutations.extend(sources.keys().filter(|(table, _)| table == name).map(
-                |(table, row_id)| content_identity::remove_sync_source_mutation(table, *row_id),
-            ));
-            for row in &rows {
-                let key =
-                    crate::composite_store::retention_expiry_key(name, row.row_id, row.created_tx);
-                identity_mutations.extend(content_identity::config_mutations(&key, None));
-            }
             {
-                let mut meta_table = write_txn
-                    .open_table(META_TABLE)
-                    .map_err(Self::storage_error)?;
-                let key = Self::meta_key(name);
-                meta_table
-                    .remove(key.as_str())
-                    .map_err(Self::storage_error)?;
-            }
-            let table_name = Self::rel_table_name(name);
-            let table_def: TableDefinition<&[u8], &[u8]> =
-                TableDefinition::new(table_name.as_str());
-            content_size::reset_rows(&write_txn, name)?;
-            match write_txn.delete_table(table_def) {
-                Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
-                Err(redb::TableError::TableTypeMismatch { .. }) => {}
-                Err(err) => return Err(Self::storage_error(err)),
-            }
-            let legacy_table_def: TableDefinition<u64, &[u8]> =
-                TableDefinition::new(table_name.as_str());
-            match write_txn.delete_table(legacy_table_def) {
-                Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
-                Err(redb::TableError::TableTypeMismatch { .. }) => {}
-                Err(err) => return Err(Self::storage_error(err)),
-            }
-            Self::remove_sync_source_provenance_for_table(&write_txn, name)?;
-            Self::remove_retention_expiries_for_table(&write_txn, name)?;
-            if !config_values.is_empty() {
-                let mut config_table = write_txn
-                    .open_table(CONFIG_TABLE)
-                    .map_err(Self::storage_error)?;
-                for (key, encoded) in config_values {
-                    Self::raise_config_identity_floors_in_write(&write_txn, key, &encoded)?;
-                    Self::update_policy_hold_release_index(&write_txn, key, true)?;
-                    config_table
-                        .insert(key, encoded.as_slice())
-                        .map_err(Self::storage_error)?;
-                    identity_mutations
-                        .extend(content_identity::config_mutations(key, Some(&encoded)));
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
                 }
+                graph_commit_result
             }
-            if !ddl.is_empty() {
-                let mut ddl_table = write_txn
-                    .open_table(DDL_LOG_TABLE)
-                    .map_err(Self::storage_error)?;
-                for (index, change) in ddl.iter().enumerate() {
-                    let key = Self::ddl_log_key_for_index(lsn, index, ddl.len());
-                    Self::append_ddl_summary_in_write(&write_txn, &key, change)?;
-                    let encoded = Self::encode(change)?;
-                    ddl_table
-                        .insert(key.as_str(), encoded.as_slice())
-                        .map_err(Self::storage_error)?;
-                    identity_mutations
-                        .push(content_identity::encoded_history_mutation(&key, change)?);
-                }
-            }
-            Self::apply_content_identity_mutations_in_write(
-                &write_txn,
-                &identity_mutations,
-                &mut self.proof_admission(),
-            )?;
-            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-            write_txn.commit().map_err(Self::storage_error)?;
-            self.complete_writer_schema_change(schema);
-            Ok(())
-        })
-    }
-
-    pub fn remove_table_rewrite_aux_with_config_values_and_ddl_log(
-        &self,
-        name: &str,
-        config_values: Vec<(&str, Vec<u8>)>,
-        lsn: Lsn,
-        ddl: &[DdlChange],
-        graph_edges: &[AdjEntry],
-    ) -> Result<()> {
-        let rows = self.load_relational_table(name)?;
-        let sources = self.load_sync_source_lsns()?;
-        let table_meta = self.load_all_table_meta()?;
-        let quantization = Self::vector_quantization_map(&table_meta);
-        let removed_vectors = self
-            .load_vectors()?
-            .into_iter()
-            .filter(|entry| entry.index.table == name)
-            .collect::<Vec<_>>();
-        let schema =
-            self.prepare_writer_schema_change(std::iter::once(name), std::iter::empty())?;
-        self.with_db(|db| {
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
-            let mut identity_mutations = content_identity::remove_schema_mutations(name);
-            identity_mutations.extend(
-                rows.iter()
-                    .map(|row| content_identity::remove_row_mutation(name, row.row_id)),
-            );
-            identity_mutations.extend(sources.keys().filter(|(table, _)| table == name).map(
-                |(table, row_id)| content_identity::remove_sync_source_mutation(table, *row_id),
-            ));
-            for row in &rows {
-                let key =
-                    crate::composite_store::retention_expiry_key(name, row.row_id, row.created_tx);
-                identity_mutations.extend(content_identity::config_mutations(&key, None));
-            }
-            identity_mutations.extend(removed_vectors.iter().map(|entry| {
-                content_identity::remove_vector_mutation(
-                    &entry.index,
-                    entry.row_id,
-                    quantization.get(&entry.index).copied().unwrap_or_default(),
-                )
-            }));
-            identity_mutations.extend(removed_vectors.iter().map(|entry| {
-                content_identity::remove_vector_version_mutation(
-                    &entry.index,
-                    entry.row_id,
-                    entry.created_tx,
-                    entry.lsn,
-                    quantization.get(&entry.index).copied().unwrap_or_default(),
-                )
-            }));
-            self.remove_vector_partition_records_matching_all_in_write(
-                &write_txn,
-                name,
-                None,
-                &|index: &VectorIndexRef| index.table == name,
-            )?;
-            self.remove_vector_entries_matching_in_write(&write_txn, &|index| index.table == name)?;
-            {
-                let mut meta_table = write_txn
-                    .open_table(META_TABLE)
-                    .map_err(Self::storage_error)?;
-                let key = Self::meta_key(name);
-                meta_table
-                    .remove(key.as_str())
-                    .map_err(Self::storage_error)?;
-            }
-            let table_name = Self::rel_table_name(name);
-            let table_def: TableDefinition<&[u8], &[u8]> =
-                TableDefinition::new(table_name.as_str());
-            content_size::reset_rows(&write_txn, name)?;
-            match write_txn.delete_table(table_def) {
-                Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
-                Err(redb::TableError::TableTypeMismatch { .. }) => {}
-                Err(err) => return Err(Self::storage_error(err)),
-            }
-            let legacy_table_def: TableDefinition<u64, &[u8]> =
-                TableDefinition::new(table_name.as_str());
-            match write_txn.delete_table(legacy_table_def) {
-                Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
-                Err(redb::TableError::TableTypeMismatch { .. }) => {}
-                Err(err) => return Err(Self::storage_error(err)),
-            }
-            Self::remove_sync_source_provenance_for_table(&write_txn, name)?;
-            Self::remove_retention_expiries_for_table(&write_txn, name)?;
-
-            match write_txn.delete_table(GRAPH_FWD_TABLE) {
-                Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
-                Err(err) => return Err(Self::storage_error(err)),
-            }
-            match write_txn.delete_table(GRAPH_REV_TABLE) {
-                Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
-                Err(err) => return Err(Self::storage_error(err)),
-            }
-            {
-                let mut fwd_table = write_txn
-                    .open_table(GRAPH_FWD_TABLE)
-                    .map_err(Self::storage_error)?;
-                let mut rev_table = write_txn
-                    .open_table(GRAPH_REV_TABLE)
-                    .map_err(Self::storage_error)?;
-                for entry in graph_edges {
-                    let encoded = Self::encode(entry)?;
-                    let fwd_key = Self::graph_fwd_key(entry);
-                    let rev_key = Self::graph_rev_key(entry);
-                    fwd_table
-                        .insert(fwd_key.as_slice(), encoded.as_slice())
-                        .map_err(Self::storage_error)?;
-                    rev_table
-                        .insert(rev_key.as_slice(), encoded.as_slice())
-                        .map_err(Self::storage_error)?;
-                }
-            }
-            Self::reset_content_identity_families_in_write(
-                &write_txn,
-                &[content_identity::LogicalFamily::Graph],
-                &mut self.proof_admission(),
-            )?;
-            let mut ordered_edges = graph_edges.iter().collect::<Vec<_>>();
-            ordered_edges.sort_by_key(|entry| (entry.lsn, entry.created_tx));
-            for entry in ordered_edges {
-                identity_mutations.push(content_identity::edge_mutation(entry)?);
-            }
-
-            if !config_values.is_empty() {
-                let mut config_table = write_txn
-                    .open_table(CONFIG_TABLE)
-                    .map_err(Self::storage_error)?;
-                for (key, encoded) in config_values {
-                    Self::raise_config_identity_floors_in_write(&write_txn, key, &encoded)?;
-                    Self::update_policy_hold_release_index(&write_txn, key, true)?;
-                    config_table
-                        .insert(key, encoded.as_slice())
-                        .map_err(Self::storage_error)?;
-                    identity_mutations
-                        .extend(content_identity::config_mutations(key, Some(&encoded)));
-                }
-            }
-            if !ddl.is_empty() {
-                let mut ddl_table = write_txn
-                    .open_table(DDL_LOG_TABLE)
-                    .map_err(Self::storage_error)?;
-                for (index, change) in ddl.iter().enumerate() {
-                    let key = Self::ddl_log_key_for_index(lsn, index, ddl.len());
-                    Self::append_ddl_summary_in_write(&write_txn, &key, change)?;
-                    let encoded = Self::encode(change)?;
-                    ddl_table
-                        .insert(key.as_str(), encoded.as_slice())
-                        .map_err(Self::storage_error)?;
-                    identity_mutations
-                        .push(content_identity::encoded_history_mutation(&key, change)?);
-                }
-            }
-            Self::apply_content_identity_mutations_in_write(
-                &write_txn,
-                &identity_mutations,
-                &mut self.proof_admission(),
-            )?;
-            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-            write_txn.commit().map_err(Self::storage_error)?;
-            self.complete_writer_schema_change(schema);
-            Ok(())
-        })
-    }
-
-    pub fn rewrite_table_rows(&self, name: &str, rows: &[VersionedRow]) -> Result<()> {
-        let table_meta = self.load_all_table_meta()?;
-        let previous_rows = self.load_relational_table(name)?;
-        let sources = self.load_sync_source_lsns()?;
-        self.with_db(|db| {
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
-            Self::invalidate_retention_clock_in_write(&write_txn, name)?;
-            {
-                let table_name = Self::rel_table_name(name);
-                let table_def: TableDefinition<&[u8], &[u8]> =
-                    TableDefinition::new(table_name.as_str());
-                content_size::reset_rows(&write_txn, name)?;
-                write_txn
-                    .delete_table(table_def)
-                    .map_err(Self::storage_error)?;
-                let legacy_table_def: TableDefinition<u64, &[u8]> =
-                    TableDefinition::new(table_name.as_str());
-                write_txn
-                    .delete_table(legacy_table_def)
-                    .map_err(Self::storage_error)?;
-                let mut redb_table =
-                    content_size::open_rows(&write_txn, table_def).map_err(Self::storage_error)?;
-                for row in rows {
-                    let encoded = Self::encode_versioned_row(row, table_meta.get(name))?;
-                    let key = Self::rel_row_key(row);
-                    redb_table
-                        .insert(key.as_slice(), encoded.as_slice())
-                        .map_err(Self::storage_error)?;
-                }
-            }
-            if let Some(meta) = table_meta.get(name) {
-                Self::rebuild_relational_indexes_in_write(
-                    &write_txn,
-                    &self.path,
-                    name,
-                    meta,
-                    Some(rows),
-                    &mut self.proof_admission(),
-                )?;
-            }
-            Self::retain_sync_source_provenance_for_table_rows(&write_txn, name, rows)?;
-            let mut mutations = previous_rows
-                .iter()
-                .map(|row| content_identity::remove_row_mutation(name, row.row_id))
-                .collect::<Vec<_>>();
-            let mut ordered_rows = rows.iter().collect::<Vec<_>>();
-            ordered_rows.sort_by_key(|row| (row.lsn, row.created_tx));
-            for row in ordered_rows {
-                mutations.push(content_identity::row_mutation(
-                    name,
-                    row,
-                    table_meta.get(name),
-                )?);
-            }
-            let live_rows = rows
-                .iter()
-                .filter(|row| row.deleted_tx.is_none())
-                .map(|row| row.row_id)
-                .collect::<HashSet<_>>();
-            mutations.extend(
-                sources
-                    .keys()
-                    .filter(|(table, row_id)| table == name && !live_rows.contains(row_id))
-                    .map(|(table, row_id)| {
-                        content_identity::remove_sync_source_mutation(table, *row_id)
-                    }),
-            );
-            Self::apply_content_identity_mutations_in_write(
-                &write_txn,
-                &mutations,
-                &mut self.proof_admission(),
-            )?;
-            Self::raise_noncanonical_writer_floors_in_write(
-                &write_txn,
-                rows.iter()
-                    .chain(&previous_rows)
-                    .flat_map(|row| std::iter::once(row.created_tx).chain(row.deleted_tx))
-                    .max()
-                    .unwrap_or(TxId(0)),
-                rows.iter()
-                    .chain(&previous_rows)
-                    .map(|row| row.lsn)
-                    .max()
-                    .unwrap_or(Lsn(0)),
-                rows.iter()
-                    .chain(&previous_rows)
-                    .map(|row| row.row_id)
-                    .max()
-                    .unwrap_or(RowId(0)),
-            )?;
-            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-            write_txn.commit().map_err(Self::storage_error)?;
+            .map_err(Self::storage_error)?;
             Ok(())
         })
     }
@@ -25498,7 +27320,10 @@ impl RedbPersistence {
         let vector_quantization = Self::vector_quantization_map(&table_meta);
         let previous_vectors = self.load_vectors()?;
         self.with_db(|db| {
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            let write_txn = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
             content_size::reset_vector_bytes(&write_txn)?;
             write_txn
                 .delete_table(VECTORS_TABLE)
@@ -25558,286 +27383,39 @@ impl RedbPersistence {
                 &mutations,
                 &mut self.proof_admission(),
             )?;
-            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-            write_txn.commit().map_err(Self::storage_error)?;
-            Ok(())
-        })
-    }
-
-    pub fn rewrite_table_meta_rows_and_append_ddl_log(
-        &self,
-        name: &str,
-        meta: &TableMeta,
-        rows: &[VersionedRow],
-        lsn: Lsn,
-        ddl: &[DdlChange],
-        config_values: Vec<(&str, Vec<u8>)>,
-    ) -> Result<()> {
-        let mut table_meta = self.load_all_table_meta()?;
-        let previous_meta = table_meta.get(name).cloned();
-        let previous_vector_quantization = Self::vector_quantization_map(&table_meta);
-        let previous_rows = self.load_relational_table(name)?;
-        let sources = self.load_sync_source_lsns()?;
-        let previous_vectors = self
-            .load_vectors()?
-            .into_iter()
-            .filter(|entry| entry.index.table == name)
-            .collect::<Vec<_>>();
-        table_meta.insert(name.to_string(), meta.clone());
-        let vector_quantization = Self::vector_quantization_map(&table_meta);
-        let previous_vector_columns = previous_meta
-            .as_ref()
-            .map(|previous| {
-                previous
-                    .columns
-                    .iter()
-                    .filter(|column| matches!(column.column_type, ColumnType::Vector(_)))
-                    .map(|column| column.name.clone())
-                    .collect::<HashSet<_>>()
-            })
-            .unwrap_or_default();
-        let current_vector_columns = meta
-            .columns
-            .iter()
-            .filter(|column| matches!(column.column_type, ColumnType::Vector(_)))
-            .map(|column| column.name.clone())
-            .collect::<HashSet<_>>();
-        let vector_renames = ddl
-            .iter()
-            .filter_map(|change| {
-                let DdlChange::AlterTable {
-                    name: change_table,
-                    constraints,
-                    ..
-                } = change
-                else {
-                    return None;
-                };
-                (change_table == name)
-                    .then(|| read_vector_rename_constraint(constraints))
-                    .flatten()
-                    .filter(|(from, to)| {
-                        previous_vector_columns.contains(from)
-                            && current_vector_columns.contains(to)
-                    })
-            })
-            .map(|(from, to)| {
-                (
-                    VectorIndexRef::new(name, from),
-                    VectorIndexRef::new(name, to),
-                )
-            })
-            .collect::<Vec<_>>();
-        let renamed_from = vector_renames
-            .iter()
-            .map(|(from, _)| from.column.clone())
-            .collect::<HashSet<_>>();
-        let dropped_vector_columns = previous_vector_columns
-            .difference(&current_vector_columns)
-            .filter(|column| !renamed_from.contains(*column))
-            .cloned()
-            .collect::<HashSet<_>>();
-        let schema =
-            self.prepare_writer_schema_change(std::iter::empty(), std::iter::once((name, meta)))?;
-        self.with_db(|db| {
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
-            Self::invalidate_retention_clock_in_write(&write_txn, name)?;
-            let mut identity_mutations = content_identity::schema_mutations(name, meta)?;
-            identity_mutations.extend(
-                previous_rows
-                    .iter()
-                    .map(|row| content_identity::remove_row_mutation(name, row.row_id)),
-            );
-            let mut ordered_rows = rows.iter().collect::<Vec<_>>();
-            ordered_rows.sort_by_key(|row| (row.lsn, row.created_tx));
-            for row in ordered_rows {
-                identity_mutations.push(content_identity::row_mutation(name, row, Some(meta))?);
-            }
-            for entry in &previous_vectors {
-                let previous_quantization = previous_vector_quantization
-                    .get(&entry.index)
-                    .copied()
-                    .unwrap_or_default();
-                identity_mutations.push(content_identity::remove_vector_mutation(
-                    &entry.index,
-                    entry.row_id,
-                    previous_quantization,
-                ));
-                identity_mutations.push(content_identity::remove_vector_version_mutation(
-                    &entry.index,
-                    entry.row_id,
-                    entry.created_tx,
+            for entry in vectors {
+                Self::raise_table_read_lsn_in_write(&write_txn, &entry.index.table, entry.lsn)?;
+                Self::raise_noncanonical_writer_floors_in_write(
+                    &write_txn,
+                    entry.created_tx.max(entry.deleted_tx.unwrap_or(TxId(0))),
                     entry.lsn,
-                    previous_quantization,
-                ));
-                if dropped_vector_columns.contains(&entry.index.column) {
-                    continue;
-                }
-                let mut current = entry.clone();
-                if let Some((_, to)) = vector_renames.iter().find(|(from, _)| from == &entry.index)
-                {
-                    current.index = to.clone();
-                }
-                if current_vector_columns.contains(&current.index.column) {
-                    let quantization = vector_quantization
-                        .get(&current.index)
-                        .copied()
-                        .unwrap_or_default();
-                    identity_mutations
-                        .push(content_identity::vector_mutation(&current, quantization));
-                    identity_mutations.push(content_identity::vector_version_mutation(
-                        &current,
-                        quantization,
-                    ));
-                }
-            }
-            for (from, to) in &vector_renames {
-                self.rename_vector_partition_generation_index_in_write(&write_txn, from, to)?;
-            }
-            if !dropped_vector_columns.is_empty() {
-                self.remove_vector_partition_records_matching_all_in_write(
-                    &write_txn,
-                    name,
-                    Some(&dropped_vector_columns),
-                    &|index: &VectorIndexRef| {
-                        index.table == name && dropped_vector_columns.contains(&index.column)
-                    },
+                    entry.row_id,
                 )?;
             }
-            self.rewrite_vector_entries_for_schema_in_write(
-                &write_txn,
-                name,
-                &vector_renames,
-                &dropped_vector_columns,
-                &vector_quantization,
-            )?;
-            {
-                let mut meta_table = write_txn
-                    .open_table(META_TABLE)
-                    .map_err(Self::storage_error)?;
-                let key = Self::meta_key(name);
-                let encoded_schema = self.schema_update_in_table(&meta_table, name, meta, ddl)?;
-                let encoded = &encoded_schema.bytes;
-                meta_table
-                    .insert(key.as_str(), encoded.as_slice())
-                    .map_err(Self::storage_error)?;
-                vector_membership_pages::ensure_declared_routes(
-                    &write_txn,
-                    name,
-                    meta,
-                    self.proof_accountant(),
-                )?;
-            }
-            {
-                let table_name = Self::rel_table_name(name);
-                let table_def: TableDefinition<&[u8], &[u8]> =
-                    TableDefinition::new(table_name.as_str());
-                content_size::reset_rows(&write_txn, name)?;
-                write_txn
-                    .delete_table(table_def)
-                    .map_err(Self::storage_error)?;
-                let legacy_table_def: TableDefinition<u64, &[u8]> =
-                    TableDefinition::new(table_name.as_str());
-                write_txn
-                    .delete_table(legacy_table_def)
-                    .map_err(Self::storage_error)?;
-                let mut redb_table =
-                    content_size::open_rows(&write_txn, table_def).map_err(Self::storage_error)?;
-                for row in rows {
-                    let encoded = Self::encode_versioned_row(row, Some(meta))?;
-                    let key = Self::rel_row_key(row);
-                    redb_table
-                        .insert(key.as_slice(), encoded.as_slice())
-                        .map_err(Self::storage_error)?;
-                }
-            }
-            // An index this rewrite stops declaring is retired here, while the
-            // declaration that wrote its postings is still the one they match.
-            if let Some(previous_meta) = previous_meta.as_ref() {
-                Self::retire_undeclared_relational_indexes_in_write(
-                    &write_txn,
-                    &self.path,
-                    name,
-                    previous_meta,
-                    meta,
-                    &mut self.proof_admission(),
-                )?;
-            }
-            #[cfg(any(test, feature = "test-seams"))]
-            table_meta_rewrite_checkpoint_for_test(1);
-            // The ready marker is a promise about the exact committed image,
-            // including an index with no rows. Rebuild its posting tables in
-            // this schema-rewrite transaction before publishing that marker.
-            Self::rebuild_relational_indexes_in_write(
-                &write_txn,
-                &self.path,
-                name,
-                meta,
-                Some(rows),
-                &mut self.proof_admission(),
-            )?;
-            #[cfg(any(test, feature = "test-seams"))]
-            table_meta_rewrite_checkpoint_for_test(2);
-            Self::retain_sync_source_provenance_for_table_rows(&write_txn, name, rows)?;
-            let live_rows = rows
-                .iter()
-                .filter(|row| row.deleted_tx.is_none())
-                .map(|row| row.row_id)
-                .collect::<HashSet<_>>();
-            identity_mutations.extend(
-                sources
-                    .keys()
-                    .filter(|(table, row_id)| table == name && !live_rows.contains(row_id))
-                    .map(|(table, row_id)| {
-                        content_identity::remove_sync_source_mutation(table, *row_id)
-                    }),
-            );
-            {
-                let mut config_table = write_txn
-                    .open_table(CONFIG_TABLE)
-                    .map_err(Self::storage_error)?;
-                for (key, encoded) in config_values {
-                    Self::raise_config_identity_floors_in_write(&write_txn, key, &encoded)?;
-                    Self::update_policy_hold_release_index(&write_txn, key, true)?;
-                    config_table
-                        .insert(key, encoded.as_slice())
-                        .map_err(Self::storage_error)?;
-                    identity_mutations
-                        .extend(content_identity::config_mutations(key, Some(&encoded)));
-                }
-            }
-            {
-                let mut ddl_table = write_txn
-                    .open_table(DDL_LOG_TABLE)
-                    .map_err(Self::storage_error)?;
-                for (index, change) in ddl.iter().enumerate() {
-                    let key = Self::ddl_log_key_for_index(lsn, index, ddl.len());
-                    Self::append_ddl_summary_in_write(&write_txn, &key, change)?;
-                    let encoded = Self::encode(change)?;
-                    ddl_table
-                        .insert(key.as_str(), encoded.as_slice())
-                        .map_err(Self::storage_error)?;
-                    identity_mutations
-                        .push(content_identity::encoded_history_mutation(&key, change)?);
-                }
-            }
-            Self::apply_content_identity_mutations_in_write(
-                &write_txn,
-                &identity_mutations,
-                &mut self.proof_admission(),
-            )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-            write_txn.commit().map_err(Self::storage_error)?;
-            self.complete_writer_schema_change(schema);
-            #[cfg(any(test, feature = "test-seams"))]
-            table_meta_rewrite_checkpoint_for_test(3);
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)?;
             Ok(())
         })
     }
 
     pub fn rewrite_graph_edges(&self, edges: &[AdjEntry]) -> Result<()> {
         self.with_db(|db| {
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            let write_txn = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
+            self.retire_graph_replacement_in_write(&write_txn, edges, None)?;
             write_txn
                 .delete_table(GRAPH_FWD_TABLE)
                 .map_err(Self::storage_error)?;
@@ -25857,13 +27435,23 @@ impl RedbPersistence {
                     let fwd_key = Self::graph_fwd_key(entry);
                     let rev_key = Self::graph_rev_key(entry);
                     fwd_table
-                        .insert(fwd_key.as_slice(), encoded.as_slice())
+                        .insert(
+                            observed_graph_key!("graph_fwd", "insert", fwd_key.as_slice(), 5),
+                            encoded.as_slice(),
+                        )
                         .map_err(Self::storage_error)?;
+                    self.graph_writer_window(|| {
+                        Self::install_graph_creation_in_write(&write_txn, entry, &encoded)
+                    })?;
                     rev_table
-                        .insert(rev_key.as_slice(), encoded.as_slice())
+                        .insert(
+                            observed_graph_key!("graph_rev", "insert", rev_key.as_slice(), 5),
+                            encoded.as_slice(),
+                        )
                         .map_err(Self::storage_error)?;
                 }
             }
+
             Self::reset_content_identity_families_in_write(
                 &write_txn,
                 &[content_identity::LogicalFamily::Graph],
@@ -25880,8 +27468,27 @@ impl RedbPersistence {
                 &mutations,
                 &mut self.proof_admission(),
             )?;
+            for edge in edges {
+                Self::raise_noncanonical_writer_floors_in_write(
+                    &write_txn,
+                    edge.created_tx.max(edge.deleted_tx.unwrap_or(TxId(0))),
+                    edge.lsn,
+                    RowId(0),
+                )?;
+            }
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-            write_txn.commit().map_err(Self::storage_error)?;
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)?;
             Ok(())
         })
     }
@@ -26190,6 +27797,7 @@ impl RedbPersistence {
         key: &str,
         memory: &Arc<crate::read_image_memory::ImageMemory>,
     ) -> Result<Option<T>> {
+        let _decode_scope = self.writer_decode_scope()?;
         self.with_db(|db| {
             let txn = db.begin_read().map_err(Self::storage_error)?;
             let table = match txn.open_table(if policy_hold_index_key(key) {
@@ -26219,6 +27827,7 @@ impl RedbPersistence {
         keys: &[String],
         memory: &Arc<crate::read_image_memory::ImageMemory>,
     ) -> Result<Vec<T>> {
+        let _decode_scope = self.writer_decode_scope()?;
         self.with_db(|db| {
             let txn = db.begin_read().map_err(Self::storage_error)?;
             let table = match txn.open_table(CONFIG_TABLE) {
@@ -26248,6 +27857,7 @@ impl RedbPersistence {
         prefixes: &[String],
         memory: &Arc<crate::read_image_memory::ImageMemory>,
     ) -> Result<Vec<(String, T)>> {
+        let _decode_scope = self.writer_decode_scope()?;
         self.with_db(|db| {
             let txn = db.begin_read().map_err(Self::storage_error)?;
             let table = match txn.open_table(CONFIG_TABLE) {
@@ -26305,6 +27915,7 @@ impl RedbPersistence {
         &self,
         key: &str,
     ) -> Result<Option<T>> {
+        let _decode_scope = self.writer_decode_scope()?;
         self.with_db(|db| {
             let read_txn = db.begin_read().map_err(Self::storage_error)?;
             let config_table = match read_txn.open_table(CONFIG_TABLE) {
@@ -26329,13 +27940,15 @@ impl RedbPersistence {
         meta: &TableMeta,
         bytes: &[u8],
     ) -> Result<VersionedRow> {
+        let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
         contextdb_core::find_attribution::count("decoded_rows", 1);
         #[cfg(feature = "test-seams")]
         {
             crate::read_work_probe::note_decoded_row();
             crate::read_work_probe::note_stored_row_bytes(bytes.len());
         }
-        let row = Self::decode_versioned_row(bytes, Some(meta))?;
+        let row = Self::decode_versioned_row(bytes, Some(meta))
+            .map_err(|error| Self::relational_decode_error(table, error))?;
         validate_read_row(table, &row, meta).map_err(|error| Error::StoreCorrupted {
             path: table.to_owned(),
             reason: error.to_string(),
@@ -26367,7 +27980,7 @@ impl RedbPersistence {
                     reason: format!("relational table {table} is absent from the {root_kind} root"),
                 });
             }
-            Err(error) => return Err(Self::storage_error(error)),
+            Err(error) => return Err(Self::relational_table_error(table, error)),
         };
         let (lower, upper) = Self::rel_row_key_range(row_id);
         let mut versions = {
@@ -26378,7 +27991,7 @@ impl RedbPersistence {
             );
             relation
                 .range(lower.as_slice()..upper.as_slice())
-                .map_err(Self::storage_error)?
+                .map_err(|error| Self::relational_storage_error(table, error))?
         };
         while let Some(entry) = {
             #[cfg(feature = "test-seams")]
@@ -26388,7 +28001,8 @@ impl RedbPersistence {
             );
             versions.next_back()
         } {
-            let (key, value) = entry.map_err(Self::storage_error)?;
+            let (key, value) =
+                entry.map_err(|error| Self::relational_storage_error(table, error))?;
             #[cfg(feature = "test-seams")]
             crate::writer_query_test_seams::note_target_entry(table);
             let row = Self::decode_relational_source_row(table, meta, value.value())?;
@@ -26432,7 +28046,7 @@ impl RedbPersistence {
                     reason: format!("relational table {table} is absent from the {root_kind} root"),
                 });
             }
-            Err(error) => return Err(Self::storage_error(error)),
+            Err(error) => return Err(Self::relational_table_error(table, error)),
         };
         let (lower, upper) = Self::rel_row_key_range(row_id);
         let versions = {
@@ -26443,7 +28057,7 @@ impl RedbPersistence {
             );
             relation
                 .range(lower.as_slice()..upper.as_slice())
-                .map_err(Self::storage_error)?
+                .map_err(|error| Self::relational_storage_error(table, error))?
         };
         #[cfg(feature = "test-seams")]
         let versions = {
@@ -26457,7 +28071,8 @@ impl RedbPersistence {
             })
         };
         for entry in versions {
-            let (key, value) = entry.map_err(Self::storage_error)?;
+            let (key, value) =
+                entry.map_err(|error| Self::relational_storage_error(table, error))?;
             let encoded_key = key.value();
             if encoded_key.len() != 24 {
                 return Err(Error::StoreCorrupted {
@@ -26571,7 +28186,7 @@ impl RedbPersistence {
                         let opened = match read.open_table(definition) {
                             Ok(relation) => Some(relation),
                             Err(redb::TableError::TableDoesNotExist(_)) => None,
-                            Err(error) => return Err(Self::storage_error(error)),
+                            Err(error) => return Err(Self::relational_table_error(table, error)),
                         };
                         entry.insert(opened)
                     }
@@ -26580,7 +28195,9 @@ impl RedbPersistence {
                     continue;
                 };
                 let key = Self::rel_row_key_from_parts(*row_id, *created_tx, *lsn);
-                let Some(stored) = relation.get(key.as_slice()).map_err(Self::storage_error)?
+                let Some(stored) = relation
+                    .get(key.as_slice())
+                    .map_err(|error| Self::relational_storage_error(table, error))?
                 else {
                     continue;
                 };
@@ -26605,6 +28222,7 @@ impl RedbPersistence {
         created_tx: TxId,
         lsn: Lsn,
     ) -> Result<Option<VersionedRow>> {
+        let _decode_scope = self.writer_decode_scope()?;
         #[cfg(feature = "test-seams")]
         crate::read_work_probe::note_row_version_point_read();
         self.with_db(|db| {
@@ -26614,10 +28232,13 @@ impl RedbPersistence {
             let relation = match read.open_table(definition) {
                 Ok(relation) => relation,
                 Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-                Err(error) => return Err(Self::storage_error(error)),
+                Err(error) => return Err(Self::relational_table_error(table, error)),
             };
             let key = Self::rel_row_key_from_parts(row_id, created_tx, lsn);
-            let Some(value) = relation.get(key.as_slice()).map_err(Self::storage_error)? else {
+            let Some(value) = relation
+                .get(key.as_slice())
+                .map_err(|error| Self::relational_storage_error(table, error))?
+            else {
                 return Ok(None);
             };
             let row = Self::decode_relational_source_row(table, meta, value.value())?;
@@ -26641,6 +28262,9 @@ impl RedbPersistence {
     ) -> Result<()> {
         self.with_db(|db| {
             let write = db.begin_write().map_err(Self::storage_error)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write);
             let name = Self::rel_table_name(table);
             let definition: TableDefinition<&[u8], &[u8]> = TableDefinition::new(name.as_str());
             {
@@ -26670,35 +28294,18 @@ impl RedbPersistence {
                         .map_err(Self::storage_error)?;
                 }
             }
-            write.commit().map_err(Self::storage_error)
-        })
-    }
-
-    pub fn load_relational_table(&self, name: &str) -> Result<Vec<VersionedRow>> {
-        self.with_db(|db| {
-            let read_txn = db.begin_read().map_err(Self::storage_error)?;
-            let table_meta = Self::load_table_meta_in_read_txn(&read_txn, name)?;
-            let table_name = Self::rel_table_name(name);
-            let table_def: TableDefinition<&[u8], &[u8]> =
-                TableDefinition::new(table_name.as_str());
-            match read_txn.open_table(table_def) {
-                Ok(table) => {
-                    let mut rows = Vec::new();
-                    for entry in table.iter().map_err(Self::storage_error)? {
-                        let (_, value) = entry.map_err(Self::storage_error)?;
-                        rows.push(Self::decode_versioned_row(
-                            value.value(),
-                            table_meta.as_ref(),
-                        )?);
-                    }
-                    Ok(rows)
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
                 }
-                Err(redb::TableError::TableDoesNotExist(_)) => Ok(Vec::new()),
-                Err(redb::TableError::TableTypeMismatch { .. }) => {
-                    Err(Self::unrecognized_relational_layout(name))
-                }
-                Err(err) => Err(Self::storage_error(err)),
+                graph_commit_result
             }
+            .map_err(Self::storage_error)
         })
     }
 
@@ -26719,7 +28326,7 @@ impl RedbPersistence {
         name: &str,
         visit: impl FnMut(VersionedRow) -> Result<()>,
     ) -> Result<()> {
-        self.visit_relational_table_impl(name, None, visit)
+        self.visit_relational_table_impl(name, &self.require_decode_accountant()?, visit)
     }
 
     /// Charge one persisted row's decoded allocations before each allocation
@@ -26731,115 +28338,64 @@ impl RedbPersistence {
         accountant: &Arc<crate::memory_accounting::MemoryAccountant>,
         visit: impl FnMut(VersionedRow) -> Result<()>,
     ) -> Result<()> {
-        self.visit_relational_table_impl(name, Some(accountant), visit)
+        self.visit_relational_table_impl(name, accountant, visit)
     }
 
     fn visit_relational_table_impl(
         &self,
         name: &str,
-        accountant: Option<&Arc<crate::memory_accounting::MemoryAccountant>>,
+        accountant: &Arc<crate::memory_accounting::MemoryAccountant>,
         mut visit: impl FnMut(VersionedRow) -> Result<()>,
     ) -> Result<()> {
-        let page_memory = accountant.map(|accountant| {
-            crate::read_image_memory::ImageMemory::charging_for(
-                Arc::clone(accountant),
-                "sync",
-                "stage_received_unit_row_image",
-                "Raise MEMORY_LIMIT to admit the affected stored row before decoding it.",
-            )
-        });
-        let admission = page_memory.as_ref().map(|memory| {
-            let memory = Arc::clone(memory);
+        let page_memory =
+            crate::read_image_memory::ImageMemory::operation_writer(Arc::clone(accountant))?;
+        let _page_scope = page_memory.enter();
+        // The existing page callback's native Arc control precedes allocation.
+        page_memory.reserve(
+            std::mem::size_of::<Arc<crate::read_image_memory::ImageMemory>>()
+                + 2 * std::mem::size_of::<usize>(),
+        )?;
+        let admission = {
+            let memory = Arc::clone(&page_memory);
             Arc::new(move |bytes: usize| {
                 memory
                     .reserve(bytes)
                     .map_err(|error| redb::StorageError::AdmissionRefused(Box::new(error)))
             })
                 as Arc<dyn Fn(usize) -> std::result::Result<(), redb::StorageError> + Send + Sync>
-        });
-        let mut read = || {
-            self.with_db(|db| {
-            let read_txn = db.begin_read().map_err(Self::storage_error)?;
-            let table_meta = Self::load_table_meta_in_read_txn(&read_txn, name)?;
-            let table_name = Self::rel_table_name(name);
-            let table_def: TableDefinition<&[u8], &[u8]> =
-                TableDefinition::new(table_name.as_str());
-            match read_txn.open_table(table_def) {
-                Ok(table) => {
-                    for entry in table.iter().map_err(Self::storage_error)? {
-                        let (_, value) = entry.map_err(Self::storage_error)?;
-                        let decoded = accountant.map(|accountant| {
-                            crate::read_image_memory::ImageMemory::charging_for(
-                                Arc::clone(accountant),
-                                "sync",
-                                "stage_received_unit_row_image",
-                                "Raise MEMORY_LIMIT to admit the affected stored row before decoding it.",
-                            )
-                        });
-                        if let Some(decoded) = decoded.as_ref() {
-                            decoded.reserve(value.value().len())?;
-                        }
-                        let row = match decoded.as_ref() {
-                            Some(decoded) => decoded.scope(|| {
-                                Self::decode_versioned_row(value.value(), table_meta.as_ref())
-                            }),
-                            None => Self::decode_versioned_row(value.value(), table_meta.as_ref()),
-                        }?;
-                        #[cfg(feature = "in-process-test-seams")]
-                        crate::writer_query_test_seams::note_history(
-                            crate::writer_query_test_seams::HistoryFamily::Row,
-                        );
-                        visit(row)?;
-                    }
-                    Ok(())
-                }
-                Err(redb::TableError::TableDoesNotExist(_)) => Ok(()),
-                Err(redb::TableError::TableTypeMismatch { .. }) => {
-                    Err(Self::unrecognized_relational_layout(name))
-                }
-                Err(err) => Err(Self::storage_error(err)),
-            }
-        })
         };
-        match admission {
-            Some(admission) => redb::with_read_memory_admission_storage(admission, read),
-            None => read(),
-        }
-    }
-
-    pub fn load_all_tables(&self) -> Result<HashMap<String, Vec<VersionedRow>>> {
-        let mut all_tables = HashMap::new();
-        for name in self.load_all_table_meta()?.into_keys() {
-            let rows = self.load_relational_table(&name)?;
-            all_tables.insert(name, rows);
-        }
-        Ok(all_tables)
-    }
-
-    pub fn load_forward_edges(&self) -> Result<Vec<AdjEntry>> {
-        self.load_graph_table(GRAPH_FWD_TABLE)
-    }
-
-    pub fn load_reverse_edges(&self) -> Result<Vec<AdjEntry>> {
-        self.load_graph_table(GRAPH_REV_TABLE)
-    }
-
-    pub fn load_vectors(&self) -> Result<Vec<VectorEntry>> {
-        self.with_db(|db| {
-            let read_txn = db.begin_read().map_err(Self::storage_error)?;
-            let table = match read_txn.open_table(VECTORS_TABLE) {
-                Ok(table) => table,
-                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-                Err(err) => return Err(Self::storage_error(err)),
-            };
-
-            let mut vectors = Vec::new();
-            for entry in table.iter().map_err(Self::storage_error)? {
-                let (_, value) = entry.map_err(Self::storage_error)?;
-                vectors.push(Self::decode_vector_entry(value.value())?);
-            }
-            Ok(vectors)
-        })
+        let read = || {
+            self.with_db(|db| {
+                let read_txn = db.begin_read().map_err(Self::storage_error)?;
+                let table_meta = Self::load_table_meta_in_read_txn(&read_txn, name)?;
+                let table_name = Self::rel_table_name(name);
+                let table_def: TableDefinition<&[u8], &[u8]> =
+                    TableDefinition::new(table_name.as_str());
+                match read_txn.open_table(table_def) {
+                    Ok(table) => {
+                        for entry in table.iter().map_err(Self::storage_error)? {
+                            let (_, value) = entry.map_err(Self::storage_error)?;
+                            let decoded = page_memory.row_owner()?;
+                            let row = decoded.scope(|| {
+                                Self::decode_versioned_row(value.value(), table_meta.as_ref())
+                            })?;
+                            #[cfg(feature = "in-process-test-seams")]
+                            crate::writer_query_test_seams::note_history(
+                                crate::writer_query_test_seams::HistoryFamily::Row,
+                            );
+                            visit(row)?;
+                        }
+                        Ok(())
+                    }
+                    Err(redb::TableError::TableDoesNotExist(_)) => Ok(()),
+                    Err(redb::TableError::TableTypeMismatch { .. }) => {
+                        Err(Self::unrecognized_relational_layout(name))
+                    }
+                    Err(err) => Err(Self::storage_error(err)),
+                }
+            })
+        };
+        redb::with_read_memory_admission_storage(admission, read)
     }
 
     fn load_vector_partition_table_in_read<T: serde::de::DeserializeOwned>(
@@ -26962,7 +28518,10 @@ impl RedbPersistence {
         ) -> Result<()>,
     ) -> Result<T> {
         self.with_db(|db| {
-            let read = db.begin_read().map_err(Self::storage_error)?;
+            let read = match vector_membership_source::operation_read_for_persistence(self) {
+                Some(read) => read,
+                None => Arc::new(db.begin_read().map_err(Self::storage_error)?),
+            };
             // Memberships and bodies share this pinned root. The callback must
             // never reacquire persistence ownership while close/recycle waits.
             let mut load_body = |membership: &VectorPartitionMembershipRecord| {
@@ -27092,7 +28651,10 @@ impl RedbPersistence {
             return Ok(Vec::new());
         }
         self.with_db(|db| {
-            let read_txn = db.begin_read().map_err(Self::storage_error)?;
+            let read_txn = match vector_membership_source::operation_read_for_persistence(self) {
+                Some(read) => read,
+                None => Arc::new(db.begin_read().map_err(Self::storage_error)?),
+            };
             self.load_vector_entries_for_memberships_in_read(
                 &read_txn,
                 memberships,
@@ -27125,115 +28687,188 @@ impl RedbPersistence {
         expected_dimension: usize,
         quantization: Option<VectorQuantization>,
     ) -> Result<Vec<(VectorEntry, Option<TxId>)>> {
+        let _decode_scope = self.writer_decode_scope()?;
+        self.prepare_proof_owner()?;
         #[cfg(feature = "test-seams")]
         crate::writer_query_test_seams::note_physical_source(
             crate::writer_query_test_seams::PhysicalFamily::Vector,
             read_txn,
         );
-        let verifier = quantization
-            .map(|_| {
-                content_identity::ContentIdentityReadVerifier::open(
-                    read_txn,
-                    &self.path,
-                    self.proof_accountant(),
-                )
-            })
-            .transpose()?;
-        let mut proof = content_identity::ReadAuthenticationNodes::new(
-            RAW_VECTOR_BODY_SCAN_PROOF_BYTES,
-            self.proof_accountant(),
-        );
-        let table = match read_txn.open_byte_table_bounded(VECTORS_TABLE) {
-            Ok(table) => table,
-            Err(redb::TableError::TableDoesNotExist(_)) => {
-                return Err(self.vector_partition_corruption(
-                    "a non-empty raw-vector directory has no vector body table",
-                ));
-            }
-            Err(error) => return Err(Self::storage_error(error)),
-        };
-        let mut entries = Vec::with_capacity(memberships.len());
-        for membership in memberships {
-            let key = Self::vector_identity_key(
-                &membership.index,
-                membership.row_id,
-                membership.vector_created_tx,
-                membership.vector_lsn,
-            );
-            let stored = table
-                .get_bounded(key.as_slice())
-                .map_err(Self::storage_error)?
-                .ok_or_else(|| {
-                    self.vector_partition_corruption(
-                        "a raw-vector directory identity has no durable body",
-                    )
-                })?;
-            self.validate_raw_vector_entry_encoded_width(
-                stored.value(),
-                &membership.index,
-                expected_dimension,
+        let operation_memory =
+            vector_membership_source::historical_memory_for_persistence(self, read_txn)?;
+        let load = || {
+            let verifier = content_identity::ContentIdentityReadVerifier::open(
+                read_txn,
+                &self.path,
+                if operation_memory.is_some() {
+                    None
+                } else {
+                    self.proof_accountant()
+                },
             )?;
-            let persisted: PersistedVectorEntry =
-                Self::decode(stored.value()).map_err(|error| {
+            let mut proof = content_identity::ReadAuthenticationNodes::new(
+                RAW_VECTOR_BODY_SCAN_PROOF_BYTES,
+                if operation_memory.is_some() {
+                    None
+                } else {
+                    self.proof_accountant()
+                },
+            );
+            let table = match read_txn.open_byte_table_bounded(VECTORS_TABLE) {
+                Ok(table) => table,
+                Err(redb::TableError::TableDoesNotExist(_)) => {
+                    return Err(self.vector_partition_corruption(
+                        "a non-empty raw-vector directory has no vector body table",
+                    ));
+                }
+                Err(error) => return Err(Self::storage_error(error)),
+            };
+            let mut entries = Vec::with_capacity(memberships.len());
+            for membership in memberships {
+                vector_membership_source::operation_checkpoint()?;
+                let quantization = match quantization {
+                    Some(quantization) => quantization,
+                    None => {
+                        Self::load_table_meta_in_read_txn(read_txn, &membership.index.table)?
+                            .and_then(|meta| {
+                                meta.columns
+                                    .into_iter()
+                                    .find(|column| column.name == membership.index.column)
+                            })
+                            .ok_or_else(|| {
+                                self.vector_partition_corruption(
+                                    "vector body has no captured quantization declaration",
+                                )
+                            })?
+                            .quantization
+                    }
+                };
+                vector_membership_source::authenticate_row_for_persistence(
+                    self,
+                    read_txn,
+                    &membership.index,
+                    &vector_membership_source::body_identity_for_record(membership),
+                    expected_dimension,
+                    quantization,
+                    None,
+                )?;
+                let key = Self::vector_identity_key(
+                    &membership.index,
+                    membership.row_id,
+                    membership.vector_created_tx,
+                    membership.vector_lsn,
+                );
+                let stored = table
+                    .get_bounded(key.as_slice())
+                    .map_err(Self::storage_error)?
+                    .ok_or_else(|| {
+                        self.vector_partition_corruption(
+                            "a raw-vector directory identity has no durable body",
+                        )
+                    })?;
+                self.validate_raw_vector_entry_encoded_width(
+                    stored.value(),
+                    &membership.index,
+                    expected_dimension,
+                )?;
+                let persisted: PersistedVectorEntry =
+                    Self::decode(stored.value()).map_err(|error| {
+                        self.vector_partition_corruption(format!(
+                            "a raw-vector directory body cannot be decoded: {error}"
+                        ))
+                    })?;
+                if persisted.index != membership.index
+                    || persisted.row_id != membership.row_id
+                    || persisted.created_tx != membership.vector_created_tx
+                    || persisted.lsn != membership.vector_lsn
+                {
+                    return Err(self.vector_partition_corruption(
+                        "a raw-vector body disagrees with its membership identity",
+                    ));
+                }
+                // Validate the exact length that to_f32 will produce BEFORE its
+                // clone/dequantization allocation. A corrupt SQ4 coded payload
+                // can fit the encoded-width bound yet expand beyond the declared
+                // F32 scratch unless its predicted dimension is checked here.
+                let decoded_bytes = persisted.vector.decoded_bytes();
+                let decoded_dimension = decoded_bytes / std::mem::size_of::<f32>();
+                if decoded_dimension != expected_dimension {
+                    return Err(self.vector_partition_corruption(format!(
+                    "raw-vector body dimension {} does not match declared dimension {expected_dimension}",
+                    decoded_dimension
+                )));
+                }
+                crate::read_image_memory::reserve(decoded_bytes).map_err(|error| {
                     self.vector_partition_corruption(format!(
                         "a raw-vector directory body cannot be decoded: {error}"
                     ))
                 })?;
-            if persisted.index != membership.index
-                || persisted.row_id != membership.row_id
-                || persisted.created_tx != membership.vector_created_tx
-                || persisted.lsn != membership.vector_lsn
-            {
-                return Err(self.vector_partition_corruption(
-                    "a raw-vector body disagrees with its membership identity",
-                ));
-            }
-            // Validate the exact length that to_f32 will produce BEFORE its
-            // clone/dequantization allocation. A corrupt SQ4 coded payload
-            // can fit the encoded-width bound yet expand beyond the declared
-            // F32 scratch unless its predicted dimension is checked here.
-            let decoded_bytes = persisted.vector.decoded_bytes();
-            let decoded_dimension = decoded_bytes / std::mem::size_of::<f32>();
-            if decoded_dimension != expected_dimension {
-                return Err(self.vector_partition_corruption(format!(
-                    "raw-vector body dimension {} does not match declared dimension {expected_dimension}",
-                    decoded_dimension
-                )));
-            }
-            crate::read_image_memory::reserve(decoded_bytes).map_err(|error| {
-                self.vector_partition_corruption(format!(
-                    "a raw-vector directory body cannot be decoded: {error}"
-                ))
-            })?;
-            let mut entry = VectorEntry {
-                index: persisted.index,
-                row_id: persisted.row_id,
-                vector: persisted.vector.to_f32(),
-                created_tx: persisted.created_tx,
-                deleted_tx: persisted.deleted_tx,
-                lsn: persisted.lsn,
-            };
-            // Membership combines row and vector lifecycle. A row may
-            // make the occurrence unavailable before the body receives
-            // its own tombstone, so the effective partition visibility is
-            // the checksummed membership value.
-            if let (Some(verifier), Some(quantization)) = (&verifier, quantization) {
-                verifier.verify_with_nodes(
-                    &mut proof,
-                    &content_identity::decoded_vector_version_mutation(&entry, quantization),
-                )?;
-                if entry.deleted_tx.is_none() {
+                let mut entry = VectorEntry {
+                    index: persisted.index,
+                    row_id: persisted.row_id,
+                    vector: persisted.vector.to_f32(),
+                    created_tx: persisted.created_tx,
+                    deleted_tx: persisted.deleted_tx,
+                    lsn: persisted.lsn,
+                };
+                // Membership combines row and vector lifecycle. A row may
+                // make the occurrence unavailable before the body receives
+                // its own tombstone, so the effective partition visibility is
+                // the checksummed membership value.
+
+                if let Some(memory) = &operation_memory {
+                    let _proof_controls = contextdb_core::read_memory::ReadCredit::try_new(
+                        memory.clone(),
+                        std::mem::size_of::<content_identity::ContentIdentityMutation>()
+                            .checked_add(entry.vector.len().checked_mul(4).ok_or_else(|| {
+                                vector_membership_source::damage("bulk proof body overflow")
+                            })?)
+                            .and_then(|n| n.checked_add(entry.index.table.len()))
+                            .and_then(|n| n.checked_add(entry.index.column.len()))
+                            .and_then(|n| n.checked_add(320))
+                            .ok_or_else(|| {
+                                vector_membership_source::damage("bulk proof controls overflow")
+                            })?,
+                        "reader",
+                        "historical_vector_bulk_mutation",
+                        "Raise the declared reader memory limit.",
+                    )?;
+                    verifier.verify_with_read_memory_before(
+                        &content_identity::decoded_vector_version_mutation(&entry, quantization),
+                        memory.clone(),
+                        &mut || vector_membership_source::operation_checkpoint(),
+                    )?;
+                    vector_membership_source::authenticate_row_for_persistence(
+                        self,
+                        read_txn,
+                        &membership.index,
+                        &vector_membership_source::body_identity_for_record(membership),
+                        expected_dimension,
+                        quantization,
+                        Some(entry.deleted_tx),
+                    )?;
+                } else {
                     verifier.verify_with_nodes(
                         &mut proof,
-                        &content_identity::decoded_vector_mutation(&entry, quantization),
+                        &content_identity::decoded_vector_version_mutation(&entry, quantization),
                     )?;
+                    if entry.deleted_tx.is_none() {
+                        verifier.verify_with_nodes(
+                            &mut proof,
+                            &content_identity::decoded_vector_mutation(&entry, quantization),
+                        )?;
+                    }
                 }
+                let canonical_deleted_tx = entry.deleted_tx;
+                entry.deleted_tx = membership.deleted_tx;
+                entries.push((entry, canonical_deleted_tx));
             }
-            let canonical_deleted_tx = entry.deleted_tx;
-            entry.deleted_tx = membership.deleted_tx;
-            entries.push((entry, canonical_deleted_tx));
+            Ok(entries)
+        };
+        match &operation_memory {
+            Some(memory) => graph_read::with_pages(memory.clone(), load),
+            None => load(),
         }
-        Ok(entries)
     }
 
     fn validate_raw_vector_entry_encoded_width(
@@ -27251,6 +28886,21 @@ impl RedbPersistence {
         self: &Arc<Self>,
         index: &VectorIndexRef,
     ) -> Result<WritableRawVectorBodyScan> {
+        if let Some(read) = vector_membership_source::operation_read(
+            &vector_membership_source::MembershipOwner::Writable(self.clone()),
+        ) {
+            let writer = self
+                .scoped_vector_root_capture
+                .get()
+                .map(|capture| capture())
+                .transpose()?
+                .flatten();
+            return self.open_raw_vector_body_scan_at(
+                index,
+                read,
+                writer.map(|root| root as Arc<dyn std::any::Any + Send + Sync>),
+            );
+        }
         self.with_db(|db| {
             let (transaction, root) = match self.paged_root_capture.get() {
                 Some(capture) => {
@@ -27290,66 +28940,80 @@ impl RedbPersistence {
         transaction: Arc<redb::ReadTransaction>,
         root: Option<Arc<dyn std::any::Any + Send + Sync>>,
     ) -> Result<WritableRawVectorBodyScan> {
-        if let Some(root) = &root {
-            let writer = root.downcast_ref::<WriterSnapshot>().ok_or_else(|| {
-                self.vector_partition_corruption("raw body read has another root owner")
-            })?;
-            writer.check_table_scope(&index.table)?;
-            if transaction.storage_snapshot_identity() != writer.storage_identity() {
-                return Err(self.vector_partition_corruption(
-                    "raw body read escaped its captured physical root",
-                ));
-            }
-        }
-        let producer_body_root = if root.is_some() {
-            vector_membership_pages::validate_in_read(&transaction)?;
-            vector_scan_body_root_matches(&transaction)?
+        let owner = vector_membership_source::MembershipOwner::Writable(self.clone());
+        let memory = vector_membership_source::historical_operation_memory(&owner, &transaction)?;
+        let proof_accountant = if memory.is_some() {
+            None
         } else {
-            false
+            self.proof_accountant()
         };
-        let memberships = match transaction.open_table(VECTOR_PARTITION_MEMBERSHIP_TABLE) {
-            Ok(table) => Some(table),
-            Err(redb::TableError::TableDoesNotExist(_)) => None,
-            Err(error) => return Err(vector_membership_pages::metadata_error(error)),
-        };
-        let vectors = {
-            #[cfg(feature = "test-seams")]
-            crate::writer_query_test_seams::note_physical_source(
-                crate::writer_query_test_seams::PhysicalFamily::Vector,
-                &transaction,
-            );
-            #[cfg(feature = "test-seams")]
-            let _body_reads = crate::writer_query_test_seams::physical_operation(
-                crate::writer_query_test_seams::PhysicalFamily::Vector,
-                &index.table,
-            );
-            #[cfg(not(feature = "test-seams"))]
-            let _ = index;
-            match transaction.open_table(VECTORS_TABLE) {
+        let open = || {
+            vector_membership_source::operation_checkpoint()?;
+            if let Some(root) = &root {
+                let writer = root.downcast_ref::<WriterSnapshot>().ok_or_else(|| {
+                    self.vector_partition_corruption("raw body read has another root owner")
+                })?;
+                writer.check_table_scope(&index.table)?;
+                if transaction.storage_snapshot_identity() != writer.storage_identity() {
+                    return Err(self.vector_partition_corruption(
+                        "raw body read escaped its captured physical root",
+                    ));
+                }
+            }
+            let producer_body_root = if root.is_some() {
+                vector_membership_pages::validate_in_read(&transaction)?;
+                vector_scan_body_root_matches(&transaction)?
+            } else {
+                false
+            };
+            let memberships = match transaction.open_table(VECTOR_PARTITION_MEMBERSHIP_TABLE) {
                 Ok(table) => Some(table),
                 Err(redb::TableError::TableDoesNotExist(_)) => None,
                 Err(error) => return Err(vector_membership_pages::metadata_error(error)),
-            }
+            };
+            let vectors = {
+                #[cfg(feature = "test-seams")]
+                crate::writer_query_test_seams::note_physical_source(
+                    crate::writer_query_test_seams::PhysicalFamily::Vector,
+                    &transaction,
+                );
+                #[cfg(feature = "test-seams")]
+                let _body_reads = crate::writer_query_test_seams::physical_operation(
+                    crate::writer_query_test_seams::PhysicalFamily::Vector,
+                    &index.table,
+                );
+                #[cfg(not(feature = "test-seams"))]
+                let _ = index;
+                match transaction.open_table(VECTORS_TABLE) {
+                    Ok(table) => Some(table),
+                    Err(redb::TableError::TableDoesNotExist(_)) => None,
+                    Err(error) => return Err(vector_membership_pages::metadata_error(error)),
+                }
+            };
+            let verifier = content_identity::ContentIdentityReadVerifier::open(
+                &transaction,
+                &self.path,
+                proof_accountant.clone(),
+            )?;
+            Ok(WritableRawVectorBodyScan {
+                producer_body_root,
+                selected_stream_identity: None,
+                source: Arc::clone(self),
+                memberships,
+                vectors,
+                verifier,
+                proof: content_identity::ReadAuthenticationNodes::new(
+                    RAW_VECTOR_BODY_SCAN_PROOF_BYTES,
+                    proof_accountant.clone(),
+                ),
+                _transaction: transaction,
+                _root: root,
+            })
         };
-        let verifier = content_identity::ContentIdentityReadVerifier::open(
-            &transaction,
-            &self.path,
-            self.proof_accountant(),
-        )?;
-        Ok(WritableRawVectorBodyScan {
-            producer_body_root,
-            selected_stream_identity: None,
-            source: Arc::clone(self),
-            memberships,
-            vectors,
-            verifier,
-            proof: content_identity::ReadAuthenticationNodes::new(
-                RAW_VECTOR_BODY_SCAN_PROOF_BYTES,
-                self.proof_accountant(),
-            ),
-            _transaction: transaction,
-            _root: root,
-        })
+        match memory {
+            Some(memory) => graph_read::with_pages(memory, open),
+            None => open(),
+        }
     }
 
     /// Read one durable vector body through its exact partition, row, vector
@@ -27907,6 +29571,9 @@ impl RedbPersistence {
             &partition.partition_key,
         );
         let write = database.begin_write().map_err(Self::storage_error)?;
+        #[cfg(any(test, feature = "test-seams"))]
+        let mut graph_publication_attempt =
+            crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write);
         {
             let mut table = write
                 .open_table(VECTOR_PARTITION_GENERATION_CATALOG_TABLE)
@@ -27952,7 +29619,18 @@ impl RedbPersistence {
                 }
             }
         }
-        write.commit().map_err(Self::storage_error)
+        {
+            #[cfg(any(test, feature = "test-seams"))]
+            graph_observation_checkpoint(10)?;
+            let graph_commit_result = write.commit();
+            #[cfg(any(test, feature = "test-seams"))]
+            if graph_commit_result.is_ok() {
+                graph_publication_attempt.committed();
+                graph_observation_checkpoint(11)?;
+            }
+            graph_commit_result
+        }
+        .map_err(Self::storage_error)
     }
 
     #[cfg(any(test, feature = "test-seams"))]
@@ -27963,6 +29641,9 @@ impl RedbPersistence {
         let database = redb_builder().open(path).map_err(Self::storage_error)?;
         let prefix = Self::vector_partition_prefix(&partition.index, &partition.partition_key);
         let write = database.begin_write().map_err(Self::storage_error)?;
+        #[cfg(any(test, feature = "test-seams"))]
+        let mut graph_publication_attempt =
+            crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write);
         {
             let mut table = write
                 .open_table(VECTOR_PARTITION_JOURNAL_TABLE)
@@ -27989,7 +29670,18 @@ impl RedbPersistence {
                 .insert(key.as_slice(), bytes.as_slice())
                 .map_err(Self::storage_error)?;
         }
-        write.commit().map_err(Self::storage_error)
+        {
+            #[cfg(any(test, feature = "test-seams"))]
+            graph_observation_checkpoint(10)?;
+            let graph_commit_result = write.commit();
+            #[cfg(any(test, feature = "test-seams"))]
+            if graph_commit_result.is_ok() {
+                graph_publication_attempt.committed();
+                graph_observation_checkpoint(11)?;
+            }
+            graph_commit_result
+        }
+        .map_err(Self::storage_error)
     }
 
     #[cfg(any(test, feature = "test-seams"))]
@@ -28022,6 +29714,9 @@ impl RedbPersistence {
             &partition.partition_key,
         );
         let write = database.begin_write().map_err(Self::storage_error)?;
+        #[cfg(any(test, feature = "test-seams"))]
+        let mut graph_publication_attempt =
+            crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write);
         let base_key = {
             let catalogs = write
                 .open_table(VECTOR_PARTITION_GENERATION_CATALOG_TABLE)
@@ -28065,7 +29760,18 @@ impl RedbPersistence {
                 .insert(base_key.as_slice(), bytes.as_slice())
                 .map_err(Self::storage_error)?;
         }
-        write.commit().map_err(Self::storage_error)
+        {
+            #[cfg(any(test, feature = "test-seams"))]
+            graph_observation_checkpoint(10)?;
+            let graph_commit_result = write.commit();
+            #[cfg(any(test, feature = "test-seams"))]
+            if graph_commit_result.is_ok() {
+                graph_publication_attempt.committed();
+                graph_observation_checkpoint(11)?;
+            }
+            graph_commit_result
+        }
+        .map_err(Self::storage_error)
     }
 
     #[cfg(any(test, feature = "test-seams"))]
@@ -28079,6 +29785,9 @@ impl RedbPersistence {
             &partition.partition_key,
         );
         let write = database.begin_write().map_err(Self::storage_error)?;
+        #[cfg(any(test, feature = "test-seams"))]
+        let mut graph_publication_attempt =
+            crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write);
         let base_key = {
             let catalogs = write
                 .open_table(VECTOR_PARTITION_GENERATION_CATALOG_TABLE)
@@ -28123,7 +29832,18 @@ impl RedbPersistence {
                 .insert(page_key.as_slice(), bytes.as_slice())
                 .map_err(Self::storage_error)?;
         }
-        write.commit().map_err(Self::storage_error)
+        {
+            #[cfg(any(test, feature = "test-seams"))]
+            graph_observation_checkpoint(10)?;
+            let graph_commit_result = write.commit();
+            #[cfg(any(test, feature = "test-seams"))]
+            if graph_commit_result.is_ok() {
+                graph_publication_attempt.committed();
+                graph_observation_checkpoint(11)?;
+            }
+            graph_commit_result
+        }
+        .map_err(Self::storage_error)
     }
 
     #[cfg(any(test, feature = "test-seams"))]
@@ -28318,11 +30038,31 @@ impl RedbPersistence {
     ) -> Result<(usize, u64)> {
         self.with_db(|db| {
             checkpoint()?;
-            let write = db.begin_write().map_err(Self::storage_error)?;
-            let result =
-                self.reclaim_vector_generations_in_write_with_checkpoint(&write, catalog, retained_chains, true, &mut checkpoint)?;
+            let write = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write);
+            let result = self.reclaim_vector_generations_in_write_with_checkpoint(
+                &write,
+                catalog,
+                retained_chains,
+                true,
+                &mut checkpoint,
+            )?;
             checkpoint()?;
-            write.commit().map_err(Self::storage_error)?;
+            Self::write_read_bounds_roots_in_write(&write)?;
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)?;
             Ok(result)
         })
     }
@@ -28333,10 +30073,11 @@ impl RedbPersistence {
         catalog: &VectorPartitionGenerationCatalogRecord,
         retained_chains: &[(u64, Option<u64>)],
     ) -> Result<(usize, u64)> {
+        self.prepare_proof_owner()?;
         // These legacy write transactions do not pass a decode workspace.
         // Own their fixed route-inspection scratch locally, never attach it
         // to a caller token that survives this helper's copies.
-        let _inspection = self.proof_accountant.get().cloned().map(|accountant| {
+        let _inspection = self.proof_accountant().map(|accountant| {
             crate::memory_accounting::OwnedMemoryReservation::try_new_for(
                 accountant, (64usize * 1024).saturating_add(
                     Self::vector_partition_physical_key_bound(&catalog.index, &catalog.partition_key, 32)
@@ -28348,7 +30089,8 @@ impl RedbPersistence {
     }
 
     fn reclaim_vector_generations_in_write_with_checkpoint(
-        &self, write: &redb::WriteTransaction,
+        &self,
+        write: &redb::WriteTransaction,
         catalog: &VectorPartitionGenerationCatalogRecord,
         retained_chains: &[(u64, Option<u64>)],
         retire_damage: bool,
@@ -28359,9 +30101,15 @@ impl RedbPersistence {
         const KEYS: usize = 64;
         let prefix = Self::vector_partition_prefix(&catalog.index, &catalog.partition_key);
         let has_membership = {
-            let table = write.open_table(VECTOR_PARTITION_MEMBERSHIP_TABLE).map_err(Self::storage_error)?;
-            table.prefix_bounded(prefix.as_slice()).map_err(Self::storage_error)?
-                .next().transpose().map_err(Self::storage_error)?
+            let table = write
+                .open_table(VECTOR_PARTITION_MEMBERSHIP_TABLE)
+                .map_err(Self::storage_error)?;
+            table
+                .prefix_bounded(prefix.as_slice())
+                .map_err(Self::storage_error)?
+                .next()
+                .transpose()
+                .map_err(Self::storage_error)?
                 .is_some_and(|(key, _)| key.value().starts_with(&prefix))
         };
         let retain_catalog = has_membership || !retained_chains.is_empty();
@@ -28377,34 +30125,54 @@ impl RedbPersistence {
                 let mut candidate = None;
                 // There are at most two protected keys per held chain. Each
                 // completed iteration removes a key or advances its page cleanup.
-                for entry in table.prefix_bounded(prefix.as_slice()).map_err(Self::storage_error)? {
+                for entry in table
+                    .prefix_bounded(prefix.as_slice())
+                    .map_err(Self::storage_error)?
+                {
                     let (key, value) = entry.map_err(Self::storage_error)?;
-                    if !key.value().starts_with(&prefix) { break; }
+                    if !key.value().starts_with(&prefix) {
+                        break;
+                    }
                     let suffix = &key.value()[prefix.len()..];
                     let expected = if is_base { 8 } else { 16 };
                     if suffix.len() != expected {
-                        return Err(self.vector_partition_corruption("retired generation physical key is malformed"));
+                        return Err(self.vector_partition_corruption(
+                            "retired generation physical key is malformed",
+                        ));
                     }
                     let base = u64::from_be_bytes(suffix[..8].try_into().unwrap());
-                    let change = (!is_base).then(|| u64::from_be_bytes(suffix[8..].try_into().unwrap()));
-                    let selected = retain_catalog && if is_base {
-                        base == catalog.base.generation_id
-                    } else {
-                        base == catalog.base.generation_id && change == catalog.change.map(|c| c.generation_id)
-                    };
-                    let pinned = retained_chains.iter().any(|(b, c)| *b == base && (is_base || *c == change));
-                    if selected || pinned { continue; }
+                    let change =
+                        (!is_base).then(|| u64::from_be_bytes(suffix[8..].try_into().unwrap()));
+                    let selected = retain_catalog
+                        && if is_base {
+                            base == catalog.base.generation_id
+                        } else {
+                            base == catalog.base.generation_id
+                                && change == catalog.change.map(|c| c.generation_id)
+                        };
+                    let pinned = retained_chains
+                        .iter()
+                        .any(|(b, c)| *b == base && (is_base || *c == change));
+                    if selected || pinned {
+                        continue;
+                    }
                     // Authenticate both envelopes before a native storage id
                     // becomes deletion authority. Failure only leaves orphan
                     // discovery to the durable fence, never to guessed bytes.
                     checkpoint()?;
-                    let native = match Self::authenticated_generation_storage(value.value(), key.value(), is_base) {
+                    let native = match Self::authenticated_generation_storage(
+                        value.value(),
+                        key.value(),
+                        is_base,
+                    ) {
                         Ok(native) => native,
                         Err(error) => {
                             // Pruning/currency transactions keep their prior
                             // refusal; damaged retirement belongs to the
                             // cancellable repair/catalog maintenance path.
-                            if !retire_damage { return Err(error); }
+                            if !retire_damage {
+                                return Err(error);
+                            }
                             // This also covers fitting resident repair, not
                             // only the retirement-to-paged branch.
                             Self::raise_repair_fence_in_write(write)?;
@@ -28414,12 +30182,18 @@ impl RedbPersistence {
                     candidate = Some((key.value().to_vec(), value.value().len() as u64, native));
                     break;
                 }
-                let Some((key, value_bytes, native)) = candidate else { break; };
-                let (complete, count, page_bytes) = Self::remove_retired_graph_pages_step_in_write(write, &key, is_base, remaining)?;
+                let Some((key, value_bytes, native)) = candidate else {
+                    break;
+                };
+                let (complete, count, page_bytes) = Self::remove_retired_graph_pages_step_in_write(
+                    write, &key, is_base, remaining,
+                )?;
                 remaining = remaining.saturating_sub(count);
                 reclaimed += count;
                 bytes = bytes.saturating_add(page_bytes);
-                if !complete || remaining == 0 { return Ok((reclaimed, bytes)); }
+                if !complete || remaining == 0 {
+                    return Ok((reclaimed, bytes));
+                }
                 if let Some(id) = native {
                     Self::queue_authenticated_native_storage_in_write(write, id)?;
                 }
@@ -28433,37 +30207,67 @@ impl RedbPersistence {
         // A last-membership removal may only drop the catalog after both
         // generation tables are empty; partial page cleanup keeps the parent.
         if !retain_catalog {
-            let any = [VECTOR_PARTITION_BASE_GENERATION_TABLE, VECTOR_PARTITION_CHANGE_GENERATION_TABLE]
-                .into_iter().try_fold(false, |found, definition| -> Result<bool> {
-                    let table = write.open_table(definition).map_err(Self::storage_error)?;
-                    Ok(found || table.prefix_bounded(prefix.as_slice()).map_err(Self::storage_error)?
-                        .next().transpose().map_err(Self::storage_error)?.is_some_and(|(key, _)| key.value().starts_with(&prefix)))
-                })?;
+            let any = [
+                VECTOR_PARTITION_BASE_GENERATION_TABLE,
+                VECTOR_PARTITION_CHANGE_GENERATION_TABLE,
+            ]
+            .into_iter()
+            .try_fold(false, |found, definition| -> Result<bool> {
+                let table = write.open_table(definition).map_err(Self::storage_error)?;
+                Ok(found
+                    || table
+                        .prefix_bounded(prefix.as_slice())
+                        .map_err(Self::storage_error)?
+                        .next()
+                        .transpose()
+                        .map_err(Self::storage_error)?
+                        .is_some_and(|(key, _)| key.value().starts_with(&prefix)))
+            })?;
             if !any {
-                write.open_table(VECTOR_PARTITION_GENERATION_CATALOG_TABLE).map_err(Self::storage_error)?
-                    .remove(prefix.as_slice()).map_err(Self::storage_error)?;
-                vector_membership_pages::reset_pending_frontier(write,
-                    &VectorPartitionRef::new(catalog.index.clone(), catalog.partition_key.clone()))?;
+                write
+                    .open_table(VECTOR_PARTITION_GENERATION_CATALOG_TABLE)
+                    .map_err(Self::storage_error)?
+                    .remove(prefix.as_slice())
+                    .map_err(Self::storage_error)?;
+                vector_membership_pages::reset_pending_frontier(
+                    write,
+                    &VectorPartitionRef::new(catalog.index.clone(), catalog.partition_key.clone()),
+                )?;
             }
         }
         Ok((reclaimed, bytes))
     }
 
     fn remove_retired_graph_pages_step_in_write(
-        write: &redb::WriteTransaction, generation_key: &[u8], is_base: bool, limit: usize,
+        write: &redb::WriteTransaction,
+        generation_key: &[u8],
+        is_base: bool,
+        limit: usize,
     ) -> Result<(bool, usize, u64)> {
         let root = Self::vector_partition_graph_page_root_key(generation_key, is_base);
-        let mut pages = write.open_table(VECTOR_PARTITION_GRAPH_PAGE_TABLE).map_err(Self::storage_error)?;
+        let mut pages = write
+            .open_table(VECTOR_PARTITION_GRAPH_PAGE_TABLE)
+            .map_err(Self::storage_error)?;
         let mut count = 0;
         let mut bytes = 0u64;
         while count != limit {
             let key = {
-                let next = pages.prefix_bounded(root.as_slice()).map_err(Self::storage_error)?
-                    .next().transpose().map_err(Self::storage_error)?;
-                let Some((key, value)) = next else { return Ok((true, count, bytes)); };
-                if !key.value().starts_with(&root) { return Ok((true, count, bytes)); }
+                let next = pages
+                    .prefix_bounded(root.as_slice())
+                    .map_err(Self::storage_error)?
+                    .next()
+                    .transpose()
+                    .map_err(Self::storage_error)?;
+                let Some((key, value)) = next else {
+                    return Ok((true, count, bytes));
+                };
+                if !key.value().starts_with(&root) {
+                    return Ok((true, count, bytes));
+                }
                 if key.value().len() != root.len() && key.value().len() != root.len() + 4 {
-                    return Err(vector_paged::corruption("retired graph page physical key is malformed"));
+                    return Err(vector_paged::corruption(
+                        "retired graph page physical key is malformed",
+                    ));
                 }
                 let key = key.value().to_vec();
                 bytes = bytes.saturating_add(value.value().len() as u64);
@@ -29054,7 +30858,12 @@ impl RedbPersistence {
         expected_graph_bytes: u64,
     ) -> Result<VectorPartitionBaseGenerationRecord> {
         let mut base = self.load_vector_partition_base_generation_with_size(
-            index, partition_key, generation_id, Some(expected_graph_bytes), None, false,
+            index,
+            partition_key,
+            generation_id,
+            Some(expected_graph_bytes),
+            None,
+            false,
         )?;
         if base.graph.bytes.starts_with(&vector_paged::META_MAGIC) {
             base.graph = VectorPartitionGraphBytes::verified(
@@ -29074,7 +30883,12 @@ impl RedbPersistence {
         expected_graph_bytes: u64,
     ) -> Result<VectorPartitionBaseGenerationRecord> {
         self.load_vector_partition_base_generation_with_size(
-            index, partition_key, generation_id, Some(expected_graph_bytes), None, true,
+            index,
+            partition_key,
+            generation_id,
+            Some(expected_graph_bytes),
+            None,
+            true,
         )
     }
 
@@ -29449,6 +31263,7 @@ impl RedbPersistence {
         partition_key: &VectorPartitionKey,
         covered_lsn: Lsn,
     ) -> Result<(Vec<VectorEntry>, Lsn)> {
+        let _decode_scope = self.writer_decode_scope()?;
         let prefix = Self::vector_partition_prefix(index, partition_key);
         self.with_db(|db| {
             let read_txn = db.begin_read().map_err(Self::storage_error)?;
@@ -29533,7 +31348,10 @@ impl RedbPersistence {
         prepared: &PreencodedVectorPartitionGenerationCandidate,
     ) -> Result<Option<(usize, usize)>> {
         self.with_db(|db| {
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            let write_txn = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
             self.insert_preencoded_vector_partition_generation_objects_in_write(
                 &write_txn, prepared,
             )?;
@@ -29545,7 +31363,18 @@ impl RedbPersistence {
             crate::writer_commit_test_seams::reached(
                 crate::writer_commit_test_seams::CommitBoundary::GenerationBeforeRedb,
             );
-            write_txn.commit().map_err(Self::storage_error)?;
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)?;
             Ok(pending)
         })
     }
@@ -29565,7 +31394,16 @@ impl RedbPersistence {
         } else {
             self.vector_schema_binding(index)?
         };
-        Self::prepare_vector_partition_graph_pages_with_binding(index, partition_key, base_generation_id, generation_id, is_base, generation_key, graph, schema_binding)
+        Self::prepare_vector_partition_graph_pages_with_binding(
+            index,
+            partition_key,
+            base_generation_id,
+            generation_id,
+            is_base,
+            generation_key,
+            graph,
+            schema_binding,
+        )
     }
 
     // Preserve the existing framing-only fixture entry. An unbound frame can
@@ -29580,7 +31418,19 @@ impl RedbPersistence {
         generation_key: &[u8],
         graph: &VectorPartitionGraphBytes,
     ) -> Result<PreencodedVectorPartitionGraphPages> {
-        Self::prepare_vector_partition_graph_pages_with_binding(index, partition_key, base_generation_id, generation_id, is_base, generation_key, graph, VectorSchemaBinding { table_generation: 0, column_incarnation: 0 })
+        Self::prepare_vector_partition_graph_pages_with_binding(
+            index,
+            partition_key,
+            base_generation_id,
+            generation_id,
+            is_base,
+            generation_key,
+            graph,
+            VectorSchemaBinding {
+                table_generation: 0,
+                column_incarnation: 0,
+            },
+        )
     }
 
     fn prepare_vector_partition_graph_pages_with_binding(
@@ -29740,8 +31590,12 @@ impl RedbPersistence {
         mut admit_scan: impl FnMut(usize) -> Result<()>,
     ) -> Result<PreencodedVectorPartitionGenerationCandidate> {
         self.validate_vector_partition_generation_candidate(candidate)?;
-        let mut paged_candidate = self.prepare_saved_topology_candidate(candidate, &mut admit_scan)?;
-        let candidate = paged_candidate.as_ref().map(|saved| &saved.candidate).unwrap_or(candidate);
+        let mut paged_candidate =
+            self.prepare_saved_topology_candidate(candidate, &mut admit_scan)?;
+        let candidate = paged_candidate
+            .as_ref()
+            .map(|saved| &saved.candidate)
+            .unwrap_or(candidate);
         self.validate_vector_partition_generation_candidate(candidate)?;
         let base_key = Self::vector_partition_base_generation_key(&candidate.base);
         let base_bytes = Self::encode_vector_partition_record(
@@ -29887,10 +31741,27 @@ impl RedbPersistence {
             ),
             attributable_stale_catalog_keys,
             native_storage: [
-                candidate.base.graph.bytes.starts_with(&vector_paged::META_MAGIC).then(|| vector_paged::authenticated_native_storage_id(&candidate.base.graph.bytes)).transpose()?,
-                candidate.change.as_ref().filter(|change| change.graph.bytes.starts_with(&vector_paged::META_MAGIC)).map(|change| vector_paged::authenticated_native_storage_id(&change.graph.bytes)).transpose()?,
+                candidate
+                    .base
+                    .graph
+                    .bytes
+                    .starts_with(&vector_paged::META_MAGIC)
+                    .then(|| {
+                        vector_paged::authenticated_native_storage_id(&candidate.base.graph.bytes)
+                    })
+                    .transpose()?,
+                candidate
+                    .change
+                    .as_ref()
+                    .filter(|change| change.graph.bytes.starts_with(&vector_paged::META_MAGIC))
+                    .map(|change| {
+                        vector_paged::authenticated_native_storage_id(&change.graph.bytes)
+                    })
+                    .transpose()?,
             ],
-            _saved_export_ownership: paged_candidate.as_mut().and_then(|saved| saved.ownership.take()),
+            _saved_export_ownership: paged_candidate
+                .as_mut()
+                .and_then(|saved| saved.ownership.take()),
         })
     }
 
@@ -30018,8 +31889,13 @@ impl RedbPersistence {
     ) -> Result<()> {
         #[cfg(any(test, feature = "test-seams"))]
         crate::vector_observations::observe_workspace_resize_for_test(
-            workspace.retained_bytes(), bytes,
-            if operation == "finalize_repaired_vector_partition" { "repair_cleanup" } else { "normal_cleanup" },
+            workspace.retained_bytes(),
+            bytes,
+            if operation == "finalize_repaired_vector_partition" {
+                "repair_cleanup"
+            } else {
+                "normal_cleanup"
+            },
         );
         workspace.resize(
             bytes,
@@ -30086,7 +31962,10 @@ impl RedbPersistence {
             .map(|change| change.covered_lsn)
             .unwrap_or(expected_catalog.base.covered_lsn);
         let result = self.with_db(|db| {
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            let write_txn = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
             {
                 let catalogs = write_txn
                     .open_table(VECTOR_PARTITION_GENERATION_CATALOG_TABLE)
@@ -30128,31 +32007,66 @@ impl RedbPersistence {
             }
 
             if Self::repair_fence_in_write(&write_txn)? {
-                Self::resize_vector_cleanup_workspace(workspace,
-                    fixed_owned.saturating_add(physical_key_bound.saturating_mul(2)), OPERATION)?;
-                let mut journal = write_txn.open_table(VECTOR_PARTITION_JOURNAL_TABLE).map_err(Self::storage_error)?;
+                Self::resize_vector_cleanup_workspace(
+                    workspace,
+                    fixed_owned.saturating_add(physical_key_bound.saturating_mul(2)),
+                    OPERATION,
+                )?;
+                let mut journal = write_txn
+                    .open_table(VECTOR_PARTITION_JOURNAL_TABLE)
+                    .map_err(Self::storage_error)?;
                 let mut complete = false;
                 for _ in 0..64 {
                     checkpoint()?;
                     let key = {
-                        let next = journal.prefix_bounded(prefix.as_slice()).map_err(Self::storage_error)?
-                            .next().transpose().map_err(Self::storage_error)?;
-                        let Some((key, value)) = next else { complete = true; break; };
-                        if !key.value().starts_with(&prefix) { complete = true; break; }
+                        let next = journal
+                            .prefix_bounded(prefix.as_slice())
+                            .map_err(Self::storage_error)?
+                            .next()
+                            .transpose()
+                            .map_err(Self::storage_error)?;
+                        let Some((key, value)) = next else {
+                            complete = true;
+                            break;
+                        };
+                        if !key.value().starts_with(&prefix) {
+                            complete = true;
+                            break;
+                        }
                         let tail = &key.value()[prefix.len()..];
-                        if tail.len() != 16 { return Err(self.vector_partition_corruption("covered journal physical key is malformed")); }
+                        if tail.len() != 16 {
+                            return Err(self.vector_partition_corruption(
+                                "covered journal physical key is malformed",
+                            ));
+                        }
                         let lsn = u64::from_be_bytes(tail[..8].try_into().unwrap());
-                        if lsn > covered_lsn.0 { complete = true; break; }
+                        if lsn > covered_lsn.0 {
+                            complete = true;
+                            break;
+                        }
                         let key = key.value().to_vec();
                         drop(value);
                         key
                     };
-                    journal.remove(key.as_slice()).map_err(Self::storage_error)?;
+                    journal
+                        .remove(key.as_slice())
+                        .map_err(Self::storage_error)?;
                 }
                 drop(journal);
                 Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
                 checkpoint()?;
-                write_txn.commit().map_err(Self::storage_error)?;
+                {
+                    #[cfg(any(test, feature = "test-seams"))]
+                    graph_observation_checkpoint(10)?;
+                    let graph_commit_result = write_txn.commit();
+                    #[cfg(any(test, feature = "test-seams"))]
+                    if graph_commit_result.is_ok() {
+                        graph_publication_attempt.committed();
+                        graph_observation_checkpoint(11)?;
+                    }
+                    graph_commit_result
+                }
+                .map_err(Self::storage_error)?;
                 return Ok(complete);
             }
 
@@ -30271,7 +32185,18 @@ impl RedbPersistence {
             drop(journal);
             checkpoint()?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-            write_txn.commit().map_err(Self::storage_error)?;
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)?;
             Ok(true)
         });
         if result.is_ok() {
@@ -30301,46 +32226,88 @@ impl RedbPersistence {
         const OPERATION: &str = "finalize_repaired_vector_partition";
         let catalog_owned = Self::vector_partition_catalog_heap_bytes(expected_catalog);
         let key_bound = Self::vector_partition_physical_key_bound(
-            &expected_catalog.index, &expected_catalog.partition_key, 16,
+            &expected_catalog.index,
+            &expected_catalog.partition_key,
+            16,
         );
-        let fixed = catalog_owned.saturating_add(repair_context_owned)
-            .saturating_add(key_bound.saturating_mul(8)).saturating_add(64 * 1024);
+        let fixed = catalog_owned
+            .saturating_add(repair_context_owned)
+            .saturating_add(key_bound.saturating_mul(8))
+            .saturating_add(64 * 1024);
         Self::resize_vector_cleanup_workspace(workspace, fixed, OPERATION)?;
         let catalog_key = Self::vector_partition_catalog_key(expected_catalog);
-        let prefix = Self::vector_partition_prefix(&expected_catalog.index, &expected_catalog.partition_key);
-        let covered_lsn = expected_catalog.change.map(|c| c.covered_lsn)
+        let prefix =
+            Self::vector_partition_prefix(&expected_catalog.index, &expected_catalog.partition_key);
+        let covered_lsn = expected_catalog
+            .change
+            .map(|c| c.covered_lsn)
             .unwrap_or(expected_catalog.base.covered_lsn);
         let finalized = self.with_db(|db| {
             checkpoint()?;
-            let write = db.begin_write().map_err(Self::storage_error)?;
+            let write = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write);
             {
-                let catalogs = write.open_table(VECTOR_PARTITION_GENERATION_CATALOG_TABLE).map_err(Self::storage_error)?;
-                let Some(value) = catalogs.get_bounded(catalog_key.as_slice()).map_err(Self::storage_error)? else {
+                let catalogs = write
+                    .open_table(VECTOR_PARTITION_GENERATION_CATALOG_TABLE)
+                    .map_err(Self::storage_error)?;
+                let Some(value) = catalogs
+                    .get_bounded(catalog_key.as_slice())
+                    .map_err(Self::storage_error)?
+                else {
                     return Ok(false);
                 };
-                let decode = Self::vector_partition_record_decode_bound(value.value().len(),
-                    std::mem::size_of::<VectorPartitionGenerationCatalogRecord>());
-                Self::resize_vector_cleanup_workspace(workspace, fixed.saturating_add(decode), OPERATION)?;
-                let actual: VectorPartitionGenerationCatalogRecord = self.decode_expected_vector_partition_metadata(
-                    VectorPartitionRecordKind::GenerationCatalog, value.value(),
-                    &expected_catalog.index, &expected_catalog.partition_key,
+                let decode = Self::vector_partition_record_decode_bound(
+                    value.value().len(),
+                    std::mem::size_of::<VectorPartitionGenerationCatalogRecord>(),
+                );
+                Self::resize_vector_cleanup_workspace(
+                    workspace,
+                    fixed.saturating_add(decode),
+                    OPERATION,
                 )?;
-                if actual != *expected_catalog { return Ok(false); }
+                let actual: VectorPartitionGenerationCatalogRecord = self
+                    .decode_expected_vector_partition_metadata(
+                        VectorPartitionRecordKind::GenerationCatalog,
+                        value.value(),
+                        &expected_catalog.index,
+                        &expected_catalog.partition_key,
+                    )?;
+                if actual != *expected_catalog {
+                    return Ok(false);
+                }
             }
             Self::resize_vector_cleanup_workspace(workspace, fixed, OPERATION)?;
             {
-                let mut journal = write.open_table(VECTOR_PARTITION_JOURNAL_TABLE).map_err(Self::storage_error)?;
+                let mut journal = write
+                    .open_table(VECTOR_PARTITION_JOURNAL_TABLE)
+                    .map_err(Self::storage_error)?;
                 for _ in 0..64 {
                     checkpoint()?;
                     let key = {
-                        let next = journal.prefix_bounded(prefix.as_slice()).map_err(Self::storage_error)?
-                            .next().transpose().map_err(Self::storage_error)?;
-                        let Some((key, value)) = next else { break; };
-                        if !key.value().starts_with(&prefix) { break; }
+                        let next = journal
+                            .prefix_bounded(prefix.as_slice())
+                            .map_err(Self::storage_error)?
+                            .next()
+                            .transpose()
+                            .map_err(Self::storage_error)?;
+                        let Some((key, value)) = next else {
+                            break;
+                        };
+                        if !key.value().starts_with(&prefix) {
+                            break;
+                        }
                         let suffix = &key.value()[prefix.len()..];
-                        if suffix.len() != 16 { return Err(vector_paged::corruption("covered journal key is malformed")); }
+                        if suffix.len() != 16 {
+                            return Err(vector_paged::corruption(
+                                "covered journal key is malformed",
+                            ));
+                        }
                         let lsn = u64::from_be_bytes(suffix[..8].try_into().unwrap());
-                        if lsn > covered_lsn.0 { break; }
+                        if lsn > covered_lsn.0 {
+                            break;
+                        }
                         let key = key.value().to_vec();
                         drop(value);
                         key
@@ -30348,23 +32315,43 @@ impl RedbPersistence {
                     #[cfg(any(test, feature = "test-seams"))]
                     crate::database::maybe_pause_vector_journal_cleanup_for_test();
                     checkpoint()?;
-                    journal.remove(key.as_slice()).map_err(Self::storage_error)?;
+                    journal
+                        .remove(key.as_slice())
+                        .map_err(Self::storage_error)?;
                 }
             }
             self.reclaim_vector_generations_in_write_with_checkpoint(
-                &write, expected_catalog, retained_chains, true, &mut checkpoint,
+                &write,
+                expected_catalog,
+                retained_chains,
+                true,
+                &mut checkpoint,
             )?;
             Self::write_writer_recovery_bounds_in_write(&write, None)?;
             checkpoint()?;
-            write.commit().map_err(Self::storage_error)?;
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)?;
             // True means the expected repaired catalog remains authoritative,
             // not that all historical cleanup batches have already drained.
             Ok(true)
         })?;
         drop(prefix);
         drop(catalog_key);
-        Self::resize_vector_cleanup_workspace(workspace,
-            catalog_owned.saturating_add(repair_context_owned), OPERATION)?;
+        Self::resize_vector_cleanup_workspace(
+            workspace,
+            catalog_owned.saturating_add(repair_context_owned),
+            OPERATION,
+        )?;
         Ok((finalized, catalog_owned))
     }
 
@@ -30373,16 +32360,25 @@ impl RedbPersistence {
         write_txn: &redb::WriteTransaction,
         prepared: &PreencodedVectorPartitionGenerationCandidate,
     ) -> Result<()> {
-        let manifest: VectorPartitionGraphPageManifestRecord = self.decode_vector_partition_record(
-            VectorPartitionRecordKind::GraphPageManifest, &prepared.base_pages.manifest_bytes,
-        )?;
-        Self::validate_vector_schema_binding_in_write(write_txn, &prepared.catalog_route.index, manifest.schema_binding)?;
-        if let Some(change_pages) = &prepared.change_pages {
-            let change: VectorPartitionGraphPageManifestRecord = self.decode_vector_partition_record(
-                VectorPartitionRecordKind::GraphPageManifest, &change_pages.manifest_bytes,
+        let manifest: VectorPartitionGraphPageManifestRecord = self
+            .decode_vector_partition_record(
+                VectorPartitionRecordKind::GraphPageManifest,
+                &prepared.base_pages.manifest_bytes,
             )?;
+        Self::validate_vector_schema_binding_in_write(
+            write_txn,
+            &prepared.catalog_route.index,
+            manifest.schema_binding,
+        )?;
+        if let Some(change_pages) = &prepared.change_pages {
+            let change: VectorPartitionGraphPageManifestRecord = self
+                .decode_vector_partition_record(
+                    VectorPartitionRecordKind::GraphPageManifest,
+                    &change_pages.manifest_bytes,
+                )?;
             if change.schema_binding != manifest.schema_binding {
-                return Err(self.vector_partition_corruption("base and change column incarnations disagree"));
+                return Err(self
+                    .vector_partition_corruption("base and change column incarnations disagree"));
             }
         }
         // All callers insert immutable objects before publishing the catalog.
@@ -30506,7 +32502,7 @@ impl RedbPersistence {
             &prepared.catalog_bytes,
         )?;
         for storage in prepared.native_storage.into_iter().flatten() {
-            vector_saved::release_saved_export_in_write(write_txn,storage)?;
+            vector_saved::release_saved_export_in_write(write_txn, storage)?;
         }
         vector_membership_pages::publish_pending_frontier(
             write_txn,
@@ -30593,6 +32589,7 @@ impl RedbPersistence {
     }
 
     pub fn load_sync_source_lsns(&self) -> Result<HashMap<(String, RowId), Lsn>> {
+        let _decode_scope = self.writer_decode_scope()?;
         self.with_db(|db| {
             let read_txn = db.begin_read().map_err(Self::storage_error)?;
             let table = match read_txn.open_table(SYNC_ROW_SOURCE_LSN_TABLE) {
@@ -30613,6 +32610,7 @@ impl RedbPersistence {
     }
 
     pub fn load_sync_source_kinds(&self) -> Result<HashMap<(String, RowId), u8>> {
+        let _decode_scope = self.writer_decode_scope()?;
         self.with_db(|db| {
             let read_txn = db.begin_read().map_err(Self::storage_error)?;
             let table = match read_txn.open_table(SYNC_ROW_SOURCE_KIND_TABLE) {
@@ -30633,24 +32631,107 @@ impl RedbPersistence {
     }
 
     pub fn load_change_log(&self) -> Result<Vec<ChangeLogEntry>> {
-        self.with_db(|db| {
-            let read_txn = db.begin_read().map_err(Self::storage_error)?;
-            let table = match read_txn.open_table(CHANGE_LOG_TABLE) {
-                Ok(table) => table,
-                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-                Err(err) => return Err(Self::storage_error(err)),
-            };
-
-            let mut entries = Vec::new();
-            for entry in table.iter().map_err(Self::storage_error)? {
-                let (_, value) = entry.map_err(Self::storage_error)?;
-                #[cfg(feature = "in-process-test-seams")]
-                crate::writer_query_test_seams::note_history(
-                    crate::writer_query_test_seams::HistoryFamily::ChangeLog,
-                );
-                entries.push(Self::decode(value.value())?);
-            }
-            Ok(entries)
+        let read_memory =
+            crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(16_777_216).child()?;
+        let owner = writer_source::SourceWindowOwner::Read(read_memory.clone());
+        let _controls = owner.reserve(
+            std::mem::size_of::<redb::ReadOnlyTable<&str, &[u8]>>()
+                .saturating_add(std::mem::size_of::<redb::Range<'_, &str, &[u8]>>())
+                .saturating_add(std::mem::size_of::<
+                    crate::memory_accounting::MemoryAccountant,
+                >())
+                .saturating_add(std::mem::size_of::<crate::read_image_memory::ImageMemory>())
+                .saturating_add(128),
+            "history_load_control",
+        )?;
+        // This accountant identifies the decode bridge only. All read funding
+        // comes from the operation child, including proof pool and output.
+        let bridge = Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+        let output = crate::read_image_memory::ImageMemory::charging_reader_for(
+            bridge.clone(),
+            read_memory.clone(),
+            "history_source",
+            "load_change_log",
+            "Raise the reader limit to load requested history.",
+        );
+        graph_read::with_pages(read_memory.clone(), || {
+            self.with_db(|db| {
+                let read_txn = db.begin_read().map_err(Self::storage_error)?;
+                let table = match read_txn.open_table(CHANGE_LOG_TABLE) {
+                    Ok(table) => table,
+                    Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+                    Err(err) => return Err(Self::storage_error(err)),
+                };
+                let mut entries = Vec::new();
+                for entry in table
+                    .iter()
+                    .map_err(Self::storage_error)?
+                    .inspect(|_entry| {
+                        #[cfg(any(test, feature = "test-seams"))]
+                        if let Ok((key, _)) = _entry {
+                            crate::read_work_probe::graph_storage_key(
+                                "history",
+                                "iteration_step",
+                                key.value(),
+                            );
+                        }
+                    })
+                {
+                    let (key, value) = entry.map_err(Self::storage_error)?;
+                    let _window_control = owner.reserve(
+                        std::mem::size_of::<crate::read_image_memory::ImageMemory>()
+                            .saturating_add(32),
+                        "history_proof_window",
+                    )?;
+                    let scratch = crate::read_image_memory::ImageMemory::charging_reader_for(
+                        bridge.clone(),
+                        read_memory.clone(),
+                        "graph_source",
+                        "read_window",
+                        "Raise the reader limit to read graph history windows.",
+                    );
+                    graph_read::with_graph_proof_in_read(
+                        &read_txn,
+                        None,
+                        &owner,
+                        scratch,
+                        |context, read, memory| {
+                            context.verify_stored_graph_history(
+                                read,
+                                key.value(),
+                                value.value(),
+                                memory,
+                            )
+                        },
+                    )?;
+                    #[cfg(feature = "in-process-test-seams")]
+                    crate::writer_query_test_seams::note_history(
+                        crate::writer_query_test_seams::HistoryFamily::ChangeLog,
+                    );
+                    if entries.len() == entries.capacity() {
+                        let additional = entries.capacity().max(4);
+                        let bytes = additional
+                            .checked_mul(std::mem::size_of::<ChangeLogEntry>())
+                            .ok_or_else(|| Error::Other("history output size overflow".into()))?;
+                        output.reserve(bytes)?;
+                        entries.try_reserve_exact(additional).map_err(|error| {
+                            Error::Other(format!("history output allocation failed: {error}"))
+                        })?;
+                    }
+                    let mut record =
+                        output.scope(|| Self::decode_stored_change_log(value.value()))?;
+                    // Only public entries are returned. The manual decoder charges
+                    // the exact private predecessor copy separately; return that
+                    // transient credit as soon as this source window is consumed.
+                    if let Some(witness) = record.witness.take() {
+                        let bytes = witness.predecessor.len();
+                        drop(witness);
+                        output.release(bytes);
+                    }
+                    entries.push(record.entry);
+                }
+                Ok(entries)
+            })
         })
     }
 
@@ -30666,73 +32747,50 @@ impl RedbPersistence {
     /// order is preserved byte-for-byte with what a fresh sequence of commits
     /// would have produced.
     pub fn rewrite_change_log(&self, entries: &[ChangeLogEntry]) -> Result<()> {
+        let _decode_scope = self.writer_decode_scope()?;
+        self.prepare_proof_owner()?;
         self.with_db(|db| {
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
-            // The committed history is keyed by the exact stored position, so
-            // the records being replaced are named by the keys they are stored
-            // under in this same transaction, and the new ones by the keys
-            // written below.
-            let mut mutations = Vec::new();
-            match write_txn.open_table(CHANGE_LOG_TABLE) {
-                Ok(table) => {
-                    for entry in table.iter().map_err(Self::storage_error)? {
-                        let (key, value) = entry.map_err(Self::storage_error)?;
-                        let previous: ChangeLogEntry = Self::decode(value.value())?;
-                        mutations.push(content_identity::remove_encoded_history_mutation(
-                            key.value(),
-                            &previous,
-                        )?);
-                    }
-                }
-                Err(redb::TableError::TableDoesNotExist(_)) => {}
-                Err(err) => return Err(Self::storage_error(err)),
-            }
-            match write_txn.delete_table(CHANGE_LOG_TABLE) {
-                Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
-                Err(err) => return Err(Self::storage_error(err)),
-            }
-            Self::clear_change_log_selectors_in_write(&write_txn)?;
-            {
-                let mut table = write_txn
-                    .open_table(CHANGE_LOG_TABLE)
-                    .map_err(Self::storage_error)?;
-                let mut key = String::with_capacity(Self::change_log_entry_key_len());
-                let mut encoded = Vec::new();
-                let mut prev_lsn: Option<Lsn> = None;
-                let mut index = 0usize;
-                for entry in entries {
+            let previous_root = db.begin_read().map_err(Self::storage_error)?;
+            let write = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write);
+            let mut previous = None;
+            let mut index = 0;
+            self.publish_public_change_log_in_write(
+                &write,
+                &previous_root,
+                true,
+                entries.iter().map(|entry| {
                     let lsn = entry.lsn();
-                    if prev_lsn == Some(lsn) {
+                    if previous == Some(lsn) {
                         index += 1;
                     } else {
                         index = 0;
-                        prev_lsn = Some(lsn);
+                        previous = Some(lsn);
                     }
-                    Self::write_change_log_entry_key(lsn, index, &mut key);
-                    Self::encode_into(entry, &mut encoded)?;
-                    table
-                        .insert(key.as_str(), encoded.as_slice())
-                        .map_err(Self::storage_error)?;
-                    Self::write_change_log_selectors_in_write(
-                        &write_txn,
-                        key.as_str(),
-                        encoded.as_slice(),
-                    )?;
-                    mutations.push(content_identity::encoded_history_mutation(&key, entry)?);
-                }
-            }
-            Self::apply_content_identity_mutations_in_write(
-                &write_txn,
-                &mutations,
-                &mut self.proof_admission(),
+                    (lsn, index, entry)
+                }),
             )?;
-            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-            write_txn.commit().map_err(Self::storage_error)?;
+            Self::write_writer_recovery_bounds_in_write(&write, None)?;
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)?;
             Ok(())
         })
     }
 
     pub fn load_ddl_log(&self) -> Result<Vec<(Lsn, DdlChange)>> {
+        let _decode_scope = self.writer_decode_scope()?;
         self.with_db(|db| {
             let read_txn = db.begin_read().map_err(Self::storage_error)?;
             let table = match read_txn.open_table(DDL_LOG_TABLE) {
@@ -30763,6 +32821,7 @@ impl RedbPersistence {
         &self,
         ring_capacity: usize,
     ) -> Result<(Vec<TriggerAuditEntry>, u64)> {
+        let _decode_scope = self.writer_decode_scope()?;
         self.with_db(|db| {
             let read_txn = db.begin_read().map_err(Self::storage_error)?;
             if let Ok(config_table) = read_txn.open_table(CONFIG_TABLE) {
@@ -30817,6 +32876,7 @@ impl RedbPersistence {
     /// Returns the number removed. Rows written before stamps existed carry no
     /// stamp and are left alone rather than guessed at.
     pub fn prune_trigger_audit_history(&self, cutoff_millis: u64) -> Result<u64> {
+        self.prepare_proof_owner()?;
         self.with_db(|db| {
             // Find the expired keys under a READ transaction first. The
             // maintenance loop calls this every tick, and on the overwhelmingly
@@ -30844,7 +32904,10 @@ impl RedbPersistence {
                 return Ok(0);
             }
 
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            let write_txn = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
             let mut removed = 0u64;
             let mut identity_mutations = Vec::with_capacity(expired.len().saturating_mul(2));
             {
@@ -30876,12 +32939,24 @@ impl RedbPersistence {
                 &mut self.proof_admission(),
             )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-            write_txn.commit().map_err(Self::storage_error)?;
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)?;
             Ok(removed)
         })
     }
 
     pub fn load_trigger_audit_history(&self) -> Result<Vec<TriggerAuditEntry>> {
+        let _decode_scope = self.writer_decode_scope()?;
         self.with_db(|db| {
             let read_txn = db.begin_read().map_err(Self::storage_error)?;
             let table = match read_txn.open_table(TRIGGER_AUDIT_TABLE) {
@@ -30909,7 +32984,22 @@ impl RedbPersistence {
             };
 
             let mut index = BTreeMap::new();
-            for entry in table.iter().map_err(Self::storage_error)? {
+            for entry in table
+                .iter()
+                .map_err(Self::storage_error)?
+                .inspect(|_entry| {
+                    #[cfg(any(test, feature = "test-seams"))]
+                    if let Ok((key, _)) = _entry {
+                        crate::read_work_probe::note_graph(
+                            "commit_index",
+                            "iteration_step",
+                            &key.value().to_be_bytes(),
+                            Some(key.value()),
+                            None,
+                        );
+                    }
+                })
+            {
                 let (lsn, tx) = entry.map_err(Self::storage_error)?;
                 #[cfg(feature = "in-process-test-seams")]
                 crate::writer_query_test_seams::note_history(
@@ -30941,23 +33031,26 @@ impl RedbPersistence {
                     crate::writer_query_test_seams::HistoryFamily::CommitBound,
                 );
                 let stored_last = Lsn(stored_last.value());
-                let frontier = read_authenticated_history_frontiers(
-                    &read,
-                    &self.path,
-                    &crate::read_image_memory::ImageMemory::new(None),
-                )
-                .map_err(|error| Error::StoreCorrupted {
-                    path: self.path.display().to_string(),
-                    reason: error.to_string(),
-                })?
-                .commit_last
-                .map(|(lsn, _)| lsn);
+                let memory = crate::read_image_memory::ImageMemory::new(None);
+                let checkpoint = || Ok(());
+                let context = contextdb_tx::ReadCommitContext::new(memory.clone(), &checkpoint);
+                let frontier =
+                    read_authenticated_history_frontiers(&read, &self.path, &memory, &context)
+                        .map_err(|error| Error::StoreCorrupted {
+                            path: self.path.display().to_string(),
+                            reason: error.to_string(),
+                        })?
+                        .commit_last
+                        .map(|(lsn, _)| lsn);
                 (frontier, stored_last)
             };
             if frontier.is_some_and(|committed| stored_last <= committed) {
                 return Ok(());
             }
-            let write = db.begin_write().map_err(Self::storage_error)?;
+            let write = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write);
             let mut removed = false;
             {
                 let mut table = write
@@ -30977,30 +33070,67 @@ impl RedbPersistence {
             }
             if removed {
                 Self::write_writer_recovery_bounds_in_write(&write, None)?;
-                write.commit().map_err(Self::storage_error)?;
+                {
+                    #[cfg(any(test, feature = "test-seams"))]
+                    graph_observation_checkpoint(10)?;
+                    let graph_commit_result = write.commit();
+                    #[cfg(any(test, feature = "test-seams"))]
+                    if graph_commit_result.is_ok() {
+                        graph_publication_attempt.committed();
+                        graph_observation_checkpoint(11)?;
+                    }
+                    graph_commit_result
+                }
+                .map_err(Self::storage_error)?;
             }
             Ok(())
         })
     }
 
     pub fn flush_commit_index_entries(&self, entries: &BTreeMap<Lsn, TxId>) -> Result<()> {
+        self.prepare_proof_owner()?;
         if entries.is_empty() {
             return Ok(());
         }
         self.with_db(|db| {
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            let write_txn = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
+            let guarded = Self::final_graph_receipts_nonempty(&write_txn)?;
             {
                 let mut table = write_txn
                     .open_table(COMMIT_INDEX_TABLE)
                     .map_err(Self::storage_error)?;
                 for (lsn, tx) in entries {
-                    table.insert(lsn.0, tx.0).map_err(Self::storage_error)?;
+                    let previous = table
+                        .get(lsn.0)
+                        .map_err(Self::storage_error)?
+                        .map_or(0, |v| v.value());
+                    let final_tx = if guarded && lsn.0 != 0 {
+                        previous.max(tx.0)
+                    } else {
+                        tx.0
+                    };
+                    table.insert(lsn.0, final_tx).map_err(Self::storage_error)?;
                 }
             }
             let mutations = entries
-                .iter()
-                .map(|(lsn, tx)| content_identity::commit_index_mutation(*lsn, *tx))
-                .collect::<Vec<_>>();
+                .keys()
+                .map(|lsn| {
+                    let table = write_txn
+                        .open_table(COMMIT_INDEX_TABLE)
+                        .map_err(Self::storage_error)?;
+                    let tx = table
+                        .get(lsn.0)
+                        .map_err(Self::storage_error)?
+                        .ok_or_else(|| Error::Other("published commit entry missing".into()))?;
+                    Ok(content_identity::commit_index_mutation(
+                        *lsn,
+                        TxId(tx.value()),
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
             Self::apply_content_identity_mutations_in_write(
                 &write_txn,
                 &mutations,
@@ -31013,7 +33143,18 @@ impl RedbPersistence {
                 RowId(0),
             )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-            write_txn.commit().map_err(Self::storage_error)?;
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)?;
             Ok(())
         })
     }
@@ -31024,18 +33165,23 @@ impl RedbPersistence {
         vectors: &[VectorEntry],
         edges: &[AdjEntry],
     ) -> Result<()> {
+        self.prepare_proof_owner()?;
         let table_meta = self.load_all_table_meta()?;
         let vector_quantization = Self::vector_quantization_map(&table_meta);
         let source_lsns = self.load_sync_source_lsns()?;
         let previous_vectors = self.load_vectors()?;
         self.with_db(|db| {
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            let write_txn = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
 
             for (name, rows) in table_rows {
                 Self::invalidate_retention_clock_in_write(&write_txn, name)?;
                 let table_name = Self::rel_table_name(name);
                 let table_def: TableDefinition<&[u8], &[u8]> =
                     TableDefinition::new(table_name.as_str());
+                self.retire_relational_manifests_in_write(&write_txn, name)?;
                 content_size::reset_rows(&write_txn, name)?;
                 match write_txn.delete_table(table_def) {
                     Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
@@ -31055,6 +33201,18 @@ impl RedbPersistence {
                 for row in rows {
                     let encoded = Self::encode_versioned_row(row, table_meta.get(name))?;
                     let key = Self::rel_row_key(row);
+                    {
+                        let predecessor = redb_table
+                            .get(key.as_slice())
+                            .map_err(Self::storage_error)?;
+                        self.replace_relational_manifest_in_write(
+                            &write_txn,
+                            name,
+                            key.as_slice(),
+                            predecessor.as_ref().map(|body| body.value()),
+                            Some(encoded.as_slice()),
+                        )?;
+                    }
                     redb_table
                         .insert(key.as_slice(), encoded.as_slice())
                         .map_err(Self::storage_error)?;
@@ -31083,6 +33241,7 @@ impl RedbPersistence {
                 }
             }
 
+            self.retire_graph_replacement_in_write(&write_txn, edges, None)?;
             match write_txn.delete_table(GRAPH_FWD_TABLE) {
                 Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
                 Err(err) => return Err(Self::storage_error(err)),
@@ -31104,10 +33263,19 @@ impl RedbPersistence {
                     let fwd_key = Self::graph_fwd_key(entry);
                     let rev_key = Self::graph_rev_key(entry);
                     fwd_table
-                        .insert(fwd_key.as_slice(), encoded.as_slice())
+                        .insert(
+                            observed_graph_key!("graph_fwd", "insert", fwd_key.as_slice(), 5),
+                            encoded.as_slice(),
+                        )
                         .map_err(Self::storage_error)?;
+                    self.graph_writer_window(|| {
+                        Self::install_graph_creation_in_write(&write_txn, entry, &encoded)
+                    })?;
                     rev_table
-                        .insert(rev_key.as_slice(), encoded.as_slice())
+                        .insert(
+                            observed_graph_key!("graph_rev", "insert", rev_key.as_slice(), 5),
+                            encoded.as_slice(),
+                        )
                         .map_err(Self::storage_error)?;
                 }
             }
@@ -31185,42 +33353,177 @@ impl RedbPersistence {
             )?;
 
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-            write_txn.commit().map_err(Self::storage_error)?;
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)?;
             Ok(())
         })
     }
 
     pub fn rewrite_commit_index(&self, entries: &BTreeMap<Lsn, TxId>) -> Result<()> {
-        let previous = self.load_commit_index()?;
+        const SUPPORT: TableDefinition<u64, u64> =
+            TableDefinition::new("graph_commit_support_scratch");
         self.with_db(|db| {
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
-            write_txn
-                .delete_table(COMMIT_INDEX_TABLE)
-                .map_err(Self::storage_error)?;
+            let write = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write);
+            let guarded = Self::final_graph_receipts_nonempty(&write)?;
+            if write
+                .list_tables()
+                .map_err(Self::storage_error)?
+                .any(|t| t.name() == SUPPORT.name())
             {
-                let mut table = write_txn
+                return Err(Error::StoreCorrupted {
+                    path: self.path.display().to_string(),
+                    reason: "published graph commit-support scratch".into(),
+                });
+            }
+            {
+                let previous = write
                     .open_table(COMMIT_INDEX_TABLE)
                     .map_err(Self::storage_error)?;
+                let mut final_index = write.open_table(SUPPORT).map_err(Self::storage_error)?;
+                for item in previous
+                    .iter()
+                    .map_err(Self::storage_error)?
+                    .inspect(|_entry| {
+                        #[cfg(any(test, feature = "test-seams"))]
+                        if let Ok((key, _)) = _entry {
+                            crate::read_work_probe::note_graph(
+                                "commit_index",
+                                "iteration_step",
+                                &key.value().to_be_bytes(),
+                                Some(key.value()),
+                                None,
+                            );
+                        }
+                    })
+                {
+                    let (lsn, tx) = item.map_err(Self::storage_error)?;
+                    if lsn.value() != 0
+                        && (guarded || Self::has_graph_creation_at_lsn(&write, Lsn(lsn.value()))?)
+                    {
+                        final_index
+                            .insert(lsn.value(), tx.value())
+                            .map_err(Self::storage_error)?;
+                    }
+                }
                 for (lsn, tx) in entries {
-                    table.insert(lsn.0, tx.0).map_err(Self::storage_error)?;
+                    let old = final_index
+                        .get(lsn.0)
+                        .map_err(Self::storage_error)?
+                        .map_or(0, |v| v.value());
+                    final_index
+                        .insert(lsn.0, old.max(tx.0))
+                        .map_err(Self::storage_error)?;
                 }
             }
-            let mut mutations = previous
-                .keys()
-                .map(|lsn| content_identity::remove_commit_index_mutation(*lsn))
-                .collect::<Vec<_>>();
-            mutations.extend(
-                entries
-                    .iter()
-                    .map(|(lsn, tx)| content_identity::commit_index_mutation(*lsn, *tx)),
-            );
-            Self::apply_content_identity_mutations_in_write(
-                &write_txn,
-                &mutations,
-                &mut self.proof_admission(),
-            )?;
-            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-            write_txn.commit().map_err(Self::storage_error)?;
+            let mut after = None::<u64>;
+            loop {
+                // Copy the addressed scalar before identity publication can
+                // finalize pending roots in this same write transaction.
+                let next = {
+                    let previous = write
+                        .open_table(COMMIT_INDEX_TABLE)
+                        .map_err(Self::storage_error)?;
+                    let mut range = previous
+                        .range((
+                            after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded),
+                            std::ops::Bound::Unbounded,
+                        ))
+                        .map_err(Self::storage_error)?
+                        .inspect(|_entry| {
+                            #[cfg(any(test, feature = "test-seams"))]
+                            if let Ok((key, _)) = _entry {
+                                crate::read_work_probe::note_graph(
+                                    "commit_index",
+                                    "iteration_step",
+                                    &key.value().to_be_bytes(),
+                                    Some(key.value()),
+                                    None,
+                                );
+                            }
+                        });
+                    range
+                        .next()
+                        .transpose()
+                        .map_err(Self::storage_error)?
+                        .map(|(lsn, _)| lsn.value())
+                };
+                let Some(lsn) = next else {
+                    break;
+                };
+                after = Some(lsn);
+                let absent = {
+                    let final_index = write.open_table(SUPPORT).map_err(Self::storage_error)?;
+                    final_index.get(lsn).map_err(Self::storage_error)?.is_none()
+                };
+                if absent {
+                    Self::apply_content_identity_mutations_in_write(
+                        &write,
+                        &[content_identity::remove_commit_index_mutation(Lsn(lsn))],
+                        &mut self.proof_admission(),
+                    )?;
+                }
+            }
+            write
+                .delete_table(COMMIT_INDEX_TABLE)
+                .map_err(Self::storage_error)?;
+            let mut after = None::<u64>;
+            loop {
+                let next = {
+                    let support = write.open_table(SUPPORT).map_err(Self::storage_error)?;
+                    let mut range = support
+                        .range((
+                            after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded),
+                            std::ops::Bound::Unbounded,
+                        ))
+                        .map_err(Self::storage_error)?;
+                    range
+                        .next()
+                        .transpose()
+                        .map_err(Self::storage_error)?
+                        .map(|(lsn, tx)| (lsn.value(), tx.value()))
+                };
+                let Some((lsn, tx)) = next else {
+                    break;
+                };
+                after = Some(lsn);
+                write
+                    .open_table(COMMIT_INDEX_TABLE)
+                    .map_err(Self::storage_error)?
+                    .insert(lsn, tx)
+                    .map_err(Self::storage_error)?;
+                Self::apply_content_identity_mutations_in_write(
+                    &write,
+                    &[content_identity::commit_index_mutation(Lsn(lsn), TxId(tx))],
+                    &mut self.proof_admission(),
+                )?;
+            }
+            write.delete_table(SUPPORT).map_err(Self::storage_error)?;
+            Self::write_writer_recovery_bounds_in_write(&write, None)?;
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)?;
             Ok(())
         })
     }
@@ -31305,6 +33608,7 @@ impl RedbPersistence {
         generations: &VectorGenerationCleanup,
         selection_progress: &[(String, Vec<u8>)],
     ) -> Result<PruneScopedStats> {
+        self.prepare_proof_owner()?;
         if row_keys.is_empty()
             && pruned_change_keys.is_empty()
             && orphaned_source_lsn_rows.is_empty()
@@ -31319,7 +33623,10 @@ impl RedbPersistence {
             .proof_accountant()
             .map(crate::memory_accounting::OwnedMemoryReservation::new);
         self.with_db(|db| {
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            let write_txn = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
             let mut identity_mutations = Vec::new();
             let change_log_keys_removed = self.prune_versions_in_write(
                 &write_txn,
@@ -31400,11 +33707,10 @@ impl RedbPersistence {
                 }
             }
             self.remove_commit_index_entries_in_write(&write_txn, commit_index_lsns)?;
-            identity_mutations.extend(
-                commit_index_lsns
-                    .iter()
-                    .map(|lsn| content_identity::remove_commit_index_mutation(*lsn)),
-            );
+            identity_mutations.extend(Self::retired_commit_identity_mutations_in_write(
+                &write_txn,
+                commit_index_lsns,
+            )?);
             for (catalog, retained) in generations {
                 self.reclaim_vector_generations_in_write(&write_txn, catalog, retained)?;
             }
@@ -31422,13 +33728,26 @@ impl RedbPersistence {
                     ));
                 }
             }
+            #[cfg(any(test, feature = "test-seams"))]
+            graph_observation_checkpoint(12)?;
             Self::apply_content_identity_mutations_in_write(
                 &write_txn,
                 &identity_mutations,
                 &mut self.proof_admission(),
             )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-            write_txn.commit().map_err(Self::storage_error)?;
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)?;
             #[cfg(any(test, feature = "test-seams"))]
             retention_reclaim_checkpoint_for_test(2);
             Ok(PruneScopedStats {
@@ -31455,6 +33774,7 @@ impl RedbPersistence {
         identity_mutations: &mut Vec<content_identity::ContentIdentityMutation>,
         mut rewrite_workspace: Option<&mut crate::memory_accounting::OwnedMemoryReservation>,
     ) -> Result<u64> {
+        let _decode_scope = self.writer_decode_scope()?;
         {
             let mut config = write_txn
                 .open_table(CONFIG_TABLE)
@@ -31492,6 +33812,16 @@ impl RedbPersistence {
                             for entry in table
                                 .range(prefix.as_str()..)
                                 .map_err(Self::storage_error)?
+                                .inspect(|_entry| {
+                                    #[cfg(any(test, feature = "test-seams"))]
+                                    if let Ok((key, _)) = _entry {
+                                        crate::read_work_probe::graph_storage_key(
+                                            "history",
+                                            "iteration_step",
+                                            key.value(),
+                                        );
+                                    }
+                                })
                             {
                                 let (key, value) = entry.map_err(Self::storage_error)?;
                                 let key = key.value();
@@ -31510,7 +33840,10 @@ impl RedbPersistence {
                         };
                         let mut survivors: Vec<Vec<u8>> = Vec::with_capacity(existing.len());
                         for (key, bytes) in existing {
-                            let decoded: ChangeLogEntry = Self::decode(&bytes)?;
+                            let _row_scope = crate::read_image_memory::active_owner()?
+                                .row_owner()?
+                                .enter();
+                            let decoded = Self::decode_stored_change_log(&bytes)?.entry;
                             let referenced = match &decoded {
                                 ChangeLogEntry::RowInsert { table, row_id, .. }
                                 | ChangeLogEntry::RowDelete { table, row_id, .. } => {
@@ -31518,8 +33851,14 @@ impl RedbPersistence {
                                 }
                                 _ => false,
                             };
-                            table.remove(key.as_str()).map_err(Self::storage_error)?;
-                            Self::remove_change_log_selectors_in_write(write_txn, key.as_str())?;
+                            table
+                                .remove(observed_graph_key!("history", "remove", key.as_str(), 8))
+                                .map_err(Self::storage_error)?;
+                            Self::detach_change_log_selectors_in_write(
+                                write_txn,
+                                key.as_str(),
+                                !referenced,
+                            )?;
                             identity_mutations.push(
                                 content_identity::remove_encoded_history_mutation(&key, &decoded)?,
                             );
@@ -31532,18 +33871,23 @@ impl RedbPersistence {
                         for (index, bytes) in survivors.into_iter().enumerate() {
                             Self::write_change_log_entry_key(*lsn, index, &mut key_buf);
                             table
-                                .insert(key_buf.as_str(), bytes.as_slice())
+                                .insert(
+                                    observed_graph_key!("history", "insert", key_buf.as_str(), 8),
+                                    bytes.as_slice(),
+                                )
                                 .map_err(Self::storage_error)?;
-                            Self::write_change_log_selectors_in_write(
-                                write_txn,
-                                key_buf.as_str(),
-                                bytes.as_slice(),
-                            )?;
-                            let decoded: ChangeLogEntry = Self::decode(&bytes)?;
-                            identity_mutations.push(content_identity::encoded_history_mutation(
-                                key_buf.as_str(),
-                                &decoded,
-                            )?);
+                            let _row_scope = crate::read_image_memory::active_owner()?
+                                .row_owner()?
+                                .enter();
+                            self.graph_writer_window(|| {
+                                Self::write_carried_change_log_selectors_in_write(
+                                    write_txn,
+                                    key_buf.as_str(),
+                                    bytes.as_slice(),
+                                )
+                            })?;
+                            identity_mutations
+                                .push(Self::stored_change_log_mutation(&key_buf, &bytes)?);
                         }
                     }
                 }
@@ -31568,6 +33912,18 @@ impl RedbPersistence {
             }
             if let Some(redb_table) = opened_rel_tables.get_mut(table) {
                 let key = Self::rel_row_key_from_parts(*row_id, *created_tx, *lsn);
+                {
+                    let predecessor = redb_table
+                        .get(key.as_slice())
+                        .map_err(Self::storage_error)?;
+                    self.replace_relational_manifest_in_write(
+                        write_txn,
+                        table,
+                        key.as_slice(),
+                        predecessor.as_ref().map(|body| body.value()),
+                        None,
+                    )?;
+                }
                 redb_table
                     .remove(key.as_slice())
                     .map_err(Self::storage_error)?;
@@ -31662,6 +34018,7 @@ impl RedbPersistence {
         workspace: &mut crate::memory_accounting::OwnedMemoryReservation,
         prepaid_bytes: usize,
     ) -> Result<BTreeSet<NodeId>> {
+        let _decode_scope = self.writer_decode_scope()?;
         self.with_db(|db| {
             let txn = db.begin_read().map_err(Self::storage_error)?;
             let table = match txn.open_table(CONFIG_TABLE) {
@@ -31707,6 +34064,7 @@ impl RedbPersistence {
         cleanup_progress: &[(String, writer_cleanup_progress::CurrencyCleanupProgress)],
         cleanup_rotation: Option<[u8; 32]>,
     ) -> Result<PruneScopedStats> {
+        self.prepare_proof_owner()?;
         if row_keys.is_empty()
             && pruned_change_keys.is_empty()
             && vector_versions.is_empty()
@@ -31721,7 +34079,10 @@ impl RedbPersistence {
         let vector_quantization = Self::vector_quantization_map(&table_meta);
         let run = |admission: &mut content_identity::ProofAdmission| -> Result<PruneScopedStats> {
             self.with_db(|db| {
-                let write_txn = db.begin_write().map_err(Self::storage_error)?;
+                let write_txn = Self::begin_history_write(db)?;
+                #[cfg(any(test, feature = "test-seams"))]
+                let mut graph_publication_attempt =
+                    crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
                 let mut identity_mutations = Vec::new();
                 let change_log_keys_removed = self.prune_versions_in_write(
                     &write_txn,
@@ -31763,11 +34124,10 @@ impl RedbPersistence {
                 #[cfg(test)]
                 currency_reclaim_checkpoint_for_test(2)?;
                 self.remove_commit_index_entries_in_write(&write_txn, commit_index_lsns)?;
-                identity_mutations.extend(
-                    commit_index_lsns
-                        .iter()
-                        .map(|lsn| content_identity::remove_commit_index_mutation(*lsn)),
-                );
+                identity_mutations.extend(Self::retired_commit_identity_mutations_in_write(
+                    &write_txn,
+                    commit_index_lsns,
+                )?);
                 for (catalog, retained) in generations {
                     self.reclaim_vector_generations_in_write(&write_txn, catalog, retained)?;
                 }
@@ -31782,7 +34142,18 @@ impl RedbPersistence {
                     cleanup_rotation,
                 )?;
                 Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-                write_txn.commit().map_err(Self::storage_error)?;
+                {
+                    #[cfg(any(test, feature = "test-seams"))]
+                    graph_observation_checkpoint(10)?;
+                    let graph_commit_result = write_txn.commit();
+                    #[cfg(any(test, feature = "test-seams"))]
+                    if graph_commit_result.is_ok() {
+                        graph_publication_attempt.committed();
+                        graph_observation_checkpoint(11)?;
+                    }
+                    graph_commit_result
+                }
+                .map_err(Self::storage_error)?;
                 durable.set(true);
                 #[cfg(test)]
                 currency_reclaim_checkpoint_for_test(3)?;
@@ -31815,12 +34186,17 @@ impl RedbPersistence {
         // Presence, including a malformed fence, is sufficient to refuse.
         // The write-transaction check below closes a concurrent retirement.
         if self.has_vector_repair_fence()? || self.has_paged_cleanup()? {
-            return Err(vector_paged::corruption("vector ownership cleanup is incomplete before authoritative erasure"));
+            return Err(vector_paged::corruption(
+                "vector ownership cleanup is incomplete before authoritative erasure",
+            ));
         }
         let prepared_vector_generations =
             self.prepare_authoritative_purge_vector_generations(projection)?;
         self.with_db(|db| {
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            let write_txn = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
             Self::refuse_unresolved_vector_erasure_in_write(&write_txn)?;
             self.apply_local_erasure(
                 &write_txn,
@@ -31837,7 +34213,18 @@ impl RedbPersistence {
                 RowId(0),
             )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-            write_txn.commit().map_err(Self::storage_error)
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)
         })
     }
 
@@ -32133,6 +34520,8 @@ impl RedbPersistence {
         accountant: Arc<dyn contextdb_vector::MemoryBudget>,
         operation: &str,
     ) -> Result<()> {
+        let _decode_scope = self.writer_decode_scope()?;
+        self.prepare_proof_owner()?;
         let mut identity_mutations = Vec::new();
         // A selected change-log occurrence is identified by its full
         // value inside its LSN group.  Read and re-densify only touched
@@ -32157,6 +34546,16 @@ impl RedbPersistence {
                     for entry in table
                         .range(prefix.as_str()..)
                         .map_err(Self::storage_error)?
+                        .inspect(|_entry| {
+                            #[cfg(any(test, feature = "test-seams"))]
+                            if let Ok((key, _)) = _entry {
+                                crate::read_work_probe::graph_storage_key(
+                                    "history",
+                                    "iteration_step",
+                                    key.value(),
+                                );
+                            }
+                        })
                     {
                         let (key, value) = entry.map_err(Self::storage_error)?;
                         if !key.value().starts_with(prefix.as_str()) {
@@ -32168,14 +34567,23 @@ impl RedbPersistence {
                 };
                 let mut survivors = Vec::with_capacity(existing.len());
                 for (key, bytes) in existing {
-                    let decoded: ChangeLogEntry = Self::decode(&bytes)?;
-                    if let Some(position) = witnesses.iter().position(|wanted| *wanted == decoded) {
+                    let _row_scope = crate::read_image_memory::active_owner()?
+                        .row_owner()?
+                        .enter();
+                    let decoded = Self::decode_stored_change_log(&bytes)?.entry;
+                    let removed = if let Some(position) =
+                        witnesses.iter().position(|wanted| *wanted == decoded)
+                    {
                         witnesses.remove(position);
+                        true
                     } else {
                         survivors.push(bytes);
-                    }
-                    table.remove(key.as_str()).map_err(Self::storage_error)?;
-                    Self::remove_change_log_selectors_in_write(write_txn, key.as_str())?;
+                        false
+                    };
+                    table
+                        .remove(observed_graph_key!("history", "remove", key.as_str(), 8))
+                        .map_err(Self::storage_error)?;
+                    Self::detach_change_log_selectors_in_write(write_txn, key.as_str(), !removed)?;
                     identity_mutations.push(content_identity::remove_encoded_history_mutation(
                         &key, &decoded,
                     )?);
@@ -32189,18 +34597,22 @@ impl RedbPersistence {
                 for (index, bytes) in survivors.into_iter().enumerate() {
                     Self::write_change_log_entry_key(lsn, index, &mut key_buf);
                     table
-                        .insert(key_buf.as_str(), bytes.as_slice())
+                        .insert(
+                            observed_graph_key!("history", "insert", key_buf.as_str(), 8),
+                            bytes.as_slice(),
+                        )
                         .map_err(Self::storage_error)?;
-                    Self::write_change_log_selectors_in_write(
-                        write_txn,
-                        key_buf.as_str(),
-                        bytes.as_slice(),
-                    )?;
-                    let decoded: ChangeLogEntry = Self::decode(&bytes)?;
-                    identity_mutations.push(content_identity::encoded_history_mutation(
-                        key_buf.as_str(),
-                        &decoded,
-                    )?);
+                    let _row_scope = crate::read_image_memory::active_owner()?
+                        .row_owner()?
+                        .enter();
+                    self.graph_writer_window(|| {
+                        Self::write_carried_change_log_selectors_in_write(
+                            write_txn,
+                            key_buf.as_str(),
+                            bytes.as_slice(),
+                        )
+                    })?;
+                    identity_mutations.push(Self::stored_change_log_mutation(&key_buf, &bytes)?);
                 }
             }
         }
@@ -32240,6 +34652,19 @@ impl RedbPersistence {
                 );
             }
             let key = Self::rel_row_key_from_parts(*row_id, *created_tx, *lsn);
+            {
+                let relation = relational_tables
+                    .get(table)
+                    .expect("opened relational table");
+                let predecessor = relation.get(key.as_slice()).map_err(Self::storage_error)?;
+                self.replace_relational_manifest_in_write(
+                    write_txn,
+                    table,
+                    key.as_slice(),
+                    predecessor.as_ref().map(|body| body.value()),
+                    None,
+                )?;
+            }
             let removed = relational_tables
                 .get_mut(table)
                 .expect("opened relational table")
@@ -32381,11 +34806,54 @@ impl RedbPersistence {
             for entry in &projection.graph_entries {
                 let forward_key = Self::graph_fwd_key(entry);
                 let reverse_key = Self::graph_rev_key(entry);
+                {
+                    let body = forward
+                        .get(observed_graph_key!(
+                            "graph_fwd",
+                            "get",
+                            forward_key.as_slice()
+                        ))
+                        .map_err(Self::storage_error)?
+                        .ok_or_else(|| Error::StoreCorrupted {
+                            path: self.path.display().to_string(),
+                            reason: "purged graph forward projection missing".into(),
+                        })?;
+                    let other = reverse
+                        .get(observed_graph_key!(
+                            "graph_rev",
+                            "get",
+                            reverse_key.as_slice()
+                        ))
+                        .map_err(Self::storage_error)?
+                        .ok_or_else(|| Error::StoreCorrupted {
+                            path: self.path.display().to_string(),
+                            reason: "purged graph reverse projection missing".into(),
+                        })?;
+                    if body.value() != other.value() {
+                        return Err(Error::StoreCorrupted {
+                            path: self.path.display().to_string(),
+                            reason: "purged graph projections disagree".into(),
+                        });
+                    }
+                    self.graph_writer_window(|| {
+                        Self::reclaim_graph_creation_in_write(write_txn, &forward_key, body.value())
+                    })?;
+                }
                 let removed_forward = forward
-                    .remove(forward_key.as_slice())
+                    .remove(observed_graph_key!(
+                        "graph_fwd",
+                        "remove",
+                        forward_key.as_slice(),
+                        5
+                    ))
                     .map_err(Self::storage_error)?;
                 let removed_reverse = reverse
-                    .remove(reverse_key.as_slice())
+                    .remove(observed_graph_key!(
+                        "graph_rev",
+                        "remove",
+                        reverse_key.as_slice(),
+                        5
+                    ))
                     .map_err(Self::storage_error)?;
                 if removed_forward.is_none() || removed_reverse.is_none() {
                     return Err(Error::SyncError(
@@ -32526,12 +34994,16 @@ impl RedbPersistence {
         &self,
         versions: &[contextdb_vector::VectorVersionIdentity],
     ) -> Result<PruneScopedStats> {
+        self.prepare_proof_owner()?;
         if versions.is_empty() {
             return Ok(PruneScopedStats::default());
         }
         let quantization = Self::vector_quantization_map(&self.load_all_table_meta()?);
         self.with_db(|db| {
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            let write_txn = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
             self.prune_vector_versions_in_write(&write_txn, versions, None)?;
             let mut mutations = versions
                 .iter()
@@ -32570,7 +35042,18 @@ impl RedbPersistence {
                 &mut self.proof_admission(),
             )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-            write_txn.commit().map_err(Self::storage_error)?;
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)?;
             Ok(PruneScopedStats {
                 row_keys_removed: 0,
                 change_log_keys_removed: 0,
@@ -32634,12 +35117,16 @@ impl RedbPersistence {
         vectors: &[VectorEntry],
         edges: &[AdjEntry],
     ) -> Result<PruneScopedStats> {
+        self.prepare_proof_owner()?;
         if vectors.is_empty() && edges.is_empty() {
             return Ok(PruneScopedStats::default());
         }
         let quantization = Self::vector_quantization_map(&self.load_all_table_meta()?);
         self.with_db(|db| {
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            let write_txn = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
             self.prune_vectors_and_edges_in_write(&write_txn, vectors, edges)?;
             let mut mutations = vectors
                 .iter()
@@ -32688,7 +35175,18 @@ impl RedbPersistence {
                 &mut self.proof_admission(),
             )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-            write_txn.commit().map_err(Self::storage_error)?;
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)?;
             Ok(PruneScopedStats {
                 row_keys_removed: 0,
                 change_log_keys_removed: 0,
@@ -32740,10 +35238,49 @@ impl RedbPersistence {
                     for entry in edges {
                         let fwd_key = Self::graph_fwd_key(entry);
                         let rev_key = Self::graph_rev_key(entry);
-                        fwd.remove(fwd_key.as_slice())
-                            .map_err(Self::storage_error)?;
-                        rev.remove(rev_key.as_slice())
-                            .map_err(Self::storage_error)?;
+                        {
+                            let body = fwd
+                                .get(observed_graph_key!("graph_fwd", "get", fwd_key.as_slice()))
+                                .map_err(Self::storage_error)?
+                                .ok_or_else(|| Error::StoreCorrupted {
+                                    path: self.path.display().to_string(),
+                                    reason: "reclaimed graph forward projection missing".into(),
+                                })?;
+                            let other = rev
+                                .get(observed_graph_key!("graph_rev", "get", rev_key.as_slice()))
+                                .map_err(Self::storage_error)?
+                                .ok_or_else(|| Error::StoreCorrupted {
+                                    path: self.path.display().to_string(),
+                                    reason: "reclaimed graph reverse projection missing".into(),
+                                })?;
+                            if body.value() != other.value() {
+                                return Err(Error::StoreCorrupted {
+                                    path: self.path.display().to_string(),
+                                    reason: "reclaimed graph projections disagree".into(),
+                                });
+                            }
+                            self.graph_writer_window(|| {
+                                Self::reclaim_graph_creation_in_write(
+                                    write_txn,
+                                    &fwd_key,
+                                    body.value(),
+                                )
+                            })?;
+                        }
+                        fwd.remove(observed_graph_key!(
+                            "graph_fwd",
+                            "remove",
+                            fwd_key.as_slice(),
+                            5
+                        ))
+                        .map_err(Self::storage_error)?;
+                        rev.remove(observed_graph_key!(
+                            "graph_rev",
+                            "remove",
+                            rev_key.as_slice(),
+                            5
+                        ))
+                        .map_err(Self::storage_error)?;
                     }
                 }
                 (Err(redb::TableError::TableDoesNotExist(_)), _)
@@ -32917,23 +35454,35 @@ impl RedbPersistence {
     /// (their change-log entries are all gone and nothing else names them).
     /// Point removes; nothing else in the index is read or rewritten.
     pub fn remove_commit_index_entries_scoped(&self, lsns: &[Lsn]) -> Result<u64> {
+        self.prepare_proof_owner()?;
         if lsns.is_empty() {
             return Ok(0);
         }
         self.with_db(|db| {
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            let write_txn = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
             let removed = self.remove_commit_index_entries_in_write(&write_txn, lsns)?;
-            let mutations = lsns
-                .iter()
-                .map(|lsn| content_identity::remove_commit_index_mutation(*lsn))
-                .collect::<Vec<_>>();
+            let mutations = Self::retired_commit_identity_mutations_in_write(&write_txn, lsns)?;
             Self::apply_content_identity_mutations_in_write(
                 &write_txn,
                 &mutations,
                 &mut self.proof_admission(),
             )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-            write_txn.commit().map_err(Self::storage_error)?;
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)?;
             Ok(removed)
         })
     }
@@ -32947,9 +35496,15 @@ impl RedbPersistence {
             return Ok(0);
         }
         let mut removed = 0u64;
+        if Self::final_graph_receipts_nonempty(write_txn)? {
+            return Ok(0);
+        }
         match write_txn.open_table(COMMIT_INDEX_TABLE) {
             Ok(mut table) => {
                 for lsn in lsns {
+                    if Self::has_graph_creation_at_lsn(write_txn, *lsn)? {
+                        continue;
+                    }
                     if table.remove(lsn.0).map_err(Self::storage_error)?.is_some() {
                         removed = removed.saturating_add(1);
                     }
@@ -33195,6 +35750,7 @@ impl RedbPersistence {
     }
 
     pub(crate) fn restore_storage_compaction(&self) -> Result<()> {
+        let _decode_scope = self.writer_decode_scope()?;
         let checkpoint = self.with_db(|db| {
             let read = db.begin_read().map_err(Self::storage_error)?;
             let table = match read.open_table(TableDefinition::<&str, &[u8]>::new(
@@ -33208,10 +35764,9 @@ impl RedbPersistence {
                 return Ok(None);
             };
             let memory = self
-                .proof_accountant
-                .get()
+                .proof_accountant()
                 .map(|accountant| {
-                    crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+                    PersistenceBytes::try_new_for(
                         accountant.clone(),
                         512usize.saturating_add(value.value().len().saturating_mul(3)),
                         "storage_compaction",
@@ -33247,7 +35802,12 @@ impl RedbPersistence {
             .3
             .as_ref()
             .map_or(0, |memory| memory.bytes())
-            .saturating_add(self.vector_repair_audit.lock().as_ref().map_or(0, |audit| audit._memory.bytes()))
+            .saturating_add(
+                self.vector_repair_audit
+                    .lock()
+                    .as_ref()
+                    .map_or(0, |audit| audit._memory.bytes()),
+            )
     }
 
     /// One bounded durable relocation batch. Only a position survives the
@@ -33299,9 +35859,8 @@ impl RedbPersistence {
                 .map_or(STORAGE_MAINTENANCE_PAGE_BATCH, |available| {
                     (available / 2 / PATH_BYTES_PER_PAGE).clamp(1, STORAGE_MAINTENANCE_PAGE_BATCH)
                 });
-        let workspace = Arc::new(parking_lot::Mutex::new(
-            crate::memory_accounting::OwnedMemoryReservation::new(accountant),
-        ));
+        let workspace = crate::memory_accounting::OwnedMemoryReservation::new(accountant)
+            .into_admitted_mutex_arc()?;
         // Position paths and the relocation map are bounded independently of
         // file size. Source and destination page buffers are admitted below
         // using their actual allocation sizes, including oversized values.
@@ -33325,7 +35884,10 @@ impl RedbPersistence {
         // A Redb transaction owns its storage references. Keep only that
         // bounded writer transaction during relocation, not the handle or
         // companion mutexes needed by foreground reads and writes.
-        let txn = self.with_db(|db| db.begin_write().map_err(Self::storage_error))?;
+        let txn = self.with_db(Self::begin_history_write)?;
+        #[cfg(any(test, feature = "test-seams"))]
+        let mut graph_compaction_attempt =
+            crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&txn);
         let fingerprint_failure = Arc::new(parking_lot::Mutex::new(None));
         let on_fingerprint_failure = Arc::clone(&fingerprint_failure);
         let checkpoint_ratio = state.2;
@@ -33344,10 +35906,15 @@ impl RedbPersistence {
                     admission(bytes)
                 },
                 |txn, successor| {
-                    Self::write_vector_body_root_fingerprint(txn)
-                        .and_then(|()| Self::write_commit_directory_root_in_write(txn))
-                        .and_then(|()| Self::write_row_heads_root(txn))
-                        .and_then(|()| Self::rebind_ddl_selector_roots_in_write(txn))
+                    #[cfg(any(test, feature = "test-seams"))]
+                    crate::read_work_probe::note_graph(
+                        "publication",
+                        "compaction_hook",
+                        &[],
+                        None,
+                        None,
+                    );
+                    Self::rebind_ddl_selector_roots_in_write(txn)
                         .and_then(|()| {
                             let (phase, table, advance, position, active) = successor.checkpoint();
                             if active {
@@ -33380,12 +35947,41 @@ impl RedbPersistence {
                                 .map_err(Self::storage_error)?;
                             Ok(())
                         })
+                        // Publish fingerprints only after selectors and the
+                        // successor checkpoint have reached their final state.
+                        .and_then(|()| {
+                            #[cfg(any(test, feature = "test-seams"))]
+                            graph_observation_checkpoint(27)?;
+                            Self::write_vector_body_root_fingerprint(txn)?;
+                            #[cfg(any(test, feature = "test-seams"))]
+                            graph_observation_checkpoint(28)?;
+                            Self::write_commit_directory_root_in_write(txn)?;
+                            #[cfg(any(test, feature = "test-seams"))]
+                            graph_observation_checkpoint(29)?;
+                            Self::write_row_heads_root(txn)?;
+                            #[cfg(any(test, feature = "test-seams"))]
+                            graph_observation_checkpoint(30)?;
+                            Self::write_read_bounds_roots_in_write(txn)?;
+                            #[cfg(any(test, feature = "test-seams"))]
+                            graph_observation_checkpoint(31)?;
+                            #[cfg(any(test, feature = "test-seams"))]
+                            graph_observation_checkpoint(10)?;
+                            Ok(())
+                        })
                         .map_err(|error| {
-                            Self::compaction_checkpoint_storage_error(error, &on_fingerprint_failure)
+                            Self::compaction_checkpoint_storage_error(
+                                error,
+                                &on_fingerprint_failure,
+                            )
                         })
                 },
             )
         });
+        #[cfg(any(test, feature = "test-seams"))]
+        if result.is_ok() {
+            graph_compaction_attempt.committed();
+            graph_observation_checkpoint(11)?;
+        }
         if let Some(error) = fingerprint_failure.lock().take() {
             return Err(error);
         }
@@ -33398,7 +35994,7 @@ impl RedbPersistence {
         state.1 = progress;
         state.3 = next_controls;
         for _ in 0..2 {
-            let txn = self.with_db(|db| db.begin_write().map_err(Self::storage_error))?;
+            let txn = self.with_db(Self::begin_history_write)?;
             txn.commit_compaction_frees().map_err(Self::storage_error)?;
         }
         let recycle_micros = if progress.complete {
@@ -33454,6 +36050,7 @@ impl RedbPersistence {
         table_name: &str,
         hasher: &mut blake3::Hasher,
     ) -> Result<u64> {
+        let _decode_scope = self.writer_decode_scope()?;
         digest_field(hasher, table_name.as_bytes());
         let definition: TableDefinition<&[u8], &[u8]> = TableDefinition::new(table_name);
         let table = read_txn
@@ -33463,6 +36060,9 @@ impl RedbPersistence {
         for entry in table.iter().map_err(Self::storage_error)? {
             let (key, value) = entry.map_err(Self::storage_error)?;
             digest_field(hasher, key.value());
+            let _row_scope = crate::read_image_memory::active_owner()?
+                .row_owner()?
+                .enter();
             let row: PersistedVersionedRow = Self::decode(value.value())?;
             rmp_serde::encode::write(
                 &mut *hasher,
@@ -33498,6 +36098,7 @@ impl RedbPersistence {
     /// relational and sink-queue table names are part of the digest, so
     /// creating or removing an empty table is still visible.
     pub(crate) fn raw_sync_apply_state_digest(&self) -> Result<RawSyncApplyStateDigest> {
+        let _decode_scope = self.writer_decode_scope()?;
         self.with_db(|db| {
             let read_txn = db.begin_read().map_err(Self::storage_error)?;
             let mut hasher = blake3::Hasher::new();
@@ -33543,6 +36144,24 @@ impl RedbPersistence {
             let edges =
                 digest_redb_table(&read_txn, GRAPH_FWD_TABLE, "graph-forward", &mut hasher)?;
             digest_redb_table(&read_txn, GRAPH_REV_TABLE, "graph-reverse", &mut hasher)?;
+            digest_redb_table(
+                &read_txn,
+                graph_history_record::GRAPH_CONTRIBUTIONS,
+                "graph-contributions",
+                &mut hasher,
+            )?;
+            digest_redb_table(
+                &read_txn,
+                graph_history_record::GRAPH_OCCURRENCE_LOCATIONS,
+                "graph-occurrence-locations",
+                &mut hasher,
+            )?;
+            digest_redb_table(
+                &read_txn,
+                graph_history_record::GRAPH_PREDECESSOR_LIFECYCLE,
+                "graph-predecessor-lifecycle",
+                &mut hasher,
+            )?;
             let vectors = digest_redb_table(&read_txn, VECTORS_TABLE, "vectors", &mut hasher)?;
             digest_redb_table(
                 &read_txn,
@@ -33736,11 +36355,15 @@ impl RedbPersistence {
     }
 
     pub(crate) fn append_trigger_audit_stamps_raw(&self, entries: &[(String, u64)]) -> Result<()> {
+        self.prepare_proof_owner()?;
         if entries.is_empty() {
             return Ok(());
         }
         self.with_db(|db| {
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            let write_txn = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
             {
                 let mut table = write_txn
                     .open_table(TRIGGER_AUDIT_STAMPS_TABLE)
@@ -33767,7 +36390,18 @@ impl RedbPersistence {
                 &mut self.proof_admission(),
             )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-            write_txn.commit().map_err(Self::storage_error)?;
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)?;
             Ok(())
         })
     }
@@ -33782,11 +36416,15 @@ impl RedbPersistence {
         namespace: &[u8],
         entries: &[(String, Vec<u8>)],
     ) -> Result<()> {
+        self.prepare_proof_owner()?;
         if entries.is_empty() {
             return Ok(());
         }
         self.with_db(|db| {
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            let write_txn = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
             {
                 let mut table = write_txn
                     .open_table(definition)
@@ -33809,7 +36447,18 @@ impl RedbPersistence {
                 &mut self.proof_admission(),
             )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-            write_txn.commit().map_err(Self::storage_error)?;
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)?;
             Ok(())
         })
     }
@@ -33851,11 +36500,16 @@ impl RedbPersistence {
         sink: &str,
         entries: &[(u64, Vec<u8>)],
     ) -> Result<()> {
+        let _decode_scope = self.writer_decode_scope()?;
+        self.prepare_proof_owner()?;
         if entries.is_empty() {
             return Ok(());
         }
         self.with_db(|db| {
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            let write_txn = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
             {
                 let table_name = Self::sink_queue_table_name(sink);
                 let table_def: TableDefinition<u64, &[u8]> =
@@ -33883,7 +36537,18 @@ impl RedbPersistence {
                 &mut self.proof_admission(),
             )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-            write_txn.commit().map_err(Self::storage_error)?;
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)?;
             Ok(())
         })
     }
@@ -33894,11 +36559,15 @@ impl RedbPersistence {
         meta: Option<&TableMeta>,
         rows: &[VersionedRow],
     ) -> Result<()> {
+        self.prepare_proof_owner()?;
         if rows.is_empty() {
             return Ok(());
         }
         self.with_db(|db| {
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            let write_txn = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
             Self::invalidate_retention_clock_in_write(&write_txn, name)?;
             {
                 let table_name = Self::rel_table_name(name);
@@ -33910,6 +36579,18 @@ impl RedbPersistence {
                 for row in rows {
                     Self::encode_versioned_row_into(row, meta, &mut encoded)?;
                     let key = Self::rel_row_key(row);
+                    {
+                        let predecessor = redb_table
+                            .get(key.as_slice())
+                            .map_err(Self::storage_error)?;
+                        self.replace_relational_manifest_in_write(
+                            &write_txn,
+                            name,
+                            key.as_slice(),
+                            predecessor.as_ref().map(|body| body.value()),
+                            Some(encoded.as_slice()),
+                        )?;
+                    }
                     redb_table
                         .insert(key.as_slice(), encoded.as_slice())
                         .map_err(Self::storage_error)?;
@@ -33924,6 +36605,9 @@ impl RedbPersistence {
                 &mutations,
                 &mut self.proof_admission(),
             )?;
+            for row in rows {
+                Self::raise_table_read_lsn_in_write(&write_txn, name, row.lsn)?;
+            }
             Self::raise_noncanonical_writer_floors_in_write(
                 &write_txn,
                 TxId(
@@ -33937,7 +36621,18 @@ impl RedbPersistence {
                 RowId(0),
             )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-            write_txn.commit().map_err(Self::storage_error)?;
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)?;
             Ok(())
         })
     }
@@ -33947,8 +36642,13 @@ impl RedbPersistence {
         name: &str,
         meta: &TableMeta,
     ) -> Result<()> {
+        let _decode_scope = self.writer_decode_scope()?;
+        self.prepare_proof_owner()?;
         self.with_db(|db| {
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            let write_txn = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
             Self::rebuild_relational_indexes_in_write(
                 &write_txn,
                 &self.path,
@@ -33958,11 +36658,45 @@ impl RedbPersistence {
                 &mut self.proof_admission(),
             )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-            write_txn.commit().map_err(Self::storage_error)
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)
         })
     }
 
     pub(crate) fn checkpoint_read_source(&self) -> Result<CheckpointReadSource> {
+        let _decode_scope = self.writer_decode_scope()?;
+        let decode_memory = crate::read_image_memory::active_owner()?.row_owner()?;
+        self.checkpoint_read_source_with_owner(decode_memory)
+    }
+
+    pub(crate) fn checkpoint_read_source_with_read_memory(
+        &self,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<CheckpointReadSource> {
+        let accountant = self.proof_accountant().ok_or_else(|| {
+            Error::Other("checkpoint source requires its installed accountant identity".into())
+        })?;
+        let decode_memory =
+            crate::read_image_memory::ImageMemory::operation_reader(accountant, read_memory)?;
+        self.checkpoint_read_source_with_owner(decode_memory)
+    }
+
+    fn checkpoint_read_source_with_owner(
+        &self,
+        decode_memory: Arc<crate::read_image_memory::ImageMemory>,
+    ) -> Result<CheckpointReadSource> {
+        let _scope = decode_memory.enter();
+        self.prepare_proof_owner()?;
         self.with_db(|database| {
             let read = database.begin_read().map_err(Self::storage_error)?;
             let content_identity = content_identity::ContentIdentityReadVerifier::open(
@@ -33974,7 +36708,9 @@ impl RedbPersistence {
                 database_path: self.path().to_path_buf(),
                 read,
                 content_identity,
+                _writer_use: self.proof_accountant().as_ref().and_then(crate::memory_accounting::WriterUse::retain_if_writer),
                 accountant: self.proof_accountant(),
+                decode_memory,
             })
         })
     }
@@ -34002,11 +36738,15 @@ impl RedbPersistence {
         config_writes: &[(String, Vec<u8>)],
         config_deletes: &[String],
     ) -> Result<()> {
+        self.prepare_proof_owner()?;
         if entries.is_empty() && config_writes.is_empty() && config_deletes.is_empty() {
             return Ok(());
         }
         self.with_db(|db| {
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            let write_txn = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
             {
                 let mut lsns = write_txn
                     .open_table(SYNC_ROW_SOURCE_LSN_TABLE)
@@ -34051,16 +36791,31 @@ impl RedbPersistence {
                 &mut self.proof_admission(),
             )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-            write_txn.commit().map_err(Self::storage_error)
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)
         })
     }
 
     pub(crate) fn append_graph_edges_batch(&self, edges: &[AdjEntry]) -> Result<()> {
+        self.prepare_proof_owner()?;
         if edges.is_empty() {
             return Ok(());
         }
         self.with_db(|db| {
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            let write_txn = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
             {
                 let mut fwd_table = write_txn
                     .open_table(GRAPH_FWD_TABLE)
@@ -34074,10 +36829,19 @@ impl RedbPersistence {
                     let fwd_key = Self::graph_fwd_key(entry);
                     let rev_key = Self::graph_rev_key(entry);
                     fwd_table
-                        .insert(fwd_key.as_slice(), encoded.as_slice())
+                        .insert(
+                            observed_graph_key!("graph_fwd", "insert", fwd_key.as_slice(), 5),
+                            encoded.as_slice(),
+                        )
                         .map_err(Self::storage_error)?;
+                    self.graph_writer_window(|| {
+                        Self::install_graph_creation_in_write(&write_txn, entry, &encoded)
+                    })?;
                     rev_table
-                        .insert(rev_key.as_slice(), encoded.as_slice())
+                        .insert(
+                            observed_graph_key!("graph_rev", "insert", rev_key.as_slice(), 5),
+                            encoded.as_slice(),
+                        )
                         .map_err(Self::storage_error)?;
                 }
             }
@@ -34104,7 +36868,18 @@ impl RedbPersistence {
                 RowId(0),
             )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-            write_txn.commit().map_err(Self::storage_error)?;
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)?;
             Ok(())
         })
     }
@@ -34114,11 +36889,15 @@ impl RedbPersistence {
         entries: &[VectorEntry],
         quantization: &HashMap<VectorIndexRef, VectorQuantization>,
     ) -> Result<()> {
+        self.prepare_proof_owner()?;
         if entries.is_empty() {
             return Ok(());
         }
         self.with_db(|db| {
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            let write_txn = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
             {
                 let mut table =
                     content_size::open_vectors(&write_txn).map_err(Self::storage_error)?;
@@ -34145,6 +36924,9 @@ impl RedbPersistence {
                 &mutations,
                 &mut self.proof_admission(),
             )?;
+            for entry in entries {
+                Self::raise_table_read_lsn_in_write(&write_txn, &entry.index.table, entry.lsn)?;
+            }
             Self::raise_noncanonical_writer_floors_in_write(
                 &write_txn,
                 TxId(
@@ -34165,7 +36947,18 @@ impl RedbPersistence {
                 ),
             )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-            write_txn.commit().map_err(Self::storage_error)?;
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)?;
             Ok(())
         })
     }
@@ -34178,11 +36971,15 @@ impl RedbPersistence {
         &self,
         records: &[VectorPartitionMembershipRecord],
     ) -> Result<()> {
+        self.prepare_proof_owner()?;
         if records.is_empty() {
             return Ok(());
         }
         self.with_db(|db| {
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            let write_txn = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
             {
                 let mut table = write_txn
                     .open_table(VECTOR_PARTITION_MEMBERSHIP_TABLE)
@@ -34197,7 +36994,18 @@ impl RedbPersistence {
                 &mut self.proof_admission(),
             )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-            write_txn.commit().map_err(Self::storage_error)?;
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)?;
             Ok(())
         })
     }
@@ -34210,11 +37018,15 @@ impl RedbPersistence {
         &self,
         records: &[VectorPartitionMembershipRecord],
     ) -> Result<()> {
+        self.prepare_proof_owner()?;
         if records.is_empty() {
             return Ok(());
         }
         self.with_db(|db| {
             let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
             {
                 let mut table = write_txn
                     .open_table(VECTOR_PARTITION_MEMBERSHIP_TABLE)
@@ -34242,7 +37054,18 @@ impl RedbPersistence {
                 &mut self.proof_admission(),
             )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-            write_txn.commit().map_err(Self::storage_error)?;
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)?;
             Ok(())
         })
     }
@@ -34253,50 +37076,52 @@ impl RedbPersistence {
         &self,
         entries: &[(usize, ChangeLogEntry)],
     ) -> Result<()> {
+        let _decode_scope = self.writer_decode_scope()?;
+        self.prepare_proof_owner()?;
         if entries.is_empty() {
             return Ok(());
         }
         self.with_db(|db| {
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
-            let mut identity_mutations = Vec::new();
-            {
-                let mut table = write_txn
-                    .open_table(CHANGE_LOG_TABLE)
-                    .map_err(Self::storage_error)?;
-                let mut encoded = Vec::new();
-                let mut key = String::with_capacity(Self::change_log_entry_key_len());
-                for (index, entry) in entries {
-                    Self::write_change_log_entry_key(entry.lsn(), *index, &mut key);
-                    Self::encode_into(entry, &mut encoded)?;
-                    table
-                        .insert(key.as_str(), encoded.as_slice())
-                        .map_err(Self::storage_error)?;
-                    Self::write_change_log_selectors_in_write(
-                        &write_txn,
-                        key.as_str(),
-                        encoded.as_slice(),
-                    )?;
-                    identity_mutations
-                        .push(content_identity::encoded_history_mutation(&key, entry)?);
-                }
-            }
-            Self::apply_content_identity_mutations_in_write(
-                &write_txn,
-                &identity_mutations,
-                &mut self.proof_admission(),
+            let previous_root = db.begin_read().map_err(Self::storage_error)?;
+            let write = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write);
+            self.publish_public_change_log_in_write(
+                &write,
+                &previous_root,
+                false,
+                entries
+                    .iter()
+                    .map(|(index, entry)| (entry.lsn(), *index, entry)),
             )?;
-            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-            write_txn.commit().map_err(Self::storage_error)?;
+            Self::write_writer_recovery_bounds_in_write(&write, None)?;
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)?;
             Ok(())
         })
     }
 
     pub(crate) fn append_ddl_log_entries(&self, entries: &[(Lsn, DdlChange)]) -> Result<()> {
+        self.prepare_proof_owner()?;
         if entries.is_empty() {
             return Ok(());
         }
         self.with_db(|db| {
-            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            let write_txn = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
             let mut identity_mutations = Vec::new();
             {
                 let mut ddl_table = write_txn
@@ -34338,12 +37163,24 @@ impl RedbPersistence {
                 RowId(0),
             )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-            write_txn.commit().map_err(Self::storage_error)?;
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)?;
             Ok(())
         })
     }
 
     fn load_graph_table(&self, definition: TableDefinition<&[u8], &[u8]>) -> Result<Vec<AdjEntry>> {
+        let _decode_scope = self.writer_decode_scope()?;
         self.with_db(|db| {
             let read_txn = db.begin_read().map_err(Self::storage_error)?;
             let table = match read_txn.open_table(definition) {
@@ -34354,10 +37191,18 @@ impl RedbPersistence {
 
             let mut entries = Vec::new();
             for entry in table.iter().map_err(Self::storage_error)? {
-                let (_, value) = entry.map_err(Self::storage_error)?;
+                let (_key, value) = entry.map_err(Self::storage_error)?;
                 #[cfg(feature = "in-process-test-seams")]
                 crate::writer_query_test_seams::note_history(
                     crate::writer_query_test_seams::HistoryFamily::Graph,
+                );
+                #[cfg(any(test, feature = "test-seams"))]
+                crate::read_work_probe::note_graph(
+                    "graph_payload",
+                    "payload_decode",
+                    _key.value(),
+                    None,
+                    Some("complete_graph_load"),
                 );
                 entries.push(Self::decode(value.value())?);
             }
@@ -34562,6 +37407,7 @@ impl RedbPersistence {
     }
 
     fn decode_versioned_row(bytes: &[u8], _meta: Option<&TableMeta>) -> Result<VersionedRow> {
+        let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
         let persisted: PersistedVersionedRow = Self::decode(bytes)?;
         crate::read_image_memory::reserve(
             persisted
@@ -34614,6 +37460,7 @@ impl RedbPersistence {
     }
 
     fn decode_vector_entry(bytes: &[u8]) -> Result<VectorEntry> {
+        let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
         let persisted: PersistedVectorEntry = Self::decode(bytes)?;
         crate::read_image_memory::reserve(persisted.vector.decoded_bytes())?;
         Ok(VectorEntry {
@@ -34659,15 +37506,23 @@ impl RedbPersistence {
         meta: &TableMeta,
         position: &RelationalIndexPosition,
     ) -> std::result::Result<(), String> {
-        if position.key.len() != declaration.columns.len() {
+        Self::validated_index_key(declaration, meta, &position.key)
+    }
+
+    pub(crate) fn validated_index_key(
+        declaration: &IndexDecl,
+        meta: &TableMeta,
+        key: &[DirectedValue],
+    ) -> std::result::Result<(), String> {
+        if key.len() != declaration.columns.len() {
             return Err(format!(
                 "durable index {} posting has {} key parts where the declaration has {}",
                 declaration.name,
-                position.key.len(),
+                key.len(),
                 declaration.columns.len()
             ));
         }
-        for (part, (column, direction)) in position.key.iter().zip(declaration.columns.iter()) {
+        for (part, (column, direction)) in key.iter().zip(declaration.columns.iter()) {
             let (descending, value) = match part {
                 DirectedValue::Asc(TotalOrdAsc(value)) => (false, value),
                 DirectedValue::Desc(TotalOrdDesc(value)) => (true, value),
@@ -34710,11 +37565,15 @@ impl RedbPersistence {
     }
 
     fn relational_index_table_name(table: &str, index: &str) -> String {
-        let mut name = Vec::with_capacity(table.len() + index.len() + 1);
-        name.extend_from_slice(table.as_bytes());
-        name.push(0);
-        name.extend_from_slice(index.as_bytes());
-        format!("__rel_index_{}", blake3::hash(&name).to_hex())
+        let mut hash = blake3::Hasher::new();
+        hash.update(table.as_bytes());
+        hash.update(&[0]);
+        hash.update(index.as_bytes());
+        let encoded = hash.finalize().to_hex();
+        let mut name = String::with_capacity(12 + encoded.len());
+        name.push_str("__rel_index_");
+        name.push_str(encoded.as_str());
+        name
     }
 
     fn current_relational_index_table_name(table: &str, index: &str) -> String {
@@ -35346,6 +38205,9 @@ impl RedbPersistence {
                             #[cfg(any(test, feature = "test-seams"))]
                             RELATIONAL_INDEX_REBUILD_ROWS_DECODED
                                 .with(|count| count.set(count.get().saturating_add(1)));
+                            let _row_scope = crate::read_image_memory::active_owner()?
+                                .row_owner()?
+                                .enter();
                             let row = Self::decode_versioned_row(value.value(), Some(meta))?;
                             write_row(&row)?;
                         }
@@ -35674,6 +38536,7 @@ impl RedbPersistence {
         meta: Option<&TableMeta>,
         mut workspace: Option<&mut crate::memory_accounting::OwnedMemoryReservation>,
     ) -> Result<content_identity::ContentIdentityMutation> {
+        let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
         let redb_name = Self::rel_table_name(table_name);
         let table_def: TableDefinition<&[u8], &[u8]> = TableDefinition::new(redb_name.as_str());
         let table = match content_size::open_rows(write_txn, table_def) {
@@ -35684,7 +38547,8 @@ impl RedbPersistence {
             Err(error) => return Err(Self::storage_error(error)),
         };
         let prefix = row_id.0.to_be_bytes();
-        let mut current = None;
+        let memory = crate::read_image_memory::active_owner()?;
+        let mut current = None::<(VersionedRow, Arc<crate::read_image_memory::ImageMemory>)>;
         let mut admitted_body_bytes = 0usize;
         for item in table
             .range(prefix.as_slice()..)
@@ -35712,15 +38576,17 @@ impl RedbPersistence {
                     admitted_body_bytes = required;
                 }
             }
-            let row = Self::decode_versioned_row(value.value(), meta)?;
-            if current.as_ref().is_none_or(|seen: &VersionedRow| {
-                (row.lsn, row.created_tx) > (seen.lsn, seen.created_tx)
-            }) {
-                current = Some(row);
+            let row_memory = memory.row_owner()?;
+            let row = row_memory.scope(|| Self::decode_versioned_row(value.value(), meta))?;
+            if current
+                .as_ref()
+                .is_none_or(|(seen, _)| (row.lsn, row.created_tx) > (seen.lsn, seen.created_tx))
+            {
+                current = Some((row, row_memory));
             }
         }
         match current {
-            Some(row) => content_identity::row_mutation(table_name, &row, meta),
+            Some(row) => content_identity::row_mutation(table_name, &row.0, meta),
             None => Ok(content_identity::remove_row_mutation(table_name, row_id)),
         }
     }
@@ -35796,11 +38662,29 @@ impl RedbPersistence {
         for item in table
             .range(prefix.as_slice()..)
             .map_err(Self::storage_error)?
+            .inspect(|_entry| {
+                #[cfg(any(test, feature = "test-seams"))]
+                if let Ok((key, _)) = _entry {
+                    crate::read_work_probe::graph_storage_key(
+                        "graph_fwd",
+                        "iteration_step",
+                        key.value(),
+                    );
+                }
+            })
         {
             let (key, value) = item.map_err(Self::storage_error)?;
             if !key.value().starts_with(&prefix) {
                 break;
             }
+            #[cfg(any(test, feature = "test-seams"))]
+            crate::read_work_probe::note_graph(
+                "graph_payload",
+                "payload_decode",
+                key.value(),
+                None,
+                Some("current_edge_identity"),
+            );
             let edge = Self::decode::<AdjEntry>(value.value())?;
             if edge.deleted_tx.is_none()
                 && current.as_ref().is_none_or(|seen: &AdjEntry| {
@@ -36374,6 +39258,7 @@ impl RedbPersistence {
         write_txn: &redb::WriteTransaction,
         matches: &impl Fn(&VectorIndexRef) -> bool,
     ) -> Result<()> {
+        let _decode_scope = self.writer_decode_scope()?;
         let mut table = match content_size::open_vectors(write_txn) {
             Ok(table) => table,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
@@ -36404,6 +39289,7 @@ impl RedbPersistence {
         dropped_columns: &HashSet<String>,
         quantization: &HashMap<VectorIndexRef, VectorQuantization>,
     ) -> Result<()> {
+        let _decode_scope = self.writer_decode_scope()?;
         if renames.is_empty() && dropped_columns.is_empty() {
             return Ok(());
         }
@@ -36463,6 +39349,7 @@ impl RedbPersistence {
         from: &VectorIndexRef,
         to: &VectorIndexRef,
     ) -> Result<()> {
+        self.prepare_proof_owner()?;
         if from == to {
             return Ok(());
         }
@@ -36555,6 +39442,7 @@ impl RedbPersistence {
         columns: Option<&HashSet<String>>,
         matches: &impl Fn(&VectorIndexRef) -> bool,
     ) -> Result<()> {
+        self.prepare_proof_owner()?;
         self.remove_vector_partition_graph_pages_matching_in_write(
             write_txn,
             self.proof_accountant(),
@@ -37109,12 +39997,16 @@ impl RedbPersistence {
         expected_kind: VectorPartitionRecordKind,
         encoded: &[u8],
     ) -> Result<T> {
+        let _decode_scope = self.writer_decode_scope()?;
         let payload = vector_partition_record_payload(expected_kind, encoded)
             .map_err(|reason| self.vector_partition_corruption(reason))?;
         prevalidate_vector_partition_metadata_routes(expected_kind, payload)
             .map_err(|reason| self.vector_partition_corruption(reason))?;
         Self::decode_exact(payload).map_err(|error| {
-            self.vector_partition_corruption(format!("payload decode failed: {error}"))
+            match error {
+                Error::MemoryBudgetExceeded { .. } | Error::ReadFailure(_) | Error::ReadCancelled => error,
+                error => self.vector_partition_corruption(format!("payload decode failed: {error}")),
+            }
         })
     }
 
@@ -37125,11 +40017,15 @@ impl RedbPersistence {
         index: &VectorIndexRef,
         partition_key: &VectorPartitionKey,
     ) -> Result<T> {
+        let _decode_scope = self.writer_decode_scope()?;
         let payload =
             vector_partition_expected_metadata_payload(kind, encoded, index, partition_key)
                 .map_err(|reason| self.vector_partition_corruption(reason))?;
         Self::decode_exact(payload).map_err(|error| {
-            self.vector_partition_corruption(format!("payload decode failed: {error}"))
+            match error {
+                Error::MemoryBudgetExceeded { .. } | Error::ReadFailure(_) | Error::ReadCancelled => error,
+                error => self.vector_partition_corruption(format!("payload decode failed: {error}")),
+            }
         })
     }
 
@@ -37255,6 +40151,7 @@ impl RedbPersistence {
         membership: Option<&[u8]>,
         pending_transition: bool,
     ) -> Result<()> {
+        self.prepare_proof_owner()?;
         #[cfg(any(test, feature = "test-seams"))]
         if CORRUPT_STORE {
             vector_membership_pages::publish_corrupt_store_membership_for_test(
@@ -37559,6 +40456,8 @@ impl RedbPersistence {
         &self,
         write_txn: &redb::WriteTransaction,
     ) -> Result<()> {
+        let _decode_scope = self.writer_decode_scope()?;
+        self.prepare_proof_owner()?;
         vector_membership_pages::reset_in_write(write_txn)?;
         match write_txn.delete_table(VECTOR_OPEN_DIRECTORY_TABLE) {
             Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
@@ -37704,6 +40603,20 @@ impl RedbPersistence {
         )
     }
 
+    fn require_decode_accountant(&self) -> Result<Arc<crate::memory_accounting::MemoryAccountant>> {
+        Ok(self.proof_accountant.get_or_init(|| ProofAccountantSlot::attached(
+            crate::read_image_memory::ImageMemory::default_decode_accountant(),
+        )).accountant())
+    }
+
+    fn writer_decode_scope(&self) -> Result<crate::read_image_memory::ImageMemoryScope> {
+        if let Ok(owner) = crate::read_image_memory::active_owner() {
+            return Ok(owner.enter());
+        }
+        let accountant = self.require_decode_accountant()?;
+        crate::read_image_memory::ImageMemory::enter_writer_operation(accountant)
+    }
+
     fn encode<T: serde::Serialize>(value: &T) -> Result<Vec<u8>> {
         bincode::serde::encode_to_vec(value, bincode::config::standard())
             .map_err(|err| Error::Other(format!("bincode encode error: {err}")))
@@ -37717,15 +40630,19 @@ impl RedbPersistence {
     }
 
     fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+        let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
         let (value, _) = crate::read_image_memory::decode(bytes)?;
         Ok(value)
     }
 
     fn decode_exact<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
-        let (value, consumed) =
-            bincode::serde::decode_from_slice(bytes, bincode::config::standard())
-                .map_err(|err| Error::Other(format!("bincode decode error: {err}")))?;
+        let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
+        let owner = crate::read_image_memory::active_owner()?;
+        let before = owner.held();
+        let (value, consumed) = crate::read_image_memory::decode(bytes)?;
         if consumed != bytes.len() {
+            drop(value);
+            owner.release(owner.held() - before);
             return Err(Error::Other(
                 "bincode exact decode left trailing bytes".to_string(),
             ));
@@ -37753,16 +40670,59 @@ impl RedbPersistence {
     /// had fewer fields than today's, which is exactly the `v1.0.0` case
     /// this fallback exists for.
     fn decode_table_meta_versioned(bytes: &[u8]) -> Result<(TableMeta, bool)> {
+        let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
         if bytes.starts_with(schema_binding::SCHEMA_MAGIC) {
             return Self::decode_persisted_schema(bytes).map(|(meta, _, _)| (meta, false));
         }
         match Self::decode::<TableMeta>(bytes) {
             Ok(meta) => Ok((meta, false)),
-            Err(error @ Error::MemoryBudgetExceeded { .. }) => Err(error),
+            Err(error)
+                if crate::read_image_memory::is_memory_refusal(&error)
+                    || crate::read_image_memory::is_missing_decode_owner(&error) =>
+            {
+                Err(error)
+            }
             Err(_) => {
                 let legacy: LegacyTableMetaV1 = Self::decode(bytes)?;
+                crate::read_image_memory::reserve(
+                    legacy.columns.len().saturating_mul(std::mem::size_of::<contextdb_core::ColumnDef>()),
+                )?;
                 Ok((legacy.into(), true))
             }
+        }
+    }
+
+    // Classification belongs to the relational boundary. Decode admission and
+    // recorded native-page refusals retain precedence over malformed bytes.
+    fn relational_decode_error(path: &str, error: Error) -> Error {
+        match error {
+            Error::Other(reason) => Error::StoreCorrupted {
+                path: path.into(),
+                reason,
+            },
+            other => other,
+        }
+    }
+
+    fn relational_storage_error(path: &str, error: redb::StorageError) -> Error {
+        let corrupted = matches!(&error, redb::StorageError::Corrupted(_));
+        match Self::storage_error(error) {
+            Error::Other(reason) if corrupted => Error::StoreCorrupted {
+                path: path.into(),
+                reason,
+            },
+            other => other,
+        }
+    }
+
+    fn relational_table_error(path: &str, error: redb::TableError) -> Error {
+        match error {
+            redb::TableError::Storage(error) => Self::relational_storage_error(path, error),
+            redb::TableError::TableDoesNotExist(reason) => Error::StoreCorrupted {
+                path: path.into(),
+                reason: format!("required relational table is absent: {reason}"),
+            },
+            other => Self::storage_error(other),
         }
     }
 
@@ -37770,8 +40730,8 @@ impl RedbPersistence {
         accountant: Arc<crate::memory_accounting::MemoryAccountant>,
         table: Option<&str>,
         position: &[usize],
-    ) -> Result<crate::memory_accounting::OwnedMemoryReservation> {
-        crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+    ) -> Result<PersistenceBytes> {
+        PersistenceBytes::try_new_for(
             accountant,
             512usize
                 .saturating_add(table.map_or(0, |name| name.len().saturating_mul(2)))
@@ -37816,7 +40776,23 @@ impl RedbPersistence {
                 Err(error) => Error::Other(format!("storage admission refused: {error}")),
             };
         }
+        if let redb::Error::Corrupted(reason) = err {
+            return Error::StoreCorrupted {
+                path: "storage".into(),
+                reason,
+            };
+        }
         Self::storage_message_error(err)
+    }
+
+    fn storage_source_error(path: &str, err: impl Into<redb::Error>) -> Error {
+        match Self::storage_error(err) {
+            Error::StoreCorrupted { reason, .. } => Error::StoreCorrupted {
+                path: path.to_owned(),
+                reason,
+            },
+            other => other,
+        }
     }
 
     fn storage_message_error(err: impl std::fmt::Display) -> Error {
@@ -37939,13 +40915,19 @@ impl RedbPersistence {
     }
 
     pub(crate) fn with_db<T>(&self, f: impl FnOnce(&redb::Database) -> Result<T>) -> Result<T> {
+        // The common writer handle boundary covers commit, reopen loading and
+        // maintenance decoders. An installed reader child keeps its own owner.
+        let _decode_scope = self.writer_decode_scope()?;
+        self.prepare_proof_owner()?;
         #[cfg(test)]
         PERSISTENCE_OWNERSHIP_READS_FOR_TEST.with(|count| count.set(count.get() + 1));
         // Operations borrow shared handle ownership. A writer waiting inside
         // Redb must not hold an exclusive lock needed to begin an ordinary read.
         // Close/recycle still take both exclusive guards before replacing it.
         if let Some(error) = self.saved_export_abandonment_error.lock().as_ref() {
-            return Err(Error::Other(format!("saved generation abandonment failed: {error}")));
+            return Err(Error::Other(format!(
+                "saved generation abandonment failed: {error}"
+            )));
         }
         let companion = self.lock_file.read().map_err(Self::storage_error)?;
         if companion.is_none() {
@@ -37959,9 +40941,90 @@ impl RedbPersistence {
     }
 }
 
+struct PersistenceConstruction {
+    source: *mut RedbPersistence,
+    initialized: [bool; 18],
+}
+impl PersistenceConstruction {
+    fn finish(&mut self) {
+        for step in (0..15).chain([16, 17, 15]) {
+            if !std::mem::replace(&mut self.initialized[step], false) { continue; }
+            // Advancing before drop prevents repeating an unwinding field.
+            unsafe { match step {
+                0 => { 
+                    { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).path)); }
+                },
+                1 => { 
+                    { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).runtime_dir)); }
+                },
+                2 => { 
+                    { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).db)); }
+                },
+                3 => { 
+                    { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).writer_file)); }
+                },
+                4 => { 
+                    { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).lock_file)); }
+                },
+                5 => { 
+                    { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).storage_compaction)); }
+                },
+                6 => { #[cfg(feature = "test-seams")]
+                    { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).handoff_prepare_io_fault)); }
+                },
+                7 => { 
+                    { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).writer_snapshots)); }
+                },
+                8 => { 
+                    { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).writer_schema)); }
+                },
+                9 => { 
+                    { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).cache_charge_bytes)); }
+                },
+                10 => { 
+                    { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).used_legacy_table_meta_layout)); }
+                },
+                11 => { 
+                    { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).paged_publications)); }
+                },
+                12 => { 
+                    { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).paged_root_capture)); }
+                },
+                13 => { 
+                    { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).scoped_vector_root_capture)); }
+                },
+                14 => { 
+                    { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).vector_repair_audit)); }
+                },
+                15 => { 
+                    { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).proof_accountant)); }
+                },
+                16 => { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).saved_export_recovery_cutoff)); },
+                17 => { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).saved_export_abandonment_error)); },
+                _ => unreachable!(),
+            }}
+            #[cfg(all(test, feature = "test-seams"))]
+            RETURNED_LOADER_PARTIAL_PANIC_FOR_TEST.with(|flag| {
+                if flag.get() == Some(step) { flag.set(None); panic!("CDB127 partial persistence cleanup unwind"); }
+            });
+        }
+    }
+}
+impl Drop for PersistenceConstruction {
+    fn drop(&mut self) {
+        // If one initialized child unwinds, this stack guard resumes at the
+        // next field. finish disarms each field before its destructor runs.
+        struct Resume<'a>(&'a mut PersistenceConstruction);
+        impl Drop for Resume<'_> { fn drop(&mut self) { self.0.finish(); } }
+        let resume = Resume(self);
+        resume.0.finish();
+    }
+}
 impl Drop for RedbPersistence {
     fn drop(&mut self) {
         self.close();
+        drop(self.runtime_dir.take());
+        // Automatic field drop frees every payload before the final proof slot.
     }
 }
 
@@ -38434,6 +41497,13 @@ pub(crate) fn arm_table_meta_rewrite_crash_for_test(boundary: u8) {
 
 #[cfg(any(test, feature = "test-seams"))]
 fn table_meta_rewrite_checkpoint_for_test(boundary: u8) {
+    crate::read_work_probe::note_graph(
+        "publication",
+        "checkpoint",
+        &[boundary],
+        None,
+        Some("table_meta_rewrite_checkpoint_for_test"),
+    );
     if TABLE_META_REWRITE_CRASH.with(|armed| armed.get()) == boundary {
         eprintln!("TABLE_META_REWRITE_CRASH={boundary}");
         std::process::abort();
@@ -38447,13 +41517,20 @@ pub(crate) fn arm_retention_reclaim_crash_for_test(boundary: u8) {
 
 #[cfg(any(test, feature = "test-seams"))]
 fn retention_reclaim_checkpoint_for_test(boundary: u8) {
+    crate::read_work_probe::note_graph(
+        "publication",
+        "checkpoint",
+        &[boundary],
+        None,
+        Some("retention_reclaim_checkpoint_for_test"),
+    );
     if RETENTION_RECLAIM_CRASH.with(|armed| armed.get() == boundary) {
         eprintln!("RETENTION_RECLAIM_CRASH={boundary}");
         std::process::abort();
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-seams"))]
 thread_local! {
     static CURRENCY_RECLAIM_FAULT: std::cell::Cell<(u8, bool)> = const {
         std::cell::Cell::new((0, false))
@@ -38481,15 +41558,25 @@ pub(crate) fn arm_stored_relational_row_bytes_fault_for_test() {
     STORED_ROW_BYTES_FAULT.with(|armed| armed.set(true));
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn arm_currency_reclaim_fault_for_test(boundary: u8, crash: bool) {
-    assert!((1..=3).contains(&boundary));
-    assert!(crash || boundary < 3, "returned errors must precede commit");
+    assert!((1..=34).contains(&boundary));
+    assert!(
+        crash || boundary != 3,
+        "legacy boundary 3 remains crash-only"
+    );
     CURRENCY_RECLAIM_FAULT.with(|armed| armed.set((boundary, crash)));
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-seams"))]
 fn currency_reclaim_checkpoint_for_test(boundary: u8) -> Result<()> {
+    crate::read_work_probe::note_graph(
+        "publication",
+        "checkpoint",
+        &[boundary],
+        None,
+        Some("currency_reclaim_checkpoint_for_test"),
+    );
     let crash = CURRENCY_RECLAIM_FAULT.with(|armed| {
         let (selected, crash) = armed.get();
         if selected != boundary {
@@ -38525,16 +41612,16 @@ mod empty_declared_index_readiness_tests {
     use contextdb_core::{Value, read_contract::ReadRoute};
     use std::collections::HashMap;
 
-    /// Open proves two history frontiers and checks the ordered startup digest
-    /// against its canonical content root. No row, vector or decode work.
+    /// Open authenticates fixed history root controls and the ordered startup
+    /// digest without loading history proof bodies, rows or vectors.
     fn assert_open_proves_bounded_history_and_startup_digest(
         open: ReadWorkCounters,
         case: &str,
         expected_hashed_bytes: u64,
     ) {
-        assert_eq!(open.proof_nodes_read, 2, "{case}: {open:?}");
-        assert_eq!(open.proof_nodes_hashed, 2, "{case}: {open:?}");
-        assert_eq!(open.ordered_proof_nodes_read, 2, "{case}: {open:?}");
+        assert_eq!(open.proof_nodes_read, 0, "{case}: {open:?}");
+        assert_eq!(open.proof_nodes_hashed, 0, "{case}: {open:?}");
+        assert_eq!(open.ordered_proof_nodes_read, 0, "{case}: {open:?}");
         assert_eq!(
             ReadWorkCounters {
                 hashed_bytes: 0,
@@ -38547,6 +41634,2446 @@ mod empty_declared_index_readiness_tests {
             "{case}"
         );
         assert_eq!(open.hashed_bytes, expected_hashed_bytes, "{case}: {open:?}");
+    }
+
+
+
+    // These consumers use the graph sidecar only; legacy default oracles stay exact.
+    // The closed observation receipt supplies complete returned-key coverage.
+    // Population events denote whole-table walks; fixed seeks/probes stay separate.
+    fn assert_graph_no_population_walk(scope: &ReadWorkObservationScope) {
+        let work = scope.graph_counters();
+        let events = scope.graph_events();
+        assert_eq!(work.graph_population_walks, 0, "open and addressed proof windows never walk a complete graph/history population");
+        assert_eq!(events.iter().filter(|event| event.operation == "population_walk").count(), 0, "actual complete-walk events must agree with the graph sidecar");
+    }
+
+    fn graph_retained_zero_touch_keys(before: &GraphPublicationState) -> Vec<(&'static str, Vec<u8>)> {
+        // Decode and derive fixture identities before entering Mutation.
+        let mut retained = Vec::new();
+        for (key, bytes) in &before.1[0] {
+            retained.push(("history", key.as_bytes().to_vec()));
+            let position = RedbPersistence::numeric_change_key(key).unwrap();
+            retained.push(("history", position.to_vec()));
+            let entry = RedbPersistence::decode_stored_change_log(bytes).unwrap().entry;
+            if let Some(selector) = RedbPersistence::log_table_selector(&entry, &position) {
+                retained.push(("change_log_by_table", selector));
+            }
+        }
+        for (key, _) in &before.0[2] {
+            if key.get(17) == Some(&1) { retained.push(("graph_deletion", key.clone())); }
+        }
+        for (key, _) in &before.0[3] { retained.push(("graph_location", key.clone())); }
+        retained
+    }
+
+    fn assert_graph_retained_zero_touch(scope: &ReadWorkObservationScope, retained: &[(&str, Vec<u8>)]) {
+        assert!(retained.iter().any(|(family, _)| *family == "history"));
+        assert!(retained.iter().any(|(family, _)| *family == "graph_location"));
+        assert!(retained.iter().any(|(family, _)| *family == "graph_deletion"));
+        let events = scope.graph_events();
+        assert!(events.iter().filter(|event| matches!(event.operation.as_str(), "get" | "insert" | "remove" | "iteration_step")).all(|event| !retained.iter().any(|(family, key)| event.family == *family && event.key == *key)), "pure predecessor retirement must never read, write or visit an exact retained history/T/deletion-C key");
+    }
+
+    fn assert_graph_context(scope: &ReadWorkObservationScope, phase: ReadWorkPhase) {
+        let events = scope.graph_events();
+        assert!(!events.is_empty(), "an absent observation cannot prove zero work");
+        assert!(events.iter().all(|event| event.phase == phase));
+        assert!(events.iter().all(|event| event.operation_id.as_deref() == Some("graph-observer-row")));
+        assert!(events.iter().any(|event| event.observation_status == "OBSERVED" && event.captured_root.is_some()));
+        assert!(events.iter().filter(|event| (event.family.starts_with("graph_") || matches!(event.family.as_str(), "commit_index" | "history")) && matches!(event.operation.as_str(), "get" | "remove" | "insert" | "maximum_seek")).all(|event| event.observation_status == "OBSERVED" && event.captured_root.is_some()));
+    }
+
+    fn assert_graph_open_work(scope: &ReadWorkObservationScope, expected_root: &str) -> crate::read_work_probe::GraphReadWorkCounters {
+        assert_graph_context(scope, ReadWorkPhase::Open);
+        assert_graph_no_population_walk(scope);
+        let work = scope.graph_counters();
+        assert_eq!(work.graph_payload_decodes, 0);
+        assert_eq!(work.graph_private_history_decodes, 0);
+        let events = scope.graph_events();
+        let roots = events.iter().filter(|event| event.operation == "root" && matches!(event.family.as_str(), "graph_fwd" | "graph_rev" | "graph_contribution" | "graph_location" | "graph_lifecycle")).collect::<Vec<_>>();
+        assert!(roots.iter().all(|event| event.captured_root.as_deref() == Some(expected_root)), "the descriptors belong to the actual captured source transaction");
+        assert_eq!(roots.len(), 5, "each logical validation acquires five graph-family descriptors");
+        assert_eq!(work.graph_root_reads, roots.len() as u64);
+        for family in ["graph_fwd", "graph_rev", "graph_contribution", "graph_location", "graph_lifecycle"] {
+            let descriptors = roots.iter().filter(|event| event.family == family).collect::<Vec<_>>();
+            assert_eq!(descriptors.len(), 1);
+            assert!(descriptors[0].acquired_root.as_ref().is_some_and(|root| !root.is_empty()));
+            assert_eq!(descriptors[0].captured_root, roots[0].captured_root);
+        }
+        work
+    }
+
+    fn assert_graph_addressed_work(scope: &ReadWorkObservationScope, bound: u64) -> crate::read_work_probe::GraphReadWorkCounters {
+        assert_graph_context(scope, ReadWorkPhase::Query);
+        assert_graph_no_population_walk(scope);
+        let work = scope.graph_counters();
+        assert!(work.graph_addressed_gets > 0);
+        assert!(work.graph_addressed_gets <= bound, "additional addressed proof work: {work:?}");
+        assert_eq!(work.graph_maximum_seeks, 1);
+        assert!(work.graph_commit_gets > 0);
+        let events = scope.graph_events();
+        assert_eq!(events.iter().filter(|event| event.operation == "maximum_seek").count() as u64, work.graph_maximum_seeks);
+        assert_eq!(events.iter().filter(|event| event.family == "commit_index" && event.operation == "get").count() as u64, work.graph_commit_gets);
+        assert!(events.iter().any(|event| event.family == "commit_index" && event.role.as_deref() == Some("requested_own") && event.queried_lsn.is_some()));
+        assert!(events.iter().any(|event| event.family == "commit_index" && event.role.as_deref() == Some("maximum_source") && event.queried_lsn.is_some()));
+        // Full-key iterator coverage is unfinished. No zero-population assertion.
+        // The pinned final receipt closes that historical gap; the shared assertion above now applies.
+        work
+    }
+
+    // The supplied history bytes are fetched before Query; full-history answers
+    // remain in the original helper after these isolated proof windows finish.
+    fn graph_addressed_observer_row(root: &graph_read::GraphReadRoot, predecessor: &AdjEntry, present: bool, physical: Lsn, ordinal: usize, expected: &ChangeLogEntry) -> Vec<crate::read_work_probe::GraphReadWorkCounters> {
+        use std::ops::Bound;
+        use writer_source::SourceWindowOwner;
+        let memory = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(16 * 1024 * 1024));
+        let mut result = Vec::new();
+        let expected_root = match root {
+            graph_read::GraphReadRoot::Writer(root) => format!("{:?}", root.storage_identity()),
+            graph_read::GraphReadRoot::Image(source) => format!("{:?}", source.storage_identity()),
+        };
+        if present {
+            for reverse in [false, true] {
+                let key = if reverse { RedbPersistence::graph_rev_key(predecessor) } else { RedbPersistence::graph_fwd_key(predecessor) };
+                let scope = ReadWorkObservationScope::enter(ReadWorkPhase::Query);
+                scope.set_operation_id("graph-observer-row");
+                // This direct observation starts after capture. Bind the actual
+                // pinned source before the cursor records its first range event.
+                match root {
+                    graph_read::GraphReadRoot::Writer(source) => crate::read_work_probe::bind_graph_root(source.storage_identity()),
+                    graph_read::GraphReadRoot::Image(source) => crate::read_work_probe::bind_graph_root(source.storage_identity()),
+                }
+                let mut cursor = root.cursor(reverse, Bound::Included(&key), Bound::Included(&key), memory.clone()).unwrap();
+                assert_eq!(cursor.next_edge().unwrap().unwrap().edge(), predecessor);
+                assert!(cursor.next_edge().unwrap().is_none());
+                result.push(assert_graph_addressed_work(&scope, 7));
+                assert!(scope.graph_events().iter().filter(|event| event.observation_status == "OBSERVED").all(|event| event.captured_root.as_deref() == Some(expected_root.as_str())));
+                assert!(scope.graph_counters().graph_payload_decodes > 0);
+                drop(cursor);
+                drop(scope);
+            }
+        }
+        let mut key = String::new();
+        RedbPersistence::write_change_log_entry_key(physical, ordinal, &mut key);
+        let bytes = match root {
+            graph_read::GraphReadRoot::Writer(root) => {
+                let read = root.owner_read().unwrap();
+                let table = read.open_table(CHANGE_LOG_TABLE).unwrap();
+                let value = table.get(key.as_str()).unwrap().unwrap();
+                value.value().to_vec()
+            }
+            graph_read::GraphReadRoot::Image(source) => source.with_read(|read| {
+                let table = read.open_table(CHANGE_LOG_TABLE).unwrap();
+                let value = table.get(key.as_str()).unwrap().unwrap();
+                Ok(value.value().to_vec())
+            }).unwrap(),
+        };
+        let scope = ReadWorkObservationScope::enter(ReadWorkPhase::Query);
+        scope.set_operation_id("graph-observer-row");
+        match root {
+            graph_read::GraphReadRoot::Writer(root) => root.verify_stored_graph_history_at_root(&key, &bytes, &SourceWindowOwner::Read(memory.clone())).unwrap(),
+            graph_read::GraphReadRoot::Image(source) => source.verify_stored_graph_history(&key, &bytes, memory).unwrap(),
+        }
+        let work = assert_graph_addressed_work(&scope, if present { 12 } else { 10 });
+        assert!(scope.graph_events().iter().filter(|event| event.observation_status == "OBSERVED").all(|event| event.captured_root.as_deref() == Some(expected_root.as_str())));
+        assert_eq!(work.graph_supplied_primary_reads, 1);
+        assert!(work.graph_private_history_decodes > 0);
+        let events = scope.graph_events();
+        assert!(events.iter().filter(|event| event.family == "commit_index").all(|event| event.queried_lsn != Some(physical.0)), "physical storage coordinates never invent public commits");
+        assert!(events.iter().any(|event| event.family == "commit_index" && event.queried_lsn == Some(expected.lsn().0) && event.role.as_deref() == Some("requested_own")));
+        result.push(work);
+        result
+    }
+
+    fn graph_retirement_observer(before: &GraphPublicationState) -> ReadWorkObservationScope {
+        // Decode fixture bytes and derive every exact storage key before Mutation.
+        let mut retained = Vec::new();
+        for (key, bytes) in &before.1[0] {
+            retained.push(("history", key.as_bytes().to_vec()));
+            let position = RedbPersistence::numeric_change_key(key).unwrap();
+            retained.push(("history", position.to_vec()));
+            let entry = RedbPersistence::decode_stored_change_log(bytes).unwrap().entry;
+            if let Some(selector) = RedbPersistence::log_table_selector(&entry, &position) {
+                retained.push(("change_log_by_table", selector));
+            }
+        }
+        for (key, _) in &before.0[2] {
+            retained.push((if key.get(17) == Some(&1) { "graph_deletion" } else { "graph_creation" }, key.clone()));
+        }
+        for (key, _) in &before.0[3] { retained.push(("graph_location", key.clone())); }
+        let scope = ReadWorkObservationScope::enter(ReadWorkPhase::Mutation);
+        scope.set_operation_id("graph-observer-row");
+        for (family, key) in retained { scope.retain_graph_key(family, &key); }
+        scope
+    }
+
+    fn assert_graph_retirement_work(scope: &ReadWorkObservationScope, predecessor: &AdjEntry, repack: bool) -> [u64; 4] {
+        assert_graph_context(scope, ReadWorkPhase::Mutation);
+        let work = scope.graph_counters();
+        let events = scope.graph_events();
+        let p = RedbPersistence::graph_fwd_key(predecessor);
+        let reverse = RedbPersistence::graph_rev_key(predecessor);
+        let creation = graph_history_record::creation_contribution_key(&p).unwrap();
+        let lifecycle = graph_history_record::lifecycle_key(&p).unwrap();
+        for (family, operation, key) in [("graph_fwd", "remove", &p), ("graph_rev", "remove", &reverse), ("graph_creation", "remove", &creation)] {
+            assert_eq!(events.iter().filter(|event| event.family == family && event.operation == operation && event.key == *key).count(), 1, "exact selected-key attempted operation");
+            assert_eq!(events.iter().filter(|event| event.family == family && event.operation == operation).count(), 1, "no additional same-family removals or receipt rewrites");
+        }
+        let rewrites = events.iter().filter(|event| event.family == "graph_lifecycle" && event.operation == "insert").collect::<Vec<_>>();
+        assert!(rewrites.iter().all(|event| event.key == lifecycle));
+        if repack { assert!(!rewrites.is_empty(), "repack reinstalls witnesses before final retirement"); } else { assert_eq!(rewrites.len(), 1, "retirement alone rewrites one lifecycle receipt"); }
+        assert_eq!(work.graph_publication_commits, 1);
+        assert_eq!(events.iter().filter(|event| event.family == "publication" && event.operation == "committed").count(), 1);
+        assert_eq!(events.iter().filter(|event| event.family == "publication" && event.operation == "aborted").count(), 0);
+        assert!(events.iter().any(|event| event.family == "publication" && event.operation == "begin" && event.captured_root.is_some()));
+        // Retained keys are registered, but zero-touch counters are NOT asserted
+        // until the source receipt pins complete per-key iterator coverage.
+        // Historical gap above is closed by the pinned final source receipt.
+        if !repack {
+            assert_eq!(work.graph_survivor_history_touches, 0, "pure retirement never touches retained history keys");
+            assert_eq!(work.graph_survivor_location_touches, 0, "pure retirement never touches retained T keys");
+            assert_eq!(work.graph_survivor_deletion_contribution_touches, 0, "pure retirement never touches retained deletion C keys");
+        }
+        [work.graph_forward_mutations, work.graph_reverse_mutations, work.graph_creation_contribution_mutations, work.graph_lifecycle_mutations]
+    }
+
+    // Samples the existing worker kernel before its first graph source cursor
+    // is opened. Keep capture receipts and worker installations as they were
+    // at this boundary, before the actual query is allowed to load edges.
+    #[cfg(feature = "test-seams")]
+    #[derive(Default)]
+    struct OwnerGraphSnapshotBoundaryObserver {
+        scope: std::sync::Mutex<Option<Arc<ReadWorkObservationScope>>>,
+        snapshots: std::sync::Mutex<Vec<SnapshotId>>,
+        first_edge: std::sync::Mutex<Option<crate::read_work_probe::GraphReadWorkCounters>>,
+        capture_events: std::sync::Mutex<Vec<crate::read_work_probe::GraphWorkEvent>>,
+        capture_workers: std::sync::Mutex<Vec<crate::read_work_probe::GraphWorkerInstallation>>,
+        capture_pages: std::sync::Mutex<Option<(u64, u64)>>,
+        capture_page_owners: std::sync::Mutex<Option<std::collections::BTreeMap<String, (u64, u64)>>>,
+        first_source: std::sync::Mutex<Option<crate::read_session::ReadKernelSourceEvent>>,
+    }
+
+    #[cfg(feature = "test-seams")]
+    impl crate::read_session::ReadKernelTestObserver for OwnerGraphSnapshotBoundaryObserver {
+        fn registered_snapshot_for_test(&self, route: ReadRoute, operation: crate::read_session::ReadSessionOperation, snapshot: SnapshotId) {
+            if self.scope.lock().unwrap().is_some() {
+                assert_eq!(route, ReadRoute::Owner);
+                assert_eq!(operation, crate::read_session::ReadSessionOperation::Execute);
+                self.snapshots.lock().unwrap().push(snapshot);
+            }
+        }
+        fn before_source_touch(&self, event: crate::read_session::ReadKernelSourceEvent, _: contextdb_core::read_contract::OwnerReadCancellation) {
+            if event.source != crate::read_session::ReadKernelSource::GraphEdge { return; }
+            let installed = self.scope.lock().unwrap();
+            let Some(scope) = installed.as_ref() else { return; };
+            let mut first = self.first_edge.lock().unwrap();
+            if first.is_none() {
+                assert_eq!(event.route, ReadRoute::Owner);
+                assert_eq!(event.operation, crate::read_session::ReadSessionOperation::Execute);
+                assert_eq!(scope.phase(), ReadWorkPhase::Query);
+                assert_eq!(self.snapshots.lock().unwrap().len(), 1, "the statement has registered its real snapshot before graph capture reaches its first source touch");
+                *self.first_source.lock().unwrap() = Some(event);
+                let page_owners = scope.owner_page_admission_by_owner().expect("the executing query must expose its actual per-capability admission map");
+                let capture = scope.graph_events().into_iter().find(|event| event.family == "graph_snapshot" && event.operation == "SNAPSHOT_CAPTURE").expect("the first edge callback follows the real graph capture");
+                let capture_owner = capture.funding_owner.as_deref().expect("the actual capture names its funding capability");
+                let named_pages = page_owners.get(capture_owner).expect("the cold first graph capture must admit pages on its named capability before opening the edge cursor");
+                assert!(named_pages.0 > 0, "the first GraphEdge callback must already observe a page admitted on its named query owner");
+                assert!(named_pages.1 > 0, "nonzero bytes on the named query owner prove its actual page callback ran before the edge cursor");
+                *self.capture_page_owners.lock().unwrap() = Some(page_owners);
+                *first = Some(scope.owner_graph_counters().expect("the executing graph worker must install the owner binding"));
+                *self.capture_events.lock().unwrap() = scope.graph_events();
+                *self.capture_workers.lock().unwrap() = scope.owner_worker_paths();
+                *self.capture_pages.lock().unwrap() = Some(scope.owner_page_admission().expect("the installed graph worker must expose its actual page admissions"));
+            }
+        }
+        fn cancellation_observed(&self, _: crate::read_session::ReadKernelCancellationEvent, _: contextdb_core::read_contract::OwnerReadCancellation) {}
+    }
+
+    #[cfg(feature = "test-seams")]
+    fn assert_public_owner_open_through_graph_capture_row(directory: &Path) {
+        let path = directory.join("graph-open-capture-owner.db");
+        let observer = Arc::new(OwnerGraphSnapshotBoundaryObserver::default());
+        // This block owns every handle used to author the fixture. No source,
+        // graph reader, transaction, or writing Database survives its end.
+        let (owner_reads, declared_reader_limit) = {
+            let database = Database::open_with_options(&path, crate::DatabaseOpenOptions {
+                maintenance_policy: crate::database::MaintenancePolicy::CallerDriven,
+                test_kernel_observer: Some(observer.clone()),
+                ..Default::default()
+            }).unwrap();
+            database.execute("CREATE TABLE nodes (id UUID PRIMARY KEY) SYNC OFF", &HashMap::new()).unwrap();
+            database.execute("CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT) SYNC OFF", &HashMap::new()).unwrap();
+            for id in [1, 2] {
+                database.execute("INSERT INTO nodes VALUES ($id)", &HashMap::from([("id".into(), Value::Uuid(uuid::Uuid::from_u128(id)))])).unwrap();
+            }
+            let tx = database.begin_or_panic();
+            database.insert_edge(tx, uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2), "LINKS".into(), HashMap::new()).unwrap();
+            database.commit(tx).unwrap();
+            // Preserve the exact reader declaration used to write this fixture.
+            let owner_reads = database.owner_read_config().clone();
+            let declared_reader_limit = owner_reads.limits.limits.memory;
+            let written_edges = database.execute("SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) WHERE a.id = $source COLUMNS (b.id AS t))", &HashMap::from([("source".into(), Value::Uuid(uuid::Uuid::from_u128(1)))])).unwrap();
+            assert_eq!(written_edges.rows, vec![vec![Value::Uuid(uuid::Uuid::from_u128(2))]], "the store has the authored edge before every writing handle is dropped");
+            database.close().unwrap();
+            drop(database);
+            (owner_reads, declared_reader_limit)
+        };
+        assert!(path.is_file(), "reopen the already-written task store, never an empty replacement");
+        let database = Database::open_with_options(&path, crate::DatabaseOpenOptions {
+            owner_reads,
+            maintenance_policy: crate::database::MaintenancePolicy::CallerDriven,
+            test_kernel_observer: Some(observer.clone()),
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(database.owner_read_config().limits.limits.memory, declared_reader_limit, "reopen preserves the fixture's existing declared reader limit");
+        // Tuple fields are read hits, read misses, evictions, resident bytes.
+        let reopened_cache_bytes = database.__writer_cache_stats_for_test().unwrap().3;
+        // The live writer read transaction pins one native root page and its control.
+        assert!(reopened_cache_bytes <= 4096 + 112, "the reopened writer retains at most one native root page plus its control before public owner open: {reopened_cache_bytes}");
+        let owner_reads = database.owner_read_config().clone();
+        database.close().unwrap();
+        drop(database);
+        // Double the committed node population, then release every writing handle.
+        let growing = Database::open_with_options(&path, crate::DatabaseOpenOptions {
+            owner_reads: owner_reads.clone(),
+            maintenance_policy: crate::database::MaintenancePolicy::CallerDriven,
+            test_kernel_observer: Some(observer.clone()),
+            ..Default::default()
+        }).unwrap();
+        for id in [3, 4] {
+            growing.execute("INSERT INTO nodes VALUES ($id)", &HashMap::from([("id".into(), Value::Uuid(uuid::Uuid::from_u128(id)))])).unwrap();
+        }
+        growing.close().unwrap();
+        drop(growing);
+        let database = Database::open_with_options(&path, crate::DatabaseOpenOptions {
+            owner_reads,
+            maintenance_policy: crate::database::MaintenancePolicy::CallerDriven,
+            test_kernel_observer: Some(observer.clone()),
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(database.__writer_cache_stats_for_test().unwrap().3, reopened_cache_bytes, "the pinned writer root cache is identical after reopening two-node and four-node stores");
+        let scope = Arc::new(ReadWorkObservationScope::enter(ReadWorkPhase::Open));
+        let binding = scope.bind_owner(&database, "owner-open-graph-capture-row");
+        *observer.scope.lock().unwrap() = Some(scope.clone());
+        let session = ReadSession::open_owner_only(&path, ReadSessionOptions::default()).unwrap();
+        assert_eq!(session.route(), ReadRoute::Owner);
+        let opened = scope.owner_graph_counters().expect("public owner open must reach an installed executing worker");
+        assert_eq!(opened.graph_payload_decodes, 0);
+        assert_eq!(opened.graph_private_history_decodes, 0);
+        assert_eq!(opened.graph_range_reads, 0);
+        assert_eq!(opened.graph_iteration_steps, 0);
+        assert!(opened.graph_root_reads <= 5);
+        assert_eq!(opened.graph_population_walks, 0);
+        assert_eq!(opened.graph_snapshots_constructed, 0);
+        assert_eq!(scope.owner_page_admission().expect("handshake and status workers must be observed"), (0, 0), "handshake and status paths admit no storage pages");
+        assert!(scope.owner_page_admission_by_owner().expect("installed open workers expose an actual empty admission map").is_empty());
+        let open_workers = scope.owner_worker_paths();
+        let handshake = open_workers.iter().find(|worker| worker.path == "handshake").expect("owner-only open must observe the authenticated handshake separately");
+        let status = open_workers.iter().find(|worker| worker.path == "status").expect("owner-only open must observe its status request separately");
+        assert!(!handshake.worker_request_id.is_empty());
+        assert!(!status.worker_request_id.is_empty());
+        assert_ne!(handshake.worker_request_id, status.worker_request_id);
+        assert!(!open_workers.iter().any(|worker| worker.path == "query"), "the first graph query has not run at public open completion");
+        let (connection, handshake_ordinal) = handshake.worker_request_id.rsplit_once(':').expect("the actual handshake identity includes its connection and ordinal");
+        assert_eq!(handshake_ordinal, "0");
+        assert_eq!(status.worker_request_id.rsplit_once(':').expect("the actual status identity includes its connection and ordinal").0, connection);
+        // Handshake/status have completed without adding cache warmth;
+        // the first graph query retains the accepted fresh-writer pinned root.
+        let cache_before_query = database.__writer_cache_stats_for_test().unwrap();
+        assert_eq!(cache_before_query.3, reopened_cache_bytes, "public owner open adds no cache warmth: resident bytes equal the accepted fresh-writer baseline, with the pinned root preserved");
+        *observer.scope.lock().unwrap() = None;
+        drop(binding);
+        drop(scope);
+        let scope = Arc::new(ReadWorkObservationScope::enter(ReadWorkPhase::Query));
+        let binding = scope.bind_owner(&database, "owner-open-graph-capture-row");
+        *observer.scope.lock().unwrap() = Some(scope.clone());
+        assert!(scope.owner_graph_counters().is_none(), "a caller query scope alone is UNOBSERVED until its worker installs");
+        // The first real query samples inside the executing kernel before its
+        // edge cursor opens, then continues to the actual target as its control.
+        let actual_edges = session.execute("SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) WHERE a.id = $source COLUMNS (b.id AS t))", &HashMap::from([("source".into(), Value::Uuid(uuid::Uuid::from_u128(1)))])).unwrap();
+        let captured = observer.first_edge.lock().unwrap().expect("the first real graph query must reach the source callback after graph capture");
+        assert_eq!(captured.graph_payload_decodes, 0, "open plus first graph capture has not decoded any edge");
+        assert_eq!(captured.graph_private_history_decodes, 0);
+        assert_eq!(captured.graph_range_reads, 0, "the graph source cursor has not loaded an edge window");
+        assert_eq!(captured.graph_iteration_steps, 0);
+        assert_eq!(captured.graph_population_walks, 0);
+        assert!(captured.graph_root_reads <= 5);
+        assert_eq!(captured.graph_snapshots_constructed, 1, "the first real query captured one graph storage root");
+        assert_eq!(captured.graph_descriptors_at_last_capture, captured.graph_root_reads);
+        let capture_events = observer.capture_events.lock().unwrap();
+        let captures = capture_events.iter().filter(|event| event.family == "graph_snapshot" && event.operation == "SNAPSHOT_CAPTURE").collect::<Vec<_>>();
+        assert_eq!(captures.len(), 1, "a counter alone cannot certify storage-root capture");
+        let capture = captures[0];
+        let capture_root = capture.captured_root.as_deref().expect("storage identity must be published at graph snapshot construction");
+        assert!(!capture_root.is_empty());
+        assert_eq!(capture.observation_status, "OBSERVED");
+        assert_eq!(capture.phase, ReadWorkPhase::Query);
+        assert_eq!(capture.operation_id.as_deref(), Some("owner-open-graph-capture-row"));
+        let capture_workers = observer.capture_workers.lock().unwrap();
+        let query = capture_workers.iter().find(|worker| worker.path == "query").expect("the executing first graph query must have a separate installation receipt");
+        assert!(!query.worker_request_id.is_empty());
+        assert_eq!(capture.worker_request_id.as_deref(), Some(query.worker_request_id.as_str()));
+        assert_ne!(query.worker_request_id, handshake.worker_request_id);
+        assert_ne!(query.worker_request_id, status.worker_request_id);
+        assert_eq!(query.worker_request_id.rsplit_once(':').expect("the actual query identity includes its connection and ordinal").0, connection);
+        assert!(!capture_workers.iter().any(|worker| matches!(worker.path.as_str(), "handshake" | "status")), "open workers belong to the separate completed open scope");
+        assert!(!capture_events.iter().any(|event| matches!(event.operation.as_str(), "payload_decode" | "private_history_decode" | "range" | "iteration_step" | "population_walk")), "edge loading cannot precede the first source cursor opening");
+        let source = observer.first_source.lock().unwrap().expect("sample the actual first GraphEdge callback");
+        assert_eq!(source.completed_items, 0, "the first callback precedes the first edge cursor");
+        let source_owner = source.funding_owner.expect("the executing query must name its actual funding capability");
+        assert_ne!(source_owner, 0);
+        let capture_owner = capture.funding_owner.as_deref().expect("adapter construction must name its actual funding capability");
+        let (_, capture_address) = capture_owner.rsplit_once('@').expect("the source observer names a capability type and Arc address");
+        let capture_identity = usize::from_str_radix(capture_address.strip_prefix("0x").expect("Arc addresses are hexadecimal"), 16).unwrap();
+        assert_eq!(capture_identity, source_owner, "adapter and query source use the same actual capability, independent of the caller operation label");
+        let control_bytes = capture.control_reservation_bytes.expect("snapshot capture records the exact retained adapter-control credit");
+        assert!(control_bytes > 0);
+        assert!(control_bytes as u64 <= declared_reader_limit);
+        let request_bytes = source.control_reservation_bytes.expect("the source callback records current query request-reservation bytes");
+        assert!(request_bytes > 0);
+        assert!(request_bytes as u64 <= declared_reader_limit);
+        // Adapter-control bytes and request bytes are different actual credits.
+        // Successful page totals are cumulative admissions, not live credits.
+        let capture_pages = observer.capture_pages.lock().unwrap().expect("the first graph callback must sample the executing worker's page accessor");
+        assert_eq!(capture_pages, (captured.worker_admitted_pages, captured.worker_admitted_page_bytes));
+        assert!(capture_pages.1 <= declared_reader_limit);
+        let capture_page_owners = observer.capture_page_owners.lock().unwrap();
+        let capture_page_owners = capture_page_owners.as_ref().expect("sample the real per-capability page map at the boundary");
+        assert_eq!(capture_page_owners.values().fold((0, 0), |sum, pages| (sum.0 + pages.0, sum.1 + pages.1)), capture_pages);
+        assert!(capture_page_owners.keys().all(|owner| owner == capture_owner), "every pre-edge page admission is funded by the captured query capability");
+        assert_eq!(capture_pages.0 == 0, capture_pages.1 == 0);
+        // The observer has already required nonzero admission on this exact
+        // named owner inside the first callback, before any edge cursor opens.
+        let cache_after_query = database.__writer_cache_stats_for_test().unwrap();
+        assert!(cache_after_query.0 >= cache_before_query.0);
+        assert!(cache_after_query.1 >= cache_before_query.1);
+        assert_eq!(actual_edges.rows, vec![vec![Value::Uuid(uuid::Uuid::from_u128(2))]]);
+        let loaded = scope.owner_graph_counters().expect("the actual edge read remains observed on its worker");
+        assert!(loaded.graph_payload_decodes > captured.graph_payload_decodes);
+        let events = scope.graph_events();
+        assert!(!events.is_empty(), "the actual edge control must emit graph events");
+        assert!(events.iter().all(|event| event.phase == ReadWorkPhase::Query));
+        assert!(events.iter().all(|event| event.operation_id.as_deref() == Some("owner-open-graph-capture-row")));
+        assert!(events.iter().all(|event| event.worker_request_id.as_ref().is_some_and(|id| !id.is_empty())));
+        assert!(events.iter().any(|event| event.captured_root.is_some() && event.observation_status == "OBSERVED"));
+        let loaded_root = events.iter().find(|event| event.family == "graph_snapshot" && event.operation == "ROOT_BOUND").expect("the actual edge control must bind its source root");
+        assert_eq!(loaded_root.captured_root.as_deref().expect("edge loading must observe its actual root"), capture_root);
+        assert_eq!(loaded_root.worker_request_id.as_deref(), Some(query.worker_request_id.as_str()));
+        let loaded_pages = scope.owner_page_admission().expect("actual edge loading must preserve the executing page observer");
+        assert_eq!(loaded_pages, (loaded.worker_admitted_pages, loaded.worker_admitted_page_bytes));
+        assert!(loaded_pages.0 >= capture_pages.0);
+        assert!(loaded_pages.1 >= capture_pages.1);
+        assert!(loaded_pages.1 <= declared_reader_limit);
+        assert_eq!(loaded_pages.0 == 0, loaded_pages.1 == 0);
+        let loaded_page_owners = scope.owner_page_admission_by_owner().expect("the edge control remains observed per actual capability");
+        assert_eq!(loaded_page_owners.values().fold((0, 0), |sum, pages| (sum.0 + pages.0, sum.1 + pages.1)), loaded_pages);
+        assert!(loaded_page_owners.keys().all(|owner| owner == capture_owner));
+        for (owner, pages) in capture_page_owners {
+            let loaded = loaded_page_owners.get(owner).expect("successful admission totals retain the same capability identity");
+            assert!(loaded.0 >= pages.0 && loaded.1 >= pages.1);
+        }
+        drop(capture_workers);
+        drop(capture_events);
+        *observer.scope.lock().unwrap() = None;
+        drop(binding);
+        drop(scope);
+        drop(session);
+        database.close().unwrap();
+    }
+
+    fn assert_public_owner_graph_observer_row(directory: &Path) {
+        let path = directory.join("graph-observed-owner.db");
+        let database = Database::open_with_options(&path, crate::DatabaseOpenOptions { maintenance_policy: crate::database::MaintenancePolicy::CallerDriven, ..Default::default() }).unwrap();
+        database.execute("CREATE TABLE nodes (id UUID PRIMARY KEY) SYNC OFF", &HashMap::new()).unwrap();
+        database.execute("CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT) SYNC OFF", &HashMap::new()).unwrap();
+        for id in [1, 2] {
+            database.execute("INSERT INTO nodes VALUES ($id)", &HashMap::from([("id".into(), Value::Uuid(uuid::Uuid::from_u128(id)))])).unwrap();
+        }
+        let tx = database.begin_or_panic();
+        database.insert_edge(tx, uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2), "LINKS".into(), HashMap::new()).unwrap();
+        database.commit(tx).unwrap();
+        let session = ReadSession::open_owner_only(&path, ReadSessionOptions::default()).unwrap();
+        assert_eq!(session.route(), ReadRoute::Owner);
+        let scope = ReadWorkObservationScope::enter(ReadWorkPhase::Query);
+        let binding = scope.bind_owner(&database, "graph-observer-row");
+        let result = session.execute("SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) WHERE a.id = $source COLUMNS (b.id AS t))", &HashMap::from([("source".into(), Value::Uuid(uuid::Uuid::from_u128(1)))])).unwrap();
+        assert_eq!(result.rows, vec![vec![Value::Uuid(uuid::Uuid::from_u128(2))]]);
+        let observed = scope.owner_graph_counters().expect("executing owner worker must install the scope");
+        assert!(observed.graph_addressed_gets > 0);
+        assert!(observed.graph_payload_decodes > 0);
+        assert_graph_context(&scope, ReadWorkPhase::Query);
+        assert_graph_no_population_walk(&scope);
+        assert!(scope.graph_events().iter().all(|event| event.worker_request_id.as_ref().is_some_and(|id| !id.is_empty())));
+        drop(binding);
+        drop(scope);
+        drop(session);
+        database.close().unwrap();
+    }
+
+    // A real body and exact physical version join history repack and graph
+    // retirement through the existing scoped maintenance door.
+    fn graph_retention_row() -> (TableMeta, VersionedRow) {
+        let meta = TableMeta {
+            columns: vec![contextdb_core::ColumnDef {
+                name: "body".into(),
+                column_type: ColumnType::Text,
+                nullable: false,
+                primary_key: false,
+                unique: false,
+                default: None,
+                references: None,
+                expires: false,
+                immutable: false,
+                quantization: VectorQuantization::F32,
+                rank_policy: None,
+                context_id: false,
+                scope_label: None,
+                acl_ref: None,
+                partition_key_columns: None,
+                max_partitions: None,
+                search_mode: contextdb_core::VectorSearchMode::Exact,
+                auto_index_at: None,
+                hnsw_m: None,
+                hnsw_ef_construction: None,
+                hnsw_ef_search: None,
+                vector_policy_revision: 0,
+                consolidation_change_percent: None,
+                consolidation_tombstone_percent: None,
+                consolidation_disabled: false,
+            }],
+            ..TableMeta::default()
+        };
+        let row = VersionedRow {
+            row_id: RowId(1),
+            values: HashMap::from([("body".into(), Value::Text("selected physical retention payload".into()))]),
+            created_tx: TxId(100),
+            deleted_tx: None,
+            lsn: Lsn(20),
+            created_at: None,
+        };
+        (meta, row)
+    }
+
+    fn assert_graph_retention_row_source(root: &graph_read::GraphReadRoot, present: bool) {
+        let (meta, expected) = graph_retention_row();
+        let row = match root {
+            graph_read::GraphReadRoot::Writer(root) => {
+                let memory = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(16 * 1024 * 1024));
+                let key: [u8; 24] = RedbPersistence::rel_row_key(&expected).try_into().unwrap();
+                let mut cursor = root.exact_row(writer_source::SourceWindowOwner::Read(memory), "removed_rows", &key).unwrap();
+                let row = cursor.next_row().unwrap().map(|window| window.value.clone());
+                assert!(cursor.next_row().unwrap().is_none());
+                row
+            }
+            graph_read::GraphReadRoot::Image(source) => source.relational_row_by_id_lsn("removed_rows", &meta, expected.row_id, expected.lsn).unwrap(),
+        };
+        assert_eq!(row, present.then_some(expected), "row payload presence follows this captured root, including pinned old roots");
+    }
+
+    // Coordinates are fixture inputs, not reconstructed from an engine
+    // population. Each physical group holds one survivor with its own public J.
+    type GraphHistoryCoordinate = (Lsn, usize, ChangeLogEntry);
+    fn graph_distinct_history_fixture(path: &Path, versions: usize, references: usize) -> (RedbPersistence, AdjEntry, Vec<GraphHistoryCoordinate>) {
+        let (store, predecessor, entries) = graph_history_fixture(path, versions, 1, false);
+        let mut coordinates = vec![(Lsn(30), 0, entries[0].clone())];
+        let commits = (1..references).map(|offset| (Lsn(20 + offset as u64), TxId(100))).collect::<BTreeMap<_, _>>();
+        store.flush_commit_index_entries(&commits).unwrap();
+        for offset in 1..references {
+            let public_lsn = Lsn(20 + offset as u64);
+            let physical_lsn = Lsn(30 + offset as u64 * 10);
+            let entry = ChangeLogEntry::EdgeDelete {
+                source: predecessor.source,
+                target: predecessor.target,
+                edge_type: predecessor.edge_type.clone(),
+                lsn: public_lsn,
+            };
+            store.append_change_log(physical_lsn, std::slice::from_ref(&entry)).unwrap();
+            coordinates.push((physical_lsn, 0, entry));
+        }
+        (store, predecessor, coordinates)
+    }
+
+    fn assert_graph_coordinate_witnesses(store: &RedbPersistence, predecessor: &AdjEntry, coordinates: &[GraphHistoryCoordinate], private_bytes: &[Vec<u8>], retired: bool) {
+        use graph_history_record::*;
+        assert_eq!(coordinates.len(), private_bytes.len());
+        store.with_db(|db| {
+            let read = db.begin_read().map_err(RedbPersistence::storage_error)?;
+            let history = read.open_table(CHANGE_LOG_TABLE).unwrap();
+            let contributions = read.open_table(GRAPH_CONTRIBUTIONS).unwrap();
+            let locations = read.open_table(GRAPH_OCCURRENCE_LOCATIONS).unwrap();
+            let receipts = read.open_table(GRAPH_PREDECESSOR_LIFECYCLE).unwrap();
+            let commits = read.open_table(COMMIT_INDEX_TABLE).unwrap();
+            let p = RedbPersistence::graph_fwd_key(predecessor);
+            let rk = lifecycle_key(&p)?;
+            let receipt = receipts.get(rk.as_slice()).unwrap().unwrap();
+            let mut expected_r = vec![1];
+            expected_r.extend_from_slice(&100u64.to_be_bytes());
+            expected_r.extend_from_slice(&(coordinates.len() as u64).to_be_bytes());
+            expected_r.push(u8::from(retired));
+            assert_eq!(receipt.value(), expected_r.as_slice());
+            for ((physical, ordinal, entry), expected) in coordinates.iter().zip(private_bytes) {
+                let mut key = String::new();
+                RedbPersistence::write_change_log_entry_key(*physical, *ordinal, &mut key);
+                let value = history.get(key.as_str()).unwrap().unwrap();
+                assert_eq!(value.value(), expected.as_slice(), "retained distinct-address private bytes remain exact");
+                let record = RedbPersistence::decode_stored_change_log(value.value())?;
+                assert_eq!(record.tag, 2);
+                assert_eq!(&record.entry, entry);
+                let witness = record.witness.unwrap();
+                assert_eq!(witness.predecessor, p);
+                assert_eq!(witness.deletion_tx, TxId(100));
+                let location_key = location_key(witness.id);
+                let location = locations.get(location_key.as_slice()).unwrap().unwrap();
+                let mut expected_t = vec![1];
+                expected_t.extend_from_slice(&physical.0.to_be_bytes());
+                expected_t.extend_from_slice(&(*ordinal as u64).to_be_bytes());
+                assert_eq!(location.value(), expected_t.as_slice());
+                let c_key = deletion_contribution_key(*physical, &witness);
+                let contribution = contributions.get(c_key.as_slice()).unwrap().unwrap();
+                let mut expected_c = vec![1];
+                expected_c.extend_from_slice(&contribution_digest(false, &witness.id.to_be_bytes(), expected)?);
+                assert_eq!(contribution.value(), expected_c.as_slice());
+                assert_eq!(commits.get(entry.lsn().0).unwrap().unwrap().value(), 100);
+                assert!(commits.get(physical.0).unwrap().is_none(), "a distinct physical history coordinate does not invent a commit");
+            }
+            let fwd = read.open_table(GRAPH_FWD_TABLE).unwrap();
+            let rev = read.open_table(GRAPH_REV_TABLE).unwrap();
+            let reverse = RedbPersistence::graph_rev_key(predecessor);
+            assert_eq!(fwd.get(p.as_slice()).unwrap().is_none(), retired);
+            assert_eq!(rev.get(reverse.as_slice()).unwrap().is_none(), retired);
+            let creation = creation_contribution_key(&p)?;
+            assert_eq!(contributions.get(creation.as_slice()).unwrap().is_none(), retired);
+            Ok(())
+        }).unwrap();
+    }
+
+    fn assert_graph_coordinate_source_answers(root: graph_read::GraphReadRoot, predecessor: &AdjEntry, expected_edge: bool, coordinates: &[GraphHistoryCoordinate]) {
+        use std::ops::Bound;
+        use writer_source::SourceWindowOwner;
+        let memory = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(16 * 1024 * 1024));
+        for reverse in [false, true] {
+            let key = if reverse { RedbPersistence::graph_rev_key(predecessor) } else { RedbPersistence::graph_fwd_key(predecessor) };
+            let mut cursor = root.cursor(reverse, Bound::Included(&key), Bound::Included(&key), memory.clone()).unwrap();
+            let window = cursor.next_edge().unwrap();
+            assert_eq!(window.is_some(), expected_edge);
+            if let Some(window) = window { assert_eq!(window.edge(), predecessor); }
+            assert!(cursor.next_edge().unwrap().is_none());
+        }
+        let mut changes = Vec::new();
+        match root {
+            graph_read::GraphReadRoot::Writer(root) => {
+                for (physical, ordinal, expected) in coordinates {
+                    let mut position = [0u8; 16];
+                    position[..8].copy_from_slice(&physical.0.to_be_bytes());
+                    position[8..].copy_from_slice(&(*ordinal as u64).to_be_bytes());
+                    let mut cursor = root.cursor(SourceWindowOwner::Read(memory.clone()), writer_history::WRITER_CHANGE_LOG_TABLE.name(), writer_source::WriterCursorFamily::Bytes, Bound::Included(&position), Bound::Included(&position), false).unwrap();
+                    assert_eq!(cursor.next_change().unwrap().unwrap().value, *expected);
+                    assert!(cursor.next_change().unwrap().is_none());
+                }
+                let mut cursor = root.change_log_cursor(SourceWindowOwner::Read(memory), coordinates.first().unwrap().0, coordinates.last().unwrap().0).unwrap();
+                while let Some(window) = cursor.next_change().unwrap() { changes.push(window.value.clone()); }
+            }
+            graph_read::GraphReadRoot::Image(source) => {
+                for (physical, ordinal, expected) in coordinates {
+                    let mut key = String::new();
+                    RedbPersistence::write_change_log_entry_key(*physical, *ordinal, &mut key);
+                    source.with_read(|read| {
+                        let history = read.open_table(CHANGE_LOG_TABLE).unwrap();
+                        let value = history.get(key.as_str()).unwrap().unwrap();
+                        source.verify_stored_graph_history_in_read(read, key.as_str(), value.value(), memory.clone())?;
+                        assert_eq!(RedbPersistence::decode_stored_change_log(value.value())?.entry, *expected);
+                        Ok(())
+                    }).unwrap();
+                }
+                source.visit_changes_since(Lsn(19), memory, &|| Ok(()), &mut |entry| { changes.push(entry); Ok(()) }).unwrap();
+            }
+        }
+        assert_eq!(changes, coordinates.iter().map(|(_, _, entry)| entry.clone()).collect::<Vec<_>>());
+    }
+
+    fn assert_graph_distinct_maintenance_rows(directory: &Path) {
+        let mut mutation_control = None;
+        let mut query_controls = HashMap::new();
+        // The cross product varies fanout independently from unrelated graph
+        // population. Repeated A=30/J=20 rows remain in the original helper.
+        for references in [1, 4, 8] {
+            for versions in [4, 8, 16] {
+                let path = directory.join(format!("graph-distinct-retirement-{references}-{versions}.db"));
+                let (store, predecessor, coordinates) = graph_distinct_history_fixture(&path, versions, references);
+                let before = graph_publication_state(&store);
+                let private_bytes = before.1[0].iter().map(|(_, value)| value.clone()).collect::<Vec<_>>();
+                assert_graph_coordinate_witnesses(&store, &predecessor, &coordinates, &private_bytes, false);
+                drop(store);
+                let (image, _receipt, old_source) = load_read_image_with_memory(&path, Some(16 * 1024 * 1024)).unwrap().into_parts();
+                drop(image);
+                let fixture_open_accountant_41665 = Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+                let _fixture_decode_scope_41665 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_41665)).unwrap();
+                let store = RedbPersistence::open(&path).unwrap();
+                store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_41665));
+                let physical_end = coordinates.last().unwrap().0;
+                let old_writer = store.initialize_writer_snapshot(SnapshotId(100), physical_end).unwrap();
+                let deferred = HashSet::new();
+                let retained_zero_keys = graph_retained_zero_touch_keys(&before);
+                let scope = graph_retirement_observer(&before);
+                let stats = store.prune_retention_scoped(&HashMap::new(), &[], &[], &[], Some((&[], std::slice::from_ref(&predecessor), &deferred)), &[], &Vec::new(), &[("graph_fixture_progress".into(), vec![1])]).unwrap();
+                let counts = assert_graph_retirement_work(&scope, &predecessor, false);
+                assert_graph_retained_zero_touch(&scope, &retained_zero_keys);
+                if let Some(control) = mutation_control { assert_eq!(counts, control, "one predecessor retirement work stays fixed across independent fanout and population scales"); } else { mutation_control = Some(counts); }
+                drop(scope);
+                assert_eq!(stats.row_keys_removed, 0);
+                assert_eq!(stats.change_log_keys_removed, 0);
+                assert_eq!(stats.edge_keys_removed, 2);
+                assert_graph_coordinate_witnesses(&store, &predecessor, &coordinates, &private_bytes, true);
+                let after = graph_publication_state(&store);
+                assert_eq!(after.1[0], before.1[0], "every retained private history key and byte survives");
+                assert_eq!(after.0[3], before.0[3], "every retained T byte survives");
+                let p = RedbPersistence::graph_fwd_key(&predecessor);
+                let reverse = RedbPersistence::graph_rev_key(&predecessor);
+                let creation = graph_history_record::creation_contribution_key(&p).unwrap();
+                for (family, key) in [(0, &p), (1, &reverse), (2, &creation)] {
+                    assert_eq!(after.0[family], before.0[family].iter().filter(|(candidate, _)| candidate != key).cloned().collect::<Vec<_>>(), "only the selected predecessor projection/creation C disappears");
+                }
+                assert_eq!(before.0[4].len(), 1);
+                let rk = graph_history_record::lifecycle_key(&p).unwrap();
+                let mut expected_r = before.0[4].clone();
+                assert_eq!(expected_r[0].0, rk);
+                assert_eq!(expected_r[0].1[17], 0);
+                expected_r[0].1[17] = 1;
+                assert_eq!(after.0[4], expected_r, "one selected receipt changes Present to Retired without count or identity changes");
+                assert!(after.1[3].contains(&("graph_fixture_progress".to_owned(), vec![1])));
+                assert!(!before.1[3].iter().any(|(key, _)| key == "graph_fixture_progress"));
+                assert_ne!(after.1[4], before.1[4], "final binding joins the selected progress and graph publication");
+                assert_ne!(after.1[1], before.1[1], "recovery bounds join the same publication");
+                let query_work = graph_addressed_observer_row(&graph_read::GraphReadRoot::Writer(old_writer.clone()), &predecessor, true, coordinates[0].0, coordinates[0].1, &coordinates[0].2);
+                if let Some(control) = query_controls.get(&(true, true)) { assert_eq!(&query_work, control, "addressed work stays fixed across unrelated graph population and distinct public/physical fanout"); } else { query_controls.insert((true, true), query_work); }
+                assert_graph_coordinate_source_answers(graph_read::GraphReadRoot::Writer(old_writer), &predecessor, true, &coordinates);
+                let query_work = graph_addressed_observer_row(&graph_read::GraphReadRoot::Image(old_source.clone()), &predecessor, true, coordinates[0].0, coordinates[0].1, &coordinates[0].2);
+                if let Some(control) = query_controls.get(&(false, true)) { assert_eq!(&query_work, control, "addressed work stays fixed across unrelated graph population and distinct public/physical fanout"); } else { query_controls.insert((false, true), query_work); }
+                assert_graph_coordinate_source_answers(graph_read::GraphReadRoot::Image(old_source), &predecessor, true, &coordinates);
+                let new_writer = store.prepare_writer_snapshot(store.reserve_writer_snapshot().unwrap(), SnapshotId(100), physical_end).unwrap();
+                let query_work = graph_addressed_observer_row(&graph_read::GraphReadRoot::Writer(new_writer.clone()), &predecessor, false, coordinates[0].0, coordinates[0].1, &coordinates[0].2);
+                if let Some(control) = query_controls.get(&(true, false)) { assert_eq!(&query_work, control, "addressed work stays fixed across unrelated graph population and distinct public/physical fanout"); } else { query_controls.insert((true, false), query_work); }
+                assert_graph_coordinate_source_answers(graph_read::GraphReadRoot::Writer(new_writer), &predecessor, false, &coordinates);
+                drop(store);
+                drop(_fixture_decode_scope_41665);
+                let (image, _receipt, new_source) = load_read_image_with_memory(&path, Some(16 * 1024 * 1024)).unwrap().into_parts();
+                drop(image);
+                let query_work = graph_addressed_observer_row(&graph_read::GraphReadRoot::Image(new_source.clone()), &predecessor, false, coordinates[0].0, coordinates[0].1, &coordinates[0].2);
+                if let Some(control) = query_controls.get(&(false, false)) { assert_eq!(&query_work, control, "addressed work stays fixed across unrelated graph population and distinct public/physical fanout"); } else { query_controls.insert((false, false), query_work); }
+                assert_graph_coordinate_source_answers(graph_read::GraphReadRoot::Image(new_source), &predecessor, false, &coordinates);
+                let fixture_open_accountant_41717 = std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+                let _fixture_decode_scope_41717 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_41717)).unwrap();
+                let reopened = RedbPersistence::open(&path).unwrap();
+                reopened.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_41717));
+                assert_eq!(graph_publication_state(&reopened), after, "restart exposes the complete new publication");
+            }
+        }
+    }
+
+    // These rows use the two real captured source implementations. Graph work
+    // counts require the existing observer's graph extension; no missing
+    // observation is interpreted as zero here.
+    fn graph_history_fixture(
+        path: &Path,
+        versions: usize,
+        references: usize,
+        row_history: bool,
+    ) -> (RedbPersistence, AdjEntry, Vec<ChangeLogEntry>) {
+        let memory = Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+        let store =
+            RedbPersistence::create_with_accountant(path, Some(memory), REDB_CACHE_BYTES).unwrap();
+        let predecessor = AdjEntry {
+            source: NodeId::from_u128(1),
+            target: NodeId::from_u128(2),
+            edge_type: "retained_link".into(),
+            properties: HashMap::new(),
+            created_tx: TxId(1),
+            deleted_tx: Some(TxId(100)),
+            lsn: Lsn(1),
+        };
+        let mut commits = BTreeMap::from([(Lsn(1), TxId(1)), (Lsn(20), TxId(100))]);
+        let mut edges = vec![predecessor.clone()];
+        for version in 0..versions {
+            let tx = version as u64 + 2;
+            commits.insert(Lsn(tx), TxId(tx));
+            edges.push(AdjEntry {
+                source: NodeId::from_u128(3),
+                target: NodeId::from_u128(4),
+                edge_type: "unrelated_link".into(),
+                properties: HashMap::new(),
+                created_tx: TxId(tx),
+                deleted_tx: Some(TxId(100)),
+                lsn: Lsn(tx),
+            });
+        }
+        store.flush_commit_index_entries(&commits).unwrap();
+        store.append_graph_edges_batch(&edges).unwrap();
+        let deletion = ChangeLogEntry::EdgeDelete {
+            source: predecessor.source,
+            target: predecessor.target,
+            edge_type: predecessor.edge_type.clone(),
+            lsn: Lsn(20),
+        };
+        let mut entries = Vec::new();
+        if row_history {
+            let (meta, row) = graph_retention_row();
+            store.flush_table_meta("removed_rows", &meta).unwrap();
+            store
+                .append_table_rows_batch("removed_rows", Some(&meta), std::slice::from_ref(&row))
+                .unwrap();
+            assert_eq!(
+                store.load_relational_row_version("removed_rows", &meta, row.row_id, row.created_tx, row.lsn).unwrap(),
+                Some(row),
+                "the repack fixture contains an actual physical row version"
+            );
+            entries.push(ChangeLogEntry::RowInsert {
+                table: "removed_rows".into(),
+                row_id: RowId(1),
+                lsn: Lsn(20),
+            });
+        }
+        entries.extend(std::iter::repeat_n(deletion, references));
+        store.append_change_log(Lsn(30), &entries).unwrap();
+        assert!(
+            !store.load_commit_index().unwrap().contains_key(&Lsn(30)),
+            "a history storage coordinate does not invent commit membership"
+        );
+        (store, predecessor, entries)
+    }
+
+    // Fixture inspection stays outside operation observation scopes. This is
+    // an assertion snapshot, never the engine's survivor classifier or index.
+    type GraphPublicationState = (Vec<Vec<(Vec<u8>, Vec<u8>)>>, Vec<Vec<(String, Vec<u8>)>>);
+    fn graph_publication_state(store: &RedbPersistence) -> GraphPublicationState {
+        store
+            .with_db(|db| {
+                let read = db.begin_read().map_err(RedbPersistence::storage_error)?;
+                let mut byte_tables = Vec::new();
+                for definition in [
+                    GRAPH_FWD_TABLE,
+                    GRAPH_REV_TABLE,
+                    graph_history_record::GRAPH_CONTRIBUTIONS,
+                    graph_history_record::GRAPH_OCCURRENCE_LOCATIONS,
+                    graph_history_record::GRAPH_PREDECESSOR_LIFECYCLE,
+                ] {
+                    let table = read
+                        .open_table(definition)
+                        .map_err(RedbPersistence::storage_error)?;
+                    let mut rows = Vec::new();
+                    for next in table.iter().map_err(RedbPersistence::storage_error)? {
+                        let (key, value) = next.map_err(RedbPersistence::storage_error)?;
+                        rows.push((key.value().to_vec(), value.value().to_vec()));
+                    }
+                    byte_tables.push(rows);
+                }
+                let row_table_name = RedbPersistence::rel_table_name("removed_rows");
+                let row_definition: TableDefinition<&[u8], &[u8]> =
+                    TableDefinition::new(row_table_name.as_str());
+                let mut physical_rows = Vec::new();
+                match read.open_table(row_definition) {
+                    Ok(table) => {
+                        for next in table.iter().map_err(RedbPersistence::storage_error)? {
+                            let (key, value) = next.map_err(RedbPersistence::storage_error)?;
+                            physical_rows.push((key.value().to_vec(), value.value().to_vec()));
+                        }
+                    }
+                    Err(redb::TableError::TableDoesNotExist(_)) => {}
+                    Err(error) => return Err(RedbPersistence::storage_error(error)),
+                }
+                byte_tables.push(physical_rows);
+                let mut text_tables = Vec::new();
+                for definition in [
+                    CHANGE_LOG_TABLE,
+                    writer_recovery::RECOVERY_TABLE,
+                    META_TABLE,
+                    CONFIG_TABLE,
+                    CONTENT_IDENTITY_METADATA_TABLE,
+                ] {
+                    let mut rows = Vec::new();
+                    match read.open_table(definition) {
+                        Ok(table) => {
+                            for next in table.iter().map_err(RedbPersistence::storage_error)? {
+                                let (key, value) = next.map_err(RedbPersistence::storage_error)?;
+                                rows.push((key.value().to_owned(), value.value().to_vec()));
+                            }
+                        }
+                        Err(redb::TableError::TableDoesNotExist(_)) => {}
+                        Err(error) => return Err(RedbPersistence::storage_error(error)),
+                    }
+                    text_tables.push(rows);
+                }
+                Ok((byte_tables, text_tables))
+            })
+            .unwrap()
+    }
+
+    fn assert_retained_graph_witnesses(
+        store: &RedbPersistence,
+        predecessor: &AdjEntry,
+        private_bytes: &[Vec<u8>],
+        first_ordinal: usize,
+        retired: bool,
+    ) {
+        use graph_history_record::*;
+        store
+            .with_db(|db| {
+                let read = db.begin_read().map_err(RedbPersistence::storage_error)?;
+                let history = read.open_table(CHANGE_LOG_TABLE).unwrap();
+                let contributions = read.open_table(GRAPH_CONTRIBUTIONS).unwrap();
+                let locations = read.open_table(GRAPH_OCCURRENCE_LOCATIONS).unwrap();
+                let receipts = read.open_table(GRAPH_PREDECESSOR_LIFECYCLE).unwrap();
+                let p = RedbPersistence::graph_fwd_key(predecessor);
+                let r_key = lifecycle_key(&p)?;
+                let receipt = receipts.get(r_key.as_slice()).unwrap().unwrap();
+                assert_eq!(receipt.value().len(), 18);
+                assert_eq!(receipt.value()[0], 1);
+                assert_eq!(
+                    u64::from_be_bytes(receipt.value()[1..9].try_into().unwrap()),
+                    100
+                );
+                assert_eq!(
+                    u64::from_be_bytes(receipt.value()[9..17].try_into().unwrap()),
+                    private_bytes.len() as u64
+                );
+                assert_eq!(receipt.value()[17], u8::from(retired));
+                for (offset, expected) in private_bytes.iter().enumerate() {
+                    let ordinal = first_ordinal + offset;
+                    let mut key = String::new();
+                    RedbPersistence::write_change_log_entry_key(Lsn(30), ordinal, &mut key);
+                    let stored = history.get(key.as_str()).unwrap().unwrap();
+                    assert_eq!(
+                        stored.value(),
+                        expected.as_slice(),
+                        "retained private bytes are immutable"
+                    );
+                    let record = RedbPersistence::decode_stored_change_log(stored.value())?;
+                    assert_eq!(record.tag, 2);
+                    assert_eq!(record.entry.lsn(), Lsn(20));
+                    let witness = record.witness.unwrap();
+                    assert_eq!(witness.predecessor, p);
+                    assert_eq!(witness.deletion_tx, TxId(100));
+                    let t_key = location_key(witness.id);
+                    let location = locations.get(t_key.as_slice()).unwrap().unwrap();
+                    assert_eq!(location.value().len(), 17);
+                    assert_eq!(location.value()[0], 1);
+                    assert_eq!(
+                        u64::from_be_bytes(location.value()[1..9].try_into().unwrap()),
+                        30
+                    );
+                    assert_eq!(
+                        u64::from_be_bytes(location.value()[9..17].try_into().unwrap()),
+                        ordinal as u64
+                    );
+                    let c_key = deletion_contribution_key(Lsn(30), &witness);
+                    let contribution = contributions.get(c_key.as_slice()).unwrap().unwrap();
+                    assert_eq!(contribution.value()[0], 1);
+                    assert_eq!(
+                        &contribution.value()[1..],
+                        &contribution_digest(false, &witness.id.to_be_bytes(), expected)?
+                    );
+                }
+                let fwd = read.open_table(GRAPH_FWD_TABLE).unwrap();
+                let rev = read.open_table(GRAPH_REV_TABLE).unwrap();
+                let reverse = RedbPersistence::graph_rev_key(predecessor);
+                assert_eq!(fwd.get(p.as_slice()).unwrap().is_none(), retired);
+                assert_eq!(rev.get(reverse.as_slice()).unwrap().is_none(), retired);
+                let creation = creation_contribution_key(&p)?;
+                assert_eq!(
+                    contributions.get(creation.as_slice()).unwrap().is_none(),
+                    retired
+                );
+                let commits = read.open_table(COMMIT_INDEX_TABLE).unwrap();
+                assert_eq!(commits.get(20).unwrap().unwrap().value(), 100);
+                assert!(commits.get(30).unwrap().is_none());
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn assert_graph_source_answers(
+        root: graph_read::GraphReadRoot,
+        predecessor: &AdjEntry,
+        expected_edge: bool,
+        expected_history: &[ChangeLogEntry],
+    ) {
+        use std::ops::Bound;
+        use writer_source::SourceWindowOwner;
+        let memory = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(
+            16 * 1024 * 1024,
+        ));
+        for reverse in [false, true] {
+            let key = if reverse {
+                RedbPersistence::graph_rev_key(predecessor)
+            } else {
+                RedbPersistence::graph_fwd_key(predecessor)
+            };
+            let mut cursor = root
+                .cursor(
+                    reverse,
+                    Bound::Included(&key),
+                    Bound::Included(&key),
+                    memory.clone(),
+                )
+                .unwrap();
+            let window = cursor.next_edge().unwrap();
+            assert_eq!(window.is_some(), expected_edge);
+            if let Some(window) = window {
+                assert_eq!(window.edge(), predecessor);
+            }
+            assert!(cursor.next_edge().unwrap().is_none());
+        }
+        let requested = expected_history
+            .iter()
+            .position(|entry| matches!(entry, ChangeLogEntry::EdgeDelete { .. }))
+            .unwrap();
+        let mut requested_key = String::new();
+        RedbPersistence::write_change_log_entry_key(Lsn(30), requested, &mut requested_key);
+        let mut changes = Vec::new();
+        match root {
+            graph_read::GraphReadRoot::Writer(root) => {
+                let mut position = [0u8; 16];
+                position[..8].copy_from_slice(&30u64.to_be_bytes());
+                position[8..].copy_from_slice(&(requested as u64).to_be_bytes());
+                let mut addressed = root
+                    .cursor(
+                        SourceWindowOwner::Read(memory.clone()),
+                        writer_history::WRITER_CHANGE_LOG_TABLE.name(),
+                        writer_source::WriterCursorFamily::Bytes,
+                        Bound::Included(&position),
+                        Bound::Included(&position),
+                        false,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    addressed.next_change().unwrap().unwrap().value,
+                    expected_history[requested]
+                );
+                assert!(addressed.next_change().unwrap().is_none());
+                drop(addressed);
+                let mut cursor = root
+                    .change_log_cursor(SourceWindowOwner::Read(memory), Lsn(30), Lsn(30))
+                    .unwrap();
+                while let Some(window) = cursor.next_change().unwrap() {
+                    changes.push(window.value.clone());
+                }
+            }
+            graph_read::GraphReadRoot::Image(source) => {
+                source
+                    .with_read(|read| {
+                        let history = read.open_table(CHANGE_LOG_TABLE).unwrap();
+                        let bytes = history.get(requested_key.as_str()).unwrap().unwrap();
+                        source.verify_stored_graph_history_in_read(
+                            read,
+                            requested_key.as_str(),
+                            bytes.value(),
+                            memory.clone(),
+                        )?;
+                        assert_eq!(
+                            RedbPersistence::decode_stored_change_log(bytes.value())?.entry,
+                            expected_history[requested]
+                        );
+                        Ok(())
+                    })
+                    .unwrap();
+                source
+                    .visit_changes_since(Lsn(19), memory, &|| Ok(()), &mut |entry| {
+                        changes.push(entry);
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+        }
+        assert_eq!(
+            changes, expected_history,
+            "both captured sources retain the complete history answer"
+        );
+    }
+
+    // The callbacks use the installed execution target and its real declared
+    // operation child. Residency is a paired observation, never graph work.
+    fn assert_installed_commit_directory_rows(file: &ReadSession, expected: &[(Lsn, TxId)], path: &Path) -> ReadWorkObservationScope {
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+        use contextdb_core::read_contract::{OwnerReadCancellation, ReadLimits};
+        file.__with_resident_history_for_test(|database| {
+            assert!(database.__has_captured_commit_directory_for_test());
+            let child = database.declared_reader_memory()?;
+            let request_identity = crate::read_work_probe::funding_owner_id(&child);
+            let cancellation = OwnerReadCancellation::new();
+            let open = crate::executor::bounded::ReadOpenContext::new(
+                child, ReadLimits::default(), Arc::new(DirectoryProofClock), cancellation.clone(),
+            )?;
+            let checkpoint = || open.checkpoint();
+            let context = contextdb_tx::ReadCommitContext::new(open.read_memory(), &checkpoint);
+            let scope = ReadWorkObservationScope::enter(ReadWorkPhase::Query);
+            assert_eq!(scope.commit_directory_residency(), None, "no sample means unobserved");
+            assert_eq!(scope.commit_directory_funding(), None, "a later scope has no inferred funding owner");
+            assert_eq!(database.__commit_directory_census_with_context_for_test(&context)?, (expected.len(), Lsn(1)));
+            let funding_before = scope.commit_directory_funding().expect("installed manager binds actual native owners");
+            let request_before = funding_before.request_child.expect("caller is a native declared child");
+            assert_eq!(request_before.owner_identity, request_identity);
+            assert_ne!(request_before.owner_identity, funding_before.open_child.owner_identity);
+            assert_eq!(request_before.parent_identity, funding_before.open_child.parent_identity);
+            assert!(funding_before.open_child.alive && request_before.alive && request_before.parent_alive);
+            assert_eq!(funding_before.image_alive, Some(true));
+            assert_eq!(funding_before.image_accountant_alive, Some(true));
+            assert_eq!(scope.commit_directory_residency(), Some((0, expected.len() as u64)), "actual resident decoded slots and durable census remain separate");
+            for pair in [expected[0], *expected.last().unwrap()] {
+                assert_eq!(database.__commit_directory_get_with_context_for_test(pair.0, &context)?, Some(pair.1));
+                assert!(database.__commit_directory_contains_with_context_for_test(pair.0, &context)?);
+            }
+            for absent in [Lsn(0), Lsn(18), Lsn(19), Lsn(30)] {
+                assert_eq!(database.__commit_directory_get_with_context_for_test(absent, &context)?, None);
+                assert!(!database.__commit_directory_contains_with_context_for_test(absent, &context)?);
+            }
+            let last_small = expected[expected.len()-2];
+            for (bound, answer) in [
+                (Included(Lsn(0)), None), (Excluded(Lsn(1)), None),
+                (Included(Lsn(1)), Some(expected[0])),
+                (Included(Lsn(19)), Some(last_small)), (Excluded(Lsn(20)), Some(last_small)),
+                (Included(Lsn(20)), Some((Lsn(20), TxId(100)))),
+                (Excluded(Lsn(21)), Some((Lsn(20), TxId(100)))),
+                (Unbounded, Some((Lsn(20), TxId(100)))),
+            ] {
+                assert_eq!(database.__commit_directory_floor_with_context_for_test(bound, &context)?, answer);
+            }
+            let mut cursor = database.__commit_directory_cursor_with_context_for_test(Included(Lsn(2)), Excluded(Lsn(20)), &context)?;
+            let funding_cursor = scope.commit_directory_funding().unwrap();
+            let request_cursor = funding_cursor.request_child.unwrap();
+            assert!(request_cursor.charged_bytes > request_before.charged_bytes, "real cursor controls charge the actual caller child");
+            assert_eq!(request_cursor.parent_charged_bytes - request_before.parent_charged_bytes, request_cursor.charged_bytes - request_before.charged_bytes);
+            assert_eq!(funding_cursor.open_child.charged_bytes, funding_before.open_child.charged_bytes);
+            assert_eq!(funding_cursor.image_held_bytes, funding_before.image_held_bytes);
+            assert_eq!(funding_cursor.image_accountant_used_bytes, funding_before.image_accountant_used_bytes);
+            let mut actual = Vec::new();
+            while let Some(pair) = cursor.next_entry(&context)? { actual.push(pair); }
+            assert_eq!(actual, expected.iter().copied().filter(|(lsn, _)| lsn.0 >= 2 && lsn.0 < 20).collect::<Vec<_>>());
+            assert!(cursor.next_entry(&context)?.is_none());
+            drop(cursor);
+            let funding_refunded = scope.commit_directory_funding().unwrap();
+            assert_eq!(funding_refunded, funding_before, "real cursor drop refunds its child and parent to the quiescent baseline");
+            for (lower, upper, wanted) in [
+                (Included(Lsn(18)), Excluded(Lsn(20)), Vec::new()),
+                (Included(Lsn(u64::MAX)), Unbounded, Vec::new()),
+                (Excluded(Lsn(u64::MAX)), Unbounded, Vec::new()),
+                (Included(Lsn(20)), Included(Lsn(u64::MAX)), vec![(Lsn(20), TxId(100))]),
+            ] {
+                let mut boundary_cursor = database.__commit_directory_cursor_with_context_for_test(lower, upper, &context)?;
+                let mut found = Vec::new();
+                while let Some(pair) = boundary_cursor.next_entry(&context)? { found.push(pair); }
+                assert_eq!(found, wanted, "empty and maximum cursor bounds use the installed captured directory");
+                assert_eq!(boundary_cursor.next_entry(&context)?, None);
+            }
+            assert_eq!(scope.commit_directory_residency(), Some((0, expected.len() as u64)), "cursor output does not become resident directory state");
+            let refusal_limits = ReadLimits::default();
+            let refusal_parent = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(refusal_limits.memory);
+            let refusal_open = crate::executor::bounded::ReadOpenContext::new(refusal_parent.child()?, refusal_limits, Arc::new(DirectoryProofClock), OwnerReadCancellation::new())?;
+            let refusal_child = refusal_open.read_memory();
+            let refusal_checkpoint = || refusal_open.checkpoint();
+            let refusal_context = contextdb_tx::ReadCommitContext::new(refusal_child.clone(), &refusal_checkpoint);
+            database.__commit_directory_census_with_context_for_test(&refusal_context)?;
+            let available = (refusal_limits.memory - refusal_parent.retained_bytes_for_test()) as usize;
+            refusal_child.try_reserve(available, "reader", "commit_directory_proof", "fixture admission")?;
+            let saturated = scope.commit_directory_funding().unwrap();
+            let refusal = match database.__commit_directory_cursor_with_context_for_test(Unbounded, Unbounded, &refusal_context) {
+                Err(error) => error,
+                Ok(_) => panic!("directory cursor must refuse when its actual declared child has no headroom"),
+            };
+            assert!(matches!(refusal, Error::MemoryBudgetExceeded { requested_bytes, available_bytes, budget_limit_bytes, .. } if budget_limit_bytes as u64 == refusal_limits.memory && requested_bytes > available_bytes));
+            assert_eq!(scope.commit_directory_funding().unwrap(), saturated, "typed refusal neither charges ImageMemory nor leaks child or parent credit");
+            refusal_child.release(available);
+            drop(refusal_context); drop(refusal_child); drop(refusal_open);
+            assert_eq!(refusal_parent.retained_bytes_for_test(), 0);
+            drop(refusal_parent);
+            database.__commit_directory_census_with_context_for_test(&context)?;
+            // Captured Database is engine-private and has no public export door.
+            // Collect through the public File session that installed this target,
+            // then inspect a fresh public File target on the same durable fixture.
+            let collected = file.metadata(crate::MetadataRequest::ImageState {
+                kind: crate::DirectImageMetadataKind::ChangeLog,
+            }, None)?;
+            drop(collected);
+            let exported = ReadSession::open(path)?;
+            assert_eq!(directory_pinned_view(&exported), ((expected.len(),Lsn(1)), None, Some((Lsn(20),TxId(100))), Some((0,expected.len() as u64))));
+            database.__sample_commit_directory_residency_with_context_for_test(&context)?;
+            assert_eq!(scope.commit_directory_residency(), Some((0, expected.len() as u64)), "export collection leaves the installed captured directory unchanged");
+            let before = scope.graph_counters();
+            let error = database.__try_begin_for_test().unwrap_err();
+            assert!(matches!(error, Error::InvalidStateTransition(ref reason) if reason == "captured commit history has no writable transaction capability"));
+            assert_eq!(scope.graph_counters(), before, "captured mutation refusal precedes directory effects");
+            let mut cancelled_cursor = database.__commit_directory_cursor_with_context_for_test(Unbounded, Unbounded, &context)?;
+            assert_eq!(cancelled_cursor.next_entry(&context)?, Some(expected[0]));
+            cancellation.cancel();
+            assert!(matches!(cancelled_cursor.next_entry(&context), Err(Error::ReadCancelled)), "real cursor cancellation follows positive progress");
+            assert!(matches!(database.__commit_directory_get_with_context_for_test(Lsn(20), &context), Err(Error::ReadCancelled)));
+            drop(cancelled_cursor);
+            drop(context);
+            drop(open);
+            let request_released = scope.commit_directory_funding().unwrap().request_child.unwrap();
+            assert_eq!(request_released.owner_identity, request_identity);
+            assert!(!request_released.alive);
+            assert_eq!(request_released.charged_bytes, 0, "known request destruction is observed while the weak scope remains");
+            Ok(scope)
+        }).unwrap()
+    }
+
+    fn assert_commit_directory_final_drop(scope: &ReadWorkObservationScope) {
+        let dead = scope.commit_directory_funding().expect("previously bound funding remains observed after destruction");
+        assert!(!dead.open_child.alive && !dead.open_child.parent_alive);
+        assert_eq!((dead.open_child.charged_bytes, dead.open_child.parent_charged_bytes), (0, 0));
+        if let Some(request) = dead.request_child {
+            assert!(!request.alive && !request.parent_alive);
+            assert_eq!((request.charged_bytes, request.parent_charged_bytes), (0, 0));
+        }
+        assert_eq!((dead.image_alive, dead.image_held_bytes), (Some(false), Some(0)));
+        assert_eq!((dead.image_accountant_alive, dead.image_accountant_used_bytes), (Some(false), Some(0)));
+    }
+
+    struct DirectoryProofClock;
+    impl contextdb_core::read_contract::DeadlineClock for DirectoryProofClock {
+        fn now_ms(&self) -> u64 { 0 }
+        fn wait_until(&self, _: u64) -> contextdb_core::read_contract::DeadlineWait<'_> { Box::pin(std::future::pending()) }
+    }
+
+    // The injected clock reads the existing real suffix-advance receipt. It
+    // never calls the diagnosis helper or manufactures work/progress counts.
+    struct SuffixProgressClock {
+        scope: Arc<ReadWorkObservationScope>,
+        cancellation: contextdb_core::read_contract::OwnerReadCancellation,
+        stop: u8,
+        deadline: u64,
+        entry_reads: std::sync::atomic::AtomicU64,
+    }
+    impl contextdb_core::read_contract::DeadlineClock for SuffixProgressClock {
+        fn now_ms(&self) -> u64 {
+            if self.stop == 4 && self.entry_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                return self.deadline.saturating_add(1);
+            }
+            let progressed = self.scope.graph_events().iter().any(|event|
+                event.family == "commit_index" && event.operation == "iteration_step");
+            if progressed && self.stop == 1 { self.cancellation.cancel(); }
+            if progressed && self.stop == 2 { self.deadline.saturating_add(1) } else { 0 }
+        }
+        fn wait_until(&self, _: u64) -> contextdb_core::read_contract::DeadlineWait<'_> { Box::pin(std::future::pending()) }
+    }
+
+    fn commit_suffix_fixture(path: &Path, frontier: Option<(Lsn, TxId)>, suffix: &[(u64,u64)]) {
+        let store = RedbPersistence::create_with_accountant(path,
+            Some(Arc::new(crate::memory_accounting::MemoryAccountant::no_limit())), REDB_CACHE_BYTES).unwrap();
+        if let Some(pair) = frontier { store.flush_commit_index_entries(&BTreeMap::from([pair])).unwrap(); }
+        // These pairs are deliberately uncommitted: do not publish their
+        // content-identity frontier. Open must diagnose them before mismatch.
+        store.with_db(|database| {
+            let write = database.begin_write().map_err(RedbPersistence::storage_error)?;
+            {
+                let mut table = write.open_table(COMMIT_INDEX_TABLE).unwrap();
+                for &(lsn, tx) in suffix { table.insert(lsn, tx).unwrap(); }
+            }
+            write.commit().map_err(RedbPersistence::storage_error)?;
+            Ok(())
+        }).unwrap();
+    }
+
+    fn assert_commit_suffix_open_rows(directory: &Path) {
+        use contextdb_core::read_contract::{OwnerReadCancellation, ReadLimits, ReadFailure, OwnerLimitExceededDetail, ReadFailureLimit};
+        let frontier = Some((Lsn(20), TxId(100)));
+        let cases = [
+            ("healthy-nonempty-committed", frontier, vec![], None, 0),
+            ("monotone-three", frontier, vec![(21,101),(22,102),(23,103)], Some((ReadImageRequiresWriterCause::WritableSanitizerWouldChange, "writable recovery must truncate 3 uncommitted commit-index entries past Some((Lsn(20), TxId(100)))")), 3),
+            ("interior-decrease", frontier, vec![(21,101),(22,103),(23,102)], Some((ReadImageRequiresWriterCause::NonMonotonicCommitIndex, "commit-index transaction order needs writable repair")), 3),
+            ("first-entry-decrease", frontier, vec![(21,99),(22,101)], Some((ReadImageRequiresWriterCause::NonMonotonicCommitIndex, "commit-index transaction order needs writable repair")), 1),
+            ("empty-frontier-monotone", None, vec![(1,1),(2,2)], Some((ReadImageRequiresWriterCause::WritableSanitizerWouldChange, "writable recovery must truncate 2 uncommitted commit-index entries past None")), 2),
+            ("empty-frontier-empty", None, vec![], None, 0),
+            ("maximum-frontier", Some((Lsn(u64::MAX), TxId(100))), vec![], None, 0),
+        ];
+        for (name, frontier, suffix, repair, diagnosed) in cases {
+            let path = directory.join(format!("commit-suffix-{name}.db"));
+            commit_suffix_fixture(&path, frontier, &suffix);
+            let durable_before = std::fs::read(&path).unwrap();
+            let parent = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(16 * 1024 * 1024);
+            let baseline = parent.retained_bytes_for_test();
+            let scope = Arc::new(ReadWorkObservationScope::enter(ReadWorkPhase::Open));
+            let open = crate::executor::bounded::ReadOpenContext::new(parent.child().unwrap(), ReadLimits::default(), Arc::new(DirectoryProofClock), OwnerReadCancellation::new()).unwrap();
+            let (result, work) = read_persistence_test_scaffold::observe_open_history_work_for_test(||
+                load_read_image_at_registration_with_context(&path, None, None, None, open));
+            assert_eq!(work.commit_index_scanned, diagnosed, "{name}: only anomalous suffix entries are diagnosed");
+            assert_eq!(read_persistence_test_scaffold::OpenHistoryWork { commit_index_scanned: 0, ..work }, read_persistence_test_scaffold::OpenHistoryWork::default());
+            let advanced = scope.graph_events().into_iter().filter(|event| event.family == "commit_index" && event.operation == "iteration_step").collect::<Vec<_>>();
+            assert_eq!(advanced.len() as u64, diagnosed);
+            assert_eq!(advanced.iter().map(|event| event.key.clone()).collect::<Vec<_>>(), suffix.iter().take(diagnosed as usize).map(|(lsn, _)| lsn.to_be_bytes().to_vec()).collect::<Vec<_>>());
+            match repair {
+                Some((cause, reason)) => match result {
+                    Err(LoadReadImageError::RequiresWriter { cause: actual, reason: actual_reason }) => { assert_eq!(actual, cause); assert_eq!(actual_reason, reason); }
+                    _ => panic!("{name}: exact repair type must precede root/count disagreement"),
+                },
+                None => {
+                    let loaded = result.unwrap();
+                    assert_eq!(work, read_persistence_test_scaffold::OpenHistoryWork::default());
+                    let (image, _receipt, source) = loaded.into_parts();
+                    assert!(image.commit_index.is_empty());
+                    drop(image); drop(source);
+                }
+            }
+            drop(scope);
+            assert_eq!(parent.retained_bytes_for_test(), baseline, "{name}: actual open child releases after physical image/source release");
+            assert_eq!(std::fs::read(&path).unwrap(), durable_before);
+        }
+        for stop in [1, 2, 3, 4] {
+            let path = directory.join(format!("commit-suffix-stop-{stop}.db"));
+            commit_suffix_fixture(&path, frontier, &[(21,101),(22,103),(23,102)]);
+            let before = std::fs::read(&path).unwrap();
+            let parent = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(16 * 1024 * 1024);
+            let baseline = parent.retained_bytes_for_test();
+            let scope = Arc::new(ReadWorkObservationScope::enter(ReadWorkPhase::Open));
+            let cancellation = OwnerReadCancellation::new();
+            if stop == 3 { cancellation.cancel(); }
+            let limits = ReadLimits::default();
+            let clock = Arc::new(SuffixProgressClock { scope: scope.clone(), cancellation: cancellation.clone(), stop, deadline: limits.active_ms, entry_reads: std::sync::atomic::AtomicU64::new(0) });
+            let source_events = read_persistence_test_scaffold::observe_read_image_source_events_for_test(&path);
+            source_events.reset();
+            let open = crate::executor::bounded::ReadOpenContext::new(parent.child().unwrap(), limits, clock, cancellation);
+            let (result, work) = read_persistence_test_scaffold::observe_open_history_work_for_test(||
+                match open { Ok(open) => load_read_image_at_registration_with_context(&path, None, None, None, open), Err(error) => Err(LoadReadImageError::Memory(error)) });
+            match result {
+                Err(LoadReadImageError::Memory(Error::ReadCancelled)) if stop == 1 || stop == 3 => {},
+                Err(LoadReadImageError::Memory(Error::ReadFailure(failure))) if stop == 2 || stop == 4 => {
+                    assert_eq!(failure, ReadFailure::owner_limit_exceeded(OwnerLimitExceededDetail { limit: ReadFailureLimit::ActiveMs, value: limits.active_ms, required: None, statement: None }));
+                },
+                _ => panic!("real open interruption must retain the existing typed refusal"),
+            }
+            let diagnosed = if stop == 1 { 2 } else if stop == 2 { 1 } else { 0 };
+            assert_eq!(work.commit_index_scanned, diagnosed, "clock observes real progress; cancellation is read by the following checkpoint");
+            assert_eq!(read_persistence_test_scaffold::OpenHistoryWork { commit_index_scanned: 0, ..work }, read_persistence_test_scaffold::OpenHistoryWork::default());
+            let advanced = scope.graph_events().into_iter().filter(|event| event.family == "commit_index" && event.operation == "iteration_step").collect::<Vec<_>>();
+            assert_eq!(advanced.iter().map(|event| event.key.clone()).collect::<Vec<_>>(), [21u64,22].iter().take(diagnosed as usize).map(|lsn| lsn.to_be_bytes().to_vec()).collect::<Vec<_>>());
+            if stop == 1 || stop == 2 {
+                let events = source_events.events();
+                let dropped = events.iter().position(|event| matches!(event, read_persistence_test_scaffold::ReadImageSourceEvent::SourceHandlesDropped)).unwrap();
+                let released = events.iter().position(|event| matches!(event, read_persistence_test_scaffold::ReadImageSourceEvent::Released { .. })).unwrap();
+                assert!(dropped < released, "physical source handles drop before release is certified");
+            }
+            drop(scope);
+            assert_eq!(parent.retained_bytes_for_test(), baseline);
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+    }
+
+    fn directory_pinned_view(file: &ReadSession) -> ((usize, Lsn), Option<TxId>, Option<(Lsn,TxId)>, Option<(u64,u64)>) {
+        file.__with_resident_history_for_test(|database| {
+            let open = crate::executor::bounded::ReadOpenContext::new(database.declared_reader_memory()?,
+                contextdb_core::read_contract::ReadLimits::default(), Arc::new(DirectoryProofClock), contextdb_core::read_contract::OwnerReadCancellation::new())?;
+            let checkpoint = || open.checkpoint();
+            let context = contextdb_tx::ReadCommitContext::new(open.read_memory(), &checkpoint);
+            let scope = ReadWorkObservationScope::enter(ReadWorkPhase::Query);
+            let census = database.__commit_directory_census_with_context_for_test(&context)?;
+            let get = database.__commit_directory_get_with_context_for_test(Lsn(40), &context)?;
+            let floor = database.__commit_directory_floor_with_context_for_test(std::ops::Bound::Included(Lsn(40)), &context)?;
+            Ok((census, get, floor, scope.commit_directory_residency()))
+        }).unwrap()
+    }
+
+    fn assert_directory_pinned_publication_row(directory: &Path) {
+        let path = directory.join("commit-directory-pinned-publication.db");
+        let (store, _, _) = graph_history_fixture(&path, 4, 4, false);
+        drop(store);
+        let old = ReadSession::open(&path).unwrap();
+        let before = directory_pinned_view(&old);
+        assert_eq!(before, ((6,Lsn(1)), None, Some((Lsn(20),TxId(100))), Some((0,6))));
+        let identity = old.file_snapshot_for_test().unwrap();
+        let fixture_open_accountant_42332 = Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+        let _fixture_decode_scope_42332 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_42332)).unwrap();
+        let store = RedbPersistence::open(&path).unwrap();
+        store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_42332));
+        store.flush_commit_index_entries(&BTreeMap::from([(Lsn(40),TxId(101))])).unwrap();
+        drop(_fixture_decode_scope_42332);
+        assert_eq!(directory_pinned_view(&old), before, "installed old directory retains the captured membership and floor after real publication");
+        assert_eq!(old.file_snapshot_for_test().unwrap(), identity);
+        drop(store);
+        let fresh = ReadSession::open(&path).unwrap();
+        assert_eq!(directory_pinned_view(&fresh), ((7,Lsn(1)), Some(TxId(101)), Some((Lsn(40),TxId(101))), Some((0,7))));
+    }
+
+    fn assert_commit_directory_writable_controls(directory: &Path) {
+        for versions in [4,8,16] {
+            let path = directory.join(format!("commit-directory-writable-{versions}.db"));
+            let (store, _, _) = graph_history_fixture(&path, versions, 4, false);
+            let expected = store.load_commit_index().unwrap();
+            drop(store);
+            let database = Database::open(&path).unwrap();
+            assert!(!database.__has_captured_commit_directory_for_test());
+            let open = crate::executor::bounded::ReadOpenContext::new(database.declared_reader_memory().unwrap(),
+                contextdb_core::read_contract::ReadLimits::default(), Arc::new(DirectoryProofClock), contextdb_core::read_contract::OwnerReadCancellation::new()).unwrap();
+            let checkpoint = || open.checkpoint();
+            let context = contextdb_tx::ReadCommitContext::new(open.read_memory(), &checkpoint);
+            assert_eq!(database.__commit_directory_census_with_context_for_test(&context).unwrap(), (expected.len(),Lsn(1)));
+            assert_eq!(database.__commit_directory_floor_with_context_for_test(std::ops::Bound::Included(Lsn(19)), &context).unwrap(), Some((Lsn(versions as u64+1),TxId(versions as u64+1))));
+            assert_eq!(database.__commit_directory_floor_with_context_for_test(std::ops::Bound::Included(Lsn(20)), &context).unwrap(), Some((Lsn(20),TxId(100))));
+            assert_eq!(database.snapshot_at(Lsn(19)), SnapshotId(versions as u64+1));
+            assert_eq!(database.snapshot_at(Lsn(20)), SnapshotId(100));
+        }
+    }
+
+    fn assert_graph_open_and_maintenance_rows(directory: &Path) {
+        assert_commit_directory_writable_controls(directory);
+        assert_directory_pinned_publication_row(directory);
+        assert_commit_suffix_open_rows(directory);
+        let mut control_open = None;
+        let mut graph_open_control = None;
+        let mut directory_constructor_control = None;
+        let mut constructor_accountant_control = None;
+        // Fixed stage registries, finalization and store wrappers are admitted
+        // separately from the image-held graph source wrapper.
+        let fixed_constructor_controls_bytes = 824;
+        let mut writer_open_control = None;
+        let mut query_controls = HashMap::new();
+        let mut mutation_control = None;
+        // N/2N/4N graph versions and tombstones. No graph work count is
+        // asserted through the older row/vector-only observer.
+        for versions in [4, 8, 16] {
+            let path = directory.join(format!("graph-open-{versions}.db"));
+            let (store, predecessor, entries) = graph_history_fixture(&path, versions, 4, false);
+            // Durable fixture inspection precedes every operation scope.
+            // These are support memberships, not resident directory entries.
+            let expected_commit_count = match versions { 4 => 6, 8 => 10, 16 => 18, _ => unreachable!() };
+            let expected_commits = (1..=versions as u64 + 1)
+                .map(|lsn| (Lsn(lsn), TxId(lsn)))
+                .chain(std::iter::once((Lsn(20), TxId(100))))
+                .collect::<Vec<_>>();
+            let physical_commits = store.load_commit_index().unwrap();
+            assert_eq!(physical_commits.len(), expected_commit_count, "durable support grows at 4/8/16 versions");
+            assert_eq!(physical_commits.into_iter().collect::<Vec<_>>(), expected_commits, "every authored support commit is retained");
+            drop(store);
+            // Match the public File opener's declared parent and operation
+            // child. The image ceiling remains the existing fixture ceiling.
+            let limits = ReadSessionOptions::default().limits;
+            let declared_read_memory = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(limits.memory);
+            let raw_parent_baseline = declared_read_memory.retained_bytes_for_test();
+            let raw_parent_identity = Arc::as_ptr(&declared_read_memory) as usize;
+            let observation = ReadWorkObservationScope::enter(ReadWorkPhase::Open);
+            assert_eq!(observation.commit_directory_funding(), None);
+            let open_context = crate::executor::bounded::ReadOpenContext::new(
+                declared_read_memory.child().unwrap(), limits,
+                crate::read_session::read_clock(), OwnerReadCancellation::new(),
+            ).unwrap();
+            observation.set_operation_id("graph-observer-row");
+            let raw_open_identity = crate::read_work_probe::funding_owner_id(&open_context.read_memory());
+            let (loaded, history_work) =
+                read_persistence_test_scaffold::observe_open_history_work_for_test(|| {
+                    load_read_image_at_registration_with_context(&path, Some(16 * 1024 * 1024), None, None, open_context).unwrap()
+                });
+            let (image, _receipt, source) = loaded.into_parts();
+            assert!(image.change_log.is_empty());
+            assert!(image.ddl_log.is_empty());
+            assert!(image.commit_index.is_empty());
+            assert!(image.history_on_request.is_some());
+            assert_eq!(
+                history_work,
+                read_persistence_test_scaffold::OpenHistoryWork::default()
+            );
+            // Complete the SAME real captured Database construction while
+            // this Open scope is active. Keep the original empty-map and
+            // legacy zero-work assertions above byte-identical.
+            let raw_image_owner_identity = Arc::as_ptr(&image.memory) as usize;
+            let raw_image_accountant_identity = Arc::as_ptr(&image.memory.accountant) as usize;
+            let raw_image_held = image.memory.held();
+            let raw_accountant_used = image.memory.accountant.usage().used;
+            let constructor_context = image.open_context.clone();
+            let funding_loaded = observation.commit_directory_funding().expect("scope entered before native open observes actual child");
+            assert_eq!(funding_loaded.open_child.owner_identity, raw_open_identity);
+            assert_eq!(funding_loaded.open_child.parent_identity, raw_parent_identity);
+            assert_eq!(funding_loaded.open_child.parent_charged_bytes, declared_read_memory.retained_bytes_for_test());
+            // Keep the actual pre-directory child sample as the baseline.
+            // Zero is lawful: source cache/verifier/index use ImageMemory;
+            // the installed directory must add charge to this same child.
+            assert_eq!(funding_loaded.request_child, None, "no request child was observed during raw open");
+            assert_eq!(observation.commit_directory_source_registration_funding(), None, "raw open has not reserved the graph source wrapper");
+            let constructor_before = observation.graph_counters();
+            let constructor_accountant = image.memory.accountant.clone();
+            let (constructed, constructor_history_work) = read_persistence_test_scaffold::observe_open_history_work_for_test(||
+                Database::open_committed_image(
+                    image.into_runtime_parts(source.clone()), Arc::new(crate::plugin::CorePlugin),
+                    constructor_accountant, declared_read_memory.clone(),
+                ).unwrap());
+            assert_eq!(constructor_history_work, read_persistence_test_scaffold::OpenHistoryWork::default());
+            let constructor_after = observation.graph_counters();
+            let constructor_gets = constructor_after.graph_commit_gets - constructor_before.graph_commit_gets;
+            assert!(constructed.__has_captured_commit_directory_for_test());
+            if let Some(control) = directory_constructor_control {
+                assert_eq!(constructor_gets, control, "real directory construction adds the same fixed endpoint count at N/2N/4N");
+            } else { directory_constructor_control = Some(constructor_gets); }
+            let constructor_keys = observation.graph_events().into_iter().filter(|event| event.family == "commit_index" && event.operation == "get").map(|event| event.key).collect::<Vec<_>>();
+            assert_eq!(constructor_keys, [expected_commits.first().unwrap().0, expected_commits.last().unwrap().0].into_iter().map(|lsn| lsn.0.to_be_bytes().to_vec()).collect::<Vec<_>>(), "both real constructor endpoint accesses remain visible");
+            assert_eq!(constructor_gets, [expected_commits.first(), expected_commits.last()].into_iter().flatten().count() as u64, "real nonempty directory construction verifies exactly its two endpoints at every 4/8/16 fixture");
+            assert_eq!(observation.commit_directory_residency(), Some((0, expected_commit_count as u64)), "actual installed constructor pairs zero resident entries with growing durable support");
+            let constructor_checkpoint = || constructor_context.checkpoint();
+            let constructor_request = contextdb_tx::ReadCommitContext::new(constructor_context.read_memory(), &constructor_checkpoint);
+            constructed.__commit_directory_census_with_context_for_test(&constructor_request).unwrap();
+            let funding_constructed = observation.commit_directory_funding().unwrap();
+            let source_registration = observation.commit_directory_source_registration_funding().expect("real captured Database construction observes its successful graph source wrapper reservation");
+            assert_eq!(source_registration.image_owner_identity, raw_image_owner_identity);
+            assert_eq!(source_registration.image_accountant_identity, raw_image_accountant_identity);
+            assert_eq!(source_registration.image_held_before_reservation, raw_image_held);
+            assert_eq!(source_registration.image_accountant_used_before_reservation, raw_accountant_used);
+            let wrapper_held_delta = source_registration.image_held_after_reservation.checked_sub(source_registration.image_held_before_reservation).expect("successful source wrapper reservation increases its actual image owner counter");
+            let wrapper_accountant_delta = source_registration.image_accountant_used_after_reservation.checked_sub(source_registration.image_accountant_used_before_reservation).expect("successful source wrapper reservation increases its actual accountant counter");
+            assert_eq!(wrapper_held_delta, 8, "the image-held graph source wrapper remains exactly eight bytes");
+            assert_eq!(wrapper_accountant_delta, wrapper_held_delta, "the same native reservation funds image ownership and its accountant");
+            assert_eq!(funding_constructed.image_held_bytes.and_then(|held| held.checked_sub(raw_image_held)), Some(wrapper_held_delta), "the old image observation window contains exactly the observed wrapper reservation");
+            let constructor_accountant_delta = funding_constructed.image_accountant_used_bytes.and_then(|used| used.checked_sub(raw_accountant_used)).expect("construction retains its wrapper and fixed controls on the actual accountant");
+            assert_eq!(constructor_accountant_delta, wrapper_accountant_delta + fixed_constructor_controls_bytes, "the accountant holds the wrapper plus fixed stage registries, finalization and store wrappers");
+            if let Some(control) = constructor_accountant_control {
+                assert_eq!(constructor_accountant_delta, control, "constructor accountant bytes are identical across 4/8/16 store sizes");
+            } else { constructor_accountant_control = Some(constructor_accountant_delta); }
+            assert_eq!(funding_constructed.open_child.owner_identity, raw_open_identity);
+            assert!(funding_constructed.open_child.charged_bytes > funding_loaded.open_child.charged_bytes, "installed directory controls use the declared open child");
+            assert_eq!(funding_constructed.open_child.parent_charged_bytes - funding_loaded.open_child.parent_charged_bytes, funding_constructed.open_child.charged_bytes - funding_loaded.open_child.charged_bytes);
+            assert_eq!(funding_constructed.image_held_bytes, Some(source_registration.image_held_after_reservation), "directory controls do not charge ImageMemory instead");
+            assert_eq!(funding_constructed.image_accountant_used_bytes, Some(source_registration.image_accountant_used_after_reservation + fixed_constructor_controls_bytes), "the actual image accountant also holds the separately admitted fixed constructor controls");
+            drop(constructor_request);
+            drop(constructor_context);
+            drop(constructed);
+            let observed = observation.counters();
+            assert_eq!(observed.decoded_rows, 0);
+            assert_eq!(observed.decoded_vectors, 0);
+            assert_eq!(observed.hashed_rows, 0);
+            assert_eq!(observed.hashed_vectors, 0);
+            if let Some(control) = control_open {
+                assert_eq!(observed, control);
+            } else {
+                control_open = Some(observed);
+            }
+            let graph_open = assert_graph_open_work(&observation, &format!("{:?}", source.storage_identity()));
+            if let Some(control) = graph_open_control { assert_eq!(graph_open, control, "captured image open graph work stays fixed across 4/8/16 versions"); } else { graph_open_control = Some(graph_open); }
+            let query_work = graph_addressed_observer_row(&graph_read::GraphReadRoot::Image(source.clone()), &predecessor, true, Lsn(30), 0, &entries[0]);
+            if let Some(control) = query_controls.get(&false) { assert_eq!(&query_work, control); } else { query_controls.insert(false, query_work); }
+            assert_graph_source_answers(
+                graph_read::GraphReadRoot::Image(source),
+                &predecessor,
+                true,
+                &entries,
+            );
+            assert_eq!(declared_read_memory.retained_bytes_for_test(), raw_parent_baseline);
+            drop(declared_read_memory);
+            assert_commit_directory_final_drop(&observation);
+            drop(observation);
+            // Exercise the public File door on the same graph-only fallback
+            // fixture, without publishing readiness or removing support.
+            let public_open = ReadWorkObservationScope::enter(ReadWorkPhase::Open);
+            public_open.set_operation_id("graph-observer-row");
+            let (file, public_history_work) =
+                read_persistence_test_scaffold::observe_open_history_work_for_test(|| {
+                    ReadSession::open(&path).unwrap()
+                });
+            assert_eq!(file.route(), ReadRoute::File);
+            assert_eq!(public_history_work, read_persistence_test_scaffold::OpenHistoryWork::default());
+            assert_graph_context(&public_open, ReadWorkPhase::Open);
+            assert_eq!(public_open.graph_counters(), graph_open, "public File open has the same fixed graph work as the captured source control");
+            let public_constructor_gets = public_open.graph_events().iter().filter(|event| event.family == "commit_index" && event.operation == "get").count() as u64;
+            assert_eq!(public_constructor_gets, constructor_gets, "RAW and public File complete the same real endpoint verification, fixed across every 4/8/16 fixture");
+            let public_constructor_keys = public_open.graph_events().into_iter().filter(|event| event.family == "commit_index" && event.operation == "get").map(|event| event.key).collect::<Vec<_>>();
+            assert_eq!(public_constructor_keys, constructor_keys, "public File verifies the same first/last durable keys as the real RAW constructor at every 4/8/16 fixture");
+            assert_eq!(public_open.commit_directory_residency(), Some((0, expected_commit_count as u64)));
+            drop(public_open);
+            let funding_scope = assert_installed_commit_directory_rows(&file, &expected_commits, &path);
+            let registration = file.file_storage_registration_for_test().unwrap();
+            assert!(registration.descriptor_open);
+            assert!(!registration.load_lock_held);
+            assert_eq!(file.file_retained_charge_bytes_for_test(), Some(0), "the captured public reader never borrows the writer retention door");
+            let snapshot = file.file_snapshot_for_test().unwrap();
+            let (_, _, _, file_memory) = file.file_memory_for_test().unwrap();
+            let answer = file.metadata(crate::MetadataRequest::ImageState {
+                kind: crate::DirectImageMetadataKind::ChangeLog,
+            }, None).unwrap();
+            let crate::direct_file_reader::DirectMetadataBody::ImageState {
+                state: crate::direct_file_reader::DirectImageState::ChangeLog(changes),
+            } = &answer.body else { panic!("the requested public history metadata returns its change state"); };
+            assert_eq!(changes.commit_index.len(), expected_commit_count, "public output preserves durable membership census");
+            assert_eq!(changes.commit_index, expected_commits, "the admitted public collector returns every authored support pair in order");
+            assert_eq!(file.file_snapshot_for_test().unwrap(), snapshot, "requesting history preserves the public session's committed identity");
+            drop(answer);
+            drop(file);
+            assert!(file_memory.upgrade().is_none(), "the final public File handle releases its actual image-memory owner");
+            assert_commit_directory_final_drop(&funding_scope);
+            drop(funding_scope);
+            let fixture_open_accountant_42536 = Arc::new(
+                crate::memory_accounting::MemoryAccountant::no_limit(),
+            );
+            let _fixture_decode_scope_42536 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_42536)).unwrap();
+            let store = RedbPersistence::open(&path).unwrap();
+            store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_42536));
+            let root = store
+                .initialize_writer_snapshot(SnapshotId(100), Lsn(30))
+                .unwrap();
+            let writer_observation = ReadWorkObservationScope::enter(ReadWorkPhase::Open);
+            writer_observation.set_operation_id("graph-observer-row");
+            let captured_read = root.owner_read().unwrap();
+            RedbPersistence::read_authenticated_bounds_in_read(&captured_read).unwrap();
+            let writer_open = assert_graph_open_work(&writer_observation, &format!("{:?}", root.storage_identity()));
+            if let Some(control) = writer_open_control { assert_eq!(writer_open, control, "captured writer root validation stays fixed across 4/8/16 versions"); } else { writer_open_control = Some(writer_open); }
+            drop(captured_read);
+            drop(writer_observation);
+            let query_work = graph_addressed_observer_row(&graph_read::GraphReadRoot::Writer(root.clone()), &predecessor, true, Lsn(30), 0, &entries[0]);
+            if let Some(control) = query_controls.get(&true) { assert_eq!(&query_work, control); } else { query_controls.insert(true, query_work); }
+            assert_graph_source_answers(
+                graph_read::GraphReadRoot::Writer(root),
+                &predecessor,
+                true,
+                &entries,
+            );
+        }
+
+        // One predecessor with 1/N/2N retained references. Retirement must
+        // preserve each witness, location and deletion contribution exactly.
+        for references in [1, 4, 8] {
+            for repack in [false, true] {
+                let path = directory.join(format!("graph-retirement-{references}-{repack}.db"));
+                let (store, predecessor, entries) =
+                    graph_history_fixture(&path, 4, references, repack);
+                let before = graph_publication_state(&store);
+                let first_ordinal = usize::from(repack);
+                let private_bytes = before.1[0]
+                    .iter()
+                    .skip(first_ordinal)
+                    .map(|(_, bytes)| bytes.clone())
+                    .collect::<Vec<_>>();
+                assert_retained_graph_witnesses(
+                    &store,
+                    &predecessor,
+                    &private_bytes,
+                    first_ordinal,
+                    false,
+                );
+                drop(store);
+                let (image, _receipt, old_source) =
+                    load_read_image_with_memory(&path, Some(16 * 1024 * 1024))
+                        .unwrap()
+                        .into_parts();
+                drop(image);
+                let fixture_open_accountant_42588 = Arc::new(
+                    crate::memory_accounting::MemoryAccountant::no_limit(),
+                );
+                let _fixture_decode_scope_42588 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_42588)).unwrap();
+                let store = RedbPersistence::open(&path).unwrap();
+                store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_42588));
+                let old_writer = store
+                    .initialize_writer_snapshot(SnapshotId(100), Lsn(30))
+                    .unwrap();
+                let removed = if repack {
+                    vec![("removed_rows".to_owned(), RowId(1), Lsn(30))]
+                } else {
+                    Vec::new()
+                };
+                let (row_meta, physical_row) = graph_retention_row();
+                let row_keys = if repack {
+                    vec![("removed_rows".to_owned(), physical_row.row_id, physical_row.created_tx, physical_row.lsn)]
+                } else {
+                    Vec::new()
+                };
+                let table_meta = if repack {
+                    HashMap::from([("removed_rows".to_owned(), row_meta.clone())])
+                } else {
+                    HashMap::new()
+                };
+                // Existing returned-error checkpoints exercise aborted history
+                // repack. They do not cover the later graph retirement sites.
+                for boundary in [1, 2].into_iter().filter(|_| repack) {
+                    let durable = std::cell::Cell::new(false);
+                    arm_currency_reclaim_fault_for_test(boundary, false);
+                    let error = store
+                        .prune_currency_scoped(
+                            &[],
+                            &removed,
+                            &[],
+                            &[],
+                            &Vec::new(),
+                            &durable,
+                            &[],
+                            None,
+                        )
+                        .unwrap_err();
+                    assert!(
+                        matches!(error, Error::Other(ref message) if message == "injected currency cleanup failure")
+                    );
+                    assert!(!durable.get());
+                    assert_eq!(
+                        graph_publication_state(&store),
+                        before,
+                        "precommit repack refusal leaves all proof bytes and root bindings unchanged"
+                    );
+                }
+                let deferred = HashSet::new();
+                let retained_zero_keys = if repack { Vec::new() } else { graph_retained_zero_touch_keys(&before) };
+                let mutation_scope = graph_retirement_observer(&before);
+                let stats = store
+                    .prune_retention_scoped(
+                        &table_meta,
+                        &row_keys,
+                        &removed,
+                        &[],
+                        Some((&[], std::slice::from_ref(&predecessor), &deferred)),
+                        &[],
+                        &Vec::new(),
+                        &[("graph_fixture_progress".into(), vec![1])],
+                    )
+                    .unwrap();
+                let mutation_counts = assert_graph_retirement_work(&mutation_scope, &predecessor, repack);
+                if !repack { assert_graph_retained_zero_touch(&mutation_scope, &retained_zero_keys); }
+                if !repack {
+                    if let Some(control) = mutation_control { assert_eq!(mutation_counts, control, "one retirement has constant selected-family work across 1/4/8 retained references"); } else { mutation_control = Some(mutation_counts); }
+                }
+                drop(mutation_scope);
+                assert_eq!(stats.row_keys_removed, u64::from(repack));
+                if repack {
+                    assert!(store.load_relational_row_version("removed_rows", &row_meta, physical_row.row_id, physical_row.created_tx, physical_row.lsn).unwrap().is_none());
+                }
+                assert_eq!(stats.change_log_keys_removed, u64::from(repack));
+                assert_eq!(stats.edge_keys_removed, 2);
+                assert_retained_graph_witnesses(&store, &predecessor, &private_bytes, 0, true);
+                let after = graph_publication_state(&store);
+                assert!(after.1[3].contains(&("graph_fixture_progress".to_owned(), vec![1])));
+                assert!(!before.1[3].iter().any(|(key, _)| key == "graph_fixture_progress"));
+                if repack {
+                    assert_eq!(before.0[5].len(), 1);
+                    assert!(after.0[5].is_empty(), "the selected physical row payload joins the same publication");
+                    assert_graph_retention_row_source(&graph_read::GraphReadRoot::Writer(old_writer.clone()), true);
+                    assert_graph_retention_row_source(&graph_read::GraphReadRoot::Image(old_source.clone()), true);
+                }
+                assert_eq!(
+                    before.0[3],
+                    after.0[3]
+                        .iter()
+                        .map(|(key, value)| {
+                            let mut old = value.clone();
+                            let ordinal = u64::from_be_bytes(old[9..17].try_into().unwrap());
+                            old[9..17]
+                                .copy_from_slice(&(ordinal + first_ordinal as u64).to_be_bytes());
+                            (key.clone(), old)
+                        })
+                        .collect::<Vec<_>>(),
+                    "only the retained locations' ordinals move"
+                );
+                for (key, value) in &before.0[2] {
+                    if key[17] == 1 {
+                        assert!(
+                            after.0[2].contains(&(key.clone(), value.clone())),
+                            "repacking and predecessor retirement preserve deletion C bytes"
+                        );
+                    }
+                }
+                let p_key = RedbPersistence::graph_fwd_key(&predecessor);
+                let r_key = RedbPersistence::graph_rev_key(&predecessor);
+                for (family, selected) in [(0, p_key.as_slice()), (1, r_key.as_slice())] {
+                    let expected = before.0[family]
+                        .iter()
+                        .filter(|(key, _)| key.as_slice() != selected)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        after.0[family], expected,
+                        "unrelated graph versions remain exact"
+                    );
+                }
+                let creation = graph_history_record::creation_contribution_key(&p_key).unwrap();
+                let expected_c = before.0[2]
+                    .iter()
+                    .filter(|(key, _)| key != &creation)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    after.0[2], expected_c,
+                    "only the selected creation contribution is removed"
+                );
+                let mut expected_r = before.0[4].clone();
+                for (_, value) in &mut expected_r {
+                    value[17] = 1;
+                }
+                assert_eq!(
+                    after.0[4], expected_r,
+                    "retirement changes only the exact receipt state"
+                );
+                if !repack {
+                    assert_eq!(
+                        after.0[3], before.0[3],
+                        "retirement preserves all survivor location bytes"
+                    );
+                    assert_eq!(
+                        after.1[0], before.1[0],
+                        "retirement preserves all survivor history bytes"
+                    );
+                }
+                assert_ne!(
+                    before.1[4], after.1[4],
+                    "final root binding changes with the publication"
+                );
+                assert_ne!(
+                    before.1[1], after.1[1],
+                    "recovery/root bindings change with the publication"
+                );
+                assert_graph_source_answers(
+                    graph_read::GraphReadRoot::Writer(old_writer),
+                    &predecessor,
+                    true,
+                    &entries,
+                );
+                assert_graph_source_answers(
+                    graph_read::GraphReadRoot::Image(old_source),
+                    &predecessor,
+                    true,
+                    &entries,
+                );
+                let new_writer = store
+                    .prepare_writer_snapshot(
+                        store.reserve_writer_snapshot().unwrap(),
+                        SnapshotId(100),
+                        Lsn(30),
+                    )
+                    .unwrap();
+                if repack {
+                    assert_graph_retention_row_source(&graph_read::GraphReadRoot::Writer(new_writer.clone()), false);
+                }
+                assert_graph_source_answers(
+                    graph_read::GraphReadRoot::Writer(new_writer),
+                    &predecessor,
+                    false,
+                    &entries[first_ordinal..],
+                );
+                drop(store);
+                drop(_fixture_decode_scope_42588);
+                let (image, _receipt, new_source) =
+                    load_read_image_with_memory(&path, Some(16 * 1024 * 1024))
+                        .unwrap()
+                        .into_parts();
+                drop(image);
+                if repack {
+                    assert_graph_retention_row_source(&graph_read::GraphReadRoot::Image(new_source.clone()), false);
+                }
+                assert_graph_source_answers(
+                    graph_read::GraphReadRoot::Image(new_source),
+                    &predecessor,
+                    false,
+                    &entries[first_ordinal..],
+                );
+                let fixture_open_accountant_42789 = std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+                let _fixture_decode_scope_42789 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_42789)).unwrap();
+                let reopened = RedbPersistence::open(&path).unwrap();
+                reopened.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_42789));
+                if repack {
+                    assert!(reopened.load_relational_row_version("removed_rows", &row_meta, physical_row.row_id, physical_row.created_tx, physical_row.lsn).unwrap().is_none());
+                }
+                assert_eq!(
+                    graph_publication_state(&reopened),
+                    after,
+                    "restart retains the complete new history/proof/root publication"
+                );
+            }
+        }
+    }
+
+    // Exact durable bytes complement the existing public graph/history/root
+    // oracle with private history, selectors, read/clock bounds and commits.
+    // All census work is fixture inspection outside the mutation observer.
+    type GraphDurabilityState = (
+        GraphPublicationState,
+        Vec<Vec<(Vec<u8>, Vec<u8>)>>,
+        Vec<Vec<(String, u64)>>,
+        Vec<(u64, u64)>,
+        BTreeMap<Lsn, TxId>,
+        Vec<(String, Option<Vec<(Vec<u8>, Vec<u8>)>>)>,
+    );
+
+    fn graph_durability_state(store: &RedbPersistence) -> GraphDurabilityState {
+        let supplement = store.with_db(|db| {
+            let read = db.begin_read().map_err(RedbPersistence::storage_error)?;
+            let mut byte_tables = Vec::new();
+            for definition in [writer_history::WRITER_CHANGE_LOG_TABLE, writer_history::CHANGE_LOG_BY_TABLE] {
+                let table = read.open_table(definition).map_err(RedbPersistence::storage_error)?;
+                let mut rows = Vec::new();
+                for next in table.iter().map_err(RedbPersistence::storage_error)? {
+                    let (key, value) = next.map_err(RedbPersistence::storage_error)?;
+                    rows.push((key.value().to_vec(), value.value().to_vec()));
+                }
+                byte_tables.push(rows);
+            }
+            let mut bounds = Vec::new();
+            for name in ["retention_clock_bounds", "committed_read_lsn_bounds"] {
+                let definition: TableDefinition<&str, u64> = TableDefinition::new(name);
+                let table = read.open_table(definition).map_err(RedbPersistence::storage_error)?;
+                let mut rows = Vec::new();
+                for next in table.iter().map_err(RedbPersistence::storage_error)? {
+                    let (key, value) = next.map_err(RedbPersistence::storage_error)?;
+                    rows.push((key.value().to_owned(), value.value()));
+                }
+                bounds.push(rows);
+            }
+            let table = read.open_table(writer_history::CHANGE_LOG_LSN_COUNT).map_err(RedbPersistence::storage_error)?;
+            let mut counts = Vec::new();
+            for next in table.iter().map_err(RedbPersistence::storage_error)? {
+                let (key, value) = next.map_err(RedbPersistence::storage_error)?;
+                counts.push((key.value(), value.value()));
+            }
+            // Capture the actual related durable families, including table
+            // absence. The fixture has no vector members; these bytes certify
+            // their unchanged state, not populated-vector removal coverage.
+            let mut publication_tables = Vec::new();
+            for definition in [
+                VECTORS_TABLE,
+                VECTOR_PARTITION_MEMBERSHIP_TABLE,
+                VECTOR_OPEN_DIRECTORY_TABLE,
+                VECTOR_PARTITION_JOURNAL_TABLE,
+                VECTOR_PARTITION_TOMBSTONE_TABLE,
+                VECTOR_PARTITION_BASE_GENERATION_TABLE,
+                VECTOR_PARTITION_CHANGE_GENERATION_TABLE,
+                VECTOR_PARTITION_GRAPH_PAGE_TABLE,
+                VECTOR_PARTITION_GENERATION_CATALOG_TABLE,
+                vector_membership_pages::SOURCE,
+                vector_membership_pages::REVERSE,
+                vector_membership_pages::SUMMARY,
+                TableDefinition::new("writer_row_heads"),
+                CONTENT_IDENTITY_NODES_TABLE,
+            ] {
+                let rows = match read.open_table(definition) {
+                    Ok(table) => {
+                        let mut rows = Vec::new();
+                        for next in table.iter().map_err(RedbPersistence::storage_error)? {
+                            let (key, value) = next.map_err(RedbPersistence::storage_error)?;
+                            rows.push((key.value().to_vec(), value.value().to_vec()));
+                        }
+                        Some(rows)
+                    }
+                    Err(redb::TableError::TableDoesNotExist(_)) => None,
+                    Err(error) => return Err(RedbPersistence::storage_error(error)),
+                };
+                publication_tables.push((definition.name().to_owned(), rows));
+            }
+            let identity_roots = match read.open_table(CONTENT_IDENTITY_ROOTS_TABLE) {
+                Ok(table) => {
+                    let mut rows = Vec::new();
+                    for next in table.iter().map_err(RedbPersistence::storage_error)? {
+                        let (key, value) = next.map_err(RedbPersistence::storage_error)?;
+                        rows.push((vec![key.value()], value.value().to_vec()));
+                    }
+                    Some(rows)
+                }
+                Err(redb::TableError::TableDoesNotExist(_)) => None,
+                Err(error) => return Err(RedbPersistence::storage_error(error)),
+            };
+            publication_tables.push((CONTENT_IDENTITY_ROOTS_TABLE.name().to_owned(), identity_roots));
+            Ok((byte_tables, bounds, counts, publication_tables))
+        }).unwrap();
+        (graph_publication_state(store), supplement.0, supplement.1, supplement.2, store.load_commit_index().unwrap(), supplement.3)
+    }
+
+    // Same mixed row/history/predecessor transaction as the existing semantic
+    // row. This helper only removes its fixture's nominated physical version.
+    fn graph_durability_publication(store: &RedbPersistence, predecessor: &AdjEntry) -> Result<PruneScopedStats> {
+        let (meta, row) = graph_retention_row();
+        let deferred = HashSet::new();
+        store.prune_retention_scoped(
+            &HashMap::from([("removed_rows".to_owned(), meta)]),
+            &[("removed_rows".to_owned(), row.row_id, row.created_tx, row.lsn)],
+            &[("removed_rows".to_owned(), RowId(1), Lsn(30))],
+            &[],
+            Some((&[], std::slice::from_ref(predecessor), &deferred)),
+            &[],
+            &Vec::new(),
+            &[("graph_fixture_progress".into(), vec![1])],
+        )
+    }
+
+    // Publication attempts are linked to actual transaction fingerprints.
+    // A missing executing root is a failed observation, never a zero oracle.
+    fn assert_graph_durability_observation(scope: &ReadWorkObservationScope, committed: bool, boundary: Option<u8>) {
+        assert_eq!(scope.graph_counters().graph_publication_commits, u64::from(committed));
+        let events = scope.graph_events();
+        let begins = events.iter().filter(|event| event.family == "publication" && event.operation == "begin").collect::<Vec<_>>();
+        assert_eq!(begins.len(), 1);
+        let captured = begins[0].captured_root.as_ref().expect("the executing write has an observed root");
+        assert_eq!(begins[0].observation_status, "OBSERVED");
+        let outcomes = events.iter().filter(|event| event.family == "publication" && matches!(event.operation.as_str(), "committed" | "aborted")).collect::<Vec<_>>();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].operation, if committed { "committed" } else { "aborted" });
+        assert_eq!(outcomes[0].captured_root.as_ref(), Some(captured));
+        assert_eq!(outcomes[0].observation_status, "OBSERVED");
+        assert!(events.iter().any(|event| event.family == "root_binding" && event.operation == "root" && event.acquired_root.is_some()));
+        if let Some(boundary) = boundary {
+            assert!(events.iter().any(|event| event.family == "publication" && event.operation == "checkpoint" && event.key == vec![boundary] && event.role.as_deref() == Some("currency_reclaim_checkpoint_for_test")), "the selected returned-error checkpoint was actually reached");
+        }
+        // A successful control must visit every distinct new stage. A fault
+        // row must visit its own stage exactly once under the executing root.
+        let stages = match boundary {
+            None => (12..=26).collect::<Vec<u8>>(),
+            Some(stage @ 12..=26) => vec![stage],
+            Some(_) => Vec::new(),
+        };
+        for stage in stages {
+            let checkpoints = events.iter().filter(|event| event.family == "publication" && event.operation == "checkpoint" && event.key == vec![stage] && event.role.as_deref() == Some("currency_reclaim_checkpoint_for_test")).collect::<Vec<_>>();
+            assert_eq!(checkpoints.len(), 1, "publication stage {stage} must execute exactly once");
+            assert_eq!(checkpoints[0].observation_status, "OBSERVED", "publication stage {stage} must carry an executing root");
+            assert_eq!(checkpoints[0].captured_root.as_ref(), Some(captured), "publication stage {stage} belongs to this same transaction");
+        }
+    }
+
+    // The mapped test is its own isolated-process entry point; no additional
+    // test name, global fault cell or production injection hook is introduced.
+    fn graph_durability_interruption_child() -> bool {
+        let Some(path) = std::env::var_os("CONTEXTDB_GRAPH_DURABILITY_PATH") else { return false; };
+        let boundary: u8 = std::env::var("CONTEXTDB_GRAPH_DURABILITY_BOUNDARY").expect("child boundary").parse().expect("numeric child boundary");
+        if boundary >= 12 {
+            assert!((12..=26).contains(&boundary));
+        } else {
+        assert!((4..=11).contains(&boundary));
+        }
+        let fixture_open_accountant_42956 = Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+        let _fixture_decode_scope_42956 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_42956)).unwrap();
+        let store = RedbPersistence::open(Path::new(&path)).expect("open the parent's fresh temporary fixture");
+        store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_42956));
+        let candidates = store.load_graph_table(GRAPH_FWD_TABLE).unwrap().into_iter().filter(|edge| edge.source == NodeId::from_u128(1) && edge.target == NodeId::from_u128(2) && edge.edge_type == "retained_link").collect::<Vec<_>>();
+        assert_eq!(candidates.len(), 1);
+        arm_retention_reclaim_crash_for_test(boundary);
+        let result = graph_durability_publication(&store, &candidates[0]);
+        panic!("selected publication interruption {boundary} was not reached: {result:?}");
+    }
+
+    fn assert_graph_durability_rows(directory: &Path) {
+        let fixture_path = directory.join("graph-durability-fixture.db");
+        let (fixture, predecessor, entries) = graph_history_fixture(&fixture_path, 4, 4, true);
+        let before = graph_durability_state(&fixture);
+        let private_bytes = before.0.1[0].iter().skip(1).map(|(_, bytes)| bytes.clone()).collect::<Vec<_>>();
+        assert_retained_graph_witnesses(&fixture, &predecessor, &private_bytes, 1, false);
+        assert_eq!(before.0.0[5].len(), 1);
+        assert!(!before.0.1[3].iter().any(|(key, _)| key == "graph_fixture_progress"));
+        drop(fixture);
+
+        // Copy only the closed, test-owned database. A separate successful
+        // transaction supplies the whole new state, including root bindings.
+        let control_path = directory.join("graph-durability-control.db");
+        std::fs::copy(&fixture_path, &control_path).unwrap();
+        let fixture_open_accountant_42979 = Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+        let _fixture_decode_scope_42979 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_42979)).unwrap();
+        let control = RedbPersistence::open(&control_path).unwrap();
+        control.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_42979));
+        assert_eq!(graph_durability_state(&control), before);
+        let observation = ReadWorkObservationScope::enter(ReadWorkPhase::Mutation);
+        let stats = graph_durability_publication(&control, &predecessor).unwrap();
+        assert_graph_durability_observation(&observation, true, None);
+        drop(observation);
+        assert_eq!(stats.row_keys_removed, 1);
+        assert_eq!(stats.change_log_keys_removed, 1);
+        assert_eq!(stats.edge_keys_removed, 2);
+        let after = graph_durability_state(&control);
+        assert_ne!(before, after);
+        assert!(after.0.0[5].is_empty());
+        assert!(after.0.1[3].contains(&("graph_fixture_progress".to_owned(), vec![1])));
+        assert_ne!(before.0.1[1], after.0.1[1]);
+        assert_ne!(before.0.1[4], after.0.1[4]);
+        assert_retained_graph_witnesses(&control, &predecessor, &private_bytes, 0, true);
+        drop(control);
+        drop(_fixture_decode_scope_42979);
+
+        for boundary in (4..=11).chain(12..=26) {
+            let path = directory.join(format!("graph-durability-interruption-{boundary}.db"));
+            std::fs::copy(&fixture_path, &path).unwrap();
+            let executable = std::env::current_exe().unwrap();
+            let module = module_path!().split_once("::").expect("crate and module").1;
+            let exact_name = format!("{module}::empty_declared_index_publishes_marker_and_postings_for_a_lazy_ordered_read");
+            let output = std::process::Command::new(executable)
+                .args(["--exact", &exact_name, "--nocapture", "--test-threads=1"])
+                .env("CONTEXTDB_GRAPH_DURABILITY_PATH", &path)
+                .env("CONTEXTDB_GRAPH_DURABILITY_BOUNDARY", boundary.to_string())
+                .current_dir(directory)
+                .output().expect("dispatch the exact mapped test in a separate process");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let marker = format!("RETENTION_RECLAIM_CRASH={boundary}");
+            assert_eq!(stderr.lines().filter(|line| *line == marker).count(), 1, "the selected boundary marker is required: {stderr}");
+            assert_eq!(stderr.lines().filter(|line| line.starts_with("RETENTION_RECLAIM_CRASH=")).count(), 1);
+            assert!(!output.status.success(), "the intended interruption cannot return success");
+            #[cfg(unix)] {
+                use std::os::unix::process::ExitStatusExt;
+                assert_eq!(output.status.signal(), Some(libc::SIGABRT), "a test failure is not the intended interruption: {stdout}\n{stderr}");
+            }
+            assert!(!stdout.contains("FAILED"), "libtest failure is not a boundary interruption: {stdout}");
+            assert!(!stderr.contains("panicked at"), "a panic is not a boundary interruption: {stderr}");
+            let expected = if boundary == 11 { &after } else { &before };
+            let fixture_open_accountant_43023 = Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+            let _fixture_decode_scope_43023 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43023)).unwrap();
+            let reopened = RedbPersistence::open(&path).unwrap();
+            reopened.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43023));
+            assert_eq!(&graph_durability_state(&reopened), expected, "boundary {boundary} must expose the complete old or complete new publication after reopen");
+            assert_retained_graph_witnesses(&reopened, &predecessor, &private_bytes, usize::from(boundary != 11), boundary == 11);
+            let root = reopened.initialize_writer_snapshot(SnapshotId(100), Lsn(30)).unwrap();
+            assert_graph_retention_row_source(&graph_read::GraphReadRoot::Writer(root.clone()), boundary != 11);
+            assert_graph_source_answers(graph_read::GraphReadRoot::Writer(root), &predecessor, boundary != 11, if boundary == 11 { &entries[1..] } else { &entries });
+            drop(reopened);
+            drop(_fixture_decode_scope_43023);
+
+            // Consume the existing one-shot returned-error cell in the same
+            // mixed transaction. It covers only the named instrumented sites.
+            let error_path = directory.join(format!("graph-durability-error-{boundary}.db"));
+            std::fs::copy(&fixture_path, &error_path).unwrap();
+            let fixture_open_accountant_43036 = Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+            let _fixture_decode_scope_43036 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43036)).unwrap();
+            let store = RedbPersistence::open(&error_path).unwrap();
+            store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43036));
+            assert_eq!(graph_durability_state(&store), before);
+            let observation = ReadWorkObservationScope::enter(ReadWorkPhase::Mutation);
+            arm_currency_reclaim_fault_for_test(boundary, false);
+            let error = graph_durability_publication(&store, &predecessor).unwrap_err();
+            assert!(matches!(error, Error::Other(ref message) if message == "injected currency cleanup failure"));
+            assert_graph_durability_observation(&observation, boundary == 11, Some(boundary));
+            drop(observation);
+            assert_eq!(&graph_durability_state(&store), expected, "returned error {boundary} preserves the complete publication outcome");
+            drop(store);
+            drop(_fixture_decode_scope_43036);
+            let fixture_open_accountant_43047 = std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+            let _fixture_decode_scope_43047 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43047)).unwrap();
+            let reopened = RedbPersistence::open(&error_path).unwrap();
+            reopened.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43047));
+            assert_eq!(&graph_durability_state(&reopened), expected, "returned error {boundary} has the same exact state after reopen");
+        }
+    }
+
+    // Physical relocation uses the real callback, separate from retention.
+    // Read only the persisted cursor; postcommit reporting failure occurs
+    // before compact_incremental updates its in-memory progress receipt.
+    type GraphCompactionState = (GraphDurabilityState, Option<Vec<u8>>, redb::StorageSnapshotIdentity);
+
+    fn graph_compaction_state(store: &RedbPersistence) -> GraphCompactionState {
+        let cursor = store.with_db(|db| {
+            let read = db.begin_read().map_err(RedbPersistence::storage_error)?;
+            let definition: TableDefinition<&str, &[u8]> = TableDefinition::new("writer_storage_compaction");
+            match read.open_table(definition) {
+                Ok(table) => Ok(table.get("cursor").map_err(RedbPersistence::storage_error)?.map(|value| value.value().to_vec())),
+                Err(redb::TableError::TableDoesNotExist(_)) => Ok(None),
+                Err(error) => Err(RedbPersistence::storage_error(error)),
+            }
+        }).unwrap();
+        let root = store.initialize_writer_snapshot(SnapshotId(100), Lsn(30)).unwrap();
+        (graph_durability_state(store), cursor, root.storage_identity())
+    }
+
+    fn graph_compaction_fixture(path: &Path) -> (AdjEntry, Vec<ChangeLogEntry>) {
+        let (store, predecessor, entries) = graph_history_fixture(path, 4, 4, true);
+        // The existing overlap fixture's real page population crosses the
+        // 80-page relocation batch. It is temporary fixture data, not padding
+        // counted as live relational/vector acceptance content.
+        let payload: TableDefinition<u64, &[u8]> = TableDefinition::new("compaction_durability_payload");
+        store.with_db(|db| {
+            let write = db.begin_write().map_err(RedbPersistence::storage_error)?;
+            {
+                let mut table = write.open_table(payload).map_err(RedbPersistence::storage_error)?;
+                for id in 0..1024 { table.insert(id, &[91u8; 8192][..]).map_err(RedbPersistence::storage_error)?; }
+            }
+            write.commit().map_err(RedbPersistence::storage_error)?;
+            let write = db.begin_write().map_err(RedbPersistence::storage_error)?;
+            {
+                let mut table = write.open_table(payload).map_err(RedbPersistence::storage_error)?;
+                for id in 0..896 { table.remove(id).map_err(RedbPersistence::storage_error)?; }
+            }
+            write.commit().map_err(RedbPersistence::storage_error)
+        }).unwrap();
+        drop(store);
+        (predecessor, entries)
+    }
+
+    fn graph_compaction_publication(store: &RedbPersistence) -> Result<(redb::CompactionProgress, Option<u64>)> {
+        store.compact_incremental(Arc::new(crate::memory_accounting::MemoryAccountant::no_limit()), 0.5)
+    }
+
+    fn assert_graph_compaction_observation(scope: &ReadWorkObservationScope, boundary: Option<u8>) {
+        let committed = boundary.is_none_or(|stage| stage == 11);
+        assert_eq!(scope.graph_counters().graph_publication_commits, u64::from(committed));
+        let events = scope.graph_events();
+        let begins = events.iter().filter(|event| event.family == "publication" && event.operation == "begin").collect::<Vec<_>>();
+        assert_eq!(begins.len(), 1);
+        let root = begins[0].captured_root.as_ref().expect("actual executing compaction root");
+        let outcomes = events.iter().filter(|event| event.family == "publication" && matches!(event.operation.as_str(), "committed" | "aborted")).collect::<Vec<_>>();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].operation, if committed { "committed" } else { "aborted" });
+        assert_eq!(outcomes[0].captured_root.as_ref(), Some(root));
+        assert_eq!(events.iter().filter(|event| event.family == "publication" && event.operation == "compaction_hook").count(), 1);
+        let stages = boundary.map_or_else(|| [27, 28, 29, 30, 9].into_iter().chain(19..=26).chain([31, 10, 11]).collect::<Vec<_>>(), |stage| vec![stage]);
+        let complete_order = [27, 28, 29, 30, 9, 19, 20, 21, 22, 23, 24, 25, 26, 31, 10, 11];
+        let expected_order = boundary.map_or_else(|| complete_order.to_vec(), |stage| {
+            complete_order[..=complete_order.iter().position(|selected| *selected == stage).unwrap()].to_vec()
+        });
+        assert_eq!(events.iter().filter(|event| event.family == "publication" && event.operation == "checkpoint"
+                && event.role.as_deref() == Some("currency_reclaim_checkpoint_for_test"))
+            .map(|event| event.key.clone()).collect::<Vec<_>>(),
+            expected_order.into_iter().map(|stage| vec![stage]).collect::<Vec<_>>(),
+            "the actual compaction callback reaches precisely the source-bound stage prefix");
+        for stage in stages {
+            let selected = events.iter().filter(|event| event.family == "publication" && event.operation == "checkpoint" && event.key == vec![stage] && event.role.as_deref() == Some("currency_reclaim_checkpoint_for_test")).collect::<Vec<_>>();
+            assert_eq!(selected.len(), 1, "specific compaction stage {stage} executed exactly once");
+            assert_eq!(selected[0].observation_status, "OBSERVED");
+            assert_eq!(selected[0].captured_root.as_ref(), Some(root));
+        }
+    }
+
+    fn graph_compaction_interruption_child() -> bool {
+        let Some(path) = std::env::var_os("CONTEXTDB_GRAPH_COMPACTION_PATH") else { return false; };
+        let boundary: u8 = std::env::var("CONTEXTDB_GRAPH_COMPACTION_BOUNDARY").expect("child compaction stage").parse().expect("numeric child stage");
+        // Selectors 27 through 31 are bound to the immutable revision 8a compaction stages.
+        if (27..=31).contains(&boundary) { assert!((27..=31).contains(&boundary)); } else { assert!([10, 11].contains(&boundary) || (19..=26).contains(&boundary)); }
+        let fixture_open_accountant_43134 = Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+        let _fixture_decode_scope_43134 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43134)).unwrap();
+        let store = RedbPersistence::open(Path::new(&path)).expect("open closed temporary compaction fixture beside registered old readers");
+        store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43134));
+        arm_retention_reclaim_crash_for_test(boundary);
+        let result = graph_compaction_publication(&store);
+        panic!("selected compaction interruption {boundary} was not reached: {result:?}");
+    }
+
+    fn assert_graph_compaction_pinned_rows(directory: &Path, boundaries: &[u8]) {
+        let fixture_path = directory.join("graph-compaction-fixture.db");
+        let (predecessor, entries) = graph_compaction_fixture(&fixture_path);
+        let initial_fixture_file_bytes = std::fs::metadata(&fixture_path).unwrap().len();
+        let control_path = directory.join("graph-compaction-success.db");
+        std::fs::copy(&fixture_path, &control_path).unwrap();
+        // Begin the file readers before writer acquisition. Their registration
+        // is real custody of the old storage root, held through publication.
+        let control_session = ReadSession::open(&control_path).unwrap();
+        assert_eq!(control_session.route(), ReadRoute::File);
+        let control_registration = control_session.file_storage_registration_for_test().unwrap();
+        assert!(control_registration.descriptor_open);
+        assert!(!control_registration.load_lock_held);
+        let (image, _receipt, control_source) = load_read_image_with_memory(&control_path, Some(16 * 1024 * 1024)).unwrap().into_parts();
+        drop(image);
+        let fixture_open_accountant_43155 = Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+        let _fixture_decode_scope_43155 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43155)).unwrap();
+        let control = RedbPersistence::open(&control_path).unwrap();
+        control.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43155));
+        let page_size = control.with_db(|db| {
+            let snapshot = db.storage_statistics_snapshot().map_err(RedbPersistence::storage_error)?;
+            Ok(snapshot.stats().map_err(RedbPersistence::storage_error)?.page_size())
+        }).unwrap();
+        let initial_fixture_file_pages = initial_fixture_file_bytes.div_ceil(page_size as u64);
+        // Freeze the finite progress window before any compaction step.
+        let maximum_progress_steps = initial_fixture_file_pages.div_ceil(80) + 1;
+        let before = graph_compaction_state(&control);
+        let control_writer = control.initialize_writer_snapshot(SnapshotId(100), Lsn(30)).unwrap();
+        let writer_pin = control_writer.storage_identity();
+        let source_pin = control_source.storage_identity();
+        drop(_fixture_decode_scope_43155);
+        let session_image = control_session.file_snapshot_for_test().unwrap();
+        let row_answer = control_session.execute("SELECT body FROM removed_rows", &HashMap::new()).unwrap().rows;
+        assert_eq!(row_answer, vec![vec![Value::Text("selected physical retention payload".into())]]);
+        let history_answer = control_session.metadata(crate::MetadataRequest::ImageState { kind: crate::DirectImageMetadataKind::ChangeLog }, None).unwrap().body;
+        let directory_before = directory_pinned_view(&control_session);
+        assert_eq!(directory_before, ((6,Lsn(1)), None, Some((Lsn(20),TxId(100))), Some((0,6))));
+        let _fixture_decode_scope_43155 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43155)).unwrap();
+        let mut relocation_observed = false;
+        let mut cumulative_pages_relocated = 0;
+        let mut first_successful_step = None;
+        for step in 0..maximum_progress_steps {
+            let scope = ReadWorkObservationScope::enter(ReadWorkPhase::Mutation);
+            let (progress, _recycled) = graph_compaction_publication(&control).unwrap();
+            assert_graph_compaction_observation(&scope, None);
+            drop(scope);
+            if step == 0 {
+                first_successful_step = Some(graph_compaction_state(&control));
+            }
+            assert!(progress.pages_examined > 0);
+            cumulative_pages_relocated += progress.pages_relocated;
+            if progress.pages_relocated > 0 {
+                relocation_observed = true;
+                break;
+            }
+        }
+        let first_successful_step = first_successful_step.expect("the control executes its first successful compaction step");
+        assert!(relocation_observed, "the control must execute physical page relocation within {maximum_progress_steps} steps");
+        assert!(cumulative_pages_relocated > 0, "the control executes actual physical page relocation within the frozen progress window");
+        drop(_fixture_decode_scope_43155);
+        assert_eq!(directory_pinned_view(&control_session), directory_before, "actual installed directory survives physical relocation at its original root");
+        let _fixture_decode_scope_43155 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43155)).unwrap();
+        let after = graph_compaction_state(&control);
+        assert_ne!(after.1, before.1, "successor cursor is published durably");
+        assert_ne!(after.2, before.2, "compaction publishes a new physical root");
+        assert_eq!(after.0.0.0, before.0.0.0, "forward/reverse/C/T/R and row bytes survive relocation");
+        assert_eq!(after.0.0.1[0], before.0.0.1[0], "private history bytes survive relocation");
+        assert_eq!(after.0.1, before.0.1, "numeric history and selectors survive relocation");
+        assert_eq!(after.0.2, before.0.2, "clock/read bounds survive relocation");
+        assert_eq!(after.0.3, before.0.3, "occurrence counts survive relocation");
+        assert_eq!(after.0.4, before.0.4, "commit directory members survive relocation");
+        {
+            let observed_identity = control_writer.storage_identity();
+            assert!(observed_identity.transaction_id >= writer_pin.transaction_id);
+            assert_eq!(observed_identity.user_root, writer_pin.user_root);
+        }
+        {
+            let observed_identity = control_source.storage_identity();
+            assert!(observed_identity.transaction_id >= source_pin.transaction_id);
+            assert_eq!(observed_identity.user_root, source_pin.user_root);
+        }
+        drop(_fixture_decode_scope_43155);
+        {
+            let mut observed_registration = control_session.file_storage_registration_for_test().unwrap();
+            assert!(observed_registration.storage_transaction_id >= control_registration.storage_transaction_id);
+            observed_registration.storage_transaction_id = control_registration.storage_transaction_id;
+            assert_eq!(observed_registration, control_registration);
+        }
+        assert_eq!(control_session.file_snapshot_for_test().unwrap(), session_image);
+        assert_eq!(control_session.execute("SELECT body FROM removed_rows", &HashMap::new()).unwrap().rows, row_answer);
+        assert_eq!(control_session.metadata(crate::MetadataRequest::ImageState { kind: crate::DirectImageMetadataKind::ChangeLog }, None).unwrap().body, history_answer);
+        assert_graph_retention_row_source(&graph_read::GraphReadRoot::Writer(control_writer.clone()), true);
+        assert_graph_source_answers(graph_read::GraphReadRoot::Writer(control_writer.clone()), &predecessor, true, &entries);
+        assert_graph_retention_row_source(&graph_read::GraphReadRoot::Image(control_source.clone()), true);
+        assert_graph_source_answers(graph_read::GraphReadRoot::Image(control_source.clone()), &predecessor, true, &entries);
+        drop(control_writer);
+        drop(control_source);
+        drop(control_session);
+        drop(control);
+
+        // A normal successful call performs two later allocator housekeeping
+        // commits. Obtain the exact first publication outcome independently
+        // by stopping its reporting path at the already-bound postcommit stage.
+        // This error occurs after the relocation transaction has committed;
+        // it is never treated as an aborted publication or a success return.
+        let published_path = directory.join("graph-compaction-published-control.db");
+        std::fs::copy(&fixture_path, &published_path).unwrap();
+        let published_session = ReadSession::open(&published_path).unwrap();
+        let (image, _receipt, published_source) = load_read_image_with_memory(&published_path, Some(16 * 1024 * 1024)).unwrap().into_parts();
+        drop(image);
+        let fixture_open_accountant_43208 = Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+        let _fixture_decode_scope_43208 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43208)).unwrap();
+        let published = RedbPersistence::open(&published_path).unwrap();
+        published.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43208));
+        let published_writer = published.initialize_writer_snapshot(SnapshotId(100), Lsn(30)).unwrap();
+        let scope = ReadWorkObservationScope::enter(ReadWorkPhase::Mutation);
+        arm_currency_reclaim_fault_for_test(11, false);
+        let error = graph_compaction_publication(&published).unwrap_err();
+        assert!(matches!(error, Error::Other(ref message) if message == "injected currency cleanup failure"));
+        assert_graph_compaction_observation(&scope, None);
+        drop(scope);
+        let first_publication = graph_compaction_state(&published);
+        assert_eq!(first_publication.0, first_successful_step.0, "allocator housekeeping does not change published data/proof/binding bytes");
+        assert_eq!(first_publication.1, first_successful_step.1, "the published successor checkpoint is independent of later housekeeping");
+        assert_ne!(first_publication.2, before.2);
+        assert_graph_source_answers(graph_read::GraphReadRoot::Writer(published_writer), &predecessor, true, &entries);
+        assert_graph_source_answers(graph_read::GraphReadRoot::Image(published_source), &predecessor, true, &entries);
+        drop(_fixture_decode_scope_43208);
+        assert_eq!(published_session.execute("SELECT body FROM removed_rows", &HashMap::new()).unwrap().rows, row_answer);
+        drop(published_session);
+        drop(published);
+
+        for &boundary in boundaries {
+            if (27..=31).contains(&boundary) { assert!((27..=31).contains(&boundary)); } else { assert!([10, 11].contains(&boundary) || (19..=26).contains(&boundary)); }
+            for crash in [false, true] {
+                let path = directory.join(format!("graph-compaction-{boundary}-{crash}.db"));
+                std::fs::copy(&fixture_path, &path).unwrap();
+                let old_session = ReadSession::open(&path).unwrap();
+                assert_eq!(old_session.route(), ReadRoute::File);
+                let old_registration = old_session.file_storage_registration_for_test().unwrap();
+                assert!(old_registration.descriptor_open);
+                assert!(!old_registration.load_lock_held);
+                let old_snapshot = old_session.file_snapshot_for_test().unwrap();
+                let (image, _receipt, old_source) = load_read_image_with_memory(&path, Some(16 * 1024 * 1024)).unwrap().into_parts();
+                drop(image);
+                let old_source_pin = old_source.storage_identity();
+                assert_eq!(old_session.execute("SELECT body FROM removed_rows", &HashMap::new()).unwrap().rows, row_answer);
+                assert_eq!(old_session.metadata(crate::MetadataRequest::ImageState { kind: crate::DirectImageMetadataKind::ChangeLog }, None).unwrap().body, history_answer);
+                if crash {
+                    // The parent retains its registered reader handles across
+                    // child writer acquisition and abort. It holds no writer.
+                    let module = module_path!().split_once("::").unwrap().1;
+                    let exact_name = format!("{module}::empty_declared_index_publishes_marker_and_postings_for_a_lazy_ordered_read");
+                    let output = std::process::Command::new(std::env::current_exe().unwrap())
+                        .args(["--exact", &exact_name, "--nocapture", "--test-threads=1"])
+                        .env("CONTEXTDB_GRAPH_COMPACTION_PATH", &path)
+                        .env("CONTEXTDB_GRAPH_COMPACTION_BOUNDARY", boundary.to_string())
+                        .current_dir(directory).output().unwrap();
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let marker = format!("RETENTION_RECLAIM_CRASH={boundary}");
+                    assert_eq!(stderr.lines().filter(|line| *line == marker).count(), 1, "specific compaction interruption marker required: {stderr}");
+                    assert_eq!(stderr.lines().filter(|line| line.starts_with("RETENTION_RECLAIM_CRASH=")).count(), 1);
+                    assert!(!output.status.success());
+                    #[cfg(unix)] {
+                        use std::os::unix::process::ExitStatusExt;
+                        assert_eq!(output.status.signal(), Some(libc::SIGABRT), "generic child failure is not the selected compaction interruption: {stdout}\n{stderr}");
+                    }
+                    assert!(!stderr.contains("panicked at"));
+                    assert!(!stdout.contains("FAILED"));
+                } else {
+                    let fixture_open_accountant_43266 = Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+                    let _fixture_decode_scope_43266 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43266)).unwrap();
+                    let store = RedbPersistence::open(&path).unwrap();
+                    store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43266));
+                    let old_writer = store.initialize_writer_snapshot(SnapshotId(100), Lsn(30)).unwrap();
+                    let old_writer_pin = old_writer.storage_identity();
+                    {
+                        let mut observed_state = graph_compaction_state(&store);
+                        assert!(observed_state.2.transaction_id >= before.2.transaction_id);
+                        observed_state.2.transaction_id = before.2.transaction_id;
+                        assert_eq!(observed_state, before);
+                    }
+                    let scope = ReadWorkObservationScope::enter(ReadWorkPhase::Mutation);
+                    arm_currency_reclaim_fault_for_test(boundary, false);
+                    let error = graph_compaction_publication(&store).unwrap_err();
+                    assert!(matches!(error, Error::Other(ref message) if message == "injected currency cleanup failure"));
+                    assert_graph_compaction_observation(&scope, Some(boundary));
+                    drop(scope);
+                    {
+                        let observed_identity = old_writer.storage_identity();
+                        assert!(observed_identity.transaction_id >= old_writer_pin.transaction_id);
+                        assert_eq!(observed_identity.user_root, old_writer_pin.user_root);
+                    }
+                    assert_graph_retention_row_source(&graph_read::GraphReadRoot::Writer(old_writer.clone()), true);
+                    assert_graph_source_answers(graph_read::GraphReadRoot::Writer(old_writer), &predecessor, true, &entries);
+                    drop(store);
+                    drop(_fixture_decode_scope_43266);
+                }
+                let expected = if boundary == 11 { &first_publication } else { &before };
+                let fixture_open_accountant_43283 = Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+                let _fixture_decode_scope_43283 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43283)).unwrap();
+                let reopened = RedbPersistence::open(&path).unwrap();
+                reopened.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43283));
+                let reopened_state = graph_compaction_state(&reopened);
+                assert!(reopened_state.2.transaction_id >= before.2.transaction_id, "stage {boundary} recovery never moves the storage transaction counter backwards");
+                // Recovery may advance the counter; every committed content byte
+                // and every other physical snapshot identity field must match.
+                let reopened_content = (
+                    reopened_state.0,
+                    reopened_state.1,
+                    redb::StorageSnapshotIdentity {
+                        transaction_id: expected.2.transaction_id,
+                        ..reopened_state.2
+                    },
+                );
+                assert_eq!(&reopened_content, expected, "stage {boundary} publishes the exact old/new root, persisted progress and complete data");
+                let new_writer = reopened.initialize_writer_snapshot(SnapshotId(100), Lsn(30)).unwrap();
+                assert_graph_retention_row_source(&graph_read::GraphReadRoot::Writer(new_writer.clone()), true);
+                assert_graph_source_answers(graph_read::GraphReadRoot::Writer(new_writer), &predecessor, true, &entries);
+                drop(_fixture_decode_scope_43283);
+                {
+                    let mut observed_registration = old_session.file_storage_registration_for_test().unwrap();
+                    assert!(observed_registration.storage_transaction_id >= old_registration.storage_transaction_id);
+                    observed_registration.storage_transaction_id = old_registration.storage_transaction_id;
+                    assert_eq!(observed_registration, old_registration, "the same old descriptor/registration/root remains pinned");
+                }
+                assert_eq!(old_session.file_snapshot_for_test().unwrap(), old_snapshot);
+                {
+                    let observed_identity = old_source.storage_identity();
+                    assert!(observed_identity.transaction_id >= old_source_pin.transaction_id);
+                    assert_eq!(observed_identity.user_root, old_source_pin.user_root);
+                }
+                assert_eq!(old_session.execute("SELECT body FROM removed_rows", &HashMap::new()).unwrap().rows, row_answer);
+                assert_eq!(old_session.metadata(crate::MetadataRequest::ImageState { kind: crate::DirectImageMetadataKind::ChangeLog }, None).unwrap().body, history_answer);
+                assert_graph_retention_row_source(&graph_read::GraphReadRoot::Image(old_source.clone()), true);
+                assert_graph_source_answers(graph_read::GraphReadRoot::Image(old_source.clone()), &predecessor, true, &entries);
+                let _fixture_decode_scope_43283 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43283)).unwrap();
+                let current_root = reopened.initialize_writer_snapshot(SnapshotId(100), Lsn(30)).unwrap().storage_identity();
+                drop(_fixture_decode_scope_43283);
+                drop(reopened);
+                let fresh_session = ReadSession::open(&path).unwrap();
+                assert_eq!(fresh_session.route(), ReadRoute::File);
+                let fresh_registration = fresh_session.file_storage_registration_for_test().unwrap();
+                assert!(fresh_registration.storage_transaction_id >= current_root.transaction_id);
+                assert_eq!((fresh_registration.storage_root_page, fresh_registration.storage_root_checksum, fresh_registration.storage_root_length), (current_root.user_root.map(|root| root.page), current_root.user_root.map(|root| root.checksum), current_root.user_root.map(|root| root.length)), "fresh public session owns exactly the new current physical root");
+                assert_eq!(fresh_session.execute("SELECT body FROM removed_rows", &HashMap::new()).unwrap().rows, row_answer);
+                assert_eq!(fresh_session.metadata(crate::MetadataRequest::ImageState { kind: crate::DirectImageMetadataKind::ChangeLog }, None).unwrap().body, history_answer);
+            }
+        }
     }
 
     fn indexed_fixture(path: &Path, table: &str, index: &str) {
@@ -38792,7 +44319,7 @@ mod empty_declared_index_readiness_tests {
                         assert_open_proves_bounded_history_and_startup_digest(
                             work.counters(),
                             &format!("{case} skips complete-image hydration"),
-                            804,
+                            331,
                         );
                     } else {
                         assert!(
@@ -38800,16 +44327,798 @@ mod empty_declared_index_readiness_tests {
                             "{case} retains complete-image hydration"
                         );
                     }
+                    let first_open = work.counters();
                     drop(image);
                     drop(work);
+                    if expected_lazy {
+                        // Keep the startup projection fixed while doubling retained
+                        // row/vector bodies and adding a committed history entry.
+                        let database = Database::open(&path)
+                            .expect("reopen the readiness matrix growth fixture");
+                        database
+                            .execute(
+                                &format!("INSERT INTO {table} VALUES (2, 'ready', $body, $embedding)"),
+                                &HashMap::from([
+                                    ("body".to_owned(), Value::Text("bounded-readiness-body-".repeat(4096))),
+                                    ("embedding".to_owned(), Value::Vector(vec![0.0, 1.0])),
+                                ]),
+                            )
+                            .expect("double retained readiness bodies and append history");
+                        database.close().expect("publish the larger readiness fixture");
+
+                        let larger_work = ReadWorkObservationScope::enter(ReadWorkPhase::Open);
+                        let larger_image = load_read_image_with_memory(&path, Some(2 * 1024 * 1024))
+                            .expect("the larger readiness fixture remains readable");
+                        assert!(larger_image.image.lazy_relational, "{case}");
+                        assert_open_proves_bounded_history_and_startup_digest(
+                            larger_work.counters(),
+                            &format!("{case} doubled retained bodies skip complete-image hydration"),
+                            331,
+                        );
+                        assert_eq!(
+                            larger_work.counters(), first_open,
+                            "{case}: fixed 331 hash bytes and zero proof/row/vector work are identical at both store sizes"
+                        );
+                        drop(larger_image);
+                        drop(larger_work);
+                    }
                 }
             }
         }
     }
 
+    // Admission failures retain the reader's typed refusal and return every
+    // short-lived credit. Limits come from the existing child declaration or
+    // the actual successful request, rather than a second policy constant.
+    #[cfg(feature = "test-seams")]
+    fn assert_graph_admission_rows(directory: &Path) {
+        use writer_source::SourceWindowOwner;
+        use std::ops::Bound;
+        let path = directory.join("graph-admission-doors.db");
+        let (store, predecessor, entries) = graph_history_fixture(&path, 0, 1, false);
+        let before = graph_publication_state(&store);
+        drop(store);
+        // Every operation gets a released-file, zero-cache fixture. Both
+        // native roots retain their actual registered descriptors; no page
+        // from fixture publication or a prior direction can fund this read.
+        let cold_roots = || {
+            let image_memory = crate::read_image_memory::ImageMemory::new(None);
+            // Same non-cache source reservation as the production load door.
+            // Zero is the existing fixture cache option, not a reader limit.
+            let source_bytes = (64 * 1024)
+                + content_identity::READ_VERIFIER_MEMORY_BYTES
+                + std::mem::size_of::<Lsn>();
+            let source_memory = SourceMemoryReservation::new(image_memory.clone(), source_bytes).unwrap();
+            let limits = crate::read_session::ReadSessionOptions::default().limits;
+            let declared = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(limits.memory);
+            let open_context = crate::executor::bounded::ReadOpenContext::new(
+                declared.child().unwrap(), limits, crate::read_session::read_clock(),
+                OwnerReadCancellation::new(),
+            ).unwrap();
+            let load = image_memory.scope(|| {
+                let mut source = ReadImageSource::start(&path, 0, source_memory, None, None)?;
+                let image = source.with_read_transaction(|read| decode_complete_read_image(read, &path, image_memory.clone(), open_context.clone()))?;
+                source.finish(image)
+            }).unwrap();
+            let (_, receipt, image) = load.into_parts();
+            receipt.validate_released().unwrap();
+            let fixture_open_accountant_43602 = Arc::new(
+                crate::memory_accounting::MemoryAccountant::no_limit(),
+            );
+            let _fixture_decode_scope_43602 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43602)).unwrap();
+            let store = RedbPersistence::open_with_cache(&path, 0).unwrap();
+            store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43602));
+            let writer = store.initialize_writer_snapshot(SnapshotId(100), Lsn(30)).unwrap();
+            (store, [graph_read::GraphReadRoot::Writer(writer), graph_read::GraphReadRoot::Image(image)])
+        };
+        let declared_child = 16 * 1024 * 1024;
+        let key = RedbPersistence::graph_fwd_key(&predecessor);
+        let key_memory = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(declared_child));
+        let endpoint = SourceWindowOwner::Read(key_memory.clone()).endpoint(&[key.as_slice()], "graph_cursor").unwrap();
+        assert_eq!(key_memory.usage().used, key.len(), "the actual endpoint owns exactly its retained key");
+        drop(endpoint);
+        assert_eq!(key_memory.usage().used, 0, "the endpoint credit returns at its own lifetime boundary");
+        key_memory.set_budget(Some(key.len() - 1)).unwrap();
+        let error = SourceWindowOwner::Read(key_memory.clone()).endpoint(&[key.as_slice()], "graph_cursor").err().expect("one byte below the actual endpoint request refuses");
+        assert!(matches!(error, Error::MemoryBudgetExceeded { ref subsystem, ref operation, requested_bytes, budget_limit_bytes, .. }
+            if subsystem == "writer_source" && operation == "graph_cursor" && requested_bytes == key.len() && budget_limit_bytes == key.len() - 1),
+            "key admission keeps its original typed attribution: {error:?}");
+        assert_eq!(key_memory.usage().used, 0, "failed endpoint admission retains no credit");
+        key_memory.set_budget(Some(declared_child)).unwrap();
+        for route in 0..2 {
+            for reverse in [false, true] {
+                let (store, roots) = cold_roots();
+                let root = &roots[route];
+                assert_eq!(store.resident_cache_stats_for_test().unwrap().3, 0, "the fresh reopened writer has zero resident cache bytes before this cold page read");
+                if let graph_read::GraphReadRoot::Image(image) = root {
+                    assert_eq!(image.database.cache_stats().used_bytes(), 0, "the independent image fixture has no resident page cache before this cold page read");
+                }
+                let key = if reverse { RedbPersistence::graph_rev_key(&predecessor) } else { RedbPersistence::graph_fwd_key(&predecessor) };
+                let page_memory = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(key.len() - 1));
+                let error = graph_read::with_pages(page_memory.clone(), || {
+                    let read_page = |read: &redb::ReadTransaction| -> Result<()> {
+                        let table = read.open_table(if reverse { GRAPH_REV_TABLE } else { GRAPH_FWD_TABLE }).map_err(RedbPersistence::storage_error)?;
+                        let value = table.get_bounded(&key).map_err(RedbPersistence::storage_error)?;
+                        assert!(value.is_some(), "the actual bounded page contains this primary/reverse edge");
+                        Ok(())
+                    };
+                    match root {
+                        graph_read::GraphReadRoot::Writer(writer) => read_page(writer.owner_read()?.as_ref()),
+                        graph_read::GraphReadRoot::Image(image) => image.with_read(read_page),
+                    }
+                }).unwrap_err();
+                assert!(matches!(error, Error::MemoryBudgetExceeded { budget_limit_bytes, requested_bytes, available_bytes, .. }
+                    if budget_limit_bytes == key.len() - 1 && requested_bytes > available_bytes),
+                    "real reject-only page admission restores the original memory error: {error:?}");
+                assert_eq!(page_memory.usage().used, 0, "failed bounded primary/reverse page read releases partial credits");
+                let read_stored = |read: &redb::ReadTransaction| -> Result<Vec<u8>> {
+                    let table = read.open_table(if reverse { GRAPH_REV_TABLE } else { GRAPH_FWD_TABLE }).map_err(RedbPersistence::storage_error)?;
+                    Ok(table.get(key.as_slice()).map_err(RedbPersistence::storage_error)?.unwrap().value().to_vec())
+                };
+                let raw = match root {
+                    graph_read::GraphReadRoot::Writer(writer) => read_stored(&writer.owner_read().unwrap()).unwrap(),
+                    graph_read::GraphReadRoot::Image(image) => image.with_read(read_stored).unwrap(),
+                };
+                let decode_memory = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(declared_child));
+                let bridge = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(declared_child));
+                let decoder = crate::read_image_memory::ImageMemory::charging_reader_for(bridge.clone(), decode_memory.clone(), "graph_source", "edge_decode", "Raise the declared reader memory limit to read graph pages.");
+                let (decoded, consumed): (AdjEntry, usize) = decoder.scope(|| crate::read_image_memory::decode(&raw)).unwrap();
+                assert_eq!((&decoded, consumed), (&predecessor, raw.len()), "the actual stored primary/reverse payload has a valid complete decode");
+                let required_decode = decode_memory.high_water_for_test();
+                drop(decoded);
+                drop(decoder);
+                assert_eq!(decode_memory.usage().used, 0, "the admitted stored decoder releases its scratch at the decoder lifetime boundary");
+                decode_memory.set_budget(Some(required_decode - 1)).unwrap();
+                let decoder = crate::read_image_memory::ImageMemory::charging_reader_for(bridge.clone(), decode_memory.clone(), "graph_source", "edge_decode", "Raise the declared reader memory limit to read graph pages.");
+                let decoded: Result<(AdjEntry, usize)> = decoder.scope(|| crate::read_image_memory::decode(&raw));
+                let error = decoded.unwrap_err();
+                assert!(matches!(error, Error::MemoryBudgetExceeded { ref subsystem, ref operation, budget_limit_bytes, .. }
+                    if subsystem == "graph_source" && operation == "edge_decode" && budget_limit_bytes == required_decode - 1), "stored decoder admission preserves its original typed error: {error:?}");
+                drop(decoder);
+                assert_eq!(decode_memory.usage().used, 0, "a refused stored decoder returns its partial credits");
+                assert_eq!(bridge.usage().used, 0, "reader decoder scratch never borrows the source accountant");
+                let memory = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(declared_child));
+                let mut control = root.cursor(reverse, Bound::Included(&key), Bound::Included(&key), memory.clone()).unwrap();
+                let window = control.next_edge().unwrap().expect("the same exact bounded door has a valid source");
+                assert_eq!(window.edge(), &predecessor);
+                drop(window);
+                drop(control);
+                assert_eq!(memory.usage().used, 0, "successful page, proof, decoder and cursor credits return");
+                memory.reset_high_water_for_test();
+                let mut warm_control = root.cursor(reverse, Bound::Included(&key), Bound::Included(&key), memory.clone()).unwrap();
+                assert_eq!(warm_control.next_edge().unwrap().unwrap().edge(), &predecessor);
+                let successful_peak = memory.high_water_for_test();
+                assert!(successful_peak > key.len(), "the warmed actual source operation retains its key/decoder/proof requirement");
+                drop(warm_control);
+                assert_eq!(memory.usage().used, 0, "the warm control returns its operation credits before the refusal");
+                // The measured control is fully released before the refusing
+                // operation opens independent zero-cache captured roots. Its
+                // proof state and forward/reverse pages cannot warm the retry.
+                drop(roots);
+                drop(store);
+                let (store, roots) = cold_roots();
+                let root = &roots[route];
+                assert_eq!(store.resident_cache_stats_for_test().unwrap().3, 0, "the independently reopened refusal writer has zero resident cache bytes");
+                if let graph_read::GraphReadRoot::Image(image) = root {
+                    assert_eq!(image.database.cache_stats().used_bytes(), 0, "the independently reopened refusal image has no resident page cache");
+                }
+                memory.set_budget(Some(successful_peak - 1)).unwrap();
+                let outcome = root.cursor(reverse, Bound::Included(&key), Bound::Included(&key), memory.clone()).and_then(|mut cursor| cursor.next_edge().map(|_| ()));
+                let error = outcome.expect_err("one byte below the observed complete operation peak refuses");
+                assert!(matches!(error, Error::MemoryBudgetExceeded { budget_limit_bytes, .. } if budget_limit_bytes == successful_peak - 1),
+                    "page/decode admission preserves its memory refusal: {error:?}");
+                assert_eq!(memory.usage().used, 0, "failed page/decode operation releases every partial credit");
+                assert_eq!(memory.underflow_count_for_test(), 0, "credits return exactly once");
+                assert_eq!(graph_publication_state(&store), before, "read admission refusal changes no durable history, roots or progress");
+                memory.set_budget(Some(declared_child)).unwrap();
+                let mut restored = root.cursor(reverse, Bound::Included(&key), Bound::Included(&key), memory.clone()).unwrap();
+                assert_eq!(restored.next_edge().unwrap().unwrap().edge(), &predecessor, "retry uses the same captured source after refusal");
+                drop(restored);
+                assert_eq!(memory.usage().used, 0);
+                if reverse {
+                    assert_graph_source_answers(root.clone(), &predecessor, true, &entries);
+                }
+                drop(roots);
+                drop(store);
+            }
+        }
+        let fixture_open_accountant_43720 = std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+        let _fixture_decode_scope_43720 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43720)).unwrap();
+        let store = RedbPersistence::open_with_cache(&path, 0).unwrap();
+        store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43720));
+        assert_eq!(graph_publication_state(&store), before, "all refusals and retries leave the complete fixture unchanged");
+    }
+
+    #[cfg(feature = "test-seams")]
+    #[derive(Default)]
+    struct GraphDoorCancellationObserver {
+        armed: std::sync::atomic::AtomicBool,
+        first: std::sync::Mutex<Option<crate::read_session::ReadKernelSourceEvent>>,
+        caller_cancellation: std::sync::Mutex<Option<contextdb_core::read_contract::OwnerReadCancellation>>,
+    }
+    #[cfg(feature = "test-seams")]
+    impl crate::read_session::ReadKernelTestObserver for GraphDoorCancellationObserver {
+        fn before_source_touch(&self, event: crate::read_session::ReadKernelSourceEvent, cancellation: contextdb_core::read_contract::OwnerReadCancellation) {
+            if event.source == crate::read_session::ReadKernelSource::GraphEdge
+                && self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                *self.first.lock().unwrap() = Some(event);
+                let caller = self.caller_cancellation.lock().unwrap().clone();
+                if let Some(caller) = caller { caller.cancel(); } else { cancellation.cancel(); }
+            }
+        }
+        fn cancellation_observed(&self, _: crate::read_session::ReadKernelCancellationEvent, _: contextdb_core::read_contract::OwnerReadCancellation) {}
+    }
+
+    // Use stored ACL metadata and actual grant lookup. An allowed target and
+    // edge never confer the missing source entitlement on either public route.
+    #[cfg(feature = "test-seams")]
+    fn assert_graph_authorization_and_cancellation_rows(directory: &Path) {
+        use crate::read_session::{ReadSession, ReadSessionOptions};
+        use contextdb_core::read_contract::ReadRoute;
+        use contextdb_core::Principal;
+        let principal = "graph-door-reader";
+        let source = uuid::Uuid::from_u128(1);
+        let target = uuid::Uuid::from_u128(2);
+        let source_acl = uuid::Uuid::from_u128(3);
+        let allowed_acl = uuid::Uuid::from_u128(4);
+        let query = "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) WHERE a.id = $source COLUMNS (b.id AS t))";
+        let anchor = uuid::Uuid::from_u128(6);
+        let params = HashMap::from([("source".into(), Value::Uuid(source)), ("anchor".into(), Value::Uuid(anchor)), ("target".into(), Value::Uuid(target))]);
+        for allow_source in [false, true] {
+          for malformed_projection in [None, Some(false), Some(true)] {
+            let malformed_source = malformed_projection.is_some();
+            let path = directory.join(format!("graph-real-source-permission-{allow_source}-{malformed_projection:?}.db"));
+            let observer = Arc::new(GraphDoorCancellationObserver::default());
+            let database = Database::open_with_options(&path, crate::DatabaseOpenOptions {
+                maintenance_policy: crate::database::MaintenancePolicy::CallerDriven,
+                test_kernel_observer: Some(observer.clone()), ..Default::default()
+            }).unwrap();
+            for sql in [
+                "CREATE TABLE acl_grants (id UUID PRIMARY KEY, principal_kind TEXT, principal_id TEXT, acl_id UUID) SYNC OFF",
+                // Non-unique id keeps the visibility controls list-shaped: a hidden
+                // PRIMARY KEY identity correctly returns AclDenied, not an empty list.
+                "CREATE TABLE nodes (id UUID, acl_id UUID ACL REFERENCES acl_grants(acl_id)) SYNC OFF",
+                "CREATE INDEX graph_permission_nodes_id ON nodes(id)",
+                "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT, acl_id UUID ACL REFERENCES acl_grants(acl_id)) SYNC OFF",
+            ] { database.execute(sql, &HashMap::new()).unwrap(); }
+            database.execute("INSERT INTO acl_grants VALUES ($id, 'Agent', $principal, $acl)", &HashMap::from([
+                ("id".into(), Value::Uuid(allowed_acl)), ("principal".into(), Value::Text(principal.into())), ("acl".into(), Value::Uuid(allowed_acl))
+            ])).unwrap();
+            if allow_source {
+                database.execute("INSERT INTO acl_grants VALUES ($id, 'Agent', $principal, $acl)", &HashMap::from([
+                    ("id".into(), Value::Uuid(source_acl)), ("principal".into(), Value::Text(principal.into())), ("acl".into(), Value::Uuid(source_acl))
+                ])).unwrap();
+            }
+            for (id, acl) in [(source, source_acl), (target, allowed_acl)] {
+                database.execute("INSERT INTO nodes VALUES ($id, $acl)", &HashMap::from([("id".into(), Value::Uuid(id)), ("acl".into(), Value::Uuid(acl))])).unwrap();
+            }
+            database.execute("INSERT INTO edges VALUES ($id, $source, $target, 'LINKS', $acl)", &HashMap::from([
+                ("id".into(), Value::Uuid(uuid::Uuid::from_u128(5))), ("source".into(), Value::Uuid(source)),
+                ("target".into(), Value::Uuid(target)), ("acl".into(), Value::Uuid(allowed_acl))
+            ])).unwrap();
+            if !allow_source {
+                database.execute("INSERT INTO nodes VALUES ($id, $acl)", &HashMap::from([("id".into(), Value::Uuid(anchor)), ("acl".into(), Value::Uuid(allowed_acl))])).unwrap();
+                // A real graph edge enters the denied source from a visible node.
+                // The original relational edge/grant controls remain unchanged.
+                let tx = database.begin().unwrap();
+                database.insert_edge(tx, anchor, source, "LINKS".into(), HashMap::new()).unwrap();
+                database.commit(tx).unwrap();
+            }
+            for query in std::iter::once(query).chain((!allow_source).then_some(
+                "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->{1,2}(b) WHERE a.id = $anchor AND b.id = $target COLUMNS (b.id AS t))"
+            )) {
+            assert_eq!(database.execute(query, &params).unwrap().rows, vec![vec![Value::Uuid(target)]], "admin control confirms the actual stored graph edge");
+            }
+            database.close().unwrap();
+            drop(database);
+            if malformed_source {
+                let fixture_open_accountant_43807 = std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+                let _fixture_decode_scope_43807 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43807)).unwrap();
+                let persistence = RedbPersistence::open(&path).unwrap();
+                persistence.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43807));
+                persistence.with_db(|db| {
+                    let write = db.begin_write().map_err(RedbPersistence::storage_error)?;
+                    {
+                        let mut table = write.open_table(if malformed_projection == Some(true) { GRAPH_REV_TABLE } else { GRAPH_FWD_TABLE }).map_err(RedbPersistence::storage_error)?;
+                        let (key, mut raw) = {
+                            let endpoints = if malformed_projection == Some(true) { [target.as_bytes().as_slice(), source.as_bytes().as_slice()].concat() } else { [source.as_bytes().as_slice(), target.as_bytes().as_slice()].concat() };
+                            let (key, raw) = table.iter().map_err(RedbPersistence::storage_error)?.map(|entry| entry.map_err(RedbPersistence::storage_error)).find(|entry| entry.as_ref().is_ok_and(|(key, _)| key.value().starts_with(&endpoints))).unwrap()?;
+                            (key.value().to_vec(), raw.value().to_vec())
+                        };
+                        raw.push(0);
+                        table.insert(key.as_slice(), raw.as_slice()).map_err(RedbPersistence::storage_error)?;
+                    }
+                    // Refresh the final physical descriptor bindings so the
+                    // reader reaches the damaged accessed payload, rather
+                    // than merely refusing an obsolete descriptor at open.
+                    RedbPersistence::write_writer_recovery_bounds_in_write(&write, None)?;
+                    write.commit().map_err(RedbPersistence::storage_error)?;
+                    Ok(())
+                }).unwrap();
+                drop(persistence);
+            }
+            let database = Database::open_with_options(&path, crate::DatabaseOpenOptions {
+                maintenance_policy: crate::database::MaintenancePolicy::CallerDriven,
+                test_kernel_observer: Some(observer.clone()), ..Default::default()
+            }).unwrap();
+            let options = ReadSessionOptions { principal: Some(Principal::Agent(principal.into())), ..Default::default() };
+            let owner = ReadSession::open_owner_only(&path, options.clone()).unwrap();
+            assert_eq!(owner.route(), ReadRoute::Owner);
+            assert_graph_permission_session(&owner, &observer, allow_source, malformed_source, query, &params, target);
+            drop(owner);
+            database.close().unwrap();
+            drop(database);
+            let file = ReadSession::open_with_kernel_observer_for_test(&path, options, observer.clone()).unwrap();
+            assert_eq!(file.route(), ReadRoute::File);
+            assert_graph_permission_session(&file, &observer, allow_source, malformed_source, query, &params, target);
+          }
+        }
+    }
+
+    #[cfg(feature = "test-seams")]
+    fn assert_graph_permission_session(session: &crate::read_session::ReadSession, observer: &GraphDoorCancellationObserver, allow_source: bool, malformed_source: bool,
+        query: &str, params: &HashMap<String, Value>, target: uuid::Uuid) {
+        let expected = if allow_source { vec![vec![Value::Uuid(target)]] } else { Vec::new() };
+        assert_eq!(session.execute("SELECT id FROM nodes WHERE id = $target", &HashMap::from([("target".into(), Value::Uuid(target))])).unwrap().rows,
+            vec![vec![Value::Uuid(target)]], "the principal genuinely holds the target grant");
+        assert_eq!(session.execute("SELECT edge_type FROM edges", &HashMap::new()).unwrap().rows,
+            vec![vec![Value::Text("LINKS".into())]], "the principal genuinely holds the edge grant");
+        assert_eq!(session.execute("SELECT id FROM nodes WHERE id = $source", params).unwrap().rows,
+            if allow_source { vec![vec![params["source"].clone()]] } else { Vec::new() }, "the source permission is decided by stored ACL metadata");
+        if malformed_source && allow_source {
+            let before = session.route_resources_for_test().unwrap();
+            let error = session.execute(query, params).unwrap_err();
+            assert!(matches!(error, Error::StoreCorrupted { .. }), "an allowed source with a malformed accessed primary retains typed corruption: {error:?}");
+            let after = session.route_resources_for_test().unwrap();
+            assert_eq!(after.active_cursors, before.active_cursors, "typed accessed-source failure closes its operation lifetime");
+            let error = session.execute(query, params).unwrap_err();
+            assert!(matches!(error, Error::StoreCorrupted { .. }), "the unchanged malformed source keeps refusing on a fresh operation: {error:?}");
+            return;
+        }
+        if !allow_source {
+            let error = session.execute(query, params).unwrap_err();
+            assert!(matches!(error, Error::AclDenied { .. }), "a hidden pinned graph anchor keeps its existing typed denial: {error:?}");
+        }
+        // Hidden nodes reached by a walk are filtered; hidden pinned starts are refused.
+        let query = if allow_source { query } else {
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->{1,2}(b) WHERE a.id = $anchor AND b.id = $target COLUMNS (b.id AS t))"
+        };
+        assert_eq!(session.execute(query, params).unwrap().rows, expected, "denied source plus allowed target and edge yields zero on this real route");
+        if allow_source {
+            let before = session.route_resources_for_test().unwrap();
+            let caller_cancellation = contextdb_core::read_contract::OwnerReadCancellation::new();
+            *observer.caller_cancellation.lock().unwrap() = Some(caller_cancellation.clone());
+            observer.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+            let error = session.execute_with_cancellation(query, params, &caller_cancellation).unwrap_err();
+            observer.caller_cancellation.lock().unwrap().take();
+            assert!(matches!(error, Error::ReadCancelled), "source-boundary cancellation keeps its exact public type: {error:?}");
+            let event = observer.first.lock().unwrap().take().expect("the real graph source callback fired");
+            assert_eq!(event.completed_items, 0, "cancellation is driven before the first graph edge is fetched");
+            let after = session.route_resources_for_test().unwrap();
+            assert_eq!(after.active_cursors, before.active_cursors, "cancelled statement releases its cursor lifetime");
+            assert_eq!(session.execute(query, params).unwrap().rows, expected, "fresh operation survives cancellation without changing the pinned source");
+        }
+        let cancelled = contextdb_core::read_contract::OwnerReadCancellation::new();
+        cancelled.cancel();
+        let error = session.execute_with_cancellation(query, params, &cancelled).unwrap_err();
+        assert!(matches!(error, Error::ReadCancelled), "pre-cancelled public read keeps cancellation distinct from denied permission: {error:?}");
+        assert_eq!(session.execute(query, params).unwrap().rows, expected, "typed refusal and cancellation leave authorization and source answers unchanged");
+    }
+
     #[test]
     fn empty_declared_index_publishes_marker_and_postings_for_a_lazy_ordered_read() {
+
+        {
+            use redb::{ReadableDatabase, ReadableTable};
+            let mut failures = Vec::new();
+            for damage in ["malformed_current", "malformed_historical", "native_page", "healthy_budget"] {
+                let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let directory = tempfile::tempdir().unwrap();
+                    let path = directory.path().join("typed-relational-refusal.db");
+                    let database = Database::open(&path).unwrap();
+                    database.execute("CREATE TABLE typed_refusal_rows (id INT PRIMARY KEY, body TEXT)", &HashMap::new()).unwrap();
+                    let payload = "typed-relational-native-page-unique-marker-".repeat(8192);
+                    database.execute("INSERT INTO typed_refusal_rows VALUES (1, $body)",
+                        &HashMap::from([("body".into(), Value::Text(payload.clone()))])).unwrap();
+                    let historical = database.writer_read_root().unwrap().unwrap().snapshot;
+                    let selected = database.scan("typed_refusal_rows", historical).unwrap().remove(0);
+                    if damage == "malformed_historical" {
+                        database.execute("UPDATE typed_refusal_rows SET body = 'new head' WHERE id = 1", &HashMap::new()).unwrap();
+                    }
+                    let current = database.writer_read_root().unwrap().unwrap().snapshot;
+                    let snapshot = if damage == "malformed_historical" { historical } else { current };
+                    let statements = [
+                        "SELECT id, body FROM typed_refusal_rows WHERE id = 1",
+                        "SELECT id, body FROM typed_refusal_rows WHERE id IN (1, 2)",
+                        "SELECT id, body FROM typed_refusal_rows",
+                    ];
+                    let controls = statements.map(|sql| database.execute_at_snapshot(sql, &HashMap::new(), snapshot).unwrap().rows);
+                    assert!(controls.iter().all(|rows| !rows.is_empty()), "{damage}: every actual read door has a healthy answer");
+                    database.close().unwrap();
+                    drop(database);
+                    let key = RedbPersistence::rel_row_key(&selected);
+                    let name = RedbPersistence::rel_table_name("typed_refusal_rows");
+                    let definition = TableDefinition::<&[u8], &[u8]>::new(&name);
+                    if damage.starts_with("malformed_") {
+                        let raw = redb::Database::open(&path).unwrap();
+                        let write = raw.begin_write().unwrap();
+                        {
+                            let mut table = write.open_table(definition).unwrap();
+                            assert!(table.get(key.as_slice()).unwrap().is_some(), "the real version key exists before body damage");
+                            table.insert(key.as_slice(), b"{not a versioned row".as_slice()).unwrap();
+                            assert!(table.get(key.as_slice()).unwrap().is_some(), "malformed bytes preserve the valid physical key");
+                        }
+                        write.commit().unwrap();
+                        drop(raw);
+                    } else if damage == "native_page" {
+                        let raw = redb::Database::open(&path).unwrap();
+                        let encoded = {
+                            let read = raw.begin_read().unwrap();
+                            let table = read.open_table(definition).unwrap();
+                            let value = table.get(key.as_slice()).unwrap().unwrap();
+                            value.value().to_vec()
+                        };
+                        drop(raw);
+                        let mut file = std::fs::read(&path).unwrap();
+                        let offsets: Vec<_> = file.windows(encoded.len()).enumerate()
+                            .filter_map(|(offset, bytes)| (bytes == encoded.as_slice()).then_some(offset)).collect();
+                        assert!(!offsets.is_empty(), "locate the actual persisted relational body, without a guessed page offset");
+                        for offset in offsets { file[offset + encoded.len() - 2] ^= 1; }
+                        std::fs::write(&path, file).unwrap();
+                    }
+                    if damage == "healthy_budget" {
+                        // A tight budget on healthy data must retain a typed memory refusal.
+                        // The internal admission stage and exact byte figures are not the contract.
+                        let mut options = ReadSessionOptions::default();
+                        options.memory_limit = Some(payload.len());
+                        options.limits.memory = payload.len().try_into().unwrap();
+                        let reader = ReadSession::open_with_options(&path, options).expect("healthy metadata opens under the tight budget before the body is requested");
+                        let error = reader.execute(statements[2], &HashMap::new()).unwrap_err();
+                        assert!(matches!(error, Error::MemoryBudgetExceeded { requested_bytes, available_bytes, .. } if requested_bytes > available_bytes),
+                            "a healthy body that exceeds actual admission retains typed memory refusal: {error:?}");
+                        assert!(!matches!(&error, Error::StoreCorrupted { .. }),
+                            "a tight budget on healthy data must never report store corruption: {error:?}");
+                        drop(reader);
+                        let reader = ReadSession::open_with_options(&path, ReadSessionOptions::default()).unwrap();
+                        assert_eq!(reader.execute(statements[2], &HashMap::new()).unwrap().rows, controls[2], "tight-budget refusal preserves the healthy store and its complete answer");
+                    } else if damage == "native_page" {
+                        let result = ReadSession::open_with_options(&path, ReadSessionOptions::default())
+                            .and_then(|reader| reader.execute(statements[2], &HashMap::new()));
+                        match result {
+                            Err(Error::StoreCorrupted { reason, .. }) => assert!(!reason.is_empty(), "native relational page corruption explains its refusal"),
+                            other => panic!("native relational page corruption must refuse as StoreCorrupted: {other:?}"),
+                        }
+                    } else {
+                        let database = Database::open(&path).unwrap();
+                        let mut failed_doors = Vec::new();
+                        for sql in statements {
+                            match if damage == "malformed_current" { database.execute(sql, &HashMap::new()) } else { database.execute_at_snapshot(sql, &HashMap::new(), snapshot) } {
+                                Err(Error::StoreCorrupted { reason, .. }) if !reason.is_empty() => {},
+                                other => failed_doors.push((sql, format!("{other:?}"))),
+                            }
+                        }
+                        assert!(failed_doors.is_empty(), "{damage}: every malformed valid-key point/list/scan door must refuse as StoreCorrupted with a reason: {failed_doors:?}");
+                    }
+                }));
+                if attempt.is_err() { failures.push(damage); }
+            }
+            assert_eq!(failures, Vec::<&str>::new(), "malformed bodies and native page corruption retain StoreCorrupted while healthy admission exhaustion retains MemoryBudgetExceeded");
+        }
+        {
+            use redb::{ReadableDatabase, ReadableTable};
+            let mut failures = Vec::new();
+            for damage in ["valid_key_historical_body", "missing_historical_version", "omitted_first_posting"] {
+                let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let directory = tempfile::tempdir().unwrap();
+                    let path = directory.path().join("public-writer-historical-gap.db");
+                    let table_name = "public_history_rows";
+                                        let sql = if damage == "omitted_first_posting" {
+                        "SELECT id, body FROM public_history_rows ORDER BY bucket ASC LIMIT 1"
+                    } else {
+                        "SELECT id, body FROM public_history_rows WHERE bucket IN (1, 3)"
+                    };
+                    let database = Database::open(&path).unwrap();
+                    for statement in [
+                        "CREATE TABLE public_history_rows (id INT PRIMARY KEY, bucket INT UNIQUE, body TEXT)",
+                        "CREATE INDEX public_history_bucket ON public_history_rows (bucket)",
+                        "INSERT INTO public_history_rows (id, bucket, body) VALUES (1, 1, 'first')",
+                        "INSERT INTO public_history_rows (id, bucket, body) VALUES (2, 2, 'unaffected')",
+                        "UPDATE public_history_rows SET body = 'interior' WHERE id = 1",
+                    ] {
+                        if statement.starts_with("CREATE INDEX") && damage != "omitted_first_posting" { continue; }
+                        database.execute(statement, &HashMap::new()).unwrap();
+                    }
+                    let historical = database.writer_read_root().unwrap().unwrap().snapshot;
+                    let expected = database.execute_at_snapshot(sql, &HashMap::new(), historical).unwrap();
+                    eprintln!("CDB137_PUBLIC_CONTROL {damage}: plan={:?}, index={:?}", expected.trace.physical_plan, expected.trace.index_used);
+                    let index_name = expected.trace.index_used.clone().expect("the public control selects a maintained index");
+                    if damage != "omitted_first_posting" {
+                        let meta = database.table_meta(table_name).unwrap();
+                        let selected = meta.indexes.iter().find(|declaration| declaration.name == index_name).unwrap();
+                        assert_eq!(selected.kind, contextdb_core::IndexKind::Auto, "the historical IN-list binds the actual automatic exact-index door");
+                        assert_eq!(selected.columns.len(), 1, "the automatic exact door has one declared key column");
+                    }
+                    assert!(!expected.rows.is_empty(), "{damage}: a real historical answer is owed");
+                    database.execute("UPDATE public_history_rows SET body = 'head' WHERE id = 1", &HashMap::new()).unwrap();
+                    drop(database);
+                    let reopened = Database::open(&path).unwrap();
+                    let complete = reopened.execute_at_snapshot(sql, &HashMap::new(), historical).unwrap();
+                    assert_eq!(complete.rows, expected.rows, "{damage}: cold public historical control equals the pre-close answer");
+                    drop(reopened);
+                    let fixture_open_accountant_44039 = std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+                    let _fixture_decode_scope_44039 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_44039)).unwrap();
+                    let store = RedbPersistence::open(&path).unwrap();
+                    store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_44039));
+                    let metadata = store.load_all_table_meta().unwrap().remove(table_name).unwrap();
+                    let versions = store.load_relational_table(table_name).unwrap();
+                    let interior = versions.into_iter().find(|row| row.values.get("body") == Some(&Value::Text("interior".into()))).unwrap();
+                    let key = RedbPersistence::rel_row_key(&interior);
+                    drop(store);
+                    drop(_fixture_decode_scope_44039);
+                    let raw = redb::Database::open(&path).unwrap();
+                    let write = raw.begin_write().unwrap();
+                    if damage == "omitted_first_posting" {
+                        let name = RedbPersistence::relational_index_table_name(table_name, &index_name);
+                        let mut postings = write.open_table(TableDefinition::<DurableRelationalIndexKey, &[u8]>::new(&name)).unwrap();
+                        let first = postings.iter().unwrap().find_map(|item| {
+                            let (key, value) = item.unwrap();
+                            let position = key.value().decode_canonical().unwrap();
+                            let deleted: Option<TxId> = RedbPersistence::decode_exact(value.value()).unwrap();
+                            (position.row_id == interior.row_id && position.created_tx.0 <= historical.0 && deleted.is_none_or(|tx| tx.0 > historical.0)).then(|| key.value())
+                        }).unwrap();
+                        assert!(postings.remove(&first).unwrap().is_some(), "{damage}: the real first historical posting was omitted");
+                    } else {
+                        let name = RedbPersistence::rel_table_name(table_name);
+                        let mut rows = write.open_table(TableDefinition::<&[u8], &[u8]>::new(&name)).unwrap();
+                        if damage == "valid_key_historical_body" {
+                            let mut changed = interior.clone();
+                            changed.values.insert("body".into(), Value::Text("wrong historical value".into()));
+                            assert_eq!(RedbPersistence::rel_row_key(&changed), key, "body tampering preserves the real physical version key");
+                            let body = RedbPersistence::encode_versioned_row(&changed, Some(&metadata)).unwrap();
+                            rows.insert(key.as_slice(), body.as_slice()).unwrap();
+                        } else {
+                            assert!(rows.remove(key.as_slice()).unwrap().is_some(), "the owed historical version was physically removed");
+                        }
+                    }
+                    write.commit().unwrap();
+                    drop(raw);
+                    let database = Database::open(&path).unwrap();
+                    match database.execute_at_snapshot(sql, &HashMap::new(), historical) {
+                        Err(Error::StoreCorrupted { path: logical, reason }) => {
+                            assert!(!logical.is_empty() && !reason.is_empty(), "{damage}: typed corruption identifies its logical source");
+                        }
+                        Ok(actual) => panic!("{damage}: required corruption refusal before wrong historical answer; actual={:?}; fresh_control={:?}", actual.rows, expected.rows),
+                        Err(other) => panic!("{damage}: required typed corruption, got {other:?}"),
+                    }
+                    drop(database);
+                }));
+                if attempt.is_err() { failures.push(damage); }
+            }
+            assert_eq!(failures, Vec::<&str>::new(), "all three public historical writer gaps refuse before a wrong answer");
+        }
+        if graph_compaction_interruption_child() { return; }
+        if graph_durability_interruption_child() { return; }
+        {
+    
+        // One differential row, multiple adversarial cells, against the real serializer.
+        let window = 64_usize * 1024; // Exact native emitter window at emit_string_content.
+        let mut adversarial_json_values = Vec::new();
+        for character in ['é', '€', '🦀'] {
+            for split in 1..character.len_utf8() {
+                for output_prefix in [0_usize, 1, 2] {
+                    let mut text = "a".repeat(window - split - output_prefix);
+                    text.push(character);
+                    text.push_str("\0\u{0001}\u{0008}\t\n\r\u{001f}\"\\\u{2028}\u{2029}");
+                    text.push_str(&"z".repeat(window + character.len_utf8()));
+                    adversarial_json_values.push(serde_json::Value::String(text));
+                }
+            }
+        }
+        adversarial_json_values.push(serde_json::json!({
+            "quoted\"key\\with\ncontrols\u{2028}": [
+                {"nested": "quoted\"text\\slashes\u{2029}", "empty": []},
+                {"numbers": [i64::MIN, i64::MAX, u64::MAX, -0.0_f64, f64::MAX, f64::MIN_POSITIVE, 5e-324_f64, -123456789.125_f64]},
+                [true, false, null, {"deeper": [{"escape": "\0\u{001f}\"\\"}]}]
+            ],
+            "empty-map": {}, "empty-string": ""
+        }));
+        adversarial_json_values.push(serde_json::json!([
+            "\u{2028}\u{2029}", "\\\"\\\"", [], {},
+            {"large-string": "🌍".repeat(window), "nested-json": {"quoted": "\"\\"}}
+        ]));
+            let mut values: Vec<contextdb_core::Value> = adversarial_json_values.into_iter()
+                .flat_map(|json| match json {
+                    serde_json::Value::String(text) => vec![contextdb_core::Value::Text(text.clone()), contextdb_core::Value::Json(serde_json::Value::String(text))],
+                    other => vec![contextdb_core::Value::Json(other)],
+                }).collect();
+            values.extend([contextdb_core::Value::Int64(i64::MIN), contextdb_core::Value::Int64(i64::MAX), contextdb_core::Value::Float64(-123456789.125), contextdb_core::Value::Float64(-0.0), contextdb_core::Value::Float64(f64::MAX)]);
+            for value in values {
+                let expected = serde_json::to_string(&value).expect("reference Value serialization");
+                let mut actual = Vec::new();
+                crate::persistence::content_identity::version_manifest::emit_value(
+                    &mut actual, &value, &mut || Ok(()),
+                ).expect("bounded native Value emission");
+                assert_eq!(actual, expected.as_bytes(), "bounded Value emission equals serde_json byte for byte");
+            }
+        }
         let root = tempfile::tempdir().expect("task-scoped empty-index directory");
+        // Addressed reads prove the complete version group before returning
+        // its row, identity or absence, including the real authentication batch.
+        let mut failed_addressed_rows = Vec::new();
+        for damage in [
+            "missing_interior_version",
+            "injected_extra_version",
+            "entirely_missing_deleted_group",
+            "false_terminal_absence",
+        ] {
+            let fixture_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let path = root.path().join(format!("addressed-{damage}.db"));
+                let database = Database::open(&path).unwrap();
+                database.execute("CREATE TABLE addressed_rows (id INT PRIMARY KEY, body TEXT)", &HashMap::new()).unwrap();
+                database.execute("CREATE TABLE addressed_control (id INT PRIMARY KEY, body TEXT)", &HashMap::new()).unwrap();
+                database.execute("INSERT INTO addressed_control VALUES (1, 'unaffected')", &HashMap::new()).unwrap();
+                database.execute("INSERT INTO addressed_rows VALUES (1, 'first')", &HashMap::new()).unwrap();
+                database.execute("UPDATE addressed_rows SET body = 'interior' WHERE id = 1", &HashMap::new()).unwrap();
+                let historical = database.writer_read_root().unwrap().unwrap().snapshot;
+                let historical_row = database.scan("addressed_rows", historical).unwrap().into_iter().next().unwrap();
+                database.execute("UPDATE addressed_rows SET body = 'head' WHERE id = 1", &HashMap::new()).unwrap();
+                if damage == "entirely_missing_deleted_group" {
+                    database.execute("DELETE FROM addressed_rows WHERE id = 1", &HashMap::new()).unwrap();
+                }
+                let current = database.writer_read_root().unwrap().unwrap().snapshot;
+                let current_row = database.scan("addressed_rows", current).unwrap().into_iter().next();
+                let control = database.scan("addressed_control", current).unwrap().into_iter().next().unwrap();
+                let meta = database.table_meta("addressed_rows").unwrap();
+                let control_meta = database.table_meta("addressed_control").unwrap();
+                let provider = database.declared_read_request_provider();
+                let fixture_writer_accountant = database.bounded_read_accountant();
+                database.close().unwrap();
+                drop(database);
+
+                // Identify and save the physical member through the production
+                // row-key helper and decoder; no test codec or key layout.
+                let fixture_open_accountant_44167 = std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+                let _fixture_decode_scope_44167 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_44167)).unwrap();
+                let store = RedbPersistence::open(&path).unwrap();
+                store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_44167));
+                let versions = store.load_relational_table("addressed_rows").unwrap();
+                drop(store);
+                drop(_fixture_decode_scope_44167);
+                let interior_key = RedbPersistence::rel_row_key(&historical_row);
+                let group_keys = versions.iter().filter(|row| row.row_id == historical_row.row_id)
+                    .map(RedbPersistence::rel_row_key).collect::<Vec<_>>();
+                let table_name = RedbPersistence::rel_table_name("addressed_rows");
+                let definition = TableDefinition::<&[u8], &[u8]>::new(&table_name);
+                let raw = redb::Database::create(&path).unwrap();
+                let interior_bytes = {
+                    let read = raw.begin_read().unwrap();
+                    let table = read.open_table(definition).unwrap();
+                    table.get(interior_key.as_slice()).unwrap().unwrap().value().to_vec()
+                };
+                drop(raw);
+
+                for phase in ["valid", "damaged"] {
+                    if phase == "damaged" {
+                        if damage == "injected_extra_version" {
+                            // Lawful replacement retires the exact member;
+                            // restoring its saved bytes then makes it extra.
+                            let fixture_open_accountant_44188 = Arc::clone(&fixture_writer_accountant);
+                            let _fixture_decode_scope_44188 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_44188)).unwrap();
+                            let store = RedbPersistence::open(&path).unwrap();
+                            store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_44188));
+                            let retained = versions.iter().filter(|row|
+                                RedbPersistence::rel_row_key(row) != interior_key
+                            ).cloned().collect::<Vec<_>>();
+                            store.rewrite_table_rows("addressed_rows", &retained).unwrap();
+                            drop(store);
+                            drop(_fixture_decode_scope_44188);
+                        }
+                        let raw = redb::Database::create(&path).unwrap();
+                        let write = raw.begin_write().unwrap();
+                        {
+                            let mut table = write.open_table(definition).unwrap();
+                            match damage {
+                                "missing_interior_version" => {
+                                    table.remove(interior_key.as_slice()).unwrap().unwrap();
+                                }
+                                "injected_extra_version" => {
+                                    assert!(table.insert(interior_key.as_slice(), interior_bytes.as_slice()).unwrap().is_none(),
+                                        "{damage}: the lawful replacement retired exactly the injected physical member");
+                                }
+                                "entirely_missing_deleted_group" | "false_terminal_absence" => {
+                                    for key in &group_keys { table.remove(key.as_slice()).unwrap().unwrap(); }
+                                }
+                                _ => unreachable!(),
+                            }
+                        }
+                        write.commit().unwrap();
+                        drop(raw);
+                    }
+                    let (image, receipt, source) = load_read_image(&path).unwrap().into_parts();
+                    receipt.validate_released().unwrap();
+                    for (snapshot_name, snapshot, expected) in [
+                        ("historical", historical, Some(&historical_row)),
+                        ("current", current, current_row.as_ref()),
+                    ] {
+                        for door in ["point", "identity", "batch"] {
+                            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                let limits = ReadSessionOptions::default().limits;
+                                let context = crate::executor::bounded::ReadOpenContext::new(
+                                    provider.request_budget().unwrap(), limits,
+                                    crate::read_session::read_clock(), OwnerReadCancellation::new(),
+                                ).unwrap();
+                                context.checkpoint().unwrap();
+                                let memory = context.read_memory();
+                                let decoded = crate::read_image_memory::ImageMemory::charging_reader(
+                                    source._source_memory.memory.accountant.clone(), memory.clone(),
+                                );
+                                let (control_result, result) = graph_read::with_pages(memory, || decoded.scope(|| {
+                                    source.with_read(|read| {
+                                        context.checkpoint()?;
+                                        let pair = match door {
+                                            "point" => (
+                                                source.row_by_id_in_read(read, "addressed_control", &control_meta, control.row_id, snapshot),
+                                                source.row_by_id_in_read(read, "addressed_rows", &meta, historical_row.row_id, snapshot),
+                                            ),
+                                            "identity" => (
+                                                source.row_identity_by_id_in_read(read, "addressed_control", &control_meta, control.row_id, snapshot, None),
+                                                source.row_identity_by_id_in_read(read, "addressed_rows", &meta, historical_row.row_id, snapshot, None),
+                                            ),
+                                            "batch" => {
+                                                // The established verifier owns proof funding. Its
+                                                // constructor caps reuse at the existing source cap.
+                                                let mut batch = source.content_identity.batch(RETAINED_CONTENT_PROOF_BYTES);
+                                                (
+                                                    source.row_identity_by_id_in_read(read, "addressed_control", &control_meta, control.row_id, snapshot, Some(&mut batch)),
+                                                    source.row_identity_by_id_in_read(read, "addressed_rows", &meta, historical_row.row_id, snapshot, Some(&mut batch)),
+                                                )
+                                            }
+                                            _ => unreachable!(),
+                                        };
+                                        context.checkpoint()?;
+                                        Ok(pair)
+                                    })
+                                })).unwrap();
+                                assert_eq!(control_result.unwrap().map(|(row, _memory)| (row.row_id, row.created_tx, row.lsn, row.values)),
+                                    Some((control.row_id, control.created_tx, control.lsn, control.values.clone())),
+                                    "{damage}/{phase}/{snapshot_name}/{door}: the unaffected answer equals its fresh pre-close control");
+                                if phase == "valid" {
+                                    assert_eq!(result.unwrap().map(|(row, _memory)| (row.row_id, row.created_tx, row.lsn, row.values)),
+                                        expected.map(|row| (row.row_id, row.created_tx, row.lsn, row.values.clone())),
+                                        "{damage}/{phase}/{snapshot_name}/{door}: reopened value, identity and lawful deletion absence equal the fresh DML control");
+                                } else {
+                                    match result {
+                                        Err(Error::StoreCorrupted { path: actual, reason }) => {
+                                            assert_eq!(actual, path.display().to_string(),
+                                                "{damage}/{snapshot_name}/{door}: pre-exposure refusal names the damaged store");
+                                            assert!(!reason.is_empty(),
+                                                "{damage}/{snapshot_name}/{door}: pre-exposure refusal explains the incomplete group");
+                                        }
+                                        other => panic!("{damage}/{snapshot_name}/{door}: refuse before returning any affected value, identity or absence, got {other:?}"),
+                                    }
+                                }
+                            }));
+                            if outcome.is_err() { failed_addressed_rows.push((damage, phase, snapshot_name, door)); }
+                        }
+                    }
+                    drop((source, image));
+                }
+            }));
+            if fixture_outcome.is_err() { failed_addressed_rows.push((damage, "setup", "setup", "setup")); }
+        }
+        assert_eq!(failed_addressed_rows, Vec::<(&str, &str, &str, &str)>::new(),
+            "every named addressed-read row and clean control must run and satisfy its oracle before the inherited host");
+        #[cfg(feature = "test-seams")]
+        assert_graph_admission_rows(root.path());
+        #[cfg(feature = "test-seams")]
+        assert_graph_authorization_and_cancellation_rows(root.path());
+        assert_graph_open_and_maintenance_rows(root.path());
+        assert_graph_distinct_maintenance_rows(root.path());
+        assert_public_owner_graph_observer_row(root.path());
+        #[cfg(feature = "test-seams")]
+        assert_public_owner_open_through_graph_capture_row(root.path());
+        assert_graph_durability_rows(root.path());
+        assert_graph_compaction_pinned_rows(root.path(), &[10, 11, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]);
         let path = root.path().join("empty-declared-index.db");
         let table = "empty_status_rows";
         let index = "empty_status_rows_status_idx";
@@ -38900,7 +45209,7 @@ mod empty_declared_index_readiness_tests {
         assert_open_proves_bounded_history_and_startup_digest(
             small_config_open,
             "opening an empty declared index does not hydrate unrelated row bodies",
-            652,
+            403,
         );
         drop(open_scope);
 
@@ -38932,6 +45241,17 @@ mod empty_declared_index_readiness_tests {
         );
         drop(reader);
 
+        // Grow retained row/history bodies as well as the unrelated config.
+        // The empty index and its startup projection remain the same.
+        let database = Database::open(&path).expect("reopen the history writer");
+        database
+            .execute(
+                "INSERT INTO unrelated_large_body VALUES (2, $body)",
+                &HashMap::from([("body".to_owned(), Value::Text(unrelated_payload.clone()))]),
+            )
+            .expect("double the unrelated retained row bodies and append history");
+        database.close().expect("publish the larger history fixture");
+
         let persistence = RedbPersistence::open(&path).expect("reopen config writer");
         persistence
             .flush_config_value("unrelated_blob", &"x".repeat(512 * 1024))
@@ -38942,9 +45262,14 @@ mod empty_declared_index_readiness_tests {
             .expect("the larger unrelated config still opens");
         assert_eq!(large_reader.route(), ReadRoute::File);
         let large_config_open = large_scope.counters();
+        assert_open_proves_bounded_history_and_startup_digest(
+            large_config_open,
+            "opening doubled retained bodies and longer history authenticates fixed controls",
+            403,
+        );
         assert_eq!(
             large_config_open, small_config_open,
-            "the Configuration proof work is independent of unrelated config value size"
+            "fixed-control hash bytes and zero proof-node work are identical with longer history and doubled retained bodies"
         );
     }
 }
@@ -39006,3 +45331,1388 @@ impl RedbPersistence {
 #[cfg(test)]
 #[path = "persistence/body_placement_publication_tests.rs"]
 mod body_placement_publication_tests;
+
+#[cfg(all(test, feature = "test-seams"))]
+#[path = "persistence/cdb141_integrity_revision_tests.rs"]
+pub(crate) mod cdb141_integrity_revision_tests;
+// Extends the existing retention/currency fault cells; no independent fault index.
+// 4 repack, 5 projection, 6 lifecycle, 7 location, 8 history, 9 bounds,
+// 10 final precommit, 11 postcommit reporting (publication has already succeeded).
+// 12 mixed-retention progress; 13 scalar bounds; 14 commit directory; 15 row heads;
+// 16 relational counts; 17 scoped maxima; 18 vector fingerprints;
+// 19 recovery fingerprint; 20 scoped fingerprint; 21..=25 graph tags 1..=5;
+// 26 final metadata binding.
+// 27..=31 compaction progress/vector/commit-directory/row-head/final binding;
+// 32..=34 imported scalar bounds/commit-directory/final binding.
+#[cfg(any(test, feature = "test-seams"))]
+fn graph_observation_checkpoint(boundary: u8) -> Result<()> {
+    retention_reclaim_checkpoint_for_test(boundary);
+    currency_reclaim_checkpoint_for_test(boundary)
+}
+
+// The original raw fixture signatures are exposed to integration fixtures only
+// by the existing feature. Normal consumers use the admitted captured core.
+macro_rules! raw_persistence_surface {
+    ($visibility:vis) => {
+        impl RedbPersistence {
+    $visibility fn create(path: &Path) -> Result<Self> {
+        let accountant = crate::read_image_memory::ImageMemory::default_decode_accountant();
+        let _decode_scope = if let Ok(owner) = crate::read_image_memory::active_owner() {
+            owner.enter()
+        } else {
+            crate::read_image_memory::ImageMemory::enter_writer_operation(accountant.clone())?
+        };
+        Self::create_with_accountant(path, Some(accountant), REDB_CACHE_BYTES)
+    }
+
+    /// Open a store that must already be there, creating nothing.
+    ///
+    /// There is no existence question here and no second door: the ordinary
+    /// open is attempted, and the attempt's own "nothing at this path" becomes
+    /// [`Error::StoreMissing`] naming the store. Every refusal on this road
+    /// leaves the directory as it found it -- including the companion this
+    /// open takes for itself while it is still deciding, which is taken back
+    /// before the refusal is returned.
+    $visibility fn open_existing_only(path: &Path) -> Result<Self> {
+        let accountant = crate::read_image_memory::ImageMemory::default_decode_accountant();
+        let _decode_scope = if let Ok(owner) = crate::read_image_memory::active_owner() {
+            owner.enter()
+        } else {
+            crate::read_image_memory::ImageMemory::enter_writer_operation(accountant.clone())?
+        };
+        let persistence = Self::open_existing_only_with_cache(path, REDB_CACHE_BYTES)?;
+        persistence.attach_memory_accountant(accountant);
+        Ok(persistence)
+    }
+
+    $visibility fn open(path: &Path) -> Result<Self> {
+        let accountant = crate::read_image_memory::ImageMemory::default_decode_accountant();
+        let _decode_scope = if let Ok(owner) = crate::read_image_memory::active_owner() {
+            owner.enter()
+        } else {
+            crate::read_image_memory::ImageMemory::enter_writer_operation(accountant.clone())?
+        };
+        let persistence = Self::open_with_cache(path, REDB_CACHE_BYTES)?;
+        persistence.attach_memory_accountant(accountant);
+        Ok(persistence)
+    }
+
+    $visibility fn load_relational_table(&self, name: &str) -> Result<Vec<VersionedRow>> {
+        self.with_db(|db| {
+            let read_txn = db.begin_read().map_err(Self::storage_error)?;
+            let table_meta = Self::load_table_meta_in_read_txn(&read_txn, name)?;
+            let table_name = Self::rel_table_name(name);
+            let table_def: TableDefinition<&[u8], &[u8]> =
+                TableDefinition::new(table_name.as_str());
+            match read_txn.open_table(table_def) {
+                Ok(table) => {
+                    let mut rows = Vec::new();
+                    for entry in table.iter().map_err(Self::storage_error)? {
+                        let (_, value) = entry.map_err(Self::storage_error)?;
+                        rows.push(Self::decode_versioned_row(
+                            value.value(),
+                            table_meta.as_ref(),
+                        )?);
+                    }
+                    Ok(rows)
+                }
+                Err(redb::TableError::TableDoesNotExist(_)) => Ok(Vec::new()),
+                Err(redb::TableError::TableTypeMismatch { .. }) => {
+                    Err(Self::unrecognized_relational_layout(name))
+                }
+                Err(err) => Err(Self::storage_error(err)),
+            }
+        })
+    }
+
+    $visibility fn load_all_tables(&self) -> Result<HashMap<String, Vec<VersionedRow>>> {
+        let mut all_tables = HashMap::new();
+        for name in self.load_all_table_meta()?.into_keys() {
+            let rows = self.load_relational_table(&name)?;
+            all_tables.insert(name, rows);
+        }
+        Ok(all_tables)
+    }
+
+    $visibility fn load_forward_edges(&self) -> Result<Vec<AdjEntry>> {
+        self.load_graph_table(GRAPH_FWD_TABLE)
+    }
+
+    $visibility fn load_reverse_edges(&self) -> Result<Vec<AdjEntry>> {
+        self.load_graph_table(GRAPH_REV_TABLE)
+    }
+
+    $visibility fn load_vectors(&self) -> Result<Vec<VectorEntry>> {
+        self.with_db(|db| {
+            let read_txn = db.begin_read().map_err(Self::storage_error)?;
+            let table = match read_txn.open_table(VECTORS_TABLE) {
+                Ok(table) => table,
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+                Err(err) => return Err(Self::storage_error(err)),
+            };
+
+            let mut vectors = Vec::new();
+            for entry in table.iter().map_err(Self::storage_error)? {
+                let (_, value) = entry.map_err(Self::storage_error)?;
+                vectors.push(Self::decode_vector_entry(value.value())?);
+            }
+            Ok(vectors)
+        })
+    }
+        }
+    };
+}
+#[cfg(not(feature = "test-seams"))]
+raw_persistence_surface!(pub(crate));
+#[cfg(feature = "test-seams")]
+raw_persistence_surface!(pub);
+
+fn admitted_relational_index_endpoint(
+    key: &[DirectedValue],
+    row_id: RowId,
+    created_tx: TxId,
+    memory: &Arc<crate::read_image_memory::ImageMemory>,
+) -> Result<Vec<u8>> {
+    admitted_relational_index_endpoint_with_checkpoint(key, row_id, created_tx, memory, &mut || {
+        Ok(())
+    })
+}
+
+fn admitted_relational_index_endpoint_with_checkpoint(
+    key: &[DirectedValue],
+    row_id: RowId,
+    created_tx: TxId,
+    memory: &Arc<crate::read_image_memory::ImageMemory>,
+    checkpoint: &mut dyn FnMut() -> Result<()>,
+) -> Result<Vec<u8>> {
+    admitted_relational_index_parts_with_checkpoint(
+        key.len(),
+        key.iter().map(|part| match part {
+            DirectedValue::Asc(TotalOrdAsc(value)) => (false, value),
+            DirectedValue::Desc(TotalOrdDesc(value)) => (true, value),
+        }),
+        row_id,
+        created_tx,
+        memory,
+        checkpoint,
+    )
+}
+
+fn admitted_relational_row_index_endpoint_with_checkpoint(
+    declaration: &IndexDecl,
+    row: &VersionedRow,
+    created_tx: TxId,
+    memory: &Arc<crate::read_image_memory::ImageMemory>,
+    checkpoint: &mut dyn FnMut() -> Result<()>,
+) -> Result<Vec<u8>> {
+    // Borrow values from the already admitted row instead of deep cloning its key.
+    admitted_relational_index_parts_with_checkpoint(
+        declaration.columns.len(),
+        declaration.columns.iter().map(|(column, direction)| {
+            (
+                matches!(direction, contextdb_core::SortDirection::Desc),
+                row.values.get(column).unwrap_or(&Value::Null),
+            )
+        }),
+        row.row_id,
+        created_tx,
+        memory,
+        checkpoint,
+    )
+}
+
+fn admitted_relational_index_parts_with_checkpoint<'v, I>(
+    key_len: usize,
+    key: I,
+    row_id: RowId,
+    created_tx: TxId,
+    memory: &Arc<crate::read_image_memory::ImageMemory>,
+    checkpoint: &mut dyn FnMut() -> Result<()>,
+) -> Result<Vec<u8>>
+where
+    I: Clone + Iterator<Item = (bool, &'v Value)>,
+{
+    // Emit the existing bincode tuple layout directly. Borrowed Value's JSON
+    // serializer otherwise creates an unowned whole-document String twice.
+    struct EndpointWriter<'a> {
+        encoded: Option<&'a mut Vec<u8>>,
+        bytes: usize,
+        checkpoint: &'a mut dyn FnMut() -> Result<()>,
+        failure: Option<Error>,
+    }
+    impl std::io::Write for EndpointWriter<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if let Err(error) = (self.checkpoint)() {
+                self.failure = Some(error);
+                return Err(std::io::Error::other("index endpoint checkpoint refused"));
+            }
+            self.bytes = self
+                .bytes
+                .checked_add(bytes.len())
+                .ok_or_else(|| std::io::Error::other("index endpoint size overflow"))?;
+            if let Some(encoded) = self.encoded.as_deref_mut() {
+                if self.bytes > encoded.capacity() {
+                    return Err(std::io::Error::other(
+                        "index endpoint exceeded admitted capacity",
+                    ));
+                }
+                for window in bytes.chunks(64 * 1024) {
+                    if let Err(error) = (self.checkpoint)() {
+                        self.failure = Some(error);
+                        return Err(std::io::Error::other("index endpoint checkpoint refused"));
+                    }
+                    encoded.extend_from_slice(window);
+                }
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    fn encode<T: serde::Serialize>(value: T, writer: &mut EndpointWriter<'_>) -> Result<()> {
+        let result =
+            bincode::serde::encode_into_std_write(value, &mut *writer, bincode::config::standard());
+        if let Some(error) = writer.failure.take() {
+            return Err(error);
+        }
+        result
+            .map(|_| ())
+            .map_err(|error| Error::Other(format!("index endpoint encode: {error}")))
+    }
+    fn json(value: &serde_json::Value, writer: &mut EndpointWriter<'_>) -> Result<()> {
+        let result = serde_json::to_writer(&mut *writer, value);
+        if let Some(error) = writer.failure.take() {
+            return Err(error);
+        }
+        result.map_err(|error| Error::Other(format!("index endpoint JSON encode: {error}")))
+    }
+    fn emit<'v>(
+        key_len: usize,
+        key: impl Iterator<Item = (bool, &'v Value)>,
+        row_id: RowId,
+        created_tx: TxId,
+        writer: &mut EndpointWriter<'_>,
+    ) -> Result<()> {
+        let length = u64::try_from(key_len)
+            .map_err(|_| Error::Other("index endpoint length overflow".into()))?;
+        encode(length, writer)?;
+        for (descending, value) in key {
+            encode(descending, writer)?;
+            if let Value::Json(value) = value {
+                let mut measured = EndpointWriter {
+                    encoded: None,
+                    bytes: 0,
+                    checkpoint: &mut *writer.checkpoint,
+                    failure: None,
+                };
+                json(value, &mut measured)?;
+                let length = u64::try_from(measured.bytes)
+                    .map_err(|_| Error::Other("index JSON length overflow".into()))?;
+                drop(measured);
+                // Value::Json is variant seven and its payload is a string.
+                encode(7u32, writer)?;
+                encode(length, writer)?;
+                json(value, writer)?;
+            } else {
+                encode(value, writer)?;
+            }
+        }
+        encode(row_id, writer)?;
+        encode(created_tx, writer)
+    }
+    checkpoint()?;
+    let controls = std::mem::size_of::<EndpointWriter<'_>>()
+        .checked_mul(2)
+        .and_then(|n| {
+            n.checked_add(std::mem::size_of::<
+                serde_json::Serializer<&mut EndpointWriter<'_>>,
+            >())
+        })
+        .ok_or_else(|| Error::Other("index endpoint controls overflow".into()))?;
+    memory.reserve(controls)?;
+    let result = (|| {
+        let mut measured = EndpointWriter {
+            encoded: None,
+            bytes: 0,
+            checkpoint,
+            failure: None,
+        };
+        emit(key_len, key.clone(), row_id, created_tx, &mut measured)?;
+        let capacity = measured.bytes;
+        drop(measured);
+        checkpoint()?;
+        memory.reserve(capacity)?;
+        let mut encoded = Vec::with_capacity(capacity);
+        let mut output = EndpointWriter {
+            encoded: Some(&mut encoded),
+            bytes: 0,
+            checkpoint,
+            failure: None,
+        };
+        emit(key_len, key, row_id, created_tx, &mut output)?;
+        if output.bytes != capacity {
+            return Err(Error::Other("index endpoint size changed".into()));
+        }
+        drop(output);
+        Ok(encoded)
+    })();
+    memory.release(controls);
+    result
+}
+
+// These mutation helpers require the Database-attached writer accountant.
+// External integration fixtures retain the original signatures only through
+// the existing feature, matching the raw fixture visibility boundary.
+macro_rules! persistence_mutation_surface {
+    ($visibility:vis) => {
+        impl RedbPersistence {
+    $visibility fn remove_table_data(&self, name: &str) -> Result<()> {
+        let sources = self.load_sync_source_lsns()?;
+        self.with_db(|db| {
+            let write_txn = Self::begin_history_write(db)?;
+            let mut old_row_controls = self.proof_admission();
+            let image_layout = std::alloc::Layout::new::<[usize; 2]>()
+                .extend(std::alloc::Layout::new::<crate::read_image_memory::ImageMemory>())
+                .map_err(|_| Error::Other("writer image control layout overflow".into()))?.0.pad_to_align();
+            old_row_controls.admit(image_layout.size())?;
+            let old_row_memory = crate::read_image_memory::ImageMemory::charging_for(
+                self.proof_accountant().ok_or_else(|| Error::Other(
+                    "writer source requires the attached memory accountant".into()))?,
+                "writer_source", "retiring_row_versions",
+                "Raise MEMORY_LIMIT to admit the retained rows this mutation rewrites.");
+            let rows = self.collect_relational_rows_in_write(&write_txn, name, &old_row_memory)?;
+#[cfg(any(test, feature = "test-seams"))]
+let mut graph_publication_attempt = crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
+            let table_name = Self::rel_table_name(name);
+            let table_def: TableDefinition<&[u8], &[u8]> =
+                TableDefinition::new(table_name.as_str());
+            self.retire_relational_manifests_in_write(&write_txn, name)?;
+            content_size::reset_rows(&write_txn, name)?;
+            match write_txn.delete_table(table_def) {
+                Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
+                Err(redb::TableError::TableTypeMismatch { .. }) => {}
+                Err(err) => return Err(Self::storage_error(err)),
+            }
+            let legacy_table_def: TableDefinition<u64, &[u8]> =
+                TableDefinition::new(table_name.as_str());
+            match write_txn.delete_table(legacy_table_def) {
+                Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
+                Err(redb::TableError::TableTypeMismatch { .. }) => {}
+                Err(err) => return Err(Self::storage_error(err)),
+            }
+            Self::remove_sync_source_provenance_for_table(&write_txn, name)?;
+            Self::remove_retention_expiries_for_table(&write_txn, name)?;
+            let mut mutations = rows
+                .iter()
+                .map(|row| content_identity::remove_row_mutation(name, row.row_id))
+                .collect::<Vec<_>>();
+            for row in &rows {
+                let key =
+                    crate::composite_store::retention_expiry_key(name, row.row_id, row.created_tx);
+                mutations.extend(content_identity::config_mutations(&key, None));
+            }
+            mutations.extend(sources.keys().filter(|(table, _)| table == name).map(
+                |(table, row_id)| content_identity::remove_sync_source_mutation(table, *row_id),
+            ));
+            Self::apply_content_identity_mutations_in_write(
+                &write_txn,
+                &mutations,
+                &mut self.proof_admission(),
+            )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
+            { #[cfg(any(test, feature = "test-seams"))]
+            graph_observation_checkpoint(10)?;
+            let graph_commit_result = write_txn.commit();
+#[cfg(any(test, feature = "test-seams"))]
+if graph_commit_result.is_ok() { graph_publication_attempt.committed(); graph_observation_checkpoint(11)?; }
+graph_commit_result }.map_err(Self::storage_error)?;
+            Ok(())
+        })
+    }
+
+    $visibility fn rewrite_table_rows(&self, name: &str, rows: &[VersionedRow]) -> Result<()> {
+        let table_meta = self.load_all_table_meta()?;
+        let sources = self.load_sync_source_lsns()?;
+        self.with_db(|db| {
+            let write_txn = Self::begin_history_write(db)?;
+            let mut old_row_controls = self.proof_admission();
+            let image_layout = std::alloc::Layout::new::<[usize; 2]>()
+                .extend(std::alloc::Layout::new::<crate::read_image_memory::ImageMemory>())
+                .map_err(|_| Error::Other("writer image control layout overflow".into()))?.0.pad_to_align();
+            old_row_controls.admit(image_layout.size())?;
+            let old_row_memory = crate::read_image_memory::ImageMemory::charging_for(
+                self.proof_accountant().ok_or_else(|| Error::Other(
+                    "writer source requires the attached memory accountant".into()))?,
+                "writer_source", "retiring_row_versions",
+                "Raise MEMORY_LIMIT to admit the retained rows this mutation rewrites.");
+            let previous_rows = self.collect_relational_rows_in_write(&write_txn, name, &old_row_memory)?;
+#[cfg(any(test, feature = "test-seams"))]
+let mut graph_publication_attempt = crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
+            Self::invalidate_retention_clock_in_write(&write_txn, name)?;
+            {
+                let table_name = Self::rel_table_name(name);
+                let table_def: TableDefinition<&[u8], &[u8]> =
+                    TableDefinition::new(table_name.as_str());
+                self.retire_relational_manifests_in_write(&write_txn, name)?;
+                content_size::reset_rows(&write_txn, name)?;
+                write_txn
+                    .delete_table(table_def)
+                    .map_err(Self::storage_error)?;
+                let legacy_table_def: TableDefinition<u64, &[u8]> =
+                    TableDefinition::new(table_name.as_str());
+                write_txn
+                    .delete_table(legacy_table_def)
+                    .map_err(Self::storage_error)?;
+                let mut redb_table =
+                    content_size::open_rows(&write_txn, table_def).map_err(Self::storage_error)?;
+                for row in rows {
+                    let encoded = Self::encode_versioned_row(row, table_meta.get(name))?;
+                    let key = Self::rel_row_key(row);
+                    {
+                        let predecessor = redb_table.get(key.as_slice()).map_err(Self::storage_error)?;
+                        self.replace_relational_manifest_in_write(&write_txn, name, key.as_slice(), predecessor.as_ref().map(|body| body.value()), Some(encoded.as_slice()))?;
+                    }
+                    redb_table
+                        .insert(key.as_slice(), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+            }
+            if let Some(meta) = table_meta.get(name) {
+                Self::rebuild_relational_indexes_in_write(
+                    &write_txn,
+                    &self.path,
+                    name,
+                    meta,
+                    Some(rows),
+                    &mut self.proof_admission(),
+                )?;
+            }
+            Self::retain_sync_source_provenance_for_table_rows(&write_txn, name, rows)?;
+            let mut mutations = previous_rows
+                .iter()
+                .map(|row| content_identity::remove_row_mutation(name, row.row_id))
+                .collect::<Vec<_>>();
+            let mut ordered_rows = rows.iter().collect::<Vec<_>>();
+            ordered_rows.sort_by_key(|row| (row.lsn, row.created_tx));
+            for row in ordered_rows {
+                mutations.push(content_identity::row_mutation(
+                    name,
+                    row,
+                    table_meta.get(name),
+                )?);
+            }
+            let live_rows = rows
+                .iter()
+                .filter(|row| row.deleted_tx.is_none())
+                .map(|row| row.row_id)
+                .collect::<HashSet<_>>();
+            mutations.extend(
+                sources
+                    .keys()
+                    .filter(|(table, row_id)| table == name && !live_rows.contains(row_id))
+                    .map(|(table, row_id)| {
+                        content_identity::remove_sync_source_mutation(table, *row_id)
+                    }),
+            );
+            Self::apply_content_identity_mutations_in_write(
+                &write_txn,
+                &mutations,
+                &mut self.proof_admission(),
+            )?;
+            for row in rows.iter().chain(&previous_rows) {
+                Self::raise_table_read_lsn_in_write(&write_txn, name, row.lsn)?;
+            }
+            Self::raise_noncanonical_writer_floors_in_write(
+                &write_txn,
+                rows.iter()
+                    .chain(&previous_rows)
+                    .flat_map(|row| std::iter::once(row.created_tx).chain(row.deleted_tx))
+                    .max()
+                    .unwrap_or(TxId(0)),
+                rows.iter()
+                    .chain(&previous_rows)
+                    .map(|row| row.lsn)
+                    .max()
+                    .unwrap_or(Lsn(0)),
+                rows.iter()
+                    .chain(&previous_rows)
+                    .map(|row| row.row_id)
+                    .max()
+                    .unwrap_or(RowId(0)),
+            )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
+            { #[cfg(any(test, feature = "test-seams"))]
+            graph_observation_checkpoint(10)?;
+            let graph_commit_result = write_txn.commit();
+#[cfg(any(test, feature = "test-seams"))]
+if graph_commit_result.is_ok() { graph_publication_attempt.committed(); graph_observation_checkpoint(11)?; }
+graph_commit_result }.map_err(Self::storage_error)?;
+            Ok(())
+        })
+    }
+
+    $visibility fn rewrite_table_meta_rows_and_append_ddl_log(
+        &self,
+        name: &str,
+        meta: &TableMeta,
+        rows: &[VersionedRow],
+        lsn: Lsn,
+        ddl: &[DdlChange],
+        config_values: Vec<(&str, Vec<u8>)>,
+    ) -> Result<()> {
+        let mut table_meta = self.load_all_table_meta()?;
+        let previous_meta = table_meta.get(name).cloned();
+        let previous_vector_quantization = Self::vector_quantization_map(&table_meta);
+        let sources = self.load_sync_source_lsns()?;
+        let previous_vectors = self
+            .load_vectors()?
+            .into_iter()
+            .filter(|entry| entry.index.table == name)
+            .collect::<Vec<_>>();
+        table_meta.insert(name.to_string(), meta.clone());
+        let vector_quantization = Self::vector_quantization_map(&table_meta);
+        let previous_vector_columns = previous_meta
+            .as_ref()
+            .map(|previous| {
+                previous
+                    .columns
+                    .iter()
+                    .filter(|column| matches!(column.column_type, ColumnType::Vector(_)))
+                    .map(|column| column.name.clone())
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
+        let current_vector_columns = meta
+            .columns
+            .iter()
+            .filter(|column| matches!(column.column_type, ColumnType::Vector(_)))
+            .map(|column| column.name.clone())
+            .collect::<HashSet<_>>();
+        let vector_renames = ddl
+            .iter()
+            .filter_map(|change| {
+                let DdlChange::AlterTable {
+                    name: change_table,
+                    constraints,
+                    ..
+                } = change
+                else {
+                    return None;
+                };
+                (change_table == name)
+                    .then(|| read_vector_rename_constraint(constraints))
+                    .flatten()
+                    .filter(|(from, to)| {
+                        previous_vector_columns.contains(from)
+                            && current_vector_columns.contains(to)
+                    })
+            })
+            .map(|(from, to)| {
+                (
+                    VectorIndexRef::new(name, from),
+                    VectorIndexRef::new(name, to),
+                )
+            })
+            .collect::<Vec<_>>();
+        let renamed_from = vector_renames
+            .iter()
+            .map(|(from, _)| from.column.clone())
+            .collect::<HashSet<_>>();
+        let dropped_vector_columns = previous_vector_columns
+            .difference(&current_vector_columns)
+            .filter(|column| !renamed_from.contains(*column))
+            .cloned()
+            .collect::<HashSet<_>>();
+        let schema =
+            self.prepare_writer_schema_change(std::iter::empty(), std::iter::once((name, meta)))?;
+        self.with_db(|db| {
+            let write_txn = Self::begin_history_write(db)?;
+            let mut old_row_controls = self.proof_admission();
+            let image_layout = std::alloc::Layout::new::<[usize; 2]>()
+                .extend(std::alloc::Layout::new::<crate::read_image_memory::ImageMemory>())
+                .map_err(|_| Error::Other("writer image control layout overflow".into()))?.0.pad_to_align();
+            old_row_controls.admit(image_layout.size())?;
+            let old_row_memory = crate::read_image_memory::ImageMemory::charging_for(
+                self.proof_accountant().ok_or_else(|| Error::Other(
+                    "writer source requires the attached memory accountant".into()))?,
+                "writer_source", "retiring_row_versions",
+                "Raise MEMORY_LIMIT to admit the retained rows this mutation rewrites.");
+            let previous_rows = self.collect_relational_rows_in_write(&write_txn, name, &old_row_memory)?;
+#[cfg(any(test, feature = "test-seams"))]
+let mut graph_publication_attempt = crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
+            Self::invalidate_retention_clock_in_write(&write_txn, name)?;
+            let mut identity_mutations = content_identity::schema_mutations(name, meta)?;
+            identity_mutations.extend(
+                previous_rows
+                    .iter()
+                    .map(|row| content_identity::remove_row_mutation(name, row.row_id)),
+            );
+            let mut ordered_rows = rows.iter().collect::<Vec<_>>();
+            ordered_rows.sort_by_key(|row| (row.lsn, row.created_tx));
+            for row in ordered_rows {
+                identity_mutations.push(content_identity::row_mutation(name, row, Some(meta))?);
+            }
+            for entry in &previous_vectors {
+                let previous_quantization = previous_vector_quantization
+                    .get(&entry.index)
+                    .copied()
+                    .unwrap_or_default();
+                identity_mutations.push(content_identity::remove_vector_mutation(
+                    &entry.index,
+                    entry.row_id,
+                    previous_quantization,
+                ));
+                identity_mutations.push(content_identity::remove_vector_version_mutation(
+                    &entry.index,
+                    entry.row_id,
+                    entry.created_tx,
+                    entry.lsn,
+                    previous_quantization,
+                ));
+                if dropped_vector_columns.contains(&entry.index.column) {
+                    continue;
+                }
+                let mut current = entry.clone();
+                if let Some((_, to)) = vector_renames.iter().find(|(from, _)| from == &entry.index)
+                {
+                    current.index = to.clone();
+                }
+                if current_vector_columns.contains(&current.index.column) {
+                    let quantization = vector_quantization
+                        .get(&current.index)
+                        .copied()
+                        .unwrap_or_default();
+                    identity_mutations
+                        .push(content_identity::vector_mutation(&current, quantization));
+                    identity_mutations.push(content_identity::vector_version_mutation(
+                        &current,
+                        quantization,
+                    ));
+                }
+            }
+            for (from, to) in &vector_renames {
+                self.rename_vector_partition_generation_index_in_write(&write_txn, from, to)?;
+            }
+            if !dropped_vector_columns.is_empty() {
+                self.remove_vector_partition_records_matching_all_in_write(
+                    &write_txn,
+                    name,
+                    Some(&dropped_vector_columns),
+                    &|index: &VectorIndexRef| {
+                        index.table == name && dropped_vector_columns.contains(&index.column)
+                    },
+                )?;
+            }
+            self.rewrite_vector_entries_for_schema_in_write(
+                &write_txn,
+                name,
+                &vector_renames,
+                &dropped_vector_columns,
+                &vector_quantization,
+            )?;
+            {
+                let mut meta_table = write_txn
+                    .open_table(META_TABLE)
+                    .map_err(Self::storage_error)?;
+                let key = Self::meta_key(name);
+                let encoded = Self::encode(meta)?;
+                meta_table
+                    .insert(key.as_str(), encoded.as_slice())
+                    .map_err(Self::storage_error)?;
+                vector_membership_pages::ensure_declared_routes(
+                    &write_txn,
+                    name,
+                    meta,
+                    self.proof_accountant(),
+                )?;
+            }
+            {
+                let table_name = Self::rel_table_name(name);
+                let table_def: TableDefinition<&[u8], &[u8]> =
+                    TableDefinition::new(table_name.as_str());
+                self.retire_relational_manifests_in_write(&write_txn, name)?;
+                content_size::reset_rows(&write_txn, name)?;
+                write_txn
+                    .delete_table(table_def)
+                    .map_err(Self::storage_error)?;
+                let legacy_table_def: TableDefinition<u64, &[u8]> =
+                    TableDefinition::new(table_name.as_str());
+                write_txn
+                    .delete_table(legacy_table_def)
+                    .map_err(Self::storage_error)?;
+                let mut redb_table =
+                    content_size::open_rows(&write_txn, table_def).map_err(Self::storage_error)?;
+                for row in rows {
+                    let encoded = Self::encode_versioned_row(row, Some(meta))?;
+                    let key = Self::rel_row_key(row);
+                    {
+                        let predecessor = redb_table.get(key.as_slice()).map_err(Self::storage_error)?;
+                        self.replace_relational_manifest_in_write(&write_txn, name, key.as_slice(), predecessor.as_ref().map(|body| body.value()), Some(encoded.as_slice()))?;
+                    }
+                    redb_table
+                        .insert(key.as_slice(), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+            }
+            // An index this rewrite stops declaring is retired here, while the
+            // declaration that wrote its postings is still the one they match.
+            if let Some(previous_meta) = previous_meta.as_ref() {
+                Self::retire_undeclared_relational_indexes_in_write(
+                    &write_txn,
+                    &self.path,
+                    name,
+                    previous_meta,
+                    meta,
+                    &mut self.proof_admission(),
+                )?;
+            }
+            #[cfg(any(test, feature = "test-seams"))]
+            table_meta_rewrite_checkpoint_for_test(1);
+            // The ready marker is a promise about the exact committed image,
+            // including an index with no rows. Rebuild its posting tables in
+            // this schema-rewrite transaction before publishing that marker.
+            Self::rebuild_relational_indexes_in_write(
+                &write_txn,
+                &self.path,
+                name,
+                meta,
+                Some(rows),
+                &mut self.proof_admission(),
+            )?;
+            #[cfg(any(test, feature = "test-seams"))]
+            table_meta_rewrite_checkpoint_for_test(2);
+            Self::retain_sync_source_provenance_for_table_rows(&write_txn, name, rows)?;
+            let live_rows = rows
+                .iter()
+                .filter(|row| row.deleted_tx.is_none())
+                .map(|row| row.row_id)
+                .collect::<HashSet<_>>();
+            identity_mutations.extend(
+                sources
+                    .keys()
+                    .filter(|(table, row_id)| table == name && !live_rows.contains(row_id))
+                    .map(|(table, row_id)| {
+                        content_identity::remove_sync_source_mutation(table, *row_id)
+                    }),
+            );
+            {
+                let mut config_table = write_txn
+                    .open_table(CONFIG_TABLE)
+                    .map_err(Self::storage_error)?;
+                for (key, encoded) in config_values {
+                    Self::raise_config_identity_floors_in_write(&write_txn, key, &encoded)?;
+                    Self::update_policy_hold_release_index(&write_txn, key, true)?;
+                    config_table
+                        .insert(key, encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                    identity_mutations
+                        .extend(content_identity::config_mutations(key, Some(&encoded)));
+                }
+            }
+            {
+                let mut ddl_table = write_txn
+                    .open_table(DDL_LOG_TABLE)
+                    .map_err(Self::storage_error)?;
+                for (index, change) in ddl.iter().enumerate() {
+                    let key = Self::ddl_log_key_for_index(lsn, index, ddl.len());
+                    Self::append_ddl_summary_in_write(&write_txn, &key, change)?;
+                    let encoded = Self::encode(change)?;
+                    ddl_table
+                        .insert(key.as_str(), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                    identity_mutations
+                        .push(content_identity::encoded_history_mutation(&key, change)?);
+                }
+            }
+            Self::apply_content_identity_mutations_in_write(
+                &write_txn,
+                &identity_mutations,
+                &mut self.proof_admission(),
+            )?;
+            for row in rows {
+                Self::raise_table_read_lsn_in_write(&write_txn, name, row.lsn)?;
+                Self::raise_noncanonical_writer_floors_in_write(
+                    &write_txn,
+                    row.created_tx.max(row.deleted_tx.unwrap_or(TxId(0))),
+                    row.lsn,
+                    row.row_id,
+                )?;
+            }
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
+            { #[cfg(any(test, feature = "test-seams"))]
+            graph_observation_checkpoint(10)?;
+            let graph_commit_result = write_txn.commit();
+#[cfg(any(test, feature = "test-seams"))]
+if graph_commit_result.is_ok() { graph_publication_attempt.committed(); graph_observation_checkpoint(11)?; }
+graph_commit_result }.map_err(Self::storage_error)?;
+            self.complete_writer_schema_change(schema);
+            #[cfg(any(test, feature = "test-seams"))]
+            table_meta_rewrite_checkpoint_for_test(3);
+            Ok(())
+        })
+    }
+
+    $visibility fn remove_table_with_config_values_and_ddl_log(
+        &self,
+        name: &str,
+        config_values: Vec<(&str, Vec<u8>)>,
+        lsn: Lsn,
+        ddl: &[DdlChange],
+    ) -> Result<()> {
+        let sources = self.load_sync_source_lsns()?;
+        let schema =
+            self.prepare_writer_schema_change(std::iter::once(name), std::iter::empty())?;
+        self.with_db(|db| {
+            let write_txn = Self::begin_history_write(db)?;
+            let mut old_row_controls = self.proof_admission();
+            let image_layout = std::alloc::Layout::new::<[usize; 2]>()
+                .extend(std::alloc::Layout::new::<crate::read_image_memory::ImageMemory>())
+                .map_err(|_| Error::Other("writer image control layout overflow".into()))?.0.pad_to_align();
+            old_row_controls.admit(image_layout.size())?;
+            let old_row_memory = crate::read_image_memory::ImageMemory::charging_for(
+                self.proof_accountant().ok_or_else(|| Error::Other(
+                    "writer source requires the attached memory accountant".into()))?,
+                "writer_source", "retiring_row_versions",
+                "Raise MEMORY_LIMIT to admit the retained rows this mutation rewrites.");
+            let rows = self.collect_relational_rows_in_write(&write_txn, name, &old_row_memory)?;
+#[cfg(any(test, feature = "test-seams"))]
+let mut graph_publication_attempt = crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
+            let mut identity_mutations = content_identity::remove_schema_mutations(name);
+            identity_mutations.extend(
+                rows.iter()
+                    .map(|row| content_identity::remove_row_mutation(name, row.row_id)),
+            );
+            identity_mutations.extend(sources.keys().filter(|(table, _)| table == name).map(
+                |(table, row_id)| content_identity::remove_sync_source_mutation(table, *row_id),
+            ));
+            for row in &rows {
+                let key =
+                    crate::composite_store::retention_expiry_key(name, row.row_id, row.created_tx);
+                identity_mutations.extend(content_identity::config_mutations(&key, None));
+            }
+            {
+                let mut meta_table = write_txn
+                    .open_table(META_TABLE)
+                    .map_err(Self::storage_error)?;
+                let key = Self::meta_key(name);
+                meta_table
+                    .remove(key.as_str())
+                    .map_err(Self::storage_error)?;
+            }
+            let table_name = Self::rel_table_name(name);
+            let table_def: TableDefinition<&[u8], &[u8]> =
+                TableDefinition::new(table_name.as_str());
+            self.retire_relational_manifests_in_write(&write_txn, name)?;
+            content_size::reset_rows(&write_txn, name)?;
+            match write_txn.delete_table(table_def) {
+                Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
+                Err(redb::TableError::TableTypeMismatch { .. }) => {}
+                Err(err) => return Err(Self::storage_error(err)),
+            }
+            let legacy_table_def: TableDefinition<u64, &[u8]> =
+                TableDefinition::new(table_name.as_str());
+            match write_txn.delete_table(legacy_table_def) {
+                Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
+                Err(redb::TableError::TableTypeMismatch { .. }) => {}
+                Err(err) => return Err(Self::storage_error(err)),
+            }
+            Self::remove_sync_source_provenance_for_table(&write_txn, name)?;
+            Self::remove_retention_expiries_for_table(&write_txn, name)?;
+            if !config_values.is_empty() {
+                let mut config_table = write_txn
+                    .open_table(CONFIG_TABLE)
+                    .map_err(Self::storage_error)?;
+                for (key, encoded) in config_values {
+                    Self::raise_config_identity_floors_in_write(&write_txn, key, &encoded)?;
+                    Self::update_policy_hold_release_index(&write_txn, key, true)?;
+                    config_table
+                        .insert(key, encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                    identity_mutations
+                        .extend(content_identity::config_mutations(key, Some(&encoded)));
+                }
+            }
+            if !ddl.is_empty() {
+                let mut ddl_table = write_txn
+                    .open_table(DDL_LOG_TABLE)
+                    .map_err(Self::storage_error)?;
+                for (index, change) in ddl.iter().enumerate() {
+                    let key = Self::ddl_log_key_for_index(lsn, index, ddl.len());
+                    Self::append_ddl_summary_in_write(&write_txn, &key, change)?;
+                    let encoded = Self::encode(change)?;
+                    ddl_table
+                        .insert(key.as_str(), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                    identity_mutations
+                        .push(content_identity::encoded_history_mutation(&key, change)?);
+                }
+            }
+            Self::apply_content_identity_mutations_in_write(
+                &write_txn,
+                &identity_mutations,
+                &mut self.proof_admission(),
+            )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
+            { #[cfg(any(test, feature = "test-seams"))]
+            graph_observation_checkpoint(10)?;
+            let graph_commit_result = write_txn.commit();
+#[cfg(any(test, feature = "test-seams"))]
+if graph_commit_result.is_ok() { graph_publication_attempt.committed(); graph_observation_checkpoint(11)?; }
+graph_commit_result }.map_err(Self::storage_error)?;
+            self.complete_writer_schema_change(schema);
+            Ok(())
+        })
+    }
+
+    $visibility fn remove_table_rewrite_aux_with_config_values_and_ddl_log(
+        &self,
+        name: &str,
+        config_values: Vec<(&str, Vec<u8>)>,
+        lsn: Lsn,
+        ddl: &[DdlChange],
+        graph_edges: &[AdjEntry],
+    ) -> Result<()> {
+        let sources = self.load_sync_source_lsns()?;
+        let table_meta = self.load_all_table_meta()?;
+        let quantization = Self::vector_quantization_map(&table_meta);
+        let removed_vectors = self
+            .load_vectors()?
+            .into_iter()
+            .filter(|entry| entry.index.table == name)
+            .collect::<Vec<_>>();
+        let schema =
+            self.prepare_writer_schema_change(std::iter::once(name), std::iter::empty())?;
+        self.with_db(|db| {
+            let write_txn = Self::begin_history_write(db)?;
+            let mut old_row_controls = self.proof_admission();
+            let image_layout = std::alloc::Layout::new::<[usize; 2]>()
+                .extend(std::alloc::Layout::new::<crate::read_image_memory::ImageMemory>())
+                .map_err(|_| Error::Other("writer image control layout overflow".into()))?.0.pad_to_align();
+            old_row_controls.admit(image_layout.size())?;
+            let old_row_memory = crate::read_image_memory::ImageMemory::charging_for(
+                self.proof_accountant().ok_or_else(|| Error::Other(
+                    "writer source requires the attached memory accountant".into()))?,
+                "writer_source", "retiring_row_versions",
+                "Raise MEMORY_LIMIT to admit the retained rows this mutation rewrites.");
+            let rows = self.collect_relational_rows_in_write(&write_txn, name, &old_row_memory)?;
+#[cfg(any(test, feature = "test-seams"))]
+let mut graph_publication_attempt = crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
+            let mut identity_mutations = content_identity::remove_schema_mutations(name);
+            identity_mutations.extend(
+                rows.iter()
+                    .map(|row| content_identity::remove_row_mutation(name, row.row_id)),
+            );
+            identity_mutations.extend(sources.keys().filter(|(table, _)| table == name).map(
+                |(table, row_id)| content_identity::remove_sync_source_mutation(table, *row_id),
+            ));
+            for row in &rows {
+                let key =
+                    crate::composite_store::retention_expiry_key(name, row.row_id, row.created_tx);
+                identity_mutations.extend(content_identity::config_mutations(&key, None));
+            }
+            identity_mutations.extend(removed_vectors.iter().map(|entry| {
+                content_identity::remove_vector_mutation(
+                    &entry.index,
+                    entry.row_id,
+                    quantization.get(&entry.index).copied().unwrap_or_default(),
+                )
+            }));
+            identity_mutations.extend(removed_vectors.iter().map(|entry| {
+                content_identity::remove_vector_version_mutation(
+                    &entry.index,
+                    entry.row_id,
+                    entry.created_tx,
+                    entry.lsn,
+                    quantization.get(&entry.index).copied().unwrap_or_default(),
+                )
+            }));
+            self.remove_vector_partition_records_matching_all_in_write(
+                &write_txn,
+                name,
+                None,
+                &|index: &VectorIndexRef| index.table == name,
+            )?;
+            self.remove_vector_entries_matching_in_write(&write_txn, &|index| index.table == name)?;
+            {
+                let mut meta_table = write_txn
+                    .open_table(META_TABLE)
+                    .map_err(Self::storage_error)?;
+                let key = Self::meta_key(name);
+                meta_table
+                    .remove(key.as_str())
+                    .map_err(Self::storage_error)?;
+            }
+            let table_name = Self::rel_table_name(name);
+            let table_def: TableDefinition<&[u8], &[u8]> =
+                TableDefinition::new(table_name.as_str());
+            self.retire_relational_manifests_in_write(&write_txn, name)?;
+            content_size::reset_rows(&write_txn, name)?;
+            match write_txn.delete_table(table_def) {
+                Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
+                Err(redb::TableError::TableTypeMismatch { .. }) => {}
+                Err(err) => return Err(Self::storage_error(err)),
+            }
+            let legacy_table_def: TableDefinition<u64, &[u8]> =
+                TableDefinition::new(table_name.as_str());
+            match write_txn.delete_table(legacy_table_def) {
+                Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
+                Err(redb::TableError::TableTypeMismatch { .. }) => {}
+                Err(err) => return Err(Self::storage_error(err)),
+            }
+            Self::remove_sync_source_provenance_for_table(&write_txn, name)?;
+            Self::remove_retention_expiries_for_table(&write_txn, name)?;
+
+            self.retire_graph_replacement_in_write(&write_txn, graph_edges, None)?;
+            match write_txn.delete_table(GRAPH_FWD_TABLE) {
+                Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
+                Err(err) => return Err(Self::storage_error(err)),
+            }
+            match write_txn.delete_table(GRAPH_REV_TABLE) {
+                Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
+                Err(err) => return Err(Self::storage_error(err)),
+            }
+            {
+                let mut fwd_table = write_txn
+                    .open_table(GRAPH_FWD_TABLE)
+                    .map_err(Self::storage_error)?;
+                let mut rev_table = write_txn
+                    .open_table(GRAPH_REV_TABLE)
+                    .map_err(Self::storage_error)?;
+                for entry in graph_edges {
+                    let encoded = Self::encode(entry)?;
+                    let fwd_key = Self::graph_fwd_key(entry);
+                    let rev_key = Self::graph_rev_key(entry);
+                    fwd_table
+                        .insert(observed_graph_key!("graph_fwd", "insert", fwd_key.as_slice(), 5), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                    self.graph_writer_window(|| {
+                        Self::install_graph_creation_in_write(&write_txn, entry, &encoded)
+                    })?;
+                    rev_table
+                        .insert(observed_graph_key!("graph_rev", "insert", rev_key.as_slice(), 5), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+            }
+            Self::reset_content_identity_families_in_write(
+                &write_txn,
+                &[content_identity::LogicalFamily::Graph],
+                &mut self.proof_admission(),
+            )?;
+
+            let mut ordered_edges = graph_edges.iter().collect::<Vec<_>>();
+            ordered_edges.sort_by_key(|entry| (entry.lsn, entry.created_tx));
+            for entry in ordered_edges {
+                identity_mutations.push(content_identity::edge_mutation(entry)?);
+            }
+
+            if !config_values.is_empty() {
+                let mut config_table = write_txn
+                    .open_table(CONFIG_TABLE)
+                    .map_err(Self::storage_error)?;
+                for (key, encoded) in config_values {
+                    Self::raise_config_identity_floors_in_write(&write_txn, key, &encoded)?;
+                    Self::update_policy_hold_release_index(&write_txn, key, true)?;
+                    config_table
+                        .insert(key, encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                    identity_mutations
+                        .extend(content_identity::config_mutations(key, Some(&encoded)));
+                }
+            }
+            if !ddl.is_empty() {
+                let mut ddl_table = write_txn
+                    .open_table(DDL_LOG_TABLE)
+                    .map_err(Self::storage_error)?;
+                for (index, change) in ddl.iter().enumerate() {
+                    let key = Self::ddl_log_key_for_index(lsn, index, ddl.len());
+                    Self::append_ddl_summary_in_write(&write_txn, &key, change)?;
+                    let encoded = Self::encode(change)?;
+                    ddl_table
+                        .insert(key.as_str(), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                    identity_mutations
+                        .push(content_identity::encoded_history_mutation(&key, change)?);
+                }
+            }
+            Self::apply_content_identity_mutations_in_write(
+                &write_txn,
+                &identity_mutations,
+                &mut self.proof_admission(),
+            )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
+            { #[cfg(any(test, feature = "test-seams"))]
+            graph_observation_checkpoint(10)?;
+            let graph_commit_result = write_txn.commit();
+#[cfg(any(test, feature = "test-seams"))]
+if graph_commit_result.is_ok() { graph_publication_attempt.committed(); graph_observation_checkpoint(11)?; }
+graph_commit_result }.map_err(Self::storage_error)?;
+            self.complete_writer_schema_change(schema);
+            Ok(())
+        })
+    }
+        }
+    };
+}
+#[cfg(not(feature = "test-seams"))]
+persistence_mutation_surface!(pub(crate));
+#[cfg(feature = "test-seams")]
+persistence_mutation_surface!(pub);
+
+#[cfg(all(test, feature = "test-seams"))]
+#[path = "persistence/cdb141_ordered_direction_tests.rs"]
+mod cdb141_ordered_direction_tests;
+
+// CDB127 returned-loader rows extend the existing immutable mapped entrypoint;
+// no new test body or allocator is introduced.
+#[cfg(all(test, feature = "test-seams"))]
+thread_local! {
+    static RETURNED_LOADER_AFTER_RAW_OBSERVATION_FOR_TEST: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static RETURNED_LOADER_PARTIAL_PANIC_FOR_TEST: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static RETURNED_LOADER_OWNER_DROP_PANIC_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(all(test, feature = "test-seams"))]
+pub(crate) fn returned_loader_rows_for_test() {
+    use crate::memory_accounting::{ControlCredit, MemoryAccountant, StoreAccountantHandle, WriterBudget};
+    use content_identity::proof_allocation_oracle_tests::measured;
+    use std::mem::{align_of, offset_of, size_of};
+    // This predecessor is the exact immediately prior owner representation,
+    // including the retained writer_use field, not a guessed word-count price.
+    #[allow(dead_code)]
+    struct PriorProofOwner {
+        accountant: Option<Arc<MemoryAccountant>>,
+        writer_use: Option<crate::memory_accounting::WriterUse>,
+        control: Option<ControlCredit>,
+    }
+    assert_eq!(size_of::<ProofAccountantSlot>(), size_of::<Arc<MemoryAccountant>>());
+    assert_eq!(align_of::<ProofAccountantSlot>(), align_of::<Arc<MemoryAccountant>>());
+    assert_eq!(size_of::<std::sync::OnceLock<ProofAccountantSlot>>(), size_of::<std::sync::OnceLock<Arc<MemoryAccountant>>>());
+    assert_eq!(align_of::<std::sync::OnceLock<ProofAccountantSlot>>(), align_of::<std::sync::OnceLock<Arc<MemoryAccountant>>>());
+    assert_eq!(size_of::<PersistenceProofOwner>(), size_of::<PriorProofOwner>());
+    assert_eq!(align_of::<PersistenceProofOwner>(), align_of::<PriorProofOwner>());
+    assert_eq!(offset_of!(PersistenceProofOwner, accountant), offset_of!(PriorProofOwner, accountant));
+    assert_eq!(offset_of!(PersistenceProofOwner, writer_use), offset_of!(PriorProofOwner, writer_use));
+    assert_eq!(offset_of!(PersistenceProofOwner, control), offset_of!(PriorProofOwner, control));
+    println!("CDB127_A_LAYOUT slot_size={} slot_align={} once_size={} once_align={} owner_size={} owner_align={} accountant={} writer_use={} control={} arc_request={} arc_align={}",
+        size_of::<ProofAccountantSlot>(), align_of::<ProofAccountantSlot>(),
+        size_of::<std::sync::OnceLock<ProofAccountantSlot>>(), align_of::<std::sync::OnceLock<ProofAccountantSlot>>(),
+        size_of::<PersistenceProofOwner>(), align_of::<PersistenceProofOwner>(),
+        offset_of!(PersistenceProofOwner, accountant), offset_of!(PersistenceProofOwner, writer_use), offset_of!(PersistenceProofOwner, control),
+        crate::memory_accounting::writer_adapter_type_layout::<PersistenceProofOwner>().size(),
+        crate::memory_accounting::writer_adapter_type_layout::<PersistenceProofOwner>().align());
+
+    let reader = Arc::new(MemoryAccountant::no_limit());
+    let (slot, peak, live) = measured(|| ProofAccountantSlot::attached(reader.clone()));
+    assert_eq!((peak, live), (0, 0), "attachment cannot allocate");
+    let strong = Arc::strong_count(&reader);
+    let ((), peak, live) = measured(|| slot.prepare().unwrap());
+    assert_eq!((peak, live), (0, 0), "raw-reader preparation alone cannot allocate");
+    assert_eq!(reader.usage().used, 0);
+    assert_eq!(Arc::strong_count(&reader), strong);
+    assert_eq!(slot.0.load(Ordering::Acquire).addr() & ProofAccountantSlot::MASK, ProofAccountantSlot::RAW_READER);
+    let writer = WriterBudget::from_accountant(reader.clone()).unwrap();
+    let observed = reader.writer_registration_observation_for_test();
+    let controls = reader.writer_fixed_ownership().2;
+    let used = reader.usage().used;
+    let ((), peak, live) = measured(|| slot.prepare().unwrap());
+    assert_eq!((peak, live), (0, 0));
+    assert_eq!(reader.writer_registration_observation_for_test(), observed);
+    assert_eq!(reader.writer_fixed_ownership().2, controls);
+    assert_eq!(reader.usage().used, used);
+    let handle = slot.original_handle_for(&reader).unwrap();
+    assert!(!handle.is_writer());
+    let copied = handle.clone();
+    let budget = copied.vector_budget().unwrap();
+    assert_eq!(reader.writer_registration_observation_for_test(), observed);
+    drop((budget, copied, handle));
+    drop(writer);
+    assert_eq!(reader.writer_registration_observation_for_test().2, 0);
+    assert_eq!(reader.usage().used, 0, "reader source remains without a persistence-wide debit");
+    drop(slot);
+    assert_eq!(Arc::strong_count(&reader), 1);
+    println!("CDB127_A_ROW reader_prepare allocation_zero=true debit_zero=true immutable_reader=true later_writer_receipt_unchanged=true");
+
+    // Separate operation-control row kills current-association attribution;
+    // the reader preparation no-op never admits this control.
+    let reader_handle = StoreAccountantHandle::new(reader.clone());
+    let writer = WriterBudget::from_accountant(reader.clone()).unwrap();
+    let observation = reader.writer_registration_observation_for_test();
+    let controls = reader.writer_fixed_ownership().2;
+    let used = reader.usage().used;
+    let credit = ControlCredit::admit_from_handle(&reader_handle, 31, "proof", "original_reader_control", "proof").unwrap();
+    assert_eq!(reader.usage().used, used + 31);
+    assert_eq!(reader.writer_fixed_ownership().2, controls);
+    assert_eq!(reader.writer_registration_observation_for_test(), observation);
+    drop(credit);
+    assert_eq!(reader.usage().used, used);
+    assert_eq!(reader.writer_fixed_ownership().2, controls);
+    drop((writer, reader_handle));
+    assert_eq!(reader.usage().used, 0);
+    println!("CDB127_A_ROW original_reader_operation_control exact_debit=31 original_receipt=true no_writer_use=true");
+
+    let raw_owner = Arc::new(MemoryAccountant::no_limit());
+    let raw_writer = WriterBudget::from_accountant(raw_owner.clone()).unwrap();
+    let raw_slot = ProofAccountantSlot::attached(raw_owner.clone());
+    let raw_epoch = raw_owner.writer_registration_observation_for_test().2;
+    drop(raw_writer);
+    assert_eq!(raw_owner.writer_registration_observation_for_test().3, 1);
+    let reopened = WriterBudget::from_accountant(raw_owner.clone()).unwrap();
+    assert_eq!(raw_owner.writer_registration_observation_for_test().2, raw_epoch);
+    drop(reopened);
+    assert_eq!(raw_owner.writer_registration_observation_for_test().3, 1);
+    assert_eq!(raw_slot.0.load(Ordering::Acquire).addr() & ProofAccountantSlot::MASK, ProofAccountantSlot::RAW_WRITER);
+    drop(raw_slot);
+    assert_eq!(raw_owner.writer_registration_observation_for_test().2, 0);
+    assert_eq!(raw_owner.usage().used, 0);
+    println!("CDB127_A_ROW raw_writer_source_only original_epoch_reopen=true single_use=true final_zero=true");
+
+    let owner = Arc::new(MemoryAccountant::no_limit());
+    let writer = WriterBudget::from_accountant(owner.clone()).unwrap();
+    let baseline = owner.usage().used;
+    let controls = owner.writer_fixed_ownership().2;
+    let users = owner.writer_registration_observation_for_test().3;
+    let (slot, peak, live) = measured(|| ProofAccountantSlot::attached(owner.clone()));
+    assert_eq!((peak, live), (0, 0));
+    assert_eq!(owner.writer_registration_observation_for_test().3, users + 1);
+    let address = &slot as *const ProofAccountantSlot;
+    RETURNED_LOADER_AFTER_RAW_OBSERVATION_FOR_TEST.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            // Deterministically publish/release the raw winner after the
+            // outer acquire-load, before its increment/retain. The resumed
+            // outer operation must lose CAS without consuming the old raw use.
+            unsafe { (&*address).prepare().unwrap(); }
+        }));
+    });
+    slot.prepare().unwrap();
+    assert_eq!(owner.writer_registration_observation_for_test().3, users + 1);
+    let price = crate::memory_accounting::writer_adapter_type_layout::<PersistenceProofOwner>().size();
+    assert_eq!(owner.usage().used, baseline + price);
+    assert_eq!(owner.writer_fixed_ownership().2, controls + price);
+    assert_eq!(slot.0.load(Ordering::Acquire).addr() & ProofAccountantSlot::MASK, ProofAccountantSlot::READY_WRITER);
+    let ((), peak, live) = measured(|| slot.prepare().unwrap());
+    assert_eq!((peak, live), (0, 0));
+    drop(writer);
+    let epoch = owner.writer_registration_observation_for_test().2;
+    let reopened = WriterBudget::from_accountant(owner.clone()).unwrap();
+    assert_eq!(owner.writer_registration_observation_for_test().2, epoch);
+    drop(reopened);
+    assert_eq!(owner.writer_registration_observation_for_test().3, 1);
+    let escaped = slot.original_handle_for(&owner).unwrap().vector_budget().unwrap();
+    drop(slot);
+    assert_eq!(owner.writer_registration_observation_for_test().3, 1, "escaping adapter pins the original epoch");
+    drop(escaped);
+    assert_eq!(owner.writer_registration_observation_for_test().2, 0);
+    assert_eq!(owner.usage().used, 0);
+    assert_eq!(owner.underflow_count_for_test(), 0);
+    println!("CDB127_A_ROW delayed_raw_observer winner_then_loser=true single_slot_use=true original_epoch_reopen=true escaping_budget_final_zero=true");
+
+    // The observing thread pauses after its acquire-load. A scoped second
+    // thread publishes the winner before the observer increments/retains;
+    // resuming the observer deterministically exercises a cross-thread loser.
+    let writer = WriterBudget::from_accountant(owner.clone()).unwrap();
+    let slot = ProofAccountantSlot::attached(owner.clone());
+    let observed_users = owner.writer_registration_observation_for_test().3;
+    let observed_controls = owner.writer_fixed_ownership().2;
+    let address = &slot as *const ProofAccountantSlot;
+    RETURNED_LOADER_AFTER_RAW_OBSERVATION_FOR_TEST.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            let slot = unsafe { &*address };
+            std::thread::scope(|scope| {
+                scope.spawn(|| slot.prepare().unwrap()).join().unwrap();
+            });
+        }));
+    });
+    slot.prepare().unwrap();
+    assert_eq!(owner.writer_registration_observation_for_test().3, observed_users);
+    assert_eq!(owner.writer_fixed_ownership().2, observed_controls + price);
+    assert_eq!(slot.0.load(Ordering::Acquire).addr() & ProofAccountantSlot::MASK, ProofAccountantSlot::READY_WRITER);
+    drop((slot, writer));
+    assert_eq!(owner.usage().used, 0);
+    assert_eq!(owner.writer_registration_observation_for_test().2, 0);
+    assert_eq!(owner.underflow_count_for_test(), 0);
+    println!("CDB127_A_ROW cross_thread_raw_observer acquire_before_retain=true winner_before_resume=true loser_attempt_only=true final_zero=true");
+
+    let installed_owner = Arc::new(MemoryAccountant::no_limit());
+    let rejected_owner = Arc::new(MemoryAccountant::no_limit());
+    let installed_writer = WriterBudget::from_accountant(installed_owner.clone()).unwrap();
+    let rejected_writer = WriterBudget::from_accountant(rejected_owner.clone()).unwrap();
+    let cell = std::sync::OnceLock::new();
+    assert!(cell.set(ProofAccountantSlot::attached(installed_owner.clone())).is_ok());
+    let installed = installed_owner.writer_registration_observation_for_test();
+    let rejected = rejected_owner.writer_registration_observation_for_test();
+    let attempt = cell.set(ProofAccountantSlot::attached(rejected_owner.clone()));
+    assert!(attempt.is_err());
+    drop(attempt);
+    assert_eq!(installed_owner.writer_registration_observation_for_test(), installed);
+    assert_eq!(rejected_owner.writer_registration_observation_for_test(), rejected);
+    assert!(cell.get().unwrap().original_handle_for(&rejected_owner).is_none());
+    drop((cell, installed_writer, rejected_writer));
+    assert_eq!(installed_owner.usage().used, 0);
+    assert_eq!(rejected_owner.usage().used, 0);
+    println!("CDB127_A_ROW rejected_attachment different_funder=true installed_unchanged=true attempted_use_released=true");
+
+    let constrained = Arc::new(MemoryAccountant::with_budget(1));
+    let writer = WriterBudget::from_accountant(constrained.clone()).unwrap();
+    let slot = ProofAccountantSlot::attached(constrained.clone());
+    let observation = constrained.writer_registration_observation_for_test();
+    let strong = Arc::strong_count(&constrained);
+    let used = constrained.usage().used;
+    assert!(slot.prepare().is_err());
+    assert_eq!(constrained.writer_registration_observation_for_test(), observation);
+    assert_eq!(Arc::strong_count(&constrained), strong);
+    assert_eq!(constrained.usage().used, used);
+    assert_eq!(slot.0.load(Ordering::Acquire).addr() & ProofAccountantSlot::MASK, ProofAccountantSlot::RAW_WRITER);
+    drop((slot, writer));
+    assert_eq!(constrained.usage().used, 0);
+    println!("CDB127_A_ROW failed_prepare raw_custody_preserved=true attempt_rolled_back=true");
+
+    let writer = WriterBudget::from_accountant(owner.clone()).unwrap();
+    let slot = ProofAccountantSlot::attached(owner.clone());
+    slot.prepare().unwrap();
+    let baseline = owner.usage().used - price;
+    let users = owner.writer_registration_observation_for_test().3;
+    RETURNED_LOADER_OWNER_DROP_PANIC_FOR_TEST.with(|flag| flag.set(true));
+    let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(slot)));
+    assert!(unwind.is_err());
+    assert_eq!(owner.usage().used, baseline);
+    assert_eq!(owner.writer_registration_observation_for_test().3, users - 1);
+    drop(writer);
+    assert_eq!(owner.usage().used, 0);
+    assert_eq!(owner.underflow_count_for_test(), 0);
+    println!("CDB127_A_ROW owner_drop_unwind advancing_cleanup=true original_control_refunded=true underflow=0");
+    for unwind in [false, true] {
+        let partial_owner = Arc::new(MemoryAccountant::no_limit());
+        let writer = WriterBudget::from_accountant(partial_owner.clone()).unwrap();
+        let slot = ProofAccountantSlot::attached(partial_owner.clone());
+        let registration = partial_owner.writer_registration_observation_for_test();
+        let mut value = std::mem::MaybeUninit::<RedbPersistence>::uninit();
+        let pointer = value.as_mut_ptr();
+        let path = std::path::PathBuf::from("initialized-partial-persistence-payload");
+        let payload_pointer = path.as_os_str().as_encoded_bytes().as_ptr() as usize;
+        let cell = std::sync::OnceLock::new();
+        assert!(cell.set(slot).is_ok());
+        unsafe {
+            std::ptr::addr_of_mut!((*pointer).path).write(path);
+            std::ptr::addr_of_mut!((*pointer).proof_accountant).write(cell);
+        }
+        let mut initialized = [false; 18];
+        initialized[0] = true;
+        initialized[15] = true;
+        let construction = PersistenceConstruction { source: pointer, initialized };
+        drop(writer);
+        crate::persistence::content_identity::proof_allocation_oracle_tests::watch_candidate_payload_for_test(payload_pointer, &partial_owner);
+        if unwind { RETURNED_LOADER_PARTIAL_PANIC_FOR_TEST.with(|flag| flag.set(Some(0))); }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(construction)));
+        assert_eq!(result.is_err(), unwind);
+        let (census, payload_free, node_free) = crate::persistence::content_identity::proof_allocation_oracle_tests::candidate_payload_free_observation_for_test();
+        assert_eq!(census, (registration.2, 1, 0, registration.1));
+        assert_eq!(payload_free, (true, true));
+        assert_eq!(node_free, (registration.1, registration.1, true));
+        assert_eq!(partial_owner.usage().used, 0);
+        assert_eq!(partial_owner.writer_registration_observation_for_test().2, 0);
+        assert_eq!(partial_owner.underflow_count_for_test(), 0);
+        println!("CDB127_A_ROW partial_persistence_guard initialized_path=true initialized_slot=true unwind={} physical_payload_before_slot=true final_zero=true", unwind);
+    }
+    crate::database::returned_loader_rows_for_test();
+}

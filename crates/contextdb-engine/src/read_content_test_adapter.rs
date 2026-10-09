@@ -319,7 +319,7 @@ fn independently_enumerate_auxiliary_records(
 ) -> Result<Vec<LogicalContentRecordForTest>> {
     let mut records = Vec::new();
 
-    let edges = project_edges(parts);
+    let edges = project_edges(parts)?;
     for edge in edges {
         let properties = edge.properties.into_iter().collect::<BTreeMap<_, _>>();
         records.push(logical_record(
@@ -519,8 +519,16 @@ pub fn committed_content_for_test(
     operation_read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     declared_read_memory: Arc<crate::vector_read_memory::DeclaredReadMemory>,
 ) -> Result<CommittedContentForTest> {
-    let load = crate::persistence::load_read_image(path)
-        .map_err(|e| contextdb_core::Error::Other(e.to_string()))?;
+    let open_context = crate::executor::bounded::ReadOpenContext::new(
+        operation_read_memory.clone(),
+        crate::read_session::ReadSessionOptions::default().limits,
+        crate::read_session::read_clock(),
+        contextdb_core::read_contract::OwnerReadCancellation::new(),
+    )?;
+    let load = crate::persistence::load_read_image_at_registration_with_context(
+        path, None, None, None, open_context,
+    )
+    .map_err(|e| contextdb_core::Error::Other(e.to_string()))?;
     let (mut image, receipt, retained_source) = load.into_parts();
     receipt
         .validate_released()
@@ -558,7 +566,7 @@ pub fn committed_content_for_test(
         ("sink_queues".into(), encode(&parts.sink_queues)),
         ("queue_contents".into(), canonical_queues),
     ]);
-    let graph = project_edges(&parts);
+    let graph = project_edges(&parts)?;
     let vectors = project_vectors(&parts);
     let commits = parts
         .commit_index
@@ -595,7 +603,6 @@ pub fn committed_content_for_test(
         parts,
         Arc::new(crate::plugin::CorePlugin),
         accountant,
-        read_memory.clone(),
         declared_read_memory,
     )?;
     let mut content = project_test_content(
@@ -638,13 +645,24 @@ pub fn committed_content_for_test(
     Ok(content)
 }
 
-fn project_edges(parts: &ReadPersistenceImageParts) -> Vec<DirectStoredEdge> {
+fn project_edges(parts: &ReadPersistenceImageParts) -> Result<Vec<DirectStoredEdge>> {
     // One edge identity can carry several stored occurrences -- a later write
     // that adds properties does not erase the one that introduced the edge --
     // and an image holds current state, so the latest occurrence is the one
     // an edge reads as.
     let mut current = BTreeMap::new();
-    for edge in &parts.forward_edges {
+    let budget: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget> =
+        Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+    let mut cursor =
+        crate::persistence::graph_read::GraphReadRoot::Image(parts.retained_source.clone())
+            .cursor(
+                false,
+                std::ops::Bound::Unbounded,
+                std::ops::Bound::Unbounded,
+                budget,
+            )?;
+    while let Some(window) = cursor.next_edge()? {
+        let edge = window.edge();
         if edge.deleted_tx.is_some() {
             continue;
         }
@@ -653,7 +671,7 @@ fn project_edges(parts: &ReadPersistenceImageParts) -> Vec<DirectStoredEdge> {
         match current.get(&identity) {
             Some((seen, _)) if *seen >= order => {}
             _ => {
-                current.insert(identity, (order, edge));
+                current.insert(identity, (order, edge.clone()));
             }
         }
     }
@@ -677,7 +695,7 @@ fn project_edges(parts: &ReadPersistenceImageParts) -> Vec<DirectStoredEdge> {
             right.target,
         ))
     });
-    edges
+    Ok(edges)
 }
 
 fn project_vectors(parts: &ReadPersistenceImageParts) -> Vec<DirectStoredVector> {

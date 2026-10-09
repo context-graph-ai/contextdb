@@ -338,6 +338,14 @@ pub enum Error {
         path: String,
         reason: String,
     },
+    #[error(
+        "{operation} cannot take a holder-presence lock through {path}: {reason}; this filesystem cannot prove whether a background-work holder is alive"
+    )]
+    HolderPresenceUnavailable {
+        operation: String,
+        path: String,
+        reason: String,
+    },
     #[error("not found: {0}")]
     NotFound(String),
     #[error("transaction not found: {0}")]

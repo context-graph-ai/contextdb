@@ -32,14 +32,24 @@ pub struct PersistentCompositeStore {
     prepared_publication:
         parking_lot::Mutex<Option<Arc<crate::persistence::writer_source::WriterSnapshot>>>,
     precommit_source: parking_lot::Mutex<std::sync::Weak<crate::persistence::WriterSnapshot>>,
-    _precommit_source_memory: crate::memory_accounting::OwnedMemoryReservation,
+    _precommit_source_memory: PersistentSourceMemory,
     publication_interrupted: std::sync::atomic::AtomicBool,
+}
+
+// Keeps the pre2 Arc-plus-byte footprint while retaining one real active
+// writer use independently of the inner store and persistence payloads.
+struct PersistentSourceMemory {
+    accountant: crate::memory_accounting::StoreAccountantHandle,
+    bytes: usize,
+}
+impl Drop for PersistentSourceMemory {
+    fn drop(&mut self) { self.accountant.release(self.bytes); }
 }
 
 impl PersistentCompositeStore {
     #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn source_control_bytes_for_test(&self) -> usize {
-        self._precommit_source_memory.bytes()
+        self._precommit_source_memory.bytes
     }
 
     pub(crate) fn new(
@@ -58,10 +68,10 @@ impl PersistentCompositeStore {
             parking_lot::Mutex<std::sync::Weak<crate::persistence::WriterSnapshot>>,
         >();
         inner.accountant.charge_retained(source_bytes);
-        let source_memory = crate::memory_accounting::OwnedMemoryReservation::from_admitted(
-            inner.accountant.clone(),
-            source_bytes,
-        );
+        let source_memory = PersistentSourceMemory {
+            accountant: inner.accountant.clone(),
+            bytes: source_bytes,
+        };
         Ok(Self {
             inner,
             persistence,
@@ -157,7 +167,7 @@ impl PersistentCompositeStore {
             &mut stage_started,
         );
         let mut accepted_row_memory =
-            crate::memory_accounting::OwnedMemoryReservation::new(self.inner.accountant.clone());
+            crate::memory_accounting::OwnedMemoryReservation::new(self.inner.accountant.as_arc());
         let deleted_rows =
             self.deleted_rows_snapshot_for_write_set(ws, &mut accepted_row_memory, read_memory.clone())?;
         let log_entries = self.inner.build_change_log_entries_with_snapshots(

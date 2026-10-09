@@ -170,6 +170,7 @@ impl RedbPersistence {
         row: RowId,
     ) -> Result<[u8; 24]> {
         let read = root.owner_read()?;
+        Self::verify_history_root(&read, &Self::rel_table_name(table))?;
         let heads = read.open_table(TABLE).map_err(Self::storage_error)?;
         let fingerprint = read
             .table_root_fingerprint(TABLE)

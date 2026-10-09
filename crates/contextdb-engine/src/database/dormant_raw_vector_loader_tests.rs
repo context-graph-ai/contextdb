@@ -78,7 +78,9 @@ fn fixture() -> (
     fixture_with_rows(ROWS)
 }
 
-fn fixture_with_rows(row_count: usize) -> (
+fn fixture_with_rows(
+    row_count: usize,
+) -> (
     tempfile::TempDir,
     DurableRawVectorPartitionLoader,
     Vec<RawVectorDirectoryEntry>,
@@ -620,10 +622,15 @@ fn assert_single_membership_lifetime_admission() {
     let (_temporary, loader, directory) = fixture_with_rows(1);
     for all in [false, true] {
         let (tiny, mut tiny_owner) = loader_read_request(1);
-        let result = if all { loader.load_all(&mut tiny_owner) }
-            else { loader.load(&directory, &mut tiny_owner) };
+        let result = if all {
+            loader.load_all(&mut tiny_owner)
+        } else {
+            loader.load(&directory, &mut tiny_owner)
+        };
         let initial = match result {
-            Err(Error::MemoryBudgetExceeded { requested_bytes, .. }) => requested_bytes,
+            Err(Error::MemoryBudgetExceeded {
+                requested_bytes, ..
+            }) => requested_bytes,
             _ => panic!("one-byte reader must refuse initial scratch"),
         };
         assert_eq!(tiny.usage().used, 0);
@@ -631,40 +638,74 @@ fn assert_single_membership_lifetime_admission() {
         // that exact prefix independently from the refusal, not from layout
         // constants that belong to the returned-carrier proof.
         let (prefix_reader, mut prefix_owner) = loader_read_request(initial);
-        let prefix_result = if all { loader.load_all(&mut prefix_owner) }
-            else { loader.load(&directory, &mut prefix_owner) };
+        let prefix_result = if all {
+            loader.load_all(&mut prefix_owner)
+        } else {
+            loader.load(&directory, &mut prefix_owner)
+        };
         let next_request = match prefix_result {
-            Err(Error::MemoryBudgetExceeded { requested_bytes, available_bytes: 0, .. }) => requested_bytes,
+            Err(Error::MemoryBudgetExceeded {
+                requested_bytes,
+                available_bytes: 0,
+                ..
+            }) => requested_bytes,
             _ => panic!("exact first reservation must refuse the next reservation"),
         };
         assert_eq!(prefix_reader.usage().used, 0);
         let before_lifetime = if all {
-            assert_eq!(next_request, 900, "load_all admits lifetime node after decoder scratch");
+            assert_eq!(
+                next_request, 900,
+                "load_all admits lifetime node after decoder scratch"
+            );
             initial
         } else {
-            assert!(next_request > 1024 * 1024, "selected load admits decoder after exact output");
+            assert!(
+                next_request > 1024 * 1024,
+                "selected load admits decoder after exact output"
+            );
             initial.checked_add(next_request).unwrap()
         };
         // Native key32 + Option<TxId>16: four slots196 plus first-node704.
         let limit = before_lifetime + 900 - 1;
         let (reader, mut owner) = loader_read_request(limit);
-        let result = if all { loader.load_all(&mut owner) }
-            else { loader.load(&directory, &mut owner) };
-        assert!(matches!(result, Err(Error::MemoryBudgetExceeded {
-            requested_bytes: 900, available_bytes: 899, ..
-        })), "first membership must admit its full node before allocation, load_all={all}");
+        let result = if all {
+            loader.load_all(&mut owner)
+        } else {
+            loader.load(&directory, &mut owner)
+        };
+        assert!(
+            matches!(
+                result,
+                Err(Error::MemoryBudgetExceeded {
+                    requested_bytes: 900,
+                    available_bytes: 899,
+                    ..
+                })
+            ),
+            "first membership must admit its full node before allocation, load_all={all}"
+        );
         assert_eq!(reader.usage().used, 0);
-        assert_eq!(loader.accountant.usage().used, loader_metadata_bytes(&loader));
+        assert_eq!(
+            loader.accountant.usage().used,
+            loader_metadata_bytes(&loader)
+        );
         let (reader, mut owner) = loader_read_request(LIMIT);
-        let loaded = if all { loader.load_all(&mut owner) }
-            else { loader.load(&directory, &mut owner) }.unwrap();
+        let loaded = if all {
+            loader.load_all(&mut owner)
+        } else {
+            loader.load(&directory, &mut owner)
+        }
+        .unwrap();
         assert_eq!(loaded.entries.len(), 1);
         assert_eq!(loaded.entries[0].entry.row_id, RowId(1));
         assert_eq!(loaded.entries[0].entry.vector, vec![0.0]);
         assert_eq!(reader.usage().used, loaded.workspace_owner.retained_bytes());
         drop(loaded);
         assert_eq!(reader.usage().used, 0);
-        assert_eq!(loader.accountant.usage().used, loader_metadata_bytes(&loader));
+        assert_eq!(
+            loader.accountant.usage().used,
+            loader_metadata_bytes(&loader)
+        );
     }
     let (reader, _owner) = loader_read_request(LIMIT);
     assert_last_loader_owner_releases(loader, &reader);

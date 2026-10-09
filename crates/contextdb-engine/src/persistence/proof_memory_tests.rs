@@ -497,8 +497,15 @@ fn a_tight_reader_admits_every_transient_and_returns_all_of_it() {
     let (wide, wide_records) = committed(&root.path().join("wide-key-pool.db"), 8, key_bytes);
 
     let unwatched = take_resolved_key_copy_observations_for_test();
-    assert!(unwatched.is_empty(), "ordinary unobserved walks record no key-copy events");
-    assert_eq!(unwatched.capacity(), 0, "the default-disabled recorder owns no backing buffer");
+    assert!(
+        unwatched.is_empty(),
+        "ordinary unobserved walks record no key-copy events"
+    );
+    assert_eq!(
+        unwatched.capacity(),
+        0,
+        "the default-disabled recorder owns no backing buffer"
+    );
     drop(unwatched);
 
     // (a) The current pool is smaller than one referenced key; remaining
@@ -544,8 +551,15 @@ fn a_tight_reader_admits_every_transient_and_returns_all_of_it() {
     }
 
     let released = take_resolved_key_copy_observations_for_test();
-    assert!(released.is_empty(), "ending the successful watch disables and clears events");
-    assert_eq!(released.capacity(), 0, "ending the watch releases every backing-buffer byte");
+    assert!(
+        released.is_empty(),
+        "ending the successful watch disables and clears events"
+    );
+    assert_eq!(
+        released.capacity(),
+        0,
+        "ending the watch releases every backing-buffer byte"
+    );
     drop(released);
 
     // (b) Remaining session memory cannot hold the referenced key. The typed
@@ -576,9 +590,15 @@ fn a_tight_reader_admits_every_transient_and_returns_all_of_it() {
         assert_eq!(budget.usage().used, 0, "the refused walk holds nothing");
     }
     let released = take_resolved_key_copy_observations_for_test();
-    assert!(released.is_empty(), "ending the refusal watch disables and clears events");
-    assert_eq!(released.capacity(), 0, "refused walks release the watch backing buffer too");
-
+    assert!(
+        released.is_empty(),
+        "ending the refusal watch disables and clears events"
+    );
+    assert_eq!(
+        released.capacity(),
+        0,
+        "refused walks release the watch backing buffer too"
+    );
 }
 
 /// Every writer record lives in the reusable admitted window. Refusing

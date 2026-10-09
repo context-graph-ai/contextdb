@@ -1636,6 +1636,22 @@ pub struct LoadedRawVectorPartition {
     pub accountant: Arc<dyn MemoryBudget>,
 }
 
+pub(crate) struct HistoricalRawVectorPartition {
+    loaded: LoadedRawVectorPartition,
+}
+impl std::fmt::Debug for HistoricalRawVectorPartition {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("HistoricalRawVectorPartition")
+            .field("entries", &self.loaded.entries.len()).finish()
+    }
+}
+impl HistoricalRawVectorPartition {
+    pub(crate) fn len(&self) -> usize { self.loaded.entries.len() }
+    pub(crate) fn entry(&self, position: usize) -> Option<&LoadedRawVectorEntry> {
+        self.loaded.entries.get(position)
+    }
+}
+
 impl LoadedRawVectorPartition {
     fn into_parts(
         mut self,
@@ -1774,7 +1790,7 @@ impl LoadedRawVectorCandidate {
 
 impl Drop for LoadedRawVectorCandidate {
     fn drop(&mut self) {
-        if let Some(accountant) = self.loader_accountant.take() {
+        if let Some(accountant) = self.loader_accountant.as_ref() {
             accountant.release(self.transient_bytes);
         }
     }
@@ -3026,10 +3042,10 @@ impl IndexState {
         index: &VectorIndexRef,
         snapshot: SnapshotId,
         owner: &dyn Fn(usize) -> Result<()>,
-        accountant: &Arc<dyn MemoryBudget>,
+        copy_owner: &mut VectorCopyAdmission,
         select: impl Fn(&RawVectorDirectoryEntry) -> bool,
     ) -> Result<Vec<VectorEntry>> {
-        let mut metadata = VectorCopyAdmission::new(accountant.clone());
+        let mut metadata = copy_owner.scratch();
         let source = self.durable_membership_source().ok_or_else(|| {
             Error::Other("durable vector partition lost its membership source".into())
         })?;
@@ -3037,7 +3053,7 @@ impl IndexState {
             Error::Other("durable vector membership has no raw-body loader".into())
         })?;
         let mut selected = Vec::new();
-        let mut directory_scratch = VectorCopyAdmission::new(accountant.clone());
+        let mut directory_scratch = copy_owner.scratch();
         let mut cursor =
             with_copy_admission(&mut directory_scratch, |request| source.open(request))?;
         while let Some(interval) =
@@ -3060,7 +3076,7 @@ impl IndexState {
                     path: format!("vector index {}.{}", index.table, index.column),
                     reason: "durable membership interval has no body identity".into(),
                 })?;
-            let mut scratch = VectorCopyAdmission::new(accountant.clone());
+            let mut scratch = copy_owner.scratch();
             let mut refusal = None;
             let loaded = loader.load_candidate(&identity, true, &mut |request| {
                 if let DormantVectorLoadRequest::Reserve(bytes) = request
@@ -3103,9 +3119,9 @@ impl IndexState {
         snapshot: SnapshotId,
         after_lsn: Lsn,
         owner: &dyn Fn(usize) -> Result<()>,
-        accountant: &Arc<dyn MemoryBudget>,
+        copy_owner: &mut VectorCopyAdmission,
     ) -> Result<Option<Vec<VectorEntry>>> {
-        let mut metadata = VectorCopyAdmission::new(accountant.clone());
+        let mut metadata = copy_owner.scratch();
         let source = self.durable_membership_source().ok_or_else(|| {
             Error::Other("durable vector partition lost its membership source".into())
         })?;
@@ -3165,7 +3181,7 @@ impl IndexState {
                     path: format!("vector index {}.{}", index.table, index.column),
                     reason: "durable change suffix names a membership the directory lacks".into(),
                 })?;
-            let mut scratch = VectorCopyAdmission::new(accountant.clone());
+            let mut scratch = copy_owner.scratch();
             let mut refusal = None;
             let loaded = loader.load_candidate(&identity, true, &mut |request| {
                 if let DormantVectorLoadRequest::Reserve(bytes) = request
@@ -3319,7 +3335,7 @@ impl IndexState {
     /// the memory to hold them is refused; the caller then reads bodies one
     /// at a time through the durable source.
     pub(crate) fn try_cache_durable_bodies(&self, owner: &mut VectorCopyAdmission) -> Result<bool> {
-        if self.is_durable() {
+        if self.is_durable() || (owner.historical_durable_reads() && self.durable_membership_source().is_some()) {
             // Durable bodies and their shared-allocation headers are cached as
             // bytes in the writer's one declared buffer pool. A decoded whole
             // partition would be a second, population-sized cache outside that
@@ -3531,6 +3547,14 @@ impl IndexState {
             if !self.directory_has_visible_row(row_id, snapshot) {
                 return Ok(None);
             }
+            if let Some(partition) = self.historical_partition(owner)? {
+                return Ok(partition.loaded.entries.iter().rev().find(|carrier|
+                    carrier.entry.row_id == row_id && carrier.membership.row_lsn == lsn
+                        && carrier.membership.owning_row_tx == row_created_tx
+                        && carrier.membership.visible_from.0 <= snapshot.0
+                        && carrier.membership.deleted_tx.is_none_or(|tx| tx.0 > snapshot.0))
+                    .map(|carrier| crate::quantized::stored_vector_value(&carrier.entry.vector, self.quantization)));
+            }
             self.ensure_raw_vectors_loaded(owner)?;
             return Ok(self.vector_for_row_lsn(row_id, lsn, row_created_tx, snapshot));
         };
@@ -3642,7 +3666,9 @@ impl IndexState {
         let mut selection_copy = owner.local_scratch();
         owner.reserve(self.copy_bytes(index, 1))?;
         if let Some(source) = self.durable_membership_source() {
-            let cached = if cache {
+            let cached = if owner.historical_durable_reads() {
+                false
+            } else if cache {
                 self.try_cache_durable_bodies(owner)?
             } else {
                 self.bodies_resident()
@@ -3715,6 +3741,12 @@ impl IndexState {
             };
             return Ok(Some(output));
         }
+        if let Some(partition) = self.historical_partition(owner)? {
+            return Ok(partition.loaded.entries.iter().rev().find(|carrier|
+                carrier.entry.row_id == row_id && carrier.membership.visible_from.0 <= snapshot.0
+                    && carrier.membership.deleted_tx.is_none_or(|tx| tx.0 > snapshot.0))
+                .map(|carrier| carrier.entry.clone()));
+        }
         self.ensure_raw_vectors_loaded(owner)?;
         Ok(self.visible_entry_by_row(index, row_id, snapshot))
     }
@@ -3727,6 +3759,71 @@ impl IndexState {
         owner: &mut VectorCopyAdmission,
     ) -> Result<Option<VectorEntry>> {
         self.load_visible_entry_by_row_caching(index, row_id, snapshot, cache, owner)
+    }
+
+    /// Legacy full-load readers retain an operation-owned authenticated copy.
+    /// Their original load refusal remains observable; the shared current
+    /// residency and its owning accountant are never changed by this copy.
+    pub(crate) fn historical_partition(
+        &self,
+        owner: &mut VectorCopyAdmission,
+    ) -> Result<Option<HistoricalRawVectorPartition>> {
+        if !owner.historical_durable_reads() || self.is_durable() {
+            return Ok(None);
+        }
+        let Some(loader) = self.raw_loader.read().clone() else {
+            return Ok(None);
+        };
+        let mut directory_owner = owner.scratch();
+        let expected = {
+            let directory = self.raw_directory.read();
+            directory_owner.reserve_for(
+                directory.len().checked_mul(std::mem::size_of::<RawVectorDirectoryEntry>())
+                    .ok_or_else(|| Error::Other("raw hydration directory capacity overflow".into()))?,
+                "vector_copy", "load_raw_vector_directory",
+                "Raise the executing operation memory limit to hold the hydration directory.",
+            )?;
+            directory.iter().cloned().collect::<Vec<_>>()
+        };
+        let mut loaded = loader.load(&expected, owner)?;
+        if loaded.entries.len() != expected.len()
+            || loaded.entries.iter().zip(&expected).any(|(entry, identity)|
+                entry.entry.row_id != identity.row_id || entry.entry.created_tx != identity.created_tx
+                    || entry.entry.deleted_tx != identity.deleted_tx || entry.entry.lsn != identity.lsn
+                    || entry.membership != identity.membership)
+        {
+            return Err(Error::Other("loaded raw vector partition disagrees with its durable directory".into()));
+        }
+        drop(expected);
+        drop(directory_owner);
+        loaded.workspace_owner.reserve_for(
+            loaded.entries.len().checked_mul(crate::quantized::shared_payload_header_bytes())
+                .ok_or_else(|| Error::Other("raw vector header capacity overflow".into()))?,
+            "vector_index", "load_raw_vector_headers",
+            "Raise MEMORY_LIMIT to hold the shared raw-vector allocation headers.",
+        )?;
+        Ok(Some(HistoricalRawVectorPartition { loaded }))
+    }
+
+    pub(crate) fn historical_partition_score(
+        &self,
+        partition: &HistoricalRawVectorPartition,
+        position: usize,
+        snapshot: SnapshotId,
+        query: &[f32],
+    ) -> Result<Option<(RowId, f32)>> {
+        let carrier = partition.loaded.entries.get(position)
+            .ok_or_else(|| Error::Other("historical vector position exceeds its admitted copy".into()))?;
+        if carrier.membership.visible_from.0 > snapshot.0
+            || carrier.membership.deleted_tx.is_some_and(|tx| tx.0 <= snapshot.0) {
+            return Ok(None);
+        }
+        // The retained full-load reservation already owns the complete stored
+        // representation; one temporary representation uses that headroom.
+        let stored = self.stored_entry_ref(&carrier.entry);
+        #[cfg(feature = "test-seams")]
+        crate::mem::observe_native_vector_score_for_test();
+        Ok(Some((stored.row_id, stored.vector.cosine_similarity(query))))
     }
 
     pub(crate) fn ensure_raw_vectors_loaded(&self, owner: &mut VectorCopyAdmission) -> Result<()> {
@@ -4726,8 +4823,8 @@ impl IndexState {
         let mut local_copy_admission = owner.local_scratch();
         let owner = local_copy_admission.as_mut().unwrap_or(owner);
         before_checkpoint()?;
-        if streamed_identity.is_none() {
-            if let Some(score) = self
+        if streamed_identity.is_none() && !owner.historical_durable_reads()
+            && let Some(score) = self
                 .with_visible_stored_entry_by_row(row_id, snapshot, |entry| {
                     before_distance().map(|()| {
                         #[cfg(feature = "test-seams")]
@@ -4736,9 +4833,8 @@ impl IndexState {
                     })
                 })
                 .transpose()?
-            {
-                return Ok(Some(score));
-            }
+        {
+            return Ok(Some(score));
         }
 
         let membership_streamed = streamed_identity.is_some();
@@ -4761,7 +4857,8 @@ impl IndexState {
         // A page this statement has already authenticated answers every vector
         // it holds. Reading this candidate's own body instead would hash a
         // fresh Merkle path for one vector out of the twenty a page carries.
-        if let Some(paged) = paged
+        if !owner.historical_durable_reads()
+            && let Some(paged) = paged
             && let Some(score) = self.score_candidate_from_serving_pages(
                 paged,
                 &identity,
@@ -5659,7 +5756,7 @@ impl IndexState {
             owner,
         )?;
         selection._copy_owner = Some(retained);
-        let dormant = if selection.inspection.captured_catalog {
+        let dormant = if selection.inspection.captured_catalog || owner.historical_durable_reads() {
             None
         } else {
             let (base, change, resident_base, resident_change, base_identity, change_identity) =
@@ -10094,7 +10191,7 @@ impl VectorColumnState {
     ) {
         let new_bytes = self.directory_retained_bytes(index);
         let mut charge = self.directory_accounting.lock();
-        debug_assert!(Arc::ptr_eq(&charge.accountant, &reservation.accountant));
+        debug_assert!(crate::memory_budget::same_funder(charge.accountant.as_ref(), reservation.accountant.as_ref()));
         if new_bytes > charge.bytes {
             let growth = new_bytes - charge.bytes;
             assert!(
@@ -11892,7 +11989,7 @@ impl VectorStore {
                         let sample = SnapshotId(sample_tx.0);
                         entries.extend(
                             state
-                                .durable_entries_selected(&partition.index, sample, &|bytes| crate::memory_budget::require_copy_capacity(reservation.bytes, bytes), &reservation.accountant, |entry| {
+                                .durable_entries_selected(&partition.index, sample, &|bytes| crate::memory_budget::require_copy_capacity(reservation.bytes, bytes), &mut VectorCopyAdmission::new(reservation.accountant.clone()), |entry| {
                                     entry.created_tx <= sample_tx
                                         && entry
                                             .deleted_tx
@@ -18496,7 +18593,7 @@ impl VectorStore {
                     index,
                     snapshot,
                     &|bytes| owner.require_capacity(bytes),
-                    owner.accountant(),
+                    &mut VectorCopyAdmission::new(owner.accountant().clone()),
                     |entry| entry.membership.visible_from.0 <= snapshot.0,
                 );
             }
@@ -18575,7 +18672,7 @@ impl VectorStore {
                         snapshot,
                         after_lsn,
                         &|bytes| owner.require_capacity(bytes),
-                        owner.accountant(),
+                        &mut VectorCopyAdmission::new(owner.accountant().clone()),
                     )?
                 {
                     return Ok(entries);
@@ -18584,7 +18681,7 @@ impl VectorStore {
                     index,
                     snapshot,
                     &|bytes| owner.require_capacity(bytes),
-                    owner.accountant(),
+                    &mut VectorCopyAdmission::new(owner.accountant().clone()),
                     |entry| selected(entry.created_tx, entry.deleted_tx, entry.lsn),
                 );
             }
@@ -20367,9 +20464,20 @@ impl VectorStore {
                         .is_some_and(|state| state.raw_residency_is_accounted())
                 });
             }
-            column.partitions.read().values().any(|state| {
-                state.raw_residency_is_accounted()
-                    && state.vectors.read().by_row.contains_key(&row_id)
+            // Durable-only bodies have no resident per-insert charge to
+            // refund. A later lookup may populate an allocation-owned cache;
+            // inspecting that body must not manufacture a legacy release.
+            column.partitions.read().values().all(|state| {
+                if state.raw_residency_is_accounted() {
+                    return true;
+                }
+                let vectors = state.vectors.read();
+                !vectors.by_row.get(&row_id).is_some_and(|positions| {
+                    positions.iter().any(|position| {
+                        let entry = &vectors.entries[*position];
+                        entry.deleted_tx.is_none() && !entry.vector.payload_is_charged()
+                    })
+                })
             })
         })
     }

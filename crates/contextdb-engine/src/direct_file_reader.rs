@@ -6,8 +6,8 @@
 //! session and its cursors retain that custody and owned memory; they do not yet
 //! retain a lazy persistence or blob resolver.
 
-use crate::owned_cursor_page::OwnedCursorPage as CursorPage;
 use crate::QueryResult;
+use crate::owned_cursor_page::OwnedCursorPage as CursorPage;
 use crate::sync_types::{DdlChange, EdgeChange, RowChange, VectorChange};
 use contextdb_core::read_contract::{
     DeadlineClock, OwnerReadCancellation, ReadFailure, ReadLimits,
@@ -844,6 +844,9 @@ pub enum DirectFileReaderError {
     /// a route that must report the same fault the same way whichever way it
     /// reached the store picks the typed answer up there.
     Engine(String),
+    /// A decoder configuration refusal retains its static taxonomy across the
+    /// file route, without allocating or formatting an engine error.
+
     /// Startup admission failed before a target existed to retain the error.
     MemoryBudget {
         subsystem: String,
@@ -894,6 +897,7 @@ impl fmt::Display for DirectFileReaderError {
             Self::Cancelled => formatter.write_str("direct read was cancelled"),
             Self::ReadFailure(failure) => write!(formatter, "direct read failed: {failure:?}"),
             Self::Engine(reason) => write!(formatter, "direct read failed: {reason}"),
+
             Self::MemoryBudget {
                 subsystem,
                 operation,
@@ -923,6 +927,8 @@ pub struct DirectFileReader {
     image_memory: Arc<crate::read_image_memory::ImageMemory>,
     retained_source: Arc<crate::persistence::RetainedReadSource>,
     read_requests: Arc<dyn crate::vector_read_memory::ReadRequestBudgetProvider>,
+    #[cfg(feature = "test-seams")]
+    declared_read_memory: Arc<crate::vector_read_memory::DeclaredReadMemory>,
 }
 
 /// Privately constructible proof that target construction, owned-image
@@ -937,6 +943,8 @@ struct BackendTargetConstructionReceipt {
     image_memory: Arc<crate::read_image_memory::ImageMemory>,
     retained_source: Arc<crate::persistence::RetainedReadSource>,
     read_requests: Arc<dyn crate::vector_read_memory::ReadRequestBudgetProvider>,
+    #[cfg(feature = "test-seams")]
+    declared_read_memory: Arc<crate::vector_read_memory::DeclaredReadMemory>,
 }
 
 impl BackendTargetConstructionReceipt {
@@ -955,6 +963,8 @@ impl BackendTargetConstructionReceipt {
             verified_digest: self.verified_digest,
             retained_source: self.retained_source,
             read_requests: self.read_requests,
+            #[cfg(feature = "test-seams")]
+            declared_read_memory: self.declared_read_memory,
         })
     }
 }
@@ -963,21 +973,23 @@ fn construct_backend_neutral_target(
     pending_image: crate::persistence::ReadPersistenceImage,
     retained_source: Arc<crate::persistence::RetainedReadSource>,
     config: DirectReaderConfig,
+    declared_read_memory: Arc<crate::vector_read_memory::DeclaredReadMemory>,
 ) -> Result<BackendTargetConstructionReceipt, DirectFileReaderError> {
     let limits = config.limits;
-    // The read host resolves this root's declared limit once; statements
-    // receive children of this same parent through the constructed target.
-    let declared_read_memory = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(limits.memory);
     let constructed = pending_image.into_committed_image(
         Arc::clone(&retained_source),
         config.memory_limit,
         config.contexts,
         config.scope_labels,
         config.principal,
-        declared_read_memory,
+        declared_read_memory.clone(),
     )?;
+    #[cfg(feature = "test-seams")]
+    crate::read_work_probe::note_commit_directory_image_memory(&constructed.memory);
     let read_requests = constructed.target.declared_read_request_provider();
     Ok(BackendTargetConstructionReceipt {
+        #[cfg(feature = "test-seams")]
+        declared_read_memory,
         read_requests,
         image_memory: constructed.memory,
         target: constructed.target,
@@ -994,6 +1006,7 @@ fn handoff_to_backend_neutral_reader(
     release_receipt: crate::persistence::ReadPersistenceReleaseReceipt,
     retained_source: Arc<crate::persistence::RetainedReadSource>,
     config: DirectReaderConfig,
+    declared_read_memory: Arc<crate::vector_read_memory::DeclaredReadMemory>,
     observation: HydrationObservation,
 ) -> Result<DirectFileReader, DirectFileReaderError> {
     if release_receipt.source_accesses() == 0 {
@@ -1024,7 +1037,7 @@ fn handoff_to_backend_neutral_reader(
 
     // No target observation is possible until this fallible call returns its
     // private receipt. The current narrow stub returns the typed missing seam.
-    let constructed = construct_backend_neutral_target(pending_image, retained_source, config)?;
+    let constructed = construct_backend_neutral_target(pending_image, retained_source, config, declared_read_memory)?;
     observation.checkpoint(HydrationPhase::BackendTargetConstructed {
         breadcrumb_path: breadcrumb_path.clone(),
     });
@@ -1039,6 +1052,7 @@ fn handoff_to_backend_neutral_reader(
 fn consume_released_persistence_load(
     load: crate::persistence::ReadPersistenceLoad,
     config: DirectReaderConfig,
+    declared_read_memory: Arc<crate::vector_read_memory::DeclaredReadMemory>,
     observation: HydrationObservation,
 ) -> Result<DirectFileReader, DirectFileReaderError> {
     let (pending_image, release_receipt, retained_source): (
@@ -1051,6 +1065,7 @@ fn consume_released_persistence_load(
         release_receipt,
         retained_source,
         config,
+        declared_read_memory,
         observation,
     )
 }
@@ -1093,6 +1108,7 @@ fn publish_direct_result<T>(
             contextdb_core::Error::ReadFailure(failure) => {
                 DirectFileReaderError::ReadFailure(failure)
             }
+
             error => DirectFileReaderError::Engine(error.to_string()),
         })
 }
@@ -1260,36 +1276,62 @@ impl DirectFileReader {
         path: impl AsRef<Path>,
         config: DirectReaderConfig,
     ) -> Result<Self, DirectFileReaderError> {
-        Self::open_inner(path.as_ref(), config, HydrationObservation::disabled())
+        Self::open_with_cancellation(path.as_ref(), config, &OwnerReadCancellation::new())
     }
 
-    pub(crate) fn from_owner_snapshot(
+    pub(crate) fn open_with_cancellation(
+        path: &Path,
+        config: DirectReaderConfig,
+        cancellation: &OwnerReadCancellation,
+    ) -> Result<Self, DirectFileReaderError> {
+        Self::open_inner_with_cancellation(path, config, HydrationObservation::disabled(), None, cancellation)
+    }
+
+    pub(crate) fn from_owner_snapshot_with_cancellation(
         path: &Path,
         config: DirectReaderConfig,
         registration: crate::persistence::ReadSnapshotRegistrationGuard,
+        cancellation: &OwnerReadCancellation,
     ) -> Result<Self, DirectFileReaderError> {
-        let load = crate::persistence::load_read_image_at_registration(
-            path,
-            config.memory_limit,
-            config.runtime_dir.as_deref(),
-            Some(registration),
+        Self::open_inner_with_cancellation(
+            path, config, HydrationObservation::disabled(), Some(registration), cancellation,
         )
-        .map_err(|error| error.into_direct_reader_error())?;
-        consume_released_persistence_load(load, config, HydrationObservation::disabled())
     }
 
+    #[cfg(feature = "test-seams")]
     fn open_inner(
         path: &Path,
         config: DirectReaderConfig,
         observation: HydrationObservation,
     ) -> Result<Self, DirectFileReaderError> {
-        let load = crate::persistence::load_read_image_with_memory_in_runtime_dir(
+        Self::open_inner_with_cancellation(path, config, observation, None, &OwnerReadCancellation::new())
+    }
+
+    fn open_inner_with_cancellation(
+        path: &Path,
+        config: DirectReaderConfig,
+        observation: HydrationObservation,
+        registration: Option<crate::persistence::ReadSnapshotRegistrationGuard>,
+        cancellation: &OwnerReadCancellation,
+    ) -> Result<Self, DirectFileReaderError> {
+        // Resolve this image's declared parent once. Preparation and captured
+        // directory reads retain one child; statements use this same parent.
+        let declared_read_memory = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(config.limits.memory);
+        let open_context = crate::executor::bounded::ReadOpenContext::new(
+            declared_read_memory.child().map_err(crate::read_image::history_answer_error)?,
+            config.limits,
+            config.clock.clone(),
+            cancellation.clone(),
+        ).map_err(crate::read_image::history_answer_error)?;
+        let load = crate::persistence::load_read_image_at_registration_with_context(
             path,
             config.memory_limit,
             config.runtime_dir.as_deref(),
+            registration,
+            open_context,
         )
         .map_err(|error| error.into_direct_reader_error())?;
-        consume_released_persistence_load(load, config, observation)
+        consume_released_persistence_load(load, config, declared_read_memory, observation)
     }
 
     #[allow(dead_code)]
@@ -1370,6 +1412,7 @@ impl DirectFileReader {
                     DirectFileReaderError::ReadFailure(failure)
                 }
                 contextdb_core::Error::ReadCancelled => DirectFileReaderError::Cancelled,
+
                 error => DirectFileReaderError::Engine(error.to_string()),
             })
     }
@@ -1490,6 +1533,7 @@ pub mod test_seams {
 
     pub use crate::read_image::{AnswerEncodingHookGuard, while_encoding_answers_for_test};
     pub use crate::read_work_probe::{
+        CommitDirectoryFunding, CommitDirectorySourceRegistrationFunding, DeclaredReadChildFunding,
         ReadWorkCounters, ReadWorkObservation, ReadWorkObservationScope, ReadWorkPhase,
     };
     pub use contextdb_core::read_contract::OwnerReadCancellation as DirectCancellation;
@@ -1612,7 +1656,11 @@ pub mod test_seams {
     ) {
         let erased: Arc<dyn Send + Sync> = reader.image_memory.clone();
         (
-            reader.image_memory.accountant.usage(),
+            {
+                let mut usage = reader.image_memory.accountant.usage();
+                usage.reader_file_high_water = reader.declared_read_memory.file_child_high_water();
+                usage
+            },
             reader.image_memory.held(),
             Arc::downgrade(&erased),
         )

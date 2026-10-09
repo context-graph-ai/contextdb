@@ -5,7 +5,8 @@
 //! shape used by file-backed history, full snapshots, and server replication.
 
 use contextdb_core::{
-    ColumnType, CompositeForeignKey, Lsn, RowId, SingleColumnForeignKey, TableMeta, Value, VectorIndexRef, VectorSearchMode,
+    ColumnType, CompositeForeignKey, Lsn, RowId, SingleColumnForeignKey, TableMeta, Value,
+    VectorIndexRef, VectorSearchMode,
 };
 use serde::de::VariantAccess;
 use serde::{Deserialize, Serialize};
@@ -814,8 +815,8 @@ pub(crate) fn natural_key_from_row_values_admitted(
         bytes = bytes.saturating_add(held::text(column));
         let value = &values[column];
         bytes = bytes.saturating_add(match value {
-            // Immutable JSON handles share the originating materialization lease.
-            Value::Json(_) => 0,
+            // A JSON key owns a deep copy of its payload.
+            Value::Json(value) => crate::read_image_memory::json_clone_heap_bytes(value),
             value => held::value(value),
         });
     }
@@ -888,7 +889,7 @@ pub(crate) mod held {
             Value::Text(text) => self::text(text),
             Value::Vector(vector) if vector.is_empty() => 0,
             Value::Vector(vector) => std::mem::size_of_val(vector.as_slice()) + ALLOCATION_BYTES,
-            Value::Json(_) => 0,
+            Value::Json(value) => contextdb_core::types::json_retained_heap_bytes(value),
             _ => 0,
         }
     }

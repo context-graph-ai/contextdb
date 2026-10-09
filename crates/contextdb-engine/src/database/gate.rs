@@ -181,8 +181,8 @@ pub(crate) struct BoundedGraphEdgeCursor {
 /// the last entry fully consumed; a live cursor is kept between pulls and is
 /// reopened after that key whenever a pull failed part way through an entry.
 struct DurableGraphEdgeScan {
-    root: Arc<crate::persistence::WriterSnapshot>,
-    cursor: Option<crate::persistence::writer_source::WriterReadCursor>,
+    root: crate::persistence::graph_read::GraphReadRoot,
+    cursor: Option<crate::persistence::graph_read::GraphReadCursor>,
     last_key: Vec<u8>,
     has_last_key: bool,
 }
@@ -2424,7 +2424,7 @@ impl Database {
                         |_| Ok(()),
                         |_| Ok(()),
                         |bytes| {
-                            identities.try_grow_for(bytes, "reader", "metadata_identity",
+                            bytes.retain_into(&mut identities, "reader", "metadata_identity",
                         "Raise the declared read memory limit to inspect these metadata rows.")
                         },
                     )?
@@ -2452,7 +2452,7 @@ impl Database {
                         || Ok::<(), Error>(()),
                         || Ok(()),
                         |bytes| {
-                            identities.try_grow_for(bytes, "reader", "metadata_identity",
+                            bytes.retain_into(&mut identities, "reader", "metadata_identity",
                         "Raise the declared read memory limit to inspect these metadata rows.")
                         },
                     )?
@@ -2926,7 +2926,7 @@ impl Database {
         let mut results = Vec::new();
         let mut output = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
 
-        let root = self.writer_graph_root(read_memory.clone())?;
+        let root = self.graph_snapshot(snapshot, read_memory.clone())?;
         for orientation in [Direction::Outgoing, Direction::Incoming] {
             if !matches!(direction, Direction::Both) && direction != orientation {
                 continue;
@@ -2993,7 +2993,7 @@ impl Database {
         let mut candidates = Vec::<CountedGraphNeighbor>::new();
         let mut output = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
 
-        let root = self.writer_graph_root(read_memory.clone())?;
+        let root = self.graph_snapshot(snapshot, read_memory.clone())?;
         for orientation in [Direction::Outgoing, Direction::Incoming] {
             if !matches!(direction, Direction::Both) && direction != orientation {
                 continue;
@@ -3712,7 +3712,7 @@ impl Database {
     where
         E: From<Error>,
     {
-        if let Some(root) = self.writer_read_root().map_err(E::from)? {
+        if let Some(root) = self.graph_read_root().map_err(E::from)? {
             let phase = if matches!(direction, Direction::Outgoing | Direction::Both) {
                 BoundedGraphScanPhase::Forward
             } else if matches!(direction, Direction::Incoming) {
@@ -4265,14 +4265,10 @@ impl Database {
                     durable
                         .root
                         .cursor(
-                            crate::persistence::writer_source::SourceWindowOwner::Read(
-                                read_memory.clone(),
-                            ),
-                            if reverse { "graph_rev" } else { "graph_fwd" },
-                            crate::persistence::writer_source::WriterCursorFamily::Bytes,
+                            reverse,
                             lower,
                             std::ops::Bound::Unbounded,
-                            false,
+                            read_memory.clone(),
                         )
                         .map_err(E::from)?,
                 );
@@ -4312,7 +4308,7 @@ impl Database {
             entry_read();
             let decided = self.bounded_graph_durable_edge_decide(
                 cursor,
-                &window.value,
+                window.edge(),
                 reverse,
                 edge_types,
                 tx,
@@ -4579,7 +4575,7 @@ impl Database {
                 min_depth,
                 max_depth,
                 snapshot,
-                self.writer_graph_root(read_memory.clone())
+                self.graph_snapshot(snapshot, read_memory.clone())
                     .map_err(E::from)?,
                 before_retain,
                 release_retained,

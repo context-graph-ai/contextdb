@@ -3,8 +3,8 @@
 use super::vector_paged::*;
 use super::*;
 use contextdb_vector::hnsw::paged_builder::{
-    encode_paged_point_into, PagedGenerationTransaction, PagedVectorBatchPlan, PagedVectorIdentity,
-    PagedVectorPhase, PagedVectorPoint, PagedVectorTransaction,
+    PagedGenerationTransaction, PagedVectorBatchPlan, PagedVectorIdentity, PagedVectorPhase,
+    PagedVectorPoint, PagedVectorTransaction, encode_paged_point_into,
 };
 use contextdb_vector::hnsw::saved_topology::{SavedPointCursor, SavedTopology};
 
@@ -15,6 +15,9 @@ impl RedbPersistence {
         admit: &mut dyn FnMut(usize) -> Result<()>,
     ) -> Result<Option<SavedTopologyCandidate>> {
         let binding = self.vector_schema_binding(&candidate.base.index)?;
+        if binding == VectorSchemaBinding::UNBOUND {
+            return Ok(None);
+        }
         self.prepare_saved_topology_candidate_with_schema_binding(candidate, binding, admit)
     }
 
@@ -138,7 +141,10 @@ impl RedbPersistence {
         // Only immutable generation objects become durable here. Catalog
         // visibility is still owned by the ordinary atomic publication path.
         self.install_saved_generation_objects(&paged)?;
-        Ok(Some(SavedTopologyCandidate { candidate: paged, ownership: Some(ownership) }))
+        Ok(Some(SavedTopologyCandidate {
+            candidate: paged,
+            ownership: Some(ownership),
+        }))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -159,7 +165,11 @@ impl RedbPersistence {
     ) -> Result<VectorPartitionGraphBytes> {
         #[cfg(feature = "test-seams")]
         crate::vector_observations::observe_saved_topology_export(
-            route, descriptor.covered_lsn, is_base, descriptor.generation_id, &graph.bytes,
+            route,
+            descriptor.covered_lsn,
+            is_base,
+            descriptor.generation_id,
+            &graph.bytes,
         );
         let topology =
             SavedTopology::inspect(&graph.bytes, dimension as usize, quantization, &mut || {
@@ -196,18 +206,36 @@ impl RedbPersistence {
         ownership.acquire(record.storage_id)?;
         let original_generation_id = descriptor.generation_id;
         descriptor.generation_id = record.storage_id;
-        let base_generation_id = if is_base { record.storage_id } else { base_generation_id };
+        let base_generation_id = if is_base {
+            record.storage_id
+        } else {
+            base_generation_id
+        };
         #[cfg(any(test, feature = "test-seams"))]
         {
             let generation_key = if is_base {
-                Self::vector_partition_base_generation_key_from_parts(&route.index, &route.partition_key, record.storage_id)
+                Self::vector_partition_base_generation_key_from_parts(
+                    &route.index,
+                    &route.partition_key,
+                    record.storage_id,
+                )
             } else {
-                Self::vector_partition_change_generation_key_from_parts(&route.index, &route.partition_key, base_generation_id, record.storage_id)
+                Self::vector_partition_change_generation_key_from_parts(
+                    &route.index,
+                    &route.partition_key,
+                    base_generation_id,
+                    record.storage_id,
+                )
             };
             let root_key = Self::vector_partition_graph_page_root_key(&generation_key, is_base);
             crate::vector_observations::observe_export_identity_for_test(
-                original_generation_id, record.storage_id, record.storage_id,
-                is_base, graph.checksum, &generation_key, &root_key,
+                original_generation_id,
+                record.storage_id,
+                record.storage_id,
+                is_base,
+                graph.checksum,
+                &generation_key,
+                &root_key,
             );
         }
         #[cfg(not(any(test, feature = "test-seams")))]
@@ -234,12 +262,20 @@ impl RedbPersistence {
         let mut record_digest = [0u8; 32];
         let result = self.with_db(|db| {
             let read = db.begin_read().map_err(Self::storage_error)?;
-            Self::validate_vector_schema_binding_in_read(&read, &route.index, record.schema_binding)?;
+            Self::validate_vector_schema_binding_in_read(
+                &read,
+                &route.index,
+                record.schema_binding,
+            )?;
             vector_membership_pages::validate_in_read(&read)?;
             let mut cursor = SavedPointCursor::default();
             loop {
                 let write = db.begin_write().map_err(Self::storage_error)?;
-                Self::validate_vector_schema_binding_in_write(&write, &route.index, record.schema_binding)?;
+                Self::validate_vector_schema_binding_in_write(
+                    &write,
+                    &route.index,
+                    record.schema_binding,
+                )?;
                 let mut next = progress.clone();
                 {
                     let mut tx = NativeBatch::open(
@@ -584,10 +620,16 @@ impl RedbPersistence {
     ) -> Result<()> {
         self.with_db(|db| {
             let write = db.begin_write().map_err(Self::storage_error)?;
-            for graph in std::iter::once(&candidate.base.graph).chain(candidate.change.as_ref().map(|change| &change.graph)) {
+            for graph in std::iter::once(&candidate.base.graph)
+                .chain(candidate.change.as_ref().map(|change| &change.graph))
+            {
                 if graph.bytes.starts_with(&META_MAGIC) {
                     let meta = PagedGenerationMeta::decode(&graph.bytes)?;
-                    Self::validate_vector_schema_binding_in_write(&write, &candidate.base.index, meta.schema_binding)?;
+                    Self::validate_vector_schema_binding_in_write(
+                        &write,
+                        &candidate.base.index,
+                        meta.schema_binding,
+                    )?;
                 }
             }
             let base_key = Self::vector_partition_base_generation_key(&candidate.base);
@@ -655,14 +697,24 @@ impl RedbPersistence {
                         "saved publication has no validated complete export",
                     ));
                 }
-                let saved = meta.saved.as_ref().ok_or_else(|| corruption("saved export has no original binding"))?;
+                let saved = meta
+                    .saved
+                    .as_ref()
+                    .ok_or_else(|| corruption("saved export has no original binding"))?;
                 let generation_key = if saved.is_base {
                     Self::vector_partition_base_generation_key(&candidate.base)
                 } else {
-                    Self::vector_partition_change_generation_key(candidate.change.as_ref()
-                        .ok_or_else(|| corruption("saved change export has no change object"))?)
+                    Self::vector_partition_change_generation_key(
+                        candidate.change.as_ref().ok_or_else(|| {
+                            corruption("saved change export has no change object")
+                        })?,
+                    )
                 };
-                let owner = SavedExportRecord { storage_id: record.storage_id, generation_key, is_base: saved.is_base };
+                let owner = SavedExportRecord {
+                    storage_id: record.storage_id,
+                    generation_key,
+                    is_base: saved.is_base,
+                };
                 let owner_bytes = Self::encode(&owner)?;
                 write
                     .open_table(SAVED_EXPORTS)
@@ -739,56 +791,103 @@ struct SavedExportRecord {
     is_base: bool,
 }
 fn decode_saved_export(storage: u64, encoded: &[u8]) -> Result<SavedExportRecord> {
-    let owner: SavedExportRecord = RedbPersistence::decode_exact(open_value(&storage.to_be_bytes(), encoded)?)
-        .map_err(|_| corruption("saved publication owner is invalid"))?;
+    let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
+    let owner: SavedExportRecord =
+        RedbPersistence::decode_exact(open_value(&storage.to_be_bytes(), encoded)?)
+            .map_err(|_| corruption("saved publication owner is invalid"))?;
     let suffix = if owner.is_base { 8 } else { 16 };
-    if owner.storage_id != storage || storage == 0
+    if owner.storage_id != storage
+        || storage == 0
         || owner.generation_key.len() < suffix
         || owner.generation_key[owner.generation_key.len() - 8..] != storage.to_be_bytes()
     {
-        return Err(corruption("saved publication owner names another artifact identity"));
+        return Err(corruption(
+            "saved publication owner names another artifact identity",
+        ));
     }
     Ok(owner)
 }
 /// Only the still-owned private artifact may be retired. Atomic catalog
 /// publication removes this owner in the same transaction as selection.
-fn retire_saved_export_roots_in_write(write: &redb::WriteTransaction, owner: &SavedExportRecord) -> Result<()> {
+fn retire_saved_export_roots_in_write(
+    write: &redb::WriteTransaction,
+    owner: &SavedExportRecord,
+) -> Result<()> {
     let route_len = owner.generation_key.len() - if owner.is_base { 8 } else { 16 };
-    let catalogs = write.open_table(VECTOR_PARTITION_GENERATION_CATALOG_TABLE).map_err(RedbPersistence::storage_error)?;
-    if let Some(value) = catalogs.get(&owner.generation_key[..route_len]).map_err(RedbPersistence::storage_error)? {
-        let payload = vector_partition_record_payload(VectorPartitionRecordKind::GenerationCatalog, value.value()).map_err(corruption)?;
-        let catalog: VectorPartitionGenerationCatalogRecord = RedbPersistence::decode_exact(payload)?;
+    let catalogs = write
+        .open_table(VECTOR_PARTITION_GENERATION_CATALOG_TABLE)
+        .map_err(RedbPersistence::storage_error)?;
+    if let Some(value) = catalogs
+        .get(&owner.generation_key[..route_len])
+        .map_err(RedbPersistence::storage_error)?
+    {
+        let payload = vector_partition_record_payload(
+            VectorPartitionRecordKind::GenerationCatalog,
+            value.value(),
+        )
+        .map_err(corruption)?;
+        let catalog: VectorPartitionGenerationCatalogRecord =
+            RedbPersistence::decode_exact(payload)?;
         let selected = if owner.is_base {
             catalog.base.generation_id == owner.storage_id
         } else {
-            catalog.change.is_some_and(|change| change.generation_id == owner.storage_id)
-                && owner.generation_key[route_len..route_len + 8] == catalog.base.generation_id.to_be_bytes()
+            catalog
+                .change
+                .is_some_and(|change| change.generation_id == owner.storage_id)
+                && owner.generation_key[route_len..route_len + 8]
+                    == catalog.base.generation_id.to_be_bytes()
         };
-        if selected { return Err(corruption("saved abandonment cannot retire a catalog-selected artifact")); }
+        if selected {
+            return Err(corruption(
+                "saved abandonment cannot retire a catalog-selected artifact",
+            ));
+        }
     }
     drop(catalogs);
-    let definition = if owner.is_base { VECTOR_PARTITION_BASE_GENERATION_TABLE } else { VECTOR_PARTITION_CHANGE_GENERATION_TABLE };
-    let kind = if owner.is_base { VectorPartitionRecordKind::BaseGeneration } else { VectorPartitionRecordKind::ChangeGeneration };
-    let mut objects = write.open_table(definition).map_err(RedbPersistence::storage_error)?;
-    let matches = match objects.get(owner.generation_key.as_slice()).map_err(RedbPersistence::storage_error)? {
+    let definition = if owner.is_base {
+        VECTOR_PARTITION_BASE_GENERATION_TABLE
+    } else {
+        VECTOR_PARTITION_CHANGE_GENERATION_TABLE
+    };
+    let kind = if owner.is_base {
+        VectorPartitionRecordKind::BaseGeneration
+    } else {
+        VectorPartitionRecordKind::ChangeGeneration
+    };
+    let mut objects = write
+        .open_table(definition)
+        .map_err(RedbPersistence::storage_error)?;
+    let matches = match objects
+        .get(owner.generation_key.as_slice())
+        .map_err(RedbPersistence::storage_error)?
+    {
         Some(value) => {
-            let payload = vector_partition_record_payload(kind, value.value()).map_err(corruption)?;
+            let payload =
+                vector_partition_record_payload(kind, value.value()).map_err(corruption)?;
             let graph = if owner.is_base {
                 RedbPersistence::decode_exact::<VectorPartitionBaseGenerationRecord>(payload)?.graph
             } else {
-                RedbPersistence::decode_exact::<VectorPartitionChangeGenerationRecord>(payload)?.graph
+                RedbPersistence::decode_exact::<VectorPartitionChangeGenerationRecord>(payload)?
+                    .graph
             };
-            graph.bytes.starts_with(&META_MAGIC) && authenticated_native_storage_id(&graph.bytes)? == owner.storage_id
+            graph.bytes.starts_with(&META_MAGIC)
+                && authenticated_native_storage_id(&graph.bytes)? == owner.storage_id
         }
         None => false,
     };
     if matches {
-        objects.remove(owner.generation_key.as_slice()).map_err(RedbPersistence::storage_error)?;
+        objects
+            .remove(owner.generation_key.as_slice())
+            .map_err(RedbPersistence::storage_error)?;
         drop(objects);
         // A saved native envelope is a bounded manifest, not a population of
         // graph nodes. Its ordinary root pages retire with this exact key;
         // native point records remain in the existing finite cleanup queue.
-        RedbPersistence::remove_vector_partition_graph_pages_in_write(write, &owner.generation_key, owner.is_base)?;
+        RedbPersistence::remove_vector_partition_graph_pages_in_write(
+            write,
+            &owner.generation_key,
+            owner.is_base,
+        )?;
     }
     Ok(())
 }
@@ -885,7 +984,6 @@ impl RedbPersistence {
     }
 }
 
-
 pub(crate) struct SavedTopologyCandidate {
     pub(crate) candidate: VectorPartitionGenerationCandidate,
     pub(crate) ownership: Option<SavedExportOwnership>,
@@ -912,44 +1010,69 @@ impl SavedExportOwnership {
         }
     }
     fn acquire(&mut self, storage: u64) -> Result<()> {
-        let slot = self.storage.iter_mut().find(|id| id.is_none())
+        let slot = self
+            .storage
+            .iter_mut()
+            .find(|id| id.is_none())
             .ok_or_else(|| corruption("saved candidate has too many exports"))?;
         *slot = Some(storage);
         Ok(())
     }
     fn abandon(&self) -> Result<()> {
-        let companion = self.companion.read().map_err(RedbPersistence::storage_error)?;
+        let companion = self
+            .companion
+            .read()
+            .map_err(RedbPersistence::storage_error)?;
         if companion.is_none() {
             return Err(Error::Other("database persistence is closed".into()));
         }
         let database = self.db.read().map_err(RedbPersistence::storage_error)?;
-        let db = database.as_ref().ok_or_else(|| Error::Other("database persistence is closed".into()))?;
+        let db = database
+            .as_ref()
+            .ok_or_else(|| Error::Other("database persistence is closed".into()))?;
         let write = db.begin_write().map_err(RedbPersistence::storage_error)?;
         let mut changed = false;
         for storage in self.storage.into_iter().flatten() {
-            let mut builds = write.open_table(BUILDS).map_err(RedbPersistence::storage_error)?;
-            let owned_build = match builds.get(self.route.as_slice()).map_err(RedbPersistence::storage_error)? {
+            let mut builds = write
+                .open_table(BUILDS)
+                .map_err(RedbPersistence::storage_error)?;
+            let owned_build = match builds
+                .get(self.route.as_slice())
+                .map_err(RedbPersistence::storage_error)?
+            {
                 Some(value) => {
-                    let record: PagedBuildRecord = RedbPersistence::decode_exact(open_value(&self.route, value.value())?)
-                        .map_err(|_| corruption("saved abandonment build record is invalid"))?;
+                    let record: PagedBuildRecord =
+                        RedbPersistence::decode_exact(open_value(&self.route, value.value())?)
+                            .map_err(|_| corruption("saved abandonment build record is invalid"))?;
                     record.storage_id == storage
                 }
                 None => false,
             };
-            if owned_build { builds.remove(self.route.as_slice()).map_err(RedbPersistence::storage_error)?; }
+            if owned_build {
+                builds
+                    .remove(self.route.as_slice())
+                    .map_err(RedbPersistence::storage_error)?;
+            }
             drop(builds);
             let owned_export = saved_export_owned_in_write(&write, storage)?;
             if owned_build || owned_export {
                 if owned_export {
-                    let exports = write.open_table(SAVED_EXPORTS).map_err(RedbPersistence::storage_error)?;
-                    let value = exports.get(storage).map_err(RedbPersistence::storage_error)?
+                    let exports = write
+                        .open_table(SAVED_EXPORTS)
+                        .map_err(RedbPersistence::storage_error)?;
+                    let value = exports
+                        .get(storage)
+                        .map_err(RedbPersistence::storage_error)?
                         .ok_or_else(|| corruption("saved publication owner disappeared"))?;
                     let owner = decode_saved_export(storage, value.value())?;
                     retire_saved_export_roots_in_write(&write, &owner)?;
                 }
                 release_saved_export_in_write(&write, storage)?;
-                write.open_table(CLEANUP).map_err(RedbPersistence::storage_error)?
-                    .insert(storage, [].as_slice()).map_err(RedbPersistence::storage_error)?;
+                write
+                    .open_table(CLEANUP)
+                    .map_err(RedbPersistence::storage_error)?
+                    .insert(storage, [].as_slice())
+                    .map_err(RedbPersistence::storage_error)?;
                 changed = true;
             }
         }
@@ -963,13 +1086,17 @@ impl SavedExportOwnership {
 }
 impl Drop for SavedExportOwnership {
     fn drop(&mut self) {
-        if self.storage.iter().all(Option::is_none) { return; }
+        if self.storage.iter().all(Option::is_none) {
+            return;
+        }
         if let Err(error) = self.abandon() {
             // Drop cannot return an I/O error. Preserve it for the next normal
             // persistence operation; the unchanged durable owner is recovered
             // after reopening if the write could not commit.
             let mut failure = self.failure.lock();
-            if failure.is_none() { *failure = Some(error.to_string()); }
+            if failure.is_none() {
+                *failure = Some(error.to_string());
+            }
         }
     }
 }
@@ -979,18 +1106,28 @@ impl RedbPersistence {
     /// This materialization is absent from every production-only build.
     #[cfg(any(test, feature = "test-seams"))]
     pub(super) fn materialize_paged_topology_for_test(&self, bytes: &[u8]) -> Result<Vec<u8>> {
-        fn u64_into(bytes: &mut Vec<u8>, value: usize) { bytes.extend_from_slice(&(value as u64).to_le_bytes()); }
-        fn point_id_into(bytes: &mut Vec<u8>, id: contextdb_vector::hnsw::paged_builder::PointId) {
-            bytes.push(id.0); bytes.extend_from_slice(&id.1.to_le_bytes());
+        fn u64_into(bytes: &mut Vec<u8>, value: usize) {
+            bytes.extend_from_slice(&(value as u64).to_le_bytes());
         }
-        fn point_into<T>(out: &mut Vec<u8>, point: &contextdb_vector::hnsw::paged_builder::PagedPoint<T>, values: impl FnOnce(&mut Vec<u8>, &[T])) {
-            u64_into(out, point.origin_id); point_id_into(out, point.id);
-            u64_into(out, point.values.len()); values(out, &point.values);
+        fn point_id_into(bytes: &mut Vec<u8>, id: contextdb_vector::hnsw::paged_builder::PointId) {
+            bytes.push(id.0);
+            bytes.extend_from_slice(&id.1.to_le_bytes());
+        }
+        fn point_into<T>(
+            out: &mut Vec<u8>,
+            point: &contextdb_vector::hnsw::paged_builder::PagedPoint<T>,
+            values: impl FnOnce(&mut Vec<u8>, &[T]),
+        ) {
+            u64_into(out, point.origin_id);
+            point_id_into(out, point.id);
+            u64_into(out, point.values.len());
+            values(out, &point.values);
             u64_into(out, point.neighbours.len());
             for layer in &point.neighbours {
                 u64_into(out, layer.len());
                 for edge in layer {
-                    u64_into(out, edge.origin_id); point_id_into(out, edge.point_id);
+                    u64_into(out, edge.origin_id);
+                    point_id_into(out, edge.point_id);
                     out.extend_from_slice(&edge.distance.to_bits().to_le_bytes());
                 }
             }
@@ -998,99 +1135,168 @@ impl RedbPersistence {
         let meta = PagedGenerationMeta::decode(bytes)?;
         let progress = meta.progress()?;
         if progress.phase != PagedVectorPhase::Complete {
-            return Err(corruption("inspection requires a complete paged generation"));
+            return Err(corruption(
+                "inspection requires a complete paged generation",
+            ));
         }
         let quantized = meta.declaration.quantization != VectorQuantization::F32;
-        let (extend, pruned, max_layer, scale) = meta.saved.as_ref().map(|saved| (
-            saved.extend_candidates, saved.keep_pruned, saved.max_layer as usize, saved.scale_bits,
-        )).unwrap_or((quantized, quantized, 16, (1.0 / (meta.declaration.hnsw_m as f64).ln()).to_bits()));
+        let (extend, pruned, max_layer, scale) = meta
+            .saved
+            .as_ref()
+            .map(|saved| {
+                (
+                    saved.extend_candidates,
+                    saved.keep_pruned,
+                    saved.max_layer as usize,
+                    saved.scale_bits,
+                )
+            })
+            .unwrap_or((
+                quantized,
+                quantized,
+                16,
+                (1.0 / (meta.declaration.hnsw_m as f64).ln()).to_bits(),
+            ));
         self.with_db(|db| {
             let read = db.begin_read().map_err(Self::storage_error)?;
             validate_pages_root(&read)?;
             let pages = read.open_table(PAGES).map_err(Self::storage_error)?;
             let lookup = PagedLookup {
-                admission: None, pages: &pages, storage: storage_prefix(meta.storage_id),
-                dimension: meta.declaration.dimension as usize, quantization: meta.declaration.quantization,
-                node_limit: meta.saved.as_ref().map_or(usize::MAX, |saved| saved.node_limit as usize),
+                admission: None,
+                pages: &pages,
+                storage: storage_prefix(meta.storage_id),
+                dimension: meta.declaration.dimension as usize,
+                quantization: meta.declaration.quantization,
+                node_limit: meta
+                    .saved
+                    .as_ref()
+                    .map_or(usize::MAX, |saved| saved.node_limit as usize),
             };
             let mut envelope = b"CDHNSW\0\x01".to_vec();
             envelope.extend_from_slice(&1u16.to_le_bytes());
             envelope.extend_from_slice(&0u64.to_le_bytes());
             u64_into(&mut envelope, lookup.dimension);
-            envelope.push(match lookup.quantization { VectorQuantization::F32 => 0, VectorQuantization::SQ8 => 1, VectorQuantization::SQ4 => 2 });
+            envelope.push(match lookup.quantization {
+                VectorQuantization::F32 => 0,
+                VectorQuantization::SQ8 => 1,
+                VectorQuantization::SQ4 => 2,
+            });
             u64_into(&mut envelope, meta.declaration.hnsw_ef_search as usize);
-            let length_offset = envelope.len(); u64_into(&mut envelope, 0);
+            let length_offset = envelope.len();
+            u64_into(&mut envelope, 0);
             let graph_offset = envelope.len();
             envelope.extend_from_slice(&1u16.to_le_bytes());
             u64_into(&mut envelope, meta.declaration.hnsw_m as usize);
-            u64_into(&mut envelope, meta.declaration.hnsw_ef_construction as usize);
-            envelope.push(u8::from(extend)); envelope.push(u8::from(pruned));
+            u64_into(
+                &mut envelope,
+                meta.declaration.hnsw_ef_construction as usize,
+            );
+            envelope.push(u8::from(extend));
+            envelope.push(u8::from(pruned));
             u64_into(&mut envelope, max_layer);
             let values = match lookup.quantization {
                 VectorQuantization::F32 => lookup.dimension,
                 VectorQuantization::SQ8 => 12 + lookup.dimension,
                 VectorQuantization::SQ4 => 12 + lookup.dimension.div_ceil(2),
             };
-            u64_into(&mut envelope, values); envelope.extend_from_slice(&scale.to_le_bytes());
+            u64_into(&mut envelope, values);
+            envelope.extend_from_slice(&scale.to_le_bytes());
             u64_into(&mut envelope, max_layer);
             let mut rows = std::collections::BTreeMap::new();
-            let mut exact: std::collections::BTreeMap<Vec<u8>, std::collections::BTreeSet<u64>> = std::collections::BTreeMap::new();
+            let mut exact: std::collections::BTreeMap<Vec<u8>, std::collections::BTreeSet<u64>> =
+                std::collections::BTreeMap::new();
             for layer in 0..max_layer {
                 u64_into(&mut envelope, progress.graph.layer_counts[layer]);
                 for rank in 0..progress.graph.layer_counts[layer] {
-                    let id = contextdb_vector::hnsw::paged_builder::PointId(layer as u8, rank as i32);
+                    let id =
+                        contextdb_vector::hnsw::paged_builder::PointId(layer as u8, rank as i32);
                     let point = lookup.load_point(id)?;
                     let origin = match &*point {
                         PagedVectorPoint::F32(point) => {
                             point_into(&mut envelope, point, |out, values| {
-                                for value in values { out.extend_from_slice(&value.to_bits().to_le_bytes()); }
-                            }); point.origin_id
+                                for value in values {
+                                    out.extend_from_slice(&value.to_bits().to_le_bytes());
+                                }
+                            });
+                            point.origin_id
                         }
                         PagedVectorPoint::Quantized(point) => {
-                            point_into(&mut envelope, point, |out, values| out.extend_from_slice(values)); point.origin_id
+                            point_into(&mut envelope, point, |out, values| {
+                                out.extend_from_slice(values)
+                            });
+                            point.origin_id
                         }
                     };
                     let identity = lookup.identity(origin)?;
                     if identity.point != id || rows.insert(origin, identity.row_id).is_some() {
                         return Err(corruption("inspection point has an invalid identity"));
                     }
-
                 }
             }
             let prefix = kind_prefix(&lookup.storage, 4);
-            let end = writer_source::prefix_end(&prefix).ok_or_else(|| corruption("inspection exact directory has no successor"))?;
-            for entry in pages.range::<&[u8]>(prefix.as_slice()..end.as_slice()).map_err(Self::storage_error)? {
+            let end = writer_source::prefix_end(&prefix)
+                .ok_or_else(|| corruption("inspection exact directory has no successor"))?;
+            for entry in pages
+                .range::<&[u8]>(prefix.as_slice()..end.as_slice())
+                .map_err(Self::storage_error)?
+            {
                 let (key, value) = entry.map_err(Self::storage_error)?;
                 let key = key.value();
                 if key.len() < 29 || !open_value(key, value.value())?.is_empty() {
                     return Err(corruption("inspection exact posting is invalid"));
                 }
                 let size = u32::from_be_bytes(key[9..13].try_into().unwrap()) as usize;
-                if size.checked_add(29) != Some(key.len()) { return Err(corruption("inspection exact posting length is invalid")); }
+                if size.checked_add(29) != Some(key.len()) {
+                    return Err(corruption("inspection exact posting length is invalid"));
+                }
                 let row = u64::from_be_bytes(key[13 + size..21 + size].try_into().unwrap());
-                exact.entry(key[13..13 + size].to_vec()).or_default().insert(row);
+                exact
+                    .entry(key[13..13 + size].to_vec())
+                    .or_default()
+                    .insert(row);
             }
             match progress.graph.entry_point {
                 None => envelope.push(0),
-                Some(id) => { envelope.push(1); point_id_into(&mut envelope, id); }
+                Some(id) => {
+                    envelope.push(1);
+                    point_id_into(&mut envelope, id);
+                }
             }
             let graph_length = envelope.len() - graph_offset;
-            envelope[length_offset..graph_offset].copy_from_slice(&(graph_length as u64).to_le_bytes());
+            envelope[length_offset..graph_offset]
+                .copy_from_slice(&(graph_length as u64).to_le_bytes());
             u64_into(&mut envelope, rows.len());
-            for (origin, row) in rows { u64_into(&mut envelope, origin); envelope.extend_from_slice(&row.0.to_le_bytes()); }
+            for (origin, row) in rows {
+                u64_into(&mut envelope, origin);
+                envelope.extend_from_slice(&row.0.to_le_bytes());
+            }
             u64_into(&mut envelope, exact.len());
             for (key, rows) in exact {
-                u64_into(&mut envelope, key.len()); envelope.extend_from_slice(&key);
+                u64_into(&mut envelope, key.len());
+                envelope.extend_from_slice(&key);
                 u64_into(&mut envelope, rows.len());
-                for row in rows { envelope.extend_from_slice(&row.to_le_bytes()); }
+                for row in rows {
+                    envelope.extend_from_slice(&row.to_le_bytes());
+                }
             }
-            let checksum = envelope[18..].iter().fold(0xcbf2_9ce4_8422_2325u64, |sum, byte| (sum ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3));
+            let checksum = envelope[18..]
+                .iter()
+                .fold(0xcbf2_9ce4_8422_2325u64, |sum, byte| {
+                    (sum ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+                });
             envelope[10..18].copy_from_slice(&checksum.to_le_bytes());
-            contextdb_vector::hnsw::saved_topology::SavedTopology::inspect(&envelope, lookup.dimension, lookup.quantization, &mut || Ok(()))?;
+            contextdb_vector::hnsw::saved_topology::SavedTopology::inspect(
+                &envelope,
+                lookup.dimension,
+                lookup.quantization,
+                &mut || Ok(()),
+            )?;
             if let Some(saved) = &meta.saved
                 && blake3::hash(&envelope).as_bytes() != &saved.source_digest
             {
-                return Err(corruption("inspection differs from the original saved topology"));
+                return Err(corruption(
+                    "inspection differs from the original saved topology",
+                ));
             }
             Ok(envelope)
         })

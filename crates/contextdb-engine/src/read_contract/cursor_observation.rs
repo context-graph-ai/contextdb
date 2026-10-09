@@ -1,7 +1,7 @@
 //! Borrowed canonical cursor trace encoding; no intermediate owned disclosure is built.
 use super::*;
-use crate::owned_cursor_page::OwnedCursorPage as CursorPage;
 use crate::executor::CursorObservation;
+use crate::owned_cursor_page::OwnedCursorPage as CursorPage;
 
 #[derive(Serialize)]
 struct BorrowedTrace<'a> {
@@ -181,8 +181,11 @@ impl<'a> BorrowedObservedPage<'a> {
 }
 #[derive(Deserialize)]
 pub(crate) struct CanonicalObservedCursorPage {
-    pub(crate) page: CursorPage,
+    pub(crate) page: contextdb_core::read_contract::CursorPage,
     pub(crate) trace: CanonicalQueryTrace,
+    // Standalone validation owns its native payload until this DTO drops.
+    #[serde(skip)]
+    memory: Option<std::sync::Arc<crate::read_image_memory::ImageMemory>>,
 }
 
 pub(crate) fn encode_observed_cursor_page(
@@ -197,8 +200,21 @@ pub(crate) fn decode_observed_cursor_page(
     bytes: &[u8],
     memory_ceiling: u64,
 ) -> Result<CanonicalObservedCursorPage, ReadEncodingError> {
+    let memory = decoder_memory(memory_ceiling)
+        .map_err(|error| encoding_error_from_core(error, memory_ceiling))?;
+    let mut observed = decode_observed_cursor_page_with_memory(bytes, &memory, memory_ceiling)?;
+    observed.memory = Some(memory);
+    Ok(observed)
+}
+
+pub(crate) fn decode_observed_cursor_page_with_memory(
+    bytes: &[u8],
+    memory: &std::sync::Arc<crate::read_image_memory::ImageMemory>,
+    memory_ceiling: u64,
+) -> Result<CanonicalObservedCursorPage, ReadEncodingError> {
     crate::local_transport::preflight_observed_cursor_page_payload(bytes, memory_ceiling)?;
-    let observed: CanonicalObservedCursorPage = decode_exact(bytes)?;
+    let observed: CanonicalObservedCursorPage =
+        decode_exact_with_memory(bytes, memory, memory_ceiling)?;
     observed
         .page
         .validate()

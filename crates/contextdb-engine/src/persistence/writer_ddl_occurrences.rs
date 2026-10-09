@@ -419,7 +419,8 @@ impl RedbPersistence {
             | DdlChange::DropRoute { name, .. }
             | DdlChange::CreateTriggerIncludingSync { name, .. } => name,
         };
-        let _charge = root.adapter_control(&owner, name.len().saturating_mul(8).saturating_add(2048))?;
+        let _charge =
+            root.adapter_control(&owner, name.len().saturating_mul(8).saturating_add(2048))?;
         let prefix = prefix(change)?;
         let mut lower = prefix.clone();
         lower.extend_from_slice(&suffix(after.unwrap_or((Lsn(0), 0))));
@@ -493,7 +494,11 @@ impl RedbPersistence {
         Ok(Some(at))
     }
 
-    pub(crate) fn unmarked_ddl_occurrences(root: &WriterSnapshot, owner: writer_source::SourceWindowOwner, lsn: Lsn) -> Result<u64> {
+    pub(crate) fn unmarked_ddl_occurrences(
+        root: &WriterSnapshot,
+        owner: writer_source::SourceWindowOwner,
+        lsn: Lsn,
+    ) -> Result<u64> {
         let _charge = root.adapter_control(&owner, 256)?;
         let read = root.owner_read()?;
         Self::validate_ddl_selectors_in_read(&read)?;

@@ -100,6 +100,11 @@ fn build_committed_image(
     let digest = parts.content_identity.clone();
     let memory = parts.memory.clone();
     let accountant = memory.accountant.clone();
+    let decode_memory = crate::read_image_memory::ImageMemory::operation_reader(
+        accountant.clone(),
+        parts.open_context.read_memory(),
+    )?;
+    let _decode_scope = decode_memory.enter();
     if let Some(limit) = memory_limit {
         accountant.set_budget(Some(limit))?;
     }
@@ -118,8 +123,14 @@ fn build_committed_image(
         .find(|(key, _)| key == "memory_limit")
         .map(|(_, bytes)| crate::persistence::RedbPersistence::decode_config_value::<usize>(bytes))
         .transpose()?;
-    let mut database =
-        Database::open_committed_image(parts, Arc::new(crate::plugin::CorePlugin), accountant, memory.clone(), declared_read_memory)?;
+    let open_context = parts.open_context.clone();
+    open_context.checkpoint()?;
+    let mut database = Database::open_committed_image(
+        parts,
+        Arc::new(crate::plugin::CorePlugin),
+        accountant,
+        declared_read_memory,
+    )?;
 
     // The metadata projection is read back before any narrowing is applied.
     let mut image = project_owned_image(&database)?;
@@ -140,6 +151,7 @@ fn build_committed_image(
         database.declare_read_access(declared.contexts, declared.scope_labels, declared.principal);
     }
 
+    open_context.checkpoint()?;
     Ok(CommittedImage {
         target: Arc::new(database) as Arc<dyn ReadExecutionTarget>,
         image: Arc::new(image),
@@ -333,16 +345,23 @@ pub(crate) fn project_change_state(
 ) -> std::result::Result<DirectChangeState, DirectFileReaderError> {
     // The history is read here, with its refusal reported, before the
     // inspection below that would answer an unreadable history as empty.
+    let read_memory = match charge.reader_budget() {
+        Some(memory) => memory,
+        None => database
+            .declared_reader_memory()
+            .map_err(history_answer_error)?,
+    };
     database
-        .ensure_image_history_within(checkpoint)
+        .ensure_image_history_with_read_memory(checkpoint, read_memory.clone())
         .map_err(image_history_answer_error)?;
-    project_loaded_change_state(database, checkpoint, charge).map_err(history_answer_error)
+    project_loaded_change_state(database, checkpoint, charge, read_memory).map_err(history_answer_error)
 }
 
 fn project_loaded_change_state(
     database: &Database,
     checkpoint: &dyn Fn() -> Result<()>,
     charge: &Arc<crate::read_image_memory::ImageMemory>,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<DirectChangeState> {
     let admit = |bytes: usize| charge.reserve(bytes);
     let projection = crate::database::ChangeProjection {
@@ -360,12 +379,8 @@ fn project_loaded_change_state(
     )?;
     vector_copy.into_image();
     checkpoint()?;
-    charge.reserve(
-        database
-            .commit_index_len_for_read_image()
-            .saturating_mul(std::mem::size_of::<(Lsn, TxId)>()),
-    )?;
-    let commit_index = database.commit_index_for_read_image()?;
+    let context = contextdb_tx::ReadCommitContext::new(read_memory, checkpoint);
+    let commit_index = database.commit_index_for_read_image(&context, charge)?;
     checkpoint()?;
     let answer = direct_change_state(database, commit_index, changes);
     settle_answer_charge(charge, change_state_bytes(&answer))?;
@@ -428,8 +443,14 @@ pub(crate) fn project_sync_state(
     checkpoint: &dyn Fn() -> Result<()>,
     charge: &Arc<crate::read_image_memory::ImageMemory>,
 ) -> std::result::Result<DirectSyncState, DirectFileReaderError> {
+    let read_memory = match charge.reader_budget() {
+        Some(memory) => memory,
+        None => database
+            .declared_reader_memory()
+            .map_err(history_answer_error)?,
+    };
     database
-        .ensure_image_history_within(checkpoint)
+        .ensure_image_history_with_read_memory(checkpoint, read_memory)
         .map_err(image_history_answer_error)?;
     project_loaded_sync_state(database, checkpoint, charge).map_err(history_answer_error)
 }
@@ -1462,6 +1483,11 @@ pub(crate) fn write_metadata_body(
 pub(crate) fn read_metadata_body(
     bytes: &mut crate::read_contract::CanonicalReader<'_>,
 ) -> std::result::Result<DirectMetadataBody, crate::read_contract::ReadEncodingError> {
+    let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call().map_err(|error| {
+        crate::read_contract::encoding_error_from_core(
+            error, contextdb_core::read_contract::ReadLimits::SHIPPED_MEMORY,
+        )
+    })?;
     match bytes.tag()? {
         0 => {
             let count = bytes.element_count()?;
@@ -1513,7 +1539,14 @@ pub(crate) fn read_metadata_body(
         6 => {
             let has_more = bytes.flag()?;
             let counts: Option<crate::DeliveryStatusCounts> =
-                serde_json::from_str(&bytes.text()?).map_err(|_| invalid_metadata_payload())?;
+                crate::read_image_memory::decode_json(bytes.text()?.as_bytes()).map_err(
+                    |error| {
+                        crate::read_contract::encoding_error_from_core(
+                            error,
+                            contextdb_core::read_contract::ReadLimits::SHIPPED_MEMORY,
+                        )
+                    },
+                )?;
             if has_more == counts.is_some() {
                 return Err(invalid_metadata_payload());
             }
@@ -1521,8 +1554,14 @@ pub(crate) fn read_metadata_body(
         }
         7 => {
             let has_more = bytes.flag()?;
-            let outcome = crate::custody_types::decode_outcome_projection(&bytes.text()?)
-                .map_err(|_| invalid_metadata_payload())?;
+            let outcome = crate::custody_types::decode_outcome_projection(&bytes.text()?).map_err(
+                |error| {
+                    crate::read_contract::encoding_error_from_core(
+                        error,
+                        contextdb_core::read_contract::ReadLimits::SHIPPED_MEMORY,
+                    )
+                },
+            )?;
             if has_more && outcome.is_some() {
                 return Err(invalid_metadata_payload());
             }
@@ -1633,11 +1672,23 @@ fn read_image_state(
 fn read_rendered<T: serde::de::DeserializeOwned>(
     bytes: &mut crate::read_contract::CanonicalReader<'_>,
 ) -> std::result::Result<Vec<T>, crate::read_contract::ReadEncodingError> {
+    let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call().map_err(|error| {
+        crate::read_contract::encoding_error_from_core(
+            error, contextdb_core::read_contract::ReadLimits::SHIPPED_MEMORY,
+        )
+    })?;
     let count = bytes.element_count()?;
     let mut values = Vec::new();
     for _ in 0..count {
         let rendered = bytes.raw()?;
-        values.push(serde_json::from_slice(rendered).map_err(|_| invalid_metadata_payload())?);
+        values.push(
+            crate::read_image_memory::decode_json(rendered).map_err(|error| {
+                crate::read_contract::encoding_error_from_core(
+                    error,
+                    contextdb_core::read_contract::ReadLimits::SHIPPED_MEMORY,
+                )
+            })?,
+        );
     }
     Ok(values)
 }

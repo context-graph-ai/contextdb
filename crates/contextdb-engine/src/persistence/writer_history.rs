@@ -1,6 +1,6 @@
 //! Ordered history selectors, maintained beside their primary log atomically.
-use super::*;
 use super::writer_source::SourceWindowOwner;
+use super::*;
 
 pub(super) const WRITER_CHANGE_LOG_TABLE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("writer_change_log");
@@ -54,18 +54,56 @@ impl RedbPersistence {
         Some(key)
     }
 
+    /// Repack carries exact private bytes; it never reauthors an occurrence.
+    pub(super) fn write_carried_change_log_selectors_in_write(
+        write: &redb::WriteTransaction,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let record = Self::decode_stored_change_log(bytes)?;
+        if let Some(w) = &record.witness {
+            let old = {
+                let locations = write
+                    .open_table(graph_history_record::GRAPH_OCCURRENCE_LOCATIONS)
+                    .map_err(Self::storage_error)?;
+                let location = locations
+                    .get(observed_graph_key!("graph_location", "get", graph_history_record::location_key(w.id).as_slice()))
+                    .map_err(Self::storage_error)?
+                    .ok_or_else(|| Error::StoreCorrupted {
+                        path: "graph_history".into(),
+                        reason: "carried occurrence identity is absent".into(),
+                    })?;
+                if location.value().len() != 17 || location.value()[0] != 1 {
+                    return Err(Error::StoreCorrupted {
+                        path: "graph_history".into(),
+                        reason: "carried occurrence location is malformed".into(),
+                    });
+                }
+                <[u8; 16]>::try_from(&location.value()[1..]).unwrap()
+            };
+            Self::validate_graph_occurrence_in_write(write, &old, bytes)?;
+        }
+        Self::write_change_log_selectors_in_write(write, key, bytes)
+    }
+
     pub(super) fn write_change_log_selectors_in_write(
         write: &redb::WriteTransaction,
         textual_key: &str,
         encoded: &[u8],
     ) -> Result<()> {
+        let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
+        Self::require_graph_proof_tables_in_write(write)?;
+        let _row_scope = crate::read_image_memory::active_owner()?
+            .row_owner()?
+            .enter();
         let position = Self::numeric_change_key(textual_key)?;
         Self::remove_change_log_selectors_in_write(write, textual_key)?;
-        let entry: ChangeLogEntry = Self::decode_exact(encoded)?;
+        Self::install_graph_occurrence_in_write(write, &position, encoded)?;
+        let entry = Self::decode_stored_change_log(encoded)?.entry;
         write
             .open_table(WRITER_CHANGE_LOG_TABLE)
             .map_err(Self::storage_error)?
-            .insert(position.as_slice(), encoded)
+            .insert(observed_graph_key!("history", "insert", position.as_slice(), 8), encoded)
             .map_err(Self::storage_error)?;
         if let Some(key) = Self::log_table_selector(&entry, &position) {
             write
@@ -93,14 +131,34 @@ impl RedbPersistence {
         write: &redb::WriteTransaction,
         textual_key: &str,
     ) -> Result<()> {
+        let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
+        Self::detach_change_log_selectors_in_write(write, textual_key, false)
+    }
+
+    pub(super) fn detach_change_log_selectors_in_write(
+        write: &redb::WriteTransaction,
+        textual_key: &str,
+        carry: bool,
+    ) -> Result<()> {
+        Self::require_graph_proof_tables_in_write(write)?;
+        let _row_scope = crate::read_image_memory::active_owner()?
+            .row_owner()?
+            .enter();
         let position = Self::numeric_change_key(textual_key)?;
         let entry = {
             let mut log = write
                 .open_table(WRITER_CHANGE_LOG_TABLE)
                 .map_err(Self::storage_error)?;
-            log.remove(position.as_slice())
+            log.remove(observed_graph_key!("history", "remove", position.as_slice(), 8))
                 .map_err(Self::storage_error)?
-                .map(|value| Self::decode_exact::<ChangeLogEntry>(value.value()))
+                .map(|value| {
+                    if carry {
+                        Self::validate_graph_occurrence_in_write(write, &position, value.value())?;
+                    } else {
+                        Self::remove_graph_occurrence_in_write(write, &position, value.value())?;
+                    }
+                    Self::decode_stored_change_log(value.value()).map(|record| record.entry)
+                })
                 .transpose()?
         };
         let Some(entry) = entry else {
@@ -130,21 +188,6 @@ impl RedbPersistence {
         } else {
             counts.insert(lsn, next).map_err(Self::storage_error)?;
         }
-        Ok(())
-    }
-
-    pub(super) fn clear_change_log_selectors_in_write(
-        write: &redb::WriteTransaction,
-    ) -> Result<()> {
-        write
-            .delete_table(WRITER_CHANGE_LOG_TABLE)
-            .map_err(Self::storage_error)?;
-        write
-            .delete_table(CHANGE_LOG_BY_TABLE)
-            .map_err(Self::storage_error)?;
-        write
-            .delete_table(CHANGE_LOG_LSN_COUNT)
-            .map_err(Self::storage_error)?;
         Ok(())
     }
 }
@@ -242,8 +285,13 @@ impl super::writer_source::WriterReadCursor {
                 .map_or(key, |(lsn, _)| lsn)
                 .parse::<u64>()
                 .map_err(|_| Error::Other("invalid declaration log frontier".into()))?;
+            let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
+            let owner = crate::read_image_memory::active_owner()?;
+            let before = owner.held();
             let (change, consumed) = crate::read_image_memory::decode(value)?;
             if consumed != value.len() {
+                drop(change);
+                owner.release(owner.held() - before);
                 return Err(Error::Other(
                     "declaration history record has trailing bytes".into(),
                 ));

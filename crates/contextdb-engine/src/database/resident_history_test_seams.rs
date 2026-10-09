@@ -408,6 +408,135 @@ pub(crate) fn source_unit_boundaries_for_test<'a>(
     })
 }
 
+
+// These controls reach the manager already installed in this Database. They
+// never build a detached directory, context, or memory owner for a test.
+impl Database {
+    #[doc(hidden)]
+    pub fn __has_captured_commit_directory_for_test(&self) -> bool {
+        self.tx_mgr.has_captured_commit_directory_for_test()
+    }
+
+    #[doc(hidden)]
+    pub fn __commit_directory_get_with_context_for_test(
+        &self,
+        lsn: Lsn,
+        context: &contextdb_tx::ReadCommitContext<'_>,
+    ) -> Result<Option<TxId>> {
+        self.note_commit_directory_funding(context);
+        let result = self.tx_mgr.try_commit_index_get_with_context(lsn, context)?;
+        self.__sample_commit_directory_residency_with_context_for_test(context)?;
+        Ok(result)
+    }
+
+    #[doc(hidden)]
+    pub fn __commit_directory_contains_with_context_for_test(
+        &self,
+        lsn: Lsn,
+        context: &contextdb_tx::ReadCommitContext<'_>,
+    ) -> Result<bool> {
+        self.note_commit_directory_funding(context);
+        let result = self.tx_mgr.try_commit_index_contains_with_context(lsn, context)?;
+        self.__sample_commit_directory_residency_with_context_for_test(context)?;
+        Ok(result)
+    }
+
+    #[doc(hidden)]
+    pub fn __commit_directory_floor_with_context_for_test(
+        &self,
+        upper: std::ops::Bound<Lsn>,
+        context: &contextdb_tx::ReadCommitContext<'_>,
+    ) -> Result<Option<(Lsn, TxId)>> {
+        self.note_commit_directory_funding(context);
+        let result = self.tx_mgr.try_commit_index_floor_with_context(upper, context)?;
+        self.__sample_commit_directory_residency_with_context_for_test(context)?;
+        Ok(result)
+    }
+
+    #[doc(hidden)]
+    pub fn __commit_directory_census_with_context_for_test(
+        &self,
+        context: &contextdb_tx::ReadCommitContext<'_>,
+    ) -> Result<(usize, Lsn)> {
+        self.note_commit_directory_funding(context);
+        let census = self.tx_mgr.try_commit_index_census_with_context(context)?;
+        note_commit_directory_sample(&self.tx_mgr, census.0);
+        Ok(census)
+    }
+
+    #[doc(hidden)]
+    pub fn __commit_directory_cursor_with_context_for_test(
+        &self,
+        lower: std::ops::Bound<Lsn>,
+        upper: std::ops::Bound<Lsn>,
+        context: &contextdb_tx::ReadCommitContext<'_>,
+    ) -> Result<Box<dyn contextdb_tx::ReadCommitCursor>> {
+        self.note_commit_directory_funding(context);
+        let cursor = self.tx_mgr.read_commit_directory_cursor(lower, upper, context)?;
+        self.__sample_commit_directory_residency_with_context_for_test(context)?;
+        Ok(Box::new(ObservedReadCommitCursor {
+            cursor,
+            manager: self.tx_mgr.clone(),
+            image: self.read_image_memory.as_ref().map(Arc::downgrade),
+        }))
+    }
+
+    #[doc(hidden)]
+    pub fn __sample_commit_directory_residency_with_context_for_test(
+        &self,
+        context: &contextdb_tx::ReadCommitContext<'_>,
+    ) -> Result<()> {
+        self.__commit_directory_census_with_context_for_test(context)?;
+        Ok(())
+    }
+
+    fn note_commit_directory_funding(&self, context: &contextdb_tx::ReadCommitContext<'_>) {
+        self.tx_mgr.visit_captured_read_memory_for_test(crate::read_work_probe::note_commit_directory_open_funding);
+        if let Some(image) = self.read_image_memory.as_ref() {
+            crate::read_work_probe::note_commit_directory_image_memory(image);
+        }
+        crate::read_work_probe::note_commit_directory_request_funding(&context.read_memory);
+    }
+
+    #[doc(hidden)]
+    pub fn __try_begin_for_test(&self) -> Result<TxId> {
+        self.tx_mgr.try_begin()
+    }
+}
+
+fn note_commit_directory_sample(manager: &TransactionManager<DynStore>, durable_entries: usize) {
+    // retained_entry_bytes counts the actual decoded pair slots; source cache
+    // pages and caller-owned cursor output are not resident directory entries.
+    let resident_entries = manager.retained_commit_directory_bytes_for_test()
+        / std::mem::size_of::<(Lsn, TxId)>();
+    crate::read_work_probe::note_commit_directory_residency(
+        resident_entries as u64,
+        durable_entries as u64,
+    );
+}
+
+struct ObservedReadCommitCursor {
+    cursor: Box<dyn contextdb_tx::ReadCommitCursor>,
+    manager: Arc<TransactionManager<DynStore>>,
+    image: Option<std::sync::Weak<crate::read_image_memory::ImageMemory>>,
+}
+
+impl contextdb_tx::ReadCommitCursor for ObservedReadCommitCursor {
+    fn next_entry(
+        &mut self,
+        context: &contextdb_tx::ReadCommitContext<'_>,
+    ) -> Result<Option<(Lsn, TxId)>> {
+        self.manager.visit_captured_read_memory_for_test(crate::read_work_probe::note_commit_directory_open_funding);
+        if let Some(image) = self.image.as_ref().and_then(std::sync::Weak::upgrade) {
+            crate::read_work_probe::note_commit_directory_image_memory(&image);
+        }
+        crate::read_work_probe::note_commit_directory_request_funding(&context.read_memory);
+        let entry = self.cursor.next_entry(context)?;
+        let (durable_entries, _) = self.manager.try_commit_index_census_with_context(context)?;
+        note_commit_directory_sample(&self.manager, durable_entries);
+        Ok(entry)
+    }
+}
 /// Drive the real received apply kernel with an observed declared operation child.
 #[doc(hidden)]
 pub fn observe_source_unit_credit_for_test(
@@ -488,18 +617,27 @@ pub struct SavedVectorRootForTest {
 impl SavedVectorRootForTest {
     #[doc(hidden)]
     pub fn with_public_calls<T>(
-        &self, database: &Database,
+        &self,
+        database: &Database,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         action: impl FnOnce(&Database, &crate::read_session::ReadSession) -> Result<T>,
     ) -> Result<T> {
         if self.manager != Arc::as_ptr(&database.tx_mgr) as usize {
-            return Err(Error::Other("saved vector proof root belongs to another database".into()));
+            return Err(Error::Other(
+                "saved vector proof root belongs to another database".into(),
+            ));
         }
         if let Some(retained) = &self.retained {
-            let original = database.retained_relational_source.as_ref().or_else(||
-                database.committed_image_startup.as_ref().map(|startup| &startup.config_source));
+            let original = database.retained_relational_source.as_ref().or_else(|| {
+                database
+                    .committed_image_startup
+                    .as_ref()
+                    .map(|startup| &startup.config_source)
+            });
             if !original.is_some_and(|source| Arc::ptr_eq(source, retained)) {
-                return Err(Error::Other("saved vector proof retained source changed".into()));
+                return Err(Error::Other(
+                    "saved vector proof retained source changed".into(),
+                ));
             }
         }
         let _root = database.enter_writer_read(self.writer.clone(), read_memory);
@@ -549,88 +687,181 @@ pub struct SavedTopologyFixtureForTest {
     pub cycles: usize,
 }
 fn saved_generation_receipt(
-    version: u16, generation_id: u64, bytes: Vec<u8>,
+    version: u16,
+    generation_id: u64,
+    bytes: Vec<u8>,
     descriptor: VectorPartitionGenerationDescriptor,
 ) -> Result<SavedVectorGenerationForTest> {
     let meta = crate::persistence::vector_paged::PagedGenerationMeta::decode(&bytes)?;
     let progress = meta.progress()?;
-    let saved = meta.saved.as_ref().ok_or_else(|| Error::Other("proof fixture did not publish saved topology".into()))?;
+    let saved = meta
+        .saved
+        .as_ref()
+        .ok_or_else(|| Error::Other("proof fixture did not publish saved topology".into()))?;
     if version != 1 {
-        return Err(Error::Other("proof fixture did not publish graph format 1".into()));
+        return Err(Error::Other(
+            "proof fixture did not publish graph format 1".into(),
+        ));
     }
     Ok(SavedVectorGenerationForTest {
-        graph_format_version: version, generation_id, storage_id: meta.storage_id,
-        is_base: saved.is_base, base_generation_id: saved.base_generation_id,
-        base_tx: saved.base_tx, base_lsn: saved.base_lsn, phase: progress.phase,
-        extend_candidates: saved.extend_candidates, keep_pruned: saved.keep_pruned,
-        max_layer: saved.max_layer, scale_bits: saved.scale_bits,
+        graph_format_version: version,
+        generation_id,
+        storage_id: meta.storage_id,
+        is_base: saved.is_base,
+        base_generation_id: saved.base_generation_id,
+        base_tx: saved.base_tx,
+        base_lsn: saved.base_lsn,
+        phase: progress.phase,
+        extend_candidates: saved.extend_candidates,
+        keep_pruned: saved.keep_pruned,
+        max_layer: saved.max_layer,
+        scale_bits: saved.scale_bits,
         hnsw_ef_search: meta.declaration.hnsw_ef_search,
-        covered_tx: progress.frontier_tx, covered_lsn: progress.frontier_lsn,
-        dimension: meta.declaration.dimension as usize, quantization: meta.declaration.quantization,
-        source_digest: saved.source_digest, record_digest: saved.record_digest,
-        distinct_rows: saved.distinct_rows, points: progress.graph.points,
-        record_bytes: saved.record_bytes, node_limit: saved.node_limit,
-        declaration_digest: progress.declaration_digest, policy_revision: descriptor.policy_revision,
-        hnsw_m: descriptor.hnsw_m, hnsw_ef_construction: descriptor.hnsw_ef_construction,
+        covered_tx: progress.frontier_tx,
+        covered_lsn: progress.frontier_lsn,
+        dimension: meta.declaration.dimension as usize,
+        quantization: meta.declaration.quantization,
+        source_digest: saved.source_digest,
+        record_digest: saved.record_digest,
+        distinct_rows: saved.distinct_rows,
+        points: progress.graph.points,
+        record_bytes: saved.record_bytes,
+        node_limit: saved.node_limit,
+        declaration_digest: progress.declaration_digest,
+        policy_revision: descriptor.policy_revision,
+        hnsw_m: descriptor.hnsw_m,
+        hnsw_ef_construction: descriptor.hnsw_ef_construction,
         manifest: bytes,
     })
 }
 impl Database {
     /// Captures the existing public read root. This opens no alternate route.
     #[doc(hidden)]
-    pub fn __capture_saved_vector_root_for_test(&self, limits: ReadLimits) -> Result<SavedVectorRootForTest> {
+    pub fn __capture_saved_vector_root_for_test(
+        &self,
+        limits: ReadLimits,
+    ) -> Result<SavedVectorRootForTest> {
         let _operation = self.open_operation()?;
         let writer = self.writer_read_root()?;
-        let retained = self.retained_relational_source.clone().or_else(||
-            self.committed_image_startup.as_ref().map(|startup| Arc::clone(&startup.config_source)));
+        let retained = self.retained_relational_source.clone().or_else(|| {
+            self.committed_image_startup
+                .as_ref()
+                .map(|startup| Arc::clone(&startup.config_source))
+        });
         let (snapshot, storage) = if let Some(root) = &writer {
             (root.snapshot, root.storage_identity())
         } else if let Some(source) = &retained {
             (self.snapshot(), source.storage_identity())
         } else {
-            return Err(Error::Other("saved vector proof requires a durable root".into()));
+            return Err(Error::Other(
+                "saved vector proof requires a durable root".into(),
+            ));
         };
         Ok(SavedVectorRootForTest {
-            manager: Arc::as_ptr(&self.tx_mgr) as usize, writer, retained,
-            session: self.read_session(limits)?, snapshot, storage,
+            manager: Arc::as_ptr(&self.tx_mgr) as usize,
+            writer,
+            retained,
+            session: self.read_session(limits)?,
+            snapshot,
+            storage,
         })
     }
     /// Drive ordinary finite maintenance, without selecting a native format or
     /// changing declared policy. A route that publishes another format refuses.
     #[doc(hidden)]
     pub fn __saved_topology_fixture_for_test(
-        &self, partition: &VectorPartitionRef, require_change: bool,
+        &self,
+        partition: &VectorPartitionRef,
+        require_change: bool,
         max_cycles: usize,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<SavedTopologyFixtureForTest> {
         let sources = Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured = Arc::clone(&sources);
         let selected_partition = partition.clone();
-        let prior = crate::vector_observations::observe_additional_journal_replay(Arc::new(move |event| {
-            if event.partition != selected_partition { return; }
-            if let crate::vector_observations::VectorJournalReplayWork::SavedTopologyExport { is_base, generation_id, bytes } = &event.work {
-                captured.lock().unwrap_or_else(|error| error.into_inner()).push((*is_base, *generation_id, Arc::clone(bytes)));
-            }
-        }));
-        let persistence = self.persistence.as_ref().ok_or_else(|| Error::Other("saved topology fixture requires writable persistence".into()))?;
+        let prior =
+            crate::vector_observations::observe_additional_journal_replay(Arc::new(move |event| {
+                if event.partition != selected_partition {
+                    return;
+                }
+                if let crate::vector_observations::VectorJournalReplayWork::SavedTopologyExport {
+                    is_base,
+                    generation_id,
+                    bytes,
+                } = &event.work
+                {
+                    captured
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .push((*is_base, *generation_id, Arc::clone(bytes)));
+                }
+            }));
+        let persistence = self.persistence.as_ref().ok_or_else(|| {
+            Error::Other("saved topology fixture requires writable persistence".into())
+        })?;
         for cycles in 1..=max_cycles {
             self.run_maintenance_cycle_with_read_memory(read_memory.clone())?;
-            let Some(catalog) = persistence.load_vector_partition_generation_catalog_for(&partition.index, &partition.partition_key)? else { continue; };
-            if require_change && catalog.change.is_none() { continue; }
-            let base = persistence.load_vector_partition_base_generation(&partition.index, &partition.partition_key, catalog.base.generation_id)?;
-            let base = saved_generation_receipt(base.graph_format_version, base.generation_id, base.graph.bytes, catalog.base)?;
-            let change = catalog.change.map(|descriptor| {
-                let change = persistence.load_vector_partition_change_generation(&partition.index, &partition.partition_key, base.generation_id, descriptor.generation_id)?;
-                saved_generation_receipt(change.graph_format_version, change.change_generation_id, change.graph.bytes, descriptor)
-            }).transpose()?;
-            let original_sources = sources.lock().unwrap_or_else(|error| error.into_inner()).clone();
-            let selected = if require_change { change.as_ref().expect("requested change") } else { &base };
-            if !original_sources.iter().any(|(role, _generation, bytes)|
-                *role == selected.is_base && blake3::hash(bytes).as_bytes() == &selected.source_digest) {
+            let Some(catalog) = persistence.load_vector_partition_generation_catalog_for(
+                &partition.index,
+                &partition.partition_key,
+            )?
+            else {
+                continue;
+            };
+            if require_change && catalog.change.is_none() {
+                continue;
+            }
+            let base = persistence.load_vector_partition_base_generation(
+                &partition.index,
+                &partition.partition_key,
+                catalog.base.generation_id,
+            )?;
+            let base = saved_generation_receipt(
+                base.graph_format_version,
+                base.generation_id,
+                base.graph.bytes,
+                catalog.base,
+            )?;
+            let change = catalog
+                .change
+                .map(|descriptor| {
+                    let change = persistence.load_vector_partition_change_generation(
+                        &partition.index,
+                        &partition.partition_key,
+                        base.generation_id,
+                        descriptor.generation_id,
+                    )?;
+                    saved_generation_receipt(
+                        change.graph_format_version,
+                        change.change_generation_id,
+                        change.graph.bytes,
+                        descriptor,
+                    )
+                })
+                .transpose()?;
+            let original_sources = sources
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone();
+            let selected = if require_change {
+                change.as_ref().expect("requested change")
+            } else {
+                &base
+            };
+            if !original_sources.iter().any(|(role, _generation, bytes)| {
+                *role == selected.is_base
+                    && blake3::hash(bytes).as_bytes() == &selected.source_digest
+            }) {
                 continue;
             }
             drop(prior);
-            return Ok(SavedTopologyFixtureForTest { partition: partition.clone(), base, change, original_sources, cycles });
+            return Ok(SavedTopologyFixtureForTest {
+                partition: partition.clone(),
+                base,
+                change,
+                original_sources,
+                cycles,
+            });
         }
         Err(Error::Other("ordinary maintenance did not publish the requested saved topology within the supplied cycle bound".into()))
     }
@@ -641,10 +872,19 @@ impl SavedTopologyFixtureForTest {
     /// A previous publication's source must be retained from its factory call.
     #[doc(hidden)]
     pub fn original_source(&self, is_base: bool, generation_id: u64) -> Option<&[u8]> {
-        let selected = if is_base { Some(&self.base) } else { self.change.as_ref() }?;
-        if selected.generation_id != generation_id { return None; }
-        self.original_sources.iter().find(|(role, _generation, bytes)|
-            *role == is_base && blake3::hash(bytes).as_bytes() == &selected.source_digest)
+        let selected = if is_base {
+            Some(&self.base)
+        } else {
+            self.change.as_ref()
+        }?;
+        if selected.generation_id != generation_id {
+            return None;
+        }
+        self.original_sources
+            .iter()
+            .find(|(role, _generation, bytes)| {
+                *role == is_base && blake3::hash(bytes).as_bytes() == &selected.source_digest
+            })
             .map(|(_, _, bytes)| bytes.as_ref())
     }
 }

@@ -16,3 +16,16 @@ pub fn store_companion_path(store_path: &Path) -> PathBuf {
     name.push(".lock");
     PathBuf::from(name)
 }
+
+/// The path of a store's holder-presence companion file.
+///
+/// Named like the companion lock, by APPENDING `.holders` to the full store filename: `alpha.db`
+/// becomes `alpha.db.holders`, and `store.contextgraph` becomes `store.contextgraph.holders`. The
+/// file is always empty. A process that owns background work beside the store holds an exclusive
+/// lock on one byte of it for as long as it owns that work, so another process can tell a live
+/// holder from one that has exited. This is the one public source of truth for the name.
+pub fn store_holders_path(store_path: &Path) -> PathBuf {
+    let mut name = store_path.as_os_str().to_os_string();
+    name.push(".holders");
+    PathBuf::from(name)
+}

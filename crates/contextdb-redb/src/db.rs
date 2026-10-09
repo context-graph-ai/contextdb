@@ -647,6 +647,14 @@ impl ReadableDatabase for Database {
 }
 
 impl Database {
+    /// Capture a native retained read that authenticates every consumed page.
+    /// The ordinary native transaction guard remains responsible for retention.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn begin_verified_read(&self) -> Result<ReadTransaction, TransactionError> {
+        ReadTransaction::new_verified(self.get_memory(), self.allocate_read_transaction()?)
+    }
+
     /// Exact fixed cache-index allocation, separate from the configured page cap.
     #[doc(hidden)]
     pub fn cache_index_bytes(&self) -> usize {

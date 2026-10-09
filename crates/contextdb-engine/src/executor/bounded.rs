@@ -292,6 +292,8 @@ impl contextdb_vector::PrepaidVectorCopyCharge for PrepaidTraceCredit {
 struct RequestContext {
     limits: ReadLimits,
     vector_copies: Mutex<contextdb_vector::VectorCopyAdmission>,
+    /// The first validated vector capture fixes intent and roots across fetches.
+    vector_read_capture: Mutex<Option<Arc<crate::persistence::vector_membership_source::VectorReadOperation>>>,
     /// How this read ends when an operator runs out of budget mid-answer:
     /// refused, or paused for the next fetch.
     resumption: ReadResumption,
@@ -332,6 +334,98 @@ impl Drop for SourcePageCharge {
     }
 }
 
+/// Active preparation for a committed reader uses the bounded kernel's
+/// existing cancellation and deadline checks and its declared request owner.
+#[derive(Clone)]
+pub(crate) struct ReadOpenContext(Arc<RequestContext>);
+
+/// An operation retained by this request cannot hold a strong request back-reference.
+/// Upgrading uses the same cancellation, deadline and aggregate work state.
+pub(crate) struct VectorReadCheckpoint(std::sync::Weak<RequestContext>);
+
+impl VectorReadCheckpoint {
+    pub(crate) fn checkpoint(&self) -> contextdb_core::Result<()> {
+        self.0.upgrade().ok_or(Error::ReadCancelled)?
+            .checkpoint().map_err(ReadOpenContext::engine_error)
+    }
+
+    pub(crate) fn belongs_to(&self, context: &ReadOpenContext) -> bool {
+        std::sync::Weak::ptr_eq(&self.0, &Arc::downgrade(&context.0))
+    }
+}
+
+impl ReadOpenContext {
+    // Wrap the actual executing request. Constructing a second RequestContext
+    // would reset its cancellation, active deadline and aggregate work.
+    fn from_request(context: &Arc<RequestContext>) -> Self {
+        Self(Arc::clone(context))
+    }
+
+    pub(crate) fn new(
+        read_memory: Arc<dyn ReadMemoryBudget>,
+        limits: ReadLimits,
+        clock: Arc<dyn DeadlineClock>,
+        cancellation: OwnerReadCancellation,
+    ) -> contextdb_core::Result<Self> {
+        #[cfg(feature = "test-seams")]
+        crate::read_work_probe::note_commit_directory_open_funding(&read_memory);
+        RequestContext::new(
+            read_memory,
+            limits,
+            ReadResumption::OneShot,
+            clock,
+            cancellation,
+            None,
+            #[cfg(feature = "test-seams")]
+            None,
+        )
+        .map(Self)
+        .map_err(Self::engine_error)
+    }
+
+    pub(crate) fn checkpoint(&self) -> contextdb_core::Result<()> {
+        self.0.checkpoint().map_err(Self::engine_error)
+    }
+
+    pub(crate) fn read_memory(&self) -> Arc<dyn ReadMemoryBudget> {
+        self.0.reader_budget.clone()
+    }
+
+    pub(crate) fn vector_checkpoint(&self) -> VectorReadCheckpoint {
+        VectorReadCheckpoint(Arc::downgrade(&self.0))
+    }
+
+    pub(crate) fn vector_read_capture(
+        &self,
+    ) -> Option<Arc<crate::persistence::vector_membership_source::VectorReadOperation>> {
+        self.0.vector_read_capture.lock().unwrap_or_else(|poison| poison.into_inner()).clone()
+    }
+
+    pub(crate) fn retain_vector_read_capture(
+        &self,
+        capture: Arc<crate::persistence::vector_membership_source::VectorReadOperation>,
+    ) -> contextdb_core::Result<()> {
+        let mut slot = self.0.vector_read_capture.lock().unwrap_or_else(|poison| poison.into_inner());
+        if slot.as_ref().is_some_and(|prior| !Arc::ptr_eq(prior, &capture)) {
+            return Err(Error::StoreCorrupted { path: "vector_partition_memberships".into(),
+                reason: "request attempted to replace its immutable vector capture".into() });
+        }
+        *slot = Some(capture);
+        Ok(())
+    }
+
+    fn engine_error(error: BoundedExecutionError) -> Error {
+        match error {
+            BoundedExecutionError::Refused(failure) => Error::ReadFailure(failure),
+            BoundedExecutionError::Cancelled => Error::ReadCancelled,
+            BoundedExecutionError::Engine(error) => error,
+            BoundedExecutionError::Unimplemented => {
+                Error::Other("bounded read preparation is not implemented".into())
+            }
+        }
+    }
+}
+
 impl RequestContext {
     fn new(
         reader_budget: Arc<dyn ReadMemoryBudget>,
@@ -345,6 +439,7 @@ impl RequestContext {
         Self::check_effective_limits(&limits)?;
         let started_ms = clock.now_ms();
         let context = Arc::new_cyclic(|context| Self {
+            vector_read_capture: Mutex::new(None),
             vector_copies: Mutex::new(crate::vector_read_memory::admission(Arc::new(
                 WeakSourceDecodeBudget(context.clone()),
             ))),
@@ -1273,18 +1368,22 @@ impl RequestContext {
     /// Whatever must stop the request before it does more work: a parked
     /// release fault first, because it means the live charge no longer
     /// describes what the request holds, then cancellation.
-    fn memory_limit_failure(&self, required: u64) -> BoundedExecutionError {
-        BoundedExecutionError::Refused(ReadFailure::owner_limit_exceeded(
-            OwnerLimitExceededDetail {
-                limit: ReadFailureLimit::Memory,
-                value: self.limits.memory,
-                required: Some(RequiredBytesSetting {
-                    required_bytes: required,
-                    required_setting: "reader memory".to_string(),
-                }),
-                statement: None,
-            },
-        ))
+    fn memory_limit_failure(
+        &self,
+        held: usize,
+        requested: usize,
+        operation: &'static str,
+    ) -> BoundedExecutionError {
+        BoundedExecutionError::Engine(Error::MemoryBudgetExceeded {
+            subsystem: "bounded_read".to_string(),
+            operation: operation.to_string(),
+            requested_bytes: requested,
+            available_bytes: usize::try_from(self.limits.memory)
+                .unwrap_or(usize::MAX)
+                .saturating_sub(held),
+            budget_limit_bytes: usize::try_from(self.limits.memory).unwrap_or(usize::MAX),
+            hint: "Lower the statement's LIMIT or width, or raise MEMORY_LIMIT.".to_string(),
+        })
     }
 
     fn pending_failure(&self) -> Option<BoundedExecutionError> {
@@ -1504,6 +1603,11 @@ impl RequestContext {
         let _ = completed_source;
         #[cfg(feature = "test-seams")]
         if let Some(probe) = self.probe() {
+            let _funding = crate::read_work_probe::observe_funding(
+                crate::read_work_probe::funding_owner_name(&self.reader_budget),
+                crate::read_work_probe::funding_owner_id(&self.reader_budget),
+                self.state().memory.bytes(),
+            );
             probe.before_source_touch(touch, completed_source);
         }
         if self.elapsed_since(started_ms)? > self.limits.active_ms {
@@ -1573,6 +1677,11 @@ impl RequestContext {
         }
         #[cfg(feature = "test-seams")]
         if let Some(probe) = self.probe() {
+            let _funding = crate::read_work_probe::observe_funding(
+                crate::read_work_probe::funding_owner_name(&self.reader_budget),
+                crate::read_work_probe::funding_owner_id(&self.reader_budget),
+                self.state().memory.bytes(),
+            );
             probe.before_source_touch(touch, completed_source);
         }
         if let Some(cancelled) = self.pending_failure() {
@@ -1700,7 +1809,11 @@ impl RequestContext {
                 .checked_add(requested_u64)
                 .is_none_or(|after| after > self.limits.memory)
             {
-                return Err(self.memory_limit_failure(held.saturating_add(requested_u64)));
+                return Err(self.memory_limit_failure(
+                    usize::try_from(held).unwrap_or(usize::MAX),
+                    requested,
+                    source.reservation_operation(),
+                ));
             }
             held
         };
@@ -1746,6 +1859,29 @@ impl RequestContext {
             probe.after_temporary_reservation(source, requested_u64, held_after);
         }
         Ok(())
+    }
+
+    /// The source adapter has already admitted move bytes into state.memory.
+    /// Detaching its refund owner makes the pending row responsible for them.
+    fn admit_source_row(
+        &self,
+        source: BoundedWorkSource,
+        admission: crate::read_image_memory::RowReadAdmission<'_>,
+    ) -> std::result::Result<usize, BoundedExecutionError> {
+        match admission {
+            crate::read_image_memory::RowReadAdmission::Copy(bytes) => {
+                self.reserve(source, bytes)?;
+                Ok(bytes)
+            }
+            crate::read_image_memory::RowReadAdmission::Move(memory) => {
+                let bytes = memory.retained_payload_bytes();
+                let credit = memory.take_retained_credit(bytes)?;
+                // SourceDecodeBudget already recorded these exact bytes in
+                // this request ledger. Transfer refund responsibility only.
+                credit.transfer();
+                Ok(bytes)
+            }
+        }
     }
 
     fn release(&self, bytes: usize) -> std::result::Result<(), BoundedExecutionError> {
@@ -1834,11 +1970,7 @@ impl RequestContext {
             .and_then(|after| u64::try_from(after).ok())
             .is_some_and(|after| after <= self.limits.memory);
         if !within {
-            return Err(self.memory_limit_failure(
-                u64::try_from(held)
-                    .unwrap_or(u64::MAX)
-                    .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX)),
-            ));
+            return Err(self.memory_limit_failure(held, bytes, operation));
         }
         let credit = ReadCredit::try_new(
             Arc::clone(&self.reader_budget),
@@ -1901,7 +2033,11 @@ impl RequestContext {
             Arc::new(move |bytes: usize| {
                 context
                     .admit_source_page(source, bytes)
-                    .map(|charge| Box::new(charge) as redb::ReadPageCharge)
+                    .map(|charge| {
+                        #[cfg(any(test, feature = "test-seams"))]
+                        crate::read_work_probe::note_worker_page_admitted(bytes, crate::read_work_probe::funding_owner_name(&context.reader_budget));
+                        Box::new(charge) as redb::ReadPageCharge
+                    })
                     .map_err(|error| {
                         let error = match error {
                             BoundedExecutionError::Engine(error) => error,
@@ -2125,6 +2261,8 @@ impl<'a> RetainedRow<'a> {
     fn release(mut self) -> std::result::Result<(), BoundedExecutionError> {
         self.charged = false;
         let bytes = std::mem::take(&mut self.row.retained_bytes);
+        drop(std::mem::take(&mut self.row.values));
+        let _ = self.row.window.take();
         self.context.release(bytes)
     }
 
@@ -2163,6 +2301,8 @@ impl Drop for RetainedRow<'_> {
             return;
         }
         let bytes = std::mem::take(&mut self.row.retained_bytes);
+        drop(std::mem::take(&mut self.row.values));
+        let _ = self.row.window.take();
         if bytes != 0 {
             self.context.release_parked(bytes);
         }
@@ -2205,7 +2345,9 @@ impl PulledRow {
         self,
         context: &Arc<RequestContext>,
     ) -> std::result::Result<(), BoundedExecutionError> {
-        context.release(self.retained_bytes)
+        let bytes = self.retained_bytes;
+        drop(self);
+        context.release(bytes)
     }
 }
 
@@ -2353,6 +2495,11 @@ impl std::fmt::Debug for SourceDecodeBudget {
 }
 
 impl contextdb_core::read_memory::ReadMemoryBudget for SourceDecodeBudget {
+    #[cfg(feature = "test-seams")]
+    fn funding_owner_for_test(&self) -> Option<&Arc<dyn ReadMemoryBudget>> {
+        Some(&self.context.reader_budget)
+    }
+
     fn try_reserve(
         &self,
         bytes: usize,
@@ -4449,7 +4596,7 @@ fn value_capacity_bytes(value: &Value) -> std::result::Result<usize, BoundedExec
             std::mem::size_of::<f32>(),
             "value vector capacity",
         ),
-        Value::Json(_) => Ok(0),
+        Value::Json(value) => Ok(contextdb_core::types::json_retained_heap_bytes(value)),
         Value::Null
         | Value::Bool(_)
         | Value::Int64(_)
@@ -5424,6 +5571,63 @@ fn expression_temporary_bytes<'a>(
         )?,
         "expression evaluation",
     )
+}
+
+// A direct projection allocates the selected value clones, not two copies
+// of every input field. Charge each occurrence plus Vec collection growth.
+fn projection_temporary_bytes(
+    row: &Vec<Value>,
+    columns: &[String],
+    params: &HashMap<String, Value>,
+    projected: &[ProjectColumn],
+) -> std::result::Result<usize, BoundedExecutionError> {
+    if !projected
+        .iter()
+        .all(|column| matches!(column.expr, Expr::Column(_)))
+    {
+        return expression_temporary_bytes(
+            row,
+            params,
+            projected.iter().map(|column| &column.expr),
+        );
+    }
+    let capacity = if projected.is_empty() {
+        0
+    } else {
+        projected
+            .len()
+            .max(4)
+            .checked_next_power_of_two()
+            .ok_or_else(|| bounded_size_error("projection slots"))?
+    };
+    // Collect may grow from the preceding capacity while retaining its old
+    // buffer. This includes that temporary overlap before evaluating anything.
+    let slots = capacity
+        .checked_add(capacity / 2)
+        .ok_or_else(|| bounded_size_error("projection slots"))?;
+    let mut bytes = checked_size_add(
+        std::mem::size_of::<Vec<Value>>(),
+        checked_size_mul(slots, std::mem::size_of::<Value>(), "projection slots")?,
+        "projection output",
+    )?;
+    for column in projected {
+        let Expr::Column(name) = &column.expr else {
+            unreachable!()
+        };
+        let position = match resolve_query_result_column(columns, name) {
+            QueryResultColumn::Found(position) => position,
+            resolution => return Err(query_result_column_error(name, &resolution).into()),
+        };
+        let value = row
+            .get(position)
+            .ok_or_else(|| Error::PlanError("projection value is missing".to_string()))?;
+        bytes = checked_size_add(
+            bytes,
+            planned_value_clone_bytes(value)?,
+            "projection clones",
+        )?;
+    }
+    Ok(bytes)
 }
 
 // Direct column keys can repeat arbitrarily in a window specification. Fund
@@ -6402,7 +6606,8 @@ impl ScanState {
                                     )
                                 },
                                 &mut |bytes| {
-                                    context.reserve(BoundedWorkSource::TableScan, bytes)?;
+                                    let bytes = context
+                                        .admit_source_row(BoundedWorkSource::TableScan, bytes)?;
                                     probe.set(bytes);
                                     Ok(())
                                 },
@@ -6410,10 +6615,12 @@ impl ScanState {
                         })?;
                     // The probe asks only whether the original is there; the
                     // copy it made is handed straight back.
-                    context.release(probe.get())?;
                     had_committed = existing.is_some();
+                    drop(existing);
+                    context.release(probe.get())?;
                 }
                 if !had_committed {
+                    drop(row);
                     context.release(reserved.get())?;
                     continue;
                 }
@@ -6598,7 +6805,10 @@ impl ScanState {
                                         Ok(())
                                     },
                                     &mut |bytes| {
-                                        context.reserve(BoundedWorkSource::TableScan, bytes)?;
+                                        let bytes = context.admit_source_row(
+                                            BoundedWorkSource::TableScan,
+                                            bytes,
+                                        )?;
                                         reserved.set(bytes);
                                         Ok(())
                                     },
@@ -6664,7 +6874,10 @@ impl ScanState {
                                         Ok(())
                                     },
                                     &mut |bytes| {
-                                        context.reserve(BoundedWorkSource::IndexRange, bytes)?;
+                                        let bytes = context.admit_source_row(
+                                            BoundedWorkSource::IndexRange,
+                                            bytes,
+                                        )?;
                                         reserved.set(bytes);
                                         Ok(())
                                     },
@@ -6744,7 +6957,10 @@ impl ScanState {
                                         Ok(())
                                     },
                                     &mut |bytes| {
-                                        context.reserve(BoundedWorkSource::IndexRange, bytes)?;
+                                        let bytes = context.admit_source_row(
+                                            BoundedWorkSource::IndexRange,
+                                            bytes,
+                                        )?;
                                         reserved.set(bytes);
                                         Ok(())
                                     },
@@ -6788,7 +7004,10 @@ impl ScanState {
                                     },
                                     &mut |bytes| context.release(bytes),
                                     &mut |bytes| {
-                                        context.reserve(BoundedWorkSource::IndexRange, bytes)?;
+                                        let bytes = context.admit_source_row(
+                                            BoundedWorkSource::IndexRange,
+                                            bytes,
+                                        )?;
                                         reserved.set(bytes);
                                         Ok(())
                                     },
@@ -6818,14 +7037,14 @@ impl ScanState {
                         let selected_bytes = Cell::new(0);
                         let selected = context.with_source_page_admission(source, || {
                             db.bounded_row_by_identity(
-                                context.reader_budget.clone(),
+                                context.source_read_memory(source),
                                 None,
                                 &self.table,
                                 identity.row_id,
                                 self.snapshot,
                                 &mut || context.charge(source, BoundedSourceTouch::TableRow),
                                 &mut |bytes| {
-                                    context.reserve(source, bytes)?;
+                                    let bytes = context.admit_source_row(source, bytes)?;
                                     selected_bytes.set(bytes);
                                     Ok(())
                                 },
@@ -6854,7 +7073,15 @@ impl ScanState {
                 let row = match row {
                     Some(row) => {
                         let held = pulled_row_retained_bytes(&row)?;
-                        reconcile_new_reservation(context, source, reserved.get(), held)?;
+                        if held > reserved.get() {
+                            if let Err(error) = context.reserve(source, held - reserved.get()) {
+                                drop(row);
+                                context.release(reserved.get())?;
+                                return Err(error);
+                            }
+                        } else if reserved.get() > held {
+                            context.release(reserved.get() - held)?;
+                        }
                         reserved.set(held);
                         Some(row)
                     }
@@ -7123,23 +7350,28 @@ impl ScanState {
                 .len()
                 .checked_add(1)
                 .ok_or_else(|| bounded_size_error("scan projection"))?;
-            let projected_values = self
-                .schema_columns
-                .iter()
-                .map(|column| row.values.get(column).map_or(&Value::Null, |value| value));
-            let planned_output_bytes = value_refs_retained_bytes(
-                std::iter::once(&row_id_value).chain(projected_values),
-                output_capacity,
+            let planned_output_bytes = checked_size_add(
+                std::mem::size_of::<Vec<Value>>(),
+                checked_size_mul(
+                    output_capacity,
+                    std::mem::size_of::<Value>(),
+                    "scan projection slots",
+                )?,
+                "scan projection",
             )?;
             let vector_credit = self
                 .pending_vector_copy
                 .as_ref()
                 .map_or(0, |owner| owner.retained_bytes());
-            let funded_output_bytes = planned_output_bytes.max(vector_credit);
-            context.reserve(source, planned_output_bytes.saturating_sub(vector_credit))?;
+            let funded_output_bytes = checked_size_add(
+                checked_size_add(source_bytes, vector_credit, "source projection credit")?,
+                planned_output_bytes,
+                "projection credit",
+            )?;
+            context.reserve(source, planned_output_bytes)?;
             let mut values = Vec::new();
             if values.try_reserve_exact(output_capacity).is_err() {
-                context.release(planned_output_bytes.saturating_sub(vector_credit))?;
+                context.release(planned_output_bytes)?;
                 return Err(
                     Error::Other("bounded scan projection allocation failed".to_string()).into(),
                 );
@@ -7170,8 +7402,17 @@ impl ScanState {
             if let Some(owner) = self.pending_vector_copy.take() {
                 (*owner).transfer();
             }
-            reconcile_new_reservation(context, source, funded_output_bytes, output_bytes)?;
-            context.release(retained_source_bytes)?;
+            // The old HashMap, discarded fields and source owner are gone;
+            // reconcile all transferred credit only now.
+            if output_bytes > funded_output_bytes {
+                if let Err(error) = context.reserve(source, output_bytes - funded_output_bytes) {
+                    drop(values);
+                    context.release(funded_output_bytes)?;
+                    return Err(error);
+                }
+            } else if funded_output_bytes > output_bytes {
+                context.release(funded_output_bytes - output_bytes)?;
+            }
             if let ScanMode::Physical { cursor } = &mut self.mode {
                 // The emitted anchor is what a later pull re-anchors against
                 // after maintenance compacts the vector; an emitted row is
@@ -8682,8 +8923,8 @@ impl VectorState {
                 // `rows_examined` is one figure both doors owe the same answer to.
                 &mut || context.charge_operator(BoundedWorkSource::TableScan),
                 &mut |bytes| {
-                    retained = bytes;
-                    context.reserve(BoundedWorkSource::TableScan, bytes)
+                    retained = context.admit_source_row(BoundedWorkSource::TableScan, bytes)?;
+                    Ok(())
                 },
             )
         })?;
@@ -8691,6 +8932,7 @@ impl VectorState {
             return Ok(None);
         };
         let Some(meta) = db.table_meta(&self.table) else {
+            drop(row);
             context.release(retained)?;
             return Ok(None);
         };
@@ -8739,6 +8981,7 @@ impl VectorState {
             if let Some(index) = self.identity_source_index.as_deref()
                 && context.transaction().is_none()
             {
+                drop(row);
                 context.release(retained)?;
                 return Err(Error::StoreCorrupted {
                     path: db.bounded_store_path(),
@@ -8786,23 +9029,26 @@ impl VectorState {
             .len()
             .checked_add(1)
             .ok_or_else(|| bounded_size_error("vector row projection"))?;
-        let planned = value_refs_retained_bytes(
-            std::iter::once(&row_id_value).chain(
-                self.schema_columns
-                    .iter()
-                    .map(|column| row.values.get(column).unwrap_or(&Value::Null)),
-            ),
-            capacity,
+        let planned = checked_size_add(
+            std::mem::size_of::<Vec<Value>>(),
+            checked_size_mul(
+                capacity,
+                std::mem::size_of::<Value>(),
+                "vector projection slots",
+            )?,
+            "vector projection",
         )?;
         let vector_credit = vector_copy_owner.retained_bytes();
-        let funded = planned.max(vector_credit);
-        context.reserve(
-            BoundedWorkSource::TableScan,
-            planned.saturating_sub(vector_credit),
+        let funded = checked_size_add(
+            checked_size_add(retained, vector_credit, "vector source credit")?,
+            planned,
+            "vector projection credit",
         )?;
+        context.reserve(BoundedWorkSource::TableScan, planned)?;
         let mut values = Vec::new();
         if values.try_reserve_exact(capacity).is_err() {
-            context.release(planned.saturating_sub(vector_credit))?;
+            drop(row);
+            context.release(planned)?;
             context.release(retained)?;
             return Err(Error::Other("bounded vector row allocation failed".to_string()).into());
         }
@@ -8818,9 +9064,17 @@ impl VectorState {
         drop(source_values);
         let actual = values_retained_bytes(&values)?;
         vector_copy_owner.transfer();
-        reconcile_new_reservation(context, BoundedWorkSource::TableScan, funded, actual)?;
-        // The source copy has been projected and is no longer held.
-        context.release(retained)?;
+        if actual > funded {
+            if let Err(error) = context.reserve(BoundedWorkSource::TableScan, actual - funded) {
+                drop(values);
+                context.release(funded)?;
+                return Err(error);
+            }
+        } else if funded > actual {
+            context.release(funded - actual)?;
+        }
+        // Payload credit moved into this output; only dead map/field credit
+        // was returned by reconciliation above.
         Ok(Some(PulledRow {
             window: None,
             values,
@@ -8953,8 +9207,9 @@ impl VectorState {
                     self.snapshot,
                     &mut || context.charge_operator(BoundedWorkSource::VectorCandidates),
                     &mut |bytes| {
-                        retained = bytes;
-                        context.reserve(BoundedWorkSource::VectorCandidates, bytes)
+                        retained =
+                            context.admit_source_row(BoundedWorkSource::VectorCandidates, bytes)?;
+                        Ok(())
                     },
                 )
             })?;
@@ -10116,10 +10371,11 @@ impl ProjectState {
         let Some(row) = self.pending.as_ref() else {
             return Ok(None);
         };
-        let temporary_bytes = expression_temporary_bytes(
+        let temporary_bytes = projection_temporary_bytes(
             &row.values,
+            &self.input.columns,
             &self.params,
-            self.columns.iter().map(|column| &column.expr),
+            &self.columns,
         )?;
         context.reserve(BoundedWorkSource::TableScan, temporary_bytes)?;
         let output = self
@@ -11035,6 +11291,92 @@ fn bounded_resolve_graph_start_nodes(
     .map(Some)
 }
 
+/// Validate the complete declared inputs before building a kernel, including
+/// sources whose join/candidate branch execution can subsequently bypass.
+fn preflight_plan_indexes(
+    db: &dyn ReadExecutionTarget, plan: &PhysicalPlan, params: &HashMap<String, Value>,
+    snapshot: SnapshotId, context: &Arc<RequestContext>,
+) -> std::result::Result<(), BoundedExecutionError> {
+    let memory = context.reader_budget.clone();
+    if db.ordered_prefix_snapshot_is_current(snapshot, memory.clone())? { return Ok(()); }
+    let preflight = |table: &str, index: &str| context.with_source_page_admission(
+        BoundedWorkSource::IndexRange, || db.preflight_historical_index(table, index, snapshot,
+            memory.clone(), &mut || context.charge_operator(BoundedWorkSource::IndexRange)));
+    match plan {
+        PhysicalPlan::Limit { count: 0, .. } => Ok(()),
+        PhysicalPlan::Scan { table, filter, .. } => {
+            if let Some(filter) = filter.as_ref()
+                && let Some(meta) = db.table_meta(table)
+                && let Some(pick) = analyze_filter_for_index(table, &meta, filter, params).pick {
+                preflight(table, &pick.name)?;
+            }
+            Ok(())
+        }
+        PhysicalPlan::IndexScan { table, index, .. } => preflight(table, index),
+        PhysicalPlan::Sort { input, keys } => {
+            if let Some((table, _, ordered)) = ordered_scan(db, input, keys, params) {
+                preflight(table, &ordered.index)?;
+            }
+            preflight_plan_indexes(db, input, params, snapshot, context)
+        }
+        PhysicalPlan::WindowRank { input, .. } | PhysicalPlan::Project { input, .. }
+        | PhysicalPlan::Filter { input, .. } | PhysicalPlan::Distinct { input }
+        | PhysicalPlan::Limit { input, .. } | PhysicalPlan::MaterializeCte { input, .. }
+        | PhysicalPlan::GroupedCount { input, .. } => preflight_plan_indexes(db, input, params, snapshot, context),
+        PhysicalPlan::Join { left, right, .. } => {
+            preflight_plan_indexes(db, left, params, snapshot, context)?;
+            preflight_plan_indexes(db, right, params, snapshot, context)
+        }
+        PhysicalPlan::Union { inputs, .. } | PhysicalPlan::Pipeline(inputs) => {
+            for input in inputs { preflight_plan_indexes(db, input, params, snapshot, context)?; }
+            Ok(())
+        }
+        PhysicalPlan::GraphBfs { start_candidates, .. } => {
+            db.preflight_historical_graph(snapshot,
+                context.reader_budget.clone(),
+                &mut || context.charge_operator(BoundedWorkSource::GraphTraversal))?;
+            if let Some(input) = start_candidates { preflight_plan_indexes(db, input, params, snapshot, context)?; }
+            Ok(())
+        }
+        PhysicalPlan::VectorSearch { candidates, .. } | PhysicalPlan::HnswSearch { candidates, .. } => {
+            if let Some(candidates) = candidates { preflight_plan_indexes(db, candidates, params, snapshot, context)?; }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+// The guard is thread-local and lives only while this request is executing.
+// Cursor fetches re-enter beneath the cursor's existing immutable writer root.
+fn enter_vector_read(
+    db: &dyn ReadExecutionTarget,
+    snapshot: SnapshotId,
+    context: &Arc<RequestContext>,
+    required: bool,
+) -> std::result::Result<Option<crate::persistence::vector_membership_source::VectorReadScope>, BoundedExecutionError> {
+    if !required { return Ok(None); }
+    context.with_vector_copies(|copies| db.vector_read_preflight(
+        snapshot, context.reader_budget.clone(), copies,
+        Some(ReadOpenContext::from_request(context)),
+    )).map_err(BoundedExecutionError::from)
+}
+
+// Include branches that execution can bypass after deriving empty candidates.
+fn plan_needs_vector_read(plan: &PhysicalPlan) -> bool {
+    match plan {
+        PhysicalPlan::Limit { count: 0, .. } => false,
+        PhysicalPlan::VectorSearch { k, .. } | PhysicalPlan::HnswSearch { k, .. } => *k != 0,
+        PhysicalPlan::WindowRank { input, .. } | PhysicalPlan::Project { input, .. }
+        | PhysicalPlan::Filter { input, .. } | PhysicalPlan::Distinct { input }
+        | PhysicalPlan::Limit { input, .. } | PhysicalPlan::MaterializeCte { input, .. }
+        | PhysicalPlan::GroupedCount { input, .. } | PhysicalPlan::Sort { input, .. } => plan_needs_vector_read(input),
+        PhysicalPlan::Join { left, right, .. } => plan_needs_vector_read(left) || plan_needs_vector_read(right),
+        PhysicalPlan::Union { inputs, .. } | PhysicalPlan::Pipeline(inputs) => inputs.iter().any(plan_needs_vector_read),
+        PhysicalPlan::GraphBfs { start_candidates, .. } => start_candidates.as_deref().is_some_and(plan_needs_vector_read),
+        _ => false,
+    }
+}
+
 fn build_kernel(
     db: &dyn ReadExecutionTarget,
     plan: &PhysicalPlan,
@@ -11042,6 +11384,7 @@ fn build_kernel(
     snapshot: SnapshotId,
     context: &Arc<RequestContext>,
 ) -> std::result::Result<PullNode, BoundedExecutionError> {
+    preflight_plan_indexes(db, plan, &params, snapshot, context)?;
     build_kernel_with_ctes(db, plan, params, snapshot, &HashMap::new(), context).map(|node| *node)
 }
 
@@ -14013,8 +14356,9 @@ fn build_vector_kernel<'plan>(
                         snapshot,
                         &mut || context.charge_operator(BoundedWorkSource::VectorCandidates),
                         &mut |bytes| {
-                            retained = bytes;
-                            context.reserve(BoundedWorkSource::VectorCandidates, bytes)
+                            retained = context
+                                .admit_source_row(BoundedWorkSource::VectorCandidates, bytes)?;
+                            Ok(())
                         },
                     )
                 })?;
@@ -14765,6 +15109,18 @@ fn build_scan(
             cursor: db.bounded_physical_table_cursor(table)?,
         }
     };
+    let selected_index = match &mode {
+        ScanMode::Index { pick, .. } => Some(pick.name.as_str()),
+        ScanMode::Ordered { cursor, .. } => cursor.index_name(),
+        ScanMode::Exact { index, .. } => Some(index.as_str()),
+        ScanMode::Empty => empty_pick.as_ref().map(|pick| pick.name.as_str()),
+        ScanMode::Physical { .. } => None,
+    };
+    if let Some(index) = selected_index {
+        db.preflight_historical_index(table, index, snapshot,
+            context.source_read_memory(BoundedWorkSource::IndexRange),
+            &mut || context.charge_operator(BoundedWorkSource::IndexRange))?;
+    }
     capture_scan_membership(db, table, snapshot, &mut mode, context)?;
     let offers_every_committed_row = matches!(mode, ScanMode::Physical { .. });
     // An ordered walk with a transaction open folds the transaction's own
@@ -15169,6 +15525,9 @@ fn build_direct_index_scan(
             cursor: db.bounded_physical_table_cursor(table)?,
         }
     };
+    db.preflight_historical_index(table, index, snapshot,
+        context.source_read_memory(BoundedWorkSource::IndexRange),
+        &mut || context.charge_operator(BoundedWorkSource::IndexRange))?;
     capture_scan_membership(db, table, snapshot, &mut mode, context)?;
     let offers_every_committed_row = matches!(mode, ScanMode::Physical { .. });
     let mut columns = vec!["row_id".to_string()];
@@ -15521,7 +15880,7 @@ fn planned_value_clone_bytes(value: &Value) -> std::result::Result<usize, Bounde
             std::mem::size_of::<f32>(),
             "canonical vector clone",
         ),
-        Value::Json(_) => Ok(0),
+        Value::Json(value) => Ok(crate::read_image_memory::json_clone_heap_bytes(value)),
         Value::Null
         | Value::Bool(_)
         | Value::Int64(_)
@@ -15647,7 +16006,7 @@ fn planned_query_clone_bytes(
 }
 
 #[allow(dead_code)]
-fn canonical_query_capacity_bytes(
+pub(crate) fn canonical_query_capacity_bytes(
     result: &CanonicalQueryResult,
 ) -> std::result::Result<usize, BoundedExecutionError> {
     let mut bytes = checked_size_add(
@@ -15968,6 +16327,7 @@ pub(crate) fn drain_chosen_plan(
         #[cfg(feature = "test-seams")]
         probe,
     )?;
+    let _vector_read = enter_vector_read(db, snapshot, &context, plan_needs_vector_read(plan))?;
     let params = Arc::new(params.clone());
     let mut root = build_kernel(db, plan, Arc::clone(&params), snapshot, &context)?;
     let prepaid = adopt_kernel_construction(&mut root)?;
@@ -16203,6 +16563,36 @@ fn statement_needs_vector_graph(statement: &contextdb_parser::ast::Statement) ->
     }
 }
 
+fn statement_needs_vector_read(statement: &contextdb_parser::ast::Statement) -> bool {
+    use contextdb_parser::ast::{Cte, Expr, SelectBody, SortDirection, Statement};
+    fn expr(value: &Expr) -> bool {
+        match value {
+            Expr::CosineDistance { .. } | Expr::RowVectorSource { .. } => true,
+            Expr::InSubquery { expr: input, subquery, .. } => expr(input) || body(subquery),
+            Expr::BinaryOp { left, right, .. } | Expr::Like { expr: left, pattern: right, .. } => expr(left) || expr(right),
+            Expr::UnaryOp { operand, .. } | Expr::IsNull { expr: operand, .. } => expr(operand),
+            Expr::FunctionCall { args, .. } | Expr::Row(args) => args.iter().any(expr),
+            Expr::InList { expr: input, list, .. } => expr(input) || list.iter().any(expr),
+            _ => false,
+        }
+    }
+    fn body(select: &SelectBody) -> bool {
+        if select.limit == Some(0) { return false; }
+        select.order_by.iter().any(|item| item.direction == SortDirection::CosineDistance || expr(&item.expr))
+            || select.columns.iter().any(|column| expr(&column.expr))
+            || select.where_clause.as_ref().is_some_and(expr)
+            || select.joins.iter().any(|join| expr(&join.on))
+    }
+    match statement {
+        Statement::Select(select) => body(&select.body) || select.ctes.iter().any(|cte| match cte {
+            Cte::SqlCte { query, .. } => body(query),
+            Cte::MatchCte { match_clause, .. } => match_clause.where_clause.as_ref().is_some_and(expr)
+                || match_clause.return_cols.iter().any(|column| expr(&column.expr)),
+        }),
+        _ => false,
+    }
+}
+
 pub(super) fn execute(
     db: &dyn ReadExecutionTarget,
     sql: &str,
@@ -16247,6 +16637,8 @@ pub(super) fn execute(
             writer_root,
             context.source_read_memory(BoundedWorkSource::TableScan),
         );
+        let _vector_read = enter_vector_read(db, snapshot, &context,
+            statement_needs_vector_read(&statement))?;
         #[cfg(feature = "test-seams")]
         if let Some(probe) = context.probe() {
             probe.registered_snapshot_for_test(snapshot);
@@ -16273,6 +16665,8 @@ pub(super) fn execute(
                 }),
             )
         })?;
+        let _vector_plan_read = enter_vector_read(db, snapshot, &context,
+            plan_needs_vector_read(&plan))?;
         let publication = context.publication_scope(
             publication_lsn,
             publication_tables(&plan),
@@ -16498,6 +16892,7 @@ pub(super) struct CursorState {
     _snapshot_registration: Box<dyn Send + Sync>,
     storage_snapshot: Option<crate::persistence::OwnerCursorStoragePin>,
     writer_root: Option<Arc<crate::persistence::WriterSnapshot>>,
+    vector_read: bool,
     publication: ReadPublicationScope,
     /// The idle window this cursor's registration is judged by. Stamped
     /// beside `last_used_ms` on every page handed back, so removal reads the
@@ -16990,6 +17385,8 @@ impl CursorState {
             self.context
                 .source_read_memory(BoundedWorkSource::TableScan),
         );
+        let _vector_read = enter_vector_read(self.database.as_ref(), self._snapshot,
+            &self.context, self.vector_read)?;
         let row_limit = u64::try_from(rows.get()).map_err(|_| {
             RequestContext::limit_failure(
                 ReadFailureLimit::ResultRows,
@@ -17432,6 +17829,8 @@ pub(super) fn open_cursor(
             writer_root.clone(),
             context.source_read_memory(BoundedWorkSource::TableScan),
         );
+        let vector_read = statement_needs_vector_read(&statement);
+        let _vector_read = enter_vector_read(db.as_ref(), snapshot, &context, vector_read)?;
         #[cfg(feature = "test-seams")]
         if let Some(probe) = context.probe() {
             probe.registered_snapshot_for_test(snapshot);
@@ -17458,6 +17857,8 @@ pub(super) fn open_cursor(
                 }),
             )
         })?;
+        let vector_read = vector_read || plan_needs_vector_read(&plan);
+        let _vector_plan_read = enter_vector_read(db.as_ref(), snapshot, &context, vector_read)?;
         let publication = context.publication_scope(
             publication_lsn,
             publication_tables(&plan),
@@ -17591,6 +17992,7 @@ pub(super) fn open_cursor(
             _snapshot_registration: snapshot_registration,
             storage_snapshot,
             writer_root,
+            vector_read,
             publication,
             idle_window,
             context,

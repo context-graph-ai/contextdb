@@ -16,7 +16,7 @@ contract.
 | `traits.rs` | `RelationalExecutor`, `GraphExecutor`, `VectorExecutor`, `TransactionManager`. |
 | `read_contract.rs` | Refusal classes and kinds, read limits, owner identities and statuses shared by both read routes — values only. |
 | `read_memory.rs` / `memory.rs` | Owned memory charges and the budget capability the engine supplies. |
-| `companion.rs` | `store_companion_path` — the one source of the store's `.lock` companion name. |
+| `companion.rs` | `store_companion_path` and `store_holders_path` — the one source of the store's `.lock` and `.holders` companion names. |
 
 Must not own: behavior. No storage, routing, transport, persistence, or execution; `read_contract`
 states this in its own module doc. No dependency on another contextdb crate (engine and server are

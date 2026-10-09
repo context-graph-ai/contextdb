@@ -626,8 +626,12 @@ impl DormantVectorGraphLoader for CapturedLayerLoader {
                 &self.partition.partition_key,
                 self.descriptor.identity.generation_id,
             )?;
-            let paged = record.graph.bytes.starts_with(&crate::persistence::vector_paged::META_MAGIC) || record.graph_format_version
-                == crate::persistence::vector_paged::VECTOR_GRAPH_PAGED_FORMAT_VERSION;
+            let paged = record
+                .graph
+                .bytes
+                .starts_with(&crate::persistence::vector_paged::META_MAGIC)
+                || record.graph_format_version
+                    == crate::persistence::vector_paged::VECTOR_GRAPH_PAGED_FORMAT_VERSION;
             if record.highest_included_tx != self.descriptor.identity.covered_tx
                 || record.highest_included_lsn != self.descriptor.identity.covered_lsn
                 || record.dimension as usize != self.dimension
@@ -668,7 +672,11 @@ impl DormantVectorGraphLoader for CapturedLayerLoader {
                 "saved vector graph length disagrees with its catalog".to_string(),
             ));
         }
-        if !paged { return Err(crate::persistence::vector_paged::corruption("saved generation has no published topology pages")); }
+        if !paged {
+            return Err(crate::persistence::vector_paged::corruption(
+                "saved generation has no published topology pages",
+            ));
+        }
         let current_resident = if paged {
             resident
         } else {

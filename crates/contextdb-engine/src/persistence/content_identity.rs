@@ -13,6 +13,8 @@ use super::{
     RedbPersistence,
 };
 use crate::direct_file_reader::DirectTypedImageDigest;
+#[cfg(all(test, feature = "test-seams"))]
+use crate::memory_accounting::MemoryAccountant;
 use contextdb_core::{
     AdjEntry, Error, Lsn, Result, RowId, TableMeta, TxId, Value, VectorEntry, VectorIndexRef,
     VectorQuantization, VersionedRow,
@@ -693,7 +695,7 @@ fn key_parts(parts: &[&[u8]]) -> Vec<u8> {
     encoded
 }
 
-fn canonical_json<T: Serialize>(value: &T) -> Result<Vec<u8>> {
+fn canonical_json<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
     let encoding_failure = |error: serde_json::Error| {
         Error::Other(format!("cannot encode logical identity leaf: {error}"))
     };
@@ -1053,11 +1055,18 @@ pub(crate) enum HistoryKind {
     CommitIndex = 0,
     ChangeLog = 1,
     DdlLog = 2,
+    RelationalVersion = 3,
 }
 
 /// A stored history record type and the range it is committed in.
 pub(crate) trait HistoryRecord: Serialize {
     const KIND: HistoryKind;
+
+    /// Public history keeps its canonical JSON commitment. Private wrappers
+    /// override this with their exact durable manual encoding.
+    fn commitment_bytes(&self) -> Result<Vec<u8>> {
+        canonical_json(self)
+    }
 }
 
 impl HistoryRecord for crate::composite_store::ChangeLogEntry {
@@ -1070,6 +1079,10 @@ impl HistoryRecord for crate::sync_types::DdlChange {
 
 impl<T: HistoryRecord> HistoryRecord for &T {
     const KIND: HistoryKind = T::KIND;
+
+    fn commitment_bytes(&self) -> Result<Vec<u8>> {
+        T::commitment_bytes(*self)
+    }
 }
 
 fn history_logical_key(kind: HistoryKind, coordinate: &[u8]) -> Vec<u8> {
@@ -1080,7 +1093,7 @@ fn history_logical_key(kind: HistoryKind, coordinate: &[u8]) -> Vec<u8> {
     key
 }
 
-fn history_tree_key(kind: HistoryKind, coordinate: &[u8]) -> Vec<u8> {
+pub(super) fn history_tree_key(kind: HistoryKind, coordinate: &[u8]) -> Vec<u8> {
     let mut key = Vec::with_capacity(2 + coordinate.len());
     key.push(ORDERED_HISTORY_KEY_TAG);
     key.push(kind as u8);
@@ -1218,8 +1231,36 @@ pub(crate) fn encoded_history_mutation<T: HistoryRecord>(
     Ok(ContentIdentityMutation::put(
         LogicalFamily::ChangeAndDdl,
         history_logical_key(T::KIND, physical_key.as_bytes()),
-        canonical_json(value)?,
+        value.commitment_bytes()?,
     ))
+}
+
+/// Caller validates the private codec before passing the complete stored
+/// bytes. Never reconstruct these bytes from public equality or JSON.
+pub(super) fn private_history_mutation(
+    physical_key: &str,
+    bytes: &[u8],
+) -> Result<ContentIdentityMutation> {
+    validate_history_key(physical_key)?;
+    let owned_bytes = ORDERED_HISTORY_MAGIC
+        .len()
+        .checked_add(1)
+        .and_then(|n| n.checked_add(physical_key.len()))
+        .and_then(|n| n.checked_add(bytes.len()))
+        .ok_or_else(|| Error::StoreCorrupted {
+            path: "change_log".into(),
+            reason: "private history commitment length overflow".into(),
+        })?;
+    crate::read_image_memory::reserve(owned_bytes)?;
+    Ok(ContentIdentityMutation::put(
+        LogicalFamily::ChangeAndDdl,
+        history_logical_key(HistoryKind::ChangeLog, physical_key.as_bytes()),
+        bytes,
+    ))
+}
+
+pub(super) fn private_history_value_hash(bytes: &[u8]) -> [u8; 32] {
+    value_hash(LogicalFamily::ChangeAndDdl, bytes)
 }
 
 pub(crate) fn remove_encoded_history_mutation<T: HistoryRecord>(
@@ -1238,7 +1279,7 @@ pub(crate) fn remove_encoded_history_mutation<T: HistoryRecord>(
 pub(crate) fn history_record_value_hash<T: HistoryRecord>(value: &T) -> Result<[u8; 32]> {
     Ok(value_hash(
         LogicalFamily::ChangeAndDdl,
-        &canonical_json(value)?,
+        &value.commitment_bytes()?,
     ))
 }
 
@@ -1292,6 +1333,86 @@ fn hash_parts(domain: &[u8], parts: &[&[u8]]) -> [u8; 32] {
     *hash.finalize().as_bytes()
 }
 
+// Private readers preserve the existing framing while checkpointing actual input.
+fn hash_parts_checkpoint(domain: &[u8], parts: &[&[u8]], checkpoint: &mut dyn FnMut() -> Result<()>) -> Result<[u8; 32]> {
+    let mut hash = blake3::Hasher::new();
+    checkpoint()?;
+    hash.update(domain);
+    for part in parts {
+        hash.update(&(part.len() as u64).to_le_bytes());
+        for window in part.chunks(64 * 1024) { checkpoint()?; hash.update(window); }
+    }
+    Ok(*hash.finalize().as_bytes())
+}
+fn key_hash_checkpoint(key: &[u8], checkpoint: &mut dyn FnMut() -> Result<()>) -> Result<[u8; 32]> {
+    if key.first() == Some(&KEY_REFERENCE_TAG) && key.len() == KEY_REFERENCE_BYTES {
+        checkpoint()?;
+        Ok(key[5..].try_into().expect("key reference hash"))
+    } else { hash_parts_checkpoint(b"contextdb-prolly-key", &[key], checkpoint) }
+}
+fn bytes_cmp_checkpoint(left: &[u8], right: &[u8], checkpoint: &mut dyn FnMut() -> Result<()>) -> Result<Ordering> {
+    for (left, right) in left.chunks(64 * 1024).zip(right.chunks(64 * 1024)) {
+        checkpoint()?;
+        let ordering = left.cmp(right);
+        if ordering != Ordering::Equal { return Ok(ordering); }
+    }
+    Ok(left.len().cmp(&right.len()))
+}
+fn identity_key_cmp_checkpoint(left: &[u8], right: &[u8], checkpoint: &mut dyn FnMut() -> Result<()>) -> Result<Ordering> {
+    match (left.first(), right.first()) {
+        (Some(&HASHED_KEY_TAG), Some(&HASHED_KEY_TAG)) |
+        (Some(&ORDERED_HISTORY_KEY_TAG), Some(&ORDERED_HISTORY_KEY_TAG)) => bytes_cmp_checkpoint(left, right, checkpoint),
+        _ => { checkpoint()?; identity_key_cmp(left, right) }
+    }
+}
+pub(super) fn checkpoint_operation<E: From<Error>, T>(checkpoint: &mut dyn FnMut() -> std::result::Result<(), E>, operation: impl FnOnce(&mut dyn FnMut() -> Result<()>) -> Result<T>) -> std::result::Result<T, E> {
+    let mut failure = None;
+    let result = operation(&mut || {
+        if let Err(error) = checkpoint() {
+            failure = Some(error);
+            Err(Error::Other("reader checkpoint refused".into()))
+        } else { Ok(()) }
+    });
+    if let Some(error) = failure { return Err(error); }
+    result.map_err(E::from)
+}
+fn chunk_id_checkpoint(level: u32, last: &[u8], checkpoint: &mut dyn FnMut() -> Result<()>) -> Result<[u8; 32]> {
+    let key_hash = key_hash_checkpoint(last, checkpoint)?;
+    let mut id = [0; 32];
+    id[0] = level.min(MAX_CHUNK_LEVEL) as u8;
+    id[1..].copy_from_slice(&hash_parts_checkpoint(b"contextdb-prolly-chunk-id", &[&level.to_be_bytes(), &key_hash], checkpoint)?[..31]);
+    Ok(id)
+}
+fn resolve_key_checkpoint<'a>(table: &impl ReadableTable<&'static [u8], &'static [u8]>, family: LogicalFamily, key: &'a [u8], checkpoint: &mut dyn FnMut() -> Result<()>) -> Result<std::borrow::Cow<'a, [u8]>> {
+    checkpoint()?;
+    if key.first() != Some(&KEY_REFERENCE_TAG) { return Ok(key.into()); }
+    if key.len() != KEY_REFERENCE_BYTES { return Err(Error::Other("invalid authenticated key reference".into())); }
+    let len = u32::from_be_bytes(key[1..5].try_into().expect("length")) as usize;
+    if len <= INLINE_SEPARATOR_BYTES { return Err(Error::Other("invalid authenticated wide key length".into())); }
+    let id = key_hash_checkpoint(key, checkpoint)?;
+    let stored_key = node_storage_key(family, &id);
+    let blob = table.get(stored_key.as_slice()).map_err(RedbPersistence::storage_error)?
+        .ok_or_else(|| Error::Other("authenticated separator key is missing".into()))?;
+    let bytes = blob.value();
+    #[cfg(feature = "test-seams")] observe_node_read(bytes.len());
+    if bytes.len() != len.checked_add(1).ok_or_else(|| Error::Other("wide key length overflow".into()))? || bytes[0] != 0 || key_hash_checkpoint(&bytes[1..], checkpoint)? != id {
+        return Err(Error::Other("authenticated separator key is damaged".into()));
+    }
+    #[cfg(feature = "test-seams")] observe_resolved_key_event("copy", len);
+    let mut resolved = Vec::with_capacity(len);
+    for window in bytes[1..].chunks(64 * 1024) { checkpoint()?; resolved.extend_from_slice(window); }
+    Ok(resolved.into())
+}
+fn resolve_key_charged_checkpoint<'a>(table: &impl ReadableTable<&'static [u8], &'static [u8]>, family: LogicalFamily, key: &'a [u8], admission: &mut ProofAdmission, checkpoint: &mut dyn FnMut() -> Result<()>) -> Result<(std::borrow::Cow<'a, [u8]>, usize)> {
+    if key.first() != Some(&KEY_REFERENCE_TAG) { checkpoint()?; return Ok((key.into(), 0)); }
+    if key.len() != KEY_REFERENCE_BYTES { return Err(Error::Other("invalid authenticated key reference".into())); }
+    let charge = u32::from_be_bytes(key[1..5].try_into().expect("length")) as usize;
+    admission.admit(charge)?;
+    match resolve_key_checkpoint(table, family, key, checkpoint) {
+        Ok(key) => Ok((key, charge)),
+        Err(error) => { admission.release(charge); Err(error) }
+    }
+}
 fn record_key(family: LogicalFamily, logical_key: &[u8]) -> [u8; 32] {
     hash_parts(
         b"contextdb-logical-record-key-v1",
@@ -1459,6 +1580,7 @@ fn validated_directed_order(left: (bool, Value), right: (bool, Value)) -> Result
 }
 
 fn decode_posting_position(bytes: &[u8]) -> Result<super::EncodedRelationalIndexPosition> {
+    let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
     RedbPersistence::decode_exact::<super::EncodedRelationalIndexPosition>(bytes).map_err(|error| {
         Error::Other(format!(
             "logical identity ordered posting key is not a decodable index position: {error}"
@@ -1567,6 +1689,7 @@ impl<'a> BorrowedPostingCursor<'a> {
 /// values. Full validation still precedes comparison, including components
 /// after the first unequal one. The recursion ceiling is serde_json's default.
 fn validate_posting_json(json: &str) -> Result<()> {
+    let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
     struct Parser<'a> {
         bytes: &'a [u8],
         cursor: usize,
@@ -1689,7 +1812,24 @@ fn validate_posting_json(json: &str) -> Result<()> {
             // Use the existing JSON numeric parser, whose overflow and rounding
             // acceptance differ from Rust's f64 parser. Number owns no heap
             // storage with this workspace's pinned default serde_json features.
-            serde_json::from_str::<serde_json::Number>(number).map_err(posting_decode_error)?;
+            let owner = crate::read_image_memory::active_owner()?;
+            let bytes = number
+                .len()
+                .checked_mul(8)
+                .and_then(|n| n.checked_add(7200))
+                .ok_or_else(|| posting_decode_error("number admission size overflow"))?;
+            let credit = contextdb_core::read_memory::ReadCredit::try_new(
+                owner,
+                bytes,
+                "json_decode",
+                "validate_posting_number",
+                "Raise the operation memory limit to validate this number.",
+            )?;
+            let parsed =
+                serde_json::from_str::<serde_json::Number>(number).map_err(posting_decode_error);
+            // Arbitrary precision may retain token text: drop it before refund.
+            drop(parsed?);
+            drop(credit);
             Ok(())
         }
         fn value(&mut self, remaining: usize) -> Result<()> {
@@ -1812,6 +1952,40 @@ pub(super) fn validated_posting_order(left: &[u8], right: &[u8]) -> Result<Order
     Ok(left
         .count
         .cmp(&right.count)
+        .then_with(|| left_tail.0.cmp(&right_tail.0))
+        .then_with(|| left_tail.1.0.cmp(&right_tail.1.0)))
+}
+
+/// Preflight callers already validated both complete keys against their declaration.
+/// Borrow their scalar payloads; wide text comparison checks each 64 KiB window.
+pub(super) fn validated_preflight_posting_order(
+    left_bytes: &[u8], right_bytes: &[u8], checkpoint: &mut dyn FnMut() -> Result<()>,
+) -> Result<Ordering> {
+    fn tail(bytes: &[u8], checkpoint: &mut dyn FnMut() -> Result<()>) -> Result<(RowId, TxId)> {
+        let mut cursor = BorrowedPostingCursor::open(bytes)?;
+        for _ in 0..cursor.count { checkpoint()?; cursor.next()?; }
+        checkpoint()?;
+        cursor.tail()
+    }
+    let left_tail = tail(left_bytes, checkpoint)?;
+    let right_tail = tail(right_bytes, checkpoint)?;
+    let mut left = BorrowedPostingCursor::open(left_bytes)?;
+    let mut right = BorrowedPostingCursor::open(right_bytes)?;
+    for _ in 0..left.count.min(right.count) {
+        checkpoint()?;
+        let left_part = left.next()?;
+        let right_part = right.next()?;
+        let ordering = match (&left_part, &right_part) {
+            ((ld, BorrowedPostingValue::Text(l)), (rd, BorrowedPostingValue::Text(r))) if ld == rd => {
+                let result = bytes_cmp_checkpoint(l.as_bytes(), r.as_bytes(), checkpoint)?;
+                if *ld { result.reverse() } else { result }
+            }
+            _ => borrowed_directed_order(left_part, right_part)?,
+        };
+        if ordering != Ordering::Equal { return Ok(ordering); }
+    }
+    checkpoint()?;
+    Ok(left.count.cmp(&right.count)
         .then_with(|| left_tail.0.cmp(&right_tail.0))
         .then_with(|| left_tail.1.0.cmp(&right_tail.1.0)))
 }
@@ -1963,8 +2137,9 @@ fn mutation_tree_key(mutation: &ContentIdentityMutation) -> Result<Vec<u8>> {
         let raw = &mutation.logical_key[ORDERED_HISTORY_MAGIC.len()..];
         match raw.split_first() {
             Some((&kind, coordinate))
-                if kind <= HistoryKind::DdlLog as u8 && !coordinate.is_empty() =>
+                if kind <= HistoryKind::RelationalVersion as u8 && !coordinate.is_empty() =>
             {
+                if kind == HistoryKind::RelationalVersion as u8 { version_manifest::parse_manifest(coordinate)?; }
                 let mut key = Vec::with_capacity(1 + raw.len());
                 key.push(ORDERED_HISTORY_KEY_TAG);
                 key.extend_from_slice(raw);
@@ -2001,6 +2176,7 @@ fn empty_root(family: LogicalFamily) -> FamilyRoot {
 /// recompute these copies. Writers publish them in the same transaction as the
 /// tree root.
 struct PublishedRoot {
+    history_open: Option<HistoryOpenPublication>,
     identity: FamilyRoot,
     custody_config_root: Option<[u8; 32]>,
     vector_directory_root: Option<[u8; 32]>,
@@ -2012,6 +2188,7 @@ struct PublishedRoot {
 fn empty_published_root(family: LogicalFamily) -> PublishedRoot {
     PublishedRoot {
         identity: empty_root(family),
+        history_open: (family == LogicalFamily::ChangeAndDdl).then(HistoryOpenPublication::empty),
         content_size_root: (family == LogicalFamily::Configuration).then_some([0; 32]),
         vector_pages_root: (family == LogicalFamily::Configuration).then_some([0; 32]),
         ddl_selector_roots: (family == LogicalFamily::ChangeAndDdl).then_some([[0; 32]; 2]),
@@ -2792,6 +2969,8 @@ fn node_live_bytes(node: &Node) -> usize {
 /// With no accountant attached the charge is still measured, so the same code
 /// runs in engine-internal contracts; production always attaches one.
 pub(crate) struct ProofAdmission {
+    reader_budget: Option<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>>,
+    reader_refusal: Option<Arc<Mutex<Option<Error>>>>,
     accountant: Option<Arc<crate::memory_accounting::MemoryAccountant>>,
     /// A cache this admission may reclaim from before it refuses. A proved
     /// chunk is a cache; a read that needs its bytes gets them.
@@ -2803,9 +2982,42 @@ pub(crate) struct ProofAdmission {
     peak: std::cell::Cell<usize>,
 }
 
+/// A returned writer admission retains its epoch independently of the caller.
+/// The payload drops before the use; no extra allocation is introduced.
+pub(crate) struct OwnedProofAdmission {
+    admission: ProofAdmission,
+    _writer_use: Option<crate::memory_accounting::WriterUse>,
+}
+impl OwnedProofAdmission {
+    fn new(admission: ProofAdmission) -> Self {
+        let writer_use = admission.accountant.as_ref().or(admission.scratch_accountant.as_ref())
+            .and_then(crate::memory_accounting::WriterUse::retain_if_writer);
+        Self { admission, _writer_use: writer_use }
+    }
+}
+impl std::ops::Deref for OwnedProofAdmission {
+    type Target = ProofAdmission;
+    fn deref(&self) -> &ProofAdmission { &self.admission }
+}
+impl std::ops::DerefMut for OwnedProofAdmission {
+    fn deref_mut(&mut self) -> &mut ProofAdmission { &mut self.admission }
+}
+
 impl ProofAdmission {
+    pub(super) fn take_reader_refusal(&self) -> Option<Error> {
+        self.reader_refusal.as_ref().and_then(|slot| slot.lock().unwrap_or_else(|e| e.into_inner()).take())
+    }
+
+    pub(super) fn for_reader(memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>) -> Self {
+        let mut owner = Self::new(None);
+        owner.reader_budget = Some(memory);
+        owner
+    }
+
     pub(crate) fn new(accountant: Option<Arc<crate::memory_accounting::MemoryAccountant>>) -> Self {
         Self {
+            reader_budget: None,
+            reader_refusal: None,
             accountant,
             reclaim: None,
             charge_fixed_refusal_control: false,
@@ -2869,6 +3081,8 @@ impl ProofAdmission {
         reclaim: Arc<ResidentProofChunkSet>,
     ) -> Self {
         Self {
+            reader_budget: None,
+            reader_refusal: None,
             accountant,
             reclaim: Some(reclaim),
             charge_fixed_refusal_control: false,
@@ -2899,7 +3113,15 @@ impl ProofAdmission {
     /// Admit `bytes` before they are allocated. A refusal is the existing typed
     /// budget error and leaves this transaction to abort with nothing written.
     pub(super) fn admit(&mut self, bytes: usize) -> Result<()> {
-        if let Some(accountant) = &self.accountant {
+        if let Some(reader) = &self.reader_budget {
+            if let Err(error) = reader.try_reserve(bytes, "content_identity", "read_committed_proof", "Reduce the requested proof work or raise the declared reader memory limit.") {
+                if let Some(refusal) = &self.reader_refusal {
+                    *refusal.lock().unwrap_or_else(|e| e.into_inner()) = Some(error);
+                    return Err(Error::Other("read proof admission refused".into()));
+                }
+                return Err(error);
+            }
+        } else if let Some(accountant) = &self.accountant {
             if self.charge_fixed_refusal_control {
                 accountant.charge_retained(bytes);
             } else {
@@ -2931,9 +3153,7 @@ impl ProofAdmission {
 
     pub(super) fn release(&mut self, bytes: usize) {
         let bytes = bytes.min(self.held);
-        if let Some(accountant) = &self.accountant {
-            accountant.release(bytes);
-        }
+        if let Some(reader) = &self.reader_budget { reader.release(bytes); } else if let Some(accountant) = &self.accountant { accountant.release(bytes); }
         self.held -= bytes;
     }
 
@@ -2943,7 +3163,8 @@ impl ProofAdmission {
         let bytes = bytes.min(self.held);
         self.held -= bytes;
         AdmittedBytes {
-            accountant: self.accountant.clone(),
+            reader_budget: self.reader_budget.clone(),
+            accountant: self.accountant.clone().map(crate::memory_accounting::StoreAccountantHandle::new),
             bytes,
         }
     }
@@ -2956,7 +3177,7 @@ impl ProofAdmission {
     /// An unaccounted admission measures but admits nothing, so an allocation
     /// it makes must not outlive the call that made it.
     fn is_accounted(&self) -> bool {
-        self.accountant.is_some()
+        self.accountant.is_some() || self.reader_budget.is_some()
     }
 
     pub(crate) fn peak(&self) -> usize {
@@ -2967,15 +3188,38 @@ impl ProofAdmission {
 /// Admitted bytes owned by one allocation, returned when that allocation is
 /// dropped — including when it is dropped by an unwind.
 struct AdmittedBytes {
-    accountant: Option<Arc<crate::memory_accounting::MemoryAccountant>>,
+    reader_budget: Option<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>>,
+    accountant: Option<crate::memory_accounting::StoreAccountantHandle>,
     bytes: usize,
+
+}
+
+impl AdmittedBytes {
+    fn source_custody(&self) -> Option<crate::memory_accounting::StoreAccountantHandle> {
+        self.accountant.as_ref().filter(|owner| owner.is_writer()).cloned()
+    }
+    fn with_source(
+        source: Option<crate::memory_accounting::StoreAccountantHandle>,
+        mut debit: Option<Self>,
+    ) -> Option<Self> {
+        if let Some(source) = source {
+            if let Some(charge) = debit.as_mut() {
+                // These constructor routes establish identical payer/source
+                // allocations. Replacing only the handle leaves the debit
+                // armed exactly once and never returns its bytes early.
+                debug_assert!(charge.accountant.as_ref().is_some_and(|payer| payer.same_allocation(&source)));
+                charge.accountant = Some(source);
+            } else {
+                debit = Some(Self { reader_budget: None, accountant: Some(source), bytes: 0 });
+            }
+        }
+        debit
+    }
 }
 
 impl Drop for AdmittedBytes {
     fn drop(&mut self) {
-        if let Some(accountant) = &self.accountant {
-            accountant.release(self.bytes);
-        }
+        if let Some(reader) = &self.reader_budget { reader.release(self.bytes); } else if let Some(accountant) = &self.accountant { accountant.release(self.bytes); }
     }
 }
 
@@ -3317,7 +3561,7 @@ fn sort_canonical_from_coalesced(edits: &mut EntryEdits) -> Result<()> {
 /// What one encoded family root costs: the buffer `encode_published_root`
 /// reserves. Configuration carries the startup projection and the custody
 /// projection; a vector family carries the membership projection.
-const ENCODED_ROOT_BYTES: usize = 162;
+const ENCODED_ROOT_BYTES: usize = 462;
 
 /// What one proof-reset batch may hold at once: the working set of a family
 /// deletion, not a copy of the family. Whichever bound is reached first ends
@@ -3328,6 +3572,7 @@ const PROOF_RESET_BATCH_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, PartialEq, Eq)]
 struct RootTail {
+    history_open: Option<HistoryOpenPublication>,
     custody_config_root: Option<[u8; 32]>,
     vector_directory_root: Option<[u8; 32]>,
     ddl_selector_roots: Option<[[u8; 32]; 2]>,
@@ -3378,6 +3623,7 @@ fn persist_changed_family_roots(
         }
         let encoded = encode_published_root(&PublishedRoot {
             identity: roots[family as usize].clone(),
+            history_open: tails[family as usize].history_open,
             custody_config_root: tails[family as usize].custody_config_root,
             vector_directory_root: tails[family as usize].vector_directory_root,
             ddl_selector_roots: tails[family as usize].ddl_selector_roots,
@@ -3443,7 +3689,14 @@ fn encode_root(root: &FamilyRoot) -> Vec<u8> {
 }
 
 fn encode_published_root(root: &PublishedRoot) -> Vec<u8> {
-    let mut encoded = encode_root(&root.identity);
+    let mut encoded = if root.history_open.is_some() {
+        let mut encoded = Vec::with_capacity(ENCODED_ROOT_BYTES);
+        encoded.push(ROOT_VERSION);
+        encoded.push(u8::from(root.identity.root.is_some()));
+        encoded.extend_from_slice(&root.identity.root.unwrap_or([0;32]));
+        encoded.extend_from_slice(&root.identity.hash);
+        encoded
+    } else { encode_root(&root.identity) };
     if let Some(custody_config_root) = root.custody_config_root {
         encoded.extend_from_slice(&custody_config_root);
     }
@@ -3459,6 +3712,12 @@ fn encode_published_root(root: &PublishedRoot) -> Vec<u8> {
         encoded.extend_from_slice(&root);
     }
     if let Some(root) = root.vector_pages_root { encoded.extend_from_slice(&root); }
+    if let Some(history) = root.history_open {
+        encoded.extend_from_slice(&history.control.encode());
+        encoded.extend_from_slice(&history.control_hash);
+        history.commit.encode_into(&mut encoded);
+        history.ddl.encode_into(&mut encoded);
+    }
     encoded
 }
 
@@ -3482,6 +3741,10 @@ fn decode_published_root(family: LogicalFamily, bytes: &[u8]) -> Result<Publishe
     let root = match bytes.get(cursor).copied() {
         Some(0) => {
             cursor += 1;
+            if family == LogicalFamily::ChangeAndDdl
+                && take_bytes(bytes, &mut cursor, 32, "empty history root id")? != [0; 32] {
+                return Err(history_control_damage("nonzero absent history root address"));
+            }
             None
         }
         Some(1) => {
@@ -3524,12 +3787,25 @@ fn decode_published_root(family: LogicalFamily, bytes: &[u8]) -> Result<Publishe
         .transpose()?;
     let vector_pages_root = (family == LogicalFamily::Configuration)
         .then(|| take_root_hash(bytes, &mut cursor, "vector page root")).transpose()?;
+    let history_open = if family == LogicalFamily::ChangeAndDdl {
+        let control = HistoryOpenControl::decode(take_bytes(bytes, &mut cursor, 234, "history open control")?)?;
+        if control.tree != root || control.tree_hash != hash {
+            return Err(history_control_damage("history control differs from canonical root"));
+        }
+        Some(HistoryOpenPublication {
+            control,
+            control_hash: take_root_hash(bytes, &mut cursor, "history control digest")?,
+            commit: PhysicalHistoryTable::decode(take_bytes(bytes, &mut cursor, 33, "commit descriptor")?)?,
+            ddl: PhysicalHistoryTable::decode(take_bytes(bytes, &mut cursor, 33, "DDL descriptor")?)?,
+        })
+    } else { None };
     if cursor != bytes.len() || (root.is_none() && hash != empty_hash(family)) {
         return Err(Error::Other(
             "logical identity root is malformed".to_owned(),
         ));
     }
     Ok(PublishedRoot {
+        history_open,
         identity: FamilyRoot {
             root,
             hash,
@@ -3799,19 +4075,23 @@ impl ResidentProofChunks {
 /// cache never refuses a read while it is still holding something.
 pub(super) struct ResidentProofChunkSet {
     state: Mutex<ResidentProofChunks>,
-    accountant: Option<Arc<crate::memory_accounting::MemoryAccountant>>,
+    accountant: Option<crate::memory_accounting::StoreAccountantHandle>,
     free_floor: usize,
     ceiling: usize,
     /// Declared bytes that must stay free for the charged part of this set to
     /// be held at all. Zero when the session declared no ceiling.
     headroom: usize,
+
 }
 
+// Declaration order is the cleanup protocol: state (all chunk/index/Vec
+// children) drops before its original counted accountant handle. The enclosing
+// Arc has PRE2's unchanged layout and adds no fixed-control liability.
 impl ResidentProofChunkSet {
     fn idle() -> Self {
         Self {
             state: Mutex::new(ResidentProofChunks::default()),
-            accountant: None,
+accountant: None,
             free_floor: 0,
             ceiling: 0,
             headroom: 0,
@@ -3909,7 +4189,7 @@ impl ResidentProofChunkSet {
         let kept = Arc::new(VerifiedReadNode {
             node: Arc::clone(&chunk.node),
             bytes: chunk.bytes,
-            _charge: charge,
+            _charge: AdmittedBytes::with_source(chunk._charge.as_ref().and_then(AdmittedBytes::source_custody), charge),
             _floor: floor,
         });
         let idx = state.insert(ResidentChunk {
@@ -3927,7 +4207,7 @@ impl ResidentProofChunkSet {
     fn admit(&self, bytes: usize) -> Option<AdmittedBytes> {
         let accountant = self.accountant.as_ref()?;
         accountant
-            .try_allocate_for(
+            .try_allocate_for_original(
                 bytes,
                 "content_identity",
                 "resident_proof_chunk",
@@ -3935,7 +4215,8 @@ impl ResidentProofChunkSet {
             )
             .ok()?;
         Some(AdmittedBytes {
-            accountant: Some(Arc::clone(accountant)),
+            reader_budget: None,
+            accountant: Some(accountant.clone()),
             bytes,
         })
     }
@@ -3979,7 +4260,7 @@ impl ResidentProofChunkSet {
     ) -> Self {
         Self {
             state: Mutex::new(ResidentProofChunks::default()),
-            accountant: Some(accountant),
+accountant: Some(crate::memory_accounting::StoreAccountantHandle::new(accountant)),
             free_floor: 0,
             ceiling,
             headroom: 0,
@@ -3990,7 +4271,7 @@ impl ResidentProofChunkSet {
     fn free_for_test(floor: usize) -> Self {
         Self {
             state: Mutex::new(ResidentProofChunks::default()),
-            accountant: None,
+accountant: None,
             free_floor: floor,
             ceiling: floor,
             headroom: 0,
@@ -4064,6 +4345,7 @@ pub(super) struct ProofMemory {
     /// Set when `admission` refuses a charge. Windowing (the pool's own
     /// ceiling) leaves this empty; an accountant refusal is the typed error.
     refusal: std::cell::RefCell<Option<Error>>,
+    _writer_use: Option<crate::memory_accounting::WriterUse>,
 }
 
 /// One live charge, returned when the walk drops what it was holding —
@@ -4110,6 +4392,8 @@ impl ProofMemory {
     }
 
     fn new(limit: usize, admission: ProofAdmission) -> Self {
+        let writer_use = admission.accountant.as_ref().or(admission.scratch_accountant.as_ref())
+            .and_then(crate::memory_accounting::WriterUse::retain_if_writer);
         Self {
             limit: std::cell::Cell::new(limit),
             growth: None,
@@ -4121,6 +4405,7 @@ impl ProofMemory {
             exhausted: std::cell::Cell::new(false),
             admission: std::cell::RefCell::new(admission),
             refusal: std::cell::RefCell::new(None),
+            _writer_use: writer_use,
         }
     }
 
@@ -4309,11 +4594,14 @@ pub(crate) struct ContentIdentityReadVerifier {
     /// pinned storage snapshot, so a chunk can never be reused under another
     /// root or another snapshot. Idle until an owner declares its reservation.
     resident: Arc<ResidentProofChunkSet>,
+
+    _writer_use: Option<crate::memory_accounting::WriterUse>,
 }
 
 /// What one authenticated page's shared handle costs beside the decoded
 /// chunk it holds: the handle, its bookkeeping and the map node that keeps it.
-const VERIFIED_READ_NODE_HANDLE_BYTES: usize = 128;
+const VERIFIED_READ_NODE_HANDLE_BYTES: usize = std::mem::size_of::<VerifiedReadNode>()
+    + 4 * std::mem::size_of::<usize>();
 
 /// One authenticated page and the one charge that pays for it.
 ///
@@ -4395,6 +4683,7 @@ pub(crate) struct ReadAuthenticationNodes {
     leaves: BTreeMap<[u8; 34], CachedAuthenticatedLeaf>,
     leaf_bytes: usize,
     charge: ProofAdmission,
+    _writer_use: Option<crate::memory_accounting::WriterUse>,
 }
 
 struct CachedAuthenticatedLeaf {
@@ -4415,6 +4704,7 @@ impl ReadAuthenticationNodes {
             byte_limit,
             leaves: BTreeMap::new(),
             leaf_bytes: 0,
+            _writer_use: admission.as_ref().and_then(crate::memory_accounting::WriterUse::retain_if_writer),
             charge: ProofAdmission::new(admission),
         }
     }
@@ -4456,7 +4746,7 @@ impl ReadAuthenticationNodes {
             .nodes
             .values()
             .filter(|node| {
-                node._charge.is_some() || node._floor.is_some() || still_resident(&node.node)
+                node._charge.as_ref().is_some_and(|charge| charge.bytes != 0) || node._floor.is_some() || still_resident(&node.node)
             })
             .map(|node| node.bytes)
             .sum();
@@ -4464,7 +4754,7 @@ impl ReadAuthenticationNodes {
             .leaves
             .values()
             .filter(|leaf| {
-                leaf.node._charge.is_some()
+                leaf.node._charge.as_ref().is_some_and(|charge| charge.bytes != 0)
                     || leaf.node._floor.is_some()
                     || still_resident(&leaf.node.node)
             })
@@ -4586,16 +4876,20 @@ impl ContentIdentityReadVerifier {
         let nodes = read_txn
             .open_table(CONTENT_IDENTITY_NODES_TABLE)
             .map_err(RedbPersistence::storage_error)?;
+        let mut resident = ResidentProofChunkSet::idle();
+        resident.accountant = admission.as_ref().map(|accountant|
+            crate::memory_accounting::StoreAccountantHandle::new(Arc::clone(accountant)));
         Ok(Self {
             roots,
             custody_config_root,
             nodes,
             verified_records: Mutex::new(BTreeMap::new()),
             source: source.display().to_string(),
-            admission,
+            _writer_use: (admission).as_ref().and_then(crate::memory_accounting::WriterUse::retain_if_writer),
+admission,
             // Nothing is kept until an owner that holds the reservation says
             // so; see `retain_proved_chunks_within`.
-            resident: Arc::new(ResidentProofChunkSet::idle()),
+            resident: Arc::new(resident),
         })
     }
 
@@ -4626,13 +4920,12 @@ impl ContentIdentityReadVerifier {
                 .min(RESIDENT_PROOF_CHUNK_MAX_BYTES)
                 .max(reserved_bytes)
         });
-        self.resident = Arc::new(ResidentProofChunkSet {
-            state: Mutex::new(ResidentProofChunks::default()),
-            accountant: self.admission.clone(),
-            free_floor: reserved_bytes,
-            ceiling,
-            headroom: declared.map_or(0, |limit| limit / RESIDENT_PROOF_CHUNK_HEADROOM_SHARE),
-        });
+        // Every caller configures the fresh verifier before any walk can
+        // clone its resident handle. Reuse the control admitted at open.
+        let resident = Arc::get_mut(&mut self.resident).expect("fresh verifier owns its resident control");
+        resident.free_floor = reserved_bytes;
+        resident.ceiling = ceiling;
+        resident.headroom = declared.map_or(0, |limit| limit / RESIDENT_PROOF_CHUNK_HEADROOM_SHARE);
     }
 
     /// Open may prove ordered history before any statement begins. Release
@@ -4703,7 +4996,60 @@ impl ContentIdentityReadVerifier {
         }
     }
 
+    /// Point proof scratch belongs to this operation; any cache already held
+    /// by the source keeps its separately admitted owner.
+    pub(crate) fn verify_with_read_memory(
+        &self,
+        mutation: &ContentIdentityMutation,
+        memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<()> {
+        let _controls = contextdb_core::read_memory::ReadCredit::try_new(
+            memory.clone(),
+            std::mem::size_of::<Mutex<Option<Error>>>() + 2 * std::mem::size_of::<usize>(),
+            "content_identity", "read_proof_controls",
+            "Reduce the requested proof work or raise the declared reader memory limit.",
+        )?;
+        let refusal = Arc::new(Mutex::new(None));
+        let mut admission = ProofAdmission::new(None);
+        admission.reader_budget = Some(memory);
+        admission.reader_refusal = Some(refusal.clone());
+        let result = self.verify_with_batch_admission(mutation, &mut BTreeMap::new(), &mut 0, 0, self.admission.is_some(), &mut admission, None).map(|_| ());
+        let original = refusal.lock().unwrap_or_else(|e| e.into_inner()).take();
+        match original { Some(error) => Err(error), None => result.map_err(|error| self.typed(error)) }
+    }
+
+    /// Authenticate a hashed reader projection with operation-owned scratch
+    /// and the caller's checkpoint at every input window and proof descent.
+    pub(crate) fn verify_with_read_memory_before(
+        &self,
+        mutation: &ContentIdentityMutation,
+        memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        before: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        before()?;
+        let _controls = contextdb_core::read_memory::ReadCredit::try_new(
+            memory.clone(),
+            std::mem::size_of::<Mutex<Option<Error>>>() + 2 * std::mem::size_of::<usize>(),
+            "content_identity", "read_proof_controls",
+            "Reduce the requested proof work or raise the declared reader memory limit.",
+        )?;
+        let refusal = Arc::new(Mutex::new(None));
+        let mut admission = ProofAdmission::new(None);
+        admission.reader_budget = Some(memory);
+        admission.reader_refusal = Some(refusal.clone());
+        let result = self.verify_reader_projection(mutation, &mut admission, None, before);
+        let original = refusal.lock().unwrap_or_else(|error| error.into_inner()).take();
+        match original {
+            Some(error) => Err(error),
+            None => result.map_err(|error| match error {
+                Error::ReadCancelled | Error::ReadFailure(_) => error,
+                other => self.typed(other),
+            }),
+        }
+    }
+
     pub(crate) fn verify(&self, mutation: &ContentIdentityMutation) -> Result<()> {
+        if let Some(memory) = crate::read_image_memory::current_reader_budget() { return self.verify_with_read_memory(mutation, memory); }
         self.verify_with_batch(mutation, &mut BTreeMap::new(), &mut 0, 0, true)
             .map(|_| ())
             .map_err(|error| self.typed(error))
@@ -4866,12 +5212,44 @@ impl ContentIdentityReadVerifier {
         // until this call returns and drops it.
         let mut admission =
             ProofAdmission::reclaiming(self.admission.clone(), Arc::clone(&self.resident));
+        self.verify_with_batch_admission(mutation, batch, batch_bytes, byte_limit, remember_record, &mut admission, None)
+    }
+
+    #[allow(clippy::too_many_arguments, reason = "One proof walk retains its existing batch and supplied admission")]
+    fn verify_with_batch_admission(
+        &self,
+        mutation: &ContentIdentityMutation,
+        batch: &mut BTreeMap<[u8; 33], Arc<VerifiedReadNode>>,
+        batch_bytes: &mut usize,
+        byte_limit: usize,
+        remember_record: bool,
+        admission: &mut ProofAdmission,
+        expected_override: Option<Option<[u8;32]>>,
+    ) -> Result<Option<([u8; 33], Arc<VerifiedReadNode>)>> {
+        self.verify_with_batch_admission_and_checkpoint(
+            mutation, batch, batch_bytes, byte_limit, remember_record,
+            admission, expected_override, &mut || Ok(()),
+        )
+    }
+
+    fn verify_with_batch_admission_and_checkpoint(
+        &self,
+        mutation: &ContentIdentityMutation,
+        batch: &mut BTreeMap<[u8; 33], Arc<VerifiedReadNode>>,
+        batch_bytes: &mut usize,
+        byte_limit: usize,
+        remember_record: bool,
+        admission: &mut ProofAdmission,
+        expected_override: Option<Option<[u8;32]>>,
+        checkpoint: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Option<([u8; 33], Arc<VerifiedReadNode>)>> {
+        checkpoint()?;
+        admission.admit(mutation_key_capacity(mutation, admission)?)?;
         let wanted_key = mutation_tree_key(mutation)?;
-        admission.admit(wanted_key.capacity())?;
-        let wanted_value = mutation
+        let wanted_value = expected_override.unwrap_or_else(|| mutation
             .logical_value
             .as_deref()
-            .map(|value| value_hash(mutation.family, value));
+            .map(|value| value_hash(mutation.family, value)));
         let record_id = node_id(&wanted_key);
         let mut record_storage_key = [0; 33];
         record_storage_key[0] = mutation.family as u8;
@@ -4898,6 +5276,7 @@ impl ContentIdentityReadVerifier {
         let mut actual_value = None;
         let mut verified_leaf = None;
         while let Some(id) = current {
+            checkpoint()?;
             let verified = self.verified_node(
                 mutation.family,
                 id,
@@ -4905,7 +5284,7 @@ impl ContentIdentityReadVerifier {
                 batch,
                 batch_bytes,
                 byte_limit,
-                &mut admission,
+                admission,
             )?;
             let node = &verified.node;
             if node.level == 0 {
@@ -4914,7 +5293,7 @@ impl ContentIdentityReadVerifier {
                     mutation.family,
                     &node.entries,
                     &wanted_key,
-                    &mut admission,
+                    admission,
                 )?
                 .ok()
                 .map(|index| node.entries[index].value_hash);
@@ -4925,11 +5304,12 @@ impl ContentIdentityReadVerifier {
             let mut high = node.entries.len();
             while low < high {
                 let mid = (low + high) / 2;
+                checkpoint()?;
                 let (key, charge) = resolve_key_charged(
                     &self.nodes,
                     mutation.family,
                     &node.entries[mid].key,
-                    &mut admission,
+                    admission,
                 )?;
                 let ordering = identity_key_cmp(&key, &wanted_key)?;
                 drop(key);
@@ -4968,6 +5348,64 @@ impl ContentIdentityReadVerifier {
         Ok(verified_leaf)
     }
 
+    fn verify_reader_projection(&self, mutation: &ContentIdentityMutation, admission: &mut ProofAdmission, expected: Option<Option<[u8; 32]>>, checkpoint: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+        checkpoint()?;
+        admission.admit(mutation_key_capacity(mutation, admission)?)?;
+        // Current projection keys are hashed. Hash the borrowed logical key in
+        // windows rather than constructing another full logical-key buffer.
+        let mut wanted = Vec::with_capacity(33);
+        wanted.push(HASHED_KEY_TAG);
+        wanted.extend_from_slice(&hash_parts_checkpoint(b"contextdb-logical-record-key-v1", &[&[mutation.family as u8], &mutation.logical_key], checkpoint)?);
+        let wanted_value = match expected {
+            Some(value) => value,
+            None => mutation.logical_value.as_deref().map(|value| hash_parts_checkpoint(b"contextdb-logical-record-value-v1", &[&[mutation.family as u8], value], checkpoint)).transpose()?,
+        };
+        // Preserve the existing record-work observation, once per proof.
+        #[cfg(feature = "test-seams")]
+        observe_read_authentication_hash(mutation, mutation.logical_key.len() + mutation.logical_value.as_ref().map_or(0, Vec::len));
+        let mut current = self.roots[mutation.family as usize].root;
+        let mut expected_hash = self.roots[mutation.family as usize].hash;
+        let mut actual = None;
+        while let Some(id) = current {
+            checkpoint()?;
+            let (node, charged) = read_node_charged(&self.nodes, mutation.family, id, admission)?;
+            let result = (|| {
+                if node.subtree_hash != expected_hash { return Err(Error::Other("logical content page disagrees with its committed proof path".into())); }
+                let mut low = 0;
+                let mut high = node.entries.len();
+                while low < high {
+                    let mid = (low + high) / 2;
+                    let (key, charge) = resolve_key_charged_checkpoint(&self.nodes, mutation.family, &node.entries[mid].key, admission, checkpoint)?;
+                    let ordering = identity_key_cmp_checkpoint(&key, &wanted, checkpoint);
+                    drop(key);
+                    admission.release(charge);
+                    match ordering? {
+                        Ordering::Less => low = mid + 1,
+                        _ => high = mid,
+                    }
+                }
+                if node.level == 0 {
+                    if let Some(entry) = node.entries.get(low) {
+                        let (key, charge) = resolve_key_charged_checkpoint(&self.nodes, mutation.family, &entry.key, admission, checkpoint)?;
+                        let ordering = identity_key_cmp_checkpoint(&key, &wanted, checkpoint);
+                        drop(key);
+                        admission.release(charge);
+                        if ordering? == Ordering::Equal { actual = Some(entry.value_hash); }
+                    }
+                    current = None;
+                } else if let Some(entry) = node.entries.get(low) {
+                    current = Some(chunk_id_checkpoint(node.level - 1, &entry.key, checkpoint)?);
+                    expected_hash = entry.value_hash;
+                } else { current = None; }
+                Ok(())
+            })();
+            drop(node);
+            admission.release(charged);
+            result?;
+        }
+        verify_record_witness(mutation.family, wanted_value, actual)
+    }
+
     fn verified_node(
         &self,
         family: LogicalFamily,
@@ -4996,13 +5434,15 @@ impl ContentIdentityReadVerifier {
             (verified, false)
         } else {
             let (node, _charged) = read_node_charged(&self.nodes, family, id, decode_admission)?;
+            if decode_admission.reader_budget.is_some() { decode_admission.admit(VERIFIED_READ_NODE_HANDLE_BYTES)?; }
             #[cfg(feature = "test-seams")]
             crate::read_work_probe::note_hashed_bytes(encode_node(&node).len());
             (
                 Arc::new(VerifiedReadNode {
                     bytes: node_live_bytes(&node) + VERIFIED_READ_NODE_HANDLE_BYTES,
                     node: Arc::new(node),
-                    _charge: None,
+                    _charge: AdmittedBytes::with_source(
+                        self.admission.as_ref().and_then(crate::memory_accounting::StoreAccountantHandle::retain_if_writer), None),
                     _floor: None,
                 }),
                 true,
@@ -5026,7 +5466,7 @@ impl ContentIdentityReadVerifier {
             && (!reusable || self.statement_reuse_has_room());
         let verified = if from_store && reusable {
             let decoded = verified.bytes - VERIFIED_READ_NODE_HANDLE_BYTES;
-            match self.resident.retain(storage_key, &verified) {
+            match self.admission.as_ref().and_then(|_| self.resident.retain(storage_key, &verified)) {
                 Some(kept) => {
                     // The resident set's own admission or floor share now
                     // covers this decode, and every holder shares its handle.
@@ -5045,7 +5485,9 @@ impl ContentIdentityReadVerifier {
                     Arc::new(VerifiedReadNode {
                         node: Arc::clone(&verified.node),
                         bytes: verified.bytes,
-                        _charge: Some(decode_admission.detach(verified.bytes)),
+                        _charge: AdmittedBytes::with_source(
+                            self.admission.as_ref().and_then(crate::memory_accounting::StoreAccountantHandle::retain_if_writer),
+                            Some(decode_admission.detach(verified.bytes))),
                         _floor: None,
                     })
                 }
@@ -5240,13 +5682,61 @@ impl ContentIdentityReadVerifier {
     where
         E: From<Error>,
     {
+        self.visit_history_from(
+            kind,
+            std::ops::Bound::Unbounded,
+            reverse,
+            proof,
+            before_page,
+            visit,
+        )
+    }
+
+    /// Seek within one authenticated history range at an addressed coordinate.
+    /// The proof covers the first selected member (or its absence), so callers
+    /// can stop there without reading unrelated primary history records.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn visit_history_from<E>(
+        &self,
+        kind: HistoryKind,
+        start: std::ops::Bound<Vec<u8>>,
+        reverse: bool,
+        proof: &ProofMemory,
+        before_page: &mut dyn FnMut() -> std::result::Result<(), E>,
+        visit: &mut OrderedLeafVisit<'_, E>,
+    ) -> std::result::Result<bool, E>
+    where
+        E: From<Error>,
+    {
+        let coordinate_bytes = match &start {
+            std::ops::Bound::Included(key) | std::ops::Bound::Excluded(key) => key.len(),
+            std::ops::Bound::Unbounded => 0,
+        };
+        let bounds_bytes = coordinate_bytes.checked_add(8)
+            .and_then(|bytes| bytes.checked_add(3 * std::mem::size_of::<Vec<u8>>()))
+            .ok_or_else(|| E::from(self.corrupt("history bound layout overflow")))?;
+        let Some(_bounds_charge) = proof.charge_scratch(bounds_bytes) else { return Ok(false); };
         let low = history_tree_key(kind, &[]);
         let mut high = low.clone();
         *high.last_mut().expect("history kind byte") += 1;
-        let start = if reverse {
-            std::ops::Bound::Included(high.clone())
-        } else {
-            std::ops::Bound::Included(low.clone())
+        let mut tree_key = |coordinate: &[u8]| -> std::result::Result<Vec<u8>, E> {
+            let capacity = coordinate.len().checked_add(2).ok_or_else(|| E::from(self.corrupt("history key overflow")))?;
+            let mut key = Vec::with_capacity(capacity);
+            key.extend_from_slice(&[ORDERED_HISTORY_KEY_TAG, kind as u8]);
+            for window in coordinate.chunks(64 * 1024) { before_page()?; key.extend_from_slice(window); }
+            Ok(key)
+        };
+        let start = match start {
+            std::ops::Bound::Included(coordinate) => {
+                std::ops::Bound::Included(tree_key(&coordinate)?)
+            }
+            std::ops::Bound::Excluded(coordinate) => {
+                std::ops::Bound::Excluded(tree_key(&coordinate)?)
+            }
+            std::ops::Bound::Unbounded if reverse => {
+                std::ops::Bound::Included(high.clone())
+            }
+            std::ops::Bound::Unbounded => std::ops::Bound::Included(low.clone()),
         };
         let bounds = OrderedVisitBounds {
             low: &low,
@@ -5361,12 +5851,8 @@ impl ContentIdentityReadVerifier {
         };
         let node = &verified.node;
         if node.level > 0 {
-            let positions: Box<dyn Iterator<Item = usize>> = if bounds.reverse {
-                Box::new((0..node.entries.len()).rev())
-            } else {
-                Box::new(0..node.entries.len())
-            };
-            for position in positions {
+            for ordinal in 0..node.entries.len() {
+                let position = if bounds.reverse { node.entries.len() - 1 - ordinal } else { ordinal };
                 let child = &node.entries[position];
                 if child.key.first() == Some(&KEY_REFERENCE_TAG) {
                     before_page()?;
@@ -5380,11 +5866,8 @@ impl ContentIdentityReadVerifier {
                     *stopped = true;
                     break;
                 };
-                let upper = resolve_key(&self.nodes, family, &child.key)
-                    .map_err(|error| E::from(self.typed(error)))?;
-                let before_start = bounds
-                    .page_before_start(&upper)
-                    .map_err(|error| E::from(self.typed(error)))?;
+                let upper = checkpoint_operation(before_page, |checkpoint| resolve_key_checkpoint(&self.nodes, family, &child.key, checkpoint).map_err(|error| self.typed(error)))?;
+                let before_start = checkpoint_operation(before_page, |checkpoint| bounds.page_before_start_checkpoint(&upper, checkpoint).map_err(|error| self.typed(error)))?;
                 drop(upper);
                 drop(upper_charge);
                 if before_start {
@@ -5404,11 +5887,8 @@ impl ContentIdentityReadVerifier {
                         *stopped = true;
                         break;
                     };
-                    let lower = resolve_key(&self.nodes, family, prior)
-                        .map_err(|error| E::from(self.typed(error)))?;
-                    let after_start = bounds
-                        .page_after_start(&lower)
-                        .map_err(|error| E::from(self.typed(error)))?;
+                    let lower = checkpoint_operation(before_page, |checkpoint| resolve_key_checkpoint(&self.nodes, family, prior, checkpoint).map_err(|error| self.typed(error)))?;
+                    let after_start = checkpoint_operation(before_page, |checkpoint| bounds.page_after_start_checkpoint(&lower, checkpoint).map_err(|error| self.typed(error)))?;
                     drop(lower);
                     drop(lower_charge);
                     if after_start {
@@ -5417,7 +5897,7 @@ impl ContentIdentityReadVerifier {
                 }
                 self.visit_ordered_node(
                     family,
-                    Some(chunk_id(node.level - 1, &child.key)),
+                    Some(checkpoint_operation(before_page, |checkpoint| chunk_id_checkpoint(node.level - 1, &child.key, checkpoint))?),
                     child.value_hash,
                     bounds,
                     batch,
@@ -5432,12 +5912,9 @@ impl ContentIdentityReadVerifier {
                 }
             }
         } else {
-            let entries: Box<dyn Iterator<Item = &PageEntry>> = if bounds.reverse {
-                Box::new(node.entries.iter().rev())
-            } else {
-                Box::new(node.entries.iter())
-            };
-            for entry in entries {
+            for ordinal in 0..node.entries.len() {
+                let position = if bounds.reverse { node.entries.len() - 1 - ordinal } else { ordinal };
+                let entry = &node.entries[position];
                 if is_key_reference(entry) {
                     before_page()?;
                 }
@@ -5450,11 +5927,8 @@ impl ContentIdentityReadVerifier {
                     *stopped = true;
                     break;
                 };
-                let key = resolve_key(&self.nodes, family, &entry.key)
-                    .map_err(|error| E::from(self.typed(error)))?;
-                if !bounds
-                    .includes(&key)
-                    .map_err(|error| E::from(self.typed(error)))?
+                let key = checkpoint_operation(before_page, |checkpoint| resolve_key_checkpoint(&self.nodes, family, &entry.key, checkpoint).map_err(|error| self.typed(error)))?;
+                if !checkpoint_operation(before_page, |checkpoint| bounds.includes_checkpoint(&key, checkpoint).map_err(|error| self.typed(error)))?
                 {
                     continue;
                 }
@@ -5482,6 +5956,38 @@ struct OrderedVisitBounds<'a> {
 }
 
 impl OrderedVisitBounds<'_> {
+    fn includes_checkpoint(&self, key: &[u8], checkpoint: &mut dyn FnMut() -> Result<()>) -> Result<bool> {
+        if key.first() != Some(&ORDERED_HISTORY_KEY_TAG) { checkpoint()?; return self.includes(key); }
+        if identity_key_cmp_checkpoint(key, self.low, checkpoint)? != Ordering::Greater || identity_key_cmp_checkpoint(key, self.high, checkpoint)? != Ordering::Less { return Ok(false); }
+        let compare = match self.start {
+            std::ops::Bound::Included(start) | std::ops::Bound::Excluded(start) => identity_key_cmp_checkpoint(key, start, checkpoint)?,
+            std::ops::Bound::Unbounded => return Ok(true),
+        };
+        Ok(match (self.reverse, self.start) {
+            (true, std::ops::Bound::Included(_)) => compare.is_le(),
+            (true, _) => compare.is_lt(),
+            (false, std::ops::Bound::Included(_)) => compare.is_ge(),
+            (false, _) => compare.is_gt(),
+        })
+    }
+    fn page_before_start_checkpoint(&self, key: &[u8], checkpoint: &mut dyn FnMut() -> Result<()>) -> Result<bool> {
+        if key.first() != Some(&ORDERED_HISTORY_KEY_TAG) { checkpoint()?; return self.page_before_start(key); }
+        if self.reverse { return Ok(identity_key_cmp_checkpoint(key, self.low, checkpoint)? != Ordering::Greater); }
+        Ok(match self.start {
+            std::ops::Bound::Included(start) => identity_key_cmp_checkpoint(key, start, checkpoint)?.is_lt(),
+            std::ops::Bound::Excluded(start) => identity_key_cmp_checkpoint(key, start, checkpoint)?.is_le(),
+            std::ops::Bound::Unbounded => false,
+        })
+    }
+    fn page_after_start_checkpoint(&self, key: &[u8], checkpoint: &mut dyn FnMut() -> Result<()>) -> Result<bool> {
+        if key.first() != Some(&ORDERED_HISTORY_KEY_TAG) { checkpoint()?; return self.page_after_start(key); }
+        if !self.reverse { return Ok(identity_key_cmp_checkpoint(key, self.high, checkpoint)? != Ordering::Less); }
+        Ok(match self.start {
+            std::ops::Bound::Included(start) => identity_key_cmp_checkpoint(key, start, checkpoint)?.is_gt(),
+            std::ops::Bound::Excluded(start) => identity_key_cmp_checkpoint(key, start, checkpoint)?.is_ge(),
+            std::ops::Bound::Unbounded => false,
+        })
+    }
     fn compare_start(&self, key: &[u8], start: &[u8]) -> Result<Ordering> {
         if !self.prefix_successor {
             return identity_key_cmp(key, start);
@@ -5666,32 +6172,65 @@ fn vector_schema_pages_hash(pages: [u8; 32], schema: [u8; 32]) -> [u8; 32] {
     *hash.finalize().as_bytes()
 }
 
-pub(super) fn vector_schema_pages_root_in_write(write: &redb::WriteTransaction) -> Result<[u8; 32]> {
-    let pages = write.table_root_fingerprint(super::vector_paged::PAGES).map_err(RedbPersistence::storage_error)?.unwrap_or([0; 32]);
-    let schema = write.table_root_fingerprint(super::META_TABLE).map_err(RedbPersistence::storage_error)?.unwrap_or([0; 32]);
+pub(super) fn vector_schema_pages_root_in_write(
+    write: &redb::WriteTransaction,
+) -> Result<[u8; 32]> {
+    let pages = write
+        .table_root_fingerprint(super::vector_paged::PAGES)
+        .map_err(RedbPersistence::storage_error)?
+        .unwrap_or([0; 32]);
+    let schema = write
+        .table_root_fingerprint(super::META_TABLE)
+        .map_err(RedbPersistence::storage_error)?
+        .unwrap_or([0; 32]);
     Ok(vector_schema_pages_hash(pages, schema))
 }
 
 pub(super) fn vector_schema_pages_root_in_read(read: &redb::ReadTransaction) -> Result<[u8; 32]> {
-    let pages = read.table_root_fingerprint(super::vector_paged::PAGES).map_err(RedbPersistence::storage_error)?.unwrap_or([0; 32]);
-    let schema = read.table_root_fingerprint(super::META_TABLE).map_err(RedbPersistence::storage_error)?.unwrap_or([0; 32]);
+    let pages = read
+        .table_root_fingerprint(super::vector_paged::PAGES)
+        .map_err(RedbPersistence::storage_error)?
+        .unwrap_or([0; 32]);
+    let schema = read
+        .table_root_fingerprint(super::META_TABLE)
+        .map_err(RedbPersistence::storage_error)?
+        .unwrap_or([0; 32]);
     Ok(vector_schema_pages_hash(pages, schema))
 }
 
 pub(super) fn vector_pages_root_in_read(read: &redb::ReadTransaction) -> Result<[u8; 32]> {
-    let roots=read.open_table(CONTENT_IDENTITY_ROOTS_TABLE).map_err(RedbPersistence::storage_error)?;
-    let value=roots.get(LogicalFamily::Configuration as u8).map_err(RedbPersistence::storage_error)?.ok_or_else(|| Error::Other("committed configuration root is missing".into()))?;
-    decode_published_root(LogicalFamily::Configuration,value.value())?.vector_pages_root.ok_or_else(|| Error::Other("committed vector page root is missing".into()))
+    let roots = read
+        .open_table(CONTENT_IDENTITY_ROOTS_TABLE)
+        .map_err(RedbPersistence::storage_error)?;
+    let value = roots
+        .get(LogicalFamily::Configuration as u8)
+        .map_err(RedbPersistence::storage_error)?
+        .ok_or_else(|| Error::Other("committed configuration root is missing".into()))?;
+    decode_published_root(LogicalFamily::Configuration, value.value())?
+        .vector_pages_root
+        .ok_or_else(|| Error::Other("committed vector page root is missing".into()))
 }
 pub(super) fn bind_vector_pages_root_in_write(write: &redb::WriteTransaction) -> Result<()> {
-    let fingerprint=vector_schema_pages_root_in_write(write)?;
-    let mut roots=write.open_table(CONTENT_IDENTITY_ROOTS_TABLE).map_err(RedbPersistence::storage_error)?;
-    let mut root={
-        let value=roots.get(LogicalFamily::Configuration as u8).map_err(RedbPersistence::storage_error)?;
-        match value { Some(value) => decode_published_root(LogicalFamily::Configuration,value.value())?, None => empty_published_root(LogicalFamily::Configuration) }
+    let fingerprint = vector_schema_pages_root_in_write(write)?;
+    let mut roots = write
+        .open_table(CONTENT_IDENTITY_ROOTS_TABLE)
+        .map_err(RedbPersistence::storage_error)?;
+    let mut root = {
+        let value = roots
+            .get(LogicalFamily::Configuration as u8)
+            .map_err(RedbPersistence::storage_error)?;
+        match value {
+            Some(value) => decode_published_root(LogicalFamily::Configuration, value.value())?,
+            None => empty_published_root(LogicalFamily::Configuration),
+        }
     };
-    root.vector_pages_root=Some(fingerprint);
-    roots.insert(LogicalFamily::Configuration as u8,encode_published_root(&root).as_slice()).map_err(RedbPersistence::storage_error)?;
+    root.vector_pages_root = Some(fingerprint);
+    roots
+        .insert(
+            LogicalFamily::Configuration as u8,
+            encode_published_root(&root).as_slice(),
+        )
+        .map_err(RedbPersistence::storage_error)?;
     Ok(())
 }
 
@@ -5717,13 +6256,27 @@ impl RedbPersistence {
         &self,
         accountant: Arc<crate::memory_accounting::MemoryAccountant>,
     ) {
-        let _ = self.proof_accountant.set(accountant);
+        let _ = self.proof_accountant.set(super::ProofAccountantSlot::attached(accountant));
     }
 
     pub(crate) fn proof_accountant(
         &self,
     ) -> Option<Arc<crate::memory_accounting::MemoryAccountant>> {
-        self.proof_accountant.get().map(Arc::clone)
+        self.proof_accountant.get().map(super::ProofAccountantSlot::accountant)
+    }
+
+    // Private returned-loader provenance. Matching retains only the immutable
+    // attach-time role; a mismatched supplied reader remains its own funder.
+    pub(crate) fn proof_accountant_handle_for(
+        &self,
+        accountant: &Arc<crate::memory_accounting::MemoryAccountant>,
+    ) -> Option<crate::memory_accounting::StoreAccountantHandle> {
+        self.proof_accountant.get().and_then(|slot| slot.original_handle_for(accountant))
+    }
+
+    pub(crate) fn prepare_proof_owner(&self) -> Result<()> {
+        if let Some(slot) = self.proof_accountant.get() { slot.prepare()?; }
+        Ok(())
     }
 
     pub(super) fn proof_scratch_owner(
@@ -5736,8 +6289,8 @@ impl RedbPersistence {
     }
 
     /// One transaction's proof admission, charged to the database accountant.
-    pub(crate) fn proof_admission(&self) -> ProofAdmission {
-        ProofAdmission::new(self.proof_accountant()).with_scratch_owner(self.proof_scratch_owner())
+    pub(crate) fn proof_admission(&self) -> OwnedProofAdmission {
+        OwnedProofAdmission::new(ProofAdmission::new(self.proof_accountant()).with_scratch_owner(self.proof_scratch_owner()))
     }
 
     pub(crate) fn require_current_content_identity(&self) -> Result<()> {
@@ -5993,6 +6546,7 @@ impl RedbPersistence {
         let mut roots: [FamilyRoot; 11] =
             std::array::from_fn(|family| empty_root(LogicalFamily::ALL[family]));
         let mut tails: [RootTail; 11] = std::array::from_fn(|_| RootTail {
+            history_open: None,
             custody_config_root: None,
             vector_directory_root: None,
             ddl_selector_roots: None,
@@ -6007,6 +6561,7 @@ impl RedbPersistence {
             let published = decode_published_root(family, encoded.value())?;
             roots[family as usize] = published.identity;
             tails[family as usize] = RootTail {
+                history_open: published.history_open,
                 custody_config_root: published.custody_config_root,
                 vector_directory_root: published.vector_directory_root,
                 ddl_selector_roots: published.ddl_selector_roots,
@@ -6189,6 +6744,33 @@ impl RedbPersistence {
                     observe_identity_span(IdentitySpan::CoalesceAndGroup, sort_started);
                     enter_family(family, mutations.len());
                 }
+                let mut history = tails[family as usize].history_open;
+                let mut refresh = [false;3];
+                if let Some(publication) = history.as_mut() {
+                    for (key, value) in &mutations {
+                        if key.starts_with(&[ORDERED_HISTORY_KEY_TAG, HistoryKind::CommitIndex as u8]) {
+                            let raw: [u8;8] = key[2..].try_into().map_err(|_|history_control_damage("invalid changed commit coordinate"))?;
+                            let lsn = Lsn(u64::from_be_bytes(raw));
+                            let old = writer_window::history_member(&nodes,admission,&roots[family as usize],key)?;
+                            publication.control.commit_count = match (old.is_some(), value.is_some()) {
+                                (false, true) => publication.control.commit_count.checked_add(1),
+                                (true, false) => publication.control.commit_count.checked_sub(1),
+                                _ => Some(publication.control.commit_count),
+                            }.ok_or_else(|| history_control_damage("history member count overflow"))?;
+                            if let Some(hash) = value {
+                                if publication.control.first.is_none_or(|pair|lsn <= pair.0) { publication.control.first = Some((lsn,*hash)); }
+                                if publication.control.last.is_none_or(|pair|lsn >= pair.0) { publication.control.last = Some((lsn,*hash)); }
+                            } else {
+                                refresh[0] |= publication.control.first.is_some_and(|pair|pair.0==lsn);
+                                refresh[1] |= publication.control.last.is_some_and(|pair|pair.0==lsn);
+                            }
+                        } else if key.starts_with(&[ORDERED_HISTORY_KEY_TAG, HistoryKind::DdlLog as u8]) {
+                            // DDL's variable coordinate stays in the proof window; retain only fixed facts.
+                            writer_window::history_member(&nodes,admission,&roots[family as usize],key)?;
+                            refresh[2] = true;
+                        }
+                    }
+                }
                 let updated = writer_window::update_family_consuming_keys(
                     &mut nodes,
                     admission,
@@ -6201,6 +6783,18 @@ impl RedbPersistence {
                 #[cfg(feature = "test-seams")]
                 leave_family();
                 roots[family as usize] = updated?;
+                if let Some(publication) = history.as_mut() {
+                    let root = &roots[family as usize];
+                    publication.control.tree = root.root;
+                    publication.control.tree_hash = root.hash;
+                    if refresh[0] { publication.control.first = writer_window::history_commit_extreme(&nodes, admission, root, false)?; }
+                    if refresh[1] { publication.control.last = writer_window::history_commit_extreme(&nodes, admission, root, true)?; }
+                    if refresh[2] { publication.control.ddl = writer_window::history_ddl_extreme(&nodes, admission, root)?; }
+                    if publication.control.commit_count == 0 { publication.control.first = None; publication.control.last = None; }
+                    publication.control.validate()?;
+                    publication.control_hash = publication.control.digest();
+                    tails[family as usize].history_open = history;
+                }
             }
             drop(nodes);
             admission.release(grouped_bytes);
@@ -6229,7 +6823,8 @@ impl RedbPersistence {
                 .map_err(Self::storage_error)?
                 .unwrap_or([0; 32]),
         );
-        tails[LogicalFamily::Configuration as usize].vector_pages_root = Some(vector_schema_pages_root_in_write(write_txn)?);
+        tails[LogicalFamily::Configuration as usize].vector_pages_root =
+            Some(vector_schema_pages_root_in_write(write_txn)?);
         persist_changed_family_roots(write_txn, &roots, &original_roots, &tails, &original_tails)?;
         #[cfg(feature = "test-seams")]
         publish_directory_binding_work();
@@ -6938,7 +7533,7 @@ mod resident_chunk_gate_tests {
 mod resident_proof_chunk_set_tests {
     use super::*;
 
-    fn dummy_chunk(bytes: usize) -> Arc<VerifiedReadNode> {
+    fn dummy_chunk(bytes: usize, accountant: &Arc<MemoryAccountant>) -> Arc<VerifiedReadNode> {
         Arc::new(VerifiedReadNode {
             node: Arc::new(Node {
                 level: 0,
@@ -6949,7 +7544,8 @@ mod resident_proof_chunk_set_tests {
                 subtree_hash: [0; 32],
             }),
             bytes,
-            _charge: None,
+            _charge: AdmittedBytes::with_source(
+                crate::memory_accounting::StoreAccountantHandle::retain_if_writer(accountant), None),
             _floor: None,
         })
     }
@@ -6968,7 +7564,7 @@ mod resident_proof_chunk_set_tests {
         ));
         let set = ResidentProofChunkSet::charged_for_test(Arc::clone(&accountant), PAGE);
         let key = storage_key(1);
-        set.retain(key, &dummy_chunk(PAGE));
+        set.retain(key, &dummy_chunk(PAGE, &accountant));
         assert_eq!(accountant.usage().used, PAGE);
 
         let first = set.get(&key).expect("retained page is borrowable");
@@ -7013,9 +7609,12 @@ mod resident_proof_chunk_set_tests {
         const LARGE: u8 = 64;
         const CEILING: usize = PAGE * LARGE as usize;
 
+        let accountant = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(
+            CEILING,
+        ));
         let small = ResidentProofChunkSet::free_for_test(CEILING);
         for tag in 0..SMALL {
-            small.retain(storage_key(tag), &dummy_chunk(PAGE));
+            small.retain(storage_key(tag), &dummy_chunk(PAGE, &accountant));
         }
         reset_touch_work_for_test();
         assert!(small.get(&storage_key(SMALL - 1)).is_some());
@@ -7023,7 +7622,7 @@ mod resident_proof_chunk_set_tests {
 
         let large = ResidentProofChunkSet::free_for_test(CEILING);
         for tag in 0..LARGE {
-            large.retain(storage_key(tag), &dummy_chunk(PAGE));
+            large.retain(storage_key(tag), &dummy_chunk(PAGE, &accountant));
         }
         reset_touch_work_for_test();
         assert!(large.get(&storage_key(LARGE - 1)).is_some());
@@ -7077,11 +7676,14 @@ mod resident_proof_chunk_set_tests {
     #[test]
     fn a_borrowed_floor_page_keeps_its_share_of_the_reservation_until_released() {
         const PAGE: usize = 64;
+        let accountant = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(
+            PAGE,
+        ));
         let set = ResidentProofChunkSet::free_for_test(PAGE);
         let held = storage_key(1);
         let replacement = storage_key(2);
 
-        set.retain(held, &dummy_chunk(PAGE));
+        set.retain(held, &dummy_chunk(PAGE, &accountant));
         assert_eq!(
             set.observed(),
             (1, PAGE, 0),
@@ -7089,7 +7691,7 @@ mod resident_proof_chunk_set_tests {
         );
 
         let borrowed = set.get(&held).expect("the retained page is borrowable");
-        set.retain(replacement, &dummy_chunk(PAGE));
+        set.retain(replacement, &dummy_chunk(PAGE, &accountant));
         assert_eq!(
             set.observed(),
             (0, PAGE, 0),
@@ -7107,7 +7709,7 @@ mod resident_proof_chunk_set_tests {
             "the share returns when the last holder lets go"
         );
 
-        set.retain(replacement, &dummy_chunk(PAGE));
+        set.retain(replacement, &dummy_chunk(PAGE, &accountant));
         assert_eq!(
             set.observed(),
             (1, PAGE, 0),
@@ -7115,3 +7717,10 @@ mod resident_proof_chunk_set_tests {
         );
     }
 }
+
+pub(super) mod history_open_control;
+pub(super) use history_open_control::{HistoryOpenControl, HistoryOpenPublication, PhysicalHistoryTable, ValidatedHistoryOpenControl};
+use history_open_control::history_control_damage;
+
+#[path = "content_identity/version_manifest.rs"]
+pub(super) mod version_manifest;

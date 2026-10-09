@@ -209,7 +209,7 @@ Paths below are relative to this crate unless they start with `crates/` or `../.
 | Database-side scheduling, events, gates and erasure | `database/cron.rs`, `event_bus.rs`, `trigger.rs`, `gate.rs`, `discard.rs`, `purge_predicate.rs`; `database/custody_store.rs` owns custody storage. |
 | Database policy and schema regression guards | `database/` holds policy admission, in-memory lineage, maintenance resource and received-schema replay tests beside its operation modules; the orchestration remains in `database.rs`. |
 | Durable repair, writer ownership and purge fencing | `persistence/transaction_repair.rs` repairs transaction ordering, `writer_file.rs` owns the physical writer file, and `purge_publication.rs` fences authoritative erasure across readers and crashes. |
-| Persistent reader presence, authenticated proofs and storage regression guards | `persistence/` owns `reader_presence.rs`, content identity, page/proof and generation tests, plus durable writer and repair modules; `persistence.rs` coordinates publication. |
+| Persistent reader presence, background-work holder presence, authenticated proofs and storage regression guards | `persistence/` owns `reader_presence.rs`, `holder_presence.rs` (public hold/probe/wait on the `.holders` companion), content identity, page/proof and generation tests, plus durable writer and repair modules; `persistence.rs` coordinates publication. |
 | Cross-store application and exported entry points | `composite_store.rs` composes write sets; `lib.rs` exports supported engine entry points. |
 | Sync request and reply flow | `sync_client.rs`, `sync_server.rs`; shared records and wire types live in `sync_types.rs`, `protocol.rs`. |
 | Work-ledger state and delivery | `work_ledger.rs`; server owns polling and flags. |
@@ -232,3 +232,22 @@ cargo test -p contextdb-engine --features test-seams,iroh --test sync
 ```
 
 Tests group under `tests/*.rs`; targets using private observation hooks need `test-seams`.
+
+## Producer historical root witnesses
+
+`persistence/history_root_witness.rs` records each canonical `rel_<table>` and
+historical relational-index root in the same transaction as its producer writes.
+Every sanctioned writer starts through `begin_history_write`; creation initializes
+the required witness schema, while stores without it must be recreated. An optional
+native transaction hook validates before mutation or compaction and captures roots
+after closed handles, refusing publication if a close-hook fails. Both retained read
+routes compare the relevant historical roots and witnesses from the same snapshot
+before CURRENT point/list or ordered answers, including absence. Each comparison is
+a fixed number of directory/header and witness point lookups, with native tree-height
+navigation; it enumerates no historical payloads. The 50-byte witness record and
+native transaction hook control are fixed budget terms.
+
+Guards: `persistence::ordered_run_integrity_tests::canonical_run_rejects_missing_extra_changed_and_hidden_physical_postings`,
+`database::cdb141_current_root_witness_tests::test_b_public_current_point_list_and_join_refuse_committed_history_damage`,
+and `persistence::history_root_witness::tests` (committed bypass, later producer refusal,
+held snapshot, abort, drop/recreate, empty root and absent/malformed evidence).

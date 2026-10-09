@@ -377,3 +377,24 @@ cached guard until eviction or invocation end. A value slice length omits other
 bytes in the pinned page and cannot serve this quote. The accessor adds no IO,
 allocation, mutation, or validation bypass; guard/value semantics stay unchanged.
 Changed source: `src/tree_store/btree_base.rs` (maintained upstream delta).
+
+The internal normal-table lifecycle hook is optional and scoped to one write transaction.
+Before open/delete/rename/relocation it permits caller policy to reject the old root;
+after a handle closes or bounded relocation finishes, the caller sees the finalized
+root header. A close-hook failure is retained and refuses commit before the transaction
+is marked completed, so abort preserves the old committed state. Normal-table root
+lookup distinguishes absent from empty without payload or catalog enumeration. A rename
+validates the old and destination names before mutation, then reports removal/creation.
+The engine owns historical witness classification, representation and publication.
+Compaction reports only its already selected table, with no changed-table collection.
+`TableRootEvent` and the hidden root/hook methods are gated by `contextdb-internal`.
+The function pointer and first-error mutex are a fixed `TableRootHookControl` budget
+term per write transaction; roots and witness records have fixed stack representations.
+No hook inventory survives across transactions or grows with retained history.
+
+CDB-141 source revision: `Database::begin_verified_read` (internal feature only)
+captures the ordinary native transaction guard with `PageHint::Verified`.
+The guard and retained-root lifetime are unchanged; every consumed page verifies
+its parent/root checksum, without scanning unvisited pages or retaining another
+reader object. `transactions.rs` shares construction through `new_with_hint`;
+ordinary upstream reads continue using `Clean`.

@@ -1176,14 +1176,24 @@ impl CursorPage {
     /// Assemble a public terminal answer. Working credit belongs to the private engine page.
     #[doc(hidden)]
     pub fn from_parts(columns: Vec<String>, rows: Vec<Vec<Value>>, has_more: bool) -> Self {
-        Self { columns, rows, has_more }
+        Self {
+            columns,
+            rows,
+            has_more,
+        }
     }
     /// Public terminal copies retain the HEAD payload (rulings 76/78).
-    pub fn try_clone(&self, _owner: std::sync::Arc<dyn crate::read_memory::ReadMemoryBudget>) -> crate::Result<Self> {
+    pub fn try_clone(
+        &self,
+        _owner: std::sync::Arc<dyn crate::read_memory::ReadMemoryBudget>,
+    ) -> crate::Result<Self> {
         Ok(self.clone())
     }
     #[doc(hidden)]
-    pub fn try_empty(columns: &[String], _owner: std::sync::Arc<dyn crate::read_memory::ReadMemoryBudget>) -> crate::Result<Self> {
+    pub fn try_empty(
+        columns: &[String],
+        _owner: std::sync::Arc<dyn crate::read_memory::ReadMemoryBudget>,
+    ) -> crate::Result<Self> {
         Ok(Self::from_parts(columns.to_vec(), Vec::new(), false))
     }
 

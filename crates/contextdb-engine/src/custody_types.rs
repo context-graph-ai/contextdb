@@ -308,7 +308,11 @@ impl crate::Database {
         tx: TxId,
         manifest: DeliveryManifest<'_>,
     ) -> contextdb_core::Result<()> {
-        self.register_delivery_manifest_with_read_memory(tx, manifest, self.declared_reader_memory()?)
+        self.register_delivery_manifest_with_read_memory(
+            tx,
+            manifest,
+            self.declared_reader_memory()?,
+        )
     }
 
     pub(crate) fn register_delivery_manifest_with_read_memory(
@@ -369,7 +373,10 @@ impl crate::Database {
     /// Only an admitted durable outcome grants credit; transport watermarks do not. `SYNC OFF`
     /// returns disabled and zero eligible units. Counts obey this handle's row scope and do not
     /// mutate custody. Administrative `SHOW` queries use the ordinary read session limits.
-    pub fn delivery_status(&self, root_table: &str) -> contextdb_core::Result<DeliveryStatusCounts> {
+    pub fn delivery_status(
+        &self,
+        root_table: &str,
+    ) -> contextdb_core::Result<DeliveryStatusCounts> {
         self.delivery_status_with_read_memory(root_table, self.declared_reader_memory()?)
     }
 
@@ -387,6 +394,7 @@ impl crate::Database {
 pub(crate) fn decode_outcome_projection(
     text: &str,
 ) -> contextdb_core::Result<Option<DeliveryOutcome>> {
+    let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
     fn required_nullable<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
     where
         D: serde::Deserializer<'de>,
@@ -424,9 +432,7 @@ pub(crate) fn decode_outcome_projection(
         #[serde(deserialize_with = "required_nullable")]
         conflicts: Option<Vec<Conflict>>,
     }
-    let Some(p): Option<OutcomeProjection> =
-        serde_json::from_str(text).map_err(|_| crate::custody::canonical::invalid())?
-    else {
+    let Some(p): Option<OutcomeProjection> = crate::read_image_memory::decode_json(text.as_bytes())? else {
         return Ok(None);
     };
     if p.tenant_id != p.cursor.tenant_id

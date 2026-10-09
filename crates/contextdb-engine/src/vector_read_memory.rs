@@ -36,6 +36,7 @@ pub trait ReadRequestBudgetProvider: std::fmt::Debug + Send + Sync {
 #[derive(Debug)]
 pub struct DeclaredReadMemory {
     limit: u64,
+    file_child_high_water: std::sync::atomic::AtomicU64,
     retained: std::sync::atomic::AtomicU64,
     live_child_control_bytes: std::sync::atomic::AtomicU64,
     live_acl_cache_bytes: std::sync::atomic::AtomicU64,
@@ -44,6 +45,7 @@ impl DeclaredReadMemory {
     pub fn from_reader_limit(limit: u64) -> Arc<Self> {
         Arc::new(Self {
             limit,
+            file_child_high_water: std::sync::atomic::AtomicU64::new(0),
             retained: std::sync::atomic::AtomicU64::new(0),
             live_child_control_bytes: std::sync::atomic::AtomicU64::new(0),
             live_acl_cache_bytes: std::sync::atomic::AtomicU64::new(0),
@@ -84,6 +86,15 @@ impl DeclaredReadMemory {
         }))
     }
 
+    /// Largest admitted live-byte figure recorded by an individual file
+    /// reader child. Children update this before the native allocation and
+    /// the session keeps the receipt after an operation child is dropped.
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn file_child_high_water(&self) -> u64 {
+        self.file_child_high_water
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     pub fn child(self: &Arc<Self>) -> Result<Arc<dyn ReadMemoryBudget>> {
         let control_bytes =
             std::mem::size_of::<DeclaredReadChild>() + 2 * std::mem::size_of::<usize>();
@@ -98,11 +109,14 @@ impl DeclaredReadMemory {
         debug_assert_ne!(control_bytes, 0);
         self.live_child_control_bytes
             .fetch_add(control_bytes as u64, std::sync::atomic::Ordering::SeqCst);
-        Ok(Arc::new(DeclaredReadChild {
+        let child = Arc::new(DeclaredReadChild {
             parent: self.clone(),
             retained: std::sync::atomic::AtomicU64::new(0),
             control_bytes,
-        }))
+        });
+        #[cfg(feature = "test-seams")]
+        register_child_observer(&child);
+        Ok(child)
     }
 }
 #[derive(Debug)]
@@ -111,29 +125,25 @@ struct DeclaredReadChild {
     parent: Arc<DeclaredReadMemory>,
     retained: std::sync::atomic::AtomicU64,
 }
-fn reader_memory_refusal(limit: u64, held: u64, requested: u64) -> contextdb_core::Error {
-    use contextdb_core::read_contract::{
-        OwnerLimitExceededDetail, ReadFailure, ReadFailureLimit, RequiredBytesSetting,
-    };
-    contextdb_core::Error::ReadFailure(ReadFailure::owner_limit_exceeded(
-        OwnerLimitExceededDetail {
-            limit: ReadFailureLimit::Memory,
-            value: limit,
-            required: Some(RequiredBytesSetting {
-                required_bytes: held.saturating_add(requested),
-                required_setting: "reader memory".to_string(),
-            }),
-            statement: None,
-        },
-    ))
+fn reader_memory_refusal(
+    limit: u64, held: u64, requested: usize,
+    subsystem: &'static str, operation: &'static str, hint: &'static str,
+) -> contextdb_core::Error {
+    contextdb_core::Error::MemoryBudgetExceeded {
+        subsystem: subsystem.into(), operation: operation.into(),
+        requested_bytes: requested,
+        available_bytes: usize::try_from(limit.saturating_sub(held)).unwrap_or(usize::MAX),
+        budget_limit_bytes: usize::try_from(limit).unwrap_or(usize::MAX),
+        hint: hint.into(),
+    }
 }
 impl ReadMemoryBudget for DeclaredReadMemory {
     fn try_reserve(
         &self,
         bytes: usize,
-        _: &'static str,
-        _: &'static str,
-        _: &'static str,
+        subsystem: &'static str,
+        operation: &'static str,
+        hint: &'static str,
     ) -> Result<()> {
         use std::sync::atomic::Ordering;
         self.retained
@@ -141,7 +151,7 @@ impl ReadMemoryBudget for DeclaredReadMemory {
                 held.checked_add(bytes as u64)
                     .filter(|after| *after <= self.limit)
             })
-            .map_err(|held| reader_memory_refusal(self.limit, held, bytes as u64))?;
+            .map_err(|held| reader_memory_refusal(self.limit, held, bytes, subsystem, operation, hint))?;
         Ok(())
     }
     fn release(&self, bytes: usize) {
@@ -158,8 +168,13 @@ impl ReadMemoryBudget for DeclaredReadChild {
         hint: &'static str,
     ) -> Result<()> {
         self.parent.try_reserve(bytes, subsystem, operation, hint)?;
-        self.retained
-            .fetch_add(bytes as u64, std::sync::atomic::Ordering::SeqCst);
+        let held = self
+            .retained
+            .fetch_add(bytes as u64, std::sync::atomic::Ordering::SeqCst)
+            + bytes as u64;
+        self.parent
+            .file_child_high_water
+            .fetch_max(held, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
     fn release(&self, bytes: usize) {
@@ -170,6 +185,11 @@ impl ReadMemoryBudget for DeclaredReadChild {
 }
 impl Drop for DeclaredReadChild {
     fn drop(&mut self) {
+        #[cfg(feature = "test-seams")]
+        child_observers()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&(self as *const Self as usize));
         if self.control_bytes != 0 {
             self.parent.live_child_control_bytes.fetch_sub(
                 self.control_bytes as u64,
@@ -223,4 +243,51 @@ impl Drop for ReaderAclCacheBudget {
     fn drop(&mut self) {
         self.release(self.control_bytes);
     }
+}
+
+// Weak observation of the native owner, without extending its charge lifetime.
+#[cfg(feature = "test-seams")]
+#[derive(Clone)]
+pub(crate) struct DeclaredReadChildObserver {
+    child: std::sync::Weak<DeclaredReadChild>,
+    parent: std::sync::Weak<DeclaredReadMemory>,
+    owner_identity: usize,
+    parent_identity: usize,
+}
+#[cfg(feature = "test-seams")]
+impl DeclaredReadChildObserver {
+    pub(crate) fn sample(&self) -> crate::read_work_probe::DeclaredReadChildFunding {
+        use std::sync::atomic::Ordering;
+        let child = self.child.upgrade();
+        let parent = self.parent.upgrade();
+        crate::read_work_probe::DeclaredReadChildFunding {
+            owner_identity: self.owner_identity,
+            alive: child.is_some(),
+            charged_bytes: child.as_ref().map_or(0, |child| child.retained.load(Ordering::SeqCst)),
+            parent_identity: self.parent_identity,
+            parent_alive: parent.is_some(),
+            parent_charged_bytes: parent.as_ref().map_or(0, |parent| parent.retained.load(Ordering::SeqCst)),
+        }
+    }
+}
+#[cfg(feature = "test-seams")]
+fn child_observers() -> &'static std::sync::Mutex<std::collections::HashMap<usize, DeclaredReadChildObserver>> {
+    static OBSERVERS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, DeclaredReadChildObserver>>> = std::sync::OnceLock::new();
+    OBSERVERS.get_or_init(Default::default)
+}
+#[cfg(feature = "test-seams")]
+fn register_child_observer(child: &Arc<DeclaredReadChild>) {
+    let owner_identity = Arc::as_ptr(child) as usize;
+    let observer = DeclaredReadChildObserver {
+        child: Arc::downgrade(child),
+        parent: Arc::downgrade(&child.parent),
+        owner_identity,
+        parent_identity: Arc::as_ptr(&child.parent) as usize,
+    };
+    child_observers().lock().unwrap_or_else(|error| error.into_inner()).insert(owner_identity, observer);
+}
+#[cfg(feature = "test-seams")]
+pub(crate) fn declared_child_observer(read_memory: &Arc<dyn ReadMemoryBudget>) -> Option<DeclaredReadChildObserver> {
+    let identity = Arc::as_ptr(read_memory) as *const () as usize;
+    child_observers().lock().unwrap_or_else(|error| error.into_inner()).get(&identity).cloned()
 }

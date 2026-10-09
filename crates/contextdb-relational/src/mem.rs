@@ -656,6 +656,13 @@ pub struct BoundedPhysicalCursor {
     last_emitted: Option<(RowId, TxId)>,
     exhausted: bool,
     source_key: Option<Vec<u8>>,
+    source_position_charge: Option<Arc<ChargedPhysicalPosition>>,
+}
+
+#[derive(Debug)]
+struct ChargedPhysicalPosition {
+    key: Vec<u8>,
+    _credit: contextdb_core::read_memory::ReadCredit,
 }
 
 impl BoundedPhysicalCursor {
@@ -673,18 +680,39 @@ impl BoundedPhysicalCursor {
 
     #[doc(hidden)]
     pub fn source_position(&self) -> Option<&[u8]> {
-        self.source_key.as_deref()
+        self.source_position_charge.as_ref().map(|position| position.key.as_slice()).or(self.source_key.as_deref())
     }
 
     #[doc(hidden)]
     pub fn source_advance(&mut self, key: Vec<u8>, row: &VersionedRow) {
         self.source_key = Some(key);
+        self.source_position_charge = None;
+        self.last_inspected = Some((row.row_id, row.created_tx));
+    }
+
+    #[doc(hidden)]
+    pub fn source_position_owner_bytes() -> usize {
+        std::mem::size_of::<ChargedPhysicalPosition>() + 2 * std::mem::size_of::<usize>()
+    }
+
+    /// The engine transfers the reservation admitted before key allocation.
+    /// Cloned cursors share the immutable position and its native owner charge.
+    #[doc(hidden)]
+    pub fn source_advance_with_credit(
+        &mut self,
+        key: Vec<u8>,
+        row: &VersionedRow,
+        credit: contextdb_core::read_memory::ReadCredit,
+    ) {
+        self.source_key = None;
+        self.source_position_charge = Some(Arc::new(ChargedPhysicalPosition { key, _credit: credit }));
         self.last_inspected = Some((row.row_id, row.created_tx));
     }
 
     #[doc(hidden)]
     pub fn source_exhaust(&mut self) {
         self.exhausted = true;
+        self.source_position_charge = None;
     }
 }
 
@@ -1220,6 +1248,7 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
             last_emitted: None,
             exhausted: false,
             source_key: None,
+            source_position_charge: None,
         })
     }
 
@@ -1370,6 +1399,7 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
             last_emitted: None,
             exhausted: false,
             source_key: None,
+            source_position_charge: None,
         })
     }
 

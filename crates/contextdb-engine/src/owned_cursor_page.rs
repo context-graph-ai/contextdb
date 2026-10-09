@@ -135,7 +135,20 @@ impl Serialize for SharedRows {
 }
 impl<'de> Deserialize<'de> for SharedRows {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
-        Vec::<Vec<Value>>::deserialize(deserializer).map(Self::new)
+        let rows = Vec::<Vec<Value>>::deserialize(deserializer)?;
+        if rows.capacity() != 0 {
+            let owner = crate::read_image_memory::active_owner()
+                .map_err(|_| serde::de::Error::custom("cursor rows require a decode owner"))?;
+            owner
+                .try_reserve(
+                    Self::allocation_header_bytes(),
+                    "read_channel",
+                    "decode_cursor_root",
+                    "Reduce the page or raise the reader memory limit.",
+                )
+                .map_err(|_| serde::de::Error::custom("cursor root admission refused"))?;
+        }
+        Ok(Self::new(rows))
     }
 }
 

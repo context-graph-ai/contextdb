@@ -70,6 +70,7 @@ impl CommitDirectoryCursor for DurableCommitCursor {
 
 impl RedbPersistence {
     fn reserve_commit_directory_control(&self) -> Result<OwnedMemoryReservation> {
+        self.prepare_proof_owner()?;
         let accountant = self.proof_accountant().ok_or_else(|| {
             Error::Other("durable commit directory requires the attached memory accountant".into())
         })?;
@@ -87,6 +88,7 @@ impl RedbPersistence {
         write: &redb::WriteTransaction,
         mutation: content_identity::ContentIdentityMutation,
     ) -> Result<()> {
+        self.prepare_proof_owner()?;
         // One admitted proof window per entry, released before advancing.
         Self::apply_content_identity_mutations_in_write(
             write,

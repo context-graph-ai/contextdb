@@ -877,6 +877,19 @@ impl SavepointTransactionState {
     }
 }
 
+/// Transaction-local normal-table root lifecycle. Policy and witness storage belong to callers.
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+#[derive(Clone, Copy)]
+pub enum TableRootEvent {
+    BeforeOpen,
+    AfterClose,
+    BeforeDelete,
+    AfterDelete,
+    BeforeRelocate,
+    AfterRelocate,
+}
+
 /// A read/write transaction
 ///
 /// Only a single [`WriteTransaction`] may exist at a time
@@ -897,6 +910,10 @@ pub struct WriteTransaction {
     // All transaction-local savepoint lifecycle state. See
     // `SavepointTransactionState` for the commit/abort contract.
     savepoint_state: Mutex<SavepointTransactionState>,
+    #[cfg(feature = "contextdb-internal")]
+    table_root_hook: Option<fn(&Self, &str, TableRootEvent) -> Result<(), StorageError>>,
+    #[cfg(feature = "contextdb-internal")]
+    table_root_hook_error: Mutex<Option<StorageError>>,
 }
 
 impl WriteTransaction {
@@ -937,7 +954,47 @@ impl WriteTransaction {
             deferred_free_budget,
             shrink_policy: ShrinkPolicy::Default,
             savepoint_state: Mutex::new(SavepointTransactionState::default()),
+            #[cfg(feature = "contextdb-internal")]
+            table_root_hook: None,
+            #[cfg(feature = "contextdb-internal")]
+            table_root_hook_error: Mutex::new(None),
         })
+    }
+
+    /// Install fixed transaction-local lifecycle policy; no inventory is retained.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn with_table_root_hook(
+        mut self,
+        hook: fn(&Self, &str, TableRootEvent) -> Result<(), StorageError>,
+    ) -> Self {
+        self.table_root_hook = Some(hook);
+        self
+    }
+
+    #[cfg(feature = "contextdb-internal")]
+    fn call_table_root_hook(&self, name: &str, event: TableRootEvent) -> Result<(), StorageError> {
+        if let Some(hook) = self.table_root_hook {
+            hook(self, name, event)?;
+        }
+        Ok(())
+    }
+
+    /// Distinguish absent from empty using one normal-table directory lookup.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn normal_table_root(&self, name: &str) -> Result<Option<Option<[u8; 32]>>, TableError> {
+        let mut tables = self.tables.lock().unwrap();
+        tables.table_tree.flush_table_root_updates()?;
+        Ok(tables
+            .table_tree
+            .get_table_untyped(name, TableType::Normal)?
+            .map(|table| match table {
+                InternalTableDefinition::Normal { table_root, .. } => {
+                    table_root.map(BtreeHeader::to_le_bytes)
+                }
+                InternalTableDefinition::Multimap { .. } => unreachable!(),
+            }))
     }
 
     #[cfg(feature = "test-seams")]
@@ -1474,6 +1531,8 @@ impl WriteTransaction {
         &'txn self,
         definition: TableDefinition<K, V>,
     ) -> Result<Table<'txn, K, V>, TableError> {
+        #[cfg(feature = "contextdb-internal")]
+        self.call_table_root_hook(definition.name(), TableRootEvent::BeforeOpen)?;
         self.tables.lock().unwrap().open_table(self, definition)
     }
 
@@ -1536,6 +1595,13 @@ impl WriteTransaction {
         length: u64,
     ) {
         self.tables.lock().unwrap().close_table(name, table, length);
+        #[cfg(feature = "contextdb-internal")]
+        if let Err(error) = self.call_table_root_hook(name, TableRootEvent::AfterClose) {
+            let mut failure = self.table_root_hook_error.lock().unwrap();
+            if failure.is_none() {
+                *failure = Some(error);
+            }
+        }
     }
 
     /// Rename the given table
@@ -1547,10 +1613,21 @@ impl WriteTransaction {
         let name = definition.name().to_string();
         // Drop the definition so that callers can pass in a `Table` to rename, without getting a TableAlreadyOpen error
         drop(definition);
+        #[cfg(feature = "contextdb-internal")]
+        {
+            self.call_table_root_hook(&name, TableRootEvent::BeforeDelete)?;
+            self.call_table_root_hook(new_name.name(), TableRootEvent::BeforeOpen)?;
+        }
         self.tables
             .lock()
             .unwrap()
-            .rename_table(self, &name, new_name.name())
+            .rename_table(self, &name, new_name.name())?;
+        #[cfg(feature = "contextdb-internal")]
+        {
+            self.call_table_root_hook(&name, TableRootEvent::AfterDelete)?;
+            self.call_table_root_hook(new_name.name(), TableRootEvent::AfterClose)?;
+        }
+        Ok(())
     }
 
     /// Rename the given multimap table
@@ -1575,13 +1652,19 @@ impl WriteTransaction {
         let name = definition.name().to_string();
         // Drop the definition so that callers can pass in a `Table` or `MultimapTable` to delete, without getting a TableAlreadyOpen error
         drop(definition);
+        #[cfg(feature = "contextdb-internal")]
+        self.call_table_root_hook(&name, TableRootEvent::BeforeDelete)?;
+        let result = self.tables.lock().unwrap().delete_table(self, &name);
+        #[cfg(feature = "contextdb-internal")]
+        if result.is_ok() {
+            self.call_table_root_hook(&name, TableRootEvent::AfterDelete)?;
+        }
         #[cfg(not(feature = "test-seams"))]
         {
-            self.tables.lock().unwrap().delete_table(self, &name)
+            result
         }
         #[cfg(feature = "test-seams")]
         {
-            let result = self.tables.lock().unwrap().delete_table(self, &name);
             if matches!(result, Ok(true)) {
                 self.record_table_write_for_test(
                     &name,
@@ -1637,6 +1720,10 @@ impl WriteTransaction {
     /// All writes performed in this transaction will be visible to future transactions, and are
     /// durable as consistent with the [`Durability`] level set by [`Self::set_durability`]
     pub fn commit(mut self) -> Result<(), CommitError> {
+        #[cfg(feature = "contextdb-internal")]
+        if let Some(error) = self.table_root_hook_error.lock().unwrap().take() {
+            return Err(error.into());
+        }
         // Set completed flag first, so that we don't go through the abort() path on drop, if this fails
         self.completed = true;
         self.commit_inner()
@@ -2162,8 +2249,15 @@ impl WriteTransaction {
         } else {
             &mut system_tables.table_tree
         };
+        let user_table = cursor.phase < 2;
         let (target, pages, examined) =
             tree.compaction_page_batch(cursor, maximum, protected_table)?;
+        drop(system_tables);
+        drop(tables);
+        #[cfg(feature = "contextdb-internal")]
+        if user_table && let Some(name) = target.as_deref() {
+            self.call_table_root_hook(name, TableRootEvent::BeforeRelocate)?;
+        }
         let mut relocation_map = HashMap::new();
         let pages = pages
             .into_iter()
@@ -2211,7 +2305,23 @@ impl WriteTransaction {
         // the normal deferred-free tree. process_freed_pages uses the oldest
         // read transaction fence; neither relocation nor subsequent recording
         // can reuse those addresses until that reader releases its snapshot.
-        tree.relocate_compaction_batch(target.as_deref(), &relocation_map)?;
+        {
+            let mut tables = self.tables.lock().unwrap();
+            let mut system_tables = self.system_tables.lock().unwrap();
+            let tree = if user_table {
+                &mut tables.table_tree
+            } else {
+                &mut system_tables.table_tree
+            };
+            tree.relocate_compaction_batch(target.as_deref(), &relocation_map)?;
+        }
+        #[cfg(feature = "contextdb-internal")]
+        if user_table
+            && !relocation_map.is_empty()
+            && let Some(name) = target.as_deref()
+        {
+            self.call_table_root_hook(name, TableRootEvent::AfterRelocate)?;
+        }
         #[cfg(all(test, debug_assertions))]
         online_relocation_tests::RELOCATIONS.with(|pairs| {
             pairs
@@ -2756,12 +2866,27 @@ impl ReadTransaction {
         mem: Arc<TransactionalMemory>,
         guard: TransactionGuard,
     ) -> Result<Self, TransactionError> {
+        Self::new_with_hint(mem, guard, PageHint::Clean)
+    }
+
+    #[cfg(feature = "contextdb-internal")]
+    pub(crate) fn new_verified(
+        mem: Arc<TransactionalMemory>,
+        guard: TransactionGuard,
+    ) -> Result<Self, TransactionError> {
+        Self::new_with_hint(mem, guard, PageHint::Verified)
+    }
+
+    fn new_with_hint(
+        mem: Arc<TransactionalMemory>,
+        guard: TransactionGuard,
+        hint: PageHint,
+    ) -> Result<Self, TransactionError> {
         let root_page = mem.get_data_root();
         let guard = Arc::new(guard);
         Ok(Self {
             mem: mem.clone(),
-            tree: TableTree::new(root_page, PageHint::Clean, guard, mem)
-                .map_err(TransactionError::Storage)?,
+            tree: TableTree::new(root_page, hint, guard, mem).map_err(TransactionError::Storage)?,
         })
     }
 
@@ -2866,6 +2991,21 @@ impl ReadTransaction {
             Some(InternalTableDefinition::Multimap { .. }) => unreachable!(),
             None => None,
         })
+    }
+
+    /// Read one committed normal-table header, distinguishing empty from absent.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn normal_table_root(&self, name: &str) -> Result<Option<Option<[u8; 32]>>, TableError> {
+        Ok(self
+            .tree
+            .get_table_untyped(name, TableType::Normal)?
+            .map(|table| match table {
+                InternalTableDefinition::Normal { table_root, .. } => {
+                    table_root.map(BtreeHeader::to_le_bytes)
+                }
+                InternalTableDefinition::Multimap { .. } => unreachable!(),
+            }))
     }
 
     /// Open the given table without a type

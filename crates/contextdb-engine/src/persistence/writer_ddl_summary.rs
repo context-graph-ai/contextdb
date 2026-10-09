@@ -1,6 +1,6 @@
 //! Declaration reductions installed atomically beside their immutable history.
-use super::*;
 use super::writer_source::SourceWindowOwner;
+use super::*;
 use crate::sync_types::SchemaSyncCapability;
 use contextdb_core::SyncDirection;
 

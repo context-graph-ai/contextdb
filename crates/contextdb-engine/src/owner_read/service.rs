@@ -1334,13 +1334,27 @@ impl OwnerReadService {
         let owner_limits = self.spec.config.limits.limits;
         let carrier = UnixLocalCarrier;
         let handshake_deadline_ms = self.request_deadline_ms()?;
-        let handshake = authenticate_framed_stream_handshake(
-            stream,
-            &self.spec.expected_handshake,
-            self.spec.clock.as_ref(),
-            handshake_deadline_ms,
-        )
-        .await;
+        let handshake = {
+            // This future is driven on one connection thread by
+            // wait_for_local_completion, including every handshake poll.
+            // Install the same observer used by request workers before the
+            // first authenticated frame; its guard restores prior TLS on
+            // refusal, completion, and unwind.
+            #[cfg(any(test, feature = "test-seams"))]
+            let _graph_observation = crate::read_work_probe::enter_owner_graph_scope(
+                &self.spec.database,
+                connection_id,
+                0,
+                "handshake",
+            );
+            authenticate_framed_stream_handshake(
+                stream,
+                &self.spec.expected_handshake,
+                self.spec.clock.as_ref(),
+                handshake_deadline_ms,
+            )
+            .await
+        };
         let principal = match handshake {
             Ok(admitted) => {
                 // A declaration this writer will not serve ends THIS session
@@ -1589,6 +1603,14 @@ impl OwnerReadService {
         let request_worker = std::thread::Builder::new()
             .name("contextdb-owner-request".to_owned())
             .spawn(move || {
+                #[cfg(any(test, feature = "test-seams"))]
+                let _graph_observation = crate::read_work_probe::enter_owner_graph_scope(
+                    &worker_service.spec.database, connection_id, request_ordinal,
+                    match &request.envelope.request {
+                        LocalRequest::Query { .. } | LocalRequest::CursorOpen { .. } => "query",
+                        _ => "request",
+                    },
+                );
                 // The read runs to completion on this thread, so this is
                 // where the reader's interest in it is put in force -- the
                 // same installation an in-process caller makes, around the
@@ -2122,6 +2144,10 @@ impl OwnerReadService {
         )?;
 
         if matches!(&local_request, LocalRequest::OwnerStatus) {
+            #[cfg(any(test, feature = "test-seams"))]
+            crate::read_work_probe::note_owner_graph_path("status");
+            // Carrier dispatch remains inside the executing request worker's
+            // graph observation guard, including this admission-free status.
             return Ok(CompletedOwnerRequest::immediate(vec![
                 LocalResponse::OwnerStatus {
                     status: self.status_response()?,

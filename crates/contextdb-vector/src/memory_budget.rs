@@ -9,6 +9,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// durable-limit mutation handle.
 #[doc(hidden)]
 pub trait MemoryBudget: Debug + Send + Sync {
+    /// Lifetime-bounded identity of the funder retained by this capability.
+    /// The default preserves the existing trait-object data-address identity.
+    #[doc(hidden)]
+    fn stable_funder_identity(&self) -> usize {
+        self as *const Self as *const () as usize
+    }
+
     fn try_allocate_for(
         &self,
         bytes: usize,
@@ -52,6 +59,10 @@ pub trait MemoryBudget: Debug + Send + Sync {
     }
 }
 
+pub(crate) fn same_funder(left: &dyn MemoryBudget, right: &dyn MemoryBudget) -> bool {
+    left.stable_funder_identity() == right.stable_funder_identity()
+}
+
 /// An owned, already admitted charge supplied by the executing caller.
 /// Ordinary drop releases its exact retained bytes. `transfer` disarms that
 /// release only after another owner has adopted the complete reservation.
@@ -73,6 +84,7 @@ pub struct VectorCopyAdmission {
     prepaid_bytes: usize,
     additional_bytes: usize,
     used_bytes: usize,
+    historical_durable_reads: bool,
 }
 
 impl Debug for VectorCopyAdmission {
@@ -94,6 +106,7 @@ impl VectorCopyAdmission {
             prepaid_bytes: 0,
             additional_bytes: 0,
             used_bytes: 0,
+            historical_durable_reads: false,
         }
     }
 
@@ -103,7 +116,7 @@ impl VectorCopyAdmission {
         accountant: Arc<dyn MemoryBudget>,
         charge: C,
     ) -> Result<Self> {
-        if !Arc::ptr_eq(&accountant, &charge.accountant()) {
+        if !same_funder(accountant.as_ref(), charge.accountant().as_ref()) {
             return Err(contextdb_core::Error::Other(
                 "vector copy prepaid charge has a different accountant".into(),
             ));
@@ -115,6 +128,7 @@ impl VectorCopyAdmission {
             prepaid_bytes,
             additional_bytes: 0,
             used_bytes: 0,
+            historical_durable_reads: false,
         })
     }
 
@@ -124,7 +138,7 @@ impl VectorCopyAdmission {
     }
 
     /// Report one retained credit and whether its actual funder is the caller.
-    /// Both trait pointers are compared by data address, independent of vtables.
+    /// Compare retained funders independently of their capability allocations.
     /// The callback receives scalar observations and cannot obtain the funder.
     #[doc(hidden)]
     pub fn visit_retained_copy_credit(
@@ -132,8 +146,7 @@ impl VectorCopyAdmission {
         caller: &dyn MemoryBudget,
         visit: &mut dyn FnMut(usize, usize, bool),
     ) {
-        let funded_by_caller = Arc::as_ptr(&credit.accountant) as *const ()
-            == caller as *const dyn MemoryBudget as *const ();
+        let funded_by_caller = same_funder(credit.accountant.as_ref(), caller);
         visit(
             Arc::as_ptr(credit) as usize,
             credit.retained_bytes(),
@@ -219,7 +232,35 @@ impl VectorCopyAdmission {
 
     #[doc(hidden)]
     pub fn scratch(&self) -> Self {
-        Self::new(self.accountant.clone())
+        let mut scratch = Self::new(self.accountant.clone());
+        scratch.historical_durable_reads = self.historical_durable_reads;
+        scratch
+    }
+
+    /// Route durable reads through the operation's captured authority. This
+    /// routing preference does not itself authenticate a capture or a body.
+    #[doc(hidden)]
+    pub fn with_historical_durable_reads<T>(
+        &mut self,
+        operation: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        struct Restore<'a> {
+            owner: &'a mut VectorCopyAdmission,
+            prior: bool,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                self.owner.historical_durable_reads = self.prior;
+            }
+        }
+        let prior = self.historical_durable_reads;
+        self.historical_durable_reads = true;
+        let restore = Restore { owner: self, prior };
+        operation(restore.owner)
+    }
+
+    pub(crate) fn historical_durable_reads(&self) -> bool {
+        self.historical_durable_reads
     }
 }
 
@@ -485,6 +526,69 @@ mod tests {
 
     #[test]
     fn resizing_workspace_moves_one_charge_between_ownership_phases() {
+        // Additive historical-route ownership rows of the existing workspace host.
+        // The flag is crate-private; this module reaches it without a forwarding seam.
+        let routing_budget = Arc::new(CountingBudget::default());
+        let initial = routing_budget.0.load(Ordering::SeqCst);
+        let bytes = b"historical routing".len();
+        let mut owner = VectorCopyAdmission::new(routing_budget.clone());
+        assert!(!owner.historical_durable_reads());
+        owner.reserve(bytes).unwrap();
+        let retained = routing_budget.0.load(Ordering::SeqCst);
+        assert_eq!(retained, initial + bytes);
+        owner.with_historical_durable_reads(|marked| {
+            assert!(marked.historical_durable_reads());
+            let mut scratch = marked.scratch();
+            assert!(scratch.historical_durable_reads());
+            assert!(Arc::ptr_eq(scratch.accountant(), marked.accountant()));
+            scratch.reserve(bytes).unwrap();
+            assert_eq!(routing_budget.0.load(Ordering::SeqCst), retained + bytes);
+            drop(scratch);
+            assert_eq!(routing_budget.0.load(Ordering::SeqCst), retained);
+            let local = marked.local_scratch().unwrap();
+            assert!(local.historical_durable_reads());
+            assert!(Arc::ptr_eq(local.accountant(), marked.accountant()));
+            drop(local);
+            marked.with_historical_durable_reads(|nested| {
+                assert!(nested.historical_durable_reads());
+            });
+            assert!(marked.historical_durable_reads());
+            let failure: Result<()> = marked.with_historical_durable_reads(|nested| {
+                assert!(nested.historical_durable_reads());
+                Err(contextdb_core::Error::Other("routing control error".into()))
+            });
+            assert!(failure.is_err());
+            assert!(marked.historical_durable_reads());
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                marked.with_historical_durable_reads(|nested| {
+                    assert!(nested.historical_durable_reads());
+                    panic!("routing control unwind");
+                });
+            }));
+            assert!(panic.is_err());
+            assert!(marked.historical_durable_reads());
+            assert_eq!(routing_budget.0.load(Ordering::SeqCst), retained);
+        });
+        assert!(!owner.historical_durable_reads());
+        drop(owner);
+        assert_eq!(routing_budget.0.load(Ordering::SeqCst), initial);
+        let prepaid_live = Arc::new(AtomicUsize::new(0));
+        let charge = VectorWorkspaceReservation::try_new(
+            routing_budget.clone(), prepaid_live.clone(), bytes, "routing", "control",
+        ).unwrap();
+        let mut prepaid = VectorCopyAdmission::from_prepaid(routing_budget.clone(), charge).unwrap();
+        assert!(!prepaid.historical_durable_reads());
+        assert_eq!(routing_budget.0.load(Ordering::SeqCst), initial + bytes);
+        prepaid.with_historical_durable_reads(|marked| {
+            assert!(marked.local_scratch().is_none());
+            marked.reserve(bytes).unwrap();
+            assert!(marked.historical_durable_reads());
+            assert_eq!(routing_budget.0.load(Ordering::SeqCst), initial + bytes);
+        });
+        assert!(!prepaid.historical_durable_reads());
+        drop(prepaid);
+        assert_eq!(routing_budget.0.load(Ordering::SeqCst), initial);
+        assert_eq!(prepaid_live.load(Ordering::SeqCst), 0);
         let budget = Arc::new(CountingBudget::default());
         let live = Arc::new(AtomicUsize::new(0));
         let mut reservation =

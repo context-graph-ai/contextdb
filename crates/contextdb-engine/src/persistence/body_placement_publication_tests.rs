@@ -9,7 +9,10 @@ fn fixture() -> (tempfile::TempDir, RedbPersistence) {
         &HashMap::new(),
     ).expect("declare the physical vector fixture table and its maintained totals");
     db.close().unwrap();
+    let fixture_open_accountant_12 = std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+    let _fixture_decode_scope_12 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_12)).unwrap();
     let persistence = RedbPersistence::open(&path).unwrap();
+    persistence.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_12));
     persistence
         .append_vector_entries_batch(
             &[VectorEntry {

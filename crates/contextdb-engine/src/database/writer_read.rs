@@ -64,6 +64,9 @@ pub(super) struct ChangeReplayEntry {
     pub(super) value: ChangeLogEntry,
     _source: Option<crate::persistence::writer_source::WriterWindow<()>>,
 }
+// The durable cursor retains its counted use inline. Boxing this variant
+// would add a new independently admitted allocation solely to reduce enum size.
+#[allow(clippy::large_enum_variant)]
 pub(super) enum ChangeReplay {
     Durable(crate::persistence::writer_source::WriterReadCursor),
     Resident(std::vec::IntoIter<ChangeLogEntry>),
@@ -193,6 +196,7 @@ pub(super) fn visible_row_with_work<E: From<Error>>(
 }
 pub(crate) struct WriterReadScope {
     prior: Option<ScopedRoot>,
+    _decode: Option<crate::read_image_memory::ImageMemoryScope>,
     _read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     _same_thread: std::marker::PhantomData<std::rc::Rc<()>>,
 }
@@ -217,6 +221,44 @@ impl Drop for WriterReadScope {
     }
 }
 impl Database {
+    pub(crate) fn preflight_historical_graph<E: From<Error>>(
+        &self, snapshot: SnapshotId,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        before: &mut dyn FnMut() -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        let Some(root) = self.graph_read_root().map_err(E::from)? else { return Ok(()); };
+        if snapshot == root.frontier() { return Ok(()); }
+        before()?;
+        let capture = root.snapshot(snapshot, read_memory).map_err(E::from)?;
+        before()?;
+        drop(capture);
+        Ok(())
+    }
+
+    /// Reconcile an indexed plan input against this operation's captured root.
+    /// No successful plan output may depend on whether this input was pulled.
+    pub(crate) fn preflight_historical_index<E: From<Error>>(
+        &self, table: &str, index: &str, snapshot: SnapshotId,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        before: &mut dyn FnMut() -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        if let Some(source) = &self.retained_relational_source {
+            if source.ordered_prefix_snapshot_is_current(snapshot) { return Ok(()); }
+            let meta = self.table_meta(table).ok_or_else(|| E::from(Error::TableNotFound(table.into())))?;
+            let declaration = meta.indexes.iter().find(|declaration| declaration.name == index)
+                .ok_or_else(|| E::from(Error::IndexNotFound { table: table.into(), index: index.into() }))?;
+            return source.historical_index_preflight(table, &meta, declaration, snapshot, read_memory, before);
+        }
+        let Some(root) = self.writer_read_root().map_err(E::from)? else { return Ok(()); };
+        if snapshot == root.snapshot { return Ok(()); }
+        let source = crate::persistence::writer_adapters::WriterRelationalSource::new_for_read_at_snapshot(
+            root, read_memory, snapshot).map_err(E::from)?;
+        let mut refusal = None;
+        let result = source.historical_index_preflight(table, index, snapshot,
+            &mut || before().map_err(|error| { refusal = Some(error); Error::ReadCancelled }));
+        match refusal { Some(error) => Err(error), None => result.map_err(E::from) }
+    }
+
     /// Retain a selected immutable staged row before touching its committed
     /// predecessor. Legacy plugin rows use a prepaid, revalidated copy.
     pub(super) fn writer_staged_row_matching(
@@ -358,6 +400,7 @@ impl Database {
             read_memory.clone(),
         )
         .map_err(E::from)?;
+        source.verify_historical_versions(table).map_err(E::from)?;
         let mut cursor = source
             .row_cursor(table, Bound::Unbounded, Bound::Unbounded, false)
             .map_err(E::from)?;
@@ -434,6 +477,8 @@ impl Database {
             "Raise MEMORY_LIMIT to inspect this metadata key.",
         )?;
         let key = index_key_from_values(&index.columns[..columns.len()], values);
+        source.historical_index_preflight(table, &index.name, snapshot,
+            &mut || work(crate::executor::GraphPredicateWork::Checkpoint))?;
         let current = snapshot == source.snapshot();
         let mut cursor = if index.columns.len() == columns.len() {
             source.exact_index_cursor(table, &index.name, current, &key)?
@@ -532,6 +577,7 @@ impl Database {
             root.clone(),
             read_memory.clone(),
         )?;
+        source.historical_index_preflight(&policy.joined_table, &index.name, snapshot, &mut || Ok(()))?;
         let current = snapshot == source.snapshot();
         let mut cursor = if index.columns.len() == 1 {
             source.exact_index_cursor(&policy.joined_table, &index.name, current, &key)?
@@ -762,6 +808,7 @@ impl Database {
         let prior = ROOT.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), next));
         WriterReadScope {
             prior,
+            _decode: None,
             _read_memory: read_memory,
             _same_thread: std::marker::PhantomData,
         }
@@ -787,7 +834,13 @@ impl Database {
         &self,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<WriterReadScope> {
-        Ok(self.enter_writer_read(self.writer_read_root()?, read_memory))
+        let image = crate::read_image_memory::ImageMemory::operation_reader(
+            self.accountant.clone(),
+            read_memory.clone(),
+        )?;
+        let mut scope = self.enter_writer_read(self.writer_read_root()?, read_memory);
+        scope._decode = Some(image.enter());
+        Ok(scope)
     }
 
     /// Predicate rows are temporary even when their statement retains its root.
@@ -795,6 +848,10 @@ impl Database {
         &self,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<WriterReadScope> {
+        let image = crate::read_image_memory::ImageMemory::operation_reader(
+            self.accountant.clone(),
+            read_memory.clone(),
+        )?;
         let next = Some((
             Arc::as_ptr(&self.tx_mgr) as usize,
             self.writer_read_root()?,
@@ -803,6 +860,7 @@ impl Database {
         let prior = ROOT.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), next));
         Ok(WriterReadScope {
             prior,
+            _decode: Some(image.enter()),
             _read_memory: read_memory,
             _same_thread: std::marker::PhantomData,
         })
@@ -1000,6 +1058,14 @@ impl Database {
             RelationalIndexRange, RelationalReadSource, visible_row,
         };
         use std::ops::Bound;
+        let mut preflight_refusal = None;
+        let preflight = source.historical_index_preflight(table,
+            cursor.index_name().ok_or_else(|| E::from(Error::Other("ordered cursor has no index".into())))?,
+            snapshot, &mut || touch().map_err(|error| {
+                preflight_refusal = Some(error); Error::ReadCancelled
+            }));
+        if let Some(error) = preflight_refusal { return Err(error); }
+        preflight.map_err(E::from)?;
         if cursor.is_exhausted()
             || cursor.source_prefix_stopped()
             || cursor.source_prefix_quota() == Some(0)
@@ -1014,24 +1080,20 @@ impl Database {
                     Bound::Included(key) => Some((
                         true,
                         source
-                            .index_position_key(
+                            .index_position_key_before(
                                 current,
-                                &key.to_vec(),
+                                key,
                                 if reverse { RowId(u64::MAX) } else { RowId(0) },
-                                if reverse { TxId(u64::MAX) } else { TxId(0) },
-                            )
-                            .map_err(E::from)?,
+                                if reverse { TxId(u64::MAX) } else { TxId(0) }, &mut touch)?,
                     )),
                     Bound::Excluded(key) => Some((
                         false,
                         source
-                            .index_position_key(
+                            .index_position_key_before(
                                 current,
-                                &key.to_vec(),
+                                key,
                                 if reverse { RowId(0) } else { RowId(u64::MAX) },
-                                if reverse { TxId(0) } else { TxId(u64::MAX) },
-                            )
-                            .map_err(E::from)?,
+                                if reverse { TxId(0) } else { TxId(u64::MAX) }, &mut touch)?,
                     )),
                     Bound::Unbounded => None,
                 }
@@ -1145,24 +1207,20 @@ impl Database {
                 Bound::Included(key) => Some((
                     true,
                     source
-                        .index_position_key(
+                        .index_position_key_before(
                             current,
                             key,
                             if reverse { RowId(0) } else { RowId(u64::MAX) },
-                            if reverse { TxId(0) } else { TxId(u64::MAX) },
-                        )
-                        .map_err(E::from)?,
+                            if reverse { TxId(0) } else { TxId(u64::MAX) }, &mut touch)?,
                 )),
                 Bound::Excluded(key) => Some((
                     false,
                     source
-                        .index_position_key(
+                        .index_position_key_before(
                             current,
                             key,
                             if reverse { RowId(u64::MAX) } else { RowId(0) },
-                            if reverse { TxId(u64::MAX) } else { TxId(0) },
-                        )
-                        .map_err(E::from)?,
+                            if reverse { TxId(u64::MAX) } else { TxId(0) }, &mut touch)?,
                 )),
                 Bound::Unbounded => None,
             };
@@ -1260,7 +1318,7 @@ impl Database {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn writer_exact_next<E: From<Error>>(
         &self,
-        source: &dyn contextdb_relational::source::RelationalReadSource,
+        source: &crate::persistence::writer_adapters::WriterRelationalSource,
         table: &str,
         index: &str,
         snapshot: SnapshotId,
@@ -1270,16 +1328,19 @@ impl Database {
         mut release: impl FnMut(usize) -> std::result::Result<(), E>,
         mut clone: impl FnMut(usize) -> std::result::Result<(), E>,
     ) -> std::result::Result<Option<VersionedRow>, E> {
-        use contextdb_relational::source::{RelationalIndexRange, visible_row};
+        use contextdb_relational::source::{RelationalIndexRange, RelationalReadSource, visible_row};
         use std::ops::Bound;
+        let mut preflight_refusal = None;
+        let preflight = source.historical_index_preflight(table, index, snapshot,
+            &mut || touch().map_err(|error| { preflight_refusal = Some(error); Error::ReadCancelled }));
+        if let Some(error) = preflight_refusal { return Err(error); }
+        preflight.map_err(E::from)?;
         while let Some(key) = cursor.source_probe() {
             let current = snapshot == source.snapshot();
             let start = source
-                .index_position_key(current, key, RowId(0), TxId(0))
-                .map_err(E::from)?;
+                .index_position_key_before(current, key, RowId(0), TxId(0), &mut touch)?;
             let end = source
-                .index_position_key(current, key, RowId(u64::MAX), TxId(u64::MAX))
-                .map_err(E::from)?;
+                .index_position_key_before(current, key, RowId(u64::MAX), TxId(u64::MAX), &mut touch)?;
             let lower = cursor
                 .source_position()
                 .map_or(Bound::Included(start.as_bytes()), Bound::Excluded);
@@ -1418,6 +1479,7 @@ impl Database {
                 SortDirection::Asc => DirectedValue::Asc(TotalOrdAsc(value.clone())),
                 SortDirection::Desc => DirectedValue::Desc(TotalOrdDesc(value.clone())),
             }];
+            source.historical_index_preflight(table, &index.name, snapshot, &mut || Ok(()))?;
             let mut postings = source.exact_index_cursor(
                 table,
                 &index.name,
@@ -1705,6 +1767,7 @@ impl Database {
             "Raise MEMORY_LIMIT to validate this key.",
         )?;
         let key = index_key_from_values(&index.columns[..columns.len()], values);
+        source.historical_index_preflight(table, &index.name, snapshot, &mut || Ok(()))?;
         let current = snapshot == source.snapshot();
         let mut cursor = if index.columns.len() == columns.len() {
             source.exact_index_cursor(table, &index.name, current, &key)?
@@ -1769,19 +1832,27 @@ impl Database {
 }
 
 impl Database {
-    pub(crate) fn writer_graph_root(
+    /// One dispatch for every graph consumer: images never ask for a writer
+    /// publication, and memory databases alone have no captured source.
+    pub(crate) fn graph_read_root(
         &self,
-
+    ) -> Result<Option<crate::persistence::graph_read::GraphReadRoot>> {
+        if let Some(source) = &self.retained_graph_source {
+            return Ok(Some(crate::persistence::graph_read::GraphReadRoot::Image(
+                source.clone(),
+            )));
+        }
+        Ok(self
+            .writer_read_root()?
+            .map(crate::persistence::graph_read::GraphReadRoot::Writer))
+    }
+    pub(crate) fn graph_snapshot(
+        &self,
+        snapshot: SnapshotId,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Option<Arc<dyn contextdb_graph::source::GraphSnapshot>>> {
-        self.writer_read_root()?
-            .map(|root| {
-                crate::persistence::writer_adapters::WriterGraphSnapshot::new_for_read(
-                    root,
-                    read_memory.clone(),
-                )
-                .map(|source| Arc::new(source) as Arc<dyn contextdb_graph::source::GraphSnapshot>)
-            })
+        self.graph_read_root()?
+            .map(|root| root.snapshot(snapshot, read_memory))
             .transpose()
     }
 }
@@ -1962,20 +2033,42 @@ impl Database {
     }
 }
 
-pub(super) struct WriterStagedPostingAdmission(
-    pub(super) Arc<crate::memory_accounting::MemoryAccountant>,
-);
+pub(super) struct WriterStagedPostingAdmission {
+    accountant: Option<Arc<crate::memory_accounting::MemoryAccountant>>,
+    writer_use: Option<crate::memory_accounting::WriterUse>,
+    control: Option<crate::memory_accounting::ControlCredit>,
+}
+impl WriterStagedPostingAdmission {
+    pub(super) fn prepare(accountant: Arc<crate::memory_accounting::MemoryAccountant>) -> Result<Arc<Self>> {
+        let mut value = Self {
+            writer_use: crate::memory_accounting::WriterUse::retain_if_writer(&accountant),
+            accountant: Some(accountant),
+            control: None,
+        };
+        let bytes = crate::memory_accounting::writer_adapter_layout(&value).size();
+        value.control = Some(crate::memory_accounting::ControlCredit::admit(
+            value.accountant.as_ref().expect("provider has its funder"),
+            bytes, "staged_posting_provider",
+        )?);
+        Ok(Arc::new(value))
+    }
+}
 impl contextdb_relational::mem::StagedPostingAdmission for WriterStagedPostingAdmission {
     fn reserve(&self, bytes: usize) -> Result<Arc<dyn contextdb_tx::StagedPostingCharge>> {
-        Ok(Arc::new(
-            crate::memory_accounting::OwnedMemoryReservation::try_new_for(
-                self.0.clone(),
-                bytes,
-                "relational",
-                "staged_index_posting",
-                "Reduce staged rows or raise MEMORY_LIMIT.",
-            )?,
-        ))
+        crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+            self.accountant.as_ref().expect("live provider has its funder").clone(),
+            bytes, "relational", "staged_index_posting",
+            "Reduce staged rows or raise MEMORY_LIMIT.",
+        )?.into_admitted_arc().map(|owner| owner as Arc<dyn contextdb_tx::StagedPostingCharge>)
+    }
+}
+impl Drop for WriterStagedPostingAdmission {
+    fn drop(&mut self) {
+        let refund = self.control.take().map(crate::memory_accounting::ControlCredit::prepare);
+        let mut cleanup = crate::memory_accounting::ReservationCleanup::new(
+            self.accountant.take(), self.writer_use.take(), 0, refund,
+        );
+        cleanup.finish();
     }
 }
 
@@ -2095,24 +2188,17 @@ pub(super) fn visit_graph_versions(
     read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<()> {
     if let Some(root) = root {
-        let mut cursor = root.cursor(
-            crate::persistence::writer_source::SourceWindowOwner::Read(read_memory.clone()),
-            "graph_fwd",
-            crate::persistence::writer_source::WriterCursorFamily::Bytes,
-            std::ops::Bound::Unbounded,
-            std::ops::Bound::Unbounded,
-            false,
-        )?;
-        while let Some(window) = cursor.next_edge()? {
-            visit(&window.value)?;
-        }
+        // All-version enumeration is historical even at frontier equality.
+        let graph = crate::persistence::graph_read::GraphReadRoot::Writer(root);
+        let mut cursor = graph.cursor(false, std::ops::Bound::Unbounded,
+            std::ops::Bound::Unbounded, read_memory.clone())?;
+        while let Some(window) = cursor.next_edge()? { visit(window.edge())?; }
     } else {
-        for edge in store.forward_adj.read().values().flatten() {
-            visit(edge)?;
-        }
+        for edge in store.forward_adj.read().values().flatten() { visit(edge)?; }
     }
     Ok(())
 }
+
 impl Database {
     /// A durable store, writer or retained reader, keeps every relational
     /// posting, automatic or declared, in one ordered family, so a bounded
@@ -2128,21 +2214,27 @@ impl Database {
     pub(super) fn visit_graph_adjacency(
         &self,
         reverse: bool,
-        mut visit: impl FnMut(&AdjEntry) -> Result<()>,
-
+        visit: impl FnMut(&AdjEntry) -> Result<()>,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<()> {
-        if let Some(root) = self.writer_read_root()? {
+        self.visit_graph_adjacency_at_root(self.graph_read_root()?, reverse, visit, read_memory)
+    }
+    pub(super) fn visit_graph_adjacency_at_root(
+        &self,
+        root: Option<crate::persistence::graph_read::GraphReadRoot>,
+        reverse: bool,
+        mut visit: impl FnMut(&AdjEntry) -> Result<()>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<()> {
+        if let Some(root) = root {
             let mut cursor = root.cursor(
-                crate::persistence::writer_source::SourceWindowOwner::Read(read_memory.clone()),
-                if reverse { "graph_rev" } else { "graph_fwd" },
-                crate::persistence::writer_source::WriterCursorFamily::Bytes,
+                reverse,
                 std::ops::Bound::Unbounded,
                 std::ops::Bound::Unbounded,
-                false,
+                read_memory,
             )?;
             while let Some(window) = cursor.next_edge()? {
-                visit(&window.value)?;
+                visit(window.edge())?;
             }
             return Ok(());
         }
@@ -2161,12 +2253,7 @@ impl Database {
         visit: impl FnMut(&AdjEntry) -> Result<()>,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<()> {
-        visit_graph_versions(
-            &self.graph_store,
-            self.writer_read_root()?,
-            visit,
-            read_memory.clone(),
-        )
+        self.visit_graph_adjacency(false, visit, read_memory)
     }
     pub(super) fn collect_graph_versions(
         &self,
@@ -2206,7 +2293,7 @@ impl Database {
 
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<bool> {
-        let root = self.writer_graph_root(read_memory.clone())?;
+        let root = self.graph_snapshot(snapshot, read_memory.clone())?;
         let mut memory = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
         let mut visited = HashSet::new();
         let mut queue = VecDeque::new();
@@ -2343,6 +2430,7 @@ impl Database {
             root,
             read_memory.clone(),
         )?;
+        source.verify_historical_versions(table)?;
         let Some(index) = index else {
             let mut rows = source.row_cursor(
                 table,
@@ -2355,6 +2443,7 @@ impl Database {
             }
             return Ok(());
         };
+        source.historical_index_versions_preflight(table, &index.name, &mut || Ok(()))?;
         let mut memory = contextdb_core::read_memory::ReadCredit::try_new(
             read_memory.clone(),
             values

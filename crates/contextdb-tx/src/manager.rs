@@ -1,6 +1,10 @@
-use crate::commit_directory::{CommitDirectory, CommitDirectoryCursor, MemoryCommitDirectory};
+use crate::commit_directory::{
+    CapturedLegacyCursor, CommitDirectory, CommitDirectoryCursor, MemoryCommitDirectory,
+    ReadCommitContext, ReadCommitCursor, ReadCommitDirectory,
+};
 use crate::write_set::{WriteSet, WriteSetApplicator};
 use contextdb_core::read_contract::OwnerReadCancellation;
+use contextdb_core::read_memory::ReadMemoryBudget;
 use contextdb_core::{AtomicLsn, AtomicTxId, Error, Lsn, Result, RowId, SnapshotId, TxId};
 use parking_lot::{Condvar, Mutex, MutexGuard};
 use std::any::Any;
@@ -126,6 +130,15 @@ impl std::fmt::Debug for PublishedRead {
     }
 }
 
+/// Captured history cannot implement or acquire the mutable directory trait.
+enum CommitHistoryCapability {
+    Writable(Arc<dyn CommitDirectory>),
+    Captured {
+        directory: Arc<dyn ReadCommitDirectory>,
+        image_read_memory: Arc<dyn ReadMemoryBudget>,
+    },
+}
+
 pub struct TransactionManager<S: WriteSetApplicator> {
     next_tx: AtomicTxId,
     committed_watermark: AtomicTxId,
@@ -136,7 +149,7 @@ pub struct TransactionManager<S: WriteSetApplicator> {
     /// while a commit is between their stores.
     published_read: Mutex<PublishedRead>,
     active_txs: Mutex<HashMap<TxId, WriteSet>>,
-    commit_index: Arc<dyn CommitDirectory>,
+    commit_index: CommitHistoryCapability,
     commit_mutex: Mutex<()>,
     commit_release: Arc<CommitRelease>,
     owed_publication: Mutex<Option<OwedPublication>>,
@@ -208,7 +221,7 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
                 handle,
             }),
             active_txs: Mutex::new(HashMap::new()),
-            commit_index: directory,
+            commit_index: CommitHistoryCapability::Writable(directory),
             commit_mutex: Mutex::new(()),
             commit_release: Arc::new(CommitRelease::default()),
             owed_publication: Mutex::new(None),
@@ -217,13 +230,74 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         }
     }
 
-    pub fn begin(&self) -> TxId {
+    /// Internal construction for the sealed committed image. Its directory and
+    /// legacy adapters retain the image's already-declared reader child. The
+    /// committed frontier is authenticated during fallible open, independently
+    /// of the allocator successor (which cannot encode a successor after MAX).
+    // The design-approved explicit committed_lsn signature keeps the authenticated
+    // committed LSN separate from the allocator successor even at u64::MAX.
+    #[allow(clippy::too_many_arguments)]
+    #[doc(hidden)]
+    pub fn new_with_captured_directory(
+        store: S,
+        next_tx: TxId,
+        next_lsn: Lsn,
+        committed_watermark: TxId,
+        committed_lsn: Lsn,
+        directory: Arc<dyn ReadCommitDirectory>,
+        image_read_memory: Arc<dyn ReadMemoryBudget>,
+        handle: Option<Arc<dyn Any + Send + Sync>>,
+    ) -> Self {
+        Self {
+            next_tx: AtomicTxId::new(next_tx),
+            committed_watermark: AtomicTxId::new(committed_watermark),
+            next_lsn: AtomicLsn::new(next_lsn),
+            committed_lsn: AtomicLsn::new(committed_lsn),
+            published_read: Mutex::new(PublishedRead {
+                snapshot: SnapshotId::from_tx(committed_watermark),
+                lsn: committed_lsn,
+                handle,
+            }),
+            active_txs: Mutex::new(HashMap::new()),
+            commit_index: CommitHistoryCapability::Captured {
+                directory,
+                image_read_memory,
+            },
+            commit_mutex: Mutex::new(()),
+            commit_release: Arc::new(CommitRelease::default()),
+            owed_publication: Mutex::new(None),
+            direct_commit_sequence: AtomicU64::new(0),
+            store,
+        }
+    }
+
+    fn writable_directory(&self) -> Result<&dyn CommitDirectory> {
+        match &self.commit_index {
+            CommitHistoryCapability::Writable(directory) => Ok(directory.as_ref()),
+            CommitHistoryCapability::Captured { .. } => Err(Error::InvalidStateTransition(
+                "captured commit history has no writable transaction capability".into(),
+            )),
+        }
+    }
+
+    fn require_writable(&self) {
+        self.writable_directory()
+            .expect("operation requires writable transaction capability");
+    }
+
+    #[doc(hidden)]
+    pub fn try_begin(&self) -> Result<TxId> {
+        self.writable_directory()?;
         let tx_id = self.next_tx.fetch_add(1, Ordering::SeqCst);
         let mut write_set = WriteSet::new();
         write_set.base_read = Some(self.capture_published_read());
-        let mut active = self.active_txs.lock();
-        active.insert(tx_id, write_set);
-        tx_id
+        self.active_txs.lock().insert(tx_id, write_set);
+        Ok(tx_id)
+    }
+
+    pub fn begin(&self) -> TxId {
+        self.try_begin()
+            .expect("begin requires writable transaction capability")
     }
 
     /// The immutable read view held from begin until commit or rollback.
@@ -257,6 +331,7 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
     where
         F: FnOnce(&mut WriteSet) -> R,
     {
+        self.writable_directory()?;
         let mut active = self.active_txs.lock();
         let ws = active.get_mut(&tx).ok_or(Error::TxNotFound(tx))?;
         Ok(f(ws))
@@ -297,6 +372,7 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
     where
         F: FnOnce(&mut WriteSet) -> R,
     {
+        self.writable_directory()?;
         let mut ws = {
             let mut active = self.active_txs.lock();
             active.remove(&tx).ok_or(Error::TxNotFound(tx))?
@@ -354,6 +430,10 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         F: FnOnce(Lsn) -> Result<()>,
         G: FnOnce(&mut WriteSet) -> Result<()>,
     {
+        let directory = self.writable_directory().map_err(|error| CommitFailure {
+            error,
+            write_set: None,
+        })?;
         let _lock = self.lock_commit_boundary();
         let reserved_lsn = self.next_lsn.load(Ordering::SeqCst);
         if let Err(error) = before_commit(reserved_lsn) {
@@ -397,7 +477,7 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
                 write_set: Some(Box::new(ws)),
             });
         }
-        self.commit_index.record_applied(lsn, visibility_tx);
+        directory.record_applied(lsn, visibility_tx);
         self.publish_read_snapshot(lsn, Some(visibility_tx));
         Ok((lsn, ws))
     }
@@ -444,6 +524,10 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         F: FnOnce(&mut WriteSet) -> Result<()>,
         G: FnOnce(Lsn, &WriteSet),
     {
+        let directory = self.writable_directory().map_err(|error| CommitFailure {
+            error,
+            write_set: None,
+        })?;
         let _lock = self.lock_commit_boundary();
         let mut ws = {
             let mut active = self.active_txs.lock();
@@ -483,7 +567,7 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         // reader that can see a row must also be able to see the creation and
         // delete evidence published for the same commit.
         after_apply(lsn, &ws);
-        self.commit_index.record_applied(lsn, visibility_tx);
+        directory.record_applied(lsn, visibility_tx);
         self.publish_read_snapshot(lsn, Some(visibility_tx));
         Ok((lsn, ws))
     }
@@ -526,6 +610,10 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         F: FnOnce(Lsn, TxId) -> Result<()>,
         G: FnOnce(&mut WriteSet) -> Result<()>,
     {
+        let directory = self.writable_directory().map_err(|error| CommitFailure {
+            error,
+            write_set: None,
+        })?;
         let _lock = self.lock_commit_boundary();
         if !self.active_txs.lock().contains_key(&tx) {
             return Err(CommitFailure {
@@ -607,7 +695,7 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         // complete. This is the atomic visibility boundary for engine-owned
         // sidecars that are not part of the generic store.
         after_apply(lsn, &ws);
-        self.commit_index.record_applied(lsn, visibility_tx);
+        directory.record_applied(lsn, visibility_tx);
         self.publish_read_snapshot(lsn, Some(visibility_tx));
         Ok((lsn, ws))
     }
@@ -625,6 +713,12 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
     /// transaction opened with `begin()` and abandoned left its whole
     /// admission charged against a limit nothing was holding any more.
     pub fn drain_active_write_sets(&self) -> Vec<WriteSet> {
+        // Captured construction has no active transactions, and try_begin
+        // rejects before insertion. Resource release needs no write authority.
+        if matches!(&self.commit_index, CommitHistoryCapability::Captured { .. }) {
+            return Vec::new();
+        }
+        self.require_writable();
         let _lock = self.lock_commit_boundary();
         let mut active = self.active_txs.lock();
         active.drain().map(|(_, write_set)| write_set).collect()
@@ -643,17 +737,20 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
     where
         F: FnOnce(&mut HashMap<TxId, WriteSet>) -> R,
     {
+        self.require_writable();
         let mut active = self.active_txs.lock();
         f(&mut active)
     }
 
     pub fn rollback_write_set(&self, tx: TxId) -> Result<WriteSet> {
+        self.writable_directory()?;
         let _lock = self.lock_commit_boundary();
         let mut active = self.active_txs.lock();
         active.remove(&tx).ok_or(Error::TxNotFound(tx))
     }
 
     pub fn rollback_empty_without_commit_lock(&self, tx: TxId) -> Result<()> {
+        self.writable_directory()?;
         let mut active = self.active_txs.lock();
         let ws = active.get(&tx).ok_or(Error::TxNotFound(tx))?;
         if !ws.is_empty() {
@@ -682,6 +779,7 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
     }
 
     pub fn new_row_id(&self) -> RowId {
+        self.require_writable();
         self.store.new_row_id()
     }
 
@@ -690,6 +788,7 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
     }
 
     fn publish_read_snapshot(&self, lsn: Lsn, visibility_tx: Option<TxId>) {
+        self.require_writable();
         // The applicator prepared/reserved the root outside this lock. The
         // descriptor swap alone is the publication critical section. The old
         // root may release pages/accounting, so drop it after unlocking.
@@ -722,14 +821,44 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         lower: Bound<Lsn>,
         upper: Bound<Lsn>,
     ) -> Result<Box<dyn CommitDirectoryCursor>> {
-        self.commit_index.cursor(lower, upper)
+        match &self.commit_index {
+            CommitHistoryCapability::Writable(directory) => directory.cursor(lower, upper),
+            CommitHistoryCapability::Captured {
+                directory,
+                image_read_memory,
+            } => CapturedLegacyCursor::open(
+                directory.as_ref(),
+                lower,
+                upper,
+                image_read_memory.clone(),
+            ),
+        }
     }
 
-    /// Collection results belong to the caller; durable cursors never retain
-    /// decoded history in the transaction manager. Engine consumers should
-    /// prefer the cursor and fallible point APIs on file-backed stores.
+    /// Delivers one pair directly to the engine, which owns output admission.
+    #[doc(hidden)]
+    pub fn read_commit_directory_cursor(
+        &self,
+        lower: Bound<Lsn>,
+        upper: Bound<Lsn>,
+        context: &ReadCommitContext<'_>,
+    ) -> Result<Box<dyn ReadCommitCursor>> {
+        context.checkpoint()?;
+        match &self.commit_index {
+            CommitHistoryCapability::Writable(directory) => {
+                directory.cursor_with_read_context(lower, upper, context)
+            }
+            CommitHistoryCapability::Captured { directory, .. } => {
+                directory.cursor(lower, upper, context)
+            }
+        }
+    }
+
+    /// Legacy collection belongs to Writable callers. Captured consumers use
+    /// the context cursor so output allocation is admitted and owned by them.
     pub fn try_commit_index_prefix(&self, up_to: Lsn) -> Result<BTreeMap<Lsn, TxId>> {
-        let mut cursor = self.commit_directory_cursor(Bound::Unbounded, Bound::Included(up_to))?;
+        let directory = self.writable_directory()?;
+        let mut cursor = directory.cursor(Bound::Unbounded, Bound::Included(up_to))?;
         let mut entries = BTreeMap::new();
         while let Some((lsn, tx)) = cursor.next_entry()? {
             entries.insert(lsn, tx);
@@ -743,7 +872,7 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
     }
 
     pub fn try_replace_commit_index(&self, retained: BTreeMap<Lsn, TxId>) -> Result<u64> {
-        self.commit_index.replace(retained)
+        self.writable_directory()?.replace(retained)
     }
 
     pub fn replace_commit_index(&self, retained: BTreeMap<Lsn, TxId>) -> u64 {
@@ -752,7 +881,7 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
     }
 
     pub fn try_remove_commit_index_entries(&self, lsns: &[Lsn]) -> Result<u64> {
-        self.commit_index.remove(lsns)
+        self.writable_directory()?.remove(lsns)
     }
 
     pub fn remove_commit_index_entries(&self, lsns: &[Lsn]) -> u64 {
@@ -760,8 +889,28 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
             .expect("commit directory removal failed")
     }
 
+    #[doc(hidden)]
+    pub fn try_commit_index_census_with_context(
+        &self,
+        context: &ReadCommitContext<'_>,
+    ) -> Result<(usize, Lsn)> {
+        context.checkpoint()?;
+        match &self.commit_index {
+            CommitHistoryCapability::Writable(directory) => directory.census(),
+            CommitHistoryCapability::Captured { directory, .. } => directory.census(context),
+        }
+    }
+
     pub fn try_commit_index_census(&self) -> Result<(usize, Lsn)> {
-        self.commit_index.census()
+        match &self.commit_index {
+            CommitHistoryCapability::Writable(directory) => directory.census(),
+            CommitHistoryCapability::Captured {
+                image_read_memory, ..
+            } => self.try_commit_index_census_with_context(&ReadCommitContext::new(
+                image_read_memory.clone(),
+                &|| Ok(()),
+            )),
+        }
     }
 
     pub fn commit_index_len(&self) -> usize {
@@ -776,32 +925,106 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         self.commit_index_prefix(Lsn(u64::MAX))
     }
 
+    #[doc(hidden)]
+    pub fn try_commit_index_floor_with_context(
+        &self,
+        upper: Bound<Lsn>,
+        context: &ReadCommitContext<'_>,
+    ) -> Result<Option<(Lsn, TxId)>> {
+        context.checkpoint()?;
+        match &self.commit_index {
+            CommitHistoryCapability::Writable(directory) => directory.floor(upper),
+            CommitHistoryCapability::Captured { directory, .. } => directory.floor(upper, context),
+        }
+    }
+
     pub fn try_commit_index_floor(&self, upper: Bound<Lsn>) -> Result<Option<(Lsn, TxId)>> {
-        self.commit_index.floor(upper)
+        match &self.commit_index {
+            CommitHistoryCapability::Writable(directory) => directory.floor(upper),
+            CommitHistoryCapability::Captured {
+                image_read_memory, ..
+            } => self.try_commit_index_floor_with_context(
+                upper,
+                &ReadCommitContext::new(image_read_memory.clone(), &|| Ok(())),
+            ),
+        }
     }
 
     pub fn commit_index_floor_below(&self, lsn: Lsn) -> Option<(Lsn, TxId)> {
+        self.require_writable();
         self.try_commit_index_floor(Bound::Excluded(lsn))
             .expect("commit directory seek failed")
     }
 
     pub fn commit_index_last(&self) -> Option<(Lsn, TxId)> {
+        self.require_writable();
         self.try_commit_index_floor(Bound::Unbounded)
             .expect("commit directory seek failed")
     }
 
+    #[doc(hidden)]
+    pub fn try_commit_index_get_with_context(
+        &self,
+        lsn: Lsn,
+        context: &ReadCommitContext<'_>,
+    ) -> Result<Option<TxId>> {
+        context.checkpoint()?;
+        match &self.commit_index {
+            CommitHistoryCapability::Writable(directory) => Ok(directory
+                .floor(Bound::Included(lsn))?
+                .filter(|(entry_lsn, _)| *entry_lsn == lsn)
+                .map(|(_, tx)| tx)),
+            CommitHistoryCapability::Captured { directory, .. } => directory.get(lsn, context),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn try_commit_index_contains_with_context(
+        &self,
+        lsn: Lsn,
+        context: &ReadCommitContext<'_>,
+    ) -> Result<bool> {
+        context.checkpoint()?;
+        match &self.commit_index {
+            CommitHistoryCapability::Writable(directory) => directory.contains(lsn),
+            CommitHistoryCapability::Captured { directory, .. } => directory.contains(lsn, context),
+        }
+    }
+
     pub fn try_commit_index_contains(&self, lsn: Lsn) -> Result<bool> {
-        self.commit_index.contains(lsn)
+        match &self.commit_index {
+            CommitHistoryCapability::Writable(directory) => directory.contains(lsn),
+            CommitHistoryCapability::Captured {
+                image_read_memory, ..
+            } => self.try_commit_index_contains_with_context(
+                lsn,
+                &ReadCommitContext::new(image_read_memory.clone(), &|| Ok(())),
+            ),
+        }
     }
 
     pub fn commit_index_contains(&self, lsn: Lsn) -> bool {
+        self.require_writable();
         self.try_commit_index_contains(lsn)
             .expect("commit directory probe failed")
     }
 
     pub fn commit_index_census(&self) -> (usize, Lsn) {
+        self.require_writable();
         self.try_commit_index_census()
             .expect("commit directory bounds failed")
+    }
+
+    #[doc(hidden)]
+    pub fn try_snapshot_at_lsn_with_context(
+        &self,
+        lsn: Lsn,
+        context: &ReadCommitContext<'_>,
+    ) -> Result<SnapshotId> {
+        Ok(SnapshotId::from_tx(
+            self.try_commit_index_floor_with_context(Bound::Included(lsn), context)?
+                .map_or(TxId(0), |(_, tx)| tx),
+        ))
     }
 
     pub fn try_snapshot_at_lsn(&self, lsn: Lsn) -> Result<SnapshotId> {
@@ -812,6 +1035,7 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
     }
 
     pub fn snapshot_at_lsn(&self, lsn: Lsn) -> SnapshotId {
+        self.require_writable();
         self.try_snapshot_at_lsn(lsn)
             .expect("commit directory seek failed")
     }
@@ -820,6 +1044,7 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
     where
         F: FnOnce(Lsn) -> Result<R>,
     {
+        self.writable_directory()?;
         let _lock = self.lock_commit_boundary();
         let publication = self.store.reserve_metadata_publication()?;
         let lsn = self.next_lsn.fetch_add(1, Ordering::SeqCst);
@@ -841,6 +1066,7 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
     where
         F: FnOnce(Lsn) -> Result<Option<R>>,
     {
+        self.writable_directory()?;
         let _lock = self.lock_commit_boundary();
         let publication = self.store.reserve_metadata_publication()?;
         let lsn = self.next_lsn.fetch_add(1, Ordering::SeqCst);
@@ -878,6 +1104,7 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
     where
         F: for<'guard> FnOnce(&mut MaintenancePublication<'guard, S>) -> Result<R>,
     {
+        self.writable_directory()?;
         let _lock = self.lock_commit_boundary();
         let (snapshot, lsn) = self.published_read_snapshot();
         let mut publication = MaintenancePublication {
@@ -929,6 +1156,7 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
     /// drops this reservation without recording a publication debt.
     #[doc(hidden)]
     pub fn reserve_deferred_metadata_publication(&self) -> Result<Option<Box<dyn Any + Send>>> {
+        self.writable_directory()?;
         self.store.reserve_metadata_publication()
     }
 
@@ -936,6 +1164,7 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
     /// Inside this thread's commit guard, its unwind performs completion instead.
     #[doc(hidden)]
     pub fn owe_metadata_publication(&self, reservation: Option<Box<dyn Any + Send>>) {
+        self.require_writable();
         let sequence = self.direct_commit_sequence.fetch_add(1, Ordering::SeqCst) + 1;
         let mut owed = self.owed_publication.lock();
         if let Some(existing) = owed.as_mut() {
@@ -1065,6 +1294,7 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
     /// sync-apply. The overflow guard fires on `u64::MAX` before any mutation so
     /// the receiver's counters are unchanged on error.
     pub fn advance_for_sync(&self, tx: TxId, table: &str, incoming: TxId) -> Result<()> {
+        self.writable_directory()?;
         if incoming.0 == u64::MAX {
             return Err(Error::TxIdOverflow {
                 table: table.to_string(),
@@ -1101,7 +1331,6 @@ impl<S: WriteSetApplicator> contextdb_core::TransactionManager for TransactionMa
         TransactionManager::snapshot(self)
     }
 }
-
 #[cfg(test)]
 mod commit_wait_tests {
     mod test_read_memory {

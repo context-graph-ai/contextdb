@@ -30,7 +30,12 @@ fn public_cold_metadata_refusal(metadata: ColdMetadata) {
         },
     )
     .unwrap();
-    let declaration = if matches!(metadata, ColdMetadata::SavedPublicationFailure | ColdMetadata::GraphLifetimeNormal | ColdMetadata::GraphLifetimeRepair) {
+    let declaration = if matches!(
+        metadata,
+        ColdMetadata::SavedPublicationFailure
+            | ColdMetadata::GraphLifetimeNormal
+            | ColdMetadata::GraphLifetimeRepair
+    ) {
         "CREATE TABLE metadata_items (id INT PRIMARY KEY, v VECTOR(3) SEARCH_MODE INDEXED HNSW (M = 4, EF_CONSTRUCTION = 64))"
     } else {
         "CREATE TABLE metadata_items (id INT PRIMARY KEY, v VECTOR(3) SEARCH_MODE INDEXED)"
@@ -43,26 +48,48 @@ fn public_cold_metadata_refusal(metadata: ColdMetadata) {
         )
         .unwrap();
     }
-    if matches!(metadata, ColdMetadata::GraphLifetimeNormal | ColdMetadata::GraphLifetimeRepair) {
+    if matches!(
+        metadata,
+        ColdMetadata::GraphLifetimeNormal | ColdMetadata::GraphLifetimeRepair
+    ) {
         use crate::persistence::content_identity::proof_allocation_oracle_tests as oracle;
         let repair = matches!(metadata, ColdMetadata::GraphLifetimeRepair);
         if repair {
             let established = db.run_maintenance_cycle().unwrap();
-            assert_eq!(established.vector.built_partitions, 1, "repair begins from an established generation: {established:?}");
-            let partition = VectorPartitionRef::new(VectorIndexRef::new("metadata_items", "v"), VectorPartitionKey::default());
-            assert!(db.vector_store.quarantine_partition_route(&partition,
-                contextdb_vector::VectorRouteQuarantineReason::CorruptChanges));
+            assert_eq!(
+                established.vector.built_partitions, 1,
+                "repair begins from an established generation: {established:?}"
+            );
+            let partition = VectorPartitionRef::new(
+                VectorIndexRef::new("metadata_items", "v"),
+                VectorPartitionKey::default(),
+            );
+            assert!(db.vector_store.quarantine_partition_route(
+                &partition,
+                contextdb_vector::VectorRouteQuarantineReason::CorruptChanges
+            ));
         }
         let allocation_scope = oracle::watch_graph_allocations();
-        let observation = crate::vector_observations::observe_graph_workspace_for_test(
-            Arc::new(oracle::graph_workspace_event));
+        let observation = crate::vector_observations::observe_graph_workspace_for_test(Arc::new(
+            oracle::graph_workspace_event,
+        ));
         let report = db.run_maintenance_cycle().unwrap();
         drop(observation);
-        assert_eq!(report.vector.built_partitions, 1, "real graph publication completed: {report:?}");
-        assert!(report.vector.first_failure.is_none(), "cleanup completes: {report:?}");
+        assert_eq!(
+            report.vector.built_partitions, 1,
+            "real graph publication completed: {report:?}"
+        );
+        assert!(
+            report.vector.first_failure.is_none(),
+            "cleanup completes: {report:?}"
+        );
         oracle::assert_graph_freed_before_workspace_refund(repair);
         drop(allocation_scope);
-        assert_eq!(db.vector_memory_ownership_receipt_for_test().temporary_workspace, 0);
+        assert_eq!(
+            db.vector_memory_ownership_receipt_for_test()
+                .temporary_workspace,
+            0
+        );
         assert_eq!(db.accountant.underflow_count_for_test(), 0);
         db.close().unwrap();
         return;
@@ -73,57 +100,97 @@ fn public_cold_metadata_refusal(metadata: ColdMetadata) {
             TableDefinition::new("vector_paged_generation_pages");
         let owners: TableDefinition<u64, &[u8]> =
             TableDefinition::new("vector_saved_publication_owners");
-        let census = || persistence.with_db(|source| {
-            let read = source.begin_read().unwrap();
-            let pages = match read.open_table(pages) {
-                Ok(pages) => pages,
-                Err(redb::TableError::TableDoesNotExist(_)) => return Ok((0, 0, 0)),
-                Err(error) => panic!("paged census: {error}"),
-            };
-            let owners = match read.open_table(owners) {
-                Ok(owners) => owners,
-                Err(redb::TableError::TableDoesNotExist(_)) => return Ok((0, 0, pages.len().unwrap())),
-                Err(error) => panic!("saved owner census: {error}"),
-            };
-            let mut owned_unreachable_pages = 0;
-            for owner in owners.iter().unwrap() {
-                let storage = owner.unwrap().0.value().to_be_bytes();
-                for page in pages.iter().unwrap() {
-                    if page.unwrap().0.value().starts_with(&storage) {
-                        owned_unreachable_pages += 1;
+        let census = || {
+            persistence
+                .with_db(|source| {
+                    let read = source.begin_read().unwrap();
+                    let pages = match read.open_table(pages) {
+                        Ok(pages) => pages,
+                        Err(redb::TableError::TableDoesNotExist(_)) => return Ok((0, 0, 0)),
+                        Err(error) => panic!("paged census: {error}"),
+                    };
+                    let owners = match read.open_table(owners) {
+                        Ok(owners) => owners,
+                        Err(redb::TableError::TableDoesNotExist(_)) => {
+                            return Ok((0, 0, pages.len().unwrap()));
+                        }
+                        Err(error) => panic!("saved owner census: {error}"),
+                    };
+                    let mut owned_unreachable_pages = 0;
+                    for owner in owners.iter().unwrap() {
+                        let storage = owner.unwrap().0.value().to_be_bytes();
+                        for page in pages.iter().unwrap() {
+                            if page.unwrap().0.value().starts_with(&storage) {
+                                owned_unreachable_pages += 1;
+                            }
+                        }
                     }
-                }
-            }
-            Ok((owners.len().unwrap(), owned_unreachable_pages, pages.len().unwrap()))
-        }).unwrap();
-        use crate::persistence::content_identity::proof_allocation_oracle_tests as oracle; let identity_scope = oracle::watch_graph_allocations(); let identity_observation = crate::vector_observations::observe_graph_workspace_for_test(Arc::new(oracle::graph_workspace_event)); let baseline = census();
+                    Ok((
+                        owners.len().unwrap(),
+                        owned_unreachable_pages,
+                        pages.len().unwrap(),
+                    ))
+                })
+                .unwrap()
+        };
+        use crate::persistence::content_identity::proof_allocation_oracle_tests as oracle;
+        let identity_scope = oracle::watch_graph_allocations();
+        let identity_observation = crate::vector_observations::observe_graph_workspace_for_test(
+            Arc::new(oracle::graph_workspace_event),
+        );
+        let baseline = census();
         let mut observations = Vec::new();
         for _ in 0..4 {
             db.arm_vector_durable_compaction_failure_for_test();
             let report = db.run_maintenance_cycle().unwrap();
-            assert_eq!(report.vector.first_failure,
+            assert_eq!(
+                report.vector.first_failure,
                 Some(contextdb_vector::VectorMaintenanceFailure::BuildFailure),
-                "a real completed candidate reaches the existing prepublication failure: {report:?}");
-            assert!(db.vector_durable_compaction_failure_consumed_for_test(), "attempt={} report={report:?}", observations.len());
+                "a real completed candidate reaches the existing prepublication failure: {report:?}"
+            );
+            assert!(
+                db.vector_durable_compaction_failure_consumed_for_test(),
+                "attempt={} report={report:?}",
+                observations.len()
+            );
             assert_eq!(report.vector.built_partitions, 0);
             // Drive only the existing finite reclamation kernel, so retry cannot
             // accidentally publish an otherwise unreachable candidate.
             for _ in 0..64 {
-                if persistence.paged_cleanup_step(64, |_| Ok(()), || Ok(())).unwrap() == 0 {
+                if persistence
+                    .paged_cleanup_step(64, |_| Ok(()), || Ok(()))
+                    .unwrap()
+                    == 0
+                {
                     break;
                 }
             }
-            observations.push(census()); eprintln!("RUNTIME_PROOF_CENSUS attempt={} census={:?}", observations.len() - 1, observations.last().unwrap());
+            observations.push(census());
+            eprintln!(
+                "RUNTIME_PROOF_CENSUS attempt={} census={:?}",
+                observations.len() - 1,
+                observations.last().unwrap()
+            );
         }
         for observation in observations {
-            assert_eq!(observation.1, 0,
-                "failed publications retain zero owned unreachable pages in this process; census={observation:?}");
-            assert_eq!(observation.0, baseline.0,
-                "each failed publication releases its durable saved-export owner");
-            assert_eq!(observation.2, baseline.2,
-                "finite cleanup returns unreachable durable pages to the fresh control");
+            assert_eq!(
+                observation.1, 0,
+                "failed publications retain zero owned unreachable pages in this process; census={observation:?}"
+            );
+            assert_eq!(
+                observation.0, baseline.0,
+                "each failed publication releases its durable saved-export owner"
+            );
+            assert_eq!(
+                observation.2, baseline.2,
+                "finite cleanup returns unreachable durable pages to the fresh control"
+            );
         }
-        assert_saved_retry_publication(&db); oracle::assert_saved_export_identities(5); drop(identity_observation); drop(identity_scope); db.close().unwrap();
+        assert_saved_retry_publication(&db);
+        oracle::assert_saved_export_identities(5);
+        drop(identity_observation);
+        drop(identity_scope);
+        db.close().unwrap();
         return;
     }
     assert_eq!(
@@ -175,7 +242,11 @@ fn public_cold_metadata_refusal(metadata: ColdMetadata) {
     journal_key.extend_from_slice(&journal_lsn.to_be_bytes());
     journal_key.extend_from_slice(&0u64.to_be_bytes());
     let (definition, malformed_key) = match metadata {
-        ColdMetadata::GraphLifetimeNormal | ColdMetadata::GraphLifetimeRepair | ColdMetadata::SavedPublicationFailure => unreachable!("mapped failure row returned above"),
+        ColdMetadata::GraphLifetimeNormal
+        | ColdMetadata::GraphLifetimeRepair
+        | ColdMetadata::SavedPublicationFailure => {
+            unreachable!("mapped failure row returned above")
+        }
         ColdMetadata::Catalog => (CATALOGS, catalog_key.as_slice()),
         ColdMetadata::CoveredJournal => (JOURNAL, journal_key.as_slice()),
         ColdMetadata::Journal => (JOURNAL, journal_key.as_slice()),
@@ -1434,20 +1505,80 @@ fn public_cycle_repair_graph_allocations_retire_before_workspace_refund() {
 
 // This strengthens the existing mapped publication-failure row after its four failures.
 fn assert_saved_retry_publication(db: &Database) {
-    let partition = VectorPartitionRef::new(VectorIndexRef::new("metadata_items", "v"), VectorPartitionKey::unpartitioned());
-    let fixture = db.__saved_topology_fixture_for_test(&partition, false, 1, db.declared_reader_memory().unwrap()).unwrap();
-    assert_eq!(fixture.cycles, 1, "the same process publishes on the first unarmed retry");
+    let partition = VectorPartitionRef::new(
+        VectorIndexRef::new("metadata_items", "v"),
+        VectorPartitionKey::unpartitioned(),
+    );
+    let fixture = db
+        .__saved_topology_fixture_for_test(
+            &partition,
+            false,
+            1,
+            db.declared_reader_memory().unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        fixture.cycles, 1,
+        "the same process publishes on the first unarmed retry"
+    );
     assert_eq!(fixture.base.graph_format_version, 1);
     assert_eq!(fixture.base.generation_id, fixture.base.storage_id);
-    let source = fixture.original_source(true, fixture.base.generation_id).unwrap();
+    let source = fixture
+        .original_source(true, fixture.base.generation_id)
+        .unwrap();
     assert_eq!(blake3::hash(source).as_bytes(), &fixture.base.source_digest);
-    let catalog = db.persistence.as_ref().unwrap().load_vector_partition_generation_catalog_for(&partition.index, &partition.partition_key).unwrap().unwrap();
+    let catalog = db
+        .persistence
+        .as_ref()
+        .unwrap()
+        .load_vector_partition_generation_catalog_for(&partition.index, &partition.partition_key)
+        .unwrap()
+        .unwrap();
     assert_eq!(catalog.base.generation_id, fixture.base.generation_id);
-    let base = db.persistence.as_ref().unwrap().load_vector_partition_base_generation_with_expected_graph_bytes(&partition.index, &partition.partition_key, catalog.base.generation_id, catalog.base.durable_bytes).unwrap();
-    assert!(base.graph.bytes.starts_with(b"CDHNSW"), "canonical inspector materializes the actual paged producer");
-    assert_eq!(HnswIndex::decode_durable_generation(base.graph.bytes.as_slice(), 3, VectorQuantization::F32).unwrap().len(), 16, "same decoder oracle as the frozen durable-only row");
-    assert_eq!(HnswIndex::decode_durable_generation(source, 3, VectorQuantization::F32).unwrap().len(), 16);
-    assert_eq!(db.vector_memory_ownership_receipt_for_test().temporary_workspace, 0);
+    let base = db
+        .persistence
+        .as_ref()
+        .unwrap()
+        .load_vector_partition_base_generation_with_expected_graph_bytes(
+            &partition.index,
+            &partition.partition_key,
+            catalog.base.generation_id,
+            catalog.base.durable_bytes,
+        )
+        .unwrap();
+    assert!(
+        base.graph.bytes.starts_with(b"CDHNSW"),
+        "canonical inspector materializes the actual paged producer"
+    );
+    assert_eq!(
+        HnswIndex::decode_durable_generation(
+            base.graph.bytes.as_slice(),
+            3,
+            VectorQuantization::F32
+        )
+        .unwrap()
+        .len(),
+        16,
+        "same decoder oracle as the frozen durable-only row"
+    );
+    assert_eq!(
+        HnswIndex::decode_durable_generation(source, 3, VectorQuantization::F32)
+            .unwrap()
+            .len(),
+        16
+    );
+    assert_eq!(
+        db.vector_memory_ownership_receipt_for_test()
+            .temporary_workspace,
+        0
+    );
     assert_eq!(db.accountant.underflow_count_for_test(), 0);
-    eprintln!("RUNTIME_PROOF_SUCCESS artifact={} storage={} source_hash={} inspector_hash={} manifest_hash={} points=16", fixture.base.generation_id, fixture.base.storage_id, blake3::hash(source), blake3::hash(&base.graph.bytes), blake3::hash(&fixture.base.manifest));
+    eprintln!(
+        "RUNTIME_PROOF_SUCCESS artifact={} storage={} source_hash={} inspector_hash={} manifest_hash={} points=16",
+        fixture.base.generation_id,
+        fixture.base.storage_id,
+        blake3::hash(source),
+        blake3::hash(&base.graph.bytes),
+        blake3::hash(&fixture.base.manifest)
+    );
 }

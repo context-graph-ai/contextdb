@@ -322,6 +322,13 @@ fn content_size_result(
 }
 
 pub(crate) trait ReadExecutionTarget: Send + Sync {
+    #[cfg(feature = "test-seams")]
+    fn resident_history_database_for_test(&self) -> Result<&Database> {
+        Err(Error::PlanError(
+            "this execution target has no installed history database".into(),
+        ))
+    }
+
     fn register_writer_cursor(&self, _cursor: &Arc<BoundedCursorExecutionState>) -> Result<()> {
         Ok(())
     }
@@ -737,7 +744,9 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         row_id: RowId,
         snapshot: SnapshotId,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
-        before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        before_clone: &mut dyn FnMut(
+            crate::read_image_memory::RowReadAdmission<'_>,
+        ) -> std::result::Result<(), BoundedExecutionError>,
     ) -> std::result::Result<Option<VersionedRow>, BoundedExecutionError>;
 
     fn bounded_physical_table_cursor(
@@ -753,8 +762,30 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         cursor: &mut contextdb_relational::mem::BoundedPhysicalCursor,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         observed: &mut dyn FnMut(&VersionedRow) -> std::result::Result<(), BoundedExecutionError>,
-        before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        before_clone: &mut dyn FnMut(
+            crate::read_image_memory::RowReadAdmission<'_>,
+        ) -> std::result::Result<(), BoundedExecutionError>,
     ) -> std::result::Result<Option<VersionedRow>, BoundedExecutionError>;
+
+    fn vector_read_preflight(
+        &self,
+        snapshot: SnapshotId,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        copies: &mut contextdb_vector::VectorCopyAdmission,
+        checkpoint: Option<bounded::ReadOpenContext>,
+    ) -> Result<Option<crate::persistence::vector_membership_source::VectorReadScope>>;
+
+    fn preflight_historical_graph(
+        &self, snapshot: SnapshotId,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        before: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+    ) -> std::result::Result<(), BoundedExecutionError>;
+
+    fn preflight_historical_index(
+        &self, table: &str, index: &str, snapshot: SnapshotId,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        before: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+    ) -> std::result::Result<(), BoundedExecutionError>;
 
     /// Exact correspondence with this statement's captured source root.
     fn ordered_prefix_snapshot_is_current(
@@ -780,7 +811,9 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
             &IndexKey,
             RowId,
         ) -> std::result::Result<(), BoundedExecutionError>,
-        before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        before_clone: &mut dyn FnMut(
+            crate::read_image_memory::RowReadAdmission<'_>,
+        ) -> std::result::Result<(), BoundedExecutionError>,
     ) -> std::result::Result<Option<VersionedRow>, BoundedExecutionError>;
 
     fn bounded_visit_verified_ordered_identities(
@@ -825,7 +858,9 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         release_retained: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
-        before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        before_clone: &mut dyn FnMut(
+            crate::read_image_memory::RowReadAdmission<'_>,
+        ) -> std::result::Result<(), BoundedExecutionError>,
     ) -> std::result::Result<Option<VersionedRow>, BoundedExecutionError>;
 
     fn bounded_vector_schema_read_many(
@@ -1411,6 +1446,11 @@ impl BoundedCursorTarget {
 /// these questions.
 #[allow(clippy::too_many_arguments)]
 impl ReadExecutionTarget for Database {
+    #[cfg(feature = "test-seams")]
+    fn resident_history_database_for_test(&self) -> Result<&Database> {
+        Ok(self)
+    }
+
     fn register_writer_cursor(&self, cursor: &Arc<BoundedCursorExecutionState>) -> Result<()> {
         Database::register_writer_cursor(self, cursor)
     }
@@ -1885,6 +1925,32 @@ impl ReadExecutionTarget for Database {
             .is_some_and(|filter| filter_has_equality_for_columns(filter, params, &anchor_columns))
     }
 
+    fn vector_read_preflight(
+        &self,
+        snapshot: SnapshotId,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        copies: &mut contextdb_vector::VectorCopyAdmission,
+        checkpoint: Option<bounded::ReadOpenContext>,
+    ) -> Result<Option<crate::persistence::vector_membership_source::VectorReadScope>> {
+        Database::vector_read_preflight(self, snapshot, read_memory, copies, checkpoint)
+    }
+
+    fn preflight_historical_graph(
+        &self, snapshot: SnapshotId,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        before: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+    ) -> std::result::Result<(), BoundedExecutionError> {
+        Database::preflight_historical_graph(self, snapshot, read_memory, before)
+    }
+
+    fn preflight_historical_index(
+        &self, table: &str, index: &str, snapshot: SnapshotId,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        before: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+    ) -> std::result::Result<(), BoundedExecutionError> {
+        Database::preflight_historical_index(self, table, index, snapshot, read_memory, before)
+    }
+
     fn bounded_row_by_identity(
         &self,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
@@ -1893,9 +1959,11 @@ impl ReadExecutionTarget for Database {
         row_id: RowId,
         snapshot: SnapshotId,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
-        before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        before_clone: &mut dyn FnMut(
+            crate::read_image_memory::RowReadAdmission<'_>,
+        ) -> std::result::Result<(), BoundedExecutionError>,
     ) -> std::result::Result<Option<VersionedRow>, BoundedExecutionError> {
-        Database::bounded_row_by_identity(
+        Database::bounded_row_by_identity_admitted(
             self,
             read_memory,
             tx,
@@ -1922,21 +1990,20 @@ impl ReadExecutionTarget for Database {
         cursor: &mut contextdb_relational::mem::BoundedPhysicalCursor,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         observed: &mut dyn FnMut(&VersionedRow) -> std::result::Result<(), BoundedExecutionError>,
-        before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        before_clone: &mut dyn FnMut(
+            crate::read_image_memory::RowReadAdmission<'_>,
+        ) -> std::result::Result<(), BoundedExecutionError>,
     ) -> std::result::Result<Option<VersionedRow>, BoundedExecutionError> {
-        let row = Database::bounded_physical_table_row_next(
+        Database::bounded_physical_table_row_next_admitted(
             self,
             read_memory,
             table,
             snapshot,
             cursor,
             before_touch,
+            observed,
             before_clone,
-        )?;
-        if let Some(row) = &row {
-            observed(row)?;
-        }
-        Ok(row)
+        )
     }
 
     fn bounded_exact_index_row_next(
@@ -1949,7 +2016,9 @@ impl ReadExecutionTarget for Database {
         before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         release_retained: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
-        before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        before_clone: &mut dyn FnMut(
+            crate::read_image_memory::RowReadAdmission<'_>,
+        ) -> std::result::Result<(), BoundedExecutionError>,
     ) -> std::result::Result<Option<VersionedRow>, BoundedExecutionError> {
         Database::bounded_exact_index_row_next(
             self,
@@ -1987,7 +2056,9 @@ impl ReadExecutionTarget for Database {
             &IndexKey,
             RowId,
         ) -> std::result::Result<(), BoundedExecutionError>,
-        before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        before_clone: &mut dyn FnMut(
+            crate::read_image_memory::RowReadAdmission<'_>,
+        ) -> std::result::Result<(), BoundedExecutionError>,
     ) -> std::result::Result<Option<VersionedRow>, BoundedExecutionError> {
         Database::bounded_ordered_table_row_next_observed(
             self,
@@ -12272,8 +12343,14 @@ fn execute_writer_index_scan(
             Ok::<_, Error>(())
         },
         |bytes| {
+            bytes.retain_into(
+                &mut admission,
+                "query",
+                "eager_index_output",
+                "Reduce query output or raise MEMORY_LIMIT.",
+            )?;
             admission.try_grow_for(
-                bytes.saturating_add(std::mem::size_of::<VersionedRow>() * 4),
+                std::mem::size_of::<VersionedRow>() * 4,
                 "query",
                 "eager_index_output",
                 "Reduce query output or raise MEMORY_LIMIT.",
@@ -20151,6 +20228,11 @@ fn project_graph_frontier_rows(
 }
 
 impl ReadExecutionTarget for BoundedCursorTarget {
+    #[cfg(feature = "test-seams")]
+    fn resident_history_database_for_test(&self) -> Result<&Database> {
+        self.store.resident_history_database_for_test()
+    }
+
     fn load_row_vector_for_column(
         &self,
         tx: Option<TxId>,
@@ -20519,6 +20601,32 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         )
     }
 
+    fn vector_read_preflight(
+        &self,
+        snapshot: SnapshotId,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        copies: &mut contextdb_vector::VectorCopyAdmission,
+        checkpoint: Option<bounded::ReadOpenContext>,
+    ) -> Result<Option<crate::persistence::vector_membership_source::VectorReadScope>> {
+        self.store.vector_read_preflight(snapshot, read_memory, copies, checkpoint)
+    }
+
+    fn preflight_historical_graph(
+        &self, snapshot: SnapshotId,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        before: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+    ) -> std::result::Result<(), BoundedExecutionError> {
+        self.store.preflight_historical_graph(snapshot, read_memory, before)
+    }
+
+    fn preflight_historical_index(
+        &self, table: &str, index: &str, snapshot: SnapshotId,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        before: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+    ) -> std::result::Result<(), BoundedExecutionError> {
+        self.store.preflight_historical_index(table, index, snapshot, read_memory, before)
+    }
+
     fn bounded_row_by_identity(
         &self,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
@@ -20527,7 +20635,9 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         row_id: RowId,
         snapshot: SnapshotId,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
-        before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        before_clone: &mut dyn FnMut(
+            crate::read_image_memory::RowReadAdmission<'_>,
+        ) -> std::result::Result<(), BoundedExecutionError>,
     ) -> std::result::Result<Option<VersionedRow>, BoundedExecutionError> {
         self.store.bounded_row_by_identity(
             read_memory,
@@ -20555,7 +20665,9 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         cursor: &mut contextdb_relational::mem::BoundedPhysicalCursor,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         observed: &mut dyn FnMut(&VersionedRow) -> std::result::Result<(), BoundedExecutionError>,
-        before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        before_clone: &mut dyn FnMut(
+            crate::read_image_memory::RowReadAdmission<'_>,
+        ) -> std::result::Result<(), BoundedExecutionError>,
     ) -> std::result::Result<Option<VersionedRow>, BoundedExecutionError> {
         self.store.bounded_physical_table_row_next(
             read_memory,
@@ -20578,7 +20690,9 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         release_retained: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
-        before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        before_clone: &mut dyn FnMut(
+            crate::read_image_memory::RowReadAdmission<'_>,
+        ) -> std::result::Result<(), BoundedExecutionError>,
     ) -> std::result::Result<Option<VersionedRow>, BoundedExecutionError> {
         self.store.bounded_exact_index_row_next(
             read_memory,
@@ -20616,7 +20730,9 @@ impl ReadExecutionTarget for BoundedCursorTarget {
             &IndexKey,
             RowId,
         ) -> std::result::Result<(), BoundedExecutionError>,
-        before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        before_clone: &mut dyn FnMut(
+            crate::read_image_memory::RowReadAdmission<'_>,
+        ) -> std::result::Result<(), BoundedExecutionError>,
     ) -> std::result::Result<Option<VersionedRow>, BoundedExecutionError> {
         self.store.bounded_ordered_table_row_next_observed(
             read_memory,

@@ -501,10 +501,18 @@
  }
  
  impl ReadableDatabase for Database {
-@@ -518,6 +647,32 @@
+@@ -518,6 +647,40 @@
  }
  
  impl Database {
++    /// Capture a native retained read that authenticates every consumed page.
++    /// The ordinary native transaction guard remains responsible for retention.
++    #[cfg(feature = "contextdb-internal")]
++    #[doc(hidden)]
++    pub fn begin_verified_read(&self) -> Result<ReadTransaction, TransactionError> {
++        ReadTransaction::new_verified(self.get_memory(), self.allocate_read_transaction()?)
++    }
++
 +    /// Exact fixed cache-index allocation, separate from the configured page cap.
 +    #[doc(hidden)]
 +    pub fn cache_index_bytes(&self) -> usize {
@@ -534,7 +542,7 @@
      /// Opens the specified file as a redb database.
      /// * if the file does not exist, or is an empty file, a new database will be initialized in it
      /// * if the file is a valid redb database, it will be opened
-@@ -571,9 +726,17 @@
+@@ -571,9 +734,17 @@
      /// Returns [`DatabaseError::TransactionInProgress`] if any read or write transaction is still
      /// alive when this method is called.
      pub fn check_integrity(&mut self) -> Result<bool, DatabaseError> {
@@ -553,7 +561,7 @@
  
          let old_roots = [self.mem.get_data_root(), self.mem.get_system_root()];
  
-@@ -619,6 +782,7 @@
+@@ -619,6 +790,7 @@
          // Once https://github.com/cberner/redb/issues/829 is fixed, we should upgrade this to use quick-repair -- that way the user
          // can cancel the compaction without requiring a full repair afterwards
          let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -561,7 +569,7 @@
          if txn.list_persistent_savepoints()?.next().is_some() {
              return Err(CompactionError::PersistentSavepointExists);
          }
-@@ -629,6 +793,7 @@
+@@ -629,6 +801,7 @@
          txn.commit().map_err(|e| e.into_storage_error())?;
          // Repeat, just in case executing list_persistent_savepoints() created a new table
          let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -569,7 +577,7 @@
          txn.set_two_phase_commit(true);
          txn.commit().map_err(|e| e.into_storage_error())?;
          // There can't be any outstanding transactions because we have a `&mut self`, so all pending free pages
-@@ -643,6 +808,7 @@
+@@ -643,6 +816,7 @@
              let mut progress = false;
  
              let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -577,7 +585,7 @@
              if txn.compact_pages()? {
                  progress = true;
                  txn.commit().map_err(|e| e.into_storage_error())?;
-@@ -652,6 +818,7 @@
+@@ -652,6 +826,7 @@
  
              // Double commit to free up the relocated pages for reuse
              let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -585,7 +593,7 @@
              txn.set_two_phase_commit(true);
              // Also shrink the database file by the maximum amount
              txn.set_shrink_policy(ShrinkPolicy::Maximum);
-@@ -660,6 +827,7 @@
+@@ -660,6 +835,7 @@
              // TODO: this really shouldn't be necessary, but the data freed tree is a system table
              // and so free'ing up its pages causes more deletes from the system tree
              let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -593,7 +601,7 @@
              txn.set_two_phase_commit(true);
              // Also shrink the database file by the maximum amount
              txn.set_shrink_policy(ShrinkPolicy::Maximum);
-@@ -676,6 +844,218 @@
+@@ -676,6 +852,218 @@
          }
  
          Ok(compacted)
@@ -812,7 +820,7 @@
      }
  
      #[cfg_attr(not(debug_assertions), expect(dead_code))]
-@@ -891,6 +1271,7 @@
+@@ -891,6 +1279,7 @@
          Ok([data_root, system_root])
      }
  
@@ -820,7 +828,7 @@
      fn new(
          file: Box<dyn StorageBackend>,
          allow_initialize: bool,
-@@ -898,6 +1279,8 @@
+@@ -898,6 +1287,8 @@
          region_size: Option<u64>,
          cache_size: usize,
          repair_callback: &(dyn Fn(&mut RepairSession) + 'static),
@@ -829,7 +837,7 @@
      ) -> Result<Self, DatabaseError> {
          #[cfg(feature = "logging")]
          let file_path = format!("{:?}", &file);
-@@ -910,6 +1293,7 @@
+@@ -910,6 +1301,7 @@
              region_size,
              cache_size,
              false,
@@ -837,7 +845,7 @@
          )?;
          let mut mem = Arc::new(mem);
          // If the last transaction used 2-phase commit and updated the allocator state table, then
-@@ -919,7 +1303,12 @@
+@@ -919,7 +1311,12 @@
              info!("Found valid allocator state, full repair not needed");
              mem.load_allocator_state(&tree)?;
              #[cfg(debug_assertions)]
@@ -851,7 +859,7 @@
          } else {
              #[cfg(feature = "logging")]
              warn!("Database {:?} not shutdown cleanly. Repairing", &file_path);
-@@ -944,8 +1333,20 @@
+@@ -944,8 +1341,20 @@
  
          let db = Database {
              mem,
@@ -873,7 +881,7 @@
  
          // Restore the tracker state for any persistent savepoints
          let txn = db.begin_write().map_err(|e| e.into_storage_error())?;
-@@ -1035,12 +1436,21 @@
+@@ -1035,12 +1444,21 @@
      /// write may be in progress at a time. If a write is in progress, this function will block
      /// until it completes.
      pub fn begin_write(&self) -> Result<WriteTransaction, TransactionError> {
@@ -895,7 +903,7 @@
          WriteTransaction::new(guard, self.transaction_tracker.clone(), self.mem.clone())
              .map_err(|e| e.into())
      }
-@@ -1056,16 +1466,74 @@
+@@ -1056,16 +1474,74 @@
  
          Ok(())
      }
@@ -972,7 +980,7 @@
              #[cfg(feature = "logging")]
              warn!("Failed to flush database file. Repair may be required at restart.");
          }
-@@ -1106,6 +1574,7 @@
+@@ -1106,6 +1582,7 @@
      region_size: Option<u64>,
      cache_size: usize,
      repair_callback: Box<dyn Fn(&mut RepairSession)>,
@@ -980,7 +988,7 @@
  }
  
  impl Builder {
-@@ -1125,6 +1594,7 @@
+@@ -1125,6 +1602,7 @@
              // TODO: Default should probably take into account the total system memory
              cache_size: 1024 * 1024 * 1024,
              repair_callback: Box::new(|_| {}),
@@ -988,7 +996,7 @@
          }
      }
  
-@@ -1157,13 +1627,27 @@
+@@ -1157,13 +1635,27 @@
          self
      }
  
@@ -1017,7 +1025,7 @@
      pub fn set_region_size(&mut self, size: u64) -> &mut Self {
          assert!(size.is_power_of_two());
          self.region_size = Some(size);
-@@ -1175,6 +1659,7 @@
+@@ -1175,6 +1667,7 @@
      /// * if the file is a valid redb database, it will be opened
      /// * otherwise this function will return an error
      pub fn create(&self, path: impl AsRef<Path>) -> Result<Database, DatabaseError> {
@@ -1025,7 +1033,7 @@
          let file = OpenOptions::new()
              .read(true)
              .write(true)
-@@ -1183,26 +1668,71 @@
+@@ -1183,26 +1676,71 @@
              .open(path)?;
  
          Database::new(
@@ -1099,7 +1107,7 @@
          )
      }
  
-@@ -1222,6 +1752,36 @@
+@@ -1222,6 +1760,36 @@
              self.page_size,
              None,
              self.cache_size,
@@ -1136,7 +1144,7 @@
          )
      }
  
-@@ -1236,6 +1796,29 @@
+@@ -1236,6 +1804,29 @@
              self.region_size,
              self.cache_size,
              &self.repair_callback,
@@ -1166,7 +1174,7 @@
          )
      }
  
-@@ -1251,6 +1834,8 @@
+@@ -1251,6 +1842,8 @@
              self.region_size,
              self.cache_size,
              &self.repair_callback,
@@ -1175,7 +1183,7 @@
          )
      }
  }
-@@ -1260,18 +1845,215 @@
+@@ -1260,18 +1853,215 @@
          f.debug_struct("Database").finish()
      }
  }
@@ -1498,7 +1506,7 @@
  mod transaction_tracker;
  mod transactions;
  mod tree_store;
-@@ -106,3 +130,17 @@
+@@ -106,3 +130,21 @@
          tempfile::NamedTempFile::new().unwrap()
      }
  }
@@ -1516,6 +1524,10 @@
 +#[cfg(feature = "test-seams")]
 +#[doc(hidden)]
 +pub use db::allocator_metadata_test_seams::observe_allocator_region_loads_for_test;
++
++#[cfg(feature = "contextdb-internal")]
++#[doc(hidden)]
++pub use transactions::TableRootEvent;
 --- a/src/multimap_table.rs
 +++ b/src/multimap_table.rs
 @@ -212,12 +212,12 @@
@@ -2571,7 +2583,27 @@
  const NEXT_SAVEPOINT_TABLE: SystemTableDefinition<(), SavepointId> =
      SystemTableDefinition::new("next_savepoint_id");
  pub(crate) const SAVEPOINT_TABLE: SystemTableDefinition<SavepointId, SerializedSavepoint> =
-@@ -832,6 +893,7 @@
+@@ -816,6 +877,19 @@
+     }
+ }
+ 
++/// Transaction-local normal-table root lifecycle. Policy and witness storage belong to callers.
++#[cfg(feature = "contextdb-internal")]
++#[doc(hidden)]
++#[derive(Clone, Copy)]
++pub enum TableRootEvent {
++    BeforeOpen,
++    AfterClose,
++    BeforeDelete,
++    AfterDelete,
++    BeforeRelocate,
++    AfterRelocate,
++}
++
+ /// A read/write transaction
+ ///
+ /// Only a single [`WriteTransaction`] may exist at a time
+@@ -832,9 +906,14 @@
      two_phase_commit: bool,
      shrink_policy: ShrinkPolicy,
      quick_repair: bool,
@@ -2579,7 +2611,14 @@
      // All transaction-local savepoint lifecycle state. See
      // `SavepointTransactionState` for the commit/abort contract.
      savepoint_state: Mutex<SavepointTransactionState>,
-@@ -850,8 +912,16 @@
++    #[cfg(feature = "contextdb-internal")]
++    table_root_hook: Option<fn(&Self, &str, TableRootEvent) -> Result<(), StorageError>>,
++    #[cfg(feature = "contextdb-internal")]
++    table_root_hook_error: Mutex<Option<StorageError>>,
+ }
+ 
+ impl WriteTransaction {
+@@ -850,8 +929,16 @@
          let system_page = mem.get_system_root();
  
          let tables = TableNamespace::new(root_page, guard.clone(), mem.clone());
@@ -2596,14 +2635,54 @@
          Ok(Self {
              transaction_tracker,
              mem: mem.clone(),
-@@ -864,9 +934,41 @@
+@@ -864,9 +951,81 @@
              durability: InternalDurability::Immediate,
              two_phase_commit: false,
              quick_repair: false,
 +            deferred_free_budget,
              shrink_policy: ShrinkPolicy::Default,
              savepoint_state: Mutex::new(SavepointTransactionState::default()),
++            #[cfg(feature = "contextdb-internal")]
++            table_root_hook: None,
++            #[cfg(feature = "contextdb-internal")]
++            table_root_hook_error: Mutex::new(None),
          })
++    }
++
++    /// Install fixed transaction-local lifecycle policy; no inventory is retained.
++    #[cfg(feature = "contextdb-internal")]
++    #[doc(hidden)]
++    pub fn with_table_root_hook(
++        mut self,
++        hook: fn(&Self, &str, TableRootEvent) -> Result<(), StorageError>,
++    ) -> Self {
++        self.table_root_hook = Some(hook);
++        self
++    }
++
++    #[cfg(feature = "contextdb-internal")]
++    fn call_table_root_hook(&self, name: &str, event: TableRootEvent) -> Result<(), StorageError> {
++        if let Some(hook) = self.table_root_hook {
++            hook(self, name, event)?;
++        }
++        Ok(())
++    }
++
++    /// Distinguish absent from empty using one normal-table directory lookup.
++    #[cfg(feature = "contextdb-internal")]
++    #[doc(hidden)]
++    pub fn normal_table_root(&self, name: &str) -> Result<Option<Option<[u8; 32]>>, TableError> {
++        let mut tables = self.tables.lock().unwrap();
++        tables.table_tree.flush_table_root_updates()?;
++        Ok(tables
++            .table_tree
++            .get_table_untyped(name, TableType::Normal)?
++            .map(|table| match table {
++                InternalTableDefinition::Normal { table_root, .. } => {
++                    table_root.map(BtreeHeader::to_le_bytes)
++                }
++                InternalTableDefinition::Multimap { .. } => unreachable!(),
++            }))
 +    }
 +
 +    #[cfg(feature = "test-seams")]
@@ -2638,7 +2717,7 @@
      }
  
      pub(crate) fn set_shrink_policy(&mut self, shrink_policy: ShrinkPolicy) {
-@@ -892,6 +994,29 @@
+@@ -892,6 +1051,29 @@
              return Ok(true);
          }
  
@@ -2668,10 +2747,15 @@
          Ok(false)
      }
  
-@@ -1352,6 +1477,44 @@
+@@ -1349,7 +1531,47 @@
+         &'txn self,
+         definition: TableDefinition<K, V>,
+     ) -> Result<Table<'txn, K, V>, TableError> {
++        #[cfg(feature = "contextdb-internal")]
++        self.call_table_root_hook(definition.name(), TableRootEvent::BeforeOpen)?;
          self.tables.lock().unwrap().open_table(self, definition)
-     }
- 
++    }
++
 +    /// Check a user family's directory entry without finalizing dirty payload pages.
 +    #[cfg(feature = "contextdb-internal")]
 +    #[doc(hidden)]
@@ -2708,23 +2792,64 @@
 +            Some(InternalTableDefinition::Multimap { .. }) => unreachable!(),
 +            None => None,
 +        })
-+    }
-+
+     }
+ 
      /// Open the given table
-     ///
-     /// The table will be created if it does not exist
-@@ -1412,7 +1575,23 @@
+@@ -1373,6 +1595,13 @@
+         length: u64,
+     ) {
+         self.tables.lock().unwrap().close_table(name, table, length);
++        #[cfg(feature = "contextdb-internal")]
++        if let Err(error) = self.call_table_root_hook(name, TableRootEvent::AfterClose) {
++            let mut failure = self.table_root_hook_error.lock().unwrap();
++            if failure.is_none() {
++                *failure = Some(error);
++            }
++        }
+     }
+ 
+     /// Rename the given table
+@@ -1384,10 +1613,21 @@
+         let name = definition.name().to_string();
+         // Drop the definition so that callers can pass in a `Table` to rename, without getting a TableAlreadyOpen error
+         drop(definition);
++        #[cfg(feature = "contextdb-internal")]
++        {
++            self.call_table_root_hook(&name, TableRootEvent::BeforeDelete)?;
++            self.call_table_root_hook(new_name.name(), TableRootEvent::BeforeOpen)?;
++        }
+         self.tables
+             .lock()
+             .unwrap()
+-            .rename_table(self, &name, new_name.name())
++            .rename_table(self, &name, new_name.name())?;
++        #[cfg(feature = "contextdb-internal")]
++        {
++            self.call_table_root_hook(&name, TableRootEvent::AfterDelete)?;
++            self.call_table_root_hook(new_name.name(), TableRootEvent::AfterClose)?;
++        }
++        Ok(())
+     }
+ 
+     /// Rename the given multimap table
+@@ -1412,7 +1652,29 @@
          let name = definition.name().to_string();
          // Drop the definition so that callers can pass in a `Table` or `MultimapTable` to delete, without getting a TableAlreadyOpen error
          drop(definition);
 -        self.tables.lock().unwrap().delete_table(self, &name)
++        #[cfg(feature = "contextdb-internal")]
++        self.call_table_root_hook(&name, TableRootEvent::BeforeDelete)?;
++        let result = self.tables.lock().unwrap().delete_table(self, &name);
++        #[cfg(feature = "contextdb-internal")]
++        if result.is_ok() {
++            self.call_table_root_hook(&name, TableRootEvent::AfterDelete)?;
++        }
 +        #[cfg(not(feature = "test-seams"))]
 +        {
-+            self.tables.lock().unwrap().delete_table(self, &name)
++            result
 +        }
 +        #[cfg(feature = "test-seams")]
 +        {
-+            let result = self.tables.lock().unwrap().delete_table(self, &name);
 +            if matches!(result, Ok(true)) {
 +                self.record_table_write_for_test(
 +                    &name,
@@ -2738,7 +2863,18 @@
      }
  
      /// Delete the given table
-@@ -1469,11 +1648,36 @@
+@@ -1458,6 +1720,10 @@
+     /// All writes performed in this transaction will be visible to future transactions, and are
+     /// durable as consistent with the [`Durability`] level set by [`Self::set_durability`]
+     pub fn commit(mut self) -> Result<(), CommitError> {
++        #[cfg(feature = "contextdb-internal")]
++        if let Some(error) = self.table_root_hook_error.lock().unwrap().take() {
++            return Err(error.into());
++        }
+         // Set completed flag first, so that we don't go through the abort() path on drop, if this fails
+         self.completed = true;
+         self.commit_inner()
+@@ -1469,11 +1735,36 @@
              self.two_phase_commit = true;
          }
  
@@ -2777,7 +2913,7 @@
  
          #[cfg(feature = "logging")]
          debug!(
-@@ -1484,6 +1688,9 @@
+@@ -1484,6 +1775,9 @@
              InternalDurability::None => self.non_durable_commit(user_root)?,
              InternalDurability::Immediate => self.durable_commit(user_root)?,
          }
@@ -2787,7 +2923,7 @@
  
          self.savepoint_state
              .lock()
-@@ -1627,18 +1834,36 @@
+@@ -1627,18 +1921,36 @@
      }
  
      pub(crate) fn durable_commit(&mut self, user_root: Option<BtreeHeader>) -> Result {
@@ -2827,7 +2963,7 @@
  
          if self.quick_repair {
              system_tree.create_table_and_flush_table_root(
-@@ -1680,6 +1905,14 @@
+@@ -1680,6 +1992,14 @@
          }
  
          let system_root = system_tree.finalize_dirty_checksums()?;
@@ -2842,7 +2978,7 @@
  
          self.mem.commit(
              user_root,
-@@ -1688,6 +1921,11 @@
+@@ -1688,6 +2008,11 @@
              self.two_phase_commit,
              self.shrink_policy,
          )?;
@@ -2854,7 +2990,7 @@
  
          // Mark any pending non-durable commits as fully committed.
          self.transaction_tracker.clear_pending_non_durable_commits();
-@@ -1766,6 +2004,9 @@
+@@ -1766,6 +2091,9 @@
      // Relocate pages to lower number regions/pages
      // Returns true if a page(s) was moved
      pub(crate) fn compact_pages(&mut self) -> Result<bool> {
@@ -2864,7 +3000,7 @@
          let mut progress = false;
  
          // Find the 1M highest pages
-@@ -1823,46 +2064,361 @@
+@@ -1823,46 +2151,384 @@
          Ok(progress)
      }
  
@@ -2966,8 +3102,15 @@
 +        } else {
 +            &mut system_tables.table_tree
 +        };
++        let user_table = cursor.phase < 2;
 +        let (target, pages, examined) =
 +            tree.compaction_page_batch(cursor, maximum, protected_table)?;
++        drop(system_tables);
++        drop(tables);
++        #[cfg(feature = "contextdb-internal")]
++        if user_table && let Some(name) = target.as_deref() {
++            self.call_table_root_hook(name, TableRootEvent::BeforeRelocate)?;
++        }
 +        let mut relocation_map = HashMap::new();
 +        let pages = pages
 +            .into_iter()
@@ -3015,7 +3158,23 @@
 +        // the normal deferred-free tree. process_freed_pages uses the oldest
 +        // read transaction fence; neither relocation nor subsequent recording
 +        // can reuse those addresses until that reader releases its snapshot.
-+        tree.relocate_compaction_batch(target.as_deref(), &relocation_map)?;
++        {
++            let mut tables = self.tables.lock().unwrap();
++            let mut system_tables = self.system_tables.lock().unwrap();
++            let tree = if user_table {
++                &mut tables.table_tree
++            } else {
++                &mut system_tables.table_tree
++            };
++            tree.relocate_compaction_batch(target.as_deref(), &relocation_map)?;
++        }
++        #[cfg(feature = "contextdb-internal")]
++        if user_table
++            && !relocation_map.is_empty()
++            && let Some(name) = target.as_deref()
++        {
++            self.call_table_root_hook(name, TableRootEvent::AfterRelocate)?;
++        }
 +        #[cfg(all(test, debug_assertions))]
 +        online_relocation_tests::RELOCATIONS.with(|pairs| {
 +            pairs
@@ -3256,7 +3415,7 @@
      }
  
      fn process_freed_pages_nondurable_helper(
-@@ -2037,6 +2593,18 @@
+@@ -2037,6 +2703,18 @@
          })
      }
  
@@ -3275,7 +3434,7 @@
      #[allow(dead_code)]
      pub(crate) fn print_debug(&self) -> Result {
          // Flush any pending updates to make sure we get the latest root
-@@ -2107,6 +2675,82 @@
+@@ -2107,18 +2785,148 @@
      tree: TableTree,
  }
  
@@ -3358,10 +3517,33 @@
  impl ReadTransaction {
      pub(crate) fn new(
          mem: Arc<TransactionalMemory>,
-@@ -2121,6 +2765,45 @@
-         })
-     }
- 
+         guard: TransactionGuard,
+     ) -> Result<Self, TransactionError> {
++        Self::new_with_hint(mem, guard, PageHint::Clean)
++    }
++
++    #[cfg(feature = "contextdb-internal")]
++    pub(crate) fn new_verified(
++        mem: Arc<TransactionalMemory>,
++        guard: TransactionGuard,
++    ) -> Result<Self, TransactionError> {
++        Self::new_with_hint(mem, guard, PageHint::Verified)
++    }
++
++    fn new_with_hint(
++        mem: Arc<TransactionalMemory>,
++        guard: TransactionGuard,
++        hint: PageHint,
++    ) -> Result<Self, TransactionError> {
+         let root_page = mem.get_data_root();
+         let guard = Arc::new(guard);
+         Ok(Self {
+             mem: mem.clone(),
+-            tree: TableTree::new(root_page, PageHint::Clean, guard, mem)
++            tree: TableTree::new(root_page, hint, guard, mem).map_err(TransactionError::Storage)?,
++        })
++    }
++
 +    pub(crate) fn new_external(
 +        mem: Arc<TransactionalMemory>,
 +        snapshot: StorageSnapshotIdentity,
@@ -3384,8 +3566,8 @@
 +        Ok(Self {
 +            mem: mem.clone(),
 +            tree: TableTree::new(root, PageHint::Verified, guard, mem)
-+                .map_err(TransactionError::Storage)?,
-+        })
+                 .map_err(TransactionError::Storage)?,
+         })
 +    }
 +
 +    /// Name the exact committed user-tree root this transaction reads.
@@ -3399,12 +3581,10 @@
 +                length: root.length,
 +            }),
 +        }
-+    }
-+
+     }
+ 
      /// Open the given table
-     pub fn open_table<K: Key + 'static, V: Value + 'static>(
-         &self,
-@@ -2135,12 +2818,54 @@
+@@ -2135,12 +2943,69 @@
              InternalTableDefinition::Normal { table_root, .. } => Ok(ReadOnlyTable::new(
                  definition.name().to_string(),
                  table_root,
@@ -3457,10 +3637,25 @@
 +            Some(InternalTableDefinition::Multimap { .. }) => unreachable!(),
 +            None => None,
 +        })
++    }
++
++    /// Read one committed normal-table header, distinguishing empty from absent.
++    #[cfg(feature = "contextdb-internal")]
++    #[doc(hidden)]
++    pub fn normal_table_root(&self, name: &str) -> Result<Option<Option<[u8; 32]>>, TableError> {
++        Ok(self
++            .tree
++            .get_table_untyped(name, TableType::Normal)?
++            .map(|table| match table {
++                InternalTableDefinition::Normal { table_root, .. } => {
++                    table_root.map(BtreeHeader::to_le_bytes)
++                }
++                InternalTableDefinition::Multimap { .. } => unreachable!(),
++            }))
      }
  
      /// Open the given table without a type
-@@ -2161,7 +2886,7 @@
+@@ -2161,7 +3026,7 @@
                  ..
              } => Ok(ReadOnlyUntypedTable::new(
                  table_root,
@@ -3469,7 +3664,7 @@
                  fixed_key_size,
                  fixed_value_size,
                  self.mem.clone(),
-@@ -2189,7 +2914,7 @@
+@@ -2189,7 +3054,7 @@
              } => Ok(ReadOnlyMultimapTable::new(
                  table_root,
                  table_length,
@@ -3478,7 +3673,7 @@
                  self.tree.transaction_guard().clone(),
                  self.mem.clone(),
              )?),
-@@ -2217,7 +2942,7 @@
+@@ -2217,7 +3082,7 @@
              } => Ok(ReadOnlyUntypedMultimapTable::new(
                  table_root,
                  table_length,
@@ -3487,7 +3682,7 @@
                  fixed_key_size,
                  fixed_value_size,
                  self.mem.clone(),
-@@ -2263,7 +2988,15 @@
+@@ -2263,7 +3128,15 @@
  
  #[cfg(test)]
  mod test {
@@ -3504,7 +3699,7 @@
  
      const X: TableDefinition<&str, &str> = TableDefinition::new("x");
  
-@@ -2284,4 +3017,840 @@
+@@ -2284,4 +3157,840 @@
          let write_txn = db2.begin_write().unwrap();
          assert!(write_txn.transaction_id > first_txn_id);
      }
@@ -4348,7 +4543,7 @@
 +}
 --- /dev/null
 +++ b/src/tree_store/bounded_bytes.rs
-@@ -0,0 +1,1981 @@
+@@ -0,0 +1,1978 @@
 +//! Reject-only inspection for byte tables. Selected records use ordinary pages.
 +use super::btree::page_checksum;
 +use super::page_store::{Page, PageImpl};
@@ -6318,9 +6513,6 @@
 +                assert_eq!(
 +                    table.get_bounded(b"key").unwrap().unwrap().value(),
 +                    b"original"
-+                );
-+                eprintln!(
-+                    "production lookup: one Cached computation, repeated memo hits; corrupt/new expected checksum refused on memo hit"
 +                );
 +            }
 +            // Restore this task-created store before redb close housekeeping.
@@ -9845,7 +10037,7 @@
  
      #[test]
      fn cache_leak() {
-@@ -653,4 +1164,159 @@
+@@ -653,4 +1164,729 @@
          cached_file.invalidate_cache(0, 128);
          assert_eq!(cached_file.read_cache_bytes.load(Ordering::Acquire), 0);
      }
@@ -10004,6 +10196,576 @@
 +            transferred.memoized_byte_node_checksum(|| Ok(46)).unwrap(),
 +            46
 +        );
++    }
++
++    // The writer reopen/doubling acceptance fixture promises that its warmed
++    // fixed cache share stays saturated without growth. These controls prove
++    // that same occupancy promise with the real native cache and page owners.
++    // A uniform native cache fills its declared share to the maximum complete
++    // page count. Held branch pages stay resident while CLOCK replaces leaves.
++    const UNIFORM_PAGE_BYTES: usize = 4096;
++    const UNIFORM_CACHE_CAP: usize = 4 * 1024 * 1024;
++    const UNIFORM_CACHE_SLOTS: usize = 996;
++
++    fn uniform_cache_file(extra_pages: usize) -> PagedCachedFile {
++        assert_eq!(super::cached_page_bytes(UNIFORM_PAGE_BYTES), 4208);
++        assert_eq!(UNIFORM_CACHE_CAP / 4208, UNIFORM_CACHE_SLOTS);
++        let backend = InMemoryBackend::new();
++        backend
++            .set_len(((UNIFORM_CACHE_SLOTS + extra_pages) * UNIFORM_PAGE_BYTES) as u64)
++            .unwrap();
++        PagedCachedFile::new(
++            Box::new(backend),
++            UNIFORM_PAGE_BYTES as u64,
++            UNIFORM_CACHE_CAP,
++        )
++        .unwrap()
++    }
++
++    fn uniform_page(file: &PagedCachedFile, ordinal: usize) -> super::PageMemory {
++        let page = file
++            .read(
++                (ordinal * UNIFORM_PAGE_BYTES) as u64,
++                UNIFORM_PAGE_BYTES,
++                PageHint::Clean,
++            )
++            .unwrap();
++        assert_eq!(page.len(), UNIFORM_PAGE_BYTES);
++        page
++    }
++
++    // Inspect by borrowing: no get, second-chance bit change, or page clone.
++    fn uniform_cache_cut(file: &PagedCachedFile) -> (usize, usize, usize, usize) {
++        let mut entries = 0;
++        let mut payload = 0;
++        let mut charge = 0;
++        let mut pinned = 0;
++        for stripe in &file.read_cache {
++            let stripe = stripe.read().unwrap();
++            for (_, page) in stripe.iter() {
++                assert_eq!(page.len(), UNIFORM_PAGE_BYTES);
++                entries += 1;
++                payload += page.len();
++                charge += super::cached_page_bytes(page.len());
++                pinned += usize::from(Arc::strong_count(&*page) > 1);
++            }
++        }
++        (entries, payload, charge, pinned)
++    }
++
++    fn assert_uniform_cache_full(file: &PagedCachedFile, pinned: usize) {
++        assert_eq!(
++            uniform_cache_cut(file),
++            (
++                UNIFORM_CACHE_SLOTS,
++                UNIFORM_CACHE_SLOTS * UNIFORM_PAGE_BYTES,
++                UNIFORM_CACHE_SLOTS * 4208,
++                pinned,
++            ),
++            "every funded uniform page remains in the cache map"
++        );
++        assert_eq!(
++            file.read_cache_bytes.load(Ordering::Acquire),
++            UNIFORM_CACHE_SLOTS * 4208,
++            "the ledger reconciles every resident page, including pinned pages"
++        );
++        assert_eq!(file.write_buffer_bytes.load(Ordering::Acquire), 0);
++        assert_eq!(
++            file.max_cache_size.load(Ordering::Acquire),
++            UNIFORM_CACHE_CAP
++        );
++        assert!(UNIFORM_CACHE_SLOTS * 4208 <= UNIFORM_CACHE_CAP);
++        assert!((UNIFORM_CACHE_SLOTS + 1) * 4208 > UNIFORM_CACHE_CAP);
++    }
++
++    #[test]
++    fn uniform_cache_fills_its_complete_page_capacity_and_preserves_it_on_misses() {
++        let misses = UNIFORM_CACHE_SLOTS * 2;
++        let file = uniform_cache_file(misses);
++        for ordinal in 0..UNIFORM_CACHE_SLOTS {
++            let page = uniform_page(&file, ordinal);
++            assert!(matches!(page, super::PageMemory::Cached(_)));
++            drop(page);
++        }
++        assert_uniform_cache_full(&file, 0);
++        for ordinal in UNIFORM_CACHE_SLOTS..UNIFORM_CACHE_SLOTS + misses {
++            let page = uniform_page(&file, ordinal);
++            assert!(matches!(page, super::PageMemory::Cached(_)));
++            drop(page);
++            assert_uniform_cache_full(&file, 0);
++        }
++        for stripe in &file.read_cache {
++            stripe.write().unwrap().clear();
++        }
++        assert_eq!(file.read_cache_bytes.load(Ordering::Acquire), 0);
++    }
++
++    #[test]
++    fn pinned_branch_pages_preserve_uniform_cache_occupancy_through_the_last_miss_and_drop() {
++        let misses = UNIFORM_CACHE_SLOTS * 2;
++        let file = uniform_cache_file(misses);
++        // Three branch-like pages in the first CLOCK stripe remain held
++        // across more than two complete passes over every stripe's victims.
++        let branch_ordinals = [0, 131, 262];
++        let branches = branch_ordinals.map(|ordinal| uniform_page(&file, ordinal));
++        for page in &branches {
++            assert!(matches!(page, super::PageMemory::Cached(_)));
++        }
++        for ordinal in 0..UNIFORM_CACHE_SLOTS {
++            drop(uniform_page(&file, ordinal));
++        }
++        assert_uniform_cache_full(&file, branches.len());
++        for ordinal in UNIFORM_CACHE_SLOTS..UNIFORM_CACHE_SLOTS + misses {
++            let page = uniform_page(&file, ordinal);
++            assert!(matches!(page, super::PageMemory::Cached(_)));
++            drop(page);
++            assert_uniform_cache_full(&file, branches.len());
++        }
++        // No refill read occurs after the last miss: holder drop alone must
++        // not lower the funded resident map or its saturated native ledger.
++        drop(branches);
++        assert_uniform_cache_full(&file, 0);
++        #[cfg(feature = "cache_metrics")]
++        let hits = file.cache_stats().read_hits;
++        for ordinal in branch_ordinals {
++            drop(uniform_page(&file, ordinal));
++        }
++        #[cfg(feature = "cache_metrics")]
++        assert_eq!(
++            file.cache_stats().read_hits,
++            hits + branch_ordinals.len() as u64
++        );
++        assert_uniform_cache_full(&file, 0);
++        for stripe in &file.read_cache {
++            stripe.write().unwrap().clear();
++        }
++        assert_eq!(file.read_cache_bytes.load(Ordering::Acquire), 0);
++    }
++
++    #[test]
++    fn an_all_pinned_uniform_cache_finishes_misses_without_eviction_or_cache_growth() {
++        struct MissCharge(Arc<std::sync::atomic::AtomicUsize>, usize);
++        impl Drop for MissCharge {
++            fn drop(&mut self) {
++                self.0.fetch_sub(self.1, Ordering::SeqCst);
++            }
++        }
++        let misses = 5;
++        let file = uniform_cache_file(misses);
++        let holders = (0..UNIFORM_CACHE_SLOTS)
++            .map(|ordinal| uniform_page(&file, ordinal))
++            .collect::<Vec<_>>();
++        assert_uniform_cache_full(&file, UNIFORM_CACHE_SLOTS);
++        let resident_identities = || {
++            let mut entries = std::collections::BTreeMap::new();
++            for stripe in &file.read_cache {
++                for (offset, page) in stripe.read().unwrap().iter() {
++                    entries.insert(offset, Arc::as_ptr(&*page) as usize);
++                }
++            }
++            entries
++        };
++        let before = resident_identities();
++        #[cfg(feature = "cache_metrics")]
++        let evictions = file.cache_stats().evictions;
++        let charged = Arc::new(std::sync::atomic::AtomicUsize::new(0));
++        for ordinal in UNIFORM_CACHE_SLOTS..UNIFORM_CACHE_SLOTS + misses {
++            let admission = charged.clone();
++            let page = crate::with_read_page_charge(
++                Arc::new(move |bytes| {
++                    assert_eq!(bytes, super::admitted_page_bytes(UNIFORM_PAGE_BYTES));
++                    admission.fetch_add(bytes, Ordering::SeqCst);
++                    Ok(Box::new(MissCharge(admission.clone(), bytes)))
++                }),
++                || uniform_page(&file, ordinal),
++            );
++            // Reaching this assertion proves the all-pinned victim walk
++            // terminated. The miss belongs to its reader, never the cache.
++            assert!(matches!(page, super::PageMemory::Charged(_)));
++            assert_eq!(
++                charged.load(Ordering::SeqCst),
++                super::admitted_page_bytes(UNIFORM_PAGE_BYTES)
++            );
++            assert_eq!(
++                resident_identities(),
++                before,
++                "no pinned entry is removed or replaced"
++            );
++            assert_uniform_cache_full(&file, UNIFORM_CACHE_SLOTS);
++            #[cfg(feature = "cache_metrics")]
++            assert_eq!(file.cache_stats().evictions, evictions);
++            drop(page);
++            assert_eq!(charged.load(Ordering::SeqCst), 0);
++        }
++        // Every pinned holder drops after the final miss, with no refill.
++        drop(holders);
++        assert_uniform_cache_full(&file, 0);
++        assert_eq!(resident_identities(), before);
++        for stripe in &file.read_cache {
++            stripe.write().unwrap().clear();
++        }
++        assert_eq!(file.read_cache_bytes.load(Ordering::Acquire), 0);
++        assert_eq!(charged.load(Ordering::SeqCst), 0);
++    }
++    // P1: actual index allocation includes the boxed stripe descriptors.
++    #[test]
++    fn read_index_live_bytes_are_fixed_for_uniform_and_one_stripe_spreads() {
++        use crate::tree_store::page_store::lru_cache::arena_index_tests::Watch;
++        let mut spread_bytes = [0; 2];
++        let page = super::CachedPage::admitted(
++            Arc::<[u8]>::from(vec![0; 4096]),
++            &Arc::new(std::sync::atomic::AtomicUsize::new(0)),
++        );
++        for (spread, skewed) in [false, true].into_iter().enumerate() {
++            let watch = Watch::start();
++            let stripes = PagedCachedFile::new_read_index(4 * 1024 * 1024, 4096, 0);
++            let index_bytes = stripes[0].read().unwrap().arena_index_bytes()
++                + stripes
++                    .iter()
++                    .map(|s| s.read().unwrap().index_bytes())
++                    .sum::<usize>()
++                + stripes.len()
++                    * size_of::<
++                        std::sync::RwLock<
++                            crate::tree_store::page_store::lru_cache::LRUCache<
++                                Arc<super::CachedPage>,
++                            >,
++                        >,
++                    >();
++            let construction = watch.cut();
++            assert_eq!(construction[2], 0);
++            assert_eq!(construction[3] - construction[4], index_bytes);
++            spread_bytes[spread] = index_bytes;
++            watch.reset();
++            for round in 0..3_u64 {
++                for ordinal in 0..996_u64 {
++                    let stripe = if skewed {
++                        0
++                    } else {
++                        ordinal as usize % stripes.len()
++                    };
++                    assert!(matches!(
++                        stripes[stripe]
++                            .write()
++                            .unwrap()
++                            .try_insert(round * 996 + ordinal, page.clone()),
++                        Ok(None)
++                    ));
++                }
++                assert_eq!(
++                    stripes
++                        .iter()
++                        .map(|s| s.read().unwrap().len())
++                        .sum::<usize>(),
++                    996
++                );
++                for stripe in &stripes {
++                    let mut stripe = stripe.write().unwrap();
++                    while stripe.pop_lowest_priority().is_some() {}
++                }
++                assert_eq!(
++                    watch.cut(),
++                    [0; 5],
++                    "only the original fixed index allocations remain live"
++                );
++            }
++            drop(stripes);
++            let released = watch.cut();
++            assert_eq!(released[0], 0);
++            assert_eq!(released[2], 0);
++            assert_eq!(released[3], 0);
++            assert_eq!(released[4], index_bytes);
++        }
++        assert_eq!(spread_bytes[0], spread_bytes[1]);
++    }
++
++    #[derive(Debug)]
++    struct SparseZeroFixture(std::sync::atomic::AtomicU64);
++    impl StorageBackend for SparseZeroFixture {
++        fn len(&self) -> io::Result<u64> {
++            Ok(self.0.load(Ordering::SeqCst))
++        }
++        fn set_len(&self, len: u64) -> io::Result<()> {
++            self.0.store(len, Ordering::SeqCst);
++            Ok(())
++        }
++        fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
++            assert!(offset + out.len() as u64 <= self.0.load(Ordering::SeqCst));
++            out.fill(0);
++            Ok(())
++        }
++        fn write(&self, _: u64, _: &[u8]) -> io::Result<()> {
++            panic!("the read-only sparse pressure fixture is never written")
++        }
++        fn sync_data(&self) -> io::Result<()> {
++            Ok(())
++        }
++    }
++
++    // P2: offset skew cannot impose a per-stripe occupancy ceiling.
++    #[test]
++    fn one_stripe_pressure_uses_all_996_shared_read_arena_slots() {
++        let cap = 4 * 1024 * 1024;
++        assert_eq!(super::cached_page_bytes(4096), 4208);
++        assert_eq!(cap / super::cached_page_bytes(4096), 996);
++        let pages = 3 * 996;
++        let backend = SparseZeroFixture(std::sync::atomic::AtomicU64::new(
++            (pages * 131 * 4096) as u64,
++        ));
++        let file = PagedCachedFile::new(Box::new(backend), 4096, cap).unwrap();
++        let index_bytes = file.index_bytes();
++        for ordinal in 0..pages {
++            let offset = (ordinal * 131 * 4096) as u64;
++            assert_eq!(offset % PagedCachedFile::lock_stripes(), 0);
++            let page = file.read(offset, 4096, PageHint::Clean).unwrap();
++            assert!(matches!(page, super::PageMemory::Cached(_)));
++            assert!(page.iter().all(|byte| *byte == 0));
++            drop(page);
++            if ordinal >= 995 {
++                assert_eq!(file.read_cache[0].read().unwrap().len(), 996);
++                assert!(
++                    file.read_cache[1..]
++                        .iter()
++                        .all(|s| s.read().unwrap().len() == 0)
++                );
++                assert_eq!(file.read_cache_bytes.load(Ordering::SeqCst), 996 * 4208);
++                assert_eq!(file.index_bytes(), index_bytes);
++            }
++        }
++    }
++
++    // P5 and P5b: settle changes its fixed index and preserves live holders.
++    #[test]
++    #[cfg(feature = "contextdb-internal")]
++    fn settle_rebuilds_exact_read_index_and_preserves_above_cap_held_pages() {
++        let backend = InMemoryBackend::new();
++        backend.set_len(64 * 4096).unwrap();
++        let file = PagedCachedFile::new(Box::new(backend), 4096, 16 * 4208).unwrap();
++        for cap in [4 * 4208, 32 * 4208, 8 * 4208] {
++            assert_eq!(
++                file.settle_startup_cache_budget(cap).unwrap(),
++                cap + file.index_bytes()
++            );
++            assert_eq!(
++                file.read_cache[0].read().unwrap().arena_capacity_for_test(),
++                cap / super::cached_page_bytes(4096) + 1
++            );
++        }
++        let holders = (0..8)
++            .map(|ordinal| {
++                file.read((ordinal * 4096) as u64, 4096, PageHint::Clean)
++                    .unwrap()
++            })
++            .collect::<Vec<_>>();
++        assert!(
++            holders
++                .iter()
++                .all(|p| matches!(p, super::PageMemory::Cached(_)))
++        );
++        let before = || {
++            file.read_cache
++                .iter()
++                .flat_map(|stripe| {
++                    let stripe = stripe.read().unwrap();
++                    stripe
++                        .iter()
++                        .map(|(key, value)| (key, Arc::as_ptr(&*value) as usize))
++                        .collect::<Vec<_>>()
++                })
++                .collect::<std::collections::BTreeMap<_, _>>()
++        };
++        let identities = before();
++        let held_bytes = 8 * 4208;
++        let cap = 2 * 4208;
++        assert_eq!(
++            file.settle_startup_cache_budget(cap).unwrap(),
++            held_bytes.max(cap) + file.index_bytes()
++        );
++        assert_eq!(file.read_cache_bytes.load(Ordering::SeqCst), held_bytes);
++        assert_eq!(
++            before(),
++            identities,
++            "settle keeps every held page in its linked stripe index"
++        );
++        for page in &holders {
++            assert_eq!(page.len(), 4096);
++            assert!(page.iter().all(|byte| *byte == 0));
++        }
++        drop(holders);
++        let next_cap = cap;
++        assert_eq!(
++            file.settle_startup_cache_budget(next_cap).unwrap(),
++            next_cap + file.index_bytes()
++        );
++        assert_eq!(
++            file.read_cache[0].read().unwrap().arena_capacity_for_test(),
++            next_cap / super::cached_page_bytes(4096) + 1
++        );
++        assert!(file.read_cache_bytes.load(Ordering::SeqCst) <= next_cap);
++    }
++
++    #[derive(Debug)]
++    struct WritableHeaderFixture {
++        len: std::sync::atomic::AtomicU64,
++        header: std::sync::Mutex<[u8; 320]>,
++    }
++    impl WritableHeaderFixture {
++        fn new(len: u64) -> Self {
++            Self { len: std::sync::atomic::AtomicU64::new(len), header: std::sync::Mutex::new([0; 320]) }
++        }
++    }
++    impl StorageBackend for WritableHeaderFixture {
++        fn len(&self) -> io::Result<u64> { Ok(self.len.load(Ordering::SeqCst)) }
++        fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
++            assert!(offset + out.len() as u64 <= self.len.load(Ordering::SeqCst));
++            out.fill(0);
++            if offset == 0 {
++                let header = self.header.lock().unwrap();
++                let count = out.len().min(header.len());
++                out[..count].copy_from_slice(&header[..count]);
++            }
++            Ok(())
++        }
++        fn set_len(&self, len: u64) -> io::Result<()> { self.len.store(len, Ordering::SeqCst); Ok(()) }
++        fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
++            assert!(offset + data.len() as u64 <= self.len.load(Ordering::SeqCst));
++            if offset == 0 {
++                let mut header = self.header.lock().unwrap();
++                let count = data.len().min(header.len());
++                header[..count].copy_from_slice(&data[..count]);
++            }
++            Ok(())
++        }
++        fn sync_data(&self) -> io::Result<()> { Ok(()) }
++    }
++
++    // R115: actual header writes reach the read cache through the normal flush.
++    #[test]
++    #[cfg(feature = "contextdb-internal")]
++    fn flushed_header_and_full_pages_use_the_unchanged_cache_byte_budget() {
++        let header_len = super::super::header::DB_HEADER_SIZE;
++        assert_eq!(header_len, 320);
++        let full_bytes = super::cached_page_bytes(4096);
++        let header_bytes = super::cached_page_bytes(header_len);
++        assert_eq!((full_bytes, header_bytes), (4208, 432));
++        for (cap, expected_index) in [(4 * 1024 * 1024, 63_436), (64 * 1024 * 1024, 903_768)] {
++            for stride in [1, 131] {
++                let full_pages = cap / full_bytes;
++                let backend = WritableHeaderFixture::new(
++                    ((full_pages + 1) * stride * 4096) as u64,
++                );
++                let file = PagedCachedFile::new(Box::new(backend), 4096, cap).unwrap();
++                let index_bytes = file.index_bytes();
++                let mut writable = file.write(0, header_len, true).unwrap();
++                writable.mem_mut().fill(0x7a);
++                drop(writable);
++                file.flush().unwrap();
++                assert_eq!(file.read_cache_bytes.load(Ordering::SeqCst), header_bytes);
++                assert_eq!(file.write_map_for_test(), (0, 0));
++                let header = file.read(0, header_len, PageHint::Clean).unwrap();
++                assert!(matches!(header, super::PageMemory::Cached(_)));
++                assert!(header.iter().all(|byte| *byte == 0x7a));
++                for ordinal in 1..=full_pages {
++                    let offset = (ordinal * stride * 4096) as u64;
++                    let page = file.read(offset, 4096, PageHint::Clean).unwrap();
++                    assert!(matches!(page, super::PageMemory::Cached(_)), "a byte-fitting full page must not exhaust the fixed index");
++                    assert!(page.iter().all(|byte| *byte == 0));
++                    drop(page);
++                    assert_eq!(file.index_bytes(), index_bytes);
++                }
++                let resident_bytes = file.read_cache_bytes.load(Ordering::SeqCst);
++                assert_eq!(resident_bytes, header_bytes + full_pages * full_bytes);
++                assert_eq!(index_bytes, expected_index);
++                assert!(resident_bytes <= cap);
++                assert!(cap - resident_bytes < full_bytes);
++                assert_eq!(file.read_cache.iter().map(|s| s.read().unwrap().len()).sum::<usize>(), full_pages + 1);
++                assert_eq!(file.read_cache[0].read().unwrap().arena_capacity_for_test(), full_pages + 1);
++                if stride == 131 {
++                    assert_eq!(file.read_cache[0].read().unwrap().len(), full_pages + 1);
++                    assert!(file.read_cache[1..].iter().all(|s| s.read().unwrap().len() == 0));
++                }
++                assert_eq!(file.settle_startup_cache_budget(cap).unwrap(), cap + index_bytes);
++                assert_eq!(file.settle_startup_cache_budget(cap).unwrap(), cap + index_bytes);
++                assert_eq!(file.index_bytes(), index_bytes);
++                assert_eq!(file.read_cache_bytes.load(Ordering::SeqCst), resident_bytes);
++                assert!(header.iter().all(|byte| *byte == 0x7a));
++            }
++        }
++    }
++
++    // Every indexed admission route enforces the same sole-header premise.
++    #[test]
++    #[cfg(debug_assertions)]
++    fn invalid_subpage_normal_scan_and_flush_admissions_fail_loudly() {
++        for (offset, len) in [(4096, 320), (0, 319)] {
++            for route in ["normal", "scan", "flush"] {
++                let backend = WritableHeaderFixture::new(16_384);
++                let file = PagedCachedFile::new(Box::new(backend), 4096, 4 * 1024 * 1024).unwrap();
++                // Ensure the exhausted scan branch has a real evictable page to replace.
++                drop(file.read(8192, 4096, PageHint::Clean).unwrap());
++                let invalid = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++                    match route {
++                        "normal" => { let _page = file.read(offset, len, PageHint::Clean).unwrap(); }
++                        "scan" => crate::read_admission::with_scan_reads(|| {
++                            assert!(crate::read_admission::take_scan_growth(crate::read_admission::SCAN_GROWTH_ALLOWANCE));
++                            let _page = file.read(offset, len, PageHint::Clean).unwrap();
++                        }),
++                        "flush" => {
++                            let mut page = file.write(offset, len, true).unwrap();
++                            page.mem_mut().fill(0x7a);
++                            drop(page);
++                            file.flush().unwrap();
++                        }
++                        _ => unreachable!(),
++                    }
++                }));
++                let panic = invalid.expect_err("an invalid subpage admission must panic");
++                let message = panic.downcast_ref::<String>().map(String::as_str)
++                    .or_else(|| panic.downcast_ref::<&str>().copied()).unwrap_or("");
++                assert!(message.contains("DB_HEADER_SIZE"), "route {route} offset {offset} length {len} must fail its actual header invariant, not a fixture panic: {message}");
++            }
++        }
++    }
++
++    // P6: borrowed write pages keep the baseline cap-0 semantics; flush frees the map.
++    #[test]
++    fn write_buffer_has_zero_entries_and_capacity_after_each_flush() {
++        for cap in [0, 4096, 4 * 1024 * 1024] {
++            let backend = InMemoryBackend::new();
++            backend.set_len(16 * 4096).unwrap();
++            let file = PagedCachedFile::new(Box::new(backend), 4096, cap).unwrap();
++            let index_bytes = file.index_bytes();
++            for transaction in 0..2_u64 {
++                let mut first = file.write(0, 4096, true).unwrap();
++                let mut second = file.write(4096, 4096, true).unwrap();
++                let mut third = file.write(8192, 4096, true).unwrap();
++                first.mem_mut()[..8].copy_from_slice(&(transaction + 1).to_le_bytes());
++                second.mem_mut()[..8].copy_from_slice(&(transaction + 2).to_le_bytes());
++                third.mem_mut()[..8].copy_from_slice(&(transaction + 3).to_le_bytes());
++                drop(third);
++                drop(second);
++                drop(first);
++                file.flush().unwrap();
++                let write = file.write_buffer.lock().unwrap();
++                assert_eq!(write.cache.len(), 0);
++                assert_eq!(write.cache.map_capacity_for_test(), 0);
++                assert_eq!(file.write_buffer_bytes.load(Ordering::SeqCst), 0);
++                drop(write);
++                assert_eq!(file.index_bytes(), index_bytes);
++                for ordinal in 0..3_u64 {
++                    let page = file.read(ordinal * 4096, 4096, PageHint::Clean).unwrap();
++                    assert_eq!(&page[..8], &(transaction + ordinal + 1).to_le_bytes());
++                }
++            }
++        }
++    }
++}
++
++#[cfg(test)]
++impl PagedCachedFile {
++    pub(crate) fn write_map_for_test(&self) -> (usize, usize) {
++        let write = self.write_buffer.lock().unwrap();
++        (write.cache.len(), write.cache.map_capacity_for_test())
 +    }
 +}
 --- a/src/tree_store/page_store/file_backend/fallback.rs
@@ -10598,7 +11360,7 @@
          }
      }
  
-@@ -21,83 +356,127 @@
+@@ -21,83 +356,485 @@
          self.cache.len()
      }
  
@@ -10662,16 +11424,6 @@
 -                for _ in 0..2 {
 -                    if let Some(removed_key) = self.lru_queue.pop_front()
 -                        && let Some((_, second_chance)) = self.cache.get(&removed_key)
--                    {
--                        second_chance.store(false, Ordering::Release);
--                        self.lru_queue.push_back(removed_key);
--                    }
--                }
--            }
--            Some(value)
--        } else {
--            None
--        }
 +        let entry = self.cache.remove(&key)?;
 +        if let Some(previous) = entry.previous {
 +            self.cache.get_mut(&previous).unwrap().next = entry.next;
@@ -10691,56 +11443,31 @@
 +            self.cache.shrink_to_fit();
 +        }
 +        Some(entry.value)
-     }
- 
-     pub(crate) fn get(&self, key: u64) -> Option<&T> {
--        if let Some((value, second_chance)) = self.cache.get(&key) {
--            second_chance.store(true, Ordering::Release);
--            Some(value)
--        } else {
--            None
--        }
++    }
++
++    pub(crate) fn get(&self, key: u64) -> Option<&T> {
 +        let entry = self.cache.get(&key)?;
 +        entry.second_chance.store(true, Ordering::Release);
 +        Some(&entry.value)
-     }
- 
-     pub(crate) fn get_mut(&mut self, key: u64) -> Option<&mut T> {
--        if let Some((value, second_chance)) = self.cache.get_mut(&key) {
--            second_chance.store(true, Ordering::Release);
--            Some(value)
--        } else {
--            None
--        }
++    }
++
++    pub(crate) fn get_mut(&mut self, key: u64) -> Option<&mut T> {
 +        let entry = self.cache.get_mut(&key)?;
 +        entry.second_chance.store(true, Ordering::Release);
 +        Some(&mut entry.value)
-     }
- 
-     pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = (&u64, &T)> {
--        self.cache.iter().map(|(k, (v, _))| (k, v))
++    }
++
++    pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = (&u64, &T)> {
 +        self.cache.iter().map(|(key, entry)| (key, &entry.value))
-     }
- 
-     pub(crate) fn iter_mut(&mut self) -> impl ExactSizeIterator<Item = (&u64, &mut T)> {
--        self.cache.iter_mut().map(|(k, (v, _))| (k, v))
++    }
++
++    pub(crate) fn iter_mut(&mut self) -> impl ExactSizeIterator<Item = (&u64, &mut T)> {
 +        self.cache
 +            .iter_mut()
 +            .map(|(key, entry)| (key, &mut entry.value))
-     }
- 
-     pub(crate) fn pop_lowest_priority(&mut self) -> Option<(u64, T)> {
--        while let Some(key) = self.lru_queue.pop_front() {
--            if let Some((_, second_chance)) = self.cache.get(&key) {
--                if second_chance
--                    .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
--                    .is_ok()
--                {
--                    self.lru_queue.push_back(key);
--                } else {
--                    let (value, _) = self.cache.remove(&key).unwrap();
--                    return Some((key, value));
--                }
++    }
++
++    pub(crate) fn pop_lowest_priority(&mut self) -> Option<(u64, T)> {
 +        self.pop_lowest_priority_where(|_| true)
 +    }
 +
@@ -10766,20 +11493,432 @@
 +                entry.next = None;
 +                self.first = Some(next);
 +                self.last = Some(key);
-             }
-         }
-         None
-     }
- 
-     pub(crate) fn clear(&mut self) {
++            }
++        }
++        None
++    }
++
++    pub(crate) fn clear(&mut self) {
++        *self = Self::new();
++    }
++}
++
++#[cfg(test)]
++pub(crate) mod arena_index_tests {
++    use std::alloc::{GlobalAlloc, Layout, System};
++    use std::cell::Cell;
++
++    thread_local! {
++        static WATCH: Cell<bool> = const { Cell::new(false) };
++        // Successful allocation calls, frees, reallocations, allocated bytes, freed bytes.
++        static COUNTS: Cell<[usize; 5]> = const { Cell::new([0; 5]) };
++    }
++    struct ObservedAllocator;
++    #[global_allocator]
++    static ALLOCATOR: ObservedAllocator = ObservedAllocator;
++
++    fn note(index: usize, bytes_index: usize, bytes: usize) {
++        let _ = WATCH.try_with(|watch| {
++            if watch.get() {
++                let _ = COUNTS.try_with(|counts| {
++                    let mut cut = counts.get();
++                    cut[index] += 1;
++                    cut[bytes_index] += bytes;
++                    counts.set(cut);
++                });
++            }
++        });
++    }
++    unsafe impl GlobalAlloc for ObservedAllocator {
++        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
++            let ptr = unsafe { System.alloc(layout) };
++            if !ptr.is_null() {
++                note(0, 3, layout.size());
++            }
++            ptr
++        }
++        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
++            let ptr = unsafe { System.alloc_zeroed(layout) };
++            if !ptr.is_null() {
++                note(0, 3, layout.size());
++            }
++            ptr
++        }
++        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
++            note(1, 4, layout.size());
++            unsafe { System.dealloc(ptr, layout) };
++        }
++        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
++            let next = unsafe { System.realloc(ptr, layout, size) };
++            if !next.is_null() {
++                let _ = WATCH.try_with(|watch| {
++                    if watch.get() {
++                        let _ = COUNTS.try_with(|counts| {
++                            let mut cut = counts.get();
++                            cut[2] += 1;
++                            cut[3] += size;
++                            cut[4] += layout.size();
++                            counts.set(cut);
++                        });
++                    }
++                });
++            }
++            next
++        }
++    }
++    pub(crate) struct Watch;
++    impl Watch {
++        pub(crate) fn start() -> Self {
++            COUNTS.with(|counts| counts.set([0; 5]));
++            WATCH.with(|watch| assert!(!watch.replace(true)));
++            Self
++        }
++        pub(crate) fn reset(&self) {
++            COUNTS.with(|counts| counts.set([0; 5]));
++        }
++        pub(crate) fn cut(&self) -> [usize; 5] {
++            COUNTS.with(Cell::get)
++        }
++    }
++    impl Drop for Watch {
++        fn drop(&mut self) {
++            WATCH.with(|watch| watch.set(false));
++        }
++    }
++
++    #[test]
++    fn arena_index_bytes_equal_actual_live_allocation_across_uniform_and_skewed_churn() {
++        let mut spread_bytes = [0; 2];
++        for (spread, skewed) in [false, true].into_iter().enumerate() {
++            let watch = Watch::start();
++            let arena = super::EntryArena::<u64>::new(996);
++            let mut stripes: [super::LRUCache<u64>; 131] =
++                std::array::from_fn(|_| super::LRUCache::new(arena.clone(), 8));
++            let index_bytes =
++                arena.index_bytes() + stripes.iter().map(|s| s.index_bytes()).sum::<usize>();
++            let construction = watch.cut();
++            assert_eq!(construction[2], 0);
++            assert_eq!(construction[3] - construction[4], index_bytes);
++            spread_bytes[spread] = index_bytes;
++            watch.reset();
++            for round in 0..3_u64 {
++                for ordinal in 0..996_u64 {
++                    let key = round * 996 + ordinal;
++                    let stripe = if skewed { 0 } else { ordinal as usize % 131 };
++                    assert_eq!(stripes[stripe].try_insert(key, key), Ok(None));
++                }
++                assert_eq!(stripes.iter().map(|s| s.len()).sum::<usize>(), 996);
++                assert_eq!(stripes[0].try_insert(u64::MAX, 7), Err(7));
++                for stripe in &mut stripes {
++                    while let Some((key, value)) = stripe.pop_lowest_priority() {
++                        assert_eq!(key, value);
++                    }
++                }
++                assert!(stripes.iter().all(|s| s.len() == 0));
++                assert_eq!(
++                    arena.index_bytes() + stripes.iter().map(|s| s.index_bytes()).sum::<usize>(),
++                    index_bytes
++                );
++                assert_eq!(
++                    watch.cut(),
++                    [0; 5],
++                    "fill, eviction and refill retain exactly the original arena and heads"
++                );
++            }
++            for ordinal in 0..996_u64 {
++                assert_eq!(
++                    stripes[0].try_insert_lowest_priority(ordinal, ordinal),
++                    Ok(None)
++                );
++            }
++            for stripe in &mut stripes {
++                stripe.clear();
++            }
++            assert_eq!(watch.cut(), [0; 5]);
++            drop(stripes);
++            drop(arena);
++            let released = watch.cut();
++            assert_eq!(released[0], 0);
++            assert_eq!(released[2], 0);
++            assert_eq!(released[3], 0);
++            assert_eq!(released[4], index_bytes);
++        }
++        assert_eq!(
++            spread_bytes[0], spread_bytes[1],
++            "offset spread cannot change index ownership"
++        );
++    }
++
++    #[test]
++    fn arena_clock_victim_trace_matches_the_published_hash_map_cache() {
++        let mut old = old_reference::LRUCache::new();
++        let mut new = super::LRUCache::new(super::EntryArena::new(32), 8);
++        for key in 1..=5_u64 {
++            assert_eq!(old.insert(key, key), new.insert(key, key));
++        }
++        for key in [1, 2, 5] {
++            assert_eq!(old.get(key).copied(), new.get(key).map(|v| *v));
++        }
++        // Key 3 remains pinned while eligible entries spend second chances.
++        for _ in 0..2 {
++            assert_eq!(
++                old.pop_lowest_priority_where(|v| *v != 3),
++                new.pop_lowest_priority_where(|v| *v != 3)
++            );
++        }
++        assert_eq!(
++            old.insert_lowest_priority(9, 9),
++            new.try_insert_lowest_priority(9, 9).unwrap()
++        );
++        assert_eq!(
++            old.pop_lowest_priority_where(|v| *v != 3),
++            new.pop_lowest_priority_where(|v| *v != 3)
++        );
++        assert_eq!(old.remove(2), new.remove(2));
++        for key in 10..14 {
++            assert_eq!(old.insert(key, key), new.insert(key, key));
++        }
++        for key in [3, 11, 13] {
++            assert_eq!(old.get(key).copied(), new.get(key).map(|v| *v));
++        }
++        while old.len() > 0 {
++            assert_eq!(old.pop_lowest_priority(), new.pop_lowest_priority());
++        }
++        assert_eq!(new.pop_lowest_priority(), None);
++        assert_eq!(new.len(), 0);
++    }
++
++    // Independent published pre-arena implementation, SHA f062c990.
++    mod old_reference {
++        use crate::tree_store::page_store::fast_hash::FastHasher64;
++        type FastHashMapU64<T> =
++            std::collections::HashMap<u64, T, std::hash::BuildHasherDefault<FastHasher64>>;
++        use std::sync::atomic::{AtomicBool, Ordering};
++
++        struct Entry<T> {
++            value: T,
++            second_chance: AtomicBool,
++            previous: Option<u64>,
++            next: Option<u64>,
++        }
++
++        pub struct LRUCache<T> {
++            cache: FastHashMapU64<Entry<T>>,
++            first: Option<u64>,
++            last: Option<u64>,
++        }
++
++        impl<T> Default for LRUCache<T> {
++            fn default() -> Self {
++                Self::new()
++            }
++        }
++
++        impl<T> LRUCache<T> {
++            pub(crate) fn new() -> Self {
++                Self {
++                    cache: Default::default(),
++                    first: None,
++                    last: None,
++                }
++            }
++
++            pub(crate) fn len(&self) -> usize {
++                self.cache.len()
++            }
++
++            fn insert_at(&mut self, key: u64, value: T, lowest: bool) -> Option<T> {
++                if let Some(entry) = self.cache.get_mut(&key) {
++                    entry.second_chance.store(false, Ordering::Release);
++                    return Some(std::mem::replace(&mut entry.value, value));
++                }
++                let (previous, next) = if lowest {
++                    (None, self.first)
++                } else {
++                    (self.last, None)
++                };
++                self.cache.insert(
++                    key,
++                    Entry {
++                        value,
++                        second_chance: AtomicBool::new(false),
++                        previous,
++                        next,
++                    },
++                );
++                if let Some(previous) = previous {
++                    self.cache.get_mut(&previous).unwrap().next = Some(key);
++                } else {
++                    self.first = Some(key);
++                }
++                if let Some(next) = next {
++                    self.cache.get_mut(&next).unwrap().previous = Some(key);
++                } else {
++                    self.last = Some(key);
++                }
++                None
++            }
++
++            pub(crate) fn insert(&mut self, key: u64, value: T) -> Option<T> {
++                self.insert_at(key, value, false)
++            }
++
++            /// A one-pass page has lowest priority until another access grants a second chance.
++            pub(crate) fn insert_lowest_priority(&mut self, key: u64, value: T) -> Option<T> {
++                self.insert_at(key, value, true)
++            }
++
++            pub(crate) fn remove(&mut self, key: u64) -> Option<T> {
++                let entry = self.cache.remove(&key)?;
++                if let Some(previous) = entry.previous {
++                    self.cache.get_mut(&previous).unwrap().next = entry.next;
++                } else {
++                    self.first = entry.next;
++                }
++                if let Some(next) = entry.next {
++                    self.cache.get_mut(&next).unwrap().previous = entry.previous;
++                } else {
++                    self.last = entry.previous;
++                }
++                // Geometric reclamation keeps metadata proportional to live cache entries
++                // without reallocating the queue or rehashing on each page replacement.
++                if self.cache.is_empty() {
++                    self.cache = Default::default();
++                } else if self.cache.capacity() > self.cache.len().saturating_mul(4) {
++                    self.cache.shrink_to_fit();
++                }
++                Some(entry.value)
++            }
++
++            pub(crate) fn get(&self, key: u64) -> Option<&T> {
++                let entry = self.cache.get(&key)?;
++                entry.second_chance.store(true, Ordering::Release);
++                Some(&entry.value)
++            }
++
++            pub(crate) fn get_mut(&mut self, key: u64) -> Option<&mut T> {
++                let entry = self.cache.get_mut(&key)?;
++                entry.second_chance.store(true, Ordering::Release);
++                Some(&mut entry.value)
++            }
++
++            pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = (&u64, &T)> {
++                self.cache.iter().map(|(key, entry)| (key, &entry.value))
++            }
++
++            pub(crate) fn iter_mut(&mut self) -> impl ExactSizeIterator<Item = (&u64, &mut T)> {
++                self.cache
++                    .iter_mut()
++                    .map(|(key, entry)| (key, &mut entry.value))
++            }
++
++            pub(crate) fn pop_lowest_priority(&mut self) -> Option<(u64, T)> {
++                self.pop_lowest_priority_where(|_| true)
++            }
++
++            /// Keep ineligible entries linked while looking for a CLOCK victim. Two
++            /// passes let each eligible entry spend its second chance without looping
++            /// forever when every entry is held by a reader.
++            pub(crate) fn pop_lowest_priority_where(
++                &mut self,
++                mut eligible: impl FnMut(&T) -> bool,
++            ) -> Option<(u64, T)> {
++                for _ in 0..self.cache.len().saturating_mul(2) {
++                    let key = self.first?;
++                    let entry = self.cache.get(&key).unwrap();
++                    if !entry.second_chance.swap(false, Ordering::AcqRel) && eligible(&entry.value)
+                     {
+-                        second_chance.store(false, Ordering::Release);
+-                        self.lru_queue.push_back(removed_key);
++                        return self.remove(key).map(|value| (key, value));
+                     }
+-                }
+-            }
+-            Some(value)
+-        } else {
+-            None
+-        }
+-    }
+-
+-    pub(crate) fn get(&self, key: u64) -> Option<&T> {
+-        if let Some((value, second_chance)) = self.cache.get(&key) {
+-            second_chance.store(true, Ordering::Release);
+-            Some(value)
+-        } else {
+-            None
+-        }
+-    }
+-
+-    pub(crate) fn get_mut(&mut self, key: u64) -> Option<&mut T> {
+-        if let Some((value, second_chance)) = self.cache.get_mut(&key) {
+-            second_chance.store(true, Ordering::Release);
+-            Some(value)
+-        } else {
+-            None
+-        }
+-    }
+-
+-    pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = (&u64, &T)> {
+-        self.cache.iter().map(|(k, (v, _))| (k, v))
+-    }
+-
+-    pub(crate) fn iter_mut(&mut self) -> impl ExactSizeIterator<Item = (&u64, &mut T)> {
+-        self.cache.iter_mut().map(|(k, (v, _))| (k, v))
+-    }
+-
+-    pub(crate) fn pop_lowest_priority(&mut self) -> Option<(u64, T)> {
+-        while let Some(key) = self.lru_queue.pop_front() {
+-            if let Some((_, second_chance)) = self.cache.get(&key) {
+-                if second_chance
+-                    .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+-                    .is_ok()
+-                {
+-                    self.lru_queue.push_back(key);
+-                } else {
+-                    let (value, _) = self.cache.remove(&key).unwrap();
+-                    return Some((key, value));
+-                }
+-            }
+-        }
+-        None
+-    }
+-
+-    pub(crate) fn clear(&mut self) {
 -        self.cache.shrink_to_fit();
 -        self.cache.clear();
 -        self.lru_queue.shrink_to_fit();
 -        self.lru_queue.clear();
 -    }
 -}
-+        *self = Self::new();
++                    if let Some(next) = entry.next {
++                        let last = self.last.unwrap();
++                        self.cache.get_mut(&next).unwrap().previous = None;
++                        self.cache.get_mut(&last).unwrap().next = Some(key);
++                        let entry = self.cache.get_mut(&key).unwrap();
++                        entry.previous = Some(last);
++                        entry.next = None;
++                        self.first = Some(next);
++                        self.last = Some(key);
++                    }
++                }
++                None
++            }
++
++            pub(crate) fn clear(&mut self) {
++                *self = Self::new();
++            }
++        }
 +    }
++}
++
++
++#[cfg(test)]
++impl<T> LRUCache<T> {
++    pub(crate) fn arena_capacity_for_test(&self) -> usize { self.arena_capacity() }
++}
++#[cfg(test)]
++impl<T> WriteCache<T> {
++    pub(crate) fn map_capacity_for_test(&self) -> usize { self.cache.capacity() }
 +}
 --- a/src/tree_store/page_store/mod.rs
 +++ b/src/tree_store/page_store/mod.rs
@@ -11437,12 +12576,10 @@
  
              let address = page_number.address_range(
                  self.page_size.into(),
-@@ -774,6 +1045,23 @@
-             #[cfg(debug_assertions)]
-             open_pages: self.read_page_ref_counts.clone(),
+@@ -776,6 +1047,23 @@
          })
-+    }
-+
+     }
+ 
 +    pub(crate) fn get_page_window(
 +        &self,
 +        page: PageNumber,
@@ -11458,9 +12595,11 @@
 +        let extent_len = usize::try_from(address.end - address.start).unwrap();
 +        self.storage
 +            .read_window(address.start, extent_len, range, hint)
-     }
- 
++    }
++
      // NOTE: the caller must ensure that the read cache has been invalidated or stale reads my occur
+     pub(crate) fn get_page_mut<'txn>(&self, page_number: PageNumber) -> Result<PageMut<'txn>> {
+         #[cfg(debug_assertions)]
 @@ -871,7 +1159,9 @@
                      .unwrap()
                      .contains_key(&page)
@@ -11489,7 +12628,7 @@
 +                StorageError::Corrupted("allocator growth yielded no free page".into())
 +            })?
          };
- 
++
 +        if let Some(error) = state
 +            .allocators
 +            .pager()
@@ -11497,7 +12636,7 @@
 +        {
 +            return Err(error);
 +        }
-+
+ 
          #[cfg(debug_assertions)]
          {
 -            assert!(self.allocated_pages.lock().unwrap().insert(page_number));
@@ -11627,6 +12766,110 @@
              let mut state = self.state.lock()?;
              if self.storage.flush().is_ok() {
                  state.header.recovery_required = false;
+@@ -1228,4 +1598,103 @@
+         let mut db = Database::open(tmpfile).unwrap();
+         assert!(db.check_integrity().unwrap());
+     }
++
++    #[test]
++    #[cfg(debug_assertions)]
++    fn read_reference_tracker_releases_all_history_after_the_last_reference() {
++        use crate::tree_store::Page;
++        use crate::tree_store::page_store::base::PageHint;
++
++        let tmpfile = crate::create_tempfile();
++        let db = Database::create(&tmpfile).unwrap();
++        let mem = db.get_memory();
++        assert!(mem.read_page_ref_counts.lock().unwrap().is_empty());
++        for _ in 0..32 {
++            let first = mem.allocate_lowest(mem.get_page_size()).unwrap();
++            let first_number = first.get_page_number();
++            drop(first);
++            let second = mem.allocate_lowest(mem.get_page_size()).unwrap();
++            let second_number = second.get_page_number();
++            drop(second);
++            assert_ne!(first_number, second_number);
++
++            let first = mem.get_page(first_number, PageHint::Clean).unwrap();
++            let first_clone = first.clone();
++            let second = mem.get_page(second_number, PageHint::Clean).unwrap();
++            {
++                let refs = mem.read_page_ref_counts.lock().unwrap();
++                assert_eq!(refs.len(), 2);
++                assert_eq!(refs.get(&first_number), Some(&2));
++                assert_eq!(refs.get(&second_number), Some(&1));
++            }
++            drop(first);
++            assert_eq!(
++                mem.read_page_ref_counts.lock().unwrap().get(&first_number),
++                Some(&1)
++            );
++            drop(first_clone);
++            {
++                let refs = mem.read_page_ref_counts.lock().unwrap();
++                assert_eq!(refs.len(), 1);
++                assert!(!refs.contains_key(&first_number));
++                assert_eq!(refs.get(&second_number), Some(&1));
++            }
++            drop(second);
++            let refs = mem.read_page_ref_counts.lock().unwrap();
++            assert!(
++                refs.is_empty(),
++                "no historical page number survives its last reference"
++            );
++            assert_eq!(
++                refs.capacity(),
++                0,
++                "no historical bucket allocation survives an empty tracker"
++            );
++        }
++    }
++    #[test]
++    fn committed_write_buffer_releases_all_map_capacity_even_at_zero_cache_cap() {
++        use crate::{ReadableDatabase, ReadableTable};
++        for cap in [0, 4096, 4 * 1024 * 1024] {
++            let tmpfile = crate::create_tempfile();
++            let db = Database::builder()
++                .set_cache_size(cap)
++                .create(tmpfile.path())
++                .unwrap();
++            let mem = db.get_memory();
++            let index_bytes = mem.storage.index_bytes();
++            let definition: TableDefinition<u64, &[u8]> =
++                TableDefinition::new("commit_index_probe");
++            for round in 0..2_u64 {
++                let transaction = db.begin_write().unwrap();
++                {
++                    let mut table = transaction.open_table(definition).unwrap();
++                    for key in 0..16_u64 {
++                        let bytes = [round as u8; 512];
++                        table.insert(&key, bytes.as_slice()).unwrap();
++                    }
++                }
++                transaction.commit().unwrap();
++                assert_eq!(mem.storage.write_map_for_test(), (0, 0));
++                assert_eq!(mem.storage.index_bytes(), index_bytes);
++                {
++                    let read = db.begin_read().unwrap();
++                    let table = read.open_table(definition).unwrap();
++                    for key in 0..16_u64 {
++                        assert_eq!(
++                            table.get(&key).unwrap().unwrap().value(),
++                            &[round as u8; 512]
++                        );
++                    }
++                }
++                assert_eq!(mem.storage.write_map_for_test(), (0, 0));
++                #[cfg(debug_assertions)]
++                {
++                    let refs = mem.read_page_ref_counts.lock().unwrap();
++                    assert!(refs.is_empty());
++                    assert_eq!(refs.capacity(), 0);
++                }
++            }
++        }
++    }
+ }
 --- a/src/tree_store/page_store/region.rs
 +++ b/src/tree_store/page_store/region.rs
 @@ -1,10 +1,21 @@

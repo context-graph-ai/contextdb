@@ -480,8 +480,9 @@ pub struct CompositeStore {
     pub change_log_lsn_refcounts: Arc<RwLock<ChangeLogLsnRefcounts>>,
     pub ddl_log: Arc<RwLock<Vec<(Lsn, DdlChange)>>>,
     vector_partition_snapshot_stages: VectorPartitionSnapshotStageRegistry,
-    pub(crate) accountant: Arc<MemoryAccountant>,
+    pub(crate) accountant: crate::memory_accounting::StoreAccountantHandle,
     apply_phase_pause: Arc<ApplyPhasePause>,
+
 }
 
 #[derive(Debug, Default)]
@@ -615,7 +616,7 @@ impl CompositeStore {
             change_log_lsn_refcounts,
             ddl_log,
             vector_partition_snapshot_stages,
-            accountant,
+            accountant: crate::memory_accounting::StoreAccountantHandle::new(accountant),
             apply_phase_pause,
         }
     }
@@ -1283,7 +1284,7 @@ impl CompositeStore {
         let memberships = self.relational.prepare_memberships(
             &ws.relational_deletes,
             &ws.relational_inserts,
-            self.accountant.clone(),
+            self.accountant.as_arc(),
         )?;
         let vector_publication = if mutations.is_empty() {
             None
@@ -1322,7 +1323,7 @@ impl CompositeStore {
             .collect::<Result<Vec<(TableName, RowId, TxId, Lsn)>>>()?;
         let retention_expiries = self
             .relational
-            .prepare_retention_expiries(retention_identities, self.accountant.clone())?;
+            .prepare_retention_expiries(retention_identities, self.accountant.as_arc())?;
         Ok(PreparedVectorPartitionMutationBatch {
             memberships,
             retention_expiries,

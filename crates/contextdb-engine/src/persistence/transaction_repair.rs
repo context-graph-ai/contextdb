@@ -13,6 +13,7 @@ impl RedbPersistence {
         commit_index: &BTreeMap<Lsn, TxId>,
         tables: &HashMap<String, TableMeta>,
     ) -> Result<()> {
+        self.prepare_proof_owner()?;
         let mut mapping = HashMap::new();
         for (position, tx) in commit_index.values().enumerate() {
             mapping.entry(*tx).or_insert(TxId(position as u64 + 1));
@@ -46,7 +47,7 @@ impl RedbPersistence {
             remap(&mut entry.deleted_tx);
         };
         self.with_db(|db| {
-            let write = db.begin_write().map_err(Self::storage_error)?;
+            let write = Self::begin_history_write(db)?;
             for table in tables.keys() {
                 let name = Self::rel_table_name(table);
                 self.transform_transaction_records(
@@ -58,9 +59,18 @@ impl RedbPersistence {
                         if let Some(deleted) = &mut row.deleted_tx {
                             remap(deleted);
                         }
-                        let new_key = Self::rel_row_key_from_parts(row.row_id, row.created_tx, row.lsn);
+                        let new_key =
+                            Self::rel_row_key_from_parts(row.row_id, row.created_tx, row.lsn);
                         let encoded = Self::encode(&row)?;
-                        content_size::repair_row_value(&write, table, old_key, &new_key, bytes.len(), encoded.len(), row.deleted_tx.is_none())?;
+                        content_size::repair_row_value(
+                            &write,
+                            table,
+                            old_key,
+                            &new_key,
+                            bytes.len(),
+                            encoded.len(),
+                            row.deleted_tx.is_none(),
+                        )?;
                         Ok((new_key, encoded))
                     },
                 )?;
@@ -82,7 +92,9 @@ impl RedbPersistence {
                 ))
             })?;
             for (definition, reverse) in [(GRAPH_FWD_TABLE, false), (GRAPH_REV_TABLE, true)] {
-                self.transform_transaction_records(&write, definition, |_, bytes| {
+                self.transform_transaction_records(&write, definition, |_key, bytes| {
+                    #[cfg(any(test, feature = "test-seams"))]
+                    crate::read_work_probe::note_graph("graph_payload", "payload_decode", _key, None, Some(if reverse { "transaction_repair_reverse" } else { "transaction_repair_forward" }));
                     let mut entry: AdjEntry = Self::decode(bytes)?;
                     remap(&mut entry.created_tx);
                     if let Some(deleted) = &mut entry.deleted_tx {
@@ -244,13 +256,20 @@ impl RedbPersistence {
         }
         for (key, _) in &records {
             if vector_values {
-                let bytes = table.get(key.as_slice()).map_err(Self::storage_error)?.ok_or_else(|| Error::Other("selected repair vector disappeared".into()))?.value().len();
+                let bytes = table
+                    .get(key.as_slice())
+                    .map_err(Self::storage_error)?
+                    .ok_or_else(|| Error::Other("selected repair vector disappeared".into()))?
+                    .value()
+                    .len();
                 content_size::repair_vector_value(write, key, key, bytes, 0)?;
             }
             table.remove(key.as_slice()).map_err(Self::storage_error)?;
         }
         for (_, (key, value)) in records {
-            if vector_values { content_size::repair_vector_value(write, &key, &key, 0, value.len())?; }
+            if vector_values {
+                content_size::repair_vector_value(write, &key, &key, 0, value.len())?;
+            }
             table
                 .insert(key.as_slice(), value.as_slice())
                 .map_err(Self::storage_error)?;

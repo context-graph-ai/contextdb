@@ -1,10 +1,14 @@
 //! Checkpoint history copies retain one admitted occurrence at the captured root.
-use super::*;
 use super::writer_source::SourceWindowOwner;
+use super::*;
 use std::ops::Bound;
 
 impl WriterSnapshot {
-    pub(crate) fn copy_config_into(self: &Arc<Self>, owner: SourceWindowOwner, artifact: &RedbPersistence) -> Result<()> {
+    pub(crate) fn copy_config_into(
+        self: &Arc<Self>,
+        owner: SourceWindowOwner,
+        artifact: &RedbPersistence,
+    ) -> Result<()> {
         let mut cursor = self.config_cursor(owner, "")?;
         while let Some(window) = cursor.next(|key, bytes| {
             crate::read_image_memory::reserve(
@@ -79,6 +83,7 @@ impl WriterSnapshot {
 
 impl RedbPersistence {
     fn append_encoded_config_occurrence(&self, key: &str, encoded: &[u8]) -> Result<()> {
+        self.prepare_proof_owner()?;
         let mut admission = self.proof_admission();
         admission.admit(
             encoded
@@ -88,7 +93,7 @@ impl RedbPersistence {
                 .saturating_add(4096),
         )?;
         self.with_db(|db| {
-            let write = db.begin_write().map_err(Self::storage_error)?;
+            let write = Self::begin_history_write(db)?;
             Self::raise_config_identity_floors_in_write(&write, key, encoded)?;
             Self::update_policy_hold_release_index(&write, key, true)?;
             write
@@ -104,6 +109,7 @@ impl RedbPersistence {
     }
 
     fn append_ddl_occurrence(&self, key: &str, lsn: Lsn, change: &DdlChange) -> Result<()> {
+        self.prepare_proof_owner()?;
         let mut admission = self.proof_admission();
         struct Counter(usize);
         impl std::io::Write for Counter {
@@ -129,7 +135,7 @@ impl RedbPersistence {
                 .saturating_add(4096),
         )?;
         self.with_db(|db| {
-            let write = db.begin_write().map_err(Self::storage_error)?;
+            let write = Self::begin_history_write(db)?;
             let encoded = Self::encode(change)?;
             write
                 .open_table(DDL_LOG_TABLE)

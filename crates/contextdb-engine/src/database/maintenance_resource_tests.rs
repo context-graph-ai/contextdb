@@ -1258,7 +1258,8 @@ fn switching_to_caller_driven_during_build_reports_pending_before_retry() {
                 // Retain a refusal as an observation so the batch is always
                 // released before the assertion on the pre-fix tree.
                 observations.push(
-                    inspection_reader.execute(sql, &HashMap::new())
+                    inspection_reader
+                        .execute(sql, &HashMap::new())
                         .map_err(|error| format!("{error:?}"))
                         .map(|shown| {
                             if shown.rows.len() != 1 {
@@ -1844,22 +1845,26 @@ fn last_membership_cleanup_keeps_catalog_targets_with_a_pinned_retired_chain() {
         drop(info);
         drop(layout);
         drop(inventory_owner);
-        assert!(!seed
-            .persistence
-            .as_ref()
-            .unwrap()
-            .vector_partition_has_covered_journal_records(&combined)
-            .unwrap());
-        assert!(!seed
-            .persistence
-            .as_ref()
-            .unwrap()
-            .vector_partition_has_uncovered_journal_records(
-                &partition.index,
-                &partition.partition_key,
-                combined.change.unwrap().covered_lsn
-            )
-            .unwrap());
+        assert!(
+            !seed
+                .persistence
+                .as_ref()
+                .unwrap()
+                .vector_partition_has_covered_journal_records(&combined)
+                .unwrap()
+        );
+        assert!(
+            !seed
+                .persistence
+                .as_ref()
+                .unwrap()
+                .vector_partition_has_uncovered_journal_records(
+                    &partition.index,
+                    &partition.partition_key,
+                    combined.change.unwrap().covered_lsn
+                )
+                .unwrap()
+        );
         let combined_peak = whole_peak(&combined);
         assert!(combined_peak > base_peak);
         let declared = base_peak + (combined_peak - base_peak) / 2;
@@ -1974,10 +1979,8 @@ fn last_membership_cleanup_keeps_catalog_targets_with_a_pinned_retired_chain() {
         let sql = "SELECT id FROM items ORDER BY v <=> [1,0,0] USE VECTOR INDEXED LIMIT 8";
         insert(0, 100);
         insert(1, 100);
-        db.vector_store_for_test().quarantine_partition_route(
-            &partition,
-            VectorRouteQuarantineReason::CorruptBase,
-        );
+        db.vector_store_for_test()
+            .quarantine_partition_route(&partition, VectorRouteQuarantineReason::CorruptBase);
         db.run_maintenance_cycle().unwrap();
         let first_base = catalog().base.generation_id;
         db.execute("DELETE FROM items", &HashMap::new()).unwrap();
@@ -1995,10 +1998,8 @@ fn last_membership_cleanup_keeps_catalog_targets_with_a_pinned_retired_chain() {
         db.execute("UPDATE items SET v = '[0,1,0]'", &HashMap::new())
             .unwrap();
         if with_change {
-            db.vector_store_for_test().quarantine_partition_route(
-                &partition,
-                VectorRouteQuarantineReason::CorruptBase,
-            );
+            db.vector_store_for_test()
+                .quarantine_partition_route(&partition, VectorRouteQuarantineReason::CorruptBase);
         }
         db.run_maintenance_cycle().unwrap();
         let replacement = catalog();

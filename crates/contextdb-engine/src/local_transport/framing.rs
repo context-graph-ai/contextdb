@@ -5,7 +5,7 @@ use super::{
 };
 use crate::read_contract::decode_metadata_page;
 use bincode::config::standard;
-use bincode::serde::{decode_from_slice, encode_to_vec};
+use bincode::serde::encode_to_vec;
 use contextdb_core::read_contract::{
     DatabaseIdentity, LocalUserIdentity, MetadataPageVocabulary, OwnerReadLimits, OwnerReadStatus,
     OwnerServiceTimeouts, ReadFailure, ReadLimits, WriterRunNumber,
@@ -36,6 +36,8 @@ pub enum PayloadViolation {
         ceiling: u64,
         required: Option<u64>,
     },
+    /// The linked JSON configuration cannot produce an admitted native tree.
+    /// This is an engine refusal with static taxonomy, not malformed bytes.
     TrailingBytes,
 }
 
@@ -902,7 +904,7 @@ impl LocalProtocolBoundary {
                     });
                 let continued = self.answer_assembly_in_flight();
                 preflight_response(payload, &expectation, memory_ceiling, continued)?;
-                let response: LocalResponse = decode_preflighted_message(payload)?;
+                let response: LocalResponse = decode_preflighted_message(payload, memory_ceiling)?;
                 // The frame ceiling stops here: an answer that arrived in
                 // pieces is whole again before anything validates or reads it.
                 let (response, position) =
@@ -1301,41 +1303,23 @@ fn canonical_bytes_identity(bytes: &[u8]) -> CanonicalBytesIdentity {
     }
 }
 
-/// An upper bound on the number of nodes the decoded form of this JSON text
-/// can hold. Every value in a JSON document is either the whole document or
-/// sits immediately after an opening bracket, a comma, or a colon, so counting
-/// those bytes cannot undercount the tree. Text that only looks like structure
-/// — those bytes inside a quoted string — inflates the count, which charges
-/// more than the decode will use and never less.
-fn json_node_ceiling(text: &[u8]) -> usize {
-    let mut nodes = 1_usize;
-    for byte in text {
-        if matches!(byte, b'[' | b'{' | b',' | b':') {
-            nodes = nodes.saturating_add(1);
-        }
-    }
-    nodes
-}
-
 /// Executable canonical grammar that walks the assembled result bytes without
 /// allocating anything: every nested container length is bounded by the bytes
-/// that remain, and the native allocation each length would claim is charged
-/// against the effective memory ceiling. A hostile or truncated assembly is
-/// refused here, before the deserializer is asked to build one container.
+/// that remain. Native buffers and JSON parser allocations are admitted by
+/// the shared scoped decoder; a cumulative wire-shape count cannot describe
+/// their live peak or the lifetime of temporary serialized JSON strings.
 struct CanonicalAllocationPreflight<'a> {
     bytes: &'a [u8],
     offset: usize,
     charged_bytes: u64,
-    memory_ceiling: u64,
 }
 
 impl<'a> CanonicalAllocationPreflight<'a> {
-    const fn new(bytes: &'a [u8], memory_ceiling: u64) -> Self {
+    const fn new(bytes: &'a [u8], _memory_ceiling: u64) -> Self {
         Self {
             bytes,
             offset: 0,
             charged_bytes: 0,
-            memory_ceiling,
         }
     }
 
@@ -1443,16 +1427,6 @@ impl<'a> CanonicalAllocationPreflight<'a> {
             .checked_mul(element_bytes)
             .and_then(|bytes| self.charged_bytes.checked_add(bytes))
             .ok_or(crate::read_contract::ReadEncodingError::InvalidPayload)?;
-        if claimed > self.memory_ceiling {
-            // A payload that is exactly what it claims to be and simply too
-            // large to hold inside the ceiling in force is a budget answer,
-            // not unreadable content.
-            return Err(
-                crate::read_contract::ReadEncodingError::MemoryCeilingExceeded {
-                    ceiling: self.memory_ceiling,
-                },
-            );
-        }
         self.charged_bytes = claimed;
         Ok(())
     }
@@ -1473,18 +1447,14 @@ impl<'a> CanonicalAllocationPreflight<'a> {
             .map_err(|_| crate::read_contract::ReadEncodingError::InvalidPayload)
     }
 
-    /// A JSON value travels as text and decodes into a tree of nodes plus
-    /// copies of the text it holds. Both are charged from the text itself,
-    /// before the tree is built.
+    /// Validate the serialized string only. Native JSON payload and parser
+    /// scratch are admitted incrementally by the shared core builder.
     fn json_text(&mut self) -> Result<(), crate::read_contract::ReadEncodingError> {
         let text = self.byte_vector()?;
         if std::str::from_utf8(text).is_err() {
             return Self::malformed();
         }
-        let nodes = json_node_ceiling(text);
-        let text_length = text.len();
-        self.charge::<serde_json::Value>(nodes)?;
-        self.charge::<u8>(text_length)
+        Ok(())
     }
 
     fn strings(&mut self) -> Result<(), crate::read_contract::ReadEncodingError> {
@@ -1745,6 +1715,7 @@ pub struct OrdinaryResultReceiver {
     byte_limit: u64,
     memory_ceiling: u64,
     state: Option<ResultReceiveState>,
+    receiving_memory: Option<std::sync::Arc<crate::read_image_memory::ImageMemory>>,
 }
 
 /// Split route-neutral canonical bytes into result envelopes whose complete
@@ -1840,6 +1811,16 @@ impl OrdinaryResultReceiver {
         Ok(receiver)
     }
 
+    pub(crate) fn with_receiving_memory(
+        byte_limit: u64,
+        memory_ceiling: u64,
+        receiving_memory: std::sync::Arc<crate::read_image_memory::ImageMemory>,
+    ) -> Result<Self, LocalTransportError> {
+        let mut receiver = Self::with_effective_ceilings(byte_limit, memory_ceiling)?;
+        receiver.receiving_memory = Some(receiving_memory);
+        Ok(receiver)
+    }
+
     pub fn new() -> Self {
         Self {
             chunks: Vec::new(),
@@ -1847,6 +1828,7 @@ impl OrdinaryResultReceiver {
             byte_limit: ReadLimits::SHIPPED_RESULT_BYTES,
             memory_ceiling: ReadLimits::SHIPPED_MEMORY,
             state: Some(ResultReceiveState::Receiving),
+            receiving_memory: None,
         }
     }
 
@@ -1860,6 +1842,7 @@ impl OrdinaryResultReceiver {
             byte_limit,
             memory_ceiling: ReadLimits::SHIPPED_MEMORY,
             state: Some(ResultReceiveState::Receiving),
+            receiving_memory: None,
         })
     }
 
@@ -2155,7 +2138,28 @@ impl OrdinaryResultReceiver {
                 // handed the assembled bytes.
                 let admitted = Self::preflight_canonical_result(&bytes, self.memory_ceiling)
                     .and_then(|()| {
-                        Self::decode_preflighted_canonical_result(&bytes, self.memory_ceiling)
+                        if let Some(memory) = self.receiving_memory.as_ref() {
+                            #[cfg(feature = "test-seams")]
+                            Self::authorize_canonical_decode_for_test(&bytes, self.memory_ceiling);
+                            let validation = memory.row_owner().map_err(|error| {
+                                crate::read_contract::encoding_error_from_core(
+                                    error,
+                                    self.memory_ceiling,
+                                )
+                            })?;
+                            let decoded = crate::read_contract::decode_query_result_with_memory(
+                                &bytes,
+                                &validation,
+                                self.memory_ceiling,
+                            )?;
+                            // Destroy the temporary tree before its row owner refunds.
+                            drop(decoded);
+                            drop(validation);
+                            Ok(())
+                        } else {
+                            Self::decode_preflighted_canonical_result(&bytes, self.memory_ceiling)
+                                .map(drop)
+                        }
                     })
                     .map(|_decoded| ());
                 if let Err(error) = admitted {
@@ -2169,6 +2173,7 @@ impl OrdinaryResultReceiver {
                                 required: None,
                             })
                         }
+
                         _ => invalid_channel_data(),
                     });
                 }
@@ -2226,16 +2231,6 @@ pub(crate) fn response_is_encodable(response: &LocalResponse) -> Result<(), Loca
     Ok(())
 }
 
-/// The decoder's own limit counts the bytes it reads off the wire, and it
-/// counts each integer field at its fixed width rather than the shorter
-/// variable-length form actually consumed: one maximal result chunk claims
-/// twelve units for a six-byte envelope. Stated in those units, this backstop
-/// admits any payload the four-mebibyte wire ceiling already admits, at the
-/// decoder's worst-case eight units per wire byte. It bounds wire reads only.
-/// What the decoded form costs in live memory is bounded before this point, by
-/// the allocation-free preflight below.
-const DECODE_WIRE_CLAIM_CEILING: usize = MAX_FRAME_BYTES * 8;
-
 /// Decode one complete bincode-standard payload and reject trailing bytes.
 /// The decoded footprint is charged against the shipped memory ceiling; a
 /// caller holding narrower or wider effective limits decodes through
@@ -2253,7 +2248,7 @@ pub(crate) fn decode_message_under_memory_ceiling<T: serde::de::DeserializeOwned
     memory_ceiling: u64,
 ) -> Result<T, LocalTransportError> {
     preflight_known_message::<T>(bytes, memory_ceiling)?;
-    decode_preflighted_message(bytes)
+    decode_preflighted_message(bytes, memory_ceiling)
 }
 
 /// Decode a bounded blob refusal through the existing read-channel grammar.
@@ -2275,16 +2270,29 @@ pub(crate) fn decode_read_error_under_memory_ceiling(
 /// undo that.
 fn decode_preflighted_message<T: serde::de::DeserializeOwned>(
     bytes: &[u8],
+    memory_ceiling: u64,
 ) -> Result<T, LocalTransportError> {
-    let configuration = standard().with_limit::<DECODE_WIRE_CLAIM_CEILING>();
-    let (value, consumed) = decode_from_slice(bytes, configuration)
-        .map_err(|_| LocalTransportError::Payload(PayloadViolation::Malformed))?;
-    if consumed != bytes.len() {
-        return Err(LocalTransportError::Payload(
-            PayloadViolation::TrailingBytes,
-        ));
+    let memory = crate::read_contract::decoder_memory(memory_ceiling).map_err(|error| {
+        transport_decode_error(crate::read_contract::encoding_error_from_core(
+            error,
+            memory_ceiling,
+        ))
+    })?;
+    crate::read_contract::decode_exact_with_memory(bytes, &memory, memory_ceiling)
+        .map_err(transport_decode_error)
+}
+
+fn transport_decode_error(error: crate::read_contract::ReadEncodingError) -> LocalTransportError {
+    match error {
+        crate::read_contract::ReadEncodingError::MemoryCeilingExceeded { ceiling } => {
+            LocalTransportError::Payload(PayloadViolation::MemoryCeilingExceeded {
+                ceiling,
+                required: None,
+            })
+        }
+
+        _ => LocalTransportError::Payload(PayloadViolation::Malformed),
     }
-    Ok(value)
 }
 
 /// The live memory one payload would occupy once decoded, accumulated as the
@@ -2471,14 +2479,6 @@ impl<'a> WirePreflight<'a> {
             .checked_mul(element_bytes)
             .and_then(|bytes| self.budget.charged_bytes.checked_add(bytes))
             .ok_or(LocalTransportError::Payload(PayloadViolation::Malformed))?;
-        if charged > self.budget.memory_ceiling {
-            return Err(LocalTransportError::Payload(
-                PayloadViolation::MemoryCeilingExceeded {
-                    ceiling: self.budget.memory_ceiling,
-                    required: Some(charged),
-                },
-            ));
-        }
         self.budget.charged_bytes = charged;
         Ok(())
     }
@@ -2495,6 +2495,7 @@ impl<'a> WirePreflight<'a> {
                     required: None,
                 })
             }
+
             _ => LocalTransportError::Payload(PayloadViolation::Malformed),
         })?;
         self.budget.charged_bytes = nested.charged_bytes;
@@ -2526,18 +2527,14 @@ impl<'a> WirePreflight<'a> {
             .map_err(|_| LocalTransportError::Payload(PayloadViolation::Malformed))
     }
 
-    /// A JSON value travels as text and decodes into a tree of nodes plus
-    /// copies of the text it holds. Both are charged from the text itself,
-    /// before the tree is built.
+    /// Validate the serialized string only. Native JSON payload and parser
+    /// scratch are admitted incrementally by the shared core builder.
     fn json_text(&mut self) -> Result<(), LocalTransportError> {
         let text = self.byte_vector()?;
         if std::str::from_utf8(text).is_err() {
             return Self::malformed();
         }
-        let nodes = json_node_ceiling(text);
-        let text_length = text.len();
-        self.charge::<serde_json::Value>(nodes)?;
-        self.charge::<u8>(text_length)
+        Ok(())
     }
 
     fn value(&mut self) -> Result<(), LocalTransportError> {
@@ -2950,19 +2947,6 @@ pub(crate) fn preflight_canonical_query_result(
         .map(|_| ())
 }
 
-/// Exact decoded and trace allocation sizes, walked before answer allocation.
-pub(crate) fn query_result_allocation_bytes(
-    bytes: &[u8],
-    memory_ceiling: u64,
-) -> Result<(usize, usize), crate::read_contract::ReadEncodingError> {
-    let mut preflight = CanonicalAllocationPreflight::new(bytes, memory_ceiling);
-    let trace = preflight.query_result()?;
-    let convert = |bytes| {
-        usize::try_from(bytes).map_err(|_| crate::read_contract::ReadEncodingError::InvalidPayload)
-    };
-    Ok((convert(preflight.charged_bytes)?, convert(trace)?))
-}
-
 /// Admit one cursor-page payload on its own, charging its decoded footprint
 /// against the memory ceiling in force.
 pub(crate) fn preflight_cursor_page_payload(
@@ -3303,14 +3287,14 @@ fn validate_response(
             )?;
             if position.is_whole() {
                 crate::read_contract::decode_observed_cursor_page(&opened.payload, limits.memory)
-                    .map_err(|_| invalid_channel_data())?;
+                    .map_err(transport_decode_error)?;
             }
         }
         LocalResponse::CursorPage { page } | LocalResponse::CursorCancelled { page } => {
             validate_answer_payload_limit(page.payload.len(), position, limits.cursor_page_bytes)?;
             if position.is_whole() {
                 crate::read_contract::decode_observed_cursor_page(&page.payload, limits.memory)
-                    .map_err(|_| invalid_channel_data())?;
+                    .map_err(transport_decode_error)?;
             }
         }
         LocalResponse::Metadata { metadata } => {
