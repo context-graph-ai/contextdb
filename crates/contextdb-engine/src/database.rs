@@ -19551,7 +19551,9 @@ fn register_loaded_dormant_vector_generations(
                 layout: layout.clone(),
                 live_rows,
                 declared_serving_cache: declared_serving_cache.clone(),
-                tail_covered_lsn: catalog.change.is_none().then_some(catalog.base.covered_lsn),
+                // Captured serving owns journal replay at its selected root. The
+                // shared retained loader installs only this sealed generation.
+                tail_covered_lsn: None,
             });
         vector.register_dormant_partition_generation(
             &partition,
@@ -19613,7 +19615,7 @@ fn register_loaded_dormant_vector_generations(
                     layout: layout.clone(),
                     live_rows,
                     declared_serving_cache: declared_serving_cache.clone(),
-                    tail_covered_lsn: Some(change.covered_lsn),
+                    tail_covered_lsn: None,
                 });
             vector.register_dormant_partition_generation(
                 &partition,
@@ -20515,7 +20517,9 @@ impl MaintenanceContext {
                 declared_serving_cache: DeclaredServingCache::Live(
                     self.vector_serving_cache_bytes.clone(),
                 ),
-                tail_covered_lsn: catalog.change.is_none().then_some(catalog.base.covered_lsn),
+                // Captured serving owns journal replay at its selected root. The
+                // shared retained loader installs only this sealed generation.
+                tail_covered_lsn: None,
             });
         self.vector.register_dormant_partition_generation(
             &partition,
@@ -20558,7 +20562,7 @@ impl MaintenanceContext {
                     declared_serving_cache: DeclaredServingCache::Live(
                         self.vector_serving_cache_bytes.clone(),
                     ),
-                    tail_covered_lsn: Some(change.covered_lsn),
+                    tail_covered_lsn: None,
                 });
             self.vector.register_dormant_partition_generation(
                 &partition,
