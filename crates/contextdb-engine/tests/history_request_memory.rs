@@ -425,63 +425,6 @@ fn reader_with_available_within(
     panic!("no limit leaves room within a hundredth of {wanted}");
 }
 
-/// Open a fresh reader at `limit` and try to force its history log gap the
-/// same way `fallback_reader` does, WITHOUT letting a too-tight limit end
-/// the test: `force_history_log_gap_for_test`'s `ensure_image_history()`
-/// panics rather than returning an error when there is not enough room for
-/// the load, so a limit below the threshold is caught with `catch_unwind`
-/// and reported as `None` rather than as a crash.
-fn try_open_at_after_history_load(
-    path: &std::path::Path,
-    limit: usize,
-) -> Option<(
-    contextdb_engine::direct_file_reader::test_seams::DirectFileReader,
-    usize,
-)> {
-    use contextdb_engine::direct_file_reader::test_seams::force_history_log_gap_for_test;
-    let reader = open_for_test(path, config(Some(limit))).expect("open inside the tight limit");
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        force_history_log_gap_for_test(&reader);
-    })) {
-        Ok(()) => {
-            let (usage, _, _) = image_memory_for_test(&reader);
-            let available = limit.saturating_sub(usage.used);
-            Some((reader, available))
-        }
-        Err(_) => None,
-    }
-}
-
-/// The smallest `limit` (within 64 bytes) between `known_too_small` and
-/// `known_safe` whose forced history log gap succeeds. `known_too_small`
-/// must genuinely be too small (an open-only probe's own charge, with no
-/// room left over, is always too small) and `known_safe` must genuinely
-/// succeed (an unlimited reader's own used bytes after its own successful
-/// load, added to that same probe's charge, always does) -- the bisection
-/// never has to guess at either end. A declared limit changes the resident
-/// proof cache's own ceiling (a share of the declared session), so this is
-/// the actual cost the load pays at each candidate limit, not a delta
-/// transferred from a differently-provisioned reader.
-fn history_load_threshold(
-    path: &std::path::Path,
-    known_too_small: usize,
-    known_safe: usize,
-) -> usize {
-    let mut lower = known_too_small;
-    let mut upper = known_safe;
-    let previous_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    while upper - lower > 64 {
-        let mid = lower + (upper - lower) / 2;
-        match try_open_at_after_history_load(path, mid) {
-            Some(_) => upper = mid,
-            None => lower = mid,
-        }
-    }
-    std::panic::set_hook(previous_hook);
-    upper
-}
-
 /// A ceiling far below the answer's encoded size refuses it on that size,
 /// before the encoding is built, and a refused request leaves nothing of its
 /// own charged.
@@ -1446,31 +1389,21 @@ fn many_pending_deletions_under_a_tight_limit_are_refused_before_they_are_built(
     drop(answered);
     drop(roomy);
 
-    // At 3,000 pending deletions, the resident proof cache's ceiling being a
-    // share of the declared limit (see `open_at`'s own doc comment) makes
-    // the forced history load's real cost swing by much more, as the limit
-    // is bisected, than a fixed pad transferred from the unlimited `roomy`
-    // reader above can cover -- a pad this test tried at 32 KiB and again at
-    // 512 KiB, and a larger pad made the room actually left at the failing
-    // allocation SMALLER, not bigger, confirming the transfer itself, not
-    // its size, was wrong. `history_load_threshold` finds the load's actual
-    // minimum at each candidate limit directly (catching the panic
-    // `force_history_log_gap_for_test` raises below that minimum, rather
-    // than transferring a number from elsewhere), bisecting between a
-    // limit definitely too small (an open-only probe's own charge, with
-    // nothing left over) and one definitely safe (the unlimited reader's
-    // own used bytes after its own successful load). A quarter of the
-    // answer's charge is added on top of that measured minimum, which
-    // still refuses the full answer below.
-    let probe = open_for_test(&path, config(None)).expect("probe the open charge");
-    let (opened, _, _) = image_memory_for_test(&probe);
-    drop(probe);
-    let threshold = history_load_threshold(&path, opened.used, opened.used + cached);
-    let limit = threshold + answer_charge / 4;
+    // On-demand history loading needs transient space that it returns before
+    // answering. Its load threshold therefore does not measure answer room.
+    // Hold competing admitted work after loading, leaving only a quarter of
+    // the complete answer's charge, regardless of cache residency policy.
+    let limit = cached + answer_charge * 8;
     let (tight, before) = fallback_reader(&path, Some(limit));
+    let room = answer_charge / 4;
+    let _competing_work =
+        contextdb_engine::direct_file_reader::test_seams::hold_reader_memory_leaving_for_test(
+            &tight, room,
+        )
+        .expect("hold competing admitted work");
+    let frontier = contextdb_engine::direct_file_reader::test_seams::snapshot_for_test(&tight);
     let (refused, refused_peak) = measure(|| change_response(&tight));
     let (after, _, _) = image_memory_for_test(&tight);
-    let room = limit.saturating_sub(before);
     println!(
         "pending deletions: answer_charge={answer_charge} room={room} refused_peak={refused_peak}"
     );
@@ -1484,6 +1417,11 @@ fn many_pending_deletions_under_a_tight_limit_are_refused_before_they_are_built(
     assert_eq!(
         after.used, before,
         "a refused answer gives back every byte it took"
+    );
+    assert_eq!(
+        contextdb_engine::direct_file_reader::test_seams::snapshot_for_test(&tight),
+        frontier,
+        "a refusal keeps the committed frontier unchanged"
     );
     assert!(
         refused_peak <= room + STORAGE_READ_SLACK_BYTES,

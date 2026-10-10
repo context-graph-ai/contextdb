@@ -1725,6 +1725,27 @@ pub mod test_seams {
         reader.target.force_change_log_gap_for_test();
     }
 
+    /// Hold competing admitted work so a request has exactly `room` left.
+    /// The credit is returned by its ordinary owner on drop.
+    pub fn hold_reader_memory_leaving_for_test(
+        reader: &DirectFileReader,
+        room: usize,
+    ) -> contextdb_core::Result<contextdb_core::read_memory::ReadCredit> {
+        let held = reader.declared_read_memory.retained_bytes_for_test();
+        let available = reader.limits.memory.saturating_sub(held);
+        let bytes = usize::try_from(available)
+            .map_err(|error| contextdb_core::Error::Other(error.to_string()))?
+            .checked_sub(room)
+            .ok_or_else(|| contextdb_core::Error::Other("reader already has less room".into()))?;
+        contextdb_core::read_memory::ReadCredit::try_new(
+            reader.declared_read_memory.clone(),
+            bytes,
+            "reader_test",
+            "competing_work",
+            "Leave more reader memory available.",
+        )
+    }
+
     /// The memory an answer holds against its reader's limit while it is
     /// held.
     pub fn held_answer_bytes_for_test(response: &DirectMetadataResponse) -> usize {
