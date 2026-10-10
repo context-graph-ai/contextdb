@@ -69,6 +69,7 @@ pub(crate) mod purge_publication;
 pub(crate) mod read_commit_directory;
 #[cfg(target_os = "linux")]
 mod reader_presence;
+mod relational_posting_prune;
 mod relational_version_manifest;
 #[cfg(feature = "test-seams")]
 mod resident_history_test_seams;
@@ -34404,6 +34405,17 @@ graph_commit_result }.map_err(Self::storage_error)?;
                     let predecessor = redb_table
                         .get(key.as_slice())
                         .map_err(Self::storage_error)?;
+                    if let Some(body) = predecessor.as_ref() {
+                        let _row_scope = crate::read_image_memory::active_owner()?
+                            .row_owner()?
+                            .enter();
+                        self.prune_relational_posting_intervals_in_write(
+                            write_txn,
+                            table,
+                            table_meta.get(table),
+                            body.value(),
+                        )?;
+                    }
                     self.replace_relational_manifest_in_write(
                         write_txn,
                         table,
