@@ -6214,12 +6214,17 @@ impl IndexState {
                 Self::layer_identity(change, dormant_change),
             )
         };
-        let mut selection = source.capture_serving_selection(
+        let mut selection = match source.capture_serving_selection(
             snapshot,
             frozen_registry.4.as_ref(),
             frozen_registry.5.as_ref(),
             owner,
-        )?;
+        ) {
+            // A valid newer catalog cannot serve this old snapshot. Its raw
+            // memberships still can, after compatible graphs are reclaimed.
+            Err(Error::VectorIndexedRouteUnavailable { .. }) => return Ok(None),
+            result => result?,
+        };
         selection._copy_owner = Some(retained);
         let dormant = if selection.inspection.captured_catalog || owner.historical_durable_reads() {
             None

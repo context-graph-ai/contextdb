@@ -1775,9 +1775,9 @@ impl RawVectorMembershipSource for DurableMembershipSource {
             .or(inspection.base)
             .is_some_and(|generation| generation.covered_tx > TxId::from_snapshot(snapshot))
         {
-            return Err(damage(
-                "captured serving frontier is newer than the requested snapshot",
-            ));
+            return Err(Error::VectorIndexedRouteUnavailable {
+                index: self.partition.index.clone(),
+            });
         }
         if generations.is_none() {
             let summary = self.read_pending_metadata(&root)?;
