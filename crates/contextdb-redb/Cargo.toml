@@ -71,3 +71,8 @@ path = "tests/open_with_backend_contract.rs"
 [[test]]
 name = "allocator_residency_contract"
 path = "tests/allocator_residency_contract.rs"
+
+[[test]]
+name = "reclaim_step_contract"
+path = "tests/reclaim_step_contract.rs"
+required-features = ["contextdb-internal", "test-seams"]

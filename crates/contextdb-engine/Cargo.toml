@@ -388,3 +388,18 @@ path = "tests/writecost_planner_reversed.rs"
 [[example]]
 name = "custody_scale"
 required-features = ["iroh", "test-seams"]
+
+
+[[test]]
+name = "writecost_reclaim"
+path = "tests/writecost_reclaim.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "writecost_planner"
+path = "tests/writecost_planner.rs"
+
+[[test]]
+name = "writecost_cycle_bound"
+path = "tests/writecost_cycle_bound.rs"
+required-features = ["test-seams"]

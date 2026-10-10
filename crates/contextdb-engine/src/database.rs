@@ -91225,3 +91225,7 @@ mod cdb126_reader_history_tests {
         );
     }
 }
+
+#[cfg(all(test, feature = "test-seams"))]
+#[path = "database/writecost_reclaim_cancellation_tests.rs"]
+mod writecost_reclaim_cancellation_tests;

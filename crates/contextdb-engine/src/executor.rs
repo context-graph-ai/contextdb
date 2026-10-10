@@ -21953,3 +21953,7 @@ mod composite_resume_range_tests {
         }
     }
 }
+#[cfg(all(test, feature = "test-seams"))]
+#[path = "executor/writecost_missing_index_tests.rs"]
+mod writecost_missing_index_tests;
+
