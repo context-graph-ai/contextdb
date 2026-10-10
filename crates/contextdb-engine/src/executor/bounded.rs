@@ -17662,7 +17662,8 @@ impl CursorState {
             let page_bytes = encoded;
             let encoded = u64::try_from(serialized_size(
                 &crate::read_contract::cursor_observation::BorrowedObservedPage::new(
-                    &page, &observation,
+                    &page,
+                    &observation,
                 ),
             )?)
             .map_err(|_| bounded_size_error("cursor observation telemetry"))?;
