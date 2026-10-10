@@ -565,13 +565,25 @@ fn score_fixture() -> (tempfile::TempDir, Database) {
                 .vector_store_for_test()
                 .partition_graph_generation_status(&contextdb_vector::VectorPartitionRef::new(
                     index.clone(),
-                    key,
+                    key.clone(),
                 ))
                 .expect("the score route remains present");
             assert!(status.base.is_some(), "the score query spans a sealed base");
             assert_eq!(
-                status.fresh_tail_entries, 1,
-                "the score query also spans one fresh layer in each partition"
+                status.fresh_tail_entries, 0,
+                "the durable suffix remains deferred until its captured search loads it"
+            );
+            let journal = db.__debug_vector_partition_journal_file_for_test(
+                &contextdb_vector::VectorPartitionRef::new(index.clone(), key),
+            );
+            assert_eq!(
+                journal
+                    .physical_record_lsns
+                    .iter()
+                    .filter(|lsn| **lsn > journal.truncated_through_lsn)
+                    .count(),
+                1,
+                "the captured score query spans one durable fresh entry in each partition",
             );
         }
     }
