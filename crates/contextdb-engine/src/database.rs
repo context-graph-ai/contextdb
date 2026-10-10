@@ -48560,11 +48560,12 @@ impl Database {
         source: NodeId,
         target: NodeId,
         edge_type: EdgeType,
-        properties: HashMap<String, Value>,
+        mut properties: HashMap<String, Value>,
 
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<bool> {
         let _operation = self.open_operation_after_write_control_wait(tx, "insert_edge")?;
+        let _writer_read = self.writer_read_scope(read_memory.clone())?;
         let snapshot = self.snapshot();
         self.assert_node_write_allowed(source, snapshot, read_memory.clone())?;
         self.assert_node_write_allowed(target, snapshot, read_memory.clone())?;
@@ -48576,6 +48577,37 @@ impl Database {
             snapshot,
             read_memory.clone(),
         )?;
+        // An existing edge can stage a replacement while still returning
+        // false. Price its complete merged properties before staging, and
+        // settle against the staged entry rather than the public new-edge flag.
+        let deleted_in_ws = self.tx_mgr.with_write_set(tx, |ws| {
+            ws.adj_deletes
+                .iter()
+                .any(|(s, kind, t, _)| *s == source && *t == target && kind == &edge_type)
+        })?;
+        if !properties.is_empty()
+            && !deleted_in_ws
+            && let Some(mut existing) = self.edge_properties_unchecked_with_read_memory(
+                source,
+                target,
+                &edge_type,
+                snapshot,
+                read_memory.clone(),
+            )?
+        {
+            existing.extend(properties);
+            properties = existing;
+        }
+        let staged_bytes = |ws: &mut WriteSet| {
+            ws.adj_inserts
+                .iter()
+                .filter(|edge| {
+                    edge.source == source && edge.target == target && edge.edge_type == edge_type
+                })
+                .map(AdjEntry::estimated_bytes)
+                .sum::<usize>()
+        };
+        let before = self.tx_mgr.with_write_set(tx, staged_bytes)?;
         let bytes = estimate_edge_bytes(source, target, &edge_type, &properties);
         self.finalization.accountant.try_allocate_for(
             bytes,
@@ -48588,14 +48620,17 @@ impl Database {
             tx,
             source,
             target,
-            edge_type,
+            edge_type.clone(),
             properties,
             read_memory.clone(),
         ) {
             Ok(inserted) => {
-                if !inserted {
-                    self.finalization.accountant.release(bytes);
-                }
+                let after = self.tx_mgr.with_write_set(tx, staged_bytes)?;
+                let unused = before
+                    .checked_add(bytes)
+                    .and_then(|held| held.checked_sub(after))
+                    .expect("the staged edge is covered by its admitted merged properties");
+                self.finalization.accountant.release(unused);
                 Ok(inserted)
             }
             Err(err) => {
@@ -48816,6 +48851,25 @@ impl Database {
         {
             return Ok(None);
         }
+        self.edge_properties_unchecked_with_read_memory(
+            source,
+            target,
+            edge_type,
+            snapshot,
+            read_memory,
+        )
+    }
+
+    // Internal write pricing follows write authorization; it must see the
+    // complete entry even when the writer cannot expose it as a read answer.
+    fn edge_properties_unchecked_with_read_memory(
+        &self,
+        source: NodeId,
+        target: NodeId,
+        edge_type: &str,
+        snapshot: SnapshotId,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<Option<HashMap<String, Value>>> {
         if let Some(root) = self.graph_snapshot(snapshot, read_memory.clone())? {
             let mut cursor = root.cursor(contextdb_graph::source::GraphQuery {
                 node: source,
