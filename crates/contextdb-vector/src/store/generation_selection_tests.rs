@@ -231,7 +231,7 @@ fn selected_generation_materialization_preserves_all_representations_and_snapsho
 #[test]
 fn selected_generation_refuses_inconsistent_metadata_before_body_materialization() {
     let executing_accountant = Arc::new(super::tests::CountingMemoryBudget::default());
-    let mut executing_admission = VectorCopyAdmission::new(executing_accountant.clone());
+    let _executing_admission = VectorCopyAdmission::new(executing_accountant.clone());
 
     let declared_column_owner = Arc::new(super::tests::CountingMemoryBudget::default());
     let store = VectorStore::default();

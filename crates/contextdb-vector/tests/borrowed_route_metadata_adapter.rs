@@ -201,7 +201,7 @@ fn fixed_metadata_can_be_sampled_from_source_and_publication_views() {
     fn require_copy<T: Copy>(_: T) {}
 
     let declared_column_owner = Arc::new(Budget::default());
-    let executing_owner = Arc::new(Budget::default());
+    let _executing_owner = Arc::new(Budget::default());
     let store = VectorStore::default();
     let index = index();
     store
@@ -237,7 +237,7 @@ fn fixed_metadata_can_be_sampled_from_source_and_publication_views() {
 #[test]
 fn scalar_marks_and_none_leave_existing_fields_and_serving_state_intact() {
     let declared_column_owner = Arc::new(Budget::default());
-    let executing_owner = Arc::new(Budget::default());
+    let _executing_owner = Arc::new(Budget::default());
     let store = VectorStore::default();
     let index = index();
     store

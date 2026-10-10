@@ -1262,7 +1262,7 @@ pub(crate) fn merge_layer_searches<E>(
     let mut spent = 0usize;
     for position in 0..layers {
         let remaining = cap.saturating_sub(spent);
-        let mut one = search_layer(position, remaining, spent)?;
+        let one = search_layer(position, remaining, spent)?;
         spent = spent
             .saturating_add(one.admission_evaluations)
             .saturating_add(one.expansion_evaluations);

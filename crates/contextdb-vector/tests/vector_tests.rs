@@ -205,7 +205,7 @@ fn quarantined_preload_propagates_typed_cancellation_on_both_search_routes() {
         "ordinary indexed search preserves typed cancellation: {ordinary:?}"
     );
 
-    let (_store, exec, r, accountant) = quarantined_cancel_fixture();
+    let (_store, exec, r, _accountant) = quarantined_cancel_fixture();
     let bounded = exec.bounded_hnsw_search::<Error>(
         &r,
         &[1.0, 0.0],
@@ -398,7 +398,7 @@ fn insert_fixture_vectors(
     store: &VectorStore,
     entries: Vec<VectorEntry>,
     graph_owner: Option<&dyn MemoryBudget>,
-    mut executing_owner: VectorCopyAdmission,
+    executing_owner: VectorCopyAdmission,
 ) -> contextdb_core::Result<()> {
     let mut bodies = Vec::new();
     for entry in &entries {
@@ -436,7 +436,7 @@ fn seed_ranked(
         })
         .collect::<Vec<_>>();
     insert_fixture_vectors(
-        &store,
+        store,
         entries,
         Some(accountant),
         VectorCopyAdmission::new(Arc::new(MemoryAccountant::no_limit())),
@@ -466,7 +466,7 @@ fn maintain_until_hnsw_ready(
 fn vector_count_for(
     store: &VectorStore,
     index: &VectorIndexRef,
-    accountant: &Arc<MemoryAccountant>,
+    _accountant: &Arc<MemoryAccountant>,
 ) -> usize {
     store
         .entries_for_index(

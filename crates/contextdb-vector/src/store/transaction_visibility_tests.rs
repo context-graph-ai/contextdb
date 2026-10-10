@@ -68,7 +68,7 @@ fn layout() -> VectorIndexLayout {
 
 fn seeded() -> (VectorStore, Arc<IndexState>, Arc<Budget>) {
     let executing_accountant = Arc::new(super::tests::CountingMemoryBudget::default());
-    let mut executing_admission = VectorCopyAdmission::new(executing_accountant.clone());
+    let _executing_admission = VectorCopyAdmission::new(executing_accountant.clone());
 
     let store = VectorStore::default();
     let budget = Arc::new(Budget::default());
@@ -103,7 +103,7 @@ fn seeded() -> (VectorStore, Arc<IndexState>, Arc<Budget>) {
 #[test]
 fn refused_tail_admission_preserves_the_row_directory_and_existing_graph() {
     let executing_accountant = Arc::new(super::tests::CountingMemoryBudget::default());
-    let mut executing_admission = VectorCopyAdmission::new(executing_accountant.clone());
+    let _executing_admission = VectorCopyAdmission::new(executing_accountant.clone());
 
     let (store, state, budget) = seeded();
     let serial = state.raw_hnsw_build_serial_for_test();
@@ -166,7 +166,7 @@ fn refused_tail_admission_preserves_the_row_directory_and_existing_graph() {
 #[test]
 fn successful_tail_publication_consumes_prior_admission_without_rebuilding() {
     let executing_accountant = Arc::new(super::tests::CountingMemoryBudget::default());
-    let mut executing_admission = VectorCopyAdmission::new(executing_accountant.clone());
+    let _executing_admission = VectorCopyAdmission::new(executing_accountant.clone());
 
     let (store, state, budget) = seeded();
     let serial = state.raw_hnsw_build_serial_for_test();
@@ -525,7 +525,7 @@ fn dormant_counts_keep_old_snapshot_visibility_and_sorted_row_versions() {
 #[test]
 fn a_sealed_reload_cannot_replace_a_tail_with_prepared_insertions() {
     let executing_accountant = Arc::new(super::tests::CountingMemoryBudget::default());
-    let mut executing_admission = VectorCopyAdmission::new(executing_accountant.clone());
+    let _executing_admission = VectorCopyAdmission::new(executing_accountant.clone());
 
     let (store, state, budget) = seeded();
     let identity = VectorGraphGeneration {
@@ -609,7 +609,7 @@ fn a_sealed_reload_cannot_replace_a_tail_with_prepared_insertions() {
 #[test]
 fn refusing_a_later_tail_insert_releases_the_whole_prepared_batch() {
     let executing_accountant = Arc::new(super::tests::CountingMemoryBudget::default());
-    let mut executing_admission = VectorCopyAdmission::new(executing_accountant.clone());
+    let _executing_admission = VectorCopyAdmission::new(executing_accountant.clone());
 
     let (store, state, budget) = seeded();
     let bytes = budget.used.load(Ordering::SeqCst);
