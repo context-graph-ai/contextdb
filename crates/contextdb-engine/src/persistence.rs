@@ -11659,17 +11659,24 @@ fn stream_raw_partition_memberships<T>(
             &partition.partition_key,
         )
         .map_err(&corruption)?;
-        let membership: VectorPartitionMembershipRecord = RedbPersistence::decode_exact(payload)
-            .map_err(|error| {
-                corruption(format!("raw membership payload decode failed: {error}"))
-            })?;
-        if RedbPersistence::vector_partition_membership_key(&membership).as_slice() != key.value() {
-            return Err(corruption(
-                "raw-vector membership key disagrees with its checksummed payload".into(),
-            ));
-        }
-        vector_membership_source::operation_checkpoint()?;
-        visit(&mut state, membership)?;
+        // Each callback consumes this one metadata window. Its decoded route
+        // and temporary body decodes must release before the next membership,
+        // rather than accumulating in the enclosing operation's image owner.
+        let window = crate::read_image_memory::active_owner()?.row_owner()?;
+        window.scope(|| -> Result<()> {
+            let membership: VectorPartitionMembershipRecord = RedbPersistence::decode_exact(payload)
+                .map_err(|error| {
+                    if preserves_typed_read_refusal(&error) { error }
+                    else { corruption(format!("raw membership payload decode failed: {error}")) }
+                })?;
+            if RedbPersistence::vector_partition_membership_key(&membership).as_slice() != key.value() {
+                return Err(corruption(
+                    "raw-vector membership key disagrees with its checksummed payload".into(),
+                ));
+            }
+            vector_membership_source::operation_checkpoint()?;
+            visit(&mut state, membership)
+        })?;
     }
     vector_membership_source::operation_checkpoint()?;
     Ok(state)
