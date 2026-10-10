@@ -2478,6 +2478,27 @@ where
                 });
             }
         };
+        // Admission already funded this point's distance. Admit it to the
+        // candidate heap/frontier now, rather than discarding every observed
+        // point except the final greedy pivot.
+        if let Some(stop) = consider(
+            layer,
+            position,
+            entry_id,
+            walk,
+            query,
+            allow_bridges,
+            is_allowed,
+            before_source_entry,
+            before_distance,
+            acquire,
+            release,
+        )? {
+            return Ok(Admitted {
+                layers,
+                stop: Some(stop),
+            });
+        }
         for level in (0..=entry_id.0).rev() {
             loop {
                 let mut changed = false;
@@ -2520,6 +2541,24 @@ where
                             });
                         }
                     };
+                    if let Some(stop) = consider(
+                        layer,
+                        position,
+                        neighbour_id,
+                        walk,
+                        query,
+                        allow_bridges,
+                        is_allowed,
+                        before_source_entry,
+                        before_distance,
+                        acquire,
+                        release,
+                    )? {
+                        return Ok(Admitted {
+                            layers,
+                            stop: Some(stop),
+                        });
+                    }
                     if distance < pivot_distance {
                         pivot_id = neighbour_id;
                         pivot_distance = distance;
@@ -2530,31 +2569,6 @@ where
                     break;
                 }
             }
-        }
-        let pivot_origin = layer
-            .origin(pivot_id, before_source_entry)?
-            .ok_or_else(|| E::from(Error::Other("graph entry point".to_string())))?;
-        if let Some(bit) = layer.bit(pivot_id) {
-            walk.mark(bit, acquire)?;
-        }
-        let reached = Reached {
-            distance: pivot_distance,
-            row_id: layer
-                .row(pivot_origin, before_source_entry)?
-                .unwrap_or(RowId(u64::MAX)),
-            layer: position as u32,
-            point: pivot_id,
-            origin: pivot_origin,
-        };
-        walk.push_frontier(reached, acquire)?;
-        if let Some(row_id) = layer.row(pivot_origin, before_source_entry)?
-            && is_allowed(partition, row_id)
-        {
-            walk.keep(Kept {
-                reached,
-                partition,
-                row_id,
-            });
         }
         let seeds = std::mem::take(&mut layer.seeds);
         let seeded = (|| -> std::result::Result<Option<Stop>, E> {
