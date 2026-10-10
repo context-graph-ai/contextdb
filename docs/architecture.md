@@ -497,6 +497,11 @@ working set to that writer; a mismatch or refused cache admission drops it and u
 The carried tail holds no store source or lock and is released at import end, error or eviction.
 <!-- enforced by: writer_tail_reuse_is_bounded_across_physical_opens::repeated_writer_opens_reuse_tail_without_reexamining_n_or_four_n_history, writer_tail_reuse_is_bounded_across_physical_opens::another_writer_between_opens_invalidates_tail_and_its_answer_is_exact, writer_tail_reuse_is_bounded_across_physical_opens::optional_tail_never_refuses_an_open_that_fits_without_it -->
 
+Journal suffix admission and replay seek past the entire covered LSN cohort. They authenticate
+selected records without decoding already-covered history; a finite upper frontier includes every
+ordinal of its LSN, and a maximal covered frontier has an empty suffix.
+<!-- enforced by: persistence::bounded_journal_suffix_tests::fixed_journal_suffix_selection_does_not_examine_n_or_four_n_covered_records, persistence::bounded_journal_suffix_tests::suffix_seek_includes_all_ordinals_and_excludes_later_cohorts, persistence::bounded_journal_suffix_tests::suffix_seek_still_authenticates_each_selected_record, persistence::bounded_journal_suffix_tests::both_tail_loaders_and_delete_carrier_selection_seek_past_covered_history -->
+
 Raw vectors, base graphs, change graphs, and compaction workspace are independently accounted for.
 Generation admission counts raw versions separately from selected live graph points at one committed
 frontier. Ordinary resident generations price and copy only their consumed frontier-live entries,

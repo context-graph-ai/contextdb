@@ -31026,7 +31026,15 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 "captured suffix replay starts below the journal truncation floor",
             ));
         }
-        let prefix = Self::vector_partition_prefix(index, partition_key);
+        let Some((lower, upper)) = Self::vector_partition_journal_suffix_bounds(
+            index,
+            partition_key,
+            covered_lsn,
+            through_lsn,
+        )?
+        else {
+            return Ok((Vec::new(), covered_lsn));
+        };
         let journal = match read.open_byte_table_bounded(VECTOR_PARTITION_JOURNAL_TABLE) {
             Ok(table) => table,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok((Vec::new(), covered_lsn)),
@@ -31035,14 +31043,13 @@ graph_commit_result }.map_err(Self::storage_error)?;
         let mut identities = BTreeSet::new();
         let mut replayed_through_lsn = covered_lsn;
         for entry in journal
-            .prefix_bounded(prefix.as_slice())
+            .range(lower.as_slice()..upper.as_slice())
             .map_err(Self::storage_error)?
         {
             checkpoint()?;
             let (key, value) = entry.map_err(Self::storage_error)?;
-            if !key.value().starts_with(&prefix) {
-                break;
-            }
+            #[cfg(test)]
+            bounded_journal_suffix_tests::note_examined();
             let record: VectorPartitionJournalRecord = decode_vector_partition_record_payload(
                 VectorPartitionRecordKind::Journal,
                 value.value(),
@@ -31458,6 +31465,37 @@ graph_commit_result }.map_err(Self::storage_error)?;
         })
     }
 
+    /// Seek strictly after the complete covered LSN cohort, including every
+    /// ordinal of that LSN. A finite upper frontier also ends after its whole
+    /// cohort. Both keys stay inside this route's canonical prefix.
+    fn vector_partition_journal_suffix_bounds(
+        index: &VectorIndexRef,
+        partition_key: &VectorPartitionKey,
+        covered_lsn: Lsn,
+        through_lsn: Option<Lsn>,
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        let Some(first_lsn) = covered_lsn.0.checked_add(1) else {
+            return Ok(None);
+        };
+        if through_lsn.is_some_and(|through| through <= covered_lsn) {
+            return Ok(None);
+        }
+        let prefix = Self::vector_partition_prefix(index, partition_key);
+        let mut lower = prefix.clone();
+        lower.extend_from_slice(&first_lsn.to_be_bytes());
+        let upper = if let Some(next_lsn) = through_lsn.and_then(|through| through.0.checked_add(1))
+        {
+            let mut upper = prefix;
+            upper.extend_from_slice(&next_lsn.to_be_bytes());
+            upper
+        } else {
+            writer_source::prefix_end(&prefix).ok_or_else(|| {
+                Self::captured_generation_corruption("journal route has no upper bound")
+            })?
+        };
+        Ok(Some((lower, upper)))
+    }
+
     /// Materialize only the vector insert/move suffix after a sealed coverage
     /// point. The ordered journal chooses exact immutable vector identities;
     /// no partition or whole-vector-table scan occurs.
@@ -31467,7 +31505,11 @@ graph_commit_result }.map_err(Self::storage_error)?;
         partition_key: &VectorPartitionKey,
         covered_lsn: Lsn,
     ) -> Result<usize> {
-        let prefix = Self::vector_partition_prefix(index, partition_key);
+        let Some((lower, upper)) =
+            Self::vector_partition_journal_suffix_bounds(index, partition_key, covered_lsn, None)?
+        else {
+            return Ok(0);
+        };
         self.with_db(|db| {
             let read_txn = db.begin_read().map_err(Self::storage_error)?;
             let table = match read_txn.open_byte_table_bounded(VECTOR_PARTITION_JOURNAL_TABLE) {
@@ -31477,13 +31519,12 @@ graph_commit_result }.map_err(Self::storage_error)?;
             };
             let mut count = 0usize;
             for entry in table
-                .prefix_bounded(prefix.as_slice())
+                .range(lower.as_slice()..upper.as_slice())
                 .map_err(Self::storage_error)?
             {
                 let (key, value) = entry.map_err(Self::storage_error)?;
-                if !key.value().starts_with(&prefix) {
-                    break;
-                }
+                #[cfg(test)]
+                bounded_journal_suffix_tests::note_examined();
                 let record: VectorPartitionJournalRecord = self.decode_vector_partition_record(
                     VectorPartitionRecordKind::Journal,
                     value.value(),
@@ -31578,7 +31619,11 @@ graph_commit_result }.map_err(Self::storage_error)?;
         covered_lsn: Lsn,
         mut admit_decode: impl FnMut(usize) -> Result<()>,
     ) -> Result<bool> {
-        let prefix = Self::vector_partition_prefix(index, partition_key);
+        let Some((lower, upper)) =
+            Self::vector_partition_journal_suffix_bounds(index, partition_key, covered_lsn, None)?
+        else {
+            return Ok(false);
+        };
         self.with_db(|db| {
             let read_txn = db.begin_read().map_err(Self::storage_error)?;
             let table = match read_txn.open_byte_table_bounded(VECTOR_PARTITION_JOURNAL_TABLE) {
@@ -31587,13 +31632,12 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 Err(error) => return Err(Self::storage_error(error)),
             };
             for entry in table
-                .prefix_bounded(prefix.as_slice())
+                .range(lower.as_slice()..upper.as_slice())
                 .map_err(Self::storage_error)?
             {
                 let (key, value) = entry.map_err(Self::storage_error)?;
-                if !key.value().starts_with(&prefix) {
-                    break;
-                }
+                #[cfg(test)]
+                bounded_journal_suffix_tests::note_examined();
                 admit_decode(Self::vector_partition_record_decode_bound(
                     value.value().len(),
                     std::mem::size_of::<VectorPartitionJournalRecord>(),
@@ -31632,7 +31676,15 @@ graph_commit_result }.map_err(Self::storage_error)?;
         through_lsn: Lsn,
         expected_dimension: usize,
     ) -> Result<Vec<VectorEntry>> {
-        let prefix = Self::vector_partition_prefix(index, partition_key);
+        let Some((lower, upper)) = Self::vector_partition_journal_suffix_bounds(
+            index,
+            partition_key,
+            covered_lsn,
+            Some(through_lsn),
+        )?
+        else {
+            return Ok(Vec::new());
+        };
         let memberships = self.with_db(|db| {
             let read_txn = db.begin_read().map_err(Self::storage_error)?;
             let journal = match read_txn.open_byte_table_bounded(VECTOR_PARTITION_JOURNAL_TABLE) {
@@ -31642,13 +31694,12 @@ graph_commit_result }.map_err(Self::storage_error)?;
             };
             let mut memberships = BTreeMap::new();
             for item in journal
-                .prefix_bounded(prefix.as_slice())
+                .range(lower.as_slice()..upper.as_slice())
                 .map_err(Self::storage_error)?
             {
                 let (key, value) = item.map_err(Self::storage_error)?;
-                if !key.value().starts_with(&prefix) {
-                    break;
-                }
+                #[cfg(test)]
+                bounded_journal_suffix_tests::note_examined();
                 let record: VectorPartitionJournalRecord = self
                     .decode_expected_vector_partition_metadata(
                         VectorPartitionRecordKind::Journal,
@@ -31688,19 +31739,41 @@ graph_commit_result }.map_err(Self::storage_error)?;
         covered_lsn: Lsn,
     ) -> Result<(Vec<VectorEntry>, Lsn)> {
         let _decode_scope = self.reader_decode_scope()?;
-        let prefix = Self::vector_partition_prefix(index, partition_key);
+        let Some((lower, upper)) =
+            Self::vector_partition_journal_suffix_bounds(index, partition_key, covered_lsn, None)?
+        else {
+            return Ok((Vec::new(), covered_lsn));
+        };
         self.with_db(|db| {
             let read_txn = db.begin_read().map_err(Self::storage_error)?;
-            let journal = self.load_vector_partition_table_in_read(
-                &read_txn,
-                VECTOR_PARTITION_JOURNAL_TABLE,
-                VectorPartitionRecordKind::Journal,
-                Self::vector_partition_journal_key,
-                Some(&prefix),
-            )?;
+            let journal = match read_txn.open_byte_table_bounded(VECTOR_PARTITION_JOURNAL_TABLE) {
+                Ok(table) => table,
+                Err(redb::TableError::TableDoesNotExist(_)) => {
+                    return Ok((Vec::new(), covered_lsn));
+                }
+                Err(error) => return Err(Self::storage_error(error)),
+            };
             let mut identities = BTreeSet::new();
             let mut replayed_through_lsn = covered_lsn;
-            for record in journal {
+            for entry in journal
+                .range(lower.as_slice()..upper.as_slice())
+                .map_err(Self::storage_error)?
+            {
+                let (key, value) = entry.map_err(Self::storage_error)?;
+                #[cfg(test)]
+                bounded_journal_suffix_tests::note_examined();
+                let record: VectorPartitionJournalRecord = self
+                    .decode_expected_vector_partition_metadata(
+                        VectorPartitionRecordKind::Journal,
+                        value.value(),
+                        index,
+                        partition_key,
+                    )?;
+                if Self::vector_partition_journal_key(&record).as_slice() != key.value() {
+                    return Err(self.vector_partition_corruption(
+                        "journal tail key disagrees with its payload",
+                    ));
+                }
                 if record.lsn.0 <= covered_lsn.0 {
                     continue;
                 }
@@ -47300,3 +47373,6 @@ pub(crate) fn returned_loader_rows_for_test() {
     }
     crate::database::returned_loader_rows_for_test();
 }
+
+#[cfg(test)]
+mod bounded_journal_suffix_tests;
