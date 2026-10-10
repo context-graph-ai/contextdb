@@ -1711,10 +1711,9 @@ where
         )));
     }
 
-    // Opening the layers is a floor on top of the one budget, bounded only by
-    // the declared limit; the walk after it may spend the whole budget. The
-    // cap is set again once the layers are open.
-    let evaluation_cap = limits.max_vector_evaluations;
+    // Opening and expanding the layers share the declared per-index cap,
+    // additionally bounded by the request's remaining logical work.
+    let evaluation_cap = budget.min(limits.max_vector_evaluations);
     // Every frontier entry is one evaluation, so the frontier never outgrows
     // what the budget can pay for, however many partitions were admitted.
     let frontier_capacity = total_points
@@ -1841,12 +1840,8 @@ where
                 break;
             }
             let before_expansion = walk.evaluations;
-            // The walk spends what is left of the one budget -- all of it on
-            // the first pass, whatever opening the layers cost -- and never
-            // past the declared limit.
-            walk.evaluation_cap = before_expansion
-                .saturating_add(budget.saturating_sub(expansion_evaluations))
-                .min(limits.max_vector_evaluations);
+            // Admission and both expansion passes spend the same per-index
+            // cap. Advancing the phase must not replenish its spent credit.
             #[cfg(feature = "test-seams")]
             expansion_cap.get_or_insert(walk.evaluation_cap.saturating_sub(before_expansion));
             let expanded = expand(
@@ -2983,6 +2978,84 @@ pub(crate) fn record_union_search(receipt: UnionSearchReceipt) {
 #[cfg(test)]
 mod canonical_tie_tests {
     use super::*;
+
+    #[test]
+    fn opening_and_expansion_share_the_original_per_index_cap() {
+        use contextdb_core::{Lsn, TxId};
+
+        let vector = |ordinal: usize| {
+            (0..16)
+                .map(|axis| {
+                    let mixed = (ordinal as u64 + 17)
+                        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                        .wrapping_add((axis as u64 + 31).wrapping_mul(0xbf58_476d_1ce4_e5b9));
+                    ((mixed ^ (mixed >> 29)) % 100_003) as f32 / 100_003.0 - 0.5
+                })
+                .collect::<Vec<_>>()
+        };
+        let entries = (0..96)
+            .map(|ordinal| StoredVectorEntry {
+                membership: crate::store::VectorMembershipProvenance::new(
+                    TxId(1),
+                    Lsn(1),
+                    TxId(1),
+                    None,
+                ),
+                canonical_deleted_tx: None,
+                row_id: RowId(ordinal as u64 + 1),
+                vector: StoredVector::from_f32(&vector(ordinal), VectorQuantization::F32),
+                created_tx: TxId(1),
+                deleted_tx: None,
+                lsn: Lsn(1),
+            })
+            .collect::<Vec<_>>();
+        let graph = HnswIndex::new(&entries, 16, VectorQuantization::F32);
+        let layers = [HnswUnionLayer {
+            graph: &graph,
+            partition: 0,
+            allowed_count: entries.len(),
+            live_count: entries.len(),
+            seed_rows: None,
+        }];
+        let query = vector(1000);
+        let mut saw_expansion = false;
+        let mut saw_refusal = false;
+        for budget in 1..=96 {
+            let mut query_scores = BoundedHnswQuerySelfScores::new(&query);
+            let distances = std::cell::Cell::new(0usize);
+            let answer = search_union_allowed_bounded(
+                &layers,
+                &query,
+                10,
+                32,
+                budget,
+                HnswAllowedSearchLimits {
+                    max_visited_nodes: usize::MAX,
+                    max_vector_evaluations: usize::MAX,
+                },
+                true,
+                false,
+                &mut query_scores,
+                |_, _| true,
+                |_, _, _, _| Ok::<_, Error>(None),
+                || Ok::<(), Error>(()),
+                || {
+                    distances.set(distances.get() + 1);
+                    Ok::<(), Error>(())
+                },
+                |_| Ok::<(), Error>(()),
+                |_| {},
+            )
+            .unwrap();
+            let spent = answer.admission_evaluations + answer.expansion_evaluations;
+            assert!(spent <= budget, "budget={budget}, spent={spent}");
+            assert_eq!(distances.get(), spent, "all distances use the same cap");
+            saw_expansion |= answer.expansion_evaluations > 0;
+            saw_refusal |= answer.terminal == UnionTerminal::Refused;
+        }
+        assert!(saw_expansion, "the cap includes an actual expansion");
+        assert!(saw_refusal, "an unfunded walk refuses");
+    }
 
     #[test]
     fn a_full_result_heap_replaces_larger_row_ids_at_equal_distance() {
