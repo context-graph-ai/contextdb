@@ -1061,9 +1061,13 @@ fn historical_vector_placement_survives_pruning_and_reconstruction_until_version
     );
     assert_eq!(historical_vector_directory_count(&db), 4);
     let receipt_after_partial_prune = db.vector_memory_ownership_receipt_for_test();
-    assert!(
-        receipt_after_partial_prune.raw_vector_bodies < receipt_before_prune.raw_vector_bodies,
-        "pruning the unrelated version returns its raw vector body"
+    assert_eq!(
+        (
+            receipt_before_prune.raw_vector_bodies,
+            receipt_after_partial_prune.raw_vector_bodies
+        ),
+        (0, 0),
+        "native-page history stays readable without retaining raw bodies across pruning"
     );
     assert_eq!(receipt_after_partial_prune.temporary_workspace, 0);
 
@@ -1198,22 +1202,22 @@ fn historical_vector_placement_survives_pruning_and_reconstruction_until_version
         (before_release_prune.partition_vectors + before_release_prune.vector_partition_controls)
             - (after_release_prune.partition_vectors
                 + after_release_prune.vector_partition_controls),
-        2560,
-        "reclaim releases the two obsolete durable partition registry owners"
+        2720,
+        "reclaim releases the two obsolete durable partition registry owners and their retained root controls"
     );
     assert_eq!(
         before_release_prune.typed_partition_keys - after_release_prune.typed_partition_keys,
-        48,
-        "reclaim releases the two obsolete typed-key owners"
+        112,
+        "reclaim releases the two obsolete typed-key owners and their charged controls"
     );
     assert_eq!(
         before_release_prune.retained_total - after_release_prune.retained_total,
-        2608,
+        3440,
         "the retained-owner release is exactly registry plus typed keys"
     );
     assert_eq!(
         before_release_prune.accountant_total - after_release_prune.accountant_total,
-        2608,
+        3440,
         "the caller accountant releases the same owners exactly once"
     );
     assert!(
