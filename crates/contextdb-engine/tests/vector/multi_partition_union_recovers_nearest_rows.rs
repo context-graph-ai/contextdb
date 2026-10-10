@@ -215,11 +215,7 @@ fn check_shared_walk(fixture: Fixture) {
                     let found = ids(&indexed);
                     assert_eq!(found.len(), LIMIT);
                     let matched = found.intersection(&truth).count();
-                    let threshold = if matches!(fixture, Fixture::Uniform) && scope == 8 {
-                        0.826
-                    } else {
-                        0.95
-                    };
+                    let threshold = 0.95;
                     if (matched as f64 / LIMIT as f64) < threshold {
                         low_recall_queries.push((probe, matched));
                     }
@@ -268,8 +264,7 @@ fn check_shared_walk(fixture: Fixture) {
                 "uniform all-scope recall regressed"
             );
         }
-        // Uniform 3/8 has no recall floor: its independent random directions
-        // are a separate fixture question. All 8/8 uses the real B=12,800.
+        // Every scope also keeps the per-query recall floor above.
     }
 }
 
