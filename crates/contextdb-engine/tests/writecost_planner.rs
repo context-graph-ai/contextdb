@@ -270,3 +270,46 @@ fn the_unique_key_is_the_chosen_plan_and_costs_one_probe_at_any_size() {
     assert!(examined.iter().all(|n| *n <= 2), "one key probe at every size: {examined:?}");
     assert!(examined.windows(2).all(|pair| pair[0] == pair[1]), "work does not grow with members: {examined:?}");
 }
+
+/// Continued-growth ruling: fully bound predicate writes examine the current unique entry,
+/// independent of retained versions. Existing planner rows only exercise SELECT, so this row
+/// covers the write route, staged replacements, and the competing conditional commit.
+#[test]
+fn unique_predicate_writes_keep_equal_work_across_retained_history() {
+    let mut work = Vec::new();
+    for versions in [8, 32] {
+        let root = tempfile::tempdir().unwrap();
+        let db = Database::open(root.path().join("predicate-writes.db")).unwrap();
+        db.execute("CREATE TABLE items (tenant INTEGER NOT NULL, id INTEGER NOT NULL, token INTEGER NOT NULL, body INTEGER NOT NULL, PRIMARY KEY (tenant, id), UNIQUE (tenant, token))", &none()).unwrap();
+        db.execute("INSERT INTO items VALUES (1, 1, 10, 0)", &none()).unwrap();
+        for body in 1..=versions {
+            db.execute("UPDATE items SET body = $body WHERE tenant = 1 AND id = 1", &params(vec![("body", Value::Int64(body))])).unwrap();
+        }
+        let point_work = db.execute("SELECT body FROM items WHERE tenant = 1 AND id = 1", &none()).unwrap().trace.rows_examined;
+        let tx = db.begin().unwrap();
+        let first = db.execute_in_tx(tx, "UPDATE items SET body = 100 WHERE tenant = 1 AND id = 1", &none()).unwrap();
+        assert_eq!(first.rows_affected, 1);
+        let staged = db.execute_in_tx(tx, "UPDATE items SET body = 101 WHERE tenant = 1 AND id = 1 AND body = 100", &none()).unwrap();
+        assert_eq!(staged.rows_affected, 1, "the unique route sees this transaction's replacement");
+        let read = db.execute_in_tx(tx, "SELECT body FROM items WHERE tenant = 1 AND id = 1", &none()).unwrap();
+        assert_eq!(read.rows, vec![vec![Value::Int64(101)]]);
+        db.commit(tx).unwrap();
+        let tx = db.begin().unwrap();
+        assert!(db.guard_row_conditions_in_tx(tx, "items", "id", &Value::Int64(1), &[("body".into(), Value::Int64(101))]).unwrap());
+        let changed = db.execute_in_tx(tx, "UPDATE items SET body = 102 WHERE tenant = 1 AND id = 1 AND body = 101", &none()).unwrap();
+        assert_eq!(changed.rows_affected, 1);
+        db.execute("UPDATE items SET body = 103 WHERE tenant = 1 AND id = 1", &none()).unwrap();
+        assert!(db.commit(tx).is_err(), "a competing publication still invalidates the conditional write");
+        let tx = db.begin().unwrap();
+        let replacement = db.execute_in_tx(tx, "UPDATE items SET body = 104 WHERE tenant = 1 AND id = 1", &none()).unwrap();
+        assert_eq!(replacement.rows_affected, 1);
+        let deleted = db.execute_in_tx(tx, "DELETE FROM items WHERE tenant = 1 AND token = 10 AND body = 104", &none()).unwrap();
+        assert_eq!(deleted.rows_affected, 1, "the secondary unique key sees the staged replacement");
+        db.commit(tx).unwrap();
+        assert!(db.execute("SELECT body FROM items WHERE tenant = 1 AND id = 1", &none()).unwrap().rows.is_empty());
+        let observed = (first.trace.rows_examined, staged.trace.rows_examined, deleted.trace.rows_examined);
+        assert_eq!(observed, (point_work, point_work, point_work), "fully bound writes use the same current-entry work as a unique read at {versions} retained versions");
+        work.push(observed);
+    }
+    assert_eq!(work[0], work[1], "predicate write work must not grow with retained history");
+}
