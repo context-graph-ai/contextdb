@@ -19,6 +19,8 @@ mod published_vector_install_tests;
 #[doc(hidden)]
 pub mod resident_history_test_seams;
 pub(crate) mod vector_captured_serving;
+#[cfg(all(test, feature = "test-seams"))]
+mod vector_suffix_inspection_tests;
 #[cfg(test)]
 mod vector_frontier_metadata_admission_tests;
 #[cfg(test)]
@@ -62843,6 +62845,40 @@ impl Database {
     #[doc(hidden)]
     pub fn writer_memory_underflow_count_for_test(&self) -> usize {
         self.finalization.accountant.underflow_count_for_test()
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn arm_vector_current_identity_admission_failure_for_test(&self) {
+        self.finalization
+            .accountant
+            .arm_current_identity_admission_failure_for_test();
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn vector_current_identity_admission_failure_consumed_for_test(&self) -> bool {
+        self.finalization
+            .accountant
+            .current_identity_admission_failure_consumed_for_test()
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn inspect_captured_vector_suffix_for_test(
+        &self,
+        partition: &contextdb_vector::VectorPartitionRef,
+        snapshot: SnapshotId,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        checkpoint: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Option<contextdb_vector::store::CapturedVectorSuffixInspectionForTest>> {
+        let _operation = self.open_operation()?;
+        let _schema = self.vector_schema_read(&partition.index);
+        let _source = self.writer_read_scope(read_memory.clone())?;
+        let mut owner = crate::vector_read_memory::admission(read_memory);
+        self.vector_store.inspect_captured_vector_suffix_for_test(
+            partition, snapshot, &mut owner, checkpoint,
+        )
     }
 
     #[cfg(any(test, feature = "test-seams"))]

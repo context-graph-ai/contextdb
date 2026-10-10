@@ -1444,6 +1444,18 @@ pub struct LoadedVectorFreshTail {
     pub replayed_through_lsn: Lsn,
 }
 
+#[cfg(any(test, feature = "test-seams"))]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapturedVectorSuffixInspectionForTest {
+    pub base: Option<VectorGraphGeneration>,
+    pub change: Option<VectorGraphGeneration>,
+    pub points: usize,
+    pub policy: (usize, usize, usize),
+    pub topology_digest: u64,
+    pub replayed_through_lsn: Lsn,
+}
+
 /// A persistence-owned loader asks its caller either to check cancellation or
 /// to admit an additional load allocation learned after lightweight metadata
 /// I/O and before that allocation is materialized.
@@ -13454,6 +13466,86 @@ impl VectorStore {
             Ok(())
         })
     }
+    /// Inspect only the suffix owned by this operation's captured source.
+    /// This test seam never installs a graph or changes resident inspection.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn inspect_captured_vector_suffix_for_test(
+        &self,
+        partition: &VectorPartitionRef,
+        snapshot: SnapshotId,
+        owner: &mut VectorCopyAdmission,
+        checkpoint: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Option<CapturedVectorSuffixInspectionForTest>> {
+        checkpoint()?;
+        let Some(state) = self.try_partition_state(&partition.index, &partition.partition_key)
+        else {
+            return Ok(None);
+        };
+        let Some(selection) = state.capture_serving_selection(snapshot, owner)? else {
+            return Ok(None);
+        };
+        checkpoint()?;
+        let suffix = selection
+            .suffix
+            .as_ref()
+            .expect("captured suffix was bound once");
+        let mut scratch = owner.scratch();
+        scratch.reserve(suffix.load_bytes)?;
+        let mut interrupted = None;
+        let loaded = suffix.loader.load(suffix.load_bytes, &mut |request| {
+            let result = checkpoint().and_then(|()| match request {
+                DormantVectorLoadRequest::Reserve(bytes) => scratch.reserve(bytes),
+                _ => Ok(()),
+            });
+            if let Err(error) = result {
+                interrupted = Some(error);
+                false
+            } else {
+                true
+            }
+        });
+        let loaded = match loaded {
+            Ok(loaded) => loaded,
+            Err(error) => return Err(interrupted.unwrap_or(error)),
+        };
+        if let Some(error) = interrupted {
+            return Err(error);
+        }
+        let Some(tail) = loaded.tail else {
+            return Ok(None);
+        };
+        checkpoint()?;
+        // The existing mutable-graph digest copies one point's finite
+        // neighborhood at a time (sixteen levels, at most 2M each).
+        scratch.reserve(
+            16usize.saturating_mul(
+                std::mem::size_of::<Vec<usize>>().saturating_add(
+                    tail.graph
+                        .policy_values()
+                        .0
+                        .saturating_mul(2)
+                        .saturating_mul(32),
+                ),
+            ),
+        )?;
+        let inspected = CapturedVectorSuffixInspectionForTest {
+            base: selection.inspection.base,
+            change: selection.inspection.change,
+            points: tail.graph.len(),
+            policy: tail.graph.policy_values(),
+            topology_digest: tail.graph.graph_topology_digest_for_test(),
+            replayed_through_lsn: tail.replayed_through_lsn,
+        };
+        // LoadedVectorFreshTail is a plain transfer record. Keep the complete
+        // caller reservation until its actual graph is freed; no adoption or
+        // resident registry charge is created by this one-shot inspection.
+        drop(tail);
+        drop(selection);
+        drop(scratch);
+        Ok(Some(inspected))
+    }
+
     /// The callback must commit row bodies/MVCC, journal, graph pages and the
     /// successor root together. No vector registry/publication lock is held
     /// during admission or that callback. The engine serializes this operation
