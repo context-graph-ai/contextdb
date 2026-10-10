@@ -136,7 +136,7 @@ async fn entitled_resolve_streams_bit_identical_bytes() {
     let endpoint = within(IrohServer::bind(&bind_spec(&holder_key)))
         .await
         .expect("bind holder");
-    holder.serve_on(&endpoint);
+    let _ = holder.serve_on(&endpoint);
     let ticket = endpoint.ticket();
 
     let consumer_db = Arc::new(Database::open_memory());
@@ -223,7 +223,7 @@ async fn holder_refuses_unentitled_fetcher_by_authenticated_node_id() {
     let endpoint = within(IrohServer::bind(&bind_spec(&holder_key)))
         .await
         .expect("bind holder");
-    holder.serve_on(&endpoint);
+    let _ = holder.serve_on(&endpoint);
     let ticket = endpoint.ticket();
 
     let rogue_db = Arc::new(Database::open_memory());
@@ -374,7 +374,7 @@ async fn holder_refuses_a_fetcher_whose_lease_has_expired_at_resolve() {
     let endpoint = within(IrohServer::bind(&bind_spec(&holder_key)))
         .await
         .expect("bind holder");
-    holder.serve_on(&endpoint);
+    let _ = holder.serve_on(&endpoint);
     let ticket = endpoint.ticket();
 
     let consumer_db = Arc::new(Database::open_memory());
@@ -429,7 +429,7 @@ async fn unset_holder_clock_falls_back_to_fabric_wallclock_and_refuses_expired_l
     let endpoint = within(IrohServer::bind(&bind_spec(&holder_key)))
         .await
         .expect("bind holder");
-    holder.serve_on(&endpoint);
+    let _ = holder.serve_on(&endpoint);
     let ticket = endpoint.ticket();
 
     let consumer_db = Arc::new(Database::open_memory());
@@ -489,7 +489,7 @@ async fn resolve_time_policy_recheck_forbids_entitled_node() {
     let endpoint = within(IrohServer::bind(&bind_spec(&holder_key)))
         .await
         .expect("bind holder");
-    holder.serve_on(&endpoint);
+    let _ = holder.serve_on(&endpoint);
     let ticket = endpoint.ticket();
 
     let consumer_db = Arc::new(Database::open_memory());
@@ -546,7 +546,7 @@ async fn resolve_time_policy_recheck_forbids_entitled_node() {
     let mixed_endpoint = within(IrohServer::bind(&bind_spec(&mixed_holder_key)))
         .await
         .expect("bind mixed holder");
-    mixed_holder.serve_on(&mixed_endpoint);
+    let _ = mixed_holder.serve_on(&mixed_endpoint);
     let mixed_ticket = mixed_endpoint.ticket();
 
     let mixed_consumer_db = Arc::new(Database::open_memory());
@@ -614,7 +614,7 @@ async fn tampered_bytes_are_caught_by_hash_verify() {
     let endpoint = within(IrohServer::bind(&bind_spec(&holder_key)))
         .await
         .expect("bind holder");
-    holder.serve_on(&endpoint);
+    let _ = holder.serve_on(&endpoint);
     let ticket = endpoint.ticket();
 
     let consumer_db = Arc::new(Database::open_memory());
@@ -767,7 +767,7 @@ async fn authorized_holder_without_the_blob_returns_blob_not_found() {
     let endpoint = within(IrohServer::bind(&bind_spec(&holder_key)))
         .await
         .expect("bind holder");
-    holder.serve_on(&endpoint);
+    let _ = holder.serve_on(&endpoint);
     let ticket = endpoint.ticket();
 
     let consumer_db = Arc::new(Database::open_memory());
@@ -819,7 +819,7 @@ async fn holder_dropping_mid_transfer_yields_typed_abort_no_hang() {
     let endpoint = within(IrohServer::bind(&bind_spec(&holder_key)))
         .await
         .expect("bind holder");
-    holder.serve_on(&endpoint);
+    let _ = holder.serve_on(&endpoint);
     let ticket = endpoint.ticket();
 
     let consumer_db = Arc::new(Database::open_memory());
@@ -871,7 +871,7 @@ async fn blob_exceeding_the_frame_ceiling_transfers_over_the_streaming_surface()
     let endpoint = within(IrohServer::bind(&bind_spec(&holder_key)))
         .await
         .expect("bind holder");
-    holder.serve_on(&endpoint);
+    let _ = holder.serve_on(&endpoint);
     let ticket = endpoint.ticket();
 
     let consumer_db = Arc::new(Database::open_memory());
@@ -971,7 +971,7 @@ async fn hub_holds_only_the_reference_never_the_blob_bytes() {
     let endpoint = within(IrohServer::bind(&bind_spec(&holder_key)))
         .await
         .expect("bind holder");
-    holder.serve_on(&endpoint);
+    let _ = holder.serve_on(&endpoint);
     let ticket = endpoint.ticket();
 
     let consumer_db = Arc::new(Database::open_memory());
@@ -1109,7 +1109,7 @@ async fn sink_write_failure_is_a_distinct_typed_error_no_hang() {
     let endpoint = within(IrohServer::bind(&bind_spec(&holder_key)))
         .await
         .expect("bind holder");
-    holder.serve_on(&endpoint);
+    let _ = holder.serve_on(&endpoint);
     let ticket = endpoint.ticket();
 
     let consumer_db = Arc::new(Database::open_memory());
@@ -1220,7 +1220,7 @@ async fn reclaim_deletes_an_unreferenced_blob_then_resolve_is_blob_not_found() {
     let endpoint = within(IrohServer::bind(&bind_spec(&holder_key)))
         .await
         .expect("bind holder");
-    holder.serve_on(&endpoint);
+    let _ = holder.serve_on(&endpoint);
     let ticket = endpoint.ticket();
 
     let consumer_db = Arc::new(Database::open_memory());
@@ -1275,7 +1275,7 @@ async fn two_entitled_consumers_resolve_the_same_blob_concurrently() {
     let endpoint = within(IrohServer::bind(&bind_spec(&holder_key)))
         .await
         .expect("bind holder");
-    holder.serve_on(&endpoint);
+    let _ = holder.serve_on(&endpoint);
     let ticket = endpoint.ticket();
 
     let c1_db = Arc::new(Database::open_memory());
@@ -1354,7 +1354,7 @@ async fn interrupted_large_transfer_resumes_from_offset_not_from_zero() {
     let endpoint = within(IrohServer::bind(&bind_spec(&holder_key)))
         .await
         .expect("bind holder");
-    holder.serve_on(&endpoint);
+    let _ = holder.serve_on(&endpoint);
     let ticket = endpoint.ticket();
 
     let consumer_db = Arc::new(Database::open_memory());
@@ -1422,7 +1422,7 @@ async fn interrupted_large_transfer_resumes_from_offset_not_from_zero() {
     let resumed_endpoint = within(IrohServer::bind(&bind_spec(&holder_key)))
         .await
         .expect("rebind holder after prefix check");
-    holder.serve_on(&resumed_endpoint);
+    let _ = holder.serve_on(&resumed_endpoint);
     let resumed_ticket = resumed_endpoint.ticket();
 
     let rogue_db = Arc::new(Database::open_memory());
@@ -1602,7 +1602,7 @@ fn same_parent_identities_with_independent_repositories_refuse_unentitled_fetch_
     let endpoint = setup_rt
         .block_on(IrohServer::bind(&bind_spec(&holder_key)))
         .expect("bind holder");
-    holder.serve_on(&endpoint);
+    let _ = holder.serve_on(&endpoint);
     let ticket = endpoint.ticket();
 
     let consumer_db = Arc::new(Database::open_memory());
@@ -1703,7 +1703,7 @@ async fn resolve_blob_ref_wedged_fetch_phase_returns_typed_timeout_within_declar
     let endpoint = IrohServer::bind(&bind_spec(&holder_key))
         .await
         .expect("bind holder");
-    holder.serve_on(&endpoint);
+    let _ = holder.serve_on(&endpoint);
     let ticket = endpoint.ticket();
 
     let consumer_db = Arc::new(Database::open_memory());
