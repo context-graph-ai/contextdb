@@ -856,10 +856,14 @@ impl MaintenanceContext {
                 // Source views are gone before ordinary route helpers acquire
                 // their bulk/partition registry guards.
                 for (route, source_position, route_heap, fixed, mut workspace) in sampled_routes {
-                    let mut info = match self
-                        .vector
-                        .try_partition_info(&route.index, &route.partition_key, &mut maintenance_vector_copy_owner)
-                    {
+                    let mut info = match vector_source_page_admission::with_preparation_source_page_admission(
+                        Arc::clone(&self.finalization.accountant),
+                        || self.vector.try_partition_info(
+                            &route.index,
+                            &route.partition_key,
+                            &mut maintenance_vector_copy_owner,
+                        ),
+                    ) {
                         Ok(Some(info)) => info,
                         Ok(None) => continue,
                         Err(error @ (Error::ReadCancelled | Error::PublicationInterrupted)) => {

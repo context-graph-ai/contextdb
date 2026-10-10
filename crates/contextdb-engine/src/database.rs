@@ -21232,10 +21232,13 @@ impl MaintenanceContext {
                 &partition.index,
                 &mut maintenance_vector_copy_owner,
             )?;
-            let info = self.vector.try_partition_info(
-                &partition.index,
-                &partition.partition_key,
-                &mut maintenance_vector_copy_owner,
+            let info = vector_source_page_admission::with_preparation_source_page_admission(
+                Arc::clone(&self.finalization.accountant),
+                || self.vector.try_partition_info(
+                    &partition.index,
+                    &partition.partition_key,
+                    &mut maintenance_vector_copy_owner,
+                ),
             )?;
             let live_vectors = info.as_ref().map_or(0, |info| info.live_rows);
             let policy = layout.resolve_policy(live_vectors, 1);
@@ -21710,14 +21713,14 @@ impl MaintenanceContext {
                             reason.as_str()
                         } else if current.is_none() {
                             "initial_build"
-                        } else if self
-                            .vector
-                            .try_partition_info(
+                        } else if vector_source_page_admission::with_preparation_source_page_admission(
+                            Arc::clone(&self.finalization.accountant),
+                            || self.vector.try_partition_info(
                                 &partition.index,
                                 &partition.partition_key,
                                 &mut maintenance_vector_copy_owner,
-                            )?
-                            .is_some_and(|info| info.tombstones != 0)
+                            ),
+                        )?.is_some_and(|info| info.tombstones != 0)
                         {
                             "tombstones"
                         } else {

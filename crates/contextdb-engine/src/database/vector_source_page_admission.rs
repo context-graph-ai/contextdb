@@ -91,7 +91,7 @@ pub(super) fn with_preparation_source_page_admission<T>(
         accountant,
         "prepare_vector_generation",
         "Raise MEMORY_LIMIT before inspecting this maintained route.",
-        read,
+        || crate::persistence::vector_membership_source::with_maintenance_inspection(read),
     )
 }
 

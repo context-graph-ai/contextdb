@@ -4027,7 +4027,7 @@ impl RedbPersistence {
                 Err(error) => return Err(Self::storage_error(error)),
             };
             Ok(table
-                .get(key.as_slice())
+                .get_bounded(key.as_slice())
                 .map_err(Self::storage_error)?
                 .is_some())
         })?;
