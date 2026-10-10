@@ -250,18 +250,15 @@ fn cleanup_refusal_skips_its_build_while_sibling_and_complete_query_frontiers_pr
         .unwrap();
     assert_eq!(auto.rows, exact.rows);
     assert!(
-        trace.used_hnsw,
-        "the sibling keeps its complete indexed route"
+        !trace.used_hnsw,
+        "AUTO follows its costing decision: {trace:?}"
     );
-    assert_eq!(trace.supplemented_row_count, (INITIAL_ROWS + 3) as usize);
+    assert_eq!(trace.fallback_reason, Some("graph_work_not_below_exact"));
+    assert_eq!(trace.supplemented_row_count, 0);
     assert_eq!(trace.partition_routes.len(), 2);
-    assert!(trace.partition_routes.iter().any(|route| {
+    assert!(trace.partition_routes.iter().all(|route| {
         route.route == VectorPartitionSearchRoute::Exact
             && route.reason == "maintained_graph_incomplete"
-    }));
-    assert!(trace.partition_routes.iter().any(|route| {
-        route.route == VectorPartitionSearchRoute::Indexed
-            && route.reason == "maintained_graph_ready"
     }));
     drop(partial);
     assert_eq!(
