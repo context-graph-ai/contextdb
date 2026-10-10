@@ -421,20 +421,6 @@ fn independently_enumerate_auxiliary_records(
     // counting from zero within its LSN; a schema statement at `{lsn:020}`
     // when it is alone at its LSN and at `{lsn:020}:{ordinal:06}` otherwise;
     // a commit at its LSN.
-    let mut change_ordinal = (None, 0usize);
-    for entry in &parts.change_log {
-        let lsn = entry.lsn().0;
-        change_ordinal = match change_ordinal {
-            (Some(previous), ordinal) if previous == lsn => (Some(lsn), ordinal + 1),
-            _ => (Some(lsn), 0),
-        };
-        let position = format!("{lsn:020}:{:06}", change_ordinal.1);
-        records.push(logical_record(
-            8,
-            logical_history_key(1, position.as_bytes()),
-            logical_json(entry)?,
-        ));
-    }
     let mut at_lsn = BTreeMap::<u64, usize>::new();
     for (lsn, _) in &parts.ddl_log {
         *at_lsn.entry(lsn.0).or_default() += 1;
@@ -505,6 +491,92 @@ fn independently_enumerate_auxiliary_records(
     Ok(records)
 }
 
+// The oracle decodes physical bodies into its own wire representation. It
+// does not read identity leaves or call the production version-manifest hash.
+#[derive(Serialize, Deserialize)]
+struct IndependentVersion {
+    row_id: RowId,
+    values: HashMap<String, IndependentStoredValue>,
+    created_tx: TxId,
+    deleted_tx: Option<TxId>,
+    lsn: Lsn,
+    created_at: Option<contextdb_core::Wallclock>,
+}
+
+#[derive(Serialize, Deserialize)]
+enum IndependentStoredValue {
+    Plain(Value),
+    Vector(IndependentStoredVector),
+}
+
+#[derive(Serialize, Deserialize)]
+enum IndependentStoredVector {
+    F32(Vec<f32>),
+    SQ8 {
+        min: f32,
+        max: f32,
+        len: u32,
+        payload: Vec<u8>,
+    },
+    SQ4 {
+        min: f32,
+        max: f32,
+        len: u32,
+        payload: Vec<u8>,
+    },
+}
+
+fn independently_reconstruct_version_records(
+    bodies: Vec<(String, Vec<u8>)>,
+) -> Result<Vec<LogicalContentRecordForTest>> {
+    let mut records = Vec::new();
+    for (table, body) in bodies {
+        let (row, consumed): (IndependentVersion, usize) =
+            bincode::serde::decode_from_slice(&body, bincode::config::standard())
+                .map_err(|error| contextdb_core::Error::Other(error.to_string()))?;
+        if consumed != body.len() {
+            return Err(contextdb_core::Error::Other(
+                "oracle row has trailing bytes".into(),
+            ));
+        }
+        let mut identity = Vec::new();
+        for value in [row.row_id.0, row.created_tx.0, row.lsn.0] {
+            identity.extend_from_slice(&value.to_be_bytes());
+        }
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"contextdb.relational.version.v1");
+        hash.update(&(table.len() as u32).to_be_bytes());
+        hash.update(table.as_bytes());
+        hash.update(&identity);
+        for value in [
+            row.created_at.map(|stamp| stamp.0),
+            row.deleted_tx.map(|tx| tx.0),
+        ] {
+            hash.update(&[u8::from(value.is_some())]);
+            hash.update(&value.unwrap_or(0).to_be_bytes());
+        }
+        hash.update(&(row.values.len() as u64).to_be_bytes());
+        for (name, value) in row.values.into_iter().collect::<BTreeMap<_, _>>() {
+            let encoded = bincode::serde::encode_to_vec(value, bincode::config::standard())
+                .map_err(|error| contextdb_core::Error::Other(error.to_string()))?;
+            hash.update(&(name.len() as u32).to_be_bytes());
+            hash.update(name.as_bytes());
+            hash.update(&encoded[..1]);
+            hash.update(&((encoded.len() - 1) as u64).to_be_bytes());
+            hash.update(&encoded[1..]);
+        }
+        let mut coordinate = vec![1];
+        coordinate.extend_from_slice(&(table.len() as u32).to_be_bytes());
+        coordinate.extend_from_slice(table.as_bytes());
+        coordinate.extend_from_slice(&identity);
+        coordinate.push(u8::from(row.deleted_tx.is_some()));
+        coordinate.extend_from_slice(&row.deleted_tx.map(|tx| tx.0).unwrap_or(0).to_be_bytes());
+        coordinate.extend_from_slice(hash.finalize().as_bytes());
+        records.push(logical_record(8, logical_history_key(3, &coordinate), [1]));
+    }
+    Ok(records)
+}
+
 /// A history record's logical key: the ordered-history marker, its kind
 /// (0 commit, 1 change, 2 schema) and its stored position.
 fn logical_history_key(kind: u8, position: &[u8]) -> Vec<u8> {
@@ -526,7 +598,11 @@ pub fn committed_content_for_test(
         contextdb_core::read_contract::OwnerReadCancellation::new(),
     )?;
     let load = crate::persistence::load_read_image_at_registration_with_context(
-        path, None, None, None, open_context,
+        path,
+        None,
+        None,
+        None,
+        open_context,
     )
     .map_err(|e| contextdb_core::Error::Other(e.to_string()))?;
     let (mut image, receipt, retained_source) = load.into_parts();
@@ -537,7 +613,20 @@ pub fn committed_content_for_test(
     image.hydrate_logical_content_for_test(&retained_source)?;
     let parts = image.into_runtime_parts(retained_source);
     let identity_table_meta = parts.table_meta.clone();
+    let version_records = independently_reconstruct_version_records(
+        parts
+            .retained_source
+            .relational_version_bodies_for_test(&identity_table_meta)?,
+    )?;
     let mut logical_records = independently_enumerate_auxiliary_records(&parts)?;
+    logical_records.extend(version_records);
+    for (position, body) in parts.retained_source.change_history_bodies_for_test()? {
+        logical_records.push(logical_record(
+            8,
+            logical_history_key(1, position.as_bytes()),
+            body,
+        ));
+    }
     let encode = |value: &dyn std::fmt::Debug| format!("{value:?}").into_bytes();
     // These are witnesses of committed auxiliary mutations, not canonical root
     // encodings. Ordered table entries are supplied by the persistence decoder.

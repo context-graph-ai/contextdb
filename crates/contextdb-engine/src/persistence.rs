@@ -8276,6 +8276,52 @@ impl RetainedReadSource {
         Ok(entry)
     }
 
+    /// The private history commitment includes its durable deletion witness,
+    /// which the public change projection intentionally does not carry.
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn change_history_bodies_for_test(&self) -> Result<Vec<(String, Vec<u8>)>> {
+        self.with_read(|read| {
+            let table = match read.open_table(CHANGE_LOG_TABLE) {
+                Ok(table) => table,
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+                Err(error) => return Err(RedbPersistence::storage_error(error)),
+            };
+            let mut bodies = Vec::new();
+            for entry in table.iter().map_err(RedbPersistence::storage_error)? {
+                let (key, value) = entry.map_err(RedbPersistence::storage_error)?;
+                bodies.push((key.value().to_owned(), value.value().to_vec()));
+            }
+            Ok(bodies)
+        })
+    }
+
+    /// Disposable oracle input: physical row bodies from the pinned root,
+    /// independent of the maintained identity records and vector projection.
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn relational_version_bodies_for_test(
+        &self,
+        table_meta: &HashMap<String, TableMeta>,
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        self.with_read(|read| {
+            let mut bodies = Vec::new();
+            for name in table_meta.keys() {
+                let table_name = RedbPersistence::rel_table_name(name);
+                let definition: TableDefinition<&[u8], &[u8]> =
+                    TableDefinition::new(table_name.as_str());
+                let table = match read.open_table(definition) {
+                    Ok(table) => table,
+                    Err(redb::TableError::TableDoesNotExist(_)) => continue,
+                    Err(error) => return Err(RedbPersistence::storage_error(error)),
+                };
+                for entry in table.iter().map_err(RedbPersistence::storage_error)? {
+                    let (_, value) = entry.map_err(RedbPersistence::storage_error)?;
+                    bodies.push((name.clone(), value.value().to_vec()));
+                }
+            }
+            Ok(bodies)
+        })
+    }
+
     #[cfg(any(test, feature = "test-seams"))]
     fn compatibility_vector_projection_for_test(
         &self,
