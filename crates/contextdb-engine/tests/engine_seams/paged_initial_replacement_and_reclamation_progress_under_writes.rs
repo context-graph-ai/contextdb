@@ -170,7 +170,7 @@ fn paged_initial_replacement_and_reclamation_progress_under_writes() {
         Some(committed),
         "successful batch cursor is durable before cancellation"
     );
-    let pinned = db.pin_snapshot(frontier);
+    let pinned = db.pin_snapshot(frontier).unwrap();
     // Admit writes/read barriers between committed batches, while that batch's
     // workspace is released. The cancellation pause need not fund another
     // transaction from the deliberately small builder allowance.
@@ -448,7 +448,7 @@ fn paged_initial_replacement_and_reclamation_progress_under_writes() {
         "ALTER TABLE building ALTER COLUMN v SET CONSOLIDATION (TOMBSTONE_PERCENT = 5)",
     );
     let old = db.snapshot();
-    let pin = db.pin_snapshot(old);
+    let pin = db.pin_snapshot(old).unwrap();
     for id in 0..128 {
         exec(&db, &format!("DELETE FROM building WHERE id = {id}"));
     }

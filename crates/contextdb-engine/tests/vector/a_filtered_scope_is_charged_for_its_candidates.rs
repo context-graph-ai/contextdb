@@ -971,7 +971,7 @@ fn historical_vector_placement_survives_pruning_and_reconstruction_until_version
     .expect("insert the unpartitioned row that will be deleted");
 
     let old_snapshot = db.snapshot();
-    let old_pin = db.pin_snapshot(old_snapshot);
+    let old_pin = db.pin_snapshot(old_snapshot).unwrap();
     db.execute(
         "UPDATE historical_grouping SET partition_id = 2, embedding = [0.0, 1.0, 0.0] \
          WHERE id = 1",
@@ -1258,7 +1258,7 @@ fn exhaustive_exact_scan_charges_retained_dead_and_future_versions_before_visibi
     .expect("insert the snapshot-visible vector");
 
     let snapshot = db.snapshot();
-    let _pin = db.pin_snapshot(snapshot);
+    let _pin = db.pin_snapshot(snapshot).unwrap();
     let sql = "SELECT id FROM exhaustive_history \
                ORDER BY embedding <=> $query USE VECTOR EXACT LIMIT 1";
     let params = HashMap::from([("query".into(), Value::Vector(vec![1.0, 0.0, 0.0]))]);

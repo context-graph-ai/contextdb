@@ -90,7 +90,7 @@ fn paged_constraints_preserve_staging_and_competing_commit_conflicts() {
         )
         .unwrap();
         database.set_maintenance_policy(MaintenancePolicy::CallerDriven);
-        let pin = database.pin_snapshot(historical);
+        let pin = database.pin_snapshot(historical).unwrap();
         let displace = || {
             let before = database.__writer_cache_stats_for_test().unwrap();
             // The ordinal seam walks every prior wide leaf; visit the range once.

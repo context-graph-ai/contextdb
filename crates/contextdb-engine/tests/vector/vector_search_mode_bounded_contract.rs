@@ -723,7 +723,7 @@ fn old_snapshot_keeps_each_partition_graph_after_a_later_write() {
     );
     let unaffected_rows = partition_row_ids(&db, 0);
     let old_snapshot = db.snapshot();
-    let old_pin = db.pin_snapshot(old_snapshot);
+    let old_pin = db.pin_snapshot(old_snapshot).unwrap();
     let bound = params([("query", query_vector())]);
 
     db.__reset_last_query_vector_trace_for_test();

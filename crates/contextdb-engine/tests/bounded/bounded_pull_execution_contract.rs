@@ -2086,7 +2086,7 @@ fn mostly_invisible_vector_history_is_charged_at_direct_and_cursor_boundaries() 
     )
     .expect("insert the version visible to the held snapshot");
     let old_snapshot = db.snapshot();
-    let _old_pin = db.pin_snapshot(old_snapshot);
+    let _old_pin = db.pin_snapshot(old_snapshot).unwrap();
     for version in 1..STORED_VERSIONS {
         db.execute(
             "UPDATE mostly_dead_vectors SET embedding = $embedding WHERE id = 1",

@@ -148,7 +148,7 @@ fn an_open_old_snapshot_and_a_later_historical_snapshot_keep_their_complete_vect
     insert(&db, row, scope_before, axis(0));
 
     let old_snapshot = db.snapshot();
-    let old_pin = db.pin_snapshot(old_snapshot);
+    let old_pin = db.pin_snapshot(old_snapshot).unwrap();
 
     // Nothing is retirable yet: one partition, one live vector, no deletes
     // or moves, and a registered pin -- so the persisted-catalog branch is

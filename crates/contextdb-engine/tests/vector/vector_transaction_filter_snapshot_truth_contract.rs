@@ -1284,7 +1284,7 @@ fn old_snapshot_indexed_uses_its_retained_generation_and_ignores_unselected_grow
     let before = id(70_000);
     let g1 = generation(&db, selected_scope());
     let old_snapshot = db.snapshot();
-    let old_pin = db.pin_snapshot(old_snapshot);
+    let old_pin = db.pin_snapshot(old_snapshot).unwrap();
 
     for ordinal in 0..6_u128 {
         db.execute(
@@ -1628,7 +1628,7 @@ async fn database_late_lower_commit_keeps_unique_vectors_across_snapshots_restar
     drive_until_indexed(&db, selected_scope());
     assert_three_current_vectors(&db, &[1.0, 0.0, 0.0]);
     let initial_snapshot = db.snapshot();
-    let initial_pin = db.pin_snapshot(initial_snapshot);
+    let initial_pin = db.pin_snapshot(initial_snapshot).unwrap();
     let lower = db.begin().unwrap();
     let higher = db.begin().unwrap();
     assert!(lower < higher);
@@ -1644,7 +1644,7 @@ async fn database_late_lower_commit_keeps_unique_vectors_across_snapshots_restar
     .unwrap();
     db.commit(higher).unwrap();
     let intermediate_snapshot = db.snapshot();
-    let intermediate_pin = db.pin_snapshot(intermediate_snapshot);
+    let intermediate_pin = db.pin_snapshot(intermediate_snapshot).unwrap();
     assert_three_current_vectors(&db, &[0.6, 0.8, 0.0]);
     let mut waiting = Vec::new();
     for keyword in ["EXACT", "INDEXED"] {
@@ -1786,7 +1786,7 @@ async fn database_late_lower_commit_keeps_unique_vectors_across_snapshots_restar
         );
         if round == 0 {
             let before = hub.snapshot();
-            let pin = hub.pin_snapshot(before);
+            let pin = hub.pin_snapshot(before).unwrap();
             edge.execute(
                 update,
                 &params([

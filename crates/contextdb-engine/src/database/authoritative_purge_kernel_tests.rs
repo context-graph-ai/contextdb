@@ -988,7 +988,7 @@ fn assert_full_selected_absence_after_reopen(
 fn authoritative_file_purge_kernel_removes_only_the_immutable_selected_lineage() {
     let seed = fixture_seed();
     let pinned_snapshot = seed.db.snapshot();
-    let pinned = seed.db.pin_snapshot(pinned_snapshot);
+    let pinned = seed.db.pin_snapshot(pinned_snapshot).unwrap();
     let fixture = finish_fixture(&seed, pinned_snapshot);
     let before = owned_copies(&seed.db, &fixture);
     assert_eq!(before.selected_note_disk_sync_source, Some((Lsn(701), 1)));
@@ -1288,7 +1288,7 @@ fn authoritative_file_purge_kernel_removes_only_the_immutable_selected_lineage()
 fn authoritative_file_purge_kernel_fences_stale_transactions_and_exports() {
     let seed = fixture_seed();
     let pinned_snapshot = seed.db.snapshot();
-    let pinned = seed.db.pin_snapshot(pinned_snapshot);
+    let pinned = seed.db.pin_snapshot(pinned_snapshot).unwrap();
     let fixture = finish_fixture(&seed, pinned_snapshot);
     let fixture_operation_reader_9 = seed
         .db
@@ -1432,7 +1432,7 @@ fn authoritative_file_purge_kernel_fences_stale_transactions_and_exports() {
 fn authoritative_file_purge_kernel_rolls_back_every_owned_copy_on_persistence_failure() {
     let seed = fixture_seed();
     let pinned_snapshot = seed.db.snapshot();
-    let pinned = seed.db.pin_snapshot(pinned_snapshot);
+    let pinned = seed.db.pin_snapshot(pinned_snapshot).unwrap();
     let fixture = finish_fixture(&seed, pinned_snapshot);
     let before = owned_copies(&seed.db, &fixture);
     seed.db

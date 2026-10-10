@@ -306,7 +306,7 @@ fn delete_only_final_route_truncates_covered_history_before_snapshot_release_can
     let journal_before_delete =
         db.__debug_vector_partition_journal_file_for_test(&route(emptied_scope));
     let pre_delete_snapshot = db.snapshot();
-    let retirement_hold = db.pin_snapshot(pre_delete_snapshot);
+    let retirement_hold = db.pin_snapshot(pre_delete_snapshot).unwrap();
     let deleted_rows = db
         .execute(
             "DELETE FROM delete_only_items WHERE id = $id",

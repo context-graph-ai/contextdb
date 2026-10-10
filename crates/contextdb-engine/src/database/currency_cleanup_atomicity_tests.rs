@@ -423,7 +423,7 @@ fn currency_cleanup_reclaims_eligible_generations_at_its_durable_boundary() {
         }
         db.run_maintenance_cycle().unwrap();
         let snapshot = db.snapshot();
-        let pin = db.pin_snapshot(snapshot);
+        let pin = db.pin_snapshot(snapshot).unwrap();
         for v in [0.25, 0.5] {
             db.execute(
                 "UPDATE items SET v = $v WHERE id = 0",

@@ -208,7 +208,7 @@ fn in_memory_consolidation_keeps_an_active_old_snapshot_on_its_indexed_route() {
         1
     );
     let old_snapshot = db.snapshot();
-    let old_pin = db.pin_snapshot(old_snapshot);
+    let old_pin = db.pin_snapshot(old_snapshot).unwrap();
     let sql = "SELECT id FROM items WHERE scope = 0 \
                ORDER BY v <=> [1,0,0] USE VECTOR INDEXED LIMIT 1";
     assert_eq!(
@@ -995,7 +995,7 @@ fn refused_partition_still_closes_the_cycle_and_retires_a_sibling_partition() {
     );
     query(&db, Some(1));
     query(&db, Some(2));
-    let held = db.pin_snapshot(db.snapshot());
+    let held = db.pin_snapshot(db.snapshot()).unwrap();
     for id in 32..48 {
         db.execute(
             "DELETE FROM items WHERE id = $id",

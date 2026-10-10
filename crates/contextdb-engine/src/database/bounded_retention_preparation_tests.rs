@@ -102,7 +102,7 @@ fn due_retention_next_to_history_is_charged_atomic_and_snapshot_safe() {
         .unwrap();
     }
     let snapshot = db.snapshot();
-    let pin = db.pin_snapshot(snapshot);
+    let pin = db.pin_snapshot(snapshot).unwrap();
     let used = db.accountant.usage().used;
     db.accountant.set_budget(Some(used + 256 * 1024)).unwrap();
     db.accountant.reset_high_water_for_test();
@@ -452,7 +452,7 @@ fn reader_deferred_edges_remain_charged_and_carry_only_retries_are_admitted() {
     db.commit(tx).unwrap();
     // This snapshot sees the edges, while the subsequently inserted row is
     // newer. Row reclamation must leave the older adjacency owed to this pin.
-    let pin = db.pin_snapshot(db.snapshot());
+    let pin = db.pin_snapshot(db.snapshot()).unwrap();
     for id in 0..64 {
         db.execute(
             "INSERT INTO retained VALUES ($id, $expires)",

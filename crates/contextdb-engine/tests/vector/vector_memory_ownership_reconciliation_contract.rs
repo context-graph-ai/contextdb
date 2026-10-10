@@ -977,7 +977,7 @@ fn restart_churn_reconciles_each_vector_owner_once_and_final_drop_restores_the_c
         // currency compaction must defer pruning it rather than physically
         // removing a version out from under a registered reader.
         let held_snapshot = db.snapshot();
-        let held_pin = db.pin_snapshot(held_snapshot);
+        let held_pin = db.pin_snapshot(held_snapshot).unwrap();
         let one_vector_payload_bytes = contextdb_core::VectorQuantization::F32.storage_bytes(3);
         let before_pinned_versions = db.__physical_version_count_for_test("current_only_items");
 
@@ -1464,7 +1464,7 @@ fn long_typed_key_move_and_snapshot_retirement_admit_before_mutation_and_release
         insert(&calibration, "key_items", 0x301, "source", 0);
         drive_maintenance(&calibration, "key_items", "source");
         let source_snapshot = calibration.snapshot();
-        let source_pin = calibration.pin_snapshot(source_snapshot);
+        let source_pin = calibration.pin_snapshot(source_snapshot).unwrap();
         let before = receipt!(&calibration);
         let before_used = calibration.accountant().usage().used;
         calibration
@@ -1513,7 +1513,7 @@ fn long_typed_key_move_and_snapshot_retirement_admit_before_mutation_and_release
     insert(&db, "key_items", 0x301, "source", 0);
     drive_maintenance(&db, "key_items", "source");
     let old_snapshot = db.snapshot();
-    let pin = db.pin_snapshot(old_snapshot);
+    let pin = db.pin_snapshot(old_snapshot).unwrap();
     let before_move = receipt!(&db);
     let before_move_used = db.accountant().usage().used;
     db.set_memory_limit(Some(before_move_used + admission - 1))
@@ -1883,7 +1883,7 @@ fn retired_graphs_release_between_partition_rebuilds_without_losing_pinned_reads
         drive_maintenance(&db, "rebuild_items", scope);
     }
     let snapshot = db.snapshot();
-    let pin = db.pin_snapshot(snapshot);
+    let pin = db.pin_snapshot(snapshot).unwrap();
     let sql = "SELECT id FROM rebuild_items WHERE scope = 'alpha' ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 2";
     let query = params([("query", Value::Vector(vector(0)))]);
     let old = db.execute_at_snapshot(sql, &query, snapshot).unwrap();
@@ -1919,7 +1919,7 @@ fn retired_graphs_release_between_partition_rebuilds_without_losing_pinned_reads
             > 0
     );
     let newer_snapshot = db.snapshot();
-    let newer_pin = db.pin_snapshot(newer_snapshot);
+    let newer_pin = db.pin_snapshot(newer_snapshot).unwrap();
     let newer_rows = db
         .execute_at_snapshot(sql, &query, newer_snapshot)
         .unwrap()
@@ -2246,7 +2246,7 @@ fn repair_pre_admits_snapshot_transition_and_retained_long_generation_keys() {
     );
 
     let old_snapshot = db.snapshot();
-    let old_pin = db.pin_snapshot(old_snapshot);
+    let old_pin = db.pin_snapshot(old_snapshot).unwrap();
     db.execute(
         "UPDATE repair_admission_items SET embedding = $embedding WHERE id = $id",
         &params([
@@ -2288,7 +2288,7 @@ fn repair_pre_admits_snapshot_transition_and_retained_long_generation_keys() {
     );
     let sampled_snapshot = db.snapshot();
     let sample_pins = (0..SAMPLE_PINS)
-        .map(|_| db.pin_snapshot(sampled_snapshot))
+        .map(|_| db.pin_snapshot(sampled_snapshot).unwrap())
         .collect::<Vec<_>>();
     let pause = db.__arm_one_shot_vector_repair_snapshot_sample_transition_pause_for_test();
     let repair_db = Arc::clone(&db);

@@ -1011,7 +1011,7 @@ fn public_later_inventory_slot_refusal(slot: &'static str) {
     };
     let mut retirement_snapshot = None;
     if slot == "closing_routes" {
-        let held = db.pin_snapshot(db.snapshot());
+        let held = db.pin_snapshot(db.snapshot()).unwrap();
         // Retained raw history keeps the later delete below the declared
         // consolidation threshold, leaving retirement to the closing pass.
         for step in 1u16..=10 {

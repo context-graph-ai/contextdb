@@ -15812,7 +15812,6 @@ pub struct TableSizeEstimate {
 /// - Bounded reads register independently of SQL statements; a suspended
 ///   cursor keeps that registration between pages for exactly its published
 ///   idle window.
-#[derive(Default)]
 struct SnapshotFloorRegistry {
     next_token: AtomicU64,
     /// Construction floors of unpublished paged vector builds: one registered
@@ -15828,6 +15827,7 @@ struct SnapshotFloorRegistry {
     /// land un-accounted-for and then return, promising protection the
     /// SAME in-flight pass was still free to violate.)
     state: Arc<Mutex<SnapshotFloorState>>,
+    pin_slots: Mutex<Option<Arc<SnapshotPinPool>>>,
     /// Wakes a `register` call blocked in the `while` loop below when a
     /// pass's `ActiveRemovalPassGuard` drops.
     pass_finished: Arc<Condvar>,
@@ -15850,6 +15850,104 @@ struct SnapshotFloorRegistry {
     durable_admission_test_pause: Arc<ApplyPhasePause>,
     #[cfg(test)]
     owner_cursor_busy_test_pause: Arc<ApplyPhasePause>,
+}
+
+/// Fixed, open-time-funded capacity for public caller-held snapshot pins.
+struct SnapshotPinPool {
+    available: AtomicUsize,
+    slots: usize,
+    slot_bytes: usize,
+    accountant: Arc<MemoryAccountant>,
+}
+
+impl SnapshotPinPool {
+    fn acquire(self: &Arc<Self>) -> contextdb_core::Result<SnapshotPinSlot> {
+        let mut available = self.available.load(Ordering::SeqCst);
+        loop {
+            if available == 0 {
+                return Err(contextdb_core::Error::MemoryBudgetExceeded {
+                    subsystem: "snapshot_pin".into(),
+                    operation: "admit_pin".into(),
+                    requested_bytes: self.slot_bytes,
+                    available_bytes: 0,
+                    budget_limit_bytes: self.slots.saturating_mul(self.slot_bytes),
+                    hint: "drop a SnapshotPin before pinning another snapshot".into(),
+                });
+            }
+            match self.available.compare_exchange(
+                available,
+                available - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return Ok(SnapshotPinSlot { pool: self.clone() }),
+                Err(observed) => available = observed,
+            }
+        }
+    }
+}
+
+impl Drop for SnapshotPinPool {
+    fn drop(&mut self) {
+        self.accountant.release(self.slots.saturating_mul(self.slot_bytes));
+    }
+}
+
+struct SnapshotPinSlot {
+    pool: Arc<SnapshotPinPool>,
+}
+
+impl Drop for SnapshotPinSlot {
+    fn drop(&mut self) {
+        self.pool.available.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl Default for SnapshotFloorRegistry {
+    fn default() -> Self {
+        Self {
+            next_token: AtomicU64::new(0),
+            construction_floors: Mutex::new(HashMap::new()),
+            state: Arc::new(Mutex::new(SnapshotFloorState::default())),
+            pin_slots: Mutex::new(None),
+            pass_finished: Arc::new(Condvar::new()),
+            removal_pass_test_pause: Arc::new(ApplyPhasePause::new()),
+            #[cfg(test)]
+            durable_admission_test_pause: Arc::new(ApplyPhasePause::new()),
+            #[cfg(test)]
+            owner_cursor_busy_test_pause: Arc::new(ApplyPhasePause::new()),
+        }
+    }
+}
+
+impl SnapshotFloorRegistry {
+    fn fund_pin_slots(&self, accountant: Arc<MemoryAccountant>) {
+        let mut configured = self.pin_slots.lock();
+        if configured.is_some() {
+            return;
+        }
+        let slots = contextdb_core::read_contract::ReadLimits::SHIPPED_SNAPSHOT_PIN_SLOTS;
+        let slot_bytes = std::mem::size_of::<RegisteredSnapshot>()
+            .saturating_add(std::mem::size_of::<SnapshotRegistration>())
+            .saturating_add(3 * std::mem::size_of::<usize>());
+        let bytes = slots.saturating_mul(slot_bytes);
+        self.state.lock().active.reserve(slots);
+        accountant.charge_retained(bytes);
+        *configured = Some(Arc::new(SnapshotPinPool {
+            available: AtomicUsize::new(slots),
+            slots,
+            slot_bytes,
+            accountant,
+        }));
+    }
+
+    fn acquire_pin_slot(&self) -> contextdb_core::Result<SnapshotPinSlot> {
+        self.pin_slots
+            .lock()
+            .as_ref()
+            .expect("snapshot pin pool is funded when the database opens")
+            .acquire()
+    }
 }
 
 /// One registered read snapshot, plus whatever the holder published about
@@ -16503,6 +16601,7 @@ fn any_registered_snapshot_sees_version(
 pub struct SnapshotPin<'a> {
     _database: &'a Database,
     _registration: SnapshotRegistration,
+    _slot: SnapshotPinSlot,
     _root: Option<Arc<crate::persistence::WriterSnapshot>>,
 }
 
@@ -23365,6 +23464,7 @@ impl Database {
         declared_read_memory: Arc<crate::vector_read_memory::DeclaredReadMemory>,
     ) -> Self {
         let accountant = Arc::clone(&finalization.accountant);
+        snapshot_registry.fund_pin_slots(accountant.clone());
         let vector_accountant = Arc::clone(&finalization.vector_accountant);
         {
         let mut storage = std::mem::MaybeUninit::<Database>::uninit();
@@ -55469,7 +55569,10 @@ impl Database {
     /// cannot come back — that is the pre-existing, documented unpinned-
     /// held-snapshot boundary above, unchanged. A pin whose `snapshot` is
     /// not older than any in-flight pass's own floor never blocks.
-    pub fn pin_snapshot(&self, snapshot: SnapshotId) -> SnapshotPin<'_> {
+    /// The store's fixed `ReadLimits::SHIPPED_SNAPSHOT_PIN_SLOTS` pool bounds
+    /// caller-held registrations; exhaustion returns a typed memory refusal.
+    pub fn pin_snapshot(&self, snapshot: SnapshotId) -> contextdb_core::Result<SnapshotPin<'_>> {
+        let slot = self.snapshot_registry.acquire_pin_slot()?;
         let root = self.snapshot_registry.pinned_root(snapshot).or_else(|| {
             self.writer_read_root()
                 .expect("an open database has a published read root")
@@ -55495,11 +55598,12 @@ impl Database {
                 registered.pinned_root = Some(Arc::downgrade(root));
             }
         }
-        SnapshotPin {
+        Ok(SnapshotPin {
             _database: self,
             _registration: registration,
+            _slot: slot,
             _root: root,
-        }
+        })
     }
 
     /// Whether committing `tx`'s write set could leave a partitioned vector
@@ -88028,7 +88132,7 @@ mod retention_prune_persistence_tests {
             let case = std::env::var(CHILD_CASE).unwrap();
             let db = Database::open(&path).unwrap();
             db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
-            let pin = (case == "deferred").then(|| db.pin_snapshot(db.snapshot()));
+            let pin = (case == "deferred").then(|| db.pin_snapshot(db.snapshot()).unwrap());
             if pin.is_some() {
                 insert(&db, expired, -1);
             }
@@ -90214,6 +90318,9 @@ mod dormant_raw_vector_loader_tests;
 #[cfg(all(test, feature = "test-seams"))]
 #[path = "database/bounded_retention_preparation_tests.rs"]
 mod bounded_retention_preparation_tests;
+#[cfg(test)]
+#[path = "database/snapshot_pin_pool_tests.rs"]
+mod snapshot_pin_pool_tests;
 #[cfg(test)]
 mod generation_route_admission_tests;
 

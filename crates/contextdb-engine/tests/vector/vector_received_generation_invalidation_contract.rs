@@ -178,7 +178,7 @@ async fn complete_received_image_invalidates_stale_maintained_vector_generations
         vec![sibling_id]
     );
     let old_snapshot = edge.snapshot();
-    let old_pin = edge.pin_snapshot(old_snapshot);
+    let old_pin = edge.pin_snapshot(old_snapshot).unwrap();
 
     // The schema entry makes the next authenticated pull use the received
     // complete-image transaction. Its accepted rows now contain only the

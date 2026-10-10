@@ -708,7 +708,7 @@ fn repair_preserves_a_dormant_generation_selected_by_a_held_old_snapshot() {
     let db = Database::open(&path).expect("reopen with the first graph dormant");
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     let old_snapshot = db.snapshot();
-    let old_pin = db.pin_snapshot(old_snapshot);
+    let old_pin = db.pin_snapshot(old_snapshot).unwrap();
     db.execute(
         "INSERT INTO generation_items (id, scope_id, embedding) VALUES ($id, $scope, $embedding)",
         &params([
@@ -1541,7 +1541,7 @@ fn pinned_old_snapshot_keeps_its_indexed_generation_until_release_then_reclaims_
     drive_maintenance_until_ready(&db, &[scope]);
     let prior_generation = generation(&db, scope);
     let old_snapshot = db.snapshot();
-    let old_pin = db.pin_snapshot(old_snapshot);
+    let old_pin = db.pin_snapshot(old_snapshot).unwrap();
     db.execute(
         "INSERT INTO generation_items (id, scope_id, embedding) VALUES ($id, $scope, $embedding)",
         &params([

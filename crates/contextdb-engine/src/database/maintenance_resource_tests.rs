@@ -1985,7 +1985,7 @@ fn last_membership_cleanup_keeps_catalog_targets_with_a_pinned_retired_chain() {
         let first_base = catalog().base.generation_id;
         db.execute("DELETE FROM items", &HashMap::new()).unwrap();
         let snapshot = db.snapshot();
-        let pin = db.pin_snapshot(snapshot);
+        let pin = db.pin_snapshot(snapshot).unwrap();
         let old_rows = db
             .execute_at_snapshot(sql, &HashMap::new(), snapshot)
             .unwrap()
@@ -2505,7 +2505,7 @@ fn resident_generation_selection_keeps_the_pinned_frontier_during_concurrent_wri
         };
         let original = catalog().unwrap();
         let old_snapshot = db.snapshot();
-        let pin = db.pin_snapshot(old_snapshot);
+        let pin = db.pin_snapshot(old_snapshot).unwrap();
         let query = "SELECT id, v FROM t ORDER BY v <=> [1] USE VECTOR INDEXED LIMIT 1";
         let query_params = HashMap::new();
         let old_answer = db

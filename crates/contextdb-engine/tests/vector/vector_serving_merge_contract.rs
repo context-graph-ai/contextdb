@@ -106,7 +106,7 @@ fn query_policy_discloses_serving_snapshot_and_full_partition_search_breadth() {
     db.commit(tx).unwrap();
     db.run_maintenance_cycle().unwrap();
     let snapshot = db.snapshot();
-    let _pin = db.pin_snapshot(snapshot);
+    let _pin = db.pin_snapshot(snapshot).unwrap();
     let query = [0.7, 0.3, 0.1];
     let sql = "SELECT id FROM items WHERE bucket = 0 ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 10";
     db.execute(
@@ -774,7 +774,7 @@ fn current_only_cleanup_keeps_native_candidate_order_across_readers_and_restart(
                 .expect("the counterexample needs an immutable base with the old score");
             let query = [1.0, 0.0, 0.0];
             let old_snapshot = db.snapshot();
-            let pin = db.pin_snapshot(old_snapshot);
+            let pin = db.pin_snapshot(old_snapshot).unwrap();
             let sql = "SELECT id, score FROM items ORDER BY embedding <=> $query \
                        USE VECTOR INDEXED LIMIT 2";
             let old_answer = db.execute(sql, &parameters(&query)).unwrap();
@@ -979,7 +979,7 @@ fn closer_noncurrent_rows_do_not_change_current_results_or_add_complete_entry_pa
         .unwrap();
     assert_eq!(ids(&exact), vec![1, 2, 3, 4, 5]);
     let snapshot = db.snapshot();
-    let _pin = db.pin_snapshot(snapshot);
+    let _pin = db.pin_snapshot(snapshot).unwrap();
 
     for (start, end) in [(100, 612), (612, 4196)] {
         let tx = db.begin().unwrap();

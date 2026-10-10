@@ -37,7 +37,7 @@ fn graph_delete_seeks_only_its_edge_identity() {
         database.commit(tx).unwrap();
         let insert_tx = tx;
         let old_snapshot = database.snapshot();
-        let old = database.pin_snapshot(old_snapshot);
+        let old = database.pin_snapshot(old_snapshot).unwrap();
         let tx = database.begin_or_panic();
         database.delete_edge(tx, source, target, "links").unwrap();
         let (result, work) = observe(|| database.commit(tx));

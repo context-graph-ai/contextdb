@@ -423,7 +423,7 @@ fn current_filtered_rows_keep_the_same_answers_as_excluded_history_grows() {
         db.run_maintenance_cycle().unwrap();
     }
     let snapshot = db.snapshot();
-    let pin = db.pin_snapshot(snapshot);
+    let pin = db.pin_snapshot(snapshot).unwrap();
     let sql = "SELECT id FROM items WHERE is_current = true ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1";
     let bound = HashMap::from([("q".to_owned(), Value::Vector(vec![1.0, 0.0]))]);
     let expected = db.execute(sql, &bound).unwrap().rows;

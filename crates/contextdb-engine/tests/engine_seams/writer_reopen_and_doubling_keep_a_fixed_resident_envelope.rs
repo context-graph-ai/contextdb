@@ -295,7 +295,7 @@ fn prepare(path: &Path, n: usize) {
         .unwrap();
     }
     let expiry_frontier = db.snapshot();
-    let pin = db.pin_snapshot(expiry_frontier);
+    let pin = db.pin_snapshot(expiry_frontier).unwrap();
     db.run_pruning_cycle_checked().unwrap();
     assert_eq!(
         exec(&db, "SELECT COUNT(*) FROM expired_items"),

@@ -216,7 +216,7 @@ fn file_content_totals_match_persisted_values_through_replacement_delete_and_pru
     );
     assert!(!held_cursor.first_page.has_more);
     let snapshot = database.snapshot();
-    let pin = database.pin_snapshot(snapshot);
+    let pin = database.pin_snapshot(snapshot).unwrap();
     mutate(
         &database,
         "UPDATE content_rows SET payload = $payload, embedding = $embedding WHERE id = 1",

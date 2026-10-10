@@ -1619,7 +1619,7 @@ async fn authoritative_purge_removes_every_engine_held_copy() {
         );
     }
     let held_snapshot = edge_a.snapshot();
-    let _open_read = edge_a.pin_snapshot(held_snapshot);
+    let _open_read = edge_a.pin_snapshot(held_snapshot).unwrap();
     edit(&edge_a, selected, "selected-secret-after-edit");
     assert_eq!(
         edge_a

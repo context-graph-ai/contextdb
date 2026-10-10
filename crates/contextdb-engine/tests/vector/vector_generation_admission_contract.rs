@@ -268,7 +268,7 @@ fn retained_versions_and_tombstones_admit_base_replacement_and_serve_old_graph()
     assert_eq!(first.vector.built_partitions, 1, "{first:?}");
     assert!(first.vector.first_failure.is_none());
     let old_snapshot = db.snapshot();
-    let pin = db.pin_snapshot(old_snapshot);
+    let pin = db.pin_snapshot(old_snapshot).unwrap();
     let old_generation = generation(&db);
     db.execute(
         "DELETE FROM admission_items WHERE id < 3700",
@@ -471,7 +471,7 @@ fn multiple_pinned_generations_remain_charged_until_their_final_snapshot_release
     assert_indexed(&db, 63, 0);
     let first_generation = generation(&db);
     let first_snapshot = db.snapshot();
-    let first_pin = db.pin_snapshot(first_snapshot);
+    let first_pin = db.pin_snapshot(first_snapshot).unwrap();
     replace_vectors(&db, 1);
     db.execute(
         "ALTER TABLE admission_items ALTER COLUMN embedding SET HNSW (M = 20, EF_CONSTRUCTION = 300)",
@@ -493,10 +493,10 @@ fn multiple_pinned_generations_remain_charged_until_their_final_snapshot_release
         second_generation.generation_id
     );
     let second_snapshot = db.snapshot();
-    let second_pin = db.pin_snapshot(second_snapshot);
+    let second_pin = db.pin_snapshot(second_snapshot).unwrap();
     // Two independent reader holds at the same generation: releasing one is
     // insufficient to reclaim the graph still reachable by the other.
-    let second_pin_again = db.pin_snapshot(second_snapshot);
+    let second_pin_again = db.pin_snapshot(second_snapshot).unwrap();
     replace_vectors(&db, 2);
     db.execute(
         "ALTER TABLE admission_items ALTER COLUMN embedding SET HNSW (M = 24, EF_CONSTRUCTION = 400)",

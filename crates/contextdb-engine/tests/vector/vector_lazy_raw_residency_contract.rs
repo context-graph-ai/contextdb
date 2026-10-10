@@ -356,7 +356,7 @@ fn indexed_many_partition_reads_point_load_only_visible_versioned_candidates() {
 
     let replaced_row_id = row_id_for_uuid(&db, replaced);
     let old_snapshot = db.snapshot();
-    let old_pin = db.pin_snapshot(old_snapshot);
+    let old_pin = db.pin_snapshot(old_snapshot).unwrap();
     db.execute(
         "UPDATE raw_residency_items SET embedding = $embedding WHERE id = $id",
         &params([

@@ -1751,7 +1751,7 @@ fn checkpoint_uses_one_pinned_durable_source_while_history_pruning_waits() {
     )
     .unwrap();
     let old_snapshot = src.snapshot();
-    let old_pin = src.pin_snapshot(old_snapshot);
+    let old_pin = src.pin_snapshot(old_snapshot).unwrap();
     src.execute(
         "UPDATE checkpoint_history SET embedding = $embedding WHERE id = 1",
         &params(vec![("embedding", Value::Vector(captured.to_vec()))]),

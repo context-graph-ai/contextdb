@@ -157,7 +157,7 @@ fn reader_at_boundary(boundary: CommitBoundary) {
     );
     let old_snapshot = database.snapshot();
 
-    let pinned = database.pin_snapshot(old_snapshot);
+    let pinned = database.pin_snapshot(old_snapshot).unwrap();
     let transaction = database.begin_or_panic();
     let sql = "SELECT id, unique_key, embedding FROM reader_items WHERE unique_key >= 'old-' ORDER BY unique_key";
     let successor_sql =
