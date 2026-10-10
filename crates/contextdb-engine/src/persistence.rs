@@ -6356,7 +6356,11 @@ impl CheckpointReadSource {
         meta: &TableMeta,
         rows: &mut [VersionedRow],
     ) -> Result<(usize, ExportBodyAdmission)> {
-        let admission = ExportBodyAdmission::empty(self.decode_memory.row_owner()?);
+        // Explicit export readers supply their own child. Standalone writer
+        // exports retain the captured source's writer funder.
+        let memory = crate::read_image_memory::active_owner()
+            .unwrap_or_else(|_| self.decode_memory.clone());
+        let admission = ExportBodyAdmission::empty(memory.row_owner()?);
         if rows.is_empty() {
             return Ok((0, admission));
         }
@@ -6571,7 +6575,11 @@ impl CheckpointReadSource {
         meta: &TableMeta,
         rows: &mut [VersionedRow],
     ) -> Result<ExportBodyAdmission> {
-        let admission = ExportBodyAdmission::empty(self.decode_memory.row_owner()?);
+        // Explicit export readers supply their own child. Standalone writer
+        // exports retain the captured source's writer funder.
+        let memory = crate::read_image_memory::active_owner()
+            .unwrap_or_else(|_| self.decode_memory.clone());
+        let admission = ExportBodyAdmission::empty(memory.row_owner()?);
         if let Err(error) = self
             .overlay_export_row_f32_projections_with_admission(name, meta, rows, &admission, false)
         {
@@ -37136,7 +37144,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
     }
 
     pub(crate) fn checkpoint_read_source(&self) -> Result<CheckpointReadSource> {
-        let _decode_scope = self.reader_decode_scope()?;
+        let _decode_scope = self.writer_decode_scope()?;
         let decode_memory = crate::read_image_memory::active_owner()?.row_owner()?;
         self.checkpoint_read_source_with_owner(decode_memory)
     }
