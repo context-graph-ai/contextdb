@@ -48826,22 +48826,40 @@ impl Database {
             self.retain_writer_output(output);
             return Ok(properties);
         }
-        let props = self
-            .graph_store
-            .forward_adj
-            .read()
-            .get(&source)
-            .and_then(|entries| {
-                entries
-                    .iter()
-                    .rev()
-                    .find(|entry| {
-                        entry.target == target
-                            && entry.edge_type == edge_type
-                            && entry.visible_at(snapshot)
-                    })
-                    .map(|entry| entry.properties.clone())
-            });
+        let graph = self.graph_store.forward_adj.read();
+        let properties = graph.get(&source).and_then(|entries| {
+            entries
+                .iter()
+                .rev()
+                .find(|entry| {
+                    entry.target == target
+                        && entry.edge_type == edge_type
+                        && entry.visible_at(snapshot)
+                })
+                .map(|entry| &entry.properties)
+        });
+        let mut output = contextdb_core::read_memory::ReadCredit::new(read_memory);
+        let props = if let Some(properties) = properties {
+            let bytes = properties
+                .iter()
+                .map(|(name, value)| {
+                    name.len()
+                        .saturating_add(value.estimated_bytes())
+                        .saturating_add(96)
+                })
+                .sum();
+            output.try_grow_for(
+                bytes,
+                "reader",
+                "edge_property_output",
+                "Raise the declared read memory limit to return edge properties.",
+            )?;
+            Some(properties.clone())
+        } else {
+            None
+        };
+        drop(graph);
+        self.retain_writer_output(output);
         Ok(props)
     }
 
@@ -70467,12 +70485,10 @@ impl Database {
             if !with_arrivals {
                 return Ok((changes, HashMap::new()));
             }
-            if projection.bounded {
-                (projection.admit)(changes.rows.len().saturating_mul(ARRIVAL_ENTRY_BYTES))?;
-            }
             let arrivals = self.sync_arrivals_for_changes_within(
                 &changes,
                 projection.checkpoint,
+                projection.admit,
                 read_memory.clone(),
             )?;
             Ok((changes, arrivals))
@@ -71142,12 +71158,43 @@ impl Database {
     ) -> Result<(ChangeSet, HashMap<Lsn, Option<Lsn>>)> {
         (|| {
             let _operation = self.open_operation()?;
-            let changes = self.changes_since_under_schema_gate(
+            let output = std::cell::RefCell::new(
+                contextdb_core::read_memory::ReadCredit::new(read_memory.clone()),
+            );
+            let admit = |bytes| {
+                output.borrow_mut().try_grow_for(
+                    bytes,
+                    "reader",
+                    "changes_since_with_arrivals",
+                    "Reduce the selected history or raise the declared read memory limit.",
+                )
+            };
+            let checkpoint = || Ok(());
+            let projection = ChangeProjection {
+                checkpoint: &checkpoint,
+                admit: &admit,
+                bounded: true,
+                ddl: true,
+            };
+            let pending = self.durable_pending_deletes_projected(
                 since_lsn,
+                &projection,
+                read_memory.clone(),
+            )?;
+            let (base, _) = self.changes_since_base_projected(
+                since_lsn,
+                &projection,
                 vector_copy_owner,
                 read_memory.clone(),
             )?;
-            let arrivals = self.sync_arrivals_for_changes(&changes, read_memory.clone())?;
+            let changes = Self::reconcile_durable_pending_deletes_projected(base, pending, &projection)?;
+            let arrivals = self.sync_arrivals_for_changes_within(
+                &changes,
+                &checkpoint,
+                &admit,
+                read_memory.clone(),
+            )?;
+            self.retain_writer_output(output.into_inner());
             Ok((changes, arrivals))
         })()
     }
@@ -71198,10 +71245,10 @@ impl Database {
             )?;
             let changes =
                 Self::reconcile_durable_pending_deletes_projected(base, pending, &projection)?;
-            (projection.admit)(changes.rows.len().saturating_mul(ARRIVAL_ENTRY_BYTES))?;
             let arrivals = self.sync_arrivals_for_changes_within(
                 &changes,
                 projection.checkpoint,
+                projection.admit,
                 read_memory.clone(),
             )?;
             Ok((changes, arrivals, provenance_source))
@@ -71211,17 +71258,26 @@ impl Database {
     pub(crate) fn sync_arrivals_for_changes(
         &self,
         changes: &ChangeSet,
-
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<HashMap<Lsn, Option<Lsn>>> {
-        self.sync_arrivals_for_changes_within(changes, &|| Ok(()), read_memory.clone())
+        let output = std::cell::RefCell::new(contextdb_core::read_memory::ReadCredit::new(read_memory.clone()));
+        let admit = |bytes| output.borrow_mut().try_grow_for(
+            bytes,
+            "reader",
+            "sync_arrivals_for_changes",
+            "Reduce the selected changes or raise the declared read memory limit.",
+        );
+        let arrivals = self.sync_arrivals_for_changes_within(changes, &|| Ok(()), &admit, read_memory)?;
+        self.retain_writer_output(output.into_inner());
+        Ok(arrivals)
     }
 
-    /// [`Self::sync_arrivals_for_changes`] with a checkpoint between rows.
+    /// Build the arrival sidecar with a checkpoint and admission per row.
     fn sync_arrivals_for_changes_within(
         &self,
         changes: &ChangeSet,
         checkpoint: &dyn Fn() -> Result<()>,
+        admit: &dyn Fn(usize) -> Result<()>,
 
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<HashMap<Lsn, Option<Lsn>>> {
@@ -71276,6 +71332,7 @@ impl Database {
             // own committed position before a peer ever sees it (the wire
             // format itself is unchanged -- see `SYNC_SOURCE_LSN_OWN_COMMIT`).
             let arrival = Self::resolve_sync_source_lsn(arrival, row.lsn);
+            admit(ARRIVAL_ENTRY_BYTES)?;
             arrivals.insert(row.lsn, arrival);
         }
         Ok(arrivals)
@@ -73078,16 +73135,36 @@ impl Database {
         filter: TriggerAuditFilter,
     ) -> Result<Vec<TriggerAuditEntry>> {
         let _operation = self.open_operation()?;
-        let history = if let Some(persistence) = &self.persistence {
-            persistence.load_trigger_audit_history()?
+        let read_memory = self.declared_reader_memory()?;
+        let (history, credit) = if let Some(persistence) = &self.persistence {
+            let (history, credit) = persistence
+                .load_trigger_audit_history_with_read_memory(Some(read_memory))?;
+            (history, credit)
         } else {
-            self.trigger
-                .volatile_audit_history
-                .lock()
-                .iter()
-                .map(|(_, entry)| entry.clone())
-                .collect()
+            let mut credit = contextdb_core::read_memory::ReadCredit::new(read_memory);
+            let history = self.trigger.volatile_audit_history.lock();
+            let mut entries = Vec::new();
+            for (_, entry) in history.iter() {
+                let reason_bytes = match &entry.status {
+                    TriggerAuditStatus::RolledBack { reason } => reason.len(),
+                    _ => 0,
+                };
+                credit.try_grow_for(
+                    std::mem::size_of::<TriggerAuditEntry>()
+                        .saturating_add(entry.trigger_name.len())
+                        .saturating_add(reason_bytes)
+                        .saturating_add(96),
+                    "reader",
+                    "trigger_audit_history",
+                    "Reduce the selected audit history or raise the declared read memory limit.",
+                )?;
+                entries.push(entry.clone());
+            }
+            (entries, Some(credit))
         };
+        if let Some(credit) = credit {
+            self.retain_writer_output(credit);
+        }
         Ok(history
             .into_iter()
             .filter(|entry| {
@@ -91092,3 +91169,59 @@ fn initialized_received_access_for_test() {
 #[cfg(all(test, feature = "test-seams"))]
 #[path = "database/d1_initialized_control_proofs.rs"]
 pub(crate) mod d1_initialized_control_proofs;
+
+#[cfg(test)]
+mod cdb126_reader_history_tests {
+    use super::*;
+
+    fn typed_memory_refusal(result: Result<impl Sized>, operation: &str) {
+        match result {
+            Err(Error::MemoryBudgetExceeded { operation: actual, .. }) => assert_eq!(actual, operation),
+            Err(error) => panic!("expected typed memory refusal for {operation}, got {error:?}"),
+            Ok(_) => panic!("expected typed memory refusal for {operation}"),
+        }
+    }
+
+    #[test]
+    fn trigger_audit_history_refuses_when_reader_budget_cannot_hold_one_entry() {
+        let mut db = Database::open_memory();
+        db.trigger.volatile_audit_history.lock().push((
+            Wallclock(1),
+            TriggerAuditEntry {
+                trigger_name: "long_trigger_name".into(),
+                firing_tx: TxId(1),
+                firing_lsn: Lsn(1),
+                depth: 0,
+                cascade_row_count: 1,
+                status: TriggerAuditStatus::Fired,
+            },
+        ));
+        db.declared_read_memory =
+            crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(128);
+        typed_memory_refusal(
+            db.trigger_audit_history(TriggerAuditFilter::default()),
+            "trigger_audit_history",
+        );
+    }
+
+    #[test]
+    fn changes_since_history_projection_refuses_before_returning_unbounded_history() {
+        let mut db = Database::open_memory();
+        db.execute(
+            "CREATE TABLE cdb126_rows (id INTEGER PRIMARY KEY, value TEXT)",
+            &HashMap::new(),
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO cdb126_rows VALUES (1, 'history payload')",
+            &HashMap::new(),
+        )
+        .unwrap();
+        db.declared_read_memory =
+            crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(128);
+        typed_memory_refusal(
+            db.changes_since_with_arrivals(Lsn(0)),
+            "changes_since_with_arrivals",
+        );
+    }
+}

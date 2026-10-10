@@ -10679,7 +10679,15 @@ fn preserves_typed_read_refusal(error: &Error) -> bool {
     crate::read_image_memory::is_memory_refusal(error) || matches!(error, Error::ReadCancelled)
 }
 
+// Preserve native storage provenance without changing the shared error vocabulary.
+const STORAGE_IO_ERROR_PREFIX: &str = "contextdb-engine-storage-io:";
+
 fn read_image_error(error: Error) -> LoadReadImageError {
+    if let Error::Other(message) = &error
+        && let Some(reason) = message.strip_prefix(STORAGE_IO_ERROR_PREFIX)
+    {
+        return read_image_io("reading Redb storage", reason);
+    }
     if matches!(
         error,
         Error::MemoryBudgetExceeded { .. } | Error::ReadFailure(_) | Error::ReadCancelled
@@ -10691,6 +10699,23 @@ fn read_image_error(error: Error) -> LoadReadImageError {
         invalid_read_image_state(error)
     } else {
         read_image_corruption(ReadImageCorruptionCause::MalformedRecord, error)
+    }
+}
+
+#[cfg(test)]
+mod cdb130_storage_error_tests {
+    use super::*;
+
+    #[test]
+    fn native_storage_error_is_io_while_decode_error_is_malformed() {
+        let native = RedbPersistence::storage_error(redb::Error::ValueTooLarge(9));
+        let storage = read_storage_error(redb::StorageError::AdmissionRefused(Box::new(native)));
+        assert_eq!(storage.kind(), LoadReadImageErrorKind::Io);
+        let decode = read_image_error(Error::Other("invalid bincode record".into()));
+        assert_eq!(
+            decode.kind(),
+            LoadReadImageErrorKind::Corrupt(ReadImageCorruptionCause::MalformedRecord)
+        );
     }
 }
 
@@ -33316,21 +33341,43 @@ graph_commit_result }.map_err(Self::storage_error)?;
     }
 
     pub fn load_trigger_audit_history(&self) -> Result<Vec<TriggerAuditEntry>> {
+        self.load_trigger_audit_history_with_read_memory(None)
+            .map(|(entries, _)| entries)
+    }
+
+    pub(crate) fn load_trigger_audit_history_with_read_memory(
+        &self,
+        read_memory: Option<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>>,
+    ) -> Result<(Vec<TriggerAuditEntry>, Option<contextdb_core::read_memory::ReadCredit>)> {
         let _decode_scope = self.reader_decode_scope()?;
         self.with_db(|db| {
             let read_txn = db.begin_read().map_err(Self::storage_error)?;
             let table = match read_txn.open_table(TRIGGER_AUDIT_TABLE) {
                 Ok(table) => table,
-                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok((Vec::new(), None)),
                 Err(err) => return Err(Self::storage_error(err)),
             };
 
             let mut entries = Vec::new();
+            let mut credit = read_memory.map(contextdb_core::read_memory::ReadCredit::new);
             for entry in table.iter().map_err(Self::storage_error)? {
                 let (_, value) = entry.map_err(Self::storage_error)?;
-                entries.push(Self::decode(value.value())?);
+                if let Some(credit) = &mut credit {
+                    credit.try_grow_for(
+                        value
+                            .value()
+                            .len()
+                            .saturating_add(std::mem::size_of::<TriggerAuditEntry>())
+                            .saturating_add(96),
+                        "reader",
+                        "trigger_audit_history",
+                        "Reduce the selected audit history or raise the declared read memory limit.",
+                    )?;
+                }
+                let decoded: TriggerAuditEntry = Self::decode(value.value())?;
+                entries.push(decoded);
             }
-            Ok(entries)
+            Ok((entries, credit))
         })
     }
 
@@ -41277,7 +41324,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                         .to_owned(),
             };
         }
-        Error::Other(format!("storage error: {message}"))
+        Error::Other(format!("{STORAGE_IO_ERROR_PREFIX}{message}"))
     }
 
     fn storage_open_error(path: &Path, err: redb::DatabaseError) -> Error {

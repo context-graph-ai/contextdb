@@ -298,6 +298,16 @@ allocated. Opening a session need not read that value: the refusal belongs to th
 selects it, on both the file and owner routes, and leaves no new charge behind.
 <!-- enforced by: direct_file_image_memory_lifetime::one_oversized_durable_value_is_refused_before_its_source_buffer_is_allocated -->
 
+Fallible engine reads that return history-sized results use a per-operation reader child and
+admit retained output as it is built. `trigger_audit_history` and `changes_since_with_arrivals`
+therefore refuse with `MemoryBudgetExceeded` when their selected history exceeds that child;
+`get_edge_properties` uses the same pattern for its returned properties. Configuration-scale
+metadata reads (`table_names`, `table_meta`, `retention_sync_peer`, `list_triggers`, and
+`registered_trigger_callbacks`) remain infallible and are exempt from per-operation admission.
+`plugin_describe` returns host-supplied plugin output, and `RowChange`/`ChangeSet` DTO cloning and
+transformations operate on values already owned by the caller; those allocations belong to the
+host. `trigger_audit_log` is a bounded recent ring rather than persisted unbounded history.
+
 This is still the standard embedded-database model — the same shape as SQLite,
 LMDB, or redb: the application that mutates the data **owns the handle for its
 lifetime**, and every write goes through that owner. Two consequences for anyone
