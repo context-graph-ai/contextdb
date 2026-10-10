@@ -6356,7 +6356,11 @@ impl CheckpointReadSource {
         meta: &TableMeta,
         rows: &mut [VersionedRow],
     ) -> Result<(usize, ExportBodyAdmission)> {
-        let admission = ExportBodyAdmission::empty(self.decode_memory.row_owner()?);
+        // Explicit export readers supply their own child. Standalone writer
+        // exports retain the captured source's writer funder.
+        let memory = crate::read_image_memory::active_owner()
+            .unwrap_or_else(|_| self.decode_memory.clone());
+        let admission = ExportBodyAdmission::empty(memory.row_owner()?);
         if rows.is_empty() {
             return Ok((0, admission));
         }
@@ -6571,7 +6575,11 @@ impl CheckpointReadSource {
         meta: &TableMeta,
         rows: &mut [VersionedRow],
     ) -> Result<ExportBodyAdmission> {
-        let admission = ExportBodyAdmission::empty(self.decode_memory.row_owner()?);
+        // Explicit export readers supply their own child. Standalone writer
+        // exports retain the captured source's writer funder.
+        let memory = crate::read_image_memory::active_owner()
+            .unwrap_or_else(|_| self.decode_memory.clone());
+        let admission = ExportBodyAdmission::empty(memory.row_owner()?);
         if let Err(error) = self
             .overlay_export_row_f32_projections_with_admission(name, meta, rows, &admission, false)
         {
@@ -11659,6 +11667,10 @@ fn stream_raw_partition_memberships<T>(
             &partition.partition_key,
         )
         .map_err(&corruption)?;
+        // The decoded route is local to this visit; retained identities and
+        // vector bodies are admitted by the callback's own owner.
+        let scratch = crate::read_image_memory::active_owner()?.row_owner()?;
+        let _scratch_scope = scratch.enter();
         let membership: VectorPartitionMembershipRecord = RedbPersistence::decode_exact(payload)
             .map_err(|error| {
                 corruption(format!("raw membership payload decode failed: {error}"))
@@ -31100,7 +31112,12 @@ graph_commit_result }.map_err(Self::storage_error)?;
             ));
         }
         let prefix = Self::vector_partition_prefix(index, partition_key);
-        let journal = match read.open_byte_table_bounded(VECTOR_PARTITION_JOURNAL_TABLE) {
+        // Coverage is authenticated by the captured catalog above. Old
+        // cleanup records are outside this query's source window.
+        let mut start = prefix.clone();
+        start.extend_from_slice(&covered_lsn.0.to_be_bytes());
+        start.extend_from_slice(&u64::MAX.to_be_bytes());
+        let journal = match read.open_table(VECTOR_PARTITION_JOURNAL_TABLE) {
             Ok(table) => table,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok((Vec::new(), covered_lsn)),
             Err(error) => return Err(Self::storage_error(error)),
@@ -31108,7 +31125,10 @@ graph_commit_result }.map_err(Self::storage_error)?;
         let mut identities = BTreeSet::new();
         let mut replayed_through_lsn = covered_lsn;
         for entry in journal
-            .prefix_bounded(prefix.as_slice())
+            .range::<&[u8]>((
+                std::ops::Bound::Excluded(start.as_slice()),
+                std::ops::Bound::Unbounded,
+            ))
             .map_err(Self::storage_error)?
         {
             checkpoint()?;
@@ -37182,7 +37202,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
     }
 
     pub(crate) fn checkpoint_read_source(&self) -> Result<CheckpointReadSource> {
-        let _decode_scope = self.reader_decode_scope()?;
+        let _decode_scope = self.writer_decode_scope()?;
         let decode_memory = crate::read_image_memory::active_owner()?.row_owner()?;
         self.checkpoint_read_source_with_owner(decode_memory)
     }
@@ -40736,6 +40756,12 @@ graph_commit_result }.map_err(Self::storage_error)?;
         membership: Option<&[u8]>,
         pending_transition: bool,
     ) -> Result<()> {
+        let _writer_scope = self.writer_decode_scope()?;
+        let decoded = crate::read_image_memory::active_owner()?.row_owner()?;
+        let _record_scope = decoded.enter();
+        // No decoded membership escapes this mutation. Release its scratch
+        // before publishing the next member of a batch.
+
         self.prepare_proof_owner()?;
         #[cfg(any(test, feature = "test-seams"))]
         if CORRUPT_STORE {

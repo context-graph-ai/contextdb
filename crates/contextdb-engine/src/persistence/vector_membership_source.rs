@@ -49,6 +49,22 @@ pub(crate) enum MembershipOwner {
     Writable(Arc<RedbPersistence>),
     Retained(Arc<RetainedReadSource>),
 }
+
+thread_local! {
+    static MAINTENANCE_INSPECTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn with_maintenance_inspection<T>(inspect: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            MAINTENANCE_INSPECTION.with(|active| active.set(self.0));
+        }
+    }
+    let _restore = Restore(MAINTENANCE_INSPECTION.with(|active| active.replace(true)));
+    inspect()
+}
+
 impl MembershipOwner {
     pub(crate) fn historical_operation(&self) -> bool {
         operation_for(self).is_some_and(|context| context.historical)
@@ -2074,7 +2090,15 @@ impl RawVectorMembershipSource for DurableMembershipSource {
     ) -> Result<Option<RawVectorInspectionSnapshot>> {
         let _window = self.pending_metadata_window(owner)?;
         operation_checkpoint()?;
-        let root = self.owner.capture()?;
+        // Maintenance inspects the current committed facts before selecting
+        // work. Query operations retain their one published snapshot root.
+        let root = if MAINTENANCE_INSPECTION.with(std::cell::Cell::get) {
+            let root = self.owner.latest()?;
+            vector_membership_pages::validate_in_read(&root.read)?;
+            root
+        } else {
+            self.owner.capture()?
+        };
         let generations = self.catalog_generations(&root)?;
         self.inspection_in_root(&root, generations, serving_covered)
             .map(Some)

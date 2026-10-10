@@ -2927,6 +2927,9 @@ mod received_schema_stage_tests {
             deleted_tx: None,
             lsn: Lsn(12),
         };
+        db.accountant
+            .try_allocate(old_edge.estimated_bytes())
+            .expect("fund the graph fixture that finalization refunds");
         db.graph_store.apply_inserts(vec![old_edge.clone()]);
         let ddl = DdlChange::AlterTable {
             name: "embeddings".to_string(),
@@ -3392,7 +3395,9 @@ mod received_schema_stage_tests {
 
     #[test]
     fn staged_vector_replacement_releases_retired_hnsw_and_negative_delta() {
-        let accountant = Arc::new(MemoryAccountant::with_budget(4096));
+        // Fund the counted preparation controls as well as the vector fixture.
+        // The invariant below is exact retirement back to the opening balance.
+        let accountant = Arc::new(MemoryAccountant::with_budget(8 * 1024));
         let db = Database::open_memory_with_accountant(accountant.clone());
         let baseline = accountant.usage().used;
         let index = VectorIndexRef::new("retired", "embedding");
@@ -3401,9 +3406,15 @@ mod received_schema_stage_tests {
                 index.clone(),
                 2,
                 contextdb_core::VectorQuantization::F32,
-                db.accountant.clone(),
+                Arc::clone(&db.finalization.vector_accountant),
             )
             .expect("read or publish the admitted vector fixture");
+        accountant
+            .try_allocate(contextdb_vector::stored_vector_resident_bytes(
+                2,
+                contextdb_core::VectorQuantization::F32,
+            ))
+            .unwrap();
         db.vector_store
             .insert_loaded_vector(
                 VectorEntry {
@@ -3414,10 +3425,11 @@ mod received_schema_stage_tests {
                     deleted_tx: None,
                     lsn: Lsn(1),
                 },
-                db.accountant.clone(),
+                Arc::clone(&db.finalization.vector_accountant),
             )
             .expect("read or publish the admitted vector fixture");
         let state = db.vector_store.try_state(&index).unwrap();
+        accountant.try_allocate(64).unwrap();
         state.set_hnsw_bytes(64);
         let received_schema_read_memory_10 = db
             .declared_reader_memory()
@@ -3440,7 +3452,13 @@ mod received_schema_stage_tests {
                 received_schema_read_memory_10,
             )
             .unwrap();
+        assert_eq!(db.tx_mgr.commit_index_len(), 0);
         db.publish_received_schema_stage(stage);
+        // This fixture bypasses the transaction manager: publication funds
+        // its future commit-index entry, but no such entry is installed here.
+        assert_eq!(db.tx_mgr.commit_index_len(), 0);
+        accountant.release(crate::composite_store::COMMIT_INDEX_ENTRY_BYTES);
+        drop(state);
         let vector_fixture_reader_8 = db
             .declared_reader_memory()
             .expect("admit the vector fixture reader");
@@ -3475,6 +3493,9 @@ mod received_schema_stage_tests {
             deleted_tx: None,
             lsn: Lsn(1),
         };
+        db.accountant
+            .try_allocate(graph_entry.estimated_bytes())
+            .expect("fund the graph fixture that finalization refunds");
         db.graph_store.apply_inserts(vec![graph_entry]);
         let vector_index = VectorIndexRef::new("kept", "embedding");
         db.vector_store
@@ -15857,7 +15878,7 @@ struct SnapshotPinPool {
     available: AtomicUsize,
     slots: usize,
     slot_bytes: usize,
-    accountant: Arc<MemoryAccountant>,
+    _credit: crate::memory_accounting::ControlCredit,
 }
 
 impl SnapshotPinPool {
@@ -15884,12 +15905,6 @@ impl SnapshotPinPool {
                 Err(observed) => available = observed,
             }
         }
-    }
-}
-
-impl Drop for SnapshotPinPool {
-    fn drop(&mut self) {
-        self.accountant.release(self.slots.saturating_mul(self.slot_bytes));
     }
 }
 
@@ -15921,24 +15936,31 @@ impl Default for SnapshotFloorRegistry {
 }
 
 impl SnapshotFloorRegistry {
-    fn fund_pin_slots(&self, accountant: Arc<MemoryAccountant>) {
+    fn fund_pin_slots(&self, accountant: Arc<MemoryAccountant>) -> Result<()> {
         let mut configured = self.pin_slots.lock();
         if configured.is_some() {
-            return;
+            return Ok(());
         }
         let slots = contextdb_core::read_contract::ReadLimits::SHIPPED_SNAPSHOT_PIN_SLOTS;
         let slot_bytes = std::mem::size_of::<RegisteredSnapshot>()
             .saturating_add(std::mem::size_of::<SnapshotRegistration>())
             .saturating_add(3 * std::mem::size_of::<usize>());
         let bytes = slots.saturating_mul(slot_bytes);
+        // This fixed capacity belongs to opening the engine, like the other
+        // assembly controls. It must not consume write payload headroom.
+        let credit = crate::memory_accounting::ControlCredit::admit_open_residue(
+            &crate::memory_accounting::StoreAccountantHandle::new(accountant),
+            bytes,
+            "snapshot_pin_slots_open_residue",
+        )?;
         self.state.lock().active.reserve(slots);
-        accountant.charge_retained(bytes);
         *configured = Some(Arc::new(SnapshotPinPool {
             available: AtomicUsize::new(slots),
             slots,
             slot_bytes,
-            accountant,
+            _credit: credit,
         }));
+        Ok(())
     }
 
     fn acquire_pin_slot(&self) -> contextdb_core::Result<SnapshotPinSlot> {
@@ -21231,10 +21253,13 @@ impl MaintenanceContext {
                 &partition.index,
                 &mut maintenance_vector_copy_owner,
             )?;
-            let info = self.vector.try_partition_info(
-                &partition.index,
-                &partition.partition_key,
-                &mut maintenance_vector_copy_owner,
+            let info = vector_source_page_admission::with_preparation_source_page_admission(
+                Arc::clone(&self.finalization.accountant),
+                || self.vector.try_partition_info(
+                    &partition.index,
+                    &partition.partition_key,
+                    &mut maintenance_vector_copy_owner,
+                ),
             )?;
             let live_vectors = info.as_ref().map_or(0, |info| info.live_rows);
             let policy = layout.resolve_policy(live_vectors, 1);
@@ -21709,14 +21734,14 @@ impl MaintenanceContext {
                             reason.as_str()
                         } else if current.is_none() {
                             "initial_build"
-                        } else if self
-                            .vector
-                            .try_partition_info(
+                        } else if vector_source_page_admission::with_preparation_source_page_admission(
+                            Arc::clone(&self.finalization.accountant),
+                            || self.vector.try_partition_info(
                                 &partition.index,
                                 &partition.partition_key,
                                 &mut maintenance_vector_copy_owner,
-                            )?
-                            .is_some_and(|info| info.tombstones != 0)
+                            ),
+                        )?.is_some_and(|info| info.tombstones != 0)
                         {
                             "tombstones"
                         } else {
@@ -22620,7 +22645,18 @@ impl MaintenanceContext {
         cycle_failures.first = cycle_failures.first.or(cleanup_retry_failure);
         let pruning = self.run_pruning(read_memory.clone())?;
         let pruned_trigger_audit_rows = self.run_trigger_audit_retention()?;
-        let currency = self.run_currency(gate, read_memory.clone())?;
+        let currency = match self.run_currency(gate, read_memory.clone()) {
+            Ok(report) => report,
+            Err(error @ Error::MemoryBudgetExceeded { .. }) if cycle_failures.first.is_some() => {
+                let details = VectorMaintenanceFailureDetails::from_error(&error);
+                CurrencyCompactionReport {
+                    first_failure: Some(details.failure),
+                    first_failure_details: Some(details),
+                    ..CurrencyCompactionReport::default()
+                }
+            }
+            Err(error) => return Err(error),
+        };
         let candidate_sample = self
             .persistence
             .as_ref()
@@ -23472,9 +23508,9 @@ impl Database {
         event_bus: Arc<EventBusState>,
         trigger: Arc<TriggerState>,
         declared_read_memory: Arc<crate::vector_read_memory::DeclaredReadMemory>,
-    ) -> Self {
+    ) -> Result<Self> {
         let accountant = Arc::clone(&finalization.accountant);
-        snapshot_registry.fund_pin_slots(accountant.clone());
+        snapshot_registry.fund_pin_slots(accountant.clone())?;
         let vector_accountant = Arc::clone(&finalization.vector_accountant);
         {
         let mut storage = std::mem::MaybeUninit::<Database>::uninit();
@@ -24458,7 +24494,7 @@ impl Database {
             }
         }
         construction.initialized.fill(false);
-        unsafe { storage.assume_init() }
+        unsafe { Ok(storage.assume_init()) }
     }
     }
 
@@ -26724,7 +26760,7 @@ impl Database {
             event_bus,
             trigger,
             declared_read_memory,
-        );
+        )?;
         #[cfg(any(test, feature = "test-seams"))]
         let db = {
             let mut db = db;
@@ -27091,7 +27127,7 @@ impl Database {
             event_bus,
             trigger,
             declared_read_memory,
-        );
+        )?;
         _image_memory
             .accountant
             .register_idle_graph_reclaimer(&db.vector_store);
@@ -27210,7 +27246,7 @@ impl Database {
             event_bus,
             trigger,
             declared_read_memory,
-        );
+        )?;
         maybe_prebuild_hnsw(&db.vector_store, db.accountant());
         Ok(db)
     }
@@ -37171,17 +37207,29 @@ impl Database {
             .into_iter()
             .filter(|placed| {
                 let entry = &placed.entry;
-                row_versions
-                    .binary_search_by_key(
-                        &(
-                            entry.index.table.as_str(),
-                            entry.row_id,
-                            placed.membership.owning_row_tx,
-                            placed.membership.row_lsn,
-                        ),
-                        |(table, row)| (*table, row.row_id, row.created_tx, row.lsn),
-                    )
-                    .is_ok()
+                // Memory-only vectors retain independent MVCC stamps through
+                // the legacy library insertion door. Their owning row is
+                // identified by row id; durable placements carry exact stamps.
+                (if self.persistence.is_none() {
+                    row_versions
+                        .binary_search_by_key(
+                            &(entry.index.table.as_str(), entry.row_id),
+                            |(table, row)| (*table, row.row_id),
+                        )
+                        .is_ok()
+                } else {
+                    row_versions
+                        .binary_search_by_key(
+                            &(
+                                entry.index.table.as_str(),
+                                entry.row_id,
+                                placed.membership.owning_row_tx,
+                                placed.membership.row_lsn,
+                            ),
+                            |(table, row)| (*table, row.row_id, row.created_tx, row.lsn),
+                        )
+                        .is_ok()
+                })
                     && semantic.tables.get(&entry.index.table).is_some_and(|meta| {
                         meta.columns.iter().any(|column| {
                             column.name == entry.index.column

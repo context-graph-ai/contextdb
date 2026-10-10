@@ -40,8 +40,7 @@ fn authenticated_graph_page_records_fit_the_fixed_64_kib_extent() {
     assert_eq!(manifest.page_count, 3);
 }
 
-/// What the damaged catalog claims is already resident. The graph admission
-/// asks for the recomputed charge less this, so the refusal names it.
+/// An old catalog's understated charge cannot replace actual admission.
 const CATALOG_DECLARED_RESIDENT_BYTES: usize = 1;
 
 #[test]
@@ -92,15 +91,8 @@ fn an_older_catalog_charge_is_recomputed_before_graph_decode() {
     let db = Database::open(&path).unwrap();
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     let used = db.accountant().usage().used;
-    // Headroom is derived from the charge this test is about rather than
-    // guessed: half the resolved topology charge. It has to be large enough
-    // that the query actually reaches the graph admission, and that each
-    // persisted configuration write below can admit its own committed-proof
-    // maintenance - both `set_memory_limit` calls would refuse otherwise, and
-    // their `unwrap`s carry that end of the relationship. It has to stay
-    // strictly under the topology charge so that admission is the thing that
-    // fails; the refusal's own `requested_bytes` carries that end, which is
-    // what keeps this test from passing on some cheaper refusal.
+    // Keep less than the actual initial generation owner available. Paged
+    // admission must recompute its own charge rather than trust the catalog.
     let headroom = before / 2;
     assert!(
         headroom < before,
@@ -108,37 +100,54 @@ fn an_older_catalog_charge_is_recomputed_before_graph_decode() {
     );
     db.set_memory_limit(Some(used + headroom)).unwrap();
     let sql = "SELECT id FROM items ORDER BY v <=> [1,0,0] USE VECTOR INDEXED LIMIT 3";
+    let partition = VectorPartitionRef::new(
+        VectorIndexRef::new("items", "v"),
+        VectorPartitionKey::unpartitioned(),
+    );
+    let committed_frontier = db.snapshot();
     let refusal = db
-        .execute(sql, &HashMap::new())
+        .vector_store_for_test()
+        .preload_dormant_partition_generation(&partition, true)
         .expect_err("an understated catalog cannot admit its real graph");
     let Error::MemoryBudgetExceeded {
         subsystem,
+        operation,
         requested_bytes,
+        available_bytes,
+        budget_limit_bytes,
         ..
     } = &refusal
     else {
         panic!("the typed budget refusal, not {refusal:?}");
     };
-    // The refusal is the recomputed topology charge, minus the single byte the
-    // damaged catalog claimed was already resident. The bounded read relabels
-    // the subsystem as it propagates, so the requested amount - not the label -
-    // is what says this was the graph admission and not the proof maintenance
-    // of the configuration write or the query's own candidate buffer.
-    assert_ne!(
-        subsystem, "content_identity",
-        "the refusal is the graph admission, not proof setup: {refusal:?}"
+    assert_eq!(subsystem, "vector_index");
+    assert_eq!(operation, "load_durable_vector_generation");
+    assert!(
+        *requested_bytes > headroom && *requested_bytes > *available_bytes,
+        "the actual paged generation owner exceeds admitted headroom: {refusal:?}"
     );
+    assert_eq!(*budget_limit_bytes, used + headroom);
     assert_eq!(
-        *requested_bytes,
-        before - CATALOG_DECLARED_RESIDENT_BYTES,
-        "the refused amount is the recomputed topology charge: {refusal:?}"
+        db.snapshot(),
+        committed_frontier,
+        "refusal preserves the committed frontier"
     );
     assert_eq!(db.vector_memory_ownership_receipt_for_test().base_graph, 0);
     db.set_memory_limit(None).unwrap();
     assert_eq!(db.execute(sql, &HashMap::new()).unwrap().rows.len(), 3);
+    let reloaded = db.vector_memory_ownership_receipt_for_test().base_graph;
+    assert!(
+        reloaded > CATALOG_DECLARED_RESIDENT_BYTES && reloaded <= before,
+        "retry admits the real paged owner rather than trusting the catalog byte: {reloaded}"
+    );
     assert_eq!(
-        db.vector_memory_ownership_receipt_for_test().base_graph,
-        before
+        db.execute(
+            "SELECT id FROM items ORDER BY v <=> [1,0,0] USE VECTOR INDEXED LIMIT 32",
+            &HashMap::new()
+        )
+        .unwrap()
+        .rows,
+        (0..32).map(|id| vec![Value::Int64(id)]).collect::<Vec<_>>()
     );
     eprintln!(
         "catalog_declared_bytes={CATALOG_DECLARED_RESIDENT_BYTES} resolved_topology_charge={before} headroom={headroom} refused_bytes={requested_bytes} refused_before_decode=true retry=ok"

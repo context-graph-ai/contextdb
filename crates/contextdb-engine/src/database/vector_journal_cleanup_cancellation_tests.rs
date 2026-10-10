@@ -209,6 +209,7 @@ fn cancellation_after_committed_journal_retry_leaves_later_partitions_untouched_
         .map(|partition| db.vector_store.partition_graph_generation_status(partition))
         .collect::<Vec<_>>();
     let baseline = db.vector_memory_ownership_receipt_for_test();
+    let baseline_writer = db.writer_memory_ownership_receipt_for_test();
     let stop = Arc::new(AtomicBool::new(false));
     let mut context = db.maintenance_context();
     context.worker_stop = Some(Arc::clone(&stop));
@@ -284,8 +285,16 @@ fn cancellation_after_committed_journal_retry_leaves_later_partitions_untouched_
     let released = db.vector_memory_ownership_receipt_for_test();
     assert_eq!(released.temporary_workspace, 0);
     assert_eq!(
-        released.non_vector_total, baseline.non_vector_total,
-        "catalog inventory and route reservations also release"
+        released.non_vector_total,
+        baseline.non_vector_total
+            + 2 * MemoryAccountant::writer_vector_adapter_type_layout_for_test().size(),
+        "only the newly installed paged change's standing adapters remain"
+    );
+    let released_writer = db.writer_memory_ownership_receipt_for_test();
+    assert_eq!(released_writer.reconciliation_gap, 0);
+    assert_eq!(
+        released_writer.writer_adapter_controls - baseline_writer.writer_adapter_controls,
+        2 * MemoryAccountant::writer_vector_adapter_type_layout_for_test().size()
     );
     assert_eq!(db.accountant.underflow_count_for_test(), 0);
     drop(context);
