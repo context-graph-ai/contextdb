@@ -918,3 +918,16 @@ pub(super) fn note_checkpoint() {
         observer();
     }
 }
+
+impl Database {
+    /// Remove one index's physical storage while its declaration stays in the table metadata, so
+    /// the next statement that picks it takes the executor's missing-physical-index fallback.
+    /// Returns whether storage was present. Test seams only; production never drops storage alone.
+    pub fn __remove_physical_index_storage_for_test(&self, table: &str, index: &str) -> bool {
+        self.relational_store()
+            .indexes
+            .write()
+            .get_mut(table)
+            .is_some_and(|indexes| indexes.remove(index).is_some())
+    }
+}

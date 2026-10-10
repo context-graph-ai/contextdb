@@ -5,6 +5,215 @@ use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, OnceLock};
 
+// The process aggregate: native runtime and named open residue plus every writer
+// counter that has joined it. A counter joins at its first writer registration
+// and stays a member for its lifetime, so retirement never touches the
+// aggregate; each byte enters once (a member increment, or the join) and
+// leaves once (the matching decrement, or the counter's final drop).
+static PROCESS_WRITER_AGGREGATE: AtomicUsize = AtomicUsize::new(0);
+
+// The high bit classifies a fixed process-owned open residue without growing
+// the inherited control layouts (writer decode 232 B; received registry 104 B).
+pub(crate) const OPEN_RESIDUE_TAG: usize = 1 << (usize::BITS - 1);
+
+pub(crate) fn admit_open_residue(bytes: usize, operation: &str) -> contextdb_core::Result<()> {
+    assert!(bytes < OPEN_RESIDUE_TAG);
+    let domain = PROCESS_WRITER_BUDGET_DOMAIN.read();
+    let ceiling = domain.ceiling.unwrap_or_else(inherited_process_ceiling);
+    aggregate_try_reserve(bytes, ceiling).map_err(|available| contextdb_core::Error::MemoryBudgetExceeded {
+        subsystem: "process_native_ceiling".to_string(),
+        operation: operation.to_string(),
+        requested_bytes: bytes,
+        available_bytes: available,
+        budget_limit_bytes: ceiling,
+        hint: "The inherited process ceiling funds fixed writer open residue.".to_string(),
+    })
+}
+
+pub(crate) fn refund_open_residue(bytes: usize) {
+    aggregate_refund(bytes);
+}
+
+fn aggregate_refund(bytes: usize) {
+    if bytes != 0 {
+        PROCESS_WRITER_AGGREGATE
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| held.checked_sub(bytes))
+            .map_or_else(|_| refund_invariant_broken("process aggregate refund is owned"), |_| ());
+    }
+}
+
+/// Reserve on the process aggregate against the inherited ceiling. This CAS is
+/// the linearization point: from its success the bytes count in the aggregate.
+fn aggregate_try_reserve(bytes: usize, ceiling: usize) -> Result<(), usize> {
+    PROCESS_WRITER_AGGREGATE
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
+            held.checked_add(bytes).filter(|next| *next <= ceiling)
+        })
+        .map(|_| ())
+        .map_err(|held| ceiling.saturating_sub(held))
+}
+
+// A writer's `used` counter: the byte count first (`repr(C)`), so the word at
+// the counter's address is exactly its bytes, and the aggregate membership
+// beside it. Membership is set once, at the first writer registration, under
+// the domain WRITE gate. Every counter mutation either holds the domain read
+// gate (admission, release, retained charge, control refund), runs on the
+// activation thread that holds the write gate, or belongs to an adapter that
+// exists only after its writer registered -- so no mutation runs concurrently
+// with the join, and the join counts exactly the bytes it marks. No `Deref`:
+// every mutation names whether it moves the process aggregate.
+#[derive(Debug, Default)]
+#[repr(C)]
+pub(crate) struct WriterCounter {
+    used: AtomicUsize,
+    aggregate_member: AtomicBool,
+}
+impl WriterCounter {
+    pub(crate) fn load(&self, ordering: Ordering) -> usize {
+        self.used.load(ordering)
+    }
+    fn is_member(&self) -> bool {
+        self.aggregate_member.load(Ordering::SeqCst)
+    }
+    /// Local admission CAS on the byte value.
+    fn compare_exchange_local(&self, current: usize, next: usize) -> bool {
+        self.used
+            .compare_exchange(current, next, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+    /// Undo a local reservation whose aggregate CAS failed or never ran.
+    /// Those bytes never entered the aggregate, so ONLY the local counter is
+    /// decremented -- the one member decrement that skips the aggregate.
+    fn rollback_local_only(&self, bytes: usize) {
+        self.used
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| used.checked_sub(bytes))
+            .map_or_else(|_| refund_invariant_broken("local rollback is owned"), |_| ());
+    }
+    /// Unconditional charge (retained startup floors); a member's bytes join
+    /// the aggregate without a ceiling check, as the local charge has none.
+    fn charge(&self, bytes: usize) {
+        self.used
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| used.checked_add(bytes))
+            .expect("retained ownership cannot overflow its counter");
+        if self.is_member() {
+            PROCESS_WRITER_AGGREGATE.fetch_add(bytes, Ordering::SeqCst);
+        }
+    }
+    /// Return owned bytes; a member's bytes leave the aggregate once, here.
+    pub(crate) fn release_owned(&self, bytes: usize) -> Result<(), usize> {
+        self.used
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| used.checked_sub(bytes))?;
+        if self.is_member() {
+            aggregate_refund(bytes);
+        }
+        Ok(())
+    }
+    /// Saturating release; returns the byte value before it. Only the bytes
+    /// actually removed from the counter leave the aggregate.
+    fn release_saturating(&self, bytes: usize) -> usize {
+        let before = self
+            .used
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| Some(used.saturating_sub(bytes)))
+            .expect("release update always supplies a value");
+        if self.is_member() {
+            aggregate_refund(bytes.min(before));
+        }
+        before
+    }
+    /// Join the aggregate at the first writer registration (write gate held).
+    fn join_aggregate(&self) {
+        if !self.aggregate_member.swap(true, Ordering::SeqCst) {
+            PROCESS_WRITER_AGGREGATE.fetch_add(self.used.load(Ordering::SeqCst), Ordering::SeqCst);
+        }
+    }
+}
+impl Drop for WriterCounter {
+    fn drop(&mut self) {
+        // A residual member charge leaves with its counter, so a leaked
+        // charge never pins process headroom after its owner is gone.
+        if *self.aggregate_member.get_mut() {
+            aggregate_refund(*self.used.get_mut());
+        }
+    }
+}
+
+/// The inherited whole-process memory limit: the effective cgroup v2
+/// `memory.max` (the minimum along this process's cgroup path), else the
+/// host's physical memory. It is never absent. Writer ceilings govern only
+/// each writer's own working memory.
+fn inherited_process_ceiling() -> usize {
+    #[cfg(any(test, feature = "test-seams"))]
+    if let Some(ceiling) = *PROCESS_CEILING_FOR_TEST.lock() {
+        return ceiling;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(ceiling) = cgroup_memory_max() {
+            return ceiling;
+        }
+        if let Some(total) = std::fs::read_to_string("/proc/meminfo").ok().and_then(|text| {
+            text.lines()
+                .find_map(|line| line.strip_prefix("MemTotal:"))
+                .and_then(|rest| rest.trim().trim_end_matches("kB").trim().parse::<usize>().ok())
+                .and_then(|kib| kib.checked_mul(1024))
+        }) {
+            return total;
+        }
+    }
+    #[cfg(unix)]
+    {
+        // SAFETY: sysconf has no preconditions and reads process-global values.
+        let (pages, page) = unsafe { (libc::sysconf(libc::_SC_PHYS_PAGES), libc::sysconf(libc::_SC_PAGESIZE)) };
+        if pages > 0 && page > 0 {
+            return (pages as usize).saturating_mul(page as usize);
+        }
+    }
+    usize::MAX
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_memory_max() -> Option<usize> {
+    let membership = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let path = membership.lines().find_map(|line| line.strip_prefix("0::"))?.trim();
+    let mut current = std::path::PathBuf::from("/sys/fs/cgroup");
+    let mut limit: Option<usize> = None;
+    let mut visit = |dir: &std::path::Path| {
+        if let Ok(text) = std::fs::read_to_string(dir.join("memory.max"))
+            && let Ok(bytes) = text.trim().parse::<usize>()
+        {
+            limit = Some(limit.map_or(bytes, |held| held.min(bytes)));
+        }
+    };
+    visit(&current);
+    for component in std::path::Path::new(path).components() {
+        if let std::path::Component::Normal(name) = component {
+            current.push(name);
+            visit(&current);
+        }
+    }
+    limit
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+static PROCESS_CEILING_FOR_TEST: parking_lot::Mutex<Option<usize>> = parking_lot::Mutex::new(None);
+
+/// Test seam: fix the inherited process ceiling for a later activation, and
+/// for an already active runtime.
+#[cfg(any(test, feature = "test-seams"))]
+pub(crate) fn set_process_ceiling_for_test(ceiling: Option<usize>) {
+    *PROCESS_CEILING_FOR_TEST.lock() = ceiling;
+    let mut domain = PROCESS_WRITER_BUDGET_DOMAIN.write();
+    if domain.native.is_some() {
+        domain.ceiling = Some(ceiling.unwrap_or_else(inherited_process_ceiling));
+    }
+}
+
+/// (aggregate bytes, recorded process ceiling) for receipts and rows.
+pub(crate) fn process_aggregate_snapshot() -> (usize, Option<usize>) {
+    let domain = PROCESS_WRITER_BUDGET_DOMAIN.read();
+    (PROCESS_WRITER_AGGREGATE.load(Ordering::SeqCst), domain.ceiling)
+}
+
 // Ordinary writer mutations share this gate. Runtime activation alone takes
 // its exclusive side. The build lease is independent and never an admission gate.
 #[derive(Debug)]
@@ -23,7 +232,7 @@ struct WriterRegistration {
     epoch: usize,
     users: usize,
     limit: Arc<AtomicUsize>,
-    used: Arc<AtomicUsize>,
+    used: Arc<WriterCounter>,
     // Attribution is retained in every profile; only the test-seam observer
     // reads it. It has no admission or last-use authority.
     #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
@@ -34,6 +243,8 @@ struct WriterRegistration {
 #[derive(Debug)]
 struct ProcessWriterBudgetDomain {
     native: Option<ResidentInsertionRuntime>,
+    // Recorded once at the first activation: the inherited process ceiling.
+    ceiling: Option<usize>,
     writers: Option<Box<WriterRegistration>>,
     next_identity: usize,
 }
@@ -83,6 +294,7 @@ impl ProcessWriterBudgetDomain {
 static PROCESS_WRITER_BUDGET_DOMAIN: parking_lot::RwLock<ProcessWriterBudgetDomain> =
     parking_lot::RwLock::new(ProcessWriterBudgetDomain {
         native: None,
+        ceiling: None,
         writers: None,
         next_identity: 1,
     });
@@ -290,6 +502,7 @@ impl WriterBudget {
             accountant.used.load(Ordering::SeqCst).checked_add(registration_bytes)
                 .ok_or_else(|| contextdb_core::Error::Other("writer registration size overflow".into()))?;
             accountant.charge_retained_under_admission(registration_bytes);
+            accountant.used.join_aggregate();
             let registration = Box::new(WriterRegistration {
                 stable_identity, epoch, users: 1,
                 limit: accountant.limit.clone(), used: accountant.used.clone(),
@@ -336,7 +549,17 @@ impl Drop for ActivationScope {
 }
 struct WriterAdmission {
     _gate: Option<parking_lot::RwLockReadGuard<'static, ProcessWriterBudgetDomain>>,
-    native_bytes: usize,
+    // The inherited process ceiling this admission must also fit, once a
+    // runtime recorded it. None: no aggregate check (no ceiling yet, or the
+    // activation scope, whose whole post-sum was checked under the write gate).
+    ceiling: Option<usize>,
+}
+
+impl WriterAdmission {
+    fn process_available(&self) -> Option<usize> {
+        self.ceiling
+            .map(|ceiling| ceiling.saturating_sub(PROCESS_WRITER_AGGREGATE.load(Ordering::SeqCst)))
+    }
 }
 
 // One envelope calculation for admission, replacement credit, fit and reports.
@@ -352,22 +575,24 @@ fn writer_headroom(
     used: usize,
     releasing: usize,
     private: usize,
-    native: usize,
 ) -> WriterHeadroom {
     let occupied = used
         .checked_sub(releasing)
         .expect("replacement credit must be owned by this accountant");
-    let combined_used = occupied.checked_add(native);
+    let combined_used = Some(occupied);
     let effective = limit.checked_add(private).unwrap_or(usize::MAX);
     WriterHeadroom {
-        available: (limit != 0).then(|| {
-            effective
-                .checked_sub(native)
-                .and_then(|n| n.checked_sub(occupied))
-                .unwrap_or(0)
-        }),
+        available: (limit != 0).then(|| effective.checked_sub(occupied).unwrap_or(0)),
         combined_used,
         within_limit: limit == 0 || combined_used.is_some_and(|bytes| bytes <= effective),
+    }
+}
+
+fn min_available(local: Option<usize>, process: Option<usize>) -> Option<usize> {
+    match (local, process) {
+        (Some(local), Some(process)) => Some(local.min(process)),
+        (local, None) => local,
+        (None, process) => process,
     }
 }
 
@@ -490,7 +715,7 @@ impl Drop for TransitionHeadroomScope {
 #[allow(dead_code)]
 pub struct MemoryAccountant {
     limit: Arc<AtomicUsize>,
-    used: Arc<AtomicUsize>,
+    used: Arc<WriterCounter>,
     writer_identity: OnceLock<usize>,
     #[cfg(feature = "test-seams")]
     high_water_for_test: AtomicUsize,
@@ -732,6 +957,20 @@ impl ControlCredit {
         } else { None };
         Ok(Self { accountant: Some(accountant.as_arc()), bytes, registration })
     }
+    pub(crate) fn admit_open_residue(accountant: &StoreAccountantHandle, bytes: usize, operation: &str) -> contextdb_core::Result<Self> {
+        admit_open_residue(bytes, operation)?;
+        Ok(Self { accountant: Some(accountant.as_arc()), bytes: bytes | OPEN_RESIDUE_TAG, registration: None })
+    }
+    // Only constant per-assembly controls call this door. Growing write
+    // payloads, including staged posting charges, retain ordinary admission.
+    pub(crate) fn admit_assembly(accountant: &Arc<MemoryAccountant>, bytes: usize, operation: &str) -> contextdb_core::Result<Self> {
+        let handle = StoreAccountantHandle::new(accountant.clone());
+        if handle.is_writer() {
+            Self::admit_open_residue(&handle, bytes, operation)
+        } else {
+            Self::admit(accountant, bytes, operation)
+        }
+    }
     pub(crate) fn admit(accountant: &Arc<MemoryAccountant>, bytes: usize, operation: &str) -> contextdb_core::Result<Self> {
         accountant.admit_box_control(bytes, operation, "Raise MEMORY_LIMIT for this fixed writer control.")?;
         Ok(Self { accountant: Some(accountant.clone()), bytes, registration: accountant.prepare_control_refund().1 })
@@ -768,25 +1007,51 @@ impl Drop for ControlCredit {
         }
     }
 }
+/// A refund that does not hold is a broken invariant and panics, except on a
+/// thread already unwinding from another failure: a second panic there runs
+/// inside a destructor and aborts the whole process instead of reporting the
+/// failure that started the unwind.
+#[track_caller]
+fn refund_invariant_broken(what: &str) {
+    if !std::thread::panicking() {
+        panic!("{what}");
+    }
+}
+
 pub(crate) struct PendingControlRefund {
-    counter: Arc<AtomicUsize>,
+    counter: Arc<WriterCounter>,
     bytes: usize,
     registration: Option<(usize, usize)>,
 }
 impl Drop for PendingControlRefund {
     fn drop(&mut self) {
+        if self.bytes & OPEN_RESIDUE_TAG != 0 {
+            refund_open_residue(self.bytes & !OPEN_RESIDUE_TAG);
+            return;
+        }
         // Receipt ownership lasts through every child/use cleanup. A retired
         // original epoch has no record; a reopened epoch must never lose this
         // old control's price. The bounded counter retains its original funder.
+        // A refund that runs while its thread already unwinds from another
+        // failure must not panic again: that aborts the whole process instead
+        // of reporting the first failure. The invariants stay hard otherwise.
+        let unwinding = std::thread::panicking();
         let domain = PROCESS_WRITER_BUDGET_DOMAIN.read();
         if let Some((key, epoch)) = self.registration
             && let Some(record) = domain.lookup_in(key).filter(|record| record.epoch == epoch)
         {
-            record.adapter_control_bytes.fetch_update(Ordering::SeqCst, Ordering::SeqCst,
-                |used| used.checked_sub(self.bytes)).expect("final control receipt is owned");
+            let receipt = record.adapter_control_bytes.fetch_update(Ordering::SeqCst, Ordering::SeqCst,
+                |used| used.checked_sub(self.bytes));
+            if !unwinding {
+                receipt.expect("final control receipt is owned");
+            }
         }
-        self.counter.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| used.checked_sub(self.bytes))
-            .expect("final control refund is owned");
+        // Leaves the process aggregate exactly once, here, whether or not
+        // this epoch's registration has retired (retirement never refunds).
+        let refund = self.counter.release_owned(self.bytes);
+        if !unwinding {
+            refund.expect("final control refund is owned");
+        }
     }
 }
 
@@ -1110,7 +1375,7 @@ impl MemoryAccountant {
     pub fn no_limit() -> Self {
         Self {
             limit: Arc::new(AtomicUsize::new(0)),
-            used: Arc::new(AtomicUsize::new(0)),
+            used: Arc::new(WriterCounter::default()),
             #[cfg(feature = "test-seams")]
             high_water_for_test: AtomicUsize::new(0),
             #[cfg(feature = "test-seams")]
@@ -1136,7 +1401,7 @@ impl MemoryAccountant {
     pub fn with_budget(bytes: usize) -> Self {
         Self {
             limit: Arc::new(AtomicUsize::new(bytes)),
-            used: Arc::new(AtomicUsize::new(0)),
+            used: Arc::new(WriterCounter::default()),
             #[cfg(feature = "test-seams")]
             high_water_for_test: AtomicUsize::new(0),
             #[cfg(feature = "test-seams")]
@@ -1164,7 +1429,7 @@ impl MemoryAccountant {
     pub(crate) fn with_runtime_budget(bytes: usize) -> Self {
         Self {
             limit: Arc::new(AtomicUsize::new(bytes)),
-            used: Arc::new(AtomicUsize::new(0)),
+            used: Arc::new(WriterCounter::default()),
             #[cfg(feature = "test-seams")]
             high_water_for_test: AtomicUsize::new(0),
             #[cfg(feature = "test-seams")]
@@ -1246,18 +1511,18 @@ impl MemoryAccountant {
     }
     // A ControlCredit already captured its original registration. Refund
     // custody needs only that accountant's source counter, never a new epoch.
-    fn original_control_counter(&self) -> Arc<AtomicUsize> {
+    fn original_control_counter(&self) -> Arc<WriterCounter> {
         assert!(self.exclusive_activation().is_none(), "control cleanup is outside borrowed activation");
         self.used.clone()
     }
-    fn prepare_control_refund(&self) -> (Arc<AtomicUsize>, Option<(usize, usize)>) {
+    fn prepare_control_refund(&self) -> (Arc<WriterCounter>, Option<(usize, usize)>) {
         assert!(self.exclusive_activation().is_none(), "control cleanup is outside borrowed activation");
         let domain = PROCESS_WRITER_BUDGET_DOMAIN.read();
         let registration = self.writer_identity.get().and_then(|key|
             domain.lookup_in(*key).map(|record| (*key, record.epoch)));
         (self.used.clone(), registration)
     }
-    pub(crate) fn retain_box_control_refund(&self, bytes: usize) -> Arc<AtomicUsize> {
+    pub(crate) fn retain_box_control_refund(&self, bytes: usize) -> Arc<WriterCounter> {
         self.change_adapter_control_receipt(bytes, false);
         self.used.clone()
     }
@@ -1267,8 +1532,9 @@ impl MemoryAccountant {
         Ok(())
     }
     fn release_under_exclusive_gate(&self, bytes: usize) {
-        self.used.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| used.checked_sub(bytes))
-            .expect("exclusive lifecycle refund must be owned");
+        if self.used.release_owned(bytes).is_err() {
+            refund_invariant_broken("exclusive lifecycle refund must be owned");
+        }
     }
     fn exclusive_activation(&self) -> Option<usize> {
         let address = self as *const Self as usize;
@@ -1282,25 +1548,20 @@ impl MemoryAccountant {
         assert!(std::ptr::eq(self, &**handle), "admission retains its original accountant");
         assert!(self.exclusive_activation().is_none(), "registry admission is outside borrowed activation");
         let gate = PROCESS_WRITER_BUDGET_DOMAIN.read();
-        let native_bytes = if handle.is_writer() {
+        if handle.is_writer() {
             let key = *self.writer_identity.get().expect("tagged handle has its original key");
             gate.lookup_in(key).expect("tagged handle pins its original epoch");
-            gate.native.as_ref().map_or(0, |runtime| runtime.reservation.bytes)
-        } else { 0 };
-        WriterAdmission { _gate: Some(gate), native_bytes }
+        }
+        let ceiling = gate.ceiling.filter(|_| self.used.is_member());
+        WriterAdmission { _gate: Some(gate), ceiling }
     }
     fn writer_admission(&self) -> WriterAdmission {
-        if let Some(native_bytes) = self.exclusive_activation() {
-            return WriterAdmission {
-                _gate: None,
-                native_bytes,
-            };
+        if self.exclusive_activation().is_some() {
+            return WriterAdmission { _gate: None, ceiling: None };
         }
         let gate = PROCESS_WRITER_BUDGET_DOMAIN.read();
-        let native_bytes = if self.writer_identity.get().is_some_and(|key| gate.lookup_in(*key).is_some()) {
-            gate.native.as_ref().map_or(0, |runtime| runtime.reservation.bytes)
-        } else { 0 };
-        WriterAdmission { _gate: Some(gate), native_bytes }
+        let ceiling = gate.ceiling.filter(|_| self.used.is_member());
+        WriterAdmission { _gate: Some(gate), ceiling }
     }
     // Exclusive activation validates ALL live records and admits the requesting
     // build's complete local peak before publishing the one permanent owner.
@@ -1329,21 +1590,31 @@ impl MemoryAccountant {
                 .ok_or_else(|| {
                     contextdb_core::Error::Other("runtime activation envelope overflow".into())
                 })?;
-            let envelope = writer_headroom(limit, local, 0, 0, native_bytes);
-            if envelope.combined_used.is_none() {
-                return Err(contextdb_core::Error::Other(
-                    "runtime activation combined size overflow".into(),
-                ));
-            }
-            if !envelope.within_limit {
+            // Writer limits govern each writer's own working memory only.
+            if !writer_headroom(limit, local, 0, 0).within_limit {
                 return Ok(false);
             }
             next = record.next.as_deref();
+        }
+        // The reservation is process memory: the post-activation aggregate,
+        // with this build's peak replacing its old workspace, must fit the
+        // inherited whole-process ceiling, never a writer's limit.
+        let ceiling = domain.ceiling.unwrap_or_else(inherited_process_ceiling);
+        let after = PROCESS_WRITER_AGGREGATE
+            .load(Ordering::SeqCst)
+            .checked_sub(old_workspace)
+            .and_then(|bytes| bytes.checked_add(complete_peak))
+            .and_then(|bytes| bytes.checked_add(native_bytes))
+            .ok_or_else(|| contextdb_core::Error::Other("runtime activation combined size overflow".into()))?;
+        if after > ceiling {
+            return Ok(false);
         }
         let previous = ACTIVATING_WRITER.with(|slot| slot.replace(Some((self as *const Self as usize, native_bytes))));
         let scope = ActivationScope(previous);
         admit_workspace()?;
         drop(scope);
+        PROCESS_WRITER_AGGREGATE.fetch_add(native_bytes, Ordering::SeqCst);
+        domain.ceiling = Some(ceiling);
         domain.native = Some(ResidentInsertionRuntime {
             width, funder_identity: Arc::as_ptr(&self.used) as usize,
             reservation: ProcessNativeReservation { bytes: native_bytes },
@@ -1357,14 +1628,47 @@ impl MemoryAccountant {
     /// retained process debit after returning only that workspace's credit.
     pub(crate) fn available_after_releasing(&self, bytes: usize) -> Option<usize> {
         let admission = self.writer_admission();
-        writer_headroom(
+        let local = writer_headroom(
             self.limit.load(Ordering::SeqCst),
             self.used.load(Ordering::SeqCst),
             bytes,
             self.private_transition_headroom(),
-            admission.native_bytes,
         )
-        .available
+        .available;
+        // The released workspace is this member's own aggregate share.
+        let process = admission.process_available().map(|room| room.saturating_add(bytes));
+        min_available(local, process)
+    }
+
+    /// Step 2 of admission, run only for bytes this writer's own limit has
+    /// already admitted (step 1). A member's bytes join the process aggregate;
+    /// once a ceiling is recorded, they must fit it. A failed aggregate CAS
+    /// rolls back ONLY the local counter: those bytes never entered the
+    /// aggregate, the one member decrement that does not refund it.
+    fn admit_to_process_aggregate(
+        &self, admission: &WriterAdmission, bytes: usize, operation: &str, hint: &str,
+    ) -> contextdb_core::Result<()> {
+        if !self.used.is_member() {
+            return Ok(());
+        }
+        let Some(ceiling) = admission.ceiling else {
+            PROCESS_WRITER_AGGREGATE.fetch_add(bytes, Ordering::SeqCst);
+            return Ok(());
+        };
+        if let Err(available) = aggregate_try_reserve(bytes, ceiling) {
+            self.used.rollback_local_only(bytes);
+            return Err(contextdb_core::Error::MemoryBudgetExceeded {
+                subsystem: "process_native_ceiling".to_string(),
+                operation: operation.to_string(),
+                requested_bytes: bytes,
+                available_bytes: available,
+                budget_limit_bytes: ceiling,
+                hint: format!(
+                    "The process memory ceiling also holds the resident insertion runtime. {hint}"
+                ),
+            });
+        }
+        Ok(())
     }
 
     /// Attempt to allocate bytes. CAS-based, no TOCTOU.
@@ -1389,7 +1693,7 @@ impl MemoryAccountant {
                     .saturating_add(self.private_transition_headroom())
             };
             if limit != 0 {
-                let available = writer_headroom(limit, used, 0, 0, admission.native_bytes)
+                let available = writer_headroom(limit, used, 0, 0)
                     .available
                     .unwrap_or(usize::MAX - used);
                 if bytes > available {
@@ -1432,11 +1736,7 @@ impl MemoryAccountant {
             // exactly that order deterministically.
             #[cfg(test)]
             if self.fire_accounting_hook_without_gate_for_provenance(&mut admission, provenance, true) { continue; }
-            if self
-                .used
-                .compare_exchange(used, next, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
+            if self.used.compare_exchange_local(used, next) {
                 // Admission and publication share ONE linearization boundary,
                 // and it is this load. An admission is not SUCCESSFUL until it
                 // has been validated against a published limit read that
@@ -1455,13 +1755,17 @@ impl MemoryAccountant {
                     current
                         .saturating_add(self.private_transition_headroom())
                 };
-                if writer_headroom(admissible, used, 0, 0, admission.native_bytes)
+                if writer_headroom(admissible, used, 0, 0)
                     .available
                     .is_some_and(|available| bytes > available)
                 {
-                    self.release_under_admission(bytes);
+                    // Still inside local admission: the aggregate step below
+                    // has not run, so these bytes never entered it.
+                    self.used.rollback_local_only(bytes);
                     continue;
                 }
+                self.admit_to_process_aggregate(&admission, bytes, "allocate",
+                    "Reduce retained data, lower working-set size, or raise MEMORY_LIMIT.")?;
                 #[cfg(feature = "test-seams")]
                 self.high_water_for_test.fetch_max(next, Ordering::SeqCst);
                 #[cfg(feature = "test-seams")]
@@ -1498,7 +1802,7 @@ impl MemoryAccountant {
                 published
                     .saturating_add(self.private_transition_headroom())
             };
-            let available = writer_headroom(limit, used, old_bytes, 0, admission.native_bytes)
+            let available = writer_headroom(limit, used, old_bytes, 0)
                 .available
                 .unwrap_or(usize::MAX - others);
             // A shrinking phase always remains admitted, including after a
@@ -1515,7 +1819,7 @@ impl MemoryAccountant {
                     subsystem: subsystem.to_owned(),
                     operation: operation.to_owned(),
                     requested_bytes: new_bytes - old_bytes,
-                    available_bytes: writer_headroom(limit, used, 0, 0, admission.native_bytes)
+                    available_bytes: writer_headroom(limit, used, 0, 0)
                         .available
                         .unwrap_or(usize::MAX - used),
                     budget_limit_bytes: if limit == 0 { usize::MAX } else { limit },
@@ -1536,11 +1840,7 @@ impl MemoryAccountant {
             if self.fire_accounting_hook_without_gate(&mut admission, true) {
                 continue;
             }
-            if self
-                .used
-                .compare_exchange(used, next, Ordering::SeqCst, Ordering::SeqCst)
-                .is_err()
-            {
+            if !self.used.compare_exchange_local(used, next) {
                 continue;
             }
             // Match allocation's post-CAS limit linearization. Only growth
@@ -1554,12 +1854,18 @@ impl MemoryAccountant {
                     .saturating_add(self.private_transition_headroom())
             };
             if new_bytes > old_bytes
-                && writer_headroom(admissible, used, old_bytes, 0, admission.native_bytes)
+                && writer_headroom(admissible, used, old_bytes, 0)
                     .available
                     .is_some_and(|available| new_bytes > available)
             {
-                self.release_under_admission(new_bytes - old_bytes);
+                // Still inside local admission; the growth never entered the aggregate.
+                self.used.rollback_local_only(new_bytes - old_bytes);
                 continue;
+            }
+            if new_bytes > old_bytes {
+                self.admit_to_process_aggregate(&admission, new_bytes - old_bytes, operation, hint)?;
+            } else if self.used.is_member() {
+                aggregate_refund(old_bytes - new_bytes);
             }
             #[cfg(feature = "test-seams")]
             {
@@ -1594,11 +1900,7 @@ impl MemoryAccountant {
         if bytes == 0 {
             return;
         }
-        self.used
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
-                used.checked_add(bytes)
-            })
-            .expect("retained ownership cannot overflow its counter");
+        self.used.charge(bytes);
         #[cfg(feature = "test-seams")]
         {
             self.high_water_for_test
@@ -1680,11 +1982,7 @@ accountant: Arc::clone(self),
             return;
         }
 
-        let released = self
-            .used
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
-                Some(used.saturating_sub(bytes))
-            });
+        let released: Result<usize, usize> = Ok(self.used.release_saturating(bytes));
         #[cfg(any(test, feature = "test-seams"))]
         if bytes > released.expect("release update always supplies a value") {
             self.underflow_count.fetch_add(1, Ordering::SeqCst);
@@ -1769,19 +2067,20 @@ accountant: Arc::clone(self),
     }
 
     pub(crate) fn writer_envelope_usage(&self) -> contextdb_core::Result<(usize, usize, usize)> {
+        // Report-only: this writer's bytes, the process runtime reservation,
+        // and their sum. The reservation is owned by the process, not by
+        // this writer's headroom.
         let admission = self.writer_admission();
         let used = self.used.load(Ordering::SeqCst);
-        let envelope = writer_headroom(
-            self.limit.load(Ordering::SeqCst),
-            used,
-            0,
-            0,
-            admission.native_bytes,
-        );
-        let combined = envelope.combined_used.ok_or_else(|| {
+        let native = admission
+            ._gate
+            .as_ref()
+            .and_then(|gate| gate.native.as_ref())
+            .map_or(0, |runtime| runtime.reservation.bytes);
+        let combined = used.checked_add(native).ok_or_else(|| {
             contextdb_core::Error::Other("writer report combined size overflow".into())
         })?;
-        Ok((used, admission.native_bytes, combined))
+        Ok((used, native, combined))
     }
 
     /// Snapshot of current memory state.
@@ -1801,8 +2100,10 @@ accountant: Arc::clone(self),
             reader_file_high_water: 0,
             limit,
             used,
-            available: writer_headroom(limit.unwrap_or(0), used, 0, 0, admission.native_bytes)
-                .available,
+            available: min_available(
+                writer_headroom(limit.unwrap_or(0), used, 0, 0).available,
+                admission.process_available(),
+            ),
             startup_ceiling,
         }
     }
@@ -1845,8 +2146,11 @@ accountant: Arc::clone(self),
     }
     fn available_for_provenance(&self, provenance: Option<&StoreAccountantHandle>) -> Option<usize> {
         let admission = self.writer_admission_for_provenance(provenance);
-        writer_headroom(self.limit.load(Ordering::SeqCst), self.used.load(Ordering::SeqCst),
-            0, 0, admission.native_bytes).available
+        min_available(
+            writer_headroom(self.limit.load(Ordering::SeqCst), self.used.load(Ordering::SeqCst), 0, 0)
+                .available,
+            admission.process_available(),
+        )
     }
     fn try_allocate_for_provenance(
         &self, bytes: usize, subsystem: &str, operation: &str, hint: &str,
@@ -1985,13 +2289,25 @@ impl Drop for WriterVectorBudget {
             drop(self._writer_use.take());
             return;
         }
+        // Alignment one is a receipt discriminator only, never an allocator
+        // layout: the concrete Arc has pointer alignment. Reusing this field
+        // keeps the fixed assembly adapter at its inherited 64 B footprint.
+        if self.layout.align() == 1 {
+            drop(self._writer_use.take());
+            drop(accountant);
+            refund_open_residue(self.layout.size());
+            return;
+        }
         let refund = accountant.retain_box_control_refund(self.layout.size());
         // Registration/payload cleanup and accountant destruction finish before
         // the fixed ArcInner refund. No Weak exists for this allocation.
         drop(self._writer_use.take());
         drop(accountant);
-        refund.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| used.checked_sub(self.layout.size()))
-            .expect("adapter control refund is owned");
+        let released = refund.release_owned(self.layout.size());
+        // Never a second panic while unwinding from another failure.
+        if !std::thread::panicking() {
+            released.expect("adapter control refund is owned");
+        }
         // Only std's AtomicUsize Arc destruction and ArcInner deallocation
         // follow; all payload fields are empty or Copy.
     }
@@ -2036,22 +2352,21 @@ impl MemoryAccountant {
         let adapter = WriterVectorBudget { accountant: Some(self.clone()), layout: Layout::new::<()>(), _writer_use: WriterUse::retain_if_writer(self) };
         writer_adapter_layout(&adapter)
     }
-    fn budget_adapter(self: &Arc<Self>, writer_use: WriterUse, retained_startup: bool) -> contextdb_core::Result<Arc<WriterVectorBudget>> {
+    fn budget_adapter(self: &Arc<Self>, writer_use: WriterUse, open_residue: bool) -> contextdb_core::Result<Arc<WriterVectorBudget>> {
         let mut adapter = WriterVectorBudget {
             accountant: Some(self.clone()), layout: Layout::new::<()>(),
             _writer_use: Some(writer_use),
         };
         let layout = writer_adapter_layout(&adapter);
-        if retained_startup {
-            // The construction root is unavoidable retained startup ownership,
-            // like the registration and private accountant backing. Its actual
-            // fixed layout is charged before allocation; later growth refuses.
-            self.charge_retained(layout.size());
+        if open_residue {
+            assert!(layout.align() > 1);
+            admit_open_residue(layout.size(), "assembly_budget_adapter_open_residue")?;
+            adapter.layout = Layout::from_size_align(layout.size(), 1).expect("receipt size is already valid");
         } else {
             self.try_allocate_for(layout.size(), "writer", "adapter_control", "Raise MEMORY_LIMIT for the writer adapter.")?;
+            adapter.layout = layout;
+            self.change_adapter_control_receipt(layout.size(), true);
         }
-        adapter.layout = layout;
-        self.change_adapter_control_receipt(layout.size(), true);
         Ok(Arc::new(adapter))
     }
     fn vector_budget_for_startup(self: &Arc<Self>) -> contextdb_core::Result<Arc<dyn contextdb_vector::MemoryBudget>> {
@@ -2061,6 +2376,12 @@ impl MemoryAccountant {
     pub(crate) fn vector_budget(self: &Arc<Self>) -> contextdb_core::Result<Arc<dyn contextdb_vector::MemoryBudget>> {
         match WriterUse::retain_if_writer(self) {
             Some(writer_use) => Ok(self.budget_adapter(writer_use, false)?),
+            None => Ok(self.clone()),
+        }
+    }
+    pub(crate) fn assembly_read_budget(self: &Arc<Self>) -> contextdb_core::Result<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>> {
+        match WriterUse::retain_if_writer(self) {
+            Some(writer_use) => Ok(self.budget_adapter(writer_use, true)?),
             None => Ok(self.clone()),
         }
     }
@@ -2161,11 +2482,11 @@ impl MemoryAccountant {
         &self, admission: &mut WriterAdmission, provenance: Option<&StoreAccountantHandle>, success: bool,
     ) -> bool {
         if self.exclusive_activation().is_some() { return false; }
-        let native_before = admission.native_bytes;
+        let ceiling_before = admission.ceiling;
         drop(admission._gate.take());
         if success { self.fire_admission_race_hook(); } else { self.fire_alloc_race_hook(); }
         *admission = self.writer_admission_for_provenance(provenance);
-        admission.native_bytes != native_before
+        admission.ceiling != ceiling_before
     }
 
     /// Test-build only: install the one-shot interleaving hook.

@@ -634,6 +634,21 @@ pub struct VectorGraphGenerationStatus {
     pub fresh_tail_entries: usize,
     pub retained_generations: usize,
     pub pending_generation_count: usize,
+    /// How many searches answered through paged/durable reads because this
+    /// partition's saved graph could not be retained, and the last such
+    /// refusal. The search still answers; this keeps the reason visible.
+    pub paged_route_refusals: u64,
+    pub last_paged_route_refusal: Option<VectorPagedRouteRefusal>,
+}
+
+/// The memory refusal that sent one search to the paged/durable route
+/// instead of a retained saved graph.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VectorPagedRouteRefusal {
+    pub requested_bytes: usize,
+    pub available_bytes: usize,
+    pub budget_limit_bytes: usize,
 }
 
 #[doc(hidden)]
@@ -1452,6 +1467,7 @@ pub trait DormantVectorGraphLoader: Send + Sync {
         caller_reserved_load_bytes: usize,
         request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool,
     ) -> Result<LoadedVectorGraphGeneration>;
+
 }
 
 /// An immutable layer supplier retained by one serving operation. The loader
@@ -1522,6 +1538,11 @@ pub struct CapturedVectorServingSelection {
     pub suffix_source: Arc<dyn CapturedVectorSuffixSource>,
     suffix: Option<CapturedVectorSuffix>,
     resident: parking_lot::Mutex<CapturedServingResidency>,
+    /// The store's refusal to retain this selection's base (0) or change (1)
+    /// layer during this find. It is replayed once to the page-scoring
+    /// preload, so the same retained load is not attempted, read and hashed
+    /// twice in one find.
+    retention_refusal: parking_lot::Mutex<[Option<Error>; 2]>,
     _copy_owner: Option<VectorCopyAdmission>,
 }
 
@@ -1551,6 +1572,7 @@ impl CapturedVectorServingSelection {
             suffix_source,
             suffix: None,
             resident: parking_lot::Mutex::new(CapturedServingResidency::default()),
+            retention_refusal: parking_lot::Mutex::new([None, None]),
             _copy_owner: None,
         }
     }
@@ -1618,6 +1640,12 @@ impl CapturedVectorServingSelection {
             || !resident.suffix_loaded
         {
             return (VectorGraphLayerAvailability::Dormant, Vec::new());
+        }
+        // A route no maintenance ever published has no serving generation; a
+        // suffix of journal rows alone is not a maintained route, exactly as
+        // the store serves a bare tail only once a serving policy exists.
+        if self.serving_policy().is_none() {
+            return (VectorGraphLayerAvailability::Unavailable, Vec::new());
         }
         let mut layers = Vec::with_capacity(3);
         for generation in resident.base.iter().chain(resident.change.iter()) {
@@ -2751,6 +2779,8 @@ pub struct IndexState {
     /// mutable tail.  Keeping it separate makes it impossible for an insert
     /// to reach a sealed graph loaded from durable storage.
     sealed_hnsw: RwLock<SealedHnswGenerations>,
+    paged_route_refusals: AtomicU64,
+    last_paged_route_refusal: Mutex<Option<VectorPagedRouteRefusal>>,
     #[cfg(any(test, feature = "test-seams"))]
     passive_activity: OnceLock<Arc<VectorPassiveActivity>>,
 }
@@ -2879,6 +2909,8 @@ impl IndexState {
             #[cfg(any(test, feature = "test-seams"))]
             graph_callback_pause: Mutex::new(None),
             sealed_hnsw: RwLock::new(SealedHnswGenerations::default()),
+            paged_route_refusals: AtomicU64::new(0),
+            last_paged_route_refusal: Mutex::new(None),
             #[cfg(any(test, feature = "test-seams"))]
             passive_activity: OnceLock::new(),
         }
@@ -5048,6 +5080,7 @@ impl IndexState {
     pub(crate) fn sealed_page_scoring<E>(
         &self,
         snapshot: SnapshotId,
+        captured: Option<&CapturedVectorServingSelection>,
         query: &[f32],
         before_checkpoint: &mut impl FnMut() -> std::result::Result<(), E>,
         before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
@@ -5080,6 +5113,7 @@ impl IndexState {
             };
             self.preload_snapshot_compatible_hnsw_layers_for_request::<Error>(
                 snapshot,
+                captured,
                 &mut checkpoint,
                 &mut retain,
                 release_retained,
@@ -5087,6 +5121,24 @@ impl IndexState {
         };
         if let Some(error) = cancelled.into_inner() {
             return Err(error);
+        }
+        if let Err(error) = &preloaded {
+            // The search answers through paged/durable reads instead; record
+            // the refusal so the reason that route ran is not silent.
+            if let Error::MemoryBudgetExceeded {
+                requested_bytes,
+                available_bytes,
+                budget_limit_bytes,
+                ..
+            } = error
+            {
+                self.paged_route_refusals.fetch_add(1, Ordering::SeqCst);
+                *self.last_paged_route_refusal.lock() = Some(VectorPagedRouteRefusal {
+                    requested_bytes: *requested_bytes,
+                    available_bytes: *available_bytes,
+                    budget_limit_bytes: *budget_limit_bytes,
+                });
+            }
         }
         if preloaded.is_err() {
             // A reservation boundary can refuse for reasons that are NOT a
@@ -6213,6 +6265,78 @@ impl IndexState {
 
     /// Load only operation-owned suppliers. A completed graph never changes
     /// the global registry, publication revision, or mutable tail.
+    /// A share of this partition's current-chain layer with `identity`,
+    /// loading it through the store's retained loader when it is dormant.
+    /// Ownership: the store owns the charge from its load on (one owner);
+    /// the selection holds an `Arc` share and no charge, so a later retirement
+    /// leaves the selection serving its captured snapshot. A store refusal is
+    /// recorded on the selection and answered `None`.
+    fn share_current_store_layer<E>(
+        &self,
+        selection: &CapturedVectorServingSelection,
+        is_base: bool,
+        identity: VectorGraphGeneration,
+        before_checkpoint: &mut impl FnMut() -> std::result::Result<(), E>,
+        before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
+        release_retained: &mut impl FnMut(usize),
+    ) -> std::result::Result<Option<SealedHnswGeneration>, E>
+    where
+        E: From<Error>,
+    {
+        let resident_now = |this: &Self| {
+            let sealed = this.sealed_hnsw.read();
+            let slot = if is_base { sealed.base.as_ref() } else { sealed.change.as_ref() };
+            slot.filter(|generation| generation.identity == identity).cloned()
+        };
+        if let Some(shared) = resident_now(self) {
+            return Ok(Some(shared));
+        }
+        let dormant_matches = {
+            let sealed = self.sealed_hnsw.read();
+            let dormant = if is_base { sealed.dormant_base.as_ref() } else { sealed.dormant_change.as_ref() };
+            dormant.is_some_and(|dormant| dormant.descriptor.identity == identity)
+        };
+        if !dormant_matches {
+            return Ok(None);
+        }
+        // The caller's own refusals (cancellation, its statement ceiling) are
+        // captured and re-raised as themselves; only the store's refusal to
+        // retain the graph is recorded and answered by the selection's loader.
+        let control: RefCell<Option<E>> = RefCell::new(None);
+        let loaded = {
+            let mut checkpoint = || -> Result<()> {
+                before_checkpoint().map_err(|error| {
+                    *control.borrow_mut() = Some(error);
+                    Error::Other("the caller stopped this load".to_string())
+                })
+            };
+            let mut retain = |bytes: usize| -> Result<()> {
+                before_retain(bytes).map_err(|error| {
+                    *control.borrow_mut() = Some(error);
+                    Error::Other("the caller does not admit this load".to_string())
+                })
+            };
+            self.preload_dormant_sealed_generation_with::<Error>(
+                is_base,
+                true,
+                &mut checkpoint,
+                &mut retain,
+                release_retained,
+            )
+        };
+        if let Some(error) = control.into_inner() {
+            return Err(error);
+        }
+        match loaded {
+            Ok(_) => Ok(resident_now(self)),
+            Err(error @ Error::MemoryBudgetExceeded { .. }) => {
+                selection.retention_refusal.lock()[usize::from(!is_base)] = Some(error);
+                Ok(None)
+            }
+            Err(error) => Err(E::from(error)),
+        }
+    }
+
     pub(crate) fn preload_captured_serving_selection<E>(
         &self,
         selection: &CapturedVectorServingSelection,
@@ -6275,6 +6399,25 @@ impl IndexState {
                 }
             };
             if already_loaded {
+                continue;
+            }
+            // One load per generation per find: a layer of the store's current
+            // chain is loaded once by the store's retained loader, and the
+            // selection holds a share of it. The selection's own loader runs
+            // only when the store refuses to retain it, or for a retired chain.
+            if let Some(shared) = self.share_current_store_layer(
+                selection,
+                is_base,
+                layer.descriptor.identity,
+                before_checkpoint,
+                before_retain,
+                release_retained,
+            )? {
+                let mut resident = selection.resident.lock();
+                let slot = if is_base { &mut resident.base } else { &mut resident.change };
+                if slot.is_none() {
+                    *slot = Some(shared);
+                }
                 continue;
             }
             let dormant = DormantSealedGeneration {
@@ -6785,6 +6928,30 @@ impl IndexState {
             ));
         }
         let incoming = SealedHnswGeneration::new(identity, graph, resident_bytes, Some(accountant));
+        self.install_incoming_sealed_generation_locked(
+            &mut sealed,
+            is_base,
+            identity,
+            current_generation_id,
+            incoming,
+            preserve_dormant_descriptor,
+        );
+        drop(sealed);
+        self.finish_sealed_installation(identity, fresh_tail, true);
+        Ok(())
+    }
+
+    /// The installation half shared by a load and an adoption, under the
+    /// publication lock and the registry's write side.
+    fn install_incoming_sealed_generation_locked(
+        &self,
+        sealed: &mut parking_lot::RwLockWriteGuard<'_, SealedHnswGenerations>,
+        is_base: bool,
+        identity: VectorGraphGeneration,
+        current_generation_id: Option<u64>,
+        incoming: SealedHnswGeneration,
+        preserve_dormant_descriptor: bool,
+    ) {
         let installing_pending_base = is_base
             && sealed
                 .pending_base
@@ -6794,7 +6961,7 @@ impl IndexState {
             && (installing_pending_base
                 || current_generation_id.is_some_and(|current| current != identity.generation_id))
         {
-            Self::retire_current_chain(&mut sealed);
+            Self::retire_current_chain(sealed);
         }
         if installing_pending_base {
             sealed.dormant_base = sealed.pending_base.take();
@@ -6815,7 +6982,18 @@ impl IndexState {
             }
         }
         sealed.pending_generation_count = sealed.pending_generation_count.saturating_sub(1);
-        drop(sealed);
+    }
+
+    /// What follows an installation once the registry's write side is
+    /// released: the serving policy, and a load's replayed fresh tail.
+    fn finish_sealed_installation(
+        &self,
+        identity: VectorGraphGeneration,
+        fresh_tail: Option<LoadedVectorFreshTail>,
+        loaded: bool,
+    ) {
+        #[cfg(not(any(test, feature = "test-seams")))]
+        let _ = loaded;
         self.set_serving_policy_from_generation(identity);
         if let Some(tail) = fresh_tail {
             let LoadedVectorFreshTail {
@@ -6840,12 +7018,13 @@ impl IndexState {
                 .store(replayed_through_lsn.0, Ordering::SeqCst);
         }
         #[cfg(any(test, feature = "test-seams"))]
+        if loaded {
         self.note_passive_activity(|activity| {
             activity
                 .sealed_generation_loads
                 .fetch_add(1, Ordering::SeqCst);
         });
-        Ok(())
+        }
     }
 
     /// Build preparation completes before this call.  Publication swaps the
@@ -7010,6 +7189,8 @@ impl IndexState {
                     ))
             }),
             pending_generation_count: sealed.pending_generation_count,
+            paged_route_refusals: self.paged_route_refusals.load(Ordering::SeqCst),
+            last_paged_route_refusal: *self.last_paged_route_refusal.lock(),
         }
     }
 
@@ -7681,6 +7862,7 @@ impl IndexState {
     pub(crate) fn preload_snapshot_compatible_hnsw_layers_for_request<E>(
         &self,
         snapshot: SnapshotId,
+        captured: Option<&CapturedVectorServingSelection>,
         before_checkpoint: &mut impl FnMut() -> std::result::Result<(), E>,
         before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
         release_retained: &mut impl FnMut(usize),
@@ -7759,6 +7941,15 @@ impl IndexState {
             let Some((location, is_base)) = load else {
                 return Ok(());
             };
+            // The captured selection already asked the store to retain this
+            // layer in this find and was refused: replay that refusal rather
+            // than reading and hashing the same saved generation again.
+            if matches!(location, SealedChainLocation::Current)
+                && let Some(selection) = captured
+                && let Some(refusal) = selection.retention_refusal.lock()[usize::from(!is_base)].take()
+            {
+                return Err(E::from(refusal));
+            }
             contextdb_core::find_attribution::count("dormant_layers_loaded", 1);
             let _loading = contextdb_core::find_attribution::stage("graph_load");
             match location {
@@ -14918,17 +15109,28 @@ impl VectorStore {
                 .saturating_add(index.column.len())
                 .saturating_add(key.estimated_bytes())
         };
+        // Per row (one input item): projection keeps at most one row slot in
+        // each of its row maps and event logs, and holds at most a few
+        // transient route clones (candidate, touched and requested sets)
+        // before deduplication drops them. Per distinct route the projection,
+        // cap and reclaim maps keep their own copies (the 32x term below).
+        let per_row = |route: usize| {
+            route
+                .saturating_mul(4)
+                .saturating_add(8 * std::mem::size_of::<(RowId, usize)>())
+        };
         let mut bytes = std::mem::size_of::<PreparedPartitionedVectorBatch>();
         for delete in deletes {
-            bytes = bytes.saturating_add(
-                route_bytes(&delete.partition.index, &delete.partition.partition_key)
-                    .saturating_mul(32),
-            );
+            bytes = bytes.saturating_add(per_row(route_bytes(
+                &delete.partition.index,
+                &delete.partition.partition_key,
+            )));
         }
         for insert in inserts {
-            bytes = bytes.saturating_add(
-                route_bytes(&insert.entry.index, &insert.partition_key).saturating_mul(32),
-            );
+            bytes = bytes.saturating_add(per_row(route_bytes(
+                &insert.entry.index,
+                &insert.partition_key,
+            )));
             if let Some(column) = self.try_column(&insert.entry.index) {
                 let layout = column.layout.read();
                 // Quantized publication constructs a new representation while
@@ -14943,12 +15145,14 @@ impl VectorStore {
         }
         for row_move in moves {
             bytes = bytes
-                .saturating_add(
-                    route_bytes(&row_move.index, &row_move.source_partition_key).saturating_mul(32),
-                )
-                .saturating_add(
-                    route_bytes(&row_move.index, &row_move.target_partition_key).saturating_mul(32),
-                );
+                .saturating_add(per_row(route_bytes(
+                    &row_move.index,
+                    &row_move.source_partition_key,
+                )))
+                .saturating_add(per_row(route_bytes(
+                    &row_move.index,
+                    &row_move.target_partition_key,
+                )));
         }
         for partition in reclaimable {
             bytes = bytes.saturating_add(
@@ -21002,6 +21206,21 @@ impl VectorStore {
                 .fold(0usize, usize::saturating_add),
             ..VectorMemoryOwnershipSnapshot::default()
         };
+        // A paged generation's root and partition charges are held by its
+        // durable tail, not by the generation's own charge; clones and
+        // successor roots share them, so each is counted once.
+        let mut paged_roots = HashSet::<usize>::new();
+        let mut paged_root_bytes = |generation: Option<&SealedHnswGeneration>| -> usize {
+            generation
+                .and_then(|generation| generation.graph().paged_tail_snapshot())
+                .map_or(0, |tail| {
+                    tail.retained_control_receipts()
+                        .into_iter()
+                        .filter(|(owner, _)| paged_roots.insert(*owner))
+                        .map(|(_, bytes)| bytes)
+                        .fold(0usize, usize::saturating_add)
+                })
+        };
         for (index, column) in registry.iter() {
             let directory = column.directory_ownership(index);
             receipt.raw_reverse_directory = receipt
@@ -21020,12 +21239,14 @@ impl VectorStore {
                     .base
                     .as_ref()
                     .map(SealedHnswGeneration::bytes)
-                    .unwrap_or(0);
+                    .unwrap_or(0)
+                    .saturating_add(paged_root_bytes(sealed.base.as_ref()));
                 let current_change = sealed
                     .change
                     .as_ref()
                     .map(SealedHnswGeneration::bytes)
-                    .unwrap_or(0);
+                    .unwrap_or(0)
+                    .saturating_add(paged_root_bytes(sealed.change.as_ref()));
                 if state.vector_count() == 0 {
                     receipt.retired_pinned_graph_bytes = receipt
                         .retired_pinned_graph_bytes
@@ -21046,6 +21267,7 @@ impl VectorStore {
                                     .map(SealedHnswGeneration::bytes)
                                     .unwrap_or(0),
                             )
+                            .saturating_add(paged_root_bytes(chain.base.as_ref()))
                             .saturating_add(
                                 chain
                                     .change
@@ -21053,6 +21275,7 @@ impl VectorStore {
                                     .map(SealedHnswGeneration::bytes)
                                     .unwrap_or(0),
                             )
+                            .saturating_add(paged_root_bytes(chain.change.as_ref()))
                     }));
             }
         }

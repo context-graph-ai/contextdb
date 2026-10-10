@@ -171,9 +171,11 @@ fn shared_body_coverage_count_is_bound_to_the_committed_vector_projection() {
             write.commit().map_err(RedbPersistence::storage_error)
         })
         .unwrap();
+    // Open no longer re-proves every membership (lazy open); the compensated
+    // count still cannot hide the orphan, which open refuses by its body key.
     let error = decode_catalog(&persistence).unwrap_err();
     assert!(
-        format!("{error:?}").contains("vector directory projection disagrees"),
+        format!("{error:?}").contains("a vector body key is absent from the committed directory"),
         "{error:?}"
     );
 }

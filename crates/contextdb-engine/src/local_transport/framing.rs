@@ -1626,7 +1626,9 @@ impl<'a> CanonicalAllocationPreflight<'a> {
         if groups > self.remaining() {
             return Self::malformed();
         }
-        self.charge::<crate::database::GroupDisclosure>(groups)?;
+        // Three counters, the owned key, and a full word for the route tag
+        // conservatively cover the decoded group without importing storage.
+        self.charge::<(u64, String, u64, u64, u64)>(groups)?;
         for _ in 0..groups {
             // Keep the serde wire order of GroupDisclosure: ordinal precedes
             // the rendered partition key, then the counters and route.

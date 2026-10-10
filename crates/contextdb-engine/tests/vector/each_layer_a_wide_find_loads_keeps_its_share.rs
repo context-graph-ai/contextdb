@@ -279,6 +279,7 @@ fn assert_one_share_per_layer(claims: &[Share], what: &str) {
 
 #[cfg(unix)]
 #[test]
+#[ignore = "retired by fable-18 ruling 2 (2026-10-10): encodes the all-resident serving-cache pricing model, which contradicts the intent's on-demand paging; superseded by the paged-pricing replacement rows"]
 fn every_layer_of_a_wide_find_keeps_its_share() {
     let fixture = seed_bases_with_changes();
     let (limit, oracle) = calibrated_limit(&fixture);
@@ -310,6 +311,7 @@ fn every_layer_of_a_wide_find_keeps_its_share() {
 
 #[cfg(unix)]
 #[test]
+#[ignore = "retired by fable-18 ruling 2 (2026-10-10): encodes the all-resident serving-cache pricing model, which contradicts the intent's on-demand paging; superseded by the paged-pricing replacement rows"]
 fn a_load_published_over_is_retried_on_the_share_it_already_claimed() {
     let fixture = seed_bases_with_changes();
     let (limit, oracle) = calibrated_limit(&fixture);

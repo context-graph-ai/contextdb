@@ -24,7 +24,7 @@ macro_rules! observed_graph_key {
             "commit_index",
             "get",
             &key.to_be_bytes(),
-            Some(key),
+            Some(Lsn(key)),
             Some($role),
         );
         key
@@ -80,7 +80,7 @@ pub(crate) mod vector_membership_source;
 pub(crate) mod vector_paged;
 mod vector_saved;
 pub(crate) use schema_binding::VectorSchemaBinding;
-mod history_root_witness;
+pub(crate) mod history_root_witness;
 #[cfg(test)]
 mod vector_streamed_frame_tests;
 pub(crate) mod writer_adapters;
@@ -2026,7 +2026,8 @@ impl ReadPersistenceImage {
                 &Arc::new(crate::memory_accounting::MemoryAccountant::no_limit()),
                 &checkpoint,
                 read_memory.clone(),
-            )?;
+            )
+                .map_err(crate::database::ImageHistoryError::into_engine_error)?;
             self.change_log = history.change_log;
             self.ddl_log = history.ddl_log;
             let mut lower = std::ops::Bound::Unbounded;
@@ -5249,6 +5250,17 @@ impl Drop for SourceMemoryReservation {
 /// lifetime of a direct reader. It is established and registered while the
 /// load lock is held, then serves checksum-verifying reads without reopening
 /// the pathname or consulting historical system-tree pages.
+/// How a read that reaches a relational index authenticates the index
+/// table's physical root against its producer witness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IndexRootCheck {
+    /// The read consumes physical postings: any mismatch refuses.
+    Physical,
+    /// The read asks only the canonical tree and reads no physical posting:
+    /// a mismatch is disclosed, never served from.
+    Canonical,
+}
+
 pub(crate) struct RetainedReadSource {
     database_path: PathBuf,
     database: redb::ReadOnlyDatabase,
@@ -5549,6 +5561,9 @@ impl WritableRawVectorBodyScan {
             |reason| source.vector_partition_corruption(reason),
         )?;
         let mut entry = RedbPersistence::decode_vector_entry(stored.value()).map_err(|error| {
+            if preserves_typed_read_refusal(&error) {
+                return error;
+            }
             source.vector_partition_corruption(format!(
                 "a raw-vector candidate body cannot be decoded: {error}"
             ))
@@ -7035,7 +7050,7 @@ impl RetainedReadSource {
         accountant: &Arc<crate::memory_accounting::MemoryAccountant>,
         checkpoint: &dyn Fn() -> Result<()>,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-    ) -> Result<LoadedReadHistory> {
+    ) -> std::result::Result<LoadedReadHistory, crate::database::ImageHistoryError> {
         checkpoint()?;
         let mut reservation = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
         reservation.try_grow_for(
@@ -7054,7 +7069,8 @@ impl RetainedReadSource {
             Arc::clone(accountant),
             read_memory.clone(),
         );
-        graph_read::with_pages(read_memory.clone(), || {
+        let diagnosis = std::cell::RefCell::new(None);
+        let result = graph_read::with_pages(read_memory.clone(), || {
             self.with_read(|read| {
                 self.check_history_directory_in_read(read, read_memory.clone(), checkpoint)?;
                 self.history_open_control.check_ddl(read)?;
@@ -7069,6 +7085,15 @@ impl RetainedReadSource {
                     &decoded,
                     checkpoint,
                     &|key, raw| {
+                        let record = RedbPersistence::decode_stored_change_log(raw)?;
+                        if let Err(error) = self.check_requested_tombstone_commit_in_read(read, &record) {
+                            let engine = Error::ReadFailure(contextdb_core::read_contract::ReadFailure::new(
+                                contextdb_core::read_contract::ReadFailureKind::DirectReadRequiresWriter,
+                                contextdb_core::read_contract::ReadFailureDetail::Reason { reason: error.to_string() },
+                            ).expect("a deferred history refusal carries its reason"));
+                            diagnosis.replace(Some(error));
+                            return Err(engine);
+                        }
                         self.verify_stored_graph_history_in_read(
                             read,
                             key,
@@ -7113,6 +7138,13 @@ impl RetainedReadSource {
                     },
                 })
             })
+        });
+        result.map_err(|error| match diagnosis.into_inner() {
+            Some(diagnosis) => crate::database::ImageHistoryError::Store {
+                path: self.database_path.display().to_string(),
+                diagnosis: Box::new(diagnosis),
+            },
+            None => crate::database::ImageHistoryError::Engine(error),
         })
     }
 
@@ -7623,7 +7655,12 @@ impl RetainedReadSource {
         prefix: &IndexKey,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Option<u64>> {
-        self.verify_relational_source_roots(table, index, read_memory.clone())?;
+        self.verify_relational_source_roots(
+            table,
+            index,
+            IndexRootCheck::Canonical,
+            read_memory.clone(),
+        )?;
         let memory = crate::read_image_memory::ImageMemory::charging_reader(
             self._source_memory.memory.accountant.clone(),
             read_memory,
@@ -8208,6 +8245,9 @@ impl RetainedReadSource {
             |reason| self.raw_vector_corruption(reason),
         )?;
         let entry = RedbPersistence::decode_vector_entry(stored.value()).map_err(|error| {
+            if preserves_typed_read_refusal(&error) {
+                return error;
+            }
             self.raw_vector_corruption(format!(
                 "a raw-vector candidate body cannot be decoded: {error}"
             ))
@@ -9252,6 +9292,7 @@ impl RetainedReadSource {
         &self,
         table: &str,
         index: &str,
+        mode: IndexRootCheck,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<()> {
         let memory = crate::read_image_memory::ImageMemory::charging_reader(
@@ -9267,10 +9308,31 @@ impl RetainedReadSource {
         )?;
         self.with_read(|read| {
             self.verify_history_root_in_read(read, &RedbPersistence::rel_table_name(table))?;
-            self.verify_history_root_in_read(
-                read,
-                &RedbPersistence::relational_index_table_name(table, index),
-            )
+            let name = RedbPersistence::relational_index_table_name(table, index);
+            match mode {
+                IndexRootCheck::Physical => self.verify_history_root_in_read(read, &name),
+                // Nothing is read from the physical index, so its root
+                // disagreeing with the producer's witness changes no answer.
+                // The row table stays strict above; the mismatch is disclosed
+                // and every read that consumes physical postings still refuses.
+                IndexRootCheck::Canonical => match RedbPersistence::verify_history_root_canonical(read, &name) {
+                    Ok(matches) => {
+                        history_root_witness::note_index_root_damage(
+                            &self.database_path,
+                            table,
+                            index,
+                            !matches,
+                        );
+                        Ok(())
+                    }
+                    Err(error) => Err(match error {
+                        Error::StoreCorrupted { reason, .. } => {
+                            self.content_identity_corruption(reason)
+                        }
+                        other => other,
+                    }),
+                },
+            }
         })
     }
 
@@ -9288,7 +9350,12 @@ impl RetainedReadSource {
     {
         check_boundary()?;
         before_touch()?;
-        self.verify_relational_source_roots(table, &declaration.name, read_memory.clone())
+        self.verify_relational_source_roots(
+            table,
+            &declaration.name,
+            IndexRootCheck::Canonical,
+            read_memory.clone(),
+        )
             .map_err(E::from)?;
         let _attribution = contextdb_core::find_attribution::stage("window_probe");
         let Some(memory) = self.verified_ordered_runs.begin_build(read_memory.clone()) else {
@@ -9773,7 +9840,12 @@ impl RetainedReadSource {
         E: From<Error>,
     {
         check_boundary()?;
-        self.verify_relational_source_roots(table, &declaration.name, read_memory.clone())
+        self.verify_relational_source_roots(
+            table,
+            &declaration.name,
+            IndexRootCheck::Physical,
+            read_memory.clone(),
+        )
             .map_err(E::from)?;
         self.historical_index_preflight(
             table,
@@ -10075,6 +10147,7 @@ impl RetainedReadSource {
         declaration: &IndexDecl,
         snapshot: SnapshotId,
         cursor: &mut contextdb_relational::mem::BoundedExactIndexCursor,
+        before_storage_step: &mut dyn FnMut() -> std::result::Result<(), E>,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), E>,
         before_clone: &mut dyn FnMut(
             crate::read_image_memory::RowReadAdmission<'_>,
@@ -10090,7 +10163,7 @@ impl RetainedReadSource {
             declaration,
             snapshot,
             read_memory.clone(),
-            before_touch,
+            before_storage_step,
         )?;
         loop {
             let decode_owner = crate::read_image_memory::ImageMemory::operation_reader(
@@ -10600,6 +10673,12 @@ fn read_image_corruption(
     LoadReadImageError::Corrupt { cause, reason }
 }
 
+/// A memory refusal or cancellation met while decoding a stored body is the
+/// caller's budget or stop, never damage to the store: report it typed.
+fn preserves_typed_read_refusal(error: &Error) -> bool {
+    crate::read_image_memory::is_memory_refusal(error) || matches!(error, Error::ReadCancelled)
+}
+
 fn read_image_error(error: Error) -> LoadReadImageError {
     if matches!(
         error,
@@ -10960,6 +11039,42 @@ fn decode_vector_partition_record_payload<T: serde::de::DeserializeOwned>(
         .map_err(|error| format!("payload decode failed: {error}"))
 }
 
+/// Why a record payload did not decode: a memory refusal or cancellation is
+/// the caller's to report as itself; anything else is damage to the record.
+enum RecordDecodeFailure {
+    Refusal(Error),
+    Damage(String),
+}
+
+impl RecordDecodeFailure {
+    fn into_error(self, damage: impl FnOnce(String) -> Error) -> Error {
+        match self {
+            Self::Refusal(error) => error,
+            Self::Damage(reason) => damage(reason),
+        }
+    }
+}
+
+/// `decode_vector_partition_record_payload` for read paths that must never
+/// relabel a declared-budget refusal as a corrupt store.
+fn decode_vector_partition_record_payload_checked<T: serde::de::DeserializeOwned>(
+    expected_kind: VectorPartitionRecordKind,
+    encoded: &[u8],
+) -> std::result::Result<T, RecordDecodeFailure> {
+    let classify = |error: Error| {
+        if preserves_typed_read_refusal(&error) {
+            RecordDecodeFailure::Refusal(error)
+        } else {
+            RecordDecodeFailure::Damage(format!("payload decode failed: {error}"))
+        }
+    };
+    let _decode_scope =
+        crate::read_image_memory::ImageMemory::enter_decode_call().map_err(classify)?;
+    let payload = vector_partition_record_payload(expected_kind, encoded)
+        .map_err(RecordDecodeFailure::Damage)?;
+    RedbPersistence::decode_exact(payload).map_err(classify)
+}
+
 fn vector_partition_record_payload(
     expected_kind: VectorPartitionRecordKind,
     encoded: &[u8],
@@ -10971,12 +11086,19 @@ fn vector_partition_record_payload(
     }
     let checksum_offset = encoded.len() - 32;
     let expected_checksum = {
-        // A record that carries a saved graph is hashed over the whole graph;
-        // that pass is one a graph load pays for, so it is metered as one.
+        // A record that carries a whole saved graph is hashed over that graph,
+        // and that pass is one a graph load pays for, so it is metered as one.
+        // A paged generation's record carries only its small META; the graph's
+        // one full pass is the route page-set walk, so this digest of the
+        // record still runs but is not a graph pass.
+        const PAGED_META_RECORD_LIMIT: usize = 64 * 1024;
         let carries_graph = matches!(
             expected_kind,
             VectorPartitionRecordKind::BaseGeneration | VectorPartitionRecordKind::ChangeGeneration
-        );
+        ) && !(checksum_offset <= PAGED_META_RECORD_LIMIT
+            && encoded[..checksum_offset]
+                .windows(vector_paged::META_MAGIC.len())
+                .any(|window| window == vector_paged::META_MAGIC));
         let _hashing = carries_graph
             .then(|| contextdb_core::find_attribution::stage("graph_load_record_digest"));
         if carries_graph {
@@ -11369,6 +11491,9 @@ fn decode_retained_raw_vector_entry(
         &corruption,
     )?;
     let persisted: PersistedVectorEntry = RedbPersistence::decode(bytes).map_err(|error| {
+        if preserves_typed_read_refusal(&error) {
+            return error;
+        }
         corruption(format!(
             "a raw-vector directory body cannot be decoded: {error}"
         ))
@@ -11390,6 +11515,9 @@ fn decode_retained_raw_vector_entry(
         )));
     }
     crate::read_image_memory::reserve(decoded_bytes).map_err(|error| {
+        if preserves_typed_read_refusal(&error) {
+            return error;
+        }
         corruption(format!(
             "a raw-vector directory body cannot be decoded: {error}"
         ))
@@ -11638,6 +11766,9 @@ fn decode_read_vector_generation_catalog(
 > {
     let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call().map_err(read_image_error)?;
     vector_membership_pages::validate_in_read(read_txn).map_err(read_image_error)?;
+    // Schema metadata is store-wide: damage there refuses the whole read here,
+    // before any route could take it for that route's own graph damage.
+    vector_paged::validate_schema_meta_root(read_txn).map_err(read_image_error)?;
     let mut known_by_key = HashMap::<Vec<u8>, VectorPartitionRef>::new();
     let mut raw_ready = true;
     let memberships = match read_txn.open_table(VECTOR_PARTITION_MEMBERSHIP_TABLE) {
@@ -11680,17 +11811,13 @@ fn decode_read_vector_generation_catalog(
         }
         verify_open_index_commitment(read_txn, VECTOR_OPEN_DIRECTORY_COMMITMENT_KEY, root)?;
     }
-    let mut directory_entries = directory
-        .as_ref()
-        .map(|table| table.iter().map_err(read_storage_error))
-        .transpose()?;
-    if let Some(entries) = directory_entries.as_mut() {
-        let _ = entries.next(); // The authenticated aggregate has the empty key.
-    }
-    let mut directory_count = 0_u64;
-    let mut directory_xor = [0_u8; 32];
-    let mut membership_projection = None;
     let memberships_present = memberships.is_some();
+    let membership_count = match memberships.as_ref() {
+        Some(table) => table.len().map_err(read_storage_error)?,
+        None => 0,
+    };
+    drop(memberships);
+    drop(directory);
     if !memberships_present {
         let indexed_count = directory_root
             .as_ref()
@@ -11705,81 +11832,70 @@ fn decode_read_vector_generation_catalog(
         // memberships takes the full-image reconstruction route.
         raw_ready = indexed_count == 0 && body_count == 0;
     }
-    if let Some(memberships) = memberships {
-        let mut projection = content_identity::SetCommitment::empty(
-            content_identity::CompactIndexSet::VectorDirectory,
-        );
-        for entry in memberships.iter().map_err(read_storage_error)? {
-            let (key, value) = entry.map_err(read_storage_error)?;
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(key.value());
-            hasher.update(value.value());
-            let digest = hasher.finalize();
-            projection
-                .insert(key.value(), digest.as_bytes())
-                .map_err(read_image_error)?;
-            if let Some(entries) = directory_entries.as_mut() {
-                let (directory_key, witness) = entries
-                    .next()
-                    .ok_or_else(|| {
-                        read_image_corruption(
-                            ReadImageCorruptionCause::MalformedRecord,
-                            "compact vector directory is missing a membership",
-                        )
-                    })?
-                    .map_err(read_storage_error)?;
-                if directory_key.value() != key.value() || witness.value() != digest.as_bytes() {
-                    return Err(read_image_corruption(
-                        ReadImageCorruptionCause::MalformedRecord,
-                        "compact vector directory disagrees with a membership",
-                    ));
-                }
-                directory_count = directory_count.saturating_add(1);
-                for (dst, src) in directory_xor.iter_mut().zip(digest.as_bytes()) {
-                    *dst ^= src;
-                }
-            } else {
-                raw_ready = false;
-            }
-            let Ok(membership) = decode_vector_partition_record_payload::<
-                VectorPartitionMembershipRecord,
-            >(VectorPartitionRecordKind::Membership, value.value()) else {
-                raw_ready = false;
-                continue;
-            };
-            if RedbPersistence::vector_partition_membership_key(&membership).as_slice()
-                != key.value()
-            {
-                raw_ready = false;
-                continue;
-            }
-            let route =
-                VectorPartitionRef::new(membership.index.clone(), membership.partition_key.clone());
-            known_by_key.insert(
-                RedbPersistence::vector_partition_catalog_key_from_parts(
-                    &route.index,
-                    &route.partition_key,
-                ),
-                route,
-            );
-        }
-        membership_projection = Some(projection);
+    // Routes come from the writer-maintained per-route summaries: one keyed,
+    // checksummed row per route, never a walk of the memberships. Each route's
+    // key, decoded identity and map slot are admitted before allocation; the
+    // map lives only for this decode, so the charge returns when it ends.
+    struct RouteMapCharge {
+        owner: Arc<crate::read_image_memory::ImageMemory>,
+        bytes: usize,
     }
-    if memberships_present
-        && directory_entries
-            .as_mut()
-            .is_some_and(|entries| entries.next().is_some())
-    {
-        return Err(read_image_corruption(
-            ReadImageCorruptionCause::MalformedRecord,
-            "compact vector directory has an unmatched membership",
-        ));
+    impl Drop for RouteMapCharge {
+        fn drop(&mut self) {
+            if self.bytes != 0 {
+                self.owner.release(self.bytes);
+            }
+        }
+    }
+    let mut route_map_charge = RouteMapCharge {
+        owner: crate::read_image_memory::active_owner().map_err(read_image_error)?,
+        bytes: 0,
+    };
+    match read_txn.open_table(vector_membership_pages::SUMMARY) {
+        Ok(summaries) => {
+            for entry in summaries.iter().map_err(read_storage_error)? {
+                let (key, value) = entry.map_err(read_storage_error)?;
+                let prefix = key.value();
+                if prefix.is_empty() {
+                    continue;
+                }
+                let route_bytes = prefix
+                    .len()
+                    .saturating_mul(3)
+                    .saturating_add(value.value().len())
+                    .saturating_add(std::mem::size_of::<VectorPartitionRef>())
+                    .saturating_add(std::mem::size_of::<(Vec<u8>, VectorPartitionRef)>())
+                    .saturating_add(64);
+                route_map_charge
+                    .owner
+                    .reserve(route_bytes)
+                    .map_err(read_image_error)?;
+                route_map_charge.bytes += route_bytes;
+                vector_membership_pages::decode_summary(prefix, value.value())
+                    .map_err(read_image_error)?;
+                let route = vector_membership_pages::partition_from_prefix(prefix)
+                    .map_err(read_image_error)?;
+                known_by_key.insert(
+                    RedbPersistence::vector_partition_catalog_key_from_parts(
+                        &route.index,
+                        &route.partition_key,
+                    ),
+                    route,
+                );
+            }
+        }
+        Err(redb::TableError::TableDoesNotExist(_)) => {}
+        Err(error) => return Err(read_table_error(error)),
     }
     if memberships_present && let Some(root) = directory_root {
-        if root[..8] != directory_count.to_be_bytes() || root[8..] != directory_xor {
+        // The membership and open-directory pages are bound to the committed
+        // root by their table-root fingerprints (validated above, O(1)); the
+        // per-record envelopes are checked when a route reads them. Only the
+        // O(1) cardinalities are compared here.
+        if root[..8] != membership_count.to_be_bytes() {
             return Err(read_image_corruption(
                 ReadImageCorruptionCause::MalformedRecord,
-                "compact vector directory aggregate disagrees with memberships",
+                "compact vector directory count disagrees with memberships",
             ));
         }
         let vector_count = match read_txn.open_table(VECTORS_TABLE) {
@@ -11799,19 +11915,7 @@ fn decode_read_vector_generation_catalog(
                 "compact vector directory distinct body count disagrees with vector bodies",
             ));
         }
-        let committed = content_identity::vector_directory_projection_in_read(read_txn)
-            .map_err(read_image_error)?;
-        if membership_projection
-            .take()
-            .expect("scanned memberships produce a directory projection")
-            .root_with_vector_body_count(referenced_body_count)
-            != committed
-        {
-            return Err(read_image_corruption(
-                ReadImageCorruptionCause::MalformedRecord,
-                "vector directory projection disagrees with committed vector root",
-            ));
-        }
+
         if !vector_body_root_matches(read_txn)? {
             // A raw write changed the vector tree without changing the
             // writer-owned directory. This rare damage path may inspect body
@@ -12594,7 +12698,7 @@ fn diagnose_commit_index_past_committed_frontier(
             "commit_index",
             "iteration_step",
             &lsn.to_be_bytes(),
-            Some(lsn),
+            Some(Lsn(lsn)),
             None,
         );
         note_open_history(OpenHistoryClass::CommitIndexScanned, 0);
@@ -18290,6 +18394,98 @@ pub mod read_persistence_test_scaffold {
         .map_err(|error| error.to_string())
     }
 
+    /// Raw damage to one live posting of a relational index, made without the
+    /// producer, so the index table's root no longer matches its witness.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum IndexPostingDamage {
+        /// The row's live posting is removed.
+        Remove,
+        /// The row's live posting is marked retired.
+        Hide,
+    }
+
+    /// Damage the live posting of `row_id` in `index` of `table`.
+    pub fn damage_relational_index_posting_for_test(
+        path: &Path,
+        table: &str,
+        index: &str,
+        row_id: super::RowId,
+        damage: IndexPostingDamage,
+    ) -> std::result::Result<(), String> {
+        let database = open_damage_fixture(path)?;
+        let redb_name = super::RedbPersistence::relational_index_table_name(table, index);
+        let definition: TableDefinition<super::DurableRelationalIndexKey, &[u8]> =
+            TableDefinition::new(redb_name.as_str());
+        let mut found = None;
+        {
+            let read = database.begin_read().map_err(|error| error.to_string())?;
+            let index_table = read
+                .open_table(definition)
+                .map_err(|error| error.to_string())?;
+            for entry in index_table.iter().map_err(|error| error.to_string())? {
+                let (key, value) = entry.map_err(|error| error.to_string())?;
+                let deleted =
+                    super::RedbPersistence::decode_exact::<Option<super::TxId>>(value.value())
+                        .map_err(|error| error.to_string())?;
+                if deleted.is_some() {
+                    continue;
+                }
+                let position = key
+                    .value()
+                    .decode_canonical()
+                    .map_err(|error| error.to_string())?;
+                if position.row_id == row_id {
+                    found = Some((key.value().0.clone(), position.created_tx));
+                    break;
+                }
+            }
+        }
+        let Some((physical_key, created_tx)) = found else {
+            return Err(format!("index {index} has no live posting for row {row_id}"));
+        };
+        let write = database.begin_write().map_err(|error| error.to_string())?;
+        {
+            let mut index_table = write
+                .open_table(definition)
+                .map_err(|error| error.to_string())?;
+            let key = super::DurableRelationalIndexKey(physical_key);
+            match damage {
+                IndexPostingDamage::Remove => {
+                    index_table.remove(&key).map_err(|error| error.to_string())?;
+                }
+                IndexPostingDamage::Hide => {
+                    let retired = super::RedbPersistence::encode(&Some(super::TxId(
+                        created_tx.0.saturating_add(1),
+                    )))
+                    .map_err(|error| error.to_string())?;
+                    index_table
+                        .insert(&key, retired.as_slice())
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+        }
+        write.commit().map_err(|error| error.to_string())
+    }
+
+    /// A raw entry added to the physical row table of `table`, made without
+    /// the producer.
+    pub fn damage_relational_row_table_for_test(
+        path: &Path,
+        table: &str,
+    ) -> std::result::Result<(), String> {
+        let database = open_damage_fixture(path)?;
+        let name = super::RedbPersistence::rel_table_name(table);
+        let write = database.begin_write().map_err(|error| error.to_string())?;
+        {
+            let mut rows = write
+                .open_table(TableDefinition::<&[u8], &[u8]>::new(name.as_str()))
+                .map_err(|error| error.to_string())?;
+            rows.insert(b"\xffraw-damage".as_slice(), b"x".as_slice())
+                .map_err(|error| error.to_string())?;
+        }
+        write.commit().map_err(|error| error.to_string())
+    }
+
     /// How the commit-index entry of a store's last commit disagrees with the
     /// deleted edge whose tombstone that commit wrote.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18363,6 +18559,14 @@ pub mod read_persistence_test_scaffold {
                 .with_scratch_owner(Some(std::sync::Arc::downgrade(&owner))),
         )
         .map_err(|error| error.to_string())?;
+        // Keep unrelated open-time controls consistent so the requested
+        // tombstone/commit-index cross-check diagnoses this fixture.
+        super::RedbPersistence::write_writer_recovery_bounds_in_write(&write, None)
+            .map_err(|error| error.to_string())?;
+        super::RedbPersistence::write_commit_directory_root_in_write(&write)
+            .map_err(|error| error.to_string())?;
+        super::RedbPersistence::write_read_bounds_roots_in_write(&write)
+            .map_err(|error| error.to_string())?;
         {
             #[cfg(any(test, feature = "test-seams"))]
             let graph_commit_result = write.commit();
@@ -18813,6 +19017,11 @@ pub fn read_source_cache_reservation_for_limit_for_test(limit: Option<usize>) ->
 }
 
 const STORAGE_MAINTENANCE_PAGE_BATCH: usize = 64;
+/// Per-commit reclaim limits of a maintenance reclaim step. Ordinary commits keep
+/// `STORAGE_MAINTENANCE_PAGE_BATCH`; a reclaim-only maintenance commit has no foreground write to
+/// delay, and 4,096 measured the same worst single-commit latency as 64.
+const RECLAIM_EXTENTS_PER_STEP: usize = 4096;
+const RECLAIM_ENTRIES_PER_STEP: usize = 4096;
 
 fn redb_builder() -> redb::Builder {
     redb_builder_with_cache(REDB_CACHE_BYTES)
@@ -18825,6 +19034,9 @@ fn redb_builder_with_cache(cache_bytes: usize) -> redb::Builder {
         STORAGE_MAINTENANCE_PAGE_BATCH,
         STORAGE_MAINTENANCE_PAGE_BATCH,
     );
+    // An active writer reclaims at least what each commit frees, so a long-lived writer with no
+    // maintenance worker cannot accumulate an ever-growing deferred-free backlog.
+    builder.set_keep_pace_reclaim(true);
     builder
 }
 
@@ -20608,6 +20820,24 @@ impl ReadOnlyVectorGenerationSource {
 #[doc(hidden)]
 #[cfg(any(test, feature = "test-seams"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PagedRouteFaultForTest {
+    /// Flip a byte of the route's first point page; its keyed check fails.
+    FlipFirstPointPage,
+    /// Flip a byte of the route's last page, which a find need not visit.
+    FlipLastPage,
+    /// A different, correctly sealed point payload under the same key.
+    ResealFirstPointPage,
+    /// Another route's point payload, sealed under this route's key.
+    CrossRouteFirstPointPage,
+    /// One correctly sealed page past the committed page set.
+    ExtraPage,
+    /// A correctly sealed point page far wider than any page the route wrote.
+    OversizedPage,
+}
+
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-seams"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VectorGenerationCatalogRecordFaultForTest {
     MalformedEnvelope,
     RelocateToMalformedPhysicalKey,
@@ -21617,6 +21847,39 @@ impl RedbPersistence {
     #[cfg(feature = "test-seams")]
     pub(crate) fn fail_next_handoff_for_test(&self) {
         self.handoff_prepare_io_fault.store(true, Ordering::SeqCst);
+    }
+
+    /// One bounded maintenance reclaim step over this owner's storage: at most
+    /// `RECLAIM_EXTENTS_PER_STEP` extents and `RECLAIM_ENTRIES_PER_STEP` entries freed before both the
+    /// reader floor and the cycle's boundary, in one ordinary durable commit.
+    pub(crate) fn reclaim_deferred_step(
+        &self,
+        boundary: Option<redb::ReclaimBoundary>,
+    ) -> Result<redb::ReclaimStep> {
+        let companion = self.lock_file.read().map_err(Self::storage_error)?;
+        if companion.is_none() {
+            return Err(Error::Other("database persistence is closed".to_string()));
+        }
+        let database = self.db.read().map_err(Self::storage_error)?;
+        match database.as_ref() {
+            Some(database) => database
+                .reclaim_deferred_step(boundary, RECLAIM_EXTENTS_PER_STEP, RECLAIM_ENTRIES_PER_STEP)
+                .map_err(Self::storage_error),
+            None => Ok(redb::ReclaimStep::Drained),
+        }
+    }
+
+    /// Whether a foreground writer is waiting for the write slot.
+    pub(crate) fn has_waiting_writer(&self) -> bool {
+        self.db
+            .read()
+            .ok()
+            .and_then(|database| {
+                database
+                    .as_ref()
+                    .map(redb::Database::has_waiting_write_transactions)
+            })
+            .unwrap_or(false)
     }
 
     /// Drain eligible deferred frees while this owner can still commit. A
@@ -23072,10 +23335,15 @@ impl RedbPersistence {
                     "complete received image contains conflicting vector memberships",
                 ));
             }
-            occupied
-                .entry(membership.index.clone())
-                .or_default()
-                .insert(partition_key);
+            // The cap counts placements that are still live, as the vector
+            // store's own cap and SHOW VECTOR_INDEXES do; an ended placement
+            // occupies no partition.
+            if membership.deleted_tx.is_none() {
+                occupied
+                    .entry(membership.index.clone())
+                    .or_default()
+                    .insert(partition_key);
+            }
         }
         if body_has_placement
             .iter()
@@ -26923,7 +27191,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
     }
 
     pub fn load_sink_queue<T: serde::de::DeserializeOwned>(&self, sink: &str) -> Result<Vec<T>> {
-        let _decode_scope = self.writer_decode_scope()?;
+        let _decode_scope = self.reader_decode_scope()?;
         self.with_db(|db| {
             let read_txn = db.begin_read().map_err(Self::storage_error)?;
             let table_name = Self::sink_queue_table_name(sink);
@@ -27797,7 +28065,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         key: &str,
         memory: &Arc<crate::read_image_memory::ImageMemory>,
     ) -> Result<Option<T>> {
-        let _decode_scope = self.writer_decode_scope()?;
+        let _decode_scope = self.reader_decode_scope()?;
         self.with_db(|db| {
             let txn = db.begin_read().map_err(Self::storage_error)?;
             let table = match txn.open_table(if policy_hold_index_key(key) {
@@ -27827,7 +28095,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         keys: &[String],
         memory: &Arc<crate::read_image_memory::ImageMemory>,
     ) -> Result<Vec<T>> {
-        let _decode_scope = self.writer_decode_scope()?;
+        let _decode_scope = self.reader_decode_scope()?;
         self.with_db(|db| {
             let txn = db.begin_read().map_err(Self::storage_error)?;
             let table = match txn.open_table(CONFIG_TABLE) {
@@ -27857,7 +28125,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         prefixes: &[String],
         memory: &Arc<crate::read_image_memory::ImageMemory>,
     ) -> Result<Vec<(String, T)>> {
-        let _decode_scope = self.writer_decode_scope()?;
+        let _decode_scope = self.reader_decode_scope()?;
         self.with_db(|db| {
             let txn = db.begin_read().map_err(Self::storage_error)?;
             let table = match txn.open_table(CONFIG_TABLE) {
@@ -27915,7 +28183,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         &self,
         key: &str,
     ) -> Result<Option<T>> {
-        let _decode_scope = self.writer_decode_scope()?;
+        let _decode_scope = self.reader_decode_scope()?;
         self.with_db(|db| {
             let read_txn = db.begin_read().map_err(Self::storage_error)?;
             let config_table = match read_txn.open_table(CONFIG_TABLE) {
@@ -28222,7 +28490,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         created_tx: TxId,
         lsn: Lsn,
     ) -> Result<Option<VersionedRow>> {
-        let _decode_scope = self.writer_decode_scope()?;
+        let _decode_scope = self.reader_decode_scope()?;
         #[cfg(feature = "test-seams")]
         crate::read_work_probe::note_row_version_point_read();
         self.with_db(|db| {
@@ -28375,7 +28643,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                     Ok(table) => {
                         for entry in table.iter().map_err(Self::storage_error)? {
                             let (_, value) = entry.map_err(Self::storage_error)?;
-                            let decoded = page_memory.row_owner()?;
+                            let decoded = page_memory.staged_row_copy_owner()?;
                             let row = decoded.scope(|| {
                                 Self::decode_versioned_row(value.value(), table_meta.as_ref())
                             })?;
@@ -28687,7 +28955,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         expected_dimension: usize,
         quantization: Option<VectorQuantization>,
     ) -> Result<Vec<(VectorEntry, Option<TxId>)>> {
-        let _decode_scope = self.writer_decode_scope()?;
+        let _decode_scope = self.reader_decode_scope()?;
         self.prepare_proof_owner()?;
         #[cfg(feature = "test-seams")]
         crate::writer_query_test_seams::note_physical_source(
@@ -28773,6 +29041,9 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 )?;
                 let persisted: PersistedVectorEntry =
                     Self::decode(stored.value()).map_err(|error| {
+                        if preserves_typed_read_refusal(&error) {
+                            return error;
+                        }
                         self.vector_partition_corruption(format!(
                             "a raw-vector directory body cannot be decoded: {error}"
                         ))
@@ -28799,6 +29070,9 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 )));
                 }
                 crate::read_image_memory::reserve(decoded_bytes).map_err(|error| {
+                    if preserves_typed_read_refusal(&error) {
+                        return error;
+                    }
                     self.vector_partition_corruption(format!(
                         "a raw-vector directory body cannot be decoded: {error}"
                     ))
@@ -29811,9 +30085,36 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 catalog.base.generation_id,
             )
         };
+        let base: VectorPartitionBaseGenerationRecord = {
+            let bases = write
+                .open_table(VECTOR_PARTITION_BASE_GENERATION_TABLE)
+                .map_err(Self::storage_error)?;
+            let bytes = bases
+                .get_bounded(base_key.as_slice())
+                .map_err(Self::storage_error)?
+                .map(|value| value.value().to_vec())
+                .ok_or_else(|| Error::Other("selected vector base fixture is absent".into()))?;
+            decode_vector_partition_record_payload(VectorPartitionRecordKind::BaseGeneration, &bytes)
+                .map_err(|reason| Error::Other(format!("invalid base fixture: {reason}")))?
+        };
+        let paged = match vector_paged::paged_storage_of_graph_for_test(
+            base.graph_format_version,
+            &base.graph.bytes,
+        )? {
+            Some(storage) => {
+                vector_paged::damage_route_pages_in_write_for_test(
+                    &write,
+                    storage,
+                    None,
+                    PagedRouteFaultForTest::FlipFirstPointPage,
+                )?;
+                true
+            }
+            None => false,
+        };
         let root = Self::vector_partition_graph_page_root_key(&base_key, true);
         let page_key = Self::vector_partition_graph_page_key(&root, 0);
-        {
+        if !paged {
             let mut pages = write
                 .open_table(VECTOR_PARTITION_GRAPH_PAGE_TABLE)
                 .map_err(Self::storage_error)?;
@@ -29844,6 +30145,65 @@ graph_commit_result }.map_err(Self::storage_error)?;
             graph_commit_result
         }
         .map_err(Self::storage_error)
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    fn paged_storage_of_route_in_write_for_test(
+        write: &redb::WriteTransaction,
+        partition: &contextdb_vector::VectorPartitionRef,
+    ) -> Result<u64> {
+        let catalog_key = Self::vector_partition_catalog_key_from_parts(
+            &partition.index,
+            &partition.partition_key,
+        );
+        let catalogs = write
+            .open_table(VECTOR_PARTITION_GENERATION_CATALOG_TABLE)
+            .map_err(Self::storage_error)?;
+        let bytes = catalogs
+            .get_bounded(catalog_key.as_slice())
+            .map_err(Self::storage_error)?
+            .map(|value| value.value().to_vec())
+            .ok_or_else(|| Error::Other("vector generation catalog fixture is absent".into()))?;
+        let catalog: VectorPartitionGenerationCatalogRecord =
+            decode_vector_partition_record_payload(VectorPartitionRecordKind::GenerationCatalog, &bytes)
+                .map_err(|reason| Error::Other(format!("invalid catalog fixture: {reason}")))?;
+        let base_key = Self::vector_partition_base_generation_key_from_parts(
+            &partition.index,
+            &partition.partition_key,
+            catalog.base.generation_id,
+        );
+        let bases = write
+            .open_table(VECTOR_PARTITION_BASE_GENERATION_TABLE)
+            .map_err(Self::storage_error)?;
+        let bytes = bases
+            .get_bounded(base_key.as_slice())
+            .map_err(Self::storage_error)?
+            .map(|value| value.value().to_vec())
+            .ok_or_else(|| Error::Other("selected vector base fixture is absent".into()))?;
+        let base: VectorPartitionBaseGenerationRecord =
+            decode_vector_partition_record_payload(VectorPartitionRecordKind::BaseGeneration, &bytes)
+                .map_err(|reason| Error::Other(format!("invalid base fixture: {reason}")))?;
+        vector_paged::paged_storage_of_graph_for_test(base.graph_format_version, &base.graph.bytes)?
+            .ok_or_else(|| Error::Other("selected vector base is not paged".into()))
+    }
+
+    /// Damage one route's committed paged page set; `other` names the route
+    /// a cross-route substitution copies from.
+    #[cfg(any(test, feature = "test-seams"))]
+    pub(crate) fn damage_paged_route_pages_for_test(
+        path: &Path,
+        partition: &contextdb_vector::VectorPartitionRef,
+        other: Option<&contextdb_vector::VectorPartitionRef>,
+        fault: PagedRouteFaultForTest,
+    ) -> Result<()> {
+        let database = redb_builder().open(path).map_err(Self::storage_error)?;
+        let write = database.begin_write().map_err(Self::storage_error)?;
+        let storage = Self::paged_storage_of_route_in_write_for_test(&write, partition)?;
+        let other = other
+            .map(|other| Self::paged_storage_of_route_in_write_for_test(&write, other))
+            .transpose()?;
+        vector_paged::damage_route_pages_in_write_for_test(&write, storage, other, fault)?;
+        write.commit().map_err(Self::storage_error)
     }
 
     #[cfg(any(test, feature = "test-seams"))]
@@ -31263,7 +31623,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         partition_key: &VectorPartitionKey,
         covered_lsn: Lsn,
     ) -> Result<(Vec<VectorEntry>, Lsn)> {
-        let _decode_scope = self.writer_decode_scope()?;
+        let _decode_scope = self.reader_decode_scope()?;
         let prefix = Self::vector_partition_prefix(index, partition_key);
         self.with_db(|db| {
             let read_txn = db.begin_read().map_err(Self::storage_error)?;
@@ -32589,7 +32949,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
     }
 
     pub fn load_sync_source_lsns(&self) -> Result<HashMap<(String, RowId), Lsn>> {
-        let _decode_scope = self.writer_decode_scope()?;
+        let _decode_scope = self.reader_decode_scope()?;
         self.with_db(|db| {
             let read_txn = db.begin_read().map_err(Self::storage_error)?;
             let table = match read_txn.open_table(SYNC_ROW_SOURCE_LSN_TABLE) {
@@ -32610,7 +32970,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
     }
 
     pub fn load_sync_source_kinds(&self) -> Result<HashMap<(String, RowId), u8>> {
-        let _decode_scope = self.writer_decode_scope()?;
+        let _decode_scope = self.reader_decode_scope()?;
         self.with_db(|db| {
             let read_txn = db.begin_read().map_err(Self::storage_error)?;
             let table = match read_txn.open_table(SYNC_ROW_SOURCE_KIND_TABLE) {
@@ -32790,7 +33150,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
     }
 
     pub fn load_ddl_log(&self) -> Result<Vec<(Lsn, DdlChange)>> {
-        let _decode_scope = self.writer_decode_scope()?;
+        let _decode_scope = self.reader_decode_scope()?;
         self.with_db(|db| {
             let read_txn = db.begin_read().map_err(Self::storage_error)?;
             let table = match read_txn.open_table(DDL_LOG_TABLE) {
@@ -32821,7 +33181,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         &self,
         ring_capacity: usize,
     ) -> Result<(Vec<TriggerAuditEntry>, u64)> {
-        let _decode_scope = self.writer_decode_scope()?;
+        let _decode_scope = self.reader_decode_scope()?;
         self.with_db(|db| {
             let read_txn = db.begin_read().map_err(Self::storage_error)?;
             if let Ok(config_table) = read_txn.open_table(CONFIG_TABLE) {
@@ -32956,7 +33316,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
     }
 
     pub fn load_trigger_audit_history(&self) -> Result<Vec<TriggerAuditEntry>> {
-        let _decode_scope = self.writer_decode_scope()?;
+        let _decode_scope = self.reader_decode_scope()?;
         self.with_db(|db| {
             let read_txn = db.begin_read().map_err(Self::storage_error)?;
             let table = match read_txn.open_table(TRIGGER_AUDIT_TABLE) {
@@ -32994,7 +33354,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                             "commit_index",
                             "iteration_step",
                             &key.value().to_be_bytes(),
-                            Some(key.value()),
+                            Some(Lsn(key.value())),
                             None,
                         );
                     }
@@ -33403,7 +33763,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                                 "commit_index",
                                 "iteration_step",
                                 &key.value().to_be_bytes(),
-                                Some(key.value()),
+                                Some(Lsn(key.value())),
                                 None,
                             );
                         }
@@ -33449,7 +33809,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                                     "commit_index",
                                     "iteration_step",
                                     &key.value().to_be_bytes(),
-                                    Some(key.value()),
+                                    Some(Lsn(key.value())),
                                     None,
                                 );
                             }
@@ -34018,7 +34378,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         workspace: &mut crate::memory_accounting::OwnedMemoryReservation,
         prepaid_bytes: usize,
     ) -> Result<BTreeSet<NodeId>> {
-        let _decode_scope = self.writer_decode_scope()?;
+        let _decode_scope = self.reader_decode_scope()?;
         self.with_db(|db| {
             let txn = db.begin_read().map_err(Self::storage_error)?;
             let table = match txn.open_table(CONFIG_TABLE) {
@@ -34197,7 +34557,10 @@ graph_commit_result }.map_err(Self::storage_error)?;
             #[cfg(any(test, feature = "test-seams"))]
             let mut graph_publication_attempt =
                 crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
-            Self::refuse_unresolved_vector_erasure_in_write(&write_txn)?;
+            Self::refuse_unresolved_vector_erasure_in_write(
+                &write_txn,
+                &Self::preencoded_native_storage(&prepared_vector_generations),
+            )?;
             self.apply_local_erasure(
                 &write_txn,
                 projection,
@@ -34765,6 +35128,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
             &projection.vector_partition_identities,
             accountant,
             operation,
+            &Self::preencoded_native_storage(prepared_vector_generations),
         )?;
 
         if !projection.vectors.is_empty() {
@@ -35954,6 +36318,9 @@ graph_commit_result }.map_err(Self::storage_error)?;
                             #[cfg(any(test, feature = "test-seams"))]
                             graph_observation_checkpoint(27)?;
                             Self::write_vector_body_root_fingerprint(txn)?;
+                            // Relocation rewrites membership and open-directory
+                            // pages too; their root fingerprints follow.
+                            vector_membership_pages::write_fingerprints(txn)?;
                             #[cfg(any(test, feature = "test-seams"))]
                             graph_observation_checkpoint(28)?;
                             Self::write_commit_directory_root_in_write(txn)?;
@@ -36051,7 +36418,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         table_name: &str,
         hasher: &mut blake3::Hasher,
     ) -> Result<u64> {
-        let _decode_scope = self.writer_decode_scope()?;
+        let _decode_scope = self.reader_decode_scope()?;
         digest_field(hasher, table_name.as_bytes());
         let definition: TableDefinition<&[u8], &[u8]> = TableDefinition::new(table_name);
         let table = read_txn
@@ -36099,7 +36466,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
     /// relational and sink-queue table names are part of the digest, so
     /// creating or removing an empty table is still visible.
     pub(crate) fn raw_sync_apply_state_digest(&self) -> Result<RawSyncApplyStateDigest> {
-        let _decode_scope = self.writer_decode_scope()?;
+        let _decode_scope = self.reader_decode_scope()?;
         self.with_db(|db| {
             let read_txn = db.begin_read().map_err(Self::storage_error)?;
             let mut hasher = blake3::Hasher::new();
@@ -36675,7 +37042,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
     }
 
     pub(crate) fn checkpoint_read_source(&self) -> Result<CheckpointReadSource> {
-        let _decode_scope = self.writer_decode_scope()?;
+        let _decode_scope = self.reader_decode_scope()?;
         let decode_memory = crate::read_image_memory::active_owner()?.row_owner()?;
         self.checkpoint_read_source_with_owner(decode_memory)
     }
@@ -37181,7 +37548,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
     }
 
     fn load_graph_table(&self, definition: TableDefinition<&[u8], &[u8]>) -> Result<Vec<AdjEntry>> {
-        let _decode_scope = self.writer_decode_scope()?;
+        let _decode_scope = self.reader_decode_scope()?;
         self.with_db(|db| {
             let read_txn = db.begin_read().map_err(Self::storage_error)?;
             let table = match read_txn.open_table(definition) {
@@ -39198,7 +39565,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         kind: VectorPartitionRecordKind,
         from: &VectorIndexRef,
         to: &VectorIndexRef,
-        rename: impl Fn(&mut T, &VectorIndexRef),
+        rename: impl Fn(&mut T, &VectorIndexRef) -> Result<()>,
         key_for: impl Fn(&T) -> Vec<u8>,
     ) -> Result<()>
     where
@@ -39219,7 +39586,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
             }
         }
         for (old_key, mut record) in renamed {
-            rename(&mut record, to);
+            rename(&mut record, to)?;
             let new_key = key_for(&record);
             let bytes = Self::encode_vector_partition_record(kind, &record)?;
             if let Some(existing) = table.get(new_key.as_slice()).map_err(Self::storage_error)?
@@ -39370,7 +39737,10 @@ graph_commit_result }.map_err(Self::storage_error)?;
             VectorPartitionRecordKind::Membership,
             from,
             to,
-            |record, to| record.index = to.clone(),
+            |record, to| {
+                record.index = to.clone();
+                Ok(())
+            },
             Self::vector_partition_membership_key,
         )?;
         vector_membership_pages::rename_pending_routes(
@@ -39385,7 +39755,10 @@ graph_commit_result }.map_err(Self::storage_error)?;
             VectorPartitionRecordKind::Tombstone,
             from,
             to,
-            |record, to| record.membership.index = to.clone(),
+            |record, to| {
+                record.membership.index = to.clone();
+                Ok(())
+            },
             Self::vector_partition_tombstone_key,
         )?;
         self.rename_vector_partition_records_in_write::<VectorPartitionJournalRecord>(
@@ -39404,6 +39777,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                         tombstone.membership.index = to.clone()
                     }
                 }
+                Ok(())
             },
             Self::vector_partition_journal_key,
         )?;
@@ -39413,7 +39787,15 @@ graph_commit_result }.map_err(Self::storage_error)?;
             VectorPartitionRecordKind::BaseGeneration,
             from,
             to,
-            |record, to| record.index = to.clone(),
+            |record, to| {
+                record.index = to.clone();
+                self.rebind_paged_generation_in_write(
+                    write_txn,
+                    to,
+                    &record.partition_key,
+                    &mut record.graph,
+                )
+            },
             Self::vector_partition_base_generation_key,
         )?;
         self.rename_vector_partition_records_in_write::<VectorPartitionChangeGenerationRecord>(
@@ -39422,7 +39804,15 @@ graph_commit_result }.map_err(Self::storage_error)?;
             VectorPartitionRecordKind::ChangeGeneration,
             from,
             to,
-            |record, to| record.index = to.clone(),
+            |record, to| {
+                record.index = to.clone();
+                self.rebind_paged_generation_in_write(
+                    write_txn,
+                    to,
+                    &record.partition_key,
+                    &mut record.graph,
+                )
+            },
             Self::vector_partition_change_generation_key,
         )?;
         self.rename_vector_partition_records_in_write::<VectorPartitionGenerationCatalogRecord>(
@@ -39431,9 +39821,48 @@ graph_commit_result }.map_err(Self::storage_error)?;
             VectorPartitionRecordKind::GenerationCatalog,
             from,
             to,
-            |record, to| record.index = to.clone(),
+            |record, to| {
+                record.index = to.clone();
+                let bases = write_txn
+                    .open_table(VECTOR_PARTITION_BASE_GENERATION_TABLE)
+                    .map_err(Self::storage_error)?;
+                let key = Self::vector_partition_base_generation_key_from_parts(
+                    to,
+                    &record.partition_key,
+                    record.base.generation_id,
+                );
+                if let Some(value) = bases.get(key.as_slice()).map_err(Self::storage_error)? {
+                    let base: VectorPartitionBaseGenerationRecord = self
+                        .decode_vector_partition_record(
+                            VectorPartitionRecordKind::BaseGeneration,
+                            value.value(),
+                        )?;
+                    record.base.durable_bytes = base.graph.bytes.len() as u64;
+                }
+                if let Some(change) = &mut record.change {
+                    let changes = write_txn
+                        .open_table(VECTOR_PARTITION_CHANGE_GENERATION_TABLE)
+                        .map_err(Self::storage_error)?;
+                    let key = Self::vector_partition_change_generation_key_from_parts(
+                        to,
+                        &record.partition_key,
+                        record.base.generation_id,
+                        change.generation_id,
+                    );
+                    if let Some(value) = changes.get(key.as_slice()).map_err(Self::storage_error)? {
+                        let changed: VectorPartitionChangeGenerationRecord = self
+                            .decode_vector_partition_record(
+                                VectorPartitionRecordKind::ChangeGeneration,
+                                value.value(),
+                            )?;
+                        change.durable_bytes = changed.graph.bytes.len() as u64;
+                    }
+                }
+                Ok(())
+            },
             Self::vector_partition_catalog_key,
         )?;
+        self.rename_paged_build_bindings_in_write(write_txn, from, to)?;
         Self::ensure_open_vector_directory_in_write(write_txn)
     }
 
@@ -39687,12 +40116,23 @@ graph_commit_result }.map_err(Self::storage_error)?;
         Ok(())
     }
 
+    /// Storage of the replacement generations an erasure prepared for itself.
+    fn preencoded_native_storage(
+        prepared: &[PreencodedVectorPartitionGenerationCandidate],
+    ) -> Vec<u64> {
+        prepared
+            .iter()
+            .flat_map(|candidate| candidate.native_storage.iter().flatten().copied())
+            .collect()
+    }
+
     fn purge_vector_partition_generation_identities_in_write(
         &self,
         write_txn: &redb::WriteTransaction,
         identities: &[VectorPartitionVersionIdentity],
         accountant: Arc<dyn contextdb_vector::MemoryBudget>,
         operation: &str,
+        own_storage: &[u64],
     ) -> Result<()> {
         if identities.is_empty() {
             return Ok(());
@@ -39834,6 +40274,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 &prefix,
                 accountant.clone(),
                 operation,
+                own_storage,
             )?;
             self.remove_vector_partition_graph_pages_for_partition_in_write(
                 write_txn,
@@ -40001,7 +40442,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         expected_kind: VectorPartitionRecordKind,
         encoded: &[u8],
     ) -> Result<T> {
-        let _decode_scope = self.writer_decode_scope()?;
+        let _decode_scope = self.reader_decode_scope()?;
         let payload = vector_partition_record_payload(expected_kind, encoded)
             .map_err(|reason| self.vector_partition_corruption(reason))?;
         prevalidate_vector_partition_metadata_routes(expected_kind, payload)
@@ -40021,7 +40462,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         index: &VectorIndexRef,
         partition_key: &VectorPartitionKey,
     ) -> Result<T> {
-        let _decode_scope = self.writer_decode_scope()?;
+        let _decode_scope = self.reader_decode_scope()?;
         let payload =
             vector_partition_expected_metadata_payload(kind, encoded, index, partition_key)
                 .map_err(|reason| self.vector_partition_corruption(reason))?;
@@ -40613,11 +41054,28 @@ graph_commit_result }.map_err(Self::storage_error)?;
         )).accountant())
     }
 
-    fn writer_decode_scope(&self) -> Result<crate::read_image_memory::ImageMemoryScope> {
+    /// A standalone persistence read has the default declared reader limit.
+    /// Database callers install their own operation child before entering here;
+    /// actual write methods install their writer scope before borrowing the file.
+    fn reader_decode_scope(&self) -> Result<crate::read_image_memory::ImageMemoryScope> {
         if let Ok(owner) = crate::read_image_memory::active_owner() {
             return Ok(owner.enter());
         }
+        let declared = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+            crate::OwnerReadConfig::default().limits.limits.memory,
+        );
+        Ok(crate::read_image_memory::ImageMemory::operation_reader(
+            self.require_decode_accountant()?, declared.child()?,
+        )?.enter())
+    }
+
+    fn writer_decode_scope(&self) -> Result<crate::read_image_memory::ImageMemoryScope> {
         let accountant = self.require_decode_accountant()?;
+        if let Ok(owner) = crate::read_image_memory::active_owner()
+            && owner.funded_by_writer(&accountant)
+        {
+            return Ok(owner.enter());
+        }
         crate::read_image_memory::ImageMemory::enter_writer_operation(accountant)
     }
 
@@ -40918,10 +41376,31 @@ graph_commit_result }.map_err(Self::storage_error)?;
         )
     }
 
+    /// Declared relational indexes whose physical table root differs from
+    /// the root its producer witnessed. Constant work per index: one root
+    /// comparison, no posting is read.
+    pub(crate) fn index_root_damage(&self, indexes: &[(String, String)]) -> Result<Vec<(String, String)>> {
+        self.with_db(|db| {
+            let read = db.begin_read().map_err(Self::storage_error)?;
+            let mut damaged = Vec::new();
+            for (table, index) in indexes {
+                let name = Self::relational_index_table_name(table, index);
+                match Self::verify_history_root_canonical(&read, &name) {
+                    Ok(true) => {}
+                    Ok(false) | Err(Error::StoreCorrupted { .. }) => {
+                        damaged.push((table.clone(), index.clone()));
+                    }
+                    Err(other) => return Err(other),
+                }
+            }
+            Ok(damaged)
+        })
+    }
+
     pub(crate) fn with_db<T>(&self, f: impl FnOnce(&redb::Database) -> Result<T>) -> Result<T> {
         // The common writer handle boundary covers commit, reopen loading and
         // maintenance decoders. An installed reader child keeps its own owner.
-        let _decode_scope = self.writer_decode_scope()?;
+        let _decode_scope = self.reader_decode_scope()?;
         self.prepare_proof_owner()?;
         #[cfg(test)]
         PERSISTENCE_OWNERSHIP_READS_FOR_TEST.with(|count| count.set(count.get() + 1));
@@ -42697,8 +43176,8 @@ mod empty_declared_index_readiness_tests {
     // The callbacks use the installed execution target and its real declared
     // operation child. Residency is a paired observation, never graph work.
     fn assert_installed_commit_directory_rows(file: &ReadSession, expected: &[(Lsn, TxId)], path: &Path) -> ReadWorkObservationScope {
-        use std::ops::Bound::{Excluded, Included, Unbounded};
         use contextdb_core::read_contract::{OwnerReadCancellation, ReadLimits};
+        use std::ops::Bound::{Excluded, Included, Unbounded};
         file.__with_resident_history_for_test(|database| {
             assert!(database.__has_captured_commit_directory_for_test());
             let child = database.declared_reader_memory()?;
@@ -42879,7 +43358,8 @@ mod empty_declared_index_readiness_tests {
     }
 
     fn assert_commit_suffix_open_rows(directory: &Path) {
-        use contextdb_core::read_contract::{OwnerReadCancellation, ReadLimits, ReadFailure, OwnerLimitExceededDetail, ReadFailureLimit};
+        use contextdb_core::read_contract::{OwnerLimitExceededDetail, OwnerReadCancellation, ReadFailure, ReadFailureLimit,
+            ReadLimits, };
         let frontier = Some((Lsn(20), TxId(100)));
         let cases = [
             ("healthy-nonempty-committed", frontier, vec![], None, 0),
@@ -44376,8 +44856,8 @@ mod empty_declared_index_readiness_tests {
     // the actual successful request, rather than a second policy constant.
     #[cfg(feature = "test-seams")]
     fn assert_graph_admission_rows(directory: &Path) {
-        use writer_source::SourceWindowOwner;
         use std::ops::Bound;
+        use writer_source::SourceWindowOwner;
         let path = directory.join("graph-admission-doors.db");
         let (store, predecessor, entries) = graph_history_fixture(&path, 0, 1, false);
         let before = graph_publication_state(&store);
@@ -44558,8 +45038,8 @@ mod empty_declared_index_readiness_tests {
     #[cfg(feature = "test-seams")]
     fn assert_graph_authorization_and_cancellation_rows(directory: &Path) {
         use crate::read_session::{ReadSession, ReadSessionOptions};
-        use contextdb_core::read_contract::ReadRoute;
         use contextdb_core::Principal;
+        use contextdb_core::read_contract::ReadRoute;
         let principal = "graph-door-reader";
         let source = uuid::Uuid::from_u128(1);
         let target = uuid::Uuid::from_u128(2);
@@ -44778,8 +45258,17 @@ mod empty_declared_index_readiness_tests {
                         options.limits.memory = payload.len().try_into().unwrap();
                         let reader = ReadSession::open_with_options(&path, options).expect("healthy metadata opens under the tight budget before the body is requested");
                         let error = reader.execute(statements[2], &HashMap::new()).unwrap_err();
-                        assert!(matches!(error, Error::MemoryBudgetExceeded { requested_bytes, available_bytes, .. } if requested_bytes > available_bytes),
-                            "a healthy body that exceeds actual admission retains typed memory refusal: {error:?}");
+                        // The read's own declared ceiling answers in the read
+                        // vocabulary (dev contract); the store budget keeps its
+                        // MemoryBudgetExceeded. Either is the typed memory refusal.
+                        let typed_memory = match &error {
+                            Error::MemoryBudgetExceeded { requested_bytes, available_bytes, .. } => requested_bytes > available_bytes,
+                            Error::ReadFailure(failure) => matches!(failure.detail(),
+                                contextdb_core::read_contract::ReadFailureDetail::OwnerLimitExceeded(detail)
+                                    if detail.limit == contextdb_core::read_contract::ReadFailureLimit::Memory),
+                            _ => false,
+                        };
+                        assert!(typed_memory, "a healthy body that exceeds actual admission retains typed memory refusal: {error:?}");
                         assert!(!matches!(&error, Error::StoreCorrupted { .. }),
                             "a tight budget on healthy data must never report store corruption: {error:?}");
                         drop(reader);
@@ -45995,9 +46484,6 @@ let mut graph_publication_attempt = crate::read_work_probe::GraphPublicationAtte
                     ));
                 }
             }
-            for (from, to) in &vector_renames {
-                self.rename_vector_partition_generation_index_in_write(&write_txn, from, to)?;
-            }
             if !dropped_vector_columns.is_empty() {
                 self.remove_vector_partition_records_matching_all_in_write(
                     &write_txn,
@@ -46020,7 +46506,11 @@ let mut graph_publication_attempt = crate::read_work_probe::GraphPublicationAtte
                     .open_table(META_TABLE)
                     .map_err(Self::storage_error)?;
                 let key = Self::meta_key(name);
-                let encoded = Self::encode(meta)?;
+                // Keep the column incarnations the schema already allocated:
+                // vector routes bind to them, and a raw declaration would
+                // leave every saved generation without its column identity.
+                let encoded_schema = self.schema_update_in_table(&meta_table, name, meta, ddl)?;
+                let encoded = &encoded_schema.bytes;
                 meta_table
                     .insert(key.as_str(), encoded.as_slice())
                     .map_err(Self::storage_error)?;
@@ -46113,6 +46603,10 @@ let mut graph_publication_attempt = crate::read_work_probe::GraphPublicationAtte
                     identity_mutations
                         .extend(content_identity::config_mutations(key, Some(&encoded)));
                 }
+            }
+            // Schema, lineage and paged bindings publish as one durable rename.
+            for (from, to) in &vector_renames {
+                self.rename_vector_partition_generation_index_in_write(&write_txn, from, to)?;
             }
             {
                 let mut ddl_table = write_txn

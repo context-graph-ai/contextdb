@@ -122,17 +122,19 @@ pub(crate) struct TransactionTracker {
     local_snapshot_provider: std::sync::OnceLock<ExternalSnapshotProvider>,
     external_snapshot_refresh: Mutex<()>,
     pub(crate) deferred_free_budget: (usize, usize),
+    pub(crate) keep_pace_reclaim: bool,
 }
 
 impl TransactionTracker {
     pub(crate) fn new(next_transaction_id: TransactionId) -> Self {
-        Self::new_with_external_snapshots(next_transaction_id, None, (usize::MAX, usize::MAX))
+        Self::new_with_external_snapshots(next_transaction_id, None, (usize::MAX, usize::MAX), false)
     }
 
     pub(crate) fn new_with_external_snapshots(
         next_transaction_id: TransactionId,
         external_snapshot_provider: Option<ExternalSnapshotProvider>,
         deferred_free_budget: (usize, usize),
+        keep_pace_reclaim: bool,
     ) -> Self {
         Self {
             state: Mutex::new(State {
@@ -152,6 +154,7 @@ impl TransactionTracker {
             local_snapshot_provider: std::sync::OnceLock::new(),
             external_snapshot_refresh: Mutex::new(()),
             deferred_free_budget,
+            keep_pace_reclaim,
             #[cfg(feature = "test-seams")]
             table_write_observer: Default::default(),
         }
@@ -364,7 +367,6 @@ impl TransactionTracker {
         transaction_id
     }
 
-    #[cfg(feature = "test-seams")]
     pub(crate) fn has_waiting_write_transactions(&self) -> bool {
         self.state.lock().unwrap().waiting_write_transactions > 0
     }

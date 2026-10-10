@@ -150,12 +150,9 @@ impl ImageMemory {
     /// the operation owner holds and releases only its own admitted payloads.
     pub(crate) fn operation_writer(accountant: Arc<MemoryAccountant>) -> Result<Arc<Self>> {
         let control = std::mem::size_of::<Self>() + 2 * std::mem::size_of::<usize>();
-        accountant.try_allocate_for(
-            control,
-            "writer_source",
-            "decode_owner",
-            "Raise MEMORY_LIMIT to decode this writer operation's stored values.",
-        )?;
+        // Fixed decode control is named open residue; growing payloads below
+        // still use this writer's declared working-memory limit.
+        crate::memory_accounting::admit_open_residue(control, "writer_decode_open_residue")?;
         let writer_custody = crate::memory_accounting::StoreAccountantHandle::retain_if_writer(&accountant);
         Ok(Arc::new(Self {
             accountant,
@@ -163,8 +160,8 @@ impl ImageMemory {
             operation: "decode_stored_value",
             hint: "Raise MEMORY_LIMIT to decode this writer operation's stored values.",
             reader_budget: None,
-            held: AtomicUsize::new(control),
-            control_bytes: control,
+            held: AtomicUsize::new(0),
+            control_bytes: control | crate::memory_accounting::OPEN_RESIDUE_TAG,
             failure: parking_lot::Mutex::new(None),
             _writer_custody: writer_custody,
         }))
@@ -372,7 +369,11 @@ impl ImageMemory {
     }
 
     pub(crate) fn retained_payload_bytes(&self) -> usize {
-        self.held().saturating_sub(self.control_bytes)
+        self.held().saturating_sub(if self.control_bytes & crate::memory_accounting::OPEN_RESIDUE_TAG != 0 {
+            0
+        } else {
+            self.control_bytes
+        })
     }
 
     pub(crate) fn held(&self) -> usize {
@@ -383,6 +384,18 @@ impl ImageMemory {
     }
     /// A separate row lifetime funded by this operation's existing capability.
     /// The parent remains live while a selected row is being replaced.
+    /// A decoded row transferred directly into a detached write projection
+    /// is a staged write copy. It keeps the same preallocation funder and
+    /// receipt shape while naming that copy's admission at the payload boundary.
+    pub(crate) fn staged_row_copy_owner(self: &Arc<Self>) -> Result<Arc<Self>> {
+        let mut owner = self.row_owner()?;
+        let memory = Arc::get_mut(&mut owner).expect("new row owner is exclusive");
+        memory.subsystem = "sync";
+        memory.operation = "stage_received_unit_row_image";
+        memory.hint = "Raise MEMORY_LIMIT to stage this received row copy.";
+        Ok(owner)
+    }
+
     pub(crate) fn row_owner(self: &Arc<Self>) -> Result<Arc<Self>> {
         let control = std::mem::size_of::<Self>() + 2 * std::mem::size_of::<usize>();
         self.reserve_funding(control)?;
@@ -484,6 +497,9 @@ impl contextdb_core::read_memory::ReadMemoryBudget for ImageMemory {
 impl Drop for ImageMemory {
     fn drop(&mut self) {
         self.release(self.held.load(Ordering::SeqCst));
+        if self.control_bytes & crate::memory_accounting::OPEN_RESIDUE_TAG != 0 {
+            crate::memory_accounting::refund_open_residue(self.control_bytes & !crate::memory_accounting::OPEN_RESIDUE_TAG);
+        }
     }
 }
 #[derive(Debug)]

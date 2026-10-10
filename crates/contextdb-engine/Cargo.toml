@@ -381,6 +381,10 @@ name = "event_custody"
 required-features = ["iroh"]
 
 # Receipt for ordinary Iroh delivery cost at scale.
+[[test]]
+name = "writecost_planner_reversed"
+path = "tests/writecost_planner_reversed.rs"
+
 [[example]]
 name = "custody_scale"
 required-features = ["iroh", "test-seams"]

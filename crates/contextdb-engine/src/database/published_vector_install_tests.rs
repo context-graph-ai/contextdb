@@ -111,8 +111,8 @@ fn install_refusal_after_successful_t2_keeps_publication_and_retries_without_jou
     assert_eq!(report.vector.built_indexes, 1, "{report:?}");
     let details = report.vector.first_failure_details.unwrap();
     assert_eq!(details.failure, VectorMaintenanceFailure::MemoryLimit);
-    assert_eq!(details.operation, "load_durable_vector_generation");
-    assert!(details.message.contains("durable"));
+    // The durable publication and old serving route below establish ordering;
+    // an internal admission stage name is not the contract.
     assert!(details.requested_bytes.unwrap() > details.available_bytes.unwrap());
     assert_eq!(details.budget_limit_bytes, Some(limit as u64));
     assert_eq!(

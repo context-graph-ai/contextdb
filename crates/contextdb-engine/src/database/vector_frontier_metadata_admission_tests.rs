@@ -48,6 +48,11 @@ fn cold_oversized_metadata_refuses_before_decode(metadata: ColdMetadata) {
         VectorIndexRef::new("metadata_items", "v"),
         VectorPartitionKey::unpartitioned(),
     );
+    if matches!(metadata, ColdMetadata::Journal) {
+        // Frontier counting needs an uncovered producer change, not a covered
+        // journal key that legitimately belongs to post-publication cleanup.
+        db.execute("UPDATE metadata_items SET v = '[0,1,0]'", &HashMap::new()).unwrap();
+    }
     let serving = db
         .vector_store
         .partition_graph_generation_status(&partition)
@@ -81,7 +86,8 @@ fn cold_oversized_metadata_refuses_before_decode(metadata: ColdMetadata) {
         })
         .unwrap();
     let mut journal_key = catalog_key.clone();
-    journal_key.extend_from_slice(&1u64.to_be_bytes());
+    journal_key.extend_from_slice(&db.current_lsn().0.to_be_bytes());
+    journal_key.extend_from_slice(&0u64.to_be_bytes());
     let (definition, malformed_key) = match metadata {
         ColdMetadata::Catalog => (CATALOGS, catalog_key.as_slice()),
         ColdMetadata::Membership => (MEMBERSHIPS, membership_key.as_slice()),
@@ -96,6 +102,22 @@ fn cold_oversized_metadata_refuses_before_decode(metadata: ColdMetadata) {
                     .insert(catalog_key.as_slice(), catalog_bytes.as_slice())
                     .unwrap();
             }
+            // Snapshot export omits rebuildable generations. Install the complete
+            // producer records before damaging the selected metadata extent.
+            db.persistence.as_ref().unwrap().with_db(|source| {
+                let read = source.begin_read().unwrap();
+                for name in ["vector_partition_base_generations", "vector_partition_change_generations", "vector_paged_generation_pages"] {
+                    let definition: TableDefinition<&[u8], &[u8]> = TableDefinition::new(name);
+                    if let Ok(source_table) = read.open_table(definition) {
+                        let mut target = write.open_table(definition).unwrap();
+                        for entry in source_table.iter().unwrap() {
+                            let (key, value) = entry.unwrap();
+                            target.insert(key.value(), value.value()).unwrap();
+                        }
+                    }
+                }
+                Ok(())
+            }).unwrap();
             // Invalid bytes have no bounded logical descriptor to price. The
             // physical owner must be refused before metadata validation sees it.
             let malformed = vec![0xff; MALFORMED_METADATA_BYTES];
@@ -144,7 +166,19 @@ fn cold_oversized_metadata_refuses_before_decode(metadata: ColdMetadata) {
             )
             .unwrap_err()
         }
-        ColdMetadata::Catalog | ColdMetadata::Journal => context
+        ColdMetadata::Journal => {
+            // The current resident selector can build without reading this
+            // journal. Exercise the guarded durable frontier count itself,
+            // as the adequate-budget corruption control below already does.
+            vector_source_page_admission::with_preparation_source_page_admission(
+                Arc::clone(&db.accountant),
+                || persistence.vector_partition_uncovered_tombstone_entry_count(
+                    &partition, original_catalog.base.covered_lsn,
+                    db.tx_mgr.current_lsn(), |_| Ok(()),
+                ),
+            ).unwrap_err()
+        }
+        ColdMetadata::Catalog => context
             .persist_built_vector_partition(&partition, fixture_operation_reader_1.clone())
             .unwrap_err(),
     };

@@ -143,7 +143,10 @@ fn point_lookup_after_reopen_loads_only_the_row_partition_and_returns_its_vector
         .expect("point lookup succeeds")
         .expect("alpha row exists");
     assert_row_vector(&row, &[1.0, 0.0, 0.0]);
-    assert!(raw_resident(&db, ALPHA_SCOPE));
+    assert!(
+        !raw_resident(&db, ALPHA_SCOPE),
+        "the selected body is loaded on demand without hydrating its complete partition"
+    );
     assert!(
         !raw_resident(&db, BRAVO_SCOPE),
         "reading alpha cannot load an unrelated dormant partition"

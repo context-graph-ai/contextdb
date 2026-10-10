@@ -382,15 +382,26 @@ fn opening_and_walking_are_charged_against_the_declared_work() {
                  than the request declared: {receipt:?}"
             );
             searched_within_a_tight_limit |= (work as usize) < approved_budget(400, LIMIT, 24);
+            if answer.is_ok() {
+                assert!(
+                    spent < PARTITIONS * ROWS_PER_PARTITION,
+                    "work={work}: an answered search does strictly less work than EXACT"
+                );
+            }
         }
         if let Ok(answer) = answer {
             assert_eq!(answer.rows.len(), LIMIT, "work={work}: never a short page");
         }
     }
-    assert!(
-        searched_within_a_tight_limit,
-        "some declared limit smaller than the budget still ran the search"
-    );
+    // Re-targeted (fable-18 ruling 2026-10-10, recall wins): one shared walk
+    // across Contexts measurably loses recall (near-tie 8/10; real 8 x 1,250
+    // min 0.80), contradicting V19. Each Context is searched to its own
+    // termination inside the one declared cap; the bar is work within that
+    // cap and strictly below EXACT, with p95 <= EXACT held by the gate rows.
+    // A search that cannot finish every Context inside a tight declared limit
+    // refuses rather than answering from part of the scope, so a tight limit
+    // need not run a search at all.
+    let _ = searched_within_a_tight_limit;
 }
 
 /// A scope whose partitions' graphs were built at different degrees is given

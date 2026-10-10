@@ -299,7 +299,7 @@ impl RedbPersistence {
                 // contributions. Still inspect tags instead of treating a
                 // physical deletion prefix as public commit membership.
                 #[cfg(any(test, feature = "test-seams"))]
-                crate::read_work_probe::note_graph("graph_contribution", "range", &prefix, Some(lsn.0), Some("commit_reclamation_candidate"));
+                crate::read_work_probe::note_graph("graph_contribution", "range", &prefix, Some(contextdb_core::Lsn(lsn.0)), Some("commit_reclamation_candidate"));
                 let mut entries = contributions
                     .range(prefix.as_slice()..)
                     .map_err(Self::storage_error)?.inspect(|_entry| { #[cfg(any(test, feature = "test-seams"))] if let Ok((key, _)) = _entry { crate::read_work_probe::graph_storage_key("graph_contribution", "iteration_step", key.value()); } });
@@ -662,6 +662,10 @@ graph_commit_result }.map_err(Self::storage_error)
                 .open_table(READ_LSN_BOUNDS)
                 .map_err(Self::storage_error)?;
         }
+        // Every writer commit carries the schema half of the paged binding
+        // forward, before the recovery root below is taken: only a change
+        // made outside the writer can leave schema metadata unbound.
+        super::content_identity::rebind_vector_schema_meta_root_if_bound_in_write(write)?;
         // Table existence is distinct from an existing empty root. A write
         // open_table would silently create missing proof state, so inspect
         // the catalog before obtaining any graph descriptor.

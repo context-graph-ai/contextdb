@@ -77,7 +77,7 @@ impl RetainedCommitDirectory {
                         "commit_index",
                         "iteration_step",
                         &_key.value().to_be_bytes(),
-                        Some(_key.value()),
+                        Some(contextdb_core::Lsn(_key.value())),
                         None,
                     );
                 }
@@ -146,7 +146,7 @@ impl RetainedCommitDirectory {
                     "commit_index",
                     "get",
                     &lsn.0.to_be_bytes(),
-                    Some(lsn.0),
+                    Some(contextdb_core::Lsn(lsn.0)),
                     None,
                 );
                 let tx = table

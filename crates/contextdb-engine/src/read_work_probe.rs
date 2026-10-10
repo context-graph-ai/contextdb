@@ -5,8 +5,8 @@
 //! value to read, and nested scopes restore their parent even while unwinding.
 
 use std::cell::RefCell;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadWorkPhase {
@@ -672,7 +672,7 @@ pub(crate) fn note_graph(
     family: &str,
     operation: &str,
     key: &[u8],
-    lsn: Option<u64>,
+    lsn: Option<contextdb_core::Lsn>,
     role: Option<&str>,
 ) {
     ACTIVE.with(|a| {
@@ -766,7 +766,7 @@ pub(crate) fn note_graph(
                 family: family.into(),
                 operation: operation.into(),
                 key: key.into(),
-                queried_lsn: lsn,
+                queried_lsn: lsn.map(|lsn| lsn.0),
                 role: role.map(Into::into),
                 funding_owner: observed_funding().map(|v| v.0),
                 control_reservation_bytes: observed_funding().map(|v| v.1),

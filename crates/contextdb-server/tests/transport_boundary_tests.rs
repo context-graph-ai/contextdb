@@ -931,6 +931,10 @@ fn smoke_policy_journey_without_authorized_verifier_orchestration(src: &str) -> 
         );
     }
     for (authorized_use, expected_count) in [
+        (
+            "contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(",
+            1,
+        ),
         // Each is an existing durable verifier handle. A new open expression
         // must stay visible to the ownership scanner.
         ("Arc<Database>", 2),

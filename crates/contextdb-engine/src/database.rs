@@ -11279,6 +11279,14 @@ impl std::ops::Deref for RetainedVectorSearchTrace {
     }
 }
 impl RetainedVectorSearchTrace {
+    /// Hand the trace and the admission holding it to the trace slot.
+    fn into_published(self) -> contextdb_vector::mem::OwnedVectorSearchTrace {
+        contextdb_vector::mem::OwnedVectorSearchTrace::from_admitted(
+            self.trace,
+            self.executing_owner,
+            self.owner,
+        )
+    }
     fn from_owned(
         trace: contextdb_vector::mem::OwnedVectorSearchTrace,
         executing_owner: Arc<dyn contextdb_vector::MemoryBudget>,
@@ -13960,7 +13968,7 @@ impl<T: contextdb_tx::WriteSetApplicator> AdmittedDynStore<T> {
     fn prepare(payload: T, accountant: &Arc<MemoryAccountant>) -> Result<DynStore>
     where T: 'static {
         let mut value = Self { payload: std::mem::ManuallyDrop::new(payload), control: None };
-        value.control = Some(crate::memory_accounting::ControlCredit::admit(
+        value.control = Some(crate::memory_accounting::ControlCredit::admit_assembly(
             accountant, std::alloc::Layout::for_value(&value).size(), "dyn_store_control",
         )?);
         Ok(Box::new(value))
@@ -14047,6 +14055,29 @@ struct RetainedNonVectorMemoryOwner {
     _writer_use: Option<crate::memory_accounting::WriterUse>,
 }
 
+impl RetainedNonVectorMemoryOwner {
+    fn new(relational: Arc<RelationalStore>, graph: Arc<GraphStore>, accountant: Arc<MemoryAccountant>) -> Self {
+        Self {
+            _writer_use: crate::memory_accounting::WriterUse::retain_if_writer(&accountant),
+            relational, graph, accountant,
+        }
+    }
+
+    /// Drop the held handles without returning the retained-state charge,
+    /// for an owner whose state was never charged.
+    fn release_handles_without_refund(self) {
+        let mut owner = std::mem::ManuallyDrop::new(self);
+        // SAFETY: `owner` is never used or dropped again; each field is
+        // moved out exactly once and dropped normally.
+        unsafe {
+            drop(std::ptr::read(&owner.relational));
+            drop(std::ptr::read(&owner.graph));
+            drop(std::ptr::read(&owner.accountant));
+            drop(std::ptr::read(&mut owner._writer_use));
+        }
+    }
+}
+
 impl Drop for RetainedNonVectorMemoryOwner {
     fn drop(&mut self) {
         let metadata = self.relational.table_meta.read().clone();
@@ -14113,6 +14144,21 @@ struct PendingStoreRelease {
 }
 
 impl StoreFinalization {
+    /// A store loaded from disk owes nothing for its loaded rows, edges and
+    /// metadata until `account_loaded_state` has charged them, so it has no
+    /// retained-state owner until then: an open that fails earlier has
+    /// nothing to refund that it never charged.
+    fn defer_loaded_state_owner(&self) {
+        if let Some(owner) = self.non_vector_memory.lock().take() {
+            owner.release_handles_without_refund();
+        }
+    }
+
+    fn install_loaded_state_owner(&self, owner: RetainedNonVectorMemoryOwner) {
+        let previous = self.non_vector_memory.lock().replace(owner);
+        assert!(previous.is_none(), "one retained-state owner per store");
+    }
+
     fn prepare(
         relational: Arc<RelationalStore>,
         graph: Arc<GraphStore>,
@@ -14122,10 +14168,7 @@ impl StoreFinalization {
         use std::mem::ManuallyDrop;
         let (accountant, writer_use, vector_accountant) = budget.into_accountant();
         let provider = writer_read::WriterStagedPostingAdmission::prepare(accountant.clone())?;
-        let non_vector_memory = RetainedNonVectorMemoryOwner {
-            _writer_use: crate::memory_accounting::WriterUse::retain_if_writer(&accountant),
-            relational, graph, accountant: accountant.clone(),
-        };
+        let non_vector_memory = RetainedNonVectorMemoryOwner::new(relational, graph, accountant.clone());
         let mut value = Self {
             live_holders: AtomicUsize::new(1),
             pending: ManuallyDrop::new(Mutex::new(None)),
@@ -14138,7 +14181,7 @@ impl StoreFinalization {
             control: None,
         };
         let bytes = crate::memory_accounting::writer_adapter_layout(&value).size();
-        value.control = Some(crate::memory_accounting::ControlCredit::admit(
+        value.control = Some(crate::memory_accounting::ControlCredit::admit_assembly(
             &value.accountant, bytes, "store_finalization_control",
         )?);
         Ok(Arc::new(value))
@@ -18330,13 +18373,21 @@ impl DurableVectorGenerationLoader {
                     let resident = vector_paged_build::PAGED_GENERATION_RESIDENT_BYTES as usize;
                     #[cfg(feature = "test-seams")]
                     contextdb_vector::hnsw::observe_paged_resident_admission(resident, metadata_workspace);
+                    // The fresh tail built after this graph is retained under
+                    // the same owner: admit its resident bound and workspace
+                    // now, exactly as the unpaged path does, so the tail bytes
+                    // the generation later returns were charged here.
+                    let admitted = resident
+                        .checked_add(tail_resident)
+                        .and_then(|value| value.checked_add(tail_workspace))
+                        .ok_or_else(|| Error::Other("retained vector load overflow".to_string()))?;
                     self.accountant.try_allocate_for(
-                        resident,
+                        admitted,
                         "vector_index",
                         "load_retained_vector_generation",
                         "Evict another vector partition or raise MEMORY_LIMIT before loading this maintained route.",
                     )?;
-                    owned = resident;
+                    owned = admitted;
                     Self::load_checkpoint(request)?;
                     let graph = self.paged_generation_graph(saved.bytes)?;
                     contextdb_core::find_attribution::note_saved_graph_load(
@@ -18825,6 +18876,8 @@ fn paged_generation_graph_from(
             })?,
         node_limit,
         checkpoint: Arc::new(|| Ok(())),
+        page_set: meta.page_set,
+        verified: Arc::new(parking_lot::Mutex::new(false)),
     });
     #[cfg(feature = "test-seams")]
     contextdb_vector::hnsw::observe_paged_native_control_allocation();
@@ -18843,6 +18896,7 @@ fn paged_generation_graph_from(
 }
 
 impl DormantVectorGraphLoader for DurableVectorGenerationLoader {
+
     fn load(
         &self,
         generation: DormantVectorGraphGeneration,
@@ -19921,6 +19975,43 @@ impl MaintenanceContext {
         self.vector
             .record_partition_maintenance_failure_details(partition, details)?;
         Ok(outcome)
+    }
+
+    /// Reclaim the deferred-free backlog in at most `RECLAIM_STEPS_PER_CYCLE` bounded durable
+    /// steps, stopping at the cycle's sampled boundary, at work a reader or savepoint still
+    /// protects, at a stop request (through `build_checkpoint` before every step), or as soon as a
+    /// foreground writer waits for the write slot. Committed steps stay durable; whatever remains is
+    /// reclaimed by later cycles.
+    fn reclaim_deferred_storage(&self) -> Result<()> {
+        let Some(persistence) = self.persistence.as_ref() else {
+            return Ok(());
+        };
+        // A storage compaction sweep reclaims deferred frees in its own batches while it relocates
+        // pages toward the front of the file; extra commits here would allocate behind it. The
+        // stage resumes on the first cycle after the sweep completes.
+        if persistence.storage_compaction_fragmentation_ratio()?.is_some() {
+            return Ok(());
+        }
+        let mut boundary = None;
+        #[cfg(feature = "test-seams")]
+        RECLAIM_STEPS_LAST_CYCLE_FOR_TEST.with(|steps| steps.set(0));
+        for _ in 0..reclaim_steps_per_cycle() {
+            self.build_checkpoint()?;
+            match persistence.reclaim_deferred_step(boundary)? {
+                redb::ReclaimStep::Progressed(next) => {
+                    boundary = Some(next);
+                    #[cfg(feature = "test-seams")]
+                    RECLAIM_STEPS_LAST_CYCLE_FOR_TEST.with(|steps| steps.set(steps.get() + 1));
+                }
+                redb::ReclaimStep::Drained
+                | redb::ReclaimStep::ReaderHeld
+                | redb::ReclaimStep::Blocked => break,
+            }
+            if persistence.has_waiting_writer() {
+                break;
+            }
+        }
+        Ok(())
     }
 
     fn build_checkpoint(&self) -> Result<()> {
@@ -22056,7 +22147,19 @@ impl MaintenanceContext {
                                 })
                                 .unwrap_or(0)
                         };
-                        if durable_generation != previous_generation {
+                        // A quarantined route with no readable catalog falls back to
+                        // the highest generation key on disk. The candidate's own
+                        // saved objects are already installed under its ids before
+                        // this check, so they are its staging, not a competing
+                        // publication; counting them made every attempt abandon
+                        // itself and retry under a fresh id without end.
+                        let candidate_owns_durable = quarantined
+                            && (durable_generation == candidate.catalog.base.generation_id
+                                || candidate
+                                    .catalog
+                                    .change
+                                    .is_some_and(|change| change.generation_id == durable_generation));
+                        if durable_generation != previous_generation && !candidate_owns_durable {
                             return Ok(false);
                         }
                         self.admit_generation_disk(prepared.write_reservation_bytes())?;
@@ -22111,6 +22214,7 @@ impl MaintenanceContext {
                 return self.retain_published_vector_cleanup_failure(partition, &error).map(Some);
             }
 
+                        let repaired_generation_id = candidate.catalog.base.generation_id;
                         let (published_catalog, cleanup_complete) = if quarantined {
                             let cleanup = self.tx_mgr.with_maintenance_publication(|publication| -> Result<_> {
                     self.build_checkpoint()?;
@@ -22200,6 +22304,38 @@ impl MaintenanceContext {
                                 Err(
                                     error @ (Error::ReadCancelled | Error::PublicationInterrupted),
                                 ) => {
+                                    // A stop after the repair's durable publication
+                                    // does not undo it: the replacement serves, and
+                                    // only its covered-evidence cleanup is left for
+                                    // the next cycle.
+                                    if partition_state_present {
+                                        if let Some(durable) = persistence
+                                            .load_vector_partition_generation_catalog_for(
+                                                &partition.index,
+                                                &partition.partition_key,
+                                            )?
+                                            .filter(|durable| {
+                                                durable.base.generation_id
+                                                    == repaired_generation_id
+                                            })
+                                        {
+                                            match self.install_published_vector_catalog(
+                                                &durable,
+                                                read_memory.clone(),
+                                            ) {
+                                                Ok(()) => {}
+                                                Err(
+                                                    install @ (Error::MemoryBudgetExceeded { .. }
+                                                    | Error::DiskBudgetExceeded { .. }),
+                                                ) => {
+                                                    self.retain_published_vector_cleanup_failure(
+                                                        partition, &install,
+                                                    )?;
+                                                }
+                                                Err(install) => return Err(install),
+                                            }
+                                        }
+                                    }
                                     return Err(error);
                                 }
                                 Err(error) => {
@@ -22474,6 +22610,8 @@ impl MaintenanceContext {
             .retire_snapshot_free_vector_partitions(read_memory.clone())?
             .first);
         vector.first_failure = vector.first_failure_details.map(|details| details.failure);
+        // Reclaim the deferred-free backlog before compaction, so compaction sees the free space.
+        self.reclaim_deferred_storage()?;
         // The rare, interval-gated automatic compaction path -- see
         // `maybe_auto_compact`'s own doc comment. Runs LAST, after every
         // scoped pass this cycle already did its own work, and (like every
@@ -22742,6 +22880,41 @@ pub(crate) const TRIGGER_AUDIT_RETENTION: Duration = Duration::from_secs(7 * 24 
 /// [`CURRENCY_COMPACTION_SUPERSEDED_THRESHOLD`], so a quiet node does near-zero
 /// work, and only a tick that actually did something prints a receipt line.
 pub(crate) const MAINTENANCE_TICK: Duration = Duration::from_secs(60);
+/// Upper bound on bounded reclaim steps one maintenance cycle performs.
+const RECLAIM_STEPS_PER_CYCLE: usize = 64;
+
+#[cfg(feature = "test-seams")]
+thread_local! {
+    /// Test-only override of the per-cycle reclaim step limit for cycles run on this thread.
+    static RECLAIM_STEPS_PER_CYCLE_FOR_TEST: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    /// Durable reclaim steps the last reclaim stage on this thread committed.
+    static RECLAIM_STEPS_LAST_CYCLE_FOR_TEST: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: cap the reclaim steps a maintenance cycle run on this thread may take (`None`
+/// restores the production limit), so a test can prove the per-cycle bound with a small backlog.
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub fn set_reclaim_steps_per_cycle_for_test(steps: Option<usize>) {
+    RECLAIM_STEPS_PER_CYCLE_FOR_TEST.with(|limit| limit.set(steps));
+}
+
+/// Test-only: durable reclaim steps committed by the last maintenance cycle run on this thread.
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub fn reclaim_steps_last_cycle_for_test() -> usize {
+    RECLAIM_STEPS_LAST_CYCLE_FOR_TEST.with(std::cell::Cell::get)
+}
+
+fn reclaim_steps_per_cycle() -> usize {
+    #[cfg(feature = "test-seams")]
+    if let Some(steps) = RECLAIM_STEPS_PER_CYCLE_FOR_TEST.with(std::cell::Cell::get) {
+        return steps;
+    }
+    RECLAIM_STEPS_PER_CYCLE
+}
 pub(crate) const MAINTENANCE_POLL_INTERVAL_CONFIG_KEY: &str = "maintenance_poll_interval_ms";
 pub(crate) const VECTOR_SERVING_CACHE_CONFIG_KEY: &str = "vector_serving_cache_bytes";
 
@@ -26130,9 +26303,9 @@ impl Database {
         declared_read_memory: Arc<crate::vector_read_memory::DeclaredReadMemory>,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Self> {
-        let _decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
-            writer_budget.accountant(),
-        )?;
+        let _decode_scope = crate::read_image_memory::ImageMemory::operation_reader(
+            writer_budget.accountant(), read_memory.clone(),
+        )?.enter();
         #[cfg(feature = "test-seams")]
         crate::read_probe::note_writable_database_open();
         let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
@@ -26179,9 +26352,9 @@ impl Database {
         read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         declared_read_memory: Arc<crate::vector_read_memory::DeclaredReadMemory>,
     ) -> Result<Self> {
-        let _decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
-            writer_budget.accountant(),
-        )?;
+        let _decode_scope = crate::read_image_memory::ImageMemory::operation_reader(
+            writer_budget.accountant(), read_memory.clone(),
+        )?.enter();
         let accountant = writer_budget.accountant();
         let vector_accountant = writer_budget.vector_accountant();
         persistence.require_current_content_identity()?;
@@ -26337,6 +26510,7 @@ impl Database {
         let finalization = StoreFinalization::prepare(
             relational.clone(), graph.clone(), vector.clone(), DatabaseAssemblyBudget::Writer(writer_budget),
         )?;
+        finalization.defer_loaded_state_owner();
         let composite = CompositeStore::new_with_apply_phase_pause(
             relational.clone(),
             graph.clone(),
@@ -26671,7 +26845,7 @@ impl Database {
             }
         }
         let max_row_id = max_row_id.max(lineage_bounds.max_row_id);
-        let max_lsn = max_lsn_across_all(&relational, &graph, &vector, &mut vector_copy_owner)?
+        let max_lsn = max_lsn_across_all(&relational, &graph)
             .max(commit_index_max_lsn)
             .max(ddl_max_lsn)
             .max(lineage_bounds.purge_frontier_max_lsn)
@@ -26717,6 +26891,7 @@ impl Database {
         let finalization = StoreFinalization::prepare(
             relational.clone(), graph.clone(), vector.clone(), DatabaseAssemblyBudget::ReadImage(accountant.clone()),
         )?;
+        finalization.defer_loaded_state_owner();
         let composite = CompositeStore::new_with_apply_phase_pause(
             relational.clone(),
             graph.clone(),
@@ -30432,10 +30607,11 @@ impl Database {
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
         read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<CommitValidationOutcome> {
-        // Commit preparation also validates serialized JSON before entering
-        // persistence. Fund that decode from this database's writer owner.
-        let _decode_scope =
-            crate::read_image_memory::ImageMemory::enter_writer_operation(Arc::clone(&self.finalization.accountant))?;
+        // Source reads in preparation use this operation's reader. Each actual
+        // persistence write admits its own writer decode scope at that boundary.
+        let _decode_scope = crate::read_image_memory::ImageMemory::operation_reader(
+            self.accountant.clone(), read_memory.clone(),
+        )?.enter();
         (|| {
             let vector_copy_owner = std::cell::RefCell::new(vector_copy_owner);
 
@@ -34899,6 +35075,18 @@ impl Database {
                 }
             }
         }
+        // The working image's retained-state owner returns the metadata fold
+        // when it drops; charge exactly that fold now, so the drop refunds a
+        // charge this image actually holds.
+        let metadata_bytes = working
+            .relational_store
+            .table_meta
+            .read()
+            .values()
+            .fold(0usize, |bytes, meta| {
+                bytes.saturating_add(retained_table_metadata_bytes(&working.relational_store, meta))
+            });
+        working.finalization.accountant.charge_retained(metadata_bytes);
         Ok(working)
     }
 
@@ -37774,6 +37962,7 @@ impl Database {
         // prepared memory image into place.
         let committed_result = std::cell::RefCell::new(None);
         let committed_write_set = std::cell::RefCell::new(None);
+        let published_stage = std::cell::RefCell::new(None::<ReceivedSchemaStage>);
         let policy_releases = std::cell::RefCell::new(Vec::new());
         let policy_release_memory = std::cell::RefCell::new(Vec::new());
         // Held outside the callbacks so it outlives every one of them. Its
@@ -37923,17 +38112,8 @@ impl Database {
                         *committed_result.borrow_mut() = Some(
                             crate::protocol::WireApplyResult::from(stage.apply_result.clone()),
                         );
-                        // Past this point publication does no fallible work:
-                        // every schema/index artifact it installs was prepared
-                        // and admitted before the durable commit.
-                        self.publish_received_schema_stage(stage);
-                        self.vector_schema_gates.bump_epochs(&changed_vector_refs);
-                        if self.persistence.is_none() {
-                            self.in_memory_sync_progress
-                                .lock()
-                                .policy_hold_releases
-                                .extend(policy_releases.borrow_mut().drain(..));
-                        }
+                        // Published below, once the commit boundary is released.
+                        *published_stage.borrow_mut() = Some(stage);
                     }
                 },
             )
@@ -37947,6 +38127,24 @@ impl Database {
                 }
                 failure.error
             });
+        // Two orders meet here. Durable order: this stage's commit, and its
+        // storage-version publication, completed under the commit boundary
+        // above; nothing below writes. In-memory order: the stage is published
+        // only now, after that boundary is released, so a commit or sink
+        // acknowledgement queued behind the boundary never waits on this
+        // in-memory publication. Past this point publication does no fallible
+        // work: every schema/index artifact it installs was prepared and
+        // admitted before the durable commit.
+        if let Some(stage) = published_stage.into_inner() {
+            self.publish_received_schema_stage(stage);
+            self.vector_schema_gates.bump_epochs(&changed_vector_refs);
+            if self.persistence.is_none() {
+                self.in_memory_sync_progress
+                    .lock()
+                    .policy_hold_releases
+                    .extend(policy_releases.borrow_mut().drain(..));
+            }
+        }
         // Whatever the outcome, the registration stops holding the stage here.
         drop(registration.into_inner());
         // Publication returned, or the commit failed with an ordinary error:
@@ -44152,6 +44350,7 @@ impl Database {
                     snapshot,
                     &mut cursor,
                     || Ok::<(), Error>(()),
+                    || Ok::<(), Error>(()),
                     |_| Ok(()),
                     |_| Ok(()),
                     |bytes| {
@@ -44344,7 +44543,7 @@ impl Database {
             )));
         };
         row_id
-            .map(|row_id| self.committed_row_at(table, row_id, snapshot, read_memory.clone()))
+            .map(|row_id| self.committed_indexed_point_row_at(table, row_id, snapshot, read_memory.clone()))
             .transpose()
             .map(Option::flatten)
     }
@@ -47584,6 +47783,29 @@ impl Database {
         Ok(None)
     }
 
+    /// Rehydrate the identity selected by the captured, witnessed index point
+    /// lookup above without enumerating its retained version manifest again.
+    fn committed_indexed_point_row_at(
+        &self, table: &str, row_id: RowId, snapshot: SnapshotId,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<Option<VersionedRow>> {
+        let Some(root) = self.writer_read_root()? else {
+            return self.committed_row_at(table, row_id, snapshot, read_memory);
+        };
+        let source = crate::persistence::writer_adapters::WriterRelationalSource::new_for_read(
+            root, read_memory.clone(),
+        )?;
+        let window = source.indexed_point_row(table, row_id, snapshot)?;
+        let mut output = contextdb_core::read_memory::ReadCredit::new(read_memory);
+        let row = window.map(|window| {
+            output.try_grow_for(window.value().estimated_bytes(), "writer_source", "row_output",
+                "Raise the declared reader memory limit to return this row.")?;
+            Ok(window.value().clone())
+        }).transpose();
+        self.retain_writer_output(output);
+        row
+    }
+
     fn committed_rows_at(
         &self,
         table: &str,
@@ -47743,6 +47965,31 @@ impl Database {
             inserts.reverse();
             rows.extend(inserts);
         })
+    }
+
+    /// Every row the statement's snapshot (and transaction, if any) can see, before any access
+    /// gate. Only for a caller that applies the complete predicate and then the refusing gate.
+    pub(crate) fn scan_rows_ungated_for_select(
+        &self,
+        tx: Option<TxId>,
+        table: &str,
+        snapshot: SnapshotId,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<Vec<VersionedRow>> {
+        if let Some(tx) = tx {
+            return self.scan_in_tx_raw(tx, table, snapshot, vector_copy_owner, read_memory);
+        }
+        let _operation = self.open_operation()?;
+        let mut rows = self.committed_rows_at(table, snapshot, read_memory.clone())?;
+        self.supplement_quantized_vectors(
+            table,
+            snapshot,
+            &mut rows,
+            vector_copy_owner,
+            read_memory.clone(),
+        )?;
+        Ok(rows)
     }
 
     pub(crate) fn scan_in_tx_raw(
@@ -50127,7 +50374,10 @@ impl Database {
             read_memory,
             executing_owner,
         )
-        .map(|(results, _)| results)
+        .map(|(results, trace)| {
+            self.publish_vector_search_trace(trace.into_published());
+            results
+        })
     }
 
     pub(crate) fn semantic_search_with_candidates(
@@ -50183,7 +50433,11 @@ impl Database {
             read_memory.clone(),
             executing_owner.clone(),
         )
-        .map(|(results, trace)| (results, trace.used_hnsw))
+        .map(|(results, trace)| {
+            let used_hnsw = trace.used_hnsw;
+            self.publish_vector_search_trace(trace.into_published());
+            (results, used_hnsw)
+        })
     }
 
     pub(crate) fn semantic_search_with_candidates_under_schema_read_in_tx_with_strategy(
@@ -53273,9 +53527,12 @@ impl Database {
             .saturating_add(metadata_bound.saturating_mul(4))
             .saturating_add(edges_bound.saturating_mul(4))
             .max(1);
-        let image = crate::read_image_memory::ImageMemory::charging_reader_for(
+        // An authoritative purge is writer work: its replacement image is engine
+        // write working memory, which the writer budget covers. The caller's
+        // declared read memory funds only the reads it asked for.
+        drop(read_memory);
+        let image = crate::read_image_memory::ImageMemory::charging_for(
             Arc::clone(&self.finalization.accountant),
-            read_memory,
             "vector",
             "prepare_authoritative_vector_purge",
             "Raise MEMORY_LIMIT or reduce the selected purge set before preparing its replacement vector image.",
@@ -57260,6 +57517,7 @@ impl Database {
         index: &str,
         snapshot: SnapshotId,
         cursor: &mut contextdb_relational::mem::BoundedExactIndexCursor,
+        mut before_storage_step: impl FnMut() -> std::result::Result<(), E>,
         mut before_touch: impl FnMut() -> std::result::Result<(), E>,
         before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
         release_retained: impl FnMut(usize) -> std::result::Result<(), E>,
@@ -57291,6 +57549,7 @@ impl Database {
                 declaration,
                 snapshot,
                 cursor,
+                &mut before_storage_step,
                 &mut before_touch,
                 &mut before_clone,
                 read_memory.clone(),
@@ -57308,6 +57567,7 @@ impl Database {
                 index,
                 snapshot,
                 cursor,
+                before_storage_step,
                 before_touch,
                 before_retain,
                 release_retained,
@@ -62615,7 +62875,7 @@ impl Database {
             }
             let prepared = self
                 .relational_store
-                .prepare_retention_expiries(identities, self.finalization.accountant.read_budget()?)?;
+                .prepare_retention_expiries(identities, self.finalization.accountant.assembly_read_budget()?)?;
             self.relational_store.publish_retention_expiries(prepared);
         }
         let metadata_bytes =
@@ -62626,12 +62886,22 @@ impl Database {
                 .fold(0usize, |acc, meta| {
                     acc.saturating_add(retained_table_metadata_bytes(&self.relational_store, meta))
                 });
+        // Charges taken so far are returned if a later one is refused: until
+        // the whole set is charged, the retained-state owner refunds nothing.
+        struct LoadedCharges<'a>(&'a MemoryAccountant, usize);
+        impl Drop for LoadedCharges<'_> {
+            fn drop(&mut self) {
+                self.0.release(self.1);
+            }
+        }
+        let mut charged = LoadedCharges(self.finalization.accountant.as_ref(), 0);
         self.finalization.accountant.try_allocate_for(
             metadata_bytes,
             "open",
             "load_table_metadata",
             "Open the database with a larger MEMORY_LIMIT or reduce stored schema metadata.",
         )?;
+        charged.1 = metadata_bytes;
 
         let row_bytes =
             self.relational_store
@@ -62671,6 +62941,7 @@ impl Database {
             "load_rows",
             "Open the database with a larger MEMORY_LIMIT or prune retained rows first.",
         )?;
+        charged.1 = charged.1.saturating_add(row_bytes);
 
         let edge_bytes = self
             .graph_store
@@ -62687,6 +62958,7 @@ impl Database {
             "load_edges",
             "Open the database with a larger MEMORY_LIMIT or reduce graph edge volume.",
         )?;
+        charged.1 = charged.1.saturating_add(edge_bytes);
 
         // The vector store attaches the exact open-time reservations to the
         // directory/raw objects that own them. A later DROP or eviction can
@@ -62694,6 +62966,12 @@ impl Database {
         // it from a different cache state.
         self.vector_store
             .account_loaded_state(Arc::clone(&self.finalization.vector_accountant))?;
+        charged.1 = 0;
+        self.finalization.install_loaded_state_owner(RetainedNonVectorMemoryOwner::new(
+            self.relational_store.clone(),
+            self.graph_store.clone(),
+            Arc::clone(&self.finalization.accountant),
+        ));
 
         Ok(())
     }
@@ -63233,6 +63511,20 @@ impl Database {
         &self,
     ) -> Result<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>> {
         self.declared_read_memory.child()
+    }
+
+    /// Bytes the declared reader memory currently holds for reads.
+    pub(crate) fn declared_read_charged_bytes(&self) -> u64 {
+        self.declared_read_memory.charged_bytes()
+    }
+
+    /// Observe the reader parent that funds operation and cursor owners.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn declared_read_memory_for_test(
+        &self,
+    ) -> Arc<crate::vector_read_memory::DeclaredReadMemory> {
+        self.declared_read_memory.clone()
     }
 
     pub fn declared_read_request_provider(
@@ -69656,10 +69948,11 @@ impl Database {
                             &row,
                             snapshot,
                             read_memory.clone(),
-                        )? && let Some((_, values)) = self.row_change_values_projected(
+                        )? && let Some((_, values)) = self.row_change_values_projected_at(
                             &index.table,
                             &row,
                             projection,
+                            snapshot,
                             vector_copy_owner,
                             read_memory.clone(),
                         )? && let Some(Value::Vector(vector)) = values.get(&index.column)
@@ -70690,6 +70983,13 @@ impl Database {
     ) -> Result<ChangeSet> {
         (|| {
             let _operation = self.open_operation()?;
+            // A change read is funded by the caller's declared reader memory;
+            // its stored-record decodes never spend the writer's budget.
+            let decode = crate::read_image_memory::ImageMemory::operation_reader(
+                self.accountant.clone(),
+                read_memory.clone(),
+            )?;
+            let _decode = decode.enter();
             self.changes_since_under_schema_gate(since_lsn, vector_copy_owner, read_memory.clone())
         })()
     }
@@ -72302,11 +72602,69 @@ impl Database {
 
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-seams"))]
+    pub fn __damage_paged_route_pages_for_test(
+        path: &Path,
+        partition: &VectorPartitionRef,
+        other: Option<&VectorPartitionRef>,
+        fault: crate::persistence::PagedRouteFaultForTest,
+    ) -> Result<()> {
+        RedbPersistence::damage_paged_route_pages_for_test(path, partition, other, fault)
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
     pub fn __corrupt_vector_partition_graph_page_for_test(
         path: &Path,
         partition: &VectorPartitionRef,
     ) -> Result<()> {
         RedbPersistence::corrupt_vector_partition_graph_page_for_test(path, partition)
+    }
+
+    /// Declared relational indexes whose physical table no longer matches the
+    /// root its writer last published. Reads that consume an index's physical
+    /// postings refuse such an index; a read that asks only the canonical
+    /// tree still answers and records it here. Repair: recreate the store.
+    pub fn index_root_damage(&self) -> Result<Vec<(String, String)>> {
+        let _operation = self.open_operation()?;
+        let Some(persistence) = self.persistence.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let indexes = self
+            .relational_store
+            .table_meta
+            .read()
+            .iter()
+            .flat_map(|(table, meta)| {
+                meta.indexes
+                    .iter()
+                    .map(|index| (table.clone(), index.name.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        persistence.index_root_damage(&indexes)
+    }
+
+    /// Indexes a canonical-only read of the store at `path`, in this process,
+    /// found disagreeing with their writer's published root.
+    pub fn observed_index_root_damage(path: impl AsRef<Path>) -> Result<Vec<(String, String)>> {
+        let path = canonical_database_path(path.as_ref())?;
+        Ok(crate::persistence::history_root_witness::observed_index_root_damage(&path))
+    }
+
+    /// Strict index-table root checks made on this thread. Every read that
+    /// opens a physical index cursor, an ordered window or a maintained group
+    /// makes one.
+    #[doc(hidden)]
+    #[cfg(feature = "test-seams")]
+    pub fn __strict_index_root_checks_for_test() -> u64 {
+        crate::persistence::history_root_witness::strict_index_root_checks_for_test()
+    }
+
+    /// (route page-set verifications, pages walked, bytes hashed) on this thread.
+    #[doc(hidden)]
+    #[cfg(feature = "test-seams")]
+    pub fn __paged_route_verifications_for_test() -> (u64, u64, u64) {
+        crate::persistence::vector_paged::route_verifications_for_test()
     }
 
     #[cfg(any(test, feature = "test-seams"))]
@@ -80496,11 +80854,21 @@ impl Database {
             if self.table_meta(table).is_none() {
                 return Ok(None);
             }
+            // Authenticate only this row's retained version group before its
+            // versions are read; a whole-table history proof per change made a
+            // change read cost every change times the table's history.
+            root.visit_historical_rows(
+                table,
+                Some(row_id),
+                root.snapshot,
+                read_memory.clone(),
+                &mut || checkpoint(),
+                &mut |_| Ok(()),
+            )?;
             let source = crate::persistence::writer_adapters::WriterRelationalSource::new_for_read(
                 root,
                 read_memory.clone(),
             )?;
-            source.verify_historical_versions_with_checkpoint(table, &mut || checkpoint())?;
             let mut cursor = source.row_id_cursor(table, row_id, source.snapshot())?;
             while let Some(window) = cursor.next_window_before(&mut || checkpoint())? {
                 if window.value().lsn == lsn {
@@ -80579,10 +80947,30 @@ impl Database {
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Option<(NaturalKey, HashMap<String, Value>)>> {
+        self.row_change_values_projected_at(
+            table,
+            row,
+            projection,
+            SnapshotId(row.created_tx.0),
+            vector_copy_owner,
+            read_memory,
+        )
+    }
+
+    fn row_change_values_projected_at(
+        &self,
+        table: &str,
+        row: &VersionedRow,
+        projection: &ChangeProjection<'_>,
+        snapshot: SnapshotId,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<Option<(NaturalKey, HashMap<String, Value>)>> {
         if !projection.bounded {
-            return self.row_change_values_from_row(
+            return self.row_change_values_from_row_at(
                 table,
                 row,
+                snapshot,
                 vector_copy_owner,
                 read_memory.clone(),
             );
@@ -80618,9 +81006,10 @@ impl Database {
             projection,
             read_memory.clone(),
         )?);
-        self.fill_quantized_from_store(
+        self.fill_quantized_columns(
             table,
             row,
+            snapshot,
             &mut values,
             vector_copy_owner,
             read_memory.clone(),
@@ -80632,6 +81021,23 @@ impl Database {
         &self,
         table: &str,
         row: &VersionedRow,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<Option<(NaturalKey, HashMap<String, Value>)>> {
+        self.row_change_values_from_row_at(
+            table,
+            row,
+            SnapshotId(row.created_tx.0),
+            vector_copy_owner,
+            read_memory,
+        )
+    }
+
+    fn row_change_values_from_row_at(
+        &self,
+        table: &str,
+        row: &VersionedRow,
+        snapshot: SnapshotId,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Option<(NaturalKey, HashMap<String, Value>)>> {
@@ -80655,9 +81061,10 @@ impl Database {
             &ChangeProjection::unbounded(),
             read_memory.clone(),
         )?);
-        self.fill_quantized_from_store(
+        self.fill_quantized_columns(
             table,
             row,
+            snapshot,
             &mut values,
             vector_copy_owner,
             read_memory.clone(),
@@ -85234,12 +85641,12 @@ fn max_tx_across_all(
     Ok(relational_max.max(graph_max).max(vector_max))
 }
 
-fn max_lsn_across_all(
-    relational: &RelationalStore,
-    graph: &GraphStore,
-    vector: &VectorStore,
-    vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-) -> Result<Lsn> {
+/// Vector memberships are written only by commits, and every commit's LSN is
+/// bounded by the authenticated commit directory, DDL log and source floor the
+/// caller folds in -- the same bound a writer derives its next LSN from
+/// (`writer_open_bounds_in_read`). Walking every membership here would make
+/// read-only open proportional to stored vectors.
+fn max_lsn_across_all(relational: &RelationalStore, graph: &GraphStore) -> Lsn {
     let relational_max = relational
         .tables
         .read()
@@ -85254,14 +85661,7 @@ fn max_lsn_across_all(
         .flat_map(|entries| entries.iter().map(|entry| entry.lsn))
         .max()
         .unwrap_or(Lsn(0));
-    let vector_max = vector
-        .raw_directory_entries(vector_copy_owner)?
-        .into_iter()
-        .map(|(_, entry)| entry.lsn)
-        .max()
-        .unwrap_or(Lsn(0));
-
-    Ok(relational_max.max(graph_max).max(vector_max))
+    relational_max.max(graph_max)
 }
 
 /// Given a delete's threshold `lsn`, return the `deleted_tx` of the tombstone
@@ -89640,7 +90040,7 @@ mod table_size_estimate_tests {
     fn a_table_size_that_cannot_be_read_is_never_reported_as_a_smaller_table() {
         let directory = tempfile::TempDir::new().expect("task-scoped size directory");
         let path = directory.path().join("sized.db");
-        let database = seeded(&path);
+        let mut database = seeded(&path);
 
         let healthy = database
             .table_size_estimates()
@@ -89667,21 +90067,21 @@ mod table_size_estimate_tests {
         );
 
         crate::persistence::arm_stored_relational_row_bytes_fault_for_test();
+        let failed = database
+            .table_size_estimate("notes")
+            .expect_err("the fallible single-table API reports the unreadable stored size");
         assert!(
-            database
-                .table_size_estimate("notes")
-                .expect("read the actual fixture observation")
-                .is_none(),
-            "the answer with nowhere to put a reason says nothing at all rather than \
-             a figure that is too small"
+            failed.to_string().contains("injected stored relational row size read failure"),
+            "the single-table caller is told what failed: {failed}"
         );
 
         // A run of rows is room, and room is admitted: a budget with none left
         // refuses the answer instead of building the whole table's lists.
-        let used = database.accountant().usage().used;
-        database
-            .set_memory_limit(Some(used.saturating_add(8)))
-            .expect("declare a budget with no room to spare");
+        let used = database.declared_read_memory.retained_bytes_for_test();
+        let original_reader = std::mem::replace(
+            &mut database.declared_read_memory,
+            crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(used.saturating_add(8)),
+        );
         let refused = database
             .table_size_estimates()
             .expect_err("sizing a table takes room it must be admitted for");
@@ -89689,7 +90089,7 @@ mod table_size_estimate_tests {
             matches!(refused, Error::MemoryBudgetExceeded { .. }),
             "the refusal is the typed memory one: {refused}"
         );
-        database.set_memory_limit(None).expect("lift the budget");
+        database.declared_read_memory = original_reader;
 
         database.close().expect("release the store");
     }
@@ -90260,8 +90660,10 @@ pub(crate) fn returned_loader_rows_for_test() {
         assert_eq!(owner.writer_fixed_ownership().2, payload_controls);
     }
     {
+        use crate::persistence::vector_membership_source::{
+            DurableMembershipSource, MembershipOwner,
+        };
         use contextdb_vector::store::RawVectorMembershipSource;
-        use crate::persistence::vector_membership_source::{DurableMembershipSource, MembershipOwner};
         let retained = copy_owner.scratch();
         let directory = DurableMembershipSource::from_owner_admitted(
             MembershipOwner::Writable(source.clone()), None, &partition,
@@ -90496,9 +90898,9 @@ pub(crate) fn returned_loader_rows_for_test() {
 
 #[cfg(all(test, feature = "test-seams"))]
 fn initialized_prepaid_controls_for_test() {
-    use crate::persistence::content_identity::proof_allocation_oracle_tests::{measured,
-        last_request_for_test, last_request_pointer_for_test, watch_registry_free_for_test,
-        registry_free_observation_for_test};
+    use crate::persistence::content_identity::proof_allocation_oracle_tests::{last_request_for_test, last_request_pointer_for_test, measured,
+        registry_free_observation_for_test, watch_registry_free_for_test,
+        };
     let owner = Arc::new(MemoryAccountant::no_limit());
     let writer = crate::memory_accounting::WriterBudget::from_accountant(owner.clone()).unwrap();
     let registration = owner.writer_registration_observation_for_test();
@@ -90539,9 +90941,9 @@ fn initialized_prepaid_controls_for_test() {
 
 #[cfg(all(test, feature = "test-seams"))]
 fn initialized_received_access_for_test() {
-    use crate::persistence::content_identity::proof_allocation_oracle_tests::{measured,
-        last_request_for_test, last_request_pointer_for_test, watch_registry_free_for_test,
-        registry_free_observation_for_test};
+    use crate::persistence::content_identity::proof_allocation_oracle_tests::{last_request_for_test, last_request_pointer_for_test, measured,
+        registry_free_observation_for_test, watch_registry_free_for_test,
+        };
     let owner = Arc::new(MemoryAccountant::no_limit());
     let source = Database::open_memory_with_accountant(owner.clone());
     source.execute("CREATE TABLE received_access_table (id INTEGER PRIMARY KEY)", &HashMap::new()).unwrap();

@@ -400,8 +400,8 @@ pub(super) fn validate_universe(
             .map_err(|reason| damage(&reason))?;
         window.reserve(vector_partition_route_native_capacity(payload).map_err(|reason| damage(&reason))?
             .checked_mul(6).ok_or_else(|| damage("vector route clone capacity overflow"))?)?;
-        let member: VectorPartitionMembershipRecord = decode_vector_partition_record_payload(
-            VectorPartitionRecordKind::Membership, value.value()).map_err(|reason| damage(&reason))?;
+        let member: VectorPartitionMembershipRecord = decode_vector_partition_record_payload_checked(
+            VectorPartitionRecordKind::Membership, value.value()).map_err(|failure| failure.into_error(|reason| damage(&reason)))?;
         let partition = VectorPartitionRef::new(member.index.clone(), member.partition_key.clone());
         decode_forward(&partition, key.value(), value.value())?;
         let context = OPERATION.with(|slot| slot.borrow().clone())
@@ -453,7 +453,12 @@ pub(super) fn validate_universe(
     let body_count = vector_membership_pages::referenced_body_count_in_read(read)?;
     if vectors.as_ref().map(|table| table.len().map_err(vector_membership_pages::metadata_error)).transpose()?.unwrap_or(0) != body_count
         || projection.root_with_vector_body_count(body_count) != content_identity::vector_directory_projection_in_read(read)
-            .map_err(|error| damage(&format!("captured vector root projection is invalid: {error}")))?
+            .map_err(|error| {
+                if crate::read_image_memory::is_memory_refusal(&error) || matches!(error, Error::ReadCancelled) {
+                    return error;
+                }
+                damage(&format!("captured vector root projection is invalid: {error}"))
+            })?
         || !vector_scan_body_root_matches(read)? {
         return Err(damage("captured vector body universe differs from its committed directory"));
     }
@@ -782,8 +787,8 @@ pub(crate) fn select_live_fallback(
             .map_err(|reason| damage(&reason))?;
         window.reserve(vector_partition_route_native_capacity(payload).map_err(|reason| damage(&reason))?
             .checked_mul(6).ok_or_else(|| damage("vector route clone capacity overflow"))?)?;
-        let record: VectorPartitionMembershipRecord = decode_vector_partition_record_payload(
-            VectorPartitionRecordKind::Membership, value.value()).map_err(|reason| damage(&reason))?;
+        let record: VectorPartitionMembershipRecord = decode_vector_partition_record_payload_checked(
+            VectorPartitionRecordKind::Membership, value.value()).map_err(|failure| failure.into_error(|reason| damage(&reason)))?;
         let partition = VectorPartitionRef::new(record.index.clone(), record.partition_key.clone());
         decode_forward(&partition, key.value(), value.value())?;
         authenticate_owning_row(&owner, &root.read, &record.index, &body_identity(&record), None,
@@ -963,8 +968,8 @@ fn decode_forward(
     #[cfg(feature = "test-seams")]
     crate::database::resident_history_test_seams::note(|work| work.membership_keys_examined += 1);
     let record: VectorPartitionMembershipRecord =
-        decode_vector_partition_record_payload(VectorPartitionRecordKind::Membership, value)
-            .map_err(|reason| damage(&reason))?;
+        decode_vector_partition_record_payload_checked(VectorPartitionRecordKind::Membership, value)
+            .map_err(|failure| failure.into_error(|reason| damage(&reason)))?;
     if RedbPersistence::vector_partition_membership_key(&record).as_slice() != key
         || record.index != partition.index
         || record.partition_key != partition.partition_key
@@ -1334,11 +1339,11 @@ impl DurableMembershipSource {
             if required > scratch.retained_bytes() {
                 scratch.reserve(required - scratch.retained_bytes())?;
             }
-            let record: VectorPartitionJournalRecord = decode_vector_partition_record_payload(
+            let record: VectorPartitionJournalRecord = decode_vector_partition_record_payload_checked(
                 VectorPartitionRecordKind::Journal,
                 value.value(),
             )
-            .map_err(|reason| damage(&reason))?;
+            .map_err(|failure| failure.into_error(|reason| damage(&reason)))?;
             if record.index != self.partition.index
                 || record.partition_key != self.partition.partition_key
             {
@@ -2295,11 +2300,11 @@ impl ReverseCursor {
             self.scratch.reserve(needed - self.admitted_bytes)?;
             self.admitted_bytes = needed;
         }
-        let record: VectorPartitionMembershipRecord = decode_vector_partition_record_payload(
+        let record: VectorPartitionMembershipRecord = decode_vector_partition_record_payload_checked(
             VectorPartitionRecordKind::Membership,
             value.value(),
         )
-        .map_err(|reason| damage(&reason))?;
+        .map_err(|failure| failure.into_error(|reason| damage(&reason)))?;
         if vector_membership_pages::reverse_key(&record).as_slice() != key.value()
             || record.index != self.index
             || record.row_id != self.row

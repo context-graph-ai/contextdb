@@ -2395,6 +2395,9 @@ fn resident_generation_selection_preserves_retained_canonical_digests() {
         drop(full);
         drop(selected);
         drop(old_selected);
+        drop(vector_fixture_workspace_4);
+        drop(vector_fixture_workspace_5);
+        drop(vector_fixture_workspace_6);
         let report = db.run_maintenance_cycle().unwrap();
         assert_eq!(report.vector.first_failure, None, "{report:?}");
         assert_eq!(report.vector.built_partitions, 1, "{report:?}");
@@ -3028,6 +3031,8 @@ fn resident_generation_selection_admits_history_below_the_full_copy_bound_and_re
     );
     drop(full_entries);
     drop(selected_entries);
+    drop(vector_fixture_workspace_13);
+    drop(vector_fixture_workspace_14);
     let vector_fixture_reader_15 = db
         .declared_reader_memory()
         .expect("admit the vector fixture reader");

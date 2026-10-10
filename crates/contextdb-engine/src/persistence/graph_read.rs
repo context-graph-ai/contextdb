@@ -433,7 +433,7 @@ impl GraphDiagnosis for GraphProofContext<'_> {
 fn diagnosis(source: &(impl GraphDiagnosis + ?Sized), error: LoadReadImageError) -> Error {
     source.diagnose(error)
 }
-fn image_diagnosis(source: &RetainedReadSource, error: LoadReadImageError) -> Error {
+pub(super) fn image_diagnosis(source: &RetainedReadSource, error: LoadReadImageError) -> Error {
     crate::database::ImageHistoryError::Store {
         path: source.database_path.display().to_string(),
         diagnosis: Box::new(error),
@@ -791,7 +791,7 @@ crate::read_work_probe::note_graph(redb::TableHandle::name(&definition), "get", 
             Err(e) => return Err(diagnosis(self, read_table_error(e))),
         };
         #[cfg(any(test, feature = "test-seams"))]
-crate::read_work_probe::note_graph("commit_index", "get", &j.0.to_be_bytes(), Some(j.0), Some(_role));
+crate::read_work_probe::note_graph("commit_index", "get", &j.0.to_be_bytes(), Some(contextdb_core::Lsn(j.0)), Some(_role));
         let value = table
             .get(j.0)
             .map_err(|e| diagnosis(self, read_storage_error(e)))?
@@ -832,7 +832,7 @@ crate::read_work_probe::note_graph("commit_index", "get", &j.0.to_be_bytes(), So
             .open_table(graph_history_record::GRAPH_CONTRIBUTIONS)
             .map_err(|e| diagnosis(self, read_table_error(e)))?;
         #[cfg(any(test, feature = "test-seams"))]
-crate::read_work_probe::note_graph("graph_contribution", "maximum_seek", &prefix.key, Some(a.0), None);
+crate::read_work_probe::note_graph("graph_contribution", "maximum_seek", &prefix.key, Some(contextdb_core::Lsn(a.0)), None);
         let mut range = table
             .range::<&[u8]>((
                 Bound::Included(prefix.key.as_ref()),

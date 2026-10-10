@@ -542,6 +542,12 @@ fn durable_public_mutation_surface_matches_the_frozen_allowlist() {
 
     let database_names = method_names(&database);
     let database_normal_names = method_names(&database_normal_public_methods(&engine));
+    for name in database_names.difference(&database_normal_names) {
+        assert!(
+            is_test_door(name),
+            "only test seams may disappear without their cfg: {name}"
+        );
+    }
     let client_names = method_names(&client);
     let server_names = method_names(&server);
     let accountant = public_impl_methods(
@@ -592,7 +598,7 @@ fn durable_public_mutation_surface_matches_the_frozen_allowlist() {
         .expect("the client host constructor accepts its executing read owner");
     assert_embedder_read_owner_facades(&root);
     assert_eq!(
-        database_names,
+        database_normal_names,
         frozen_names(include_str!("../fixtures/public_api_database_names.txt")),
         "Database public impl-name inventory drifted from the frozen durable surface"
     );

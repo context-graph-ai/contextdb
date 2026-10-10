@@ -80,12 +80,12 @@ fn short_authenticated_metadata_hints_are_rejected_before_the_serde_vec_reservat
     ] {
         let bytes = envelope(kind, &hostile_route(&index));
         let (unrestricted, old_peak, _) = measured(|| {
-            decode_vector_partition_record_payload::<VectorPartitionMembershipRecord>(kind, &bytes)
+            persistence.decode_vector_partition_record::<VectorPartitionMembershipRecord>(kind, &bytes)
         });
         assert!(unrestricted.is_err());
         assert!(
-            old_peak >= 1024 * 1024,
-            "fixture must exercise the initial reservation: {old_peak}"
+            old_peak < 4096,
+            "guarded generic decode must reject before a large reservation: {old_peak}"
         );
         drop(unrestricted);
         let (result, guarded_peak, _) = measured(|| {

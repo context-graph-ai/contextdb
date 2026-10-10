@@ -113,7 +113,9 @@ impl BoundedExecutionProbe for ProbeAdapter {
             BoundedSourceTouch::HnswCandidate,
             "HNSW touches must come from the sealed vector distance-loop handoff"
         );
-        self.0.before_source_touch(touch.into(), completed_items);
+        if let Some(touch) = TestSourceTouch::from_bounded(touch) {
+            self.0.before_source_touch(touch, completed_items);
+    }
     }
 
     fn before_hnsw_candidate_distance(
@@ -194,9 +196,10 @@ pub enum TestSourceTouch {
     AccessRow,
 }
 
-impl From<BoundedSourceTouch> for TestSourceTouch {
-    fn from(value: BoundedSourceTouch) -> Self {
-        match value {
+impl TestSourceTouch {
+    pub(crate) fn from_bounded(value: BoundedSourceTouch) -> Option<Self> {
+        Some(match value {
+            BoundedSourceTouch::StorageStep => return None,
             BoundedSourceTouch::TableRow => Self::TableRow,
             BoundedSourceTouch::IndexEntry => Self::IndexEntry,
             BoundedSourceTouch::SortCandidate => Self::SortCandidate,
@@ -207,6 +210,7 @@ impl From<BoundedSourceTouch> for TestSourceTouch {
             BoundedSourceTouch::RankCandidate => Self::RankCandidate,
             BoundedSourceTouch::AccessRow => Self::AccessRow,
         }
+    )
     }
 }
 

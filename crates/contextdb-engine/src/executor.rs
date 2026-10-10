@@ -855,6 +855,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         index: &str,
         snapshot: SnapshotId,
         cursor: &mut contextdb_relational::mem::BoundedExactIndexCursor,
+        before_storage_step: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         release_retained: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
@@ -1887,7 +1888,9 @@ impl ReadExecutionTarget for Database {
         params: &HashMap<String, Value>,
     ) -> bool {
         match filter {
-            Some(filter) => is_anchor_shape_index_pick(self, table, pick, filter, params),
+            Some(filter) => self
+                .table_meta(table)
+                .is_some_and(|meta| statement_names_one_row(&meta, filter, params)),
             None => pick_names_one_row(self, table, pick).is_some(),
         }
     }
@@ -1902,27 +1905,11 @@ impl ReadExecutionTarget for Database {
         let Some(meta) = self.table_meta(table) else {
             return false;
         };
-        let Some(declaration) = meta
-            .indexes
-            .iter()
-            .find(|declaration| declaration.name == index)
-        else {
-            return false;
-        };
-        let columns: Vec<&str> = declaration
-            .columns
-            .iter()
-            .map(|(column, _)| column.as_str())
-            .collect();
-        let Some(anchor_columns) = unique_anchor_columns_for_pick(&meta, &columns) else {
-            return false;
-        };
-        // A source with no residual predicate cannot be naming one row: the
-        // keys it is probing came from somewhere, and without the statement to
-        // confirm an equality there is nothing that says the somewhere was a
-        // single key.
-        filter
-            .is_some_and(|filter| filter_has_equality_for_columns(filter, params, &anchor_columns))
+        // A source with no residual predicate cannot be naming one row: the keys it is probing
+        // came from somewhere, and without the statement to confirm an equality there is nothing
+        // that says the somewhere was a single key.
+        let _ = index;
+        filter.is_some_and(|filter| statement_names_one_row(&meta, filter, params))
     }
 
     fn vector_read_preflight(
@@ -2013,9 +2000,11 @@ impl ReadExecutionTarget for Database {
         index: &str,
         snapshot: SnapshotId,
         cursor: &mut contextdb_relational::mem::BoundedExactIndexCursor,
+        before_storage_step: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
-        release_retained: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        release_retained: &mut dyn FnMut(
+            usize) -> std::result::Result<(), BoundedExecutionError>,
         before_clone: &mut dyn FnMut(
             crate::read_image_memory::RowReadAdmission<'_>,
         ) -> std::result::Result<(), BoundedExecutionError>,
@@ -2027,6 +2016,7 @@ impl ReadExecutionTarget for Database {
             index,
             snapshot,
             cursor,
+            before_storage_step,
             before_touch,
             before_retain,
             release_retained,
@@ -3058,6 +3048,8 @@ impl BoundedWorkSource {
 /// edge, vector candidate, sort candidate, or access-controlled row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum BoundedSourceTouch {
+    /// Storage/proof work charged without claiming another examined row.
+    StorageStep,
     TableRow,
     IndexEntry,
     SortCandidate,
@@ -5771,11 +5763,13 @@ fn execute_plan_once(
                     return Ok(result);
                 } else {
                     // Scan with rejection trace.
-                    let rows = scan_rows_for_select(
+                    let rows = scan_rows_for_select_statement(
                         db,
                         table,
                         snapshot,
                         tx,
+                        resolved_filter.as_ref(),
+                        params,
                         vector_copy_owner,
                         read_memory.clone(),
                     )?;
@@ -5804,11 +5798,13 @@ fn execute_plan_once(
                 }
             }
 
-            let rows = scan_rows_for_select(
+            let rows = scan_rows_for_select_statement(
                 db,
                 table,
                 snapshot,
                 tx,
+                resolved_filter.as_ref(),
+                params,
                 vector_copy_owner,
                 read_memory.clone(),
             )?;
@@ -10282,6 +10278,9 @@ fn analyze_filter_for_index_with_capability(
         .iter()
         .min_by_key(|c| {
             (
+                // A fully bound, non-NULL unique equality matches at most one row; prefer it
+                // over any prefix that is not one, however many more columns that prefix binds.
+                !(c.whole_key && c.unique && c.single_row_probe),
                 std::cmp::Reverse(c.match_count),
                 c.tier,
                 candidate_placement_rank(c, order_by_pending),
@@ -10302,7 +10301,18 @@ fn analyze_filter_for_index_with_capability(
                 && candidate.whole_key
                 && candidate.unique
                 && candidate.single_row_probe;
-            let reason = if candidate.match_count < winner.match_count {
+            let winner_is_unique_point =
+                winner.whole_key && winner.unique && winner.single_row_probe;
+            let candidate_is_unique_point =
+                candidate.whole_key && candidate.unique && candidate.single_row_probe;
+            let reason = if winner_is_unique_point
+                && !candidate_is_unique_point
+                && candidate.match_count > winner.match_count
+            {
+                // Only where the unique-point preference overturned the old order; every other
+                // loser keeps its existing reason.
+                "chosen index is UNIQUE and fully bound, so it matches at most one row"
+            } else if candidate.match_count < winner.match_count {
                 "fewer predicate columns matched than chosen index"
             } else if candidate.tier > winner.tier {
                 "lower selectivity than chosen index"
@@ -11022,20 +11032,36 @@ pub(crate) fn pick_names_one_row(
     unique_anchor_columns_for_pick(&meta, &pick_cols)
 }
 
-pub(crate) fn is_anchor_shape_index_pick(
-    db: &Database,
-    table: &str,
-    pick: &IndexPick,
+/// Whether a statement names at most one row by itself: its conjunctive filter binds every column
+/// of a declared key -- a primary key of any width, a single-column `UNIQUE`, or a composite
+/// `UNIQUE` -- with a single-value, non-NULL equality. This is decided from the statement and the
+/// table's declared keys, never from the index a planner chose, so a hidden row the statement names
+/// is refused, and any other hidden row is hidden, the same way on every index and every route
+/// (docs/query-language.md, "Explicit-anchor `SELECT` shapes").
+pub(crate) fn statement_names_one_row(
+    meta: &TableMeta,
     filter: &Expr,
     params: &HashMap<String, Value>,
 ) -> bool {
-    // The pick decides whether the shape pins a row; the filter confirms the
-    // statement really carries that equality, which a caller holding the
-    // residual predicate can check and a caller holding only the pick cannot.
-    let Some(anchor_cols) = pick_names_one_row(db, table, pick) else {
+    let mut bound = HashSet::new();
+    for conjunct in split_conjuncts(filter) {
+        if let Some((column, shape)) = classify_index_predicate(&conjunct, params)
+            && shape_is_single_value_equality(&shape)
+        {
+            bound.insert(column);
+        }
+    }
+    if bound.is_empty() {
         return false;
+    }
+    let covers = |columns: &[String]| {
+        !columns.is_empty() && columns.iter().all(|column| bound.contains(column))
     };
-    filter_has_equality_for_columns(filter, params, &anchor_cols)
+    meta.columns
+        .iter()
+        .any(|column| (column.primary_key || column.unique) && bound.contains(&column.name))
+        || covers(&meta.primary_key_columns)
+        || meta.enforced_unique_tuples().any(|tuple| covers(tuple))
 }
 
 fn unique_anchor_columns_for_pick(meta: &TableMeta, pick_cols: &[&str]) -> Option<Vec<String>> {
@@ -11056,24 +11082,6 @@ fn unique_anchor_columns_for_pick(meta: &TableMeta, pick_cols: &[&str]) -> Optio
         }
     }
     None
-}
-
-fn filter_has_equality_for_columns(
-    filter: &Expr,
-    params: &HashMap<String, Value>,
-    required_columns: &[String],
-) -> bool {
-    let mut equality_columns = HashSet::new();
-    for conjunct in split_conjuncts(filter) {
-        if let Some((column, IndexPredicateShape::Equality(_))) =
-            classify_index_predicate(&conjunct, params)
-        {
-            equality_columns.insert(column);
-        }
-    }
-    required_columns
-        .iter()
-        .all(|column| equality_columns.contains(column))
 }
 
 /// Combine multiple index-shapes on the same column into the most-selective
@@ -11196,6 +11204,16 @@ fn classify_index_predicate(
 ) -> Option<(String, IndexPredicateShape)> {
     match expr {
         Expr::BinaryOp { left, op, right } => {
+            // Equality is symmetric: `$v = column` is the same predicate as `column = $v`, so it
+            // classifies, picks and names rows exactly the same way.
+            let (left, right) = if *op == BinOp::Eq
+                && extract_simple_col_ref(left).is_none()
+                && extract_simple_col_ref(right).is_some()
+            {
+                (right, left)
+            } else {
+                (left, right)
+            };
             let col = extract_simple_col_ref(left)?;
             // Reject function / arithmetic / column-ref RHS / subquery.
             if !is_literal_or_param(right) {
@@ -11892,11 +11910,15 @@ fn execute_index_scan(
         .is_none()
     {
         drop(indexes);
-        let rows = scan_rows_for_select(
+        let rows = scan_rows_for_select_statement(
             db,
             table,
             snapshot,
             tx,
+            (access_mode == IndexScanAccessMode::Select)
+                .then_some(residual_filter)
+                .flatten(),
+            params,
             vector_copy_owner,
             read_memory.clone(),
         )?;
@@ -11929,11 +11951,15 @@ fn execute_index_scan(
         Some(s) => s,
         None => {
             drop(indexes);
-            let rows = scan_rows_for_select(
+            let rows = scan_rows_for_select_statement(
                 db,
                 table,
                 snapshot,
                 tx,
+                (access_mode == IndexScanAccessMode::Select)
+                    .then_some(residual_filter)
+                    .flatten(),
+                params,
                 vector_copy_owner,
                 read_memory.clone(),
             )?;
@@ -12044,11 +12070,15 @@ fn execute_index_scan(
         )?;
         let Some(keys) = exact_probe_keys(storage.columns.len(), pick) else {
             drop(indexes);
-            let rows = scan_rows_for_select(
+            let rows = scan_rows_for_select_statement(
                 db,
                 table,
                 snapshot,
                 tx,
+                (access_mode == IndexScanAccessMode::Select)
+                    .then_some(residual_filter)
+                    .flatten(),
+                params,
                 vector_copy_owner,
                 read_memory.clone(),
             )?;
@@ -12253,9 +12283,10 @@ fn execute_index_scan(
         read_memory.clone(),
     )?;
     let anchor_shape = access_mode == IndexScanAccessMode::Select
-        && residual_filter
-            .map(|filter| is_anchor_shape_index_pick(db, table, pick, filter, params))
-            .unwrap_or(false);
+        && residual_filter.is_some_and(|filter| {
+            db.table_meta(table)
+                .is_some_and(|meta| statement_names_one_row(&meta, filter, params))
+        });
     if anchor_shape {
         out = filter_rows_by_predicate(out, residual_filter, params)?;
         out =
@@ -12291,11 +12322,15 @@ fn execute_writer_index_scan(
         return Err(Error::TableNotFound(table.into()));
     };
     if !meta.indexes.iter().any(|decl| decl.name == pick.name) {
-        let rows = scan_rows_for_select(
+        let rows = scan_rows_for_select_statement(
             db,
             table,
             snapshot,
             tx,
+            (access_mode == IndexScanAccessMode::Select)
+                .then_some(residual_filter)
+                .flatten(),
+            params,
             vector_copy_owner,
             read_memory.clone(),
         )?;
@@ -12380,8 +12415,10 @@ fn execute_writer_index_scan(
         read_memory.clone(),
     )?;
     let anchor = access_mode == IndexScanAccessMode::Select
-        && residual_filter
-            .is_some_and(|filter| is_anchor_shape_index_pick(db, table, &pick, filter, params));
+        && residual_filter.is_some_and(|filter| {
+            db.table_meta(table)
+                .is_some_and(|meta| statement_names_one_row(&meta, filter, params))
+        });
     if anchor {
         out = filter_rows_by_predicate(out, residual_filter, params)?;
         out =
@@ -13069,6 +13106,37 @@ fn scan_rows_for_select(
         read_memory.clone(),
     )?;
     Ok(rows)
+}
+
+/// The table-scan answer for a statement whose index vanished under it. A statement that names one
+/// row is served as it would be on its index: the complete predicate first, then the gate that
+/// refuses a hidden row it names. Any other statement scans with the gate that hides.
+#[allow(clippy::too_many_arguments)]
+fn scan_rows_for_select_statement(
+    db: &Database,
+    table: &str,
+    snapshot: SnapshotId,
+    tx: Option<TxId>,
+    filter: Option<&Expr>,
+    params: &HashMap<String, Value>,
+    vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<Vec<VersionedRow>> {
+    let Some(filter) = filter.filter(|filter| {
+        db.table_meta(table)
+            .is_some_and(|meta| statement_names_one_row(&meta, filter, params))
+    }) else {
+        return scan_rows_for_select(db, table, snapshot, tx, vector_copy_owner, read_memory);
+    };
+    let rows = db.scan_rows_ungated_for_select(
+        tx,
+        table,
+        snapshot,
+        vector_copy_owner,
+        read_memory.clone(),
+    )?;
+    let rows = filter_rows_by_predicate(rows, Some(filter), params)?;
+    db.filter_rows_for_anchor_read_in_tx(tx, table, rows, snapshot, read_memory)
 }
 
 fn rows_by_row_id(
@@ -20687,9 +20755,11 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         index: &str,
         snapshot: SnapshotId,
         cursor: &mut contextdb_relational::mem::BoundedExactIndexCursor,
+        before_storage_step: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
-        release_retained: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        release_retained: &mut dyn FnMut(
+            usize) -> std::result::Result<(), BoundedExecutionError>,
         before_clone: &mut dyn FnMut(
             crate::read_image_memory::RowReadAdmission<'_>,
         ) -> std::result::Result<(), BoundedExecutionError>,
@@ -20700,6 +20770,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
             index,
             snapshot,
             cursor,
+            before_storage_step,
             before_touch,
             before_retain,
             release_retained,

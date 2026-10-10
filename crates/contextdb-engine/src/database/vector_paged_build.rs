@@ -1116,11 +1116,15 @@ impl MaintenanceContext {
             Arc::clone(&self.finalization.vector_accountant), metadata_bytes, "prepare_vector_generation",
             "Free writer memory before preparing paged publication metadata.",
         )?;
+        // The build is complete: its last page write has committed, so this
+        // root is final for the page set the publication names.
+        let page_set = persistence.paged_storage_page_set_root(record.storage_id)?;
         let meta = RedbPersistence::encode_paged_generation_meta(
             record.storage_id,
             &record.declaration,
             progress,
             record.schema_binding,
+            page_set,
         )?;
         let durable_bytes = u64::try_from(meta.len())
             .map_err(|_| Error::Other("paged generation metadata exceeds u64".into()))?;

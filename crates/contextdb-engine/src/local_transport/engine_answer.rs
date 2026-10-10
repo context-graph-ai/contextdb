@@ -184,7 +184,6 @@ pub const fn body_grammar(tag: u16) -> Option<&'static [BodyField]> {
         | TAG_OWNER_READ_DRAIN_TIMEOUT
         | TAG_READ_CANCELLED
         | TAG_RECURSIVE_CTE_NOT_SUPPORTED
-        | TAG_WINDOW_FUNCTION_NOT_SUPPORTED
         | TAG_STORED_PROC_NOT_SUPPORTED
         | TAG_SUBQUERY_NOT_SUPPORTED
         | TAG_FULL_TEXT_SEARCH_NOT_SUPPORTED
@@ -196,7 +195,8 @@ pub const fn body_grammar(tag: u16) -> Option<&'static [BodyField]> {
         | TAG_USE_VECTOR_REQUIRES_VECTOR_ORDER
         | TAG_VECTOR_WHOLE_INDEX_INSPECTION_DENIED => &[],
         TAG_READ_FAILURE => &[Failure],
-        TAG_PARSE_ERROR
+        TAG_WINDOW_FUNCTION_NOT_SUPPORTED
+        | TAG_PARSE_ERROR
         | TAG_PLAN_ERROR
         | TAG_SCHEMA_INVALID
         | TAG_TABLE_NOT_FOUND
@@ -1181,8 +1181,8 @@ pub(crate) fn encode_read_error_into_slice(
     error: &contextdb_core::Error,
     output: &mut [u8],
 ) -> Result<usize, super::LocalTransportError> {
-    use contextdb_core::Error as E;
     use super::{LocalTransportError, PayloadViolation};
+    use contextdb_core::Error as E;
     struct Sink<'a> { bytes: &'a mut [u8], offset: usize }
     impl Sink<'_> {
         fn field<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), LocalTransportError> {

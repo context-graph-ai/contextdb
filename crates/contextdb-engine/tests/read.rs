@@ -136,6 +136,8 @@ mod saved_row_key_integrity;
 #[cfg(unix)]
 #[path = "read/session_charged_bytes.rs"]
 mod session_charged_bytes;
+#[path = "read/a_live_read_charge_is_the_reads_own.rs"]
+mod a_live_read_charge_is_the_reads_own;
 #[cfg(unix)]
 #[path = "read/vector_compaction_publication_contract.rs"]
 mod vector_compaction_publication_contract;

@@ -68,7 +68,10 @@ fn retained_corrupt_sq4_refuses_before_conversion_owner() {
         .scope(|| RedbPersistence::decode::<PersistedVectorEntry>(&encoded))
         .unwrap();
     let decode_charge = calibration.held();
-    let memory = crate::read_image_memory::ImageMemory::new(Some(decode_charge));
+    // The guarded decoder admits its fixed control transient before parsing.
+    // That transient is refunded; the body still owns exactly decode_charge.
+    let decode_control = std::mem::size_of::<PersistedVectorEntry>() * 4 + 128;
+    let memory = crate::read_image_memory::ImageMemory::new(Some(decode_charge + decode_control));
     let error = memory
         .scope(|| decode_retained_raw_vector_entry(&encoded, &membership, 1, corruption))
         .unwrap_err();

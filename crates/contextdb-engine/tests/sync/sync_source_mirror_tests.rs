@@ -45,18 +45,19 @@ fn combined_schema_commit_keeps_event_bus_and_trigger_sidecar_ordinals_aligned()
     let persistence = include_str!("../../src/persistence.rs");
 
     assert!(
-        event_bus.contains("self.ddl_generation_sidecar_values(lsn, ddl, 0)?"),
+        event_bus.contains("self.ddl_generation_sidecar_values(lsn, ddl, 0, read_memory.clone())?"),
         "staged event-bus DDL must carry its leading immutable sidecars"
     );
     assert!(
         trigger.contains("start_ordinal: u32")
-            && trigger.contains("self.ddl_generation_sidecar_values(lsn, ddl, start_ordinal)?"),
+            && trigger.contains("self.ddl_generation_sidecar_values(lsn, ddl, start_ordinal, read_memory.clone())?"
+            ),
         "staged trigger DDL must receive the preceding event-bus ordinal count"
     );
     assert!(
         database.contains("let trigger_ddl_start =\n                                self.stage_event_bus_ddl_for_commit")
             && database.contains(
-                "self.stage_trigger_ddl_for_commit(lsn, trigger_ddl, trigger_ddl_start)?;"
+                "self.stage_trigger_ddl_for_commit(lsn, trigger_ddl, trigger_ddl_start, read_memory.clone())?;"
             ),
         "the transaction coordinator must pass the staged event-bus count to triggers"
     );
@@ -92,7 +93,7 @@ fn local_schema_authoring_persists_one_projected_ddl_batch_before_memory_publish
     );
     assert!(
         database.contains("including any CASCADEd index drops")
-            && database.contains("ddl_generation_sidecar_values(lsn, ddl, 0)?"),
+            && database.contains("ddl_generation_sidecar_values(lsn, ddl, 0, read_memory.clone())?"),
         "the projected durable batch must assign one same-LSN sidecar sequence"
     );
 }
@@ -113,14 +114,14 @@ fn local_schema_authoring_never_publishes_a_metadata_only_index_or_uses_a_vanish
         "a projected table must build its postings first, then publish rows, metadata, and indexes together"
     );
     assert!(
-        database.contains("RelationalStore::projected_index_storage_with_budget(meta, rows, self.accountant.clone())")
+        database.contains("RelationalStore::projected_index_storage_with_budget(meta, rows, self.finalization.accountant.read_budget()?)")
             && database
                 .contains("store.publish_table_projection(name, meta, rows, projected_indexes)"),
         "the durable local-DDL publisher must use the coherent relational projection path"
     );
     assert!(
         executor
-            .matches("let rows = scan_rows_for_select(db, table, snapshot, tx)?;")
+            .matches("let rows = scan_rows_for_select(\n            db,\n            table,\n            snapshot,\n            tx,\n            vector_copy_owner,\n            read_memory.clone(),\n        )?;")
             .count()
             >= 2,
         "both index-presence race windows must fall back to the normal full scan, not return empty rows"
@@ -140,7 +141,7 @@ fn local_structural_ddl_revalidates_the_complete_schema_under_the_allocation_loc
         "foreign-key-sensitive local DDL must compare the complete metadata map before publishing"
     );
     assert!(
-        executor.contains("let table_generation = db.next_table_generation_for_create(&p.name)?;")
+        executor.contains("db.next_table_generation_for_create(&p.name, read_memory.clone())?;")
             && executor.contains("A generation belongs to the CREATE that actually won"),
         "CREATE must allocate its generation only after its schema baseline still matches"
     );
@@ -187,7 +188,7 @@ fn outbound_changeset_extraction_holds_the_schema_gate_before_commit_sampling() 
     let checked = &checked_tail[..checked_end];
 
     let base_start = database
-        .find("fn changes_since_base(&self, since_lsn: Lsn)")
+        .find("fn changes_since_base_projected(")
         .expect("commit-locked outbound base extraction");
     let base_tail = &database[base_start..];
     let base_end = base_tail
@@ -195,31 +196,35 @@ fn outbound_changeset_extraction_holds_the_schema_gate_before_commit_sampling() 
         .expect("end of commit-locked outbound base extraction");
     let base = &base_tail[..base_end];
     assert!(
-        base.contains("self.enter_schema_publication_gate(false)")
-            && base.contains("let _operation = self.assert_open_operation();"),
+        base.contains("let _operation = self.open_operation()?;")
+            && database
+                .contains("let schema_publication = self.enter_schema_publication_gate(false);"),
         "outbound base extraction must retain its schema gate before sampling committed changes"
     );
     assert!(
         database
-            .matches("let _schema_publication = self.enter_schema_publication_gate(false);")
-            .count()
-            >= 4,
+            .contains("fn changes_since_with_read_memory(")
+            && database.contains("fn changes_since_with_arrivals_with_read_memory(")
+            && checked.contains("let _operation = self.open_operation()?;")
+            && database
+                .contains("let _schema_publication = self.enter_schema_publication_gate(false);")
+            ,
         "public changes, arrival-bearing changes, checked sync extraction, and EXPLAIN must retain a schema read guard"
     );
     let guard = checked
-        .find("self.enter_schema_publication_gate(false)")
+        .find("let _operation = self.open_operation()?;")
         .expect("checked extraction schema guard");
     let pending = checked
-        .find("self.durable_pending_deletes_since(since_lsn)?")
+        .find("self.durable_pending_deletes_projected(")
         .expect("durable pending-delete obligations");
-    let base = checked
-        .find("self.changes_since_base(since_lsn)")
+    let base= checked
+        .find("self.changes_since_base_projected(")
         .expect("commit-locked base extraction");
     let reconcile = checked
-        .find("Self::reconcile_durable_pending_deletes(base, pending)")
+        .find("Self::reconcile_durable_pending_deletes_projected(base, pending, &projection)?")
         .expect("durable pending-delete reconciliation");
     let arrivals = checked
-        .find("self.sync_arrivals_for_changes(&changes)")
+        .find("self.sync_arrivals_for_changes_within(")
         .expect("sync arrivals");
     assert!(
         guard < pending && pending < base && base < reconcile && reconcile < arrivals,
@@ -263,7 +268,7 @@ fn outbound_wire_evidence_is_prepared_before_the_schema_lease_is_released() {
         .find("let schema_read = self.db.enter_outbound_sync_schema_read();")
         .expect("push enters outbound schema lease");
     let client_extract = client[client_enter..]
-        .find("checked_changes_since_with_arrivals(since)?")
+        .find("checked_changes_since_with_arrivals(")
         .map(|offset| client_enter + offset)
         .expect("push extracts under lease");
     let client_provenance = client[client_extract..]
@@ -275,7 +280,7 @@ fn outbound_wire_evidence_is_prepared_before_the_schema_lease_is_released() {
         .map(|offset| client_provenance + offset)
         .expect("push drops lease");
     let client_await = client[client_drop..]
-        .find(".request_push(encoded, protocol_version, retry_safety)")
+        .find(".request_push(encoded, protocol_version, retry_safety, read_memory.clone())")
         .map(|offset| client_drop + offset)
         .expect("push awaits transport after lease");
     assert!(
@@ -290,7 +295,7 @@ fn outbound_wire_evidence_is_prepared_before_the_schema_lease_is_released() {
         .find("let schema_read = db.enter_outbound_sync_schema_read();")
         .expect("pull enters outbound schema lease");
     let server_extract = server[server_enter..]
-        .find("db.checked_changes_since_with_arrivals(scan_since)?")
+        .find("db.checked_changes_since_with_arrivals(")
         .map(|offset| server_enter + offset)
         .expect("pull extracts under lease");
     let server_provenance = server[server_extract..]

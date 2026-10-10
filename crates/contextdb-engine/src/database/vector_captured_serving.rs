@@ -708,6 +708,22 @@ impl DormantVectorGraphLoader for CapturedLayerLoader {
         } else {
             HnswIndex::decode_durable_generation(&graph_bytes, self.dimension, self.quantization)?
         };
+        // This is the find's one load of the generation: the store adopts it
+        // rather than loading again, so the load is metered here.
+        // The same figures the retained loader reports for a paged load: its
+        // control handle is what stays resident; pages are served on demand.
+        contextdb_core::find_attribution::note_saved_graph_load(
+            contextdb_core::find_attribution::LoadCharge {
+                saved_bytes: graph_bytes.len(),
+                priced_bytes: self.descriptor.reclaim_bytes,
+                minimum_bytes: current_resident,
+                admitted_bytes: current_resident,
+                held_bytes: current_resident,
+                cache_bytes: 0,
+                minimum_cache_bytes: 0,
+                maximum_cache_bytes: 0,
+            },
+        );
         drop(graph_bytes);
         checkpoint(request)?;
         if !paged && graph.estimated_resident_bytes() != current_resident {

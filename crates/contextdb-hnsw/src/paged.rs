@@ -101,7 +101,9 @@ pub struct PagedGraphPolicy {
 impl PagedGraphPolicy {
     pub fn validate(&self) -> bool {
         self.m > 1
-            && self.m <= 256
+            // Layer zero holds twice M links; any declared M whose degree is
+            // representable is valid, as it is for the resident graph.
+            && self.m.checked_mul(2).is_some()
             && self.ef_construction > 0
             && self.max_layer > 0
             && self.max_layer <= NB_LAYER_MAX as usize

@@ -2421,6 +2421,7 @@ impl Database {
                         snapshot,
                         &mut cursor,
                         || Ok::<(), Error>(()),
+                        || Ok::<(), Error>(()),
                         |_| Ok(()),
                         |_| Ok(()),
                         |bytes| {

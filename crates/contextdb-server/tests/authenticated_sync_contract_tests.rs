@@ -1337,10 +1337,7 @@ async fn a_maintained_count_declaration_crosses_sync_or_holds_back_its_table() {
         )]])),
         "the receiver carries the declaration the author wrote"
     );
-    // A writable handle counts the live postings over the same exact prefix
-    // range instead of reading the stored count: a stored maintained count is
-    // reachable only from a store read as a committed image, the direct-file
-    // read route (docs/query-language.md:928-931).
+    // The captured writer root serves the declared count on this handle.
     let sql = "SELECT COUNT(*) FROM placements WHERE owner = $owner";
     let params = HashMap::from([("owner".to_string(), Value::Text("ada".into()))]);
     let count = hub.db.execute(sql, &params).unwrap();
@@ -1349,11 +1346,10 @@ async fn a_maintained_count_declaration_crosses_sync_or_holds_back_its_table() {
         matches!(
             count.trace.maintained_count.as_deref(),
             Some(
-                contextdb_engine::maintained_counts::MaintainedCountDisclosure::DeclaredNotServed { .. }
+                contextdb_engine::maintained_counts::MaintainedCountDisclosure::Used { .. }
             )
         ),
-        "a writable handle documents the same exact count from the live postings, not the \
-         maintained count, per docs/query-language.md:928-931: {:?}",
+        "a writable handle serves the same exact maintained count: {:?}",
         count.trace.maintained_count
     );
 

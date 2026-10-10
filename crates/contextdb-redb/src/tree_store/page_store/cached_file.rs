@@ -1761,7 +1761,7 @@ mod test {
         fn sync_data(&self) -> io::Result<()> { Ok(()) }
     }
 
-    // R115: actual header writes reach the read cache through the normal flush.
+    // Actual header writes reach the read cache through the normal flush.
     #[test]
     #[cfg(feature = "contextdb-internal")]
     fn flushed_header_and_full_pages_use_the_unchanged_cache_byte_budget() {

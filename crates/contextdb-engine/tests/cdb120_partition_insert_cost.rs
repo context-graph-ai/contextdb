@@ -137,7 +137,7 @@ impl Flavor {
 }
 
 // ---------------------------------------------------------------------------
-// R1: scaling. One new-key insert and one existing-key insert cost one
+// Scaling. One new-key insert and one existing-key insert cost one
 // projected route, no cap-edge visit and no hold lookup, at 64 and 4096
 // non-empty partitions alike.
 // ---------------------------------------------------------------------------
@@ -210,7 +210,7 @@ fn r1b_cap_four_refuses_the_fifth_key_and_admits_the_fourth() {
 }
 
 // ---------------------------------------------------------------------------
-// R3: the cap edge through SQL. A deleted-out route keeps a pending tombstone
+// The cap edge through SQL. A deleted-out route keeps a pending tombstone
 // until maintenance retires it, so the cap-time sweep has no authority over it
 // (inherited rule); the edge must neither visit historical routes nor refuse
 // differently from the base, and must admit as soon as maintenance retires.
@@ -391,7 +391,7 @@ fn r3_extension_the_last_vector_move_reads_no_history_while_a_route_grows_from_1
 }
 
 // ---------------------------------------------------------------------------
-// R4: one fixed writer budget admits the same one-row insert while unrelated
+// One fixed writer budget admits the same one-row insert while unrelated
 // partitions and rows grow 16x.
 // ---------------------------------------------------------------------------
 

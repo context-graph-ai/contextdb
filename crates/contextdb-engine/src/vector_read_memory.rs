@@ -51,8 +51,9 @@ impl DeclaredReadMemory {
             live_acl_cache_bytes: std::sync::atomic::AtomicU64::new(0),
         })
     }
-    #[cfg(test)]
-    pub(crate) fn retained_bytes_for_test(&self) -> u64 {
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn retained_bytes_for_test(&self) -> u64 {
         self.retained.load(std::sync::atomic::Ordering::SeqCst)
     }
     /// Quiescent observation of actual admitted live child controls and parent bytes.
@@ -62,6 +63,11 @@ impl DeclaredReadMemory {
                 .load(std::sync::atomic::Ordering::SeqCst),
             self.retained.load(std::sync::atomic::Ordering::SeqCst),
         )
+    }
+
+    /// Bytes every reader child currently holds against this parent.
+    pub(crate) fn charged_bytes(&self) -> u64 {
+        self.retained.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub(crate) fn acl_cache_bytes(&self) -> u64 {
@@ -126,17 +132,39 @@ struct DeclaredReadChild {
     retained: std::sync::atomic::AtomicU64,
 }
 fn reader_memory_refusal(
-    limit: u64, held: u64, requested: usize,
-    subsystem: &'static str, operation: &'static str, hint: &'static str,
+    limit: u64,
+    held: u64,
+    requested: usize,
+    subsystem: &'static str,
+    operation: &'static str,
+    hint: &'static str,
 ) -> contextdb_core::Error {
     contextdb_core::Error::MemoryBudgetExceeded {
-        subsystem: subsystem.into(), operation: operation.into(),
+        subsystem: subsystem.into(),
+        operation: operation.into(),
         requested_bytes: requested,
         available_bytes: usize::try_from(limit.saturating_sub(held)).unwrap_or(usize::MAX),
         budget_limit_bytes: usize::try_from(limit).unwrap_or(usize::MAX),
         hint: hint.into(),
     }
 }
+#[cfg(feature = "test-seams")]
+thread_local! {
+    static READER_BUDGET_LEDGER: std::cell::RefCell<Option<Vec<crate::memory_accounting::BudgetLedgerEntry>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub fn watch_reader_budget_ledger_for_test() {
+    READER_BUDGET_LEDGER.with(|ledger| *ledger.borrow_mut() = Some(Vec::new()));
+}
+
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub fn take_reader_budget_ledger_for_test() -> Vec<crate::memory_accounting::BudgetLedgerEntry> {
+    READER_BUDGET_LEDGER.with(|ledger| ledger.borrow_mut().take().unwrap_or_default())
+}
+
 impl ReadMemoryBudget for DeclaredReadMemory {
     fn try_reserve(
         &self,
@@ -151,7 +179,20 @@ impl ReadMemoryBudget for DeclaredReadMemory {
                 held.checked_add(bytes as u64)
                     .filter(|after| *after <= self.limit)
             })
-            .map_err(|held| reader_memory_refusal(self.limit, held, bytes, subsystem, operation, hint))?;
+            .map_err(|held| {
+                reader_memory_refusal(self.limit, held, bytes, subsystem, operation, hint)
+            })?;
+        #[cfg(feature = "test-seams")]
+        READER_BUDGET_LEDGER.with(|ledger| {
+            if let Some(entries) = ledger.borrow_mut().as_mut() {
+                entries.push(crate::memory_accounting::BudgetLedgerEntry {
+                    what: format!("{subsystem}/{operation}"),
+                    bytes,
+                    used_after: usize::try_from(self.retained.load(Ordering::SeqCst))
+                        .unwrap_or(usize::MAX),
+                });
+            }
+        });
         Ok(())
     }
     fn release(&self, bytes: usize) {

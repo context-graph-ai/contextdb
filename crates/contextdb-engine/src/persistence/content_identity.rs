@@ -1209,6 +1209,7 @@ impl RedbPersistence {
         };
         config.content_size_root = Some(content_fingerprint);
         config.vector_pages_root = Some(vector_schema_pages_root_in_write(write)?);
+        bind_vector_schema_meta_root_in_write(write)?;
         roots
             .insert(
                 LogicalFamily::Configuration as u8,
@@ -2055,10 +2056,24 @@ fn total_directed_order(left: &(bool, Value), right: &(bool, Value)) -> Ordering
 /// equal, and any pair that does not decode, falls back to the raw bytes. A
 /// pair-dependent choice between typed and raw order cannot do this — valid
 /// `aa` and `z` with a trailing-byte copy of `z` form a cycle under it.
+/// A comparator's decoded position lives only for one comparison and is
+/// bounded by its own key bytes, so it is a per-item transient: decoded under
+/// a fixed allocation limit, never charged to (and left held by) whichever
+/// read owner happens to be active while redb compares keys.
+fn decode_posting_position_for_compare(bytes: &[u8]) -> Option<super::EncodedRelationalIndexPosition> {
+    const COMPARE_DECODE_LIMIT: usize = 1 << 20;
+    let (position, consumed) = bincode::serde::decode_from_slice::<super::EncodedRelationalIndexPosition, _>(
+        bytes,
+        bincode::config::standard().with_limit::<COMPARE_DECODE_LIMIT>(),
+    )
+    .ok()?;
+    (consumed == bytes.len()).then_some(position)
+}
+
 pub(super) fn total_posting_order(left: &[u8], right: &[u8]) -> Ordering {
     match (
-        decode_posting_position(left).ok(),
-        decode_posting_position(right).ok(),
+        decode_posting_position_for_compare(left),
+        decode_posting_position_for_compare(right),
     ) {
         (Some(left_position), Some(right_position)) => {
             let mut ordering = Ordering::Equal;
@@ -6198,6 +6213,34 @@ pub(super) fn vector_schema_pages_root_in_read(read: &redb::ReadTransaction) -> 
     Ok(vector_schema_pages_hash(pages, schema))
 }
 
+/// Whether a paged bind ever recorded the schema half of its binding.
+pub(super) fn vector_schema_meta_root_bound_in_read(read: &redb::ReadTransaction) -> Result<bool> {
+    let recovery = match read.open_table(super::writer_recovery::RECOVERY_TABLE) {
+        Ok(table) => table,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+        Err(error) => return Err(RedbPersistence::storage_error(error)),
+    };
+    Ok(recovery
+        .get(VECTOR_SCHEMA_META_ROOT_KEY)
+        .map_err(RedbPersistence::storage_error)?
+        .is_some())
+}
+
+/// Whether the committed schema half of the paged binding still matches.
+pub(super) fn vector_schema_meta_root_matches_in_read(read: &redb::ReadTransaction) -> Result<bool> {
+    let schema = read
+        .table_root_fingerprint(super::META_TABLE)
+        .map_err(RedbPersistence::storage_error)?
+        .unwrap_or([0; 32]);
+    let recovery = read
+        .open_table(super::writer_recovery::RECOVERY_TABLE)
+        .map_err(RedbPersistence::storage_error)?;
+    Ok(recovery
+        .get(VECTOR_SCHEMA_META_ROOT_KEY)
+        .map_err(RedbPersistence::storage_error)?
+        .is_some_and(|bound| bound.value() == schema))
+}
+
 pub(super) fn vector_pages_root_in_read(read: &redb::ReadTransaction) -> Result<[u8; 32]> {
     let roots = read
         .open_table(CONTENT_IDENTITY_ROOTS_TABLE)
@@ -6210,8 +6253,13 @@ pub(super) fn vector_pages_root_in_read(read: &redb::ReadTransaction) -> Result<
         .vector_pages_root
         .ok_or_else(|| Error::Other("committed vector page root is missing".into()))
 }
+/// The schema half of the paged binding, kept on its own so a damaged page
+/// table can be told apart from damaged schema metadata.
+pub(super) const VECTOR_SCHEMA_META_ROOT_KEY: &str = "vector_schema_meta_root_v1";
+
 pub(super) fn bind_vector_pages_root_in_write(write: &redb::WriteTransaction) -> Result<()> {
     let fingerprint = vector_schema_pages_root_in_write(write)?;
+    bind_vector_schema_meta_root_in_write(write)?;
     let mut roots = write
         .open_table(CONTENT_IDENTITY_ROOTS_TABLE)
         .map_err(RedbPersistence::storage_error)?;
@@ -6231,6 +6279,49 @@ pub(super) fn bind_vector_pages_root_in_write(write: &redb::WriteTransaction) ->
             encode_published_root(&root).as_slice(),
         )
         .map_err(RedbPersistence::storage_error)?;
+    Ok(())
+}
+
+/// Carry an existing schema-half binding forward to this commit's metadata.
+/// A store that never bound a paged generation is left without one.
+pub(super) fn rebind_vector_schema_meta_root_if_bound_in_write(
+    write: &redb::WriteTransaction,
+) -> Result<()> {
+    let bound = {
+        let recovery = write
+            .open_table(super::writer_recovery::RECOVERY_TABLE)
+            .map_err(RedbPersistence::storage_error)?;
+        recovery
+            .get(VECTOR_SCHEMA_META_ROOT_KEY)
+            .map_err(RedbPersistence::storage_error)?
+            .is_some()
+    };
+    if bound {
+        bind_vector_schema_meta_root_in_write(write)?;
+    }
+    Ok(())
+}
+
+/// Record the schema half of the paged binding beside every combined bind.
+pub(super) fn bind_vector_schema_meta_root_in_write(write: &redb::WriteTransaction) -> Result<()> {
+    let schema = write
+        .table_root_fingerprint(super::META_TABLE)
+        .map_err(RedbPersistence::storage_error)?
+        .unwrap_or([0; 32]);
+    {
+        let mut recovery = write
+            .open_table(super::writer_recovery::RECOVERY_TABLE)
+            .map_err(RedbPersistence::storage_error)?;
+        let unchanged = recovery
+            .get(VECTOR_SCHEMA_META_ROOT_KEY)
+            .map_err(RedbPersistence::storage_error)?
+            .is_some_and(|existing| existing.value() == schema);
+        if !unchanged {
+            recovery
+                .insert(VECTOR_SCHEMA_META_ROOT_KEY, schema.as_slice())
+                .map_err(RedbPersistence::storage_error)?;
+        }
+    }
     Ok(())
 }
 

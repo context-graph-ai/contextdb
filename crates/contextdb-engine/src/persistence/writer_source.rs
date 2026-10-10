@@ -1530,6 +1530,11 @@ impl WriterReadCursor {
         self.next_before_handoff(
             before,
             |key, value| {
+                #[cfg(feature = "test-seams")]
+                {
+                    crate::read_work_probe::note_decoded_row();
+                    crate::read_work_probe::note_stored_row_bytes(value.len());
+                }
                 let row = RedbPersistence::decode_versioned_row(value, None)
                     .map_err(|error| RedbPersistence::relational_decode_error("relational row", error))?;
                 if RedbPersistence::rel_row_key(&row) != key {
@@ -1858,7 +1863,7 @@ impl WriterCommitCursor {
         crate::read_work_probe::note_graph("commit_index", "range", &[], None, None);
         let mut range = table
             .range((lower, upper))
-            .map_err(RedbPersistence::storage_error)?.inspect(|_entry| { #[cfg(any(test, feature = "test-seams"))] if let Ok((key, _)) = _entry { crate::read_work_probe::note_graph("commit_index", "iteration_step", &key.value().to_be_bytes(), Some(key.value()), Some("writer_commit_cursor")); } });
+            .map_err(RedbPersistence::storage_error)?.inspect(|_entry| { #[cfg(any(test, feature = "test-seams"))] if let Ok((key, _)) = _entry { crate::read_work_probe::note_graph("commit_index", "iteration_step", &key.value().to_be_bytes(), Some(contextdb_core::Lsn(key.value())), Some("writer_commit_cursor")); } });
         let next = if self.reverse {
             range.next_back()
         } else {
@@ -2758,16 +2763,22 @@ impl WriterReadCursor {
 #[cfg(all(test, feature = "test-seams"))]
 pub(crate) fn r1_schema_control_rows_for_test() {
     use crate::memory_accounting::{WriterBudget, writer_adapter_type_layout};
-    use crate::persistence::content_identity::proof_allocation_oracle_tests::{measured, last_request_for_test};
+    use crate::persistence::content_identity::proof_allocation_oracle_tests::{last_request_for_test, measured, };
     let owner = Arc::new(MemoryAccountant::no_limit());
     let root = WriterBudget::from_accountant(owner.clone()).unwrap();
     let baseline = owner.usage().used;
     let controls = owner.writer_fixed_ownership().2;
     let meta: TableMeta = serde_json::from_str(r#"{"columns":[],"immutable":false}"#).unwrap();
     let memory = OwnedMemoryReservation::from_admitted(owner.clone(), 0)
-        .with_enclosing_arc_control::<WriterTableMeta>(false).unwrap();
+        .with_enclosing_arc_control::<WriterTableMeta>(false)
+        .unwrap();
     last_request_for_test(true);
-    let (table, _, _) = measured(|| Arc::new(WriterTableMeta { meta, _memory: memory }));
+    let (table, _, _) = measured(|| {
+        Arc::new(WriterTableMeta {
+            meta,
+            _memory: memory ,
+        })
+    });
     let request = last_request_for_test(true);
     let table_layout = writer_adapter_type_layout::<WriterTableMeta>();
     assert_eq!(request, (table_layout.size(), table_layout.align(), 1));

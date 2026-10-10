@@ -289,6 +289,7 @@ fn eager_indexed_projection_loads_only_selected_vector_bodies() {
         "an unselected vector partition stays dormant"
     );
 
+    let selected_work = ReadWorkObservationScope::enter(ReadWorkPhase::Query);
     let vectors = database
         .execute(
             "SELECT embedding FROM projected_rows WHERE group_name = 'wanted'",
@@ -300,9 +301,11 @@ fn eager_indexed_projection_loads_only_selected_vector_bodies() {
     let activity_after_selected = database.__vector_passive_activity_counters_for_test();
     assert_eq!(
         activity_after_selected.raw_partition_loads - activity_after_unselected.raw_partition_loads,
-        1,
-        "selecting vectors loads only their one bounded partition"
+        0,
+        "projecting selected bodies does not hydrate a complete partition"
     );
+    assert_eq!(selected_work.counters().decoded_vectors, matching as u64);
+    assert!(vectors.rows.iter().all(|row| row == &vec![expected_vector()]));
     database.close().expect("close the projection fixture");
 }
 

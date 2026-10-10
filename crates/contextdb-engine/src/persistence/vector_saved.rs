@@ -260,6 +260,7 @@ impl RedbPersistence {
         let mut distinct_rows = 0usize;
         let mut record_bytes = 0u64;
         let mut record_digest = [0u8; 32];
+        let mut page_set = None;
         let result = self.with_db(|db| {
             let read = db.begin_read().map_err(Self::storage_error)?;
             Self::validate_vector_schema_binding_in_read(
@@ -365,6 +366,7 @@ impl RedbPersistence {
                     )
                     .map_err(Self::storage_error)?;
                 bind_pages_root(&write)?;
+                Self::write_read_bounds_roots_in_write(&write)?;
                 write.commit().map_err(Self::storage_error)?;
                 progress = next;
                 if progress.encoded_points == topology.state.points {
@@ -473,6 +475,7 @@ impl RedbPersistence {
             let storage_end = writer_source::prefix_end(&storage)
                 .ok_or_else(|| corruption("saved storage has no successor"))?;
             let mut hasher = blake3::Hasher::new();
+            let mut page_root = PageSetHasher::new();
             for entry in pages
                 .range::<&[u8]>(storage.as_slice()..storage_end.as_slice())
                 .map_err(Self::storage_error)?
@@ -489,11 +492,13 @@ impl RedbPersistence {
                 hasher.update(key.value());
                 hasher.update(&(value.value().len() as u64).to_be_bytes());
                 hasher.update(value.value());
+                page_root.page(key.value(), value.value())?;
                 record_bytes = record_bytes
                     .checked_add((key.value().len() + value.value().len()) as u64)
                     .ok_or_else(|| corruption("saved record bytes overflow"))?;
             }
             record_digest = *hasher.finalize().as_bytes();
+            page_set = Some(page_root.finish());
             if posting_count != actual_postings {
                 return Err(corruption("saved exact directory coverage is incomplete"));
             }
@@ -525,6 +530,7 @@ impl RedbPersistence {
             progress: ProgressRecord::from_progress(&progress),
             saved: Some(saved),
             schema_binding: record.schema_binding,
+            page_set: page_set.ok_or_else(|| corruption("saved export has no page set root"))?,
         };
         let bytes = Self::encode(&meta)?;
         // The caller installs the authenticated complete object before removing
@@ -750,6 +756,12 @@ fn saved_member(
         .open_table(vector_membership_pages::REVERSE)
         .map_err(RedbPersistence::storage_error)?;
     let mut selected = None;
+    // A saved generation keeps a point for a row deleted at or before its
+    // frontier as a tombstone; that point's membership is the version deleted
+    // by then. It is chosen only when no version is live at the frontier and
+    // exactly one such version exists.
+    let mut tombstoned = None;
+    let mut tombstoned_count = 0usize;
     for entry in table
         .range::<&[u8]>(prefix.as_slice()..upper.as_slice())
         .map_err(RedbPersistence::storage_error)?
@@ -773,7 +785,17 @@ fn saved_member(
                 return Err(corruption("saved row has ambiguous frontier membership"));
             }
             selected = Some(member);
+        } else if member.partition_key == route.partition_key
+            && member.row_lsn <= lsn
+            && member.visible_from <= frontier
+            && member.deleted_tx.is_some_and(|tx| tx <= frontier)
+        {
+            tombstoned_count += 1;
+            tombstoned = Some(member);
         }
+    }
+    if selected.is_none() && tombstoned_count == 1 {
+        selected = tombstoned;
     }
     selected.ok_or_else(|| corruption("saved point has no original frontier membership"))
 }
@@ -820,14 +842,17 @@ fn retire_saved_export_roots_in_write(
     if let Some(value) = catalogs
         .get(&owner.generation_key[..route_len])
         .map_err(RedbPersistence::storage_error)?
-    {
-        let payload = vector_partition_record_payload(
+        // An owned export is unpublished by construction: publication moves
+        // its owner in the catalog transaction. A catalog that no longer
+        // decodes is a quarantined route and cannot select this export, so
+        // the cross-check applies only to a readable catalog.
+        && let Ok(payload) = vector_partition_record_payload(
             VectorPartitionRecordKind::GenerationCatalog,
             value.value(),
         )
-        .map_err(corruption)?;
-        let catalog: VectorPartitionGenerationCatalogRecord =
-            RedbPersistence::decode_exact(payload)?;
+        && let Ok(catalog) =
+            RedbPersistence::decode_exact::<VectorPartitionGenerationCatalogRecord>(payload)
+    {
         let selected = if owner.is_base {
             catalog.base.generation_id == owner.storage_id
         } else {

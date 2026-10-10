@@ -792,15 +792,28 @@ fn a_budget_too_small_for_one_working_page_is_still_the_typed_refusal() {
     let path = dir.path().join("no-room.db");
     fixture(&path);
     let load = load_read_image_with_memory(&path, Some(256 * 1024 * 1024)).unwrap();
-    let memory = Arc::clone(&load.source.verified_ordered_runs.memory);
-    let free = (256 * 1024 * 1024usize).saturating_sub(memory.accountant.usage().used);
+    let reader = load.image.open_context.read_memory();
+    let memory = crate::read_image_memory::ImageMemory::charging_reader(
+        load.source.verified_ordered_runs.memory.accountant.clone(), reader.clone(),
+    );
+    let free = match memory.reserve(256 * 1024 * 1024) {
+        Err(Error::MemoryBudgetExceeded { available_bytes, .. }) => available_bytes,
+        other => panic!("the supplied reader has a finite declared ceiling: {other:?}"),
+    };
     // Leave a few hundred bytes: not a page, not a descent, not one posting.
     memory
         .reserve(free.saturating_sub(256))
         .expect("the session may hold what it has already admitted");
 
     let mut walk = cursor(false);
-    let refused = pull(&load, &mut walk);
+    let meta = &load.image.table_meta["postings"];
+    let declaration = RedbPersistence::relational_index_declarations(meta)
+        .into_iter().find(|d| d.name == "by_bucket").unwrap();
+    let snapshot = SnapshotId(load.image.newest_committed_tx_for_test().unwrap().0);
+    let refused = load.source.bounded_relational_ordered_next(
+        "postings", meta, &declaration, snapshot, &mut walk,
+        &mut || Ok(()), &mut || Ok(()), &mut |_| Ok(()), reader,
+    ).map(|row| row.map(|row| row.row_id));
     assert!(
         matches!(refused, Err(Error::MemoryBudgetExceeded { .. })),
         "a budget that cannot hold one working page is the existing typed \

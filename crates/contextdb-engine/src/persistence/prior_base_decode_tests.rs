@@ -298,12 +298,41 @@ fn raw_membership(entry: &PersistedVectorEntry) -> VectorPartitionMembershipReco
     }
 }
 
+// Install the declaration and authenticated placement the current loader captures.
+// The raw write below remains intentional damage injection, after that foundation.
+fn declare_raw_fixture(
+    persistence: &RedbPersistence,
+    membership: &VectorPartitionMembershipRecord,
+    dimension: usize,
+    quantization: VectorQuantization,
+) -> Result<()> {
+    let fixture = crate::Database::open_memory();
+    fixture.execute(
+        "CREATE TABLE fixture (id INTEGER PRIMARY KEY, embedding VECTOR(1))",
+        &HashMap::new(),
+    )?;
+    let mut meta = fixture.table_meta("fixture").unwrap();
+    let column = meta.columns.iter_mut().find(|column| column.name == "embedding").unwrap();
+    column.name = membership.index.column.clone();
+    column.column_type = ColumnType::Vector(dimension);
+    column.quantization = quantization;
+    persistence.flush_table_meta(&membership.index.table, &meta)?;
+    persistence.write_corrupt_store_vector_memberships_for_test(std::slice::from_ref(membership))
+}
+
 fn write_and_load_raw_entry(
     persistence: &RedbPersistence,
     encoded: &[u8],
     membership: &VectorPartitionMembershipRecord,
     dimension: usize,
 ) -> Result<Vec<VectorEntry>> {
+    let persisted: PersistedVectorEntry = RedbPersistence::decode(encoded)?;
+    let quantization = match &persisted.vector {
+        PersistedVector::F32(_) => VectorQuantization::F32,
+        PersistedVector::SQ8 { .. } => VectorQuantization::SQ8,
+        PersistedVector::SQ4 { .. } => VectorQuantization::SQ4,
+    };
+    declare_raw_fixture(persistence, membership, dimension, quantization)?;
     let key = RedbPersistence::vector_identity_key(
         &membership.index,
         membership.row_id,
@@ -320,13 +349,26 @@ fn write_and_load_raw_entry(
                 .insert(key.as_slice(), encoded)
                 .map_err(RedbPersistence::storage_error)?;
         }
+        let entry = VectorEntry {
+            index: persisted.index.clone(),
+            row_id: persisted.row_id,
+            vector: persisted.vector.to_f32(),
+            created_tx: persisted.created_tx,
+            deleted_tx: persisted.deleted_tx,
+            lsn: persisted.lsn,
+        };
+        RedbPersistence::apply_content_identity_mutations_in_write(
+            &write,
+            &[content_identity::decoded_vector_version_mutation(&entry, quantization)],
+            &mut persistence.proof_admission(),
+        )?;
         write.commit().map_err(RedbPersistence::storage_error)?;
         let read = db.begin_read().map_err(RedbPersistence::storage_error)?;
         persistence.load_vector_entries_for_memberships_in_read(
             &read,
             std::slice::from_ref(membership),
             dimension,
-            None,
+            Some(quantization),
         )
     })
 }
@@ -336,6 +378,7 @@ fn oversized_raw_dimension_or_route_is_refused_before_body_decode() {
     let (_directory, persistence) = writer();
     let expected = raw_entry(1, VectorQuantization::F32);
     let membership = raw_membership(&expected);
+    declare_raw_fixture(&persistence, &membership, 1, VectorQuantization::F32).unwrap();
     let key = RedbPersistence::vector_identity_key(
         &membership.index,
         membership.row_id,
@@ -360,7 +403,7 @@ fn oversized_raw_dimension_or_route_is_refused_before_body_decode() {
                 &read,
                 std::slice::from_ref(&membership),
                 1,
-                None,
+                Some(VectorQuantization::F32),
             ).unwrap_err();
             // A successful body decode would instead reach the existing
             // dimension/identity checks. This reason is the predecode guard.
@@ -382,6 +425,7 @@ fn corrupt_sq4_expansion_is_refused_before_dequantization_allocation() {
     let (_directory, persistence) = writer();
     let mut corrupt = raw_entry(1, VectorQuantization::SQ4);
     let membership = raw_membership(&corrupt);
+    declare_raw_fixture(&persistence, &membership, 1, VectorQuantization::SQ4).unwrap();
     corrupt.vector = PersistedVector::SQ4 {
         min: 0.0,
         max: 1.0,
@@ -402,7 +446,10 @@ fn corrupt_sq4_expansion_is_refused_before_dequantization_allocation() {
     // Admit exactly the owned coded record, with no credit for a subsequent
     // F32 clone/dequantization. Reaching the old conversion path would refuse
     // its reserve instead of returning the predicted dimension corruption.
-    let memory = crate::read_image_memory::ImageMemory::new(Some(decode_charge));
+    // The guarded decoder admits its fixed control transient before parsing.
+    // That transient is refunded; the body still owns exactly decode_charge.
+    let decode_control = std::mem::size_of::<PersistedVectorEntry>() * 4 + 128;
+    let memory = crate::read_image_memory::ImageMemory::new(Some(decode_charge + decode_control));
     let key = RedbPersistence::vector_identity_key(
         &membership.index,
         membership.row_id,
@@ -428,7 +475,7 @@ fn corrupt_sq4_expansion_is_refused_before_dequantization_allocation() {
                         &read,
                         std::slice::from_ref(&membership),
                         1,
-                        None,
+                        Some(VectorQuantization::SQ4),
                     )
                 })
                 .unwrap_err();

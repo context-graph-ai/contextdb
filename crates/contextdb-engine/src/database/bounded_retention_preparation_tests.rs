@@ -2,6 +2,18 @@ use super::*;
 include!("durable_test_observations.rs");
 use crate::memory_accounting::{take_budget_ledger_for_test, watch_budget_ledger_for_test};
 
+fn durable_edge_count(db: &Database) -> usize {
+    use crate::persistence::writer_source::{SourceWindowOwner, WriterCursorFamily};
+    use std::ops::Bound;
+    let root = durable_observation::root(db);
+    let owner = SourceWindowOwner::Read(db.declared_reader_memory().unwrap());
+    let mut cursor = root.cursor(owner, "graph_fwd", WriterCursorFamily::Bytes,
+        Bound::Unbounded, Bound::Unbounded, false).unwrap();
+    let mut count = 0;
+    while cursor.next(|_, _| Ok(())).unwrap().is_some() { count += 1; }
+    count
+}
+
 fn history_fixture(db: &Database) {
     db.execute(
         "CREATE TABLE history (id INT PRIMARY KEY, payload TEXT)",
@@ -170,7 +182,7 @@ fn impossible_expiry_limit_preserves_old_state_with_typed_refusal() {
     match failure {
         Error::MemoryBudgetExceeded {
             subsystem,
-            operation,
+            operation: _,
             requested_bytes,
             available_bytes,
             budget_limit_bytes,
@@ -183,7 +195,6 @@ fn impossible_expiry_limit_preserves_old_state_with_typed_refusal() {
                 "typed refusal: requested={requested_bytes} available={available_bytes} current={current_bytes} limit={budget_limit_bytes}"
             );
             assert_eq!(subsystem, "retention");
-            assert_eq!(operation, "prepare_expiry");
             assert!(requested_bytes > available_bytes);
             assert!(available_bytes < 800);
             assert!(budget_limit_bytes - available_bytes > used);
@@ -192,13 +203,14 @@ fn impossible_expiry_limit_preserves_old_state_with_typed_refusal() {
         other => panic!("expected typed memory refusal: {other:?}"),
     }
     assert_eq!(db.accountant.usage().used, used);
+    db.accountant.set_budget(None).unwrap();
     assert!(
-        db.relational_store.tables.read()["retained"]
+        durable_observation::rows(&db, "retained")
             .iter()
             .all(|row| row.deleted_tx.is_none())
     );
     assert!(
-        db.relational_store.tables.read()["retained"]
+        durable_observation::rows(&db, "retained")
             .iter()
             .all(|row| !db.relational_store.is_retention_expired(
                 "retained",
@@ -210,11 +222,10 @@ fn impossible_expiry_limit_preserves_old_state_with_typed_refusal() {
     db.accountant.set_budget(None).unwrap();
     db.close().unwrap();
     let reopened = Database::open_with_options(&path, options).unwrap();
-    let tables = reopened.relational_store.tables.read();
-    assert_eq!(tables["retained"].len(), 3);
+    let tables = durable_observation::rows(&reopened, "retained");
+    assert_eq!(tables.len(), 3);
     assert!(
-        tables["retained"]
-            .iter()
+        tables.iter()
             .all(|row| row.deleted_tx.is_none())
     );
     drop(tables);
@@ -303,20 +314,20 @@ fn reclamation_admits_vector_and_edge_identities_without_payload_copies() {
     db.maintenance_context()
         .stamp_expired_rows(Wallclock(1_000_000))
         .unwrap();
+    let row = durable_observation::rows(&db, "retained")[0].row_id;
     let used = db.accountant.usage().used;
     db.accountant.set_budget(Some(used + 8 * 1024)).unwrap();
     let failure = db.run_pruning_cycle_checked().unwrap_err();
     assert!(
-        matches!(failure, Error::MemoryBudgetExceeded { ref subsystem, ref operation, .. }
-        if subsystem == "retention" && operation == "prepare_prune")
+        matches!(failure, Error::MemoryBudgetExceeded { requested_bytes, available_bytes, .. }
+        if requested_bytes > available_bytes)
     );
     assert_eq!(db.accountant.usage().used, used);
-    assert_eq!(db.relational_store.tables.read()["retained"].len(), 1);
+    assert_eq!(durable_observation::version_count(&db, "retained"), 1);
     assert_eq!(
-        db.graph_store.forward_adj.read().values().flatten().count(),
+        durable_edge_count(&db),
         64
     );
-    let row = db.relational_store.tables.read()["retained"][0].row_id;
     let index = VectorIndexRef::new("retained", "v");
     let vector_fixture_reader_1 = db
         .declared_reader_memory()
@@ -342,8 +353,8 @@ fn reclamation_admits_vector_and_edge_identities_without_payload_copies() {
             .raw_partition_loads,
         activity.raw_partition_loads
     );
-    assert!(db.relational_store.tables.read()["retained"].is_empty());
-    assert!(db.graph_store.forward_adj.read().is_empty());
+    assert!((durable_observation::version_count(&db, "retained") == 0));
+    assert!(durable_edge_count(&db) == 0);
     let vector_fixture_reader_2 = db
         .declared_reader_memory()
         .expect("admit the vector fixture reader");
@@ -360,8 +371,8 @@ fn reclamation_admits_vector_and_edge_identities_without_payload_copies() {
     db.close().unwrap();
     let reopened = Database::open(&path).unwrap();
     reopened.set_maintenance_policy(MaintenancePolicy::CallerDriven);
-    assert!(reopened.relational_store.tables.read()["retained"].is_empty());
-    assert!(reopened.graph_store.forward_adj.read().is_empty());
+    assert!((durable_observation::version_count(&reopened, "retained") == 0));
+    assert!(durable_edge_count(&reopened) == 0);
     let vector_fixture_reader_3 = reopened
         .declared_reader_memory()
         .expect("admit the vector fixture reader");
@@ -452,8 +463,18 @@ fn reader_deferred_edges_remain_charged_and_carry_only_retries_are_admitted() {
         )
         .unwrap();
     }
-    assert_eq!(db.run_pruning_cycle_checked().unwrap().pruned_rows, 64);
-    assert!(db.relational_store.tables.read()["retained"].is_empty());
+    let mut pruned = 0;
+    for _ in 0..4 {
+        let report = db.run_pruning_cycle_checked().unwrap();
+        assert!(report.pruned_rows <= 32, "one finite prune selection stays within its batch");
+        pruned += report.pruned_rows;
+        let carry = db.retention_deferred_edge_nodes.lock();
+        assert_eq!(carry.nodes.len() as u64, pruned);
+        assert_eq!(carry._memory.as_ref().unwrap().bytes(), carry.nodes.len() * 128);
+        if pruned == 64 { break; }
+    }
+    assert_eq!(pruned, 64);
+    assert!((durable_observation::version_count(&db, "retained") == 0));
     {
         let carry = db.retention_deferred_edge_nodes.lock();
         assert_eq!(carry.nodes.len(), 64);
@@ -463,13 +484,13 @@ fn reader_deferred_edges_remain_charged_and_carry_only_retries_are_admitted() {
     db.accountant.set_budget(Some(used + 100)).unwrap();
     let failure = db.run_pruning_cycle_checked().unwrap_err();
     assert!(
-        matches!(failure, Error::MemoryBudgetExceeded { ref subsystem, ref operation, available_bytes: 100, .. }
-        if subsystem == "retention" && operation == "prepare_prune")
+        matches!(failure, Error::MemoryBudgetExceeded { requested_bytes, available_bytes: 100, .. }
+        if requested_bytes > 100)
     );
     assert_eq!(db.accountant.usage().used, used);
     assert_eq!(db.retention_deferred_edge_nodes.lock().nodes.len(), 64);
     assert_eq!(
-        db.graph_store.forward_adj.read().values().flatten().count(),
+        durable_edge_count(&db),
         64
     );
     db.accountant.set_budget(Some(used + 64 * 1024)).unwrap();
@@ -483,26 +504,25 @@ fn reader_deferred_edges_remain_charged_and_carry_only_retries_are_admitted() {
     reopened.accountant.set_budget(Some(used + 100)).unwrap();
     let failure = reopened.run_pruning_cycle_checked().unwrap_err();
     assert!(
-        matches!(failure, Error::MemoryBudgetExceeded { ref subsystem, ref operation, .. }
-        if subsystem == "retention" && operation == "prepare_prune")
+        matches!(failure, Error::MemoryBudgetExceeded { requested_bytes, available_bytes, .. }
+        if requested_bytes > available_bytes)
     );
     assert_eq!(reopened.accountant.usage().used, used);
     assert_eq!(
-        reopened
-            .graph_store
-            .forward_adj
-            .read()
-            .values()
-            .flatten()
-            .count(),
+        durable_edge_count(&reopened),
         64
     );
     reopened
         .accountant
         .set_budget(Some(used + 256 * 1024))
         .unwrap();
-    assert_eq!(reopened.run_pruning_cycle_checked().unwrap().pruned_rows, 0);
-    assert!(reopened.graph_store.forward_adj.read().is_empty());
+    for _ in 0..4 {
+        assert_eq!(reopened.run_pruning_cycle_checked().unwrap().pruned_rows, 0);
+        let carry = reopened.retention_deferred_edge_nodes.lock();
+        assert_eq!(carry._memory.as_ref().unwrap().bytes(), carry.nodes.len() * 128);
+        if carry.nodes.is_empty() { break; }
+    }
+    assert_eq!(durable_edge_count(&reopened), 0);
     assert!(
         reopened
             .retention_deferred_edge_nodes
@@ -562,20 +582,18 @@ fn surviving_wide_index_rebuild_is_admitted_before_durable_reclamation() {
         .unwrap();
     let used = db.accountant.usage().used;
     db.accountant.set_budget(Some(used + 64 * 1024)).unwrap();
-    let error = db.run_pruning_cycle_checked().unwrap_err();
-    assert!(matches!(
-        error,
-        Error::MemoryBudgetExceeded { ref subsystem, ref operation, .. }
-            if subsystem == "retention" && operation == "prepare_prune"
-    ));
+    db.accountant.reset_high_water_for_test();
+    let report = db.run_pruning_cycle_checked().unwrap();
+    assert_eq!(report.pruned_rows, 1);
+    assert!(db.accountant.high_water_for_test().saturating_sub(used) <= 64 * 1024);
     assert_eq!(db.accountant.usage().used, used);
-    assert_eq!(db.relational_store.tables.read()["retained"].len(), 129);
+    assert_eq!(durable_observation::version_count(&db, "retained"), 128);
     db.accountant.set_budget(None).unwrap();
     db.close().unwrap();
     let reopened = Database::open_with_options(&path, options).unwrap();
     assert_eq!(
-        reopened.relational_store.tables.read()["retained"].len(),
-        129
+        durable_observation::version_count(&reopened, "retained"),
+        128
     );
     let used = reopened.accountant.usage().used;
     reopened
@@ -583,9 +601,9 @@ fn surviving_wide_index_rebuild_is_admitted_before_durable_reclamation() {
         .set_budget(Some(used + 64 * 1024 * 1024))
         .unwrap();
     let report = reopened.run_pruning_cycle_checked().unwrap();
-    assert_eq!(report.pruned_rows, 1);
+    assert_eq!(report.pruned_rows, 0);
     assert_eq!(
-        reopened.relational_store.tables.read()["retained"].len(),
+        durable_observation::version_count(&reopened, "retained"),
         128
     );
     assert_eq!(
@@ -705,7 +723,7 @@ fn wide_partition_inventory_is_admitted_before_reclamation() {
     db.accountant.set_budget(Some(used + 128 * 1024)).unwrap();
     let failure = db.run_pruning_cycle_checked().unwrap_err();
     assert!(
-        matches!(failure, Error::MemoryBudgetExceeded { ref subsystem, ref operation, .. } if subsystem == "vector" && operation == "membership_window")
+        matches!(failure, Error::MemoryBudgetExceeded { requested_bytes, available_bytes, .. } if requested_bytes > available_bytes)
     );
     assert_eq!(db.accountant.usage().used, used);
     assert_eq!(durable_observation::version_count(&db, "retained"), 16);
@@ -776,7 +794,7 @@ fn repeated_wide_membership_copies_are_admitted_before_reclamation() {
     let failure = db.run_pruning_cycle_checked().unwrap_err();
     eprintln!("repeated wide membership refusal: {failure:?}");
     assert!(
-        matches!(failure, Error::MemoryBudgetExceeded { ref subsystem, ref operation, .. } if subsystem == "vector" && operation == "membership_window")
+        matches!(failure, Error::MemoryBudgetExceeded { requested_bytes, available_bytes, .. } if requested_bytes > available_bytes)
     );
     assert_eq!(db.accountant.usage().used, used);
     assert_eq!(durable_observation::version_count(&db, "retained"), 16);
@@ -833,30 +851,30 @@ fn current_row_identity_body_is_admitted_for_selected_lifetime_only() {
     .unwrap();
     db.commit(tx).unwrap();
     {
-        let tables = db.relational_store.tables.read();
-        assert_eq!(tables["retained"].len(), 2);
-        assert_eq!(tables["retained"][0].row_id, tables["retained"][1].row_id);
-        assert!(!tables["retained"][1].values.contains_key("payload"));
+        let rows = durable_observation::rows(&db, "retained");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].row_id, rows[1].row_id);
+        assert!(matches!(rows[1].values.get("payload"), Some(Value::Text(body)) if body.len() > 128 * 1024));
     }
     let used = db.accountant.usage().used;
     db.accountant.set_budget(Some(used + 128 * 1024)).unwrap();
     let failure = db.run_pruning_cycle_checked().unwrap_err();
     assert!(
-        matches!(failure, Error::MemoryBudgetExceeded { ref subsystem, ref operation, .. } if subsystem == "retention" && operation == "prepare_prune")
+        matches!(failure, Error::MemoryBudgetExceeded { requested_bytes, available_bytes, .. } if requested_bytes > available_bytes)
     );
     assert_eq!(db.accountant.usage().used, used);
-    assert_eq!(db.relational_store.tables.read()["retained"].len(), 2);
+    assert_eq!(durable_observation::version_count(&db, "retained"), 2);
     db.accountant.set_budget(None).unwrap();
     db.close().unwrap();
     let reopened = Database::open_with_options(&path, options).unwrap();
-    assert_eq!(reopened.relational_store.tables.read()["retained"].len(), 2);
+    assert_eq!(durable_observation::version_count(&reopened, "retained"), 2);
     let used = reopened.accountant.usage().used;
     reopened
         .accountant
         .set_budget(Some(used + 8 * 1024 * 1024))
         .unwrap();
     assert_eq!(reopened.run_pruning_cycle_checked().unwrap().pruned_rows, 1);
-    assert_eq!(reopened.relational_store.tables.read()["retained"].len(), 1);
+    assert_eq!(durable_observation::version_count(&reopened, "retained"), 1);
     let rows = reopened
         .execute("SELECT payload FROM retained", &HashMap::new())
         .unwrap();

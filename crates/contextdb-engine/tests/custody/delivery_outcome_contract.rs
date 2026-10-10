@@ -2490,10 +2490,12 @@ fn whole_unit_rows(db: &Database) -> Vec<Vec<Vec<Value>>> {
 async fn complete_outcome_readback() {
     let tenant = "complete-outcome-readback";
     let broker = InProcessBroker::new();
-    let hub_db = Arc::new(Database::open_memory());
+    let mut oversized_reader = contextdb_engine::DatabaseOpenOptions::default();
+    oversized_reader.owner_reads.limits.limits.memory = 512 * 1024 * 1024;
+    let hub_db = Arc::new(Database::open_with_options(":memory:", oversized_reader.clone()).unwrap());
     create_core_tables(&hub_db);
     let hub = start_hub(&broker, tenant, hub_db.clone()).await;
-    let db = Arc::new(Database::open_memory());
+    let db = Arc::new(Database::open_with_options(":memory:", oversized_reader).unwrap());
     let (client, _) = edge_client(&db, &broker, tenant);
     within(
         client.__seed_application_table_policy_binding_for_test(

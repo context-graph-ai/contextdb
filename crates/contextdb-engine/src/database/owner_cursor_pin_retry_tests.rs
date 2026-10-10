@@ -358,7 +358,12 @@ fn owner_channel_registry_wait(outcome: RegistryWaitOutcome, phase: RegistryWait
         let [LocalResponse::CursorOpened { opened }] = responses.as_slice() else {
             panic!("expected owner cursor page: {responses:?}");
         };
-        let page = crate::read_contract::decode_cursor_page(&opened.payload).unwrap();
+        let page = crate::read_contract::decode_observed_cursor_page(
+                &opened.payload,
+                ReadLimits::SHIPPED_MEMORY,
+            )
+            .unwrap()
+            .page;
         assert_eq!(page.rows, vec![vec![expected_first]]);
         assert!(page.has_more);
     }
@@ -639,7 +644,12 @@ fn owner_channel_registry_teardown(outcome: RegistryTeardownOutcome) {
             let [LocalResponse::CursorOpened { opened }] = responses.as_slice() else {
                 panic!("expected owner cursor page: {responses:?}");
             };
-            let page = crate::read_contract::decode_cursor_page(&opened.payload).unwrap();
+            let page = crate::read_contract::decode_observed_cursor_page(
+                &opened.payload,
+                ReadLimits::SHIPPED_MEMORY,
+            )
+            .unwrap()
+            .page;
             assert_eq!(page.rows, vec![vec![Value::Int64(1)]]);
             assert!(page.has_more);
             assert!(

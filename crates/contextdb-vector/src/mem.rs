@@ -976,6 +976,25 @@ pub struct OwnedVectorSearchTrace {
 }
 
 impl OwnedVectorSearchTrace {
+    /// Rebuild an owned trace from a materialized trace and the admission
+    /// that already holds its retained allocation, so publication keeps the
+    /// same charge instead of copying or re-reserving it.
+    #[doc(hidden)]
+    pub fn from_admitted(
+        trace: VectorSearchDebugTrace,
+        executing_owner: Arc<dyn MemoryBudget>,
+        admission: crate::VectorCopyAdmission,
+    ) -> OwnedVectorSearchTrace {
+        OwnedVectorSearchTrace {
+            trace,
+            credit: ScoreCredit {
+                budget: executing_owner,
+                bytes: 0,
+            },
+            admission: Some(admission),
+        }
+    }
+
     pub fn hnsw_len(&self) -> Option<usize> {
         self.trace.hnsw_len
     }
@@ -2760,6 +2779,11 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             return Err(error);
         }
         for source in &mut sources {
+            // A quarantined route serves no graph; its exact reads use the
+            // raw memberships, which do not depend on the damaged catalog.
+            if source.state.route_quarantine().is_some() {
+                continue;
+            }
             match source.state.capture_serving_selection(snapshot, owner) {
                 Ok(selection) => source.serving_selection = selection,
                 Err(error) => {
@@ -3845,6 +3869,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     ),
                     None => state.preload_snapshot_compatible_hnsw_layers_for_request(
                         snapshot,
+                        None,
                         &mut preload_checkpoint,
                         &mut preload_retain,
                         &mut release_retained,
@@ -3996,8 +4021,36 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 });
             }
 
+            // AUTO decides up front, from declared figures, whether graph work
+            // can beat EXACT: when the shared cap is not below the rows EXACT
+            // would score, or every layer cannot reach its k-floor beam inside
+            // the cap, the union answers by EXACT without opening a layer.
+            // INDEXED always attempts the walk; the cap then refuses it by type.
+            let crossover_to_exact = mode == VectorSearchMode::Auto && !union_partitions.is_empty() && {
+                let layer_count = union_partitions
+                    .iter()
+                    .map(|partition| partition.layers.len())
+                    .fold(0usize, usize::saturating_add);
+                let degree = union_partitions
+                    .iter()
+                    .flat_map(|partition| partition.layers.iter())
+                    .filter_map(|layer| layer.graph())
+                    .map(|graph| graph.layer0_max_degree())
+                    .max()
+                    .unwrap_or(0)
+                    .max(1);
+                let rows = union_partitions
+                    .iter()
+                    .map(|partition| partition.allowed_count)
+                    .fold(0usize, usize::saturating_add);
+                let cap = crate::hnsw::union_candidate_budget(statement_policy.hnsw_ef_search, k, degree);
+                crate::hnsw::union::graph_work_cannot_beat_exact(cap, rows, layer_count, k, degree)
+            };
+            if crossover_to_exact {
+                first_fallback_reason.get_or_insert("graph_work_not_below_exact");
+            }
             if !union_partitions.is_empty() {
-                let outcome = self.bounded_union_search(
+                let outcome = if crossover_to_exact { None } else { Some(self.bounded_union_search(
                     index,
                     query,
                     k,
@@ -4012,9 +4065,12 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     &mut before_retain,
                     &mut release_retained,
                     owner,
-                )?;
+                )?) };
+                let resolved = match outcome {
+                    None => None,
+                    Some(outcome) => {
                 union_receipt = Some(outcome.receipt);
-                let resolved = match outcome.outcome {
+                match outcome.outcome {
                     UnionOutcome::Answered {
                         accepted,
                         accepted_bytes,
@@ -4037,6 +4093,8 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                             return Ok(BoundedHnswOutcome::Incomplete { reason });
                         }
                         None
+                    }
+                }
                     }
                 };
                 match resolved {
@@ -4493,13 +4551,27 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         let mut navigation_copy_owner = owner.scratch();
         let admitted_owner = std::cell::RefCell::new(&mut navigation_copy_owner);
         let membership_error = std::cell::RefCell::new(None);
-        let searched = crate::hnsw::union::search_union_allowed_bounded_with_navigation(
-            &layers,
+        // Each admitted layer is a separate graph and runs its own search to its
+        // own termination; one beam shared across disjoint graphs let a layer
+        // be pruned unexpanded. All layers spend ONE hard cap: each search may
+        // use only what the earlier ones left, admission included, and a layer
+        // that cannot finish inside it makes the whole union Incomplete.
+        let funder = owner.funder();
+        let mut run_layer = |slice: &[crate::hnsw::HnswUnionLayer<'_>], remaining: usize, spent: usize| crate::hnsw::union::search_union_allowed_bounded_with_navigation(
+            slice,
             query,
             k,
             ef_search,
-            budget,
-            limits,
+            remaining,
+            // The declared work limit is one too: what earlier partitions
+            // spent is gone from it as well as from the shared cap.
+            HnswAllowedSearchLimits {
+                max_vector_evaluations: limits
+                    .max_vector_evaluations
+                    .saturating_sub(spent)
+                    .min(remaining),
+                ..limits
+            },
             graph_scores_are_current,
             true,
             query_self_scores,
@@ -4566,8 +4638,35 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 (*retained.borrow_mut())(bytes)
             }),
             |event| apply_hnsw_scratch_release(event, &mut |bytes| (*released.borrow_mut())(bytes)),
-            Some(&navigation_session),
+            Some(&crate::hnsw::union::NavigationSession::new(Some(funder.clone()))),
         );
+        // Layers are grouped by partition: a partition's base, change and
+        // fresh tail jointly hold its rows, so they are searched together;
+        // separate partitions are separate graphs and each runs its own search.
+        let mut partition_runs = Vec::<(usize, usize)>::new();
+        for (position, layer) in layers.iter().enumerate() {
+            match partition_runs.last_mut() {
+                Some((start, end)) if layers[*start].partition == layer.partition && *end == position => {
+                    *end = position + 1;
+                }
+                _ => partition_runs.push((position, position + 1)),
+            }
+        }
+        let searched = crate::hnsw::union::merge_layer_searches(
+            partition_runs.len(),
+            budget,
+            k,
+            |run, remaining, spent| {
+                let (start, end) = partition_runs[run];
+                run_layer(&layers[start..end], remaining, spent).map(|mut result| {
+                    for candidate in &mut result.candidates {
+                        candidate.layer += start;
+                    }
+                    result
+                })
+            },
+        );
+        drop(run_layer);
         drop(retained);
         drop(released);
         drop(layers);
@@ -4785,6 +4884,15 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         let mut walked = Vec::<(RowId, f32)>::new();
         let mut walked_bytes = 0usize;
         let mut contributing = Vec::<(usize, usize)>::new();
+        // Rescoring spends the same shared cap the layer searches drew from;
+        // a candidate that cannot be rescored inside it leaves the union
+        // Incomplete, even though every layer's walk terminated.
+        let mut rescore_credit = searched.budget.saturating_sub(
+            searched
+                .admission_evaluations
+                .saturating_add(searched.expansion_evaluations),
+        );
+        let mut rescore_exhausted = false;
         let resolved = (|| -> std::result::Result<(), E> {
             let mut scoring_open = true;
             for (position, candidate) in searched.candidates.iter().enumerate() {
@@ -4864,11 +4972,19 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 if !owner.historical_durable_reads() && page_scoring.is_none() && resolved_score.is_none() {
                     *page_scoring = Some(state.sealed_page_scoring(
                         snapshot,
+                        source.serving_selection.as_deref(),
                         query,
                         before_source_entry,
                         before_retain,
                         release_retained,
                     )?);
+                }
+                if resolved_score.is_none() {
+                    if rescore_credit == 0 {
+                        rescore_exhausted = true;
+                        return Ok(());
+                    }
+                    rescore_credit -= 1;
                 }
                 let score = match resolved_score {
                     Some(score) => Some(score),
@@ -4924,6 +5040,17 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             drop(short);
             release_retained(short_bytes);
             return Err(error);
+        }
+        if rescore_exhausted {
+            drop(accepted);
+            release_retained(accepted_bytes);
+            drop(walked);
+            release_retained(walked_bytes);
+            drop(short);
+            release_retained(short_bytes);
+            return Ok(UnionOutcome::Unresolved(
+                HnswAllowedSearchIncomplete::VectorEvaluationLimitReached,
+            ));
         }
         if accepted.len() < required {
             drop(accepted);

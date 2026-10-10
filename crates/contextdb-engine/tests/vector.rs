@@ -1,3 +1,7 @@
+#[path = "vector/a_damaged_index_refuses_only_reads_that_consume_its_postings.rs"]
+mod a_damaged_index_refuses_only_reads_that_consume_its_postings;
+#[path = "vector/a_damaged_saved_graph_page_refuses_only_its_route.rs"]
+mod a_damaged_saved_graph_page_refuses_only_its_route;
 #[path = "vector/a_declared_breadth_gets_exactly_its_approved_budget.rs"]
 mod a_declared_breadth_gets_exactly_its_approved_budget;
 #[path = "vector/a_declared_graph_degree_loads_when_its_memory_fits.rs"]
@@ -27,6 +31,8 @@ mod a_saved_graph_load_checks_its_bytes_once;
 #[cfg(unix)]
 #[path = "vector/a_saved_graph_search_reports_its_distance_work.rs"]
 mod a_saved_graph_search_reports_its_distance_work;
+#[path = "vector/a_store_reopens_after_every_vector_maintenance_commit.rs"]
+mod a_store_reopens_after_every_vector_maintenance_commit;
 #[path = "vector/a_tied_frontier_cannot_hide_a_smaller_row.rs"]
 mod a_tied_frontier_cannot_hide_a_smaller_row;
 #[cfg(unix)]
@@ -172,3 +178,7 @@ mod what_the_approved_budget_does_to_one_large_context;
 mod where_one_partition_spends_its_find;
 #[path = "vector/writer_residency_attribution.rs"]
 mod writer_residency_attribution;
+
+#[cfg(unix)]
+#[path = "vector/paged_generation_load_pricing_contract.rs"]
+mod paged_generation_load_pricing_contract;

@@ -1001,10 +1001,11 @@ cannot fit is the ordinary typed budget refusal with nothing installed.
 **Which route a `COUNT(*)` took.** `.explain` says so in one of three states,
 and names the statement that would change it when a statement would.
 
-A stored count is reachable only from a store read as a committed image — the
-direct-file read route. A writable handle and the owner read route count the
-live postings over the same exact prefix range instead. Every one of the three
-answers is exact; only the first is O(1):
+The direct-file route serves a stored count from its committed image. Writable
+handles and the owner read route serve it from the statement's captured writer
+root and report `used`. If a route cannot serve the stored count, it counts the
+live postings over the same exact prefix range and reports `declared`. Every
+answer is exact; serving the stored count is O(1):
 
 ```
 IndexScan { index: events_by_context }

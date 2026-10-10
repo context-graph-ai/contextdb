@@ -107,6 +107,8 @@ pub(crate) struct PreparedVectorPartitionMutationBatch {
     // The engine projection can outlive vector publication within apply.
     // Keep its copied inputs funded until every projection payload is gone.
     _vector_copy_owner: contextdb_vector::VectorCopyAdmission,
+    // Staged INSERT copies are write preparation, separate from source reads.
+    _insert_copy_owner: contextdb_vector::VectorCopyAdmission,
 }
 
 impl PreparedVectorPartitionMutationBatch {
@@ -556,8 +558,18 @@ impl ApplyPhasePause {
         }
         state.reached = true;
         self.waiters.notify_all();
+        // An armed pause is held by a test that releases it. If that test
+        // fails first -- often inside a thread scope that then joins this very
+        // thread -- nobody releases it, and the whole test binary would hang
+        // instead of reporting the failure. Far past any deliberate hold, the
+        // pause lets the paused operation continue.
+        const ABANDONED_PAUSE: std::time::Duration = std::time::Duration::from_secs(300);
+        let deadline = std::time::Instant::now() + ABANDONED_PAUSE;
         while state.armed && !state.released {
-            self.waiters.wait(&mut state);
+            if self.waiters.wait_until(&mut state, deadline).timed_out() {
+                eprintln!("an armed test pause was never released; continuing after {ABANDONED_PAUSE:?}");
+                break;
+            }
         }
         state.armed = false;
         state.reached = false;
@@ -978,6 +990,9 @@ impl CompositeStore {
         read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<PreparedVectorPartitionMutationBatch> {
         let mut vector_copy_owner = vector_copy_owner.scratch();
+        let mut insert_copy_owner = contextdb_vector::VectorCopyAdmission::new(
+            self.accountant.as_arc().vector_budget()?,
+        );
         let commit_lsn = ws.commit_lsn.unwrap_or(Lsn(0));
         let new_rows = ws
             .relational_inserts
@@ -1096,7 +1111,12 @@ impl CompositeStore {
                 .and_then(|bytes| bytes.checked_mul(2))
                 .and_then(|bytes| bytes.checked_add(after.partition_key.estimated_bytes()))
                 .ok_or_else(|| Error::Other("vector input copy size overflow".into()))?;
-            vector_copy_owner.reserve(copied_body_bytes)?;
+            insert_copy_owner.reserve_for(
+                copied_body_bytes,
+                "writer",
+                "prepare_vector_insert_copies",
+                "Raise MEMORY_LIMIT to prepare this vector write.",
+            )?;
             keyed_inserts.push(PartitionedVectorEntry::with_membership(
                 after.partition_key.clone(),
                 entry.clone(),
@@ -1331,6 +1351,7 @@ impl CompositeStore {
             mutations,
             vector_publication,
             _vector_copy_owner: vector_copy_owner,
+            _insert_copy_owner: insert_copy_owner,
         })
     }
 

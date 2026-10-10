@@ -114,10 +114,10 @@ impl Fixture {
             .publish_prepared_partitioned_batch(prepared, Lsn(lsn), None);
     }
 
-    fn insert(&mut self, k: u64, row: u64, tx: u64, holds: &[SnapshotId]) -> Result<()> {
+    fn insert(&mut self, k: u64, row: u64, tx: TxId, holds: &[SnapshotId]) -> Result<()> {
         let prepared = self.prepare(
             vec![],
-            vec![PartitionedVectorEntry::new(key(k), entry(row, tx))],
+            vec![PartitionedVectorEntry::new(key(k), entry(row, tx.0))],
             vec![],
             holds,
         )?;
@@ -125,14 +125,14 @@ impl Fixture {
         Ok(())
     }
 
-    fn delete(&mut self, k: u64, row: u64, tx: u64, created: u64, holds: &[SnapshotId]) {
+    fn delete(&mut self, k: u64, row: u64, tx: TxId, created: u64, holds: &[SnapshotId]) {
         let prepared = self
             .prepare(
                 vec![PartitionedVectorDelete::new(
                     index(),
                     key(k),
                     RowId(row),
-                    TxId(tx),
+                    tx,
                     TxId(created),
                     Lsn(created),
                 )],
@@ -184,15 +184,15 @@ fn cap_refusal(error: &Error, cap: u32) -> bool {
 fn cdb120_ledger_equals_a_recount_after_every_kind_of_publication() {
     let mut f = Fixture::new(4);
     for k in 0..4 {
-        f.insert(k, 10 + k, 1 + k, &[]).unwrap();
+        f.insert(k, 10 + k, TxId(1 + k), &[]).unwrap();
         f.audit("insert through the cap");
     }
-    let refusal = f.insert(4, 20, 5, &[]).unwrap_err();
+    let refusal = f.insert(4, 20, TxId(5), &[]).unwrap_err();
     assert!(cap_refusal(&refusal, 4), "{refusal:?}");
     f.audit("failed preparation: the cap refusal");
 
     f.budget.refuse.store(true, Ordering::SeqCst);
-    let _ = f.insert(0, 21, 6, &[]);
+    let _ = f.insert(0, 21, TxId(6), &[]);
     f.budget.refuse.store(false, Ordering::SeqCst);
     f.audit("failed preparation: the budget refusal");
 
@@ -220,8 +220,8 @@ fn cdb120_ledger_equals_a_recount_after_every_kind_of_publication() {
     f.store.account_loaded_state(f.budget.clone()).unwrap();
     assert_eq!(f.audit("loaded").occupied, 4, "a loaded insert into an existing route adds no route");
 
-    f.delete(0, 10, 9, 1, &[SnapshotId(5)]);
-    f.delete(0, 31, 9, 8, &[SnapshotId(5)]);
+    f.delete(0, 10, TxId(9), 1, &[SnapshotId(5)]);
+    f.delete(0, 31, TxId(9), 8, &[SnapshotId(5)]);
     let audit = f.audit("delete of a last vector under a hold");
     assert!(audit.empty_counted.contains(&key(0)), "the emptied route is counted-empty");
 
@@ -238,7 +238,7 @@ fn cdb120_ledger_equals_a_recount_after_every_kind_of_publication() {
     let audit = f.audit("retirement to historical-only");
     assert!(!audit.empty_counted.contains(&key(0)));
 
-    f.insert(0, 50, 13, &[]).unwrap_or_else(|e| panic!("reactivating a historical route: {e}"));
+    f.insert(0, 50, TxId(13), &[]).unwrap_or_else(|e| panic!("reactivating a historical route: {e}"));
     f.audit("historical route reactivated");
 }
 
@@ -259,10 +259,10 @@ fn row_of(k: u64) -> u64 {
 fn make_historical(f: &mut Fixture) {
     for wave in [100_u64, 110] {
         for k in wave..wave + u64::from(CAP) {
-            f.insert(k, row_of(k), 1, &[]).unwrap();
+            f.insert(k, row_of(k), TxId(1), &[]).unwrap();
         }
         for k in wave..wave + u64::from(CAP) {
-            f.delete(k, row_of(k), 2, 1, &[]);
+            f.delete(k, row_of(k), TxId(2), 1, &[]);
         }
         f.store
             .retire_snapshot_free_partition_states(&[], f.budget.as_ref(), &mut f.admission())
@@ -280,19 +280,19 @@ fn edge_fixture(with_reclaimable: bool, extra_history: u64) -> Fixture {
     let mut f = Fixture::new(CAP);
     make_historical(&mut f);
     for k in (0..2).chain(10..13).chain(20..22) {
-        f.insert(k, row_of(k), 10, &[]).unwrap();
+        f.insert(k, row_of(k), TxId(10), &[]).unwrap();
     }
     if with_reclaimable {
         for n in 0..=extra_history {
-            f.insert(30, 500_000 + n, 10, &[]).unwrap_or_else(|e| panic!("route 30 row {n}: {e}"));
+            f.insert(30, 500_000 + n, TxId(10), &[]).unwrap_or_else(|e| panic!("route 30 row {n}: {e}"));
         }
         for n in 0..=extra_history {
-            f.delete(30, 500_000 + n, 11, 10, &[SnapshotId(10)]);
+            f.delete(30, 500_000 + n, TxId(11), 10, &[SnapshotId(10)]);
         }
         f.cover(30, 15);
     }
     for k in (10..13).chain(20..22) {
-        f.delete(k, row_of(k), 15, 10, &[HOLD]);
+        f.delete(k, row_of(k), TxId(15), 10, &[HOLD]);
     }
     for k in 10..13 {
         f.cover(k, 15);
@@ -319,7 +319,7 @@ fn cdb120_edge_admits_through_the_one_reclaimable_route_and_visits_only_counted_
     assert_eq!(audit.occupied, CAP as usize, "the cap is full of counted routes");
     assert_eq!(audit.empty_counted.len(), 6, "three held, two ineligible, one reclaimable");
     let (before, _) = work(&f);
-    f.insert(40, row_of(40), 16, &[HOLD])
+    f.insert(40, row_of(40), TxId(16), &[HOLD])
         .unwrap_or_else(|e| panic!("the reclaimable route must admit the new key: {e}"));
     let (after, _) = work(&f);
     let visits = after.cap_edge_route_visits - before.cap_edge_route_visits;
@@ -336,9 +336,9 @@ fn cdb120_edge_with_no_reclaimable_route_refuses_exactly_as_the_base_does() {
     let mut f = edge_fixture(false, 0);
     let audit = f.audit("edge fixture");
     assert_eq!(audit.occupied, 7, "seven counted routes");
-    f.insert(41, row_of(41), 16, &[HOLD]).unwrap(); // the eighth: the cap itself
+    f.insert(41, row_of(41), TxId(16), &[HOLD]).unwrap(); // the eighth: the cap itself
     let (before, _) = work(&f);
-    let refusal = f.insert(40, row_of(40), 17, &[HOLD]).unwrap_err();
+    let refusal = f.insert(40, row_of(40), TxId(17), &[HOLD]).unwrap_err();
     assert!(cap_refusal(&refusal, CAP), "{refusal:?}");
     let (after, _) = work(&f);
     let visits = after.cap_edge_route_visits - before.cap_edge_route_visits;
@@ -353,7 +353,7 @@ fn cdb120_edge_cost_does_not_grow_with_a_candidate_routes_retained_history() {
     for extra in [15_u64, 4095] {
         let mut f = edge_fixture(true, extra);
         let (before, inspected_before) = work(&f);
-        f.insert(40, row_of(40), 16, &[HOLD]).unwrap();
+        f.insert(40, row_of(40), TxId(16), &[HOLD]).unwrap();
         let (after, inspected_after) = work(&f);
         measured.push((
             after.cap_edge_route_visits - before.cap_edge_route_visits,
@@ -388,8 +388,8 @@ fn cdb120_edge_confirms_a_candidate_with_one_probe_however_long_its_first_rows_p
         let mut f = Fixture::new(CAP);
         let mut tx = 100;
         for h in 0..history {
-            f.insert(1_000 + h, SHARED_ROW, tx, &[]).unwrap();
-            f.delete(1_000 + h, SHARED_ROW, tx + 1, tx, &[]);
+            f.insert(1_000 + h, SHARED_ROW, TxId(tx), &[]).unwrap();
+            f.delete(1_000 + h, SHARED_ROW, TxId(tx + 1), tx, &[]);
             tx += 2;
             f.store
                 .retire_snapshot_free_partition_states(&[], f.budget.as_ref(), &mut f.admission())
@@ -398,19 +398,20 @@ fn cdb120_edge_confirms_a_candidate_with_one_probe_however_long_its_first_rows_p
         assert_eq!(f.audit("history routes retired").occupied, 0);
         // Seven live routes, then the candidate: R's last placement, closed.
         for k in 0..7 {
-            f.insert(k, row_of(k), tx, &[]).unwrap();
+            f.insert(k, row_of(k), TxId(tx), &[]).unwrap();
         }
         let candidate_key = 9_000_000;
-        f.insert(candidate_key, SHARED_ROW, tx, &[]).unwrap();
-        f.delete(candidate_key, SHARED_ROW, tx + 1, tx, &[SnapshotId(tx)]);
+        f.insert(candidate_key, SHARED_ROW, TxId(tx), &[]).unwrap();
+        f.delete(candidate_key, SHARED_ROW, TxId(tx + 1), tx, &[SnapshotId(tx)]);
         f.cover(candidate_key, tx + 5);
         let audit = f.audit("candidate is the only counted-empty route");
         assert_eq!(audit.occupied, CAP as usize);
         assert_eq!(audit.empty_counted, vec![key(candidate_key)]);
 
         let (before, _) = work(&f);
-        f.insert(40, row_of(40), tx + 10, &[SnapshotId(tx + 5)])
-            .unwrap_or_else(|e| panic!("history {history}: the reclaimable candidate admits the new key: {e}"));
+        f.insert(40, row_of(40), TxId(tx + 10), &[SnapshotId(tx + 5)])
+            .unwrap_or_else(|e| {
+                panic!("history {history}: the reclaimable candidate admits the new key: {e}")});
         let (after, _) = work(&f);
         let visits = after.cap_edge_route_visits - before.cap_edge_route_visits;
         let probes = after.cap_edge_identity_probes - before.cap_edge_identity_probes;

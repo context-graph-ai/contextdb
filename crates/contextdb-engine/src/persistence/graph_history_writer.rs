@@ -138,13 +138,14 @@ impl RedbPersistence {
             .open_table(COMMIT_INDEX_TABLE)
             .map_err(Self::storage_error)?;
         #[cfg(any(test, feature = "test-seams"))]
-        crate::read_work_probe::note_graph("commit_index", "get", &lsn.0.to_be_bytes(), Some(lsn.0), Some(_role));
+        crate::read_work_probe::note_graph("commit_index", "get", &lsn.0.to_be_bytes(), Some(contextdb_core::Lsn(lsn.0)), Some(_role));
         let bound = table
             .get(lsn.0)
             .map_err(Self::storage_error)?
             .ok_or_else(|| corrupt("graph contribution required commit is absent"))?;
         if tx.0 > bound.value() {
-            return Err(corrupt("graph contribution exceeds its own commit"));
+            return Err(corrupt("graph contribution exceeds its committed source position",
+            ));
         }
         Ok(())
     }
@@ -1517,7 +1518,7 @@ impl RedbPersistence {
             .open_table(GRAPH_CONTRIBUTIONS)
             .map_err(Self::storage_error)?;
         #[cfg(any(test, feature = "test-seams"))]
-crate::read_work_probe::note_graph("graph_contribution", "maximum_seek", &low, Some(address.0), None);
+crate::read_work_probe::note_graph("graph_contribution", "maximum_seek", &low, Some(contextdb_core::Lsn(address.0)), None);
         let mut range = c
             .range::<&[u8]>(low.as_slice()..high.as_slice())
             .map_err(Self::storage_error)?.inspect(|_entry| { #[cfg(any(test, feature = "test-seams"))] if let Ok((key, _)) = _entry { crate::read_work_probe::graph_storage_key("graph_contribution", "iteration_step", key.value()); } });

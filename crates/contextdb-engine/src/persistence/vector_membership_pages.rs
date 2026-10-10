@@ -541,8 +541,8 @@ fn decode_member(key: &[u8], encoded: &[u8]) -> Result<VectorPartitionMembership
     prevalidate_vector_partition_metadata_routes(VectorPartitionRecordKind::Membership, payload)
         .map_err(|reason| corruption(&reason))?;
     let record: VectorPartitionMembershipRecord =
-        decode_vector_partition_record_payload(VectorPartitionRecordKind::Membership, encoded)
-            .map_err(|reason| corruption(&reason))?;
+        decode_vector_partition_record_payload_checked(VectorPartitionRecordKind::Membership, encoded)
+            .map_err(|failure| failure.into_error(|reason| corruption(&reason)))?;
     if source_key(&record) != key {
         return Err(corruption(
             "membership source key does not match its authenticated identity",
@@ -560,8 +560,8 @@ fn decode_primary_member(
     prevalidate_vector_partition_metadata_routes(VectorPartitionRecordKind::Membership, payload)
         .map_err(|reason| corruption(&reason))?;
     let record: VectorPartitionMembershipRecord =
-        decode_vector_partition_record_payload(VectorPartitionRecordKind::Membership, encoded)
-            .map_err(|reason| corruption(&reason))?;
+        decode_vector_partition_record_payload_checked(VectorPartitionRecordKind::Membership, encoded)
+            .map_err(|failure| failure.into_error(|reason| corruption(&reason)))?;
     if RedbPersistence::vector_partition_membership_key(&record) != membership_key {
         return Err(corruption(
             "one owning row version has conflicting vector placements",
@@ -711,11 +711,11 @@ fn validate_body_placement_transition<const CHECK_OVERLAP: bool>(
                 )
             })
             .transpose()?;
-        let other: VectorPartitionMembershipRecord = decode_vector_partition_record_payload(
+        let other: VectorPartitionMembershipRecord = decode_vector_partition_record_payload_checked(
             VectorPartitionRecordKind::Membership,
             value.value(),
         )
-        .map_err(|reason| corruption(&reason))?;
+        .map_err(|failure| failure.into_error(|reason| corruption(&reason)))?;
         if reverse_key(&other).as_slice() != key.value() {
             return Err(corruption(
                 "reverse membership key disagrees with its body identity",
@@ -895,11 +895,11 @@ fn publish_membership_impl<const CHECK_OVERLAP: bool>(
             .map_err(metadata_error)?
         {
             let catalog: VectorPartitionGenerationCatalogRecord =
-                decode_vector_partition_record_payload(
+                decode_vector_partition_record_payload_checked(
                     VectorPartitionRecordKind::GenerationCatalog,
                     value.value(),
                 )
-                .map_err(|reason| corruption(&reason))?;
+                .map_err(|failure| failure.into_error(|reason| corruption(&reason)))?;
             partition.pending.covered_tx = catalog.change.unwrap_or(catalog.base).covered_tx;
             partition.base_pending = catalog.change.map(|_| PendingCounts {
                 covered_tx: catalog.base.covered_tx,
@@ -1567,12 +1567,19 @@ pub(super) fn remove_routes_matching(
 const SOURCE_ROOT: &str = "vector_membership_source_pages_root_v1";
 const REVERSE_ROOT: &str = "vector_membership_reverse_pages_root_v1";
 const SUMMARY_ROOT: &str = "vector_membership_summary_pages_root_v1";
+// The authoritative membership table and its compact open directory are bound
+// to each committed root the same way, so a read-only open verifies them in
+// O(1) instead of re-proving every membership.
+const MEMBERSHIP_ROOT: &str = "vector_membership_authority_pages_root_v1";
+const OPEN_DIRECTORY_ROOT: &str = "vector_open_directory_pages_root_v1";
 
 pub(super) fn write_fingerprints(write: &redb::WriteTransaction) -> Result<()> {
     for (definition, key) in [
         (SOURCE, SOURCE_ROOT),
         (REVERSE, REVERSE_ROOT),
         (SUMMARY, SUMMARY_ROOT),
+        (VECTOR_PARTITION_MEMBERSHIP_TABLE, MEMBERSHIP_ROOT),
+        (VECTOR_OPEN_DIRECTORY_TABLE, OPEN_DIRECTORY_ROOT),
     ] {
         let fingerprint = write
             .table_root_fingerprint(definition)
@@ -1604,6 +1611,8 @@ pub(super) fn validate_in_read(read: &redb::ReadTransaction) -> Result<()> {
         (SOURCE, SOURCE_ROOT),
         (REVERSE, REVERSE_ROOT),
         (SUMMARY, SUMMARY_ROOT),
+        (VECTOR_PARTITION_MEMBERSHIP_TABLE, MEMBERSHIP_ROOT),
+        (VECTOR_OPEN_DIRECTORY_TABLE, OPEN_DIRECTORY_ROOT),
     ] {
         let actual = read
             .table_root_fingerprint(definition)
@@ -1621,6 +1630,10 @@ pub(super) fn validate_in_read(read: &redb::ReadTransaction) -> Result<()> {
                 ));
             }
             Some(expected) if expected.value() == actual.unwrap_or([0; 32]) => {}
+            // A store without its membership directory takes the full-image
+            // reconstruction route, which trusts nothing from the absent
+            // tables; only a PRESENT table must match its fingerprint.
+            Some(_) if actual.is_none() && (key == MEMBERSHIP_ROOT || key == OPEN_DIRECTORY_ROOT) => {}
             Some(_) => {
                 return Err(corruption(
                     "membership page root differs from its committed fingerprint",
@@ -1649,8 +1662,8 @@ pub(super) fn decode_reverse_member(
     prevalidate_vector_partition_metadata_routes(VectorPartitionRecordKind::Membership, payload)
         .map_err(|reason| corruption(&reason))?;
     let record: VectorPartitionMembershipRecord =
-        decode_vector_partition_record_payload(VectorPartitionRecordKind::Membership, encoded)
-            .map_err(|reason| corruption(&reason))?;
+        decode_vector_partition_record_payload_checked(VectorPartitionRecordKind::Membership, encoded)
+            .map_err(|failure| failure.into_error(|reason| corruption(&reason)))?;
     if reverse_key(&record) != key {
         return Err(corruption(
             "reverse membership key disagrees with its authenticated identity",

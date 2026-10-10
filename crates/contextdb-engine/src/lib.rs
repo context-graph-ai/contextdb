@@ -172,6 +172,9 @@ pub use custody_types::{
 };
 #[doc(hidden)]
 pub use database::CommitStageStats;
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub use database::{reclaim_steps_last_cycle_for_test, set_reclaim_steps_per_cycle_for_test};
 pub use database::MemoryHeldReceivedSchemaUnit;
 pub use database::PolicyHeldReceivedTable;
 pub use database::TriggerProgressTelemetrySnapshot;
@@ -218,6 +221,8 @@ pub use identity::FabricIdentity;
 #[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub use persistence::VectorGenerationCatalogRecordFaultForTest;
+#[cfg(any(test, feature = "test-seams"))]
+pub use persistence::PagedRouteFaultForTest;
 pub use plugin::DatabasePlugin;
 pub use read_progress::{ReadPhase, ReadProgress, ReadProgressObserver};
 pub use read_session::{

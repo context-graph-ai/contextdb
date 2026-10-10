@@ -1323,6 +1323,7 @@ impl Database {
         index: &str,
         snapshot: SnapshotId,
         cursor: &mut contextdb_relational::mem::BoundedExactIndexCursor,
+        mut storage_step: impl FnMut() -> std::result::Result<(), E>,
         mut touch: impl FnMut() -> std::result::Result<(), E>,
         mut retain: impl FnMut(usize) -> std::result::Result<(), E>,
         mut release: impl FnMut(usize) -> std::result::Result<(), E>,
@@ -1332,15 +1333,15 @@ impl Database {
         use std::ops::Bound;
         let mut preflight_refusal = None;
         let preflight = source.historical_index_preflight(table, index, snapshot,
-            &mut || touch().map_err(|error| { preflight_refusal = Some(error); Error::ReadCancelled }));
+            &mut || storage_step().map_err(|error| { preflight_refusal = Some(error); Error::ReadCancelled }));
         if let Some(error) = preflight_refusal { return Err(error); }
         preflight.map_err(E::from)?;
         while let Some(key) = cursor.source_probe() {
             let current = snapshot == source.snapshot();
             let start = source
-                .index_position_key_before(current, key, RowId(0), TxId(0), &mut touch)?;
+                .index_position_key_before(current, key, RowId(0), TxId(0), &mut storage_step)?;
             let end = source
-                .index_position_key_before(current, key, RowId(u64::MAX), TxId(u64::MAX), &mut touch)?;
+                .index_position_key_before(current, key, RowId(u64::MAX), TxId(u64::MAX), &mut storage_step)?;
             let lower = cursor
                 .source_position()
                 .map_or(Bound::Included(start.as_bytes()), Bound::Excluded);
@@ -1358,7 +1359,7 @@ impl Database {
                 .map_err(E::from)?;
             let mut callback_error = None;
             let fetched = physical.next_window_before(&mut || {
-                touch().map_err(|error| {
+                storage_step().map_err(|error| {
                     callback_error = Some(error);
                     Error::Other("posting work admission refused".into())
                 })
@@ -1372,6 +1373,7 @@ impl Database {
                 release(bytes)?;
                 continue;
             };
+            touch()?;
             let row = if posting.value().entry.visible_at(snapshot) {
                 let selected = visible_row(source, table, posting.value().entry.row_id, snapshot)
                     .map_err(E::from)?;
@@ -1731,7 +1733,7 @@ impl Database {
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Option<Option<RowId>>> {
         use contextdb_relational::source::{
-            RelationalIndexRange, RelationalReadSource, visible_row,
+            RelationalIndexRange, RelationalReadSource,
         };
         use std::ops::Bound;
         let Some(root) = self.writer_read_root()? else {
@@ -1767,7 +1769,7 @@ impl Database {
             "Raise MEMORY_LIMIT to validate this key.",
         )?;
         let key = index_key_from_values(&index.columns[..columns.len()], values);
-        source.historical_index_preflight(table, &index.name, snapshot, &mut || Ok(()))?;
+        source.indexed_point_preflight(table, &index.name, snapshot, &mut || Ok(()))?;
         let current = snapshot == source.snapshot();
         let mut cursor = if index.columns.len() == columns.len() {
             source.exact_index_cursor(table, &index.name, current, &key)?
@@ -1812,7 +1814,21 @@ impl Database {
             {
                 continue;
             }
-            if let Some(row) = visible_row(&source, table, posting.entry.row_id, snapshot)? {
+            if let Some(row) = source.indexed_point_row(table, posting.entry.row_id, snapshot)? {
+                // An unchanged index key can retain its older posting while
+                // scalar row versions advance; compare the indexed values.
+                if posting.key.len() != index.columns.len()
+                    || index.columns.iter().zip(&posting.key).any(|((column, _), value)| {
+                        let value = match value {
+                            DirectedValue::Asc(value) => &value.0,
+                            DirectedValue::Desc(value) => &value.0,
+                        };
+                        row.value().values.get(column) != Some(value)
+                    })
+                {
+                    return Err(Error::StoreCorrupted { path: table.into(),
+                        reason: "indexed point posting differs from its captured row".into() });
+                }
                 if let Some((tx, _)) = overlay
                     && self.tx_mgr.with_write_set(tx, |ws| {
                         row_matches_delete_predicates(
@@ -2046,7 +2062,7 @@ impl WriterStagedPostingAdmission {
             control: None,
         };
         let bytes = crate::memory_accounting::writer_adapter_layout(&value).size();
-        value.control = Some(crate::memory_accounting::ControlCredit::admit(
+        value.control = Some(crate::memory_accounting::ControlCredit::admit_assembly(
             value.accountant.as_ref().expect("provider has its funder"),
             bytes, "staged_posting_provider",
         )?);
@@ -2480,5 +2496,89 @@ impl Database {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "test-seams"))]
+mod indexed_lineage_growth_tests {
+    use super::*;
+    use crate::read_work_probe::{ReadWorkObservationScope, ReadWorkPhase};
+
+    #[test]
+    fn historical_indexed_lineage_point_work_is_flat_across_unrelated_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Database::open(directory.path().join("lineage-growth.db")).unwrap();
+        db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+        db.execute("CREATE TABLE notes (id INT PRIMARY KEY, body TEXT) HISTORY ALL", &HashMap::new()).unwrap();
+        db.execute("INSERT INTO notes VALUES (0, 'original')", &HashMap::new()).unwrap();
+        let snapshot = db.snapshot();
+        let mut previous = 0;
+        for count in [16, 32, 64] {
+            for id in previous..count {
+                db.execute("INSERT INTO notes VALUES ($id, 'neighbor')",
+                    &HashMap::from([("id".into(), Value::Int64(id + 1))])).unwrap();
+            }
+            previous = count;
+            let reader = db.declared_reader_memory().unwrap();
+            let work = ReadWorkObservationScope::enter(ReadWorkPhase::Query);
+            let row = db.required_indexed_visible_row_by_columns("notes", &["id".into()], &[Value::Int64(0)],
+                snapshot, &HashSet::new(), reader).unwrap().unwrap();
+            assert_eq!(row.values.get("body"), Some(&Value::Text("original".into())));
+            let observed = work.counters();
+            assert_eq!(observed.decoded_rows, 2, "one served lineage at history {count}: {observed:?}");
+            assert_eq!(observed.hashed_rows, 0, "producer root witnesses replace history hashing");
+            assert_eq!(observed.hashed_bytes, 0, "the indexed seek hashes no unrelated history");
+            assert_eq!(observed.proof_nodes_hashed, 0, "producer witnesses avoid a history proof walk");
+            println!("LINEAGE_GROWTH history={count} {observed:?}");
+        }
+    }
+}
+
+#[cfg(all(test, feature = "test-seams"))]
+mod vector_write_copy_budget_tests {
+    use super::*;
+
+    fn staged_fixture(db: &Database) -> TxId {
+        db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+        db.execute("CREATE TABLE vectors (id INT PRIMARY KEY, v VECTOR(1024))", &HashMap::new()).unwrap();
+        let tx = db.begin().unwrap();
+        for id in 0..40 {
+            db.execute_in_tx(tx, "INSERT INTO vectors VALUES ($id, $v)", &HashMap::from([
+                ("id".into(), Value::Int64(id)), ("v".into(), Value::Vector(vec![1.0; 1024])),
+            ])).unwrap();
+        }
+        tx
+    }
+
+    #[test]
+    fn staged_insert_copies_use_writer_memory_without_consuming_the_reader_ceiling() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut options = crate::DatabaseOpenOptions::default();
+        options.owner_reads.limits.limits.memory = 128 * 1024;
+        let db = Database::open_with_options(directory.path().join("write-copies.db"), options).unwrap();
+        let tx = staged_fixture(&db);
+        let reader_before = db.declared_read_memory.standing_control_bytes();
+        db.commit(tx).expect("write copies exceed reader memory but fit writer memory");
+        assert_eq!(db.declared_read_memory.standing_control_bytes(), reader_before,
+            "publication releases its source-reader controls and owns INSERT copies on the writer");
+    }
+
+    #[test]
+    fn staged_insert_copy_writer_refusal_preserves_the_committed_frontier() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Database::open(directory.path().join("write-copy-refusal.db")).unwrap();
+        let tx = staged_fixture(&db);
+        let frontier = db.current_lsn();
+        let used = db.accountant().usage().used;
+        db.set_memory_limit(Some(used + 16 * 1024)).unwrap();
+        let error = db.commit(tx).expect_err("writer copy preparation must admit before mutation");
+        assert!(matches!(&error, Error::MemoryBudgetExceeded { subsystem, operation, .. }
+            if subsystem == "writer" && operation == "prepare_vector_insert_copies"), "{error:?}");
+        assert_eq!(db.current_lsn(), frontier);
+        db.set_memory_limit(None).unwrap();
+        // A refused public commit already aborts the staged transaction.
+        assert!(matches!(db.rollback(tx), Err(Error::TxNotFound(_))));
+        let rows = db.execute("SELECT COUNT(*) FROM vectors", &HashMap::new()).unwrap();
+        assert_eq!(rows.rows, vec![vec![Value::Int64(0)]]);
     }
 }

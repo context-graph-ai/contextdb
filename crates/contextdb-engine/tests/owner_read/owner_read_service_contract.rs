@@ -20,7 +20,7 @@ use contextdb_engine::owner_read::{
     OwnerServicePublicationObserver, OwnerServiceSpec, ValidatedOwnerListener,
 };
 use contextdb_engine::read_contract::{
-    cursor_page_encoded_size, decode_metadata_body, decode_metadata_page, decode_query_result,
+    decode_metadata_body, decode_metadata_page, decode_query_result,
     query_result_encoded_size,
 };
 use contextdb_engine::{
@@ -935,6 +935,7 @@ struct ObserverState {
     active_clock_base_ms: u64,
     record_budget: bool,
     blocked_budget_ledger: Vec<contextdb_engine::memory_accounting::BudgetLedgerEntry>,
+reader_reservations: Vec<(TestWorkSource, usize)>,
 }
 
 #[derive(Clone, Default)]
@@ -967,6 +968,7 @@ impl ProductionObserver {
         state.max_work = 0;
         state.peak_temporary_bytes = 0;
         state.cancellation_observed = 0;
+        state.reader_reservations.clear();
     }
 
     fn arm_block(&self, operation: OwnerBoundedOperation) {
@@ -1102,7 +1104,7 @@ impl OwnerBoundedExecutionObserver for ProductionObserver {
     ) {
         let mut state = self.state.0.lock().expect("bounded observer state");
         if state.record_budget {
-            contextdb_engine::memory_accounting::watch_budget_ledger_for_test();
+            contextdb_engine::vector_read_memory::watch_reader_budget_ledger_for_test();
         }
         state.next_event = state.next_event.saturating_add(1);
         let operation_event = state.next_event;
@@ -1133,7 +1135,7 @@ impl OwnerBoundedExecutionObserver for ProductionObserver {
             if should_block {
                 if state.record_budget {
                     state.blocked_budget_ledger =
-                        contextdb_engine::memory_accounting::take_budget_ledger_for_test();
+                        contextdb_engine::vector_read_memory::take_reader_budget_ledger_for_test();
                 }
                 state.blocked = true;
                 changed.notify_all();
@@ -1180,11 +1182,17 @@ impl OwnerBoundedExecutionObserver for ProductionObserver {
 
     fn after_temporary_reservation(
         &self,
-        _source: TestWorkSource,
+        source: TestWorkSource,
         reserved_bytes: u64,
         held_temporary_bytes: u64,
     ) {
         let mut state = self.state.0.lock().expect("bounded observer state");
+        if state.record_budget {
+            state.reader_reservations.push((
+                source,
+                usize::try_from(reserved_bytes).expect("reservation fits usize"),
+            ));
+        }
         state.peak_temporary_bytes = state
             .peak_temporary_bytes
             .max(held_temporary_bytes)
@@ -1506,8 +1514,8 @@ fn eof_hup_cancels_once_at_bounded_work_discards_publication_and_releases_every_
     assert_eq!(while_disconnected_handler_ignores.buffered_bytes, 0);
     assert_eq!(while_disconnected_handler_ignores.active_cancellations, 1);
     assert_eq!(
-        while_disconnected_handler_ignores.accountant_used_bytes,
-        baseline.accountant_used_bytes,
+        while_disconnected_handler_ignores.reader_used_bytes,
+        baseline.reader_used_bytes,
     );
 
     handler.release();
@@ -2309,7 +2317,7 @@ fn cursor_page_rows_bytes_identity_exhaustion_close_and_expiry_follow_the_frozen
     );
     assert!(first.has_more);
     let full_two_row_bytes =
-        u64::try_from(cursor_page_encoded_size(&first).expect("canonical two-row page size"))
+        u64::try_from(opened.payload.len())
             .expect("cursor page size fits u64");
     let live = harness.service.resources();
     assert_eq!(live.active_slots, baseline.active_slots + 1);
@@ -2319,8 +2327,8 @@ fn cursor_page_rows_bytes_identity_exhaustion_close_and_expiry_follow_the_frozen
         "a live cursor has a strict independently visible retained charge",
     );
     assert_eq!(
-        live.accountant_used_bytes - baseline.accountant_used_bytes,
-        live.cursor_retained_bytes,
+        live.reader_used_bytes - baseline.reader_used_bytes,
+        live.cursor_retained_bytes+ live.reader_control_bytes - baseline.reader_control_bytes,
     );
     let live_status = owner_status(
         harness
@@ -2626,8 +2634,7 @@ fn cursor_page_rows_bytes_identity_exhaustion_close_and_expiry_follow_the_frozen
     let calibration_page =
         decode_cursor_page(&calibration.payload).expect("decode calibration cursor page");
     let required_page_bytes = u64::try_from(
-        cursor_page_encoded_size(&calibration_page).expect("canonical cursor page encoded size"),
-    )
+        calibration.payload.len())
     .expect("cursor page size fits u64");
     assert!(!calibration_page.has_more);
     assert_resources(&harness.service, baseline);
@@ -2968,8 +2975,8 @@ fn a_cancelled_fetch_is_nonterminal_and_resumes_original_state() {
     assert_eq!(live.cursor_count, baseline.cursor_count + 1);
     assert!(live.cursor_retained_bytes > 0);
     assert_eq!(
-        live.accountant_used_bytes - baseline.accountant_used_bytes,
-        live.cursor_retained_bytes,
+        live.reader_used_bytes - baseline.reader_used_bytes,
+        live.cursor_retained_bytes+ live.reader_control_bytes - baseline.reader_control_bytes,
     );
     observer.clear();
     observer.arm_block(OwnerBoundedOperation::CursorFetch);
@@ -2998,9 +3005,17 @@ fn a_cancelled_fetch_is_nonterminal_and_resumes_original_state() {
         during_fetch.cursor_retained_bytes,
         live.cursor_retained_bytes
     );
-    assert_eq!(
-        during_fetch.accountant_used_bytes,
-        live.accountant_used_bytes + 24 + 266 + "cancellation_cursor".len() as u64
+    // Native page/proof holds also belong to this reader. The source ledger
+    // below proves each selected source term exactly once; operation completion
+    // proves the whole reader balance, including those native holds, is refunded.
+    assert!(
+        during_fetch.reader_used_bytes
+            >= live.reader_used_bytes
+                + 24 + 266 + "cancellation_cursor".len() as u64
+    + (during_fetch.reader_control_bytes - live.reader_control_bytes)
+    );
+    assert_eq!(during_fetch.accountant_used_bytes,
+        live.accountant_used_bytes
     );
     assert_eq!(during_fetch.active_cancellations, 1);
     let status = owner_status(
@@ -3027,26 +3042,44 @@ fn a_cancelled_fetch_is_nonterminal_and_resumes_original_state() {
         .clone();
     let source_owners = ledger
         .iter()
-        .filter(|entry| {
-            entry.what.starts_with("writer_source/")
-                && entry.what != "writer_source/commit_directory"
-        })
-        .map(|entry| (entry.what.as_str(), entry.bytes))
+        .map(|entry| {
+            let source = match entry.what.as_str(){
+                "bounded_read/read/table_scan" => TestWorkSource::TableScan,
+                "bounded_read/read/index_range" => TestWorkSource::IndexRange,
+                other => panic!("unexpected reader owner: {other}"),
+            };
+            (source, entry.bytes)})
         .collect::<Vec<_>>();
-    let expected_owners = vec![
-        ("writer_source/store_adapter", 24),
-        ("writer_source/cursor_keys", 266),
-        ("writer_source/cursor_keys", "cancellation_cursor".len()),
-    ];
-    assert_eq!(source_owners, expected_owners);
+    let expected_owners = observer.state.0.lock().unwrap().reader_reservations.clone();
+    assert!(!expected_owners.is_empty());
+    assert_eq!(source_owners, expected_owners,
+        "each admitted source term is charged once at the reader owner"
+    );
     let mut wrong_owner = source_owners.clone();
-    wrong_owner[0].0 = "writer_source/commit_directory";
+    wrong_owner[0].0 = TestWorkSource::IndexRange;
     assert_ne!(
         wrong_owner, expected_owners,
         "the same bytes under a different owner must fail reconciliation"
     );
     assert_eq!(observer.cancellation_observed(), 1);
-    assert_resources(&harness.service, live);
+    let after_cancel = harness.service.resources();
+    let observation_bytes = ledger
+        .iter()
+        .filter(|entry| entry.what == "bounded_read/read/table_scan")
+        .map(|entry| entry.bytes as u64)
+        .sum::<u64>();
+    assert_eq!(
+        observation_bytes, 26 + 112,
+        "one admitted observation payload and carrier"
+    );
+    let mut cancelled_receipt = live;
+    cancelled_receipt.cursor_retained_bytes += observation_bytes;
+    cancelled_receipt.reader_used_bytes += observation_bytes;
+    assert_eq!(
+        after_cancel, cancelled_receipt,
+        "source temporaries refund; the single observation remains charged"
+    );
+    let live = after_cancel;
 
     harness
         .database
@@ -3143,8 +3176,11 @@ fn a_cancelled_fetch_is_nonterminal_and_resumes_original_state() {
             - live.cursor_retained_bytes,
         buffered_bytes: live_after_later_commit.buffered_bytes,
         active_cancellations: live_after_later_commit.active_cancellations,
-        accountant_used_bytes: live_after_later_commit.accountant_used_bytes
+        reader_used_bytes: live_after_later_commit.reader_used_bytes
             - live.cursor_retained_bytes
+            - (live.reader_control_bytes - baseline.reader_control_bytes),
+        reader_control_bytes: baseline.reader_control_bytes,
+        accountant_used_bytes: live_after_later_commit.accountant_used_bytes
             - captured_root as u64,
     };
     assert_resources(&harness.service, expected_after_exhaustion);
@@ -3451,10 +3487,9 @@ fn cursor_snapshot_stays_stable_while_writer_and_maintenance_progress_then_relea
     assert_eq!(held_writer.captured_root_charge, 264);
     assert_eq!(
         held_writer.reconciliation_gap,
-        live_after_writer.cursor_retained_bytes as i64
-    );
+        0);
     assert_eq!(
-        held_writer.named_owner_total as u64 + live_after_writer.cursor_retained_bytes,
+        held_writer.named_owner_total as u64 ,
         live_after_writer.accountant_used_bytes
     );
     assert_eq!(live_after_writer.active_slots, live.active_slots);
@@ -3496,8 +3531,11 @@ fn cursor_snapshot_stays_stable_while_writer_and_maintenance_progress_then_relea
                 - live.cursor_retained_bytes,
             buffered_bytes: live_after_writer.buffered_bytes,
             active_cancellations: live_after_writer.active_cancellations,
-            accountant_used_bytes: live_after_writer.accountant_used_bytes
+            reader_used_bytes: live_after_writer.reader_used_bytes
                 - live.cursor_retained_bytes
+                - (live.reader_control_bytes - baseline.reader_control_bytes),
+            reader_control_bytes: baseline.reader_control_bytes,
+            accountant_used_bytes: live_after_writer.accountant_used_bytes
                 - held_writer.captured_root_charge as u64,
         },
     );
@@ -3615,7 +3653,7 @@ fn shutdown_timeout_retains_service_and_database_then_retry_drains_without_closi
     assert_eq!(while_ignoring.active_slots, baseline.active_slots + 2);
     assert_eq!(while_ignoring.cursor_count, baseline.cursor_count + 1);
     assert!(while_ignoring.cursor_retained_bytes > baseline.cursor_retained_bytes);
-    assert!(while_ignoring.accountant_used_bytes > baseline.accountant_used_bytes);
+    assert!(while_ignoring.reader_used_bytes > baseline.reader_used_bytes);
     harness.clock.advance_to(111);
     handler.pulse();
     let timed_out = drain

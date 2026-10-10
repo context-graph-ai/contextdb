@@ -2298,10 +2298,10 @@ impl SyncClient {
         let vector_copy_owner = &mut retained_vector_copy;
 
         let envelope = decode_sync_envelope(&decoded_memory, reply, Some(protocol_version))
-            .map_err(PushReplyError::Terminal)?;
+            .map_err(classify_push_reply_decode)?;
         let response: PushResponse = decoded_memory
             .decode_msgpack(&envelope.payload)
-            .map_err(PushReplyError::Terminal)?;
+            .map_err(classify_push_reply_decode)?;
         self.validate_refused_schema_units(
             &response.refused_schema_units,
             response.hub_incarnation,
@@ -4764,6 +4764,13 @@ impl PushReplyError {
             PushReplyError::Malformed(err) => PushRequestError::Ambiguous(err),
             PushReplyError::Terminal(err) => PushRequestError::Terminal(err),
         }
+    }
+}
+
+fn classify_push_reply_decode(error: Error) -> PushReplyError {
+    match error {
+        Error::SyncError(_) => PushReplyError::Malformed(error),
+        _ => PushReplyError::Terminal(error),
     }
 }
 

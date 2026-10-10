@@ -163,6 +163,39 @@ impl RetainedReadSource {
         )
     }
 
+    /// Check just this selected deletion against its captured commit directory.
+    pub(super) fn check_requested_tombstone_commit_in_read(
+        &self,
+        read: &redb::ReadTransaction,
+        record: &graph_history_record::StoredChangeLogEntry,
+    ) -> std::result::Result<(), LoadReadImageError> {
+        let Some(witness) = record.witness.as_ref() else {
+            return Ok(());
+        };
+        let missing = || {
+            direct_read_requires_writer_for(
+                ReadImageRequiresWriterCause::MissingCommitIndex,
+                "commit index is missing the requested edge tombstone",
+            )
+        };
+        let commits = match read.open_table(COMMIT_INDEX_TABLE) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Err(missing()),
+            Err(error) => return Err(read_table_error(error)),
+        };
+        let committed = commits
+            .get(record.entry.lsn().0)
+            .map_err(read_storage_error)?
+            .ok_or_else(missing)?;
+        if committed.value() != witness.deletion_tx.0 {
+            return Err(read_image_corruption(
+                ReadImageCorruptionCause::MalformedRecord,
+                "commit index names another transaction for the requested edge tombstone",
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn visit_changes_since(
         &self,
         since: Lsn,
@@ -183,6 +216,8 @@ impl RetainedReadSource {
                     first = Some(record.entry.lsn());
                 }
                 if record.entry.lsn() > since {
+                    self.check_requested_tombstone_commit_in_read(read, &record)
+                        .map_err(|error| graph_read::image_diagnosis(self, error))?;
                     self.verify_stored_graph_history_in_read(read, key, bytes, memory.clone())?;
                     keep(record.entry)?;
                 }
@@ -268,7 +303,7 @@ impl RetainedReadSource {
                         let entry = entry.transpose().map_err(RedbPersistence::storage_error)?;
                         #[cfg(any(test, feature = "test-seams"))]
                         if let Some((key, _)) = &entry {
-                            crate::read_work_probe::note_graph("commit_index", "iteration_step", &key.value().to_be_bytes(), Some(key.value()), None);
+                            crate::read_work_probe::note_graph("commit_index", "iteration_step", &key.value().to_be_bytes(), Some(contextdb_core::Lsn(key.value())), None);
                         }
                         entry
                     }

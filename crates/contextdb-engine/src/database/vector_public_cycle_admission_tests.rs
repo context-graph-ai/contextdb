@@ -346,6 +346,9 @@ fn public_cold_metadata_refusal(metadata: ColdMetadata) {
             .unwrap(),
         Some(original_catalog)
     );
+    // The damage probe used a separate snapshot. The public writer's captured
+    // relational/vector roots still belong to its original serving authority.
+    db.persistence = Some(original_persistence);
     assert_eq!(
         db.execute(
             "SELECT id FROM metadata_items ORDER BY v <=> [1,0,0] USE VECTOR INDEXED LIMIT 3",
@@ -515,6 +518,14 @@ fn public_unknown_catalog_preserves_healthy_work(before: bool, kind: UnknownCata
                 (
                     TableDefinition::<&[u8], &[u8]>::new("vector_membership_summary_pages"),
                     "vector_membership_summary_pages_root_v1",
+                ),
+                (
+                    TableDefinition::<&[u8], &[u8]>::new("vector_partition_membership"),
+                    "vector_membership_authority_pages_root_v1",
+                ),
+                (
+                    TableDefinition::<&[u8], &[u8]>::new("vector_open_directory"),
+                    "vector_open_directory_pages_root_v1",
                 ),
             ] {
                 let fingerprint = write

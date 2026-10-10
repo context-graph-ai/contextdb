@@ -106,13 +106,11 @@ fn an_undeclared_prefix_count_still_answers_exactly() {
         "the undeclared prefix answers the same number as the declared one"
     );
 
-    // A writable handle holds no committed read image, so it answers both from
-    // the index range. The disclosure still tells the two apart: `owner` is
-    // declared and kept current by every write, `(owner, slot)` is not
-    // declared at all and is the one an `ALTER TABLE` would change.
+    // The writable route serves a declared count from the captured writer
+    // root; the undeclared prefix still names the missing declaration.
     assert_eq!(
         declared_trace.maintained_count.as_deref(),
-        Some(&MaintainedCountDisclosure::DeclaredNotServed {
+        Some(&MaintainedCountDisclosure::Used {
             table: "placements".to_owned(),
             columns: vec![("owner".to_owned(), contextdb_core::SortDirection::Asc)],
         })
@@ -137,7 +135,7 @@ fn an_undeclared_prefix_count_still_answers_exactly() {
 
     let declared_explain = render_explain_trace(&declared_trace);
     assert!(
-        declared_explain.contains("maintained count: declared (owner)")
+        declared_explain.contains("maintained count: used (owner)")
             && !declared_explain.contains("not declared"),
         "a declared count is never reported as undeclared: {declared_explain}"
     );
@@ -161,7 +159,7 @@ fn an_undeclared_prefix_count_still_answers_exactly() {
     assert!(
         matches!(
             after_trace.maintained_count.as_deref(),
-            Some(MaintainedCountDisclosure::DeclaredNotServed { .. })
+            Some(MaintainedCountDisclosure::Used { .. })
         ),
         "once declared it is no longer advised about: {:?}",
         after_trace.maintained_count

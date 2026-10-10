@@ -1227,6 +1227,110 @@ impl HnswIndex {
 /// expands, read from the graphs, never a scaled declared degree. It is one
 /// number for the whole search and never multiplied by the number of
 /// partitions or layers it admits.
+/// AUTO's up-front routing condition (not a proof; the measured gate rows
+/// are): graph work is attempted only when its whole cap is below the rows
+/// EXACT would score -- at most half of them across several layers, so a
+/// cap hit followed by EXACT stays bounded -- and every layer can run its
+/// k-floor beam inside the cap.
+pub(crate) fn graph_work_cannot_beat_exact(
+    cap: usize,
+    rows: usize,
+    layers: usize,
+    k: usize,
+    degree: usize,
+) -> bool {
+    // Only the structural case routes: every search's k-floor beam cannot
+    // fit the cap. The cap is an upper bound on work, not the work a search
+    // spends, so comparing it with the row count would send searches the dev
+    // AUTO contract answers from the graph to EXACT; the measured gate rows
+    // (multi-Context p95 <= EXACT, single-Context mean below EXACT) decide.
+    let _ = rows;
+    layers > 1 && layers.saturating_mul(k).saturating_mul(degree.max(1)) > cap
+}
+
+/// Run each partition's own search (its base, change and tail together, as
+/// one partition's layers always were) in turn against one shared evaluation
+/// cap and merge their kept rows by distance. A layer search that stops on a limit
+/// (the cap included) makes the union Incomplete; a refused layer refuses it.
+pub(crate) fn merge_layer_searches<E>(
+    layers: usize,
+    cap: usize,
+    k: usize,
+    mut search_layer: impl FnMut(usize, usize, usize) -> std::result::Result<HnswUnionSearchResult, E>,
+) -> std::result::Result<HnswUnionSearchResult, E> {
+    let mut merged: Option<HnswUnionSearchResult> = None;
+    let mut spent = 0usize;
+    for position in 0..layers {
+        let remaining = cap.saturating_sub(spent);
+        let mut one = search_layer(position, remaining, spent)?;
+        spent = spent
+            .saturating_add(one.admission_evaluations)
+            .saturating_add(one.expansion_evaluations);
+        let stop = !matches!(one.status, HnswAllowedSearchStatus::Complete);
+        merged = Some(match merged.take() {
+            None => one,
+            Some(mut all) => {
+                all.candidates.extend(one.candidates);
+                all.retained_bytes = all.retained_bytes.saturating_add(one.retained_bytes);
+                all.admission_evaluations += one.admission_evaluations;
+                all.expansion_evaluations += one.expansion_evaluations;
+                all.allowed_admissions += one.allowed_admissions;
+                all.layers_admitted += one.layers_admitted;
+                all.frontier_exhausted &= one.frontier_exhausted;
+                if all.below_admission_floor.is_none() {
+                    all.below_admission_floor = one.below_admission_floor;
+                }
+                if stop {
+                    all.status = one.status;
+                }
+                if one.terminal == UnionTerminal::Refused {
+                    all.terminal = UnionTerminal::Refused;
+                }
+                all
+            }
+        });
+        if stop {
+            break;
+        }
+    }
+    let mut all = merged.unwrap_or_else(|| HnswUnionSearchResult {
+        terminal: UnionTerminal::FrontierExhausted,
+        candidates: Vec::new(),
+        retained_bytes: 0,
+        status: HnswAllowedSearchStatus::Complete,
+        below_admission_floor: None,
+        budget: cap,
+        admission_evaluations: 0,
+        expansion_evaluations: 0,
+        allowed_admissions: 0,
+        #[cfg(feature = "test-seams")]
+        expansion_cap: cap,
+        layers_admitted: 0,
+        frontier_exhausted: true,
+    });
+    all.budget = cap;
+    // Nearest first across layers, ties by partition then row, exactly as
+    // one walk's kept rows are ordered.
+    all.candidates.sort_by(|left, right| {
+        left.distance
+            .total_cmp(&right.distance)
+            .then(left.partition.cmp(&right.partition))
+            .then(left.row_id.cmp(&right.row_id))
+    });
+    if all.terminal != UnionTerminal::Refused {
+        all.terminal = if matches!(all.status, HnswAllowedSearchStatus::Complete)
+            && all.candidates.len() >= k
+        {
+            UnionTerminal::AnswerComplete
+        } else if matches!(all.status, HnswAllowedSearchStatus::Complete) {
+            UnionTerminal::FrontierExhausted
+        } else {
+            UnionTerminal::Refused
+        };
+    }
+    Ok(all)
+}
+
 pub(crate) fn union_candidate_budget(
     ef_search: usize,
     k: usize,

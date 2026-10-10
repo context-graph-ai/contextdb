@@ -118,9 +118,49 @@ impl RedbPersistence {
         })?;
         Ok(())
     }
+    /// For a read that asks only the canonical tree of an index: whether the
+    /// index table's physical root still matches its producer witness. An
+    /// absent or malformed witness, and a storage failure, still refuse.
+    pub(super) fn verify_history_root_canonical(
+        read: &redb::ReadTransaction,
+        name: &str,
+    ) -> Result<bool> {
+        if !protected(name) {
+            return Ok(true);
+        }
+        let map_error = |error: redb::Error| match Self::storage_error(error) {
+            Error::StoreCorrupted { reason, .. } => corruption(name, &reason),
+            other => other,
+        };
+        let physical = read
+            .normal_table_root(name)
+            .map_err(|error| map_error(error.into()))?;
+        let witnesses = read.open_table(WITNESSES).map_err(|error| match error {
+            redb::TableError::TableDoesNotExist(_) => corruption(name, "metadata is absent"),
+            other => map_error(other.into()),
+        })?;
+        let witness = witnesses
+            .get(name)
+            .map_err(|error| map_error(error.into()))?;
+        match (physical, witness) {
+            (Some(root), Some(witness)) => {
+                let bytes = witness.value();
+                if bytes.len() != RECORD_BYTES || bytes[0] != 1 {
+                    return Err(corruption(name, "record is malformed"));
+                }
+                Ok(matches(bytes, root))
+            }
+            _ => Err(corruption(name, "does not match the captured historical root")),
+        }
+    }
+
     pub(super) fn verify_history_root(read: &redb::ReadTransaction, name: &str) -> Result<()> {
         if !protected(name) {
             return Ok(());
+        }
+        #[cfg(feature = "test-seams")]
+        if name.starts_with("__rel_index_") {
+            STRICT_INDEX_ROOT_CHECKS.with(|count| count.set(count.get() + 1));
         }
         let map_error = |error: redb::Error| match Self::storage_error(error) {
             Error::StoreCorrupted { reason, .. } => corruption(name, &reason),
@@ -144,6 +184,48 @@ impl RedbPersistence {
             )),
         }
     }
+}
+
+#[cfg(feature = "test-seams")]
+thread_local! {
+    /// Strict index-table root checks on this thread. Every physical index
+    /// cursor, ordered window and maintained group passes one.
+    static STRICT_INDEX_ROOT_CHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(feature = "test-seams")]
+pub(crate) fn strict_index_root_checks_for_test() -> u64 {
+    STRICT_INDEX_ROOT_CHECKS.with(std::cell::Cell::get)
+}
+
+/// Index tables whose physical root was found to differ from its producer
+/// witness by a canonical-only read, per store. Bounded: one entry per
+/// damaged index, cleared when a later canonical check of it matches.
+static OBSERVED_INDEX_ROOT_DAMAGE: parking_lot::Mutex<
+    std::collections::BTreeMap<std::path::PathBuf, std::collections::BTreeSet<(String, String)>>,
+> = parking_lot::Mutex::new(std::collections::BTreeMap::new());
+
+pub(crate) fn note_index_root_damage(path: &std::path::Path, table: &str, index: &str, damaged: bool) {
+    let mut observed = OBSERVED_INDEX_ROOT_DAMAGE.lock();
+    if damaged {
+        observed
+            .entry(path.to_path_buf())
+            .or_default()
+            .insert((table.to_owned(), index.to_owned()));
+    } else if let Some(indexes) = observed.get_mut(path) {
+        indexes.remove(&(table.to_owned(), index.to_owned()));
+        if indexes.is_empty() {
+            observed.remove(path);
+        }
+    }
+}
+
+pub(crate) fn observed_index_root_damage(path: &std::path::Path) -> Vec<(String, String)> {
+    OBSERVED_INDEX_ROOT_DAMAGE
+        .lock()
+        .get(path)
+        .map(|indexes| indexes.iter().cloned().collect())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

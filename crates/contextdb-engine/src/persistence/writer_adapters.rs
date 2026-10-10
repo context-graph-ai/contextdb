@@ -127,6 +127,44 @@ impl WriterRelationalSource {
         self.historical_index_preflight_with_intent(table, index, snapshot, false, before)
     }
 
+    /// An indexed point lookup consumes producer-maintained postings from this
+    /// captured root. Authenticate their root and the row root before seeking;
+    /// unrelated retained versions are not part of the lookup's working set.
+    pub(crate) fn indexed_point_preflight(
+        &self, table: &str, index: &str, snapshot: SnapshotId,
+        before: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        if snapshot.0 > self.root.snapshot.0 {
+            return Err(Error::Other("index snapshot exceeds captured frontier".into()));
+        }
+        let names = self.owner.endpoint(&[b"rel_", table.as_bytes()], "index_witness_names")?;
+        let row_name = std::str::from_utf8(&names.key).expect("UTF-8 table name");
+        before()?;
+        let read = self.root.owner_read()?;
+        RedbPersistence::verify_history_root(&read, row_name)?;
+        let _index_name = self.owner.reserve(table.len().saturating_add(index.len()).saturating_add(96), "index_witness_names")?;
+        let index_name = RedbPersistence::relational_index_table_name(table, index);
+        before()?;
+        RedbPersistence::verify_history_root(&read, &index_name)?;
+        before()
+    }
+
+    pub(crate) fn indexed_point_row(
+        &self, table: &str, row: RowId, snapshot: SnapshotId,
+    ) -> Result<Option<OwnedReadBox<dyn RelationalWindow<VersionedRow>>>> {
+        let mut lower = [0u8; 24];
+        lower[..8].copy_from_slice(&row.0.to_be_bytes());
+        let mut upper = [255u8; 24];
+        upper[..8].copy_from_slice(&row.0.to_be_bytes());
+        upper[8..16].copy_from_slice(&snapshot.0.to_be_bytes());
+        // The point preflight authenticated both producer roots. Seek the
+        // selected row's latest version at the requested frontier directly.
+        let mut cursor = self.row_cursor_owned(table, Bound::Included(&lower),
+            Bound::Included(&upper), true, None)?;
+        let selected = cursor.next_window()?;
+        Ok(selected.filter(|row| row.value().visible_at(snapshot)))
+    }
+
     pub(crate) fn historical_index_versions_preflight(
         &self, table: &str, index: &str, before: &mut dyn FnMut() -> Result<()>,
     ) -> Result<()> {

@@ -907,6 +907,9 @@ pub struct WriteTransaction {
     shrink_policy: ShrinkPolicy,
     quick_repair: bool,
     deferred_free_budget: (usize, usize),
+    // An exclusive upper bound on the freeing transaction ids this commit may reclaim, applied on
+    // top of the reader floor. Set only by a bounded maintenance reclaim step.
+    reclaim_ceiling: Option<TransactionId>,
     // All transaction-local savepoint lifecycle state. See
     // `SavepointTransactionState` for the commit/abort contract.
     savepoint_state: Mutex<SavepointTransactionState>,
@@ -952,6 +955,7 @@ impl WriteTransaction {
             two_phase_commit: false,
             quick_repair: false,
             deferred_free_budget,
+            reclaim_ceiling: None,
             shrink_policy: ShrinkPolicy::Default,
             savepoint_state: Mutex::new(SavepointTransactionState::default()),
             #[cfg(feature = "contextdb-internal")]
@@ -1021,6 +1025,35 @@ impl WriteTransaction {
     #[doc(hidden)]
     pub fn set_deferred_free_budget(&mut self, extents: usize, entries: usize) {
         self.deferred_free_budget = (extents, entries);
+    }
+
+    #[cfg(any(test, feature = "contextdb-internal"))]
+    /// Limit this commit's reclamation to entries freed by transactions before `ceiling`, in
+    /// addition to the reader floor. The ceiling only ever lowers what may be freed.
+    pub(crate) fn set_reclaim_ceiling(&mut self, ceiling: TransactionId) {
+        self.reclaim_ceiling = Some(ceiling);
+    }
+
+    #[cfg(any(test, feature = "contextdb-internal"))]
+    pub(crate) fn transaction_id(&self) -> TransactionId {
+        self.transaction_id
+    }
+
+    #[cfg(any(test, feature = "contextdb-internal"))]
+    /// Whether either deferred-free tree has an entry freed before `ceiling`.
+    pub(crate) fn pending_free_pages_before(&self, ceiling: TransactionId) -> Result<bool> {
+        let mut system_tables = self.system_tables.lock().unwrap();
+        for definition in [DATA_FREED_TABLE, SYSTEM_FREED_TABLE] {
+            let table = system_tables.open_system_table(self, definition)?;
+            if table
+                .tree
+                .first()?
+                .is_some_and(|(key, _)| key.value().transaction_id < ceiling.raw_id())
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     // Explicit whole-file compaction retains its upstream full-drain semantics.
@@ -1758,6 +1791,15 @@ impl WriteTransaction {
             crate::commit_work::observe_commit(data_freed.len(), allocated_pages.len());
             crate::commit_work::set_tag(crate::commit_work::TAG_COMMIT_BOOKKEEPING)
         };
+        if self.transaction_tracker.keep_pace_reclaim {
+            // Reclaim at least as much as this commit frees, so an active writer's backlog does not
+            // grow while eligible older work exists. Explicit budgets above this stay in force.
+            let own = data_freed.len();
+            self.deferred_free_budget = (
+                self.deferred_free_budget.0.max(own),
+                self.deferred_free_budget.1.max(own),
+            );
+        }
         self.store_data_freed_pages(data_freed)?;
         self.store_allocated_pages(allocated_pages)?;
         #[cfg(feature = "test-seams")]
@@ -1923,10 +1965,13 @@ impl WriteTransaction {
     pub(crate) fn durable_commit(&mut self, user_root: Option<BtreeHeader>) -> Result {
         #[cfg(feature = "test-seams")]
         let mut span_started = std::time::Instant::now();
-        let free_until_transaction = self
+        let mut free_until_transaction = self
             .transaction_tracker
             .oldest_live_read_transaction()
             .map_or(self.transaction_id, |x| x.next());
+        if let Some(ceiling) = self.reclaim_ceiling {
+            free_until_transaction = TransactionId::min(free_until_transaction, ceiling);
+        }
         self.process_freed_pages(free_until_transaction)?;
         #[cfg(feature = "test-seams")]
         {

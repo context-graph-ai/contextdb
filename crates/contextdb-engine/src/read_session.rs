@@ -2627,18 +2627,19 @@ impl ReadSession {
         self.route
     }
 
-    /// Current bytes charged to the accountant that serves this route.
+    /// Current bytes charged to the reads this route serves.
     ///
+    /// A live database reports what its declared reader memory holds for
+    /// reads -- never the database's shared total, which also carries writer
+    /// state and background-maintenance reservations whose size depends on
+    /// timing, so identical reads would report different charges.
     /// A file reader has its own accountant. An owner-channel reader observes
     /// the owner's shared accountant through its already-selected channel, so
     /// that figure can also include other work the owner is serving. Charges
     /// held only during a statement return when that work releases them.
     pub fn charged_bytes(&self) -> Result<u64> {
         match self.state.as_ref() {
-            ReadSessionState::LiveDatabase(database) => Ok(u64::try_from(
-                database.bounded_read_accountant().usage().used,
-            )
-            .unwrap_or(u64::MAX)),
+            ReadSessionState::LiveDatabase(database) => Ok(database.declared_read_charged_bytes()),
             ReadSessionState::DirectFile(reader) => Ok(reader.charged_bytes()),
             ReadSessionState::OwnerChannel(owner) => {
                 let responses = owner.ask(

@@ -103,6 +103,7 @@ pub(crate) fn limit_for(fixture: &Fixture, working: &WorkingSet, slack: isize) -
 
 #[cfg(unix)]
 #[test]
+#[ignore = "retired by fable-18 ruling 2 (2026-10-10): encodes the all-resident serving-cache pricing model, which contradicts the intent's on-demand paging; superseded by the paged-pricing replacement rows"]
 fn a_wide_find_answers_from_every_saved_graph_once_earlier_pages_give_way() {
     let fixture = seed_shape(SHAPE);
     let working = calibrate(&fixture);
@@ -177,6 +178,7 @@ fn a_wide_find_answers_from_every_saved_graph_once_earlier_pages_give_way() {
 
 #[cfg(unix)]
 #[test]
+#[ignore = "retired by fable-18 ruling 2 (2026-10-10): encodes the all-resident serving-cache pricing model, which contradicts the intent's on-demand paging; superseded by the paged-pricing replacement rows"]
 fn a_wide_find_whose_topologies_do_not_fit_is_refused_by_type() {
     let fixture = seed_shape(SHAPE);
     let working = calibrate(&fixture);
@@ -214,6 +216,7 @@ fn a_wide_find_whose_topologies_do_not_fit_is_refused_by_type() {
 /// refused asking for 65 KB of candidates.
 #[cfg(unix)]
 #[test]
+#[ignore = "retired by fable-18 ruling 2 (2026-10-10): encodes the all-resident serving-cache pricing model, which contradicts the intent's on-demand paging; superseded by the paged-pricing replacement rows"]
 fn a_wide_find_whose_loads_filled_memory_with_pages_still_answers() {
     let fixture = seed_shape(SHAPE);
     let working = calibrate(&fixture);

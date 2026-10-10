@@ -44,7 +44,7 @@ const CANONICAL_QUERY_RESULT_BYTES: &[u8] = &[
     1, 10, 0, 1, 1, 2, 13, 3, 0, 0, 0, 0, 0, 0, 0x0c, 0x40, 4, 1, b'v', 5, 16, 0x55, 0x55, 0x55,
     0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 6, 3, 7, 7, b'{',
     b'"', b'a', b'"', b':', b'1', b'}', 8, 2, 0, 0, 0x80, 0x3f, 0, 0, 0, 0xc0, 9, 42, 2, 1, b'P',
-    1, 1, b'I', 1, 1, b'p', 1, 1, b'i', 1, b'r', 1, 1, 1, b't', 1, b'v', 0, 3, 0, 1, 1, 1, b'd',
+    1, 1, b'I', 1, 1, b'p', 1, 1, b'i', 1, b'r', 1, 1, 1, b't', 1, b'v', 0, 3, 0, 0, 1, 1, 1, b'd',
 ];
 
 const HELD_BY_READERS_FAILURE: &[u8] = &[9, 2, 1, 2, 1, 7, 1, b'r', 9];
@@ -329,7 +329,7 @@ fn canonical_query_result_has_one_independent_literal_and_field_mutation_matrix(
             .expect("decode independent canonical query bytes"),
         expected
     );
-    let mut terminal_fixture = vec![1, 108];
+    let mut terminal_fixture = vec![1, 109];
     terminal_fixture.extend_from_slice(CANONICAL_QUERY_RESULT_BYTES);
     assert_response_codec(
         LocalResponse::TerminalSuccess {
@@ -479,7 +479,7 @@ fn canonical_query_result_has_one_independent_literal_and_field_mutation_matrix(
         .as_mut()
         .expect("canonical cascade")
         .dropped_indexes[0] = "e".to_owned();
-    assert_query_mutation(result, canonical, 107, b'e');
+    assert_query_mutation(result, canonical, 108, b'e');
 
     assert!(matches!(
         decode_query_result(

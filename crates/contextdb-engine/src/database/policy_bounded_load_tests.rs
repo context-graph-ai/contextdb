@@ -166,9 +166,9 @@ fn a_single_large_refused_outcome_is_admitted_before_decode() {
     let used = db.accountant().usage().used;
     db.set_memory_limit(Some(used.saturating_add(4096)))
         .expect("leave less room than the encoded outcome needs");
-    let fixture_operation_reader_5 = db
-        .declared_reader_memory()
-        .expect("admit the actual fixture reader");
+    let fixture_operation_reader_5 = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(4096)
+        .child()
+        .expect("admit the bounded fixture reader");
 
     let refused = match db.refused_schema_unit_outcomes_for_digests(
         &tenant,
@@ -208,8 +208,8 @@ fn a_single_large_refused_outcome_is_admitted_before_decode() {
         )
         .expect("read after lifting the budget");
     assert!(
-        db.accountant().usage().used > used,
-        "the response holds its decoded charge"
+        lease.retained_payload_bytes() > 0,
+        "the response holds its decoded reader charge"
     );
     assert_eq!(page, vec![outcome]);
     drop(page);
@@ -263,8 +263,9 @@ fn a_large_local_refusal_fact_is_admitted_before_decode_and_survives_refusal() {
             hub,
             hub_life,
             &[[1; 32]],
-            db.declared_reader_memory()
-                .expect("admit the actual fixture reader"),
+            crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(4096)
+                .child()
+                .expect("admit the bounded fixture reader"),
         )
         .expect_err("the encoded fact must be admitted before decoding");
     assert!(
@@ -290,8 +291,8 @@ fn a_large_local_refusal_fact_is_admitted_before_decode_and_survives_refusal() {
         )
         .expect("read the retained fact");
     assert!(
-        db.accountant().usage().used > used,
-        "decoded facts retain their charge"
+        lease.as_ref().unwrap().retained_payload_bytes() > 0,
+        "decoded facts retain their reader charge"
     );
     assert_eq!(facts, vec![outcome]);
     drop(facts);

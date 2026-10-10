@@ -313,8 +313,11 @@ fn first_bounded_restart_query_charges_lazy_decode_and_replay_to_the_request_cei
     );
 }
 
-/// The store-wide budget must reject the same lazy work before it changes
-/// resident state, even if the individual request declared ample room.
+/// A store-wide budget that cannot retain the saved graph must not change
+/// resident state. The bounded query still answers through the paged/durable
+/// route, with the refused retention recorded, and only a statement budget too
+/// small for that route's own reads refuses (lazy-replay, paged
+/// answer accepted under the paging intent).
 #[test]
 fn first_bounded_restart_query_charges_lazy_decode_and_replay_to_the_store_budget() {
     let directory = TempDir::new().expect("temporary vector store directory");
@@ -340,19 +343,52 @@ fn first_bounded_restart_query_charges_lazy_decode_and_replay_to_the_store_budge
         .expect("the fixture saved one base generation");
     db.set_memory_limit(Some(before + resident_increase.saturating_sub(1)))
         .expect("tighten only the standing store budget after open");
-    let request = request(limits());
-    let error = db
-        .read_session(limits())
-        .unwrap()
-        .execute(&request.sql, &request.params)
-        .expect_err("one byte below lazy decode/replay residency must refuse before allocation");
     let budget = before + resident_increase.saturating_sub(1);
+    let refusals_before = status(&db).paged_route_refusals;
+    bounded_tail_result(&db, limits());
+    let paged = status(&db);
     assert!(
-        matches!(error, contextdb_core::Error::MemoryBudgetExceeded {
-        budget_limit_bytes, requested_bytes, available_bytes, ..
-    } if budget_limit_bytes == budget && requested_bytes > available_bytes),
-        "the STORE refusal keeps the actual exhausted budget: {error:?}"
+        paged.paged_route_refusals > refusals_before,
+        "one byte below graph residency the answer comes from the paged route, and the refused \
+         retention is recorded rather than silent"
     );
+    let refusal = paged
+        .last_paged_route_refusal
+        .expect("the recorded refusal carries its budget");
+    assert!(
+        refusal.budget_limit_bytes == budget && refusal.requested_bytes > refusal.available_bytes,
+        "the recorded refusal names the STORE budget that could not retain the graph: {refusal:?}"
+    );
+    assert_dormant_and_uncharged(&db, before, expected_base);
+
+    // Under the same store budget, find the least statement memory the paged
+    // answer needs. One byte below it the STATEMENT budget refuses by type,
+    // naming its own limit, and the route stays dormant and uncharged.
+    let answers = |memory: u64| {
+        bounded::execute(&db, &request(ReadLimits { memory, ..limits() }))
+    };
+    let (mut low, mut high) = (1u64, limits().memory);
+    assert!(answers(high).is_ok(), "the ample statement budget answers through the paged route");
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if answers(middle).is_ok() {
+            high = middle;
+        } else {
+            low = middle + 1;
+        }
+    }
+    assert!(high > 1, "the paged route's reads are charged to the statement");
+    let error = answers(high - 1)
+        .expect_err("one byte below the paged route's reads the statement budget refuses");
+    let bounded::TestError::Refused(statement_refusal) = error else {
+        panic!("the statement refusal uses the bounded read refusal vocabulary, got {error:?}");
+    };
+    assert_eq!(statement_refusal.kind(), ReadFailureKind::OwnerLimitExceeded);
+    let ReadFailureDetail::OwnerLimitExceeded(detail) = statement_refusal.detail() else {
+        panic!("the crossed statement ceiling carries typed detail");
+    };
+    assert_eq!(detail.limit, ReadFailureLimit::Memory, "the refusal names memory");
+    assert_eq!(detail.value, high - 1, "the refusal names the statement's own declared memory");
     assert_dormant_and_uncharged(&db, before, expected_base);
 
     db.set_memory_limit(None)

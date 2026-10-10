@@ -868,6 +868,14 @@ impl PagedVectorTail {
     pub fn retained_control_bytes(&self) -> usize {
         self.root_charge.bytes + self.partition.charge.bytes
     }
+    /// The two retained charges with their owner identities, so a receipt
+    /// that meets clones or successor roots counts each charge once.
+    pub(crate) fn retained_control_receipts(&self) -> [(usize, usize); 2] {
+        [
+            (Arc::as_ptr(&self.root_charge) as usize, self.root_charge.bytes),
+            (Arc::as_ptr(&self.partition) as usize, self.partition.charge.bytes),
+        ]
+    }
 
     pub fn len(&self) -> usize {
         self.progress.graph.points

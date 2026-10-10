@@ -266,18 +266,18 @@ fn reopen_and_selected_queries_keep_raw_vector_residency_partition_local() {
     );
 
     search(&db, alpha, 0, "EXACT");
-    assert!(raw_resident(&db, alpha));
+    assert!(!raw_resident(&db, alpha), "EXACT streams the selected bodies");
     assert!(!raw_resident(&db, bravo));
     assert_eq!(
         db.vector_store_for_test()
             .resident_raw_partition_count_for_test(),
-        1
+        0
     );
 
     assert!(
-        db.vector_store_for_test()
+        !db.vector_store_for_test()
             .evict_raw_partition_for_test(&index(), &partition(alpha)),
-        "an idle raw partition returns its resident body and charge"
+        "a streamed read leaves no whole partition to evict"
     );
     assert!(!raw_resident(&db, alpha));
     assert_eq!(
@@ -931,7 +931,9 @@ fn public_point_lookup_leaves_unrelated_quantized_partitions_dormant() {
         matches!(&row.values["payload_vec"], Value::Vector(v) if v.len() == MANY_VECTOR_DIMENSION)
     );
     let after = db.__vector_passive_activity_counters_for_test();
-    assert_eq!(after.raw_partition_loads - before.raw_partition_loads, 2);
+    assert_eq!(after.raw_partition_loads - before.raw_partition_loads, 0);
+    assert!(!raw_resident(&db, lang_scope(0)));
+    assert!(!payload_resident(&db, lang_scope(0)));
     for partition_ordinal in 1..LANG_PARTITIONS {
         assert!(!raw_resident(&db, lang_scope(partition_ordinal)));
         assert!(!payload_resident(&db, lang_scope(partition_ordinal)));
@@ -1033,9 +1035,8 @@ fn projecting_the_searched_column_loads_only_answer_partitions() {
             assert_eq!(
                 db.vector_store_for_test()
                     .raw_partition_resident_for_test(&index(), &partition(scope)),
-                expected_scopes.contains(&partition_ordinal),
-                "{mode} ordinary reader: embedding residency for scope {partition_ordinal} \
-                 must follow exactly whether the answer returned one of its rows"
+                false,
+                "{mode} ordinary reader: projected bodies are loaded on demand for scope {partition_ordinal}"
             );
         }
 
@@ -1056,11 +1057,8 @@ fn projecting_the_searched_column_loads_only_answer_partitions() {
             assert_eq!(
                 db.vector_store_for_test()
                     .raw_partition_resident_for_test(&index(), &partition(scope)),
-                expected_scopes.contains(&partition_ordinal),
-                "{mode} bounded reader: embedding residency for scope {partition_ordinal} \
-                 must follow exactly whether the answer returned one of its rows; the bounded \
-                 kernel must not push the answer's own projected column demand into the \
-                 candidate scan"
+                false,
+                "{mode} bounded reader: projected bodies are loaded on demand for scope {partition_ordinal}"
             );
         }
     }

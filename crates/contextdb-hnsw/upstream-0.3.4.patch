@@ -3425,7 +3425,7 @@
 +//! The AnnT trait is implemented with macros for u32, u16, u8, f32, f64 and i32.
 --- /dev/null
 +++ b/src/paged.rs
-@@ -0,0 +1,1172 @@
+@@ -0,0 +1,1174 @@
 +//! Storage-access version of the seeded, sequential HNSW construction algorithm.
 +//!
 +//! A provider owns node persistence and transactions. This module retains only
@@ -3529,7 +3529,9 @@
 +impl PagedGraphPolicy {
 +    pub fn validate(&self) -> bool {
 +        self.m > 1
-+            && self.m <= 256
++            // Layer zero holds twice M links; any declared M whose degree is
++            // representable is valid, as it is for the resident graph.
++            && self.m.checked_mul(2).is_some()
 +            && self.ef_construction > 0
 +            && self.max_layer > 0
 +            && self.max_layer <= NB_LAYER_MAX as usize

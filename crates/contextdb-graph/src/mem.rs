@@ -1959,9 +1959,13 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
             .bfs_visited_cap
             .load(std::sync::atomic::Ordering::Relaxed);
         let mut nodes = Vec::new();
-        let mut emitted = HashSet::new();
-        let mut emitted_bytes = 0;
-        let single_hop = min_depth == 1 && max_depth == 1;
+        let (mut emitted , mut emitted_bytes ) =
+            bounded_graph_visited(start, &mut admit, &mut |bytes| {
+                credit
+                    .borrow_mut()
+                    .try_shrink(bytes)
+                    .expect("graph dedupe releases admitted storage")
+            })?;
         while let Some(output) = self.bounded_bfs_next_including_staged::<Error>(
             &mut cursor,
             || Ok(()),
@@ -1978,7 +1982,7 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
             || {},
             Some(cap),
         )? {
-            if !single_hop {
+            {
                 if emitted.contains(&output.node.id) {
                     let bytes = output.reserved_bytes;
                     drop(output);

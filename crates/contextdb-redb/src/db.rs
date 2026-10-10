@@ -1289,6 +1289,7 @@ impl Database {
         repair_callback: &(dyn Fn(&mut RepairSession) + 'static),
         external_snapshot_provider: Option<ExternalSnapshotProvider>,
         deferred_free_budget: (usize, usize),
+        keep_pace_reclaim: bool,
     ) -> Result<Self, DatabaseError> {
         #[cfg(feature = "logging")]
         let file_path = format!("{:?}", &file);
@@ -1345,6 +1346,7 @@ impl Database {
                 next_transaction_id,
                 external_snapshot_provider,
                 deferred_free_budget,
+                keep_pace_reclaim,
             )),
             read_only_handoff_prepared: false,
             #[cfg(feature = "test-seams")]
@@ -1505,6 +1507,56 @@ impl Database {
         }
     }
 
+    /// Whether another writer is waiting for the write slot.
+    #[doc(hidden)]
+    pub fn has_waiting_write_transactions(&self) -> bool {
+        self.transaction_tracker.has_waiting_write_transactions()
+    }
+
+    /// One bounded maintenance reclaim step: an ordinary durable write transaction that frees at
+    /// most `extents` allocation extents and visits at most `entries` deferred-free entries, all
+    /// freed by transactions before both the reader floor and `boundary`.
+    ///
+    /// The first step of a cycle passes `None` and samples the boundary as its own write
+    /// transaction id, so every entry freed by an already committed transaction — including the
+    /// last one — is included, and every later commit's frees, including these steps' own
+    /// bookkeeping, are not. Later steps of the cycle pass the returned boundary back. Savepoints
+    /// block reclamation exactly as in `drain_deferred_frees`.
+    #[cfg(any(test, feature = "contextdb-internal"))]
+    #[doc(hidden)]
+    pub fn reclaim_deferred_step(
+        &self,
+        boundary: Option<ReclaimBoundary>,
+        extents: usize,
+        entries: usize,
+    ) -> Result<ReclaimStep, Error> {
+        let mut tx = self.begin_write()?;
+        if self.transaction_tracker.any_savepoint_exists()
+            || tx.list_persistent_savepoints()?.next().is_some()
+        {
+            tx.abort()?;
+            return Ok(ReclaimStep::Blocked);
+        }
+        let boundary = boundary.map_or_else(|| tx.transaction_id(), |boundary| boundary.0);
+        let floor = self
+            .transaction_tracker
+            .oldest_live_read_transaction()
+            .map_or(tx.transaction_id(), |id| id.next());
+        if !tx.pending_free_pages_before(TransactionId::min(floor, boundary))? {
+            let held = tx.pending_free_pages_before(boundary)?;
+            tx.abort()?;
+            return Ok(if held {
+                ReclaimStep::ReaderHeld
+            } else {
+                ReclaimStep::Drained
+            });
+        }
+        tx.set_deferred_free_budget(extents, entries);
+        tx.set_reclaim_ceiling(boundary);
+        tx.commit()?;
+        Ok(ReclaimStep::Progressed(ReclaimBoundary(boundary)))
+    }
+
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
     pub fn fail_next_deferred_free_commit_for_test(&self) {
@@ -1524,6 +1576,25 @@ impl Database {
         }
         Ok(())
     }
+}
+
+/// The exclusive freeing-transaction boundary a maintenance reclaim cycle sampled on its first step.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReclaimBoundary(TransactionId);
+
+/// What one bounded maintenance reclaim step did.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReclaimStep {
+    /// Reclaimed eligible entries below the boundary and committed.
+    Progressed(ReclaimBoundary),
+    /// Nothing remains below the boundary.
+    Drained,
+    /// Entries remain below the boundary, but a live reader or snapshot still protects all of them.
+    ReaderHeld,
+    /// A savepoint exists, so nothing may be reclaimed.
+    Blocked,
 }
 
 impl Drop for Database {
@@ -1583,6 +1654,7 @@ pub struct Builder {
     cache_size: usize,
     repair_callback: Box<dyn Fn(&mut RepairSession)>,
     deferred_free_budget: (usize, usize),
+    keep_pace_reclaim: bool,
 }
 
 impl Builder {
@@ -1603,6 +1675,7 @@ impl Builder {
             cache_size: 1024 * 1024 * 1024,
             repair_callback: Box::new(|_| {}),
             deferred_free_budget: (usize::MAX, usize::MAX),
+            keep_pace_reclaim: false,
         }
     }
 
@@ -1649,6 +1722,16 @@ impl Builder {
         self
     }
 
+    /// Let each durable commit reclaim at least as many deferred extents (and entries) as it
+    /// freed itself, above the configured budget, so an active writer's backlog cannot grow while
+    /// eligible work exists. Reclamation still never passes the reader floor.
+    #[cfg(any(test, feature = "contextdb-internal"))]
+    #[doc(hidden)]
+    pub fn set_keep_pace_reclaim(&mut self, keep_pace: bool) -> &mut Self {
+        self.keep_pace_reclaim = keep_pace;
+        self
+    }
+
     /// Set the amount of memory (in bytes) used for caching data
     pub fn set_cache_size(&mut self, bytes: usize) -> &mut Self {
         self.cache_size = bytes;
@@ -1684,6 +1767,7 @@ impl Builder {
             &self.repair_callback,
             None,
             self.deferred_free_budget,
+            self.keep_pace_reclaim,
         )
     }
 
@@ -1701,6 +1785,7 @@ impl Builder {
             &self.repair_callback,
             None,
             self.deferred_free_budget,
+            self.keep_pace_reclaim,
         )
     }
 
@@ -1721,6 +1806,7 @@ impl Builder {
             &self.repair_callback,
             None,
             self.deferred_free_budget,
+            self.keep_pace_reclaim,
         )
     }
 
@@ -1741,6 +1827,7 @@ impl Builder {
             &self.repair_callback,
             Some(provider),
             self.deferred_free_budget,
+            self.keep_pace_reclaim,
         )
     }
 
@@ -1806,6 +1893,7 @@ impl Builder {
             &self.repair_callback,
             None,
             self.deferred_free_budget,
+            self.keep_pace_reclaim,
         )
     }
 
@@ -1827,6 +1915,7 @@ impl Builder {
             &self.repair_callback,
             Some(provider),
             self.deferred_free_budget,
+            self.keep_pace_reclaim,
         )
     }
 
@@ -1844,6 +1933,7 @@ impl Builder {
             &self.repair_callback,
             None,
             self.deferred_free_budget,
+            self.keep_pace_reclaim,
         )
     }
 }

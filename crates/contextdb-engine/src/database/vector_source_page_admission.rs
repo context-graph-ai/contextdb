@@ -6,7 +6,6 @@ use crate::memory_accounting::MemoryAccountant;
 use contextdb_core::Error;
 use contextdb_core::Result;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 struct SourcePageCharge {
     accountant: Option<Arc<MemoryAccountant>>,
@@ -28,8 +27,7 @@ impl Drop for SourcePageCharge {
         // All engine cleanup precedes the narrowly authorized own-Box refund.
         drop(self._writer_use.take());
         drop(accountant);
-        refund.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| used.checked_sub(self.own_layout.size()))
-            .expect("source charge control refund is owned");
+        refund.release_owned(self.own_layout.size()).expect("source charge control refund is owned");
         // Remaining fields are empty or Copy; refund's Arc drop runs only std
         // counter cleanup before std deallocates this uniquely owned Box.
     }

@@ -1365,27 +1365,22 @@ impl RequestContext {
         ))
     }
 
+    /// The read's own declared memory ceiling refused this charge: answered in
+    /// the read vocabulary (owner limit, memory), as the dev contract requires.
+    /// A refusal of the database's standing budget is not this one; it keeps
+    /// the store's own typed refusal from the store's credit.
+    fn memory_limit_failure(
+        &self,
+        _held: usize,
+        _requested: usize,
+        _operation: &'static str,
+    ) -> BoundedExecutionError {
+        Self::limit_failure(ReadFailureLimit::Memory, self.limits.memory)
+    }
+
     /// Whatever must stop the request before it does more work: a parked
     /// release fault first, because it means the live charge no longer
     /// describes what the request holds, then cancellation.
-    fn memory_limit_failure(
-        &self,
-        held: usize,
-        requested: usize,
-        operation: &'static str,
-    ) -> BoundedExecutionError {
-        BoundedExecutionError::Engine(Error::MemoryBudgetExceeded {
-            subsystem: "bounded_read".to_string(),
-            operation: operation.to_string(),
-            requested_bytes: requested,
-            available_bytes: usize::try_from(self.limits.memory)
-                .unwrap_or(usize::MAX)
-                .saturating_sub(held),
-            budget_limit_bytes: usize::try_from(self.limits.memory).unwrap_or(usize::MAX),
-            hint: "Lower the statement's LIMIT or width, or raise MEMORY_LIMIT.".to_string(),
-        })
-    }
-
     fn pending_failure(&self) -> Option<BoundedExecutionError> {
         let fault = {
             let mut state = self.state();
@@ -2355,7 +2350,8 @@ impl PulledRow {
 enum PullKind {
     Scan(ScanState),
     Graph(GraphState),
-    Vector(VectorState),
+    // Admit this fixed native control separately from each recursive plan frame.
+    Vector(Box<VectorState>),
     Project(ProjectState),
     Sort(SortState),
     Window(WindowState),
@@ -5263,7 +5259,9 @@ fn pull_continuation_bytes(node: &PullNode) -> std::result::Result<usize, Bounde
         }
         PullKind::Vector(state) => {
             let mut state_bytes = checked_size_add(
-                state.table.capacity(),
+                checked_size_add(
+                    size_of::<VectorState>(), state.table.capacity(), "vector control",
+                )?,
                 checked_size_add(
                     state.index.table.capacity(),
                     state.index.column.capacity(),
@@ -6780,14 +6778,17 @@ impl ScanState {
                                     self.snapshot,
                                     cursor,
                                     &mut || {
-                                        context.charge(
-                                            BoundedWorkSource::TableScan,
-                                            BoundedSourceTouch::TableRow,
+                                        context.observe_precharged_touch(
+                                            BoundedSourceTouch::StorageStep,
                                         )?;
                                         receipt.set(true);
                                         Ok(())
                                     },
                                     &mut |row| {
+                                        context.charge(
+                                            BoundedWorkSource::TableScan,
+                                            BoundedSourceTouch::TableRow,
+                                        )?;
                                         if !receipt.replace(false) {
                                             return Err(Error::Other(
                                                 "physical input has no admitted work receipt"
@@ -6847,14 +6848,17 @@ impl ScanState {
                                     cursor,
                                     &mut || context.check_final_boundary(),
                                     &mut || {
-                                        context.charge(
-                                            BoundedWorkSource::IndexRange,
-                                            BoundedSourceTouch::IndexEntry,
+                                        context.observe_precharged_touch(
+                                            BoundedSourceTouch::StorageStep,
                                         )?;
                                         receipt.set(true);
                                         Ok(())
                                     },
                                     &mut |key, row_id| {
+                                        context.charge(
+                                            BoundedWorkSource::IndexRange,
+                                            BoundedSourceTouch::IndexEntry,
+                                        )?;
                                         if !receipt.replace(false) {
                                             return Err(Error::Other(
                                                 "index input has no admitted work receipt"
@@ -6930,14 +6934,17 @@ impl ScanState {
                                     cursor,
                                     &mut || context.check_final_boundary(),
                                     &mut || {
-                                        context.charge(
-                                            BoundedWorkSource::IndexRange,
-                                            BoundedSourceTouch::IndexEntry,
+                                        context.observe_precharged_touch(
+                                            BoundedSourceTouch::StorageStep,
                                         )?;
                                         receipt.set(true);
                                         Ok(())
                                     },
                                     &mut |key, row_id| {
+                                        context.charge(
+                                            BoundedWorkSource::IndexRange,
+                                            BoundedSourceTouch::IndexEntry,
+                                        )?;
                                         if !receipt.replace(false) {
                                             return Err(Error::Other(
                                                 "index input has no admitted work receipt"
@@ -6993,6 +7000,11 @@ impl ScanState {
                                     index,
                                     self.snapshot,
                                     cursor,
+                                    &mut || {
+                                        context.observe_precharged_touch(
+                                            BoundedSourceTouch::StorageStep,
+                                        )
+                                    },
                                     &mut || {
                                         context.charge(
                                             BoundedWorkSource::IndexRange,
@@ -7247,7 +7259,13 @@ impl ScanState {
                 ScanMode::Exact { index, .. } => Some(index.as_str()),
                 _ => self.authenticated_exact_index.as_deref(),
             };
-            let names_one_row = match (exact_index, index_pick) {
+            // The statement decides whether it names one row, on every target and source; only a
+            // source that carries its keys with no statement filter is asked about itself.
+            let statement_pins = self
+                .filter
+                .as_ref()
+                .map(|filter| crate::executor::statement_names_one_row(&self.meta, filter, &self.params));
+            let names_one_row = statement_pins.unwrap_or_else(|| match (exact_index, index_pick) {
                 // An exact-lookup source asked a whole key: it is already
                 // reading the row that key names.
                 (Some(index), _) => db.read_index_names_one_row(
@@ -7263,7 +7281,7 @@ impl ScanState {
                     &self.params,
                 ),
                 _ => false,
-            };
+            });
             let mut charge_access = |_candidate_bytes: usize| {
                 context.charge(
                     BoundedWorkSource::AccessControl,
@@ -7287,6 +7305,22 @@ impl ScanState {
             if candidate_range_answers_gate {
                 note_vector_candidate_identity("candidate range answers the gate")?;
             } else if names_one_row {
+                // Only a row that matches the complete statement can be the row it names; any
+                // other row is not an answer at all, so it is skipped before the refusing gate.
+                if let Some(filter) = self.filter.as_ref()
+                    && !(self.identities_only && from_committed)
+                {
+                    context.check_final_boundary()?;
+                    let matched = bounded_row_matches(row, filter, &self.params);
+                    context.check_final_boundary()?;
+                    if !matched? {
+                        let (_, bytes, _) = self.pending_row.take().ok_or_else(|| {
+                            Error::Other("bounded scan lost a filtered row".to_string())
+                        })?;
+                        context.release(bytes)?;
+                        continue;
+                    }
+                }
                 refused = db.bounded_read_denial_for_row(
                     // The request's transaction, not this scan's row
                     // overlay: a transaction that staged only a GRANT row has
@@ -8259,15 +8293,10 @@ impl GraphState {
                     }
                 }
             }
-            // In a longer match, two starts that arrive at the same nodes are
-            // ONE answer, and the walk out of those nodes is made once: the key
-            // is what the pattern's target aliases are bound to, never where
-            // the walk began. Without it the same decision is reported once per
-            // route that reaches it, so a statement asking which decisions a
-            // detection reaches gets one row per detection rather than one row
-            // per decision. A single hop is not keyed: each matching edge out
-            // of its distinct starts is its own answer.
-            if !self.single_step_probe {
+            // Answers are keyed by the pattern's target bindings, including
+            // single-hop probes that reach one neighbour from both directions.
+            // The existing admitted path-key set owns each distinct answer.
+            {
                 let key = {
                     let active = self.active.as_ref().ok_or_else(|| {
                         Error::Other("bounded graph lost its emitted path".to_string())
@@ -14483,10 +14512,11 @@ fn build_vector_kernel<'plan>(
     let restricted_candidates =
         candidates.is_some_and(|candidate| !is_unrestricted_scan_for_table(candidate, table));
     let trace = vector_search_trace_with_source(operator, candidate_trace, query_vector_source);
+    context.reserve(BoundedWorkSource::VectorCandidates, size_of::<VectorState>())?;
     Ok(PullNode {
         columns,
         trace,
-        kind: PullKind::Vector(VectorState {
+        kind: PullKind::Vector(Box::new(VectorState {
             #[cfg(feature = "test-seams")]
             receipt: vector_search_receipt::SearchReceiptState::Unstarted,
             supplement_columns: Vec::new(),
@@ -14534,7 +14564,7 @@ fn build_vector_kernel<'plan>(
             disclosure: None,
             vector_overlay,
             overlay_bytes,
-        }),
+        })),
     })
 }
 

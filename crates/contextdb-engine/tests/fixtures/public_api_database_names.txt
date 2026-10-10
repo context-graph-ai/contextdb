@@ -1,23 +1,3 @@
-__additional_resident_owners_for_test
-__allocator_metadata_bytes_for_test
-__create_region_fixture_for_test
-__damage_membership_envelope_for_test
-__durable_ddl_for_test
-__durable_page_population_for_test
-__durable_relation_tree_height_for_test
-__durable_sidecars_for_test
-__durable_version_count_for_test
-__history_sidecar_owners_for_test
-__hold_row_page_for_test
-__maintenance_with_stop_for_test
-__native_read_transaction_count_for_test
-__physical_snapshot_for_test
-__resident_commit_directory_bytes_for_test
-__resident_row_directory_capacity_for_test
-__retention_directory_bytes_for_test
-__storage_batch_for_test
-__storage_cursor_for_test
-__writer_cache_stats_for_test
 begin
 begin_or_panic
 change_log_rows_since
@@ -28,6 +8,7 @@ check_disk_budget
 close
 column_has_covering_index
 commit
+commit_returning_txid
 committed_watermark
 compact_currency_versions
 compact_now
@@ -59,6 +40,7 @@ get_edge_properties
 graph_change_arrived_by_sync
 guard_row_conditions_in_tx
 has_live_vector
+index_root_damage
 insert_edge
 insert_row
 insert_vector
@@ -72,6 +54,7 @@ maintenance_status
 memory_held_received_schema_units
 memory_limit
 next_tx
+observed_index_root_damage
 open
 open_as_principal
 open_memory

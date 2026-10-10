@@ -1,6 +1,5 @@
 //! Service-side listener for authenticated owner reads.
 
-use crate::owned_cursor_page::OwnedCursorPage as CursorPage;
 use super::admission::{OwnerAdmission, RequestLease};
 use super::{OwnerReadScaffoldError, OwnerReadScaffoldResult, response_expectation};
 use crate::executor::{
@@ -23,6 +22,7 @@ use crate::local_transport::{
 use crate::local_transport::{
     UnixLocalCarrier, authenticate_framed_stream_handshake, serve_request_with_deadline,
 };
+use crate::owned_cursor_page::OwnedCursorPage as CursorPage;
 use crate::read_contract::{
     encode_metadata_page, encode_observed_cursor_page, encode_query_result,
 };
@@ -215,8 +215,10 @@ impl BoundedExecutionProbe for OwnerBoundedProbeAdapter {
 
     fn before_source_touch(&self, touch: BoundedSourceTouch, completed_items: u64) {
         self.observe_start();
-        self.observer
-            .before_source_touch(touch.into(), completed_items);
+        if let Some(touch) = TestSourceTouch::from_bounded(touch) {
+            self.observer
+            .before_source_touch(touch, completed_items);
+    }
     }
 
     fn before_hnsw_candidate_distance(
@@ -756,6 +758,10 @@ pub struct OwnerReadResourceSnapshot {
     pub buffered_bytes: u64,
     pub active_cancellations: u64,
     pub accountant_used_bytes: u64,
+    #[cfg(feature = "test-seams")]
+    pub reader_used_bytes: u64,
+    #[cfg(feature = "test-seams")]
+    pub reader_control_bytes: u64,
 }
 
 #[cfg(unix)]
@@ -2105,6 +2111,19 @@ impl OwnerReadService {
             )
             .unwrap_or(u64::MAX),
             accountant_used_bytes: u64::try_from(usage.used).unwrap_or(u64::MAX),
+        #[cfg(feature = "test-seams")]
+            reader_used_bytes: self
+                .spec
+                .database
+                .declared_read_memory_for_test()
+                .retained_bytes_for_test(),
+            #[cfg(feature = "test-seams")]
+            reader_control_bytes: self
+                .spec
+                .database
+                .declared_read_memory_for_test()
+                .standing_control_bytes()
+                .0,
         }
     }
 
@@ -2984,7 +3003,7 @@ impl OwnerReadService {
                 .cursor
                 .as_ref()
                 .expect("live cursor handle")
-                .retained_read_bytes_with_observations(fetched_observation, None),
+                .retained_read_bytes_with_observations(fetched_observation, None).saturating_add(fetched.as_ref().map_or(0, |page| page.page.credit_bytes())),
         )
         .unwrap_or(u64::MAX);
         self.adjust_cursor_retained(entry.retained_memory_bytes, retained_memory_bytes);
@@ -3117,6 +3136,7 @@ impl OwnerReadService {
 
         if publication.published_rows < pending.page.rows.len() {
             let previous_pending_bytes = pending.memory.bytes();
+            let previous_page_bytes = pending.page.credit_bytes();
             let mut remaining_page = match pending.page.try_clone(entry.read_memory.clone()) {
                 Ok(page) => page,
                 Err(error) => {
@@ -3141,6 +3161,12 @@ impl OwnerReadService {
                 .and_then(|(released, counted)| {
                     retained_memory_bytes
                         .checked_sub(counted)
+                        .and_then(|current| {
+                            current.checked_sub(u64::try_from(previous_page_bytes).ok()?)
+                        })
+                        .and_then(|current| {
+                            current.checked_add(u64::try_from(remaining_page.credit_bytes()).ok()?)
+                        })
                         .map(|current| (released, current))
                 });
             let Some((released_pending_bytes, current_retained_memory_bytes)) = resized else {
@@ -3166,7 +3192,8 @@ impl OwnerReadService {
             return Ok(());
         }
 
-        let pending_bytes = match u64::try_from(pending.memory.bytes()) {
+        let pending_bytes = match u64::try_from(pending.memory.bytes().saturating_add(pending.page.credit_bytes()),
+        ) {
             Ok(bytes) => bytes,
             Err(_) => {
                 let close = entry.close();
@@ -3263,45 +3290,13 @@ impl OwnerReadService {
         connection_id: [u8; 16],
         cursor_id: [u8; 16],
     ) -> OwnerReadScaffoldResult<Vec<LocalResponse>> {
-        let mut entry = self.take_cursor(connection_id, cursor_id)?;
-        let observation = if let Some(pending) = &entry.unpublished_page {
-            pending
-                .observation
-                .groups_published_through(pending.published_rows)
-        } else {
-            entry
-                .cursor
-                .as_mut()
-                .expect("live cursor handle")
-                .work_observation()
-                .and_then(|observation| {
-                    observation.ok_or_else(|| {
-                        BoundedExecutionError::Engine(contextdb_core::Error::Other(
-                            "cancelled cursor lost its work observation".into(),
-                        ))
-                    })
-                })
-                .and_then(|observation| observation.unpublished_groups_withdrawn())
-        };
-        let observation = match observation {
-            Ok(observation) => observation,
-            Err(error) => {
-                self.store_cursor(entry, CursorRegistration::Returning)?;
-                return Err(map_bounded_error(error));
-            }
-        };
-        let page = CursorPage::from_parts(Vec::new(), Vec::new(), true);
-        let payload = encode_observed_cursor_page(&page, &observation).map_err(|_| {
-            OwnerReadScaffoldError::unimplemented("canonical cancelled-cursor observation")
-        });
+        // Keep the unpublished page for replay, but refuse this fetch with
+        // the same typed cancellation returned by the bounded kernel.
+        let entry = self.take_cursor(connection_id, cursor_id)?;
         self.store_cursor(entry, CursorRegistration::Returning)?;
-        let responses = split_payload_answer(payload?, |payload| LocalResponse::CursorCancelled {
-            page: CursorPageResponse { payload },
-        })?;
-        for response in &responses {
-            response_is_encodable(response)?;
-        }
-        Ok(responses)
+        Ok(vec![refusal_response(map_bounded_error(
+            BoundedExecutionError::Cancelled,
+        ))])
     }
 
     fn empty_exhausted_cursor_page(&self) -> OwnerReadScaffoldResult<Vec<LocalResponse>> {

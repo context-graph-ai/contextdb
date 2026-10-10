@@ -67,7 +67,7 @@
 pub use db::scratch_backend_allocation_size;
 pub use db::{
     Builder, CacheStats, Database, MultimapTableDefinition, MultimapTableHandle, ReadOnlyDatabase,
-    ReadableDatabase, RepairSession, ScratchBackend, StorageBackend, TableDefinition, TableHandle,
+    ReadableDatabase, ReclaimBoundary, ReclaimStep, RepairSession, ScratchBackend, StorageBackend, TableDefinition, TableHandle,
     UntypedMultimapTableHandle, UntypedTableHandle, scratch_backend_in_directory,
 };
 pub use error::{
