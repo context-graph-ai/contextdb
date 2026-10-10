@@ -363,11 +363,9 @@ fn a_find_over_many_contexts_spends_one_search_budget() {
         narrow.evaluations > 0,
         "the fixture must be large enough that a partition takes the maintained route"
     );
-    // Re-targeted (fable-18 ruling 2026-10-10, recall wins): one shared walk
-    // across Contexts measurably loses recall (near-tie 8/10; real 8 x 1,250
-    // min 0.80), contradicting V19. Each Context is searched to its own
-    // termination inside the one declared cap; the bar is work within that
-    // cap and strictly below EXACT, with p95 <= EXACT held by the gate rows.
+    // Each Context searches to its own termination within the declared
+    // per-index cap. The aggregate stays within the funded scope total
+    // and strictly below EXACT; the gate rows retain the latency bar.
     let _ = ADMISSION_ALLOWANCE_PER_PARTITION;
     for (selected, observed) in &measured {
         let exact = (*selected * ROWS_PER_PARTITION) as u64;
@@ -498,11 +496,9 @@ fn expansion_work_does_not_grow_with_context_count() {
         broad.layers_admitted >= PARTITIONS && broad.layers_admitted > narrow.layers_admitted,
         "every admitted Context's layers are opened: {narrow:?} against {broad:?}"
     );
-    // Re-targeted (fable-18 ruling 2026-10-10, recall wins): one shared walk
-    // across Contexts measurably loses recall (near-tie 8/10; real 8 x 1,250
-    // min 0.80), contradicting V19. Each Context is searched to its own
-    // termination inside the one declared cap; the bar is work within that
-    // cap and strictly below EXACT, with p95 <= EXACT held by the gate rows.
+    // Each Context searches to its own termination within the declared
+    // per-index cap. The aggregate stays within the funded scope total
+    // and strictly below EXACT; the gate rows retain the latency bar.
     let broad_work = broad.admission_evaluations + broad.expansion_evaluations;
     assert!(
         broad_work <= broad.budget,
@@ -589,11 +585,9 @@ fn opening_more_layers_never_shrinks_the_walk() {
             receipt.admission_evaluations > 0,
             "layers were opened: {receipt:?}"
         );
-    // Re-targeted (fable-18 ruling 2026-10-10, recall wins): one shared walk
-    // across Contexts measurably loses recall (near-tie 8/10; real 8 x 1,250
-    // min 0.80), contradicting V19. Each Context is searched to its own
-    // termination inside the one declared cap; the bar is work within that
-    // cap and strictly below EXACT, with p95 <= EXACT held by the gate rows.
+        // Each Context searches to its own termination within the declared
+        // per-index cap. The aggregate stays within the funded scope total
+        // and strictly below EXACT; the gate rows retain the latency bar.
         let spent = receipt.admission_evaluations + receipt.expansion_evaluations;
         if spent > receipt.budget || spent >= selected * ROWS_PER_PARTITION {
             failures.push(format!(
