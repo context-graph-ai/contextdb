@@ -22621,7 +22621,18 @@ impl MaintenanceContext {
         cycle_failures.first = cycle_failures.first.or(cleanup_retry_failure);
         let pruning = self.run_pruning(read_memory.clone())?;
         let pruned_trigger_audit_rows = self.run_trigger_audit_retention()?;
-        let currency = self.run_currency(gate, read_memory.clone())?;
+        let currency = match self.run_currency(gate, read_memory.clone()) {
+            Ok(report) => report,
+            Err(error @ Error::MemoryBudgetExceeded { .. }) if cycle_failures.first.is_some() => {
+                let details = VectorMaintenanceFailureDetails::from_error(&error);
+                CurrencyCompactionReport {
+                    first_failure: Some(details.failure),
+                    first_failure_details: Some(details),
+                    ..CurrencyCompactionReport::default()
+                }
+            }
+            Err(error) => return Err(error),
+        };
         let candidate_sample = self
             .persistence
             .as_ref()
