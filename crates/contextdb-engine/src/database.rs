@@ -15862,18 +15862,21 @@ struct SnapshotPinPool {
 }
 
 impl SnapshotPinPool {
-    fn acquire(self: &Arc<Self>) -> contextdb_core::Result<SnapshotPinSlot> {
+    fn acquire(
+        self: &Arc<Self>,
+        reader: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> contextdb_core::Result<SnapshotPinSlot> {
         let mut available = self.available.load(Ordering::SeqCst);
         loop {
             if available == 0 {
-                return Err(contextdb_core::Error::MemoryBudgetExceeded {
-                    subsystem: "snapshot_pin".into(),
-                    operation: "admit_pin".into(),
-                    requested_bytes: self.slot_bytes,
-                    available_bytes: 0,
-                    budget_limit_bytes: self.slots.saturating_mul(self.slot_bytes),
-                    hint: "drop a SnapshotPin before pinning another snapshot".into(),
-                });
+                return contextdb_core::read_memory::ReadCredit::try_new(
+                    reader,
+                    self.slot_bytes,
+                    "snapshot_pin",
+                    "admit_pin",
+                    "Drop a SnapshotPin or raise the declared reader memory limit.",
+                )
+                .map(|credit| SnapshotPinSlot::Reader { _credit: credit });
             }
             match self.available.compare_exchange(
                 available,
@@ -15881,7 +15884,7 @@ impl SnapshotPinPool {
                 Ordering::SeqCst,
                 Ordering::SeqCst,
             ) {
-                Ok(_) => return Ok(SnapshotPinSlot { pool: self.clone() }),
+                Ok(_) => return Ok(SnapshotPinSlot::Prepaid(self.clone())),
                 Err(observed) => available = observed,
             }
         }
@@ -15894,13 +15897,18 @@ impl Drop for SnapshotPinPool {
     }
 }
 
-struct SnapshotPinSlot {
-    pool: Arc<SnapshotPinPool>,
+enum SnapshotPinSlot {
+    Prepaid(Arc<SnapshotPinPool>),
+    Reader {
+        _credit: contextdb_core::read_memory::ReadCredit,
+    },
 }
 
 impl Drop for SnapshotPinSlot {
     fn drop(&mut self) {
-        self.pool.available.fetch_add(1, Ordering::SeqCst);
+        if let Self::Prepaid(pool) = self {
+            pool.available.fetch_add(1, Ordering::SeqCst);
+        }
     }
 }
 
@@ -15942,12 +15950,15 @@ impl SnapshotFloorRegistry {
         }));
     }
 
-    fn acquire_pin_slot(&self) -> contextdb_core::Result<SnapshotPinSlot> {
+    fn acquire_pin_slot(
+        &self,
+        reader: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> contextdb_core::Result<SnapshotPinSlot> {
         self.pin_slots
             .lock()
             .as_ref()
             .expect("snapshot pin pool is funded when the database opens")
-            .acquire()
+            .acquire(reader)
     }
 }
 
@@ -55722,10 +55733,14 @@ impl Database {
     /// cannot come back — that is the pre-existing, documented unpinned-
     /// held-snapshot boundary above, unchanged. A pin whose `snapshot` is
     /// not older than any in-flight pass's own floor never blocks.
-    /// The store's fixed `ReadLimits::SHIPPED_SNAPSHOT_PIN_SLOTS` pool bounds
-    /// caller-held registrations; exhaustion returns a typed memory refusal.
+    /// The first `ReadLimits::SHIPPED_SNAPSHOT_PIN_SLOTS` registrations use
+    /// prepaid capacity. Further pins reserve their exact registration bytes
+    /// from the store's declared reader memory until unpin; insufficient
+    /// memory returns a typed `snapshot_pin` refusal.
     pub fn pin_snapshot(&self, snapshot: SnapshotId) -> contextdb_core::Result<SnapshotPin<'_>> {
-        let slot = self.snapshot_registry.acquire_pin_slot()?;
+        let slot = self
+            .snapshot_registry
+            .acquire_pin_slot(self.declared_read_memory.clone())?;
         let root = self.snapshot_registry.pinned_root(snapshot).or_else(|| {
             self.writer_read_root()
                 .expect("an open database has a published read root")
