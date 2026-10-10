@@ -11621,6 +11621,10 @@ fn stream_raw_partition_memberships<T>(
             &partition.partition_key,
         )
         .map_err(&corruption)?;
+        // The decoded route is local to this visit; retained identities and
+        // vector bodies are admitted by the callback's own owner.
+        let scratch = crate::read_image_memory::active_owner()?.row_owner()?;
+        let _scratch_scope = scratch.enter();
         let membership: VectorPartitionMembershipRecord = RedbPersistence::decode_exact(payload)
             .map_err(|error| {
                 corruption(format!("raw membership payload decode failed: {error}"))
