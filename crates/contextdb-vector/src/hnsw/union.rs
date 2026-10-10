@@ -1249,7 +1249,7 @@ pub(crate) fn graph_work_cannot_beat_exact(
 }
 
 /// Run each partition's own search (its base, change and tail together, as
-/// one partition's layers always were) in turn against one shared evaluation
+/// one partition's layers always were) in turn against its declared evaluation
 /// cap and merge their kept rows by distance. A layer search that stops on a limit
 /// (the cap included) makes the union Incomplete; a refused layer refuses it.
 pub(crate) fn merge_layer_searches<E>(
@@ -1261,7 +1261,7 @@ pub(crate) fn merge_layer_searches<E>(
     let mut merged: Option<HnswUnionSearchResult> = None;
     let mut spent = 0usize;
     for position in 0..layers {
-        let remaining = cap.saturating_sub(spent);
+        let remaining = cap;
         let one = search_layer(position, remaining, spent)?;
         spent = spent
             .saturating_add(one.admission_evaluations)
@@ -1308,7 +1308,7 @@ pub(crate) fn merge_layer_searches<E>(
         layers_admitted: 0,
         frontier_exhausted: true,
     });
-    all.budget = cap;
+    all.budget = cap.saturating_mul(layers);
     // Nearest first across layers, ties by partition then row, exactly as
     // one walk's kept rows are ordered.
     all.candidates.sort_by(|left, right| {
@@ -3099,5 +3099,40 @@ mod canonical_tie_tests {
                 "a tied plateau of {breadth} needs no retained-heap scan per pop: {comparisons} comparisons"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod partition_cap_tests {
+    use super::*;
+
+    #[test]
+    fn each_partition_receives_its_full_declared_cap() {
+        let mut grants = Vec::new();
+        let result = merge_layer_searches(2, 10, 0, |position, cap, spent| {
+            grants.push((position, cap, spent));
+            Ok::<_, ()>(HnswUnionSearchResult {
+                terminal: UnionTerminal::FrontierExhausted,
+                candidates: Vec::new(),
+                retained_bytes: 0,
+                status: HnswAllowedSearchStatus::Complete,
+                below_admission_floor: None,
+                budget: cap,
+                admission_evaluations: 2,
+                expansion_evaluations: 6,
+                allowed_admissions: 2,
+                #[cfg(feature = "test-seams")]
+                expansion_cap: cap,
+                layers_admitted: 1,
+                frontier_exhausted: true,
+            })
+        })
+        .unwrap();
+        assert_eq!(grants, [(0, 10, 0), (1, 10, 8)]);
+        assert_eq!(result.budget, 20);
+        assert_eq!(
+            result.admission_evaluations + result.expansion_evaluations,
+            16
+        );
     }
 }

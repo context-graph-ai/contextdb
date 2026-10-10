@@ -2339,6 +2339,7 @@ struct UnionPartition<'g> {
     live_count: usize,
     entry_count: usize,
     bounded_limits: bool,
+    rescore_credit: std::cell::Cell<usize>,
     layers: Vec<crate::store::SnapshotCompatibleLayer<'g>>,
     /// What this entry and its layer list were charged when admitted.
     charged_bytes: usize,
@@ -3956,6 +3957,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                         live_count: eligibility.live_count,
                         entry_count: eligibility.entry_count,
                         bounded_limits: every_graph_point_is_allowed || candidates.is_some(),
+                        rescore_credit: std::cell::Cell::new(0),
                         layers: owned_layers,
                         charged_bytes,
                         routes_before: partition_routes.len(),
@@ -4468,10 +4470,9 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         }
     }
 
-    /// One best-first search over every admitted layer of every partition in
-    /// `partitions`, with one frontier, one result heap and one candidate
-    /// budget, followed by re-scoring each candidate from its own partition's
-    /// stored vector. Expansion work is the budget's, not the scope's.
+    /// Search each selected partition's admitted layers with its declared
+    /// candidate budget, then merge their rows and re-score candidates from
+    /// their own partition's stored vector. The request work limit is shared.
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::drop_non_drop)] // Explicitly end callback borrows before partition publication.
     fn bounded_union_search<E>(
@@ -4561,9 +4562,9 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         let membership_error = std::cell::RefCell::new(None);
         // Each admitted layer is a separate graph and runs its own search to its
         // own termination; one beam shared across disjoint graphs let a layer
-        // be pruned unexpanded. All layers spend ONE hard cap: each search may
-        // use only what the earlier ones left, admission included, and a layer
-        // that cannot finish inside it makes the whole union Incomplete.
+        // be pruned unexpanded. Each selected partition receives the declared
+        // per-index cap, admission included. The request logical work limit
+        // remains shared across all partitions.
         let funder = owner.funder();
         let mut run_layer = |slice: &[crate::hnsw::HnswUnionLayer<'_>], remaining: usize, spent: usize| crate::hnsw::union::search_union_allowed_bounded_with_navigation(
             slice,
@@ -4572,7 +4573,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             ef_search,
             remaining,
             // The declared work limit is one too: what earlier partitions
-            // spent is gone from it as well as from the shared cap.
+            // spent is gone from it; the per-index cap is funded separately.
             HnswAllowedSearchLimits {
                 max_vector_evaluations: limits
                     .max_vector_evaluations
@@ -4667,6 +4668,11 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             |run, remaining, spent| {
                 let (start, end) = partition_runs[run];
                 run_layer(&layers[start..end], remaining, spent).map(|mut result| {
+                    partitions[layers[start].partition].rescore_credit.set(
+                        remaining.saturating_sub(
+                            result.admission_evaluations.saturating_add(result.expansion_evaluations),
+                        ),
+                    );
                     for candidate in &mut result.candidates {
                         candidate.layer += start;
                     }
@@ -4892,14 +4898,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         let mut walked = Vec::<(RowId, f32)>::new();
         let mut walked_bytes = 0usize;
         let mut contributing = Vec::<(usize, usize)>::new();
-        // Rescoring spends the same shared cap the layer searches drew from;
-        // a candidate that cannot be rescored inside it leaves the union
-        // Incomplete, even though every layer's walk terminated.
-        let mut rescore_credit = searched.budget.saturating_sub(
-            searched
-                .admission_evaluations
-                .saturating_add(searched.expansion_evaluations),
-        );
+        // Each partition rescoring spends only the credit its own walk left.
         let mut rescore_exhausted = false;
         let resolved = (|| -> std::result::Result<(), E> {
             let mut scoring_open = true;
@@ -4988,11 +4987,12 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     )?);
                 }
                 if resolved_score.is_none() {
-                    if rescore_credit == 0 {
+                    let credit = partitions[candidate.partition].rescore_credit.get();
+                    if credit == 0 {
                         rescore_exhausted = true;
                         return Ok(());
                     }
-                    rescore_credit -= 1;
+                    partitions[candidate.partition].rescore_credit.set(credit - 1);
                 }
                 let score = match resolved_score {
                     Some(score) => Some(score),
