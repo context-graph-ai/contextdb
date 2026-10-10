@@ -19495,6 +19495,9 @@ pub struct RedbPersistence {
     /// page cache when it opened it, so the close that stops holding the
     /// cache hands back exactly that.
     cache_charge_bytes: std::sync::OnceLock<usize>,
+    /// The native cache's constant per-stripe controls, held as named open
+    /// residue (bytes, credit) for as long as the cache exists.
+    cache_stripe_residue: std::sync::OnceLock<(usize, crate::memory_accounting::ControlCredit)>,
     /// Set the first time a table's meta decodes only via an older
     /// `TableMeta`/`ColumnDef` layout (see
     /// [`Self::decode_table_meta_versioned`]) rather than the current one.
@@ -22111,7 +22114,7 @@ impl RedbPersistence {
         Ok({
         let mut storage = std::mem::MaybeUninit::<Self>::uninit();
         let mut construction = PersistenceConstruction {
-            source: storage.as_mut_ptr(), initialized: [false; 18],
+            source: storage.as_mut_ptr(), initialized: [false; 19],
         };
         // SAFETY: each field is written once and marked only after its
         // initializer succeeds. The stack guard owns exactly marked fields.
@@ -22171,6 +22174,8 @@ impl RedbPersistence {
             {
                 std::ptr::addr_of_mut!((*construction.source).cache_charge_bytes).write(std::sync::OnceLock::new());
                 construction.initialized[9] = true;
+                std::ptr::addr_of_mut!((*construction.source).cache_stripe_residue).write(std::sync::OnceLock::new());
+                construction.initialized[18] = true;
             }
 
             {
@@ -22258,7 +22263,7 @@ impl RedbPersistence {
                     Ok({
         let mut storage = std::mem::MaybeUninit::<Self>::uninit();
         let mut construction = PersistenceConstruction {
-            source: storage.as_mut_ptr(), initialized: [false; 18],
+            source: storage.as_mut_ptr(), initialized: [false; 19],
         };
         // SAFETY: each field is written once and marked only after its
         // initializer succeeds. The stack guard owns exactly marked fields.
@@ -22318,6 +22323,8 @@ impl RedbPersistence {
             {
                 std::ptr::addr_of_mut!((*construction.source).cache_charge_bytes).write(std::sync::OnceLock::new());
                 construction.initialized[9] = true;
+                std::ptr::addr_of_mut!((*construction.source).cache_stripe_residue).write(std::sync::OnceLock::new());
+                construction.initialized[18] = true;
             }
 
             {
@@ -22383,6 +22390,24 @@ impl RedbPersistence {
 
     pub(crate) fn record_cache_charge(&self, bytes: usize) {
         let _ = self.cache_charge_bytes.set(bytes);
+    }
+
+    /// The constant per-stripe lock controls inside the native cache index.
+    pub(crate) fn writer_cache_stripe_control_bytes(&self) -> Result<usize> {
+        self.with_db(|db| Ok(db.cache_stripe_control_bytes()))
+    }
+
+    /// Hold the cache's constant stripe controls as open residue.
+    pub(crate) fn hold_cache_stripe_residue(
+        &self,
+        bytes: usize,
+        credit: crate::memory_accounting::ControlCredit,
+    ) {
+        let _ = self.cache_stripe_residue.set((bytes, credit));
+    }
+
+    fn cache_stripe_residue_bytes(&self) -> usize {
+        self.cache_stripe_residue.get().map_or(0, |(bytes, _)| *bytes)
     }
 
     /// What the close hands back for this store's page cache.
@@ -22511,7 +22536,7 @@ impl RedbPersistence {
                 let persistence = {
         let mut storage = std::mem::MaybeUninit::<Self>::uninit();
         let mut construction = PersistenceConstruction {
-            source: storage.as_mut_ptr(), initialized: [false; 18],
+            source: storage.as_mut_ptr(), initialized: [false; 19],
         };
         // SAFETY: each field is written once and marked only after its
         // initializer succeeds. The stack guard owns exactly marked fields.
@@ -22571,6 +22596,8 @@ impl RedbPersistence {
             {
                 std::ptr::addr_of_mut!((*construction.source).cache_charge_bytes).write(std::sync::OnceLock::new());
                 construction.initialized[9] = true;
+                std::ptr::addr_of_mut!((*construction.source).cache_stripe_residue).write(std::sync::OnceLock::new());
+                construction.initialized[18] = true;
             }
 
             {
@@ -36077,6 +36104,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 self.cache_charge_bytes
                     .get()
                     .copied()
+                    .map(|writer| writer + self.cache_stripe_residue_bytes())
                     .unwrap_or(REDB_CACHE_BYTES),
             )
             .open_with_backend_and_external_snapshots(owner.view(), provider)
@@ -41492,11 +41520,11 @@ graph_commit_result }.map_err(Self::storage_error)?;
 
 struct PersistenceConstruction {
     source: *mut RedbPersistence,
-    initialized: [bool; 18],
+    initialized: [bool; 19],
 }
 impl PersistenceConstruction {
     fn finish(&mut self) {
-        for step in (0..15).chain([16, 17, 15]) {
+        for step in (0..15).chain([16, 17, 18, 15]) {
             if !std::mem::replace(&mut self.initialized[step], false) { continue; }
             // Advancing before drop prevents repeating an unwinding field.
             unsafe { match step {
@@ -41529,6 +41557,9 @@ impl PersistenceConstruction {
                 },
                 9 => { 
                     { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).cache_charge_bytes)); }
+                },
+                18 => { 
+                    { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).cache_stripe_residue)); }
                 },
                 10 => { 
                     { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).used_legacy_table_meta_layout)); }
@@ -47260,7 +47291,7 @@ pub(crate) fn returned_loader_rows_for_test() {
             std::ptr::addr_of_mut!((*pointer).path).write(path);
             std::ptr::addr_of_mut!((*pointer).proof_accountant).write(cell);
         }
-        let mut initialized = [false; 18];
+        let mut initialized = [false; 19];
         initialized[0] = true;
         initialized[15] = true;
         let construction = PersistenceConstruction { source: pointer, initialized };

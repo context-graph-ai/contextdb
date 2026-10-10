@@ -661,6 +661,12 @@ impl Database {
         self.mem.cache_index_bytes()
     }
 
+    /// The constant per-stripe lock controls within `cache_index_bytes`.
+    #[doc(hidden)]
+    pub fn cache_stripe_control_bytes(&self) -> usize {
+        self.mem.cache_stripe_control_bytes()
+    }
+
     /// Settle a writer cache share before exposing its first reader root.
     /// The caller must exclude concurrent database operations during startup.
     /// The returned reserve covers the capacity and any still-held pages.

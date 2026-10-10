@@ -440,6 +440,10 @@ impl TransactionalMemory {
         self.storage.index_bytes()
     }
 
+    pub(crate) fn cache_stripe_control_bytes(&self) -> usize {
+        self.storage.stripe_control_bytes()
+    }
+
     pub(crate) fn cache_stats(&self) -> CacheStats {
         self.storage.cache_stats()
     }

@@ -501,7 +501,7 @@
  }
  
  impl ReadableDatabase for Database {
-@@ -518,6 +647,40 @@
+@@ -518,6 +647,46 @@
  }
  
  impl Database {
@@ -517,6 +517,12 @@
 +    #[doc(hidden)]
 +    pub fn cache_index_bytes(&self) -> usize {
 +        self.mem.cache_index_bytes()
++    }
++
++    /// The constant per-stripe lock controls within `cache_index_bytes`.
++    #[doc(hidden)]
++    pub fn cache_stripe_control_bytes(&self) -> usize {
++        self.mem.cache_stripe_control_bytes()
 +    }
 +
 +    /// Settle a writer cache share before exposing its first reader root.
@@ -542,7 +548,7 @@
      /// Opens the specified file as a redb database.
      /// * if the file does not exist, or is an empty file, a new database will be initialized in it
      /// * if the file is a valid redb database, it will be opened
-@@ -571,9 +734,17 @@
+@@ -571,9 +740,17 @@
      /// Returns [`DatabaseError::TransactionInProgress`] if any read or write transaction is still
      /// alive when this method is called.
      pub fn check_integrity(&mut self) -> Result<bool, DatabaseError> {
@@ -561,7 +567,7 @@
  
          let old_roots = [self.mem.get_data_root(), self.mem.get_system_root()];
  
-@@ -619,6 +790,7 @@
+@@ -619,6 +796,7 @@
          // Once https://github.com/cberner/redb/issues/829 is fixed, we should upgrade this to use quick-repair -- that way the user
          // can cancel the compaction without requiring a full repair afterwards
          let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -569,7 +575,7 @@
          if txn.list_persistent_savepoints()?.next().is_some() {
              return Err(CompactionError::PersistentSavepointExists);
          }
-@@ -629,6 +801,7 @@
+@@ -629,6 +807,7 @@
          txn.commit().map_err(|e| e.into_storage_error())?;
          // Repeat, just in case executing list_persistent_savepoints() created a new table
          let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -577,7 +583,7 @@
          txn.set_two_phase_commit(true);
          txn.commit().map_err(|e| e.into_storage_error())?;
          // There can't be any outstanding transactions because we have a `&mut self`, so all pending free pages
-@@ -643,6 +816,7 @@
+@@ -643,6 +822,7 @@
              let mut progress = false;
  
              let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -585,7 +591,7 @@
              if txn.compact_pages()? {
                  progress = true;
                  txn.commit().map_err(|e| e.into_storage_error())?;
-@@ -652,6 +826,7 @@
+@@ -652,6 +832,7 @@
  
              // Double commit to free up the relocated pages for reuse
              let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -593,7 +599,7 @@
              txn.set_two_phase_commit(true);
              // Also shrink the database file by the maximum amount
              txn.set_shrink_policy(ShrinkPolicy::Maximum);
-@@ -660,6 +835,7 @@
+@@ -660,6 +841,7 @@
              // TODO: this really shouldn't be necessary, but the data freed tree is a system table
              // and so free'ing up its pages causes more deletes from the system tree
              let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -601,7 +607,7 @@
              txn.set_two_phase_commit(true);
              // Also shrink the database file by the maximum amount
              txn.set_shrink_policy(ShrinkPolicy::Maximum);
-@@ -676,6 +852,218 @@
+@@ -676,6 +858,218 @@
          }
  
          Ok(compacted)
@@ -820,7 +826,7 @@
      }
  
      #[cfg_attr(not(debug_assertions), expect(dead_code))]
-@@ -891,6 +1279,7 @@
+@@ -891,6 +1285,7 @@
          Ok([data_root, system_root])
      }
  
@@ -828,16 +834,17 @@
      fn new(
          file: Box<dyn StorageBackend>,
          allow_initialize: bool,
-@@ -898,6 +1287,8 @@
+@@ -898,6 +1293,9 @@
          region_size: Option<u64>,
          cache_size: usize,
          repair_callback: &(dyn Fn(&mut RepairSession) + 'static),
 +        external_snapshot_provider: Option<ExternalSnapshotProvider>,
 +        deferred_free_budget: (usize, usize),
++        keep_pace_reclaim: bool,
      ) -> Result<Self, DatabaseError> {
          #[cfg(feature = "logging")]
          let file_path = format!("{:?}", &file);
-@@ -910,6 +1301,7 @@
+@@ -910,6 +1308,7 @@
              region_size,
              cache_size,
              false,
@@ -845,7 +852,7 @@
          )?;
          let mut mem = Arc::new(mem);
          // If the last transaction used 2-phase commit and updated the allocator state table, then
-@@ -919,7 +1311,12 @@
+@@ -919,7 +1318,12 @@
              info!("Found valid allocator state, full repair not needed");
              mem.load_allocator_state(&tree)?;
              #[cfg(debug_assertions)]
@@ -859,7 +866,7 @@
          } else {
              #[cfg(feature = "logging")]
              warn!("Database {:?} not shutdown cleanly. Repairing", &file_path);
-@@ -944,8 +1341,20 @@
+@@ -944,8 +1348,21 @@
  
          let db = Database {
              mem,
@@ -868,6 +875,7 @@
 +                next_transaction_id,
 +                external_snapshot_provider,
 +                deferred_free_budget,
++                keep_pace_reclaim,
 +            )),
 +            read_only_handoff_prepared: false,
 +            #[cfg(feature = "test-seams")]
@@ -881,7 +889,7 @@
  
          // Restore the tracker state for any persistent savepoints
          let txn = db.begin_write().map_err(|e| e.into_storage_error())?;
-@@ -1035,12 +1444,21 @@
+@@ -1035,12 +1452,21 @@
      /// write may be in progress at a time. If a write is in progress, this function will block
      /// until it completes.
      pub fn begin_write(&self) -> Result<WriteTransaction, TransactionError> {
@@ -903,7 +911,7 @@
          WriteTransaction::new(guard, self.transaction_tracker.clone(), self.mem.clone())
              .map_err(|e| e.into())
      }
-@@ -1056,16 +1474,74 @@
+@@ -1056,16 +1482,143 @@
  
          Ok(())
      }
@@ -938,6 +946,56 @@
 +        }
 +    }
 +
++    /// Whether another writer is waiting for the write slot.
++    #[doc(hidden)]
++    pub fn has_waiting_write_transactions(&self) -> bool {
++        self.transaction_tracker.has_waiting_write_transactions()
++    }
++
++    /// One bounded maintenance reclaim step: an ordinary durable write transaction that frees at
++    /// most `extents` allocation extents and visits at most `entries` deferred-free entries, all
++    /// freed by transactions before both the reader floor and `boundary`.
++    ///
++    /// The first step of a cycle passes `None` and samples the boundary as its own write
++    /// transaction id, so every entry freed by an already committed transaction — including the
++    /// last one — is included, and every later commit's frees, including these steps' own
++    /// bookkeeping, are not. Later steps of the cycle pass the returned boundary back. Savepoints
++    /// block reclamation exactly as in `drain_deferred_frees`.
++    #[cfg(any(test, feature = "contextdb-internal"))]
++    #[doc(hidden)]
++    pub fn reclaim_deferred_step(
++        &self,
++        boundary: Option<ReclaimBoundary>,
++        extents: usize,
++        entries: usize,
++    ) -> Result<ReclaimStep, Error> {
++        let mut tx = self.begin_write()?;
++        if self.transaction_tracker.any_savepoint_exists()
++            || tx.list_persistent_savepoints()?.next().is_some()
++        {
++            tx.abort()?;
++            return Ok(ReclaimStep::Blocked);
++        }
++        let boundary = boundary.map_or_else(|| tx.transaction_id(), |boundary| boundary.0);
++        let floor = self
++            .transaction_tracker
++            .oldest_live_read_transaction()
++            .map_or(tx.transaction_id(), |id| id.next());
++        if !tx.pending_free_pages_before(TransactionId::min(floor, boundary))? {
++            let held = tx.pending_free_pages_before(boundary)?;
++            tx.abort()?;
++            return Ok(if held {
++                ReclaimStep::ReaderHeld
++            } else {
++                ReclaimStep::Drained
++            });
++        }
++        tx.set_deferred_free_budget(extents, entries);
++        tx.set_reclaim_ceiling(boundary);
++        tx.commit()?;
++        Ok(ReclaimStep::Progressed(ReclaimBoundary(boundary)))
++    }
++
 +    #[cfg(feature = "test-seams")]
 +    #[doc(hidden)]
 +    pub fn fail_next_deferred_free_commit_for_test(&self) {
@@ -957,6 +1015,25 @@
 +        }
 +        Ok(())
 +    }
++}
++
++/// The exclusive freeing-transaction boundary a maintenance reclaim cycle sampled on its first step.
++#[doc(hidden)]
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct ReclaimBoundary(TransactionId);
++
++/// What one bounded maintenance reclaim step did.
++#[doc(hidden)]
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum ReclaimStep {
++    /// Reclaimed eligible entries below the boundary and committed.
++    Progressed(ReclaimBoundary),
++    /// Nothing remains below the boundary.
++    Drained,
++    /// Entries remain below the boundary, but a live reader or snapshot still protects all of them.
++    ReaderHeld,
++    /// A savepoint exists, so nothing may be reclaimed.
++    Blocked,
  }
  
  impl Drop for Database {
@@ -980,23 +1057,25 @@
              #[cfg(feature = "logging")]
              warn!("Failed to flush database file. Repair may be required at restart.");
          }
-@@ -1106,6 +1582,7 @@
+@@ -1106,6 +1659,8 @@
      region_size: Option<u64>,
      cache_size: usize,
      repair_callback: Box<dyn Fn(&mut RepairSession)>,
 +    deferred_free_budget: (usize, usize),
++    keep_pace_reclaim: bool,
  }
  
  impl Builder {
-@@ -1125,6 +1602,7 @@
+@@ -1125,6 +1680,8 @@
              // TODO: Default should probably take into account the total system memory
              cache_size: 1024 * 1024 * 1024,
              repair_callback: Box::new(|_| {}),
 +            deferred_free_budget: (usize::MAX, usize::MAX),
++            keep_pace_reclaim: false,
          }
      }
  
-@@ -1157,13 +1635,27 @@
+@@ -1157,13 +1714,37 @@
          self
      }
  
@@ -1014,6 +1093,16 @@
 +        self
 +    }
 +
++    /// Let each durable commit reclaim at least as many deferred extents (and entries) as it
++    /// freed itself, above the configured budget, so an active writer's backlog cannot grow while
++    /// eligible work exists. Reclamation still never passes the reader floor.
++    #[cfg(any(test, feature = "contextdb-internal"))]
++    #[doc(hidden)]
++    pub fn set_keep_pace_reclaim(&mut self, keep_pace: bool) -> &mut Self {
++        self.keep_pace_reclaim = keep_pace;
++        self
++    }
++
      /// Set the amount of memory (in bytes) used for caching data
      pub fn set_cache_size(&mut self, bytes: usize) -> &mut Self {
          self.cache_size = bytes;
@@ -1025,7 +1114,7 @@
      pub fn set_region_size(&mut self, size: u64) -> &mut Self {
          assert!(size.is_power_of_two());
          self.region_size = Some(size);
-@@ -1175,6 +1667,7 @@
+@@ -1175,6 +1756,7 @@
      /// * if the file is a valid redb database, it will be opened
      /// * otherwise this function will return an error
      pub fn create(&self, path: impl AsRef<Path>) -> Result<Database, DatabaseError> {
@@ -1033,7 +1122,7 @@
          let file = OpenOptions::new()
              .read(true)
              .write(true)
-@@ -1183,26 +1676,71 @@
+@@ -1183,26 +1765,75 @@
              .open(path)?;
  
          Database::new(
@@ -1046,6 +1135,7 @@
              &self.repair_callback,
 +            None,
 +            self.deferred_free_budget,
++            self.keep_pace_reclaim,
          )
      }
  
@@ -1064,6 +1154,7 @@
              &self.repair_callback,
 +            None,
 +            self.deferred_free_budget,
++            self.keep_pace_reclaim,
 +        )
 +    }
 +
@@ -1084,6 +1175,7 @@
 +            &self.repair_callback,
 +            None,
 +            self.deferred_free_budget,
++            self.keep_pace_reclaim,
 +        )
 +    }
 +
@@ -1104,10 +1196,11 @@
 +            &self.repair_callback,
 +            Some(provider),
 +            self.deferred_free_budget,
++            self.keep_pace_reclaim,
          )
      }
  
-@@ -1222,6 +1760,36 @@
+@@ -1222,6 +1853,36 @@
              self.page_size,
              None,
              self.cache_size,
@@ -1144,12 +1237,13 @@
          )
      }
  
-@@ -1236,6 +1804,29 @@
+@@ -1236,6 +1897,31 @@
              self.region_size,
              self.cache_size,
              &self.repair_callback,
 +            None,
 +            self.deferred_free_budget,
++            self.keep_pace_reclaim,
 +        )
 +    }
 +
@@ -1171,19 +1265,21 @@
 +            &self.repair_callback,
 +            Some(provider),
 +            self.deferred_free_budget,
++            self.keep_pace_reclaim,
          )
      }
  
-@@ -1251,6 +1842,8 @@
+@@ -1251,6 +1937,9 @@
              self.region_size,
              self.cache_size,
              &self.repair_callback,
 +            None,
 +            self.deferred_free_budget,
++            self.keep_pace_reclaim,
          )
      }
  }
-@@ -1260,18 +1853,215 @@
+@@ -1260,18 +1949,215 @@
          f.debug_struct("Database").finish()
      }
  }
@@ -1460,7 +1556,7 @@
      Builder, CacheStats, Database, MultimapTableDefinition, MultimapTableHandle, ReadOnlyDatabase,
 -    ReadableDatabase, RepairSession, StorageBackend, TableDefinition, TableHandle,
 -    UntypedMultimapTableHandle, UntypedTableHandle,
-+    ReadableDatabase, RepairSession, ScratchBackend, StorageBackend, TableDefinition, TableHandle,
++    ReadableDatabase, ReclaimBoundary, ReclaimStep, RepairSession, ScratchBackend, StorageBackend, TableDefinition, TableHandle,
 +    UntypedMultimapTableHandle, UntypedTableHandle, scratch_backend_in_directory,
  };
  pub use error::{
@@ -2201,7 +2297,7 @@
      valid_savepoints: BTreeMap<SavepointId, TransactionId>,
      // Non-durable commits that are still in-memory, and waiting for a durable commit to get flushed
      // We need to make sure that the freed-table does not get processed for these, since they are not durable yet
-@@ -89,33 +106,254 @@
+@@ -89,33 +106,257 @@
      pending_non_durable_commits: HashMap<TransactionId, TransactionId>,
      // Non-durable commits which have NOT been processed in the freed table
      unprocessed_freed_non_durable_commits: BTreeSet<TransactionId>,
@@ -2221,17 +2317,19 @@
 +    local_snapshot_provider: std::sync::OnceLock<ExternalSnapshotProvider>,
 +    external_snapshot_refresh: Mutex<()>,
 +    pub(crate) deferred_free_budget: (usize, usize),
++    pub(crate) keep_pace_reclaim: bool,
  }
  
  impl TransactionTracker {
      pub(crate) fn new(next_transaction_id: TransactionId) -> Self {
-+        Self::new_with_external_snapshots(next_transaction_id, None, (usize::MAX, usize::MAX))
++        Self::new_with_external_snapshots(next_transaction_id, None, (usize::MAX, usize::MAX), false)
 +    }
 +
 +    pub(crate) fn new_with_external_snapshots(
 +        next_transaction_id: TransactionId,
 +        external_snapshot_provider: Option<ExternalSnapshotProvider>,
 +        deferred_free_budget: (usize, usize),
++        keep_pace_reclaim: bool,
 +    ) -> Self {
          Self {
              state: Mutex::new(State {
@@ -2252,6 +2350,7 @@
 +            local_snapshot_provider: std::sync::OnceLock::new(),
 +            external_snapshot_refresh: Mutex::new(()),
 +            deferred_free_budget,
++            keep_pace_reclaim,
 +            #[cfg(feature = "test-seams")]
 +            table_write_observer: Default::default(),
 +        }
@@ -2457,19 +2556,18 @@
          }
          assert!(state.live_write_transaction.is_none());
          let transaction_id = state.next_transaction_id.increment();
-@@ -124,6 +362,11 @@
+@@ -124,6 +365,10 @@
          state.live_write_transaction = Some(transaction_id);
  
          transaction_id
 +    }
 +
-+    #[cfg(feature = "test-seams")]
 +    pub(crate) fn has_waiting_write_transactions(&self) -> bool {
 +        self.state.lock().unwrap().waiting_write_transactions > 0
      }
  
      pub(crate) fn end_write_transaction(&self, id: TransactionId) {
-@@ -293,13 +536,37 @@
+@@ -293,13 +538,37 @@
      }
  
      pub(crate) fn oldest_live_read_transaction(&self) -> Option<TransactionId> {
@@ -2603,11 +2701,14 @@
  /// A read/write transaction
  ///
  /// Only a single [`WriteTransaction`] may exist at a time
-@@ -832,9 +906,14 @@
+@@ -832,9 +906,17 @@
      two_phase_commit: bool,
      shrink_policy: ShrinkPolicy,
      quick_repair: bool,
 +    deferred_free_budget: (usize, usize),
++    // An exclusive upper bound on the freeing transaction ids this commit may reclaim, applied on
++    // top of the reader floor. Set only by a bounded maintenance reclaim step.
++    reclaim_ceiling: Option<TransactionId>,
      // All transaction-local savepoint lifecycle state. See
      // `SavepointTransactionState` for the commit/abort contract.
      savepoint_state: Mutex<SavepointTransactionState>,
@@ -2618,7 +2719,7 @@
  }
  
  impl WriteTransaction {
-@@ -850,8 +929,16 @@
+@@ -850,8 +932,16 @@
          let system_page = mem.get_system_root();
  
          let tables = TableNamespace::new(root_page, guard.clone(), mem.clone());
@@ -2635,11 +2736,12 @@
          Ok(Self {
              transaction_tracker,
              mem: mem.clone(),
-@@ -864,9 +951,81 @@
+@@ -864,9 +954,111 @@
              durability: InternalDurability::Immediate,
              two_phase_commit: false,
              quick_repair: false,
 +            deferred_free_budget,
++            reclaim_ceiling: None,
              shrink_policy: ShrinkPolicy::Default,
              savepoint_state: Mutex::new(SavepointTransactionState::default()),
 +            #[cfg(feature = "contextdb-internal")]
@@ -2711,13 +2813,42 @@
 +        self.deferred_free_budget = (extents, entries);
 +    }
 +
++    #[cfg(any(test, feature = "contextdb-internal"))]
++    /// Limit this commit's reclamation to entries freed by transactions before `ceiling`, in
++    /// addition to the reader floor. The ceiling only ever lowers what may be freed.
++    pub(crate) fn set_reclaim_ceiling(&mut self, ceiling: TransactionId) {
++        self.reclaim_ceiling = Some(ceiling);
++    }
++
++    #[cfg(any(test, feature = "contextdb-internal"))]
++    pub(crate) fn transaction_id(&self) -> TransactionId {
++        self.transaction_id
++    }
++
++    #[cfg(any(test, feature = "contextdb-internal"))]
++    /// Whether either deferred-free tree has an entry freed before `ceiling`.
++    pub(crate) fn pending_free_pages_before(&self, ceiling: TransactionId) -> Result<bool> {
++        let mut system_tables = self.system_tables.lock().unwrap();
++        for definition in [DATA_FREED_TABLE, SYSTEM_FREED_TABLE] {
++            let table = system_tables.open_system_table(self, definition)?;
++            if table
++                .tree
++                .first()?
++                .is_some_and(|(key, _)| key.value().transaction_id < ceiling.raw_id())
++            {
++                return Ok(true);
++            }
++        }
++        Ok(false)
++    }
++
 +    // Explicit whole-file compaction retains its upstream full-drain semantics.
 +    pub(crate) fn reclaim_all_deferred_pages(&mut self) {
 +        self.deferred_free_budget = (usize::MAX, usize::MAX);
      }
  
      pub(crate) fn set_shrink_policy(&mut self, shrink_policy: ShrinkPolicy) {
-@@ -892,6 +1051,29 @@
+@@ -892,6 +1084,29 @@
              return Ok(true);
          }
  
@@ -2747,7 +2878,7 @@
          Ok(false)
      }
  
-@@ -1349,7 +1531,47 @@
+@@ -1349,7 +1564,47 @@
          &'txn self,
          definition: TableDefinition<K, V>,
      ) -> Result<Table<'txn, K, V>, TableError> {
@@ -2795,7 +2926,7 @@
      }
  
      /// Open the given table
-@@ -1373,6 +1595,13 @@
+@@ -1373,6 +1628,13 @@
          length: u64,
      ) {
          self.tables.lock().unwrap().close_table(name, table, length);
@@ -2809,7 +2940,7 @@
      }
  
      /// Rename the given table
-@@ -1384,10 +1613,21 @@
+@@ -1384,10 +1646,21 @@
          let name = definition.name().to_string();
          // Drop the definition so that callers can pass in a `Table` to rename, without getting a TableAlreadyOpen error
          drop(definition);
@@ -2832,7 +2963,7 @@
      }
  
      /// Rename the given multimap table
-@@ -1412,7 +1652,29 @@
+@@ -1412,7 +1685,29 @@
          let name = definition.name().to_string();
          // Drop the definition so that callers can pass in a `Table` or `MultimapTable` to delete, without getting a TableAlreadyOpen error
          drop(definition);
@@ -2863,7 +2994,7 @@
      }
  
      /// Delete the given table
-@@ -1458,6 +1720,10 @@
+@@ -1458,6 +1753,10 @@
      /// All writes performed in this transaction will be visible to future transactions, and are
      /// durable as consistent with the [`Durability`] level set by [`Self::set_durability`]
      pub fn commit(mut self) -> Result<(), CommitError> {
@@ -2874,7 +3005,7 @@
          // Set completed flag first, so that we don't go through the abort() path on drop, if this fails
          self.completed = true;
          self.commit_inner()
-@@ -1469,11 +1735,36 @@
+@@ -1469,11 +1768,45 @@
              self.two_phase_commit = true;
          }
  
@@ -2902,6 +3033,15 @@
 +            crate::commit_work::observe_commit(data_freed.len(), allocated_pages.len());
 +            crate::commit_work::set_tag(crate::commit_work::TAG_COMMIT_BOOKKEEPING)
 +        };
++        if self.transaction_tracker.keep_pace_reclaim {
++            // Reclaim at least as much as this commit frees, so an active writer's backlog does not
++            // grow while eligible older work exists. Explicit budgets above this stay in force.
++            let own = data_freed.len();
++            self.deferred_free_budget = (
++                self.deferred_free_budget.0.max(own),
++                self.deferred_free_budget.1.max(own),
++            );
++        }
          self.store_data_freed_pages(data_freed)?;
 -        self.store_allocated_pages(allocated_pages.into_iter().collect())?;
 +        self.store_allocated_pages(allocated_pages)?;
@@ -2913,7 +3053,7 @@
  
          #[cfg(feature = "logging")]
          debug!(
-@@ -1484,6 +1775,9 @@
+@@ -1484,6 +1817,9 @@
              InternalDurability::None => self.non_durable_commit(user_root)?,
              InternalDurability::Immediate => self.durable_commit(user_root)?,
          }
@@ -2923,16 +3063,20 @@
  
          self.savepoint_state
              .lock()
-@@ -1627,18 +1921,36 @@
+@@ -1627,18 +1963,39 @@
      }
  
      pub(crate) fn durable_commit(&mut self, user_root: Option<BtreeHeader>) -> Result {
+-        let free_until_transaction = self
 +        #[cfg(feature = "test-seams")]
 +        let mut span_started = std::time::Instant::now();
-         let free_until_transaction = self
++        let mut free_until_transaction = self
              .transaction_tracker
              .oldest_live_read_transaction()
              .map_or(self.transaction_id, |x| x.next());
++        if let Some(ceiling) = self.reclaim_ceiling {
++            free_until_transaction = TransactionId::min(free_until_transaction, ceiling);
++        }
          self.process_freed_pages(free_until_transaction)?;
 +        #[cfg(feature = "test-seams")]
 +        {
@@ -2963,7 +3107,7 @@
  
          if self.quick_repair {
              system_tree.create_table_and_flush_table_root(
-@@ -1680,6 +1992,14 @@
+@@ -1680,6 +2037,14 @@
          }
  
          let system_root = system_tree.finalize_dirty_checksums()?;
@@ -2978,7 +3122,7 @@
  
          self.mem.commit(
              user_root,
-@@ -1688,6 +2008,11 @@
+@@ -1688,6 +2053,11 @@
              self.two_phase_commit,
              self.shrink_policy,
          )?;
@@ -2990,7 +3134,7 @@
  
          // Mark any pending non-durable commits as fully committed.
          self.transaction_tracker.clear_pending_non_durable_commits();
-@@ -1766,6 +2091,9 @@
+@@ -1766,6 +2136,9 @@
      // Relocate pages to lower number regions/pages
      // Returns true if a page(s) was moved
      pub(crate) fn compact_pages(&mut self) -> Result<bool> {
@@ -3000,7 +3144,7 @@
          let mut progress = false;
  
          // Find the 1M highest pages
-@@ -1823,46 +2151,384 @@
+@@ -1823,46 +2196,384 @@
          Ok(progress)
      }
  
@@ -3415,7 +3559,7 @@
      }
  
      fn process_freed_pages_nondurable_helper(
-@@ -2037,6 +2703,18 @@
+@@ -2037,6 +2748,18 @@
          })
      }
  
@@ -3434,7 +3578,7 @@
      #[allow(dead_code)]
      pub(crate) fn print_debug(&self) -> Result {
          // Flush any pending updates to make sure we get the latest root
-@@ -2107,18 +2785,148 @@
+@@ -2107,18 +2830,148 @@
      tree: TableTree,
  }
  
@@ -3584,7 +3728,7 @@
      }
  
      /// Open the given table
-@@ -2135,12 +2943,69 @@
+@@ -2135,12 +2988,69 @@
              InternalTableDefinition::Normal { table_root, .. } => Ok(ReadOnlyTable::new(
                  definition.name().to_string(),
                  table_root,
@@ -3655,7 +3799,7 @@
      }
  
      /// Open the given table without a type
-@@ -2161,7 +3026,7 @@
+@@ -2161,7 +3071,7 @@
                  ..
              } => Ok(ReadOnlyUntypedTable::new(
                  table_root,
@@ -3664,7 +3808,7 @@
                  fixed_key_size,
                  fixed_value_size,
                  self.mem.clone(),
-@@ -2189,7 +3054,7 @@
+@@ -2189,7 +3099,7 @@
              } => Ok(ReadOnlyMultimapTable::new(
                  table_root,
                  table_length,
@@ -3673,7 +3817,7 @@
                  self.tree.transaction_guard().clone(),
                  self.mem.clone(),
              )?),
-@@ -2217,7 +3082,7 @@
+@@ -2217,7 +3127,7 @@
              } => Ok(ReadOnlyUntypedMultimapTable::new(
                  table_root,
                  table_length,
@@ -3682,7 +3826,7 @@
                  fixed_key_size,
                  fixed_value_size,
                  self.mem.clone(),
-@@ -2263,7 +3128,15 @@
+@@ -2263,7 +3173,15 @@
  
  #[cfg(test)]
  mod test {
@@ -3699,7 +3843,7 @@
  
      const X: TableDefinition<&str, &str> = TableDefinition::new("x");
  
-@@ -2284,4 +3157,840 @@
+@@ -2284,4 +3202,840 @@
          let write_txn = db2.begin_write().unwrap();
          assert!(write_txn.transaction_id > first_txn_id);
      }
@@ -9444,7 +9588,7 @@
              next_eviction_stripe: AtomicUsize::new(0),
              #[cfg(feature = "cache_metrics")]
              reads_total: Default::default(),
-@@ -268,6 +451,51 @@
+@@ -268,6 +451,57 @@
              read_cache,
              write_buffer: Arc::new(Mutex::new(LRUWriteCache::new())),
          })
@@ -9488,6 +9632,12 @@
 +        }
 +    }
 +
++    /// The constant per-stripe lock controls inside `index_bytes`: fixed by
++    /// the stripe count, independent of the configured cache size.
++    pub(crate) fn stripe_control_bytes(&self) -> usize {
++        self.read_cache.len() * size_of::<RwLock<LRUCache<Arc<CachedPage>>>>()
++    }
++
 +    pub(crate) fn index_bytes(&self) -> usize {
 +        let read = self.read_cache[0].read().unwrap();
 +        read.arena_index_bytes()
@@ -9496,7 +9646,7 @@
      }
  
      #[allow(clippy::unused_self)]
-@@ -301,6 +529,42 @@
+@@ -301,6 +535,42 @@
                  used_bytes: read_bytes + write_bytes,
              }
          }
@@ -9539,7 +9689,7 @@
      }
  
      pub(crate) fn close(&self) -> Result {
-@@ -339,13 +603,17 @@
+@@ -339,13 +609,17 @@
              let stripe = (start + i) % num_stripes;
              let mut lock = self.read_cache[stripe].write().unwrap();
              while freed < bytes_needed {
@@ -9560,7 +9710,7 @@
                  } else {
                      break;
                  }
-@@ -364,21 +632,27 @@
+@@ -364,21 +638,27 @@
          // drained, so the total check only considers the read cache size.
          for (offset, buffer) in write_buffer.cache.iter_mut() {
              let buffer = buffer.take().unwrap();
@@ -9597,7 +9747,7 @@
                  break;
              }
          }
-@@ -390,10 +664,28 @@
+@@ -390,10 +670,28 @@
  
      // Caller should invalidate all cached pages that are no longer valid
      pub(super) fn resize(&self, len: u64) -> Result {
@@ -9628,7 +9778,7 @@
      }
  
      pub(super) fn flush(&self) -> Result {
-@@ -419,15 +711,22 @@
+@@ -419,15 +717,22 @@
      // Like `read_direct`, but writes directly into an `Arc<[u8]>` instead of a
      // `Vec<u8>` that is then copied into an `Arc`. The buffer is zero-filled
      // because `StorageBackend::read` takes `&mut [u8]`.
@@ -9654,7 +9804,7 @@
          debug_assert_eq!(0, offset % self.page_size);
          #[cfg(feature = "cache_metrics")]
          self.reads_total.fetch_add(1, Ordering::AcqRel);
-@@ -438,7 +737,7 @@
+@@ -438,7 +743,7 @@
                  #[cfg(feature = "cache_metrics")]
                  self.reads_hits.fetch_add(1, Ordering::Release);
                  debug_assert_eq!(cached.len(), len);
@@ -9663,7 +9813,7 @@
              }
          }
  
-@@ -449,45 +748,163 @@
+@@ -449,45 +754,163 @@
                  #[cfg(feature = "cache_metrics")]
                  self.reads_hits.fetch_add(1, Ordering::Release);
                  debug_assert_eq!(cached.len(), len);
@@ -9864,7 +10014,7 @@
      }
  
      // Discard pending writes to the given range
-@@ -507,18 +924,13 @@
+@@ -507,18 +930,13 @@
          let mut lock = self.read_cache[cache_slot].write().unwrap();
          if let Some(removed) = lock.remove(offset) {
              assert_eq!(len, removed.len());
@@ -9884,7 +10034,7 @@
          }
      }
  
-@@ -539,9 +951,9 @@
+@@ -539,9 +957,9 @@
                      "cache inconsistency {len} != {} for offset {offset}",
                      removed.len()
                  );
@@ -9897,7 +10047,7 @@
              } else {
                  None
              }
-@@ -554,7 +966,7 @@
+@@ -554,7 +972,7 @@
          } else {
              let previous = self.write_buffer_bytes.fetch_add(len, Ordering::AcqRel);
              let mut write_bytes = previous + len;
@@ -9906,7 +10056,7 @@
  
              // Rule 1: write buffer NEVER exceeds 50%.  Flush excess to disk.
              if write_bytes > half {
-@@ -586,8 +998,11 @@
+@@ -586,8 +1004,11 @@
              // exceeds the budget then read must be > 50%, so evict from the
              // read cache (fairness: we only take from read when read > 50%).
              let read_bytes = self.read_cache_bytes.load(Ordering::Acquire);
@@ -9920,7 +10070,7 @@
              }
              let result = if let Some(data) = existing {
                  #[cfg(feature = "cache_metrics")]
-@@ -598,7 +1013,9 @@
+@@ -598,7 +1019,9 @@
                  self.writes_hits.fetch_add(1, Ordering::AcqRel);
                  zero_filled_arc(len)
              } else {
@@ -9931,7 +10081,7 @@
              };
              lock.insert(offset, result);
              lock.take_value(offset).unwrap()
-@@ -618,9 +1035,103 @@
+@@ -618,9 +1041,103 @@
      use crate::StorageBackend;
      use crate::backends::InMemoryBackend;
      use crate::tree_store::PageHint;
@@ -10037,7 +10187,7 @@
  
      #[test]
      fn cache_leak() {
-@@ -653,4 +1164,729 @@
+@@ -653,4 +1170,729 @@
          cached_file.invalidate_cache(0, 128);
          assert_eq!(cached_file.read_cache_bytes.load(Ordering::Acquire), 0);
      }
@@ -12196,7 +12346,7 @@
  
          assert!(page_size >= DB_HEADER_SIZE);
  
-@@ -280,12 +431,66 @@
+@@ -280,12 +431,70 @@
          })
      }
  
@@ -12207,6 +12357,10 @@
 +
 +    pub(crate) fn cache_index_bytes(&self) -> usize {
 +        self.storage.index_bytes()
++    }
++
++    pub(crate) fn cache_stripe_control_bytes(&self) -> usize {
++        self.storage.stripe_control_bytes()
 +    }
 +
      pub(crate) fn cache_stats(&self) -> CacheStats {
@@ -12263,7 +12417,7 @@
      }
  
      #[cfg(debug_assertions)]
-@@ -295,23 +500,30 @@
+@@ -295,23 +504,30 @@
  
      #[cfg(debug_assertions)]
      pub(crate) fn all_allocated_pages(&self) -> Vec<PageNumber> {
@@ -12300,7 +12454,7 @@
          }
      }
  
-@@ -346,7 +558,9 @@
+@@ -346,7 +562,9 @@
  
          self.needs_recovery
              .store(header.recovery_required, Ordering::Release);
@@ -12311,7 +12465,7 @@
  
          Ok(was_clean)
      }
-@@ -379,7 +593,8 @@
+@@ -379,7 +597,8 @@
  
      pub(crate) fn begin_repair(&self) -> Result<()> {
          let mut state = self.state.lock().unwrap();
@@ -12321,7 +12475,7 @@
          #[cfg(debug_assertions)]
          self.allocated_pages.lock().unwrap().clear();
  
-@@ -392,7 +607,9 @@
+@@ -392,7 +611,9 @@
          let allocator = state.get_region_mut(region_index);
          allocator.record_alloc(page_number.page_index, page_number.page_order);
          #[cfg(debug_assertions)]
@@ -12332,7 +12486,7 @@
      }
  
      fn write_header(&self, header: &DatabaseHeader) -> Result {
-@@ -405,6 +622,7 @@
+@@ -405,6 +626,7 @@
      }
  
      pub(crate) fn end_repair(&self) -> Result<()> {
@@ -12340,7 +12494,7 @@
          let mut state = self.state.lock().unwrap();
          state.header.recovery_required = false;
          self.write_header(&state.header)?;
-@@ -419,30 +637,25 @@
+@@ -419,30 +641,25 @@
          tree: &mut AllocatorStateTreeMut,
          transaction_id: TransactionId,
      ) -> Result<u32> {
@@ -12384,7 +12538,7 @@
  
          tree.insert(
              &AllocatorStateKey::TransactionId,
-@@ -458,43 +671,43 @@
+@@ -458,43 +675,43 @@
          tree: &mut AllocatorStateTreeMut,
          num_regions: u32,
      ) -> Result<bool> {
@@ -12454,7 +12608,7 @@
          Ok(true)
      }
  
-@@ -519,12 +732,58 @@
+@@ -519,12 +736,58 @@
      pub(crate) fn load_allocator_state(&self, tree: &AllocatorStateTree) -> Result {
          assert!(self.is_valid_allocator_state(tree)?);
  
@@ -12515,7 +12669,7 @@
          }
  
          let region_tracker = RegionTracker::from_bytes(
-@@ -536,12 +795,13 @@
+@@ -536,12 +799,13 @@
          let mut state = self.state.lock().unwrap();
          state.allocators = Allocators {
              region_tracker,
@@ -12531,7 +12685,7 @@
          drop(state);
  
          self.state.lock().unwrap().header.recovery_required = false;
-@@ -554,8 +814,15 @@
+@@ -554,8 +818,15 @@
      pub(crate) fn is_allocated(&self, page: PageNumber) -> bool {
          #[cfg(debug_assertions)]
          {
@@ -12549,7 +12703,7 @@
          }
          #[cfg(not(debug_assertions))]
          {
-@@ -612,6 +879,7 @@
+@@ -612,6 +883,7 @@
          // Copy the header so that we can release the state lock, while we flush the file
          let mut header = state.header.clone();
          drop(state);
@@ -12557,7 +12711,7 @@
  
          let old_transaction_id = header.secondary_slot().transaction_id;
          let secondary = header.secondary_slot_mut();
-@@ -678,6 +946,7 @@
+@@ -678,6 +950,7 @@
          #[cfg(debug_assertions)]
          debug_assert!(self.open_dirty_pages.lock().unwrap().is_empty());
          assert!(!self.needs_recovery.load(Ordering::Acquire));
@@ -12565,7 +12719,7 @@
  
          let mut unpersisted = self.unpersisted.lock().unwrap();
          let mut allocated_since_commit = self.allocated_since_commit.lock().unwrap();
-@@ -726,7 +995,9 @@
+@@ -726,7 +999,9 @@
                  .get_region_mut(region_index)
                  .free(page_number.page_index, page_number.page_order);
              #[cfg(debug_assertions)]
@@ -12576,7 +12730,7 @@
  
              let address = page_number.address_range(
                  self.page_size.into(),
-@@ -776,6 +1047,23 @@
+@@ -776,6 +1051,23 @@
          })
      }
  
@@ -12600,7 +12754,7 @@
      // NOTE: the caller must ensure that the read cache has been invalidated or stale reads my occur
      pub(crate) fn get_page_mut<'txn>(&self, page_number: PageNumber) -> Result<PageMut<'txn>> {
          #[cfg(debug_assertions)]
-@@ -871,7 +1159,9 @@
+@@ -871,7 +1163,9 @@
                      .unwrap()
                      .contains_key(&page)
              );
@@ -12611,7 +12765,7 @@
              assert!(!self.open_dirty_pages.lock().unwrap().contains(&page));
          }
          allocated.remove(page);
-@@ -953,12 +1243,32 @@
+@@ -953,12 +1247,32 @@
              page_number
          } else {
              self.grow(&mut state, required_order)?;
@@ -12646,7 +12800,7 @@
              assert!(
                  !self
                      .read_page_ref_counts
-@@ -1024,7 +1334,27 @@
+@@ -1024,7 +1338,27 @@
              } else {
                  region.alloc(required_order)
              };
@@ -12674,7 +12828,7 @@
                  return Ok(Some(PageNumber::new(
                      candidate_region,
                      page,
-@@ -1061,7 +1391,7 @@
+@@ -1061,7 +1395,7 @@
  
          let mut new_layout = layout;
          new_layout.reduce_last_region(reduce_by);
@@ -12683,7 +12837,7 @@
          assert!(new_layout.len() <= layout.len());
          state.header.set_layout(new_layout);
  
-@@ -1107,13 +1437,20 @@
+@@ -1107,13 +1441,20 @@
  
          let result = self.storage.resize(new_layout.len());
          if result.is_err() {
@@ -12705,7 +12859,7 @@
          state.header.set_layout(new_layout);
          Ok(())
      }
-@@ -1135,7 +1472,7 @@
+@@ -1135,7 +1476,7 @@
      }
  
      pub(crate) fn count_allocated_pages(&self) -> Result<u64> {
@@ -12714,7 +12868,7 @@
          let mut count = 0u64;
          for i in 0..state.header.layout().num_regions() {
              count += u64::from(state.get_region(i).count_allocated_pages());
-@@ -1145,7 +1482,7 @@
+@@ -1145,7 +1486,7 @@
      }
  
      pub(crate) fn count_free_pages(&self) -> Result<u64> {
@@ -12723,7 +12877,7 @@
          let mut count = 0u64;
          for i in 0..state.header.layout().num_regions() {
              count += u64::from(state.get_region(i).count_free_pages());
-@@ -1158,8 +1495,41 @@
+@@ -1158,8 +1499,41 @@
          self.page_size.try_into().unwrap()
      }
  
@@ -12766,7 +12920,7 @@
              let mut state = self.state.lock()?;
              if self.storage.flush().is_ok() {
                  state.header.recovery_required = false;
-@@ -1228,4 +1598,103 @@
+@@ -1228,4 +1602,103 @@
          let mut db = Database::open(tmpfile).unwrap();
          assert!(db.check_integrity().unwrap());
      }

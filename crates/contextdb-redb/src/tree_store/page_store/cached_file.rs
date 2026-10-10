@@ -491,6 +491,12 @@ impl PagedCachedFile {
         }
     }
 
+    /// The constant per-stripe lock controls inside `index_bytes`: fixed by
+    /// the stripe count, independent of the configured cache size.
+    pub(crate) fn stripe_control_bytes(&self) -> usize {
+        self.read_cache.len() * size_of::<RwLock<LRUCache<Arc<CachedPage>>>>()
+    }
+
     pub(crate) fn index_bytes(&self) -> usize {
         let read = self.read_cache[0].read().unwrap();
         read.arena_index_bytes()

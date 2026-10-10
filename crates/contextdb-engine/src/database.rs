@@ -26498,8 +26498,26 @@ impl Database {
         // limit sees the bytes and the ordinary typed refusal fires on the
         // next admission, which is the same rule the change log follows.
         if accountant.usage().limit.is_some() {
-            accountant.charge_retained(cache_bytes);
-            persistence.record_cache_charge(cache_bytes);
+            // The constant per-stripe controls are named open residue funded by
+            // the inherited process ceiling; only the cache's growing terms are
+            // writer working memory. A residue the process cannot fund stays
+            // on the writer, as before.
+            let stripe_controls = persistence
+                .writer_cache_stripe_control_bytes()?
+                .min(cache_bytes);
+            let writer_bytes = match crate::memory_accounting::ControlCredit::admit_open_residue(
+                &crate::memory_accounting::StoreAccountantHandle::new(Arc::clone(&accountant)),
+                stripe_controls,
+                "writer_cache_stripe_controls",
+            ) {
+                Ok(residue) => {
+                    persistence.hold_cache_stripe_residue(stripe_controls, residue);
+                    cache_bytes - stripe_controls
+                }
+                Err(_) => cache_bytes,
+            };
+            accountant.charge_retained(writer_bytes);
+            persistence.record_cache_charge(writer_bytes);
         }
         let persisted_disk_limit = persistence.load_config_value::<u64>("disk_limit")?;
         let startup_disk_ceiling = startup_disk_limit;
