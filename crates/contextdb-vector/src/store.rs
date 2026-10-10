@@ -12026,6 +12026,13 @@ impl VectorStore {
     #[cfg(not(any(test, feature = "test-seams")))]
     fn note_cap_work(&self, _note: impl FnOnce(&VectorCapWork)) {}
 
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn has_maintenance_progress_pause_for_test(&self, partition: &VectorPartitionRef) -> bool {
+        self.maintenance_progress_pauses.lock().get(partition)
+            .is_some_and(|slot| slot.requested_vectors().is_some())
+    }
+
     /// Arm one partition's next maintenance build to pause after the requested
     /// number of actual stored vectors has been traversed.
     #[doc(hidden)]

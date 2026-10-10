@@ -21481,6 +21481,13 @@ impl MaintenanceContext {
                     .min(16)
                     .min(graph_count);
                 let width = held.map_or(host_width, |(width, _, _)| host_width.min(width));
+                #[cfg(any(test, feature = "test-seams"))]
+                let width = if self.vector.has_maintenance_progress_pause_for_test(partition) {
+                    // An exact insertion boundary must not be crossed by a parallel wave.
+                    1
+                } else {
+                    width
+                };
                 for workers in (2..=width).rev() {
                     let extra =
                         HnswIndex::parallel_insertion_extra_bytes(graph_count, policy, workers)?;
