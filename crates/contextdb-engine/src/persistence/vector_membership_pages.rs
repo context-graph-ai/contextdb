@@ -921,6 +921,9 @@ fn publish_membership_impl<const CHECK_OVERLAP: bool>(
         next_record.as_ref(),
         accountant.as_ref(),
     )?;
+    super::vector_current_identity::transition::<CHECK_OVERLAP>(
+        write, previous_record.as_ref(), next_record.as_ref(), accountant.as_ref(),
+    )?;
     content_size::membership_transition(write, previous_record.as_ref(), next_record.as_ref())?;
     let boundary_before = partition.max_tx;
     if let (Some(record), Some(bytes), Some(key)) = (
@@ -1390,7 +1393,14 @@ pub(super) fn reset_in_write(write: &redb::WriteTransaction) -> Result<()> {
         .map_err(metadata_error)?
         .remove(VECTOR_REFERENCED_BODY_COUNT_KEY)
         .map_err(metadata_error)?;
-    for definition in [SOURCE, REVERSE, SUMMARY, OCCUPANCY, OCCUPANCY_DIRTY] {
+    for definition in [
+        SOURCE,
+        REVERSE,
+        SUMMARY,
+        OCCUPANCY,
+        OCCUPANCY_DIRTY,
+        super::vector_current_identity::CURRENT,
+    ] {
         match write.delete_table(definition) {
             Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
             Err(error) => return Err(metadata_error(error)),
@@ -1574,7 +1584,17 @@ const MEMBERSHIP_ROOT: &str = "vector_membership_authority_pages_root_v1";
 const OPEN_DIRECTORY_ROOT: &str = "vector_open_directory_pages_root_v1";
 
 pub(super) fn write_fingerprints(write: &redb::WriteTransaction) -> Result<()> {
+    // Greenfield required authority: publish even the empty CURRENT table.
+    drop(
+        write
+            .open_table(super::vector_current_identity::CURRENT)
+            .map_err(metadata_error)?,
+    );
     for (definition, key) in [
+        (
+            super::vector_current_identity::CURRENT,
+            super::vector_current_identity::ROOT,
+        ),
         (SOURCE, SOURCE_ROOT),
         (REVERSE, REVERSE_ROOT),
         (SUMMARY, SUMMARY_ROOT),
@@ -1608,6 +1628,10 @@ pub(super) fn validate_in_read(read: &redb::ReadTransaction) -> Result<()> {
         Err(error) => return Err(metadata_error(error)),
     };
     for (definition, key) in [
+        (
+            super::vector_current_identity::CURRENT,
+            super::vector_current_identity::ROOT,
+        ),
         (SOURCE, SOURCE_ROOT),
         (REVERSE, REVERSE_ROOT),
         (SUMMARY, SUMMARY_ROOT),
@@ -1622,6 +1646,19 @@ pub(super) fn validate_in_read(read: &redb::ReadTransaction) -> Result<()> {
             .map(|table| table.get(key).map_err(metadata_error))
             .transpose()?
             .flatten();
+        if key == super::vector_current_identity::ROOT
+            && (expected.is_some()
+                || read
+                    .table_root_fingerprint(SOURCE)
+                    .map_err(metadata_error)?
+                    .is_some())
+            && matches!(
+                read.open_table(definition),
+                Err(redb::TableError::TableDoesNotExist(_))
+            )
+        {
+            return Err(corruption("required CURRENT identity table is missing"));
+        }
         match expected {
             None if actual.is_none() => {}
             None => {

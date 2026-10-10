@@ -74,6 +74,7 @@ mod relational_version_manifest;
 mod resident_history_test_seams;
 mod schema_binding;
 mod transaction_repair;
+pub(crate) mod vector_current_identity;
 pub(crate) mod vector_identity_range;
 mod vector_membership_pages;
 pub(crate) mod vector_membership_source;
