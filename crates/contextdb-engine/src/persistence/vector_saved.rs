@@ -323,6 +323,9 @@ impl RedbPersistence {
                             &identity.exact_key,
                             dimension as usize,
                             quantization,
+                            member
+                                .deleted_tx
+                                .is_some_and(|tx| tx <= descriptor.covered_tx),
                             admit,
                         )?;
                         let native = point.decode()?;
@@ -544,6 +547,7 @@ impl RedbPersistence {
         exact: &[u8],
         dimension: usize,
         quantization: VectorQuantization,
+        tombstone: bool,
         admit: &mut dyn FnMut(usize) -> Result<()>,
     ) -> Result<()> {
         let key = Self::vector_identity_key(
@@ -612,7 +616,11 @@ impl RedbPersistence {
             }
             _ => false,
         };
-        if !same {
+        // A point the saved generation keeps only as a tombstone (its row was
+        // deleted at or before the frontier) is never served; its identity
+        // above is what ties it to the membership. Only a point live at the
+        // frontier must carry exactly its original body.
+        if !same && !tombstone {
             return Err(corruption(
                 "saved exact mapping disagrees with its original body",
             ));

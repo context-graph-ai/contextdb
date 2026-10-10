@@ -16068,11 +16068,15 @@ impl SnapshotFloorRegistry {
             if registered.snapshot != snapshot || !registered.holder_still_entitled() {
                 return None;
             }
+            // A root an authoritative erasure has since invalidated is not
+            // served: the read re-captures the committed post-erasure storage
+            // at its pinned visibility, so it finishes on its own view with
+            // the erased rows absent rather than failing.
             registered
                 .pinned_root
                 .as_ref()?
                 .upgrade()
-                .filter(|root| root.snapshot == snapshot)
+                .filter(|root| root.snapshot == snapshot && !root.erased())
         })
     }
 
@@ -50268,24 +50272,13 @@ impl Database {
         Ok(Some(scope))
     }
 
-    /// One owner-door vector search over every admitted partition. Copied
-    /// search output uses the supplied executing read owner; durable generation
-    /// loading retains its existing store reservation transfer.
-    fn owner_vector_search(
+    /// The reservation transfer through which the store retains a durable
+    /// generation a read loads, funded by that read's executing owner.
+    fn vector_load_transfer(
         &self,
-        index: VectorIndexRef,
-        query: &[f32],
-        k: usize,
-        candidates: Option<&RoaringTreemap>,
-        snapshot: SnapshotId,
-        mode: contextdb_core::VectorSearchMode,
-        executing_owner: std::sync::Arc<dyn contextdb_vector::MemoryBudget>,
+        executing_owner: Arc<dyn contextdb_vector::MemoryBudget>,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-    ) -> Result<(
-        contextdb_vector::mem::SearchScores,
-        RetainedVectorSearchTrace,
-    )> {
+    ) -> Result<crate::memory_accounting::VectorLoadReservationTransfer> {
         fn callback(
             source: Arc<dyn contextdb_vector::MemoryBudget>,
             funding: contextdb_core::read_memory::ReadCredit,
@@ -50315,8 +50308,28 @@ impl Database {
             "load_transfer_callback",
             "Raise reader memory to fund the vector load transfer callback.",
         )?;
-        let load_transfer: crate::memory_accounting::VectorLoadReservationTransfer =
-            Arc::new(callback(executing_owner.clone(), funding));
+        Ok(Arc::new(callback(executing_owner, funding)))
+    }
+
+    /// One owner-door vector search over every admitted partition. Copied
+    /// search output uses the supplied executing read owner; durable generation
+    /// loading retains its existing store reservation transfer.
+    fn owner_vector_search(
+        &self,
+        index: VectorIndexRef,
+        query: &[f32],
+        k: usize,
+        candidates: Option<&RoaringTreemap>,
+        snapshot: SnapshotId,
+        mode: contextdb_core::VectorSearchMode,
+        executing_owner: std::sync::Arc<dyn contextdb_vector::MemoryBudget>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+    ) -> Result<(
+        contextdb_vector::mem::SearchScores,
+        RetainedVectorSearchTrace,
+    )> {
+        let load_transfer = self.vector_load_transfer(executing_owner.clone(), read_memory)?;
         let (rows, trace) = crate::memory_accounting::with_vector_load_reservation_transfer(
             &self.finalization.accountant,
             load_transfer,
@@ -50409,31 +50422,41 @@ impl Database {
                 vector_copy_owner,
                 read_memory.clone(),
             )?;
-            let (rows, trace) = if self
-                .vector_membership_owner()
-                .is_some_and(|owner| owner.historical_operation())
-            {
-                vector_copy_owner.with_historical_durable_reads(|owner| {
-                    self.vector.search_with_mode_admission(
-                        index,
-                        query,
-                        k,
-                        effective_candidates.as_ref(),
-                        (snapshot, search_mode),
-                        owner,
-                    )
-                })
-            } else {
-                self.vector.search_with_mode_owned(
-                    index,
-                    query,
-                    k,
-                    effective_candidates.as_ref(),
-                    snapshot,
-                    search_mode,
-                    executing_owner.clone(),
-                )
-            }?;
+            // A durable generation this search loads is retained by the store
+            // through the same reservation transfer every vector search door
+            // installs; the executing read owner funds it.
+            let load_transfer = self.vector_load_transfer(executing_owner.clone(), read_memory.clone())?;
+            let (rows, trace) = crate::memory_accounting::with_vector_load_reservation_transfer(
+                &self.finalization.accountant,
+                load_transfer,
+                || {
+                    if self
+                        .vector_membership_owner()
+                        .is_some_and(|owner| owner.historical_operation())
+                    {
+                        vector_copy_owner.with_historical_durable_reads(|owner| {
+                            self.vector.search_with_mode_admission(
+                                index,
+                                query,
+                                k,
+                                effective_candidates.as_ref(),
+                                (snapshot, search_mode),
+                                owner,
+                            )
+                        })
+                    } else {
+                        self.vector.search_with_mode_owned(
+                            index,
+                            query,
+                            k,
+                            effective_candidates.as_ref(),
+                            snapshot,
+                            search_mode,
+                            executing_owner.clone(),
+                        )
+                    }
+                },
+            )?;
             self.publish_vector_search_trace(trace);
             Ok(rows)
         })
@@ -55101,17 +55124,30 @@ impl Database {
                     #[cfg(feature = "test-seams")]
                     crash_at_purge_publication_boundary_for_test("before-durable-commit");
                     let marker = publication.as_ref().map(|publication| publication.marker());
-                    if let Err(error) = persistence.commit_authoritative_purge(
+                    let published_identities = match persistence.commit_authoritative_purge(
                         &persistence_projection,
                         marker,
                         frontier,
                         erasure_accountant.clone(),
                         "authoritative_purge",
                     ) {
-                        if let Some(publication) = publication {
-                            let _ = publication.abort();
+                        Ok(published) => published,
+                        Err(error) => {
+                            if let Some(publication) = publication {
+                                let _ = publication.abort();
+                            }
+                            return Err(error);
                         }
-                        return Err(error);
+                    };
+                    // The in-memory replacement serves under the identity its
+                    // durable catalog was published with. Past durability
+                    // nothing may fail; the partitions were prepared above.
+                    for (partition, generation_id, durable_bytes) in &published_identities {
+                        let adopted = prepared
+                            .publication_replacements
+                            .vector
+                            .adopt_published_base_generation(partition, *generation_id, *durable_bytes);
+                        debug_assert!(adopted.is_ok(), "purge replacement partition was prepared");
                     }
                     _read_publication.invalidate_cursors();
                     writer_erasure.publish();
@@ -60967,6 +61003,10 @@ impl Database {
         temp_lock_name.push(".lock");
         let temp_lock_path = PathBuf::from(temp_lock_name);
 
+        // Where this export's copy starts. A purge whose frontier lands after
+        // it fences the export, whether the copy finished or the erasure
+        // invalidated the storage it was copying from.
+        let export_start_lsn = self.current_lsn();
         match self.write_export_artifact(dest, &temp_path, vector_copy_owner, read_memory.clone()) {
             Ok(report) => {
                 // The purge frontier recheck and no-replace publish share
@@ -61010,6 +61050,29 @@ impl Database {
                 // and its lock — and nothing else.
                 let _ = std::fs::remove_file(&temp_path);
                 let _ = std::fs::remove_file(&temp_lock_path);
+                let erased = matches!(
+                    &err,
+                    Error::ReadFailure(failure)
+                        if failure.kind() == contextdb_core::read_contract::ReadFailureKind::AuthoritativeErasure
+                );
+                if erased
+                    && let Some(record) = self.with_commit_lock(|| {
+                        self.purge_frontier_after_snapshot(export_start_lsn)
+                    })?
+                {
+                    let frontier = record
+                        .purge_frontier
+                        .as_deref()
+                        .and_then(|frontier| frontier.parse::<u64>().ok())
+                        .expect("permanent purge frontier was checked");
+                    return Err(Error::PurgeExportSnapshotFence {
+                        table: record.table,
+                        key: record.natural_key.pairs(),
+                        lineage_root: record.lineage_root,
+                        frontier: Lsn(frontier),
+                        snapshot_lsn: export_start_lsn,
+                    });
+                }
                 Err(err)
             }
         }

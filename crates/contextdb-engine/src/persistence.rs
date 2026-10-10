@@ -34589,7 +34589,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         frontier: Lsn,
         accountant: Arc<dyn contextdb_vector::MemoryBudget>,
         operation: &str,
-    ) -> Result<()> {
+    ) -> Result<Vec<(VectorPartitionRef, u64, u64)>> {
         // Presence, including a malformed fence, is sufficient to refuse.
         // The write-transaction check below closes a concurrent retirement.
         if self.has_vector_repair_fence()? || self.has_paged_cleanup()? {
@@ -34599,6 +34599,24 @@ graph_commit_result }.map_err(Self::storage_error)?;
         }
         let prepared_vector_generations =
             self.prepare_authoritative_purge_vector_generations(projection)?;
+        // A saved (paged) replacement is renumbered to its storage identity
+        // when it is prepared; the caller's in-memory replacement adopts the
+        // published identity so a restart registers the same generation.
+        let published_identities = prepared_vector_generations
+            .iter()
+            .map(|prepared| {
+                let catalog: VectorPartitionGenerationCatalogRecord = self
+                    .decode_vector_partition_record(
+                        VectorPartitionRecordKind::GenerationCatalog,
+                        &prepared.catalog_bytes,
+                    )?;
+                Ok((
+                    prepared.catalog_route.clone(),
+                    catalog.base.generation_id,
+                    catalog.base.durable_bytes,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
         self.with_db(|db| {
             let write_txn = Self::begin_history_write(db)?;
             #[cfg(any(test, feature = "test-seams"))]
@@ -34635,7 +34653,8 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 graph_commit_result
             }
             .map_err(Self::storage_error)
-        })
+        })?;
+        Ok(published_identities)
     }
 
     #[cfg(target_os = "linux")]

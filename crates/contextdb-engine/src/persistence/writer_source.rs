@@ -61,6 +61,11 @@ struct WriterTableMeta {
 }
 
 impl WriterSnapshot {
+    /// Whether an authoritative erasure invalidated part of this captured view.
+    pub(crate) fn erased(&self) -> bool {
+        let erasure = self.erasure.read();
+        !erasure.tables.is_empty() || !erasure.graph_keys.is_empty()
+    }
     pub(super) fn internal_source_owner(&self) -> SourceWindowOwner {
         SourceWindowOwner::Write(self.accountant.clone(), crate::memory_accounting::WriterUse::retain_if_writer(&self.accountant))
     }

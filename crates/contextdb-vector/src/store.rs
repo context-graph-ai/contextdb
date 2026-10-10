@@ -8987,6 +8987,14 @@ impl IndexState {
         Ok((encoded, resident_bytes))
     }
 
+    fn adopt_published_base_generation(&self, generation_id: u64, durable_bytes: u64) {
+        let _publication = self.generation_publication.lock();
+        if let Some(base) = self.sealed_hnsw.write().base.as_mut() {
+            base.identity.generation_id = generation_id;
+            base.identity.durable_bytes = durable_bytes;
+        }
+    }
+
     #[doc(hidden)]
     pub(crate) fn initialize_empty_fresh_tail(
         &self,
@@ -11771,6 +11779,33 @@ impl PreparedVectorPublication {
             })?;
         let policy = column.layout().resolve_policy(state.vector_count(), 1);
         state.prepare_fresh_tail_as_base_generation(identity, policy)
+    }
+}
+
+impl PreparedVectorPublication {
+    /// Adopt the identity a replacement base generation was durably published
+    /// under. Only identity fields change; nothing is allocated.
+    pub fn adopt_published_base_generation(
+        &self,
+        partition: &VectorPartitionRef,
+        generation_id: u64,
+        durable_bytes: u64,
+    ) -> Result<()> {
+        let column = self.registry.get(&partition.index).ok_or_else(|| {
+            Error::UnknownVectorIndex {
+                index: partition.index.clone(),
+            }
+        })?;
+        let state = column
+            .partition_state(&partition.partition_key)
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "prepared vector partition is missing for {}.{}",
+                    partition.index.table, partition.index.column
+                ))
+            })?;
+        state.adopt_published_base_generation(generation_id, durable_bytes);
+        Ok(())
     }
 }
 

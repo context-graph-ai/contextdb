@@ -167,7 +167,9 @@ impl<'a> SavedTopology<'a> {
             || max_layer > 16
             || !scale.is_finite()
             || scale <= 0.0
-            || value_dimension != expected_values
+            // A graph with no points records no value width; every point
+            // present is checked below against this same width.
+            || (value_dimension != expected_values && value_dimension != 0)
             || graph.read_usize()? != max_layer
         {
             return Err(invalid());
