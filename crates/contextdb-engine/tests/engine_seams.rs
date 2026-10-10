@@ -143,3 +143,6 @@ mod consumer_declared_count_and_pending_seek_contract;
 
 #[path = "grouped_session_top_n_contract.rs"]
 mod grouped_session_top_n_contract;
+
+#[path = "engine_seams/writer_tail_reuse_is_bounded_across_physical_opens.rs"]
+mod writer_tail_reuse_is_bounded_across_physical_opens;

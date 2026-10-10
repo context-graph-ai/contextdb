@@ -36,6 +36,9 @@ mod vector_quarantine_inventory_admission_tests;
 #[cfg(all(test, feature = "test-seams"))]
 mod vector_retry_frontier_integrity_tests;
 mod vector_source_page_admission;
+mod vector_writer_session;
+#[doc(hidden)]
+pub use vector_writer_session::WriterVectorSession;
 #[cfg(feature = "test-seams")]
 pub(crate) mod writer_ownership_receipt;
 pub(crate) mod writer_read;
@@ -18995,12 +18998,38 @@ fn paged_generation_graph_from(
 }
 
 impl DormantVectorGraphLoader for DurableVectorGenerationLoader {
-
     fn load(
         &self,
         generation: DormantVectorGraphGeneration,
         caller_reserved_load_bytes: usize,
         request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool,
+    ) -> Result<LoadedVectorGraphGeneration> {
+        self.load_selected_tail(generation, caller_reserved_load_bytes, request, self.tail_covered_lsn)
+    }
+
+    fn load_reusing_fresh_tail(
+        &self,
+        generation: DormantVectorGraphGeneration,
+        caller_reserved_load_bytes: usize,
+        request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool,
+        fresh_tail_present: bool,
+    ) -> Result<LoadedVectorGraphGeneration> {
+        let tail_covered_lsn = if fresh_tail_present && matches!(self.source, DurableVectorGenerationSource::Writable(_)) {
+            None
+        } else {
+            self.tail_covered_lsn
+        };
+        self.load_selected_tail(generation, caller_reserved_load_bytes, request, tail_covered_lsn)
+    }
+}
+
+impl DurableVectorGenerationLoader {
+    fn load_selected_tail(
+        &self,
+        generation: DormantVectorGraphGeneration,
+        caller_reserved_load_bytes: usize,
+        request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool,
+        tail_covered_lsn: Option<Lsn>,
     ) -> Result<LoadedVectorGraphGeneration> {
         if self.source.is_committed_image() {
             return self.load_retained(generation, caller_reserved_load_bytes, request);
@@ -19044,7 +19073,7 @@ impl DormantVectorGraphLoader for DurableVectorGenerationLoader {
             self.base_generation_id,
             (!self.is_base).then_some(self.descriptor.generation_id),
         )?;
-        let tail_count = match self.tail_covered_lsn {
+        let tail_count = match tail_covered_lsn {
             Some(covered_lsn) => self.source.tail_entry_count(
                 &self.partition.index,
                 &self.partition.partition_key,
@@ -19053,7 +19082,7 @@ impl DormantVectorGraphLoader for DurableVectorGenerationLoader {
             None => 0,
         };
         Self::load_checkpoint(request)?;
-        let (tail_resident_reservation, tail_workspace) = if self.tail_covered_lsn.is_some() {
+        let (tail_resident_reservation, tail_workspace) = if tail_covered_lsn.is_some() {
             self.tail_reservation(tail_count)?
         } else {
             (0, 0)
@@ -19212,7 +19241,7 @@ impl DormantVectorGraphLoader for DurableVectorGenerationLoader {
                 ));
             }
 
-            let fresh_tail = match self.tail_covered_lsn {
+            let fresh_tail = match tail_covered_lsn {
                 None => None,
                 Some(covered_lsn) => {
                     Self::load_checkpoint(request)?;
@@ -19312,7 +19341,7 @@ impl DormantVectorGraphLoader for DurableVectorGenerationLoader {
                 })
             }
         }
-    }
+        }
 }
 
 /// What a statement keeps for one committed-image layer it has still to
@@ -24520,7 +24549,37 @@ impl Database {
             .damage_checkpoint_f32_projection_for_test()
     }
 
+    #[doc(hidden)]
+    pub fn open_with_writer_vector_session(path: impl AsRef<Path>, options: DatabaseOpenOptions, session: &WriterVectorSession) -> Result<Self> {
+        #[cfg(feature = "test-seams")]
+        {
+            let interceptor = COMMON_OPTIONS_OPEN_INTERCEPTOR.with(|slot| slot.borrow().clone());
+            if let Some(interceptor) = interceptor {
+                let result = interceptor.intercept(path.as_ref(), &options);
+                match &result {
+                    Ok(db) => db.reattach_writer_vector_session(session),
+                    Err(_) => session.clear(),
+                }
+                return result;
+            }
+        }
+        let saved = session.take();
+        let had_saved = saved.is_some();
+        let retry_options = options.clone();
+        match Self::open_configured_carrying(path.as_ref(), options, saved) {
+            Err(Error::MemoryBudgetExceeded { .. }) if had_saved => {
+                // The optional cache must never cause an open refusal.
+                Self::open_configured(path.as_ref(), retry_options)
+            }
+            result => result,
+        }
+    }
+
     fn open_configured(path: &Path, options: DatabaseOpenOptions) -> Result<Self> {
+        Self::open_configured_carrying(path, options, None)
+    }
+
+    fn open_configured_carrying(path: &Path, options: DatabaseOpenOptions, mut carried: Option<vector_writer_session::CarriedWriterTail>) -> Result<Self> {
         let in_memory = path.as_os_str() == ":memory:";
         // A throwaway database has no file, so a ceiling on file growth is a
         // configuration mistake rather than a limit to enforce. Saying so
@@ -24552,6 +24611,9 @@ impl Database {
             Some(bytes) => MemoryAccountant::writer_budget(bytes)?,
             None => MemoryAccountant::writer_no_limit()?,
         };
+        if carried.as_mut().is_some_and(|tail| tail.recharge(accountant.vector_accountant()).is_err()) {
+            carried = None;
+        }
         let declared_read_memory = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(
             owner_reads.limits.limits.memory,
         );
@@ -24652,6 +24714,7 @@ impl Database {
                 crate::persistence::redb_writer_cache_bytes_for_limit(db.accountant.usage().limit),
             )?;
         }
+        db.reattach_carried_writer_tail(carried);
         Ok(db)
     }
 
