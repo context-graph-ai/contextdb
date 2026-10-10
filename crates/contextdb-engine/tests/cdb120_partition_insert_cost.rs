@@ -328,7 +328,7 @@ fn delete_rows(db: &Database, first: u64, n: u64) {
 fn history_route<'a>(db: &'a Database, n: u64, at: PinAt) -> SnapshotPin<'a> {
     create(db, 4, "HISTORY ALL");
     let mut pins: Vec<(PinAt, SnapshotPin<'a>)> = Vec::new();
-    let mut pin = |db: &'a Database, which: PinAt| pins.push((which, db.pin_snapshot(db.snapshot())));
+    let mut pin = |db: &'a Database, which: PinAt| pins.push((which, db.pin_snapshot(db.snapshot()).expect("pin snapshot")));
     pin(db, PinAt::BeforeEverything);
     seed(db, (0..3).map(|k| (900 + k, format!("live{k}"))));
     seed(db, (0..n).map(|k| (10_000 + k, "x".to_owned())));
