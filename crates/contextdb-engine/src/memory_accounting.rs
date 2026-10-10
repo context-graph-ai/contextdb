@@ -200,6 +200,7 @@ static PROCESS_CEILING_FOR_TEST: parking_lot::Mutex<Option<usize>> = parking_lot
 /// Test seam: fix the inherited process ceiling for a later activation, and
 /// for an already active runtime.
 #[cfg(any(test, feature = "test-seams"))]
+#[allow(dead_code)] // Keep the process ceiling control available to focused accounting tests.
 pub(crate) fn set_process_ceiling_for_test(ceiling: Option<usize>) {
     *PROCESS_CEILING_FOR_TEST.lock() = ceiling;
     let mut domain = PROCESS_WRITER_BUDGET_DOMAIN.write();
@@ -209,6 +210,7 @@ pub(crate) fn set_process_ceiling_for_test(ceiling: Option<usize>) {
 }
 
 /// (aggregate bytes, recorded process ceiling) for receipts and rows.
+#[allow(dead_code)] // Keep the aggregate receipt seam available to memory-accounting tests.
 pub(crate) fn process_aggregate_snapshot() -> (usize, Option<usize>) {
     let domain = PROCESS_WRITER_BUDGET_DOMAIN.read();
     (PROCESS_WRITER_AGGREGATE.load(Ordering::SeqCst), domain.ceiling)
@@ -567,6 +569,7 @@ impl WriterAdmission {
 // remains unlimited; finite arithmetic cannot manufacture capacity on overflow.
 struct WriterHeadroom {
     available: Option<usize>,
+    #[allow(dead_code)] // Preserve the full writer headroom report for future diagnostics.
     combined_used: Option<usize>,
     within_limit: bool,
 }
@@ -580,9 +583,9 @@ fn writer_headroom(
         .checked_sub(releasing)
         .expect("replacement credit must be owned by this accountant");
     let combined_used = Some(occupied);
-    let effective = limit.checked_add(private).unwrap_or(usize::MAX);
+    let effective = limit.saturating_add(private);
     WriterHeadroom {
-        available: (limit != 0).then(|| effective.checked_sub(occupied).unwrap_or(0)),
+        available: (limit != 0).then(|| effective.saturating_sub(occupied)),
         combined_used,
         within_limit: limit == 0 || combined_used.is_some_and(|bytes| bytes <= effective),
     }
@@ -1300,6 +1303,7 @@ accountant: Some(accountant),
 
     /// Transfer an existing charge to a store owner. The shared accountant
     /// total is deliberately unchanged; only this request stops owning it.
+    #[allow(dead_code)] // Keep the explicit transfer operation beside reservation release.
     pub(crate) fn try_transfer_to_store(&mut self, bytes: usize) -> contextdb_core::Result<()> {
         self.bytes = self.bytes.checked_sub(bytes).ok_or_else(|| {
             contextdb_core::Error::MemoryBudgetExceeded {
@@ -1982,9 +1986,9 @@ accountant: Arc::clone(self),
             return;
         }
 
-        let released: Result<usize, usize> = Ok(self.used.release_saturating(bytes));
+        let released = self.used.release_saturating(bytes);
         #[cfg(any(test, feature = "test-seams"))]
-        if bytes > released.expect("release update always supplies a value") {
+        if bytes > released {
             self.underflow_count.fetch_add(1, Ordering::SeqCst);
         }
         #[cfg(feature = "test-seams")]

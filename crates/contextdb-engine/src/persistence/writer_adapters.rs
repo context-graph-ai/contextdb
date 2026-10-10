@@ -495,7 +495,7 @@ impl RelationalReadSource for WriterRelationalSource {
         row: RowId,
         created: TxId,
     ) -> Result<OwnedReadBox<dyn RelationalPositionKey>> {
-        Ok(self
+        self
             .root
             .index_position_key(
                 self.owner.clone(),
@@ -503,7 +503,7 @@ impl RelationalReadSource for WriterRelationalSource {
                 row,
                 if current { TxId(0) } else { created },
             )?
-            .boxed(|boxed| boxed as Box<dyn RelationalPositionKey>)?)
+            .boxed(|boxed| boxed as Box<dyn RelationalPositionKey>)
     }
     fn sync_source(&self, table: &str, row: RowId) -> Result<Option<(Lsn, SyncSourceKind)>> {
         self.validate_table(table)?;

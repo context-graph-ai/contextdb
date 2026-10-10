@@ -495,8 +495,8 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
     fn explain_plan_without_running_it(
         &self,
         sql: &str,
-        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        _read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<String> {
         let _ = sql;
         Err(Error::PlanError(
@@ -824,7 +824,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         cursor: &mut contextdb_relational::mem::BoundedOrderedRowCursor,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         visit: &mut dyn FnMut(RowId) -> std::result::Result<(), BoundedExecutionError>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<bool, BoundedExecutionError> {
         let _ = (table, index, snapshot, cursor, before_touch, visit);
         Ok(false)
@@ -839,7 +839,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         prefixes: &[IndexKey],
         check_boundary: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<Option<bool>, BoundedExecutionError> {
         let _ = (table, index, prefixes, check_boundary, before_touch);
         Ok(None)
@@ -3473,7 +3473,7 @@ fn vector_partition_key_json(columns: &[String], key: &VectorPartitionKey) -> Re
     for (column, component) in columns.iter().zip(key.components()) {
         object.insert(column.clone(), vector_partition_component_json(component));
     }
-    Ok(Value::Json(serde_json::Value::Object(object).into()))
+    Ok(Value::Json(serde_json::Value::Object(object)))
 }
 
 fn vector_partition_query_state(
@@ -3992,7 +3992,7 @@ fn vector_index_inspection_row(
         Value::Text(info.layout.quantization.as_str().to_owned()),
         vector_inspection_usize(vector_count, "vector_count")?,
         vector_inspection_usize(bytes, "bytes")?,
-        Value::Json(partition_key_columns.into()),
+        Value::Json(partition_key_columns),
         declaration
             .max_partitions
             .map(|value| Value::Int64(i64::from(value)))
@@ -6827,7 +6827,6 @@ fn execute_plan_once(
 }
 
 #[inline(never)]
-
 fn execute_materialized_cte(
     db: &Database,
     input: &PhysicalPlan,
@@ -6863,11 +6862,10 @@ impl WindowRankValues {
     }
 
     fn get(self, binding: WindowBindingId) -> Result<Value> {
-        if binding == self.binding.0 {
-            if let Some(rank) = self.values.get(self.binding.1) {
+        if binding == self.binding.0
+            && let Some(rank) = self.values.get(self.binding.1) {
                 return Ok(Value::Int64(*rank));
             }
-        }
         Err(Error::PlanError(
             "window rank binding is outside its scope".to_string(),
         ))
@@ -15691,6 +15689,7 @@ where
     })
 }
 
+#[allow(dead_code)] // Retain the plan-based graph resolver for bounded read fallbacks.
 fn resolve_graph_start_nodes_from_plan(
     db: &Database,
     plan: &PhysicalPlan,
@@ -16395,7 +16394,7 @@ fn graph_node_column_values(
     snapshot: contextdb_core::SnapshotId,
     cache: &mut GraphValueCache<'_>,
 
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    _read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<Vec<Value>> {
     if column == "id" {
         return Ok(vec![Value::Uuid(node)]);
@@ -16799,7 +16798,7 @@ fn resolve_row_vector_source(
             snapshot,
             tx,
             |_| Ok::<(), Error>(()),
-            |vector| Ok::<Vec<f32>, Error>(vector),
+            Ok::<Vec<f32>, Error>,
             vector_copy_owner,
             read_memory.clone(),
         )?

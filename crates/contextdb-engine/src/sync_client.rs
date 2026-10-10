@@ -3628,6 +3628,7 @@ impl SyncClient {
     /// A consumed frontier is not acceptance. Reconcile the exact request
     /// through its existing push response; the hub's durable apply record
     /// returns the original result without reapplying rows, vectors or DDL.
+#[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
     async fn finish_interrupted_push(
         &self,
         transport_err: Error,
@@ -4775,6 +4776,7 @@ fn classify_push_reply_decode(error: Error) -> PushReplyError {
 }
 
 #[cfg(test)]
+#[allow(dead_code)] // Retain the decoder seam for focused push-response fixtures.
 fn decode_push_response(reply: &[u8], protocol_version: u8) -> Result<ApplyResult, PushReplyError> {
     let envelope = decode_for_version(reply, protocol_version)
         .map_err(|e| PushReplyError::Malformed(Error::SyncError(e.to_string())))?;

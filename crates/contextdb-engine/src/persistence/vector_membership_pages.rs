@@ -663,10 +663,10 @@ fn lifetimes_overlap(
         && b.deleted_tx.is_none_or(|end| a.visible_from < end)
 }
 
-/// Existing reverse keys order owning row stamps rather than interval starts.
-/// Check only this row's history, keeping one charged decoded neighbour at a
-/// time. A row's history can require quadratic work over successive producers;
-/// unrelated rows are never scanned and no population identity set is built.
+// Existing reverse keys order owning row stamps rather than interval starts.
+// Check only this row's history, keeping one charged decoded neighbour at a
+// time. A row's history can require quadratic work over successive producers;
+// unrelated rows are never scanned and no population identity set is built.
 #[cfg(test)]
 thread_local! {
     static BODY_PLACEMENT_VALIDATION_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };

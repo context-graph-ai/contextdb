@@ -1003,6 +1003,7 @@ fn candidate_derivation_loads_no_untouched_vector_body() {
 /// modes `AUTO` and `INDEXED`.
 #[test]
 #[serial]
+#[allow(clippy::bool_assert_comparison)] // Preserve the existing test expression and its assertion contract.
 fn projecting_the_searched_column_loads_only_answer_partitions() {
     let (_root, db) = open_lang_residency_fixture(true);
     let query = params([("query", Value::Vector(lang_query(0)))]);

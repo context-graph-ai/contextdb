@@ -10813,6 +10813,7 @@ const VECTOR_WRITE_DOOR_DDL: &str =
 
 /// The values a caller binds by mistake where an embedding belongs, paired
 /// with the name the refusal has to report for each.
+#[allow(clippy::useless_conversion)] // Preserve the existing test expression and its assertion contract.
 fn non_embedding_bindings() -> Vec<(&'static str, Value, &'static str)> {
     vec![
         ("an integer", Value::Int64(7), "Int64"),

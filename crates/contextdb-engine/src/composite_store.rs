@@ -846,7 +846,7 @@ impl CompositeStore {
         partition_key: &VectorPartitionKey,
         row_id: RowId,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Option<contextdb_core::VectorEntry>> {
         let Some(current_key) =
             self.vector
@@ -978,6 +978,7 @@ impl CompositeStore {
         commit_lsn.and_then(|lsn| self.received_arriving_table_meta.lock().remove(&lsn))
     }
 
+#[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
     fn prepare_vector_partition_mutations_with_reclamation(
         &self,
         ws: &WriteSet,
@@ -1385,14 +1386,14 @@ impl CompositeStore {
         } else {
             self.build_change_log_entries_with_snapshots(
                 ws,
-                Some(&table_meta),
+                Some(table_meta),
                 deleted_rows.as_ref(),
             )
         };
         let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
         let partition_mutations = self.prepare_vector_partition_mutations_with_reclamation(
             ws,
-            &table_meta,
+            table_meta,
             deleted_rows.as_ref(),
             HashSet::new(),
             registered_snapshots.as_deref(),
@@ -1542,6 +1543,7 @@ impl WriteSetApplicator for CompositeStore {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)] // Keep test-only publication controls beside their tests.
 mod tests {
     use super::*;
     use contextdb_core::TxId;

@@ -96,6 +96,7 @@ fn stream_counts(db: &Database, id: u128, expected: &[(&str, &str, i64)]) -> u64
 }
 
 #[test]
+#[allow(clippy::erasing_op, clippy::identity_op)] // Preserve the existing test expression and its assertion contract.
 fn grouped_event_counts_use_the_declared_context_stream_count_and_survive_reopen() {
     let count_columns = vec![
         ("context_id".into(), SortDirection::Asc),

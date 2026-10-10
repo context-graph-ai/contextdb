@@ -188,8 +188,10 @@ fn writer_reopen(row: &Row) {
     // COUNT(id) still decodes the row. Give only this verification read an
     // explicit 64 MiB memory budget; its small result keeps the default result
     // ceiling. This is not a shipped-reader acceptance claim.
-    let mut verification_limits = ReadLimits::default();
-    verification_limits.memory = 64 * 1_048_576;
+    let verification_limits = ReadLimits {
+        memory: 64 * 1_048_576,
+        ..ReadLimits::default()
+    };
     let verification = database.read_session(verification_limits).expect("open explicit-budget verification read");
     let answer = verification.execute("SELECT COUNT(id) FROM json_decode_rows", &HashMap::new()).expect("count persisted row after reopening 16 MiB document");
     assert_eq!(answer.rows.len(), 1, "16 MiB writer/reopen returns one count row");
@@ -221,12 +223,18 @@ fn seed(path: &Path, document: &str, sequential: bool) {
 }
 
 fn session(path: &Path) -> ReadSession {
-    let mut options = ReadSessionOptions::default();
-    options.memory_limit = Some(DEFAULT_MEMORY);
-    options.limits.memory = ReadLimits::SHIPPED_MEMORY;
+    let options = ReadSessionOptions {
+        memory_limit: Some(DEFAULT_MEMORY),
+        limits: ReadLimits {
+            memory: ReadLimits::SHIPPED_MEMORY,
+            ..ReadLimits::default()
+        },
+        ..ReadSessionOptions::default()
+    };
     ReadSession::open_with_options(path, options).expect("open file route under shipped memory")
 }
 
+#[allow(clippy::useless_conversion)] // Preserve the existing test expression and its assertion contract.
 fn receipt(reader: &ReadSession) -> (usize, usize, usize, usize) {
     let (usage, held, high_water, _) = reader
         .file_memory_for_test()

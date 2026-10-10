@@ -662,7 +662,7 @@ impl Database {
                         if let Ok(Ok(())) = &result
                             && let Err(error) = self.prepare_active_trigger_write_set_for_dispatch(
                                 tx,
-                                &mut **vector_copy_owner.borrow_mut(),
+                                &mut vector_copy_owner.borrow_mut(),
                                 read_memory.clone(),
                             )
                         {
@@ -671,7 +671,7 @@ impl Database {
                         if let Ok(Ok(())) = &result {
                             match self.dispatch_triggers_for_tx(
                                 tx,
-                                &mut **vector_copy_owner.borrow_mut(),
+                                &mut vector_copy_owner.borrow_mut(),
                                 read_memory.clone(),
                             ) {
                                 Ok(outcome) => {
@@ -692,7 +692,7 @@ impl Database {
                         if let Ok(Ok(())) = &result
                             && let Err(error) = self.prepare_active_trigger_write_set_for_dispatch(
                                 tx,
-                                &mut **vector_copy_owner.borrow_mut(),
+                                &mut vector_copy_owner.borrow_mut(),
                                 read_memory.clone(),
                             )
                         {
@@ -724,7 +724,7 @@ impl Database {
                         let _validation = self.commit_validate(
                             tx,
                             ws,
-                            &mut **vector_copy_owner.borrow_mut(),
+                            &mut vector_copy_owner.borrow_mut(),
                             read_memory.clone(),
                         )?;
                         self.plugin.pre_commit(ws, CommitSource::AutoCommit)?;
@@ -762,7 +762,7 @@ impl Database {
                         *delete_release_bytes.borrow_mut() = self
                             .delete_release_bytes_for_write_set(
                                 ws,
-                                &mut **vector_copy_owner.borrow_mut(),
+                                &mut vector_copy_owner.borrow_mut(),
                                 read_memory.clone(),
                             )?;
                     }

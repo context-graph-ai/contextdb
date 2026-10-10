@@ -448,7 +448,7 @@ fn projected_allocator_growth_respects_disk_limit_with_a_live_retained_reader() 
         .sum::<usize>()
         .div_ceil(64)
         + 2;
-    for pass in 0..passes {
+    for _pass in 0..passes {
         writer
             .__commit_storage_transaction_for_test()
             .expect("finite deferred-free pass fits the unchanged disk ceiling");

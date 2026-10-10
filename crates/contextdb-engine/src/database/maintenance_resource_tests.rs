@@ -434,7 +434,7 @@ fn cancellation_during_actual_build_returns_workspace_and_preserves_serving_cata
     {
         use contextdb_vector::VectorCopyAdmission;
         use contextdb_vector::hnsw::paged_builder::PagedVectorPhase;
-        use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
+        use redb::{ReadableDatabase, ReadableTable, TableDefinition};
         let directory = tempfile::tempdir().unwrap();
         let db = Database::open(directory.path().join("audit-cancel.db")).unwrap();
         db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
@@ -829,7 +829,7 @@ fn retention_cleanup_commits_generation_catalog_and_eligible_commit_index_remova
     // before any insertion batch (maintenance intent line 41; policy 22).
     {
         use contextdb_vector::hnsw::{HnswBuildObserver, with_hnsw_build_observer};
-        use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
+        use redb::{ReadableDatabase, ReadableTableMetadata, TableDefinition};
         const REPAIR_CHILD: &str = "CONTEXTDB_REPAIR_RETIRED_NATIVE_PATH";
         const RETIRED_EXIT: i32 = 86;
         let route = VectorPartitionRef::new(
@@ -1493,6 +1493,7 @@ fn switching_to_caller_driven_during_build_reports_pending_before_retry() {
 }
 
 #[test]
+#[allow(clippy::needless_borrows_for_generic_args)] // Preserve the existing test expression and assertion contract.
 fn last_membership_cleanup_keeps_catalog_targets_with_a_pinned_retired_chain() {
     // A corrupt neighbour cannot stop a fenced route's maintenance or healthy
     // serving (maintenance intent line 41; root policy 22).
@@ -1627,7 +1628,7 @@ fn last_membership_cleanup_keeps_catalog_targets_with_a_pinned_retired_chain() {
                         summary.5 = None;
                         summary.6 = None;
                         let payload =
-                            bincode::serde::encode_to_vec(&summary, bincode::config::standard())
+                            bincode::serde::encode_to_vec(summary, bincode::config::standard())
                                 .unwrap();
                         let mut encoded = b"CDBVMS01".to_vec();
                         encoded.extend_from_slice(&payload);
@@ -2476,7 +2477,7 @@ fn resident_generation_selection_keeps_the_pinned_frontier_during_concurrent_wri
     // Maintenance completes within the declared writer budget, and old reads
     // keep their generation (maintenance intent line 41; root policy 22).
     {
-        use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
+        use redb::{ReadableDatabase, ReadableTable, TableDefinition};
         const HEADROOM: usize = 512 * 1024;
         let directory = tempfile::tempdir().unwrap();
         let db = Database::open(directory.path().join("refused-whole-repair.db")).unwrap();
@@ -2641,10 +2642,10 @@ fn resident_generation_selection_keeps_the_pinned_frontier_during_concurrent_wri
             );
             context.persist_built_vector_partition(&partition, db.declared_reader_memory().unwrap())
                 .expect("an over-budget corrupt whole replacement progresses through the finite paged builder");
-            if let Some(current) = catalog() {
-                if current.base.generation_id > before.base.generation_id {
-                    break;
-                }
+            if let Some(current) = catalog()
+                && current.base.generation_id > before.base.generation_id
+            {
+                break;
             }
         }
         let repaired = catalog().expect("bounded repair publishes a complete generation");

@@ -104,6 +104,7 @@ fn each_cycle_reports_at_most_its_cap_and_a_larger_backlog_drains_across_cycles(
 }
 
 #[test]
+#[allow(clippy::manual_range_contains)] // Preserve the existing test expression and its assertion contract.
 fn without_a_cap_one_cycle_finishes_a_backlog_that_the_cap_split() {
     let (_dir, db) = parked_backlog();
     set_reclaim_steps_per_cycle_for_test(None);

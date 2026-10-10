@@ -162,7 +162,7 @@ fn retention_expiry_and_prune_examine_fixed_work_as_unrelated_edges_and_rows_gro
                 // Complete the finite future-stamp recount before requiring its
                 // exact completed tally. Each cycle still uses the same cap.
                 let mut graph_cycles = Vec::new();
-                for cycle in 0..32 {
+                for _cycle in 0..32 {
                     let (next, work) = observe(|| db.run_pruning_cycle_checked());
                     report = next.unwrap();
                     graph_cycles.push(work.graph_keys_examined);

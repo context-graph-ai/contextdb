@@ -1645,9 +1645,7 @@ fn contradictory_owner_status_is_rejected_on_encode_and_complete_decode() {
     );
 }
 
-#[path = "../owner_cursor_test_support.rs"]
-#[allow(dead_code)]
-mod owner_cursor_test_support;
+use super::owner_cursor_test_support;
 
 fn owner_cursor_payload() -> Vec<u8> {
     let page_bytes = CANONICAL_CURSOR_PAGE;

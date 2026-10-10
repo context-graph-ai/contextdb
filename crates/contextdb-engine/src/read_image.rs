@@ -2427,6 +2427,7 @@ pub(crate) fn image_state_is_a_file_question() -> Error {
     ))
 }
 
+#[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
 pub(crate) fn project_metadata(
     target: &dyn ReadExecutionTarget,
     read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,

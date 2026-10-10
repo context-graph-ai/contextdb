@@ -2095,6 +2095,7 @@ impl RedbPersistence {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)] // Keep test-only source controls beside their tests.
 mod tests {
     use super::*;
 

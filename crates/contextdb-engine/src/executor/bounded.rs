@@ -3233,8 +3233,8 @@ impl WindowState {
                 let remaining = ceiling
                     .checked_sub(self.rank as u64)
                     .ok_or_else(|| Error::Other("window prefix demand underflow".to_string()))?;
-                if let PullKind::Scan(scan) = &mut self.input.kind {
-                    if let ScanMode::Ordered { cursor, .. } = &mut scan.mode {
+                if let PullKind::Scan(scan) = &mut self.input.kind
+                    && let ScanMode::Ordered { cursor, .. } = &mut scan.mode {
                         // A maintained overlay needs only the next committed
                         // comparator head, irrespective of remaining rank demand.
                         cursor.source_set_prefix_quota(Some(if scan.transaction.is_some() {
@@ -3243,7 +3243,6 @@ impl WindowState {
                             remaining
                         }));
                     }
-                }
             }
             self.pending = match self.group_binding {
                 Some(binding) if self.ceiling.is_some() => {
@@ -11604,12 +11603,12 @@ struct RankedPrefixGroup {
     ceiling: u64,
 }
 
-fn ranked_prefix_shape<'a>(
-    input: &'a PhysicalPlan,
+fn ranked_prefix_shape(
+    input: &PhysicalPlan,
 ) -> Option<(
-    &'a PhysicalPlan,
-    &'a [ProjectColumn],
-    &'a contextdb_parser::RowNumberWindow,
+    &PhysicalPlan,
+    &[ProjectColumn],
+    &contextdb_parser::RowNumberWindow,
     WindowBindingId,
 )> {
     let input = match input {
@@ -11658,7 +11657,7 @@ fn ranked_prefix_project_expr<'a>(
 ) -> Option<&'a Expr> {
     let mut matched = None;
     for column in columns {
-        let name = column.alias.as_deref().or_else(|| match &column.expr {
+        let name = column.alias.as_deref().or(match &column.expr {
             Expr::Column(source) => Some(source.column.as_str()),
             _ => None,
         });
@@ -12157,8 +12156,8 @@ fn ranked_prefix_group_filter(
             negated: false,
             ..
         } => {
-            if let Expr::Column(column) = expr.as_ref() {
-                if let Some(position) = window
+            if let Expr::Column(column) = expr.as_ref()
+                && let Some(position) = window
                     .partition_by
                     .iter()
                     .position(|partition| partition.column == column.column)
@@ -12169,7 +12168,6 @@ fn ranked_prefix_group_filter(
                         right: Box::new(super::value_to_literal(key[position].clone())?),
                     });
                 }
-            }
             Ok(original.clone())
         }
         _ => Ok(expr.clone()),
@@ -12377,18 +12375,17 @@ fn build_ranked_prefix(
             return Ok(None);
         }
         let null_restriction = ranked_prefix_null_restriction(inner_filter);
-        if let Some((column, _)) = null_restriction {
-            if declaration
+        if let Some((column, _)) = null_restriction
+            && (declaration
                 .columns
                 .get(group.key.len())
                 .is_none_or(|(indexed, _)| *indexed != column.column)
                 || declaration.columns[group.key.len() + 1..]
                     .iter()
-                    .any(|(_, direction)| *direction != contextdb_core::SortDirection::Asc)
+                    .any(|(_, direction)| *direction != contextdb_core::SortDirection::Asc))
             {
                 return Ok(None);
             }
-        }
         fn represented(
             expr: &Expr,
             pushed: &[String],
@@ -12441,8 +12438,8 @@ fn build_ranked_prefix(
         let PullKind::Scan(state) = &mut source.kind else {
             return Ok(None);
         };
-        if let Some(transaction) = &state.transaction {
-            if !transaction
+        if let Some(transaction) = &state.transaction
+            && !transaction
                 .overlay
                 .staged_rows
                 .as_ref()
@@ -12450,7 +12447,6 @@ fn build_ranked_prefix(
             {
                 return Ok(None);
             }
-        }
         let ScanMode::Ordered { cursor, .. } = &mut state.mode else {
             return Ok(None);
         };
@@ -12956,8 +12952,7 @@ fn build_kernel_with_ctes<'plan>(
                 input: selected,
                 predicate,
             } = input.as_ref()
-            {
-                if let Some((_, columns, window, binding)) = ranked_prefix_shape(selected) {
+                && let Some((_, columns, window, binding)) = ranked_prefix_shape(selected) {
                     let matches = keys.len() == window.partition_by.len() + 1
                         && keys.iter().enumerate().all(|(position, key)| {
                             if key.direction != SortDirection::Asc {
@@ -12980,8 +12975,8 @@ fn build_kernel_with_ctes<'plan>(
                                 _ => false,
                             }
                         });
-                    if matches {
-                        if let Some(prefix) = build_ranked_prefix(
+                    if matches
+                        && let Some(prefix) = build_ranked_prefix(
                             db,
                             selected,
                             predicate,
@@ -12991,9 +12986,7 @@ fn build_kernel_with_ctes<'plan>(
                         )? {
                             return Ok(prefix);
                         }
-                    }
                 }
-            }
             // An ordered index run is the committed rows in order and nothing
             // else, so with a transaction open the rows it staged have to be
             // put where they belong. The scan does that as it walks, which is
@@ -17614,12 +17607,11 @@ impl CursorState {
                     page.has_more = matches!(self.root.has_more_hint(), Some(true));
                     break;
                 };
-                if let Some(binding) = row.group_binding {
-                    if let Err(error) = self.context.stage_group_return(binding) {
+                if let Some(binding) = row.group_binding
+                    && let Err(error) = self.context.stage_group_return(binding) {
                         self.replay_push_front(row)?;
                         return Err(error);
                     }
-                }
                 retained.push((row.retained_bytes, row.group_binding));
                 page.rows.push(row.values);
                 page.has_more =

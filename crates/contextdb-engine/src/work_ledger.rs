@@ -266,7 +266,7 @@ impl InputRef {
     pub fn ledger_input() -> Self {
         Self {
             kind: REF_KIND_LEDGER_INPUT.to_string(),
-            detail: serde_json::Value::Null.into(),
+            detail: serde_json::Value::Null,
         }
     }
 
@@ -274,7 +274,7 @@ impl InputRef {
     pub fn local_path(path: &str) -> Self {
         Self {
             kind: REF_KIND_LOCAL_PATH.to_string(),
-            detail: serde_json::json!({ "path": path }).into(),
+            detail: serde_json::json!({ "path": path }),
         }
     }
 
@@ -283,7 +283,7 @@ impl InputRef {
     pub fn blob_ref(hash: BlobHash) -> InputRef {
         InputRef {
             kind: REF_KIND_BLOB_REF.to_string(),
-            detail: serde_json::json!({ "hash": hash.to_hex() }).into(),
+            detail: serde_json::json!({ "hash": hash.to_hex() }),
         }
     }
 }
@@ -707,7 +707,7 @@ fn opt_int_at(row: &[Value], idx: usize, what: &str) -> Result<Option<i64>> {
 fn json_at(row: &[Value], idx: usize, what: &str) -> Result<serde_json::Value> {
     match &row[idx] {
         Value::Json(v) => Ok(v.clone()),
-        Value::Null => Ok(serde_json::Value::Null.into()),
+        Value::Null => Ok(serde_json::Value::Null),
         other => Err(Error::Other(format!(
             "work ledger: {what} must be JSON, found {other:?}"
         ))),
@@ -984,11 +984,11 @@ pub fn submit_job_in_tx_with_read_memory(
     params.insert("mode".to_string(), text(&spec.mode));
     params.insert(
         "requirement_tags".to_string(),
-        Value::Json(serde_json::json!(spec.requirement_tags).into()),
+        Value::Json(serde_json::json!(spec.requirement_tags)),
     );
     params.insert(
         "input_refs".to_string(),
-        Value::Json(input_refs_to_json(&spec.input_refs).into()),
+        Value::Json(input_refs_to_json(&spec.input_refs)),
     );
     params.insert(
         "output_schema".to_string(),
@@ -1013,7 +1013,7 @@ pub fn submit_job_in_tx_with_read_memory(
     params.insert(
         "provenance".to_string(),
         match &spec.provenance {
-            Some(p) => Value::Json(p.clone().into()),
+            Some(p) => Value::Json(p.clone()),
             None => Value::Null,
         },
     );
@@ -2318,6 +2318,7 @@ pub fn record_result(
 }
 
 /// Execute using the caller's existing operation read owner.
+#[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
 pub fn record_result_with_read_memory(
     db: &Database,
     job_id: &str,
@@ -2336,7 +2337,7 @@ pub fn record_result_with_read_memory(
     params.insert("attempt".to_string(), Value::Int64(attempt));
     params.insert("executor_node_id".to_string(), text(executor_node_id));
     params.insert("output".to_string(), text(&encode_payload(output)));
-    params.insert("receipt".to_string(), Value::Json(receipt.into()));
+    params.insert("receipt".to_string(), Value::Json(receipt));
     params.insert("completed_at".to_string(), Value::Timestamp(now_ms));
     db.execute_with_read_memory(
         "INSERT INTO work_results (job_id, attempt, executor_node_id, output, receipt, \
@@ -2522,7 +2523,7 @@ pub fn advertise_capability_with_read_memory(
     params.insert("capability_id".to_string(), text(capability_id));
     params.insert(
         "tags".to_string(),
-        Value::Json(serde_json::json!(tags).into()),
+        Value::Json(serde_json::json!(tags)),
     );
     params.insert("detail".to_string(), Value::Null);
     params.insert("advertised_at".to_string(), Value::Timestamp(now_ms));
