@@ -3073,6 +3073,7 @@ pub(crate) enum BoundedSourceTouch {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct BoundedExecutionTelemetry {
     pub(crate) work_units: u64,
+    pub(crate) native_source_touches: u64,
     pub(crate) source_work: BTreeMap<BoundedWorkSource, u64>,
     pub(crate) source_peak_temporary_bytes: BTreeMap<BoundedWorkSource, u64>,
     pub(crate) encoded_bytes: u64,

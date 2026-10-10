@@ -5329,14 +5329,13 @@ impl IndexState {
                 "dormant raw vector candidate has no loader".to_string(),
             ))
         })?;
-        // Exact fallback touches the partition membership and then its stored
-        // body. Both are physical work in addition to the distance calculation
-        // charged below; a bounded caller pays once for each touch.
+        // Membership and body reads are native source steps. Only scoring is
+        // logical distance work; page admission bounds these physical reads.
         if caller_charged && bodies.is_some() {
             if !membership_streamed {
-                before_distance()?;
+                before_checkpoint()?;
             }
-            before_distance()?;
+            before_checkpoint()?;
         }
         let mut interrupted = None;
         let mut caller_reserved = 0usize;
