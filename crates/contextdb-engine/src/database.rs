@@ -43990,10 +43990,14 @@ impl Database {
             self.forced_change_log_gap_through
                 .store(self.current_lsn().0, Ordering::SeqCst);
             let mut change_log = self.change_log.write();
-            self.finalization.accountant
-                .release(crate::composite_store::change_log_retained_bytes(
-                    &change_log,
-                ));
+            // Captured-image history is funded by LoadedImageHistoryCharge's
+            // reader owner, not by the writer's retained-log accountant.
+            if self.read_image_memory.is_none() {
+                self.finalization.accountant
+                    .release(crate::composite_store::change_log_retained_bytes(
+                        &change_log,
+                    ));
+            }
             change_log.clear();
             drop(change_log);
             self.change_log_table_index.write().clear();
