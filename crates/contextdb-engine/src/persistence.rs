@@ -37479,6 +37479,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         &self,
         records: &[VectorPartitionMembershipRecord],
     ) -> Result<()> {
+        let _decode_scope = self.writer_decode_scope()?;
         self.prepare_proof_owner()?;
         if records.is_empty() {
             return Ok(());
@@ -37526,6 +37527,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         &self,
         records: &[VectorPartitionMembershipRecord],
     ) -> Result<()> {
+        let _decode_scope = self.writer_decode_scope()?;
         self.prepare_proof_owner()?;
         if records.is_empty() {
             return Ok(());
