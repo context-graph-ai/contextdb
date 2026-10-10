@@ -3395,7 +3395,9 @@ mod received_schema_stage_tests {
 
     #[test]
     fn staged_vector_replacement_releases_retired_hnsw_and_negative_delta() {
-        let accountant = Arc::new(MemoryAccountant::with_budget(4096));
+        // Fund the counted preparation controls as well as the vector fixture.
+        // The invariant below is exact retirement back to the opening balance.
+        let accountant = Arc::new(MemoryAccountant::with_budget(8 * 1024));
         let db = Database::open_memory_with_accountant(accountant.clone());
         let baseline = accountant.usage().used;
         let index = VectorIndexRef::new("retired", "embedding");
@@ -3404,9 +3406,15 @@ mod received_schema_stage_tests {
                 index.clone(),
                 2,
                 contextdb_core::VectorQuantization::F32,
-                db.accountant.clone(),
+                Arc::clone(&db.finalization.vector_accountant),
             )
             .expect("read or publish the admitted vector fixture");
+        accountant
+            .try_allocate(contextdb_vector::stored_vector_resident_bytes(
+                2,
+                contextdb_core::VectorQuantization::F32,
+            ))
+            .unwrap();
         db.vector_store
             .insert_loaded_vector(
                 VectorEntry {
@@ -3417,10 +3425,11 @@ mod received_schema_stage_tests {
                     deleted_tx: None,
                     lsn: Lsn(1),
                 },
-                db.accountant.clone(),
+                Arc::clone(&db.finalization.vector_accountant),
             )
             .expect("read or publish the admitted vector fixture");
         let state = db.vector_store.try_state(&index).unwrap();
+        accountant.try_allocate(64).unwrap();
         state.set_hnsw_bytes(64);
         let received_schema_read_memory_10 = db
             .declared_reader_memory()
@@ -3443,7 +3452,13 @@ mod received_schema_stage_tests {
                 received_schema_read_memory_10,
             )
             .unwrap();
+        assert_eq!(db.tx_mgr.commit_index_len(), 0);
         db.publish_received_schema_stage(stage);
+        // This fixture bypasses the transaction manager: publication funds
+        // its future commit-index entry, but no such entry is installed here.
+        assert_eq!(db.tx_mgr.commit_index_len(), 0);
+        accountant.release(crate::composite_store::COMMIT_INDEX_ENTRY_BYTES);
+        drop(state);
         let vector_fixture_reader_8 = db
             .declared_reader_memory()
             .expect("admit the vector fixture reader");
