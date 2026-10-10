@@ -86,6 +86,7 @@ impl GraphCursorOwner {
             _credit: credit,
         }
     }
+    #[allow(clippy::should_implement_trait)] // The owner exposes its boxed cursor without releasing its credit.
     pub fn as_ref(&self) -> &dyn GraphCursor {
         self.payload.as_ref()
     }

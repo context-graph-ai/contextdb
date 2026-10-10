@@ -431,9 +431,7 @@ where
         return Ok(());
     }
     let capacity = storage
-        .capacity()
-        .checked_mul(2)
-        .unwrap_or(usize::MAX)
+        .capacity().saturating_mul(2)
         .max(4);
     let requested = checked_graph_add(
         bounded_capacity_bytes::<T>(capacity, "predecessor storage").map_err(E::from)?,
