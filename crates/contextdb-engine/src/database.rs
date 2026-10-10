@@ -37172,17 +37172,29 @@ impl Database {
             .into_iter()
             .filter(|placed| {
                 let entry = &placed.entry;
-                row_versions
-                    .binary_search_by_key(
-                        &(
-                            entry.index.table.as_str(),
-                            entry.row_id,
-                            placed.membership.owning_row_tx,
-                            placed.membership.row_lsn,
-                        ),
-                        |(table, row)| (*table, row.row_id, row.created_tx, row.lsn),
-                    )
-                    .is_ok()
+                // Memory-only vectors retain independent MVCC stamps through
+                // the legacy library insertion door. Their owning row is
+                // identified by row id; durable placements carry exact stamps.
+                (if self.persistence.is_none() {
+                    row_versions
+                        .binary_search_by_key(
+                            &(entry.index.table.as_str(), entry.row_id),
+                            |(table, row)| (*table, row.row_id),
+                        )
+                        .is_ok()
+                } else {
+                    row_versions
+                        .binary_search_by_key(
+                            &(
+                                entry.index.table.as_str(),
+                                entry.row_id,
+                                placed.membership.owning_row_tx,
+                                placed.membership.row_lsn,
+                            ),
+                            |(table, row)| (*table, row.row_id, row.created_tx, row.lsn),
+                        )
+                        .is_ok()
+                })
                     && semantic.tables.get(&entry.index.table).is_some_and(|meta| {
                         meta.columns.iter().any(|column| {
                             column.name == entry.index.column
