@@ -1660,11 +1660,8 @@ fn last_membership_cleanup_keeps_catalog_targets_with_a_pinned_retired_chain() {
                         .unwrap()
                         .insert(0, b"damaged-fence".as_slice())
                         .unwrap();
-                    write
-                        .open_table(TableDefinition::<&str, u64>::new("vector_paged_counters"))
-                        .unwrap()
-                        .insert("next_storage_id", 2)
-                        .unwrap();
+                    // Retirement does not rewind the live storage namespace:
+                    // B and C still own their allocated page roots.
                     write.commit().unwrap();
                     Ok(())
                 })
