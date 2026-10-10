@@ -148,6 +148,7 @@ impl<T: ?Sized> OwnedReadBox<T> {
             _credit: credit,
         }
     }
+    #[allow(clippy::should_implement_trait)] // The owner projects its payload while retaining the read credit.
     pub fn as_ref(&self) -> &T {
         &self.payload
     }

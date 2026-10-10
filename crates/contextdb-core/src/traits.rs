@@ -30,6 +30,7 @@ pub trait RelationalExecutor: Send + Sync {
 }
 
 pub trait GraphExecutor: Send + Sync {
+#[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
     fn bfs(
         &self,
         start: NodeId,
