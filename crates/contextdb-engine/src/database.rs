@@ -2927,6 +2927,9 @@ mod received_schema_stage_tests {
             deleted_tx: None,
             lsn: Lsn(12),
         };
+        db.accountant
+            .try_allocate(old_edge.estimated_bytes())
+            .expect("fund the graph fixture that finalization refunds");
         db.graph_store.apply_inserts(vec![old_edge.clone()]);
         let ddl = DdlChange::AlterTable {
             name: "embeddings".to_string(),
@@ -3475,6 +3478,9 @@ mod received_schema_stage_tests {
             deleted_tx: None,
             lsn: Lsn(1),
         };
+        db.accountant
+            .try_allocate(graph_entry.estimated_bytes())
+            .expect("fund the graph fixture that finalization refunds");
         db.graph_store.apply_inserts(vec![graph_entry]);
         let vector_index = VectorIndexRef::new("kept", "embedding");
         db.vector_store
