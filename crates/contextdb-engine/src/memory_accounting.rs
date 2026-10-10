@@ -235,9 +235,7 @@ struct WriterRegistration {
     users: usize,
     limit: Arc<AtomicUsize>,
     used: Arc<WriterCounter>,
-    // Attribution is retained in every profile; only the test-seam observer
-    // reads it. It has no admission or last-use authority.
-    #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
+    // The engine's backing for this accountant, refunded at last use.
     engine_backing_bytes: AtomicUsize,
     adapter_control_bytes: AtomicUsize,
     next: Option<Box<WriterRegistration>>,
@@ -282,10 +280,17 @@ impl ProcessWriterBudgetDomain {
                 if record.users != 0 { return; }
                 let mut record = slot.take().expect("last-use registration");
                 *slot = record.next.take();
+                // The engine's custody of this accountant ends with its last
+                // use: the registration and the engine's backing for the
+                // accountant both leave the books here. A holder that keeps
+                // the accountant afterwards holds it outside the engine.
+                let backing = record.engine_backing_bytes.load(Ordering::SeqCst);
                 // Only counter handles and inert receipt state remain in the
                 // detached record. No payload destructor runs under this gate.
                 drop(record);
-                accountant.release_under_exclusive_gate(Layout::new::<WriterRegistration>().size());
+                accountant.release_under_exclusive_gate(
+                    Layout::new::<WriterRegistration>().size() + backing,
+                );
                 return;
             }
             slot = &mut slot.as_mut().expect("registration exists").next;
