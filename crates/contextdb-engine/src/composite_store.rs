@@ -1407,6 +1407,8 @@ impl CompositeStore {
         self.graph.apply_deletes_ref(&ws.adj_deletes);
         self.graph.apply_inserts_ref(&ws.adj_inserts);
         if let Some(publication) = partition_mutations.vector_publication {
+            #[cfg(feature = "test-seams")]
+            abort_before_vector_publication_for_test();
             self.vector.publish_prepared_partitioned_batch(
                 publication,
                 partition_mutations.commit_lsn,
@@ -1614,5 +1616,21 @@ mod tests {
             table_index.read().contains_key("kept"),
             "unaffected table history and newly published deletes remain indexed"
         );
+    }
+}
+
+/// Crash seam (test-seams only): when the named environment variable holds a
+/// marker path, a commit whose durable transaction has already committed
+/// writes `reached` to that path and aborts the process before any vector
+/// state is published in memory. Production builds contain no such path.
+#[cfg(feature = "test-seams")]
+pub const ABORT_BEFORE_VECTOR_PUBLICATION_ENV: &str =
+    "CONTEXTDB_TEST_ABORT_AFTER_DURABLE_COMMIT_BEFORE_VECTOR_PUBLICATION";
+
+#[cfg(feature = "test-seams")]
+fn abort_before_vector_publication_for_test() {
+    if let Some(marker) = std::env::var_os(ABORT_BEFORE_VECTOR_PUBLICATION_ENV) {
+        let _ = std::fs::write(&marker, b"reached");
+        std::process::abort();
     }
 }

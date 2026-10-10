@@ -23,7 +23,7 @@ use parking_lot::{Condvar, Mutex, RwLock};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 
 // unpartitioned_vector_membership_pages_reload_at_constant_residency observes private directory owners.
 #[cfg(feature = "test-seams")]
@@ -91,6 +91,49 @@ pub struct VectorPassiveActivityCounters {
     pub hnsw_repairs_or_compactions: u64,
     pub raw_partition_evictions: u64,
     pub sealed_generation_evictions: u64,
+}
+
+/// Work a partitioned write spends on the declared partition cap (CDB-120).
+#[cfg(any(test, feature = "test-seams"))]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VectorCapWorkCountersForTest {
+    /// Routes projected by partitioned-batch preparation.
+    pub projected_routes: u64,
+    /// Counted-empty routes the exact cap edge examined.
+    pub cap_edge_route_visits: u64,
+    /// Indexed hold lookups made by reclaim selection, one per snapshot.
+    pub hold_lookups: u64,
+    /// Partition-map lookups the cap edge made to confirm each candidate's
+    /// identity: one per examined candidate, carried key included.
+    pub cap_edge_identity_probes: u64,
+    /// Membership records the hold check streamed because a durable route
+    /// had no usable occupancy index (zero on every indexed path).
+    pub hold_streamed_records: u64,
+}
+
+/// The cap occupancy and directory figure a column maintains, beside the
+/// same figures recounted from every partition and row map.
+#[cfg(any(test, feature = "test-seams"))]
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VectorPartitionLimitAuditForTest {
+    pub occupied: usize,
+    pub recounted_occupied: usize,
+    pub empty_counted: Vec<VectorPartitionKey>,
+    pub recounted_empty_counted: Vec<VectorPartitionKey>,
+    pub directory_bytes: usize,
+    pub recounted_directory_bytes: usize,
+}
+
+#[derive(Default)]
+#[cfg_attr(not(any(test, feature = "test-seams")), allow(dead_code))]
+struct VectorCapWork {
+    projected_routes: AtomicU64,
+    cap_edge_route_visits: AtomicU64,
+    hold_lookups: AtomicU64,
+    cap_edge_identity_probes: AtomicU64,
+    hold_streamed_records: AtomicU64,
 }
 
 /// Exact retained-owner categories sampled without changing residency.
@@ -1128,6 +1171,211 @@ impl VectorDirectoryOwnership {
             .saturating_add(self.partition_vectors)
             .saturating_add(self.typed_partition_keys)
     }
+}
+
+/// A partition's standing toward its column's declared partition cap. Counted
+/// means retained entries on a route that is not historical-only (the cap
+/// predicate); counted-empty additionally has no live vector, which makes it
+/// the only kind of route a capacity-expanding write may try to reclaim.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum PartitionLimitClass {
+    #[default]
+    NotCounted,
+    CountedLive,
+    CountedEmpty,
+}
+
+impl PartitionLimitClass {
+    fn counted(self) -> bool {
+        self != Self::NotCounted
+    }
+}
+
+/// The link inside each attached state holds one shared copy of its map key,
+/// priced in the directory figure with the key (`partition_entry_terms`) and
+/// admitted with each new partition (`prepared_directory_growth_upper_bound`).
+/// The counted-empty set holds one weak state handle and one shared key
+/// handle per counted-empty route, a fixed per-route term bounded by the
+/// declared cap; it never copies a key.
+#[derive(Default)]
+struct PartitionLimitTally {
+    occupied: usize,
+    empty_counted: HashMap<usize, (Weak<IndexState>, Arc<VectorPartitionKey>)>,
+}
+
+/// The retained bytes of the cap link's own key copy: the shared allocation
+/// header plus the key.
+fn partition_link_key_bytes(key_bytes: usize) -> usize {
+    key_bytes.saturating_add(2 * std::mem::size_of::<usize>())
+}
+
+/// Derived in-memory occupancy of one column's partition cap. Every state
+/// mutation that can change a partition's class reports only its difference
+/// here, so admission reads the count without visiting other partitions.
+/// Open, reload and clear rebuild it as states enter or leave the map.
+#[derive(Default)]
+struct PartitionLimitLedger {
+    tally: Mutex<PartitionLimitTally>,
+}
+
+impl PartitionLimitLedger {
+    fn apply(
+        &self,
+        state: &Weak<IndexState>,
+        key: &Arc<VectorPartitionKey>,
+        old: PartitionLimitClass,
+        new: PartitionLimitClass,
+    ) {
+        if old == new {
+            return;
+        }
+        let mut tally = self.tally.lock();
+        if old.counted() {
+            tally.occupied = tally
+                .occupied
+                .checked_sub(1)
+                .expect("partition cap occupancy never goes below zero");
+        }
+        if new.counted() {
+            tally.occupied += 1;
+        }
+        if old == PartitionLimitClass::CountedEmpty {
+            tally.empty_counted.remove(&(state.as_ptr() as usize));
+        }
+        if new == PartitionLimitClass::CountedEmpty {
+            tally
+                .empty_counted
+                .insert(state.as_ptr() as usize, (state.clone(), key.clone()));
+        }
+    }
+
+    fn occupied(&self) -> usize {
+        self.tally.lock().occupied
+    }
+
+    fn empty_counted_len(&self) -> usize {
+        self.tally.lock().empty_counted.len()
+    }
+
+    /// Edge path only: at most the declared cap, priced by the caller. Each
+    /// candidate carries its own key, so no route is identified by a search.
+    fn empty_counted(&self) -> Vec<(Arc<IndexState>, Arc<VectorPartitionKey>)> {
+        self.tally
+            .lock()
+            .empty_counted
+            .values()
+            .filter_map(|(state, key)| state.upgrade().map(|state| (state, key.clone())))
+            .collect()
+    }
+}
+
+#[derive(Default)]
+struct PartitionLimitLink {
+    ledger: Weak<PartitionLimitLedger>,
+    /// This state, as the ledger's counted-empty set holds it.
+    this: Weak<IndexState>,
+    /// This state's map key, held once and shared with the counted-empty set.
+    key: Option<Arc<VectorPartitionKey>>,
+    class: PartitionLimitClass,
+    /// Directory figure of this state last reported to the column tally.
+    directory_bytes: usize,
+    directory: Weak<DirectoryTally>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct ResidentPendingMarks {
+    newest_open_created: Option<TxId>,
+    newest_tombstone: Option<TxId>,
+}
+
+impl ResidentPendingMarks {
+    fn note(&mut self, entry: &RawVectorDirectoryEntry) {
+        match entry.deleted_tx {
+            None => {
+                self.newest_open_created = self.newest_open_created.max(Some(entry.created_tx));
+            }
+            Some(deleted) => self.newest_tombstone = self.newest_tombstone.max(Some(deleted)),
+        }
+    }
+
+    fn of(directory: &[RawVectorDirectoryEntry]) -> Self {
+        let mut marks = Self::default();
+        for entry in directory {
+            marks.note(entry);
+        }
+        marks
+    }
+}
+
+/// Reports a state's class and directory differences when a mutator returns,
+/// after the mutator's own field guards (declared later) have dropped.
+struct ReclassifyOnReturn<'a>(&'a IndexState);
+
+impl Drop for ReclassifyOnReturn<'_> {
+    fn drop(&mut self) {
+        self.0.reclassify_limit();
+    }
+}
+
+/// Derived retained-directory figure of one column. Partition states report
+/// their own directory differences; row-map mutators report theirs. The
+/// figure equals `VectorColumnState::directory_ownership_recount`.
+#[derive(Default)]
+struct DirectoryTally {
+    figures: Mutex<DirectoryFigures>,
+}
+
+#[derive(Default, Clone, Copy)]
+struct DirectoryFigures {
+    raw_reverse_directory: usize,
+    partition_vectors: usize,
+    typed_partition_keys: usize,
+}
+
+impl DirectoryTally {
+    fn adjust(&self, apply: impl FnOnce(&mut DirectoryFigures)) {
+        apply(&mut self.figures.lock());
+    }
+
+    fn figures(&self) -> DirectoryFigures {
+        *self.figures.lock()
+    }
+}
+
+fn add_signed(value: &mut usize, before: usize, after: usize) {
+    *value = value
+        .checked_sub(before)
+        .expect("derived vector-directory figure never goes below zero")
+        .saturating_add(after);
+}
+
+/// Per-partition retained directory terms outside its raw reverse directory:
+/// the map entry and state, the map key, and the cap link's shared key copy.
+fn partition_entry_terms(key_bytes: usize) -> (usize, usize) {
+    let vectors = std::mem::size_of::<Arc<IndexState>>()
+        .saturating_add(IndexState::allocation_bytes())
+        .saturating_add(std::mem::size_of::<usize>().saturating_mul(3));
+    (vectors, key_bytes.saturating_add(partition_link_key_bytes(key_bytes)))
+}
+
+fn row_entry_terms(key: &VectorPartitionKey) -> (usize, usize) {
+    (
+        std::mem::size_of::<(RowId, Arc<VectorPartitionKey>)>(),
+        key.estimated_bytes()
+            .saturating_add(2 * std::mem::size_of::<usize>()),
+    )
+}
+
+fn history_entry_terms(keys: &[Arc<VectorPartitionKey>], capacity: usize) -> (usize, usize) {
+    let vectors = std::mem::size_of::<(RowId, Vec<Arc<VectorPartitionKey>>)>().saturating_add(
+        capacity.saturating_mul(std::mem::size_of::<Arc<VectorPartitionKey>>()),
+    );
+    let typed = keys.iter().fold(0usize, |bytes, key| {
+        bytes
+            .saturating_add(key.estimated_bytes())
+            .saturating_add(2 * std::mem::size_of::<usize>())
+    });
+    (vectors, typed)
 }
 
 /// A durable catalog entry that is known to be valid but whose graph pages are
@@ -2454,6 +2702,14 @@ pub struct IndexState {
     /// flag retires only its maintained graph/count identity, without
     /// allocating a second copy of that key in a side registry.
     historical_only: AtomicBool,
+    /// This state's cap class and directory figure as last reported to the
+    /// column that holds it. Mutators report differences on return.
+    limit_link: Mutex<PartitionLimitLink>,
+    /// Resident pending-work marks, kept exact by the directory mutators:
+    /// the newest creation among open entries and the newest tombstone, so
+    /// the cap edge answers "any pending work after this frontier" without a
+    /// walk of the route's history.
+    pending_marks: Mutex<ResidentPendingMarks>,
     hnsw: OnceLock<RwLock<Option<HnswIndex>>>,
     hnsw_bytes: AtomicUsize,
     hnsw_accountant: RwLock<Option<Arc<dyn MemoryBudget>>>,
@@ -2592,6 +2848,8 @@ impl IndexState {
             raw_payload_counter: RwLock::new(Arc::new(AtomicUsize::new(0))),
             raw_payload_header_counter: RwLock::new(Arc::new(AtomicUsize::new(0))),
             historical_only: AtomicBool::new(false),
+            limit_link: Mutex::new(PartitionLimitLink::default()),
+            pending_marks: Mutex::new(ResidentPendingMarks::default()),
             hnsw: OnceLock::new(),
             hnsw_bytes: AtomicUsize::new(0),
             hnsw_accountant: RwLock::new(None),
@@ -2667,10 +2925,121 @@ impl IndexState {
 
     fn mark_historical_only(&self) {
         self.historical_only.store(true, Ordering::SeqCst);
+        self.reclassify_limit();
     }
 
     fn reactivate_maintained_state(&self) {
         self.historical_only.store(false, Ordering::SeqCst);
+        self.reclassify_limit();
+    }
+
+    /// Whether this resident partition has pending inserts or tombstones
+    /// after `covered`, from its fixed marks.
+    fn resident_pending_after(&self, covered: Option<TxId>) -> bool {
+        let marks = *self.pending_marks.lock();
+        let after =
+            |tx: Option<TxId>| tx.is_some_and(|tx| covered.is_none_or(|covered| tx > covered));
+        after(marks.newest_open_created) || after(marks.newest_tombstone)
+    }
+
+    fn limit_class(&self) -> PartitionLimitClass {
+        if self.is_historical_only() || self.entry_count() == 0 {
+            PartitionLimitClass::NotCounted
+        } else if self.vector_count() == 0 {
+            PartitionLimitClass::CountedEmpty
+        } else {
+            PartitionLimitClass::CountedLive
+        }
+    }
+
+    /// Report this state's own class and directory differences to the column
+    /// holding it. Callers have released every field guard they took; the
+    /// work reads only this partition's fixed counts and reverse directory.
+    fn reclassify_limit(&self) {
+        let mut link = self.limit_link.lock();
+        let Some(ledger) = link.ledger.upgrade() else {
+            return;
+        };
+        let class = self.limit_class();
+        let key = link.key.clone().expect("an attached partition state holds its key");
+        ledger.apply(&link.this, &key, link.class, class);
+        link.class = class;
+        if let Some(directory) = link.directory.upgrade() {
+            let bytes = self.directory_byte_count();
+            let before = link.directory_bytes;
+            if bytes != before {
+                directory.adjust(|figures| {
+                    add_signed(&mut figures.raw_reverse_directory, before, bytes);
+                });
+                link.directory_bytes = bytes;
+            }
+        }
+    }
+
+    /// Enter one column's map under `key`. Idempotent for the same column and
+    /// key; a state moved from another column leaves that column first.
+    fn attach_limit(
+        this: &Arc<Self>,
+        ledger: &Arc<PartitionLimitLedger>,
+        directory: &Arc<DirectoryTally>,
+        key: &VectorPartitionKey,
+    ) {
+        {
+            let link = this.limit_link.lock();
+            if std::ptr::eq(link.ledger.as_ptr(), Arc::as_ptr(ledger)) {
+                drop(link);
+                this.reclassify_limit();
+                return;
+            }
+        }
+        this.detach_limit();
+        let mut link = this.limit_link.lock();
+        let weak = Arc::downgrade(this);
+        let key = Arc::new(key.clone());
+        let class = this.limit_class();
+        ledger.apply(&weak, &key, PartitionLimitClass::NotCounted, class);
+        let bytes = this.directory_byte_count();
+        let (vectors, keys) = partition_entry_terms(key.estimated_bytes());
+        directory.adjust(|figures| {
+            figures.raw_reverse_directory = figures.raw_reverse_directory.saturating_add(bytes);
+            figures.partition_vectors = figures.partition_vectors.saturating_add(vectors);
+            figures.typed_partition_keys = figures.typed_partition_keys.saturating_add(keys);
+        });
+        *link = PartitionLimitLink {
+            ledger: Arc::downgrade(ledger),
+            this: weak,
+            key: Some(key),
+            class,
+            directory_bytes: bytes,
+            directory: Arc::downgrade(directory),
+        };
+    }
+
+    /// Leave `ledger`'s column if this state is attached there; a state
+    /// shared with a staged image stays with its live column.
+    fn detach_limit_from(&self, ledger: &Arc<PartitionLimitLedger>) {
+        if std::ptr::eq(self.limit_link.lock().ledger.as_ptr(), Arc::as_ptr(ledger)) {
+            self.detach_limit();
+        }
+    }
+
+    /// Leave the column map this state was attached to, if any.
+    fn detach_limit(&self) {
+        let mut link = self.limit_link.lock();
+        let previous = std::mem::take(&mut *link);
+        drop(link);
+        let (Some(ledger), Some(key)) = (previous.ledger.upgrade(), previous.key) else {
+            return;
+        };
+        ledger.apply(&previous.this, &key, previous.class, PartitionLimitClass::NotCounted);
+        if let Some(directory) = previous.directory.upgrade() {
+            let (vectors, keys) = partition_entry_terms(key.estimated_bytes());
+            directory.adjust(|figures| {
+                add_signed(&mut figures.raw_reverse_directory, previous.directory_bytes, 0);
+                add_signed(&mut figures.partition_vectors, vectors, 0);
+                add_signed(&mut figures.typed_partition_keys, keys, 0);
+            });
+        }
     }
 
     fn set_serving_policy(&self, policy: ResolvedVectorPolicy) {
@@ -2776,6 +3145,7 @@ impl IndexState {
         entries: Vec<RawVectorDirectoryEntry>,
         loader: Arc<dyn DormantRawVectorLoader>,
     ) -> Result<()> {
+        let _reclassify = ReclassifyOnReturn(self);
         let _gate = self.raw_residency_gate.write();
         if !self.vectors.read().entries.is_empty() || !self.raw_directory.read().is_empty() {
             return Err(Error::Other(
@@ -2795,6 +3165,7 @@ impl IndexState {
         mut expected: Vec<RawVectorDirectoryEntry>,
         loader: Arc<dyn DormantRawVectorLoader>,
     ) -> Result<()> {
+        let _reclassify = ReclassifyOnReturn(self);
         let _gate = self.raw_residency_gate.write();
         let order = |entry: &RawVectorDirectoryEntry| {
             (
@@ -2835,6 +3206,7 @@ impl IndexState {
         payload: Arc<AtomicUsize>,
         payload_headers: Arc<AtomicUsize>,
     ) {
+        let _reclassify = ReclassifyOnReturn(self);
         // All durable bodies, including new writes, use the declared page
         // cache. Retaining decoded bodies here would create an additional
         // population-sized cache outside that share.
@@ -2852,6 +3224,32 @@ impl IndexState {
         *self.raw_payload_header_counter.write() = payload_headers;
     }
 
+    /// Whether any retained membership of this partition is visible to one of
+    /// `snapshots`. Resident partitions answer from their maintained
+    /// visibility boundaries (two binary searches per snapshot); durable
+    /// partitions from their source's occupancy-interval index. Neither reads
+    /// a membership record.
+    fn visible_at_any_registered(
+        &self,
+        snapshots: &[SnapshotId],
+        owner: &mut VectorCopyAdmission,
+        streamed_records: &mut u64,
+    ) -> Result<bool> {
+        if snapshots.is_empty() {
+            return Ok(false);
+        }
+        if let Some(source) = self.durable_membership_source() {
+            let mut local_copy_admission = owner.local_scratch();
+            let owner = local_copy_admission.as_mut().unwrap_or(owner);
+            if let Some(visible) = source.occupancy_visible_at_any(snapshots, owner)? {
+                return Ok(visible);
+            }
+            return self.durable_visible_at_any(snapshots, owner, streamed_records);
+        }
+        let counts = self.visibility_counts.read();
+        Ok(snapshots.iter().any(|snapshot| counts.count(*snapshot) != 0))
+    }
+
     /// Whether any retained membership of this durable partition is visible
     /// to one of `snapshots`. Streams the durable directory once; an incomplete
     /// read refuses the preparation before any partition is retired.
@@ -2859,6 +3257,7 @@ impl IndexState {
         &self,
         snapshots: &[SnapshotId],
         owner: &mut VectorCopyAdmission,
+        streamed_records: &mut u64,
     ) -> Result<bool> {
         let Some(source) = self.durable_membership_source() else {
             return Ok(true);
@@ -2872,6 +3271,7 @@ impl IndexState {
             while let Some(entry) =
                 with_copy_admission(&mut scratch, |request| cursor.next(request))?
             {
+                *streamed_records += 1;
                 if snapshots.iter().any(|snapshot| {
                     entry.membership.visible_from.0 <= snapshot.0
                         && entry
@@ -3007,6 +3407,7 @@ impl IndexState {
     }
 
     fn apply_refreshed_durable_counts(&self, summary: RawVectorMembershipSummary) {
+        let _reclassify = ReclassifyOnReturn(self);
         let previous = std::mem::replace(&mut *self.durable_counts.lock(), summary);
         if previous == summary {
             return;
@@ -3285,6 +3686,7 @@ impl IndexState {
         payload: Arc<AtomicUsize>,
         payload_headers: Arc<AtomicUsize>,
     ) {
+        let _reclassify = ReclassifyOnReturn(self);
         let summary = RawVectorMembershipSummary {
             entries: self.entry_count(),
             live_entries: self.vector_count(),
@@ -3296,6 +3698,7 @@ impl IndexState {
             *vectors = PartitionVectors::default();
             *self.raw_directory.write() = Vec::new();
             *self.raw_directory_by_row.write() = HashMap::new();
+            *self.pending_marks.lock() = ResidentPendingMarks::default();
             *self.visibility_counts.write() = VectorVisibilityCounts::default();
             self.raw_resident_bytes.store(0, Ordering::SeqCst);
             self.raw_accountant.write().take();
@@ -4046,26 +4449,26 @@ impl IndexState {
     }
 
     fn directory_byte_count(&self) -> usize {
-        let directory_bytes = self.raw_directory.read().len().saturating_mul(
+        let directory_len = self.raw_directory.read().len();
+        let directory_bytes = directory_len.saturating_mul(
             std::mem::size_of::<RawVectorDirectoryEntry>()
                 + std::mem::size_of::<StoredVectorEntry>()
                 + std::mem::size_of::<(usize, usize)>(),
         );
-        let by_row = self.raw_directory_by_row.read();
+        let rows = self.raw_directory_by_row.read().len();
+        // Every directory position is listed under exactly one row identity
+        // (`push_entry`, `rebuild_raw_directory_positions`), so the position
+        // lists hold exactly `directory_len` slots. Reading the length keeps
+        // a per-insert refresh constant instead of a walk of the partition.
         directory_bytes
             .saturating_add(self.visibility_counts.read().retained_bytes())
-            .saturating_add(
-                by_row
-                    .len()
-                    .saturating_mul(std::mem::size_of::<(RowId, Vec<usize>)>()),
-            )
-            .saturating_add(by_row.values().fold(0usize, |bytes, positions| {
-                bytes.saturating_add(positions.len().saturating_mul(std::mem::size_of::<usize>()))
-            }))
+            .saturating_add(rows.saturating_mul(std::mem::size_of::<(RowId, Vec<usize>)>()))
+            .saturating_add(directory_len.saturating_mul(std::mem::size_of::<usize>()))
     }
 
     fn rebuild_raw_directory_positions(&self) {
         let directory = self.raw_directory.read();
+        *self.pending_marks.lock() = ResidentPendingMarks::of(&directory);
         let mut by_row = HashMap::<RowId, Vec<usize>>::new();
         for (position, entry) in directory.iter().enumerate() {
             by_row.entry(entry.row_id).or_default().push(position);
@@ -5284,6 +5687,7 @@ impl IndexState {
     }
 
     fn push_entry(&self, entry: StoredVectorEntry) {
+        let _reclassify = ReclassifyOnReturn(self);
         debug_assert!(self.raw_resident.load(Ordering::SeqCst));
         let mut directory = self.raw_directory.write();
         let position = directory.len();
@@ -5293,6 +5697,7 @@ impl IndexState {
             counts.add(&identity);
             counts.set_interval(position, &identity);
         }
+        self.pending_marks.lock().note(&identity);
         directory.push(identity);
         #[cfg(feature = "test-seams")]
         {
@@ -5410,6 +5815,7 @@ impl IndexState {
     }
 
     fn tombstone_row(&self, row_id: RowId, deleted_tx: TxId) -> usize {
+        let _reclassify = ReclassifyOnReturn(self);
         debug_assert!(self.raw_resident.load(Ordering::SeqCst));
         let mut released = 0usize;
         let mut vectors = self.vectors.write();
@@ -5470,10 +5876,14 @@ impl IndexState {
             VectorVisibilityCounts::insert(&mut counts.deleted, boundary);
             counts.set_interval(directory_position, entry);
         }
+        // The walk above already visited this partition's directory; one more
+        // pass over the same entries keeps the pending marks exact.
+        *self.pending_marks.lock() = ResidentPendingMarks::of(&self.raw_directory.read());
         released
     }
 
     fn clear_entries(&self) {
+        let _reclassify = ReclassifyOnReturn(self);
         let _gate = self.raw_residency_gate.write();
         let mut vectors = self.vectors.write();
         vectors.entries.clear();
@@ -5482,6 +5892,7 @@ impl IndexState {
         vectors.owned_payload_bytes = 0;
         self.raw_directory.write().clear();
         self.raw_directory_by_row.write().clear();
+        *self.pending_marks.lock() = ResidentPendingMarks::default();
         *self.visibility_counts.write() = VectorVisibilityCounts::default();
         self.raw_loader.write().take();
         self.durable_memberships.write().take();
@@ -5520,6 +5931,7 @@ impl IndexState {
         &self,
         mut keep: impl FnMut(&RawVectorDirectoryEntry) -> bool,
     ) -> usize {
+        let _reclassify = ReclassifyOnReturn(self);
         let _gate = self.raw_residency_gate.write();
         if self.raw_directory.read().iter().all(&mut keep) {
             return 0;
@@ -5543,6 +5955,7 @@ impl IndexState {
     /// the one caller and reaches here only on that branch; a dormant
     /// partition takes its directory-only path instead.
     fn retain_entries(&self, mut keep: impl FnMut(&StoredVectorEntry) -> bool) -> usize {
+        let _reclassify = ReclassifyOnReturn(self);
         debug_assert!(self.raw_resident.load(Ordering::SeqCst));
         let state_owned = self.raw_accountant.read().is_some();
         let mut vectors = self.vectors.write();
@@ -9347,7 +9760,8 @@ fn prepared_directory_growth_upper_bound_matching(
                 .saturating_add(std::mem::size_of::<Arc<IndexState>>())
                 .saturating_add(IndexState::allocation_bytes())
                 .saturating_add(std::mem::size_of::<usize>().saturating_mul(3))
-                .saturating_add(key.estimated_bytes());
+                .saturating_add(key.estimated_bytes())
+                .saturating_add(partition_link_key_bytes(key.estimated_bytes()));
         }
     }
     for partition in reclaimable_partitions
@@ -9451,6 +9865,15 @@ struct VectorColumnState {
     /// The current directory above stays the fast path; this one makes an old
     /// snapshot resolve its own placement without probing every partition.
     row_partition_history: RwLock<HashMap<RowId, Vec<Arc<VectorPartitionKey>>>>,
+    /// Derived cap occupancy of `partitions`, maintained by state mutators.
+    limit_ledger: Arc<PartitionLimitLedger>,
+    /// Derived retained-directory figure of the maps above.
+    directory_tally: Arc<DirectoryTally>,
+    /// A live column keeps the two derived figures above. A staged column
+    /// (a replacement image under preparation, which may share states with
+    /// the live column it replaces) recounts instead and goes live when it
+    /// is installed.
+    derived: AtomicBool,
     /// Registration declares the owner of every resident registry/directory
     /// image, including memory stores. Preparation admits its retained bytes;
     /// DROP COLUMN/TABLE returns them once, independent of cache state.
@@ -9470,19 +9893,137 @@ impl VectorColumnState {
                 Arc::new(IndexState::new(layout.dimension, layout.quantization)),
             );
         }
-        Self {
+        let column = Self {
             layout: RwLock::new(layout),
             partitions: RwLock::new(partitions),
             row_to_partition: RwLock::new(HashMap::new()),
             durable_reverse_memberships: RwLock::new(None),
             durable_partition_factory: RwLock::new(None),
             row_partition_history: RwLock::new(HashMap::new()),
+            limit_ledger: Arc::new(PartitionLimitLedger::default()),
+            directory_tally: Arc::new(DirectoryTally::default()),
+            derived: AtomicBool::new(true),
             registry_copy_bytes: AtomicUsize::new(0),
             directory_accounting: Mutex::new(RetainedMemoryCharge {
                 bytes: 0,
                 accountant: declared_owner,
             }),
+        };
+        for (key, state) in column.partitions.read().iter() {
+            column.attach_state(key, state);
         }
+        column
+    }
+
+    /// A replacement image under preparation. It may hold states that the
+    /// live column it replaces still owns, so it keeps no derived figures
+    /// until `go_live`.
+    fn new_staged(layout: VectorIndexLayout, declared_owner: Arc<dyn MemoryBudget>) -> Self {
+        let column = Self::new(layout, declared_owner);
+        for state in column.partitions.read().values() {
+            state.detach_limit_from(&column.limit_ledger);
+        }
+        column.derived.store(false, Ordering::SeqCst);
+        *column.directory_tally.figures.lock() = DirectoryFigures::default();
+        column
+    }
+
+    /// Install a staged image as the live column: one bulk pass that links
+    /// every state and recounts the row maps.
+    fn go_live(&self) {
+        if self.derived.load(Ordering::SeqCst) {
+            return;
+        }
+        *self.directory_tally.figures.lock() = DirectoryFigures::default();
+        self.derived.store(true, Ordering::SeqCst);
+        for (key, state) in self.partitions.read().iter() {
+            self.attach_state(key, state);
+        }
+        let rows = Self::row_map_terms(&self.row_to_partition.read());
+        let history = Self::history_map_terms(&self.row_partition_history.read());
+        self.reset_row_map_terms((0, 0), (0, 0), rows, history);
+    }
+
+    /// Routes counted toward the declared cap. A staged image keeps no
+    /// derived figures and recounts.
+    fn occupied_partition_count(&self) -> usize {
+        if self.derived.load(Ordering::SeqCst) {
+            return self.limit_ledger.occupied();
+        }
+        self.partitions
+            .read()
+            .values()
+            .filter(|state| state.entry_count() != 0 && !state.is_historical_only())
+            .count()
+    }
+
+    /// A state entered this column's map under `key`.
+    fn attach_state(&self, key: &VectorPartitionKey, state: &Arc<IndexState>) {
+        if self.derived.load(Ordering::SeqCst) {
+            IndexState::attach_limit(state, &self.limit_ledger, &self.directory_tally, key);
+        }
+    }
+
+
+    /// Remove every state from the map; a bulk boundary that already visits
+    /// each partition.
+    fn clear_partition_map(&self) {
+        let mut partitions = self.partitions.write();
+        for state in partitions.values() {
+            state.detach_limit_from(&self.limit_ledger);
+        }
+        partitions.clear();
+    }
+
+    fn clear_row_maps(&self) {
+        let old_rows = Self::row_map_terms(&std::mem::take(&mut *self.row_to_partition.write()));
+        let old_history =
+            Self::history_map_terms(&std::mem::take(&mut *self.row_partition_history.write()));
+        self.reset_row_map_terms(old_rows, old_history, (0, 0), (0, 0));
+    }
+
+    fn adjust_row_terms(&self, removed: Option<&VectorPartitionKey>, added: Option<&VectorPartitionKey>) {
+        let (removed_vectors, removed_keys) = removed.map_or((0, 0), row_entry_terms);
+        let (added_vectors, added_keys) = added.map_or((0, 0), row_entry_terms);
+        self.directory_tally.adjust(|figures| {
+            add_signed(&mut figures.partition_vectors, removed_vectors, added_vectors);
+            add_signed(&mut figures.typed_partition_keys, removed_keys, added_keys);
+        });
+    }
+
+    fn adjust_history_terms(&self, before: (usize, usize), after: (usize, usize)) {
+        self.directory_tally.adjust(|figures| {
+            add_signed(&mut figures.partition_vectors, before.0, after.0);
+            add_signed(&mut figures.typed_partition_keys, before.1, after.1);
+        });
+    }
+
+    /// Recompute both row-map terms after a bulk rebuild or clear of the maps.
+    fn reset_row_map_terms(
+        &self,
+        old_rows: (usize, usize),
+        old_history: (usize, usize),
+        new_rows: (usize, usize),
+        new_history: (usize, usize),
+    ) {
+        self.adjust_history_terms(
+            (old_rows.0.saturating_add(old_history.0), old_rows.1.saturating_add(old_history.1)),
+            (new_rows.0.saturating_add(new_history.0), new_rows.1.saturating_add(new_history.1)),
+        );
+    }
+
+    fn row_map_terms(rows: &HashMap<RowId, Arc<VectorPartitionKey>>) -> (usize, usize) {
+        rows.values().fold((0, 0), |(vectors, keys), key| {
+            let (v, k) = row_entry_terms(key);
+            (vectors.saturating_add(v), keys.saturating_add(k))
+        })
+    }
+
+    fn history_map_terms(history: &HashMap<RowId, Vec<Arc<VectorPartitionKey>>>) -> (usize, usize) {
+        history.values().fold((0, 0), |(vectors, typed), keys| {
+            let (v, k) = history_entry_terms(keys, keys.capacity());
+            (vectors.saturating_add(v), typed.saturating_add(k))
+        })
     }
 
     fn layout(&self) -> VectorIndexLayout {
@@ -9925,23 +10466,35 @@ impl VectorColumnState {
         // one and extending exactly keeps the retained-directory delta aligned
         // with that pre-commit reservation instead of Vec's four-slot append
         // growth making the first historical identity larger than admitted.
-        let keys = history
-            .entry(row_id)
-            .or_insert_with(|| Vec::with_capacity(1));
+        let mut created = false;
+        let keys = history.entry(row_id).or_insert_with(|| {
+            created = true;
+            Vec::with_capacity(1)
+        });
         if let Err(position) = keys.binary_search_by(|candidate| candidate.as_ref().cmp(key)) {
+            let before = if created {
+                (0, 0)
+            } else {
+                history_entry_terms(keys, keys.capacity())
+            };
             if keys.len() == keys.capacity() {
                 keys.reserve_exact(1);
             }
             keys.insert(position, Arc::new(key.clone()));
+            let after = history_entry_terms(keys, keys.capacity());
+            drop(history);
+            self.adjust_history_terms(before, after);
         }
     }
 
     fn note_live_insert(&self, key: &VectorPartitionKey, entry: &StoredVectorEntry) {
         self.note_partition_history(entry.row_id, key);
         if entry.deleted_tx.is_none() {
-            self.row_to_partition
+            let previous = self
+                .row_to_partition
                 .write()
                 .insert(entry.row_id, Arc::new(key.clone()));
+            self.adjust_row_terms(previous.as_deref(), Some(key));
         }
     }
 
@@ -9952,7 +10505,9 @@ impl VectorColumnState {
             .get(&row_id)
             .is_some_and(|current| current.as_ref() == key)
         {
-            rows.remove(&row_id);
+            let removed = rows.remove(&row_id);
+            drop(rows);
+            self.adjust_row_terms(removed.as_deref(), None);
         }
     }
 
@@ -9966,13 +10521,18 @@ impl VectorColumnState {
         self.note_partition_history(old_row_id, source_key);
         self.note_partition_history(new_row_id, target_key);
         let mut rows = self.row_to_partition.write();
-        if rows
+        let removed = if rows
             .get(&old_row_id)
             .is_some_and(|current| current.as_ref() == source_key)
         {
-            rows.remove(&old_row_id);
-        }
-        rows.insert(new_row_id, Arc::new(target_key.clone()));
+            rows.remove(&old_row_id)
+        } else {
+            None
+        };
+        let replaced = rows.insert(new_row_id, Arc::new(target_key.clone()));
+        drop(rows);
+        self.adjust_row_terms(removed.as_deref(), None);
+        self.adjust_row_terms(replaced.as_deref(), Some(target_key));
     }
 
     fn rebuild_current_rows(&self) {
@@ -10008,11 +10568,36 @@ impl VectorColumnState {
                 }
             }
         }
-        *self.row_partition_history.write() = history;
-        *self.row_to_partition.write() = latest
+        let latest = latest
             .into_iter()
             .map(|(row_id, (_, _, key))| (row_id, key))
-            .collect();
+            .collect::<HashMap<_, _>>();
+        let new_rows = Self::row_map_terms(&latest);
+        let new_history = Self::history_map_terms(&history);
+        let old_history = Self::history_map_terms(&std::mem::replace(
+            &mut *self.row_partition_history.write(),
+            history,
+        ));
+        let old_rows = Self::row_map_terms(&std::mem::replace(
+            &mut *self.row_to_partition.write(),
+            latest,
+        ));
+        self.reset_row_map_terms(old_rows, old_history, new_rows, new_history);
+    }
+
+    /// Keyed removal of one retired route that retains no entry.
+    fn remove_empty_partition(&self, key: &VectorPartitionKey) {
+        if !self.layout.read().is_partitioned() {
+            return;
+        }
+        let mut partitions = self.partitions.write();
+        if partitions
+            .get(key)
+            .is_some_and(|state| state.entry_count() == 0)
+            && let Some(state) = partitions.remove(key)
+        {
+            state.detach_limit_from(&self.limit_ledger);
+        }
     }
 
     fn remove_empty_partitioned_states(&self) -> bool {
@@ -10026,16 +10611,26 @@ impl VectorColumnState {
                 .filter(|(_, state)| state.entry_count() == 0)
                 .map(|(key, _)| key.clone())
                 .collect::<HashSet<_>>();
-            partitions.retain(|key, _| !removed.contains(key));
+            partitions.retain(|key, state| {
+                let keep = !removed.contains(key);
+                if !keep {
+                    state.detach_limit_from(&self.limit_ledger);
+                }
+                keep
+            });
             removed
         };
         if !removed.is_empty() {
             let mut history = self.row_partition_history.write();
+            let before = Self::history_map_terms(&history);
             history.retain(|_, keys| {
                 keys.retain(|key| !removed.contains(key.as_ref()));
                 keys.shrink_to_fit();
                 !keys.is_empty()
             });
+            let after = Self::history_map_terms(&history);
+            drop(history);
+            self.adjust_history_terms(before, after);
         }
         !removed.is_empty()
     }
@@ -10111,6 +10706,30 @@ impl VectorColumnState {
     /// admitted before publication instead of inferred from allocator
     /// capacity after mutation.
     fn directory_ownership(&self, index: &VectorIndexRef) -> VectorDirectoryOwnership {
+        if !self.derived.load(Ordering::SeqCst) {
+            return self.directory_ownership_recount(index);
+        }
+        let figures = self.directory_tally.figures();
+        VectorDirectoryOwnership {
+            raw_reverse_directory: figures.raw_reverse_directory,
+            partition_vectors: self
+                .directory_fixed_bytes(index)
+                .saturating_add(figures.partition_vectors),
+            typed_partition_keys: figures.typed_partition_keys,
+        }
+    }
+
+    fn directory_fixed_bytes(&self, index: &VectorIndexRef) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(self.registry_copy_bytes.load(Ordering::SeqCst))
+            .saturating_add(index.table.capacity())
+            .saturating_add(index.column.capacity())
+            .saturating_add(self.layout.read().estimated_bytes())
+    }
+
+    /// The same figure recounted from every map; the oracle the derived
+    /// figure above must equal.
+    fn directory_ownership_recount(&self, index: &VectorIndexRef) -> VectorDirectoryOwnership {
         let layout_bytes = self.layout.read().estimated_bytes();
         let partitions = self.partitions.read();
         let mut ownership = VectorDirectoryOwnership {
@@ -10122,14 +10741,9 @@ impl VectorColumnState {
             ..VectorDirectoryOwnership::default()
         };
         for (key, state) in partitions.iter() {
-            ownership.typed_partition_keys = ownership
-                .typed_partition_keys
-                .saturating_add(key.estimated_bytes());
-            ownership.partition_vectors = ownership
-                .partition_vectors
-                .saturating_add(std::mem::size_of::<Arc<IndexState>>())
-                .saturating_add(IndexState::allocation_bytes())
-                .saturating_add(std::mem::size_of::<usize>().saturating_mul(3));
+            let (vectors, keys) = partition_entry_terms(key.estimated_bytes());
+            ownership.typed_partition_keys = ownership.typed_partition_keys.saturating_add(keys);
+            ownership.partition_vectors = ownership.partition_vectors.saturating_add(vectors);
             ownership.raw_reverse_directory = ownership
                 .raw_reverse_directory
                 .saturating_add(state.directory_byte_count());
@@ -10744,6 +11358,7 @@ impl PreparedVectorIndexRename<'_> {
         for prepared in self.sources.drain(..) {
             *prepared.state.durable_memberships.write() = prepared.source;
             *prepared.state.raw_loader.write() = prepared.loader;
+            prepared.state.reclassify_limit();
         }
         *self.column.durable_reverse_memberships.write() = self.reverse.take();
         let outgoing = std::mem::replace(
@@ -10791,6 +11406,8 @@ pub struct VectorStore {
     graph_candidate_caps: crate::test_seam::GraphCandidateCapRegistry,
     #[cfg(any(test, feature = "test-seams"))]
     passive_activity: Arc<VectorPassiveActivity>,
+    #[cfg(any(test, feature = "test-seams"))]
+    cap_work: VectorCapWork,
     #[cfg(any(test, feature = "test-seams"))]
     maintenance_progress_pauses:
         Mutex<HashMap<VectorPartitionRef, Arc<MaintenanceProgressPauseSlot>>>,
@@ -10862,6 +11479,9 @@ impl PreparedLoadedVectorReplacement<'_> {
         self.destination.with_bulk_maintenance(|| {
             if self.destination.memory_accountant.read().is_none() {
                 *self.destination.memory_accountant.write() = Some(self.accountant.clone());
+            }
+            for column in self.registry.values() {
+                column.go_live();
             }
             let old = std::mem::replace(&mut *self.destination.registry.write(), self.registry);
             for column in old.values() {
@@ -11019,6 +11639,8 @@ impl VectorStore {
             #[cfg(any(test, feature = "test-seams"))]
             passive_activity: Arc::new(VectorPassiveActivity::default()),
             #[cfg(any(test, feature = "test-seams"))]
+            cap_work: VectorCapWork::default(),
+            #[cfg(any(test, feature = "test-seams"))]
             maintenance_progress_pauses: Mutex::new(HashMap::new()),
             #[cfg(any(test, feature = "test-seams"))]
             maintenance_preparation_pauses: Mutex::new(HashMap::new()),
@@ -11086,6 +11708,70 @@ impl VectorStore {
     pub fn passive_activity_counters_for_test(&self) -> VectorPassiveActivityCounters {
         self.passive_activity.snapshot()
     }
+
+    /// Cap work spent by partitioned writes since this store opened.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn cap_work_counters_for_test(&self) -> VectorCapWorkCountersForTest {
+        VectorCapWorkCountersForTest {
+            projected_routes: self.cap_work.projected_routes.load(Ordering::SeqCst),
+            cap_edge_route_visits: self.cap_work.cap_edge_route_visits.load(Ordering::SeqCst),
+            hold_lookups: self.cap_work.hold_lookups.load(Ordering::SeqCst),
+            cap_edge_identity_probes: self
+                .cap_work
+                .cap_edge_identity_probes
+                .load(Ordering::SeqCst),
+            hold_streamed_records: self.cap_work.hold_streamed_records.load(Ordering::SeqCst),
+        }
+    }
+
+    /// The column's maintained cap occupancy and directory figure beside a
+    /// full recount. Test observation only; the recount walks every map.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn partition_limit_audit_for_test(
+        &self,
+        index: &VectorIndexRef,
+    ) -> Option<VectorPartitionLimitAuditForTest> {
+        self.with_bulk_read(|| {
+            let column = self.try_column(index)?;
+            let partitions = column.partition_snapshots();
+            let recounted_occupied = partitions
+                .iter()
+                .filter(|(_, state)| state.limit_class().counted())
+                .count();
+            let recounted_empty_counted = partitions
+                .iter()
+                .filter(|(_, state)| state.limit_class() == PartitionLimitClass::CountedEmpty)
+                .map(|(key, _)| key.clone())
+                .collect();
+            Some(VectorPartitionLimitAuditForTest {
+                occupied: column.limit_ledger.occupied(),
+                recounted_occupied,
+                empty_counted: {
+                    let mut keys = column
+                        .limit_ledger
+                        .empty_counted()
+                        .into_iter()
+                        .map(|(_, key)| key.as_ref().clone())
+                        .collect::<Vec<_>>();
+                    keys.sort();
+                    keys
+                },
+                recounted_empty_counted,
+                directory_bytes: column.directory_retained_bytes(index),
+                recounted_directory_bytes: column.directory_ownership_recount(index).total(),
+            })
+        })
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    fn note_cap_work(&self, note: impl FnOnce(&VectorCapWork)) {
+        note(&self.cap_work);
+    }
+
+    #[cfg(not(any(test, feature = "test-seams")))]
+    fn note_cap_work(&self, _note: impl FnOnce(&VectorCapWork)) {}
 
     /// Arm one partition's next maintenance build to pause after the requested
     /// number of actual stored vectors has been traversed.
@@ -11227,7 +11913,7 @@ impl VectorStore {
         for (index, dimension, quantization) in schemas {
             registry.try_insert(
                 index,
-                Arc::new(VectorColumnState::new(
+                Arc::new(VectorColumnState::new_staged(
                     VectorIndexLayout::unpartitioned(dimension, quantization),
                     declared_owner.clone(),
                 )),
@@ -11238,7 +11924,7 @@ impl VectorStore {
             if !registry.contains_key(&index) {
                 registry.try_insert(
                     index.clone(),
-                    Arc::new(VectorColumnState::new(
+                    Arc::new(VectorColumnState::new_staged(
                         VectorIndexLayout::unpartitioned(
                             entry.vector.len(),
                             VectorQuantization::F32,
@@ -11419,7 +12105,7 @@ impl VectorStore {
             Self::validate_layout(&index, &layout)?;
             registry.try_insert(
                 index,
-                Arc::new(VectorColumnState::new(layout, declared_owner)),
+                Arc::new(VectorColumnState::new_staged(layout, declared_owner)),
             )?;
         }
 
@@ -11553,7 +12239,7 @@ impl VectorStore {
                 .clone();
             registry.try_insert(
                 index,
-                Arc::new(VectorColumnState::new(layout, declared_owner)),
+                Arc::new(VectorColumnState::new_staged(layout, declared_owner)),
             )?;
         }
 
@@ -12910,6 +13596,9 @@ impl VectorStore {
                 }
             }
         }
+        for column in registry.values() {
+            column.go_live();
+        }
         let old_registry = std::mem::replace(&mut *self.registry.write(), registry);
         for column in old_registry.values() {
             column.clear_hnsw_except(&*accountant, &preserved_states);
@@ -13218,31 +13907,21 @@ impl VectorStore {
         let Some(max_partitions) = layout.max_partitions else {
             return Ok(());
         };
-        let partitions = column.partitions.read();
-        let needs_admission = requested.iter().any(|key| {
-            partitions
-                .get(key)
-                .is_none_or(|state| state.entry_count() == 0)
-                || column.partition_is_historical_only(key)
-        });
-        if !needs_admission {
+        let new_count = {
+            let partitions = column.partitions.read();
+            requested
+                .iter()
+                .filter(|key| {
+                    partitions.get(*key).is_none_or(|state| {
+                        state.entry_count() == 0 || state.is_historical_only()
+                    })
+                })
+                .count()
+        };
+        if new_count == 0 {
             return Ok(());
         }
-        let occupied_count = partitions
-            .iter()
-            .filter(|(key, state)| {
-                state.entry_count() != 0 && !column.partition_is_historical_only(key)
-            })
-            .count();
-        let new_count = requested
-            .iter()
-            .filter(|key| {
-                partitions
-                    .get(*key)
-                    .is_none_or(|state| state.entry_count() == 0)
-                    || column.partition_is_historical_only(key)
-            })
-            .count();
+        let occupied_count = column.occupied_partition_count();
         if occupied_count.saturating_add(new_count) > max_partitions as usize {
             return Err(Error::VectorPartitionLimitExceeded {
                 index: index.clone(),
@@ -13284,6 +13963,80 @@ impl VectorStore {
             }
         }
         Ok(all_present)
+    }
+
+    /// Whether one route may be retired by a write that holds the
+    /// registered-snapshot guard: it has no live vector after the batch, an
+    /// untouched route has no pending durability or repair work, and no
+    /// registered snapshot sees any of its retained memberships. The hold
+    /// test is a fixed number of indexed lookups per snapshot, never a walk
+    /// of the route's membership history.
+    fn reclaim_candidate_selected(
+        &self,
+        partition: &VectorPartitionRef,
+        changed_by_batch: bool,
+        projected: &HashMap<VectorIndexRef, HashMap<VectorPartitionKey, ProjectedPartitionState>>,
+        registered_snapshots: &[SnapshotId],
+        owner: &mut VectorCopyAdmission,
+    ) -> Result<bool> {
+        let Some(column) = self.try_column(&partition.index) else {
+            return Ok(false);
+        };
+        if !column.layout.read().is_partitioned() {
+            return Ok(false);
+        }
+        let Some(state) = column.partition_state(&partition.partition_key) else {
+            return Ok(false);
+        };
+        let projected_is_empty = if changed_by_batch {
+            projected
+                .get(&partition.index)
+                .and_then(|states| states.get(&partition.partition_key))
+                .is_some_and(|state| state.live_count() == 0)
+        } else {
+            state.vector_count() == 0
+        };
+        if !projected_is_empty {
+            return Ok(false);
+        }
+        if !changed_by_batch && !state.is_durable() {
+            if state.route_quarantine().is_some()
+                || state.resident_pending_after(Self::inspection_covered_tx(&state))
+            {
+                // The cap-time sweep has no authority to discard an
+                // untouched route's pending durability or repair work.
+                return Ok(false);
+            }
+        } else if !changed_by_batch {
+            let layout = column.scoped_layout(owner)?;
+            let info = Self::partition_info_snapshot(
+                &partition.index,
+                &partition.partition_key,
+                &state,
+                &layout,
+                owner,
+            )?;
+            if info.pending_inserts != 0
+                || info.tombstones != 0
+                || info.quarantine_reason.is_some()
+            {
+                // The cap-time sweep has no authority to discard an
+                // untouched route's pending durability or repair work.
+                return Ok(false);
+            }
+        }
+        self.note_cap_work(|work| {
+            work.hold_lookups
+                .fetch_add(registered_snapshots.len() as u64, Ordering::SeqCst);
+        });
+        let mut streamed_records = 0u64;
+        let visible =
+            state.visible_at_any_registered(registered_snapshots, owner, &mut streamed_records)?;
+        self.note_cap_work(|work| {
+            work.hold_streamed_records
+                .fetch_add(streamed_records, Ordering::SeqCst);
+        });
+        Ok(!visible)
     }
 
     fn project_partitioned_batch(
@@ -13336,38 +14089,29 @@ impl VectorStore {
                 .iter()
                 .map(|partition| partition.index.clone()),
         );
+        // Only the batch's own routes are projected. The cap count of every
+        // other route is the column's maintained occupancy, which this batch
+        // cannot change.
         let mut projected =
             HashMap::<VectorIndexRef, HashMap<VectorPartitionKey, ProjectedPartitionState>>::new();
+        let mut counted_before = HashMap::<VectorIndexRef, usize>::new();
         for index in candidate_indexes {
             let column = self
                 .try_column(&index)
                 .expect("candidate vector index was validated");
             let states = projected.entry(index.clone()).or_default();
-            if enforce_partition_cap {
-                states.extend(
-                    column
-                        .partition_snapshots()
-                        .into_iter()
-                        .map(|(key, state)| {
-                            let counts_toward_partition_limit =
-                                !column.partition_is_historical_only(&key);
-                            (
-                                key,
-                                ProjectedPartitionState::from_entry_count(
-                                    state.entry_count(),
-                                    counts_toward_partition_limit,
-                                ),
-                            )
-                        }),
-                );
-            }
             for partition in candidate_partitions
                 .iter()
                 .filter(|partition| partition.index == index)
             {
+                self.note_cap_work(|work| {
+                    work.projected_routes.fetch_add(1, Ordering::SeqCst);
+                });
                 if let Some(state) = column.partition_state(&partition.partition_key) {
-                    let counts_toward_partition_limit =
-                        !column.partition_is_historical_only(&partition.partition_key);
+                    let counts_toward_partition_limit = !state.is_historical_only();
+                    if counts_toward_partition_limit && state.entry_count() != 0 {
+                        *counted_before.entry(index.clone()).or_default() += 1;
+                    }
                     let projection = if state.is_durable() {
                         ProjectedPartitionState::from_durable_state(
                             &state,
@@ -13446,59 +14190,13 @@ impl VectorStore {
                 })
                 .collect::<HashSet<_>>();
             for partition in source_candidates.drain() {
-                let selected = (|| -> Result<bool> {
-                    let Some(column) = self.try_column(&partition.index) else {
-                        return Ok(false);
-                    };
-                    if !column.layout.read().is_partitioned() {
-                        return Ok(false);
-                    }
-                    let Some(state) = column.partition_state(&partition.partition_key) else {
-                        return Ok(false);
-                    };
-                    let changed_by_batch = candidate_partitions.contains(&partition);
-                    let projected_is_empty = if changed_by_batch {
-                        projected
-                            .get(&partition.index)
-                            .and_then(|states| states.get(&partition.partition_key))
-                            .is_some_and(|state| state.live_count() == 0)
-                    } else {
-                        state.vector_count() == 0
-                    };
-                    if !projected_is_empty {
-                        return Ok(false);
-                    }
-                    if !changed_by_batch {
-                        let layout = column.scoped_layout(owner)?;
-                        let info = Self::partition_info_snapshot(
-                            &partition.index,
-                            &partition.partition_key,
-                            &state,
-                            &layout,
-                            owner,
-                        )?;
-                        if info.pending_inserts != 0
-                            || info.tombstones != 0
-                            || info.quarantine_reason.is_some()
-                        {
-                            // The cap-time sweep has no authority to discard an
-                            // untouched route's pending durability or repair work.
-                            return Ok(false);
-                        }
-                    }
-                    if state.is_durable() {
-                        return Ok(!state.durable_visible_at_any(registered_snapshots, owner)?);
-                    }
-                    Ok(!state.raw_directory.read().iter().any(|entry| {
-                        registered_snapshots.iter().any(|snapshot| {
-                            entry.membership.visible_from.0 <= snapshot.0
-                                && entry
-                                    .membership
-                                    .deleted_tx
-                                    .is_none_or(|tx| tx.0 > snapshot.0)
-                        })
-                    }))
-                })()?;
+                let selected = self.reclaim_candidate_selected(
+                    &partition,
+                    candidate_partitions.contains(&partition),
+                    &projected,
+                    registered_snapshots,
+                    owner,
+                )?;
                 if selected {
                     effective_reclaimable_partitions.insert(partition);
                 }
@@ -13531,6 +14229,101 @@ impl VectorStore {
                 )));
             }
             state.retire_maintained_state();
+        }
+
+        let projected_count = |index: &VectorIndexRef,
+                               projected: &HashMap<
+            VectorIndexRef,
+            HashMap<VectorPartitionKey, ProjectedPartitionState>,
+        >,
+                               counted_before: &HashMap<VectorIndexRef, usize>|
+         -> usize {
+            let column = self
+                .try_column(index)
+                .expect("projected vector index was validated");
+            let after = projected.get(index).map_or(0, |states| {
+                states
+                    .values()
+                    .filter(|state| state.counts_toward_partition_limit && state.total_entries != 0)
+                    .count()
+            });
+            column
+                .occupied_partition_count()
+                .saturating_sub(counted_before.get(index).copied().unwrap_or(0))
+                .saturating_add(after)
+        };
+
+        // The exact cap edge: only a write that the conservative count would
+        // refuse looks for a reclaimable route, and it looks only at the
+        // column's counted-empty routes (at most the declared cap), with a
+        // fixed number of indexed hold lookups each.
+        if enforce_partition_cap && let Some(registered_snapshots) = registered_snapshots {
+            for index in Self::sorted_refs(projected.keys().cloned()) {
+                let column = self
+                    .try_column(&index)
+                    .expect("projected vector index was validated");
+                let Some(max_partitions) = column.layout.read().max_partitions else {
+                    continue;
+                };
+                if projected_count(&index, &projected, &counted_before) <= max_partitions as usize {
+                    continue;
+                }
+                let candidates_len = column.limit_ledger.empty_counted_len();
+                owner.reserve(candidates_len.saturating_mul(
+                    std::mem::size_of::<Arc<IndexState>>()
+                        .saturating_add(std::mem::size_of::<VectorPartitionRef>())
+                        .saturating_add(32),
+                ))?;
+                for (candidate, key) in column.limit_ledger.empty_counted() {
+                    if projected_count(&index, &projected, &counted_before)
+                        <= max_partitions as usize
+                    {
+                        break;
+                    }
+                    self.note_cap_work(|work| {
+                        work.cap_edge_route_visits.fetch_add(1, Ordering::SeqCst);
+                    });
+                    if projected
+                        .get(&index)
+                        .is_some_and(|states| states.contains_key(key.as_ref()))
+                    {
+                        continue;
+                    }
+                    // The candidate carries its own key: one map lookup
+                    // confirms the route still holds this state.
+                    self.note_cap_work(|work| {
+                        work.cap_edge_identity_probes.fetch_add(1, Ordering::SeqCst);
+                    });
+                    let Some(state) = column.partition_state(&key) else {
+                        continue;
+                    };
+                    if !Arc::ptr_eq(&state, &candidate)
+                        || state.is_historical_only()
+                        || state.entry_count() == 0
+                    {
+                        continue;
+                    }
+                    let partition = VectorPartitionRef::new(index.clone(), key.as_ref().clone());
+                    if !self.reclaim_candidate_selected(
+                        &partition,
+                        false,
+                        &projected,
+                        registered_snapshots,
+                        owner,
+                    )? {
+                        continue;
+                    }
+                    let mut projection =
+                        ProjectedPartitionState::from_entry_count(state.entry_count(), true);
+                    projection.retire_maintained_state();
+                    projected
+                        .entry(index.clone())
+                        .or_default()
+                        .insert(partition.partition_key.clone(), projection);
+                    *counted_before.entry(index.clone()).or_default() += 1;
+                    effective_reclaimable_partitions.insert(partition);
+                }
+            }
         }
 
         let mut touched = HashSet::<VectorPartitionRef>::new();
@@ -13567,13 +14360,7 @@ impl VectorStore {
 
         let mut projected_counts = HashMap::<VectorIndexRef, usize>::new();
         for index in Self::sorted_refs(touched.iter().map(|partition| partition.index.clone())) {
-            let states = projected
-                .get(&index)
-                .expect("touched index has projected partition states");
-            let count = states
-                .values()
-                .filter(|state| state.counts_toward_partition_limit && state.total_entries != 0)
-                .count();
+            let count = projected_count(&index, &projected, &counted_before);
             let column = self
                 .try_column(&index)
                 .expect("touched vector index was validated");
@@ -14168,41 +14955,37 @@ impl VectorStore {
                 route_bytes(&partition.index, &partition.partition_key).saturating_mul(32),
             );
         }
-        // Projection and registered-snapshot sweeps can include every held
-        // route in an affected column, including untouched empty routes.
-        for (index, column) in self.registry.read().iter() {
-            if !deletes.iter().any(|entry| &entry.partition.index == index)
-                && !inserts.iter().any(|entry| &entry.entry.index == index)
-                && !moves.iter().any(|entry| &entry.index == index)
-                && !reclaimable.iter().any(|entry| &entry.index == index)
+        // Projection covers only the batch's own routes; the cap count of
+        // every other route is the column's maintained occupancy. The cap
+        // edge prices its counted-empty candidates itself before it looks.
+        let mut routes = HashSet::<(&VectorIndexRef, &VectorPartitionKey)>::new();
+        routes.extend(
+            deletes
+                .iter()
+                .map(|entry| (&entry.partition.index, &entry.partition.partition_key)),
+        );
+        routes.extend(inserts.iter().map(|entry| (&entry.entry.index, &entry.partition_key)));
+        for entry in moves {
+            routes.insert((&entry.index, &entry.source_partition_key));
+            routes.insert((&entry.index, &entry.target_partition_key));
+        }
+        routes.extend(
+            reclaimable
+                .iter()
+                .map(|entry| (&entry.index, &entry.partition_key)),
+        );
+        for (index, key) in routes {
+            bytes = bytes.saturating_add(route_bytes(index, key).saturating_mul(32));
+            // A durable projection probes only touched row identities; it
+            // never builds a map proportional to durable history.
+            if let Some(state) = self.try_partition_state(index, key)
+                && !state.is_durable()
             {
-                continue;
-            }
-            bytes = bytes.saturating_add(column.directory_retained_bytes(index).saturating_mul(16));
-            for (key, state) in column.partitions.read().iter() {
-                bytes = bytes.saturating_add(route_bytes(index, key).saturating_mul(32));
-                let touched = deletes.iter().any(|entry| {
-                    &entry.partition.index == index && &entry.partition.partition_key == key
-                }) || inserts
-                    .iter()
-                    .any(|entry| &entry.entry.index == index && &entry.partition_key == key)
-                    || moves.iter().any(|entry| {
-                        &entry.index == index
-                            && (&entry.source_partition_key == key
-                                || &entry.target_partition_key == key)
-                    })
-                    || reclaimable
-                        .iter()
-                        .any(|entry| &entry.index == index && &entry.partition_key == key);
-                // A durable projection probes only touched row identities; it
-                // never builds a map proportional to durable history.
-                if touched && !state.is_durable() {
-                    bytes = bytes.saturating_add(
-                        state
-                            .entry_count()
-                            .saturating_mul(16 * std::mem::size_of::<(RowId, TxId)>()),
-                    );
-                }
+                bytes = bytes.saturating_add(
+                    state
+                        .entry_count()
+                        .saturating_mul(16 * std::mem::size_of::<(RowId, TxId)>()),
+                );
             }
         }
         bytes
@@ -14366,23 +15149,20 @@ impl VectorStore {
                 }
                 self.install_durable_counts(&durable_counts);
 
-                let mut rebuild_indexes = HashSet::<VectorIndexRef>::new();
-                for partition in &reclaimable_partitions {
+                // Retirement is keyed: each retired route is marked
+                // historical, and removed only if it retains no entry at all.
+                // A route with no live vector maps no current row, so the
+                // row maps need no rebuild.
+                for partition in Self::sorted_partition_refs(reclaimable_partitions) {
                     let Some(column) = self.try_column(&partition.index) else {
                         continue;
                     };
                     if let Some(state) = column.partition_state(&partition.partition_key) {
                         debug_assert_eq!(state.vector_count(), 0);
                         state.clear_hnsw_with_optional_accountant(accountant);
-                        column.mark_historical_only(&partition.partition_key);
+                        state.mark_historical_only();
                     }
-                    rebuild_indexes.insert(partition.index.clone());
-                }
-                for index in Self::sorted_refs(rebuild_indexes) {
-                    if let Some(column) = self.try_column(&index) {
-                        column.remove_empty_partitioned_states();
-                        column.rebuild_current_rows();
-                    }
+                    column.remove_empty_partition(&partition.partition_key);
                 }
             });
             self.settle_directory_accounting_for_indexes(
@@ -14499,7 +15279,10 @@ impl VectorStore {
             if let Some(column) = self.try_column(&index) {
                 let mut partitions = column.partitions.write();
                 for (key, state) in states {
-                    partitions.entry(key).or_insert(state);
+                    if let std::collections::btree_map::Entry::Vacant(slot) = partitions.entry(key) {
+                        column.attach_state(slot.key(), &state);
+                        slot.insert(state);
+                    }
                 }
             }
         }
@@ -15539,6 +16322,20 @@ impl VectorStore {
                 })
                 .transpose()
         })
+    }
+
+    /// The frontier a partition's pending work is counted after, exactly as
+    /// `partition_info_snapshot` derives it for a resident partition.
+    fn inspection_covered_tx(state: &IndexState) -> Option<TxId> {
+        let generations = state.graph_generation_status();
+        let base = generations.base.or(generations.dormant_base);
+        let change = generations.change.or(generations.dormant_change);
+        let local_generation_id = state.inspection_generation_id.load(Ordering::SeqCst);
+        let local_base_tx = state.inspection_base_tx.load(Ordering::SeqCst);
+        change
+            .or(base)
+            .map(|generation| generation.covered_tx)
+            .or((local_generation_id != 0).then_some(TxId(local_base_tx)))
     }
 
     fn partition_info_snapshot(
@@ -16605,6 +17402,7 @@ impl VectorStore {
             {
                 *state.durable_counts.lock() = prepared.summary;
                 state.apply_durable_pending_events(&prepared.events);
+                state.reclassify_limit();
                 #[cfg(feature = "test-seams")]
                 {
                     let mut backlog = state.base_backlog.lock();
@@ -17121,8 +17919,7 @@ impl VectorStore {
                 );
             }
         }
-        column.row_to_partition.write().clear();
-        column.row_partition_history.write().clear();
+        column.clear_row_maps();
         *column.durable_reverse_memberships.write() = Some(reverse);
         *column.durable_partition_factory.write() = Some(partitions);
         Ok(())
@@ -17219,12 +18016,14 @@ impl VectorStore {
             }
             let state = {
                 let mut states = column.partitions.write();
-                states
+                let state = states
                     .entry(partition.partition_key.clone())
                     .or_insert_with(|| {
                         Arc::new(IndexState::new(layout.dimension, layout.quantization))
                     })
-                    .clone()
+                    .clone();
+                column.attach_state(&partition.partition_key, &state);
+                state
             };
             let _gate = state.raw_residency_gate.write();
             if state.entry_count() != 0 || state.durable_membership_source().is_some() {
@@ -17242,6 +18041,8 @@ impl VectorStore {
             if summary.live_entries == 0 && summary.entries != 0 {
                 state.historical_only.store(true, Ordering::SeqCst);
             }
+            drop(_gate);
+            state.reclassify_limit();
             Ok(())
         })
     }
@@ -17306,10 +18107,9 @@ impl VectorStore {
                     state.drop_hnsw_without_accounting();
                 }
                 if layout.is_partitioned() {
-                    column.partitions.write().clear();
+                    column.clear_partition_map();
                 }
-                column.row_to_partition.write().clear();
-                column.row_partition_history.write().clear();
+                column.clear_row_maps();
             }
             for partition in dormant {
                 let column = self
@@ -17318,12 +18118,14 @@ impl VectorStore {
                 let layout = column.layout();
                 let state = {
                     let mut partitions = column.partitions.write();
-                    partitions
+                    let state = partitions
                         .entry(partition.partition.partition_key.clone())
                         .or_insert_with(|| {
                             Arc::new(IndexState::new(layout.dimension, layout.quantization))
                         })
-                        .clone()
+                        .clone();
+                    column.attach_state(&partition.partition.partition_key, &state);
+                    state
                 };
                 *state.raw_payload_counter.write() = self.raw_payload_bytes.clone();
                 *state.raw_payload_header_counter.write() = self.raw_payload_header_bytes.clone();
@@ -17405,10 +18207,9 @@ impl VectorStore {
                     state.drop_hnsw_without_accounting();
                 }
                 if layout.is_partitioned() {
-                    column.partitions.write().clear();
+                    column.clear_partition_map();
                 }
-                column.row_to_partition.write().clear();
-                column.row_partition_history.write().clear();
+                column.clear_row_maps();
             }
             for entry in entries {
                 self.insert_loaded_vector(entry, declared_owner.clone())?;
@@ -24210,6 +25011,10 @@ mod detached_copy_payload_tests;
 #[cfg(test)]
 #[path = "store/generation_selection_tests.rs"]
 mod generation_selection_tests;
+
+#[cfg(test)]
+#[path = "store/cdb120_cap_ledger_tests.rs"]
+mod cdb120_cap_ledger_tests;
 
 #[cfg(test)]
 mod reverse_probe_lifetime_tests {

@@ -35445,6 +35445,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 }
             }
         }
+        vector_membership_pages::settle_dirty_occupancy(write_txn, self.proof_accountant())?;
         Ok(())
     }
 
@@ -39246,6 +39247,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 )?;
             }
         }
+        vector_membership_pages::settle_dirty_occupancy(write_txn, self.proof_accountant())?;
         Ok(())
     }
 
@@ -39870,6 +39872,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 &VectorPartitionRef::new(index, partition_key),
             )?;
         }
+        vector_membership_pages::settle_dirty_occupancy(write_txn, self.proof_accountant())?;
         Ok(())
     }
 
@@ -39928,6 +39931,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
             }
             cursor = Some((key, memory));
         }
+        vector_membership_pages::settle_dirty_occupancy(write_txn, self.proof_accountant())?;
         Ok(())
     }
 

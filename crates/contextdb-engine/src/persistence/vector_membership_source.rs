@@ -1856,6 +1856,28 @@ impl RawVectorMembershipSource for DurableMembershipSource {
         read_summary(&root.read, &self.partition)
     }
 
+    fn occupancy_visible_at_any(
+        &self,
+        snapshots: &[SnapshotId],
+        owner: &mut contextdb_vector::VectorCopyAdmission,
+    ) -> Result<Option<bool>> {
+        let mut scratch = owner.scratch();
+        let route = RedbPersistence::vector_partition_prefix(
+            &self.partition.index,
+            &self.partition.partition_key,
+        );
+        scratch.reserve_for(
+            route.len().saturating_mul(4).saturating_add(256),
+            "vector",
+            "membership_occupancy_lookup",
+            HINT,
+        )?;
+        operation_checkpoint()?;
+        let root = self.owner.capture()?;
+        root.check_scope(&self.partition.index.table)?;
+        vector_membership_pages::occupancy_visible_at_any_in_read(&root.read, &route, snapshots)
+    }
+
     fn visible_count(
         &self,
         snapshot: SnapshotId,

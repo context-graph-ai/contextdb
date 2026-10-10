@@ -7324,6 +7324,10 @@ mod proof_authentication_tests;
 mod proof_memory_tests;
 
 #[cfg(all(test, feature = "test-seams"))]
+#[path = "vector_occupancy_interval_tests.rs"]
+mod vector_occupancy_interval_tests;
+
+#[cfg(all(test, feature = "test-seams"))]
 #[path = "physical_key_order_tests.rs"]
 mod physical_key_order_tests;
 

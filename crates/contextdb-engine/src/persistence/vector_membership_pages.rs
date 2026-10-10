@@ -9,6 +9,17 @@ pub(super) const REVERSE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("vector_membership_reverse_pages");
 pub(super) const SUMMARY: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("vector_membership_summary_pages");
+/// Per-route occupancy intervals: the maximal, disjoint, non-adjacent
+/// intervals of the union of the route's retained membership lifetimes
+/// `[visible_from, deleted_tx or OPEN)`. Key: route prefix ++ start tx (BE);
+/// value: end tx (BE, `OPEN_END` for open) ++ 8-byte keyed checksum.
+pub(super) const OCCUPANCY: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("vector_membership_occupancy_pages");
+/// Routes whose occupancy rows await a rebuild after a membership removal.
+/// While a route is listed here its hold answer streams the directory.
+pub(super) const OCCUPANCY_DIRTY: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("vector_membership_occupancy_dirty");
+const OPEN_END: u64 = u64::MAX;
 const GLOBAL: &[u8] = b"";
 const MAGIC: &[u8] = b"CDBVMS01";
 
@@ -911,6 +922,7 @@ fn publish_membership_impl<const CHECK_OVERLAP: bool>(
         accountant.as_ref(),
     )?;
     content_size::membership_transition(write, previous_record.as_ref(), next_record.as_ref())?;
+    let boundary_before = partition.max_tx;
     if let (Some(record), Some(bytes), Some(key)) = (
         previous_record.as_ref(),
         previous.as_ref(),
@@ -935,6 +947,16 @@ fn publish_membership_impl<const CHECK_OVERLAP: bool>(
             .insert(key.as_slice(), bytes)
             .map_err(metadata_error)?;
     }
+    drop((source, reverse));
+    occupancy_transition(
+        write,
+        &partition_key,
+        previous_record.as_ref(),
+        next_record.as_ref(),
+        boundary_before,
+        &partition,
+        accountant.as_ref(),
+    )?;
     write
         .open_table(CONTENT_IDENTITY_METADATA_TABLE)
         .map_err(metadata_error)?
@@ -964,8 +986,398 @@ fn publish_membership_impl<const CHECK_OVERLAP: bool>(
             .insert(partition_key.as_slice(), partition_bytes.as_slice())
             .map_err(metadata_error)?;
     }
-    drop((source, reverse, summaries));
+    drop(summaries);
     Ok(())
+}
+
+fn membership_interval(record: &VectorPartitionMembershipRecord) -> Option<(u64, u64)> {
+    let start = record.visible_from.0;
+    let end = record.deleted_tx.map_or(OPEN_END, |tx| tx.0);
+    (end > start).then_some((start, end))
+}
+
+fn occupancy_key(route: &[u8], start: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(route.len() + 8);
+    key.extend_from_slice(route);
+    key.extend_from_slice(&start.to_be_bytes());
+    key
+}
+
+fn occupancy_checksum(key: &[u8], end: u64) -> [u8; 8] {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"CDBVOI01");
+    hash.update(key);
+    hash.update(&end.to_be_bytes());
+    hash.finalize().as_bytes()[..8].try_into().unwrap()
+}
+
+fn encode_occupancy(key: &[u8], end: u64) -> [u8; 16] {
+    let mut value = [0u8; 16];
+    value[..8].copy_from_slice(&end.to_be_bytes());
+    value[8..].copy_from_slice(&occupancy_checksum(key, end));
+    value
+}
+
+fn decode_occupancy(route: &[u8], key: &[u8], value: &[u8]) -> Result<(u64, u64)> {
+    let start = key
+        .strip_prefix(route)
+        .filter(|start| start.len() == 8)
+        .ok_or_else(|| corruption("occupancy interval key does not belong to its route"))?;
+    let start = u64::from_be_bytes(start.try_into().unwrap());
+    let value: &[u8; 16] = value
+        .try_into()
+        .map_err(|_| corruption("occupancy interval value has the wrong length"))?;
+    let end = u64::from_be_bytes(value[..8].try_into().unwrap());
+    if value[8..] != occupancy_checksum(key, end) || end <= start {
+        return Err(corruption("occupancy interval checksum or bounds are invalid"));
+    }
+    Ok((start, end))
+}
+
+type OccupancyTable<'txn> = redb::Table<'txn, &'static [u8], &'static [u8]>;
+
+/// The route's row with the greatest start at or below `at`.
+fn occupancy_predecessor(
+    table: &OccupancyTable<'_>,
+    route: &[u8],
+    at: u64,
+) -> Result<Option<(u64, u64)>> {
+    let lower = occupancy_key(route, 0);
+    let upper = occupancy_key(route, at);
+    let row = table
+        .range::<&[u8]>(lower.as_slice()..=upper.as_slice())
+        .map_err(metadata_error)?
+        .next_back()
+        .transpose()
+        .map_err(metadata_error)?
+        .map(|(key, value)| decode_occupancy(route, key.value(), value.value()))
+        .transpose()?;
+    Ok(row)
+}
+
+/// The route's first row with a start strictly above `after`.
+fn occupancy_successor(
+    table: &OccupancyTable<'_>,
+    route: &[u8],
+    after: u64,
+) -> Result<Option<(u64, u64)>> {
+    if after == OPEN_END {
+        return Ok(None);
+    }
+    let lower = occupancy_key(route, after + 1);
+    let upper = occupancy_key(route, OPEN_END);
+    let row = table
+        .range::<&[u8]>(lower.as_slice()..=upper.as_slice())
+        .map_err(metadata_error)?
+        .next()
+        .transpose()
+        .map_err(metadata_error)?
+        .map(|(key, value)| decode_occupancy(route, key.value(), value.value()))
+        .transpose()?;
+    Ok(row)
+}
+
+fn put_occupancy(table: &mut OccupancyTable<'_>, route: &[u8], start: u64, end: u64) -> Result<()> {
+    let key = occupancy_key(route, start);
+    table
+        .insert(key.as_slice(), encode_occupancy(&key, end).as_slice())
+        .map_err(metadata_error)?;
+    Ok(())
+}
+
+fn remove_occupancy(table: &mut OccupancyTable<'_>, route: &[u8], start: u64) -> Result<()> {
+    table
+        .remove(occupancy_key(route, start).as_slice())
+        .map_err(metadata_error)?;
+    Ok(())
+}
+
+/// Union-insert one lifetime: absorb the predecessor only if it overlaps or
+/// touches the new start, then absorb following rows while they overlap or
+/// touch the expanding merged end. Work is one descent plus absorbed rows.
+fn occupancy_union_insert(
+    table: &mut OccupancyTable<'_>,
+    route: &[u8],
+    start: u64,
+    end: u64,
+) -> Result<()> {
+    let (mut merged_start, mut merged_end) = (start, end);
+    if let Some((previous_start, previous_end)) = occupancy_predecessor(table, route, start)?
+        && previous_end >= start
+    {
+        merged_start = previous_start;
+        merged_end = merged_end.max(previous_end);
+        remove_occupancy(table, route, previous_start)?;
+    }
+    while let Some((next_start, next_end)) = occupancy_successor(table, route, start)? {
+        if next_start > merged_end {
+            break;
+        }
+        merged_end = merged_end.max(next_end);
+        remove_occupancy(table, route, next_start)?;
+    }
+    put_occupancy(table, route, merged_start, merged_end)
+}
+
+fn clear_route_occupancy(table: &mut OccupancyTable<'_>, route: &[u8]) -> Result<()> {
+    loop {
+        let Some((start, _)) = occupancy_successor_inclusive_first(table, route)? else {
+            return Ok(());
+        };
+        remove_occupancy(table, route, start)?;
+    }
+}
+
+fn occupancy_successor_inclusive_first(
+    table: &OccupancyTable<'_>,
+    route: &[u8],
+) -> Result<Option<(u64, u64)>> {
+    let lower = occupancy_key(route, 0);
+    let upper = occupancy_key(route, OPEN_END);
+    let row = table
+        .range::<&[u8]>(lower.as_slice()..=upper.as_slice())
+        .map_err(metadata_error)?
+        .next()
+        .transpose()
+        .map_err(metadata_error)?
+        .map(|(key, value)| decode_occupancy(route, key.value(), value.value()))
+        .transpose()?;
+    Ok(row)
+}
+
+/// Rebuild one route's rows from its own membership directory. An
+/// own-partition walk on that partition's own write; its sort buffer is
+/// funded by the writer's proof accountant before the walk.
+fn rebuild_route_occupancy(
+    write: &redb::WriteTransaction,
+    route: &[u8],
+    entries: u64,
+    accountant: Option<&Arc<crate::memory_accounting::MemoryAccountant>>,
+) -> Result<()> {
+    let _buffer = accountant
+        .map(|accountant| {
+            crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+                Arc::clone(accountant),
+                usize::try_from(entries)
+                    .unwrap_or(usize::MAX)
+                    .saturating_mul(2 * std::mem::size_of::<(u64, u64)>())
+                    .saturating_add(route.len().saturating_mul(4))
+                    .saturating_add(4096),
+                "vector",
+                "rebuild_membership_occupancy",
+                "Raise MEMORY_LIMIT to maintain this vector membership route.",
+            )
+        })
+        .transpose()?;
+    let mut intervals = Vec::<(u64, u64)>::new();
+    {
+        let source = write.open_table(SOURCE).map_err(metadata_error)?;
+        for entry in source.prefix_bounded(route).map_err(metadata_error)? {
+            let (key, value) = entry.map_err(metadata_error)?;
+            let record = decode_member(key.value(), value.value())?;
+            if let Some(interval) = membership_interval(&record) {
+                intervals.push(interval);
+            }
+        }
+    }
+    intervals.sort_unstable();
+    let mut table = write.open_table(OCCUPANCY).map_err(metadata_error)?;
+    clear_route_occupancy(&mut table, route)?;
+    let mut current: Option<(u64, u64)> = None;
+    for (start, end) in intervals {
+        match current.as_mut() {
+            Some((_, current_end)) if start <= *current_end => {
+                *current_end = (*current_end).max(end);
+            }
+            _ => {
+                if let Some((current_start, current_end)) = current.take() {
+                    put_occupancy(&mut table, route, current_start, current_end)?;
+                }
+                current = Some((start, end));
+            }
+        }
+    }
+    if let Some((current_start, current_end)) = current {
+        put_occupancy(&mut table, route, current_start, current_end)?;
+    }
+    drop(table);
+    write
+        .open_table(OCCUPANCY_DIRTY)
+        .map_err(metadata_error)?
+        .remove(route)
+        .map_err(metadata_error)?;
+    Ok(())
+}
+
+/// Keep the route's occupancy rows exactly equal to the union of its
+/// retained membership lifetimes across one membership transition.
+///
+/// * Ordinary close at the publishing boundary (the closing tx is at or above
+///   every stored boundary of the route): when no open membership remains,
+///   the open last row ends at that tx; otherwise the union is unchanged.
+/// * Any insertion, open or closed, received, loaded or replayed, and any
+///   change that only widens a lifetime: union-insert the new lifetime.
+/// * Any other change that can shrink the union (a historical close, a
+///   lowered endpoint): rebuild this route from its own directory now.
+/// * Removal: an emptied route drops its rows; otherwise the route is listed
+///   dirty and the removing pass rebuilds it once (`settle_dirty_occupancy`).
+fn occupancy_transition(
+    write: &redb::WriteTransaction,
+    route: &[u8],
+    previous: Option<&VectorPartitionMembershipRecord>,
+    next: Option<&VectorPartitionMembershipRecord>,
+    boundary_before: TxId,
+    partition: &MembershipSummary,
+    accountant: Option<&Arc<crate::memory_accounting::MemoryAccountant>>,
+) -> Result<()> {
+    let previous_interval = previous.and_then(membership_interval);
+    let next_interval = next.and_then(membership_interval);
+    match (previous, next) {
+        (None, None) => Ok(()),
+        (None, Some(_)) => {
+            let Some((start, end)) = next_interval else {
+                return Ok(());
+            };
+            let mut table = write.open_table(OCCUPANCY).map_err(metadata_error)?;
+            occupancy_union_insert(&mut table, route, start, end)
+        }
+        (Some(_), None) => {
+            if partition.entries == 0 {
+                let mut table = write.open_table(OCCUPANCY).map_err(metadata_error)?;
+                clear_route_occupancy(&mut table, route)?;
+                drop(table);
+                write
+                    .open_table(OCCUPANCY_DIRTY)
+                    .map_err(metadata_error)?
+                    .remove(route)
+                    .map_err(metadata_error)?;
+                return Ok(());
+            }
+            if previous_interval.is_none() {
+                return Ok(());
+            }
+            write
+                .open_table(OCCUPANCY_DIRTY)
+                .map_err(metadata_error)?
+                .insert(route, &[][..])
+                .map_err(metadata_error)?;
+            Ok(())
+        }
+        (Some(old), Some(new)) => {
+            if previous_interval == next_interval {
+                return Ok(());
+            }
+            let widened = match (previous_interval, next_interval) {
+                (None, _) => true,
+                (Some(_), None) => false,
+                (Some((old_start, old_end)), Some((new_start, new_end))) => {
+                    new_start <= old_start && new_end >= old_end
+                }
+            };
+            if widened {
+                let Some((start, end)) = next_interval else {
+                    return Ok(());
+                };
+                let mut table = write.open_table(OCCUPANCY).map_err(metadata_error)?;
+                return occupancy_union_insert(&mut table, route, start, end);
+            }
+            let ordinary_close = old.deleted_tx.is_none()
+                && old.visible_from == new.visible_from
+                && new
+                    .deleted_tx
+                    .is_some_and(|closed| closed >= boundary_before);
+            if ordinary_close {
+                if partition.live_entries != 0 {
+                    return Ok(());
+                }
+                let closed = new.deleted_tx.expect("ordinary close has an end").0;
+                let mut table = write.open_table(OCCUPANCY).map_err(metadata_error)?;
+                let Some((last_start, last_end)) = occupancy_predecessor(&table, route, OPEN_END)?
+                else {
+                    return Err(corruption("an open membership has no occupancy interval"));
+                };
+                if last_end != OPEN_END {
+                    return Err(corruption("an open membership's occupancy interval is closed"));
+                }
+                if closed > last_start {
+                    put_occupancy(&mut table, route, last_start, closed)?;
+                } else {
+                    remove_occupancy(&mut table, route, last_start)?;
+                }
+                return Ok(());
+            }
+            rebuild_route_occupancy(write, route, partition.entries, accountant)
+        }
+    }
+}
+
+/// Rebuild every route a removing pass listed dirty, once each.
+pub(super) fn settle_dirty_occupancy(
+    write: &redb::WriteTransaction,
+    accountant: Option<Arc<crate::memory_accounting::MemoryAccountant>>,
+) -> Result<()> {
+    loop {
+        let dirty = write.open_table(OCCUPANCY_DIRTY).map_err(metadata_error)?;
+        let route = dirty
+            .first()
+            .map_err(metadata_error)?
+            .map(|(key, _)| key.value().to_vec());
+        drop(dirty);
+        let Some(route) = route else {
+            return Ok(());
+        };
+        let entries = {
+            let summaries = write.open_table(SUMMARY).map_err(metadata_error)?;
+            summaries
+                .get_bounded(route.as_slice())
+                .map_err(metadata_error)?
+                .map(|value| decode_summary(&route, value.value()))
+                .transpose()?
+                .map_or(0, |summary| summary.entries)
+        };
+        rebuild_route_occupancy(write, &route, entries, accountant.as_ref())?;
+    }
+}
+
+/// Whether any retained membership of `route` is visible to one of
+/// `snapshots`: one predecessor lookup per snapshot, no membership read.
+/// `None` while the route awaits a rebuild after a removal.
+pub(super) fn occupancy_visible_at_any_in_read(
+    read: &redb::ReadTransaction,
+    route: &[u8],
+    snapshots: &[SnapshotId],
+) -> Result<Option<bool>> {
+    match read.open_table(OCCUPANCY_DIRTY) {
+        Ok(dirty) => {
+            if dirty.get(route).map_err(metadata_error)?.is_some() {
+                return Ok(None);
+            }
+        }
+        Err(redb::TableError::TableDoesNotExist(_)) => {}
+        Err(error) => return Err(metadata_error(error)),
+    }
+    let table = match read.open_table(OCCUPANCY) {
+        Ok(table) => table,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Some(false)),
+        Err(error) => return Err(metadata_error(error)),
+    };
+    for snapshot in snapshots {
+        let lower = occupancy_key(route, 0);
+        let upper = occupancy_key(route, snapshot.0);
+        let row = table
+            .range::<&[u8]>(lower.as_slice()..=upper.as_slice())
+            .map_err(metadata_error)?
+            .next_back()
+            .transpose()
+            .map_err(metadata_error)?;
+        if let Some((key, value)) = row {
+            let (_, end) = decode_occupancy(route, key.value(), value.value())?;
+            if end > snapshot.0 {
+                return Ok(Some(true));
+            }
+        }
+    }
+    Ok(Some(false))
 }
 
 /// Explicit bulk schema/repair publication already replaces the full forward
@@ -978,7 +1390,7 @@ pub(super) fn reset_in_write(write: &redb::WriteTransaction) -> Result<()> {
         .map_err(metadata_error)?
         .remove(VECTOR_REFERENCED_BODY_COUNT_KEY)
         .map_err(metadata_error)?;
-    for definition in [SOURCE, REVERSE, SUMMARY] {
+    for definition in [SOURCE, REVERSE, SUMMARY, OCCUPANCY, OCCUPANCY_DIRTY] {
         match write.delete_table(definition) {
             Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
             Err(error) => return Err(metadata_error(error)),

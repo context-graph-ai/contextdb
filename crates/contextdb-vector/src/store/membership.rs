@@ -123,6 +123,20 @@ pub trait RawVectorMembershipSource: Send + Sync {
         Ok(self.published_summary())
     }
 
+    /// Whether any retained membership is visible to one of `snapshots`,
+    /// answered from a maintained occupancy-interval index with a fixed
+    /// number of indexed lookups per snapshot and no membership-record read.
+    /// `None` means this source keeps no such index; the caller then streams
+    /// the directory.
+    fn occupancy_visible_at_any(
+        &self,
+        snapshots: &[SnapshotId],
+        owner: &mut super::VectorCopyAdmission,
+    ) -> Result<Option<bool>> {
+        let _ = (snapshots, owner);
+        Ok(None)
+    }
+
     /// Count visible intervals against the same root used by `open` and point
     /// probes. Older frontiers use indexed durable interval work. Verify every
     /// membership record used, including checksum and partition identity.

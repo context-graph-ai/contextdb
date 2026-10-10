@@ -115,6 +115,11 @@ name = "acceptance"
 path = "../../tests/acceptance.rs"
 
 [[test]]
+name = "cdb120_partition_insert_cost"
+path = "tests/cdb120_partition_insert_cost.rs"
+required-features = ["test-seams"]
+
+[[test]]
 name = "bounded"
 path = "tests/bounded.rs"
 required-features = ["test-seams"]
