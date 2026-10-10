@@ -140,7 +140,10 @@ fn install_refusal_after_successful_t2_keeps_publication_and_retries_without_jou
         status.base_resident,
         "old serving graph survives refused install"
     );
-    assert!(status.pending_generation_count > 0);
+    assert!(
+        published.base.generation_id > status.base.unwrap().generation_id,
+        "the durable catalog retains the refused installation for retry"
+    );
     assert!(
         db.vector_store
             .partition_route_quarantine(&partition)
