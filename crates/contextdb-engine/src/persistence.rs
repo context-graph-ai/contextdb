@@ -31066,7 +31066,12 @@ graph_commit_result }.map_err(Self::storage_error)?;
             ));
         }
         let prefix = Self::vector_partition_prefix(index, partition_key);
-        let journal = match read.open_byte_table_bounded(VECTOR_PARTITION_JOURNAL_TABLE) {
+        // Coverage is authenticated by the captured catalog above. Old
+        // cleanup records are outside this query's source window.
+        let mut start = prefix.clone();
+        start.extend_from_slice(&covered_lsn.0.to_be_bytes());
+        start.extend_from_slice(&u64::MAX.to_be_bytes());
+        let journal = match read.open_table(VECTOR_PARTITION_JOURNAL_TABLE) {
             Ok(table) => table,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok((Vec::new(), covered_lsn)),
             Err(error) => return Err(Self::storage_error(error)),
@@ -31074,7 +31079,10 @@ graph_commit_result }.map_err(Self::storage_error)?;
         let mut identities = BTreeSet::new();
         let mut replayed_through_lsn = covered_lsn;
         for entry in journal
-            .prefix_bounded(prefix.as_slice())
+            .range::<&[u8]>((
+                std::ops::Bound::Excluded(start.as_slice()),
+                std::ops::Bound::Unbounded,
+            ))
             .map_err(Self::storage_error)?
         {
             checkpoint()?;
