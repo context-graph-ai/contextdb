@@ -11883,6 +11883,42 @@ fn execute_index_scan(
         return Ok((Vec::new(), 0));
     }
 
+    // A predicate that binds a whole unique key has one current candidate. Reuse
+    // the transactional point lookup rather than walking that key's retained
+    // posting history; its staged replacement and deletion rules stay shared.
+    if matches!(access_mode, IndexScanAccessMode::Predicate)
+        && let Some(txid) = tx
+        && let Some(meta) = db.table_meta(table)
+        && let Ok(pick) = coerce_pick_shape_to_column_type(db, table, pick)
+        && pick.pushed_columns.len() == pick.columns.len()
+        && meta.indexes.iter().any(|decl| {
+            decl.name == pick.name && index_is_unique(decl, &meta)
+        })
+    {
+        let values = std::iter::once(&pick.shape)
+            .chain(&pick.suffix_shapes)
+            .map(|shape| match shape {
+                IndexPredicateShape::Equality(value) if *value != Value::Null => {
+                    Some(value.clone())
+                }
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>();
+        if let Some(values) = values.filter(|values| values.len() == pick.columns.len()) {
+            let columns = pick.columns.iter().map(|(column, _)| column.clone()).collect::<Vec<_>>();
+            let mut rows = db.unique_row_lookup_in_tx(
+                txid, table, &columns, &values, snapshot, read_memory.clone(),
+            )?.into_iter().collect::<Vec<_>>();
+            let examined = rows.len() as u64;
+            db.supplement_selected_vector_columns(
+                table, snapshot, tx, materialized_columns, &mut rows,
+                vector_copy_owner, read_memory.clone(),
+            )?;
+            let rows = db.filter_rows_for_read_in_tx(tx, table, rows, snapshot, read_memory)?;
+            return Ok((rows, examined));
+        }
+    }
+
     if db.writer_read_root()?.is_some() {
         return execute_writer_index_scan(
             db,
