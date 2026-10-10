@@ -40698,6 +40698,12 @@ graph_commit_result }.map_err(Self::storage_error)?;
         membership: Option<&[u8]>,
         pending_transition: bool,
     ) -> Result<()> {
+        let _writer_scope = self.writer_decode_scope()?;
+        let decoded = crate::read_image_memory::active_owner()?.row_owner()?;
+        let _record_scope = decoded.enter();
+        // No decoded membership escapes this mutation. Release its scratch
+        // before publishing the next member of a batch.
+
         self.prepare_proof_owner()?;
         #[cfg(any(test, feature = "test-seams"))]
         if CORRUPT_STORE {
