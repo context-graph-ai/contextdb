@@ -50,7 +50,6 @@ impl serde::Serialize for ObjectRow<'_> {
 struct JsonCell<'a>(Option<&'a Value>);
 impl serde::Serialize for JsonCell<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::Serialize;
         match self.0 {
             None | Some(Value::Null) => serializer.serialize_none(),
             Some(Value::Bool(value)) => value.serialize(serializer),
