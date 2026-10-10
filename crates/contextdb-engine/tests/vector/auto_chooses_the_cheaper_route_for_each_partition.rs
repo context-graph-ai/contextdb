@@ -82,7 +82,9 @@ fn fixture() -> Database {
 }
 
 fn partitioned_fixture(partitions: usize, rows_per_partition: usize, table: &str) -> Database {
-    let db = Database::open_memory();
+    let mut options = contextdb_engine::DatabaseOpenOptions::default();
+    options.owner_reads.limits.limits.memory = limits().memory;
+    let db = Database::open_with_options(":memory:", options).unwrap();
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     db.execute(
         &format!(

@@ -404,7 +404,9 @@ fn ranked_auto_uses_the_declared_crossover_on_ordinary_and_bounded_reads() {
 fn current_filtered_rows_keep_the_same_answers_as_excluded_history_grows() {
     use contextdb_engine::executor::bounded_read_test_support as bounded;
     let root = TempDir::new().unwrap();
-    let db = Database::open(root.path().join("history.db")).unwrap();
+    let mut options = contextdb_engine::DatabaseOpenOptions::default();
+    options.owner_reads.limits.limits.memory = 64 * 1024 * 1024;
+    let db = Database::open_with_options(root.path().join("history.db"), options).unwrap();
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, is_current BOOLEAN, embedding VECTOR(2) AUTO_INDEX_AT 1 HNSW (M = 32, EF_CONSTRUCTION = 96, EF_SEARCH = 17))", &HashMap::new()).unwrap();
     db.execute(
