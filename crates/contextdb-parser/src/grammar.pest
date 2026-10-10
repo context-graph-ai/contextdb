@@ -122,7 +122,10 @@ select_item = { expr ~ (^"AS" ~ identifier)? }
 from_clause = { ^"FROM" ~ from_item ~ ("," ~ from_item)* }
 join_clause = { join_type ~ join_table_ref ~ ^"ON" ~ expr ~ &(join_type | where_start | group_by_start | order_by_start | use_vector_start | use_rank_start | limit_start | clause_end) }
 join_table_ref = { identifier ~ (^"AS" ~ identifier | identifier ~ &(^"ON"))? }
-join_type = { (^"LEFT" ~ ^"JOIN") | (^"INNER" ~ ^"JOIN") }
+// INNER is optional: a bare JOIN is an inner join, as in standard SQL. The bare
+// keyword must end at a word boundary so an alias such as `joiner` still parses.
+join_type = { (^"LEFT" ~ ^"JOIN") | (^"INNER" ~ ^"JOIN") | bare_join_kw }
+bare_join_kw = @{ ^"JOIN" ~ !ident_char }
 from_item = { graph_table | table_ref }
 table_ref = { identifier ~ ((^"AS")? ~ table_alias)? }
 table_alias = { !(join_type | where_start | group_by_start | named_window_start | order_by_start | use_vector_start | use_rank_start | limit_start | clause_end) ~ identifier }

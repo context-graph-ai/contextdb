@@ -205,7 +205,7 @@ DELETE FROM scratch WHERE created_at < $cutoff
 
 ```sql
 SELECT [DISTINCT] columns FROM table
-  [INNER JOIN | LEFT JOIN other ON condition]
+  [[INNER] JOIN | LEFT JOIN other ON condition]
   [WHERE condition]
   [ORDER BY col [ASC|DESC]]
   [USE RANK sort_key]
@@ -255,6 +255,10 @@ A qualifier naming the query's own table, alias, or a joined relation keeps work
 SELECT t.id FROM items AS t WHERE t.name = 'a';
 SELECT items.id FROM items INNER JOIN tags ON items.id = tags.item_id WHERE tags.label = 'x';
 ```
+
+A bare `JOIN` with no join type is an inner join, as in standard SQL: `FROM items JOIN tags ON ...`
+parses exactly as `FROM items INNER JOIN tags ON ...`. The alias rules are unchanged, so
+`FROM items x JOIN tags y ON x.id = y.id` keeps `x` and `y` as the aliases.
 
 #### Standard-SQL WHERE Forms
 
@@ -342,6 +346,11 @@ specific row identity through equality on a primary key, a single-column
 hidden by the handle, the query returns the typed visibility error from the
 gate that hid it: `ContextScopeViolation`, `ScopeLabelViolation`, or
 `AclDenied`. Missing rows still return an empty result.
+
+Graph queries follow the same split. A `GRAPH_TABLE ... MATCH` query whose anchor pins a
+node the handle cannot see returns the typed visibility error that hid it — `AclDenied`
+for an ACL-hidden node — rather than an empty result. A traversal that reaches a hidden
+node omits that node silently; it does not return an error.
 
 Predicate writes keep their existing contract. `UPDATE ... WHERE pk = $id` and
 `DELETE ... WHERE pk = $id` against a hidden row return
