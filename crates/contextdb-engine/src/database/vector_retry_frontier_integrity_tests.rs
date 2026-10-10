@@ -40,7 +40,7 @@ fn cleanup_refusal_skips_its_build_while_sibling_and_complete_query_frontiers_pr
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("frontier-owner.db");
     let copy = directory.path().join("frontier-cold.db");
-    let mut db = Database::open_with_options(
+    let db = Database::open_with_options(
         &path,
         DatabaseOpenOptions {
             maintenance_policy: MaintenancePolicy::CallerDriven,
@@ -118,6 +118,14 @@ fn cleanup_refusal_skips_its_build_while_sibling_and_complete_query_frontiers_pr
                     "vector_partition_graph_pages",
                     "vector_partition_generation_catalog",
                     "vector_partition_journal",
+                    "vector_partition_membership",
+                    "vector_entries",
+                    "vector_open_directory",
+                    "vector_membership_summary_pages",
+                    "vector_membership_source_pages",
+                    "vector_membership_reverse_pages",
+                    "vector_paged_generation_pages",
+                    "vector_paged_builds",
                 ] {
                     let definition: TableDefinition<&[u8], &[u8]> = TableDefinition::new(name);
                     write.delete_table(definition).unwrap();
@@ -132,6 +140,73 @@ fn cleanup_refusal_skips_its_build_while_sibling_and_complete_query_frontiers_pr
                             .unwrap();
                     }
                 }
+                let counters = TableDefinition::<&str, u64>::new("vector_paged_counters");
+                write.delete_table(counters).unwrap();
+                if let Ok(source_table) = read.open_table(counters) {
+                    let mut destination_table = write.open_table(counters).unwrap();
+                    for entry in source_table.iter().unwrap() {
+                        let (key, value) = entry.unwrap();
+                        destination_table
+                            .insert(key.value(), value.value())
+                            .unwrap();
+                    }
+                }
+                let cleanup = TableDefinition::<u64, &[u8]>::new("vector_paged_cleanup");
+                write.delete_table(cleanup).unwrap();
+                if let Ok(source_table) = read.open_table(cleanup) {
+                    let mut destination_table = write.open_table(cleanup).unwrap();
+                    for entry in source_table.iter().unwrap() {
+                        let (key, value) = entry.unwrap();
+                        destination_table
+                            .insert(key.value(), value.value())
+                            .unwrap();
+                    }
+                }
+                let floors = TableDefinition::<&[u8], u64>::new("vector_build_floors");
+                write.delete_table(floors).unwrap();
+                if let Ok(source_table) = read.open_table(floors) {
+                    let mut destination_table = write.open_table(floors).unwrap();
+                    for entry in source_table.iter().unwrap() {
+                        let (key, value) = entry.unwrap();
+                        destination_table
+                            .insert(key.value(), value.value())
+                            .unwrap();
+                    }
+                }
+                for (name, binding) in [
+                    (
+                        "vector_membership_source_pages",
+                        "vector_membership_source_pages_root_v1",
+                    ),
+                    (
+                        "vector_membership_reverse_pages",
+                        "vector_membership_reverse_pages_root_v1",
+                    ),
+                    (
+                        "vector_membership_summary_pages",
+                        "vector_membership_summary_pages_root_v1",
+                    ),
+                    (
+                        "vector_partition_membership",
+                        "vector_membership_authority_pages_root_v1",
+                    ),
+                    (
+                        "vector_open_directory",
+                        "vector_open_directory_pages_root_v1",
+                    ),
+                ] {
+                    let fingerprint = write
+                        .table_root_fingerprint(TableDefinition::<&[u8], &[u8]>::new(name))
+                        .unwrap()
+                        .unwrap_or([0; 32]);
+                    write
+                        .open_table(TableDefinition::<&str, &[u8]>::new(
+                            "__content_identity_metadata",
+                        ))
+                        .unwrap()
+                        .insert(binding, fingerprint.as_slice())
+                        .unwrap();
+                }
                 write.commit().unwrap();
                 Ok(())
             })?;
@@ -140,6 +215,30 @@ fn cleanup_refusal_skips_its_build_while_sibling_and_complete_query_frontiers_pr
         .unwrap();
     journal_key.extend_from_slice(&catalog.base.covered_lsn.0.to_be_bytes());
     journal_key.extend_from_slice(&0u64.to_be_bytes());
+    persistence.close();
+    drop(persistence);
+    // A paged query's published root and its maintenance source must belong
+    // to this same writer. Restore the serving premise through normal preload.
+    db.close().unwrap();
+    drop(db);
+    let accountant = Arc::new(MemoryAccountant::no_limit());
+    accountant.set_budget(Some(64 * 1024 * 1024)).unwrap();
+    let db = Database::open_with_config(&copy, Arc::new(CorePlugin), accountant).unwrap();
+    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+    assert!(
+        db.vector_store
+            .preload_dormant_partition_generation(&refusing, true)
+            .unwrap()
+    );
+    assert_eq!(
+        db.vector_store.partition_graph_generation_status(&refusing),
+        Some(serving)
+    );
+    assert!(
+        crate::persistence::redb_writer_cache_bytes_for_limit(Some(64 * 1024 * 1024))
+            < REFUSING_EXTENT_BYTES
+    );
+    let persistence = Arc::clone(db.persistence.as_ref().unwrap());
     persistence
         .with_db(|destination| {
             let write = destination.begin_write().unwrap();
@@ -155,11 +254,6 @@ fn cleanup_refusal_skips_its_build_while_sibling_and_complete_query_frontiers_pr
             Ok(())
         })
         .unwrap();
-    persistence.close();
-    drop(persistence);
-    let persistence = Arc::new(RedbPersistence::open_with_cache(&copy, 0).unwrap());
-    persistence.attach_memory_accountant(Arc::clone(&db.accountant));
-    let original = db.persistence.replace(Arc::clone(&persistence)).unwrap();
     let headroom = 4 * 1024 * 1024;
     let limit = db.accountant.usage().used + headroom;
     db.accountant.set_budget(Some(limit)).unwrap();
@@ -235,8 +329,9 @@ fn cleanup_refusal_skips_its_build_while_sibling_and_complete_query_frontiers_pr
     );
     let indexed_error = db.execute(&query("INDEXED"), &HashMap::new()).unwrap_err();
     assert!(
-        matches!(indexed_error, Error::VectorIndexedRouteUnavailable { index }
-        if index == refusing.index)
+        matches!(&indexed_error, Error::VectorIndexedRouteUnavailable { index }
+        if *index == refusing.index),
+        "{indexed_error:?}"
     );
     db.__reset_last_query_vector_trace_for_test();
     let auto = db.execute(&query("AUTO"), &HashMap::new()).unwrap();
@@ -295,8 +390,6 @@ fn cleanup_refusal_skips_its_build_while_sibling_and_complete_query_frontiers_pr
         0
     );
     let accountant = Arc::clone(&db.accountant);
-    db.persistence = Some(original);
-    persistence.close();
     drop(persistence);
     db.close().unwrap();
     drop(db);
