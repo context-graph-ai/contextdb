@@ -7202,6 +7202,17 @@ impl IndexState {
         } else {
             None
         };
+        let mut roots = HashSet::new();
+        let mut retained_bytes = |generation: &SealedHnswGeneration| {
+            generation.bytes().saturating_add(
+                generation.graph().paged_tail_snapshot().map_or(0, |tail| {
+                    tail.retained_control_receipts().into_iter()
+                        .filter(|(owner, _)| roots.insert(*owner))
+                        .map(|(_, bytes)| bytes)
+                        .fold(0usize, usize::saturating_add)
+                }),
+            )
+        };
         (
             sealed
                 .retired
@@ -7221,20 +7232,20 @@ impl IndexState {
                             chain
                                 .base
                                 .as_ref()
-                                .map(SealedHnswGeneration::bytes)
+                                .map(&mut retained_bytes)
                                 .unwrap_or(0),
                         )
                         .saturating_add(
                             chain
                                 .change
                                 .as_ref()
-                                .map(SealedHnswGeneration::bytes)
+                                .map(&mut retained_bytes)
                                 .unwrap_or(0),
                         )
                 })
                 .saturating_add(
                     superseded_base
-                        .map(SealedHnswGeneration::bytes)
+                        .map(&mut retained_bytes)
                         .unwrap_or(0),
                 ),
         )

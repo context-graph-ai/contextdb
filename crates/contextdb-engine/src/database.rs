@@ -11066,6 +11066,7 @@ pub struct WriterMemoryOwnershipReceiptForTest {
     pub captured_root_charge: usize,
     pub commit_source_reference_charge: usize,
     pub storage_maintenance_control_charge: usize,
+    pub snapshot_pin_capacity_charge: usize,
 }
 
 #[cfg(any(test, feature = "test-seams"))]
@@ -62619,6 +62620,8 @@ impl Database {
                 vector: self.vector_memory_ownership_receipt_for_test(),
                 relational_inventory: self.relational_store.retained_structure_bytes(),
                 commit_source_reference_charge: self.commit_source_reference_charge,
+                snapshot_pin_capacity_charge: self.snapshot_registry.pin_slots.lock().as_ref()
+                    .map_or(0, |pool| pool.slots.saturating_mul(pool.slot_bytes)),
                 ..WriterMemoryOwnershipReceiptForTest::default()
             };
             let metadata = self.relational_store.table_meta.read();
@@ -62785,6 +62788,7 @@ impl Database {
             receipt.named_owner_total = registration + backing + adapters + receipt.pending_lineage_generation_charge
                 + receipt.storage_maintenance_control_charge
                 + receipt.commit_source_reference_charge
+                + receipt.snapshot_pin_capacity_charge
                 + receipt.published_root_charge
                 + receipt.captured_root_charge
                 + receipt.staged_index_postings
