@@ -457,12 +457,16 @@ fn run_concurrent_staged_delete(mode: StagedDeleteRaceModeForTest) -> (ReleaseOn
             .vector
             .accountant_total
             .checked_sub(rolled_back.vector.accountant_total),
-        Some(after.staged_index_postings + after.writer_adapter_controls - rolled_back.writer_adapter_controls),
+        Some(
+            after.staged_index_postings + after.writer_adapter_controls
+                - rolled_back.writer_adapter_controls
+        ),
         "rollback releases the actual remaining staged declaration controls"
     );
     assert_eq!(
         after.named_owner_total - rolled_back.named_owner_total,
-        after.staged_index_postings + after.writer_adapter_controls - rolled_back.writer_adapter_controls
+        after.staged_index_postings + after.writer_adapter_controls
+            - rolled_back.writer_adapter_controls
     );
     assert_eq!(rolled_back.staged_row_versions, 0);
     assert_eq!(rolled_back.staged_row_admissions, 0);

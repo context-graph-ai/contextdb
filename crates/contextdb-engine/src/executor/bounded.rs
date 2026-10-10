@@ -1561,7 +1561,8 @@ impl RequestContext {
         self.checkpoint()?;
         contextdb_core::find_attribution::count("bounded_native_source_touches", 1);
         let mut state = self.state();
-        state.telemetry.native_source_touches = state.telemetry.native_source_touches.saturating_add(1);
+        state.telemetry.native_source_touches =
+            state.telemetry.native_source_touches.saturating_add(1);
         Ok(())
     }
 
