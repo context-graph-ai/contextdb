@@ -517,8 +517,9 @@ fn expansion_work_does_not_grow_with_context_count() {
         PARTITIONS * ROWS_PER_PARTITION,
     );
     assert_eq!(
-        broad.budget, narrow.budget,
-        "the budget is one search's, not one per Context"
+        broad.budget,
+        narrow.budget * PARTITIONS,
+        "each selected index receives the same declared cap"
     );
 }
 

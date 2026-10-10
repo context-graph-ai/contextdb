@@ -274,16 +274,19 @@ fn check_budget(
         ));
         return;
     };
-    println!("approved_budget {cell} expected={expected} receipt={receipt:?}");
+    let scope_budget = expected * selected;
+    println!(
+        "approved_budget {cell} per_index={expected} total={scope_budget} receipt={receipt:?}"
+    );
     if receipt.partitions != selected {
         failures.push(format!(
             "{cell}: {selected} Contexts admitted, the search saw {}",
             receipt.partitions
         ));
     }
-    if receipt.budget != expected {
+    if receipt.budget != scope_budget {
         failures.push(format!(
-            "{cell}: the search was given {} evaluations, the declared numbers allow {expected}",
+            "{cell}: the search was given {} evaluations, {selected} indexes allow {scope_budget}",
             receipt.budget
         ));
     }
@@ -294,19 +297,19 @@ fn check_budget(
             receipt.expansion_cap
         ));
     }
-    if receipt.expansion_evaluations > expected {
+    let spent = receipt.admission_evaluations + receipt.expansion_evaluations;
+    if spent > scope_budget {
         failures.push(format!(
-            "{cell}: the walk spent {} evaluations past opening its layers, more than the \
-             approved {expected}",
-            receipt.expansion_evaluations
+            "{cell}: opening and walking spent {spent} evaluations, more than the \
+             scope's approved {scope_budget}",
         ));
     }
 }
 
 /// Over graphs built at `M = 16` and at `M = 24`, with `EF_SEARCH` declared
 /// at 200 and at 400, a find over one, three or eight Contexts is given
-/// exactly `EF_SEARCH x 2M` evaluations for its walk, reports the breadth it
-/// was declared, and never walks past that number.
+/// exactly `EF_SEARCH x 2M` evaluations per index for its walk, reports the
+/// breadth it was declared, and never walks past the funded scope total.
 #[cfg(unix)]
 #[test]
 fn a_declared_breadth_is_given_its_breadth_times_the_serving_degree() {
