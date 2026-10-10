@@ -61657,6 +61657,49 @@ impl Database {
                 }
             }
 
+            // Graph history validates each contribution against its commit.
+            // Install the captured directory before copying those records.
+            if let Some(root) = &writer_root {
+                let mut cursor = root.commit_cursor(
+                    crate::persistence::writer_source::SourceWindowOwner::Read(read_memory.clone()),
+                    Lsn(0),
+                    snapshot_lsn,
+                    false,
+                )?;
+                let mut batch = BTreeMap::new();
+                while let Some((lsn, tx)) = cursor.next()? {
+                    batch.insert(lsn, tx);
+                    if batch.len() == EXPORT_BATCH_SIZE {
+                        artifact.flush_commit_index_entries(&batch)?;
+                        batch.clear();
+                    }
+                }
+                artifact.flush_commit_index_entries(&batch)?;
+            } else if let Some(mut cursor) = commit_index {
+                let context = contextdb_tx::ReadCommitContext::new(read_memory.clone(), &|| Ok(()));
+                let mut credit = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
+                let mut batch = BTreeMap::new();
+                while let Some((lsn, tx)) = cursor.next_entry(&context)? {
+                    // Conservative per-insertion node funding covers internal
+                    // splits as well as the retained pair and allocator header.
+                    let node_bytes = 11 * std::mem::size_of::<(Lsn, TxId)>()
+                        + 12 * std::mem::size_of::<usize>()
+                        + 4 * std::mem::size_of::<usize>()
+                        + crate::sync_types::held::ALLOCATION_BYTES;
+                    credit.try_grow_for(2 * node_bytes, "reader", "export_commit_output",
+                        "Reduce the export batch or raise the declared reader memory limit.")?;
+                    batch.insert(lsn, tx);
+                    if batch.len() == EXPORT_BATCH_SIZE {
+                        artifact.flush_commit_index_entries(&batch)?;
+                        batch.clear();
+                        credit.try_shrink(credit.bytes())?;
+                    }
+                }
+                artifact.flush_commit_index_entries(&batch)?;
+                drop(batch);
+                drop(credit);
+            }
+
             // The same captured graph root serves image and writer exports.
             let mut edge_count = 0u64;
             let graph_root = match &writer_root {
@@ -61838,47 +61881,6 @@ impl Database {
                     .cloned()
                     .collect();
                 artifact.append_ddl_log_entries(&ddl_entries)?;
-            }
-
-            if let Some(root) = &writer_root {
-                let mut cursor = root.commit_cursor(
-                    crate::persistence::writer_source::SourceWindowOwner::Read(read_memory.clone()),
-                    Lsn(0),
-                    snapshot_lsn,
-                    false,
-                )?;
-                let mut batch = BTreeMap::new();
-                while let Some((lsn, tx)) = cursor.next()? {
-                    batch.insert(lsn, tx);
-                    if batch.len() == EXPORT_BATCH_SIZE {
-                        artifact.flush_commit_index_entries(&batch)?;
-                        batch.clear();
-                    }
-                }
-                artifact.flush_commit_index_entries(&batch)?;
-            } else if let Some(mut cursor) = commit_index {
-                let context = contextdb_tx::ReadCommitContext::new(read_memory.clone(), &|| Ok(()));
-                let mut credit = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
-                let mut batch = BTreeMap::new();
-                while let Some((lsn, tx)) = cursor.next_entry(&context)? {
-                    // Conservative per-insertion node funding covers internal
-                    // splits as well as the retained pair and allocator header.
-                    let node_bytes = 11 * std::mem::size_of::<(Lsn, TxId)>()
-                        + 12 * std::mem::size_of::<usize>()
-                        + 4 * std::mem::size_of::<usize>()
-                        + crate::sync_types::held::ALLOCATION_BYTES;
-                    credit.try_grow_for(2 * node_bytes, "reader", "export_commit_output",
-                        "Reduce the export batch or raise the declared reader memory limit.")?;
-                    batch.insert(lsn, tx);
-                    if batch.len() == EXPORT_BATCH_SIZE {
-                        artifact.flush_commit_index_entries(&batch)?;
-                        batch.clear();
-                        credit.try_shrink(credit.bytes())?;
-                    }
-                }
-                artifact.flush_commit_index_entries(&batch)?;
-                drop(batch);
-                drop(credit);
             }
 
             // The owning Redb read transaction was captured with the relational
