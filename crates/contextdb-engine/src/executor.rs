@@ -1297,9 +1297,10 @@ fn published_page(
     crate::direct_file_reader::DirectCursorPage,
     crate::direct_file_reader::DirectFileReaderError,
 > {
-    let body =
-        crate::read_contract::cursor_observation::BorrowedObservedPage::new(&page, &observation);
-    let size = read_answer(bounded::serialized_size(&body))?;
+    // The direct page's canonical body is the public page encoding. The
+    // observation travels separately; only owner-channel frames include it.
+    let body = &page;
+    let size = read_answer(bounded::serialized_size(body))?;
     let canonical_credit = contextdb_core::read_memory::ReadCredit::try_new(
         read_memory,
         size,
@@ -1310,7 +1311,7 @@ fn published_page(
     .map_err(crate::read_image::history_answer_error)?;
     let mut canonical_bytes = vec![0u8; size];
     let written =
-        bincode::serde::encode_into_slice(&body, &mut canonical_bytes, bincode::config::standard())
+        bincode::serde::encode_into_slice(body, &mut canonical_bytes, bincode::config::standard())
             .map_err(|error| {
                 crate::direct_file_reader::DirectFileReaderError::Engine(error.to_string())
             })?;

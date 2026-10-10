@@ -16139,13 +16139,13 @@ fn encoded_query_size(
 fn encoded_page_size(
     context: &Arc<RequestContext>,
     page: &CursorPage,
-    observation: &CursorObservation,
+    _observation: &CursorObservation,
 ) -> std::result::Result<u64, BoundedExecutionError> {
     page.validate()
         .map_err(|error| Error::Other(error.to_string()))?;
-    let measured = serialized_size(
-        &crate::read_contract::cursor_observation::BorrowedObservedPage::new(page, observation),
-    )?;
+    // The declared page ceiling measures the public page. Channel trace
+    // bytes keep their separate admission and telemetry charge.
+    let measured = serialized_size(page)?;
     u64::try_from(measured).map_err(|_| {
         RequestContext::limit_failure(
             ReadFailureLimit::CursorPageBytes,
@@ -17659,8 +17659,13 @@ impl CursorState {
             if encoded > self.context.limits.cursor_page_bytes {
                 return Err(self.page_bytes_refusal(encoded)?);
             }
-            let page_bytes = u64::try_from(serialized_size(&page)?)
-                .map_err(|_| bounded_size_error("cursor page telemetry"))?;
+            let page_bytes = encoded;
+            let encoded = u64::try_from(serialized_size(
+                &crate::read_contract::cursor_observation::BorrowedObservedPage::new(
+                    &page, &observation,
+                ),
+            )?)
+            .map_err(|_| bounded_size_error("cursor observation telemetry"))?;
             let trace_bytes = encoded
                 .checked_sub(page_bytes)
                 .ok_or_else(|| bounded_size_error("cursor trace telemetry"))?;
