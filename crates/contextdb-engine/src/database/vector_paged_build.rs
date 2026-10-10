@@ -438,15 +438,9 @@ impl MaintenanceContext {
         if self.vector.partition_route_quarantine(partition).is_some() {
             return Ok(None);
         }
-        let retired_without_catalog = match persistence.retired_vector_rebuild_pending(partition) {
-            Ok(pending) => pending,
-            Err(Error::StoreCorrupted { .. }) => return Ok(None),
-            Err(error) => return Err(error),
-        };
-        let force_paged = force_paged || retired_without_catalog;
         // Route selection owns keys and decoded catalog metadata before its
         // first source read. This phase ends before a batch owns its workspace.
-        let (recorded, base_build_applies) = {
+        let (recorded, base_build_applies, force_paged) = {
             let inventory_bytes = partition
                 .partition_key
                 .estimated_bytes()
@@ -460,6 +454,14 @@ impl MaintenanceContext {
                 "prepare_vector_generation",
                 "Raise MEMORY_LIMIT before inspecting this maintained route.",
             )?;
+            // Retired generations are read only once this inspection is funded.
+            let retired_without_catalog =
+                match persistence.retired_vector_rebuild_pending(partition) {
+                    Ok(pending) => pending,
+                    Err(Error::StoreCorrupted { .. }) => return Ok(None),
+                    Err(error) => return Err(error),
+                };
+            let force_paged = force_paged || retired_without_catalog;
             install_paged_root_capture(persistence, &self.tx_mgr);
             let mut recorded = persistence.load_paged_build_record(partition)?;
             if recorded
@@ -479,7 +481,7 @@ impl MaintenanceContext {
             let applies = force_paged
                 || recorded.is_some()
                 || self.paged_base_build_applies(partition, persistence, copy_owner)?;
-            (recorded, applies)
+            (recorded, applies, force_paged)
         };
         if recorded.is_none()
             && !force_paged
