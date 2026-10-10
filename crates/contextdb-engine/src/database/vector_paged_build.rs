@@ -432,15 +432,18 @@ impl MaintenanceContext {
         let Some(persistence) = self.persistence.as_ref() else {
             return Ok(None);
         };
+        // A quarantined route leaves this path for repair before anything
+        // reads its retired generations: that inspection reads generation
+        // records, which repair admits as source pages of its own.
+        if self.vector.partition_route_quarantine(partition).is_some() {
+            return Ok(None);
+        }
         let retired_without_catalog = match persistence.retired_vector_rebuild_pending(partition) {
             Ok(pending) => pending,
             Err(Error::StoreCorrupted { .. }) => return Ok(None),
             Err(error) => return Err(error),
         };
         let force_paged = force_paged || retired_without_catalog;
-        if self.vector.partition_route_quarantine(partition).is_some() {
-            return Ok(None);
-        }
         // Route selection owns keys and decoded catalog metadata before its
         // first source read. This phase ends before a batch owns its workspace.
         let (recorded, base_build_applies) = {

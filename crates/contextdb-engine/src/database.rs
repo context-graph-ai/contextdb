@@ -21226,7 +21226,6 @@ impl MaintenanceContext {
                 return Ok(outcome);
             }
             let mut maintenance_vector_copy_owner = maintenance_vector_copy_owner.scratch();
-            let schema_binding = persistence.vector_schema_binding(&partition.index)?;
             let layout = contextdb_vector::scoped_index_layout(
                 &self.vector,
                 &partition.index,
@@ -21274,6 +21273,9 @@ impl MaintenanceContext {
                 "prepare_vector_generation",
                 "Raise MEMORY_LIMIT before inspecting this maintained route.",
             )?;
+            // The column's schema binding is a storage read; it follows the
+            // metadata admission so an unfunded route reads nothing.
+            let schema_binding = persistence.vector_schema_binding(&partition.index)?;
             // Install cleanup only after metadata admission, so an early
             // refusal cannot read storage while dropping a construction floor.
             let _whole_build_floor = vector_paged_build::WholeBuildFloor::new(self, partition);
@@ -22557,7 +22559,12 @@ impl MaintenanceContext {
             })();
             let outcome = match attempt {
                 Ok(outcome) => outcome,
-                Err(Error::MemoryBudgetExceeded { .. }) if quarantined => {
+                // A paged build fits a smaller workspace; it cannot read a
+                // source page the budget already refused, so that refusal is
+                // the answer rather than a reason to retry.
+                Err(Error::MemoryBudgetExceeded { ref operation, .. })
+                    if quarantined && operation != "read_vector_generation_source_page" =>
+                {
                     retire_for_paged(&mut workspace)?;
                     force_paged = true;
                     continue;
