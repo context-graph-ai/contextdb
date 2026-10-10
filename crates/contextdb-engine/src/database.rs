@@ -49276,11 +49276,17 @@ impl Database {
         index: &VectorIndexRef,
         row_id: RowId,
         loaded: Option<Vec<f32>>,
+        snapshot: SnapshotId,
     ) -> Result<Option<Vec<f32>>> {
         let Some(vector) = loaded else {
             return Ok(None);
         };
-        if let Some(source) = &self.retained_relational_source {
+        // Historical loaders prove the retained body and owning placement.
+        // The current family names its successor, so only a current read can
+        // additionally compare this value against the current projection.
+        if snapshot == self.snapshot()
+            && let Some(source) = &self.retained_relational_source
+        {
             let quantization = self
                 .table_meta(&index.table)
                 .and_then(|meta| {
@@ -49307,6 +49313,16 @@ impl Database {
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Option<Vec<f32>>> {
+        let _historical_intent = if snapshot.0 < self.snapshot().0 {
+            self.vector_historical_read_intent(snapshot, read_memory.clone())
+        } else {
+            None
+        };
+        let _vector_capture = if _historical_intent.is_some() {
+            self.vector_read_scope(snapshot, read_memory.clone(), vector_copy_owner)?
+        } else {
+            None
+        };
         self.with_vector_read_admission(vector_copy_owner, |vector_copy_owner| {
             let index = VectorIndexRef::new(table, column.to_owned());
             if let Some(Value::Vector(vector)) = row.values.get(column) {
@@ -49337,7 +49353,7 @@ impl Database {
                         read_memory.clone(),
                     )
                     .map(|entry| entry.map(|entry| entry.vector))?;
-                return self.authenticate_selected_row_vector(&index, row.row_id, loaded);
+                return self.authenticate_selected_row_vector(&index, row.row_id, loaded, snapshot);
             }
             if let Some(vector) = self.vector_store.load_vector_for_row_lsn(
                 &index,
@@ -49347,7 +49363,12 @@ impl Database {
                 snapshot,
                 vector_copy_owner,
             )? {
-                return self.authenticate_selected_row_vector(&index, row.row_id, Some(vector));
+                return self.authenticate_selected_row_vector(
+                    &index,
+                    row.row_id,
+                    Some(vector),
+                    snapshot,
+                );
             }
             // Writable open keeps only the current membership in each dormant
             // partition directory so retired bodies do not become permanent live
@@ -49405,7 +49426,9 @@ impl Database {
                     let loaded = persistence
                         .load_vector_entries_for_memberships(&[membership], dimension, None)
                         .map(|mut entries| entries.pop().map(|entry| entry.vector))?;
-                    return self.authenticate_selected_row_vector(&index, row.row_id, loaded);
+                    return self.authenticate_selected_row_vector(
+                        &index, row.row_id, loaded, snapshot,
+                    );
                 }
             }
             Ok(None)
