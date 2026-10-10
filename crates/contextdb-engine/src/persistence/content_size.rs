@@ -444,8 +444,8 @@ pub(super) fn reconcile_row_heads(
                 u64::from_be_bytes(head[8..16].try_into().expect("checked transaction")),
             )
         };
-        if let (Some((prior_head, _)), Some(next_head)) = (prior, head) {
-            if rank(prior_head) > rank(next_head) {
+        if let (Some((prior_head, _)), Some(next_head)) = (prior, head)
+            && rank(prior_head) > rank(next_head) {
                 let relation_name = RedbPersistence::rel_table_name(table);
                 let relation = write
                     .open_table(TableDefinition::<&[u8], &[u8]>::new(&relation_name))
@@ -458,7 +458,6 @@ pub(super) fn reconcile_row_heads(
                     continue;
                 }
             }
-        }
         let new = if mutation.logical_value.is_some() {
             let head = head.ok_or_else(|| corrupt("live row has no physical head"))?;
             let relation_name = RedbPersistence::rel_table_name(table);

@@ -133,7 +133,7 @@ impl<K: Eq + Hash + Copy, V, P> Backing<K, V, P> {
         if !self.map.is_empty() || self.buckets == 0 && self.backing.is_none() {
             return;
         }
-        drop(std::mem::replace(&mut *self.map, HashMap::new()));
+        drop(std::mem::take(&mut *self.map));
         self.buckets = 0;
         drop(self.backing.take());
     }
@@ -796,6 +796,7 @@ fn clustered_numeric_keys_for_test<K: Eq + Hash + Copy, V, P>(
 }
 
 #[cfg(all(test, feature = "test-seams"))]
+#[allow(clippy::int_plus_one)] // Preserve the arithmetic threshold used by the registry test.
 fn occupied_tombstone_rehash_for_test<K, V, P>(
     registry: Arc<Mutex<OccupiedRegistry<K, V, P>>>, owner: &Arc<MemoryAccountant>,
     make_key: impl Fn(u64) -> K, family: &'static str,
@@ -875,6 +876,7 @@ fn occupied_tombstone_rehash_for_test<K, V, P>(
 }
 
 #[cfg(all(test, feature = "test-seams"))]
+#[allow(clippy::int_plus_one)] // Preserve the arithmetic threshold used by the registry test.
 fn tombstone_rehash_rows_for_test() {
     use crate::memory_accounting::WriterBudget;
     use crate::persistence::content_identity::proof_allocation_oracle_tests as oracle;
@@ -1049,6 +1051,7 @@ fn received_stage_for_test(database: &Database) -> ReceivedSchemaStage {
 }
 
 #[cfg(all(test, feature = "test-seams"))]
+#[allow(clippy::bool_assert_comparison)] // Preserve the existing boolean assertion contract.
 fn received_retired_construction_stage_witness_for_test() {
     use crate::memory_accounting::{ContainedMemoryReservation, OwnedMemoryReservation};
     use crate::persistence::content_identity::proof_allocation_oracle_tests as oracle;
@@ -1355,7 +1358,7 @@ fn family_refusal_literals_for_test() {
         match ReceivedToken::reserve(registry, Lsn(1)) { Ok(token) => { drop(token); Ok(()) }, Err(error) => Err(error) }
     });
     refusal!(LocalRegistry, "local", |registry: &Arc<Mutex<LocalRegistry>>| {
-        registry.lock().insert(Lsn(1), local_stage_for_test(&database)).map(|stage| drop(stage))
+        registry.lock().insert(Lsn(1), local_stage_for_test(&database)).map(drop)
     });
 }
 

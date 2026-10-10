@@ -2952,7 +2952,7 @@ async fn spawn_apply_and_reply(work: PushApplyWork) -> contextdb_core::Result<()
                 let read_memory = fallback_read_memory;
                 let mut retained_vector_copy =
                     crate::vector_read_memory::admission(read_memory.clone());
-                let vector_copy_owner = &mut retained_vector_copy;
+                let _vector_copy_owner = &mut retained_vector_copy;
 
                 crate::sync_system_tables::record_node_contact(
                     &contact_fallback_db,

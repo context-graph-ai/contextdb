@@ -27,9 +27,7 @@ use contextdb_engine::owner_read::{
     OwnerServiceSpec, ValidatedOwnerListener,
 };
 #[cfg(unix)]
-#[path = "../owner_cursor_test_support.rs"]
-#[allow(dead_code)]
-mod owner_cursor_test_support;
+use super::owner_cursor_test_support;
 #[cfg(unix)]
 use owner_cursor_test_support::decode_owner_cursor_page as decode_cursor_page;
 

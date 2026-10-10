@@ -529,6 +529,7 @@ fn method_mentions(method: &ImplItemFn, wanted: &str) -> bool {
 }
 
 #[test]
+#[allow(clippy::needless_borrow)] // Preserve the existing test expression and assertion contract.
 fn durable_public_mutation_surface_matches_the_frozen_allowlist() {
     let engine = engine_root();
     let root = engine.ancestors().nth(2).expect("contextdb root");
@@ -703,12 +704,12 @@ fn public_declaration_inputs(source: &str, name: &str, top_level: bool) -> Strin
     for line in source.split_inclusive('\n') {
         let declaration = if top_level { line } else { line.trim_start() };
         for prefix in [format!("pub fn {name}"), format!("pub async fn {name}")] {
-            if let Some(suffix) = declaration.strip_prefix(&prefix) {
-                if suffix.starts_with('(') || suffix.starts_with('<') {
-                    let parenthesis = line.find('(').expect("function input list");
-                    start = Some(offset + parenthesis + 1);
-                    break;
-                }
+            if let Some(suffix) = declaration.strip_prefix(&prefix)
+                && (suffix.starts_with('(') || suffix.starts_with('<'))
+            {
+                let parenthesis = line.find('(').expect("function input list");
+                start = Some(offset + parenthesis + 1);
+                break;
             }
         }
         if start.is_some() {

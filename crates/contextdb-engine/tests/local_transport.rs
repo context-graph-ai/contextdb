@@ -1,3 +1,7 @@
+#[path = "owner_cursor_test_support.rs"]
+#[allow(dead_code)] // Shared cursor wire fixtures are consumed by child test modules.
+mod owner_cursor_test_support;
+
 #[cfg(unix)]
 #[path = "local_transport/a_supplied_runtime_directory_serves_reader_and_writer.rs"]
 mod a_supplied_runtime_directory_serves_reader_and_writer;

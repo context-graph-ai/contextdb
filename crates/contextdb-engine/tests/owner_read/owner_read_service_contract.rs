@@ -3974,7 +3974,5 @@ fn a_cancelled_owner_read_is_reported_as_cancelled() {
     );
 }
 
-#[path = "../owner_cursor_test_support.rs"]
-#[allow(dead_code)]
-mod owner_cursor_test_support;
+use super::owner_cursor_test_support;
 use owner_cursor_test_support::decode_owner_cursor_page as decode_cursor_page;

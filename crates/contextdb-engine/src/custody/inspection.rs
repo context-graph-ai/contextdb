@@ -242,8 +242,7 @@ pub(crate) fn show(
         let row = vec![
             Value::Text(t.root.table.clone()),
             Value::Json(
-                (serde_json::to_value(&t.root.key).map_err(|_| super::canonical::invalid())?)
-                    .into(),
+                serde_json::to_value(&t.root.key).map_err(|_| super::canonical::invalid())?,
             ),
             Value::Text(super::canonical::hex(&t.unit_digest)),
             Value::Text(
@@ -261,9 +260,8 @@ pub(crate) fn show(
             Value::Text(t.namespace.edge_incarnation.to_hex()),
             Value::Int64(t.position.0.0 as i64),
             Value::Json(
-                (serde_json::to_value(&block.conflicts)
-                    .map_err(|_| super::canonical::invalid())?)
-                .into(),
+                serde_json::to_value(&block.conflicts)
+                    .map_err(|_| super::canonical::invalid())?,
             ),
         ];
         if let Some(filter) = filter {

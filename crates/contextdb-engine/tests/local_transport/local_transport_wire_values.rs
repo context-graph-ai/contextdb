@@ -199,6 +199,7 @@ fn statement(statement: &str, remedy: &str) -> StatementRemedy {
     }
 }
 
+#[allow(clippy::useless_conversion)] // Preserve the existing test expression and its assertion contract.
 fn query_result() -> QueryResult {
     {
         let mut query_fixture = QueryResult::empty();
@@ -289,6 +290,7 @@ fn assert_query_mutation(
 }
 
 #[test]
+#[allow(clippy::useless_conversion)] // Preserve the existing test expression and its assertion contract.
 fn all_ten_value_variants_have_independent_literal_bytes() {
     let cases = [
         (Value::Null, NULL_VALUE),
@@ -317,6 +319,7 @@ fn all_ten_value_variants_have_independent_literal_bytes() {
 }
 
 #[test]
+#[allow(clippy::useless_conversion)] // Preserve the existing test expression and its assertion contract.
 fn canonical_query_result_has_one_independent_literal_and_field_mutation_matrix() {
     let base = query_result();
     let expected = canonical_query_result();
@@ -958,9 +961,7 @@ fn canonical_cursor_and_metadata_payloads_keep_their_literal_bytes_inside_respon
     );
 }
 
-#[path = "../owner_cursor_test_support.rs"]
-#[allow(dead_code)]
-mod owner_cursor_test_support;
+use super::owner_cursor_test_support;
 
 fn owner_cursor_payload() -> Vec<u8> {
     let page_bytes = CURSOR_PAGE_BYTES;

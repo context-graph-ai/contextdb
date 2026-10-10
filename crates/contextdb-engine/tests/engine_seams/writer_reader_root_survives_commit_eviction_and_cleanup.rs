@@ -54,6 +54,7 @@ fn writer_reader_root_survives_commit_eviction_and_cleanup() {
     }
 }
 
+#[allow(unused_parens)] // Preserve the existing root checks exactly as authored.
 fn reader_at_boundary(boundary: CommitBoundary) {
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
     let directory = tempfile::tempdir().unwrap();

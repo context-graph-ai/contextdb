@@ -13,7 +13,7 @@ pub(crate) struct Runtime {
 
 pub(crate) fn require_admin(
     db: &Database,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<()> {
     if db.contexts().is_some() || db.scope_labels().is_some() || db.principal().is_some() {
         use contextdb_core::read_contract::{ReadFailure, ReadFailureDetail, ReadFailureKind};
@@ -333,7 +333,7 @@ fn policy_cells(p: &ApplicationTablePolicy) -> Vec<Value> {
         ),
         p.manifest_tables
             .as_ref()
-            .map_or(Value::Null, |v| Value::Json((serde_json::json!(v)).into())),
+            .map_or(Value::Null, |v| Value::Json(serde_json::json!(v))),
         Value::Text(
             match p.edge_discard {
                 EdgeDiscardMode::Never => "never",

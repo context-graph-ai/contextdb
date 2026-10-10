@@ -12,13 +12,16 @@ use crate::sync_types::{DdlChange, EdgeChange, RowChange, VectorChange};
 use contextdb_core::read_contract::{
     DeadlineClock, OwnerReadCancellation, ReadFailure, ReadLimits,
 };
-use contextdb_core::{ContextId, Lsn, Principal, RowId, ScopeLabel, TxId, Value, VectorIndexRef};
+use contextdb_core::{ContextId, Lsn, Principal, ScopeLabel, TxId, Value};
+#[cfg(feature = "test-seams")]
+use contextdb_core::{RowId, VectorIndexRef};
+#[cfg(feature = "test-seams")]
+use uuid::Uuid;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use uuid::Uuid;
 
 /// Inputs controlled by route assembly rather than by a file opener.
 #[derive(Clone)]

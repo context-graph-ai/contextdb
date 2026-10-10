@@ -4577,6 +4577,7 @@ impl Drop for ActiveRequest<'_> {
     }
 }
 
+#[allow(clippy::large_enum_variant)] // Keep completed owner responses inline without adding allocations.
 enum RequestOutcome {
     /// The read reported what it has done so far and is still running.
     Reported(crate::read_progress::ReadProgress),

@@ -1897,7 +1897,7 @@ async fn authoritative_purge_removes_every_engine_held_copy() {
         holder_node,
         "the serving endpoint must use edge A's one persisted participant identity"
     );
-    edge_a_blob.serve_on(&blob_endpoint);
+    let _ = edge_a_blob.serve_on(&blob_endpoint);
     edge_b_blob.set_test_clock(1_700_000_000_000);
     let mut partial = Vec::new();
     let interrupted =

@@ -232,8 +232,8 @@ fn incremental_sync_charges_fixed_memory_as_unrelated_ddl_history_grows() {
             .filter_map(|(position, entry)| (entry.used_after == source_peak).then_some(position))
             .collect::<Vec<_>>();
         for position in peak_positions {
-            let first = position.saturating_sub(8);
-            let last = (position + 9).min(ledger.len());
+            let _first = position.saturating_sub(8);
+            let _last = (position + 9).min(ledger.len());
         }
         assert_eq!(
             work.capability_summary_reads, 2,

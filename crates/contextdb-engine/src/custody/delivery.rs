@@ -200,6 +200,7 @@ pub(crate) struct DeliveryRoute<'a> {
     pub(crate) edge: &'a str,
 }
 
+#[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
 pub(crate) fn apply(
     db: &Database,
     route: DeliveryRoute<'_>,
@@ -802,7 +803,7 @@ pub(crate) fn pending_changes(
 fn missing_rows(
     db: &Database,
     changes: &ChangeSet,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> std::collections::BTreeSet<(String, Vec<u8>)> {
     let identity = |r: &RowChange| {
         RowRef {
@@ -881,6 +882,7 @@ fn remove_missing_units(
         )
     });
 }
+#[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
 fn apply_remainder(
     db: &Database,
     route: DeliveryRoute<'_>,

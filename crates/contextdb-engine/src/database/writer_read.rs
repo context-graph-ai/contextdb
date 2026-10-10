@@ -2,7 +2,6 @@
 //! the same database retain that root; another database gets its own scope.
 use super::*;
 use crate::persistence::WriterSnapshot;
-use contextdb_relational::source::RelationalCursor as _;
 /// A declaration answer releases its charge with the answer, including while
 /// consumed by an owning iterator, rather than with the statement root.
 pub(super) struct DdlHistory {
@@ -889,11 +888,9 @@ impl Database {
                         image.visit_retained_copy_credit(self.accountant.as_ref(), visit);
                     } else if let Some(credit) =
                         owner.downcast_ref::<contextdb_core::read_memory::ReadCredit>()
-                    {
-                        if credit.bytes() != 0 {
+                        && credit.bytes() != 0 {
                             visit(credit as *const _ as usize, credit.bytes(), false);
                         }
-                    }
                 }
             }
         });
@@ -1893,11 +1890,10 @@ impl Database {
         if self.already_closed() {
             return Err(closed_database_error());
         }
-        if let Some(snapshot) = SNAPSHOT_OVERRIDE.with(|cell| *cell.borrow()) {
-            if let Some(root) = self.snapshot_registry.pinned_root(snapshot) {
+        if let Some(snapshot) = SNAPSHOT_OVERRIDE.with(|cell| *cell.borrow())
+            && let Some(root) = self.snapshot_registry.pinned_root(snapshot) {
                 return Ok((snapshot, Some(root)));
             }
-        }
         if let Some(root) = ROOT.with(|slot| {
             slot.borrow()
                 .as_ref()
@@ -1930,7 +1926,7 @@ impl Database {
     pub(super) fn capture_writer_transaction_statement(
         &self,
         tx: Option<TxId>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<(SnapshotId, Option<Arc<WriterSnapshot>>)> {
         if self.persistence.is_none() || tx.is_none() {
             return self.capture_writer_statement();
@@ -1941,11 +1937,10 @@ impl Database {
         let published = self
             .tx_mgr
             .transaction_read(tx.expect("checked transaction"))?;
-        if let Some(snapshot) = SNAPSHOT_OVERRIDE.with(|cell| *cell.borrow()) {
-            if let Some(root) = self.snapshot_registry.pinned_root(snapshot) {
+        if let Some(snapshot) = SNAPSHOT_OVERRIDE.with(|cell| *cell.borrow())
+            && let Some(root) = self.snapshot_registry.pinned_root(snapshot) {
                 return Ok((snapshot, Some(root)));
             }
-        }
         let snapshot = SNAPSHOT_OVERRIDE.with(|cell| cell.borrow().unwrap_or(published.snapshot));
         Ok((snapshot, durable_root(published.handle)?))
     }

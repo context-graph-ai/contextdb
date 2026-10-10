@@ -75,6 +75,7 @@ fn pull(load: &ReadPersistenceLoad, cursor: &mut BoundedOrderedRowCursor) -> Res
 }
 
 #[test]
+#[allow(clippy::single_element_loop)] // Preserve the fixture loop surrounding unchanged assertions.
 fn independent_forward_canonical_oracle() {
     for damage in ["missing", "extra", "changed", "hidden"] {
         for reverse in [false] {
@@ -134,6 +135,7 @@ fn independent_forward_canonical_oracle() {
 }
 
 #[test]
+#[allow(clippy::single_element_loop)] // Preserve the fixture loop surrounding unchanged assertions.
 fn independent_reverse_canonical_oracle() {
     for damage in ["missing", "extra", "changed", "hidden"] {
         for reverse in [true] {

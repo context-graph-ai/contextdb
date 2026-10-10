@@ -1263,7 +1263,7 @@ async fn c9_blob_receipts_split_serve_and_fetch_by_peer() {
     let endpoint = within(IrohServer::bind(&bind_spec(&holder_key)))
         .await
         .expect("bind holder");
-    holder.serve_on(&endpoint);
+    let _ = holder.serve_on(&endpoint);
     let ticket = endpoint.ticket();
 
     let mut fetched_by_one = Vec::new();

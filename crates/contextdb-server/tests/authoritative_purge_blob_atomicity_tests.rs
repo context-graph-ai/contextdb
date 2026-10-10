@@ -285,7 +285,7 @@ async fn restart_resumes_durable_partial_without_whole_object_hydration() {
     let endpoint = within(IrohServer::bind(&bind_spec(&holder_key)))
         .await
         .expect("bind direct holder");
-    holder.serve_on(&endpoint);
+    let _ = holder.serve_on(&endpoint);
     let ticket = endpoint.ticket();
 
     let consumer_path = root.path().join("consumer.redb");
@@ -393,7 +393,7 @@ async fn control_backup_restores_complete_serve_and_interrupted_resume_state() {
     let holder_endpoint = within(IrohServer::bind(&bind_spec(&holder_key)))
         .await
         .expect("bind holder");
-    holder.serve_on(&holder_endpoint);
+    let _ = holder.serve_on(&holder_endpoint);
     let holder_ticket = holder_endpoint.ticket();
 
     let archive_path = root.path().join("archive.redb");
@@ -468,7 +468,7 @@ async fn control_backup_restores_complete_serve_and_interrupted_resume_state() {
     let restored_endpoint = within(IrohServer::bind(&bind_spec(&restored_key)))
         .await
         .expect("bind restored complete-object server");
-    restored.serve_on(&restored_endpoint);
+    let _ = restored.serve_on(&restored_endpoint);
     let verifier_db =
         Arc::new(Database::open(root.path().join("verifier.redb")).expect("open verifier"));
     install_work_ledger_schema(&verifier_db).expect("install verifier schema");

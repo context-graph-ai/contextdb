@@ -851,6 +851,7 @@ fn assert_ordinary_delete_move_file_export_restore() {
 // Acceptance: clearing a vector after a partition move returns NULL through reopen.
 // Active cursors retain their committed vector; new statements after clear see NULL.
 #[test]
+#[allow(clippy::identity_op)] // Preserve the existing test expression and assertion contract.
 fn vector_clear_after_partition_move_preserves_null_and_reader_snapshot() {
     const ARM: &str = "CONTEXTDB_VECTOR_MOVE_CLEAR_PROOF_ARM";
     if let Ok(arm) = std::env::var(ARM) {

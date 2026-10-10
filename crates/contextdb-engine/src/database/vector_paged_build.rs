@@ -1356,10 +1356,7 @@ impl MaintenanceContext {
                 )
             })
         })();
-        let status = match attempt {
-            Ok(status) => status,
-            Err(error) => return Err(error),
-        };
+        let status = attempt?;
         cursor_exit.keep = true;
         if matches!(
             status,

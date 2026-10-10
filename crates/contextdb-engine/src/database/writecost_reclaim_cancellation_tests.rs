@@ -98,6 +98,7 @@ fn cycle(db: &Database, context: &MaintenanceContext) -> Result<MaintenanceRepor
     context.run_cycle(CurrencyGate::Always, read_memory)
 }
 
+#[allow(clippy::manual_range_contains)] // Preserve the exact reclamation bounds asserted by the test.
 fn assert_one_committed_step(store: &Store, before: (usize, usize), observed: &Observed) {
     let reclaimed = observed.reclaimed_pages.load(Ordering::SeqCst) as usize;
     assert!(

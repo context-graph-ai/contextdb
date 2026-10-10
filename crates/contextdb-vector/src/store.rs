@@ -1657,15 +1657,14 @@ impl CapturedVectorServingSelection {
                 });
             }
         }
-        if let Some(suffix) = &resident.suffix {
-            if !suffix.graph.is_empty() {
+        if let Some(suffix) = &resident.suffix
+            && !suffix.graph.is_empty() {
                 layers.push(SnapshotCompatibleLayer {
                     identity: None,
                     len: suffix.graph.len(),
                     held: HeldLayer::CapturedSuffix(Arc::clone(suffix)),
                 });
             }
-        }
         let availability = if layers.is_empty() {
             VectorGraphLayerAvailability::Unavailable
         } else {
@@ -1800,14 +1799,13 @@ impl OwnedVectorEntries<'_> {
                 _ => true,
             };
             let loader = self.loader.as_ref().unwrap();
-            if let Some(receipt) = cursor.selected_receipt() {
-                if let Some(scan) =
+            if let Some(receipt) = cursor.selected_receipt()
+                && let Some(scan) =
                     self.bodies
                         .scan_for_membership(loader.as_ref(), Some(receipt), &mut control)?
                 {
                     loader.bind_streamed_membership(scan, receipt)?;
                 }
-            }
             let loaded = match self.bodies.scan_for(loader.as_ref(), &mut control)? {
                 Some(scan) => {
                     loader.load_streamed_candidate_with_scan(scan, &identity, true, &mut request)
@@ -4066,6 +4064,7 @@ impl IndexState {
         Ok(Some(std::mem::take(&mut loaded.entry.vector)))
     }
 
+    #[allow(dead_code)] // Retain the direct visible-entry route for bounded read fallbacks.
     fn load_visible_entry_by_row(
         &self,
         index: &VectorIndexRef,
@@ -4562,6 +4561,7 @@ impl IndexState {
         })
     }
 
+    #[allow(dead_code)] // Retain the direct membership check for bounded read fallbacks.
     fn directory_has_row_lsn(&self, row_id: RowId, lsn: Lsn) -> bool {
         let directory = self.raw_directory.read();
         self.raw_directory_by_row
@@ -4641,7 +4641,7 @@ impl IndexState {
         E: From<Error>,
     {
         let mut local_copy_admission = owner.local_scratch();
-        let owner = local_copy_admission.as_mut().unwrap_or(owner);
+        let _owner = local_copy_admission.as_mut().unwrap_or(owner);
         if let Some(source) = self.durable_membership_source() {
             let mut reserved = 0usize;
             let mut interrupted = None;
@@ -5122,23 +5122,21 @@ impl IndexState {
         if let Some(error) = cancelled.into_inner() {
             return Err(error);
         }
-        if let Err(error) = &preloaded {
+        if let Err(Error::MemoryBudgetExceeded {
+            requested_bytes,
+            available_bytes,
+            budget_limit_bytes,
+            ..
+        }) = &preloaded
+        {
             // The search answers through paged/durable reads instead; record
             // the refusal so the reason that route ran is not silent.
-            if let Error::MemoryBudgetExceeded {
-                requested_bytes,
-                available_bytes,
-                budget_limit_bytes,
-                ..
-            } = error
-            {
-                self.paged_route_refusals.fetch_add(1, Ordering::SeqCst);
-                *self.last_paged_route_refusal.lock() = Some(VectorPagedRouteRefusal {
-                    requested_bytes: *requested_bytes,
-                    available_bytes: *available_bytes,
-                    budget_limit_bytes: *budget_limit_bytes,
-                });
-            }
+            self.paged_route_refusals.fetch_add(1, Ordering::SeqCst);
+            *self.last_paged_route_refusal.lock() = Some(VectorPagedRouteRefusal {
+                requested_bytes: *requested_bytes,
+                available_bytes: *available_bytes,
+                budget_limit_bytes: *budget_limit_bytes,
+            });
         }
         if preloaded.is_err() {
             // A reservation boundary can refuse for reasons that are NOT a
@@ -5471,6 +5469,7 @@ impl IndexState {
         Ok(Some(score))
     }
 
+    #[allow(dead_code)] // Retain the bounded candidate scoring seam for read fallbacks.
     pub(crate) fn score_visible_candidate(
         &self,
         index: &VectorIndexRef,
@@ -5803,6 +5802,7 @@ impl IndexState {
     /// insertion cannot complete, the old graph is retired so no query can
     /// mistake a stale route for a complete one; the authoritative vectors
     /// remain available to exact search and maintenance can build a new graph.
+    #[allow(dead_code)] // Retain the materialized-index insertion path for loader fallbacks.
     fn insert_into_materialized_hnsw(
         &self,
         index: &VectorIndexRef,
@@ -9521,6 +9521,7 @@ enum VectorMoveMembership {
 }
 
 impl PartitionedVectorMove {
+#[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
     pub fn new(
         index: VectorIndexRef,
         source_partition_key: VectorPartitionKey,
@@ -10281,7 +10282,7 @@ impl VectorColumnState {
     fn scoped_partition_snapshots(
         &self,
         owner: &mut VectorCopyAdmission,
-    ) -> Result<ScopedVectorCopy<Vec<(VectorPartitionKey, Arc<IndexState>)>>> {
+    ) -> Result<ScopedVectorCopy<Vec<PartitionSnapshot>>> {
         ScopedVectorCopy::new(owner, |scratch| self.admitted_partition_snapshots(scratch))
     }
 
@@ -11091,6 +11092,7 @@ pub struct VectorMaintenanceReport {
 }
 
 #[derive(Default)]
+#[allow(dead_code)] // Keep pending change ownership grouped for the partitioned write path.
 struct PendingVectorChanges {
     deletes: Vec<(VectorIndexRef, RowId, TxId, TxId, Lsn)>,
     inserts: Vec<VectorEntry>,
@@ -11098,6 +11100,7 @@ struct PendingVectorChanges {
 }
 
 #[derive(Default)]
+#[allow(dead_code)] // Keep borrowed pending change ownership grouped with its owned form.
 struct PendingVectorChangesRef<'a> {
     deletes: Vec<&'a (VectorIndexRef, RowId, TxId)>,
     inserts: Vec<&'a VectorEntry>,
@@ -11586,6 +11589,8 @@ impl PreparedVectorIndexRename<'_> {
         receipt
     }
 }
+
+type PartitionSnapshot = (VectorPartitionKey, Arc<IndexState>);
 
 pub struct VectorStore {
     last_maintenance_partition: Mutex<Option<(VectorPartitionRef, VectorCopyAdmission)>>,
@@ -12243,9 +12248,11 @@ impl VectorStore {
             .collect();
         let mut publication = Self::prepare_partitioned_received_schema_admitted(schemas, entries)?;
         self.prepare_received_schema_durable_sources(&mut publication, &mut owner)?;
-        let mut candidate = Self::default();
-        candidate.raw_payload_bytes = self.raw_payload_bytes.clone();
-        candidate.raw_payload_header_bytes = self.raw_payload_header_bytes.clone();
+        let candidate = Self {
+            raw_payload_bytes: self.raw_payload_bytes.clone(),
+            raw_payload_header_bytes: self.raw_payload_header_bytes.clone(),
+            ..Self::default()
+        };
         *candidate.registry.write() = publication.into_parts().0;
         let directory_reservation = PreparedDirectoryReservation::empty();
         for (index, column) in candidate.registry.read().iter() {
@@ -14265,6 +14272,7 @@ impl VectorStore {
         Ok(!visible)
     }
 
+#[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
     fn project_partitioned_batch(
         &self,
         deletes: &[PartitionedVectorDelete],
@@ -16250,7 +16258,7 @@ impl VectorStore {
                     index: index.clone(),
                 })?;
             let partitions = column.partitions.read();
-            let selected = |state: &Arc<IndexState>| true;
+            let selected = |_state: &Arc<IndexState>| true;
             let count = partitions.values().filter(|state| selected(state)).count();
             let bytes = partitions.iter().filter(|(_, state)| selected(state)).fold(
                 count.saturating_mul(std::mem::size_of::<VectorPartitionKey>()),
@@ -17675,6 +17683,7 @@ impl VectorStore {
         }
     }
 
+#[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
     fn apply_admitted_partitioned_changes(
         &self,
         deletes: Vec<PartitionedVectorDelete>,
@@ -21015,6 +21024,7 @@ impl VectorStore {
         })
     }
 
+#[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
     pub fn vector_for_row_lsn_in_partition(
         &self,
         index: &VectorIndexRef,
@@ -22462,6 +22472,7 @@ mod tests {
             self.ledger
                 .try_allocate_for(bytes, subsystem, operation, hint)
         }
+#[allow(clippy::needless_borrows_for_generic_args)] // Preserve the existing test expression and assertion contract.
         fn release(&self, bytes: usize) {
             self.ledger.release(bytes);
         }
@@ -22470,7 +22481,7 @@ mod tests {
     fn empty_text_partition_cleanup_is_admitted(superseded: bool) {
         let store = VectorStore::default();
         let index = index();
-        let key = text_key(&"large partition identity".repeat(32768));
+        let key = text_key("large partition identity".repeat(32768));
         let declared = Arc::new(CountingMemoryBudget::default());
         let workspace = Arc::new(PruningRequestBudget::default());
         let body = Arc::new(CountingMemoryBudget::default());
@@ -23292,7 +23303,7 @@ mod tests {
         let mut executing_admission = VectorCopyAdmission::new(executing_accountant.clone());
 
         let declared_column_owner = Arc::new(CountingMemoryBudget::default());
-        let mut registration_workspace = VectorCopyAdmission::new(declared_column_owner.clone());
+        let _registration_workspace = VectorCopyAdmission::new(declared_column_owner.clone());
         let store = VectorStore::default();
         let index = index();
         store
@@ -24943,7 +24954,7 @@ mod tests {
     #[test]
     fn retained_bytes_include_large_text_partition_keys() {
         let executing_accountant = Arc::new(CountingMemoryBudget::default());
-        let mut executing_admission = VectorCopyAdmission::new(executing_accountant.clone());
+        let _executing_admission = VectorCopyAdmission::new(executing_accountant.clone());
 
         let declared_column_owner = Arc::new(CountingMemoryBudget::default());
         let mut registration_workspace = VectorCopyAdmission::new(declared_column_owner.clone());
@@ -25102,7 +25113,7 @@ mod tests {
         let mut executing_admission = VectorCopyAdmission::new(executing_accountant.clone());
 
         let declared_column_owner = Arc::new(CountingMemoryBudget::default());
-        let mut registration_workspace = VectorCopyAdmission::new(declared_column_owner.clone());
+        let _registration_workspace = VectorCopyAdmission::new(declared_column_owner.clone());
         let store = VectorStore::default();
         let index = index();
         let partition_key = VectorPartitionKey::unpartitioned();

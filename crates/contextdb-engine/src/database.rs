@@ -14066,14 +14066,14 @@ impl RetainedNonVectorMemoryOwner {
     /// Drop the held handles without returning the retained-state charge,
     /// for an owner whose state was never charged.
     fn release_handles_without_refund(self) {
-        let mut owner = std::mem::ManuallyDrop::new(self);
+        let owner = std::mem::ManuallyDrop::new(self);
         // SAFETY: `owner` is never used or dropped again; each field is
         // moved out exactly once and dropped normally.
         unsafe {
             drop(std::ptr::read(&owner.relational));
             drop(std::ptr::read(&owner.graph));
             drop(std::ptr::read(&owner.accountant));
-            drop(std::ptr::read(&mut owner._writer_use));
+            drop(std::ptr::read(&owner._writer_use));
         }
     }
 }
@@ -17720,7 +17720,7 @@ fn durable_raw_vector_partitions(
                 membership.vector_lsn,
             )
         });
-        let layout = contextdb_vector::scoped_index_layout(&vector, &partition.index, copy_owner)?;
+        let layout = contextdb_vector::scoped_index_layout(vector, &partition.index, copy_owner)?;
         let directory = memberships
             .iter()
             .map(|membership| RawVectorDirectoryEntry {
@@ -19413,7 +19413,7 @@ fn register_loaded_dormant_vector_generations(
         let partition =
             VectorPartitionRef::new(catalog.index.clone(), catalog.partition_key.clone());
         let Ok(layout) = contextdb_vector::scoped_index_layout(
-            &vector,
+            vector,
             &catalog.index,
             &mut maintenance_vector_copy_owner,
         ) else {
@@ -22411,8 +22411,8 @@ impl MaintenanceContext {
                                     // does not undo it: the replacement serves, and
                                     // only its covered-evidence cleanup is left for
                                     // the next cycle.
-                                    if partition_state_present {
-                                        if let Some(durable) = persistence
+                                    if partition_state_present
+                                        && let Some(durable) = persistence
                                             .load_vector_partition_generation_catalog_for(
                                                 &partition.index,
                                                 &partition.partition_key,
@@ -22438,7 +22438,6 @@ impl MaintenanceContext {
                                                 Err(install) => return Err(install),
                                             }
                                         }
-                                    }
                                     return Err(error);
                                 }
                                 Err(error) => {
@@ -28023,14 +28022,12 @@ impl Database {
         #[cfg(feature = "test-seams")]
         observe_read_execution_convergence(ReadExecutionConvergenceEvent::PublicExecuteEntered);
         let scope = QueryRowsExaminedScope::enter(self);
-        let mut result = (|| {
-            self.execute_with_rows_examined_scope(
+        let mut result = self.execute_with_rows_examined_scope(
                 sql,
                 params,
                 vector_copy_owner,
                 read_memory.clone(),
-            )
-        })();
+            );
         scope.finish(&mut result);
         if let Ok(answer) = &mut result {
             answer_copy.into_image();
@@ -29308,7 +29305,7 @@ impl Database {
         index: &VectorIndexRef,
         prefixes: Option<&[VectorPartitionKey]>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Vec<contextdb_vector::store::VectorPartitionInfo>> {
         let Some(prefixes) = prefixes else {
             return self.vector_store.partition_infos(index, vector_copy_owner);
@@ -29860,7 +29857,11 @@ impl Database {
                 vector_copy_owner,
             )
         };
-        let eligible = if let Some(prefixes) = partition_scope
+
+        // Candidate completeness is disclosed separately. An unbound,
+        // structurally covering key still reports its prepared route shape;
+        // lack of a binding is not loss of a maintained graph.
+        if let Some(prefixes) = partition_scope
             .as_ref()
             .and_then(crate::executor::VectorPartitionScope::resolved_prefixes)
         {
@@ -29871,11 +29872,7 @@ impl Database {
             )
         } else {
             eligible()
-        };
-        // Candidate completeness is disclosed separately. An unbound,
-        // structurally covering key still reports its prepared route shape;
-        // lack of a binding is not loss of a maintained graph.
-        eligible
+        }
     }
 
     pub fn execute_in_tx(
@@ -29904,15 +29901,13 @@ impl Database {
         let vector_copy_owner = &mut answer_copy.owner;
 
         let scope = QueryRowsExaminedScope::enter(self);
-        let mut result = (|| {
-            self.execute_in_tx_with_rows_examined_scope(
+        let mut result = self.execute_in_tx_with_rows_examined_scope(
                 tx,
                 sql,
                 params,
                 vector_copy_owner,
                 read_memory.clone(),
-            )
-        })();
+            );
         scope.finish(&mut result);
         if let Ok(answer) = &mut result {
             answer_copy.into_image();
@@ -30853,7 +30848,7 @@ impl Database {
                     self.tx_mgr
                         .with_write_set(tx, |ws| self.reject_purged_lineage_recreation(ws, read_memory.clone()))??;
                     if source != CommitSource::SyncPull {
-                        let outcome = self.prepare_active_trigger_write_set_for_dispatch(tx, &mut **vector_copy_owner.borrow_mut(), read_memory.clone())?;
+                        let outcome = self.prepare_active_trigger_write_set_for_dispatch(tx, &mut vector_copy_owner.borrow_mut(), read_memory.clone())?;
                         Self::reject_user_conditional_update_conflicts(source, &outcome)?;
                         validation_noop_count.set(
                             validation_noop_count
@@ -30907,9 +30902,9 @@ impl Database {
                             self.dispatch_sync_triggers_for_tx(
                                 tx,
                                 sync_pull_trigger_audit_projection,
-                             &mut **vector_copy_owner.borrow_mut(), read_memory.clone())
+                             &mut vector_copy_owner.borrow_mut(), read_memory.clone())
                         } else {
-                            self.dispatch_triggers_for_tx(tx, &mut **vector_copy_owner.borrow_mut(), read_memory.clone())
+                            self.dispatch_triggers_for_tx(tx, &mut vector_copy_owner.borrow_mut(), read_memory.clone())
                         };
                         match dispatch {
                             Ok(outcome) => {
@@ -30950,7 +30945,7 @@ impl Database {
                         let outcome = if source == CommitSource::SyncPull {
                             self.prepare_active_sync_trigger_write_set_for_dispatch(tx)?
                         } else {
-                            self.prepare_active_trigger_write_set_for_dispatch(tx, &mut **vector_copy_owner.borrow_mut(), read_memory.clone())?
+                            self.prepare_active_trigger_write_set_for_dispatch(tx, &mut vector_copy_owner.borrow_mut(), read_memory.clone())?
                         };
                         Self::reject_user_conditional_update_conflicts(source, &outcome)?;
                         validation_noop_count.set(
@@ -31013,7 +31008,7 @@ impl Database {
                             self.rewrite_txid_placeholders(tx, ws)?;
                         }
                         self.reject_purged_lineage_recreation(ws, read_memory.clone())?;
-                        let final_validation = self.commit_validate(tx, ws, &mut **vector_copy_owner.borrow_mut(), read_memory.clone())?;
+                        let final_validation = self.commit_validate(tx, ws, &mut vector_copy_owner.borrow_mut(), read_memory.clone())?;
                         Self::reject_user_conditional_update_conflicts(source, &final_validation)?;
                         validation_noop_count.set(
                             validation_noop_count
@@ -31162,7 +31157,7 @@ impl Database {
                             });
                         }
                         *delete_release_bytes.borrow_mut() =
-                            self.delete_release_bytes_for_write_set(ws, &mut **vector_copy_owner.borrow_mut(), read_memory.clone())?;
+                            self.delete_release_bytes_for_write_set(ws, &mut vector_copy_owner.borrow_mut(), read_memory.clone())?;
                         if let Some(drain) = discard_drain.take() {
                             drop(pending_sink_queue_mutation.borrow_mut().take());
                             *local_erasure_registration.borrow_mut() =
@@ -31172,7 +31167,7 @@ impl Database {
                                     drain.freeze_for_commit_locked_purge(),
                                     discard_blob_guard.as_ref().expect("discard hash fence"),
                                     discard_publication.as_ref().expect("discard read publication fence"),
-                                 &mut **vector_copy_owner.borrow_mut(), read_memory.clone())?);
+                                 &mut vector_copy_owner.borrow_mut(), read_memory.clone())?);
                             #[cfg(test)]
                             take_local_commit_stage_fault_for_test(
                                 LocalCommitStageFaultPoint::AfterLocalErasureStageRegistration,
@@ -33984,7 +33979,7 @@ impl Database {
                 reason: "received DDL arrival key does not bind one exact local occurrence".into(),
             });
         }
-        return visit(record.as_ref().map(|record| &record.value));
+        visit(record.as_ref().map(|record| &record.value))
     }
 
     fn with_superseded_ddl_occurrence<T>(
@@ -34026,7 +34021,7 @@ impl Database {
                 reason: "superseded DDL key does not bind one exact local occurrence".into(),
             });
         }
-        return visit(record.as_ref().map(|record| &record.value));
+        visit(record.as_ref().map(|record| &record.value))
     }
 
     pub(crate) fn validate_ddl_occurrence_config(
@@ -36990,8 +36985,8 @@ impl Database {
             *working.sync_incarnations.lock() = self.sync_incarnations.lock().clone();
             *working.custody_metadata.lock() = self
                 .custody_records(read_memory.clone())?
-                .into_iter()
-                .map(|record| Ok((record.key()?, crate::custody::records::encode(&record)?)))
+                .iter()
+                .map(|record| Ok((record.key()?, crate::custody::records::encode(record)?)))
                 .collect::<Result<BTreeMap<_, _>>>()?;
             for record in prepare(&working, &mut finalized_write_set)? {
                 record.verify()?;
@@ -39168,7 +39163,7 @@ impl Database {
         table: &str,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<u64> {
-        if let Some(persistence) = &self.persistence {
+        if let Some(_persistence) = &self.persistence {
             let _operation = self.open_operation()?;
             return self
                 .read_config_value::<u64>(
@@ -39221,7 +39216,7 @@ impl Database {
         table: &str,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<u64> {
-        if let Some(persistence) = &self.persistence {
+        if let Some(_persistence) = &self.persistence {
             let _operation = self.open_operation()?;
             return self
                 .read_config_value::<u64>(
@@ -42698,7 +42693,7 @@ impl Database {
         tx: TxId,
         table: &str,
         conflict_col: &str,
-        mut values: HashMap<ColName, Value>,
+        values: HashMap<ColName, Value>,
     ) -> Result<UpsertResult> {
         let read_memory = self.declared_reader_memory()?;
         let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
@@ -43789,7 +43784,7 @@ impl Database {
         &self,
         ws: &WriteSet,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<()> {
         // A received unit that declares a table AND carries that table's
         // vectors commits both together atomically. At this
@@ -47824,8 +47819,7 @@ impl Database {
         read_credit: &mut contextdb_core::read_memory::ReadCredit,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Option<VersionedRow>> {
-        (|| {
-            self.bounded_row_by_identity(
+        self.bounded_row_by_identity(
                 read_memory.clone(),
                 None,
                 table,
@@ -47841,7 +47835,6 @@ impl Database {
                     )
                 },
             )
-        })()
     }
 
     pub(crate) fn committed_row_at(
@@ -49178,7 +49171,7 @@ impl Database {
         >,
         release_retained: &mut dyn FnMut(usize),
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<Option<f32>, crate::executor::BoundedExecutionError> {
         self.with_vector_read_admission(vector_copy_owner, |vector_copy_owner| {
             self.vector_store.bounded_score_live_row(
@@ -49775,7 +49768,7 @@ impl Database {
         index: VectorIndexRef,
         row_id: RowId,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<()> {
         self.record_vector_schema_epoch(tx, &index)?;
         let existing_live = self.vector_store.has_live_entry_for_row(
@@ -51629,7 +51622,7 @@ impl Database {
         index: &VectorIndexRef,
         snapshot: SnapshotId,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<usize> {
         self.with_vector_read_admission(vector_copy_owner, |vector_copy_owner| {
             let base = self
@@ -54124,8 +54117,7 @@ impl Database {
                     Value::Int64(ids.len() as i64),
                     Value::Json(
                         serde_json::to_value(&report.rows)
-                            .map_err(|e| Error::Other(e.to_string()))?
-                            .into(),
+                            .map_err(|e| Error::Other(e.to_string()))?,
                     ),
                 ]);
             } else if report_shape == PurgeReportShape::Single {
@@ -54458,7 +54450,7 @@ impl Database {
                 result.rows.push(vec![
                     Value::Text(table.clone()),
                     Value::Int64(0),
-                    Value::Json(serde_json::json!([]).into()),
+                    Value::Json(serde_json::json!([])),
                 ]);
             }
         }
@@ -55641,8 +55633,8 @@ impl Database {
         } else {
             self.snapshot_registry.register(snapshot)
         };
-        if let Some(root) = &root {
-            if let Some(registered) = self
+        if let Some(root) = &root
+            && let Some(registered) = self
                 .snapshot_registry
                 .state
                 .lock()
@@ -55651,7 +55643,6 @@ impl Database {
             {
                 registered.pinned_root = Some(Arc::downgrade(root));
             }
-        }
         Ok(SnapshotPin {
             _database: self,
             _registration: registration,
@@ -57430,8 +57421,8 @@ impl Database {
         direction: SortDirection,
         snapshot: SnapshotId,
         cursor: &mut contextdb_relational::mem::BoundedOrderedRowCursor,
-        mut check_boundary: impl FnMut() -> std::result::Result<(), E>,
-        mut before_touch: impl FnMut() -> std::result::Result<(), E>,
+        check_boundary: impl FnMut() -> std::result::Result<(), E>,
+        before_touch: impl FnMut() -> std::result::Result<(), E>,
         before_clone: impl FnMut(
             crate::read_image_memory::RowReadAdmission<'_>,
         ) -> std::result::Result<(), E>,
@@ -57771,7 +57762,7 @@ impl Database {
         snapshot: SnapshotId,
         before_copy: &mut dyn FnMut(usize) -> std::result::Result<(), E>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<Option<Option<Vec<f32>>>, E>
     where
         E: From<Error>,
@@ -57933,7 +57924,7 @@ impl Database {
         before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
         release_retained: impl FnMut(usize),
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<contextdb_vector::mem::BoundedVectorCandidateGroups, E>
     where
         E: From<Error>,
@@ -57963,7 +57954,7 @@ impl Database {
         before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
         release_retained: impl FnMut(usize),
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<contextdb_vector::mem::BoundedBruteForceCursor, E>
     where
         E: From<Error>,
@@ -57992,7 +57983,7 @@ impl Database {
         before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
         release_retained: impl FnMut(usize),
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<contextdb_vector::mem::BoundedVectorStep, E>
     where
         E: From<Error>,
@@ -58067,7 +58058,7 @@ impl Database {
         release_retained: impl FnMut(usize),
         visit: impl FnMut(RowId) -> std::result::Result<(), E>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<(), E>
     where
         E: From<Error>,
@@ -58102,7 +58093,7 @@ impl Database {
         before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
         mut release_retained: impl FnMut(usize),
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         load_transfer: crate::memory_accounting::VectorLoadReservationTransfer,
     ) -> std::result::Result<crate::executor::BoundedVectorSearchOutcome, E>
     where
@@ -58213,7 +58204,7 @@ impl Database {
         groups: &contextdb_vector::mem::BoundedVectorCandidateGroups,
         before_source: impl FnMut() -> std::result::Result<(), E>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<usize, E>
     where
         E: From<Error>,
@@ -59316,7 +59307,6 @@ impl Database {
             rows_affected: 0,
             trace,
             cascade: None,
-            ..QueryResult::empty()
         })
     }
 
@@ -62831,7 +62821,7 @@ impl Database {
         index_column: &str,
         column: &ColumnDef,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<()> {
         if let Some(layout) = vector_index_layout_from_column(column) {
             self.vector_store.register_index_with_layout(
@@ -62850,7 +62840,7 @@ impl Database {
         index: &VectorIndexRef,
         column: &ColumnDef,
         _vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<()> {
         self.vector_store.with_index_layout(index, |_| ())?;
         if let Some(max_partitions) = column.effective_max_partitions()
@@ -62904,7 +62894,7 @@ impl Database {
         from: &str,
         to: &str,
         _vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<()> {
         let old = VectorIndexRef::new(table, from);
         let new = VectorIndexRef::new(table, to);
@@ -62979,7 +62969,7 @@ impl Database {
         &self,
         target: Option<&VectorIndexRef>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<
         Vec<(
             ColumnDef,
@@ -64758,7 +64748,7 @@ impl Database {
             tenant_id,
             peer_node_id,
         );
-        if let Some(persistence) = &self.persistence {
+        if let Some(_persistence) = &self.persistence {
             return self.read_config_value(&key, read_memory.clone());
         }
         Ok(self
@@ -64809,7 +64799,7 @@ impl Database {
         let _operation = self.open_operation()?;
         let _writer_read = self.writer_read_scope(read_memory.clone())?;
         let tenant_suffix = format!(":{}", tenant_id.as_str());
-        let mut states = if let Some(persistence) = &self.persistence {
+        let mut states = if let Some(_persistence) = &self.persistence {
             self.read_config_values_with_prefix::<DurableSchemaSyncHoldback>(
                 Self::INBOUND_SCHEMA_HOLDBACK_PREFIX,
                 read_memory.clone(),
@@ -64878,7 +64868,7 @@ impl Database {
     ) -> Result<(Lsn, Lsn)> {
         let _operation = self.open_operation()?;
         let _writer_read = self.writer_read_scope(read_memory.clone())?;
-        let Some(persistence) = &self.persistence else {
+        let Some(_persistence) = &self.persistence else {
             let progress = self.in_memory_sync_progress.lock();
             let progress = progress.tenants.get(tenant_id.as_str());
             return Ok((
@@ -64987,7 +64977,7 @@ impl Database {
     ) -> Result<Option<Lsn>> {
         let _operation = self.open_operation()?;
         let _writer_read = self.writer_read_scope(read_memory.clone())?;
-        let Some(persistence) = &self.persistence else {
+        let Some(_persistence) = &self.persistence else {
             return Ok(self
                 .in_memory_sync_progress
                 .lock()
@@ -65155,7 +65145,7 @@ impl Database {
     ) -> Result<Option<(Incarnation, Lsn)>> {
         let _operation = self.open_operation()?;
         let _writer_read = self.writer_read_scope(read_memory.clone())?;
-        let Some(persistence) = &self.persistence else {
+        let Some(_persistence) = &self.persistence else {
             return Ok(self
                 .in_memory_sync_progress
                 .lock()
@@ -65243,7 +65233,7 @@ impl Database {
         }
         self.persistence
             .as_ref()
-            .map(|p| {
+            .map(|_p| {
                 self.read_config_value::<String>(
                     &tenant.config_key("sync_incarnation"),
                     read_memory.clone(),
@@ -65357,7 +65347,7 @@ impl Database {
     ) -> Result<Option<Lsn>> {
         let _operation = self.open_operation()?;
         let _writer_read = self.writer_read_scope(read_memory.clone())?;
-        if let Some(persistence) = &self.persistence {
+        if let Some(_persistence) = &self.persistence {
             return Ok(self
                 .read_config_value::<u64>(
                     &tenant_id.config_key("sync_applied_push_watermark"),
@@ -65483,7 +65473,7 @@ impl Database {
         let _writer_read = self.writer_read_scope(read_memory.clone())?;
         let key =
             Self::applied_push_watermark_node_incarnation_key(tenant_id, node_id, incarnation);
-        if let Some(persistence) = &self.persistence {
+        if let Some(_persistence) = &self.persistence {
             return Ok(self
                 .read_config_value::<u64>(&key, read_memory.clone())?
                 .map(Lsn));
@@ -81400,8 +81390,7 @@ impl Database {
             return Ok(false);
         };
         let mut credit = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
-        (|| {
-            self.bounded_read_allowed_for_row(
+        self.bounded_read_allowed_for_row(
                 None,
                 table,
                 &meta,
@@ -81417,7 +81406,6 @@ impl Database {
                 },
                 read_memory.clone(),
             )
-        })()
     }
 
     fn row_id_read_allowed_for_change(
@@ -82595,7 +82583,7 @@ fn register_vector_layouts(
     table_meta: &HashMap<String, TableMeta>,
     declared_owner: Arc<dyn contextdb_vector::MemoryBudget>,
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<()> {
     for (index, layout) in vector_layouts_from_meta(table_meta) {
         vector.register_index_with_layout(

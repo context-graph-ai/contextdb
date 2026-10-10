@@ -189,7 +189,7 @@ impl Database {
             result.rows.push(vec![
                 Value::Text(table.clone()),
                 Value::Int64(rows.len() as i64),
-                Value::Json(serde_json::json!([]).into()),
+                Value::Json(serde_json::json!([])),
                 Value::Int64(reported_pending as i64),
             ]);
         }

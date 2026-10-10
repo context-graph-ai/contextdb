@@ -8955,7 +8955,7 @@ impl RetainedReadSource {
                 Ok(true)
             },
         )?;
-        drop(before_page);
+        let _ = before_page;
         drop(touched);
         drop(boundary);
         // The window stops short of the range when it filled, or when the
@@ -23716,7 +23716,7 @@ impl RedbPersistence {
         let has_vector_changes = write_set_has_vector_changes
             || partition_mutations.is_some_and(|batch| !batch.is_empty());
         let vector_quantization = if has_vector_changes {
-            Self::vector_quantization_map(&table_meta)
+            Self::vector_quantization_map(table_meta)
         } else {
             HashMap::new()
         };
@@ -24108,7 +24108,7 @@ let mut graph_publication_attempt = crate::read_work_probe::GraphPublicationAtte
             identity_mutations.extend(Self::flush_relational_index_changes_in_write(
                 &write_txn,
                 ws,
-                &table_meta,
+                table_meta,
                 deleted_rows_snapshot.as_ref(),
             )?);
 
@@ -30925,7 +30925,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
             index,
             partition_key,
             generation_id,
-            |reason| Self::captured_generation_corruption(reason),
+            Self::captured_generation_corruption,
         )?;
         Ok(record.into_owned())
     }
@@ -30972,7 +30972,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
             index,
             partition_key,
             base_generation_id,
-            |reason| Self::captured_generation_corruption(reason),
+            Self::captured_generation_corruption,
         )?;
         let key = Self::vector_partition_change_generation_key_from_parts(
             index,
@@ -30999,7 +30999,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
             partition_key,
             &base,
             change_generation_id,
-            |reason| Self::captured_generation_corruption(reason),
+            Self::captured_generation_corruption,
         )?;
         Ok(record.into_owned())
     }
@@ -31047,7 +31047,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 VectorPartitionRecordKind::Journal,
                 value.value(),
             )
-            .map_err(|reason| Self::captured_generation_corruption(reason))?;
+            .map_err(Self::captured_generation_corruption)?;
             if record.index != *index
                 || record.partition_key != *partition_key
                 || Self::vector_partition_journal_key(&record).as_slice() != key.value()
@@ -45259,7 +45259,7 @@ mod empty_declared_index_readiness_tests {
     fn empty_declared_index_publishes_marker_and_postings_for_a_lazy_ordered_read() {
 
         {
-            use redb::{ReadableDatabase, ReadableTable};
+            use redb::ReadableTable;
             let mut failures = Vec::new();
             for damage in ["malformed_current", "malformed_historical", "native_page", "healthy_budget"] {
                 let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -45364,7 +45364,7 @@ mod empty_declared_index_readiness_tests {
             assert_eq!(failures, Vec::<&str>::new(), "malformed bodies and native page corruption retain StoreCorrupted while healthy admission exhaustion retains MemoryBudgetExceeded");
         }
         {
-            use redb::{ReadableDatabase, ReadableTable};
+            use redb::{ReadableTable};
             let mut failures = Vec::new();
             for damage in ["valid_key_historical_body", "missing_historical_version", "omitted_first_posting"] {
                 let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

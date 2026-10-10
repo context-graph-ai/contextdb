@@ -4546,10 +4546,7 @@ impl OwnerGroupBaseline {
             bytes,
         };
         let groups = trace
-            .groups
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>()
+            .groups.to_vec()
             .into_boxed_slice();
         let ordinals = trace
             .groups
@@ -4931,8 +4928,8 @@ impl OwnedCursorExecution for OwnerCursorExecution {
         if let Some(observation) = self.cancelled_observation.take() {
             return Ok(Some(observation));
         }
-        if let Some(continuation) = self.continuation.as_ref() {
-            if let Some(cursor) = &continuation.cursor {
+        if let Some(continuation) = self.continuation.as_ref()
+            && let Some(cursor) = &continuation.cursor {
                 let observation = cursor
                     .work_observation()
                     .map_err(|error| direct_error(&continuation.path, error))?;
@@ -4950,7 +4947,6 @@ impl OwnedCursorExecution for OwnerCursorExecution {
                     })
                     .transpose();
             }
-        }
         Ok(None)
     }
     fn take_work_trace_charge(&mut self) -> Option<Arc<OwnerTraceCharge>> {
@@ -5448,8 +5444,8 @@ impl ReadCursor {
         #[cfg(feature = "test-seams")]
         let _ = (&self.state.observer, &self.state.kernel_observer);
         let fetched = execution.fetch(rows, cancellation);
-        if fetched.is_err() {
-            if let Ok(Some(observation)) = execution.work_observation() {
+        if fetched.is_err()
+            && let Ok(Some(observation)) = execution.work_observation() {
                 let observation = observation
                     .unpublished_groups_withdrawn()
                     .map_err(read_error)?;
@@ -5458,7 +5454,6 @@ impl ReadCursor {
                     self.owner_trace_charge = Some(charge);
                 }
             }
-        }
         if fetched.is_err() && !execution.is_live() {
             let _ = execution.close();
         }

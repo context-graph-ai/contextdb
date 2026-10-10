@@ -284,7 +284,7 @@ pub(crate) fn actual_row(
 pub(crate) fn actual_policy(
     db: &Database,
     table: &str,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<ApplicationTablePolicy> {
     let m = db
         .table_meta(table)
@@ -672,6 +672,7 @@ pub(crate) struct TerminalInput {
     pub cause: Option<String>,
 }
 
+#[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
 pub(crate) fn prepare_terminal(
     db: &Database,
     ws: &mut contextdb_tx::WriteSet,
@@ -1056,6 +1057,7 @@ fn edge_authority(
         })
     }
 }
+#[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
 pub(crate) fn commit_binding(
     db: &Database,
     tenant_id: TenantId,
@@ -1382,6 +1384,7 @@ pub(crate) fn current_manifest(
     }
     Ok(Some(m.clone()))
 }
+#[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
 pub(crate) fn commit_terminal(
     db: &Database,
     tenant: TenantId,
@@ -1659,6 +1662,7 @@ pub(crate) fn admit_terminals(
 /// Commit several independently signed source units in one real receiving
 /// transaction. Shared subjects must carry identical authenticated row bytes.
 #[cfg(feature = "test-seams")]
+#[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
 pub(crate) fn commit_terminal_batch(
     db: &Database,
     tenant: TenantId,

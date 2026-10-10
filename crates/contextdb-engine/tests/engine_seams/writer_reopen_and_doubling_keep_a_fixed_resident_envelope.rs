@@ -595,6 +595,7 @@ fn writer_reopen_and_doubling_keep_a_fixed_resident_envelope() {
         arms.iter().flatten().all(|sample| sample.gap == 0),
         "every charged owner reconciles: {arms:?}"
     );
+    #[allow(clippy::needless_range_loop)] // Preserve checkpoint indexing in the assertion contract.
     for checkpoint in 0..3 {
         assert_eq!(
             arms[1][checkpoint].vector_membership_bytes,
@@ -658,6 +659,7 @@ fn measure_writer_copy<T>(
     )
 }
 #[test]
+#[allow(clippy::int_plus_one)] // Preserve the existing test expression and its assertion contract.
 fn writer_copy_operations_keep_fixed_work_with_wide_unrelated_schemas() {
     if let Ok(width) = std::env::var(COPY_SCHEMA_WIDTH) {
         let width: usize = width.parse().unwrap();

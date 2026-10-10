@@ -1,4 +1,5 @@
 // Counted standalone requesting reader for cross-crate native test fixtures.
+#[allow(dead_code)] // Shared support is compiled in test targets that do not construct this fixture.
 #[derive(Debug, Default)]
 pub struct TestReadMemory {
     used: std::sync::atomic::AtomicUsize,

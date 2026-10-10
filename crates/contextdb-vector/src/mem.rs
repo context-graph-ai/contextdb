@@ -2605,7 +2605,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         let (discover_sources, mut sources, mut retained_bytes) = self
             .with_selected_partition_prefixes(index, |prefixes| {
                 let discover_sources = layout.is_partitioned() && filtered && prefixes.is_none();
-                let (mut sources, mut retained_bytes) = if let Some(prefixes) = prefixes {
+                let (sources, retained_bytes) = if let Some(prefixes) = prefixes {
                     self.bounded_scoped_snapshot_sources(
                         index,
                         &layout,
@@ -3395,6 +3395,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
 
     /// Enumerate scoped membership without loading or scoring vector bodies.
     /// Every directory touch and retained source handle uses the caller's budget.
+#[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
     pub fn bounded_visit_visible_ids<E>(
         &self,
         index: &VectorIndexRef,
@@ -4589,7 +4590,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                                 match source.state.try_directory_has_visible_row_with_copy_admission(
                                     row_id,
                                     snapshot,
-                                    &mut **admitted_owner.borrow_mut(),
+                                    &mut admitted_owner.borrow_mut(),
                                     &mut |token, bytes, component, operation, hint| navigation_session.reserve_for(token, bytes, component, operation, hint),
                                 ) {
                                     Ok(visible) => visible,
@@ -4621,7 +4622,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                         (*retained.borrow_mut())(bytes)
                     },
                     &mut |bytes| (*released.borrow_mut())(bytes),
-                    &mut **admitted_owner.borrow_mut(),
+                    &mut admitted_owner.borrow_mut(),
                     &mut |token, bytes, component, operation, hint| navigation_session.reserve_for(token, bytes, component, operation, hint),
                 )
             },
@@ -5190,7 +5191,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
 
     /// Borrow resident facts within the current prefix scope. Authorization
     /// is applied by the visitor's resident directory counters.
-
+    ///
     /// Durable sources stream authenticated memberships and one admitted body
     /// at a time. AUTO may also stream a resident loader when bulk admission
     /// refuses; explicit EXACT preserves that loader's typed refusal.
@@ -5324,6 +5325,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     /// row's own stored vector through a point read, admitting each body
     /// against the database's memory before it is read and returning it
     /// straight after, so the comparison never needs room for the partition.
+#[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
     fn stream_source_bodies(
         &self,
         index: &VectorIndexRef,
@@ -5707,6 +5709,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         Ok(breadth.min(allowed).max(limit))
     }
 
+#[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
     pub fn search_with_mode(
         &self,
         index: VectorIndexRef,
@@ -5720,6 +5723,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         self.search_with_mode_owned(index, query, k, candidates, snapshot, mode, executing_owner)
     }
 
+#[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
     pub fn search_with_mode_owned(
         &self,
         index: VectorIndexRef,

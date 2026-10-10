@@ -315,7 +315,7 @@ fn shared_cross_partition_body_survives_source_removal_and_final_external_holder
 #[test]
 fn shared_payload_preparation_rollback_and_refusal_preserve_membership_and_charge() {
     let executing_accountant = Arc::new(super::tests::CountingMemoryBudget::default());
-    let mut executing_admission = VectorCopyAdmission::new(executing_accountant.clone());
+    let _executing_admission = VectorCopyAdmission::new(executing_accountant.clone());
 
     let budget = Arc::new(Budget::default());
     let store = VectorStore::default();

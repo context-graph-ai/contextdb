@@ -153,6 +153,7 @@ fn refusal_is_typed(error: &LocalTransportError) -> bool {
 }
 
 #[test]
+#[allow(clippy::useless_conversion)] // Preserve the existing test expression and its assertion contract.
 fn the_crafted_request_bytes_match_the_channel_encoder() {
     let text = json_zero_array_text(2);
     assert_eq!(text, b"[0,0]");
@@ -222,6 +223,7 @@ fn a_json_parameter_request_within_the_wire_ceiling_is_refused_before_its_tree_i
 }
 
 #[test]
+#[allow(clippy::useless_conversion)] // Preserve the existing test expression and its assertion contract.
 fn an_ordinary_json_parameter_request_is_still_admitted() {
     let text = json_zero_array_text(4);
     let frame = crafted_json_parameter_request_bytes(&text);
@@ -377,6 +379,4 @@ fn an_ordinary_metadata_page_is_still_admitted() {
     assert_eq!(page.items.len(), 4);
 }
 
-#[path = "../owner_cursor_test_support.rs"]
-#[allow(dead_code)]
-mod owner_cursor_test_support;
+use super::owner_cursor_test_support;
