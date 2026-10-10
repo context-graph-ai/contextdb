@@ -3922,7 +3922,14 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 let (availability, owned_layers) = if preload_memory_refused {
                     (VectorGraphLayerAvailability::Unavailable, Vec::new())
                 } else { match &source.serving_selection {
-                    Some(selection) => selection.owned_layers(),
+                    Some(selection) => {
+                        let layers = selection.owned_layers();
+                        #[cfg(any(test, feature = "test-seams"))]
+                        if layers.0 == VectorGraphLayerAvailability::Ready && !layers.1.is_empty() {
+                            state.pause_graph_callback_for_test();
+                        }
+                        layers
+                    },
                     None => state.snapshot_compatible_owned_layers(snapshot),
                 }};
                 if availability == VectorGraphLayerAvailability::Ready && !owned_layers.is_empty() {

@@ -8100,6 +8100,13 @@ impl IndexState {
         }
     }
 
+    #[cfg(any(test, feature = "test-seams"))]
+    pub(crate) fn pause_graph_callback_for_test(&self) {
+        if let Some(slot) = self.graph_callback_pause.lock().clone() {
+            slot.pause_after(0);
+        }
+    }
+
     /// Every non-empty snapshot-compatible layer of this partition's chain --
     /// the sealed base, the sealed change beside it and the mutable tail --
     /// selected under one `generation_publication` acquisition and held for
