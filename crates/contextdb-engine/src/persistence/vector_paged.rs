@@ -3902,10 +3902,9 @@ impl RedbPersistence {
                 )?;
                 if let Some(storage) =
                     Self::authenticated_generation_storage(value.value(), key.value(), false)?
+                    && !own_storage.contains(&storage)
                 {
-                    if !own_storage.contains(&storage) {
-                        erase_storage(storage)?;
-                    }
+                    erase_storage(storage)?;
                 }
             }
         }
