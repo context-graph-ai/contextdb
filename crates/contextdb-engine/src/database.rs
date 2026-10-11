@@ -84100,6 +84100,13 @@ fn prune_expired_rows(
     let graph_store = &ctx.graph;
     let vector_store = &ctx.vector;
     let accountant = ctx.finalization.accountant.as_ref();
+    // Retention cleanup uses the same caller child for persistence decoding
+    // as its other maintenance reads; never fall back to a fresh declaration.
+    let _decode_scope = crate::read_image_memory::ImageMemory::operation_reader(
+        crate::memory_accounting::AccountantHandle::clone(&ctx.finalization.accountant),
+        read_memory.clone(),
+    )?
+    .enter();
     let maintenance_read_memory = read_memory.clone();
     let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
     let persistence = ctx.persistence.as_ref();
@@ -85319,6 +85326,13 @@ fn compact_currency_versions_inner(
     // pruning was therefore superseded AT OR BEFORE `watermark`, which is
     // exactly what `SnapshotFloorRegistry::register`'s blocking rule relies
     // on.
+    // Every persistence read in this cleanup uses the maintenance caller's
+    // existing reader child, including metadata and occupancy rebuilding.
+    let _decode_scope = crate::read_image_memory::ImageMemory::operation_reader(
+        accountant.clone(),
+        read_memory.clone(),
+    )?
+    .enter();
     let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
     let watermark = tx_mgr.current_tx_max();
     // Records the sampled registered set and watermark as an in-progress
