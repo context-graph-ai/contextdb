@@ -1177,6 +1177,9 @@ fn occupancy_union_insert(
     if let Some((previous_start, previous_end)) = occupancy_predecessor(table, route, start)?
         && previous_end >= start
     {
+        if previous_end >= end {
+            return Ok(());
+        }
         merged_start = previous_start;
         merged_end = merged_end.max(previous_end);
         remove_occupancy(table, route, previous_start)?;
@@ -1217,13 +1220,13 @@ fn occupancy_successor_inclusive_first(
     Ok(row)
 }
 
-/// Rebuild one route's rows from its own membership directory. An
-/// own-partition walk on that partition's own write; its sort buffer is
-/// funded by the writer's proof accountant before the walk.
+/// Rebuild a route in arbitrary source order with one decoded interval at a
+/// time. Durable union rows and the source cursor stay in this transaction;
+/// writer scratch depends on the route key, never its membership count.
 fn rebuild_route_occupancy(
     write: &redb::WriteTransaction,
     route: &[u8],
-    entries: u64,
+    _entries: u64,
     accountant: Option<&crate::memory_accounting::AccountantHandle>,
 ) -> Result<()> {
     let _call_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
@@ -1231,50 +1234,28 @@ fn rebuild_route_occupancy(
         .map(|accountant| {
             crate::memory_accounting::OwnedMemoryReservation::try_new_for(
                 accountant.clone(),
-                usize::try_from(entries)
-                    .unwrap_or(usize::MAX)
-                    .saturating_mul(2 * std::mem::size_of::<(u64, u64)>())
-                    .saturating_add(route.len().saturating_mul(4))
-                    .saturating_add(4096),
+                route.len().saturating_mul(4).saturating_add(4096),
                 "vector",
                 "rebuild_membership_occupancy",
                 "Raise MEMORY_LIMIT to maintain this vector membership route.",
             )
         })
         .transpose()?;
-    let mut intervals = Vec::<(u64, u64)>::new();
-    {
-        let source = write.open_table(SOURCE).map_err(metadata_error)?;
-        for entry in source.prefix_bounded(route).map_err(metadata_error)? {
-            let (key, value) = entry.map_err(metadata_error)?;
-            let _row_scope = crate::read_image_memory::active_owner()?.row_owner()?.enter();
-            let record = decode_member(key.value(), value.value())?;
-            if let Some(interval) = membership_interval(&record) {
-                intervals.push(interval);
-            }
-        }
-    }
-    intervals.sort_unstable();
+    let source = write.open_table(SOURCE).map_err(metadata_error)?;
     let mut table = write.open_table(OCCUPANCY).map_err(metadata_error)?;
     clear_route_occupancy(&mut table, route)?;
-    let mut current: Option<(u64, u64)> = None;
-    for (start, end) in intervals {
-        match current.as_mut() {
-            Some((_, current_end)) if start <= *current_end => {
-                *current_end = (*current_end).max(end);
-            }
-            _ => {
-                if let Some((current_start, current_end)) = current.take() {
-                    put_occupancy(&mut table, route, current_start, current_end)?;
-                }
-                current = Some((start, end));
-            }
+    for entry in source.prefix_bounded(route).map_err(metadata_error)? {
+        let (key, value) = entry.map_err(metadata_error)?;
+        let interval = {
+            let _row_scope = crate::read_image_memory::active_owner()?.row_owner()?.enter();
+            let record = decode_member(key.value(), value.value())?;
+            membership_interval(&record)
+        };
+        if let Some((start, end)) = interval {
+            occupancy_union_insert(&mut table, route, start, end)?;
         }
     }
-    if let Some((current_start, current_end)) = current {
-        put_occupancy(&mut table, route, current_start, current_end)?;
-    }
-    drop(table);
+    drop((source, table));
     write
         .open_table(OCCUPANCY_DIRTY)
         .map_err(metadata_error)?
