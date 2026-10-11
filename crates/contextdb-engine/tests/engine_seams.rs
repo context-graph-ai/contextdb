@@ -146,3 +146,6 @@ mod grouped_session_top_n_contract;
 
 #[path = "engine_seams/writer_tail_reuse_is_bounded_across_physical_opens.rs"]
 mod writer_tail_reuse_is_bounded_across_physical_opens;
+
+#[path = "engine_seams/import_tail_survives_restart_without_history_reconstruction.rs"]
+mod import_tail_survives_restart_without_history_reconstruction;
