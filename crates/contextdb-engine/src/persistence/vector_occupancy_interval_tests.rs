@@ -264,8 +264,94 @@ fn a_same_transaction_delete_plus_insert_merges_into_one_maximal_row() {
 }
 
 #[test]
+#[serial_test::serial]
 fn a_replacement_swaps_one_lifetime_for_another() {
-    case(&[put(1, 10, Some(20))], &[put(1, 30, Some(40))], &[(30, 40)], &[15, 35]);
+    case(
+        &[put(1, 10, Some(20))],
+        &[put(1, 30, Some(40))],
+        &[(30, 40)],
+        &[15, 35],
+    );
+    // The same native decoder and row owner used by occupancy rebuilding:
+    // inspect actual allocations, not a guessed struct layout or RSS.
+    use super::proof_allocation_oracle_tests::{
+        MaintenanceReaderSpy, native_free_observation_for_test, native_requests_for_test,
+        watch_native_free_for_test,
+    };
+    use crate::read_image_memory::ImageMemory;
+    use std::sync::{Arc, atomic::Ordering};
+    let writer = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(
+        1_610_612_736,
+    ));
+    let parent = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(1_073_741_824);
+    let child = parent.child().unwrap();
+    let child_control = parent.retained_bytes_for_test();
+    let spy = MaintenanceReaderSpy::new(child.clone(), writer.clone().into());
+    let owner = ImageMemory::operation_reader(writer.into(), spy.clone()).unwrap();
+    let row_owner = owner.row_owner().unwrap();
+    let baseline = owner.held();
+    let input = record(1, 10, Some(20));
+    let payload = bincode::serde::encode_to_vec(&input, bincode::config::standard()).unwrap();
+    let (decoded, requests, count) = row_owner.scope(|| {
+        native_requests_for_test(|| {
+            crate::read_image_memory::decode::<VectorPartitionMembershipRecord>(&payload)
+                .unwrap()
+                .0
+        })
+    });
+    assert!(count >= 3);
+    assert_eq!(requests[0].0, decoded.index.table.as_ptr() as usize);
+    assert_eq!(requests[1].0, decoded.index.column.as_ptr() as usize);
+    let contextdb_core::VectorPartitionComponent::Text(route_text) =
+        &decoded.partition_key.components()[0]
+    else {
+        unreachable!()
+    };
+    assert_eq!(requests[2].0, route_text.as_ptr() as usize);
+    let invoiced = spy.used.load(Ordering::SeqCst);
+    assert!(row_owner.retained_payload_bytes() > 0);
+    watch_native_free_for_test(requests, &spy.used as *const _ as usize);
+    drop(decoded);
+    let frees = native_free_observation_for_test();
+    assert_eq!(
+        frees[1],
+        (invoiced, invoiced, 1),
+        "column allocation physically freed before its row invoice"
+    );
+    assert_eq!(
+        frees[2],
+        (invoiced, invoiced, 1),
+        "partition allocation physically freed before its row invoice"
+    );
+    assert_eq!(
+        spy.used.load(Ordering::SeqCst),
+        invoiced,
+        "payload drop alone cannot refund another live row owner"
+    );
+    drop(row_owner);
+    assert_eq!(spy.used.load(Ordering::SeqCst), baseline);
+    let h = Harness::new();
+    let write =
+        owner.scope(|| h.stage(&[put(1, 10, Some(20)), put(1, 30, Some(40)), put(2, 15, None)]));
+    assert_eq!(
+        owner.held(),
+        baseline,
+        "actual membership publication returns previous/next decode invoices within this still-live operation"
+    );
+    assert_eq!(spy.used.load(Ordering::SeqCst), baseline);
+    write.commit().unwrap();
+    check(
+        &h,
+        &[9, 10, 14, 15, 20, 30, 40],
+        "provided-child publication",
+    );
+    drop(owner);
+    assert_eq!(spy.used.load(Ordering::SeqCst), 0);
+    spy.assert_payload_lifetime();
+    assert_eq!(parent.retained_bytes_for_test(), child_control);
+    drop(spy);
+    drop(child);
+    assert_eq!(parent.retained_bytes_for_test(), 0);
 }
 
 #[test]
@@ -298,6 +384,232 @@ fn removing_the_only_membership_of_a_route_clears_its_rows() {
     h.commit(&[(1, None)], true);
     assert_eq!(h.rows(), Vec::<(u64, u64)>::new());
     check(&h, &[0, 15, 25], "after removing the last membership");
+    // Selected deletion records must retain their native row owners across
+    // later fallible decoding; an error destroys payloads and refunds once.
+    use super::proof_allocation_oracle_tests::MaintenanceReaderSpy;
+    use crate::persistence::{
+        VectorPartitionJournalChange, VectorPartitionJournalRecord, VectorPartitionTombstoneCause,
+        VectorPartitionTombstoneRecord,
+    };
+    use crate::read_image_memory::ImageMemory;
+    use std::sync::{Arc, atomic::Ordering};
+    let directory = tempfile::tempdir().unwrap();
+    let writer = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(
+        1_610_612_736,
+    ));
+    let root = crate::memory_accounting::WriterBudget::from_accountant(writer.clone()).unwrap();
+    let handle: crate::memory_accounting::AccountantHandle = writer.clone().into();
+    let persistence = RedbPersistence::create_with_accountant(
+        &directory.path().join("selected-row.db"),
+        Some(handle.clone()),
+        crate::persistence::REDB_CACHE_BYTES,
+    )
+    .unwrap();
+    let records: Vec<_> = (1..=4).map(|row| record(row, 10, Some(20))).collect();
+    persistence
+        .with_db(|db| {
+            let write = db.begin_write().unwrap();
+            crate::persistence::content_size::ensure_table(&write, "items").unwrap();
+            for record in &records {
+                let key = RedbPersistence::vector_partition_membership_key(record);
+                let encoded = RedbPersistence::encode_vector_partition_record(
+                    VectorPartitionRecordKind::Membership,
+                    record,
+                )
+                .unwrap();
+                write
+                    .open_table(crate::persistence::VECTOR_PARTITION_MEMBERSHIP_TABLE)
+                    .unwrap()
+                    .insert(key.as_slice(), encoded.as_slice())
+                    .unwrap();
+                persistence
+                    .write_open_directory_entry(&write, &key, Some(&encoded))
+                    .unwrap();
+                let tombstone = VectorPartitionTombstoneRecord {
+                    membership: record.clone(),
+                    deleted_tx: TxId(20),
+                    lsn: record.row_lsn,
+                    cause: VectorPartitionTombstoneCause::Delete,
+                };
+                let mut tombstone_key = key;
+                tombstone_key.extend_from_slice(&20_u64.to_be_bytes());
+                let bytes = RedbPersistence::encode_vector_partition_record(
+                    VectorPartitionRecordKind::Tombstone,
+                    &tombstone,
+                )
+                .unwrap();
+                write
+                    .open_table(crate::persistence::VECTOR_PARTITION_TOMBSTONE_TABLE)
+                    .unwrap()
+                    .insert(tombstone_key.as_slice(), bytes.as_slice())
+                    .unwrap();
+                let journal = VectorPartitionJournalRecord {
+                    index: record.index.clone(),
+                    partition_key: record.partition_key.clone(),
+                    lsn: record.row_lsn,
+                    ordinal: 0,
+                    change: VectorPartitionJournalChange::Tombstone(tombstone),
+                };
+                let key = RedbPersistence::vector_partition_journal_key(&journal);
+                let bytes = RedbPersistence::encode_vector_partition_record(
+                    VectorPartitionRecordKind::Journal,
+                    &journal,
+                )
+                .unwrap();
+                write
+                    .open_table(crate::persistence::VECTOR_PARTITION_JOURNAL_TABLE)
+                    .unwrap()
+                    .insert(key.as_slice(), bytes.as_slice())
+                    .unwrap();
+            }
+            write.commit().unwrap();
+            Ok(())
+        })
+        .unwrap();
+    let snapshot = || {
+        persistence
+            .with_db(|db| {
+                let read = db.begin_read().unwrap();
+                let mut out = Vec::new();
+                for definition in [
+                    crate::persistence::VECTOR_PARTITION_MEMBERSHIP_TABLE,
+                    crate::persistence::VECTOR_PARTITION_TOMBSTONE_TABLE,
+                    crate::persistence::VECTOR_PARTITION_JOURNAL_TABLE,
+                    pages::SOURCE,
+                    pages::OCCUPANCY,
+                    pages::OCCUPANCY_DIRTY,
+                ] {
+                    let rows = match read.open_table(definition) {
+                        Ok(table) => table
+                            .iter()
+                            .unwrap()
+                            .map(|entry| {
+                                let (key, value) = entry.unwrap();
+                                (key.value().to_vec(), value.value().to_vec())
+                            })
+                            .collect::<Vec<_>>(),
+                        Err(redb::TableError::TableDoesNotExist(_)) => Vec::new(),
+                        Err(error) => panic!("{error}"),
+                    };
+                    out.push(rows);
+                }
+                Ok(out)
+            })
+            .unwrap()
+    };
+    let before = snapshot();
+    let parent = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(1_073_741_824);
+    let child = parent.child().unwrap();
+    let child_control = parent.retained_bytes_for_test();
+    let spy = MaintenanceReaderSpy::new(child.clone(), handle.clone());
+    spy.fail_at.store(usize::MAX, Ordering::SeqCst);
+    let owner = ImageMemory::operation_reader(handle.clone(), spy.clone()).unwrap();
+    let mut workspace = crate::memory_accounting::OwnedMemoryReservation::new(handle.clone());
+    let result = owner
+        .scope(|| {
+            persistence.with_db(|db| {
+                let write = db.begin_write().unwrap();
+                persistence.prune_vector_memberships_in_write(
+                    &write,
+                    records[..2].iter().map(|record| {
+                        (
+                            &record.index,
+                            record.row_id,
+                            record.vector_created_tx,
+                            record.vector_lsn,
+                        )
+                    }),
+                    Some(&mut workspace),
+                )
+            })
+        });
+    spy.assert_payload_lifetime();
+    let error = result.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("injected reader invoice failure"),
+        "{error:?}"
+    );
+    assert_eq!(
+        spy.live_payload_owners_at_failure.load(Ordering::SeqCst),
+        2,
+        "both selected records retain their own payload invoices through the next fallible operation"
+    );
+    assert!(spy.retained_at_failure.load(Ordering::SeqCst) > owner.held());
+    drop(owner);
+    assert!(
+        workspace.bytes() > 0,
+        "failed preparation retains its admitted writer scratch until its outer owner drops"
+    );
+    drop(workspace);
+    assert_eq!(spy.used.load(Ordering::SeqCst), 0);
+    spy.assert_payload_lifetime();
+    assert_eq!(parent.retained_bytes_for_test(), child_control);
+    assert_eq!(
+        snapshot(),
+        before,
+        "failure publishes no membership, tombstone, journal, source, interval, or dirty-marker change"
+    );
+    spy.fail_at.store(0, Ordering::SeqCst);
+    let owner = ImageMemory::operation_reader(handle.clone(), spy.clone()).unwrap();
+    let owner_control = owner.held();
+    let mut workspace = crate::memory_accounting::OwnedMemoryReservation::new(handle);
+    owner
+        .scope(|| {
+            persistence.with_db(|db| {
+                let write = db.begin_write().unwrap();
+                persistence.prune_vector_memberships_in_write(
+                    &write,
+                    records[..2].iter().map(|record| {
+                        (
+                            &record.index,
+                            record.row_id,
+                            record.vector_created_tx,
+                            record.vector_lsn,
+                        )
+                    }),
+                    Some(&mut workspace),
+                )?;
+                write.commit().unwrap();
+                Ok(())
+            })
+        })
+        .unwrap();
+    assert_eq!(
+        owner.held(),
+        owner_control,
+        "membership scans, selected deletion records and temporary journals all return their native payload invoices"
+    );
+    assert_eq!(
+        workspace.bytes(),
+        0,
+        "the actual selected-record and journal writer scratch is empty after successful deletion"
+    );
+    drop(workspace);
+    drop(owner);
+    assert_eq!(spy.used.load(Ordering::SeqCst), 0);
+    assert_eq!(spy.wrong_funder.load(Ordering::SeqCst), 0);
+    spy.assert_payload_lifetime();
+    assert_eq!(parent.retained_bytes_for_test(), child_control);
+    let after = snapshot();
+    for (old, new) in before[..4].iter().zip(&after[..4]) {
+        assert_eq!(new.len(), 2);
+        assert!(
+            new.iter().all(|row| old.contains(row)),
+            "only selected identities are deleted"
+        );
+    }
+    assert_eq!(
+        after[4], before[4],
+        "surviving equal lifetimes preserve their canonical interval"
+    );
+    assert!(after[5].is_empty());
+    drop(spy);
+    drop(child);
+    assert_eq!(parent.retained_bytes_for_test(), 0);
+    drop(persistence);
+    drop(root);
 }
 
 // ---------------------------------------------------------------------------
@@ -436,6 +748,162 @@ fn run_sequence(seed: u64, steps: usize) {
 fn random_membership_writes_keep_the_interval_set_equal_to_the_directory_scan() {
     for seed in 1..=60 {
         run_sequence(seed, 80);
+    }
+    use super::proof_allocation_oracle_tests::MaintenanceReaderSpy;
+    use crate::read_image_memory::ImageMemory;
+    use std::sync::{Arc, atomic::Ordering};
+    for disjoint in [false, true] {
+        let mut receipts = Vec::new();
+        for history in [32_u64, 64, 128] {
+            let h = Harness::new();
+            let ops: Vec<_> = (1..=history)
+                .map(|row| {
+                    let start = if disjoint {
+                        10 + 2 * ((row * 17) % history)
+                    } else {
+                        10
+                    };
+                    put(row, start, Some(start + if disjoint { 1 } else { 10 }))
+                })
+                .chain(std::iter::once(put(0, 1, Some(2))))
+                .collect();
+            h.commit(&ops, true);
+            h.commit(&[(0, None)], false);
+            assert!(h.dirty());
+            let before = h.rows();
+            let writer = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(
+                1_610_612_736,
+            ));
+            let root =
+                crate::memory_accounting::WriterBudget::from_accountant(writer.clone()).unwrap();
+            let handle: crate::memory_accounting::AccountantHandle = writer.clone().into();
+            let writer_baseline = writer.usage().used;
+            let parent =
+                crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(1_073_741_824);
+            let child = parent.child().unwrap();
+            let child_control = parent.retained_bytes_for_test();
+            let child_observer =
+                crate::vector_read_memory::declared_child_observer(&child).unwrap();
+            let spy = MaintenanceReaderSpy::new(child.clone(), handle.clone());
+            let owner = ImageMemory::operation_reader(handle.clone(), spy.clone()).unwrap();
+            let owner_control = owner.held();
+            // Abort an actual completed rebuild: neither old rows nor its
+            // committed dirty marker may be partially published.
+            let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counted_writes = writes.clone();
+            let write_observer = h.db().observe_table_writes_for_test(Arc::new(move |event| {
+                if event.table == "vector_membership_occupancy_pages"
+                    && matches!(
+                        event.operation,
+                        redb::TableWriteOperationForTest::Insert
+                            | redb::TableWriteOperationForTest::Remove
+                    )
+                {
+                    counted_writes.fetch_add(1, Ordering::SeqCst);
+                }
+            }));
+            let write = h.db().begin_write().unwrap();
+            owner
+                .scope(|| pages::settle_dirty_occupancy(&write, Some(handle.clone())))
+                .unwrap();
+            drop(write_observer);
+            spy.assert_payload_lifetime();
+            assert_eq!(
+                owner.held(),
+                owner_control,
+                "temporary decoded memberships refund before the next operation"
+            );
+            assert_eq!(spy.used.load(Ordering::SeqCst), owner_control);
+            assert_eq!(
+                child_observer.sample().charged_bytes as usize,
+                owner_control
+            );
+            assert_eq!(
+                parent.retained_bytes_for_test(),
+                child_control + owner_control as u64
+            );
+            let first_requests = spy.decode_requests.load(Ordering::SeqCst);
+            let reader_peak = spy.peak.load(Ordering::SeqCst);
+            let writer_peak = spy.writer_peak.load(Ordering::SeqCst) - writer_baseline;
+            drop(write);
+            assert_eq!(h.rows(), before);
+            assert!(h.dirty());
+            assert_eq!(writer.usage().used, writer_baseline);
+            drop(owner);
+            assert_eq!(spy.used.load(Ordering::SeqCst), 0);
+
+            // One byte below the measured successful native reader envelope
+            // refuses as reader memory with this SAME writer. Abort retains
+            // the old durable rows and dirty marker for the correct child.
+            let small_parent = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+                child_control + reader_peak as u64 - 1,
+            );
+            let small_child = small_parent.child().unwrap();
+            let small_spy = MaintenanceReaderSpy::new(small_child.clone(), handle.clone());
+            let small_owner =
+                ImageMemory::operation_reader(handle.clone(), small_spy.clone()).unwrap();
+            let write = h.db().begin_write().unwrap();
+            let error = small_owner
+                .scope(|| pages::settle_dirty_occupancy(&write, Some(handle.clone())))
+                .unwrap_err();
+            assert!(
+                matches!(error, contextdb_core::Error::MemoryBudgetExceeded { ref subsystem, .. } if subsystem == "reader"),
+                "{error:?}"
+            );
+            drop(write);
+            drop(small_owner);
+            assert_eq!(small_spy.used.load(Ordering::SeqCst), 0);
+            drop(small_spy);
+            drop(small_child);
+            assert_eq!(small_parent.retained_bytes_for_test(), 0);
+            assert_eq!(h.rows(), before);
+            assert!(h.dirty());
+            assert_eq!(writer.usage().used, writer_baseline);
+
+            let owner = ImageMemory::operation_reader(handle.clone(), spy.clone()).unwrap();
+            let write = h.db().begin_write().unwrap();
+            owner
+                .scope(|| pages::settle_dirty_occupancy(&write, Some(handle.clone())))
+                .unwrap();
+            write.commit().unwrap();
+            drop(owner);
+            assert_eq!(spy.used.load(Ordering::SeqCst), 0);
+            assert_eq!(spy.wrong_funder.load(Ordering::SeqCst), 0);
+            assert_eq!(writer.usage().used, writer_baseline);
+            check(&h, &all_holds(&h), "native fixed-budget rebuild");
+            assert_eq!(h.rows().len(), if disjoint { history as usize } else { 1 });
+            receipts.push((
+                reader_peak,
+                writer_peak,
+                first_requests,
+                writes.load(Ordering::SeqCst),
+            ));
+            drop(spy);
+            drop(child);
+            assert_eq!(parent.retained_bytes_for_test(), 0);
+            drop(root);
+        }
+        for receipt in &receipts[1..] {
+            assert_eq!(
+                receipts[0].0, receipt.0,
+                "N, 2N and 4N keep identical native live reader invoices"
+            );
+            assert_eq!(
+                receipts[0].1, receipt.1,
+                "N, 2N and 4N keep identical writer scratch"
+            );
+        }
+        assert_eq!(
+            receipts[2].2 - receipts[1].2,
+            2 * (receipts[1].2 - receipts[0].2),
+            "doubling source records doubles added native decode work, preserving fixed route work"
+        );
+        assert!(receipts[0].3 > 0);
+        assert_eq!(
+            receipts[2].3 - receipts[1].3,
+            2 * (receipts[1].3 - receipts[0].3),
+            "actual durable occupancy mutations have linear growth for overlapping and arbitrary-order disjoint inputs"
+        );
     }
 }
 

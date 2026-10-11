@@ -192,6 +192,7 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
                 measurement.peak = measurement.peak.max(measurement.live);
             }
         }
+        maintenance_payload_allocated(pointer as usize, layout.size());
         pointer
     }
 
@@ -233,6 +234,7 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
         unsafe {
             System.dealloc(pointer.sub(offset), allocation);
         }
+        maintenance_payload_freed(pointer as usize);
         if let Some(watch) = native_watch {
             let counter = watch.counter.load(AtomicOrdering::SeqCst);
             let after = if counter == 0 {
@@ -1424,4 +1426,309 @@ pub(crate) fn candidate_payload_free_observation_for_test() -> ((usize, usize, u
 // No allocation, counter mutation or pointer dereference in this process invoice.
 pub(crate) fn registry_process_free_observation_for_test() -> (usize, usize) {
     WATCH_NODE_PROCESS_FREE.with(std::cell::Cell::get)
+}
+
+// A forwarding test capability, rather than a second accountant: every
+// invoice is paid by the native child supplied by the fixture. The existing
+// allocator oracle can read `used` while observing actual payload frees.
+#[derive(Debug)]
+pub(crate) struct MaintenanceReaderSpy {
+    pub(crate) source: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    pub(crate) writer: crate::memory_accounting::AccountantHandle,
+    pub(crate) used: AtomicUsize,
+    pub(crate) peak: AtomicUsize,
+    pub(crate) writer_peak: AtomicUsize,
+    pub(crate) requests: AtomicUsize,
+    pub(crate) decode_requests: AtomicUsize,
+    pub(crate) wrong_funder: AtomicUsize,
+    pub(crate) fail_at: AtomicUsize,
+    pub(crate) retained_at_failure: AtomicUsize,
+    pub(crate) live_payload_owners_at_failure: AtomicUsize,
+    pub(crate) payload_allocations: AtomicUsize,
+    pub(crate) payload_frees: AtomicUsize,
+    pub(crate) early_payload_refunds: AtomicUsize,
+    pub(crate) allocation_watch_overflow: AtomicUsize,
+    owners: parking_lot::Mutex<Vec<std::sync::Weak<crate::read_image_memory::ImageMemory>>>,
+}
+
+impl MaintenanceReaderSpy {
+    pub(crate) fn assert_payload_lifetime(&self) {
+        assert_eq!(
+            self.allocation_watch_overflow.load(AtomicOrdering::SeqCst),
+            0,
+            "the fixed native allocation observer never loses a live block"
+        );
+        assert!(
+            self.payload_allocations.load(AtomicOrdering::SeqCst) > 0,
+            "observe actual allocations paired with successful native-child invoices"
+        );
+        assert_eq!(
+            self.payload_allocations.load(AtomicOrdering::SeqCst),
+            self.payload_frees.load(AtomicOrdering::SeqCst),
+            "every observed temporary native allocation has physically freed"
+        );
+        assert_eq!(
+            self.early_payload_refunds.load(AtomicOrdering::SeqCst),
+            0,
+            "each image owner refunds its child only after its own observed payload allocations physically free"
+        );
+    }
+
+    pub(crate) fn new(
+        source: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        writer: crate::memory_accounting::AccountantHandle,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            source,
+            writer,
+            used: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+            writer_peak: AtomicUsize::new(0),
+            requests: AtomicUsize::new(0),
+            decode_requests: AtomicUsize::new(0),
+            wrong_funder: AtomicUsize::new(0),
+            fail_at: AtomicUsize::new(0),
+            retained_at_failure: AtomicUsize::new(0),
+            live_payload_owners_at_failure: AtomicUsize::new(0),
+            payload_allocations: AtomicUsize::new(0),
+            payload_frees: AtomicUsize::new(0),
+            early_payload_refunds: AtomicUsize::new(0),
+            allocation_watch_overflow: AtomicUsize::new(0),
+            owners: parking_lot::Mutex::new(Vec::with_capacity(64)),
+        })
+    }
+}
+
+impl contextdb_core::read_memory::ReadMemoryBudget for MaintenanceReaderSpy {
+    fn try_reserve(
+        &self,
+        bytes: usize,
+        subsystem: &'static str,
+        operation: &'static str,
+        hint: &'static str,
+    ) -> contextdb_core::Result<()> {
+        let request = self.requests.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+        self.writer_peak
+            .fetch_max(self.writer.usage().used, AtomicOrdering::SeqCst);
+        if subsystem == "reader" && operation == "materialize_answer" {
+            self.decode_requests.fetch_add(1, AtomicOrdering::SeqCst);
+            if crate::read_image_memory::current_reader_budget().is_some() {
+                let owner = crate::read_image_memory::active_owner()?;
+                let funder = owner.reader_budget().expect("reader-funded image");
+                if Arc::as_ptr(&funder) as *const () as usize != self as *const Self as usize {
+                    self.wrong_funder.fetch_add(1, AtomicOrdering::SeqCst);
+                }
+                maintenance_owner_control(Arc::as_ptr(&owner) as usize, self);
+                let mut owners = self.owners.lock();
+                owners.retain(|owner| owner.strong_count() != 0);
+                if !owners
+                    .iter()
+                    .any(|seen| seen.as_ptr() == Arc::as_ptr(&owner))
+                {
+                    assert!(
+                        owners.len() < owners.capacity(),
+                        "fixed spy slots cover live image owners"
+                    );
+                    owners.push(Arc::downgrade(&owner));
+                }
+            }
+        }
+        let live_payload_owners = self
+            .owners
+            .lock()
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .filter(|owner| owner.retained_payload_bytes() != 0)
+            .count();
+        let fail_at = self.fail_at.load(AtomicOrdering::SeqCst);
+        if fail_at == request || (fail_at == usize::MAX && live_payload_owners >= 2) {
+            MAINTENANCE_INVOICES.with(|tickets| tickets.set([(0, 0, 0); 16]));
+            self.retained_at_failure.store(
+                self.used.load(AtomicOrdering::SeqCst),
+                AtomicOrdering::SeqCst,
+            );
+            self.live_payload_owners_at_failure
+                .store(live_payload_owners, AtomicOrdering::SeqCst);
+            return Err(contextdb_core::Error::Other(
+                "injected reader invoice failure".into(),
+            ));
+        }
+        // A failed invoice's typed error belongs to its caller, not to the
+        // decoded row. Do not identify those error strings as row payloads.
+        let pending_invoices =
+            MAINTENANCE_INVOICES.with(|tickets| tickets.replace([(0, 0, 0); 16]));
+        self.source.try_reserve(bytes, subsystem, operation, hint)?;
+        MAINTENANCE_INVOICES.with(|tickets| tickets.set(pending_invoices));
+        let used = self.used.fetch_add(bytes, AtomicOrdering::SeqCst) + bytes;
+        self.peak.fetch_max(used, AtomicOrdering::SeqCst);
+        if subsystem == "reader"
+            && operation == "materialize_answer"
+            && crate::read_image_memory::current_reader_budget().is_some()
+        {
+            let owner = crate::read_image_memory::active_owner()?;
+            // The first reserve on an empty image is codec or image control,
+            // not payload. Later heap admissions are matched to actual native
+            // allocations, including a Vec allocated after its element strings.
+            if owner.retained_payload_bytes() != 0 {
+                MAINTENANCE_INVOICES.with(|tickets| {
+                    let mut pending = tickets.get();
+                    if let Some(ticket) = pending.iter_mut().find(|ticket| ticket.0 == 0) {
+                        *ticket = (
+                            Arc::as_ptr(&owner) as usize,
+                            self as *const Self as usize,
+                            bytes,
+                        );
+                    } else {
+                        self.allocation_watch_overflow
+                            .fetch_add(1, AtomicOrdering::SeqCst);
+                    }
+                    tickets.set(pending);
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn release(&self, bytes: usize) {
+        // Codec control returns when decoding finishes. Any unmatched
+        // conservative heap admission cannot tag later storage writes.
+        MAINTENANCE_INVOICES.with(|tickets| tickets.set([(0, 0, 0); 16]));
+        // During ImageMemory::drop its weak pointer has zero strong owners,
+        // but the spy and the native child are still alive. Check the actual
+        // allocation census BEFORE forwarding that owner's refund.
+        self.owners.lock().retain(|owner| {
+            if owner.strong_count() == 0 {
+                maintenance_owner_refund(owner.as_ptr() as usize, self);
+                false
+            } else {
+                true
+            }
+        });
+        let before = self.used.fetch_sub(bytes, AtomicOrdering::SeqCst);
+        assert!(before >= bytes, "each actual reader invoice refunds once");
+        self.source.release(bytes);
+    }
+
+    fn funding_owner_for_test(
+        &self,
+    ) -> Option<&Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>> {
+        Some(&self.source)
+    }
+}
+
+// Extend this allocator's existing observation surface. A ticket pairs the
+// *actual successful native-child invoice* with an admitted native allocation
+// request. In these fixtures that identifies decoded strings and component Vecs;
+// it never tags later redb page buffers or guesses a native Arc layout.
+#[derive(Clone, Copy)]
+struct MaintenancePayloadSlot {
+    pointer: usize,
+    bytes: usize,
+    owner: usize,
+    funder: usize,
+}
+impl MaintenancePayloadSlot {
+    const EMPTY: Self = Self {
+        pointer: 0,
+        bytes: 0,
+        owner: 0,
+        funder: 0,
+    };
+}
+thread_local! {
+    static MAINTENANCE_INVOICES: std::cell::Cell<[(usize, usize, usize); 16]> = const { std::cell::Cell::new([(0, 0, 0); 16]) };
+    static MAINTENANCE_PAYLOADS: std::cell::Cell<[MaintenancePayloadSlot; 512]> = const { std::cell::Cell::new([MaintenancePayloadSlot::EMPTY; 512]) };
+}
+fn maintenance_payload_allocated(pointer: usize, bytes: usize) {
+    let ticket = MAINTENANCE_INVOICES
+        .try_with(|tickets| {
+            let mut pending = tickets.get();
+            // Exact owned-string invoices take precedence over a conservative Vec
+            // admission that precedes decoding those strings. Both comparisons use
+            // actual producer invoices and actual allocator requests, not layouts.
+            let chosen = pending
+                .iter()
+                .position(|ticket| ticket.0 != 0 && ticket.2 == bytes)
+                .or_else(|| {
+                    pending
+                        .iter()
+                        .position(|ticket| ticket.0 != 0 && bytes <= ticket.2)
+                });
+            let ticket = chosen
+                .map(|index| {
+                    let ticket = pending[index];
+                    pending[index] = (0, 0, 0);
+                    ticket
+                })
+                .unwrap_or((0, 0, 0));
+            tickets.set(pending);
+            ticket
+        })
+        .unwrap_or((0, 0, 0));
+    if ticket.0 == 0 {
+        return;
+    }
+    let spy = unsafe { &*(ticket.1 as *const MaintenanceReaderSpy) };
+    MAINTENANCE_PAYLOADS.with(|slots| {
+        let mut entries = slots.get();
+        if let Some(slot) = entries.iter_mut().find(|slot| slot.pointer == 0) {
+            *slot = MaintenancePayloadSlot {
+                pointer,
+                bytes,
+                owner: ticket.0,
+                funder: ticket.1,
+            };
+            spy.payload_allocations.fetch_add(1, AtomicOrdering::SeqCst);
+        } else {
+            spy.allocation_watch_overflow
+                .fetch_add(1, AtomicOrdering::SeqCst);
+        }
+        slots.set(entries);
+    });
+}
+fn maintenance_owner_control(owner: usize, spy: &MaintenanceReaderSpy) {
+    MAINTENANCE_PAYLOADS.with(|slots| {
+        let mut entries = slots.get();
+        // Identify an image-control block by the initialized owner's actual
+        // address lying inside its observed allocation, with no header offset.
+        if let Some(slot) = entries.iter_mut().find(|slot| {
+            slot.pointer != 0
+                && slot.funder == spy as *const _ as usize
+                && slot.pointer <= owner
+                && owner < slot.pointer.saturating_add(slot.bytes)
+        }) {
+            *slot = MaintenancePayloadSlot::EMPTY;
+            spy.payload_allocations.fetch_sub(1, AtomicOrdering::SeqCst);
+        }
+        slots.set(entries);
+    });
+}
+fn maintenance_payload_freed(pointer: usize) {
+    let _ = MAINTENANCE_PAYLOADS.try_with(|slots| {
+        let mut entries = slots.get();
+        if let Some(slot) = entries
+            .iter_mut()
+            .find(|slot| slot.pointer == pointer && pointer != 0)
+        {
+            // The reader scope retains this capability while its payload
+            // drops. System.dealloc has already returned at this observation.
+            let spy = unsafe { &*(slot.funder as *const MaintenanceReaderSpy) };
+            spy.payload_frees.fetch_add(1, AtomicOrdering::SeqCst);
+            *slot = MaintenancePayloadSlot::EMPTY;
+        }
+        slots.set(entries);
+    });
+}
+fn maintenance_owner_refund(owner: usize, spy: &MaintenanceReaderSpy) {
+    MAINTENANCE_PAYLOADS.with(|slots| {
+        let live = slots
+            .get()
+            .iter()
+            .filter(|slot| {
+                slot.pointer != 0 && slot.owner == owner && slot.funder == spy as *const _ as usize
+            })
+            .count();
+        spy.early_payload_refunds
+            .fetch_add(live, AtomicOrdering::SeqCst);
+    });
 }

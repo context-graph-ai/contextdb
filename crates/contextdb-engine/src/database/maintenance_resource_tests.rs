@@ -429,6 +429,111 @@ fn streamed_state_digest_preserves_the_canonical_live_entry_encoding() {
 
 #[test]
 fn cancellation_during_actual_build_returns_workspace_and_preserves_serving_catalog() {
+    // Currency cleanup must use the caller's native reader child. A smaller
+    // reader refuses without changing committed state; the original declared
+    // reader succeeds with the same writer and the same durable fixture.
+    {
+        use crate::persistence::content_identity::proof_allocation_oracle_tests::MaintenanceReaderSpy;
+        use crate::read_image_memory::ImageMemory;
+        let directory = tempfile::tempdir().unwrap();
+        let db = Database::open_with_options(
+            directory.path().join("currency-reader.db"),
+            DatabaseOpenOptions {
+                memory_limit: Some(1_610_612_736),
+                maintenance_policy: MaintenancePolicy::CallerDriven,
+                ..DatabaseOpenOptions::default()
+            },
+        )
+        .unwrap();
+        db.execute("CREATE TABLE funded_items (id INT PRIMARY KEY, v VECTOR(3)) HISTORY CURRENT ONLY SYNC OFF", &HashMap::new()).unwrap();
+        for id in 0..4 {
+            db.execute(
+                "INSERT INTO funded_items VALUES ($id, '[1,0,0]')",
+                &HashMap::from([("id".into(), Value::Int64(id))]),
+            )
+            .unwrap();
+        }
+        db.execute("UPDATE funded_items SET v = '[0,1,0]'", &HashMap::new())
+            .unwrap();
+        let parent =
+            crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(1_073_741_824);
+        let child = parent.child().unwrap();
+        let child_control = parent.retained_bytes_for_test();
+        let observer = crate::vector_read_memory::declared_child_observer(&child).unwrap();
+        let spy = MaintenanceReaderSpy::new(child.clone(), db.__accountant_handle_for_test());
+        let probe =
+            ImageMemory::operation_reader(db.__accountant_handle_for_test(), spy.clone()).unwrap();
+        assert!(Arc::ptr_eq(
+            &probe.reader_budget().unwrap(),
+            &(spy.clone() as Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>)
+        ));
+        let operation_control = probe.held();
+        drop(probe);
+        let persistence = db.persistence.as_ref().unwrap();
+        let before_rows = persistence.load_all_tables().unwrap();
+        let before_vectors = persistence.load_vectors().unwrap();
+        let before_memberships = persistence.load_vector_partition_memberships().unwrap();
+        let before_changes = persistence.load_change_log().unwrap();
+        let before_commit_index = persistence.load_commit_index().unwrap();
+        let writer_before = db.accountant().usage().used;
+        let small_parent = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+            child_control + operation_control as u64 - 1,
+        );
+        let small_child = small_parent.child().unwrap();
+        let error = db
+            .maintenance_context()
+            .run_currency(CurrencyGate::Always, small_child.clone())
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::MemoryBudgetExceeded { ref subsystem, ref operation, .. } if subsystem == "reader" && operation == "decode_owner"),
+            "{error:?}"
+        );
+        assert_eq!(persistence.load_all_tables().unwrap(), before_rows);
+        assert_eq!(persistence.load_vectors().unwrap(), before_vectors);
+        assert_eq!(
+            persistence.load_vector_partition_memberships().unwrap(),
+            before_memberships
+        );
+        assert_eq!(persistence.load_change_log().unwrap(), before_changes);
+        assert_eq!(
+            persistence.load_commit_index().unwrap(),
+            before_commit_index
+        );
+        assert_eq!(db.accountant().usage().used, writer_before);
+        drop(small_child);
+        assert_eq!(small_parent.retained_bytes_for_test(), 0);
+        let report = db
+            .maintenance_context()
+            .run_currency(CurrencyGate::Always, spy.clone())
+            .unwrap();
+        assert_eq!(report.pruned_versions, 4);
+        assert_eq!(report.vector_keys_rewritten, 4);
+        assert!(
+            spy.decode_requests.load(Ordering::SeqCst) > 0,
+            "currency's persistence decodes invoice the supplied child, never the standalone fallback"
+        );
+        assert_eq!(spy.wrong_funder.load(Ordering::SeqCst), 0);
+        assert_eq!(spy.used.load(Ordering::SeqCst), 0);
+        assert_eq!(observer.sample().charged_bytes, 0);
+        assert_eq!(parent.retained_bytes_for_test(), child_control);
+        assert_eq!(
+            persistence
+                .load_vector_partition_memberships()
+                .unwrap()
+                .len(),
+            4
+        );
+        assert_eq!(
+            db.execute("SELECT id FROM funded_items ORDER BY id", &HashMap::new())
+                .unwrap()
+                .rows,
+            (0..4).map(|id| vec![Value::Int64(id)]).collect::<Vec<_>>()
+        );
+        drop(spy);
+        drop(child);
+        assert_eq!(parent.retained_bytes_for_test(), 0);
+        db.close().unwrap();
+    }
     // Cancellation is observed during actual ownership audit before any
     // destructive commit (maintenance intent line 41; root policy 22).
     {
