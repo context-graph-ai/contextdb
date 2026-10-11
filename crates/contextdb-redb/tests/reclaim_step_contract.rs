@@ -12,6 +12,38 @@ use redb::{
 };
 use std::path::Path;
 
+#[cfg(unix)]
+struct ReclaimChild {
+    child: Option<std::process::Child>,
+}
+
+#[cfg(unix)]
+impl ReclaimChild {
+    fn new(child: std::process::Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn status(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.child.as_mut().unwrap().try_wait()
+    }
+
+    fn kill_and_reap(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let mut child = self.child.take().unwrap();
+        child.kill()?;
+        child.wait()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ReclaimChild {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 const TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("rows");
 const ROWS: u64 = 1_500;
 
@@ -444,76 +476,62 @@ fn small_commits_stay_within_the_ordinary_budget_under_keep_pace() {
     assert!(work.reclaimed_entries <= 64, "{work:?}");
 }
 
-/// A crash INSIDE a step: the child commits tiny steps in a tight loop and is killed (SIGKILL) at
-/// staggered moments after its first committed step, so some kills land mid-commit. Whatever the
-/// moment, the reopened store verifies, still holds the committed data, keeps the remainder, and
-/// finishes draining through the same step.
+/// A crash inside a reclaim step: after its reclaim transaction has staged its mutations but
+/// before durable publication, the child signals the parent and blocks. The parent kills that
+/// exact transaction. The reopened store verifies, still holds the committed data, keeps the
+/// remainder, and finishes draining through the same step.
+#[cfg(unix)]
 #[test]
 fn a_kill_at_any_moment_of_a_step_loop_recovers_through_ordinary_storage_recovery() {
     const ROLE: &str = "WRITECOST_REDB_KILL_CHILD";
-    if let Ok(path) = std::env::var(ROLE) {
+    const PAUSE_SOCKET: &str = "WRITECOST_REDB_PAUSE_BEFORE_DURABLE_COMMIT_SOCKET";
+    const MARKER: &[u8] = b"RECLAIM_MUTATIONS_STAGED";
+    if let (Ok(path), Ok(_)) = (std::env::var(ROLE), std::env::var(PAUSE_SOCKET)) {
         let db = open(Path::new(&path));
-        let mut boundary = None;
-        let mut announced = false;
-        loop {
-            match db.reclaim_deferred_step(boundary, 4, 4).unwrap() {
-                ReclaimStep::Progressed(next) => boundary = Some(next),
-                _ => {
-                    // Start a fresh cycle so the loop keeps committing until killed.
-                    boundary = None;
-                    churn(&db, 99);
-                }
-            }
-            if !announced {
-                println!("STEPPED");
-                std::io::Write::flush(&mut std::io::stdout()).unwrap();
-                announced = true;
-            }
+        let step = db.reclaim_deferred_step(None, 4, 4);
+        panic!("the parent must kill the child at the staged reclaim commit: {step:?}");
+    }
+    use std::os::unix::net::UnixDatagram;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kill.redb");
+    {
+        let db = open(&path);
+        seed(&db);
+        for generation in 1..=40 {
+            churn(&db, generation);
         }
     }
-    use std::io::{BufRead, BufReader};
-    for delay_ms in [0u64, 1, 3, 7, 13, 29] {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("kill.redb");
-        {
-            let db = open(&path);
-            seed(&db);
-            for generation in 1..=40 {
-                churn(&db, generation);
-            }
-        }
-        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "a_kill_at_any_moment_of_a_step_loop_recovers_through_ordinary_storage_recovery", "--nocapture", "--test-threads=1"])
-            .env(ROLE, &path)
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
-        loop {
-            let line = lines.next().expect("child output").unwrap();
-            if line.trim().ends_with("STEPPED") {
-                break;
-            }
-        }
-        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-        child.kill().unwrap();
-        child.wait().unwrap();
-        let mut db = open(&path);
-        assert!(db.check_integrity().unwrap(), "delay {delay_ms} ms: store must verify");
-        let read = db.begin_read().unwrap();
-        let table = read.open_table(TABLE).unwrap();
-        assert_eq!(table.len().unwrap(), ROWS, "delay {delay_ms} ms");
-        for key in 0..ROWS {
-            let value = table.get(key).unwrap().unwrap().value().to_vec();
-            let known = (0..=99).any(|generation| {
-                let expected = if key % 3 == 0 { generation } else { 0 };
-                value == payload(expected, key)
-            });
-            assert!(known, "delay {delay_ms} ms: key {key} holds a value no commit wrote");
-        }
-        drop(table);
-        drop(read);
-        let (verdict, _, _) = drive(&db, None, 2_000);
-        assert_eq!(verdict, ReclaimStep::Drained, "delay {delay_ms} ms");
+    let socket = dir.path().join("reclaim-commit.sock");
+    let ready = UnixDatagram::bind(&socket).unwrap();
+    ready.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+    let mut child = ReclaimChild::new(std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "a_kill_at_any_moment_of_a_step_loop_recovers_through_ordinary_storage_recovery", "--nocapture", "--test-threads=1"])
+        .env(ROLE, &path)
+        .env(PAUSE_SOCKET, &socket)
+        .spawn()
+        .unwrap());
+    let mut marker = [0; MARKER.len()];
+    let received = ready.recv(&mut marker);
+    assert_eq!(received.unwrap_or_else(|_| panic!("child must signal before the rendezvous deadline: {:?}", child.status().unwrap())), MARKER.len());
+    assert_eq!(marker, MARKER, "child must stop in the staged reclaim transaction");
+    child.kill_and_reap().unwrap();
+    drop(ready);
+    std::fs::remove_file(&socket).unwrap();
+    let mut db = open(&path);
+    assert!(db.check_integrity().unwrap(), "store must verify after the staged reclaim kill");
+    let read = db.begin_read().unwrap();
+    let table = read.open_table(TABLE).unwrap();
+    assert_eq!(table.len().unwrap(), ROWS);
+    for key in 0..ROWS {
+        let value = table.get(key).unwrap().unwrap().value().to_vec();
+        let known = (0..=40).any(|generation| {
+            let expected = if key % 3 == 0 { generation } else { 0 };
+            value == payload(expected, key)
+        });
+        assert!(known, "key {key} holds a value no committed generation wrote");
     }
+    drop(table);
+    drop(read);
+    let (verdict, _, _) = drive(&db, None, 2_000);
+    assert_eq!(verdict, ReclaimStep::Drained);
 }
