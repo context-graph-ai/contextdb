@@ -1156,15 +1156,14 @@ impl DurableMembershipSource {
             }
         }
         let (pending_inserts, tombstones) = Self::pending_counts_for(&summary, Some(frontier))?;
-        Ok(RawVectorInspectionSnapshot {
+        Ok(RawVectorInspectionSnapshot::new(
             captured_catalog,
-            summary: summary_counts(&summary)?,
+            summary_counts(&summary)?,
             base,
             change,
             pending_inserts,
             tombstones,
-            #[cfg(feature = "test-seams")]
-            base_pending: {
+            {
                 let frontier = base.map_or(TxId(0), |generation| generation.covered_tx);
                 [
                     &summary.pending,
@@ -1174,7 +1173,7 @@ impl DurableMembershipSource {
                 .find(|counts| counts.covered_tx == frontier)
                 .map(|counts| (counts.pending_inserts as usize, counts.tombstones as usize))
             },
-        })
+        ))
     }
 
     fn catalog_frontier(&self, root: &MembershipRoot) -> Result<Option<TxId>> {

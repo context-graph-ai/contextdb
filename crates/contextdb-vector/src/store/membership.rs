@@ -34,6 +34,32 @@ pub struct RawVectorInspectionSnapshot {
     pub base_pending: Option<(usize, usize)>,
 }
 
+impl RawVectorInspectionSnapshot {
+    #[doc(hidden)]
+    pub fn new(
+        captured_catalog: bool,
+        summary: RawVectorMembershipSummary,
+        base: Option<VectorGraphGeneration>,
+        change: Option<VectorGraphGeneration>,
+        pending_inserts: usize,
+        tombstones: usize,
+        base_pending: Option<(usize, usize)>,
+    ) -> Self {
+        #[cfg(not(feature = "test-seams"))]
+        let _ = base_pending;
+        Self {
+            captured_catalog,
+            summary,
+            base,
+            change,
+            pending_inserts,
+            tombstones,
+            #[cfg(feature = "test-seams")]
+            base_pending,
+        }
+    }
+}
+
 /// One membership change of a durable LSN-ordered change suffix.
 #[doc(hidden)]
 #[derive(Debug, Clone, PartialEq, Eq)]
