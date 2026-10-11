@@ -13998,9 +13998,14 @@ fn candidate_runs_admit_whole_partitions(
         || pick.pushed_columns.len() < leading
         || pick.columns.len() < pick.pushed_columns.len()
         || 1usize.saturating_add(pick.suffix_shapes.len()) < pick.pushed_columns.len()
+        || pick.trailing_range.is_some()
+        || pick.prefix_empty
         || !pick.pushed_columns[..leading]
             .iter()
             .all(|column| partition_keys.contains(column))
+        || !partition_keys
+            .iter()
+            .all(|key| pick.pushed_columns[..leading].contains(key))
         || !matches!(pick.tuple_arity(), 0) && pick.tuple_arity() != leading
     {
         return Ok(None);
@@ -14012,6 +14017,9 @@ fn candidate_runs_admit_whole_partitions(
             &pick.suffix_shapes[position - 1]
         }
     };
+    if (0..leading).any(|position| super::finite_shape_values(shape_at(position)).is_none()) {
+        return Ok(None);
+    }
     // Validate every suffix before allocating the proof batch. Its complete
     // domain is fixed by the declared boolean type, including NULL only when
     // nullable; the visitors below derive both sides of that domain directly.
