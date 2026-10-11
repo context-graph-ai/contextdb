@@ -181,7 +181,7 @@ fn streamed_state_digest_preserves_the_canonical_live_entry_encoding() {
         );
         let persistence = db.persistence.as_ref().unwrap().clone();
         vector_paged_build::install_paged_root_capture(&persistence, &db.tx_mgr);
-        let mut owner = VectorCopyAdmission::new(db.accountant.clone());
+        let mut owner = VectorCopyAdmission::new(db.accountant.vector_budget().unwrap());
         let context = db.maintenance_context();
         let record = context
             .start_paged_vector_build(&route, &persistence, &mut owner, true)
@@ -450,7 +450,7 @@ fn cancellation_during_actual_build_returns_workspace_and_preserves_serving_cata
         );
         let persistence = db.persistence.as_ref().unwrap().clone();
         vector_paged_build::install_paged_root_capture(&persistence, &db.tx_mgr);
-        let mut owner = VectorCopyAdmission::new(db.accountant.clone());
+        let mut owner = VectorCopyAdmission::new(db.accountant.vector_budget().unwrap());
         let context = db.maintenance_context();
         let record = context
             .start_paged_vector_build(&route, &persistence, &mut owner, true)
@@ -1155,7 +1155,7 @@ fn switching_to_caller_driven_during_build_reports_pending_before_retry() {
         );
         let persistence = db.persistence.as_ref().unwrap().clone();
         vector_paged_build::install_paged_root_capture(&persistence, &db.tx_mgr);
-        let mut owner = VectorCopyAdmission::new(db.accountant.clone());
+        let mut owner = VectorCopyAdmission::new(db.accountant.vector_budget().unwrap());
         let context = db.maintenance_context();
         let record = context
             .start_paged_vector_build(&route, &persistence, &mut owner, true)
@@ -1196,7 +1196,7 @@ fn switching_to_caller_driven_during_build_reports_pending_before_retry() {
                 record.progress().unwrap(),
                 native,
                 plan,
-                db.accountant.clone(),
+                db.accountant.vector_budget().unwrap(),
                 &mut owner,
             )
             .unwrap();

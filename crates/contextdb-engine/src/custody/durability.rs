@@ -1,23 +1,23 @@
 //! A scoped observation/fault at the actual row/outcome commit.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 use super::records::*;
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 use contextdb_core::Result;
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 use redb::ReadableTable;
 
 // Ordinary push applies on a blocking worker. Scope the test fault to the
 // intended unit, across threads, and never let a contact or status write consume it.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 struct CommitFault {
     root: RowRef,
     digest: [u8; 32],
     reached: bool,
 }
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 static BEFORE_COMMIT_FAULT: std::sync::Mutex<Option<CommitFault>> = std::sync::Mutex::new(None);
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn arm_commit_fault(root: RowRef, digest: [u8; 32]) {
     *BEFORE_COMMIT_FAULT.lock().unwrap() = Some(CommitFault {
         root,
@@ -26,7 +26,7 @@ pub(crate) fn arm_commit_fault(root: RowRef, digest: [u8; 32]) {
     });
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn commit_fault_reached() -> bool {
     BEFORE_COMMIT_FAULT
         .lock()
@@ -35,7 +35,7 @@ pub(crate) fn commit_fault_reached() -> bool {
         .is_some_and(|fault| fault.reached)
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 fn take_commit_fault(transaction: &redb::WriteTransaction) -> Result<bool> {
     let mut fault = BEFORE_COMMIT_FAULT.lock().unwrap();
     let Some(fault) = fault.as_mut().filter(|fault| !fault.reached) else {
@@ -68,7 +68,7 @@ fn take_commit_fault(transaction: &redb::WriteTransaction) -> Result<bool> {
 }
 
 // Called only at the actual shared row/outcome commit boundary.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn before_custody_commit(transaction: &redb::WriteTransaction) -> Result<()> {
     if take_commit_fault(transaction)? {
         return Err(contextdb_core::Error::Other(

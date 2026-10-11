@@ -462,7 +462,7 @@ impl EventBusState {
         self.waiters.notify_all();
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn authoritative_purge_memory_sink_queue_for_test(
         &self,
         sink: &str,
@@ -2268,9 +2268,9 @@ impl Database {
             tx_mgr: Arc::clone(&self.tx_mgr),
         };
         let thread_shutdown = shutdown.clone();
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::read_probe::note_event_delivery_start();
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::read_probe::note_background_worker_start();
         let handle = thread::spawn(move || worker.dispatch_loop(thread_shutdown));
         runtimes.insert(

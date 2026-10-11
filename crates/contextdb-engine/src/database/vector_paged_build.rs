@@ -590,7 +590,7 @@ impl MaintenanceContext {
                 .ok_or_else(|| Error::Other("paged vector build lost its registration".into()))?;
             match progress.phase {
                 PagedVectorPhase::Inserting | PagedVectorPhase::Encoding => {
-                    #[cfg(feature = "test-seams")]
+                    #[cfg(any(test, feature = "test-seams"))]
                     if progress.phase == PagedVectorPhase::Inserting && progress.graph.points == 0 {
                         contextdb_vector::hnsw::observe_paged_hnsw_build();
                     }
@@ -1208,14 +1208,14 @@ impl MaintenanceContext {
             "Free writer memory before publishing paged metadata.",
         )?;
         self.admit_generation_disk(prepared.write_reservation_bytes())?;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         let published_pending = Arc::new(parking_lot::Mutex::new(None));
         persistence.stage_paged_publication(
             partition,
             PagedPublication {
                 prepared,
                 previous_generation_id: record.previous_generation_id,
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 published_pending: Arc::clone(&published_pending),
             },
         );
@@ -1263,13 +1263,13 @@ impl MaintenanceContext {
             // must not be changed or reported as a successful publication.
             return Ok(VectorPartitionPublicationOutcome::default());
         }
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::writer_commit_test_seams::reached(
             crate::writer_commit_test_seams::CommitBoundary::GenerationAfterRedb,
         );
         self.snapshot_registry.release_construction_floor(partition);
         self.vector.clear_partition_paged_build_progress(partition);
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if let Some(pending) = published_pending.lock().take() {
             self.vector.observe_durable_base_publication(
                 partition,

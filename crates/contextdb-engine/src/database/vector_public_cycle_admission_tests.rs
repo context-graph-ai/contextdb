@@ -275,7 +275,7 @@ fn public_cold_metadata_refusal(metadata: ColdMetadata) {
     persistence.close();
     drop(persistence);
     let persistence = Arc::new(RedbPersistence::open_with_cache(&copy, 0).unwrap());
-    persistence.attach_memory_accountant(Arc::clone(&db.accountant));
+    persistence.attach_memory_accountant(db.accountant.clone());
     let original_persistence = db.persistence.replace(Arc::clone(&persistence)).unwrap();
     let baseline = db.accountant.usage().used;
     let snapshot_holds = db.snapshot_registry.state.lock().active.len();
@@ -680,7 +680,7 @@ fn public_unknown_catalog_preserves_healthy_work(before: bool, kind: UnknownCata
         );
         assert_eq!(
             vector_source_page_admission::with_preparation_source_page_admission(
-                Arc::clone(&db.accountant),
+                db.accountant.clone(),
                 || persistence.vector_partition_maintenance_entry_counts(
                     &route(0),
                     db.tx_mgr.current_tx_max(),
@@ -937,7 +937,7 @@ thread_local! {
 }
 
 pub(super) struct InventorySlotBudgetForTest {
-    accountant: Arc<MemoryAccountant>,
+    accountant: crate::memory_accounting::AccountantHandle,
     limit: Option<usize>,
 }
 
@@ -951,13 +951,13 @@ impl Drop for InventorySlotBudgetForTest {
 /// route workspace has succeeded. The real try_grow_for supplies the error.
 #[doc(hidden)]
 pub(super) fn refuse_inventory_slot_for_test(
-    accountant: &Arc<MemoryAccountant>,
+    accountant: &crate::memory_accounting::AccountantHandle,
     slot: &'static str,
 ) -> Option<InventorySlotBudgetForTest> {
     let refuse = INVENTORY_SLOT_REFUSAL_FOR_TEST.with(|active| {
         let mut active = active.borrow_mut();
         let (owner, target, attempts) = active.as_mut()?;
-        if *owner != Arc::as_ptr(accountant) as usize || *target != slot {
+        if *owner != accountant.as_ptr() as usize || *target != slot {
             return None;
         }
         *attempts += 1;
@@ -968,7 +968,7 @@ pub(super) fn refuse_inventory_slot_for_test(
     let usage = accountant.usage();
     accountant.set_budget(Some(usage.used)).unwrap();
     Some(InventorySlotBudgetForTest {
-        accountant: Arc::clone(accountant),
+        accountant: accountant.clone(),
         limit: usage.limit,
     })
 }
@@ -1135,7 +1135,7 @@ fn public_later_inventory_slot_refusal(slot: &'static str) {
         );
     }
     INVENTORY_SLOT_REFUSAL_FOR_TEST.with(|active| {
-        *active.borrow_mut() = Some((Arc::as_ptr(&db.accountant) as usize, slot, 0));
+        *active.borrow_mut() = Some((db.accountant.as_ptr() as usize, slot, 0));
     });
     let refusal = InventorySlotRefusalScopeForTest;
     db.clear_maintenance_cycle_stamp_for_test();
@@ -1274,13 +1274,13 @@ thread_local! {
 }
 
 pub(super) fn candidate_sort_budget_for_test(
-    accountant: &Arc<MemoryAccountant>,
+    accountant: &crate::memory_accounting::AccountantHandle,
     count: usize,
     bytes: usize,
 ) -> Option<InventorySlotBudgetForTest> {
     let refuse = CANDIDATE_SORT_FOR_TEST.with(|active| {
         let mut active = active.borrow_mut();
-        if active.owner != Arc::as_ptr(accountant) as usize {
+        if active.owner != accountant.as_ptr() as usize {
             return false;
         }
         active.attempts += 1;
@@ -1295,19 +1295,19 @@ pub(super) fn candidate_sort_budget_for_test(
     let usage = accountant.usage();
     accountant.set_budget(Some(usage.used)).unwrap();
     Some(InventorySlotBudgetForTest {
-        accountant: Arc::clone(accountant),
+        accountant: accountant.clone(),
         limit: usage.limit,
     })
 }
 
 pub(super) fn observe_candidate_sort_for_test<'a>(
-    accountant: &Arc<MemoryAccountant>,
+    accountant: &crate::memory_accounting::AccountantHandle,
     candidates: impl Iterator<Item = (&'a VectorPartitionRef, bool)>,
     after: bool,
 ) {
     CANDIDATE_SORT_FOR_TEST.with(|active| {
         let mut active = active.borrow_mut();
-        if active.owner != Arc::as_ptr(accountant) as usize {
+        if active.owner != accountant.as_ptr() as usize {
             return;
         }
         active.used_during = accountant.usage().used;
@@ -1396,7 +1396,7 @@ fn public_cycle_candidate_sort_heap_refusal_releases_and_retries_stably() {
     );
     CANDIDATE_SORT_FOR_TEST.with(|active| {
         *active.borrow_mut() = CandidateSortObservation {
-            owner: Arc::as_ptr(&db.accountant) as usize,
+            owner: db.accountant.as_ptr() as usize,
             refuse: true,
             ..CandidateSortObservation::default()
         }

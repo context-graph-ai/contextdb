@@ -2508,7 +2508,7 @@ fn cached_original_guards_preserve_admission_and_authenticate_fresh_loads() {
         let accountant = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(
             256 * 1024 * 1024,
         ));
-        let mut admission = database.admission(Some(Arc::clone(&accountant)));
+        let mut admission = database.admission(Some(Arc::clone(&accountant).into()));
         let inputs: EntryEdits = mutations
             .iter()
             .take(count)
@@ -2578,13 +2578,13 @@ fn cached_original_guards_preserve_admission_and_authenticate_fresh_loads() {
         }
         let baseline = accountant.usage().used;
         let mut admission = match mode {
-            0 => database.admission(Some(Arc::clone(&accountant))),
+            0 => database.admission(Some(Arc::clone(&accountant).into())),
             1 => {
                 let mut admission = database.admission(None);
-                admission.scratch_accountant = Some(Arc::clone(&accountant));
+                admission.scratch_accountant = Some(Arc::clone(&accountant).into());
                 admission
             }
-            _ => ProofAdmission::fixed_refusal_control(Some(Arc::clone(&accountant)))
+            _ => ProofAdmission::fixed_refusal_control(Some(Arc::clone(&accountant).into()))
                 .with_scratch_owner(Some(Arc::downgrade(&database.owner))),
         };
         let write = database.begin_write().unwrap();
@@ -2709,7 +2709,7 @@ fn cached_original_guards_preserve_admission_and_authenticate_fresh_loads() {
         let accountant = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(
             256 * 1024 * 1024,
         ));
-        let mut admission = database.admission(Some(Arc::clone(&accountant)));
+        let mut admission = database.admission(Some(Arc::clone(&accountant).into()));
         let write = database.begin_write().unwrap();
         let changes = mutations
             .iter()
@@ -2744,7 +2744,7 @@ fn cached_original_guards_preserve_admission_and_authenticate_fresh_loads() {
     let accountant = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(
         256 * 1024 * 1024,
     ));
-    let mut admission = database.admission(Some(Arc::clone(&accountant)));
+    let mut admission = database.admission(Some(Arc::clone(&accountant).into()));
     let mut table = write.open_table(CONTENT_IDENTITY_NODES_TABLE).unwrap();
     let original = table
         .get(stored.as_slice())

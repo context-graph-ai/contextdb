@@ -22,7 +22,7 @@ pub struct WriterQueryWork {
     pub sync_parent_key_projection_bytes: usize,
     /// Maximum simultaneous key-projection admission within this observation.
     pub sync_parent_key_projection_peak_bytes: usize,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub content_size_table_totals_visits: u64,
 }
 
@@ -36,14 +36,14 @@ pub struct WriterHistoryWork {
     pub vector_memberships: u64,
     pub commit_bound_keys: u64,
     pub ddl_occurrences: u64,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub direction_summary_reads: u64,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub capability_summary_reads: u64,
     pub sidecar_entries: [u64; 8],
     pub sidecar_decodes: [u64; 8],
     pub selection_entries: u64,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub allocator_regions_loaded: u64,
 }
 
@@ -92,12 +92,12 @@ pub fn observe<T>(operation: impl FnOnce() -> T) -> (T, WriterQueryWork) {
         }
     }
     let restore = Restore(WORK.with(|work| work.replace(Some(WriterQueryWork::default()))));
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     let (value, regions) = redb::observe_allocator_region_loads_for_test(operation);
-    #[cfg(not(feature = "test-seams"))]
+    #[cfg(not(any(test, feature = "test-seams")))]
     let value = operation();
     let counters = WORK.with(|work| work.get().expect("observation remains installed"));
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     let counters = WriterQueryWork {
         history: WriterHistoryWork {
             allocator_regions_loaded: regions,
@@ -205,7 +205,7 @@ pub(crate) fn note_ddl_occurrence() {
     });
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn note_direction_summary_read() {
     WORK.with(|slot| {
         if let Some(mut work) = slot.get() {
@@ -386,7 +386,7 @@ pub(crate) fn source_posting_operation(
 }
 
 /// Observe each actual declared-table content-total lookup, including refusals.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn note_content_size_table_total() {
     WORK.with(|slot| {
         if let Some(mut work) = slot.get() {

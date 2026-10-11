@@ -191,7 +191,7 @@ fn public_purge_batch_is_atomic_across_injected_persistence_failure_and_reopen()
         );
         let persistence = db.persistence.as_ref().unwrap().clone();
         vector_paged_build::install_paged_root_capture(&persistence, &db.tx_mgr);
-        let mut owner = VectorCopyAdmission::new(db.accountant.clone());
+        let mut owner = VectorCopyAdmission::new(db.accountant.vector_budget().unwrap());
         let context = db.maintenance_context();
         let record = context
             .start_paged_vector_build(&route, &persistence, &mut owner, true)

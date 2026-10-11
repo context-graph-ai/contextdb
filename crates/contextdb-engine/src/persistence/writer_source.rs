@@ -900,7 +900,7 @@ impl WriterSnapshot {
     pub(crate) fn storage_identity(&self) -> redb::StorageSnapshotIdentity {
         self.identity
     }
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn note_read_source(&self, family: crate::writer_query_test_seams::PhysicalFamily) {
         if let Ok(read) = self.owner_read() {
             crate::writer_query_test_seams::note_physical_source(family, &read);
@@ -1386,7 +1386,7 @@ impl WriterReadCursor {
                 if let (Bound::Included(low), Bound::Included(high)) = (&lower, &upper)
                     && low == high
                 {
-                    #[cfg(feature = "test-seams")]
+                    #[cfg(any(test, feature = "test-seams"))]
                     if self.table.starts_with("rel_") {
                         crate::read_work_probe::note_row_version_point_read();
                     }
@@ -1522,10 +1522,10 @@ impl WriterReadCursor {
         before: &mut dyn FnMut() -> Result<()>,
         handoff: impl FnOnce(WriterWindow<VersionedRow>) -> Result<H>,
     ) -> Result<Option<H>> {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         self.root
             .note_read_source(crate::writer_query_test_seams::PhysicalFamily::Row);
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         let _target_reads = self.logical_table.as_deref().map(|table| {
             crate::writer_query_test_seams::physical_operation(
                 crate::writer_query_test_seams::PhysicalFamily::Row,
@@ -1535,7 +1535,7 @@ impl WriterReadCursor {
         self.next_before_handoff(
             before,
             |key, value| {
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 {
                     crate::read_work_probe::note_decoded_row();
                     crate::read_work_probe::note_stored_row_bytes(value.len());
@@ -1701,10 +1701,10 @@ impl WriterReadCursor {
         before: &mut dyn FnMut() -> Result<()>,
         handoff: impl FnOnce(WriterWindow<WriterIndexPosting>) -> Result<H>,
     ) -> Result<Option<H>> {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         self.root
             .note_read_source(crate::writer_query_test_seams::PhysicalFamily::Posting);
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         let _target_reads = self.logical_table.as_deref().map(|table| {
             crate::writer_query_test_seams::source_posting_operation(table, |target| {
                 let expected = DurableRelationalIndexKey::new(target.clone(), RowId(0), TxId(0));
@@ -1824,7 +1824,7 @@ impl WriterReadCursor {
         let root = Arc::clone(&self.root);
         let owner = self.owner.clone();
         self.next(|position, value| {
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             crate::database::resident_history_test_seams::note(|work| {
                 work.log_keys_examined += 1;
             });
@@ -2107,8 +2107,8 @@ mod tests {
     fn store(path: &Path) -> (RedbPersistence, crate::memory_accounting::AccountantHandle) {
         let store = RedbPersistence::create(path).unwrap();
         let accountant = Arc::new(MemoryAccountant::no_limit());
-        store.attach_memory_accountant(accountant.clone());
-        (store, accountant)
+        store.attach_memory_accountant(accountant.clone().into());
+        (store, accountant.into())
     }
 
     // Exercise the manager's real publication door with the durable source.
@@ -2344,9 +2344,9 @@ mod tests {
             }
         }
         let fixture_open_accountant_2311 = Arc::new(MemoryAccountant::no_limit());
-        let _fixture_decode_scope_2311 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_2311)).unwrap();
+        let _fixture_decode_scope_2311 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_2311).into()).unwrap();
         let store = RedbPersistence::open(&path).unwrap();
-        store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_2311));
+        store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_2311).into());
         let bounds = store.writer_open_bounds(["items"]).unwrap();
         let root = store
             .initialize_writer_snapshot(SnapshotId(bounds.max_tx.0), bounds.max_lsn)
@@ -2766,7 +2766,7 @@ impl WriterReadCursor {
     }
 }
 
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 pub(crate) fn r1_schema_control_rows_for_test() {
     use crate::memory_accounting::{WriterBudget, writer_adapter_type_layout};
     use crate::persistence::content_identity::proof_allocation_oracle_tests::{last_request_for_test, measured, };
@@ -2775,7 +2775,7 @@ pub(crate) fn r1_schema_control_rows_for_test() {
     let baseline = owner.usage().used;
     let controls = owner.writer_fixed_ownership().2;
     let meta: TableMeta = serde_json::from_str(r#"{"columns":[],"immutable":false}"#).unwrap();
-    let memory = OwnedMemoryReservation::from_admitted(owner.clone(), 0)
+    let memory = OwnedMemoryReservation::from_admitted(owner.clone().into(), 0)
         .with_enclosing_arc_control::<WriterTableMeta>(false)
         .unwrap();
     last_request_for_test(true);
@@ -2791,7 +2791,7 @@ pub(crate) fn r1_schema_control_rows_for_test() {
     assert_eq!(owner.writer_fixed_ownership().2, controls + table_layout.size());
     let mut tables = HashMap::new();
     tables.insert("r1".to_owned(), table.clone());
-    let memory = OwnedMemoryReservation::from_admitted(owner.clone(), 0)
+    let memory = OwnedMemoryReservation::from_admitted(owner.clone().into(), 0)
         .with_enclosing_arc_control::<WriterSchema>(false).unwrap();
     last_request_for_test(true);
     let (schema, _, _) = measured(|| Arc::new(WriterSchema { tables, _memory: memory }));

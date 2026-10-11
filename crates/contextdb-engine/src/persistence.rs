@@ -71,7 +71,7 @@ pub(crate) mod read_commit_directory;
 mod reader_presence;
 mod relational_posting_prune;
 mod relational_version_manifest;
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 mod resident_history_test_seams;
 mod schema_binding;
 mod transaction_repair;
@@ -273,7 +273,7 @@ pub(crate) fn relational_index_prefix_is_constraint_bounded(
 /// count at 0 or 1 whatever the data is. It is computed from the declared
 /// constraints, not from the index kind: the engine also derives indexes to
 /// back foreign keys and graph edges, and those are not unique.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct IndexPrefixCountTouch {
     pub table: String,
@@ -294,7 +294,7 @@ pub struct IndexPrefixCountTouch {
 /// A posting is what `visit_relational_index_postings` walks to serve an
 /// authenticated ordered range, so unlike a prefix count it is read by every
 /// indexed range query. This names the index that pays for it.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct IndexPostingTouch {
     pub table: String,
@@ -304,13 +304,13 @@ pub struct IndexPostingTouch {
     pub postings: u64,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 thread_local! {
     static INDEX_POSTINGS: std::cell::RefCell<BTreeMap<(String, String), (Vec<String>, u64)>> =
         const { std::cell::RefCell::new(BTreeMap::new()) };
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 fn observe_index_posting(table: &str, declaration: &IndexDecl) {
     INDEX_POSTINGS.with(|postings| {
         let mut postings = postings.borrow_mut();
@@ -330,7 +330,7 @@ fn observe_index_posting(table: &str, declaration: &IndexDecl) {
     });
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn take_index_postings_for_test() -> Vec<IndexPostingTouch> {
     INDEX_POSTINGS.with(|postings| {
         std::mem::take(&mut *postings.borrow_mut())
@@ -345,10 +345,10 @@ pub(crate) fn take_index_postings_for_test() -> Vec<IndexPostingTouch> {
     })
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 type IndexPrefixCountAttribution = (String, Vec<String>, bool, String, usize, usize);
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 thread_local! {
     /// Every visit, keyed by the encoded count key, so visits that land on one
     /// count collapse the way the write itself collapses them.
@@ -361,7 +361,7 @@ thread_local! {
 
 /// Whether the table declares a primary key or a unique constraint over exactly
 /// these columns, in any order.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 fn prefix_is_uniquely_constrained(meta: &TableMeta, columns: &[String]) -> bool {
     let names = columns.iter().map(String::as_str).collect::<BTreeSet<_>>();
     if names.len() != columns.len() {
@@ -393,7 +393,7 @@ fn prefix_is_uniquely_constrained(meta: &TableMeta, columns: &[String]) -> bool 
             .any(|column| column.name == columns[0] && (column.primary_key || column.unique))
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 fn observe_index_prefix_count(
     table: &str,
     meta: &TableMeta,
@@ -422,7 +422,7 @@ fn observe_index_prefix_count(
     });
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 fn observe_index_prefix_count_value(count_key: &[u8], value: Option<u64>) {
     INDEX_PREFIX_COUNT_VALUES.with(|values| values.borrow_mut().insert(count_key.to_vec(), value));
 }
@@ -436,7 +436,7 @@ fn observe_index_prefix_count_value(count_key: &[u8], value: Option<u64>) {
 /// fourth is the write-set preparation that runs before the transaction opens,
 /// which is where the declared table metadata is copied. Nanoseconds,
 /// accumulated on the writing thread; nothing in production reads them.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AppendStageNanos {
     pub write_set_preparation: u64,
@@ -446,7 +446,7 @@ pub struct AppendStageNanos {
     pub commit: u64,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) enum AppendStage {
     WriteSetPreparation,
     TableMetaClone,
@@ -455,7 +455,7 @@ pub(crate) enum AppendStage {
     Commit,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 thread_local! {
     static APPEND_STAGE_NANOS: std::cell::Cell<AppendStageNanos> =
         const { std::cell::Cell::new(AppendStageNanos {
@@ -470,7 +470,7 @@ thread_local! {
 /// Charge the time since `started` to `stage`, and restart the clock so the
 /// next stage measures from here. Stages therefore partition the window rather
 /// than overlapping it.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn observe_append_stage(stage: AppendStage, started: &mut std::time::Instant) {
     let nanos = started.elapsed().as_nanos() as u64;
     *started = std::time::Instant::now();
@@ -488,17 +488,17 @@ pub(crate) fn observe_append_stage(stage: AppendStage, started: &mut std::time::
     });
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn reset_append_stages_for_test() {
     APPEND_STAGE_NANOS.with(|stages| stages.set(AppendStageNanos::default()));
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn take_append_stages_for_test() -> AppendStageNanos {
     APPEND_STAGE_NANOS.with(|stages| stages.replace(AppendStageNanos::default()))
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn reset_index_prefix_counts_for_test() {
     INDEX_PREFIX_COUNT_TOUCHES.with(|touches| touches.borrow_mut().clear());
     INDEX_PREFIX_COUNT_VALUES.with(|values| values.borrow_mut().clear());
@@ -506,7 +506,7 @@ pub(crate) fn reset_index_prefix_counts_for_test() {
     reset_append_stages_for_test();
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn take_index_prefix_counts_for_test() -> Vec<IndexPrefixCountTouch> {
     let values = INDEX_PREFIX_COUNT_VALUES.with(|values| std::mem::take(&mut *values.borrow_mut()));
     INDEX_PREFIX_COUNT_TOUCHES.with(|touches| {
@@ -974,7 +974,7 @@ fn prepare_companion_record_for_publication(
     fields: &CompanionRecord,
 ) -> std::result::Result<EncodedCompanionRecord, String> {
     let record = encode_companion_record(fields)?;
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     read_persistence_test_scaffold::companion_update_planned_for_test(&record);
     Ok(record)
 }
@@ -2471,9 +2471,9 @@ pub(crate) fn load_read_image_at_registration_with_context(
 /// record writer must not substitute database-file metadata for this value.
 #[allow(dead_code)]
 fn companion_effective_user_identity() -> LocalUserIdentity {
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     read_persistence_test_scaffold::note_companion_effective_user_source_call_for_test();
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     if let Some(identity) =
         read_persistence_test_scaffold::companion_effective_user_override_for_test()
     {
@@ -3232,7 +3232,7 @@ impl ReaderBreadcrumbGuard {
         })
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn path(&self) -> &Path {
         &self.path
     }
@@ -3372,7 +3372,7 @@ impl ReaderSnapshotRegistryLock {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error),
             };
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             read_persistence_test_scaffold::reader_registration_lock_checkpoint_for_test(
                 identity,
                 read_persistence_test_scaffold::ReaderRegistrationLockPhase::DescriptorOpened,
@@ -3388,7 +3388,7 @@ impl ReaderSnapshotRegistryLock {
                 metadata,
                 locked: false,
             };
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             read_persistence_test_scaffold::reader_registration_lock_checkpoint_for_test(
                 identity,
                 read_persistence_test_scaffold::ReaderRegistrationLockPhase::Validated,
@@ -3415,7 +3415,7 @@ impl ReaderSnapshotRegistryLock {
         identity: (u64, u64),
     ) -> std::io::Result<Self> {
         let (file, path) = Self::create_descriptor(runtime_root, identity)?;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         read_persistence_test_scaffold::reader_registration_lock_checkpoint_for_test(
             identity,
             read_persistence_test_scaffold::ReaderRegistrationLockPhase::DescriptorOpened,
@@ -4230,7 +4230,7 @@ impl ReadSnapshotRegistrationGuard {
         Ok(())
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn observation(&self) -> ReaderSnapshotRegistrationObservation {
         ReaderSnapshotRegistrationObservation {
             snapshot: self.snapshot.clone(),
@@ -4256,7 +4256,7 @@ impl Drop for ReadSnapshotRegistrationGuard {
     }
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ReaderSnapshotRegistrationObservation {
     pub(crate) snapshot: RegisteredReaderSnapshot,
@@ -4719,7 +4719,7 @@ fn capture_reader_snapshot_registry_one(
         Ok(directory) => directory,
         Err(_) => return ReaderSnapshotRegistry::Indeterminate(runtime.path().to_path_buf()),
     };
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     read_persistence_test_scaffold::reader_snapshot_registry_directory_inspected_for_test(
         identity, &directory,
     );
@@ -5060,7 +5060,7 @@ pub fn wait_for_reader_release(
             Ok(RangeLockOutcome::HeldByAnother) => {}
             Err(error) => return unobservable_reader_hold(path, runtime, error),
         }
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         read_persistence_test_scaffold::note_reader_release_block_for_test(
             read_persistence_test_scaffold::ReaderReleaseBlockForTest::UntilHolderReleased,
         );
@@ -5215,9 +5215,9 @@ struct ReadImageSource {
     // This final field keeps the one admitted charge alive until every
     // hydration handle, hold and breadcrumb descriptor above has closed.
     source_memory: Option<Arc<SourceMemoryReservation>>,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     source_handles_dropped_for_test: bool,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     source_released_for_test: bool,
 }
 
@@ -5530,13 +5530,13 @@ impl WritableRawVectorBodyScan {
             identity.created_tx,
             identity.lsn,
         );
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::writer_query_test_seams::note_physical_source(
             crate::writer_query_test_seams::PhysicalFamily::Vector,
             &self._transaction,
         );
         let stored = {
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             let _body_reads = crate::writer_query_test_seams::physical_operation(
                 crate::writer_query_test_seams::PhysicalFamily::Vector,
                 &index.table,
@@ -5550,7 +5550,7 @@ impl WritableRawVectorBodyScan {
                     )
                 })?
         };
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         {
             crate::read_work_probe::note_vector_body_access();
             crate::read_work_probe::note_decoded_vector();
@@ -5808,7 +5808,7 @@ impl RetainedRawVectorBodyScan {
                     .map_err(|error| source.content_identity_error(error))?;
             }
         }
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::read_work_probe::note_authoritative_body_verified();
         before()?;
         entry.deleted_tx = identity.deleted_tx;
@@ -5840,7 +5840,7 @@ struct VerifiedOrderedRunCache {
     epoch: std::sync::atomic::AtomicU64,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 mod verified_ordered_run_test_seams {
     use std::cell::Cell;
 
@@ -6104,7 +6104,7 @@ fn evict_oldest_from_verified_runs(state: &mut VerifiedOrderedRunCacheState) -> 
     };
     if let Some(evicted) = state.runs.remove(&oldest) {
         state.bytes = state.bytes.saturating_sub(evicted._memory.held());
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         verified_ordered_run_test_seams::note_capacity_displacement_for_test();
     }
     true
@@ -6143,7 +6143,7 @@ impl VerifiedOrderedRunCache {
             .cloned()
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn clear_for_test(&self) {
         let mut state = self
             .state
@@ -6159,7 +6159,7 @@ impl VerifiedOrderedRunCache {
         &self,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Option<Arc<VerifiedOrderedRunMemory>> {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if verified_ordered_run_test_seams::verified_run_memory_exhausted_for_test() {
             return None;
         }
@@ -6744,7 +6744,7 @@ impl CheckpointReadSource {
 }
 
 impl RetainedReadSource {
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn cache_index_charge_for_test(&self) -> (usize, usize) {
         (self.database.cache_index_bytes(), self._source_memory.bytes.load(Ordering::SeqCst))
     }
@@ -6793,7 +6793,7 @@ impl RetainedReadSource {
         &self.registration
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn arm_verified_ordered_run_eviction_for_test(&self, postings: usize) {
         let _ = self;
         verified_ordered_run_test_seams::arm_eviction_after_cached_postings_for_test(postings);
@@ -7380,13 +7380,13 @@ impl RetainedReadSource {
 
     /// The authenticated chunks this pinned snapshot is holding, their bytes,
     /// and how many of those bytes are charged to the declared session.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn resident_proof_chunks_for_test(&self) -> (usize, usize, usize) {
         self.content_identity.resident_proof_chunks_for_test()
     }
 
     /// The most this reader may hold in proved chunks.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn resident_proof_chunk_ceiling_for_test(&self) -> usize {
         self.content_identity
             .resident_proof_chunk_ceiling_for_test()
@@ -7397,7 +7397,7 @@ impl RetainedReadSource {
     /// currently tracked at (first), and how many of those bytes are
     /// actually accounted for by a session charge or the reader's free floor
     /// (second) -- not necessarily anything close to the first.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn retained_content_proof_bytes_for_test(&self) -> (usize, usize) {
         let proof = self
             .content_proof
@@ -7413,7 +7413,7 @@ impl RetainedReadSource {
     /// resident set charges or floor-covers for the same decoded pages.
     /// Released together with the resident set's own charge when both are
     /// cleared (`evict_resident_proof_chunks_for_test`).
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn statement_own_charge_for_test(&self) -> usize {
         let proof = self
             .content_proof
@@ -7424,7 +7424,7 @@ impl RetainedReadSource {
 
     /// Drop every retained authenticated chunk, as capacity eviction does. The
     /// next statement proves them against the committed root again.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn evict_resident_proof_chunks_for_test(&self) -> usize {
         let evicted = self.content_identity.evict_resident_proof_chunks_for_test();
         self.clear_statement_proofs();
@@ -7437,7 +7437,7 @@ impl RetainedReadSource {
     /// resident set's charge for it disappears. `evict_resident_proof_chunks_for_test`
     /// above resets both together, which a genuine forced-eviction-while-held
     /// reproduction cannot use.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn evict_resident_proof_chunks_only_for_test(&self) -> usize {
         self.content_identity.evict_resident_proof_chunks_for_test()
     }
@@ -7458,7 +7458,7 @@ impl RetainedReadSource {
     }
 
     /// Drop the remembered result-record witnesses only.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn evict_record_witnesses_for_test(&self) -> usize {
         self.content_identity.evict_record_witnesses_for_test()
     }
@@ -7951,7 +7951,7 @@ impl RetainedReadSource {
         expected_dimension: usize,
         quantization: VectorQuantization,
     ) -> Result<Vec<(VectorEntry, Option<TxId>)>> {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::writer_query_test_seams::note_physical_source(
             crate::writer_query_test_seams::PhysicalFamily::Vector,
             read,
@@ -7989,7 +7989,7 @@ impl RetainedReadSource {
                         "a raw-vector directory identity has no durable body",
                     )
                 })?;
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             crate::read_work_probe::note_decoded_vector();
             contextdb_core::find_attribution::count("decoded_vectors", 1);
             let mut entry = decode_retained_raw_vector_entry(
@@ -8245,7 +8245,7 @@ impl RetainedReadSource {
             .ok_or_else(|| {
                 self.raw_vector_corruption("a raw-vector candidate identity has no durable body")
             })?;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::read_work_probe::note_decoded_vector();
         contextdb_core::find_attribution::count("decoded_vectors", 1);
         validate_raw_vector_entry_encoded_width(
@@ -8288,7 +8288,7 @@ impl RetainedReadSource {
 
     /// The private history commitment includes its durable deletion witness,
     /// which the public change projection intentionally does not carry.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn change_history_bodies_for_test(&self) -> Result<Vec<(String, Vec<u8>)>> {
         self.with_read(|read| {
             let table = match read.open_table(CHANGE_LOG_TABLE) {
@@ -8307,7 +8307,7 @@ impl RetainedReadSource {
 
     /// Disposable oracle input: physical row bodies from the pinned root,
     /// independent of the maintained identity records and vector projection.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn relational_version_bodies_for_test(
         &self,
         table_meta: &HashMap<String, TableMeta>,
@@ -8888,7 +8888,7 @@ impl RetainedReadSource {
         // much one window hands back, never which keys or results a caller may
         // have. The descent's own pages are admitted the same way beside it.
         let window_limit = VERIFIED_ORDERED_WINDOW_MAX_BYTES;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         let window_limit = verified_ordered_run_test_seams::window_bytes().unwrap_or(window_limit);
         let logical_seek = match (after.clone(), seek, reverse) {
             (Some(after), _, _) => std::ops::Bound::Excluded(after),
@@ -8958,7 +8958,7 @@ impl RetainedReadSource {
                 // A posting delivered by the proof walk is physical stored data:
                 // decode it exactly and canonically before anything orders,
                 // compares or continues from it.
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 crate::writer_query_test_seams::note_target_entry(table);
                 let logical = DurableRelationalIndexKey(logical_key.to_vec())
                     .decode_canonical()
@@ -9072,7 +9072,7 @@ impl RetainedReadSource {
                 .map_err(E::from)?;
                 let definition: TableDefinition<DurableRelationalIndexKey, &[u8]> =
                     TableDefinition::new(name.as_str());
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 crate::writer_query_test_seams::note_physical_source(
                     crate::writer_query_test_seams::PhysicalFamily::Posting,
                     &read,
@@ -9084,7 +9084,7 @@ impl RetainedReadSource {
                     )))
                 })?;
                 contextdb_core::find_attribution::count("window_reads_opened", 1);
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 crate::read_work_probe::note_verified_read_opened();
                 // CURRENT is the logical set only at this root's proved
                 // committed frontier. Earlier snapshots keep historical reads.
@@ -9117,14 +9117,14 @@ impl RetainedReadSource {
                 opened
             }
         };
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::writer_query_test_seams::note_physical_source(
             crate::writer_query_test_seams::PhysicalFamily::Posting,
             &physical._read,
         );
         // Only data-page fetches belong to the targeted cold-posting observation.
         // Transaction admission and catalog/table setup are observed separately.
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         let _target_reads = crate::writer_query_test_seams::posting_operation(table, cursor);
         let index = physical.current.as_ref().unwrap_or(&physical.physical);
         use std::ops::Bound::{Excluded, Included, Unbounded};
@@ -9190,7 +9190,7 @@ impl RetainedReadSource {
             let entry = entry
                 .map_err(RedbPersistence::storage_error)
                 .map_err(E::from)?;
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             crate::writer_query_test_seams::note_target_entry(table);
             let physical_scratch = entry
                 .0
@@ -9297,14 +9297,14 @@ impl RetainedReadSource {
                 declaration.name
             ))));
         }
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::read_work_probe::note_verified_run_built(postings.len());
         contextdb_core::find_attribution::count("verified_runs_built", 1);
         contextdb_core::find_attribution::count("verified_postings_walked", postings.len() as u64);
         if postings.is_empty() {
             contextdb_core::find_attribution::count("verified_runs_built_empty", 1);
         }
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if std::env::var_os("CONTEXTDB_P1_WINDOW_WHY").is_some() {
             eprintln!(
                 "WINDOW postings={} more={more} window_full={window_full} exhausted={} \
@@ -9441,7 +9441,7 @@ impl RetainedReadSource {
                 &mut batch,
                 &mut before_page,
                 &mut |logical_key| {
-                    #[cfg(feature = "test-seams")]
+                    #[cfg(any(test, feature = "test-seams"))]
                     crate::writer_query_test_seams::note_target_entry(table);
                     let logical = DurableRelationalIndexKey(logical_key.to_vec())
                         .decode_canonical()
@@ -9458,7 +9458,7 @@ impl RetainedReadSource {
                 return Ok(None);
             }
             contextdb_core::find_attribution::count("verified_prefix_probes", 1);
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             crate::read_work_probe::note_verified_prefix_probe();
             if inside == Some(true) {
                 return Ok(Some(false));
@@ -9532,7 +9532,7 @@ impl RetainedReadSource {
                     cursor.source_advance_cached_position();
                     cursor.source_advance_cached_identity(&posting.source_key, posting.row_id);
                     visit(posting.row_id)?;
-                    #[cfg(feature = "test-seams")]
+                    #[cfg(any(test, feature = "test-seams"))]
                     if verified_ordered_run_test_seams::evict_after_cached_posting_for_test() {
                         self.verified_ordered_runs.clear_for_test();
                         self.clear_statement_proofs();
@@ -9991,7 +9991,7 @@ impl RetainedReadSource {
                         // the bulk drain. Once the continuation key is
                         // recorded, a window the cache cannot keep is dropped
                         // so the next posting is proved again from that key.
-                        #[cfg(feature = "test-seams")]
+                        #[cfg(any(test, feature = "test-seams"))]
                         if verified_ordered_run_test_seams::evict_after_cached_posting_for_test() {
                             drop(run);
                             self.verified_ordered_runs.clear_for_test();
@@ -10438,14 +10438,14 @@ impl ReadImageSource {
             .reserve(index_bytes)
             .map_err(LoadReadImageError::Memory)?;
         source_memory.bytes.store(total_source_bytes, Ordering::SeqCst);
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::read_probe::note_persistence_read_only_open();
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         read_persistence_test_scaffold::note_read_image_source_start_for_test(
             database_path,
             breadcrumb_guard.as_ref().map(|guard| guard.path()),
         );
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         {
             let checkpoint_breadcrumb = breadcrumb_guard.as_ref().and(breadcrumb.as_ref());
             let checkpoint_path = checkpoint_breadcrumb
@@ -10470,9 +10470,9 @@ impl ReadImageSource {
             // allowed to do.
             store_file_bytes,
             source_memory: Some(Arc::new(source_memory)),
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             source_handles_dropped_for_test: false,
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             source_released_for_test: false,
         })
     }
@@ -10498,9 +10498,9 @@ impl ReadImageSource {
         self.source_accesses = self.source_accesses.checked_add(1).ok_or_else(|| {
             invalid_read_image_state("read-only persistence source-access count overflowed")
         })?;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::read_probe::note_persistence_source_access();
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         read_persistence_test_scaffold::note_read_image_source_access_for_test(&self.database_path);
         let result = read(&transaction);
         if result.is_ok()
@@ -10648,14 +10648,14 @@ impl ReadImageSource {
         // descriptor/database/root and its authenticated registration.
         drop(self.hold.take());
         let breadcrumb = self.breadcrumb.take();
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         let mut note_handles_released = || {
             read_persistence_test_scaffold::note_read_image_source_handles_dropped_for_test(
                 &self.database_path,
             );
             self.source_handles_dropped_for_test = true;
         };
-        #[cfg(not(feature = "test-seams"))]
+        #[cfg(not(any(test, feature = "test-seams")))]
         let note_handles_released = || {};
         // All authentication and proof reads are complete before removal
         // begins. On refusal the staged release consumes and drops the only
@@ -10672,14 +10672,14 @@ impl ReadImageSource {
                 (None, source)
             }
         };
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::read_probe::note_persistence_release_receipt();
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         read_persistence_test_scaffold::note_read_image_source_release_for_test(
             &self.database_path,
             breadcrumb_path.as_deref(),
         );
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         {
             self.source_released_for_test = true;
         }
@@ -10695,7 +10695,7 @@ impl ReadImageSource {
     }
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 impl Drop for ReadImageSource {
     fn drop(&mut self) {
         if self.source_released_for_test {
@@ -10988,7 +10988,7 @@ fn decode_read_relational_table_with_bounds(
         // waiting on a large store is told how far it has got. What arrives is
         // counted where it arrives: the stored bytes of one row.
         crate::read_progress::note_hydrated_bytes(value.value().len() as u64);
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::read_work_probe::note_decoded_row();
         contextdb_core::find_attribution::count("decoded_rows", 1);
         let row = RedbPersistence::decode_versioned_row(value.value(), Some(meta))
@@ -11093,7 +11093,7 @@ fn decode_read_vectors_with_bounds(
     for entry in table.iter().map_err(read_storage_error)? {
         let (_, value) = entry.map_err(read_storage_error)?;
         crate::read_progress::note_hydrated_bytes(value.value().len() as u64);
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::read_work_probe::note_decoded_vector();
         contextdb_core::find_attribution::count("decoded_vectors", 1);
         let vector =
@@ -11193,7 +11193,7 @@ fn vector_partition_record_payload(
         }
         blake3::hash(&encoded[..checksum_offset])
     };
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     if expected_kind == VectorPartitionRecordKind::Membership {
         crate::database::resident_history_test_seams::note(|work| {
             work.membership_envelopes_verified += 1
@@ -11640,7 +11640,7 @@ fn stream_raw_partition_memberships<T>(
     {
         vector_membership_source::operation_checkpoint()?;
         let (key, _) = item.map_err(RedbPersistence::storage_error)?;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::database::resident_history_test_seams::note(|work| {
             work.membership_keys_examined += 1
         });
@@ -11658,7 +11658,7 @@ fn stream_raw_partition_memberships<T>(
     {
         vector_membership_source::operation_checkpoint()?;
         let (key, value) = item.map_err(RedbPersistence::storage_error)?;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::database::resident_history_test_seams::note(|work| {
             work.membership_keys_examined += 1
         });
@@ -15163,7 +15163,7 @@ fn write_companion_slot_payload(
     payload: &[u8],
 ) -> std::io::Result<()> {
     write_companion_region(file, offset, payload)?;
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     read_persistence_test_scaffold::companion_write_checkpoint(
         read_persistence_test_scaffold::CompanionWriteBoundary::SlotPayloadWrite,
     );
@@ -15173,7 +15173,7 @@ fn write_companion_slot_payload(
 #[allow(dead_code)]
 fn sync_companion_slot_payload(file: &File) -> std::io::Result<()> {
     file.sync_data()?;
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     read_persistence_test_scaffold::companion_write_checkpoint(
         read_persistence_test_scaffold::CompanionWriteBoundary::SlotPayloadSync,
     );
@@ -15187,7 +15187,7 @@ fn write_companion_slot_checksum(
     checksum: &[u8; 32],
 ) -> std::io::Result<()> {
     write_companion_region(file, offset, checksum)?;
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     read_persistence_test_scaffold::companion_write_checkpoint(
         read_persistence_test_scaffold::CompanionWriteBoundary::SlotChecksumWrite,
     );
@@ -15197,7 +15197,7 @@ fn write_companion_slot_checksum(
 #[allow(dead_code)]
 fn sync_companion_slot_checksum(file: &File) -> std::io::Result<()> {
     file.sync_data()?;
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     read_persistence_test_scaffold::companion_write_checkpoint(
         read_persistence_test_scaffold::CompanionWriteBoundary::SlotChecksumSync,
     );
@@ -15211,7 +15211,7 @@ fn write_companion_active_slot(
     active_slot: &[u8],
 ) -> std::io::Result<()> {
     write_companion_region(file, offset, active_slot)?;
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     read_persistence_test_scaffold::companion_write_checkpoint(
         read_persistence_test_scaffold::CompanionWriteBoundary::ActiveSlotWrite,
     );
@@ -15221,7 +15221,7 @@ fn write_companion_active_slot(
 #[allow(dead_code)]
 fn sync_companion_active_slot(file: &File) -> std::io::Result<()> {
     file.sync_data()?;
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     read_persistence_test_scaffold::companion_write_checkpoint(
         read_persistence_test_scaffold::CompanionWriteBoundary::ActiveSlotSync,
     );
@@ -15233,7 +15233,7 @@ fn write_companion_record(
     slot: usize,
     record: &EncodedCompanionRecord,
 ) -> std::io::Result<()> {
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     crate::read_probe::note_persistence_companion_mutation();
     let slot_offset = companion_slot_offset(slot)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
@@ -15527,7 +15527,7 @@ pub mod read_persistence_test_scaffold {
         WriterRunNumber,
     };
     use redb::{ReadableDatabase as _, ReadableTable as _, TableDefinition};
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     use std::collections::BTreeMap;
     use std::collections::{BTreeSet, HashMap, VecDeque};
     use std::io::{BufRead as _, Write as _};
@@ -15728,7 +15728,7 @@ pub mod read_persistence_test_scaffold {
         OnceLock::new();
     static TWO_READ_IMAGE_HYDRATIONS: OnceLock<(Mutex<TwoReadImageHydrationState>, Condvar)> =
         OnceLock::new();
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     static READER_SNAPSHOT_REGISTRY_SCANS: OnceLock<(
         Mutex<ReaderSnapshotRegistryScanState>,
         Condvar,
@@ -15760,14 +15760,14 @@ pub mod read_persistence_test_scaffold {
         store: Option<PathBuf>,
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[derive(Debug, Default)]
     struct ReaderSnapshotRegistryScanState {
         next_token: u64,
         active: BTreeMap<(u64, u64), ReaderSnapshotRegistryScanRun>,
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[derive(Debug)]
     struct ReaderSnapshotRegistryScanRun {
         token: u64,
@@ -15778,7 +15778,7 @@ pub mod read_persistence_test_scaffold {
     }
 
     /// The exact registry identity and directory observed by a production scan.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct ReaderSnapshotRegistryScanObservation {
         pub database_path: PathBuf,
@@ -15851,7 +15851,7 @@ pub mod read_persistence_test_scaffold {
 
     /// Where a reader registration can be paused while it acquires its
     /// registry lock.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum ReaderRegistrationLockPhase {
         /// The lock file's descriptor is open; nothing about it is validated.
@@ -15860,14 +15860,14 @@ pub mod read_persistence_test_scaffold {
         Validated,
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[derive(Debug, Default)]
     struct ReaderRegistrationLockPauseState {
         next_token: u64,
         active: BTreeMap<(u64, u64), ReaderRegistrationLockPauseRun>,
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[derive(Debug)]
     struct ReaderRegistrationLockPauseRun {
         token: u64,
@@ -15881,13 +15881,13 @@ pub mod read_persistence_test_scaffold {
         passthrough: bool,
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     static READER_REGISTRATION_LOCK_PAUSES: OnceLock<(
         Mutex<ReaderRegistrationLockPauseState>,
         Condvar,
     )> = OnceLock::new();
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn reader_registration_lock_pauses()
     -> &'static (Mutex<ReaderRegistrationLockPauseState>, Condvar) {
         READER_REGISTRATION_LOCK_PAUSES.get_or_init(|| {
@@ -15903,7 +15903,7 @@ pub mod read_persistence_test_scaffold {
     ///
     /// Dropping the controller releases the registration, so a failed
     /// assertion cannot strand a reader-open thread.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[derive(Debug)]
     pub struct ReaderRegistrationLockPauseController {
         identity: (u64, u64),
@@ -15947,7 +15947,7 @@ pub mod read_persistence_test_scaffold {
         Ok(ReaderRegistrationLockPauseController { identity, token })
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(super) fn reader_registration_lock_checkpoint_for_test(
         identity: (u64, u64),
         phase: ReaderRegistrationLockPhase,
@@ -15985,7 +15985,7 @@ pub mod read_persistence_test_scaffold {
         }
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     impl ReaderRegistrationLockPauseController {
         /// Wait until the paused registration has reached its phase
         /// `attempt` times, counting from one. Returns false if it has not
@@ -16065,7 +16065,7 @@ pub mod read_persistence_test_scaffold {
         }
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     impl Drop for ReaderRegistrationLockPauseController {
         fn drop(&mut self) {
             let (state, changed) = reader_registration_lock_pauses();
@@ -16083,7 +16083,7 @@ pub mod read_persistence_test_scaffold {
     ///
     /// Dropping an armed controller resumes its matching scan. This keeps a
     /// failed test assertion from stranding a production writer-open thread.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[derive(Debug)]
     pub struct ReaderSnapshotRegistryScanController {
         identity: (u64, u64),
@@ -16100,7 +16100,7 @@ pub mod read_persistence_test_scaffold {
         })
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn reader_snapshot_registry_scans() -> &'static (Mutex<ReaderSnapshotRegistryScanState>, Condvar)
     {
         READER_SNAPSHOT_REGISTRY_SCANS.get_or_init(|| {
@@ -16482,7 +16482,7 @@ pub mod read_persistence_test_scaffold {
         changed.notify_all();
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     impl ReaderSnapshotRegistryScanController {
         /// Wait for the matching production scan to acquire its registry
         /// directory descriptor, before it opens the registry lock.
@@ -16565,7 +16565,7 @@ pub mod read_persistence_test_scaffold {
         }
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     impl Drop for ReaderSnapshotRegistryScanController {
         fn drop(&mut self) {
             if self.finished {
@@ -16631,7 +16631,7 @@ pub mod read_persistence_test_scaffold {
         ))
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(super) fn reader_snapshot_registry_directory_inspected_for_test(
         identity: (u64, u64),
         directory: &Path,
@@ -16713,12 +16713,12 @@ pub mod read_persistence_test_scaffold {
         Released { breadcrumb_path: Option<PathBuf> },
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub fn take_verified_ordered_run_capacity_displacements_for_test() -> usize {
         super::verified_ordered_run_test_seams::take_capacity_displacements_for_test()
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub fn with_verified_ordered_window_bytes_for_test<T>(
         bytes: usize,
         action: impl FnOnce() -> T,
@@ -17831,7 +17831,7 @@ pub mod read_persistence_test_scaffold {
 
     /// Change one physical F32 body while preserving the committed logical
     /// root, so a subsequent exact read has to detect the disagreement.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub fn prepare_exact_vector_body_damage_for_test(
         path: &std::path::Path,
         damage: ExactVectorBodyDamage,
@@ -19092,13 +19092,13 @@ pub(crate) fn redb_writer_cache_bytes_for_limit(limit: Option<usize>) -> usize {
 /// different budgets can account for their different reserves instead of
 /// assuming they cancel. Production code never calls this; it calls
 /// `redb_writer_cache_bytes_for_limit` directly.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub fn redb_writer_cache_bytes_for_limit_for_test(limit: Option<usize>) -> usize {
     redb_writer_cache_bytes_for_limit(limit)
 }
 
 /// Exact existing page-cap and fixed source-reservation components.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub fn read_source_cache_reservation_for_limit_for_test(limit: Option<usize>) -> (usize, usize) {
     (
@@ -19205,15 +19205,15 @@ fn take_authoritative_purge_point_remove_persistence_failure_for_test() -> bool 
     AUTHORITATIVE_PURGE_PRE_COMMIT_FAULT.with(|fault| fault.replace(false))
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn arm_erasure_first_table_fault_for_test() {
     ERASURE_FIRST_TABLE_FAULT.with(|state| state.set((true, false)));
 }
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn erasure_first_table_fault_reached_for_test() -> bool {
     ERASURE_FIRST_TABLE_FAULT.with(|state| state.get().1)
 }
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 fn erasure_first_table_staged_for_test() -> Result<()> {
     let armed = ERASURE_FIRST_TABLE_FAULT.with(|state| {
         let (armed, reached) = state.get();
@@ -19395,7 +19395,7 @@ impl Drop for PersistenceProofOwner {
                     match step {
                         0 => {
                             drop(self.owner.accountant.take());
-                            #[cfg(all(test, feature = "test-seams"))]
+                            #[cfg(test)]
                             RETURNED_LOADER_OWNER_DROP_PANIC_FOR_TEST.with(|flag| {
                                 if flag.replace(false) { panic!("CDB127 original-owner cleanup unwind"); }
                             });
@@ -19497,7 +19497,7 @@ impl ProofAccountantSlot {
             Self::RAW_WRITER => {}
             _ => unreachable!("invalid proof-accountant slot state"),
         }
-        #[cfg(all(test, feature = "test-seams"))]
+        #[cfg(test)]
         RETURNED_LOADER_AFTER_RAW_OBSERVATION_FOR_TEST.with(|hook| {
             let callback = hook.borrow_mut().take();
             if let Some(callback) = callback { callback(); }
@@ -19553,7 +19553,7 @@ pub struct RedbPersistence {
         f64,
         Option<PersistenceBytes>,
     )>,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     handoff_prepare_io_fault: AtomicBool,
 
     writer_snapshots: Arc<parking_lot::Mutex<Vec<std::sync::Weak<WriterSnapshot>>>>,
@@ -20068,7 +20068,7 @@ struct RetainedVectorGraphPages {
 impl ReadOnlyVectorGraphPageSource for RetainedVectorGraphPageSource {
     fn reader(&self) -> Result<Box<dyn ReadOnlyVectorGraphPageReader>> {
         let transaction = self.source.begin_read()?;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::writer_query_test_seams::note_physical_source(
             crate::writer_query_test_seams::PhysicalFamily::Graph,
             &transaction,
@@ -20127,7 +20127,7 @@ impl ReadOnlyVectorGraphPageReader for RetainedVectorGraphPageReader {
                 "saved graph page range exceeds its generation".to_string(),
             ));
         }
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         let _graph_reads = {
             // This key was constructed from the validated generation route.
             let table_len = usize::try_from(u64::from_be_bytes(
@@ -20445,12 +20445,12 @@ impl ReadOnlyVectorGenerationSource {
             generation_id,
         );
         self.with_read(|read| {
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             crate::writer_query_test_seams::note_physical_source(
                 crate::writer_query_test_seams::PhysicalFamily::Graph,
                 read,
             );
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             let _graph_reads = crate::writer_query_test_seams::physical_operation(
                 crate::writer_query_test_seams::PhysicalFamily::Graph,
                 &index.table,
@@ -20541,12 +20541,12 @@ impl ReadOnlyVectorGenerationSource {
             change_generation_id,
         );
         self.with_read(|read| {
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             crate::writer_query_test_seams::note_physical_source(
                 crate::writer_query_test_seams::PhysicalFamily::Graph,
                 read,
             );
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             let _graph_reads = crate::writer_query_test_seams::physical_operation(
                 crate::writer_query_test_seams::PhysicalFamily::Graph,
                 &index.table,
@@ -20644,12 +20644,12 @@ impl ReadOnlyVectorGenerationSource {
             generation_id,
         );
         self.with_read(|read| {
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             crate::writer_query_test_seams::note_physical_source(
                 crate::writer_query_test_seams::PhysicalFamily::Graph,
                 read,
             );
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             let _graph_reads = crate::writer_query_test_seams::physical_operation(
                 crate::writer_query_test_seams::PhysicalFamily::Graph,
                 &index.table,
@@ -20695,12 +20695,12 @@ impl ReadOnlyVectorGenerationSource {
             change_generation_id,
         );
         self.with_read(|read| {
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             crate::writer_query_test_seams::note_physical_source(
                 crate::writer_query_test_seams::PhysicalFamily::Graph,
                 read,
             );
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             let _graph_reads = crate::writer_query_test_seams::physical_operation(
                 crate::writer_query_test_seams::PhysicalFamily::Graph,
                 &index.table,
@@ -20853,7 +20853,7 @@ impl ReadOnlyVectorGenerationSource {
                 if record.lsn <= covered_lsn || record.lsn > self.snapshot_lsn {
                     continue;
                 }
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 crate::vector_observations::emit(
                     index,
                     partition_key,
@@ -20894,7 +20894,7 @@ impl ReadOnlyVectorGenerationSource {
                         self.corruption("journal tail vector key disagrees with its payload")
                     );
                 }
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 crate::vector_observations::emit(
                     index,
                     partition_key,
@@ -21560,7 +21560,7 @@ fn sync_database_parent(path: &Path) -> Result<()> {
 
 impl RedbPersistence {
     /// Actual collection backing capacity retained by staged paged publications.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn paged_publication_owners_for_test(&self) -> usize {
         let publications = self.paged_publications.lock();
         let pages_capacity = |pages: &PreencodedVectorPartitionGraphPages| {
@@ -21913,7 +21913,7 @@ impl RedbPersistence {
     /// writes and every background writer has joined. The companion hold
     /// remains exclusive through the drain and final resource release.
     pub(crate) fn make_writer_quiescent(&self) -> Result<()> {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if self.handoff_prepare_io_fault.swap(false, Ordering::SeqCst) {
             return Err(Self::storage_error(std::io::Error::other(
                 "injected handoff preparation I/O failure",
@@ -21939,7 +21939,7 @@ impl RedbPersistence {
             .map_err(Self::storage_error)
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn fail_next_handoff_for_test(&self) {
         self.handoff_prepare_io_fault.store(true, Ordering::SeqCst);
     }
@@ -22003,7 +22003,7 @@ impl RedbPersistence {
         Ok(())
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn fail_next_close_drain_for_test(&self) -> Result<()> {
         self.with_db(|db| {
             db.fail_next_deferred_free_commit_for_test();
@@ -22070,7 +22070,7 @@ impl RedbPersistence {
         cache_bytes: usize,
         runtime_dir: Option<&Path>,
     ) -> Result<Self> {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::read_probe::note_persistence_writer_open();
         let lock_file = CompanionGuard::acquire(path, CompanionAdmission::NewStore)?;
         Self::create_with_lock(path, lock_file, accountant, cache_bytes, runtime_dir)
@@ -22102,7 +22102,7 @@ impl RedbPersistence {
             (lock_file, old_db)
         };
         lock_file.publish_writer_run(path, false)?;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         read_persistence_test_scaffold::store_replacement_checkpoint_for_test(
             read_persistence_test_scaffold::StoreReplacementBoundary::GuardAcquired,
         );
@@ -22154,7 +22154,7 @@ impl RedbPersistence {
             let _ = std::fs::remove_file(&temp_path);
             return Err(error);
         }
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         read_persistence_test_scaffold::store_replacement_checkpoint_for_test(
             read_persistence_test_scaffold::StoreReplacementBoundary::BeforeAtomicReplacement,
         );
@@ -22164,13 +22164,13 @@ impl RedbPersistence {
             let _ = std::fs::remove_file(&temp_path);
             return Err(Self::storage_error(error));
         }
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         read_persistence_test_scaffold::store_replacement_checkpoint_for_test(
             read_persistence_test_scaffold::StoreReplacementBoundary::AfterAtomicReplacement,
         );
         sync_database_parent(path)?;
         lock_file.publish_replacement_database(path)?;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         read_persistence_test_scaffold::store_replacement_checkpoint_for_test(
             read_persistence_test_scaffold::StoreReplacementBoundary::ReplacementPublishedBeforeGuardRelease,
         );
@@ -22217,7 +22217,7 @@ impl RedbPersistence {
                 construction.initialized[5] = true;
             }
 
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             {
                 std::ptr::addr_of_mut!((*construction.source).handoff_prepare_io_fault).write(AtomicBool::new(false));
                 construction.initialized[6] = true;
@@ -22366,7 +22366,7 @@ impl RedbPersistence {
                 construction.initialized[5] = true;
             }
 
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             {
                 std::ptr::addr_of_mut!((*construction.source).handoff_prepare_io_fault).write(AtomicBool::new(false));
                 construction.initialized[6] = true;
@@ -22450,7 +22450,7 @@ impl RedbPersistence {
     }
 
     /// Record what the owning database charged for this store's page cache.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn cache_index_bytes_for_test(&self) -> Result<usize> {
         self.with_db(|db| Ok(db.cache_index_bytes()))
     }
@@ -22512,11 +22512,11 @@ impl RedbPersistence {
         cache_bytes: usize,
         runtime_dir: Option<&Path>,
     ) -> Result<Self> {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::read_probe::note_persistence_writer_open();
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::read_probe::note_persistence_writer_open_attempt();
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         read_persistence_test_scaffold::note_writer_open_attempt_for_test();
         let companion_preexists = companion_exists(path)?;
         let (lock_file, db) = if companion_preexists {
@@ -22639,7 +22639,7 @@ impl RedbPersistence {
                 construction.initialized[5] = true;
             }
 
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             {
                 std::ptr::addr_of_mut!((*construction.source).handoff_prepare_io_fault).write(AtomicBool::new(false));
                 construction.initialized[6] = true;
@@ -23849,7 +23849,7 @@ impl RedbPersistence {
 #[cfg(any(test, feature = "test-seams"))]
 let mut graph_publication_attempt = crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
             let graph_commit_support=Self::capture_graph_commit_support(&write_txn,ws.commit_lsn)?;
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             let mut stage_started = std::time::Instant::now();
             let mut identity_mutations = Vec::new();
             for (table, row_id, _) in &ws.relational_deletes {
@@ -24310,7 +24310,7 @@ let mut graph_publication_attempt = crate::read_work_probe::GraphPublicationAtte
                                         memory.reserve(key.value().len().saturating_mul(2)
                                             .saturating_add(value.value().len().saturating_mul(2)).saturating_add(64))?;
                                     }
-                                    #[cfg(feature = "test-seams")]
+                                    #[cfg(any(test, feature = "test-seams"))]
                                     crate::writer_query_test_seams::note_graph_delete_decode();
                                     #[cfg(any(test, feature = "test-seams"))]
                                     crate::read_work_probe::note_graph("graph_payload", "payload_decode", key.value(), None, Some("ordinary_deletion"));
@@ -24887,7 +24887,7 @@ let mut graph_publication_attempt = crate::read_work_probe::GraphPublicationAtte
                     erasure.operation,
                 )?;
             }
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             {
                 observe_append_stage(AppendStage::RowsIndexesAndLogs, &mut stage_started);
             }
@@ -24896,12 +24896,12 @@ let mut graph_publication_attempt = crate::read_work_probe::GraphPublicationAtte
                 &identity_mutations,
                 &mut self.proof_admission(),
             )?;
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             {
                 observe_append_stage(AppendStage::ContentIdentity, &mut stage_started);
             }
             // Failure is reached after the unit and its outcome are staged.
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             if ws
                 .config_writes
                 .iter()
@@ -24909,7 +24909,7 @@ let mut graph_publication_attempt = crate::read_work_probe::GraphPublicationAtte
             {
                 crate::custody::durability::before_custody_commit(&write_txn)?;
             }
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             {
                 stage_started = std::time::Instant::now();
             }
@@ -24925,7 +24925,7 @@ if graph_commit_result.is_ok() { graph_publication_attempt.committed(); graph_ob
 graph_commit_result }.map_err(Self::storage_error)?;
             #[cfg(feature = "in-process-test-seams")]
             crate::writer_commit_test_seams::reached(crate::writer_commit_test_seams::CommitBoundary::AfterRedb);
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             {
                 observe_append_stage(AppendStage::Commit, &mut stage_started);
             }
@@ -25347,7 +25347,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
             relational_tables.sort();
             relational_tables.dedup();
             for table in relational_tables {
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 crate::database::record_received_schema_durable_table_rewrite_for_test(&table);
                 let table_name = Self::rel_table_name(&table);
                 let table_def: TableDefinition<&[u8], &[u8]> =
@@ -25374,7 +25374,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 let mut redb_table =
                     content_size::open_rows(&write_txn, table_def).map_err(Self::storage_error)?;
                 for row in rows {
-                    #[cfg(feature = "test-seams")]
+                    #[cfg(any(test, feature = "test-seams"))]
                     crate::database::record_received_schema_durable_row_rewrite_for_test();
                     let encoded = Self::encode_versioned_row(row, stage.table_meta.get(table))?;
                     let key = Self::rel_row_key(row);
@@ -26145,7 +26145,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 ));
             }
             // Failure is reached after the unit and its outcome are staged.
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             if ws
                 .config_writes
                 .iter()
@@ -26280,9 +26280,9 @@ graph_commit_result }.map_err(Self::storage_error)?;
     ) -> Result<()> {
         let _decode_scope = self.writer_decode_scope()?;
         self.prepare_proof_owner()?;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         let flush_started = std::time::Instant::now();
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         {
             crate::database::record_received_schema_persistence_work_for_test(
                 "noop-ddl-log-writes",
@@ -26310,7 +26310,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
             );
         }
         self.with_db(|db| {
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             let begin_started = std::time::Instant::now();
             let write_txn = Self::begin_history_write(db)?;
             #[cfg(any(test, feature = "test-seams"))]
@@ -26318,7 +26318,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
             let graph_commit_support =
                 Self::capture_graph_commit_support(&write_txn, ws.commit_lsn)?;
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             crate::database::record_received_schema_persistence_profile_for_test(
                 "noop-begin-write",
                 begin_started,
@@ -26456,7 +26456,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                     "injected received-schema Redb pre-commit failure".to_string(),
                 ));
             }
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             let durable_commit_started = std::time::Instant::now();
             self.preserve_graph_commit_support(
                 &write_txn,
@@ -26476,14 +26476,14 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 graph_commit_result
             }
             .map_err(Self::storage_error)?;
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             crate::database::record_received_schema_persistence_profile_for_test(
                 "noop-durable-commit",
                 durable_commit_started,
             );
             Ok(())
         })?;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::database::record_received_schema_persistence_profile_for_test(
             "noop-flush-total",
             flush_started,
@@ -26882,7 +26882,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
 
     pub fn flush_config_value<T: serde::Serialize>(&self, key: &str, value: &T) -> Result<()> {
         self.prepare_proof_owner()?;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if verified_ordered_run_test_seams::config_write_refused_for_test() {
             return Err(Error::Other(format!(
                 "injected durable configuration write failure for {key}"
@@ -26936,7 +26936,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         state: Option<&crate::sync_types::DurableSchemaSyncHoldback>,
     ) -> Result<()> {
         self.prepare_proof_owner()?;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if verified_ordered_run_test_seams::config_write_refused_for_test() {
             return Err(Error::Other(format!(
                 "injected durable memory-hold configuration write failure for {key}"
@@ -27206,7 +27206,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         removes: &[String],
     ) -> Result<()> {
         self.prepare_proof_owner()?;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if verified_ordered_run_test_seams::config_write_refused_for_test() {
             return Err(Error::Other(
                 "injected durable configuration write failure".into(),
@@ -27269,7 +27269,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
 
     pub fn remove_config_value(&self, key: &str) -> Result<()> {
         self.prepare_proof_owner()?;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if verified_ordered_run_test_seams::config_write_refused_for_test() {
             return Err(Error::Other(format!(
                 "injected durable configuration removal failure for {key}"
@@ -27954,9 +27954,9 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 if !key.starts_with(prefix) {
                     break;
                 }
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 crate::writer_query_test_seams::note_config_enumeration(key);
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 crate::writer_query_test_seams::note_config_decode(key);
                 out.push((key.to_string(), Self::decode(value.value())?));
             }
@@ -28004,11 +28004,11 @@ graph_commit_result }.map_err(Self::storage_error)?;
                     more = true;
                     break;
                 }
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 crate::writer_query_test_seams::note_config_enumeration(key);
                 let bytes = value.value();
                 memory.reserve(key.len().saturating_add(bytes.len()))?;
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 crate::writer_query_test_seams::note_config_decode(key);
                 let decoded = memory.scope(|| Self::decode(bytes))?;
                 page.push((key.to_owned(), decoded));
@@ -28052,11 +28052,11 @@ graph_commit_result }.map_err(Self::storage_error)?;
                     "read_held_replay",
                     "Raise MEMORY_LIMIT before replaying this held data unit.",
                 );
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 crate::writer_query_test_seams::note_config_enumeration(key);
                 let bytes = value.value();
                 memory.reserve(key.len().saturating_add(bytes.len()))?;
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 crate::writer_query_test_seams::note_config_decode(key);
                 let decoded: T = memory.scope(|| Self::decode(bytes))?;
                 let Some(position) = source_lsn(&decoded) else {
@@ -28101,7 +28101,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 if !key.starts_with(prefix) {
                     break;
                 }
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 crate::writer_query_test_seams::note_config_enumeration(key);
                 out.push((key.to_string(), value.value().to_vec()));
             }
@@ -28168,7 +28168,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 if after.is_some_and(|after| key <= after) {
                     continue;
                 }
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 crate::writer_query_test_seams::note_config_enumeration(key);
                 memory.reserve(key.len())?;
                 return Ok(Some(key.to_owned()));
@@ -28200,7 +28200,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 return Ok(None);
             };
             memory.reserve(value.value().len())?;
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             crate::writer_query_test_seams::note_config_decode(key);
             memory.scope(|| Self::decode(value.value())).map(Some)
         })
@@ -28228,7 +28228,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                     continue;
                 };
                 memory.reserve(value.value().len())?;
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 crate::writer_query_test_seams::note_config_decode(key);
                 values.push(memory.scope(|| Self::decode(value.value()))?);
             }
@@ -28275,7 +28275,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                         break;
                     }
                     memory.reserve(value.value().len().saturating_add(128))?;
-                    #[cfg(feature = "test-seams")]
+                    #[cfg(any(test, feature = "test-seams"))]
                     crate::writer_query_test_seams::note_selection_entry();
                     let primary: String = memory.scope(|| Self::decode(value.value()))?;
                     keys.insert(primary);
@@ -28287,9 +28287,9 @@ graph_commit_result }.map_err(Self::storage_error)?;
                     continue;
                 };
                 memory.reserve(value.value().len().saturating_add(key.len()))?;
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 crate::writer_query_test_seams::note_config_enumeration(&key);
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 crate::writer_query_test_seams::note_config_decode(&key);
                 let decoded = memory.scope(|| Self::decode(value.value()))?;
                 values.push((key, decoded));
@@ -28312,7 +28312,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
             };
             let value = match config_table.get(key).map_err(Self::storage_error)? {
                 Some(value) => {
-                    #[cfg(feature = "test-seams")]
+                    #[cfg(any(test, feature = "test-seams"))]
                     crate::writer_query_test_seams::note_config_decode(key);
                     Some(Self::decode(value.value())?)
                 }
@@ -28329,7 +28329,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
     ) -> Result<VersionedRow> {
         let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
         contextdb_core::find_attribution::count("decoded_rows", 1);
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         {
             crate::read_work_probe::note_decoded_row();
             crate::read_work_probe::note_stored_row_bytes(bytes.len());
@@ -28352,7 +28352,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         row_id: RowId,
         snapshot: SnapshotId,
     ) -> Result<Option<VersionedRow>> {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::writer_query_test_seams::note_physical_source(
             crate::writer_query_test_seams::PhysicalFamily::Row,
             read,
@@ -28371,7 +28371,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         };
         let (lower, upper) = Self::rel_row_key_range(row_id);
         let mut versions = {
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             let _target_reads = crate::writer_query_test_seams::physical_operation(
                 crate::writer_query_test_seams::PhysicalFamily::Row,
                 table,
@@ -28381,7 +28381,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 .map_err(|error| Self::relational_storage_error(table, error))?
         };
         while let Some(entry) = {
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             let _target_reads = crate::writer_query_test_seams::physical_operation(
                 crate::writer_query_test_seams::PhysicalFamily::Row,
                 table,
@@ -28390,7 +28390,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         } {
             let (key, value) =
                 entry.map_err(|error| Self::relational_storage_error(table, error))?;
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             crate::writer_query_test_seams::note_target_entry(table);
             let row = Self::decode_relational_source_row(table, meta, value.value())?;
             if Self::rel_row_key_from_parts(row.row_id, row.created_tx, row.lsn) != key.value() {
@@ -28437,7 +28437,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         };
         let (lower, upper) = Self::rel_row_key_range(row_id);
         let versions = {
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             let _target_reads = crate::writer_query_test_seams::physical_operation(
                 crate::writer_query_test_seams::PhysicalFamily::Row,
                 table,
@@ -28446,7 +28446,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 .range(lower.as_slice()..upper.as_slice())
                 .map_err(|error| Self::relational_storage_error(table, error))?
         };
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         let versions = {
             let mut versions = versions;
             std::iter::from_fn(move || {
@@ -28475,7 +28475,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
             if key_lsn != lsn.0 {
                 continue;
             }
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             crate::writer_query_test_seams::note_target_entry(table);
             let row = Self::decode_relational_source_row(table, meta, value.value())?;
             if row.row_id != row_id
@@ -28504,7 +28504,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         row_id: RowId,
         snapshot: SnapshotId,
     ) -> Result<Option<VersionedRow>> {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::read_work_probe::note_row_version_range_read();
         self.with_db(|db| {
             let read = db.begin_read().map_err(Self::storage_error)?;
@@ -28610,7 +28610,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         lsn: Lsn,
     ) -> Result<Option<VersionedRow>> {
         let _decode_scope = self.reader_decode_scope()?;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::read_work_probe::note_row_version_point_read();
         self.with_db(|db| {
             let read = db.begin_read().map_err(Self::storage_error)?;
@@ -28641,7 +28641,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         })
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn damage_first_saved_row_for_test(
         &self,
         table: &str,
@@ -29076,7 +29076,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
     ) -> Result<Vec<(VectorEntry, Option<TxId>)>> {
         let _decode_scope = self.reader_decode_scope()?;
         self.prepare_proof_owner()?;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::writer_query_test_seams::note_physical_source(
             crate::writer_query_test_seams::PhysicalFamily::Vector,
             read_txn,
@@ -29365,17 +29365,17 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 Err(error) => return Err(vector_membership_pages::metadata_error(error)),
             };
             let vectors = {
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 crate::writer_query_test_seams::note_physical_source(
                     crate::writer_query_test_seams::PhysicalFamily::Vector,
                     &transaction,
                 );
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 let _body_reads = crate::writer_query_test_seams::physical_operation(
                     crate::writer_query_test_seams::PhysicalFamily::Vector,
                     &index.table,
                 );
-                #[cfg(not(feature = "test-seams"))]
+                #[cfg(not(any(test, feature = "test-seams")))]
                 let _ = index;
                 match transaction.open_table(VECTORS_TABLE) {
                     Ok(table) => Some(table),
@@ -30400,7 +30400,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 .map_err(Self::storage_error)?
             {
                 let (key, value) = entry.map_err(Self::storage_error)?;
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 crate::database::resident_history_test_seams::note(|work| {
                     work.maintenance_source_visits += 1
                 });
@@ -30472,7 +30472,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 .map_err(Self::storage_error)?
             {
                 let (key, value) = entry.map_err(Self::storage_error)?;
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 crate::database::resident_history_test_seams::note(|work| {
                     work.maintenance_source_visits += 1
                 });
@@ -30909,12 +30909,12 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 Some(root) => root.owner_read()?,
                 None => Arc::new(db.begin_read().map_err(Self::storage_error)?),
             };
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             crate::writer_query_test_seams::note_physical_source(
                 crate::writer_query_test_seams::PhysicalFamily::Graph,
                 &read,
             );
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             let _graph_reads = crate::writer_query_test_seams::physical_operation(
                 crate::writer_query_test_seams::PhysicalFamily::Graph,
                 &index.table,
@@ -30992,12 +30992,12 @@ graph_commit_result }.map_err(Self::storage_error)?;
             partition_key,
             generation_id,
         );
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::writer_query_test_seams::note_physical_source(
             crate::writer_query_test_seams::PhysicalFamily::Graph,
             read,
         );
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         let _graph_reads = crate::writer_query_test_seams::physical_operation(
             crate::writer_query_test_seams::PhysicalFamily::Graph,
             &index.table,
@@ -31033,12 +31033,12 @@ graph_commit_result }.map_err(Self::storage_error)?;
         base_generation_id: u64,
         change_generation_id: u64,
     ) -> Result<VectorPartitionChangeGenerationRecord> {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::writer_query_test_seams::note_physical_source(
             crate::writer_query_test_seams::PhysicalFamily::Graph,
             read,
         );
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         let _graph_reads = crate::writer_query_test_seams::physical_operation(
             crate::writer_query_test_seams::PhysicalFamily::Graph,
             &index.table,
@@ -31161,7 +31161,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
             {
                 continue;
             }
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             crate::vector_observations::emit(
                 index,
                 partition_key,
@@ -31207,7 +31207,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                     "journal tail vector key disagrees with its payload",
                 ));
             }
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             crate::vector_observations::emit(
                 index,
                 partition_key,
@@ -31398,12 +31398,12 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 Some(root) => root.owner_read()?,
                 None => Arc::new(db.begin_read().map_err(Self::storage_error)?),
             };
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             crate::writer_query_test_seams::note_physical_source(
                 crate::writer_query_test_seams::PhysicalFamily::Graph,
                 &read_txn,
             );
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             let _graph_reads = crate::writer_query_test_seams::physical_operation(
                 crate::writer_query_test_seams::PhysicalFamily::Graph,
                 &index.table,
@@ -31899,7 +31899,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 if record.lsn.0 <= covered_lsn.0 {
                     continue;
                 }
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 crate::vector_observations::emit(
                     index,
                     partition_key,
@@ -31942,7 +31942,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                         "journal tail vector key disagrees with its payload",
                     ));
                 }
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 crate::vector_observations::emit(
                     index,
                     partition_key,
@@ -31978,7 +31978,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 &write_txn, prepared,
             )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             crate::writer_commit_test_seams::reached(
                 crate::writer_commit_test_seams::CommitBoundary::GenerationBeforeRedb,
             );
@@ -33456,7 +33456,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                     .unwrap_or(key)
                     .parse::<u64>()
                     .map_err(|err| Error::Other(format!("invalid ddl log key: {err}")))?;
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 crate::writer_query_test_seams::note_ddl_occurrence();
                 entries.push((Lsn(lsn), Self::decode(value.value())?));
             }
@@ -35344,7 +35344,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         }
 
         let mut relational_tables: HashMap<String, content_size::ContentTable<'_>> = HashMap::new();
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         let first_table_end = projection.row_versions.first().and_then(|first| {
             projection
                 .row_versions
@@ -35391,7 +35391,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                             .to_string(),
                     ));
             }
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             if Some(_row_index) == first_table_end {
                 erasure_first_table_staged_for_test()?;
             }
@@ -36418,7 +36418,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         )
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn external_snapshot_retention_for_test(
         &self,
     ) -> Result<read_persistence_test_scaffold::ExternalSnapshotRetentionObservation> {
@@ -36444,12 +36444,12 @@ graph_commit_result }.map_err(Self::storage_error)?;
         })
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn external_snapshot_page_allocated_for_test(&self, page: [u8; 8]) -> Result<bool> {
         self.with_db(|db| Ok(db.external_snapshot_page_allocated_for_test(page)))
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn deferred_free_backlog_for_test(&self) -> Result<[(usize, usize); 2]> {
         self.with_db(|db| {
             db.deferred_free_backlog_for_test()
@@ -36457,7 +36457,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         })
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn commit_storage_transaction_for_test(&self) -> Result<()> {
         self.with_db(|db| {
             db.begin_write()
@@ -36707,7 +36707,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
             return Err(error);
         }
         let progress = result.map_err(Self::storage_error)?;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::database::resident_history_test_seams::note(|work| {
             work.compaction_pages_examined += progress.pages_examined;
             work.compaction_pages_relocated += progress.pages_relocated;
@@ -37436,7 +37436,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         })
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn damage_checkpoint_f32_projection_for_test(&self) -> Result<()> {
         self.with_db(|database| {
             read_persistence_test_scaffold::damage_f32_row_projection_for_test(database)
@@ -38566,7 +38566,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                                 &declaration.columns[..prefix_len],
                                 &old_key[..prefix_len],
                             )?;
-                            #[cfg(feature = "test-seams")]
+                            #[cfg(any(test, feature = "test-seams"))]
                             observe_index_prefix_count(
                                 table,
                                 meta,
@@ -38657,7 +38657,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                                 &declaration.columns[..prefix_len],
                                 &key[..prefix_len],
                             )?;
-                            #[cfg(feature = "test-seams")]
+                            #[cfg(any(test, feature = "test-seams"))]
                             observe_index_prefix_count(
                                 table,
                                 meta,
@@ -38683,7 +38683,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                     current
                         .insert(&logical_key, created.as_slice())
                         .map_err(Self::storage_error)?;
-                    #[cfg(feature = "test-seams")]
+                    #[cfg(any(test, feature = "test-seams"))]
                     observe_index_posting(table, &declaration);
                     identity_mutations.push(content_identity::relational_index_posting_mutation(
                         table,
@@ -38718,7 +38718,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                             reason: "live index-prefix cardinality underflowed or overflowed"
                                 .to_owned(),
                         })?;
-                    #[cfg(feature = "test-seams")]
+                    #[cfg(any(test, feature = "test-seams"))]
                     observe_index_prefix_count_value(&key, (next > 0).then_some(next));
                     if next == 0 {
                         counts.remove(key.as_slice()).map_err(Self::storage_error)?;
@@ -38973,7 +38973,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                         &declaration.columns[..prefix_len],
                         &key[..prefix_len],
                     )?;
-                    #[cfg(feature = "test-seams")]
+                    #[cfg(any(test, feature = "test-seams"))]
                     observe_index_prefix_count(table, meta, &declaration, prefix_len, &count_key);
                     rebuilt_counts.entry(count_key).or_default().insert(row_id);
                 }
@@ -41036,7 +41036,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
             directory.remove(key).map_err(Self::storage_error)?;
         }
         set.store_in_write(write_txn)?;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         content_identity::observe_vector_directory_binding_records(1);
         let mut root = [0; 40];
         root[..8].copy_from_slice(&count.to_be_bytes());
@@ -41181,7 +41181,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         }
         if let Some(set) = set {
             set.store_in_write(write_txn)?;
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             content_identity::observe_custody_binding_records(1);
         }
         let mut root = [0_u8; 40];
@@ -41813,7 +41813,7 @@ impl PersistenceConstruction {
                 5 => { 
                     { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).storage_compaction)); }
                 },
-                6 => { #[cfg(feature = "test-seams")]
+                6 => { #[cfg(any(test, feature = "test-seams"))]
                     { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).handoff_prepare_io_fault)); }
                 },
                 7 => { 
@@ -41850,7 +41850,7 @@ impl PersistenceConstruction {
                 17 => { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).saved_export_abandonment_error)); },
                 _ => unreachable!(),
             }}
-            #[cfg(all(test, feature = "test-seams"))]
+            #[cfg(test)]
             RETURNED_LOADER_PARTIAL_PANIC_FOR_TEST.with(|flag| {
                 if flag.get() == Some(step) { flag.set(None); panic!("CDB127 partial persistence cleanup unwind"); }
             });
@@ -42688,7 +42688,7 @@ mod empty_declared_index_readiness_tests {
     // Samples the existing worker kernel before its first graph source cursor
     // is opened. Keep capture receipts and worker installations as they were
     // at this boundary, before the actual query is allowed to load edges.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[derive(Default)]
     struct OwnerGraphSnapshotBoundaryObserver {
         scope: std::sync::Mutex<Option<Arc<ReadWorkObservationScope>>>,
@@ -42701,7 +42701,7 @@ mod empty_declared_index_readiness_tests {
         first_source: std::sync::Mutex<Option<crate::read_session::ReadKernelSourceEvent>>,
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     impl crate::read_session::ReadKernelTestObserver for OwnerGraphSnapshotBoundaryObserver {
         fn registered_snapshot_for_test(&self, route: ReadRoute, operation: crate::read_session::ReadSessionOperation, snapshot: SnapshotId) {
             if self.scope.lock().unwrap().is_some() {
@@ -42737,7 +42737,7 @@ mod empty_declared_index_readiness_tests {
         fn cancellation_observed(&self, _: crate::read_session::ReadKernelCancellationEvent, _: contextdb_core::read_contract::OwnerReadCancellation) {}
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn assert_public_owner_open_through_graph_capture_row(directory: &Path) {
         let path = directory.join("graph-open-capture-owner.db");
         let observer = Arc::new(OwnerGraphSnapshotBoundaryObserver::default());
@@ -43155,9 +43155,9 @@ mod empty_declared_index_readiness_tests {
                 let (image, _receipt, old_source) = load_read_image_with_memory(&path, Some(16 * 1024 * 1024)).unwrap().into_parts();
                 drop(image);
                 let fixture_open_accountant_41665 = Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-                let _fixture_decode_scope_41665 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_41665)).unwrap();
+                let _fixture_decode_scope_41665 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_41665).into()).unwrap();
                 let store = RedbPersistence::open(&path).unwrap();
-                store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_41665));
+                store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_41665).into());
                 let physical_end = coordinates.last().unwrap().0;
                 let old_writer = store.initialize_writer_snapshot(SnapshotId(100), physical_end).unwrap();
                 let deferred = HashSet::new();
@@ -43210,9 +43210,9 @@ mod empty_declared_index_readiness_tests {
                 if let Some(control) = query_controls.get(&(false, false)) { assert_eq!(&query_work, control, "addressed work stays fixed across unrelated graph population and distinct public/physical fanout"); } else { query_controls.insert((false, false), query_work); }
                 assert_graph_coordinate_source_answers(graph_read::GraphReadRoot::Image(new_source), &predecessor, false, &coordinates);
                 let fixture_open_accountant_41717 = std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-                let _fixture_decode_scope_41717 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_41717)).unwrap();
+                let _fixture_decode_scope_41717 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_41717).into()).unwrap();
                 let reopened = RedbPersistence::open(&path).unwrap();
-                reopened.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_41717));
+                reopened.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_41717).into());
                 assert_eq!(graph_publication_state(&reopened), after, "restart exposes the complete new publication");
             }
         }
@@ -43229,7 +43229,7 @@ mod empty_declared_index_readiness_tests {
     ) -> (RedbPersistence, AdjEntry, Vec<ChangeLogEntry>) {
         let memory = Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
         let store =
-            RedbPersistence::create_with_accountant(path, Some(memory), REDB_CACHE_BYTES).unwrap();
+            RedbPersistence::create_with_accountant(path, Some(memory.into()), REDB_CACHE_BYTES).unwrap();
         let predecessor = AdjEntry {
             source: NodeId::from_u128(1),
             target: NodeId::from_u128(2),
@@ -43706,7 +43706,7 @@ mod empty_declared_index_readiness_tests {
 
     fn commit_suffix_fixture(path: &Path, frontier: Option<(Lsn, TxId)>, suffix: &[(u64,u64)]) {
         let store = RedbPersistence::create_with_accountant(path,
-            Some(Arc::new(crate::memory_accounting::MemoryAccountant::no_limit())), REDB_CACHE_BYTES).unwrap();
+            Some(Arc::new(crate::memory_accounting::MemoryAccountant::no_limit()).into()), REDB_CACHE_BYTES).unwrap();
         if let Some(pair) = frontier { store.flush_commit_index_entries(&BTreeMap::from([pair])).unwrap(); }
         // These pairs are deliberately uncommitted: do not publish their
         // content-identity frontier. Open must diagnose them before mismatch.
@@ -43829,9 +43829,9 @@ mod empty_declared_index_readiness_tests {
         assert_eq!(before, ((6,Lsn(1)), None, Some((Lsn(20),TxId(100))), Some((0,6))));
         let identity = old.file_snapshot_for_test().unwrap();
         let fixture_open_accountant_42332 = Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-        let _fixture_decode_scope_42332 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_42332)).unwrap();
+        let _fixture_decode_scope_42332 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_42332).into()).unwrap();
         let store = RedbPersistence::open(&path).unwrap();
-        store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_42332));
+        store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_42332).into());
         store.flush_commit_index_entries(&BTreeMap::from([(Lsn(40),TxId(101))])).unwrap();
         drop(_fixture_decode_scope_42332);
         assert_eq!(directory_pinned_view(&old), before, "installed old directory retains the captured membership and floor after real publication");
@@ -43871,7 +43871,12 @@ mod empty_declared_index_readiness_tests {
         let mut constructor_accountant_control = None;
         // Fixed stage registries, finalization and store wrappers are admitted
         // separately from the image-held graph source wrapper.
-        let fixed_constructor_controls_bytes = 824;
+        // The private native accountant handle expands the retained
+        // `AdmittedDynStore<CompositeStore>` allocation from 136 to 152
+        // bytes. The existing allocator invoice records that real +16-byte
+        // control; this fixture therefore observes the complete 848-byte
+        // constructor total (the 8-byte wrapper plus these 840 bytes).
+        let fixed_constructor_controls_bytes = 840;
         let mut writer_open_control = None;
         let mut query_controls = HashMap::new();
         let mut mutation_control = None;
@@ -43922,7 +43927,7 @@ mod empty_declared_index_readiness_tests {
             // this Open scope is active. Keep the original empty-map and
             // legacy zero-work assertions above byte-identical.
             let raw_image_owner_identity = Arc::as_ptr(&image.memory) as usize;
-            let raw_image_accountant_identity = Arc::as_ptr(&image.memory.accountant) as usize;
+            let raw_image_accountant_identity = image.memory.accountant.as_ptr() as usize;
             let raw_image_held = image.memory.held();
             let raw_accountant_used = image.memory.accountant.usage().used;
             let constructor_context = image.open_context.clone();
@@ -44046,9 +44051,9 @@ mod empty_declared_index_readiness_tests {
             let fixture_open_accountant_42536 = Arc::new(
                 crate::memory_accounting::MemoryAccountant::no_limit(),
             );
-            let _fixture_decode_scope_42536 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_42536)).unwrap();
+            let _fixture_decode_scope_42536 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_42536).into()).unwrap();
             let store = RedbPersistence::open(&path).unwrap();
-            store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_42536));
+            store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_42536).into());
             let root = store
                 .initialize_writer_snapshot(SnapshotId(100), Lsn(30))
                 .unwrap();
@@ -44100,9 +44105,9 @@ mod empty_declared_index_readiness_tests {
                 let fixture_open_accountant_42588 = Arc::new(
                     crate::memory_accounting::MemoryAccountant::no_limit(),
                 );
-                let _fixture_decode_scope_42588 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_42588)).unwrap();
+                let _fixture_decode_scope_42588 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_42588).into()).unwrap();
                 let store = RedbPersistence::open(&path).unwrap();
-                store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_42588));
+                store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_42588).into());
                 let old_writer = store
                     .initialize_writer_snapshot(SnapshotId(100), Lsn(30))
                     .unwrap();
@@ -44302,9 +44307,9 @@ mod empty_declared_index_readiness_tests {
                     &entries[first_ordinal..],
                 );
                 let fixture_open_accountant_42789 = std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-                let _fixture_decode_scope_42789 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_42789)).unwrap();
+                let _fixture_decode_scope_42789 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_42789).into()).unwrap();
                 let reopened = RedbPersistence::open(&path).unwrap();
-                reopened.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_42789));
+                reopened.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_42789).into());
                 if repack {
                     assert!(reopened.load_relational_row_version("removed_rows", &row_meta, physical_row.row_id, physical_row.created_tx, physical_row.lsn).unwrap().is_none());
                 }
@@ -44472,9 +44477,9 @@ mod empty_declared_index_readiness_tests {
         assert!((4..=11).contains(&boundary));
         }
         let fixture_open_accountant_42956 = Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-        let _fixture_decode_scope_42956 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_42956)).unwrap();
+        let _fixture_decode_scope_42956 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_42956).into()).unwrap();
         let store = RedbPersistence::open(Path::new(&path)).expect("open the parent's fresh temporary fixture");
-        store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_42956));
+        store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_42956).into());
         let candidates = store.load_graph_table(GRAPH_FWD_TABLE).unwrap().into_iter().filter(|edge| edge.source == NodeId::from_u128(1) && edge.target == NodeId::from_u128(2) && edge.edge_type == "retained_link").collect::<Vec<_>>();
         assert_eq!(candidates.len(), 1);
         arm_retention_reclaim_crash_for_test(boundary);
@@ -44497,9 +44502,9 @@ mod empty_declared_index_readiness_tests {
         let control_path = directory.join("graph-durability-control.db");
         std::fs::copy(&fixture_path, &control_path).unwrap();
         let fixture_open_accountant_42979 = Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-        let _fixture_decode_scope_42979 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_42979)).unwrap();
+        let _fixture_decode_scope_42979 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_42979).into()).unwrap();
         let control = RedbPersistence::open(&control_path).unwrap();
-        control.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_42979));
+        control.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_42979).into());
         assert_eq!(graph_durability_state(&control), before);
         let observation = ReadWorkObservationScope::enter(ReadWorkPhase::Mutation);
         let stats = graph_durability_publication(&control, &predecessor).unwrap();
@@ -44544,9 +44549,9 @@ mod empty_declared_index_readiness_tests {
             assert!(!stderr.contains("panicked at"), "a panic is not a boundary interruption: {stderr}");
             let expected = if boundary == 11 { &after } else { &before };
             let fixture_open_accountant_43023 = Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-            let _fixture_decode_scope_43023 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43023)).unwrap();
+            let _fixture_decode_scope_43023 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43023).into()).unwrap();
             let reopened = RedbPersistence::open(&path).unwrap();
-            reopened.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43023));
+            reopened.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43023).into());
             assert_eq!(&graph_durability_state(&reopened), expected, "boundary {boundary} must expose the complete old or complete new publication after reopen");
             assert_retained_graph_witnesses(&reopened, &predecessor, &private_bytes, usize::from(boundary != 11), boundary == 11);
             let root = reopened.initialize_writer_snapshot(SnapshotId(100), Lsn(30)).unwrap();
@@ -44560,9 +44565,9 @@ mod empty_declared_index_readiness_tests {
             let error_path = directory.join(format!("graph-durability-error-{boundary}.db"));
             std::fs::copy(&fixture_path, &error_path).unwrap();
             let fixture_open_accountant_43036 = Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-            let _fixture_decode_scope_43036 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43036)).unwrap();
+            let _fixture_decode_scope_43036 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43036).into()).unwrap();
             let store = RedbPersistence::open(&error_path).unwrap();
-            store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43036));
+            store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43036).into());
             assert_eq!(graph_durability_state(&store), before);
             let observation = ReadWorkObservationScope::enter(ReadWorkPhase::Mutation);
             arm_currency_reclaim_fault_for_test(boundary, false);
@@ -44574,9 +44579,9 @@ mod empty_declared_index_readiness_tests {
             drop(store);
             drop(_fixture_decode_scope_43036);
             let fixture_open_accountant_43047 = std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-            let _fixture_decode_scope_43047 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43047)).unwrap();
+            let _fixture_decode_scope_43047 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43047).into()).unwrap();
             let reopened = RedbPersistence::open(&error_path).unwrap();
-            reopened.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43047));
+            reopened.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43047).into());
             assert_eq!(&graph_durability_state(&reopened), expected, "returned error {boundary} has the same exact state after reopen");
         }
     }
@@ -44625,7 +44630,7 @@ mod empty_declared_index_readiness_tests {
     }
 
     fn graph_compaction_publication(store: &RedbPersistence) -> Result<(redb::CompactionProgress, Option<u64>)> {
-        store.compact_incremental(Arc::new(crate::memory_accounting::MemoryAccountant::no_limit()), 0.5)
+        store.compact_incremental(Arc::new(crate::memory_accounting::MemoryAccountant::no_limit()).into(), 0.5)
     }
 
     fn assert_graph_compaction_observation(scope: &ReadWorkObservationScope, boundary: Option<u8>) {
@@ -44664,9 +44669,9 @@ mod empty_declared_index_readiness_tests {
         // Selectors 27 through 31 are bound to the immutable revision 8a compaction stages.
         if (27..=31).contains(&boundary) { assert!((27..=31).contains(&boundary)); } else { assert!([10, 11].contains(&boundary) || (19..=26).contains(&boundary)); }
         let fixture_open_accountant_43134 = Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-        let _fixture_decode_scope_43134 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43134)).unwrap();
+        let _fixture_decode_scope_43134 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43134).into()).unwrap();
         let store = RedbPersistence::open(Path::new(&path)).expect("open closed temporary compaction fixture beside registered old readers");
-        store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43134));
+        store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43134).into());
         arm_retention_reclaim_crash_for_test(boundary);
         let result = graph_compaction_publication(&store);
         panic!("selected compaction interruption {boundary} was not reached: {result:?}");
@@ -44688,9 +44693,9 @@ mod empty_declared_index_readiness_tests {
         let (image, _receipt, control_source) = load_read_image_with_memory(&control_path, Some(16 * 1024 * 1024)).unwrap().into_parts();
         drop(image);
         let fixture_open_accountant_43155 = Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-        let _fixture_decode_scope_43155 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43155)).unwrap();
+        let _fixture_decode_scope_43155 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43155).into()).unwrap();
         let control = RedbPersistence::open(&control_path).unwrap();
-        control.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43155));
+        control.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43155).into());
         let page_size = control.with_db(|db| {
             let snapshot = db.storage_statistics_snapshot().map_err(RedbPersistence::storage_error)?;
             Ok(snapshot.stats().map_err(RedbPersistence::storage_error)?.page_size())
@@ -44709,7 +44714,7 @@ mod empty_declared_index_readiness_tests {
         let history_answer = control_session.metadata(crate::MetadataRequest::ImageState { kind: crate::DirectImageMetadataKind::ChangeLog }, None).unwrap().body;
         let directory_before = directory_pinned_view(&control_session);
         assert_eq!(directory_before, ((6,Lsn(1)), None, Some((Lsn(20),TxId(100))), Some((0,6))));
-        let _fixture_decode_scope_43155 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43155)).unwrap();
+        let _fixture_decode_scope_43155 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43155).into()).unwrap();
         let mut relocation_observed = false;
         let mut cumulative_pages_relocated = 0;
         let mut first_successful_step = None;
@@ -44733,7 +44738,7 @@ mod empty_declared_index_readiness_tests {
         assert!(cumulative_pages_relocated > 0, "the control executes actual physical page relocation within the frozen progress window");
         drop(_fixture_decode_scope_43155);
         assert_eq!(directory_pinned_view(&control_session), directory_before, "actual installed directory survives physical relocation at its original root");
-        let _fixture_decode_scope_43155 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43155)).unwrap();
+        let _fixture_decode_scope_43155 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43155).into()).unwrap();
         let after = graph_compaction_state(&control);
         assert_ne!(after.1, before.1, "successor cursor is published durably");
         assert_ne!(after.2, before.2, "compaction publishes a new physical root");
@@ -44783,9 +44788,9 @@ mod empty_declared_index_readiness_tests {
         let (image, _receipt, published_source) = load_read_image_with_memory(&published_path, Some(16 * 1024 * 1024)).unwrap().into_parts();
         drop(image);
         let fixture_open_accountant_43208 = Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-        let _fixture_decode_scope_43208 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43208)).unwrap();
+        let _fixture_decode_scope_43208 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43208).into()).unwrap();
         let published = RedbPersistence::open(&published_path).unwrap();
-        published.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43208));
+        published.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43208).into());
         let published_writer = published.initialize_writer_snapshot(SnapshotId(100), Lsn(30)).unwrap();
         let scope = ReadWorkObservationScope::enter(ReadWorkPhase::Mutation);
         arm_currency_reclaim_fault_for_test(11, false);
@@ -44844,9 +44849,9 @@ mod empty_declared_index_readiness_tests {
                     assert!(!stdout.contains("FAILED"));
                 } else {
                     let fixture_open_accountant_43266 = Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-                    let _fixture_decode_scope_43266 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43266)).unwrap();
+                    let _fixture_decode_scope_43266 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43266).into()).unwrap();
                     let store = RedbPersistence::open(&path).unwrap();
-                    store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43266));
+                    store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43266).into());
                     let old_writer = store.initialize_writer_snapshot(SnapshotId(100), Lsn(30)).unwrap();
                     let old_writer_pin = old_writer.storage_identity();
                     {
@@ -44873,9 +44878,9 @@ mod empty_declared_index_readiness_tests {
                 }
                 let expected = if boundary == 11 { &first_publication } else { &before };
                 let fixture_open_accountant_43283 = Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-                let _fixture_decode_scope_43283 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43283)).unwrap();
+                let _fixture_decode_scope_43283 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43283).into()).unwrap();
                 let reopened = RedbPersistence::open(&path).unwrap();
-                reopened.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43283));
+                reopened.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43283).into());
                 let reopened_state = graph_compaction_state(&reopened);
                 assert!(reopened_state.2.transaction_id >= before.2.transaction_id, "stage {boundary} recovery never moves the storage transaction counter backwards");
                 // Recovery may advance the counter; every committed content byte
@@ -44909,7 +44914,7 @@ mod empty_declared_index_readiness_tests {
                 assert_eq!(old_session.metadata(crate::MetadataRequest::ImageState { kind: crate::DirectImageMetadataKind::ChangeLog }, None).unwrap().body, history_answer);
                 assert_graph_retention_row_source(&graph_read::GraphReadRoot::Image(old_source.clone()), true);
                 assert_graph_source_answers(graph_read::GraphReadRoot::Image(old_source.clone()), &predecessor, true, &entries);
-                let _fixture_decode_scope_43283 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43283)).unwrap();
+                let _fixture_decode_scope_43283 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43283).into()).unwrap();
                 let current_root = reopened.initialize_writer_snapshot(SnapshotId(100), Lsn(30)).unwrap().storage_identity();
                 drop(_fixture_decode_scope_43283);
                 drop(reopened);
@@ -45218,7 +45223,7 @@ mod empty_declared_index_readiness_tests {
     // Admission failures retain the reader's typed refusal and return every
     // short-lived credit. Limits come from the existing child declaration or
     // the actual successful request, rather than a second policy constant.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn assert_graph_admission_rows(directory: &Path) {
         use std::ops::Bound;
         use writer_source::SourceWindowOwner;
@@ -45253,9 +45258,9 @@ mod empty_declared_index_readiness_tests {
             let fixture_open_accountant_43602 = Arc::new(
                 crate::memory_accounting::MemoryAccountant::no_limit(),
             );
-            let _fixture_decode_scope_43602 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43602)).unwrap();
+            let _fixture_decode_scope_43602 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43602).into()).unwrap();
             let store = RedbPersistence::open_with_cache(&path, 0).unwrap();
-            store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43602));
+            store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43602).into());
             let writer = store.initialize_writer_snapshot(SnapshotId(100), Lsn(30)).unwrap();
             (store, [graph_read::GraphReadRoot::Writer(writer), graph_read::GraphReadRoot::Image(image)])
         };
@@ -45309,7 +45314,7 @@ mod empty_declared_index_readiness_tests {
                 };
                 let decode_memory = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(declared_child));
                 let bridge = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(declared_child));
-                let decoder = crate::read_image_memory::ImageMemory::charging_reader_for(bridge.clone(), decode_memory.clone(), "graph_source", "edge_decode", "Raise the declared reader memory limit to read graph pages.");
+                let decoder = crate::read_image_memory::ImageMemory::charging_reader_for(bridge.clone().into(), decode_memory.clone(), "graph_source", "edge_decode", "Raise the declared reader memory limit to read graph pages.");
                 let (decoded, consumed): (AdjEntry, usize) = decoder.scope(|| crate::read_image_memory::decode(&raw)).unwrap();
                 assert_eq!((&decoded, consumed), (&predecessor, raw.len()), "the actual stored primary/reverse payload has a valid complete decode");
                 let required_decode = decode_memory.high_water_for_test();
@@ -45317,7 +45322,7 @@ mod empty_declared_index_readiness_tests {
                 drop(decoder);
                 assert_eq!(decode_memory.usage().used, 0, "the admitted stored decoder releases its scratch at the decoder lifetime boundary");
                 decode_memory.set_budget(Some(required_decode - 1)).unwrap();
-                let decoder = crate::read_image_memory::ImageMemory::charging_reader_for(bridge.clone(), decode_memory.clone(), "graph_source", "edge_decode", "Raise the declared reader memory limit to read graph pages.");
+                let decoder = crate::read_image_memory::ImageMemory::charging_reader_for(bridge.clone().into(), decode_memory.clone(), "graph_source", "edge_decode", "Raise the declared reader memory limit to read graph pages.");
                 let decoded: Result<(AdjEntry, usize)> = decoder.scope(|| crate::read_image_memory::decode(&raw));
                 let error = decoded.unwrap_err();
                 assert!(matches!(error, Error::MemoryBudgetExceeded { ref subsystem, ref operation, budget_limit_bytes, .. }
@@ -45371,20 +45376,20 @@ mod empty_declared_index_readiness_tests {
             }
         }
         let fixture_open_accountant_43720 = std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-        let _fixture_decode_scope_43720 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43720)).unwrap();
+        let _fixture_decode_scope_43720 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43720).into()).unwrap();
         let store = RedbPersistence::open_with_cache(&path, 0).unwrap();
-        store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43720));
+        store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43720).into());
         assert_eq!(graph_publication_state(&store), before, "all refusals and retries leave the complete fixture unchanged");
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[derive(Default)]
     struct GraphDoorCancellationObserver {
         armed: std::sync::atomic::AtomicBool,
         first: std::sync::Mutex<Option<crate::read_session::ReadKernelSourceEvent>>,
         caller_cancellation: std::sync::Mutex<Option<contextdb_core::read_contract::OwnerReadCancellation>>,
     }
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     impl crate::read_session::ReadKernelTestObserver for GraphDoorCancellationObserver {
         fn before_source_touch(&self, event: crate::read_session::ReadKernelSourceEvent, cancellation: contextdb_core::read_contract::OwnerReadCancellation) {
             if event.source == crate::read_session::ReadKernelSource::GraphEdge
@@ -45399,7 +45404,7 @@ mod empty_declared_index_readiness_tests {
 
     // Use stored ACL metadata and actual grant lookup. An allowed target and
     // edge never confer the missing source entitlement on either public route.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn assert_graph_authorization_and_cancellation_rows(directory: &Path) {
         use crate::read_session::{ReadSession, ReadSessionOptions};
         use contextdb_core::Principal;
@@ -45461,9 +45466,9 @@ mod empty_declared_index_readiness_tests {
             drop(database);
             if malformed_source {
                 let fixture_open_accountant_43807 = std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-                let _fixture_decode_scope_43807 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43807)).unwrap();
+                let _fixture_decode_scope_43807 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43807).into()).unwrap();
                 let persistence = RedbPersistence::open(&path).unwrap();
-                persistence.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43807));
+                persistence.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43807).into());
                 persistence.with_db(|db| {
                     let write = db.begin_write().map_err(RedbPersistence::storage_error)?;
                     {
@@ -45503,7 +45508,7 @@ mod empty_declared_index_readiness_tests {
         }
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn assert_graph_permission_session(session: &crate::read_session::ReadSession, observer: &GraphDoorCancellationObserver, allow_source: bool, malformed_source: bool,
         query: &str, params: &HashMap<String, Value>, target: uuid::Uuid) {
         let expected = if allow_source { vec![vec![Value::Uuid(target)]] } else { Vec::new() };
@@ -45703,9 +45708,9 @@ mod empty_declared_index_readiness_tests {
                     assert_eq!(complete.rows, expected.rows, "{damage}: cold public historical control equals the pre-close answer");
                     drop(reopened);
                     let fixture_open_accountant_44039 = std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-                    let _fixture_decode_scope_44039 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_44039)).unwrap();
+                    let _fixture_decode_scope_44039 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_44039).into()).unwrap();
                     let store = RedbPersistence::open(&path).unwrap();
-                    store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_44039));
+                    store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_44039).into());
                     let metadata = store.load_all_table_meta().unwrap().remove(table_name).unwrap();
                     let versions = store.load_relational_table(table_name).unwrap();
                     let interior = versions.into_iter().find(|row| row.values.get("body") == Some(&Value::Text("interior".into()))).unwrap();
@@ -45835,9 +45840,9 @@ mod empty_declared_index_readiness_tests {
                 // Identify and save the physical member through the production
                 // row-key helper and decoder; no test codec or key layout.
                 let fixture_open_accountant_44167 = std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-                let _fixture_decode_scope_44167 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_44167)).unwrap();
+                let _fixture_decode_scope_44167 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_44167).into()).unwrap();
                 let store = RedbPersistence::open(&path).unwrap();
-                store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_44167));
+                store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_44167).into());
                 let versions = store.load_relational_table("addressed_rows").unwrap();
                 drop(store);
                 drop(_fixture_decode_scope_44167);
@@ -45859,10 +45864,10 @@ mod empty_declared_index_readiness_tests {
                         if damage == "injected_extra_version" {
                             // Lawful replacement retires the exact member;
                             // restoring its saved bytes then makes it extra.
-                            let fixture_open_accountant_44188 = Arc::clone(&fixture_writer_accountant);
-                            let _fixture_decode_scope_44188 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_44188)).unwrap();
+                            let fixture_open_accountant_44188 = fixture_writer_accountant.clone();
+                            let _fixture_decode_scope_44188 = crate::read_image_memory::ImageMemory::enter_writer_operation(fixture_open_accountant_44188.clone()).unwrap();
                             let store = RedbPersistence::open(&path).unwrap();
-                            store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_44188));
+                            store.attach_memory_accountant(fixture_open_accountant_44188.clone());
                             let retained = versions.iter().filter(|row|
                                 RedbPersistence::rel_row_key(row) != interior_key
                             ).cloned().collect::<Vec<_>>();
@@ -45965,14 +45970,14 @@ mod empty_declared_index_readiness_tests {
         }
         assert_eq!(failed_addressed_rows, Vec::<(&str, &str, &str, &str)>::new(),
             "every named addressed-read row and clean control must run and satisfy its oracle before the inherited host");
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         assert_graph_admission_rows(root.path());
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         assert_graph_authorization_and_cancellation_rows(root.path());
         assert_graph_open_and_maintenance_rows(root.path());
         assert_graph_distinct_maintenance_rows(root.path());
         assert_public_owner_graph_observer_row(root.path());
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         assert_public_owner_open_through_graph_capture_row(root.path());
         assert_graph_durability_rows(root.path());
         assert_graph_compaction_pinned_rows(root.path(), &[10, 11, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]);
@@ -46189,7 +46194,7 @@ impl RedbPersistence {
 #[path = "persistence/body_placement_publication_tests.rs"]
 mod body_placement_publication_tests;
 
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 #[path = "persistence/cdb141_integrity_revision_tests.rs"]
 pub(crate) mod cdb141_integrity_revision_tests;
 // Extends the existing retention/currency fault cells; no independent fault index.
@@ -46319,9 +46324,9 @@ macro_rules! raw_persistence_surface {
         }
     };
 }
-#[cfg(not(feature = "test-seams"))]
+#[cfg(not(any(test, feature = "test-seams")))]
 raw_persistence_surface!(pub(crate));
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 raw_persistence_surface!(pub);
 
 fn admitted_relational_index_endpoint(
@@ -47316,9 +47321,9 @@ graph_commit_result }.map_err(Self::storage_error)?;
         }
     };
 }
-#[cfg(not(feature = "test-seams"))]
+#[cfg(not(any(test, feature = "test-seams")))]
 persistence_mutation_surface!(pub(crate));
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 persistence_mutation_surface!(pub);
 
 #[cfg(all(test, feature = "test-seams"))]
@@ -47327,14 +47332,14 @@ mod cdb141_ordered_direction_tests;
 
 // CDB127 returned-loader rows extend the existing immutable mapped entrypoint;
 // no new test body or allocator is introduced.
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 thread_local! {
     static RETURNED_LOADER_AFTER_RAW_OBSERVATION_FOR_TEST: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static RETURNED_LOADER_PARTIAL_PANIC_FOR_TEST: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     static RETURNED_LOADER_OWNER_DROP_PANIC_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 pub(crate) fn returned_loader_rows_for_test() {
     use crate::memory_accounting::{ControlCredit, MemoryAccountant, StoreAccountantHandle, WriterBudget};
     use content_identity::proof_allocation_oracle_tests::measured;
@@ -47365,7 +47370,7 @@ pub(crate) fn returned_loader_rows_for_test() {
         crate::memory_accounting::writer_adapter_type_layout::<PersistenceProofOwner>().align());
 
     let reader = Arc::new(MemoryAccountant::no_limit());
-    let (slot, peak, live) = measured(|| ProofAccountantSlot::attached(reader.clone()));
+    let (slot, peak, live) = measured(|| ProofAccountantSlot::attached(reader.clone().into()));
     assert_eq!((peak, live), (0, 0), "attachment cannot allocate");
     let strong = Arc::strong_count(&reader);
     let ((), peak, live) = measured(|| slot.prepare().unwrap());
@@ -47382,7 +47387,7 @@ pub(crate) fn returned_loader_rows_for_test() {
     assert_eq!(reader.writer_registration_observation_for_test(), observed);
     assert_eq!(reader.writer_fixed_ownership().2, controls);
     assert_eq!(reader.usage().used, used);
-    let handle = slot.original_handle_for(&reader).unwrap();
+    let handle = slot.original_handle_for(&crate::memory_accounting::AccountantHandle::from_host(reader.clone())).unwrap();
     assert!(!handle.is_writer());
     let copied = handle.clone();
     let budget = copied.vector_budget().unwrap();
@@ -47397,7 +47402,7 @@ pub(crate) fn returned_loader_rows_for_test() {
 
     // Separate operation-control row kills current-association attribution;
     // the reader preparation no-op never admits this control.
-    let reader_handle = StoreAccountantHandle::new(reader.clone());
+    let reader_handle = StoreAccountantHandle::new(reader.clone().into());
     let writer = WriterBudget::from_accountant(reader.clone()).unwrap();
     let observation = reader.writer_registration_observation_for_test();
     let controls = reader.writer_fixed_ownership().2;
@@ -47415,7 +47420,7 @@ pub(crate) fn returned_loader_rows_for_test() {
 
     let raw_owner = Arc::new(MemoryAccountant::no_limit());
     let raw_writer = WriterBudget::from_accountant(raw_owner.clone()).unwrap();
-    let raw_slot = ProofAccountantSlot::attached(raw_owner.clone());
+    let raw_slot = ProofAccountantSlot::attached(raw_owner.clone().into());
     let raw_epoch = raw_owner.writer_registration_observation_for_test().2;
     drop(raw_writer);
     assert_eq!(raw_owner.writer_registration_observation_for_test().3, 1);
@@ -47434,7 +47439,7 @@ pub(crate) fn returned_loader_rows_for_test() {
     let baseline = owner.usage().used;
     let controls = owner.writer_fixed_ownership().2;
     let users = owner.writer_registration_observation_for_test().3;
-    let (slot, peak, live) = measured(|| ProofAccountantSlot::attached(owner.clone()));
+    let (slot, peak, live) = measured(|| ProofAccountantSlot::attached(owner.clone().into()));
     assert_eq!((peak, live), (0, 0));
     assert_eq!(owner.writer_registration_observation_for_test().3, users + 1);
     let address = &slot as *const ProofAccountantSlot;
@@ -47460,7 +47465,7 @@ pub(crate) fn returned_loader_rows_for_test() {
     assert_eq!(owner.writer_registration_observation_for_test().2, epoch);
     drop(reopened);
     assert_eq!(owner.writer_registration_observation_for_test().3, 1);
-    let escaped = slot.original_handle_for(&owner).unwrap().vector_budget().unwrap();
+    let escaped = slot.original_handle_for(&crate::memory_accounting::AccountantHandle::from_host(owner.clone())).unwrap().vector_budget().unwrap();
     drop(slot);
     assert_eq!(owner.writer_registration_observation_for_test().3, 1, "escaping adapter pins the original epoch");
     drop(escaped);
@@ -47473,7 +47478,7 @@ pub(crate) fn returned_loader_rows_for_test() {
     // thread publishes the winner before the observer increments/retains;
     // resuming the observer deterministically exercises a cross-thread loser.
     let writer = WriterBudget::from_accountant(owner.clone()).unwrap();
-    let slot = ProofAccountantSlot::attached(owner.clone());
+    let slot = ProofAccountantSlot::attached(owner.clone().into());
     let observed_users = owner.writer_registration_observation_for_test().3;
     let observed_controls = owner.writer_fixed_ownership().2;
     let address = &slot as *const ProofAccountantSlot;
@@ -47500,15 +47505,15 @@ pub(crate) fn returned_loader_rows_for_test() {
     let installed_writer = WriterBudget::from_accountant(installed_owner.clone()).unwrap();
     let rejected_writer = WriterBudget::from_accountant(rejected_owner.clone()).unwrap();
     let cell = std::sync::OnceLock::new();
-    assert!(cell.set(ProofAccountantSlot::attached(installed_owner.clone())).is_ok());
+    assert!(cell.set(ProofAccountantSlot::attached(installed_owner.clone().into())).is_ok());
     let installed = installed_owner.writer_registration_observation_for_test();
     let rejected = rejected_owner.writer_registration_observation_for_test();
-    let attempt = cell.set(ProofAccountantSlot::attached(rejected_owner.clone()));
+    let attempt = cell.set(ProofAccountantSlot::attached(rejected_owner.clone().into()));
     assert!(attempt.is_err());
     drop(attempt);
     assert_eq!(installed_owner.writer_registration_observation_for_test(), installed);
     assert_eq!(rejected_owner.writer_registration_observation_for_test(), rejected);
-    assert!(cell.get().unwrap().original_handle_for(&rejected_owner).is_none());
+    assert!(cell.get().unwrap().original_handle_for(&crate::memory_accounting::AccountantHandle::from_host(rejected_owner.clone())).is_none());
     drop((cell, installed_writer, rejected_writer));
     assert_eq!(installed_owner.usage().used, 0);
     assert_eq!(rejected_owner.usage().used, 0);
@@ -47516,7 +47521,7 @@ pub(crate) fn returned_loader_rows_for_test() {
 
     let constrained = Arc::new(MemoryAccountant::with_budget(1));
     let writer = WriterBudget::from_accountant(constrained.clone()).unwrap();
-    let slot = ProofAccountantSlot::attached(constrained.clone());
+    let slot = ProofAccountantSlot::attached(constrained.clone().into());
     let observation = constrained.writer_registration_observation_for_test();
     let strong = Arc::strong_count(&constrained);
     let used = constrained.usage().used;
@@ -47530,7 +47535,7 @@ pub(crate) fn returned_loader_rows_for_test() {
     println!("CDB127_A_ROW failed_prepare raw_custody_preserved=true attempt_rolled_back=true");
 
     let writer = WriterBudget::from_accountant(owner.clone()).unwrap();
-    let slot = ProofAccountantSlot::attached(owner.clone());
+    let slot = ProofAccountantSlot::attached(owner.clone().into());
     slot.prepare().unwrap();
     let baseline = owner.usage().used - price;
     let users = owner.writer_registration_observation_for_test().3;
@@ -47546,7 +47551,7 @@ pub(crate) fn returned_loader_rows_for_test() {
     for unwind in [false, true] {
         let partial_owner = Arc::new(MemoryAccountant::no_limit());
         let writer = WriterBudget::from_accountant(partial_owner.clone()).unwrap();
-        let slot = ProofAccountantSlot::attached(partial_owner.clone());
+        let slot = ProofAccountantSlot::attached(partial_owner.clone().into());
         let registration = partial_owner.writer_registration_observation_for_test();
         let mut value = std::mem::MaybeUninit::<RedbPersistence>::uninit();
         let pointer = value.as_mut_ptr();

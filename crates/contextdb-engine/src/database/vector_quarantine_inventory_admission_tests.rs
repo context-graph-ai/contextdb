@@ -128,7 +128,7 @@ fn quarantined_inventory_refuses_cold_oversized_source(missing_catalog: bool) {
     persistence.close();
     drop(persistence);
     let persistence = Arc::new(RedbPersistence::open_with_cache(&copy, 0).unwrap());
-    persistence.attach_memory_accountant(Arc::clone(&db.accountant));
+    persistence.attach_memory_accountant(db.accountant.clone());
     assert!(
         db.vector_store
             .quarantine_partition_route(&partition, VectorRouteQuarantineReason::CorruptBase)

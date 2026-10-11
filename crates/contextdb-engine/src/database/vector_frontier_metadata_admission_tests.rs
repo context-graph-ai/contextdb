@@ -133,7 +133,7 @@ fn cold_oversized_metadata_refuses_before_decode(metadata: ColdMetadata) {
     persistence.close();
     drop(persistence);
     let persistence = Arc::new(RedbPersistence::open_with_cache(&copy, 0).unwrap());
-    persistence.attach_memory_accountant(Arc::clone(&db.accountant));
+    persistence.attach_memory_accountant(db.accountant.clone());
     let mut context = db.maintenance_context();
     context.persistence = Some(Arc::clone(&persistence));
     let baseline = db.accountant.usage().used;
@@ -155,7 +155,7 @@ fn cold_oversized_metadata_refuses_before_decode(metadata: ColdMetadata) {
             // Exercise the durable fallback frontier loader with the same
             // preparation guard used by persist_built_vector_partition.
             vector_source_page_admission::with_preparation_source_page_admission(
-                Arc::clone(&db.accountant),
+                db.accountant.clone(),
                 || {
                     persistence.vector_partition_maintenance_entry_counts(
                         &partition,
@@ -171,7 +171,7 @@ fn cold_oversized_metadata_refuses_before_decode(metadata: ColdMetadata) {
             // journal. Exercise the guarded durable frontier count itself,
             // as the adequate-budget corruption control below already does.
             vector_source_page_admission::with_preparation_source_page_admission(
-                Arc::clone(&db.accountant),
+                db.accountant.clone(),
                 || persistence.vector_partition_uncovered_tombstone_entry_count(
                     &partition, original_catalog.base.covered_lsn,
                     db.tx_mgr.current_lsn(), |_| Ok(()),
@@ -220,7 +220,7 @@ fn cold_oversized_metadata_refuses_before_decode(metadata: ColdMetadata) {
     // With adequate source admission the unchanged malformed bytes reach the
     // bounded decoder and remain corruption, rather than a hidden short count.
     let decode = vector_source_page_admission::with_preparation_source_page_admission(
-        Arc::clone(&db.accountant),
+        db.accountant.clone(),
         || match metadata {
             ColdMetadata::Catalog => persistence
                 .load_vector_partition_generation_descriptors_for(
@@ -376,7 +376,7 @@ fn cold_oversized_covered_journal_retry_probe_refuses_before_read_and_keeps_serv
     drop(persistence);
     // No cached or write-buffer page can mask the physical source extent.
     let persistence = Arc::new(RedbPersistence::open_with_cache(&copy, 0).unwrap());
-    persistence.attach_memory_accountant(Arc::clone(&db.accountant));
+    persistence.attach_memory_accountant(db.accountant.clone());
     let mut context = db.maintenance_context();
     context.persistence = Some(Arc::clone(&persistence));
     let baseline = db.accountant.usage().used;
@@ -465,13 +465,13 @@ fn cold_oversized_covered_journal_retry_probe_refuses_before_read_and_keeps_serv
     );
     assert!(
         vector_source_page_admission::with_preparation_source_page_admission(
-            Arc::clone(&db.accountant),
+            db.accountant.clone(),
             || persistence.vector_partition_has_covered_journal_records(&catalog),
         )
         .unwrap()
     );
     let decode = vector_source_page_admission::with_preparation_source_page_admission(
-        Arc::clone(&db.accountant),
+        db.accountant.clone(),
         || {
             persistence.vector_partition_uncovered_tombstone_entry_count(
                 &partition,
@@ -508,7 +508,7 @@ fn cold_oversized_covered_journal_retry_probe_refuses_before_read_and_keeps_serv
     persistence.close();
     drop(persistence);
     db.close().unwrap();
-    let accountant = Arc::clone(&db.accountant);
+    let accountant = db.accountant.clone();
     drop(db);
     assert_eq!(accountant.usage().used, 0);
     assert_eq!(accountant.underflow_count_for_test(), 0);
@@ -594,7 +594,7 @@ fn wide_text_partition_metadata_refuses_before_cold_catalog_lookup() {
     persistence.close();
     drop(persistence);
     let persistence = Arc::new(RedbPersistence::open_with_cache(&copy, 0).unwrap());
-    persistence.attach_memory_accountant(Arc::clone(&db.accountant));
+    persistence.attach_memory_accountant(db.accountant.clone());
     let mut context = db.maintenance_context();
     context.persistence = Some(Arc::clone(&persistence));
 

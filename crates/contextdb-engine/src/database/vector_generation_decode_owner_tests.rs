@@ -256,7 +256,7 @@ fn dormant_partition_loader_admits_its_decode_floor_before_reads_and_releases() 
         let loader = DurableRawVectorPartitionLoader {
             metadata_copy_owner: Some(retained_loader_metadata(accountant.clone(), &partition)),
             source: DurableRawVectorSource::Writable(persistence),
-            accountant,
+            accountant: accountant.into(),
             partition: partition.clone(),
             dimension: 1,
             quantization,
@@ -300,7 +300,7 @@ fn dormant_partition_loader_admits_its_decode_floor_before_reads_and_releases() 
         let loader = DurableRawVectorPartitionLoader {
             metadata_copy_owner: Some(retained_loader_metadata(accountant.clone(), &partition)),
             source,
-            accountant,
+            accountant: accountant.into(),
             partition: partition.clone(),
             dimension: 1,
             quantization,

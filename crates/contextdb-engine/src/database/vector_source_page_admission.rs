@@ -149,8 +149,8 @@ mod cleanup_attribution_tests {
             read: impl FnOnce() -> Result<T>,
         ) -> Result<T> {
             match self {
-                Self::Catalog => with_catalog_reclamation_source_page_admission(accountant, read),
-                Self::Journal => with_journal_cleanup_source_page_admission(accountant, read),
+                Self::Catalog => with_catalog_reclamation_source_page_admission(accountant.into(), read),
+                Self::Journal => with_journal_cleanup_source_page_admission(accountant.into(), read),
             }
         }
     }

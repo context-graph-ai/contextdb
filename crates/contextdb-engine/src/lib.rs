@@ -103,7 +103,7 @@ pub mod read_contract;
 mod read_image;
 mod read_image_memory;
 pub mod vector_read_memory;
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 mod read_probe;
 mod read_progress;
 #[cfg(not(feature = "test-seams"))]
@@ -116,7 +116,7 @@ mod read_session;
 #[cfg(feature = "test-seams")]
 #[doc(hidden)]
 pub mod read_session;
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 mod read_work_probe;
 pub mod schema_enforcer;
 pub mod sync;

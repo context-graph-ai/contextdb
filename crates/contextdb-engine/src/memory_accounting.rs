@@ -199,12 +199,12 @@ impl AccountantHandle {
     fn backing_bytes(&self) -> usize {
         if self.is_engine() { engine_writer_backing_bytes() } else { 0 }
     }
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn writer_fixed_ownership(&self) -> (usize, usize, usize) {
         let (node, _, adapters) = (**self).writer_fixed_ownership();
         (node, self.backing_bytes(), adapters)
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn native_backing_for_test(&self) -> (bool, [(usize, Layout); 3]) {
         (self.is_engine(), [
             (self.as_ptr() as usize, writer_adapter_type_layout::<MemoryAccountant>()),
@@ -224,7 +224,7 @@ impl AccountantHandle {
         let used = WriterCounterHandle::new(counter);
         let limit_control = Arc::new(AtomicUsize::new(limit.unwrap_or(0)));
         let accountant = MemoryAccountant::with_controls(limit_control, used, limit);
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         {
             accountant.high_water_for_test.store(backing_bytes, Ordering::SeqCst);
             accountant.admitted_bytes_for_test.store(backing_bytes, Ordering::SeqCst);
@@ -285,6 +285,283 @@ fn engine_writer_backing_bytes() -> usize {
     writer_adapter_type_layout::<MemoryAccountant>().size()
         + writer_adapter_type_layout::<AtomicUsize>().size()
         + writer_adapter_type_layout::<WriterCounter>().size()
+}
+
+// Native backing remains funded through its physical allocation lifetime.
+// These rows use the existing allocator and allocation-free observer storage.
+#[cfg(test)]
+pub(crate) fn native_allocation_lifetime_rows_for_test() {
+    use crate::persistence::content_identity::proof_allocation_oracle_tests as oracle;
+    fn native() -> (AccountantHandle, [(usize, usize, usize); 3], usize) {
+        let (owner, requests, count) =
+            oracle::native_requests_for_test(|| AccountantHandle::engine(None).unwrap());
+        assert_eq!(
+            count, 3,
+            "the engine constructor makes exactly its three backing allocations"
+        );
+        let (engine, controls) = owner.native_backing_for_test();
+        assert!(engine);
+        // Actual constructor order: counter, limit, accountant. Compare each
+        // independent allocator invoice to its concrete typed backing layout.
+        for (request, control) in requests.iter().zip([controls[2], controls[1], controls[0]]) {
+            assert_eq!(
+                (request.1, request.2),
+                (control.1.size(), control.1.align())
+            );
+            assert!(request.0 < control.0 && control.0 < request.0 + request.1);
+        }
+        let backing = requests.iter().map(|request| request.1).sum::<usize>();
+        assert_eq!(owner.usage().used, backing);
+        oracle::watch_native_free_for_test(requests, controls[2].0);
+        (owner, requests, backing)
+    }
+    let aggregate = process_aggregate_snapshot().0;
+    let (owner, requests, backing) = native();
+    let counter_bytes = requests[0].1;
+    // A real activation refuses before the allocation/admission callback when
+    // its requested native payload exceeds the currently available process room.
+    let writer = WriterBudget::from_handle(owner.clone()).unwrap();
+    let activation_used = owner.usage().used;
+    let activation_aggregate = process_aggregate_snapshot().0;
+    let activation_epoch = owner.writer_registration_observation_for_test().2;
+    let called = std::cell::Cell::new(false);
+    set_process_ceiling_for_test(Some(activation_aggregate));
+    let refused =
+        owner.activate_resident_insertion_runtime(1, Layout::new::<usize>().size(), 0, 0, || {
+            called.set(true);
+            Ok(())
+        });
+    set_process_ceiling_for_test(None);
+    assert!(!refused.unwrap());
+    assert!(
+        !called.get(),
+        "process refusal precedes the payload allocation callback"
+    );
+    assert_eq!(owner.usage().used, activation_used);
+    assert_eq!(process_aggregate_snapshot().0, activation_aggregate);
+    assert_eq!(
+        owner.writer_registration_observation_for_test().2,
+        activation_epoch
+    );
+    assert_eq!(oracle::native_free_observation_for_test(), [(0, 0, 0); 3]);
+    let cancelled =
+        owner.activate_resident_insertion_runtime(1, Layout::new::<usize>().size(), 0, 0, || {
+            Err(contextdb_core::Error::Other(String::new()))
+        });
+    assert!(cancelled.is_err());
+    assert_eq!(owner.usage().used, activation_used);
+    assert_eq!(process_aggregate_snapshot().0, activation_aggregate);
+    assert_eq!(
+        owner.writer_registration_observation_for_test().2,
+        activation_epoch
+    );
+    drop(writer);
+    assert_eq!(owner.usage().used, backing);
+    println!(
+        "NATIVE_ACTIVATION_WITNESS preallocation_process_refusal=true callback_not_called=true cancelled_callback_preserves_counter_and_epoch=true"
+    );
+    let mut previous_epoch = 0;
+    for _ in 0..3 {
+        let writer = WriterBudget::from_handle(owner.clone()).unwrap();
+        let registration = owner.writer_registration_observation_for_test();
+        assert_ne!(registration.2, previous_epoch);
+        previous_epoch = registration.2;
+        assert_eq!(owner.usage().used, backing + registration.1);
+        drop(writer);
+        assert_eq!(owner.writer_registration_observation_for_test().2, 0);
+        assert_eq!(
+            owner.usage().used,
+            backing,
+            "retiring an epoch cannot refund live native backing"
+        );
+        assert_eq!(process_aggregate_snapshot().0, aggregate + backing);
+    }
+    // Every contender owns the same production handle and consumes its own Arc
+    // through the production final-consumer protocol. Barriers, not polling,
+    // arrange simultaneous last-owner drops.
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+    let threads: Vec<_> = (0..2)
+        .map(|_| {
+            let owner = owner.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                drop(owner);
+            })
+        })
+        .collect();
+    drop(owner);
+    assert_eq!(oracle::native_free_observation_for_test(), [(0, 0, 0); 3]);
+    barrier.wait();
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    let free = oracle::native_free_observation_for_test();
+    assert_eq!(
+        free[2],
+        (backing, backing, 1),
+        "accountant physical free precedes its original-counter refund"
+    );
+    assert_eq!(
+        free[1],
+        (backing, backing, 1),
+        "limit physical free precedes its original-counter refund"
+    );
+    assert_eq!(
+        free[0],
+        (aggregate + counter_bytes, aggregate + counter_bytes, 1),
+        "counter backing is physically freed before its aggregate residual refunds"
+    );
+    assert_eq!(process_aggregate_snapshot().0, aggregate);
+    println!(
+        "NATIVE_BACKING_WITNESS requests={requests:?} backing={backing} free={free:?} concurrent_final_owners=2 epochs=3 original_funder=true final_aggregate_baseline=true"
+    );
+
+    let (owner, requests, backing) = native();
+    let payload_layout = Layout::new::<usize>();
+    let credit =
+        ControlCredit::admit(&owner, payload_layout.size(), "native_late_control_proof").unwrap();
+    let payload = Box::new(7usize);
+    let refund = credit.prepare();
+    let counter = owner.used.clone();
+    assert_eq!(
+        refund.counter.as_ptr(),
+        counter.as_ptr(),
+        "the late credit holds its actual original funder"
+    );
+    drop(owner);
+    let free = oracle::native_free_observation_for_test();
+    assert_eq!(
+        free[2],
+        (
+            backing + payload_layout.size(),
+            backing + payload_layout.size(),
+            1
+        )
+    );
+    assert_eq!(
+        free[1],
+        (
+            backing + payload_layout.size(),
+            backing + payload_layout.size(),
+            1
+        )
+    );
+    assert_eq!(
+        free[0].2, 0,
+        "counter-only refund custody still retains its real backing"
+    );
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        requests[0].1 + payload_layout.size()
+    );
+    assert_eq!(
+        process_aggregate_snapshot().0,
+        aggregate + requests[0].1 + payload_layout.size()
+    );
+    oracle::watch_registry_free_for_test(
+        (&*payload as *const usize) as usize,
+        counter.as_ptr() as usize,
+    );
+    drop(payload);
+    assert_eq!(
+        oracle::registry_free_observation_for_test(true),
+        (
+            requests[0].1 + payload_layout.size(),
+            requests[0].1 + payload_layout.size(),
+            true
+        ),
+        "the original counter funds the actual late payload through System.dealloc return"
+    );
+    drop(refund);
+    assert_eq!(counter.load(Ordering::SeqCst), requests[0].1);
+    drop(counter);
+    assert_eq!(
+        oracle::native_free_observation_for_test()[0],
+        (aggregate + requests[0].1, aggregate + requests[0].1, 1)
+    );
+    assert_eq!(process_aggregate_snapshot().0, aggregate);
+    println!(
+        "NATIVE_LATE_COUNTER_WITNESS requests={requests:?} original_funder=true accountant_and_limit_physically_freed=true counter_only_retained=true final_aggregate_baseline=true"
+    );
+
+    for unwind in [false, true] {
+        let (owner, requests, backing) = native();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _owner = owner;
+            if unwind {
+                panic!("native cleanup proof");
+            }
+        }));
+        assert_eq!(result.is_err(), unwind);
+        let free = oracle::native_free_observation_for_test();
+        assert_eq!(free[2], (backing, backing, 1));
+        assert_eq!(free[1], (backing, backing, 1));
+        assert_eq!(
+            free[0],
+            (aggregate + requests[0].1, aggregate + requests[0].1, 1)
+        );
+        assert_eq!(process_aggregate_snapshot().0, aggregate);
+        println!(
+            "NATIVE_CLEANUP_WITNESS unwind={unwind} physical_free_before_refund=true final_aggregate_baseline=true"
+        );
+    }
+
+    let (host, requests, count) =
+        oracle::native_requests_for_test(|| Arc::new(MemoryAccountant::no_limit()));
+    assert_eq!(count, 3);
+    let handle = AccountantHandle::from_host(host.clone());
+    let (engine, controls) = handle.native_backing_for_test();
+    assert!(
+        !engine,
+        "a supplied host Arc keeps its original representation"
+    );
+    for (request, control) in requests.iter().zip([controls[1], controls[2], controls[0]]) {
+        // Host construction creates limit before counter; engine construction
+        // above creates counter before limit.
+        assert_eq!(
+            (request.1, request.2),
+            (control.1.size(), control.1.align())
+        );
+        assert!(request.0 < control.0 && control.0 < request.0 + request.1);
+    }
+    assert_eq!(
+        handle.backing_bytes(),
+        0,
+        "host-supplied backing never becomes an engine debit"
+    );
+    assert!(Arc::ptr_eq(&handle.standard_arc().unwrap(), &host));
+    let weak = Arc::downgrade(&host);
+    let retained = host.clone();
+    let writer = WriterBudget::from_accountant(host.clone()).unwrap();
+    drop(writer);
+    assert_eq!(host.usage().used, 0);
+    assert_eq!(host.writer_registration_observation_for_test().2, 0);
+    // Observe aggregate only: after standard strong-zero the counter is gone,
+    // while the accountant Arc header can still be held by its genuine Weak.
+    oracle::watch_native_free_for_test(requests, 0);
+    drop(handle);
+    drop(host);
+    assert_eq!(oracle::native_free_observation_for_test(), [(0, 0, 0); 3]);
+    assert!(Arc::ptr_eq(&weak.upgrade().unwrap(), &retained));
+    drop(retained);
+    assert!(weak.upgrade().is_none());
+    let free = oracle::native_free_observation_for_test();
+    assert_eq!(free[0], (aggregate, aggregate, 1));
+    assert_eq!(free[1], (aggregate, aggregate, 1));
+    assert_eq!(
+        free[2].2, 0,
+        "strong-zero destroys the payload but Weak still owns the Arc header"
+    );
+    drop(weak);
+    assert_eq!(
+        oracle::native_free_observation_for_test()[2],
+        (aggregate, aggregate, 1)
+    );
+    assert_eq!(process_aggregate_snapshot().0, aggregate);
+    println!(
+        "HOST_ARC_WEAK_WITNESS requests={requests:?} engine_backing_debit=0 identity_preserved=true payload_destroyed_at_strong_zero=true header_physically_freed_only_at_weak_zero=true"
+    );
 }
 
 /// The inherited whole-process memory limit: the effective cgroup v2
@@ -405,6 +682,13 @@ pub(crate) fn set_process_ceiling_for_test(ceiling: Option<usize>) {
     if domain.native.is_some() {
         domain.ceiling = Some(ceiling.unwrap_or_else(inherited_process_ceiling));
     }
+}
+
+// Allocator callbacks can run under the process-domain gate. This test-only
+// atomic observation avoids recursively acquiring that gate and allocates nothing.
+#[cfg(test)]
+pub(crate) fn process_aggregate_bytes_for_test() -> usize {
+    PROCESS_WRITER_AGGREGATE.load(Ordering::SeqCst)
 }
 
 /// (aggregate bytes, recorded process ceiling) for receipts and rows.
@@ -928,13 +1212,13 @@ pub struct MemoryAccountant {
     limit: Arc<AtomicUsize>,
     used: WriterCounterHandle,
     writer_identity: OnceLock<usize>,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     high_water_for_test: AtomicUsize,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     admitted_bytes_for_test: AtomicUsize,
     /// Bytes taken through `charge_retained` -- the writer's own retention
     /// door, which never refuses. A read session must never pay at it.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     retained_charge_bytes_for_test: AtomicUsize,
     startup_ceiling: AtomicUsize,
     has_ceiling: AtomicBool,
@@ -964,7 +1248,7 @@ pub struct MemoryAccountant {
 /// what makes the ledger answer "who is still holding this" for a single-
 /// threaded sequence: a name whose allocations are never followed by the total
 /// coming back down is the one holding the bytes.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BudgetLedgerEntry {
     /// The `subsystem/operation` that charged, or `"release"`.
@@ -973,7 +1257,7 @@ pub struct BudgetLedgerEntry {
     pub used_after: usize,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 thread_local! {
     static BUDGET_LEDGER: std::cell::RefCell<Option<Vec<BudgetLedgerEntry>>> =
         const { std::cell::RefCell::new(None) };
@@ -981,14 +1265,14 @@ thread_local! {
 
 /// Start recording this thread's budget traffic. Recording is off until this is
 /// called, so nothing pays for the ledger on an ordinary run.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub fn watch_budget_ledger_for_test() {
     BUDGET_LEDGER.with(|ledger| *ledger.borrow_mut() = Some(Vec::new()));
 }
 
 /// Stop recording and take what was recorded.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub fn take_budget_ledger_for_test() -> Vec<BudgetLedgerEntry> {
     BUDGET_LEDGER.with(|ledger| ledger.borrow_mut().take().unwrap_or_default())
@@ -1102,7 +1386,7 @@ impl Drop for AdmittedSchemaUnit<'_> {
     }
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 fn note_budget_ledger(what: &str, bytes: usize, used_after: usize) {
     BUDGET_LEDGER.with(|ledger| {
         if let Some(entries) = ledger.borrow_mut().as_mut() {
@@ -1118,7 +1402,7 @@ fn note_budget_ledger(what: &str, bytes: usize, used_after: usize) {
 #[derive(Debug, Clone)]
 pub struct MemoryUsage {
     /// Largest live-byte charge of one file-reader child (zero for a writer).
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub reader_file_high_water: u64,
     pub limit: Option<usize>,
     pub used: usize,
@@ -1129,7 +1413,7 @@ pub struct MemoryUsage {
 // The allocator oracle must not count a disabled ledger's formatting as a
 // control allocation. Construct the identical observation only for a live
 // explicitly scoped ledger; this seam is absent without test-seams.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 fn note_budget_admission(subsystem: &str, operation: &str, bytes: usize, used_after: usize) {
     BUDGET_LEDGER.with(|ledger| {
         if let Some(entries) = ledger.borrow_mut().as_mut() {
@@ -1599,11 +1883,11 @@ impl MemoryAccountant {
     fn with_controls(limit: Arc<AtomicUsize>, used: WriterCounterHandle, startup: Option<usize>) -> Self {
         Self {
             limit, used,
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             high_water_for_test: AtomicUsize::new(0),
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             admitted_bytes_for_test: AtomicUsize::new(0),
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             retained_charge_bytes_for_test: AtomicUsize::new(0),
             startup_ceiling: AtomicUsize::new(startup.unwrap_or(0)),
             has_ceiling: AtomicBool::new(startup.is_some()),
@@ -1657,7 +1941,7 @@ impl MemoryAccountant {
     fn new_engine_writer(limit: Option<usize>) -> contextdb_core::Result<WriterBudget> {
         WriterBudget::from_handle(AccountantHandle::engine(limit)?)
     }
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn writer_fixed_ownership(&self) -> (usize, usize, usize) {
         let domain = PROCESS_WRITER_BUDGET_DOMAIN.read();
         self.writer_identity.get().and_then(|key| domain.lookup_in(*key)).map_or((0, 0, 0), |record| (
@@ -1932,9 +2216,9 @@ impl MemoryAccountant {
                 }
                 self.admit_to_process_aggregate(&admission, bytes, "allocate",
                     "Reduce retained data, lower working-set size, or raise MEMORY_LIMIT.")?;
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 self.high_water_for_test.fetch_max(next, Ordering::SeqCst);
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 self.admitted_bytes_for_test
                     .fetch_add(bytes, Ordering::SeqCst);
                 return Ok(());
@@ -2033,7 +2317,7 @@ impl MemoryAccountant {
             } else if self.used.is_member() {
                 aggregate_refund(old_bytes - new_bytes);
             }
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             {
                 self.high_water_for_test.fetch_max(next, Ordering::SeqCst);
                 self.admitted_bytes_for_test
@@ -2067,7 +2351,7 @@ impl MemoryAccountant {
             return;
         }
         self.used.charge(bytes);
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         {
             self.high_water_for_test
                 .fetch_max(self.used.load(Ordering::SeqCst), Ordering::SeqCst);
@@ -2130,7 +2414,7 @@ impl MemoryAccountant {
         if bytes > released {
             self.underflow_count.fetch_add(1, Ordering::SeqCst);
         }
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         note_budget_ledger("release", bytes, self.used.load(Ordering::SeqCst));
         #[cfg(not(any(test, feature = "test-seams")))]
         let _ = released;
@@ -2177,7 +2461,7 @@ impl MemoryAccountant {
     }
 
     /// Start the high-water mark again from what is admitted now.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn reset_high_water_for_test(&self) {
         self.high_water_for_test
@@ -2185,14 +2469,14 @@ impl MemoryAccountant {
     }
 
     /// Peak successfully admitted bytes, including allocations already released.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn high_water_for_test(&self) -> usize {
         self.high_water_for_test.load(Ordering::SeqCst)
     }
 
     /// Successful byte admissions at this accountant, on every calling thread.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn admitted_bytes_for_test(&self) -> usize {
         self.admitted_bytes_for_test.load(Ordering::SeqCst)
@@ -2203,7 +2487,7 @@ impl MemoryAccountant {
     /// zero here: a committed image never appends to a change log, and every
     /// byte of the image it does hold was already admitted when it was
     /// decoded.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn retained_charge_bytes_for_test(&self) -> usize {
         self.retained_charge_bytes_for_test.load(Ordering::SeqCst)
@@ -2239,7 +2523,7 @@ impl MemoryAccountant {
             .load(Ordering::SeqCst)
             .then(|| self.startup_ceiling.load(Ordering::SeqCst));
         MemoryUsage {
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             reader_file_high_water: 0,
             limit,
             used,
@@ -2342,7 +2626,7 @@ impl MemoryAccountant {
             });
         }
         let mut allocation = self.try_allocate_with_provenance(bytes, provenance);
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if allocation.is_ok() {
             note_budget_admission(subsystem, operation, bytes, self.used.load(Ordering::SeqCst));
         }
@@ -2501,7 +2785,7 @@ impl contextdb_vector::MemoryBudget for WriterVectorBudget {
     fn adopt_caller_reservation(&self, bytes: usize) -> contextdb_core::Result<bool> { adopt_vector_load_reservation(self.accountant(), bytes) }
 }
 impl MemoryAccountant {
-    #[cfg(all(test, feature = "test-seams"))]
+    #[cfg(test)]
     pub(crate) fn writer_registration_observation_for_test(&self) -> (usize, usize, usize, usize, usize) {
         let domain = PROCESS_WRITER_BUDGET_DOMAIN.read();
         if let Some(record) = self.writer_identity.get().and_then(|key| domain.lookup_in(*key)) {
@@ -2509,7 +2793,7 @@ impl MemoryAccountant {
         }
         (0, 0, 0, 0, self.used.as_ptr() as usize)
     }
-    #[cfg(all(test, feature = "test-seams"))]
+    #[cfg(test)]
     pub(crate) fn writer_vector_adapter_type_layout_for_test() -> Layout {
         writer_adapter_type_layout::<WriterVectorBudget>()
     }
@@ -2531,7 +2815,7 @@ accountant: self.clone(),
         })
     }
 
-    #[cfg(all(test, feature = "test-seams"))]
+    #[cfg(test)]
     pub(crate) fn writer_vector_adapter_layout_for_test(&self) -> Layout {
         crate::persistence::returned_loader_rows_for_test();
         crate::persistence::content_identity::proof_allocation_oracle_tests::r1_mapped_control_rows();
@@ -2752,7 +3036,7 @@ mod tests {
             .unwrap();
         assert_eq!(accountant.usage().used, 700);
         accountant.try_allocate(300).unwrap();
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         assert_eq!(accountant.high_water_for_test(), 1_000);
         accountant.release(1_000);
         assert_eq!(accountant.usage().used, 0);
@@ -2774,7 +3058,7 @@ mod tests {
             .transition_reservation(600, 600, "vector_index", "persist", "test")
             .unwrap();
         assert_eq!(accountant.usage().used, 950);
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         assert_eq!(accountant.high_water_for_test(), 950);
         accountant.release(600);
         assert_eq!(
@@ -2816,7 +3100,7 @@ mod tests {
             .transition_reservation(600, 700, "vector_index", "candidate", "test")
             .unwrap();
         assert_eq!(accountant.usage().used, 1_000);
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         assert_eq!(accountant.high_water_for_test(), 1_000);
         accountant.release(1_000);
         assert_eq!(accountant.underflow_count_for_test(), 0);
@@ -2921,10 +3205,10 @@ mod tests {
             .set_budget(Some(1_000_000))
             .expect("declare a limit both units are priced under");
 
-        let first = accountant
+        let first = crate::memory_accounting::AccountantHandle::from_host(accountant.clone())
             .reserve_schema_unit(100_000, "sync", "received_schema_unit", "")
             .expect("the first unit's price fits");
-        let second = accountant
+        let second = crate::memory_accounting::AccountantHandle::from_host(accountant.clone())
             .reserve_schema_unit(200_000, "sync", "received_schema_unit", "")
             .expect("the second unit's price fits too");
         assert_eq!(
@@ -3034,7 +3318,7 @@ mod redb_allocator_state_tests {
     #[test]
     fn allocator_capacity_owner_keeps_prior_charge_when_growth_refuses() {
         let accountant = Arc::new(MemoryAccountant::with_budget(128));
-        let mut owner = RedbAllocatorStateCharge::new(Arc::clone(&accountant));
+        let mut owner = RedbAllocatorStateCharge::new(Arc::clone(&accountant).into());
         owner.resize(32, 16, 8).unwrap();
         assert_eq!(accountant.usage().used, 56);
         assert!(owner.resize(64, 128, 8).is_err());

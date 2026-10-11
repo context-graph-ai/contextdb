@@ -724,7 +724,7 @@ fn the_export_destination_admits_its_format_marker_and_initial_identity() {
     let before = budget.admitted_bytes_for_test();
     let artifact = RedbPersistence::create_with_accountant(
         &root.path().join("destination.db"),
-        Some(Arc::clone(&budget)),
+        Some(Arc::clone(&budget).into()),
         crate::persistence::redb_cache_bytes_for_limit(budget.usage().limit),
     )
     .expect("create an export destination");
@@ -738,7 +738,7 @@ fn the_export_destination_admits_its_format_marker_and_initial_identity() {
     ));
     let late =
         RedbPersistence::create(&root.path().join("late.db")).expect("create a second destination");
-    late.attach_memory_accountant(Arc::clone(&control));
+    late.attach_memory_accountant(Arc::clone(&control).into());
     let unaccounted = control.admitted_bytes_for_test();
     late.close();
     assert_eq!(

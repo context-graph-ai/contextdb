@@ -158,7 +158,7 @@ impl RedbPersistence {
         if !protected(name) {
             return Ok(());
         }
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if name.starts_with("__rel_index_") {
             STRICT_INDEX_ROOT_CHECKS.with(|count| count.set(count.get() + 1));
         }
@@ -186,14 +186,14 @@ impl RedbPersistence {
     }
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 thread_local! {
     /// Strict index-table root checks on this thread. Every physical index
     /// cursor, ordered window and maintained group passes one.
     static STRICT_INDEX_ROOT_CHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn strict_index_root_checks_for_test() -> u64 {
     STRICT_INDEX_ROOT_CHECKS.with(std::cell::Cell::get)
 }

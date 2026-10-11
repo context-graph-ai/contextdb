@@ -150,13 +150,13 @@ fn fixture_with_rows(
     drop(persistence);
     let persistence = Arc::new(RedbPersistence::open(&path).unwrap());
     let accountant = Arc::new(MemoryAccountant::with_budget(LIMIT));
-    persistence.attach_memory_accountant(Arc::clone(&accountant));
+    persistence.attach_memory_accountant(Arc::clone(&accountant).into());
     (
         directory,
         DurableRawVectorPartitionLoader {
             metadata_copy_owner: Some(retained_loader_metadata(accountant.clone(), &partition)),
             source: DurableRawVectorSource::Writable(persistence),
-            accountant,
+            accountant: accountant.into(),
             partition: partition.clone(),
             dimension: 1,
             quantization: VectorQuantization::F32,

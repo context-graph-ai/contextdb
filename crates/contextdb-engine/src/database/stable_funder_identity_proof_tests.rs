@@ -63,8 +63,8 @@ fn default_funder_identity_preserves_trait_data_address() {
     assert_eq!(erased.stable_funder_identity(), clone.stable_funder_identity());
     assert_ne!(erased.stable_funder_identity(), other.stable_funder_identity());
     let root = crate::memory_accounting::WriterBudget::from_accountant(first.clone()).unwrap();
-    let adapter_a = first.vector_budget().unwrap();
-    let adapter_b = first.vector_budget().unwrap();
+    let adapter_a = crate::memory_accounting::AccountantHandle::from_host(first.clone()).vector_budget().unwrap();
+    let adapter_b = crate::memory_accounting::AccountantHandle::from_host(first.clone()).vector_budget().unwrap();
     assert_eq!(adapter_a.stable_funder_identity(), erased.stable_funder_identity());
     assert_eq!(adapter_b.stable_funder_identity(), erased.stable_funder_identity());
     assert_ne!(Arc::as_ptr(&adapter_a) as *const () as usize, Arc::as_ptr(&adapter_b) as *const () as usize);
@@ -82,9 +82,9 @@ fn independent_writer_invocations_keep_caller_credit_and_allocation_dedup() {
     let accountant = Arc::new(MemoryAccountant::no_limit());
     let db = Database::open_memory_with_accountant(accountant.clone());
     let baseline = accountant.usage().used;
-    let first = accountant.vector_budget().unwrap();
+    let first = crate::memory_accounting::AccountantHandle::from_host(accountant.clone()).vector_budget().unwrap();
     let first_credit = credit(first.clone(), 37);
-    let second = accountant.vector_budget().unwrap();
+    let second = crate::memory_accounting::AccountantHandle::from_host(accountant.clone()).vector_budget().unwrap();
     assert!(!Arc::ptr_eq(&first, &second), "independent factory calls allocate separate adapters");
     let second_credit = credit(second.clone(), 19);
     let mut visited = Vec::new();
@@ -139,8 +139,8 @@ fn distinct_writer_and_reader_funders_refuse_foreign_prepaid_and_refund_original
     let second = Arc::new(MemoryAccountant::no_limit());
     let db = Database::open_memory_with_accountant(first.clone());
     let other_root = crate::memory_accounting::WriterBudget::from_accountant(second.clone()).unwrap();
-    let a = first.vector_budget().unwrap();
-    let b = second.vector_budget().unwrap();
+    let a = crate::memory_accounting::AccountantHandle::from_host(first.clone()).vector_budget().unwrap();
+    let b = crate::memory_accounting::AccountantHandle::from_host(second.clone()).vector_budget().unwrap();
     let first_baseline = first.usage().used;
     let second_baseline = second.usage().used;
     let a_credit = credit(a.clone(), 13);

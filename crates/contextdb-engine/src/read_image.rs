@@ -22,7 +22,7 @@ use crate::direct_file_reader::{
     DirectSyncState, DirectTableSyncPolicy, DirectTypedImageDigest, DirectVectorQuantization,
 };
 use crate::executor::ReadExecutionTarget;
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 use crate::memory_accounting::MemoryAccountant;
 use crate::persistence::ReadPersistenceImageParts;
 use contextdb_core::read_contract::{
@@ -281,7 +281,7 @@ fn image_history_answer_error(error: crate::database::ImageHistoryError) -> Dire
     }
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 thread_local! {
     static ANSWER_ENCODING_HOOK: std::cell::RefCell<Option<Box<dyn Fn()>>> =
         const { std::cell::RefCell::new(None) };
@@ -290,23 +290,23 @@ thread_local! {
 /// Run `hook` on this thread each time a metadata answer's encoding is
 /// written, before the request's last check -- so a proof can cancel a
 /// request while its answer is being encoded. Dropping the guard removes it.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub fn while_encoding_answers_for_test(hook: impl Fn() + 'static) -> AnswerEncodingHookGuard {
     ANSWER_ENCODING_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
     AnswerEncodingHookGuard(())
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub struct AnswerEncodingHookGuard(());
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 impl Drop for AnswerEncodingHookGuard {
     fn drop(&mut self) {
         ANSWER_ENCODING_HOOK.with(|slot| slot.borrow_mut().take());
     }
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn answer_encoded_for_test() {
     ANSWER_ENCODING_HOOK.with(|slot| {
         if let Some(hook) = slot.borrow().as_ref() {
@@ -867,12 +867,12 @@ fn propagation_sort_key(rule: &DirectPropagationRule) -> (u8, String, String) {
 }
 
 /// Length-prefixed absorption, so two different shapes cannot hash alike.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 struct FamilyDigest {
     hasher: blake3::Hasher,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 impl FamilyDigest {
     fn new(_accountant: &Arc<MemoryAccountant>) -> Self {
         Self {
@@ -881,7 +881,7 @@ impl FamilyDigest {
     }
 
     fn bytes(&mut self, bytes: &[u8]) -> &mut Self {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::read_work_probe::note_hashed_bytes(bytes.len());
         self.hasher.update(&(bytes.len() as u64).to_le_bytes());
         self.hasher.update(bytes);
@@ -906,7 +906,7 @@ impl FamilyDigest {
     }
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 fn typed_digest(
     image: &DirectOwnedImage,
     accountant: &Arc<MemoryAccountant>,
@@ -1084,7 +1084,7 @@ fn typed_digest(
     })
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn typed_digest_for_test(image: &DirectOwnedImage) -> Result<DirectTypedImageDigest> {
     typed_digest(image, &Arc::new(MemoryAccountant::no_limit()))
 }

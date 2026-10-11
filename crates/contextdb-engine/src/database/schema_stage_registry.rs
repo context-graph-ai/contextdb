@@ -428,35 +428,45 @@ pub(crate) struct Pre2ReceivedSchemaStage {
     _vector_copy_owner: contextdb_vector::VectorCopyAdmission,
 }
 
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 pub(super) fn mapped_rows_for_test() {
-    use crate::memory_accounting::WriterBudget;
+    use crate::memory_accounting::{WriterBudget, process_aggregate_snapshot, set_process_ceiling_for_test};
     use crate::persistence::content_identity::proof_allocation_oracle_tests as oracle;
     assert_eq!(std::mem::size_of::<Database>(), std::mem::size_of::<Pre2Database>(), "the Database field representation remains pre2 sized");
     assert_eq!(std::mem::align_of::<Database>(), std::mem::align_of::<Pre2Database>());
     let owner = Arc::new(MemoryAccountant::no_limit());
     let writer = WriterBudget::from_accountant(owner.clone()).unwrap();
     let baseline = owner.usage().used;
+    let process_baseline = process_aggregate_snapshot().0;
+    let writer_counter = owner.writer_fixed_ownership().2;
     let counter = owner.writer_registration_observation_for_test().4;
     macro_rules! constructor {
         ($registry:ty, $original:ty, $name:literal) => {{
             oracle::last_request_for_test(true);
-            let (registry, _, _) = oracle::measured(|| <$registry>::new_arc(&owner).unwrap());
+            let (registry, _, _) = oracle::measured(|| <$registry>::new_arc(&crate::memory_accounting::AccountantHandle::from_host(owner.clone())).unwrap());
             let request = oracle::last_request_for_test(true);
             let final_layout = crate::memory_accounting::writer_adapter_type_layout::<Mutex<$registry>>();
             let original = crate::memory_accounting::writer_adapter_type_layout::<Mutex<$original>>();
             let correction = final_layout.size() - original.size();
             assert_eq!(request, (final_layout.size(), final_layout.align(), 1));
-            assert_eq!(owner.usage().used, baseline + correction);
+            assert_eq!(owner.usage().used, baseline, "open-residue correction is not writer-funded");
+            assert_eq!(owner.writer_fixed_ownership().2, writer_counter, "registry construction does not alter the writer counter");
+            assert_eq!(process_aggregate_snapshot().0, process_baseline + correction, "the actual mapped correction is process-open residue");
             let retained = registry.clone();
             drop(registry);
-            assert_eq!(owner.usage().used, baseline + correction);
+            assert_eq!(owner.usage().used, baseline);
+            assert_eq!(owner.writer_fixed_ownership().2, writer_counter);
+            assert_eq!(process_aggregate_snapshot().0, process_baseline + correction, "a shared registry clone has a single process debit");
             drop(retained);
             assert_eq!(owner.usage().used, baseline);
-            owner.set_budget(Some(baseline)).unwrap();
-            assert!(<$registry>::new_arc(&owner).is_err());
+            assert_eq!(owner.writer_fixed_ownership().2, writer_counter);
+            assert_eq!(process_aggregate_snapshot().0, process_baseline, "the process correction refunds only after the final physical owner");
+            set_process_ceiling_for_test(Some(process_baseline + correction - 1));
+            assert!(<$registry>::new_arc(&crate::memory_accounting::AccountantHandle::from_host(owner.clone())).is_err());
+            set_process_ceiling_for_test(None);
             assert_eq!(owner.usage().used, baseline);
-            owner.set_budget(None).unwrap();
+            assert_eq!(owner.writer_fixed_ownership().2, writer_counter);
+            assert_eq!(process_aggregate_snapshot().0, process_baseline, "the process ceiling refuses before allocating a registry");
             println!("CDB127_D2_ROW constructor={} actual_request={} align={} pre2_arc={} correction={} clone_single_debit=true refusal=true", $name, request.0, request.1, original.size(), correction);
         }};
     }
@@ -477,7 +487,7 @@ pub(super) fn mapped_rows_for_test() {
 
     // Real pending cells are valid reserved-but-unpublished production state;
     // no synthetic value type substitutes for their allocation layout.
-    let registry = PendingRegistry::new_arc(&owner).unwrap();
+    let registry = PendingRegistry::new_arc(&crate::memory_accounting::AccountantHandle::from_host(owner.clone())).unwrap();
     let control_baseline = owner.usage().used;
     let mut old_pointer = 0;
     let mut old_delta = 0;
@@ -524,7 +534,7 @@ pub(super) fn mapped_rows_for_test() {
     println!("CDB127_D2_ROW pending_empty_released backing_free_before_refund_when_empty=true last_alias=true final_original_funder_zero=true");
 }
 
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 fn received_growth_for_test() {
     use crate::memory_accounting::WriterBudget;
     use crate::persistence::content_identity::proof_allocation_oracle_tests as oracle;
@@ -534,7 +544,7 @@ fn received_growth_for_test() {
     let counter = owner.writer_registration_observation_for_test().4;
     // Real received cells are valid reserved-but-unpublished production state;
     // no synthetic value type substitutes for their allocation layout.
-    let registry = ReceivedRegistry::new_arc(&owner).unwrap();
+    let registry = ReceivedRegistry::new_arc(&crate::memory_accounting::AccountantHandle::from_host(owner.clone())).unwrap();
     let control_baseline = owner.usage().used;
     let mut old_pointer = 0;
     let mut old_delta = 0;
@@ -581,13 +591,13 @@ fn received_growth_for_test() {
     println!("CDB127_D2_ROW received_empty_released backing_free_before_refund_when_empty=true last_alias=true final_original_funder_zero=true");
 }
 
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 fn original_provenance_and_attribution_for_test() {
     use crate::memory_accounting::WriterBudget;
     macro_rules! provenance {
         ($registry:ty, $attribution:expr, $name:literal, $growth:literal, $grow:expr) => {{
             let owner = Arc::new(MemoryAccountant::no_limit());
-            let registry = <$registry>::new_arc(&owner).unwrap();
+            let registry = <$registry>::new_arc(&crate::memory_accounting::AccountantHandle::from_host(owner.clone())).unwrap();
             let reader_floor = owner.usage().used;
             assert!(!registry.lock().0.accountant.is_writer());
             let writer = WriterBudget::from_accountant(owner.clone()).unwrap();
@@ -610,7 +620,7 @@ fn original_provenance_and_attribution_for_test() {
             assert_eq!(owner.usage().used, 0);
             assert_eq!(owner.underflow_count_for_test(), 0);
             owner.set_budget(Some(1)).unwrap();
-            let error = match <$registry>::new_arc(&owner) { Ok(_) => panic!("constructor must refuse before allocation"), Err(error) => error };
+            let error = match <$registry>::new_arc(&crate::memory_accounting::AccountantHandle::from_host(owner.clone())) { Ok(_) => panic!("constructor must refuse before allocation"), Err(error) => error };
             match error {
                 Error::MemoryBudgetExceeded { subsystem, operation, hint, .. } => {
                     assert_eq!(subsystem, $attribution.subsystem);
@@ -632,10 +642,11 @@ fn original_provenance_and_attribution_for_test() {
     provenance!(LocalRegistry, LOCAL_ATTRIBUTION, "local", false, |_: &Arc<Mutex<LocalRegistry>>| {});
 }
 
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 pub(super) fn pending_interleavings_for_test() {
     use crate::persistence::content_identity::proof_allocation_oracle_tests as oracle;
     let owner = Arc::new(MemoryAccountant::no_limit());
+    let process_baseline = crate::memory_accounting::process_aggregate_snapshot().0;
     let database = Database::open_memory_with_plugin_and_accountant(Arc::new(CorePlugin), owner.clone()).unwrap();
     let registry = database.pending_local_schema_stages.clone();
     let key = TxId(91);
@@ -660,15 +671,30 @@ pub(super) fn pending_interleavings_for_test() {
     assert!(registry.lock().contains_key(&key));
     drop(other_keys);
     drop(registry.lock().remove(&key));
-    let empty_capacious = owner.usage().used;
+    let registration_bytes = owner.writer_fixed_ownership().0;
+    let final_layout = crate::memory_accounting::writer_adapter_type_layout::<Mutex<PendingRegistry>>();
+    let previous_layout = crate::memory_accounting::writer_adapter_type_layout::<Mutex<HashMap<TxId, Pre2PendingLocalSchemaStage>>>();
+    let correction_bytes = final_layout.size().checked_sub(previous_layout.size()).unwrap();
+    assert_eq!(registry.lock().0.map.capacity(), 0);
+    assert_eq!(owner.writer_fixed_ownership(), (registration_bytes, 0, 0));
+    let counter = owner.writer_registration_observation_for_test().4;
+    // The sole retained registry is an ordinary std Arc. Its pointer is the
+    // payload address minus the pinned std Arc header, as in the custody rows.
+    let pointer = Arc::as_ptr(&registry) as usize - (final_layout.size() - std::mem::size_of::<Mutex<PendingRegistry>>());
     let retained = registry.clone();
     drop(registry);
     drop(database);
     assert!(owner.usage().used > 0, "registry aliases retain funded physical backing after Database drop");
-    assert!(owner.usage().used < empty_capacious);
+    assert_eq!(owner.usage().used, registration_bytes);
+    assert_eq!(crate::memory_accounting::process_aggregate_snapshot().0,
+        process_baseline + registration_bytes + correction_bytes);
     assert_ne!(owner.writer_registration_observation_for_test().2, 0);
+    oracle::watch_registry_free_for_test(pointer, counter);
     drop(retained);
+    // Only the enclosing std Arc correction uses the recorded immediate-before-free exception.
+    assert_eq!(oracle::registry_free_observation_for_test(true), (0, 0, true));
     assert_eq!(owner.usage().used, 0);
+    assert_eq!(crate::memory_accounting::process_aggregate_snapshot().0, process_baseline);
     assert_eq!(owner.writer_registration_observation_for_test().2, 0);
     assert_eq!(owner.underflow_count_for_test(), 0);
     println!("CDB127_D2_ROW pending_interleavings other_key_growth=true same_key_overlap=true remove_clear_preserves_occupancy=true actual_restore_request_count=0 surviving_database_alias=true final_funder_zero=true");
@@ -677,7 +703,7 @@ pub(super) fn pending_interleavings_for_test() {
 // These rows are reached only from the frozen aggregate's existing mapper.
 // Payload preparation is outside the allocator window: each measured insert
 // therefore identifies its sole backing allocation independently of layout.
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 fn local_stage_for_test(database: &Database) -> LocalSchemaStage {
     let tx = database.begin().unwrap();
     database.execute_in_tx(tx,
@@ -694,7 +720,7 @@ fn local_stage_for_test(database: &Database) -> LocalSchemaStage {
     stage
 }
 
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 fn local_growth_for_test() {
     use crate::memory_accounting::WriterBudget;
     use crate::persistence::content_identity::proof_allocation_oracle_tests as oracle;
@@ -707,7 +733,7 @@ fn local_growth_for_test() {
     let writer = WriterBudget::from_accountant(owner.clone()).unwrap();
     let baseline = owner.usage().used;
     let counter = owner.writer_registration_observation_for_test().4;
-    let registry = LocalRegistry::new_arc(&owner).unwrap();
+    let registry = LocalRegistry::new_arc(&crate::memory_accounting::AccountantHandle::from_host(owner.clone())).unwrap();
     let control_baseline = owner.usage().used;
     let mut old_pointer = 0;
     let mut old_delta = 0;
@@ -777,7 +803,7 @@ fn local_growth_for_test() {
 // pinned hashbrown h1 masks the low bits with B-1; this creates a collision
 // history under ANY RandomState seed rather than hoping random removals leave
 // tombstones. No bucket/control/header bytes or allocator metadata are edited.
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 fn clustered_numeric_keys_for_test<K: Eq + Hash + Copy, V, P>(
     backing: &Backing<K, V, P>, make_key: impl Fn(u64) -> K,
 ) -> [u64; 56] {
@@ -795,7 +821,7 @@ fn clustered_numeric_keys_for_test<K: Eq + Hash + Copy, V, P>(
     keys
 }
 
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 #[allow(clippy::int_plus_one)] // Preserve the arithmetic threshold used by the registry test.
 fn occupied_tombstone_rehash_for_test<K, V, P>(
     registry: Arc<Mutex<OccupiedRegistry<K, V, P>>>, owner: &crate::memory_accounting::AccountantHandle,
@@ -875,7 +901,7 @@ fn occupied_tombstone_rehash_for_test<K, V, P>(
         family);
 }
 
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 #[allow(clippy::int_plus_one)] // Preserve the arithmetic threshold used by the registry test.
 fn tombstone_rehash_rows_for_test() {
     use crate::memory_accounting::WriterBudget;
@@ -883,15 +909,15 @@ fn tombstone_rehash_rows_for_test() {
     let owner = Arc::new(MemoryAccountant::no_limit());
     let writer = WriterBudget::from_accountant(owner.clone()).unwrap();
     let baseline = owner.usage().used;
-    occupied_tombstone_rehash_for_test(PendingRegistry::new_arc(&owner).unwrap(), &owner, TxId, "pending");
+    occupied_tombstone_rehash_for_test(PendingRegistry::new_arc(&crate::memory_accounting::AccountantHandle::from_host(owner.clone())).unwrap(), &crate::memory_accounting::AccountantHandle::from_host(owner.clone()), TxId, "pending");
     assert_eq!(owner.usage().used, baseline);
-    occupied_tombstone_rehash_for_test(ReceivedRegistry::new_arc(&owner).unwrap(), &owner, Lsn, "received");
+    occupied_tombstone_rehash_for_test(ReceivedRegistry::new_arc(&crate::memory_accounting::AccountantHandle::from_host(owner.clone())).unwrap(), &crate::memory_accounting::AccountantHandle::from_host(owner.clone()), Lsn, "received");
     assert_eq!(owner.usage().used, baseline);
 
     let payload_owner = Arc::new(MemoryAccountant::no_limit());
     let database = Database::open_memory_with_plugin_and_accountant(
         Arc::new(CorePlugin), payload_owner.clone()).unwrap();
-    let registry = LocalRegistry::new_arc(&owner).unwrap();
+    let registry = LocalRegistry::new_arc(&crate::memory_accounting::AccountantHandle::from_host(owner.clone())).unwrap();
     let keys = clustered_numeric_keys_for_test(&registry.lock().0, Lsn);
     let control_baseline = owner.usage().used;
     let counter = owner.writer_registration_observation_for_test().4;
@@ -954,9 +980,9 @@ fn tombstone_rehash_rows_for_test() {
     println!("CDB127_D2_ROW tombstone_rehash family=local real_local_prepare_door=true numeric_hasher_cluster=true tracked_buckets=64 physical_len=27 growth_left=0 next_len=28 full_capacity=56 actual_request_count=0 reclaimed_tombstones=true retained_credit_while_populated=true free_before_refund_when_empty=true");
 }
 
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 fn constructor_custody_rows_for_test() {
-    use crate::memory_accounting::WriterBudget;
+    use crate::memory_accounting::{WriterBudget, process_aggregate_snapshot};
     use crate::persistence::content_identity::proof_allocation_oracle_tests as oracle;
     macro_rules! custody {
         ($registry:ty, $name:literal) => {{
@@ -966,12 +992,17 @@ fn constructor_custody_rows_for_test() {
             let epoch = owner.writer_registration_observation_for_test().2;
             let counter = owner.writer_registration_observation_for_test().4;
             let baseline = owner.usage().used;
+            let process_baseline = process_aggregate_snapshot().0;
+            let writer_counter = owner.writer_fixed_ownership().2;
             oracle::last_request_for_test(true);
-            let (registry, _, _) = oracle::measured(|| <$registry>::new_arc(&owner).unwrap());
+            let (registry, _, _) = oracle::measured(|| <$registry>::new_arc(&crate::memory_accounting::AccountantHandle::from_host(owner.clone())).unwrap());
             let layout = crate::memory_accounting::writer_adapter_type_layout::<Mutex<$registry>>();
             assert_eq!(oracle::last_request_for_test(true), (layout.size(), layout.align(), 1));
-            assert_eq!(owner.usage().used, baseline + 104,
-                "each initialized x86_64 registry constructor admits its pinned positive 104-byte Arc correction");
+            assert_eq!(owner.usage().used, baseline,
+                "the registry correction remains process-funded rather than writer-funded");
+            assert_eq!(owner.writer_fixed_ownership().2, writer_counter);
+            assert_eq!(process_aggregate_snapshot().0, process_baseline + 104,
+                "each initialized registry contributes its actual 104-byte process correction");
             let pointer = oracle::last_request_pointer_for_test();
             let retained = registry.clone();
             assert_eq!(owner.writer_registration_observation_for_test().3, root_uses + 1);
@@ -980,12 +1011,15 @@ fn constructor_custody_rows_for_test() {
             assert_eq!(owner.writer_registration_observation_for_test().2, epoch,
                 "the original registry handle, independently of refund arithmetic, pins the writer epoch");
             assert_eq!(owner.writer_registration_observation_for_test().3, 1);
+            let process_with_last_registry_owner = process_aggregate_snapshot().0;
             oracle::watch_registry_free_for_test(pointer, counter);
             drop(retained);
             // Only this enclosing ordinary Arc correction has the authorized
             // immediate-before-std-free refund exception. Backing watches in
             // growth/empty rows demand retained credit through System.dealloc.
             assert_eq!(oracle::registry_free_observation_for_test(true), (0, 0, true));
+            assert_eq!(process_aggregate_snapshot().0, process_with_last_registry_owner - 104 - baseline,
+                "the final registry releases its 104-byte process correction and the original writer registration liability exactly");
             assert_eq!(owner.writer_registration_observation_for_test().2, 0);
             assert_eq!(owner.writer_registration_observation_for_test().3, 0);
             assert_eq!(owner.usage().used, 0);
@@ -998,12 +1032,12 @@ fn constructor_custody_rows_for_test() {
     custody!(LocalRegistry, "local");
 }
 
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 fn local_reader_growth_provenance_for_test() {
     use crate::memory_accounting::WriterBudget;
     let database = Database::open_memory();
     let owner = Arc::new(MemoryAccountant::no_limit());
-    let registry = LocalRegistry::new_arc(&owner).unwrap();
+    let registry = LocalRegistry::new_arc(&crate::memory_accounting::AccountantHandle::from_host(owner.clone())).unwrap();
     assert!(!registry.lock().0.accountant.is_writer());
     let writer = WriterBudget::from_accountant(owner.clone()).unwrap();
     let epoch = owner.writer_registration_observation_for_test().2;
@@ -1028,7 +1062,7 @@ fn local_reader_growth_provenance_for_test() {
     println!("CDB127_D2_ROW local_reader_populated_growth original_untagged_constructor=true real_local_prepare_door=true later_writer_uses_not_acquired=true reopened_epoch_not_debited=true original_funder_zero=true");
 }
 
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 fn received_stage_for_test(database: &Database) -> ReceivedSchemaStage {
     let statement = contextdb_parser::parse(
         "CREATE TABLE cdb127_received_proof (id INTEGER PRIMARY KEY)").unwrap();
@@ -1050,7 +1084,7 @@ fn received_stage_for_test(database: &Database) -> ReceivedSchemaStage {
         &mut copy_owner, read_memory).unwrap()
 }
 
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 #[allow(clippy::bool_assert_comparison)] // Preserve the existing boolean assertion contract.
 fn received_retired_construction_stage_witness_for_test() {
     use crate::memory_accounting::{ContainedMemoryReservation, OwnedMemoryReservation};
@@ -1070,7 +1104,7 @@ fn received_retired_construction_stage_witness_for_test() {
     for entry in 0..6usize {
         let bytes = 19 + entry;
         let reservation = OwnedMemoryReservation::try_new_for(
-            owner.clone(), bytes, "sync", "cdb127_stage_witness",
+            owner.clone().into(), bytes, "sync", "cdb127_stage_witness",
             "Raise MEMORY_LIMIT to retain this received-stage witness route.",
         ).unwrap();
         route_charge += bytes;
@@ -1119,12 +1153,12 @@ fn received_retired_construction_stage_witness_for_test() {
     println!("CDB127_D2_ROW received_retired_construction_stage_witness real_received_stage=true real_projection=true tuple88=true entries=6 drained_projection_retained=true actual_vec_system_free=true backing_charge_held=true physical_free_and_refund=true final_original_funder_zero=true");
 }
 
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 fn received_interleavings_for_test() {
     use crate::persistence::content_identity::proof_allocation_oracle_tests as oracle;
     let owner = Arc::new(MemoryAccountant::no_limit());
     let database = Database::open_memory_with_plugin_and_accountant(Arc::new(CorePlugin), owner.clone()).unwrap();
-    let registry = ReceivedRegistry::new_arc(&owner).unwrap();
+    let registry = ReceivedRegistry::new_arc(&crate::memory_accounting::AccountantHandle::from_host(owner.clone())).unwrap();
     let key = Lsn(101);
     ReceivedToken::reserve(&registry, key).unwrap().publish(received_stage_for_test(&database));
     let (a, first) = ReceivedToken::detach_existing(&registry, key).unwrap().unwrap();
@@ -1159,7 +1193,7 @@ fn received_interleavings_for_test() {
     println!("CDB127_D2_ROW received_interleavings real_received_prepare_door=true other_key_growth=true same_key_overlap=true remove_clear_preserves_occupancy=true actual_restore_request_count=0 surviving_database_alias=true final_original_funder_zero=true");
 }
 
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 fn received_prepublication_refusal_and_cleanup_for_test() {
     let owner = Arc::new(MemoryAccountant::no_limit());
     let database = Database::open_memory_with_plugin_and_accountant(Arc::new(CorePlugin), owner.clone()).unwrap();
@@ -1208,7 +1242,7 @@ fn received_prepublication_refusal_and_cleanup_for_test() {
     println!("CDB127_D2_ROW received_prepublication_refusal actual_received_register_door=true initial_admission_before_effects=true original_family_refusal=true no_stage_or_arriving_publication=true normal_registration_cleanup=true empty_backing_released=true final_original_funder_zero=true");
 }
 
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 fn occupied_populated_growth_for_test<K, V, P>(
     registry: Arc<Mutex<OccupiedRegistry<K, V, P>>>, owner: &Arc<MemoryAccountant>,
     make_key: impl Fn(u64) -> K, make_stage: impl Fn() -> V, family: &'static str,
@@ -1263,7 +1297,7 @@ fn occupied_populated_growth_for_test<K, V, P>(
     println!("CDB127_D2_ROW occupied_populated_empty family={} real_payload_clear=true empty_registry_frees_then_refunds=true last_alias=true post_system_free_before_refund=true", family);
 }
 
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 fn occupied_populated_rows_for_test() {
     use crate::memory_accounting::WriterBudget;
     let payload_owner = Arc::new(MemoryAccountant::no_limit());
@@ -1272,10 +1306,10 @@ fn occupied_populated_rows_for_test() {
     let owner = Arc::new(MemoryAccountant::no_limit());
     let writer = WriterBudget::from_accountant(owner.clone()).unwrap();
     let baseline = owner.usage().used;
-    occupied_populated_growth_for_test(PendingRegistry::new_arc(&owner).unwrap(), &owner,
+    occupied_populated_growth_for_test(PendingRegistry::new_arc(&crate::memory_accounting::AccountantHandle::from_host(owner.clone())).unwrap(), &owner,
         TxId, || database.new_pending_local_schema_stage().unwrap(), "pending");
     assert_eq!(owner.usage().used, baseline);
-    occupied_populated_growth_for_test(ReceivedRegistry::new_arc(&owner).unwrap(), &owner,
+    occupied_populated_growth_for_test(ReceivedRegistry::new_arc(&crate::memory_accounting::AccountantHandle::from_host(owner.clone())).unwrap(), &owner,
         Lsn, || received_stage_for_test(&database), "received");
     assert_eq!(owner.usage().used, baseline);
     drop(writer);
@@ -1286,7 +1320,7 @@ fn occupied_populated_rows_for_test() {
     assert_eq!(payload_owner.underflow_count_for_test(), 0);
 }
 
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 fn assert_pre2_family_refusal_for_test(error: Error, family: &'static str) {
     // Literal PRE2 vocabulary is independent of the production attribution
     // constants, so mutating a production label does not mutate the oracle.
@@ -1309,7 +1343,7 @@ fn assert_pre2_family_refusal_for_test(error: Error, family: &'static str) {
     }
 }
 
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 fn family_refusal_literals_for_test() {
     use crate::memory_accounting::WriterBudget;
     let database = Database::open_memory();
@@ -1317,18 +1351,18 @@ fn family_refusal_literals_for_test() {
         ($registry:ty, $name:literal, $grow:expr) => {{
             let owner = Arc::new(MemoryAccountant::no_limit());
             let empty_baseline = owner.usage().used;
-            let occupied_constructor = <$registry>::new_arc(&owner).unwrap();
+            let occupied_constructor = <$registry>::new_arc(&crate::memory_accounting::AccountantHandle::from_host(owner.clone())).unwrap();
             let occupied_baseline = owner.usage().used;
             let correction = occupied_baseline - empty_baseline;
             owner.set_budget(Some(occupied_baseline + correction - 1)).unwrap();
-            let error = match <$registry>::new_arc(&owner) {
+            let error = match <$registry>::new_arc(&crate::memory_accounting::AccountantHandle::from_host(owner.clone())) {
                 Ok(_) => panic!("positive constructor correction must refuse"), Err(error) => error,
             };
             drop(occupied_constructor);
             assert_pre2_family_refusal_for_test(error, $name);
             assert_eq!(owner.usage().used, 0);
             owner.set_budget(None).unwrap();
-            let registry = <$registry>::new_arc(&owner).unwrap();
+            let registry = <$registry>::new_arc(&crate::memory_accounting::AccountantHandle::from_host(owner.clone())).unwrap();
             assert!(!registry.lock().0.accountant.is_writer());
             let writer = WriterBudget::from_accountant(owner.clone()).unwrap();
             let receipt = owner.writer_fixed_ownership().2;
@@ -1376,7 +1410,7 @@ struct Pre2Database {
     vector_store: Arc<VectorStore>,
     vector_schema_gates: Arc<VectorSchemaGates>,
     change_log: Arc<RwLock<Vec<ChangeLogEntry>>>,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     forced_change_log_gap_through: Arc<AtomicU64>,
     /// Per-table shadow of `change_log`'s own `RowInsert`/`RowDelete`
     /// entries, and a global LSN reference count over every entry kind --
@@ -1530,9 +1564,9 @@ struct Pre2Database {
     /// start. The database itself opened; the caller is told the operating
     /// system's own reason rather than discovering an empty result later.
     owner_read_startup_failure: Option<String>,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     route_observer: Option<Arc<dyn crate::read_session::ReadSessionTestObserver>>,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     kernel_observer: Option<Arc<dyn crate::read_session::ReadKernelTestObserver>>,
     /// Production-dead: counts how many times
     /// `retire_snapshot_free_vector_partitions` actually began its guarded
@@ -1540,7 +1574,7 @@ struct Pre2Database {
     /// found nothing retirable. Shared across every scoped handle of the
     /// same database so a test can observe it regardless of which handle
     /// drove maintenance.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     snapshot_free_retirement_pass_count: Arc<AtomicUsize>,
     access: AccessConstraints,
     accountant: crate::memory_accounting::AccountantHandle,
@@ -1682,7 +1716,7 @@ struct Pre2Database {
     /// The first cleanup or handoff failure survives an owner-read drain
     /// timeout so the retry that releases resources still reports its cause.
     close_error: Mutex<Option<Error>>,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     close_follower_observer: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     resource_closed: Arc<AtomicBool>,
     /// Set when a commit reached durable storage and its in-memory
@@ -1718,7 +1752,7 @@ struct Pre2Database {
     commit_staged_vs_staged_comparisons: AtomicU64,
     commit_scan_rows_touched: AtomicU64,
     commit_index_maintenance_visits: AtomicU64,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     commit_stage_wall_nanos: [AtomicU64; 7],
     corrupt_joined_values: RwLock<HashSet<(String, RowId, String)>>,
     resource_owner: bool,
@@ -1732,12 +1766,13 @@ struct Pre2Database {
     read_image_memory: Option<Arc<crate::read_image_memory::ImageMemory>>,
 }
 
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 pub(super) fn pending_drop_unwind_for_test() {
     use crate::persistence::content_identity::proof_allocation_oracle_tests as oracle;
     let owner = Arc::new(MemoryAccountant::no_limit());
+    let process_baseline = crate::memory_accounting::process_aggregate_snapshot().0;
     let database = Database::open_memory_with_plugin_and_accountant(Arc::new(CorePlugin), owner.clone()).unwrap();
-    let registry = PendingRegistry::new_arc(&owner).unwrap();
+    let registry = PendingRegistry::new_arc(&crate::memory_accounting::AccountantHandle::from_host(owner.clone())).unwrap();
     let first = database.new_pending_local_schema_stage().unwrap();
     oracle::last_request_for_test(true);
     let (token, _, _) = oracle::measured(|| PendingToken::reserve(&registry, TxId(1)).unwrap());
@@ -1753,8 +1788,12 @@ pub(super) fn pending_drop_unwind_for_test() {
         - bucket_layout::<(TxId, Pre2PendingLocalSchemaStage)>(buckets).unwrap().size();
     let control_delta = crate::memory_accounting::writer_adapter_type_layout::<Mutex<PendingRegistry>>().size()
         - crate::memory_accounting::writer_adapter_type_layout::<Mutex<HashMap<TxId, Pre2PendingLocalSchemaStage>>>().size();
-    let counter = owner.writer_registration_observation_for_test().4;
+    let registration_bytes = owner.writer_fixed_ownership().0;
+    let original_registration = owner.writer_registration_observation_for_test();
+    let counter = original_registration.4;
+    assert_ne!(original_registration.2, 0);
     drop(database);
+    assert_eq!(owner.writer_registration_observation_for_test().2, original_registration.2);
     oracle::watch_registry_free_for_test(backing_pointer, counter);
     R1_DATABASE_DROP_PANIC_FOR_TEST.with(|slot| slot.set(true));
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(registry)));
@@ -1762,8 +1801,14 @@ pub(super) fn pending_drop_unwind_for_test() {
     let (before_free, after_free, physically_freed) = oracle::registry_free_observation_for_test(true);
     assert!(physically_freed, "single-unwind cleanup reaches actual map backing System.dealloc return");
     assert_eq!(before_free, after_free);
-    assert!(before_free >= map_delta + control_delta, "all scoped registry bytes stay funded through physical backing free");
+    assert_eq!(before_free, registration_bytes + map_delta,
+        "the original writer retains its registration and map charge through physical free");
+    assert_eq!(oracle::registry_process_free_observation_for_test(),
+        (process_baseline + registration_bytes + map_delta + control_delta,
+         process_baseline + registration_bytes + map_delta + control_delta),
+        "the aggregate also retains the independently process-funded fixed correction through map free");
     assert_eq!(owner.usage().used, 0, "advancing registry cleanup frees backing and refunds only after the remaining real payloads");
+    assert_eq!(crate::memory_accounting::process_aggregate_snapshot().0, process_baseline);
     assert_eq!(owner.writer_registration_observation_for_test().2, 0);
     assert_eq!(owner.underflow_count_for_test(), 0);
     println!("CDB127_D2_ROW pending_single_unwind actual_working_database_payload=true remaining_entries_cleaned=true actual_backing_free=true map_credit_retained_through_free=true final_original_funder_zero=true");
@@ -1792,19 +1837,19 @@ mod named_open_residue_tests {
         assert_eq!(process_aggregate_snapshot().0, aggregate + 64);
         assert_eq!(owner.usage().used, local);
         assert!(matches!(assembly_budget.try_allocate_for(local + 2, "writer", "payload", "test"), Err(Error::MemoryBudgetExceeded { .. })));
-        assert!(matches!(owner.read_budget(), Err(Error::MemoryBudgetExceeded { .. })),
+        assert!(matches!(crate::memory_accounting::AccountantHandle::from_host(owner.clone()).read_budget(), Err(Error::MemoryBudgetExceeded { .. })),
             "ordinary working-memory adapter controls retain writer admission");
         drop(assembly_budget);
         drop(assembly_writer);
         assert_eq!(process_aggregate_snapshot().0, aggregate);
-        let registry = ReceivedRegistry::new_arc(&owner).unwrap();
+        let registry = ReceivedRegistry::new_arc(&crate::memory_accounting::AccountantHandle::from_host(owner.clone())).unwrap();
         assert_eq!(process_aggregate_snapshot().0, aggregate + 104);
         assert_eq!(owner.usage().used, local);
-        let pending = PendingRegistry::new_arc(&owner).unwrap();
-        let local_registry = LocalRegistry::new_arc(&owner).unwrap();
+        let pending = PendingRegistry::new_arc(&crate::memory_accounting::AccountantHandle::from_host(owner.clone())).unwrap();
+        let local_registry = LocalRegistry::new_arc(&crate::memory_accounting::AccountantHandle::from_host(owner.clone())).unwrap();
         assert_eq!(process_aggregate_snapshot().0, aggregate + 3 * 104);
         assert_eq!(owner.usage().used, local);
-        let image = ImageMemory::operation_writer(owner.clone()).unwrap();
+        let image = ImageMemory::operation_writer(owner.clone().into()).unwrap();
         assert_eq!(std::mem::size_of::<ImageMemory>() + 2 * std::mem::size_of::<usize>(), 232);
         assert_eq!(process_aggregate_snapshot().0, aggregate + 3 * 104 + 232);
         assert_eq!(owner.usage().used, local);
@@ -1820,14 +1865,14 @@ mod named_open_residue_tests {
         assert_eq!(process_aggregate_snapshot().0, aggregate + 104);
         set_process_ceiling_for_test(Some(aggregate + 104 + 231));
         let _reset = CeilingReset;
-        assert!(matches!(ImageMemory::operation_writer(owner.clone()),
+        assert!(matches!(ImageMemory::operation_writer(owner.clone().into()),
             Err(Error::MemoryBudgetExceeded { subsystem, operation, requested_bytes: 232, .. })
             if subsystem == "process_native_ceiling" && operation == "writer_decode_open_residue"));
         assert_eq!(process_aggregate_snapshot().0, aggregate + 104);
         drop(alias);
         assert_eq!(process_aggregate_snapshot().0, aggregate);
         set_process_ceiling_for_test(Some(aggregate + 103));
-        assert!(matches!(ReceivedRegistry::new_arc(&owner),
+        assert!(matches!(ReceivedRegistry::new_arc(&crate::memory_accounting::AccountantHandle::from_host(owner.clone())),
             Err(Error::MemoryBudgetExceeded { subsystem, operation, requested_bytes: 104, .. })
             if subsystem == "process_native_ceiling" && operation == "received_registry_open_residue"));
         assert_eq!(process_aggregate_snapshot().0, aggregate);

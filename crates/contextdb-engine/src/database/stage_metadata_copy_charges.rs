@@ -2,9 +2,9 @@
 //! Only CDB-127's element-layout delta is admitted; pre2 backing remains outside
 //! this correction, and individual payload/sole prepaid Box owners are unchanged.
 use super::{Error, Result, StagedCopyCharge};
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 use super::MemoryAccountant;
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 use std::sync::Arc;
 use crate::memory_accounting::{ControlCredit, PendingControlRefund, WriterUse};
 use std::alloc::Layout;
@@ -164,7 +164,7 @@ impl Drop for MetadataCopyCharges {
     }
 }
 
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 pub(super) fn initialized_rows_for_test() {
     use crate::persistence::content_identity::proof_allocation_oracle_tests::{measured,
         last_request_for_test, watch_registry_free_for_test, registry_free_observation_for_test};
@@ -175,8 +175,8 @@ pub(super) fn initialized_rows_for_test() {
     let final_element = Layout::new::<StagedCopyCharge>();
     let pre2_element = Layout::new::<Pre2StagedCopyCharge>();
     let delta = final_element.size().checked_sub(pre2_element.size()).unwrap();
-    let charge = || StagedCopyCharge::admit(&accountant, accountant.clone(), 0, "metadata_initialized_proof").unwrap();
-    let mut charges = MetadataCopyCharges::new(&accountant);
+    let charge = || StagedCopyCharge::admit(&crate::memory_accounting::AccountantHandle::from_host(accountant.clone()), accountant.clone(), 0, "metadata_initialized_proof").unwrap();
+    let mut charges = MetadataCopyCharges::new(&crate::memory_accounting::AccountantHandle::from_host(accountant.clone()));
     assert_eq!(charges.charges.capacity(), 0);
     assert_eq!(accountant.usage().used, baseline);
     let ((), _, _) = measured(|| charges.push(charge()).unwrap());
@@ -198,7 +198,7 @@ pub(super) fn initialized_rows_for_test() {
     drop(charges);
     assert_eq!(registry_free_observation_for_test(true), (baseline + delta * 8, baseline + delta * 8, true), "final backing physically frees before its scoped refund");
     assert_eq!(accountant.usage().used, baseline);
-    let (exact, _, _) = measured(|| MetadataCopyCharges::from_array(&accountant, [charge(), charge(), charge()]).unwrap());
+    let (exact, _, _) = measured(|| MetadataCopyCharges::from_array(&crate::memory_accounting::AccountantHandle::from_host(accountant.clone()), [charge(), charge(), charge()]).unwrap());
     assert_eq!(exact.charges.capacity(), 3);
     let exact_request = last_request_for_test(false);
     assert_eq!((exact_request.0, exact_request.1), (final_element.size() * 3, final_element.align()));

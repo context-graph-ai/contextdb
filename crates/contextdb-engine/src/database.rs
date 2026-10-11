@@ -15,11 +15,11 @@ use maintenance_frontier::MaintenanceFrontier;
 pub(crate) mod graph_read_memory;
 #[cfg(test)]
 mod published_vector_install_tests;
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub mod resident_history_test_seams;
 pub(crate) mod vector_captured_serving;
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 mod vector_suffix_inspection_tests;
 #[cfg(test)]
 mod vector_frontier_metadata_admission_tests;
@@ -35,14 +35,14 @@ mod vector_public_cycle_admission_tests;
 mod vector_published_retry_source_admission_tests;
 #[cfg(test)]
 mod vector_quarantine_inventory_admission_tests;
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 mod vector_retry_frontier_integrity_tests;
 mod vector_source_page_admission;
 mod vector_writer_session;
 mod vector_import_tail;
 #[doc(hidden)]
 pub use vector_writer_session::WriterVectorSession;
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) mod writer_ownership_receipt;
 pub(crate) mod writer_read;
 #[cfg(test)]
@@ -62,7 +62,7 @@ use crate::composite_store::{
     publish_prepared_change_log_entries, record_change_log_entries,
 };
 pub use crate::custody_types::{DeliveryManifest, DeliveryOutcome};
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 use crate::executor::bounded_read_test_support::{ExecutionProbe, TestSourceTouch, TestWorkSource};
 use crate::executor::{
     analyze_passive_relational_route, apply_on_conflict_updates, execute_plan,
@@ -88,7 +88,7 @@ use crate::read_session::{
     DatabaseOpenOptions, OpenDisposition, OwnerReadConfig, ReadSession,
     owner_read_not_implemented_status,
 };
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 use crate::read_session::{
     ReadKernelSource, ReadKernelTestObserver, ReadRouteResourceSnapshot, ReadSessionEvent,
     ReadSessionTestObserver,
@@ -164,7 +164,7 @@ static VECTOR_DURABLE_COMPACTION_FAILURE_ARMED: AtomicBool = AtomicBool::new(fal
 #[cfg(any(test, feature = "test-seams"))]
 static VECTOR_DURABLE_COMPACTION_FAILURE_CONSUMED: AtomicBool = AtomicBool::new(false);
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 fn crash_at_purge_publication_boundary_for_test(boundary: &str) {
     if std::env::var("CONTEXTDB_PURGE_PUBLICATION_CRASH_AT").as_deref() == Ok(boundary) {
         // This process must disappear without destructors: dropping the
@@ -195,7 +195,7 @@ fn take_vector_memory_fault(armed: &AtomicBool, consumed: &AtomicBool) -> bool {
 /// when the build carries the observation seam at all.
 macro_rules! observe_open_event {
     ($observer:expr, $event:ident) => {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if let Some(observer) = &$observer {
             observer.observe_event(ReadSessionEvent::$event);
         }
@@ -254,7 +254,7 @@ use contextdb_vector::{VectorMaintenanceProgressPauseHandle, VectorPassiveActivi
 
 // Raw sync application and its progress writers are only public to this
 // crate's test harness. Downstream/default builds retain no capability door.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 macro_rules! sync_test_seam {
     ($(#[$attr:meta])* fn $($item:tt)*) => {
         $(#[$attr])*
@@ -280,7 +280,7 @@ mod durable_read_snapshot_admission_tests;
 #[cfg(test)]
 mod policy_bounded_load_tests;
 
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 mod policy_hold_scoped_load_tests;
 
 #[cfg(test)]
@@ -2922,7 +2922,7 @@ mod received_schema_stage_tests {
             lsn: Lsn(13),
         };
         db.vector_store
-            .insert_loaded_vector(old_vector.clone(), db.accountant.clone())
+            .insert_loaded_vector(old_vector.clone(), db.accountant.vector_budget().unwrap())
             .expect("read or publish the admitted vector fixture");
         let old_edge = AdjEntry {
             source: uuid::Uuid::from_u128(10),
@@ -3090,7 +3090,7 @@ mod received_schema_stage_tests {
                     deleted_tx: None,
                     lsn: Lsn(1),
                 },
-                db.accountant.clone(),
+                db.accountant.vector_budget().unwrap(),
             )
             .expect("read or publish the admitted vector fixture");
         let ddl = vec![
@@ -3244,16 +3244,16 @@ mod received_schema_stage_tests {
         let over_budget = Arc::new(MemoryAccountant::with_budget(4));
         over_budget.try_allocate(4).unwrap();
         let before = over_budget.usage().used;
-        assert!(PreparedMemorySwap::prepare(over_budget.clone(), 0, 1, 0).is_err());
+        assert!(PreparedMemorySwap::prepare(over_budget.clone().into(), 0, 1, 0).is_err());
         assert_eq!(over_budget.usage().used, before);
 
         let accountant = Arc::new(MemoryAccountant::with_budget(64));
-        let abandoned = PreparedMemorySwap::prepare(accountant.clone(), 0, 8, 0).unwrap();
+        let abandoned = PreparedMemorySwap::prepare(accountant.clone().into(), 0, 8, 0).unwrap();
         assert_eq!(accountant.usage().used, 8);
         drop(abandoned);
         assert_eq!(accountant.usage().used, 0);
 
-        let mut published = PreparedMemorySwap::prepare(accountant.clone(), 0, 8, 0).unwrap();
+        let mut published = PreparedMemorySwap::prepare(accountant.clone().into(), 0, 8, 0).unwrap();
         published.commit_after_swap();
         assert_eq!(accountant.usage().used, 8);
     }
@@ -3509,7 +3509,7 @@ mod received_schema_stage_tests {
                 vector_index.clone(),
                 2,
                 contextdb_core::VectorQuantization::F32,
-                db.accountant.clone(),
+                db.accountant.vector_budget().unwrap(),
             )
             .expect("read or publish the admitted vector fixture");
         db.vector_store
@@ -3522,7 +3522,7 @@ mod received_schema_stage_tests {
                     deleted_tx: None,
                     lsn: Lsn(1),
                 },
-                db.accountant.clone(),
+                db.accountant.vector_budget().unwrap(),
             )
             .expect("read or publish the admitted vector fixture");
 
@@ -5320,7 +5320,7 @@ mod received_schema_stage_tests {
     /// Put `peer` on its persisted-state fallback the way a peer whose logs
     /// no longer cover the requested cursor is: its change and schema logs
     /// are gone while its durable store is intact.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn force_persisted_state_fallback(peer: &JourneyPeer) {
         // Load the peer's history first so nothing reloads the logs later.
         let _ = peer
@@ -5366,7 +5366,7 @@ mod received_schema_stage_tests {
     /// after a restart. The edge must get the AUTHOR's migration -- its
     /// statements, order, positions and signatures -- not a snapshot the hub
     /// restated and signed as its own.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[test]
     fn a_restored_edge_gets_the_authors_migration_from_a_hub_serving_its_persisted_state() {
         let root = tempfile::TempDir::new().expect("scratch peer directory");
@@ -5418,7 +5418,7 @@ mod received_schema_stage_tests {
     /// new, empty hub, restarts, and re-uploads from its persisted state. The
     /// new hub, and a wiped edge that restores from it, must hold the AUTHOR's
     /// migration, never the moving edge's restatement of it.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[test]
     fn a_destination_reupload_from_persisted_state_forwards_the_authors_migration() {
         let root = tempfile::TempDir::new().expect("scratch peer directory");
@@ -5537,7 +5537,7 @@ mod received_schema_stage_tests {
     /// received, its persisted-state fallback refuses to serve that schema,
     /// naming the table, and the restoring edge installs nothing. It never
     /// restates the received migration under its own name.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[test]
     fn a_hub_without_the_authors_evidence_refuses_to_serve_received_schema_from_persisted_state() {
         let root = tempfile::TempDir::new().expect("scratch peer directory");
@@ -7598,13 +7598,13 @@ mod persisted_state_snapshot_tests {
                 let reopened = Database::open(&path).unwrap();
                 for (snapshot, expected) in [historical, current].into_iter().zip(&controls) {
                     for (sql, rows) in queries.into_iter().zip(expected) {
-                        #[cfg(feature = "test-seams")]
+                        #[cfg(any(test, feature = "test-seams"))]
                         let (result, work) = crate::writer_query_test_seams::observe_target("version_rows", ||
                             reopened.execute_at_snapshot(sql, &HashMap::new(), snapshot));
-                        #[cfg(not(feature = "test-seams"))]
+                        #[cfg(not(any(test, feature = "test-seams")))]
                         let result = reopened.execute_at_snapshot(sql, &HashMap::new(), snapshot);
                         let result = result.unwrap();
-                        #[cfg(feature = "test-seams")]
+                        #[cfg(any(test, feature = "test-seams"))]
                         {
                             assert_eq!(result.rows, rows.0,
                                 "{shape}/{damage}: the public read returns the fresh control for the exact requested snapshot");
@@ -7623,9 +7623,9 @@ mod persisted_state_snapshot_tests {
             // The production decoder identifies the interior member. The raw
             // mutation below copies production-encoded bytes without a codec.
             let fixture_open_accountant_7598 = std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-            let _fixture_decode_scope_7598 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_7598)).unwrap();
+            let _fixture_decode_scope_7598 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_7598).into()).unwrap();
             let store = RedbPersistence::open(&path).unwrap();
-            store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_7598));
+            store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_7598).into());
             let versions = store.load_relational_table("version_rows").unwrap();
             let interior_position = versions.iter().position(|row|
                 row.row_id == interior.row_id && row.created_tx == interior.created_tx && row.lsn == interior.lsn
@@ -7649,9 +7649,9 @@ mod persisted_state_snapshot_tests {
                 // Lawful public replacement retires this exact member first;
                 // injecting its original bytes leaves an extra physical member.
                 let fixture_open_accountant_7620 = std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-                let _fixture_decode_scope_7620 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_7620)).unwrap();
+                let _fixture_decode_scope_7620 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_7620).into()).unwrap();
                 let store = RedbPersistence::open(&path).unwrap();
-                store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_7620));
+                store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_7620).into());
                 let retained = versions.iter().enumerate().filter(|(position, _)| *position != interior_position)
                     .map(|(_, row)| row.clone()).collect::<Vec<_>>();
                 store.rewrite_table_rows("version_rows", &retained).unwrap();
@@ -7749,9 +7749,9 @@ mod persisted_state_snapshot_tests {
             // The production decoder identifies the interior member. The raw
             // mutation below copies production-encoded bytes without a codec.
             let fixture_open_accountant_7716 = std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-            let _fixture_decode_scope_7716 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_7716)).unwrap();
+            let _fixture_decode_scope_7716 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_7716).into()).unwrap();
             let store = RedbPersistence::open(&path).unwrap();
-            store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_7716));
+            store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_7716).into());
             let versions = store.load_relational_table("version_rows").unwrap();
             let interior_position = versions.iter().position(|row|
                 row.row_id == interior.row_id && row.created_tx == interior.created_tx && row.lsn == interior.lsn
@@ -7775,9 +7775,9 @@ mod persisted_state_snapshot_tests {
                 // Lawful public replacement retires this exact member first;
                 // injecting its original bytes leaves an extra physical member.
                 let fixture_open_accountant_7738 = std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-                let _fixture_decode_scope_7738 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_7738)).unwrap();
+                let _fixture_decode_scope_7738 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_7738).into()).unwrap();
                 let store = RedbPersistence::open(&path).unwrap();
-                store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_7738));
+                store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_7738).into());
                 let retained = versions.iter().enumerate().filter(|(position, _)| *position != interior_position)
                     .map(|(_, row)| row.clone()).collect::<Vec<_>>();
                 store.rewrite_table_rows("version_rows", &retained).unwrap();
@@ -7905,16 +7905,16 @@ mod persisted_state_snapshot_tests {
             let read_memory = db.declared_reader_memory().unwrap();
             drop(db);
             let fixture_open_accountant_7864 = std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-            let _fixture_decode_scope_7864 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_7864)).unwrap();
+            let _fixture_decode_scope_7864 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_7864).into()).unwrap();
             let control_store = RedbPersistence::open(&control_path).unwrap();
-            control_store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_7864));
+            control_store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_7864).into());
             let all_versions = control_store.load_relational_table("version_rows").unwrap();
             drop(control_store);
             drop(_fixture_decode_scope_7864);
             let fixture_open_accountant_7867 = std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-            let _fixture_decode_scope_7867 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_7867)).unwrap();
+            let _fixture_decode_scope_7867 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_7867).into()).unwrap();
             let store = RedbPersistence::open(&path).unwrap();
-            store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_7867));
+            store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_7867).into());
             match producer {
                 "no_log_flush_data" => {
                     let successor = current_rows.first().unwrap();
@@ -8422,7 +8422,7 @@ mod pending_delete_reconciliation_tests {
     }
 }
 
-#[cfg(not(feature = "test-seams"))]
+#[cfg(not(any(test, feature = "test-seams")))]
 macro_rules! sync_test_seam {
     ($(#[$attr:meta])* fn $($item:tt)*) => {
         $(#[$attr])*
@@ -8458,7 +8458,7 @@ mod sync_trigger_vector_epoch_tests;
 mod vector_owner_pairing_ordering_tests;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub struct SyncApplyReceipt {
     pub tenant_id: TenantId,
     pub node_id: String,
@@ -8469,7 +8469,7 @@ pub struct SyncApplyReceipt {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg(not(feature = "test-seams"))]
+#[cfg(not(any(test, feature = "test-seams")))]
 pub(crate) struct SyncApplyReceipt {
     pub tenant_id: TenantId,
     pub node_id: String,
@@ -8902,9 +8902,9 @@ pub struct ReceivedSchemaApplyObservationForTest {
     pub durable_rows_rewritten: usize,
     pub profile_nanos: std::collections::BTreeMap<String, u128>,
     pub profile_work: std::collections::BTreeMap<String, u64>,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub artifact_writes: std::collections::BTreeMap<redb::TableWriteForTest, u64>,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub durable_observer_attached: bool,
 }
 
@@ -8937,7 +8937,7 @@ impl ReceivedSchemaApplyObserverForTest {
     }
 
     /// Snapshot actual storage observation even when a receipted retry skips schema apply.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub fn storage_observation(&self) -> ReceivedSchemaApplyObservationForTest {
         self.inner.lock().observation.clone()
     }
@@ -8951,7 +8951,7 @@ impl ReceivedSchemaApplyObserverForTest {
 #[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub struct ReceivedSchemaApplyObservationScopeForTest {
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     _durable: Option<redb::TableWriteObservationGuardForTest>,
     slot: Arc<Mutex<Option<SharedReceivedSchemaApplyObservationForTest>>>,
     installed: SharedReceivedSchemaApplyObservationForTest,
@@ -9039,7 +9039,7 @@ fn record_received_schema_profile_work_for_test(name: &str, count: u64) {
     });
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn record_received_schema_persistence_profile_for_test(
     name: &str,
     started: std::time::Instant,
@@ -9047,7 +9047,7 @@ pub(crate) fn record_received_schema_persistence_profile_for_test(
     record_received_schema_profile_nanos_for_test(name, started.elapsed().as_nanos());
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn record_received_schema_persistence_work_for_test(name: &str, count: u64) {
     record_received_schema_profile_work_for_test(name, count);
 }
@@ -9081,7 +9081,7 @@ fn record_received_schema_staged_vector_for_test() {
     });
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn record_received_schema_durable_table_rewrite_for_test(table: &str) {
     with_received_schema_apply_observation_for_test(|observation| {
         observation.durable_table_rewrites += 1;
@@ -9089,7 +9089,7 @@ pub(crate) fn record_received_schema_durable_table_rewrite_for_test(table: &str)
     });
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn record_received_schema_durable_row_rewrite_for_test() {
     with_received_schema_apply_observation_for_test(|observation| {
         observation.durable_rows_rewritten += 1;
@@ -10727,7 +10727,7 @@ const CROSS_PROCESS_LOCK_SETTLE_RETRY: Duration = Duration::from_millis(250);
 /// interceptor receives the complete options value before any startup
 /// resource is acquired and supplies the call's result. Convenience openers
 /// cannot satisfy this seam by recording a side counter and opening elsewhere.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub trait DatabaseOpenInterceptor: Send + Sync {
     fn intercept(&self, path: &Path, options: &DatabaseOpenOptions) -> Result<Database>;
@@ -10736,7 +10736,7 @@ pub trait DatabaseOpenInterceptor: Send + Sync {
 /// Events emitted by the actual legacy `Database::execute` path. Planning is
 /// observed at its production call site; pull events are reserved for the one
 /// shared pull-kernel entrance and terminal drain.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadExecutionConvergenceEvent {
@@ -10752,7 +10752,7 @@ pub enum ReadExecutionConvergenceEvent {
     EagerRowSourceTouch,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub trait ReadExecutionConvergenceObserver: Send + Sync {
     fn observe(&self, event: ReadExecutionConvergenceEvent);
@@ -10761,12 +10761,12 @@ pub trait ReadExecutionConvergenceObserver: Send + Sync {
 /// This adapter is accepted only by the bounded executor's production probe
 /// entrance. It therefore cannot be satisfied by recording around an eager
 /// result after that result has already been materialized.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 struct ReadExecutionKernelProbe {
     observer: Arc<dyn ReadExecutionConvergenceObserver>,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 impl ExecutionProbe for ReadExecutionKernelProbe {
     fn before_work(&self, _source: TestWorkSource, _completed_work: u64) {}
 
@@ -10781,7 +10781,7 @@ impl ExecutionProbe for ReadExecutionKernelProbe {
     fn cancellation_observed(&self, _completed_work: u64) {}
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 thread_local! {
     static COMMON_OPTIONS_OPEN_INTERCEPTOR:
         std::cell::RefCell<Option<Arc<dyn DatabaseOpenInterceptor>>> =
@@ -10791,12 +10791,12 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 struct CommonOptionsOpenInterceptorGuard {
     previous: Option<Arc<dyn DatabaseOpenInterceptor>>,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 impl Drop for CommonOptionsOpenInterceptorGuard {
     fn drop(&mut self) {
         let previous = self.previous.take();
@@ -10806,12 +10806,12 @@ impl Drop for CommonOptionsOpenInterceptorGuard {
     }
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 struct ReadExecutionConvergenceObserverGuard {
     previous: Option<Arc<dyn ReadExecutionConvergenceObserver>>,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 impl Drop for ReadExecutionConvergenceObserverGuard {
     fn drop(&mut self) {
         let previous = self.previous.take();
@@ -10821,7 +10821,7 @@ impl Drop for ReadExecutionConvergenceObserverGuard {
     }
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 fn observe_read_execution_convergence(event: ReadExecutionConvergenceEvent) {
     let observer = READ_EXECUTION_CONVERGENCE_OBSERVER.with(|slot| slot.borrow().clone());
     if let Some(observer) = observer {
@@ -11743,7 +11743,7 @@ impl SnapshotInspector {
             declared_read_memory,
             read_memory,
         )?;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::read_probe::note_plugin_start();
         database.plugin.on_open()?;
         Ok(Self {
@@ -12043,7 +12043,7 @@ impl SnapshotInspector {
 /// Read-only deletion/purge state exposed only to ContextDB's own integration
 /// tests. `None` means the engine has no durable representation for that
 /// facet. The production engine neither consults nor mutates this snapshot.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DurableDeletionStateSnapshot {
@@ -12080,7 +12080,7 @@ pub struct AuthoritativePurgeLiveRowSidecarSnapshot {
     pub locally_created: bool,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthoritativePurgeRootClassification {
@@ -13239,7 +13239,7 @@ pub struct Database {
     vector_store: Arc<VectorStore>,
     vector_schema_gates: Arc<VectorSchemaGates>,
     change_log: Arc<RwLock<Vec<ChangeLogEntry>>>,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     forced_change_log_gap_through: Arc<AtomicU64>,
     /// Per-table shadow of `change_log`'s own `RowInsert`/`RowDelete`
     /// entries, and a global LSN reference count over every entry kind --
@@ -13393,9 +13393,9 @@ pub struct Database {
     /// start. The database itself opened; the caller is told the operating
     /// system's own reason rather than discovering an empty result later.
     owner_read_startup_failure: Option<String>,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     route_observer: Option<Arc<dyn crate::read_session::ReadSessionTestObserver>>,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     kernel_observer: Option<Arc<dyn crate::read_session::ReadKernelTestObserver>>,
     /// Production-dead: counts how many times
     /// `retire_snapshot_free_vector_partitions` actually began its guarded
@@ -13403,7 +13403,7 @@ pub struct Database {
     /// found nothing retirable. Shared across every scoped handle of the
     /// same database so a test can observe it regardless of which handle
     /// drove maintenance.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     snapshot_free_retirement_pass_count: Arc<AtomicUsize>,
     access: AccessConstraints,
     accountant: crate::memory_accounting::AccountantHandle,
@@ -13545,7 +13545,7 @@ pub struct Database {
     /// The first cleanup or handoff failure survives an owner-read drain
     /// timeout so the retry that releases resources still reports its cause.
     close_error: Mutex<Option<Error>>,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     close_follower_observer: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     resource_closed: Arc<AtomicBool>,
     /// Set when a commit reached durable storage and its in-memory
@@ -13581,7 +13581,7 @@ pub struct Database {
     commit_staged_vs_staged_comparisons: AtomicU64,
     commit_scan_rows_touched: AtomicU64,
     commit_index_maintenance_visits: AtomicU64,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     commit_stage_wall_nanos: [AtomicU64; 7],
     corrupt_joined_values: RwLock<HashSet<(String, RowId, String)>>,
     resource_owner: bool,
@@ -18015,7 +18015,7 @@ fn register_dormant_raw_vector_partitions(
             .saturating_add(16 * std::mem::size_of::<usize>()),
     )?;
     let factory_owner = Arc::new(factory_owner);
-    #[cfg(all(test, feature = "test-seams"))]
+    #[cfg(test)]
     d1_initialized_control_proofs::observe_factory_credit_for_test(&factory_owner, accountant);
     let loader_for: crate::persistence::vector_membership_source::DurableLoaderBuilder = {
         let captures = LoaderCallbackCaptures {
@@ -18035,7 +18035,7 @@ fn register_dormant_raw_vector_partitions(
             },
         )
     };
-    #[cfg(all(test, feature = "test-seams"))]
+    #[cfg(test)]
     d1_initialized_control_proofs::observe_callback_for_test(&loader_for, accountant);
     let published_root: crate::persistence::vector_membership_source::PublishedMembershipRoot = {
         let manager = Arc::downgrade(manager);
@@ -18056,7 +18056,7 @@ fn register_dormant_raw_vector_partitions(
         _copy_owner: factory_owner,
         accountant: crate::memory_accounting::StoreAccountantHandle::new(accountant.clone()),
     });
-    #[cfg(all(test, feature = "test-seams"))]
+    #[cfg(test)]
     d1_initialized_control_proofs::observe_columns_for_test(&columns);
     let layouts = vector.index_layout_infos(copy_owner)?;
     for info in &layouts {
@@ -18244,7 +18244,7 @@ impl DurableVectorGenerationSource {
         partition_key: &VectorPartitionKey,
         covered_lsn: Lsn,
     ) -> Result<usize> {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         let _reads = crate::vector_observations::observe_reads(index, partition_key, covered_lsn);
         match self {
             Self::Writable(persistence) => {
@@ -18354,7 +18354,7 @@ impl DurableVectorGenerationSource {
         partition_key: &VectorPartitionKey,
         covered_lsn: Lsn,
     ) -> Result<(Vec<VectorEntry>, Lsn)> {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         let _reads = crate::vector_observations::observe_reads(index, partition_key, covered_lsn);
         match self {
             Self::Writable(persistence) => {
@@ -18526,7 +18526,7 @@ impl DurableVectorGenerationLoader {
                     // A paged generation is served from the image's pinned
                     // pages; only its small control handle stays resident.
                     let resident = vector_paged_build::PAGED_GENERATION_RESIDENT_BYTES as usize;
-                    #[cfg(feature = "test-seams")]
+                    #[cfg(any(test, feature = "test-seams"))]
                     contextdb_vector::hnsw::observe_paged_resident_admission(resident, metadata_workspace);
                     // The fresh tail built after this graph is retained under
                     // the same owner: admit its resident bound and workspace
@@ -18688,7 +18688,7 @@ impl DurableVectorGenerationLoader {
                 let complete_total = total
                     .checked_add(metadata_workspace)
                     .ok_or_else(|| Error::Other("retained vector load overflow".to_string()))?;
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 contextdb_vector::hnsw::observe_paged_resident_admission(total, metadata_workspace);
                 self.accountant
                     .try_allocate_for(
@@ -19051,7 +19051,7 @@ fn paged_generation_graph_from(
         page_set: meta.page_set,
         verified: Arc::new(parking_lot::Mutex::new(false)),
     });
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     contextdb_vector::hnsw::observe_paged_native_control_allocation();
     let tail = contextdb_vector::hnsw::paged_builder::PagedVectorTail::new(
         partition.clone(),
@@ -19253,7 +19253,7 @@ impl DurableVectorGenerationLoader {
             }
             #[cfg(feature = "in-process-test-seams")]
             crate::writer_query_test_seams::note_saved_graph_load(graph_bytes.len());
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             if contextdb_vector::test_seam::take_dormant_vector_decode_failure_for_test() {
                 return Err(Error::Other(
                     "injected dormant vector decode failure".to_string(),
@@ -19967,7 +19967,7 @@ pub(crate) struct MaintenanceContext {
     /// The store declaration, independent of a request choosing a lower limit.
     reader_memory_limit: u64,
     read_request_provider: Arc<dyn crate::vector_read_memory::ReadRequestBudgetProvider>,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     writer_receipt_observer: Option<Arc<Database>>,
     disk_limit: Arc<AtomicU64>,
     vector_serving_cache_bytes: Arc<AtomicU64>,
@@ -19999,7 +19999,7 @@ pub(crate) struct MaintenanceContext {
     auto_compact_min_interval: Arc<Mutex<Duration>>,
     /// Shared with the `Database` handle (same `Arc`) -- see that field's
     /// doc comment.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     snapshot_free_retirement_pass_count: Arc<AtomicUsize>,
     finalization: Arc<StoreFinalization>,
 
@@ -20071,7 +20071,7 @@ impl MaintenanceCleanup {
                 1 => { 
                     { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).read_request_provider)); }
                 },
-                2 => { #[cfg(feature = "test-seams")]
+                2 => { #[cfg(any(test, feature = "test-seams"))]
                     { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).writer_receipt_observer)); }
                 },
                 3 => { 
@@ -20137,7 +20137,7 @@ impl MaintenanceCleanup {
                 23 => { 
                     { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).auto_compact_min_interval)); }
                 },
-                24 => { #[cfg(feature = "test-seams")]
+                24 => { #[cfg(any(test, feature = "test-seams"))]
                     { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).snapshot_free_retirement_pass_count)); }
                 },
                 25 => { 
@@ -20152,7 +20152,7 @@ impl Drop for MaintenanceCleanup { fn drop(&mut self) { self.finish(); } }
 impl Drop for MaintenanceContext {
     fn drop(&mut self) {
         // These optional worker owners retire before remaining payload fields.
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         drop(self.writer_receipt_observer.take());
         drop(self.worker_stop.take());
         drop(self.persistence.take());
@@ -20193,14 +20193,14 @@ impl MaintenanceContext {
             return Ok(());
         }
         let mut boundary = None;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         RECLAIM_STEPS_LAST_CYCLE_FOR_TEST.with(|steps| steps.set(0));
         for _ in 0..reclaim_steps_per_cycle() {
             self.build_checkpoint()?;
             match persistence.reclaim_deferred_step(boundary)? {
                 redb::ReclaimStep::Progressed(next) => {
                     boundary = Some(next);
-                    #[cfg(feature = "test-seams")]
+                    #[cfg(any(test, feature = "test-seams"))]
                     RECLAIM_STEPS_LAST_CYCLE_FOR_TEST.with(|steps| steps.set(steps.get() + 1));
                 }
                 redb::ReclaimStep::Drained
@@ -20215,9 +20215,9 @@ impl MaintenanceContext {
     }
 
     fn build_checkpoint(&self) -> Result<()> {
-        #[cfg(all(test, feature = "test-seams"))]
+        #[cfg(test)]
         resident_history_test_seams::note_checkpoint();
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         resident_history_test_seams::note(|work| {
             work.workspace_peak = work.workspace_peak.max(
                 self.vector
@@ -20813,7 +20813,7 @@ impl MaintenanceContext {
                             continue;
                         }
                         frontier.visit(table, |row| {
-                            #[cfg(feature = "test-seams")]
+                            #[cfg(any(test, feature = "test-seams"))]
                             resident_history_test_seams::note(|work| {
                                 work.retention_keys_examined += 1
                             });
@@ -20919,7 +20919,7 @@ impl MaintenanceContext {
         take_local_commit_stage_fault_for_test(
             LocalCommitStageFaultPoint::AfterReservedLsnDurableCommit,
         );
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         let writer_checkpoint = result
             .as_ref()
             .is_ok_and(|committed| committed.1.commit_lsn.is_some());
@@ -20929,7 +20929,7 @@ impl MaintenanceContext {
                 if let Some(watch) = watch_completed {
                     watch.completed();
                 }
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 if writer_checkpoint && let Some(observer) = &self.writer_receipt_observer {
                     observer.emit_writer_memory_ownership_receipt_for_test("commit");
                 }
@@ -21219,7 +21219,7 @@ impl MaintenanceContext {
             return Ok(MaintenanceMetadataFailures::default());
         }
         self.tx_mgr.with_maintenance_publication(|publication| {
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             self.snapshot_free_retirement_pass_count
                 .fetch_add(1, Ordering::SeqCst);
             let active_removal_pass = self
@@ -21905,7 +21905,7 @@ impl MaintenanceContext {
                                 raw_count,
                             )?
                         };
-                        #[cfg(feature = "test-seams")]
+                        #[cfg(any(test, feature = "test-seams"))]
                         resident_history_test_seams::note(|work| {
                             for entry in &entries {
                                 if work.maintenance_source_keys
@@ -22398,11 +22398,11 @@ impl MaintenanceContext {
                         let published_pending = persistence
                             .publish_prepared_vector_partition_generation_candidate(&prepared)?;
                         publication.complete();
-                        #[cfg(not(feature = "test-seams"))]
+                        #[cfg(not(any(test, feature = "test-seams")))]
                         let _ = published_pending;
-                        #[cfg(feature = "test-seams")]
+                        #[cfg(any(test, feature = "test-seams"))]
                         crate::writer_commit_test_seams::reached(crate::writer_commit_test_seams::CommitBoundary::GenerationAfterRedb);
-                        #[cfg(feature = "test-seams")]
+                        #[cfg(any(test, feature = "test-seams"))]
                         if partition_state_present && let Some(published_pending) = published_pending {
                             self.vector.observe_durable_base_publication(
                                 partition,
@@ -23130,7 +23130,7 @@ pub(crate) const MAINTENANCE_TICK: Duration = Duration::from_secs(60);
 /// Upper bound on bounded reclaim steps one maintenance cycle performs.
 const RECLAIM_STEPS_PER_CYCLE: usize = 64;
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 thread_local! {
     /// Test-only override of the per-cycle reclaim step limit for cycles run on this thread.
     static RECLAIM_STEPS_PER_CYCLE_FOR_TEST: std::cell::Cell<Option<usize>> =
@@ -23142,21 +23142,21 @@ thread_local! {
 
 /// Test-only: cap the reclaim steps a maintenance cycle run on this thread may take (`None`
 /// restores the production limit), so a test can prove the per-cycle bound with a small backlog.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub fn set_reclaim_steps_per_cycle_for_test(steps: Option<usize>) {
     RECLAIM_STEPS_PER_CYCLE_FOR_TEST.with(|limit| limit.set(steps));
 }
 
 /// Test-only: durable reclaim steps committed by the last maintenance cycle run on this thread.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub fn reclaim_steps_last_cycle_for_test() -> usize {
     RECLAIM_STEPS_LAST_CYCLE_FOR_TEST.with(std::cell::Cell::get)
 }
 
 fn reclaim_steps_per_cycle() -> usize {
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     if let Some(steps) = RECLAIM_STEPS_PER_CYCLE_FOR_TEST.with(std::cell::Cell::get) {
         return steps;
     }
@@ -23473,12 +23473,12 @@ struct CommitStageStatsGuard<'a> {
     flushed: bool,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 struct CommitStageTimer {
     last: Instant,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 impl CommitStageTimer {
     fn new() -> Self {
         Self {
@@ -23627,309 +23627,309 @@ impl Database {
             {
                 std::ptr::addr_of_mut!((*construction.source).id).write(DatabaseId::next());
                 construction.initialized[0] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(0);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).tx_mgr).write(tx_mgr.clone());
                 construction.initialized[1] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(1);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).relational_store).write(relational.clone());
                 construction.initialized[2] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(2);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).graph_store).write(graph.clone());
                 construction.initialized[3] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(3);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).vector_store).write(vector_store.clone());
                 construction.initialized[4] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(4);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).vector_schema_gates).write(Arc::new(VectorSchemaGates::default()));
                 construction.initialized[5] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(5);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).change_log).write(change_log);
                 construction.initialized[6] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(6);
             }
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             {
                 std::ptr::addr_of_mut!((*construction.source).forced_change_log_gap_through).write(Arc::new(AtomicU64::new(0)));
                 construction.initialized[7] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(7);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).change_log_table_index).write(change_log_table_index);
                 construction.initialized[8] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(8);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).change_log_lsn_refcounts).write(change_log_lsn_refcounts);
                 construction.initialized[9] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(9);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).ddl_log).write(ddl_log);
                 construction.initialized[10] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(10);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).sync_tombstone_arrivals).write(Arc::new(RwLock::new(HashMap::new())));
                 construction.initialized[11] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(11);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).sync_graph_arrivals).write(Arc::new(RwLock::new(HashMap::new())));
                 construction.initialized[12] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(12);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).terminal_refusal_markers).write(Arc::new(RwLock::new(HashMap::new())));
                 construction.initialized[13] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(13);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).terminal_refusal_scans).write(Arc::new(RwLock::new(HashMap::new())));
                 construction.initialized[14] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(14);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).accepted_sync_row_authors).write(Arc::new(RwLock::new(HashMap::new())));
                 construction.initialized[15] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(15);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).received_schema_stages).write(received_schema_stages);
                 construction.initialized[16] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(16);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).local_erasure_stages).write(local_erasure_stages);
                 construction.initialized[17] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(17);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).received_arriving_table_meta).write(received_arriving_table_meta);
                 construction.initialized[18] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(18);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).pending_local_schema_stages).write(pending_local_schema_stages);
                 construction.initialized[19] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(19);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).local_schema_stages).write(local_schema_stages);
                 construction.initialized[20] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(20);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).capture_detached_sync_write_set).write(Arc::new(AtomicBool::new(false)));
                 construction.initialized[21] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(21);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).detached_sync_write_set).write(Arc::new(Mutex::new(None)));
                 construction.initialized[22] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(22);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).received_staging_access).write(None);
                 construction.initialized[23] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(23);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).received_vector_image_pending).write(Arc::new(AtomicBool::new(false)));
                 construction.initialized[24] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(24);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).persistence).write(persistence);
                 construction.initialized[25] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(25);
             }
             #[cfg(any(test, feature = "test-seams"))]
             {
                 std::ptr::addr_of_mut!((*construction.source).commit_source_reference_charge).write(0);
                 construction.initialized[26] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(26);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).committed_image_startup).write(None);
                 construction.initialized[27] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(27);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).image_history).write(None);
                 construction.initialized[28] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(28);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).retained_relational_source).write(None);
                 construction.initialized[29] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(29);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).blob_repository).write(blob_repository);
                 construction.initialized[30] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(30);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).open_registry_path).write(Mutex::new(open_registry_path));
                 construction.initialized[31] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(31);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).operation_gate).write(Arc::new(RwLock::new(())));
                 construction.initialized[32] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(32);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).read_publication_gate).write(Arc::new(ReadPublicationGate::default()));
                 construction.initialized[33] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(33);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).schema_publication_gate).write(Arc::new(RwLock::new(())));
                 construction.initialized[34] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(34);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).apply_phase_pause).write(apply_phase_pause);
                 construction.initialized[35] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(35);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).sync_apply_pre_commit_pause).write(Arc::new(ApplyPhasePause::new()));
                 construction.initialized[36] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(36);
             }
-{ std::ptr::addr_of_mut!((*construction.source).retained_graph_source).write(None); construction.initialized[136] = true; #[cfg(all(test, feature = "test-seams"))] r1_database_field_for_test(136); }
+{ std::ptr::addr_of_mut!((*construction.source).retained_graph_source).write(None); construction.initialized[136] = true; #[cfg(test)] r1_database_field_for_test(136); }
             #[cfg(any(test, feature = "test-seams"))]
             {
                 std::ptr::addr_of_mut!((*construction.source).received_schema_pre_commit_pause).write(Arc::new(ApplyPhasePause::new()));
                 construction.initialized[37] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(37);
             }
             #[cfg(any(test, feature = "test-seams"))]
             {
                 std::ptr::addr_of_mut!((*construction.source).received_schema_pre_publish_pause).write(Arc::new(ApplyPhasePause::new()));
                 construction.initialized[38] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(38);
             }
             #[cfg(any(test, feature = "test-seams"))]
             {
                 std::ptr::addr_of_mut!((*construction.source).received_schema_apply_observer).write(Arc::new(Mutex::new(None)));
                 construction.initialized[39] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(39);
             }
             #[cfg(any(test, feature = "test-seams"))]
             {
                 std::ptr::addr_of_mut!((*construction.source).local_schema_pre_commit_pause).write(Arc::new(ApplyPhasePause::new()));
                 construction.initialized[40] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(40);
             }
             #[cfg(any(test, feature = "test-seams"))]
             {
                 std::ptr::addr_of_mut!((*construction.source).local_schema_pre_publish_pause).write(Arc::new(ApplyPhasePause::new()));
                 construction.initialized[41] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(41);
             }
             #[cfg(any(test, feature = "test-seams"))]
             {
                 std::ptr::addr_of_mut!((*construction.source).local_schema_between_publication_pause).write(Arc::new(ApplyPhasePause::new()));
                 construction.initialized[42] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(42);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).export_after_capture_pause).write(Arc::new(ApplyPhasePause::new()));
                 construction.initialized[43] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(43);
             }
             
@@ -23937,14 +23937,14 @@ impl Database {
                 std::ptr::addr_of_mut!((*construction.source).relational).write(MemRelationalExecutor::new(relational, tx_mgr.clone())
                 .with_staged_posting_admission(Arc::<writer_read::WriterStagedPostingAdmission>::clone(&finalization.staged_posting_admission)));
                 construction.initialized[44] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(44);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).graph).write(MemGraphExecutor::new(graph, tx_mgr.clone()));
                 construction.initialized[45] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(45);
             }
             
@@ -23956,112 +23956,112 @@ impl Database {
                 vector_accountant.clone(),
             ));
                 construction.initialized[46] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(46);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).image_store_file_bytes).write(None);
                 construction.initialized[47] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(47);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).session_tx).write(Arc::new(Mutex::new(None)));
                 construction.initialized[48] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(48);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).origin_session_tx).write(None);
                 construction.initialized[49] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(49);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).instance_id).write(uuid::Uuid::new_v4());
                 construction.initialized[50] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(50);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).owner_thread).write(thread::current().id());
                 construction.initialized[51] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(51);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).plugin).write(plugin);
                 construction.initialized[52] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(52);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).owner_read_config).write(Arc::new(OwnerReadConfig::default()));
                 construction.initialized[53] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(53);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).declared_read_memory).write(declared_read_memory);
                 construction.initialized[54] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(54);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).owner_read_service).write(None);
                 construction.initialized[55] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(55);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).owner_read_startup_failure).write(None);
                 construction.initialized[56] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(56);
             }
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             {
                 std::ptr::addr_of_mut!((*construction.source).route_observer).write(None);
                 construction.initialized[57] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(57);
             }
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             {
                 std::ptr::addr_of_mut!((*construction.source).kernel_observer).write(None);
                 construction.initialized[58] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(58);
             }
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             {
                 std::ptr::addr_of_mut!((*construction.source).snapshot_free_retirement_pass_count).write(Arc::new(AtomicUsize::new(0)));
                 construction.initialized[59] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(59);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).access).write(AccessConstraints::default());
                 construction.initialized[60] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(60);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).accountant).write(accountant);
                 construction.initialized[61] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(61);
             }
             
@@ -24070,70 +24070,70 @@ impl Database {
                 ConflictPolicy::InsertIfNotExists,
             )));
                 construction.initialized[62] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(62);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).subscriptions).write(Arc::new(Mutex::new(SubscriptionState::new())));
                 construction.initialized[63] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(63);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).pruning_runtime).write(Mutex::new(PruningRuntime::new()));
                 construction.initialized[64] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(64);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).pruning_guard).write(Arc::new(Mutex::new(())));
                 construction.initialized[65] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(65);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).retention_sync_peer).write(Arc::new(Mutex::new(None)));
                 construction.initialized[66] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(66);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).in_memory_destination_reuploads).write(Arc::new(Mutex::new(HashMap::new())));
                 construction.initialized[67] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(67);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).lineage_state_lock).write(Arc::new(Mutex::new(InMemoryLineageState::default())));
                 construction.initialized[68] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(68);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).received_schema_manifest_lock).write(Arc::new(Mutex::new(())));
                 construction.initialized[69] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(69);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).sync_push_apply_locks).write(Arc::new(Mutex::new(HashMap::new())));
                 construction.initialized[70] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(70);
             }
             #[cfg(feature = "sync-orchestration")]
             {
                 std::ptr::addr_of_mut!((*construction.source).sync_client_push_locks).write(Arc::new(Mutex::new(HashMap::new())));
                 construction.initialized[71] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(71);
             }
             
@@ -24142,133 +24142,133 @@ impl Database {
                 InMemoryReceivedSchemaManifestState::default(),
             )));
                 construction.initialized[72] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(72);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).in_memory_table_generations).write(Arc::new(Mutex::new(HashMap::new())));
                 construction.initialized[73] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(73);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).in_memory_ddl_generations).write(Arc::new(Mutex::new(HashMap::new())));
                 construction.initialized[74] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(74);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).received_ddl_arrivals).write(Arc::new(RwLock::new(HashMap::new())));
                 construction.initialized[75] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(75);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).superseded_ddl_occurrences).write(Arc::new(RwLock::new(HashMap::new())));
                 construction.initialized[76] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(76);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).cron).write(Arc::new(CronState::new()));
                 construction.initialized[77] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(77);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).event_bus).write(event_bus);
                 construction.initialized[78] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(78);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).trigger).write(trigger);
                 construction.initialized[79] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(79);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).sync_relay_mode).write(Arc::new(AtomicBool::new(false)));
                 construction.initialized[81] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(81);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).in_memory_sync_progress).write(Arc::new(Mutex::new(InMemorySyncProgressState::default())));
                 construction.initialized[82] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(82);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).in_memory_applied_push_watermarks).write(Arc::new(Mutex::new(HashMap::new())));
                 construction.initialized[83] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(83);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).sync_incarnations).write(Arc::new(Mutex::new(HashMap::new())));
                 construction.initialized[84] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(84);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).custody_runtime).write(Arc::new(Mutex::new(None)));
                 construction.initialized[85] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(85);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).custody_cache).write(Arc::new(Mutex::new(None)));
                 construction.initialized[86] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(86);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).custody_metadata).write(Arc::new(Mutex::new(BTreeMap::new())));
                 construction.initialized[87] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(87);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).pending_event_bus_ddl).write(Mutex::new(HashMap::new()));
                 construction.initialized[88] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(88);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).pending_commit_metadata).write(Mutex::new(HashMap::new()));
                 construction.initialized[89] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(89);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).limit_update_lock).write(Arc::new(Mutex::new(())));
                 construction.initialized[90] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(90);
             }
             #[cfg(any(test, feature = "test-seams"))]
             {
                 std::ptr::addr_of_mut!((*construction.source).maintenance_poll_interval_update_pause).write(Arc::new(ApplyPhasePause::new()));
                 construction.initialized[91] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(91);
             }
             #[cfg(any(test, feature = "test-seams"))]
@@ -24277,14 +24277,14 @@ impl Database {
                 MaintenancePollIntervalUpdateProbe::default(),
             ));
                 construction.initialized[92] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(92);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).disk_limit).write(Arc::new(AtomicU64::new(disk_limit.unwrap_or(0))));
                 construction.initialized[93] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(93);
             }
             
@@ -24293,7 +24293,7 @@ impl Database {
                 disk_limit_startup_ceiling.unwrap_or(0),
             )));
                 construction.initialized[94] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(94);
             }
             
@@ -24302,35 +24302,35 @@ impl Database {
                 TRIGGER_AUDIT_RETENTION.as_secs(),
             )));
                 construction.initialized[95] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(95);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).snapshot_registry).write(snapshot_registry);
                 construction.initialized[96] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(96);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).vector_partition_snapshot_stages).write(vector_partition_snapshot_stages);
                 construction.initialized[97] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(97);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).retention_deferred_edge_nodes).write(Arc::new(Mutex::new(RetentionDeferredEdges::default())));
                 construction.initialized[98] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(98);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).maintenance_caller_driven).write(Arc::new(AtomicBool::new(false)));
                 construction.initialized[99] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(99);
             }
             
@@ -24339,259 +24339,259 @@ impl Database {
                 MAINTENANCE_TICK.as_millis() as u64
             )));
                 construction.initialized[100] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(100);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).vector_serving_cache_bytes).write(vector_serving_cache_bytes);
                 construction.initialized[101] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(101);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).last_maintenance_cycle_at).write(Arc::new(Mutex::new(None)));
                 construction.initialized[102] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(102);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).caller_driven_backlog_warned_at).write(Arc::new(Mutex::new(None)));
                 construction.initialized[103] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(103);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).last_auto_compact_at).write(Arc::new(Mutex::new(None)));
                 construction.initialized[104] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(104);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).auto_compact_min_interval).write(Arc::new(Mutex::new(AUTO_COMPACT_MIN_INTERVAL)));
                 construction.initialized[105] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(105);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).sync_watermark).write(Arc::new(AtomicLsn::new(Lsn(0))));
                 construction.initialized[106] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(106);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).closed).write(AtomicBool::new(false));
                 construction.initialized[107] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(107);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).close_progress).write(Arc::new(Mutex::new(CloseProgress::Idle)));
                 construction.initialized[108] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(108);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).close_changed).write(Arc::new(Condvar::new()));
                 construction.initialized[109] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(109);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).close_error).write(Mutex::new(None));
                 construction.initialized[110] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(110);
             }
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             {
                 std::ptr::addr_of_mut!((*construction.source).close_follower_observer).write(Mutex::new(None));
                 construction.initialized[111] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(111);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).resource_closed).write(Arc::new(AtomicBool::new(false)));
                 construction.initialized[112] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(112);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).publication_interrupted).write(Arc::new(AtomicBool::new(false)));
                 construction.initialized[113] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(113);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).rows_examined).write(AtomicU64::new(0));
                 construction.initialized[114] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(114);
             }
             #[cfg(any(test, feature = "test-seams"))]
             {
                 std::ptr::addr_of_mut!((*construction.source).candidate_rows_materialized).write(Arc::new(AtomicU64::new(0)));
                 construction.initialized[115] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(115);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).last_vector_search_used_hnsw).write(Arc::new(AtomicBool::new(false)));
                 construction.initialized[116] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(116);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).last_vector_search_trace).write(Arc::new(RwLock::new(None)));
                 construction.initialized[117] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(117);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).statement_cache).write(RwLock::new(HashMap::new()));
                 construction.initialized[118] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(118);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).rank_formula_cache).write(Arc::new(RwLock::new(HashMap::new())));
                 construction.initialized[119] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(119);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).acl_grant_cache).write(RwLock::new(gate::AdmittedAclGrantCache::new()));
                 construction.initialized[120] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(120);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).rank_policy_eval_count).write(AtomicU64::new(0));
                 construction.initialized[121] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(121);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).rank_policy_formula_parse_count).write(AtomicU64::new(0));
                 construction.initialized[122] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(122);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).fk_indexed_tuple_probes).write(AtomicU64::new(0));
                 construction.initialized[123] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(123);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).fk_full_scan_fallbacks).write(AtomicU64::new(0));
                 construction.initialized[124] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(124);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).commit_rows_validated).write(AtomicU64::new(0));
                 construction.initialized[125] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(125);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).commit_indexed_probes).write(AtomicU64::new(0));
                 construction.initialized[126] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(126);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).commit_staged_vs_staged_comparisons).write(AtomicU64::new(0));
                 construction.initialized[127] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(127);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).commit_scan_rows_touched).write(AtomicU64::new(0));
                 construction.initialized[128] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(128);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).commit_index_maintenance_visits).write(AtomicU64::new(0));
                 construction.initialized[129] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(129);
             }
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             {
                 std::ptr::addr_of_mut!((*construction.source).commit_stage_wall_nanos).write(std::array::from_fn(|_| AtomicU64::new(0)));
                 construction.initialized[130] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(130);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).corrupt_joined_values).write(RwLock::new(HashSet::new()));
                 construction.initialized[131] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(131);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).resource_owner).write(true);
                 construction.initialized[132] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(132);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).handle_role).write(HandleRole::Owner);
                 construction.initialized[133] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(133);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).trigger_deadlock_timeout_override).write(Mutex::new(None));
                 construction.initialized[80] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(80);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).finalization).write(finalization);
                 construction.initialized[135] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(135);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).read_image_memory).write(None);
                 construction.initialized[134] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(134);
             }
         }
@@ -24619,7 +24619,7 @@ impl Database {
     /// configuration a database was opened with is the configuration it can
     /// be asked about afterwards.
     pub fn open_with_options(path: impl AsRef<Path>, options: DatabaseOpenOptions) -> Result<Self> {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         {
             let interceptor = COMMON_OPTIONS_OPEN_INTERCEPTOR.with(|slot| slot.borrow().clone());
             if let Some(interceptor) = interceptor {
@@ -24629,7 +24629,7 @@ impl Database {
         Self::open_configured(path.as_ref(), options)
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn reset_content_identity_work_for_test(&self) -> Result<()> {
         self.persistence
@@ -24639,7 +24639,7 @@ impl Database {
         Ok(())
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn take_content_identity_work_for_test(&self) -> Result<(u64, u64, u64)> {
         Ok(self
@@ -24649,7 +24649,7 @@ impl Database {
             .take_content_identity_work_for_test())
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn take_content_identity_work_bytes_for_test(&self) -> Result<(u64, u64)> {
         Ok(self
@@ -24659,7 +24659,7 @@ impl Database {
             .take_content_identity_work_bytes_for_test())
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn damage_checkpoint_f32_projection_for_test(&self) -> Result<()> {
         self.persistence
@@ -24670,7 +24670,7 @@ impl Database {
 
     #[doc(hidden)]
     pub fn open_with_writer_vector_session(path: impl AsRef<Path>, options: DatabaseOpenOptions, session: &WriterVectorSession) -> Result<Self> {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         {
             let interceptor = COMMON_OPTIONS_OPEN_INTERCEPTOR.with(|slot| slot.borrow().clone());
             if let Some(interceptor) = interceptor {
@@ -24720,9 +24720,9 @@ impl Database {
             contexts,
             scope_labels,
             principal,
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             test_observer,
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             test_kernel_observer,
         } = options;
 
@@ -24749,7 +24749,7 @@ impl Database {
             // of it, so the milestones a writer reaches below the options
             // layer -- its first claim on the store, before anything about it
             // is published -- still reach the caller that asked to see them.
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             let db =
                 crate::read_session::with_writer_open_observer(test_observer.as_ref(), || {
                     Self::open_loaded(
@@ -24763,7 +24763,7 @@ impl Database {
                         declared_read_memory.child()?,
                     )
                 })?;
-            #[cfg(not(feature = "test-seams"))]
+            #[cfg(not(any(test, feature = "test-seams")))]
             let db = Self::open_loaded(
                 path,
                 Arc::clone(&plugin),
@@ -24779,7 +24779,7 @@ impl Database {
             observe_open_event!(test_observer, BlobRepositoryOpened);
             db
         };
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::read_probe::note_plugin_start();
         db.plugin.on_open()?;
         observe_open_event!(test_observer, PluginOpened);
@@ -24797,7 +24797,7 @@ impl Database {
             scope_labels,
             principal,
         };
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         {
             db.route_observer = test_observer.clone();
             db.kernel_observer = test_kernel_observer;
@@ -24994,7 +24994,7 @@ impl Database {
 
     #[cfg(unix)]
     fn owner_read_clock(&self) -> Arc<dyn contextdb_core::read_contract::DeadlineClock> {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if let Some(hooks) = &self.owner_read_config.test_hooks {
             return Arc::clone(&hooks.clock);
         }
@@ -25037,7 +25037,7 @@ impl Database {
         ))
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn read_session_with_observer_for_test(
         &self,
@@ -25056,7 +25056,7 @@ impl Database {
     /// caller drives. Live-database sessions otherwise hardcode the monotonic
     /// clock, which leaves their deadline behaviour unreachable from a test;
     /// the owner route already honours a supplied clock.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn read_session_with_clock_for_test(
         &self,
@@ -25073,7 +25073,7 @@ impl Database {
 
     /// Attach an observer that can be reached only through the bounded
     /// executor probe used by this live-state session.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn read_session_with_kernel_observer_for_test(
         &self,
@@ -25096,7 +25096,7 @@ impl Database {
     /// each resource an open acquires is still held. Reading it never counts
     /// as a channel operation or a backend open, which is what lets a proof
     /// tell an in-process dispatch from one that went through the channel.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn read_route_resources_for_test(&self) -> Result<ReadRouteResourceSnapshot> {
         let observed = crate::read_probe::observed();
@@ -25128,7 +25128,7 @@ impl Database {
         })
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn live_owner_read_service_count_for_test() -> usize {
         crate::owner_read::OwnerReadService::live_service_count_for_test()
@@ -25139,7 +25139,7 @@ impl Database {
     /// The open registry is the one place that answers this: an entry stands
     /// for as long as some handle — or the finalizer still winding one down —
     /// owns the store, and disappears when the last of them lets go.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn store_is_retained_by_this_process_for_test(path: &Path) -> bool {
         let Ok(canonical) = canonical_database_path(path) else {
@@ -25160,7 +25160,7 @@ impl Database {
     /// open is serving it yet. The owner publishes what its kernel does for
     /// its channel under this key, and a reader that dialled the same store
     /// reads it there.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn store_channel_address_for_test(
         &self,
     ) -> Option<contextdb_core::read_contract::ChannelAddress> {
@@ -25170,14 +25170,14 @@ impl Database {
 
     /// The fixed-length key this store's local channel is reachable at, when
     /// this open is the one serving it.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn channel_identity_for_test(&self) -> Option<contextdb_core::read_contract::ChannelAddress> {
         let persistence = self.persistence.as_ref()?;
         self.owner_read_service.as_ref()?;
         crate::local_transport::derive_channel_address(persistence.path()).ok()
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn with_common_open_interceptor_for_test<T>(
         interceptor: Arc<dyn DatabaseOpenInterceptor>,
@@ -25190,7 +25190,7 @@ impl Database {
 
     /// Observe the ordinary public execution path without replacing it. The
     /// supplied closure must call the real `Database::execute` door.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn with_read_execution_convergence_observer_for_test<T>(
         &self,
@@ -25206,7 +25206,7 @@ impl Database {
     /// Called only by the shared pull kernel after it consumes the plan chosen
     /// by the active public execution. Kept crate-private so tests cannot mint
     /// a passing pull trace around a separate eager executor.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn observe_pull_kernel_entered_for_test() {
         observe_read_execution_convergence(ReadExecutionConvergenceEvent::PullKernelEntered);
     }
@@ -25214,7 +25214,7 @@ impl Database {
     /// Capture the active public-execute observer as the probe passed into the
     /// shared bounded kernel. Source-touch events can then originate only at
     /// that kernel's production source loops, even if execution moves threads.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn read_execution_kernel_probe_for_test() -> Option<Arc<dyn ExecutionProbe>> {
         READ_EXECUTION_CONVERGENCE_OBSERVER.with(|slot| {
             slot.borrow().as_ref().map(|observer| {
@@ -25226,7 +25226,7 @@ impl Database {
     }
 
     /// Called only after the shared pull kernel reaches its one terminal drain.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn observe_pull_kernel_drained_for_test() {
         observe_read_execution_convergence(ReadExecutionConvergenceEvent::PullKernelDrained);
     }
@@ -25289,7 +25289,7 @@ impl Database {
         Ok(())
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn observe_quiescent_stop_for_test(&self, phase: crate::read_session::QuiescentStopPhase) {
         if let Some(hooks) = &self.owner_read_config.test_hooks
             && let Some(observer) = &hooks.quiescent_stop
@@ -25357,7 +25357,7 @@ impl Database {
     /// Every accepted frame counts, an owner-status probe and an interrupt
     /// included, so a caller compares a reading taken immediately before with
     /// one taken immediately after.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn owner_received_request_count_for_test(&self) -> Option<u64> {
         self.owner_read_service
@@ -25369,7 +25369,7 @@ impl Database {
     /// opened. The owner service asks for it because the work a channel reader
     /// requests runs on the owner's own thread, where a reader's thread-local
     /// observer cannot reach.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn kernel_observer_for_test(
         &self,
     ) -> Option<Arc<dyn crate::read_session::ReadKernelTestObserver>> {
@@ -25439,7 +25439,7 @@ impl Database {
         self.blob_repository.clone()
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn wait_until_authoritative_purge_waits_for_blob_hash_for_test(
         &self,
@@ -25574,295 +25574,295 @@ impl Database {
             {
                 std::ptr::addr_of_mut!((*construction.source).id).write(DatabaseId::next());
                 construction.initialized[0] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(0);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).tx_mgr).write(self.tx_mgr.clone());
                 construction.initialized[1] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(1);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).relational_store).write(self.relational_store.clone());
                 construction.initialized[2] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(2);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).graph_store).write(self.graph_store.clone());
                 construction.initialized[3] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(3);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).vector_store).write(self.vector_store.clone());
                 construction.initialized[4] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(4);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).vector_schema_gates).write(self.vector_schema_gates.clone());
                 construction.initialized[5] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(5);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).change_log).write(self.change_log.clone());
                 construction.initialized[6] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(6);
             }
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             {
                 std::ptr::addr_of_mut!((*construction.source).forced_change_log_gap_through).write(self.forced_change_log_gap_through.clone());
                 construction.initialized[7] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(7);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).change_log_table_index).write(self.change_log_table_index.clone());
                 construction.initialized[8] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(8);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).change_log_lsn_refcounts).write(self.change_log_lsn_refcounts.clone());
                 construction.initialized[9] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(9);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).ddl_log).write(self.ddl_log.clone());
                 construction.initialized[10] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(10);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).sync_tombstone_arrivals).write(self.sync_tombstone_arrivals.clone());
                 construction.initialized[11] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(11);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).sync_graph_arrivals).write(self.sync_graph_arrivals.clone());
                 construction.initialized[12] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(12);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).terminal_refusal_markers).write(self.terminal_refusal_markers.clone());
                 construction.initialized[13] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(13);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).terminal_refusal_scans).write(self.terminal_refusal_scans.clone());
                 construction.initialized[14] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(14);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).accepted_sync_row_authors).write(self.accepted_sync_row_authors.clone());
                 construction.initialized[15] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(15);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).received_schema_stages).write(self.received_schema_stages.clone());
                 construction.initialized[16] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(16);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).local_erasure_stages).write(self.local_erasure_stages.clone());
                 construction.initialized[17] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(17);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).received_arriving_table_meta).write(self.received_arriving_table_meta.clone());
                 construction.initialized[18] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(18);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).pending_local_schema_stages).write(self.pending_local_schema_stages.clone());
                 construction.initialized[19] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(19);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).local_schema_stages).write(self.local_schema_stages.clone());
                 construction.initialized[20] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(20);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).capture_detached_sync_write_set).write(self.capture_detached_sync_write_set.clone());
                 construction.initialized[21] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(21);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).detached_sync_write_set).write(self.detached_sync_write_set.clone());
                 construction.initialized[22] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(22);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).received_staging_access).write(self.received_staging_access.clone());
                 construction.initialized[23] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(23);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).received_vector_image_pending).write(self.received_vector_image_pending.clone());
                 construction.initialized[24] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(24);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).persistence).write(self.persistence.clone());
                 construction.initialized[25] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(25);
             }
             #[cfg(any(test, feature = "test-seams"))]
             {
                 std::ptr::addr_of_mut!((*construction.source).commit_source_reference_charge).write(self.commit_source_reference_charge);
                 construction.initialized[26] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(26);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).committed_image_startup).write(self.committed_image_startup.clone());
                 construction.initialized[27] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(27);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).image_history).write(self.image_history.clone());
                 construction.initialized[28] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(28);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).retained_relational_source).write(self.retained_relational_source.clone());
                 construction.initialized[29] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(29);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).blob_repository).write(self.blob_repository.clone());
                 construction.initialized[30] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(30);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).open_registry_path).write(Mutex::new(None));
                 construction.initialized[31] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(31);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).operation_gate).write(self.operation_gate.clone());
                 construction.initialized[32] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(32);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).read_publication_gate).write(self.read_publication_gate.clone());
                 construction.initialized[33] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(33);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).schema_publication_gate).write(self.schema_publication_gate.clone());
                 construction.initialized[34] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(34);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).apply_phase_pause).write(self.apply_phase_pause.clone());
                 construction.initialized[35] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(35);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).sync_apply_pre_commit_pause).write(self.sync_apply_pre_commit_pause.clone());
                 construction.initialized[36] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(36);
             }
-{ std::ptr::addr_of_mut!((*construction.source).retained_graph_source).write(self.retained_graph_source.clone()); construction.initialized[136] = true; #[cfg(all(test, feature = "test-seams"))] r1_database_field_for_test(136); }
+{ std::ptr::addr_of_mut!((*construction.source).retained_graph_source).write(self.retained_graph_source.clone()); construction.initialized[136] = true; #[cfg(test)] r1_database_field_for_test(136); }
             #[cfg(any(test, feature = "test-seams"))]
             {
                 std::ptr::addr_of_mut!((*construction.source).received_schema_pre_commit_pause).write(self.received_schema_pre_commit_pause.clone());
                 construction.initialized[37] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(37);
             }
             #[cfg(any(test, feature = "test-seams"))]
             {
                 std::ptr::addr_of_mut!((*construction.source).received_schema_pre_publish_pause).write(self.received_schema_pre_publish_pause.clone());
                 construction.initialized[38] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(38);
             }
             #[cfg(any(test, feature = "test-seams"))]
             {
                 std::ptr::addr_of_mut!((*construction.source).received_schema_apply_observer).write(self.received_schema_apply_observer.clone());
                 construction.initialized[39] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(39);
             }
             #[cfg(any(test, feature = "test-seams"))]
             {
                 std::ptr::addr_of_mut!((*construction.source).local_schema_pre_commit_pause).write(self.local_schema_pre_commit_pause.clone());
                 construction.initialized[40] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(40);
             }
             #[cfg(any(test, feature = "test-seams"))]
             {
                 std::ptr::addr_of_mut!((*construction.source).local_schema_pre_publish_pause).write(self.local_schema_pre_publish_pause.clone());
                 construction.initialized[41] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(41);
             }
             #[cfg(any(test, feature = "test-seams"))]
@@ -25871,14 +25871,14 @@ impl Database {
                 .local_schema_between_publication_pause
                 .clone());
                 construction.initialized[42] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(42);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).export_after_capture_pause).write(self.export_after_capture_pause.clone());
                 construction.initialized[43] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(43);
             }
             
@@ -25889,14 +25889,14 @@ impl Database {
             )
             .with_staged_posting_admission(Arc::<writer_read::WriterStagedPostingAdmission>::clone(&self.finalization.staged_posting_admission)));
                 construction.initialized[44] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(44);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).graph).write(MemGraphExecutor::new(self.graph_store.clone(), self.tx_mgr.clone()));
                 construction.initialized[45] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(45);
             }
             
@@ -25908,98 +25908,98 @@ impl Database {
                 Arc::clone(&self.finalization.vector_accountant),
             ));
                 construction.initialized[46] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(46);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).image_store_file_bytes).write(None);
                 construction.initialized[47] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(47);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).session_tx).write(Arc::new(Mutex::new(None)));
                 construction.initialized[48] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(48);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).origin_session_tx).write(None);
                 construction.initialized[49] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(49);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).instance_id).write(uuid::Uuid::new_v4());
                 construction.initialized[50] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(50);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).owner_thread).write(thread::current().id());
                 construction.initialized[51] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(51);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).plugin).write(self.plugin.clone());
                 construction.initialized[52] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(52);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).owner_read_config).write(self.owner_read_config.clone());
                 construction.initialized[53] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(53);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).declared_read_memory).write(self.declared_read_memory.clone());
                 construction.initialized[54] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(54);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).owner_read_service).write(self.owner_read_service.clone());
                 construction.initialized[55] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(55);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).owner_read_startup_failure).write(self.owner_read_startup_failure.clone());
                 construction.initialized[56] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(56);
             }
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             {
                 std::ptr::addr_of_mut!((*construction.source).route_observer).write(self.route_observer.clone());
                 construction.initialized[57] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(57);
             }
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             {
                 std::ptr::addr_of_mut!((*construction.source).kernel_observer).write(self.kernel_observer.clone());
                 construction.initialized[58] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(58);
             }
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             {
                 std::ptr::addr_of_mut!((*construction.source).snapshot_free_retirement_pass_count).write(self.snapshot_free_retirement_pass_count.clone());
                 construction.initialized[59] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(59);
             }
             
@@ -26010,210 +26010,210 @@ impl Database {
                 principal,
             });
                 construction.initialized[60] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(60);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).accountant).write(crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant));
                 construction.initialized[61] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(61);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).conflict_policies).write(RwLock::new(self.conflict_policies.read().clone()));
                 construction.initialized[62] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(62);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).subscriptions).write(self.subscriptions.clone());
                 construction.initialized[63] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(63);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).pruning_runtime).write(Mutex::new(PruningRuntime::new()));
                 construction.initialized[64] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(64);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).pruning_guard).write(self.pruning_guard.clone());
                 construction.initialized[65] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(65);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).retention_sync_peer).write(self.retention_sync_peer.clone());
                 construction.initialized[66] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(66);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).in_memory_destination_reuploads).write(self.in_memory_destination_reuploads.clone());
                 construction.initialized[67] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(67);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).lineage_state_lock).write(self.lineage_state_lock.clone());
                 construction.initialized[68] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(68);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).received_schema_manifest_lock).write(self.received_schema_manifest_lock.clone());
                 construction.initialized[69] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(69);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).sync_push_apply_locks).write(self.sync_push_apply_locks.clone());
                 construction.initialized[70] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(70);
             }
             #[cfg(feature = "sync-orchestration")]
             {
                 std::ptr::addr_of_mut!((*construction.source).sync_client_push_locks).write(self.sync_client_push_locks.clone());
                 construction.initialized[71] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(71);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).in_memory_received_schema_manifests).write(self.in_memory_received_schema_manifests.clone());
                 construction.initialized[72] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(72);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).in_memory_table_generations).write(self.in_memory_table_generations.clone());
                 construction.initialized[73] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(73);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).in_memory_ddl_generations).write(self.in_memory_ddl_generations.clone());
                 construction.initialized[74] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(74);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).received_ddl_arrivals).write(self.received_ddl_arrivals.clone());
                 construction.initialized[75] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(75);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).superseded_ddl_occurrences).write(self.superseded_ddl_occurrences.clone());
                 construction.initialized[76] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(76);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).cron).write(self.cron.clone());
                 construction.initialized[77] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(77);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).event_bus).write(self.event_bus.clone());
                 construction.initialized[78] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(78);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).trigger).write(self.trigger.clone());
                 construction.initialized[79] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(79);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).sync_relay_mode).write(self.sync_relay_mode.clone());
                 construction.initialized[81] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(81);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).in_memory_sync_progress).write(self.in_memory_sync_progress.clone());
                 construction.initialized[82] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(82);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).in_memory_applied_push_watermarks).write(self.in_memory_applied_push_watermarks.clone());
                 construction.initialized[83] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(83);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).sync_incarnations).write(self.sync_incarnations.clone());
                 construction.initialized[84] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(84);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).custody_runtime).write(self.custody_runtime.clone());
                 construction.initialized[85] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(85);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).custody_cache).write(self.custody_cache.clone());
                 construction.initialized[86] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(86);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).custody_metadata).write(self.custody_metadata.clone());
                 construction.initialized[87] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(87);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).pending_event_bus_ddl).write(Mutex::new(HashMap::new()));
                 construction.initialized[88] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(88);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).pending_commit_metadata).write(Mutex::new(HashMap::new()));
                 construction.initialized[89] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(89);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).limit_update_lock).write(self.limit_update_lock.clone());
                 construction.initialized[90] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(90);
             }
             #[cfg(any(test, feature = "test-seams"))]
@@ -26222,7 +26222,7 @@ impl Database {
                 .maintenance_poll_interval_update_pause
                 .clone());
                 construction.initialized[91] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(91);
             }
             #[cfg(any(test, feature = "test-seams"))]
@@ -26231,294 +26231,294 @@ impl Database {
                 .maintenance_poll_interval_update_probe
                 .clone());
                 construction.initialized[92] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(92);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).disk_limit).write(Arc::clone(&self.disk_limit));
                 construction.initialized[93] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(93);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).disk_limit_startup_ceiling).write(Arc::clone(&self.disk_limit_startup_ceiling));
                 construction.initialized[94] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(94);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).trigger_audit_retention_secs).write(self.trigger_audit_retention_secs.clone());
                 construction.initialized[95] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(95);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).snapshot_registry).write(self.snapshot_registry.clone());
                 construction.initialized[96] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(96);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).vector_partition_snapshot_stages).write(self.vector_partition_snapshot_stages.clone());
                 construction.initialized[97] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(97);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).retention_deferred_edge_nodes).write(self.retention_deferred_edge_nodes.clone());
                 construction.initialized[98] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(98);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).maintenance_caller_driven).write(self.maintenance_caller_driven.clone());
                 construction.initialized[99] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(99);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).maintenance_poll_interval_ms).write(self.maintenance_poll_interval_ms.clone());
                 construction.initialized[100] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(100);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).vector_serving_cache_bytes).write(self.vector_serving_cache_bytes.clone());
                 construction.initialized[101] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(101);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).last_maintenance_cycle_at).write(self.last_maintenance_cycle_at.clone());
                 construction.initialized[102] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(102);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).caller_driven_backlog_warned_at).write(self.caller_driven_backlog_warned_at.clone());
                 construction.initialized[103] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(103);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).last_auto_compact_at).write(self.last_auto_compact_at.clone());
                 construction.initialized[104] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(104);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).auto_compact_min_interval).write(self.auto_compact_min_interval.clone());
                 construction.initialized[105] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(105);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).sync_watermark).write(self.sync_watermark.clone());
                 construction.initialized[106] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(106);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).closed).write(AtomicBool::new(false));
                 construction.initialized[107] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(107);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).close_progress).write(Arc::new(Mutex::new(CloseProgress::Idle)));
                 construction.initialized[108] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(108);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).close_changed).write(Arc::new(Condvar::new()));
                 construction.initialized[109] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(109);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).close_error).write(Mutex::new(None));
                 construction.initialized[110] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(110);
             }
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             {
                 std::ptr::addr_of_mut!((*construction.source).close_follower_observer).write(Mutex::new(None));
                 construction.initialized[111] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(111);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).resource_closed).write(self.resource_closed.clone());
                 construction.initialized[112] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(112);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).publication_interrupted).write(self.publication_interrupted.clone());
                 construction.initialized[113] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(113);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).rows_examined).write(AtomicU64::new(0));
                 construction.initialized[114] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(114);
             }
             #[cfg(any(test, feature = "test-seams"))]
             {
                 std::ptr::addr_of_mut!((*construction.source).candidate_rows_materialized).write(self.candidate_rows_materialized.clone());
                 construction.initialized[115] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(115);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).last_vector_search_used_hnsw).write(Arc::clone(&self.last_vector_search_used_hnsw));
                 construction.initialized[116] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(116);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).last_vector_search_trace).write(Arc::clone(&self.last_vector_search_trace));
                 construction.initialized[117] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(117);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).statement_cache).write(RwLock::new(HashMap::new()));
                 construction.initialized[118] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(118);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).rank_formula_cache).write(Arc::clone(&self.rank_formula_cache));
                 construction.initialized[119] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(119);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).acl_grant_cache).write(RwLock::new(gate::AdmittedAclGrantCache::new()));
                 construction.initialized[120] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(120);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).rank_policy_eval_count).write(AtomicU64::new(0));
                 construction.initialized[121] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(121);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).rank_policy_formula_parse_count).write(AtomicU64::new(0));
                 construction.initialized[122] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(122);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).fk_indexed_tuple_probes).write(AtomicU64::new(0));
                 construction.initialized[123] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(123);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).fk_full_scan_fallbacks).write(AtomicU64::new(0));
                 construction.initialized[124] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(124);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).commit_rows_validated).write(AtomicU64::new(0));
                 construction.initialized[125] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(125);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).commit_indexed_probes).write(AtomicU64::new(0));
                 construction.initialized[126] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(126);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).commit_staged_vs_staged_comparisons).write(AtomicU64::new(0));
                 construction.initialized[127] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(127);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).commit_scan_rows_touched).write(AtomicU64::new(0));
                 construction.initialized[128] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(128);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).commit_index_maintenance_visits).write(AtomicU64::new(0));
                 construction.initialized[129] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(129);
             }
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             {
                 std::ptr::addr_of_mut!((*construction.source).commit_stage_wall_nanos).write(std::array::from_fn(|_| AtomicU64::new(0)));
                 construction.initialized[130] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(130);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).corrupt_joined_values).write(RwLock::new(HashSet::new()));
                 construction.initialized[131] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(131);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).resource_owner).write(false);
                 construction.initialized[132] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(132);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).handle_role).write(HandleRole::Internal);
                 construction.initialized[133] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(133);
             }
             
@@ -26527,21 +26527,21 @@ impl Database {
                 *self.trigger_deadlock_timeout_override.lock(),
             ));
                 construction.initialized[80] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(80);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).finalization).write(Arc::clone(&self.finalization));
                 construction.initialized[135] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(135);
             }
             
             {
                 std::ptr::addr_of_mut!((*construction.source).read_image_memory).write(self.read_image_memory.clone());
                 construction.initialized[134] = true;
-                #[cfg(all(test, feature = "test-seams"))]
+                #[cfg(test)]
                 r1_database_field_for_test(134);
             }
         }
@@ -26588,7 +26588,7 @@ impl Database {
         let _decode_scope = crate::read_image_memory::ImageMemory::operation_reader(
             writer_budget.accountant(), read_memory.clone(),
         )?.enter();
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::read_probe::note_writable_database_open();
         let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
         let canonical_path = canonical_database_path(path.as_ref())?;
@@ -27078,13 +27078,13 @@ impl Database {
         relational.replace_sync_source_lsns(sync_source_lsns);
         relational.replace_sync_source_kinds(sync_source_kinds);
 
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         let graph_source_funding_before =
             (_image_memory.held(), _image_memory.accountant.usage().used);
         _image_memory.reserve(std::mem::size_of::<
             crate::persistence::graph_read::RetainedGraphSource,
         >())?;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::read_work_probe::note_commit_directory_source_registration_funding(
             &_image_memory,
             graph_source_funding_before,
@@ -28216,7 +28216,7 @@ impl Database {
         let mut answer_copy = answer_memory.vector_copy(0)?;
         let vector_copy_owner = &mut answer_copy.owner;
 
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         observe_read_execution_convergence(ReadExecutionConvergenceEvent::PublicExecuteEntered);
         let scope = QueryRowsExaminedScope::enter(self);
         let mut result = self.execute_with_rows_examined_scope(
@@ -28883,7 +28883,7 @@ impl Database {
             tx,
             snapshot,
             clock,
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             Self::read_execution_kernel_probe_for_test()
                 .map(crate::executor::bounded_read_test_support::kernel_probe),
             read_memory.clone(),
@@ -30964,7 +30964,7 @@ impl Database {
                 std::cell::RefCell::new(Vec::<(GraphIdentity, DurableGraphArrival)>::new());
             let validation_noop_count = std::cell::Cell::new(0_u64);
             let pre_apply_index_maintenance_visits = std::cell::Cell::new(0_u64);
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             let apply_started = std::cell::Cell::new(None::<Instant>);
             let delete_release_bytes = std::cell::RefCell::new(DeleteReleaseBytes::default());
             let vector_snapshot_removal_guard =
@@ -31281,7 +31281,7 @@ impl Database {
                             }
                         }
                         *prepared_delivery_memory.borrow_mut() = self.prepare_custody_commit(ws, read_memory.clone())?;
-                        #[cfg(feature = "test-seams")]
+                        #[cfg(any(test, feature = "test-seams"))]
                         let projection_started = Instant::now();
                         let prepared_sink_events = self
                             .prepare_sink_events_for_write_set_with_event_bus_ddl(
@@ -31339,7 +31339,7 @@ impl Database {
                                 &committed_trigger_audit_entries,
                             );
                         }
-                        #[cfg(feature = "test-seams")]
+                        #[cfg(any(test, feature = "test-seams"))]
                         {
                             let delta = Instant::now()
                                 .duration_since(projection_started)
@@ -31385,7 +31385,7 @@ impl Database {
                         {
                             self.local_schema_pre_commit_pause.maybe_pause();
                         }
-                        #[cfg(feature = "test-seams")]
+                        #[cfg(any(test, feature = "test-seams"))]
                         apply_started.set(Some(Instant::now()));
                     }
                     if source == CommitSource::SyncPull
@@ -31448,17 +31448,17 @@ impl Database {
                             .relational_store
                             .index_maintenance_visits()
                             .saturating_sub(pre_apply_index_maintenance_visits.get());
-                        #[cfg(feature = "test-seams")]
+                        #[cfg(any(test, feature = "test-seams"))]
                         let mut stats = CommitStageStats {
                             index_maintenance_visits,
                             ..Default::default()
                         };
-                        #[cfg(not(feature = "test-seams"))]
+                        #[cfg(not(any(test, feature = "test-seams")))]
                         let stats = CommitStageStats {
                             index_maintenance_visits,
                             ..Default::default()
                         };
-                        #[cfg(feature = "test-seams")]
+                        #[cfg(any(test, feature = "test-seams"))]
                         if let Some(started) = apply_started.get() {
                             let delta = Instant::now()
                                 .duration_since(started)
@@ -31552,7 +31552,7 @@ impl Database {
 
             if !ws.is_empty() {
                 self.release_committed_row_body_allocations(&ws);
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 self.emit_writer_memory_ownership_receipt_for_test("commit");
                 self.plugin.post_commit(&ws, source);
                 let sink_events_to_publish = if self.persistence.is_some() {
@@ -31771,7 +31771,7 @@ impl Database {
 
         let result = (|| {
             if let Some(plan) = cached_plan {
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 observe_read_execution_convergence(ReadExecutionConvergenceEvent::PlanReady);
                 let skip_static_dml_validation =
                     matches!(plan, PhysicalPlan::Update(_) | PhysicalPlan::Delete(_));
@@ -31797,7 +31797,7 @@ impl Database {
                     read_memory.clone(),
                 )?;
                 let plan = contextdb_planner::plan(&stmt)?;
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 observe_read_execution_convergence(ReadExecutionConvergenceEvent::PlanReady);
                 self.cache_statement_if_eligible(sql, &stmt, &plan);
                 (stmt, plan)
@@ -38461,7 +38461,7 @@ impl Database {
             watch.completed();
         }
         committed?;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         self.emit_writer_memory_ownership_receipt_for_test("commit");
         #[cfg(any(test, feature = "test-seams"))]
         record_received_schema_profile_nanos_for_test(
@@ -41307,7 +41307,7 @@ impl Database {
                         .saturating_add(bytes.len().saturating_mul(3)),
                 )?;
             }
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             let bytes = if PENDING_DELETION_READ_FAULT.with(|fault| fault.replace(false)) {
                 &[0xff_u8, 0xfe, 0xfd, 0xfc][..]
             } else {
@@ -43583,7 +43583,7 @@ impl Database {
                 let overlap = ws.relational_inserts.iter().find_map(|(t, row)| {
                     #[cfg(feature = "in-process-test-seams")]
                     crate::writer_query_test_seams::note_constraint_staged_row();
-                    #[cfg(feature = "test-seams")]
+                    #[cfg(any(test, feature = "test-seams"))]
                     crate::writer_query_test_seams::note_target_entry(t);
                     if t != table {
                         return None;
@@ -43632,7 +43632,7 @@ impl Database {
                 .unwrap_or_default()
         };
         for entry in entries {
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             crate::writer_query_test_seams::note_target_entry(table);
             #[cfg(feature = "in-process-test-seams")]
             crate::writer_query_test_seams::note_constraint_posting();
@@ -43765,7 +43765,7 @@ impl Database {
             }
         };
         for entry in entries {
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             crate::writer_query_test_seams::note_target_entry(table);
             if let Some(sid) = skip_row_id
                 && entry.row_id == sid
@@ -43790,7 +43790,7 @@ impl Database {
         // Tx-staged inserts.
         let overlap = self.tx_mgr.with_write_set(tx, |ws| {
             for (t, row) in &ws.relational_inserts {
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 crate::writer_query_test_seams::note_target_entry(t);
                 if t != table {
                     continue;
@@ -43904,7 +43904,7 @@ impl Database {
         let root = writer_read::durable_root(published.handle)?;
         let _writer_read = self.enter_writer_read(root, read_memory.clone());
         let mut stats_guard = CommitStageStatsGuard::new(self);
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         let mut stage_timer = CommitStageTimer::new();
         self.validate_sync_lineage_guards(
             snapshot,
@@ -43919,7 +43919,7 @@ impl Database {
             vector_copy_owner,
             read_memory.clone(),
         )?;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         stage_timer.record(stats_guard.stats_mut(), 0);
         self.validate_vector_schema_epochs(ws, &metadata.vector_schema_epochs)?;
         self.validate_vector_write_set_schema(ws, vector_copy_owner, read_memory.clone())?;
@@ -43935,7 +43935,7 @@ impl Database {
             vector_copy_owner,
             read_memory.clone(),
         )?;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         stage_timer.record(stats_guard.stats_mut(), 1);
         self.validate_foreign_keys_in_write_set(
             ws,
@@ -43944,7 +43944,7 @@ impl Database {
             stats_guard.stats_mut(),
             read_memory.clone(),
         )?;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         stage_timer.record(stats_guard.stats_mut(), 2);
         self.validate_composite_foreign_keys_in_write_set(
             ws,
@@ -43953,11 +43953,11 @@ impl Database {
             stats_guard.stats_mut(),
             read_memory.clone(),
         )?;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         stage_timer.record(stats_guard.stats_mut(), 3);
         self.validate_vector_schema_epochs(ws, &metadata.vector_schema_epochs)?;
         self.validate_vector_write_set_schema(ws, vector_copy_owner, read_memory.clone())?;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         stage_timer.record(stats_guard.stats_mut(), 4);
         stats_guard.flush();
         Ok(validation)
@@ -44166,7 +44166,7 @@ impl Database {
     /// Test-only forced log-gap seam. Durable store state remains intact, so
     /// the next extraction must exercise the same persisted-state fallback a
     /// peer encounters when its requested watermark predates available logs.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn __force_sync_log_gap_for_test(&self) {
         let _schema_publication = self.enter_schema_publication_gate(false);
@@ -44192,7 +44192,7 @@ impl Database {
 
     /// Test-only: drop the change log alone, keeping the schema log, as a
     /// store whose change history was pruned keeps its schema history.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn __force_change_log_gap_for_test(&self) {
         let _schema_publication = self.enter_schema_publication_gate(false);
@@ -44527,7 +44527,7 @@ impl Database {
             &self.commit_index_maintenance_visits,
             stats.index_maintenance_visits,
         );
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if let Some(stage_wall_nanos) = stats.stage_wall_nanos {
             for (counter, delta) in self
                 .commit_stage_wall_nanos
@@ -44715,7 +44715,7 @@ impl Database {
         }
 
         fn visible_posting(
-            #[cfg(feature = "test-seams")] table: &str,
+            #[cfg(any(test, feature = "test-seams"))] table: &str,
             entries: &[contextdb_relational::IndexEntry],
             snapshot: SnapshotId,
             skip_deleted: &HashSet<RowId>,
@@ -44723,7 +44723,7 @@ impl Database {
             entries
                 .iter()
                 .find(|entry| {
-                    #[cfg(feature = "test-seams")]
+                    #[cfg(any(test, feature = "test-seams"))]
                     crate::writer_query_test_seams::note_target_entry(table);
                     !skip_deleted.contains(&entry.row_id) && entry.visible_at(snapshot)
                 })
@@ -44758,7 +44758,7 @@ impl Database {
                             true,
                             storage.exact_postings(&key).and_then(|entries| {
                                 visible_posting(
-                                    #[cfg(feature = "test-seams")]
+                                    #[cfg(any(test, feature = "test-seams"))]
                                     table,
                                     entries,
                                     snapshot,
@@ -44788,7 +44788,7 @@ impl Database {
                         let row_id = if storage.columns.len() == columns.len() {
                             storage.exact_postings(&prefix).and_then(|entries| {
                                 visible_posting(
-                                    #[cfg(feature = "test-seams")]
+                                    #[cfg(any(test, feature = "test-seams"))]
                                     table,
                                     entries,
                                     snapshot,
@@ -44804,7 +44804,7 @@ impl Database {
                                 })
                                 .find_map(|(_, entries)| {
                                     visible_posting(
-                                        #[cfg(feature = "test-seams")]
+                                        #[cfg(any(test, feature = "test-seams"))]
                                         table,
                                         entries,
                                         snapshot,
@@ -44998,7 +44998,7 @@ impl Database {
         }
         Some(storage.exact_postings(&key).is_some_and(|entries| {
             entries.iter().any(|entry| {
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 crate::writer_query_test_seams::note_target_entry(table);
                 !skip_deleted.contains(&entry.row_id) && entry.visible_at(snapshot)
             })
@@ -45126,7 +45126,7 @@ impl Database {
         }
 
         fn visible_posting(
-            #[cfg(feature = "test-seams")] table: &str,
+            #[cfg(any(test, feature = "test-seams"))] table: &str,
             entries: &[contextdb_relational::IndexEntry],
             snapshot: SnapshotId,
             skip_deleted: &HashSet<RowId>,
@@ -45134,7 +45134,7 @@ impl Database {
             entries
                 .iter()
                 .find(|entry| {
-                    #[cfg(feature = "test-seams")]
+                    #[cfg(any(test, feature = "test-seams"))]
                     crate::writer_query_test_seams::note_target_entry(table);
                     !skip_deleted.contains(&entry.row_id) && entry.visible_at(snapshot)
                 })
@@ -45169,7 +45169,7 @@ impl Database {
             if storage.columns.len() == columns.len() {
                 storage.exact_postings(&prefix).and_then(|entries| {
                     visible_posting(
-                        #[cfg(feature = "test-seams")]
+                        #[cfg(any(test, feature = "test-seams"))]
                         table,
                         entries,
                         snapshot,
@@ -45185,7 +45185,7 @@ impl Database {
                     })
                     .find_map(|(_, entries)| {
                         visible_posting(
-                            #[cfg(feature = "test-seams")]
+                            #[cfg(any(test, feature = "test-seams"))]
                             table,
                             entries,
                             snapshot,
@@ -47941,7 +47941,7 @@ impl Database {
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Vec<VersionedRow>> {
         let _operation = self.open_operation()?;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         observe_read_execution_convergence(ReadExecutionConvergenceEvent::EagerRowSourceTouch);
         let rows = self.committed_rows_at(table, snapshot, read_memory.clone())?;
         let mut rows = self.filter_rows_for_read(table, rows, snapshot, read_memory.clone())?;
@@ -48310,7 +48310,7 @@ impl Database {
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Vec<VersionedRow>> {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         observe_read_execution_convergence(ReadExecutionConvergenceEvent::EagerRowSourceTouch);
         let mut rows = self.committed_rows_at(table, snapshot, read_memory.clone())?;
         self.overlay_transaction_rows(tx, table, &mut rows)?;
@@ -49243,7 +49243,7 @@ impl Database {
                 if !matches!(row.values.get(&column), Some(Value::Null) | None) {
                     continue;
                 }
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 crate::read_work_probe::note_vector_body_access();
                 contextdb_core::find_attribution::count("vector_body_accesses", 1);
                 let vector = self.load_row_vector_for_column(
@@ -53370,7 +53370,7 @@ impl Database {
             .received_schema_apply_observer
             .lock()
             .replace(observer.inner.clone());
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         let durable = self.persistence.as_ref().map(|persistence| {
             let sink = observer.inner.clone();
             observer.inner.lock().observation.durable_observer_attached = true;
@@ -53391,7 +53391,7 @@ impl Database {
                 .expect("attach actual writes to this file-backed database")
         });
         ReceivedSchemaApplyObservationScopeForTest {
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             _durable: durable,
             slot: self.received_schema_apply_observer.clone(),
             installed: observer.inner.clone(),
@@ -55403,7 +55403,7 @@ impl Database {
                             frontier,
                             &publication_tables,
                         )?;
-                    #[cfg(feature = "test-seams")]
+                    #[cfg(any(test, feature = "test-seams"))]
                     crash_at_purge_publication_boundary_for_test("before-durable-commit");
                     let marker = publication.as_ref().map(|publication| publication.marker());
                     let published_identities = match persistence.commit_authoritative_purge(
@@ -55433,7 +55433,7 @@ impl Database {
                     }
                     _read_publication.invalidate_cursors();
                     writer_erasure.publish();
-                    #[cfg(feature = "test-seams")]
+                    #[cfg(any(test, feature = "test-seams"))]
                     crash_at_purge_publication_boundary_for_test("after-durable-commit");
                     let publication_error = if let Some(publication) = publication {
                         // Pending is already fail-closed. If this final clear
@@ -55665,7 +55665,7 @@ impl Database {
         Ok(entries)
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn authoritative_purge_memory_sink_queue_for_test(
         &self,
@@ -55676,7 +55676,7 @@ impl Database {
             .authoritative_purge_memory_sink_queue_for_test(sink)
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn authoritative_purge_current_live_row_sidecar_for_test(
         &self,
@@ -55751,7 +55751,7 @@ impl Database {
         })
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn classify_authoritative_purge_root_for_test(
         &self,
@@ -55793,7 +55793,7 @@ impl Database {
     /// Absent fields mean this key has no lineage record; production code
     /// cannot call this seam. Redb records survive reopen; memory records do
     /// not outlive the shared database handle.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn durable_deletion_state_for_test(
         &self,
@@ -57099,6 +57099,15 @@ impl Database {
         self.relational_store.retained_structure_bytes()
     }
 
+    /// Observe the currently retained native controls without allocation or cloning.
+    /// Addresses identify live controls for allocator observation only; they grant
+    /// no pointer dereference or lifetime authority and expire with their owners.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __native_writer_backing_for_test(&self) -> (bool, [(usize, std::alloc::Layout); 3]) {
+        self.finalization.accountant.native_backing_for_test()
+    }
+
     #[cfg(test)]
     pub(crate) fn __accountant_handle_for_test(&self) -> crate::memory_accounting::AccountantHandle {
         crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant)
@@ -57874,7 +57883,7 @@ impl Database {
             .unwrap_or_else(|| "<in-memory store>".to_owned())
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn __damage_first_saved_row_for_test(&self, table: &str, swap_body: bool) -> Result<()> {
         let persistence = self
@@ -58340,7 +58349,7 @@ impl Database {
         })
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn __with_vector_pending_summary_read_failure_for_test<R>(
         &self,
@@ -59678,7 +59687,7 @@ impl Database {
     /// Production-dead: how many times `retire_snapshot_free_vector_partitions`
     /// actually began its guarded removal pass, as opposed to skipping it
     /// because a cheap pre-check found nothing retirable.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn vector_partition_retirement_pass_count_for_test(&self) -> usize {
         self.snapshot_free_retirement_pass_count
@@ -59687,13 +59696,13 @@ impl Database {
 
     /// Production-dead observation that a full maintenance wake reached its
     /// closing stamp even when one partition reported a local refusal.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn maintenance_cycle_stamp_is_set_for_test(&self) -> bool {
         self.last_maintenance_cycle_at.lock().is_some()
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn clear_maintenance_cycle_stamp_for_test(&self) {
         *self.last_maintenance_cycle_at.lock() = None;
@@ -59778,7 +59787,7 @@ impl Database {
     /// page visits during candidate discovery and relocated pages in its
     /// most recent batch.
     #[doc(hidden)]
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub fn __storage_compaction_progress_for_test(&self) -> (bool, usize, usize) {
         self.persistence
             .as_ref()
@@ -59828,7 +59837,7 @@ impl Database {
     /// Exact physical allocation versions retained for authenticated external
     /// file snapshots. This reads redb's deferred-free authority directly.
     #[doc(hidden)]
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub fn __external_snapshot_retention_for_test(
         &self,
     ) -> Result<
@@ -59841,7 +59850,7 @@ impl Database {
     }
 
     #[doc(hidden)]
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub fn __external_snapshot_page_allocated_for_test(&self, page: [u8; 8]) -> Result<bool> {
         self.persistence
             .as_ref()
@@ -59850,7 +59859,7 @@ impl Database {
     }
 
     #[doc(hidden)]
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub fn __deferred_free_backlog_for_test(&self) -> Result<[(usize, usize); 2]> {
         self.persistence
             .as_ref()
@@ -59859,7 +59868,7 @@ impl Database {
     }
 
     #[doc(hidden)]
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub fn __fail_next_close_drain_for_test(&self) -> Result<()> {
         self.persistence
             .as_ref()
@@ -59868,7 +59877,7 @@ impl Database {
     }
 
     #[doc(hidden)]
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub fn __fail_next_close_handoff_for_test(&self) -> Result<()> {
         self.persistence
             .as_ref()
@@ -59878,7 +59887,7 @@ impl Database {
     }
 
     #[doc(hidden)]
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub fn __commit_storage_transaction_for_test(&self) -> Result<()> {
         self.persistence
             .as_ref()
@@ -59887,7 +59896,7 @@ impl Database {
     }
 
     #[doc(hidden)]
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub fn __projected_disk_growth_bytes_for_test(&self) -> Result<u64> {
         self.persistence
             .as_ref()
@@ -60867,7 +60876,7 @@ impl Database {
                 std::ptr::addr_of_mut!((*construction.source).read_request_provider).write(self.declared_read_request_provider());
                 construction.initialized[1] = true;
             }
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             {
                 std::ptr::addr_of_mut!((*construction.source).writer_receipt_observer).write(self.writer_receipt_observer_for_maintenance());
                 construction.initialized[2] = true;
@@ -60982,7 +60991,7 @@ impl Database {
                 std::ptr::addr_of_mut!((*construction.source).trigger_audit_retention_secs).write(self.trigger_audit_retention_secs.clone());
                 construction.initialized[18] = true;
             }
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             {
                 std::ptr::addr_of_mut!((*construction.source).snapshot_free_retirement_pass_count).write(self.snapshot_free_retirement_pass_count.clone());
                 construction.initialized[24] = true;
@@ -61112,9 +61121,9 @@ impl Database {
         let thread_worker_clock = worker_clock.clone();
         let thread_interval_ms = interval_ms.clone();
 
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::read_probe::note_maintenance_worker_start();
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::read_probe::note_background_worker_start();
         let handle = thread::spawn(move || {
             while !thread_shutdown.load(Ordering::SeqCst) {
@@ -61181,7 +61190,7 @@ impl Database {
     #[cfg(any(test, feature = "test-seams"))]
     pub fn __commit_stage_stats(&self) -> CommitStageStats {
         let _operation = self.assert_open_operation();
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         let stage_wall_nanos = {
             let timings = self
                 .commit_stage_wall_nanos
@@ -61189,7 +61198,7 @@ impl Database {
                 .map(|counter| counter.load(Ordering::SeqCst));
             timings.iter().any(|nanos| *nanos != 0).then_some(timings)
         };
-        #[cfg(not(feature = "test-seams"))]
+        #[cfg(not(any(test, feature = "test-seams")))]
         let stage_wall_nanos = None;
         CommitStageStats {
             rows_validated: self.commit_rows_validated.load(Ordering::SeqCst),
@@ -61214,7 +61223,7 @@ impl Database {
         self.commit_scan_rows_touched.store(0, Ordering::SeqCst);
         self.commit_index_maintenance_visits
             .store(0, Ordering::SeqCst);
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         for counter in &self.commit_stage_wall_nanos {
             counter.store(0, Ordering::SeqCst);
         }
@@ -61639,7 +61648,7 @@ impl Database {
                 recovery_floors,
             ))
         })?;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         self.export_after_capture_pause.maybe_pause();
 
         let _writer_read = self.enter_writer_read(writer_root.clone(), read_memory.clone());
@@ -62214,7 +62223,7 @@ impl Database {
                     {
                         return Ok(());
                     }
-                    #[cfg(feature = "test-seams")]
+                    #[cfg(any(test, feature = "test-seams"))]
                     if let Some(observer) = self.close_follower_observer.lock().clone() {
                         observer();
                     }
@@ -62241,7 +62250,7 @@ impl Database {
         result
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn __set_close_follower_observer_for_test(
         &self,
@@ -62316,7 +62325,7 @@ impl Database {
             self.stop_pruning_thread();
         }
         let event_bus_shutdown = self.stop_event_bus_threads();
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         self.observe_quiescent_stop_for_test(
             crate::read_session::QuiescentStopPhase::WritesStopped,
         );
@@ -62335,7 +62344,7 @@ impl Database {
         // publication. Fresh readers can select the direct file while the
         // accepted owner requests finish against their retained image.
         let handoff_result = self.publish_quiescent_owner();
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if handoff_result.is_ok() {
             self.observe_quiescent_stop_for_test(
                 crate::read_session::QuiescentStopPhase::Published,
@@ -62347,14 +62356,14 @@ impl Database {
             self.close_error.lock().get_or_insert(error);
         }
         self.drain_owner_reads()?;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         self.observe_quiescent_stop_for_test(
             crate::read_session::QuiescentStopPhase::AcceptedDrained,
         );
         if self.resource_owner {
             // Sample the final logical root after accepted reads drain, while
             // the durable commit directory and its owner are still available.
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             self.emit_writer_memory_ownership_receipt_for_test("close");
             self.resource_closed.store(true, Ordering::SeqCst);
             self.tx_mgr.release_publication_handle();
@@ -62625,7 +62634,7 @@ impl Database {
             declared_read_memory.clone(),
             declared_read_memory.child()?,
         )?;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::read_probe::note_plugin_start();
         db.plugin.on_open()?;
         db.start_cron_tickler_if_schedules_present();
@@ -63268,7 +63277,7 @@ impl Database {
         let layout = self
             .vector_store
             .index_layout(index, layout_copy.as_mut().unwrap_or(vector_copy_owner))?;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         // Marks entry to the DDL drain; tests then assert schema mutation waits
         // for the subsequent same-ref maintenance drain to complete.
         self.pause_vector_ddl_for_test(index);
@@ -63288,7 +63297,7 @@ impl Database {
         table: &str,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
     ) -> Result<()> {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         // Same entry marker as the per-ref drain, keyed by table.* for DROP TABLE.
         self.pause_vector_ddl_for_test(&VectorIndexRef::new(table, "*"));
         let indexes = self
@@ -63304,7 +63313,7 @@ impl Database {
         Ok(())
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn pause_vector_ddl_for_test(&self, index: &VectorIndexRef) {
         self.vector_store.maybe_pause_ddl_for_test(index);
     }
@@ -64038,7 +64047,7 @@ impl Database {
     }
 
     /// Observe the reader parent that funds operation and cursor owners.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn declared_read_memory_for_test(
         &self,
@@ -64058,7 +64067,7 @@ impl Database {
     }
 
     /// Peak successfully admitted writer bytes for journey observation.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn write_memory_high_water_for_test(&self) -> usize {
         self.finalization.accountant.high_water_for_test()
@@ -64103,7 +64112,7 @@ impl Database {
         F: FnOnce(Lsn) -> Result<R>,
     {
         let committed = self.tx_mgr.allocate_ddl_lsn(f);
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if committed.is_ok() {
             self.emit_writer_memory_ownership_receipt_for_test("commit");
         }
@@ -64115,7 +64124,7 @@ impl Database {
         F: FnOnce(Lsn) -> Result<Option<R>>,
     {
         let committed = self.tx_mgr.allocate_ddl_lsn_maybe(f);
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if matches!(&committed, Ok(Some(_))) {
             self.emit_writer_memory_ownership_receipt_for_test("commit");
         }
@@ -64615,14 +64624,14 @@ impl Database {
         if published_during != previous {
             self.finalization.accountant.set_budget(published_during)?;
         }
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         memory_limit_transition_seam::observe(
             memory_limit_transition_seam::TransitionPhase::BeforeDurableWrite,
         );
         let outcome = self.finalization.accountant.with_transition_headroom(headroom, || {
             self.publish_direct_metadata(|| persist(persistence))
         });
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         memory_limit_transition_seam::observe(
             memory_limit_transition_seam::TransitionPhase::AfterDurableWrite,
         );
@@ -65999,7 +66008,7 @@ impl Database {
         since_lsn: Lsn,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<writer_read::ChangeReplay> {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         let since_lsn = Lsn(since_lsn
             .0
             .max(self.forced_change_log_gap_through.load(Ordering::SeqCst)));
@@ -66027,7 +66036,7 @@ impl Database {
     ) -> Result<Vec<ChangeLogEntry>> {
         // The forced gap hides the same committed prefix in resident and
         // native logs; writes after the seam remain available for replay.
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         let since_lsn = Lsn(since_lsn
             .0
             .max(self.forced_change_log_gap_through.load(Ordering::SeqCst)));
@@ -66082,11 +66091,11 @@ impl Database {
         }
         let log = self.change_log.read();
         let start = log.partition_point(|e| {
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             resident_history_test_seams::note(|work| work.log_keys_examined += 1);
             e.lsn() <= since_lsn
         });
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         resident_history_test_seams::note(|work| work.log_keys_examined += log.len() - start);
         Ok(log[start..].to_vec())
     }
@@ -70098,7 +70107,7 @@ impl Database {
                 );
             }
 
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             if since_lsn.0 < self.forced_change_log_gap_through.load(Ordering::SeqCst) {
                 drop(image_history.take());
                 drop(std::mem::replace(
@@ -72274,7 +72283,7 @@ impl Database {
     /// fixture. Unlike the combined row helper above, this performs no
     /// lineage binding. The sender still signs schema it authored with its
     /// own key, exactly as a production push does.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn outbound_ddl_provenance_for_test(
         &self,
@@ -72743,7 +72752,7 @@ impl Database {
 
     /// Arm one fault at one point of taking delivery. It fires once and
     /// disarms itself.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn arm_received_unit_fault_for_test(
         point: ReceivedUnitFaultPoint,
@@ -72754,7 +72763,7 @@ impl Database {
 
     /// Clear a fault that was armed and never reached, so a later delivery on
     /// this thread runs undisturbed.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn disarm_received_unit_fault_for_test() {
         RECEIVED_UNIT_FAULT.with(|slot| slot.set(None));
@@ -72762,7 +72771,7 @@ impl Database {
 
     /// How many prepared received-schema stages this database is holding. A
     /// delivery that ended, however it ended, holds none.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn received_schema_stage_count_for_test(&self) -> usize {
         self.received_schema_stages.lock().len()
@@ -72841,7 +72850,7 @@ impl Database {
     /// Fail this thread's next received-schema durable write immediately
     /// before its one Redb commit, after every physical and identity change
     /// of the unit is staged in that transaction.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn fail_next_received_schema_durable_commit_for_test(&self) {
         crate::persistence::arm_received_schema_pre_commit_fault_for_test();
@@ -72927,7 +72936,7 @@ impl Database {
 
     /// Pause export after its immutable snapshot point but before any artifact
     /// is published. This is a deterministic, production-dead test fence.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn pause_after_export_snapshot_capture_for_test(&self) -> ApplyPhasePauseGuard {
         let _operation = self.assert_open_operation();
@@ -73213,14 +73222,14 @@ impl Database {
     /// opens a physical index cursor, an ordered window or a maintained group
     /// makes one.
     #[doc(hidden)]
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub fn __strict_index_root_checks_for_test() -> u64 {
         crate::persistence::history_root_witness::strict_index_root_checks_for_test()
     }
 
     /// (route page-set verifications, pages walked, bytes hashed) on this thread.
     #[doc(hidden)]
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub fn __paged_route_verifications_for_test() -> (u64, u64, u64) {
         crate::persistence::vector_paged::route_verifications_for_test()
     }
@@ -73626,7 +73635,7 @@ impl Database {
     /// from an integration test without substituting the raw apply path. The
     /// source-generated provenance is validated by the same wire decoder used
     /// by sync before the private received context is created.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn apply_received_schema_for_test(
         &self,
@@ -77144,7 +77153,7 @@ impl Database {
             conflicts: Vec::new(),
             new_lsn: self.current_lsn(),
         };
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         let units = resident_history_test_seams::source_unit_boundaries_for_test(units, self);
         for unit in units {
             // Decoded declaration evidence is consumed by this publication.
@@ -82730,7 +82739,7 @@ pub(crate) fn change_set_held_bytes(changes: &ChangeSet) -> usize {
     )
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 thread_local! {
     static PENDING_DELETION_READ_FAULT: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
@@ -82738,7 +82747,7 @@ thread_local! {
 
 /// Test-only: the next pending-deletion record this thread reads for a
 /// committed reader's history answer reads as bytes that do not decode.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub fn fail_next_pending_deletion_read_for_test() {
     PENDING_DELETION_READ_FAULT.with(|fault| fault.set(true));
@@ -83421,7 +83430,7 @@ impl DatabaseConstruction {
                 6 => { 
                     { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).change_log)); }
                 },
-                7 => { #[cfg(feature = "test-seams")]
+                7 => { #[cfg(any(test, feature = "test-seams"))]
                     { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).forced_change_log_gap_through)); }
                 },
                 8 => { 
@@ -83571,13 +83580,13 @@ impl DatabaseConstruction {
                 56 => { 
                     { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).owner_read_startup_failure)); }
                 },
-                57 => { #[cfg(feature = "test-seams")]
+                57 => { #[cfg(any(test, feature = "test-seams"))]
                     { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).route_observer)); }
                 },
-                58 => { #[cfg(feature = "test-seams")]
+                58 => { #[cfg(any(test, feature = "test-seams"))]
                     { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).kernel_observer)); }
                 },
-                59 => { #[cfg(feature = "test-seams")]
+                59 => { #[cfg(any(test, feature = "test-seams"))]
                     { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).snapshot_free_retirement_pass_count)); }
                 },
                 60 => { 
@@ -83733,7 +83742,7 @@ impl DatabaseConstruction {
                 110 => { 
                     { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).close_error)); }
                 },
-                111 => { #[cfg(feature = "test-seams")]
+                111 => { #[cfg(any(test, feature = "test-seams"))]
                     { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).close_follower_observer)); }
                 },
                 112 => { 
@@ -83790,7 +83799,7 @@ impl DatabaseConstruction {
                 129 => { 
                     { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).commit_index_maintenance_visits)); }
                 },
-                130 => { #[cfg(feature = "test-seams")]
+                130 => { #[cfg(any(test, feature = "test-seams"))]
                     { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).commit_stage_wall_nanos)); }
                 },
                 131 => { 
@@ -83843,9 +83852,9 @@ impl DatabaseCleanup {
         drop(source.origin_session_tx.take());
         drop(source.owner_read_service.take());
         drop(source.owner_read_startup_failure.take());
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         drop(source.route_observer.take());
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         drop(source.kernel_observer.take());
     }
 }
@@ -83957,7 +83966,7 @@ impl Drop for Database {
             });
         }
         cleanup.handed_over_here = handed_over_here;
-        #[cfg(all(test, feature = "test-seams"))]
+        #[cfg(test)]
         R1_DATABASE_DROP_PANIC_FOR_TEST.with(|flag| {
             if flag.replace(false) { panic!("CDB127 injected single database drop unwind"); }
         });
@@ -84215,7 +84224,7 @@ fn prune_expired_rows(
         }
 
         frontier.visit(table_name, |row| {
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             resident_history_test_seams::note(|work| work.retention_keys_examined += 1);
             if !prune_candidates.contains(table_name, row) {
                 return Ok(true);
@@ -84367,7 +84376,7 @@ fn prune_expired_rows(
             })
             .saturating_add(meta.exact_probe_filter_bytes());
         frontier.visit(table, |row| {
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             resident_history_test_seams::note(|work| work.retention_keys_examined += 1);
             if versions.contains(&(row.row_id, row.created_tx)) {
                 return Ok(true);
@@ -85077,7 +85086,7 @@ const LSN_REFCOUNT_ENTRY_UPPER_BYTES: usize = 48;
 /// A change log built to exercise [`build_admitted_change_log_aux_indexes`]
 /// directly: `tables` distinct tables whose names are `name_len` bytes long,
 /// `rows_per_table` row changes each, every change at its own LSN.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub struct ChangeLogAuxIndexFixtureForTest {
     log: Vec<ChangeLogEntry>,
@@ -85085,7 +85094,7 @@ pub struct ChangeLogAuxIndexFixtureForTest {
     built: Option<(ChangeLogTableIndex, ChangeLogLsnRefcounts)>,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 impl ChangeLogAuxIndexFixtureForTest {
     pub fn new(tables: usize, name_len: usize, rows_per_table: usize) -> Self {
         let mut log = Vec::with_capacity(tables.saturating_mul(rows_per_table));
@@ -85386,7 +85395,7 @@ fn compact_currency_versions_inner(
 
     {
         let mut select = |table: &str, row: &VersionedRow, keeper_lsn: Lsn| -> Result<bool> {
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             if !durable_source {
                 resident_history_test_seams::note(|work| work.cleanup_versions_examined += 1);
             }
@@ -85497,7 +85506,7 @@ fn compact_currency_versions_inner(
                 let mut keeper_memory =
                     crate::memory_accounting::OwnedMemoryReservation::new(accountant.clone());
                 frontier.visit(table, |row| {
-                    #[cfg(feature = "test-seams")]
+                    #[cfg(any(test, feature = "test-seams"))]
                     resident_history_test_seams::note(|work| work.cleanup_versions_examined += 1);
                     if !keeper_lsn.contains_key(&row.row_id) {
                         keeper_memory.try_grow_for(
@@ -85988,7 +85997,7 @@ fn retention_prune_candidates(
         }
         let candidate_bytes = retention_candidate_workspace_bytes(table, metas);
         frontier.visit(table, |row| {
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             resident_history_test_seams::note(|work| work.retention_keys_examined += 1);
             if matches!(preparation, RetentionPreparation::Expiry) && row.deleted_tx.is_some() {
                 return Ok(true);
@@ -86028,7 +86037,7 @@ fn fk_protected_prune_candidates(
                 continue;
             }
             frontier.visit(table, |row| {
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 resident_history_test_seams::note(|work| work.retention_keys_examined += 1);
                 if !candidates.contains(table, row) || row.deleted_tx.is_some() {
                     return Ok(true);
@@ -86143,7 +86152,7 @@ fn child_rows_contain_live_reference(
         .map(|column| parent.values.get(column).expect("non-null parent key"))
         .collect::<Vec<_>>();
     frontier.visit_references(child_table, child_columns, &values, |row| {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if !frontier.is_durable() {
             resident_history_test_seams::note(|work| work.retention_keys_examined += 1);
         }
@@ -89446,20 +89455,20 @@ mod currency_version_compaction_tests {
     fn compaction_bounds_versions_and_change_log() {
         // A refused proof pass publishes no cleanup or progress and can be retried
         // with its ordinary owner after resource relief.
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         {
             use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
             struct RefuseNextProof;
             impl RefuseNextProof {
                 fn arm(
-                    owner: &Arc<MemoryAccountant>,
+                    owner: &crate::memory_accounting::AccountantHandle,
                     fired: Arc<AtomicBool>,
                     proof_seen: Arc<AtomicUsize>,
                     pruning_started: Arc<AtomicBool>,
                     unique_keys: usize,
                     grouped_bytes: usize,
                 ) {
-                    let weak = Arc::downgrade(owner);
+                    let captured_owner = owner.clone();
                     owner.set_admission_race_hook(Box::new(move || {
                         let entries = crate::memory_accounting::take_budget_ledger_for_test();
                         crate::memory_accounting::watch_budget_ledger_for_test();
@@ -89481,7 +89490,7 @@ mod currency_version_compaction_tests {
                             })
                             .count();
                         let seen = proof_seen.fetch_add(count, Ordering::SeqCst) + count;
-                        let owner = weak.upgrade().unwrap();
+                        let owner = captured_owner.clone();
                         if seen == 2 * unique_keys && !fired.swap(true, Ordering::SeqCst) {
                             // Each unique key has completed its transient validation
                             // and one AVL-node admission. The next allocation is the
@@ -90245,14 +90254,14 @@ mod currency_cleanup_atomicity_tests;
 #[cfg(test)]
 mod storage_compaction_overlap_tests;
 
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 mod maintenance_resource_tests;
 
 /// Deterministic observation points inside a memory-limit transition, so a
 /// concurrency contract can be stated as a measurement instead of an argument.
 /// The hook fires on the transitioning thread while another thread inspects the
 /// accountant; production carries neither the module nor its fire sites.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) mod memory_limit_transition_seam {
     use std::cell::RefCell;
     use std::sync::Arc;
@@ -90787,7 +90796,7 @@ mod policy_hold_legacy_format_tests {
 #[path = "database/dormant_raw_vector_loader_tests.rs"]
 mod dormant_raw_vector_loader_tests;
 
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 #[path = "database/bounded_retention_preparation_tests.rs"]
 mod bounded_retention_preparation_tests;
 #[cfg(test)]
@@ -90796,7 +90805,7 @@ mod snapshot_pin_pool_tests;
 #[cfg(test)]
 mod generation_route_admission_tests;
 
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 mod content_size_contract_tests;
 
 #[cfg(test)]
@@ -90900,7 +90909,7 @@ mod cdb141_current_root_witness_tests {
                                 [historical, current].into_iter().zip(&controls)
                             {
                                 for (sql, rows) in queries.into_iter().zip(expected) {
-                                    #[cfg(feature = "test-seams")]
+                                    #[cfg(any(test, feature = "test-seams"))]
                                     let (result, work) =
                                         crate::writer_query_test_seams::observe_target(
                                             "version_rows",
@@ -90912,14 +90921,14 @@ mod cdb141_current_root_witness_tests {
                                                 )
                                             },
                                         );
-                                    #[cfg(not(feature = "test-seams"))]
+                                    #[cfg(not(any(test, feature = "test-seams")))]
                                     let result = reopened.execute_at_snapshot(
                                         sql,
                                         &HashMap::new(),
                                         snapshot,
                                     );
                                     let result = result.unwrap();
-                                    #[cfg(feature = "test-seams")]
+                                    #[cfg(any(test, feature = "test-seams"))]
                                     {
                                         assert_eq!(
                                             result.rows, rows.0,
@@ -90947,9 +90956,9 @@ mod cdb141_current_root_witness_tests {
                         // The production decoder identifies the interior member. The raw
                         // mutation below copies production-encoded bytes without a codec.
                         let fixture_open_accountant_87263 = std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-                        let _fixture_decode_scope_87263 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_87263)).unwrap();
+                        let _fixture_decode_scope_87263 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_87263).into()).unwrap();
                         let store = RedbPersistence::open(&path).unwrap();
-                        store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_87263));
+                        store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_87263).into());
                         let versions = store.load_relational_table("version_rows").unwrap();
                         let interior_position = versions
                             .iter()
@@ -90986,9 +90995,9 @@ mod cdb141_current_root_witness_tests {
                             // Lawful public replacement retires this exact member first;
                             // injecting its original bytes leaves an extra physical member.
                             let fixture_open_accountant_87298 = std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-                            let _fixture_decode_scope_87298 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_87298)).unwrap();
+                            let _fixture_decode_scope_87298 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_87298).into()).unwrap();
                             let store = RedbPersistence::open(&path).unwrap();
-                            store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_87298));
+                            store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_87298).into());
                             let retained = versions
                                 .iter()
                                 .enumerate()
@@ -91089,19 +91098,19 @@ mod cdb141_current_root_witness_tests {
     }
 }
 
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 #[path = "database/cdb141_received_witness_tests.rs"]
 mod cdb141_received_witness_tests;
 
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 mod stable_funder_identity_proof_tests;
 
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 thread_local! {
     static R1_DATABASE_PARTIAL_FIELD_FOR_TEST: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     static R1_DATABASE_DROP_PANIC_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 fn r1_database_field_for_test(field: usize) {
     R1_DATABASE_PARTIAL_FIELD_FOR_TEST.with(|slot| {
         if slot.get() == Some(field) {
@@ -91110,7 +91119,7 @@ fn r1_database_field_for_test(field: usize) {
         }
     });
 }
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 pub(crate) fn r1_database_cleanup_rows_for_test() {
     d1_initialized_control_proofs::mapped_rows_for_test();
     initialized_prepaid_controls_for_test();
@@ -91152,7 +91161,7 @@ pub(crate) fn r1_database_cleanup_rows_for_test() {
 }
 
 // CDB127 private mapped extension; frozen test bodies/fixtures remain untouched.
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 pub(crate) fn returned_loader_rows_for_test() {
     use std::mem::{align_of, offset_of, size_of};
     #[allow(dead_code)]
@@ -91200,11 +91209,11 @@ pub(crate) fn returned_loader_rows_for_test() {
     let owner = Arc::new(MemoryAccountant::no_limit());
     // First prove absent-slot supplied-reader behavior without a later matching
     // attachment to that loader. Destroy it before constructing the attached pair.
-    let absent = DurableRawVectorSource::Writable(source.clone()).vector_budget(&owner).unwrap();
+    let absent = DurableRawVectorSource::Writable(source.clone()).vector_budget(&crate::memory_accounting::AccountantHandle::from_host(owner.clone())).unwrap();
     assert_eq!(owner.writer_registration_observation_for_test().2, 0);
     drop(absent);
-    source.attach_memory_accountant(owner.clone());
-    let loader = DurableRawVectorPartitionLoader { source: DurableRawVectorSource::Writable(source.clone()), accountant: owner.clone(),
+    source.attach_memory_accountant(owner.clone().into());
+    let loader = DurableRawVectorPartitionLoader { source: DurableRawVectorSource::Writable(source.clone()), accountant: owner.clone().into(),
         partition: partition.clone(), dimension: 1, quantization: VectorQuantization::F32, metadata_copy_owner: None };
     let writer = crate::memory_accounting::WriterBudget::from_accountant(owner.clone()).unwrap();
     let users = owner.writer_registration_observation_for_test().3;
@@ -91247,7 +91256,7 @@ pub(crate) fn returned_loader_rows_for_test() {
         let directory = DurableMembershipSource::from_owner_admitted(
             MembershipOwner::Writable(source.clone()), None, &partition,
             contextdb_vector::store::RawVectorMembershipSummary { entries: 1, live_entries: 1, max_tx: TxId(1) },
-            owner.clone(), &mut copy_owner, retained).unwrap();
+            owner.clone().into(), &mut copy_owner, retained).unwrap();
         let selection = directory.select_identity_by_row_lsn(identity.row_id, identity.lsn, &mut || true, &mut copy_owner).unwrap().unwrap();
         let selected_controls = owner.writer_fixed_ownership().2;
         let selected = loader.load_selected_candidate(&*selection, false, &mut |_| true).unwrap();
@@ -91272,7 +91281,7 @@ pub(crate) fn returned_loader_rows_for_test() {
     assert_eq!(owner.writer_registration_observation_for_test().3, users);
     assert_eq!(owner.writer_fixed_ownership().2, controls);
     let mismatch = Arc::new(MemoryAccountant::no_limit());
-    let mismatch_budget = loader.source.vector_budget(&mismatch).unwrap();
+    let mismatch_budget = loader.source.vector_budget(&crate::memory_accounting::AccountantHandle::from_host(mismatch.clone())).unwrap();
     mismatch_budget.try_allocate_for(7, "proof", "mismatched_original_funder", "proof").unwrap();
     assert_eq!(mismatch.usage().used, 7);
     assert_eq!(owner.usage().used, baseline);
@@ -91363,7 +91372,7 @@ pub(crate) fn returned_loader_rows_for_test() {
         let callback = LoaderCallbackCaptures {
             persistence: std::mem::ManuallyDrop::new(source.clone()),
             captured_owner: std::mem::ManuallyDrop::new(captured.clone()),
-            accountant: std::mem::ManuallyDrop::new(crate::memory_accounting::StoreAccountantHandle::new(owner.clone())),
+            accountant: std::mem::ManuallyDrop::new(crate::memory_accounting::StoreAccountantHandle::new(owner.clone().into())),
         };
         let layout = VectorIndexLayout { dimension: 1, quantization: VectorQuantization::F32,
             partition_key_columns: Vec::new(), max_partitions: None, search_mode: contextdb_core::VectorSearchMode::Exact,
@@ -91373,7 +91382,7 @@ pub(crate) fn returned_loader_rows_for_test() {
             contextdb_vector::VectorCopyAdmission::new(caller.clone())).unwrap();
         // Same supported attached writer pair, without metadata, isolates the
         // source/use capability from any nonzero payload/metadata credit.
-        let zero_metadata = DurableRawVectorPartitionLoader { source: DurableRawVectorSource::Writable(source.clone()), accountant: owner.clone(),
+        let zero_metadata = DurableRawVectorPartitionLoader { source: DurableRawVectorSource::Writable(source.clone()), accountant: owner.clone().into(),
             partition: partition.clone(), dimension: 1, quantization: VectorQuantization::F32, metadata_copy_owner: None };
         let epoch = owner.writer_registration_observation_for_test().2;
         let mut candidate_pointer = 0;
@@ -91475,7 +91484,7 @@ pub(crate) fn returned_loader_rows_for_test() {
     }
 }
 
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 fn initialized_prepaid_controls_for_test() {
     use crate::persistence::content_identity::proof_allocation_oracle_tests::{last_request_for_test, last_request_pointer_for_test, measured,
         registry_free_observation_for_test, watch_registry_free_for_test,
@@ -91485,7 +91494,7 @@ fn initialized_prepaid_controls_for_test() {
     let registration = owner.writer_registration_observation_for_test();
     let baseline = owner.usage().used;
     let vector: Arc<dyn contextdb_vector::MemoryBudget> = owner.clone();
-    let charge = StagedCopyCharge::admit(&owner, vector.clone(), 23, "prepaid_initialized_proof").unwrap();
+    let charge = StagedCopyCharge::admit(&crate::memory_accounting::AccountantHandle::from_host(owner.clone()), vector.clone(), 23, "prepaid_initialized_proof").unwrap();
     let charge = charge.prepare_prepaid_box().unwrap();
     let (admission, _, _) = measured(|| contextdb_vector::VectorCopyAdmission::from_prepaid(vector.clone(), charge).unwrap());
     let request = last_request_for_test(false);
@@ -91499,12 +91508,12 @@ fn initialized_prepaid_controls_for_test() {
     assert_eq!(registry_free_observation_for_test(true), (baseline, baseline, true), "untransferred Box obeys authorized terminal refund before outer free");
     assert_eq!(owner.usage().used, baseline);
     let other = Arc::new(MemoryAccountant::no_limit());
-    let charge = StagedCopyCharge::admit(&owner, vector.clone(), 23, "prepaid_initialized_proof").unwrap().prepare_prepaid_box().unwrap();
+    let charge = StagedCopyCharge::admit(&crate::memory_accounting::AccountantHandle::from_host(owner.clone()), vector.clone(), 23, "prepaid_initialized_proof").unwrap().prepare_prepaid_box().unwrap();
     let (refused, _, _) = measured(|| contextdb_vector::VectorCopyAdmission::from_prepaid(other.clone(), charge));
     assert!(refused.is_err());
     assert_eq!(owner.usage().used, baseline);
     assert_eq!(other.usage().used, 0);
-    let charge = StagedCopyCharge::admit(&owner, vector.clone(), 23, "prepaid_initialized_proof").unwrap().prepare_prepaid_box().unwrap();
+    let charge = StagedCopyCharge::admit(&crate::memory_accounting::AccountantHandle::from_host(owner.clone()), vector.clone(), 23, "prepaid_initialized_proof").unwrap().prepare_prepaid_box().unwrap();
     let (admission, _, _) = measured(|| contextdb_vector::VectorCopyAdmission::from_prepaid(vector.clone(), charge).unwrap());
     let pointer = last_request_pointer_for_test();
     watch_registry_free_for_test(pointer, registration.4);
@@ -91518,7 +91527,7 @@ fn initialized_prepaid_controls_for_test() {
     println!("CDB127_R1_ROW prepaid_box_initialized actual_size={} actual_align={} original_funder=true mismatch_refusal=true untransferred_drop=true moved_transfer_physical_free_before_refund=true", layout.size(), layout.align());
 }
 
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 fn initialized_received_access_for_test() {
     use crate::persistence::content_identity::proof_allocation_oracle_tests::{last_request_for_test, last_request_pointer_for_test, measured,
         registry_free_observation_for_test, watch_registry_free_for_test,
@@ -91533,7 +91542,7 @@ fn initialized_received_access_for_test() {
     let arc_pointer = last_request_pointer_for_test();
     assert_eq!((request.0, request.1), (layout.size(), layout.align()));
     assert_eq!(owner.usage().used, baseline + 256 + layout.size());
-    assert!(Arc::ptr_eq(&access.accountant, &owner));
+    assert_eq!(access.accountant.as_ptr(), Arc::as_ptr(&owner));
     let alias = access.clone();
     drop(access);
     assert_eq!(owner.usage().used, baseline + 256 + layout.size());
@@ -91561,7 +91570,7 @@ fn initialized_received_access_for_test() {
     println!("CDB127_R1_ROW received_access_initialized actual_size={} actual_align={} actual_arc_pointer={} original_funder=true clone_single_debit=true miss_physical_free_before_refund=true refusal_before_arc=true final_zero=true", layout.size(), layout.align(), arc_pointer);
 }
 
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 #[path = "database/d1_initialized_control_proofs.rs"]
 pub(crate) mod d1_initialized_control_proofs;
 
@@ -91621,6 +91630,6 @@ mod cdb126_reader_history_tests {
     }
 }
 
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 #[path = "database/writecost_reclaim_cancellation_tests.rs"]
 mod writecost_reclaim_cancellation_tests;

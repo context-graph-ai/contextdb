@@ -13,7 +13,7 @@ use super::{
     RedbPersistence,
 };
 use crate::direct_file_reader::DirectTypedImageDigest;
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 use crate::memory_accounting::MemoryAccountant;
 use contextdb_core::{
     AdjEntry, Error, Lsn, Result, RowId, TableMeta, TxId, Value, VectorEntry, VectorIndexRef,
@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 thread_local! {
     static IDENTITY_WORK: std::cell::Cell<(u64, u64, u64)> = const {
         std::cell::Cell::new((0, 0, 0))
@@ -39,7 +39,7 @@ thread_local! {
 /// What one logical family cost in a measured window: the coalesced mutations
 /// handed to its tree, the underlying node reads and writes its walk performed,
 /// and the bytes those moved. Measurement-only; nothing in production reads it.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FamilyWork {
     pub mutations: u64,
@@ -62,7 +62,7 @@ pub struct FamilyWork {
     pub key_blob_writes: u64,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 thread_local! {
     static FAMILY_WORK: std::cell::RefCell<BTreeMap<u8, FamilyWork>> =
         const { std::cell::RefCell::new(BTreeMap::new()) };
@@ -75,7 +75,7 @@ thread_local! {
         const { std::cell::RefCell::new(BTreeMap::new()) };
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 fn with_current_family(note: impl FnOnce(&mut FamilyWork)) {
     let Some(family) = CURRENT_FAMILY.with(|slot| slot.get()) else {
         return;
@@ -83,14 +83,14 @@ fn with_current_family(note: impl FnOnce(&mut FamilyWork)) {
     FAMILY_WORK.with(|work| note(work.borrow_mut().entry(family).or_default()));
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 fn enter_family(family: LogicalFamily, mutations: usize) {
     CURRENT_FAMILY.with(|slot| slot.set(Some(family as u8)));
     redb::commit_work::set_tag(family as u8);
     with_current_family(|work| work.mutations = work.mutations.saturating_add(mutations as u64));
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 fn leave_family() {
     CURRENT_FAMILY.with(|slot| slot.set(None));
     redb::commit_work::set_tag(redb::commit_work::TAG_UNTAGGED);
@@ -101,7 +101,7 @@ fn leave_family() {
 /// hashing the chunks the walk builds; encoding a finished chunk and handing
 /// its bytes to the storage engine; and the coalescing and grouping that turns
 /// a commit's mutations into one sorted edit list per family. Test-seams only.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct IdentitySpans {
     pub read_and_decode_nanos: u64,
@@ -110,7 +110,7 @@ pub struct IdentitySpans {
     pub coalesce_and_group_nanos: u64,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) enum IdentitySpan {
     ReadAndDecode,
     BuildAndHash,
@@ -118,7 +118,7 @@ pub(crate) enum IdentitySpan {
     CoalesceAndGroup,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 thread_local! {
     static IDENTITY_SPANS: std::cell::Cell<IdentitySpans> =
         const { std::cell::Cell::new(IdentitySpans {
@@ -129,7 +129,7 @@ thread_local! {
         }) };
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn observe_identity_span(span: IdentitySpan, started: std::time::Instant) {
     let nanos = started.elapsed().as_nanos() as u64;
     IDENTITY_SPANS.with(|spans| {
@@ -145,7 +145,7 @@ pub(crate) fn observe_identity_span(span: IdentitySpan, started: std::time::Inst
     });
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn take_identity_spans_for_test() -> IdentitySpans {
     IDENTITY_SPANS.with(|spans| spans.replace(IdentitySpans::default()))
 }
@@ -154,14 +154,14 @@ pub(crate) fn take_identity_spans_for_test() -> IdentitySpans {
 /// committed family roots: vector partition memberships for the vector
 /// directory, and custody policy and delivery records for the custody index.
 /// Test-seams only.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DirectoryBindingWork {
     pub vector_memberships: u64,
     pub custody_records: u64,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 thread_local! {
     /// Records hashed since the last root publication on this thread.
     static DIRECTORY_BINDING_PENDING: std::cell::Cell<DirectoryBindingWork> =
@@ -177,7 +177,7 @@ thread_local! {
         }) };
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn observe_vector_directory_binding_records(records: u64) {
     DIRECTORY_BINDING_PENDING.with(|work| {
         let mut current = work.get();
@@ -186,7 +186,7 @@ pub(crate) fn observe_vector_directory_binding_records(records: u64) {
     });
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn observe_custody_binding_records(records: u64) {
     DIRECTORY_BINDING_PENDING.with(|work| {
         let mut current = work.get();
@@ -195,19 +195,19 @@ pub(crate) fn observe_custody_binding_records(records: u64) {
     });
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 fn publish_directory_binding_work() {
     let pending =
         DIRECTORY_BINDING_PENDING.with(|work| work.replace(DirectoryBindingWork::default()));
     DIRECTORY_BINDING_LAST.with(|work| work.set(pending));
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn last_directory_binding_work_for_test() -> DirectoryBindingWork {
     DIRECTORY_BINDING_LAST.with(|work| work.get())
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 thread_local! {
     /// The walk found a chunk it had already read.
     ///
@@ -228,7 +228,7 @@ thread_local! {
 
 /// Chunk rewrites and copied pages by the level of the chunk, since the last
 /// reset.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn take_writes_by_level_for_test() -> Vec<(u8, u64, u64)> {
     WRITES_BY_LEVEL.with(|levels| {
         std::mem::take(&mut *levels.borrow_mut())
@@ -241,7 +241,7 @@ pub(crate) fn take_writes_by_level_for_test() -> Vec<(u8, u64, u64)> {
 /// One write landing on a storage key. A key this window has already written is
 /// a repeat, which is what a per-edit rewrite of a shared upper-level chunk
 /// would look like.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 fn observe_written_key(key: &[u8; 33], is_key_blob: bool) {
     let repeated = WRITTEN_KEYS_ACTIVE.with(|active| {
         active.get() && WRITTEN_KEYS.with(|written| !written.borrow_mut().insert(*key))
@@ -260,13 +260,13 @@ fn observe_written_key(key: &[u8; 33], is_key_blob: bool) {
     });
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 fn observe_cache_hit() {
     with_current_family(|work| work.cache_hits = work.cache_hits.saturating_add(1));
 }
 
 /// How tall the family's tree was when its walk started.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 fn observe_tree_height(height: u32) {
     with_current_family(|work| work.tree_height = work.tree_height.max(height as u64));
 }
@@ -277,7 +277,7 @@ fn observe_tree_height(height: u32) {
 /// the bare config key or table name instead; that key is reported verbatim
 /// behind a `raw:` prefix, so a duplicate of a fact another family already
 /// holds is named rather than merely counted.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 fn status_namespace(logical_key: &[u8]) -> Vec<u8> {
     fn raw(logical_key: &[u8]) -> Vec<u8> {
         let mut named = b"raw:".to_vec();
@@ -304,7 +304,7 @@ fn status_namespace(logical_key: &[u8]) -> Vec<u8> {
     }
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 fn observe_status_namespace(logical_key: &[u8]) {
     let namespace = status_namespace(logical_key);
     STATUS_NAMESPACES.with(|counts| {
@@ -312,7 +312,7 @@ fn observe_status_namespace(logical_key: &[u8]) {
     });
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 fn forget_status_namespace(logical_key: &[u8]) {
     let namespace = status_namespace(logical_key);
     STATUS_NAMESPACES.with(|counts| {
@@ -326,7 +326,7 @@ fn forget_status_namespace(logical_key: &[u8]) {
     });
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn reset_family_work_for_test() {
     WRITTEN_KEYS_ACTIVE.with(|active| active.set(true));
     FAMILY_WORK.with(|work| work.borrow_mut().clear());
@@ -339,7 +339,7 @@ pub(crate) fn reset_family_work_for_test() {
 }
 
 /// Per-family work since the last reset, as `(tag, family name, counts)`.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn take_family_work_for_test() -> Vec<(u8, &'static str, FamilyWork)> {
     WRITTEN_KEYS_ACTIVE.with(|active| active.set(false));
     WRITTEN_KEYS.with(|written| written.borrow_mut().clear());
@@ -358,14 +358,14 @@ pub(crate) fn take_family_work_for_test() -> Vec<(u8, &'static str, FamilyWork)>
 
 /// Coalesced `Status` mutations by namespace literal since the last reset.
 /// The family a page tag names, for the storage engine's per-tag page counts.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn family_name_for_tag(tag: u8) -> &'static str {
     LogicalFamily::from_tag(tag)
         .map(LogicalFamily::name_for_test)
         .unwrap_or("unknown")
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn take_status_namespaces_for_test() -> Vec<(String, u64)> {
     STATUS_NAMESPACES.with(|counts| {
         std::mem::take(&mut *counts.borrow_mut())
@@ -375,23 +375,23 @@ pub(crate) fn take_status_namespaces_for_test() -> Vec<(String, u64)> {
     })
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn reset_work_for_test() {
     IDENTITY_WORK.with(|work| work.set((0, 0, 0)));
     IDENTITY_BYTES.with(|bytes| bytes.set((0, 0)));
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn take_work_for_test() -> (u64, u64, u64) {
     IDENTITY_WORK.with(|work| work.replace((0, 0, 0)))
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn take_work_bytes_for_test() -> (u64, u64) {
     IDENTITY_BYTES.with(|bytes| bytes.replace((0, 0)))
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 thread_local! {
     /// Peak proof bytes charged: the mutation path's chunk bodies, the chunk
     /// record it must keep for the flush, and one read walk's whole charge.
@@ -400,7 +400,7 @@ thread_local! {
     };
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 fn observe_proof_memory(bodies: usize, records: usize) {
     PROOF_MEMORY_PEAK.with(|peak| {
         let (cached, kept, read) = peak.get();
@@ -408,7 +408,7 @@ fn observe_proof_memory(bodies: usize, records: usize) {
     });
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 fn observe_read_proof_memory(bytes: usize) {
     PROOF_MEMORY_PEAK.with(|peak| {
         let (cached, kept, read) = peak.get();
@@ -418,13 +418,13 @@ fn observe_read_proof_memory(bytes: usize) {
 
 /// Since the last call: the peak chunk bodies a mutation transaction held,
 /// the chunk record it kept for its flush, and the peak a read walk charged.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[allow(dead_code)] // Read by the proof-memory contracts beside this module.
 pub(crate) fn take_proof_memory_peak_for_test() -> (usize, usize, usize) {
     PROOF_MEMORY_PEAK.with(|peak| peak.replace((0, 0, 0)))
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 thread_local! {
     /// Ordered (`"charge"` / `"copy"`) observations of a referenced-key admission.
     /// A copy that precedes its charge is the defect: the allocation exists before
@@ -435,12 +435,12 @@ thread_local! {
         const { std::cell::Cell::new(false) };
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[allow(dead_code)] // Read by the proof-memory contracts beside this module.
 #[must_use = "keep the watch alive while observing referenced-key copies"]
 pub(crate) struct ResolvedKeyCopyWatchForTest(std::marker::PhantomData<std::rc::Rc<()>>);
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 impl Drop for ResolvedKeyCopyWatchForTest {
     fn drop(&mut self) {
         RESOLVED_KEY_WATCH_ENABLED.with(|enabled| enabled.set(false));
@@ -448,7 +448,7 @@ impl Drop for ResolvedKeyCopyWatchForTest {
     }
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[allow(dead_code)] // Read by the proof-memory contracts beside this module.
 pub(crate) fn watch_resolved_key_copies_for_test() -> ResolvedKeyCopyWatchForTest {
     RESOLVED_KEY_WATCH_ENABLED.with(|enabled| {
@@ -459,41 +459,41 @@ pub(crate) fn watch_resolved_key_copies_for_test() -> ResolvedKeyCopyWatchForTes
     ResolvedKeyCopyWatchForTest(std::marker::PhantomData)
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[allow(dead_code)] // Read by the proof-memory contracts beside this module.
 pub(crate) fn take_resolved_key_copy_observations_for_test() -> Vec<(&'static str, usize)> {
     RESOLVED_KEY_EVENTS.with(|obs| std::mem::take(&mut *obs.borrow_mut()))
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 fn observe_resolved_key_event(kind: &'static str, bytes: usize) {
     if RESOLVED_KEY_WATCH_ENABLED.with(|enabled| enabled.get()) {
         RESOLVED_KEY_EVENTS.with(|obs| obs.borrow_mut().push((kind, bytes)));
     }
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 thread_local! {
     /// Entries inspected or moved by one resident-chunk `touch`.
     static TOUCH_WORK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn reset_touch_work_for_test() {
     TOUCH_WORK.with(|work| work.set(0));
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn take_touch_work_for_test() -> u64 {
     TOUCH_WORK.with(|work| work.replace(0))
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 fn observe_touch_work(entries: u64) {
     TOUCH_WORK.with(|work| work.set(work.get().saturating_add(entries)));
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 fn observe_node_read(bytes: usize) {
     // Count only the underlying Redb read. Transaction-local cache hits do
     // not pass through this seam.
@@ -511,7 +511,7 @@ fn observe_node_read(bytes: usize) {
     });
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 fn observe_node_write(bytes: usize) {
     // Count only the underlying Redb insert performed by the final flush.
     IDENTITY_WORK.with(|work| {
@@ -528,7 +528,7 @@ fn observe_node_write(bytes: usize) {
     });
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 fn observe_node_remove() {
     // Count only the underlying Redb removal performed by the final flush.
     IDENTITY_WORK.with(|work| {
@@ -577,7 +577,7 @@ pub(crate) enum LogicalFamily {
 
 impl LogicalFamily {
     /// Measurement-only display name.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) const fn name_for_test(self) -> &'static str {
         match self {
             Self::Relational => "Relational",
@@ -1395,11 +1395,11 @@ fn resolve_key_checkpoint<'a>(table: &impl ReadableTable<&'static [u8], &'static
     let blob = table.get(stored_key.as_slice()).map_err(RedbPersistence::storage_error)?
         .ok_or_else(|| Error::Other("authenticated separator key is missing".into()))?;
     let bytes = blob.value();
-    #[cfg(feature = "test-seams")] observe_node_read(bytes.len());
+    #[cfg(any(test, feature = "test-seams"))] observe_node_read(bytes.len());
     if bytes.len() != len.checked_add(1).ok_or_else(|| Error::Other("wide key length overflow".into()))? || bytes[0] != 0 || key_hash_checkpoint(&bytes[1..], checkpoint)? != id {
         return Err(Error::Other("authenticated separator key is damaged".into()));
     }
-    #[cfg(feature = "test-seams")] observe_resolved_key_event("copy", len);
+    #[cfg(any(test, feature = "test-seams"))] observe_resolved_key_event("copy", len);
     let mut resolved = Vec::with_capacity(len);
     for window in bytes[1..].chunks(64 * 1024) { checkpoint()?; resolved.extend_from_slice(window); }
     Ok(resolved.into())
@@ -1428,7 +1428,7 @@ fn value_hash(family: LogicalFamily, logical_value: &[u8]) -> [u8; 32] {
     )
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 fn observe_read_authentication_hash(mutation: &ContentIdentityMutation, bytes: usize) {
     match mutation.family {
         LogicalFamily::Relational => crate::read_work_probe::note_hashed_row(),
@@ -2572,14 +2572,14 @@ fn resolve_key<'a>(
         .map_err(RedbPersistence::storage_error)?
         .ok_or_else(|| Error::Other("authenticated separator key is missing".into()))?;
     let bytes = blob.value();
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     observe_node_read(bytes.len());
     if bytes.len() != len + 1 || bytes[0] != 0 || key_hash(&bytes[1..]) != id {
         return Err(Error::Other(
             "authenticated separator key is damaged".into(),
         ));
     }
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     observe_resolved_key_event("copy", len);
     Ok(bytes[1..].to_vec().into())
 }
@@ -2795,7 +2795,7 @@ impl<'a> EncodedNode<'a> {
         node.subtree_hash = take_bytes(bytes, &mut cursor, 32, "chunk hash")?
             .try_into()
             .expect("hash");
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::read_work_probe::note_proof_node_hashed();
         if cursor != bytes.len() || *hash.finalize().as_bytes() != node.subtree_hash {
             return Err(Error::Other(
@@ -2869,16 +2869,16 @@ fn read_node_charged(
     id: [u8; 32],
     admission: &mut ProofAdmission,
 ) -> Result<(Node, usize)> {
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     let read_started = std::time::Instant::now();
     let stored_key = node_storage_key(family, &id);
     let encoded = table
         .get(stored_key.as_slice())
         .map_err(RedbPersistence::storage_error)?
         .ok_or_else(|| Error::Other("logical identity tree references a missing chunk".into()))?;
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     crate::read_work_probe::note_proof_node_read();
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     observe_node_read(encoded.value().len());
     // The decoded chunk owns a copy of every key it holds plus its entry
     // vector; charge that before `decode_node` allocates any of it. The entry
@@ -2913,7 +2913,7 @@ fn read_node_charged(
     } else {
         admission.release(decoded_bytes - live_bytes);
     }
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     observe_identity_span(IdentitySpan::ReadAndDecode, read_started);
     Ok((node, live_bytes))
 }
@@ -4025,7 +4025,7 @@ impl ResidentProofChunks {
     }
 
     fn touch_index(&mut self, idx: usize) {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         observe_touch_work(1);
         if self.newest == Some(idx) {
             return;
@@ -4250,7 +4250,7 @@ accountant: None,
         false
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn observed(&self) -> (usize, usize, usize) {
         let state = self.locked();
         (state.len(), state.bytes(), state.charged_bytes)
@@ -4304,7 +4304,7 @@ accountant: None,
     /// longer maps (or maps to a different, later chunk), so only pointer
     /// identity of the shared decode tells whether THIS allocation is still
     /// this set's responsibility.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn still_holds_for_test(&self, target: &Arc<Node>) -> bool {
         self.locked()
             .slots
@@ -4499,7 +4499,7 @@ impl ProofMemory {
         self.live_peak
             .set(self.live_peak.get().max(self.live.get()));
         self.note_peak();
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         observe_resolved_key_event("charge", bytes);
         Some(ProofCharge {
             memory: self,
@@ -4752,7 +4752,7 @@ impl ReadAuthenticationNodes {
     /// resident set) supplies it by pointer identity, since a page resident
     /// at retain time is not guaranteed to still be resident now, and a
     /// node's storage key is not reconstructable from its leaf-locator entry.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(super) fn retained_bytes_and_accounted(
         &self,
         mut still_resident: impl FnMut(&Arc<Node>) -> bool,
@@ -4792,7 +4792,7 @@ impl ReadAuthenticationNodes {
     /// for the same decoded pages, and released with this whole set when it
     /// is reset (`reset`): one live charge per shared page until its last
     /// holder drops it.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(super) fn own_charge_for_test(&self) -> usize {
         self.charge.held()
     }
@@ -4956,7 +4956,7 @@ admission,
 
     /// How many authenticated chunks this reader is holding, their bytes, and
     /// how many of those bytes are charged to the declared session.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(super) fn resident_proof_chunks_for_test(&self) -> (usize, usize, usize) {
         self.resident.observed()
     }
@@ -4967,13 +4967,13 @@ admission,
     /// after the resident set evicts it, so this answers whether that
     /// allocation is still the resident set's charge to carry -- never
     /// whether some OTHER, later chunk now occupies its old storage key.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(super) fn resident_still_holds_for_test(&self, target: &Arc<Node>) -> bool {
         self.resident.still_holds_for_test(target)
     }
 
     /// The most this reader may hold resident, floor included.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(super) fn resident_proof_chunk_ceiling_for_test(&self) -> usize {
         self.resident.ceiling
     }
@@ -4982,7 +4982,7 @@ admission,
     /// resident chunks alone. Clearing one without the other is what lets a
     /// contract separate "this record was already answered" from "the chunks
     /// that prove it are already authenticated".
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(super) fn evict_record_witnesses_for_test(&self) -> usize {
         let mut records = self
             .verified_records
@@ -4996,7 +4996,7 @@ admission,
     /// Give back every resident chunk, as a genuine eviction does. The next
     /// statement has to read, decode and prove them against the committed root
     /// again.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(super) fn evict_resident_proof_chunks_for_test(&self) -> usize {
         self.resident.clear()
     }
@@ -5145,7 +5145,7 @@ admission,
                 )
                 .map_err(|error| self.typed(error))?;
                 if let Ok(position) = found {
-                    #[cfg(feature = "test-seams")]
+                    #[cfg(any(test, feature = "test-seams"))]
                     observe_read_authentication_hash(
                         mutation,
                         mutation.logical_key.len()
@@ -5270,7 +5270,7 @@ admission,
         record_storage_key[0] = mutation.family as u8;
         record_storage_key[1..].copy_from_slice(&record_id);
 
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         observe_read_authentication_hash(
             mutation,
             mutation.logical_key.len() + mutation.logical_value.as_ref().map_or(0, Vec::len),
@@ -5376,7 +5376,7 @@ admission,
             None => mutation.logical_value.as_deref().map(|value| hash_parts_checkpoint(b"contextdb-logical-record-value-v1", &[&[mutation.family as u8], value], checkpoint)).transpose()?,
         };
         // Preserve the existing record-work observation, once per proof.
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         observe_read_authentication_hash(mutation, mutation.logical_key.len() + mutation.logical_value.as_ref().map_or(0, Vec::len));
         let mut current = self.roots[mutation.family as usize].root;
         let mut expected_hash = self.roots[mutation.family as usize].hash;
@@ -5450,7 +5450,7 @@ admission,
         } else {
             let (node, _charged) = read_node_charged(&self.nodes, family, id, decode_admission)?;
             if decode_admission.reader_budget.is_some() { decode_admission.admit(VERIFIED_READ_NODE_HANDLE_BYTES)?; }
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             crate::read_work_probe::note_hashed_bytes(encode_node(&node).len());
             (
                 Arc::new(VerifiedReadNode {
@@ -5611,7 +5611,7 @@ admission,
             before_page,
             &mut leaf,
         );
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         observe_read_proof_memory(proof.peak());
         visited
     }
@@ -5830,7 +5830,7 @@ admission,
             };
             Some(charge)
         };
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if !cached {
             crate::read_work_probe::note_ordered_proof_node_read();
         }
@@ -6326,17 +6326,17 @@ pub(super) fn bind_vector_schema_meta_root_in_write(write: &redb::WriteTransacti
 }
 
 impl RedbPersistence {
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn reset_content_identity_work_for_test(&self) {
         reset_work_for_test();
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn take_content_identity_work_for_test(&self) -> (u64, u64, u64) {
         take_work_for_test()
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn take_content_identity_work_bytes_for_test(&self) -> (u64, u64) {
         take_work_bytes_for_test()
     }
@@ -6730,14 +6730,14 @@ impl RedbPersistence {
                     admission,
                     &mut node_bytes,
                 )?;
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 if mutation.family == LogicalFamily::Status {
                     observe_status_namespace(&mutation.logical_key);
                     if replaced {
                         forget_status_namespace(&mutation.logical_key);
                     }
                 }
-                #[cfg(not(feature = "test-seams"))]
+                #[cfg(not(any(test, feature = "test-seams")))]
                 let _ = replaced;
             }
             let mut coalesced_bytes = 0usize;
@@ -6747,7 +6747,7 @@ impl RedbPersistence {
 
             // The coalesced directory borrows source records; grouping allocates
             // only exact tuple slices and the selected keys' actual payloads.
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             let group_started = std::time::Instant::now();
             type GroupEntry = (Vec<u8>, Option<[u8; 32]>);
             let mut family_counts = [0usize; LogicalFamily::ALL.len()];
@@ -6810,7 +6810,7 @@ impl RedbPersistence {
             drop(unique);
             admission.release(node_bytes);
 
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             observe_identity_span(IdentitySpan::CoalesceAndGroup, group_started);
             let mut nodes = write_txn
                 .open_table(CONTENT_IDENTITY_NODES_TABLE)
@@ -6827,10 +6827,10 @@ impl RedbPersistence {
                 // over for the whole of the deepest walk.
                 let frames = mutations.capacity() * std::mem::size_of::<GroupEntry>();
                 grouped_bytes = grouped_bytes.saturating_sub(frames);
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 let sort_started = std::time::Instant::now();
                 sort_canonical_from_coalesced(&mut mutations)?;
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 {
                     observe_identity_span(IdentitySpan::CoalesceAndGroup, sort_started);
                     enter_family(family, mutations.len());
@@ -6871,7 +6871,7 @@ impl RedbPersistence {
                     frames,
                     &mut coalesced_bytes,
                 );
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 leave_family();
                 roots[family as usize] = updated?;
                 if let Some(publication) = history.as_mut() {
@@ -6917,7 +6917,7 @@ impl RedbPersistence {
         tails[LogicalFamily::Configuration as usize].vector_pages_root =
             Some(vector_schema_pages_root_in_write(write_txn)?);
         persist_changed_family_roots(write_txn, &roots, &original_roots, &tails, &original_tails)?;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         publish_directory_binding_work();
         Ok(digest_from_roots(std::array::from_fn(|family| {
             roots[family].hash
@@ -7426,13 +7426,13 @@ mod physical_key_order_tests;
 #[path = "correction_counterexample_tests.rs"]
 mod correction_counterexample_tests;
 
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 #[path = "proof_allocation_oracle_tests.rs"]
 pub(crate) mod proof_allocation_oracle_tests;
 
 /// Damage helpers and the reuse gate, reachable from the focused contract
 /// module beside this one. Test-only.
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 pub(super) mod test_access {
     use super::*;
 
@@ -7506,7 +7506,7 @@ mod resident_chunk_gate_tests {
                 None => crate::memory_accounting::MemoryAccountant::no_limit(),
             });
             let mut verifier =
-                ContentIdentityReadVerifier::open(&read, root.path(), Some(accountant)).unwrap();
+                ContentIdentityReadVerifier::open(&read, root.path(), Some(accountant.into())).unwrap();
             verifier.retain_proved_chunks_within(RESIDENT_PROOF_CHUNK_BYTES);
             verifier.resident_proof_chunk_ceiling_for_test()
         };
@@ -7559,7 +7559,7 @@ mod resident_chunk_gate_tests {
             64 * 1024 * 1024,
         ));
         let mut verifier =
-            ContentIdentityReadVerifier::open(&read, root.path(), Some(accountant)).unwrap();
+            ContentIdentityReadVerifier::open(&read, root.path(), Some(accountant.into())).unwrap();
         verifier.retain_proved_chunks_within(RESIDENT_PROOF_CHUNK_BYTES);
 
         for mutation in &records {
@@ -7640,7 +7640,7 @@ mod resident_proof_chunk_set_tests {
             }),
             bytes,
             _charge: AdmittedBytes::with_source(
-                crate::memory_accounting::StoreAccountantHandle::retain_if_writer(accountant), None),
+                crate::memory_accounting::StoreAccountantHandle::retain_if_writer(&crate::memory_accounting::AccountantHandle::from_host(accountant.clone())), None),
             _floor: None,
         })
     }

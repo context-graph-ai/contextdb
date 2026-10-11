@@ -256,7 +256,7 @@ fn a_refused_wide_key_transaction_returns_its_charge_and_changes_no_stored_byte(
     let budget = accountant(256 * 1024);
     let baseline = budget.usage().used;
     let write = database.begin_write().unwrap();
-    let mut admission = database.admission(Some(Arc::clone(&budget)));
+    let mut admission = database.admission(Some(Arc::clone(&budget).into()));
     let failure = RedbPersistence::apply_content_identity_mutations_in_write(
         &write,
         &replacements(&records),
@@ -290,7 +290,7 @@ fn a_refused_wide_key_transaction_returns_its_charge_and_changes_no_stored_byte(
     // the budget and not the work.
     let generous = accountant(64 * 1024 * 1024);
     let write = database.begin_write().unwrap();
-    let mut admission = database.admission(Some(Arc::clone(&generous)));
+    let mut admission = database.admission(Some(Arc::clone(&generous).into()));
     RedbPersistence::apply_content_identity_mutations_in_write(
         &write,
         &replacements(&records),
@@ -344,7 +344,7 @@ fn a_damaged_chunk_aborts_the_walk_and_changes_no_stored_byte() {
     let budget = accountant(64 * 1024 * 1024);
     let baseline = budget.usage().used;
     let write = database.begin_write().unwrap();
-    let mut admission = database.admission(Some(Arc::clone(&budget)));
+    let mut admission = database.admission(Some(Arc::clone(&budget).into()));
     let failure = RedbPersistence::apply_content_identity_mutations_in_write(
         &write,
         &replacements(&records),
@@ -381,14 +381,14 @@ fn a_tight_reader_admits_every_transient_and_returns_all_of_it() {
     let verifier = ContentIdentityReadVerifier::open(
         &read,
         std::path::Path::new("tight-reader.db"),
-        Some(Arc::clone(&budget)),
+        Some(Arc::clone(&budget).into()),
     )
     .unwrap();
     for record in &records {
         verifier.verify(record).unwrap();
     }
     let mut delivered = 0;
-    let proof = ProofMemory::admitted(Some(Arc::clone(&budget)), 8 * 1024 * 1024);
+    let proof = ProofMemory::admitted(Some(Arc::clone(&budget).into()), 8 * 1024 * 1024);
     verifier
         .visit_relational_index_postings::<Error>(
             "wide",
@@ -437,7 +437,7 @@ fn a_tight_reader_admits_every_transient_and_returns_all_of_it() {
     let verifier = ContentIdentityReadVerifier::open(
         &read,
         std::path::Path::new("tight-reader.db"),
-        Some(Arc::clone(&tight)),
+        Some(Arc::clone(&tight).into()),
     )
     .unwrap();
     let refusals = records
@@ -568,7 +568,7 @@ fn a_tight_reader_admits_every_transient_and_returns_all_of_it() {
         let budget = accountant(8 * 1024);
         let baseline = budget.admitted_bytes_for_test();
         let _resolved_key_watch = watch_resolved_key_copies_for_test();
-        let proof = ProofMemory::admitted(Some(Arc::clone(&budget)), 8 * 1024 * 1024);
+        let proof = ProofMemory::admitted(Some(Arc::clone(&budget).into()), 8 * 1024 * 1024);
         let refused = scan(&wide, &proof);
         assert!(
             matches!(refused, Err(Error::MemoryBudgetExceeded { .. })),
@@ -615,7 +615,7 @@ fn a_refused_chunk_record_is_never_inserted_before_it_is_admitted() {
     accountant
         .try_allocate(1)
         .expect("consume the whole budget so nothing more can be admitted");
-    let mut admission = database.admission(Some(Arc::clone(&accountant)));
+    let mut admission = database.admission(Some(Arc::clone(&accountant).into()));
     let family = LogicalFamily::SchemaAndIndexes;
     let root = empty_root(family);
 
@@ -659,7 +659,7 @@ fn a_refused_chunk_record_is_never_inserted_before_it_is_admitted() {
         bytes + 1,
     ));
     scratch_accountant.try_allocate(1).unwrap();
-    let mut scratch_admission = existing.admission(Some(Arc::clone(&scratch_accountant)));
+    let mut scratch_admission = existing.admission(Some(Arc::clone(&scratch_accountant).into()));
     let (backend, charge) = scratch_admission
         .open_scratch()
         .expect("the exact backend payload is admitted by the real factory");
@@ -759,7 +759,7 @@ fn repeated_writes_to_one_key_admit_one_entry_not_one_per_mutation() {
             256 * 1024 * 1024,
         ));
         let write = database.begin_write().unwrap();
-        let mut admission = database.admission(Some(Arc::clone(&accountant)));
+        let mut admission = database.admission(Some(Arc::clone(&accountant).into()));
         RedbPersistence::apply_content_identity_mutations_in_write(
             &write,
             mutations,

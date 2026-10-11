@@ -443,7 +443,7 @@ impl BlobHashFenceRegistry {
         })
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn wait_until_purge_waits_for_hash_for_test(
         &self,
         hash: &[u8; 32],
@@ -736,7 +736,7 @@ impl BlobRepository {
 
     /// Attach blob tables to an existing file-backed database.
     pub fn shared(persistence: Arc<RedbPersistence>) -> Arc<Self> {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::read_probe::note_blob_repository_open();
         Arc::new(Self {
             persistence: Some(persistence),
@@ -749,7 +749,7 @@ impl BlobRepository {
 
     /// Create a disk-bounded ephemeral repository for `Database::open_memory`.
     pub fn ephemeral() -> Result<Arc<Self>> {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::read_probe::note_blob_repository_open();
         let dir = Arc::new(
             tempfile::tempdir()
@@ -775,7 +775,7 @@ impl BlobRepository {
         self.bounded_blob_bytes_read.load(Ordering::Relaxed)
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub fn wait_until_authoritative_purge_waits_for_hash_for_test(
         &self,
         hash: &[u8; 32],

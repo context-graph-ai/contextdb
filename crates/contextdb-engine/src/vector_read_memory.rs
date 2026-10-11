@@ -95,7 +95,7 @@ impl DeclaredReadMemory {
     /// Largest admitted live-byte figure recorded by an individual file
     /// reader child. Children update this before the native allocation and
     /// the session keeps the receipt after an operation child is dropped.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn file_child_high_water(&self) -> u64 {
         self.file_child_high_water
             .load(std::sync::atomic::Ordering::SeqCst)
@@ -120,7 +120,7 @@ impl DeclaredReadMemory {
             retained: std::sync::atomic::AtomicU64::new(0),
             control_bytes,
         });
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         register_child_observer(&child);
         Ok(child)
     }
@@ -148,18 +148,18 @@ fn reader_memory_refusal(
         hint: hint.into(),
     }
 }
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 thread_local! {
     static READER_BUDGET_LEDGER: std::cell::RefCell<Option<Vec<crate::memory_accounting::BudgetLedgerEntry>>> = const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub fn watch_reader_budget_ledger_for_test() {
     READER_BUDGET_LEDGER.with(|ledger| *ledger.borrow_mut() = Some(Vec::new()));
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub fn take_reader_budget_ledger_for_test() -> Vec<crate::memory_accounting::BudgetLedgerEntry> {
     READER_BUDGET_LEDGER.with(|ledger| ledger.borrow_mut().take().unwrap_or_default())
@@ -182,7 +182,7 @@ impl ReadMemoryBudget for DeclaredReadMemory {
             .map_err(|held| {
                 reader_memory_refusal(self.limit, held, bytes, subsystem, operation, hint)
             })?;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         READER_BUDGET_LEDGER.with(|ledger| {
             if let Some(entries) = ledger.borrow_mut().as_mut() {
                 entries.push(crate::memory_accounting::BudgetLedgerEntry {
@@ -226,7 +226,7 @@ impl ReadMemoryBudget for DeclaredReadChild {
 }
 impl Drop for DeclaredReadChild {
     fn drop(&mut self) {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         child_observers()
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -246,7 +246,7 @@ impl ReadRequestBudgetProvider for Arc<DeclaredReadMemory> {
     }
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 impl DeclaredReadMemory {
     /// Passive parent-byte observation for independent source-unit lifetimes.
     pub(crate) fn retained_bytes_for_source_unit_test(&self) -> u64 {
@@ -287,7 +287,7 @@ impl Drop for ReaderAclCacheBudget {
 }
 
 // Weak observation of the native owner, without extending its charge lifetime.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[derive(Clone)]
 pub(crate) struct DeclaredReadChildObserver {
     child: std::sync::Weak<DeclaredReadChild>,
@@ -295,7 +295,7 @@ pub(crate) struct DeclaredReadChildObserver {
     owner_identity: usize,
     parent_identity: usize,
 }
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 impl DeclaredReadChildObserver {
     pub(crate) fn sample(&self) -> crate::read_work_probe::DeclaredReadChildFunding {
         use std::sync::atomic::Ordering;
@@ -311,12 +311,12 @@ impl DeclaredReadChildObserver {
         }
     }
 }
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 fn child_observers() -> &'static std::sync::Mutex<std::collections::HashMap<usize, DeclaredReadChildObserver>> {
     static OBSERVERS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, DeclaredReadChildObserver>>> = std::sync::OnceLock::new();
     OBSERVERS.get_or_init(Default::default)
 }
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 fn register_child_observer(child: &Arc<DeclaredReadChild>) {
     let owner_identity = Arc::as_ptr(child) as usize;
     let observer = DeclaredReadChildObserver {
@@ -327,7 +327,7 @@ fn register_child_observer(child: &Arc<DeclaredReadChild>) {
     };
     child_observers().lock().unwrap_or_else(|error| error.into_inner()).insert(owner_identity, observer);
 }
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn declared_child_observer(read_memory: &Arc<dyn ReadMemoryBudget>) -> Option<DeclaredReadChildObserver> {
     let identity = Arc::as_ptr(read_memory) as *const () as usize;
     child_observers().lock().unwrap_or_else(|error| error.into_inner()).get(&identity).cloned()

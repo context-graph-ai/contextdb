@@ -259,9 +259,9 @@ fn canonical_run_rejects_missing_extra_changed_and_hidden_physical_postings() {
             // The production decoder identifies the interior member. The raw
             // mutation below copies production-encoded bytes without a codec.
             let fixture_open_accountant_261 = std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-            let _fixture_decode_scope_261 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_261)).unwrap();
+            let _fixture_decode_scope_261 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_261).into()).unwrap();
             let store = RedbPersistence::open(&path).unwrap();
-            store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_261));
+            store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_261).into());
             let versions = store.load_relational_table("version_rows").unwrap();
             let interior_position = versions.iter().position(|row|
                 row.row_id == interior.row_id && row.created_tx == interior.created_tx && row.lsn == interior.lsn
@@ -284,10 +284,10 @@ fn canonical_run_rejects_missing_extra_changed_and_hidden_physical_postings() {
             if damage == "injected_extra_version" {
                 // Lawful public replacement retires this exact member first;
                 // injecting its original bytes leaves an extra physical member.
-                let fixture_open_accountant_283 = Arc::clone(&fixture_writer_accountant);
-                let _fixture_decode_scope_283 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_283)).unwrap();
+                let fixture_open_accountant_283 = fixture_writer_accountant.clone();
+                let _fixture_decode_scope_283 = crate::read_image_memory::ImageMemory::enter_writer_operation(fixture_open_accountant_283.clone()).unwrap();
                 let store = RedbPersistence::open(&path).unwrap();
-                store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_283));
+                store.attach_memory_accountant(fixture_open_accountant_283.clone());
                 let retained = versions.iter().enumerate().filter(|(position, _)| *position != interior_position)
                     .map(|(_, row)| row.clone()).collect::<Vec<_>>();
                 store.rewrite_table_rows("version_rows", &retained).unwrap();

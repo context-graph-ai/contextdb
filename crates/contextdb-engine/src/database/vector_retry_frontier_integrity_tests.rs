@@ -389,7 +389,7 @@ fn cleanup_refusal_skips_its_build_while_sibling_and_complete_query_frontiers_pr
             .temporary_workspace,
         0
     );
-    let accountant = Arc::clone(&db.accountant);
+    let accountant = db.accountant.clone();
     drop(persistence);
     db.close().unwrap();
     drop(db);

@@ -87,7 +87,7 @@ fn local_current_identity_admission_refuses_the_complete_transaction_before_dura
     let root = TempDir::new().unwrap();
     let path = root.path().join("local.db");
     let db = Database::open(&path).unwrap();
-    let writer = std::sync::Arc::clone(&db.finalization.accountant);
+    let writer = db.__accountant_handle_for_test();
     seed(&db);
     let root_before = db.writer_read_root().unwrap().unwrap().storage_identity();
     let generation = db
@@ -152,7 +152,7 @@ fn sync_current_identity_admission_refuses_rows_vectors_and_the_authenticated_re
     let root = TempDir::new().unwrap();
     let path = root.path().join("receiver.db");
     let target = Database::open(&path).unwrap();
-    let writer = std::sync::Arc::clone(&target.finalization.accountant);
+    let writer = target.__accountant_handle_for_test();
     seed(&target);
     let root_before = target
         .writer_read_root()
@@ -277,7 +277,7 @@ fn sync_current_identity_admission_refuses_rows_vectors_and_the_authenticated_re
             Some(source_lsn)
         );
     }
-    let retry_writer = std::sync::Arc::clone(&reopened.finalization.accountant);
+    let retry_writer = reopened.__accountant_handle_for_test();
     reopened.close().unwrap();
     drop(reopened);
     assert_final_writer_refund(retry_writer);
@@ -454,31 +454,27 @@ fn captured_suffix_inspection_uses_actual_reader_and_root_without_resident_tail(
 fn seeded_suffix_writer_final_owner_refunds_without_injected_failure() {
     let root = TempDir::new().unwrap();
     let db = Database::open(root.path().join("control.db")).unwrap();
-    let writer = std::sync::Arc::clone(&db.finalization.accountant);
+    let writer = db.__accountant_handle_for_test();
     seed(&db);
     db.close().unwrap();
     drop(db);
     assert_final_writer_refund(writer);
 }
 
-fn assert_final_writer_refund(writer: std::sync::Arc<crate::memory_accounting::MemoryAccountant>) {
-    use crate::memory_accounting::{process_aggregate_snapshot, writer_adapter_layout};
-    use std::sync::{Arc, atomic::AtomicUsize};
-    // The diagnostic itself owns the engine-created accountant and its two
-    // counters. Price exactly that live backing, then free the final owner.
-    let backing = writer_adapter_layout(writer.as_ref()).size()
-        + 2 * writer_adapter_layout(&AtomicUsize::new(0)).size();
+fn assert_final_writer_refund(writer: crate::memory_accounting::AccountantHandle) {
+    use crate::memory_accounting::process_aggregate_snapshot;
+    // The diagnostic owns the engine-created accountant, limit, and writer
+    // counter. Their private seam reports the live identities and typed
+    // layouts; it is not an allocator measurement.
+    let (native_origin, controls) = writer.native_backing_for_test();
+    assert!(native_origin, "this diagnostic retains an engine-created writer");
+    let backing = controls.iter().map(|(_, layout)| layout.size()).sum::<usize>();
     assert_eq!(
         writer.usage().used,
         backing,
         "all store payloads and controls refund before the diagnostic accountant is freed"
     );
     assert_eq!(writer.underflow_count_for_test(), 0);
-    assert_eq!(
-        Arc::strong_count(&writer),
-        1,
-        "no store owner retains the executing writer"
-    );
     let before = process_aggregate_snapshot().0;
     drop(writer);
     assert_eq!(

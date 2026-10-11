@@ -322,7 +322,7 @@ fn content_size_result(
 }
 
 pub(crate) trait ReadExecutionTarget: Send + Sync {
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn resident_history_database_for_test(&self) -> Result<&Database> {
         Err(Error::PlanError(
             "this execution target has no installed history database".into(),
@@ -574,30 +574,30 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         Ok(None)
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn note_vector_candidate_materialized(&self);
 
     /// Snapshot completed cache lifecycle events without causing a load or
     /// eviction. This is used only to prove the file reader's physical
     /// working-set behavior through its real execution target.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn vector_passive_activity_for_test(&self) -> contextdb_vector::VectorPassiveActivityCounters;
 
     /// Load this committed image's history, then drop its change and schema
     /// logs from memory, so the next history answer is built by the
     /// persisted-state fallback a store takes when its logs do not reach
     /// back to the position asked for. The store itself is untouched.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn force_history_log_gap_for_test(&self) {}
 
     /// Load this committed image's history, then drop only its change log
     /// from memory; its schema log stays.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn force_change_log_gap_for_test(&self) {}
 
     /// The vector store this target searches, so a proof can arm a store seam
     /// on the reader it measures.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn vector_store_for_test(&self) -> Arc<contextdb_vector::VectorStore>;
 
     fn capture_read_schema(&self) -> crate::database::SchemaPublicationGuard<'_>;
@@ -1406,7 +1406,7 @@ impl BoundedCursorTarget {
         snapshot: crate::direct_file_reader::DirectSnapshot,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Arc<Self> {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         {
             crate::read_probe::note_cursor_opened();
             crate::read_probe::note_cursor_bytes_charged(retained);
@@ -1430,12 +1430,12 @@ impl BoundedCursorTarget {
             return Ok(());
         }
         let retained = self.retained.swap(0, std::sync::atomic::Ordering::SeqCst);
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         {
             crate::read_probe::note_cursor_closed();
             crate::read_probe::note_cursor_bytes_returned(retained);
         }
-        #[cfg(not(feature = "test-seams"))]
+        #[cfg(not(any(test, feature = "test-seams")))]
         let _ = retained;
         self.store.release_statement_proof_reuse();
         self.with_cursor(close_bounded_cursor)
@@ -1458,7 +1458,7 @@ impl BoundedCursorTarget {
 /// these questions.
 #[allow(clippy::too_many_arguments)]
 impl ReadExecutionTarget for Database {
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn resident_history_database_for_test(&self) -> Result<&Database> {
         Ok(self)
     }
@@ -1707,31 +1707,31 @@ impl ReadExecutionTarget for Database {
         Database::transaction_staged_vector(self, tx, capability, before_touch, before_clone)
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn note_vector_candidate_materialized(&self) {
         self.__bump_candidate_rows_materialized_for_test(1);
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn vector_passive_activity_for_test(&self) -> contextdb_vector::VectorPassiveActivityCounters {
         self.__vector_passive_activity_counters_for_test()
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn force_history_log_gap_for_test(&self) {
         self.ensure_image_history()
             .expect("the committed image's history loads before its logs are dropped");
         self.__force_sync_log_gap_for_test();
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn force_change_log_gap_for_test(&self) {
         self.ensure_image_history()
             .expect("the committed image's history loads before its change log is dropped");
         self.__force_change_log_gap_for_test();
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn vector_store_for_test(&self) -> Arc<contextdb_vector::VectorStore> {
         Database::vector_store_for_test(self)
     }
@@ -2635,7 +2635,7 @@ impl ReadExecutionTarget for Database {
         (OwnedQueryResult, Vec<u8>, ReadPublicationScope),
         crate::direct_file_reader::DirectFileReaderError,
     > {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::read_probe::note_cancellation(crate::read_probe::CANCELLATION_EXECUTE, cancellation);
         let complete = read_answer(bounded::execute(
             self,
@@ -2645,7 +2645,7 @@ impl ReadExecutionTarget for Database {
             limits,
             clock,
             cancellation.clone(),
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             crate::read_session::session_kernel_probe_for_test(),
         ))?;
         let canonical =
@@ -2673,7 +2673,7 @@ impl ReadExecutionTarget for Database {
         ),
         crate::direct_file_reader::DirectFileReaderError,
     > {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::read_probe::note_cancellation(
             crate::read_probe::CANCELLATION_CURSOR_OPEN,
             cancellation,
@@ -2687,7 +2687,7 @@ impl ReadExecutionTarget for Database {
             limits,
             clock,
             cancellation.clone(),
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             crate::read_session::session_kernel_probe_for_test(),
         ))?;
         let retained = opened.cursor.retained_read_bytes();
@@ -2817,7 +2817,7 @@ fn execute_kernel_plan(
         tx,
         db.snapshot_for_read(),
         Arc::new(crate::local_transport::MonotonicDeadlineClock::new()),
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         None,
         read_memory,
     )
@@ -2896,7 +2896,7 @@ pub(crate) fn execute_bounded(
     limits: ReadLimits,
     clock: Arc<dyn DeadlineClock>,
     cancellation: OwnerReadCancellation,
-    #[cfg(feature = "test-seams")] probe: Option<Arc<dyn BoundedExecutionProbe>>,
+    #[cfg(any(test, feature = "test-seams"))] probe: Option<Arc<dyn BoundedExecutionProbe>>,
 ) -> std::result::Result<BoundedExecutionResult, BoundedExecutionError> {
     bounded::execute(
         db,
@@ -2906,7 +2906,7 @@ pub(crate) fn execute_bounded(
         limits,
         clock,
         cancellation,
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         probe,
     )
 }
@@ -2926,7 +2926,7 @@ pub(crate) fn execute_bounded_on_target(
     limits: ReadLimits,
     clock: Arc<dyn DeadlineClock>,
     cancellation: OwnerReadCancellation,
-    #[cfg(feature = "test-seams")] probe: Option<Arc<dyn BoundedExecutionProbe>>,
+    #[cfg(any(test, feature = "test-seams"))] probe: Option<Arc<dyn BoundedExecutionProbe>>,
 ) -> std::result::Result<BoundedExecutionResult, BoundedExecutionError> {
     bounded::execute(
         db,
@@ -2936,7 +2936,7 @@ pub(crate) fn execute_bounded_on_target(
         limits,
         clock,
         cancellation,
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         probe,
     )
 }
@@ -2953,7 +2953,7 @@ pub(crate) fn open_bounded_cursor(
     limits: ReadLimits,
     clock: Arc<dyn DeadlineClock>,
     cancellation: OwnerReadCancellation,
-    #[cfg(feature = "test-seams")] probe: Option<Arc<dyn BoundedExecutionProbe>>,
+    #[cfg(any(test, feature = "test-seams"))] probe: Option<Arc<dyn BoundedExecutionProbe>>,
 ) -> std::result::Result<BoundedCursorOpen, BoundedExecutionError> {
     bounded::open_cursor(
         db,
@@ -2963,7 +2963,7 @@ pub(crate) fn open_bounded_cursor(
         limits,
         clock,
         cancellation,
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         probe,
     )
 }
@@ -2974,13 +2974,13 @@ pub(crate) fn fetch_bounded_cursor(
     cursor: &mut BoundedCursorHandle,
     rows: Option<NonZeroUsize>,
     cancellation: OwnerReadCancellation,
-    #[cfg(feature = "test-seams")] probe: Option<Arc<dyn BoundedExecutionProbe>>,
+    #[cfg(any(test, feature = "test-seams"))] probe: Option<Arc<dyn BoundedExecutionProbe>>,
 ) -> std::result::Result<BoundedCursorFetch, BoundedExecutionError> {
     bounded::fetch_cursor(
         cursor,
         rows,
         cancellation,
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         probe,
     )
 }
@@ -3076,7 +3076,7 @@ pub(crate) enum BoundedSourceTouch {
     /// themselves, which is what the executor reports as examined.
     AdjacencyEntry,
     BruteForceVectorCandidate,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     HnswCandidate,
     RankCandidate,
     AccessRow,
@@ -3175,7 +3175,7 @@ impl BoundedCursorHandle {
     }
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 impl BoundedCursorHandle {
     /// What an open cursor is holding, part by part. A cursor that has
     /// already ended holds nothing, and says so with an all-zero breakdown
@@ -3290,7 +3290,7 @@ pub(crate) fn observe_bounded_rank_candidate() {
 /// Tests can advance the shared monotonic clock or cancel inside a source
 /// batch without delay.  The pull kernel also calls `cancellation_observed`
 /// immediately before returning the cancellation refusal.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) trait BoundedExecutionProbe: Send + Sync {
     fn after_snapshot_registration(&self) {}
     /// The actual immutable MVCC identity already registered by this operation.
@@ -3331,7 +3331,7 @@ pub(crate) trait BoundedExecutionProbe: Send + Sync {
     fn graph_credit_transfer(&self, _cut: bounded::GraphCreditTransferCut) {}
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub mod bounded_read_test_support;
 
@@ -10101,7 +10101,7 @@ fn analyze_filter_for_index_with_capability(
     allow_reverse: bool,
     automatic_ordered: bool,
 ) -> IndexAnalysis {
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     let _finite_planner_observation = FinitePlannerObservationScope::enter();
 
     use std::borrow::Cow;
@@ -10847,7 +10847,7 @@ fn fallback_finite_constraint_order(left: &Value, right: &Value) -> Ordering {
         .then_with(|| format!("{left:?}").cmp(&format!("{right:?}")))
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[doc(hidden)]
 pub struct FinitePlannerValueOperations {
@@ -10855,7 +10855,7 @@ pub struct FinitePlannerValueOperations {
     equality_checks: u64,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 impl FinitePlannerValueOperations {
     #[doc(hidden)]
     pub fn comparisons(self) -> u64 {
@@ -10873,14 +10873,14 @@ impl FinitePlannerValueOperations {
     }
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[derive(Clone, Copy)]
 struct FinitePlannerOperationState {
     operations: FinitePlannerValueOperations,
     limit: Option<u64>,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 thread_local! {
     static FINITE_PLANNER_OPERATIONS: std::cell::Cell<FinitePlannerOperationState> =
         const { std::cell::Cell::new(FinitePlannerOperationState {
@@ -10893,12 +10893,12 @@ thread_local! {
     static FINITE_PLANNER_OBSERVATION_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 struct FinitePlannerObservationScope {
     previous_depth: u32,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 impl FinitePlannerObservationScope {
     fn enter() -> Self {
         let previous_depth = FINITE_PLANNER_OBSERVATION_DEPTH
@@ -10907,7 +10907,7 @@ impl FinitePlannerObservationScope {
     }
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 impl Drop for FinitePlannerObservationScope {
     fn drop(&mut self) {
         FINITE_PLANNER_OBSERVATION_DEPTH.with(|depth| depth.set(self.previous_depth));
@@ -10915,13 +10915,13 @@ impl Drop for FinitePlannerObservationScope {
 }
 
 /// A thread-local deterministic ceiling for finite-list planner value work.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub struct FinitePlannerOperationGuard {
     previous: FinitePlannerOperationState,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 impl FinitePlannerOperationGuard {
     #[doc(hidden)]
     pub fn operations(&self) -> FinitePlannerValueOperations {
@@ -10929,7 +10929,7 @@ impl FinitePlannerOperationGuard {
     }
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 impl Drop for FinitePlannerOperationGuard {
     fn drop(&mut self) {
         FINITE_PLANNER_OPERATIONS.with(|state| state.set(self.previous));
@@ -10940,7 +10940,7 @@ impl Drop for FinitePlannerOperationGuard {
 /// shared value comparisons plus equality shortcuts. The count is active only
 /// inside index analysis, so per-key execution work is measured separately by
 /// the query trace. Production builds carry no counter or ceiling.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub fn finite_planner_operation_guard(limit: u64) -> FinitePlannerOperationGuard {
     let previous = FINITE_PLANNER_OPERATIONS.with(|state| {
@@ -10955,7 +10955,7 @@ pub fn finite_planner_operation_guard(limit: u64) -> FinitePlannerOperationGuard
 /// Exercise the shared Rust-equality shortcut under planner observation.
 /// This test-only door lets a negative control prove that work outside
 /// `compare_finite_constraint_values` is still subject to the same ceiling.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub fn finite_planner_shared_equality_for_test(left: &Value, right: &Value) -> bool {
     let _observation = FinitePlannerObservationScope::enter();
@@ -10965,7 +10965,7 @@ pub fn finite_planner_shared_equality_for_test(left: &Value, right: &Value) -> b
 /// Execute one read through the eager executor implementation. This keeps
 /// its shared index-planning behavior covered after public reads converged on
 /// the bounded pull kernel.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub fn execute_eager_for_test(
     db: &Database,
@@ -10989,14 +10989,14 @@ pub fn execute_eager_for_test(
     .map(OwnedQueryResult::into_public)
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[derive(Clone, Copy)]
 enum FinitePlannerValueOperation {
     Comparison,
     EqualityCheck,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 fn observe_finite_planner_value_operation(operation: FinitePlannerValueOperation) {
     if FINITE_PLANNER_OBSERVATION_DEPTH.with(|depth| depth.get() == 0) {
         return;
@@ -14274,7 +14274,7 @@ pub fn resolve_expr(expr: &Expr, params: &HashMap<String, Value>) -> Result<Valu
 }
 
 fn compare_values(a: &Value, b: &Value) -> Option<Ordering> {
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     observe_finite_planner_value_operation(FinitePlannerValueOperation::Comparison);
 
     match (a, b) {
@@ -14324,7 +14324,7 @@ fn compare_values(a: &Value, b: &Value) -> Option<Ordering> {
 }
 
 fn values_identical(left: &Value, right: &Value) -> bool {
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     observe_finite_planner_value_operation(FinitePlannerValueOperation::EqualityCheck);
 
     left == right
@@ -20347,7 +20347,7 @@ fn project_graph_frontier_rows(
 }
 
 impl ReadExecutionTarget for BoundedCursorTarget {
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn resident_history_database_for_test(&self) -> Result<&Database> {
         self.store.resident_history_database_for_test()
     }
@@ -20538,27 +20538,27 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         self.store.bounded_store_path()
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn note_vector_candidate_materialized(&self) {
         self.store.note_vector_candidate_materialized();
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn vector_passive_activity_for_test(&self) -> contextdb_vector::VectorPassiveActivityCounters {
         self.store.vector_passive_activity_for_test()
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn force_history_log_gap_for_test(&self) {
         self.store.force_history_log_gap_for_test()
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn force_change_log_gap_for_test(&self) {
         self.store.force_change_log_gap_for_test()
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn vector_store_for_test(&self) -> Arc<contextdb_vector::VectorStore> {
         self.store.vector_store_for_test()
     }
@@ -21452,7 +21452,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         ),
         crate::direct_file_reader::DirectFileReaderError,
     > {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::read_probe::note_cancellation(
             crate::read_probe::CANCELLATION_CURSOR_FETCH,
             cancellation,
@@ -21462,7 +21462,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
                 cursor,
                 rows,
                 cancellation.clone(),
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 crate::read_session::session_kernel_probe_for_test(),
             )
         });
@@ -21480,7 +21480,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
             Err(error) => {
                 // A refused read is over: it returns its bytes here rather
                 // than waiting for a caller to remember to close it.
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 crate::read_probe::note_cursor_refusal();
                 self.release()?;
                 return Err(error);

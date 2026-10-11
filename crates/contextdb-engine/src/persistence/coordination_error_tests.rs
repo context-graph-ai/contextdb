@@ -41,7 +41,7 @@ fn closed_writer_ownership_refuses_recovery_compaction_and_cursor_pin_with_typed
     assert_coordination_error(
         persistence
             .compact_incremental(
-                Arc::new(crate::memory_accounting::MemoryAccountant::no_limit()),
+                Arc::new(crate::memory_accounting::MemoryAccountant::no_limit()).into(),
                 0.0,
             )
             .expect_err("closed ownership refuses compaction"),
@@ -84,7 +84,7 @@ fn poisoned_writer_state_refuses_recovery_compaction_and_cursor_pin_with_typed_p
     assert_coordination_error(
         persistence
             .compact_incremental(
-                Arc::new(crate::memory_accounting::MemoryAccountant::no_limit()),
+                Arc::new(crate::memory_accounting::MemoryAccountant::no_limit()).into(),
                 0.0,
             )
             .expect_err("poisoned ownership refuses compaction"),
@@ -257,7 +257,7 @@ fn compaction_checkpoint_control_reservation_remains_non_io_at_the_hook() {
     let accountant = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(31));
     accountant.try_allocate(7).unwrap();
     let refusal = match RedbPersistence::reserve_compaction_checkpoint_controls(
-        Arc::clone(&accountant),
+        Arc::clone(&accountant).into(),
         Some("items"),
         &[2, 3],
     ) {

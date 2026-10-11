@@ -422,9 +422,9 @@ fn export_rebuild_prune_and_drop_recreate_keep_producer_witnesses() {
     }
     {
         let fixture_open_accountant_415 = std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-        let _fixture_decode_scope_415 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_415)).unwrap();
+        let _fixture_decode_scope_415 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_415).into()).unwrap();
         let store = RedbPersistence::open(&path).unwrap();
-        store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_415));
+        store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_415).into());
         let metas = store.load_all_table_meta().unwrap();
         store
             .rebuild_relational_indexes_for_current_table(
@@ -436,9 +436,9 @@ fn export_rebuild_prune_and_drop_recreate_keep_producer_witnesses() {
     assert_all_history_witnesses(&path);
     {
         let fixture_open_accountant_426 = std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-        let _fixture_decode_scope_426 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_426)).unwrap();
+        let _fixture_decode_scope_426 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_426).into()).unwrap();
         let store = RedbPersistence::open(&path).unwrap();
-        store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_426));
+        store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_426).into());
         let rows = store.load_relational_table("integrity_rows").unwrap();
         let old = rows
             .iter()

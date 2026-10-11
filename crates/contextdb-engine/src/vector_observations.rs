@@ -1,7 +1,7 @@
 //! Evidence from actual journal replay, scoped to one calling operation.
 use contextdb_core::{Lsn, RowId, TxId};
 use contextdb_vector::VectorPartitionRef;
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub use contextdb_vector::observations::{
     VectorBacklog, VectorBasePublicationEvent, VectorPublicationObservation,
     observe_base_publications,
@@ -11,7 +11,7 @@ use std::{cell::RefCell, marker::PhantomData, rc::Rc, sync::Arc};
 #[derive(Clone, Debug)]
 pub enum VectorJournalReplayWork {
     /// Original immutable producer input, copied only while a proof observer is installed.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     SavedTopologyExport { is_base: bool, generation_id: u64, bytes: Arc<[u8]> },
     /// Bytes returned by the storage backend while selecting or loading the
     /// replay suffix. Counts cache misses at the backend, independently of
@@ -85,7 +85,7 @@ pub(crate) fn emit(
     }
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn observe_saved_topology_export(
     partition: &VectorPartitionRef, covered_lsn: Lsn, is_base: bool,
     generation_id: u64, bytes: &[u8],
@@ -98,7 +98,7 @@ pub(crate) fn observe_saved_topology_export(
     }
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub fn observe_additional_journal_replay(observer: Observer) -> VectorJournalObservation {
     let prior = OBSERVER.with(|slot| slot.borrow().clone());

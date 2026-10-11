@@ -22,7 +22,7 @@ fn generation_route_metadata_refuses_zero_headroom_before_record_probe() {
     let layout = VectorIndexLayout::unpartitioned(1, VectorQuantization::F32);
     let loader = DurableVectorGenerationLoader {
         source: DurableVectorGenerationSource::Writable(persistence),
-        accountant: Arc::clone(&accountant),
+        accountant: Arc::clone(&accountant).into(),
         partition: VectorPartitionRef::new(
             VectorIndexRef::new("missing", "v"),
             VectorPartitionKey::from_components(

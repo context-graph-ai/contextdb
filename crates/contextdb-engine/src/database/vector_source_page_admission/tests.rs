@@ -48,7 +48,7 @@ fn oversized_generation_source_is_refused_before_backend_read_with_exact_error()
     let _observation = redb::observe_backend_reads(Arc::new(move |bytes| {
         observed.fetch_max(bytes, Ordering::SeqCst);
     }));
-    let error = match with_source_page_admission(Arc::clone(&accountant), || {
+    let error = match with_source_page_admission(accountant.clone().into(), || {
         read.open_table(GENERATIONS)
             .map_err(storage_error)?
             .get(b"old-authoritative".as_slice())
@@ -67,7 +67,7 @@ fn oversized_generation_source_is_refused_before_backend_read_with_exact_error()
     assert!(largest_read.load(Ordering::SeqCst) < GRAPH_BYTES);
     assert_eq!(accountant.usage().used, CACHE_BYTES);
     // Refusal leaves the old durable generation addressable and intact.
-    let value = with_source_page_admission(Arc::new(MemoryAccountant::no_limit()), || {
+    let value = with_source_page_admission(Arc::new(MemoryAccountant::no_limit()).into(), || {
         read.open_table(GENERATIONS)
             .map_err(storage_error)?
             .get(b"old-authoritative".as_slice())
@@ -88,7 +88,7 @@ fn oversized_source_charge_outlives_scope_and_releases_with_last_page_handle() {
     drop(read.open_table(GENERATIONS).unwrap());
     let accountant = Arc::new(MemoryAccountant::with_budget(128 * 1024 * 1024));
     accountant.try_allocate(CACHE_BYTES).unwrap();
-    let (key, value) = with_source_page_admission(Arc::clone(&accountant), || {
+    let (key, value) = with_source_page_admission(accountant.clone().into(), || {
         let table = read.open_table(GENERATIONS).map_err(storage_error)?;
         let mut range = table.range::<&[u8]>(..).map_err(storage_error)?;
         range.next().unwrap().map_err(storage_error)
@@ -120,7 +120,7 @@ fn cached_source_hands_charge_to_fixed_cache_and_nested_scope_restores_callback(
             Ok(())
         }),
         || {
-            let value = with_source_page_admission(Arc::clone(&accountant), || {
+            let value = with_source_page_admission(accountant.clone().into(), || {
                 read.open_table(GENERATIONS)
                     .map_err(storage_error)?
                     .get(b"old-authoritative".as_slice())
@@ -155,7 +155,7 @@ fn concurrent_source_reads_share_writer_budget_without_releasing_held_page() {
     drop(read.open_table(GENERATIONS).unwrap());
     let accountant = Arc::new(MemoryAccountant::with_budget(128 * 1024 * 1024));
     accountant.try_allocate(CACHE_BYTES).unwrap();
-    let value = with_source_page_admission(Arc::clone(&accountant), || {
+    let value = with_source_page_admission(accountant.clone().into(), || {
         read.open_table(GENERATIONS)
             .map_err(storage_error)?
             .get(b"old-authoritative".as_slice())
@@ -167,12 +167,12 @@ fn concurrent_source_reads_share_writer_budget_without_releasing_held_page() {
     assert!(held > CACHE_BYTES + GRAPH_BYTES);
     accountant.set_budget(Some(held)).unwrap();
     std::thread::scope(|scope| {
-        let accountant = Arc::clone(&accountant);
+        let accountant = accountant.clone();
         let db = &db;
         scope
             .spawn(move || {
                 let other_read = db.begin_read().unwrap();
-                let result = with_source_page_admission(Arc::clone(&accountant), || {
+                let result = with_source_page_admission(accountant.clone().into(), || {
                     other_read
                         .open_table(GENERATIONS)
                         .map_err(storage_error)?
@@ -200,7 +200,7 @@ fn caught_source_refusal_preserves_success_and_unrelated_errors() {
     // Prime bounded table metadata, then release its uncached root page.
     drop(read.open_table(GENERATIONS).unwrap());
     let accountant = Arc::new(MemoryAccountant::with_budget(1));
-    let published = with_source_page_admission(Arc::clone(&accountant), || {
+    let published = with_source_page_admission(accountant.clone().into(), || {
         let error = read.open_table(GENERATIONS).err().unwrap();
         let typed = crate::persistence::RedbPersistence::storage_error(error);
         assert!(matches!(typed, Error::MemoryBudgetExceeded { .. }));
@@ -212,7 +212,7 @@ fn caught_source_refusal_preserves_success_and_unrelated_errors() {
         published.cleanup_failure.unwrap().operation,
         "read_vector_generation_source_page"
     );
-    let classified = with_source_page_admission(Arc::clone(&accountant), || {
+    let classified = with_source_page_admission(accountant.clone().into(), || {
         assert!(read.open_table(GENERATIONS).is_err());
         Ok(17)
     })
@@ -221,7 +221,7 @@ fn caught_source_refusal_preserves_success_and_unrelated_errors() {
         classified, 17,
         "successful classification survives an unconsumed refusal"
     );
-    let unrelated = with_source_page_admission(accountant, || -> Result<()> {
+    let unrelated = with_source_page_admission(accountant.into(), || -> Result<()> {
         assert!(read.open_table(GENERATIONS).is_err());
         Err(crate::persistence::RedbPersistence::storage_error(
             std::io::Error::other("independent storage failure"),
@@ -239,7 +239,7 @@ fn nested_refusals_recover_only_the_current_scope_and_restore_after_unwind() {
     let read = db.begin_read().unwrap();
     // Prime bounded table metadata, then release its uncached root page.
     drop(read.open_table(GENERATIONS).unwrap());
-    with_source_page_admission(Arc::new(MemoryAccountant::with_budget(3)), || {
+    with_source_page_admission(Arc::new(MemoryAccountant::with_budget(3)).into(), || {
         let outer = read.open_table(GENERATIONS).err().unwrap();
         assert!(matches!(
             &outer,
@@ -247,7 +247,7 @@ fn nested_refusals_recover_only_the_current_scope_and_restore_after_unwind() {
         ));
         let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _: Result<()> =
-                with_source_page_admission(Arc::new(MemoryAccountant::with_budget(7)), || {
+                with_source_page_admission(Arc::new(MemoryAccountant::with_budget(7)).into(), || {
                     let inner = read.open_table(GENERATIONS).err().unwrap();
                     assert!(matches!(
                         &inner,
@@ -560,7 +560,7 @@ fn foreground_projection_query_preserves_page_refusal_before_the_admission_scope
     let mut observed = None;
     let mut available_at_refusal = None;
     let outer =
-        persistence.visit_relational_table_with_admission("admission_driver", &pages, |_| {
+        persistence.visit_relational_table_with_admission("admission_driver", &crate::memory_accounting::AccountantHandle::from_host(pages.clone()), |_| {
             // Same public API and statement shape as selected_events_through
             // in cg foreground event-search projection. Assert its result
             // before r17's outer side-channel repair can substitute it.
@@ -598,7 +598,7 @@ fn source_page_callback_returns_original_refusal_in_storage_carrier() {
     drop(read.open_table(GENERATIONS).unwrap());
     let accountant = Arc::new(MemoryAccountant::with_budget(CACHE_BYTES + 1024));
     accountant.try_allocate(CACHE_BYTES).unwrap();
-    let result = with_source_page_admission(Arc::clone(&accountant), || {
+    let result = with_source_page_admission(accountant.clone().into(), || {
         let table = read.open_table(GENERATIONS).unwrap();
         let error = table.get(b"old-authoritative".as_slice()).err().unwrap();
         let redb::StorageError::AdmissionRefused(payload) = error else {

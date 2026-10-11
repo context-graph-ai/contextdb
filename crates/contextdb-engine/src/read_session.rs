@@ -11,14 +11,14 @@ use crate::database::OwnedQueryResult;
 use crate::direct_file_reader::{
     DirectMetadataBody as MetadataBody, DirectMetadataRequest as MetadataRequest,
 };
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 use crate::executor::bounded_read_test_support::{ExecutionProbe, TestSourceTouch, TestWorkSource};
 use crate::owned_cursor_page::OwnedCursorPage;
 use crate::plugin::{CorePlugin, DatabasePlugin};
 use crate::read_progress::{ReadProgressObserver, with_progress_observer};
 use crate::{Database, QueryResult};
 use contextdb_core::read_contract::ChannelAddress;
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 use contextdb_core::read_contract::DeadlineClock;
 use contextdb_core::read_contract::{
     CursorPage, OwnerReadCancellation, OwnerReadLimits, OwnerReadStatus, OwnerRequestHandler,
@@ -68,7 +68,7 @@ pub struct OwnerReadConfig {
     pub timeouts: OwnerServiceTimeouts,
     pub runtime_dir: Option<PathBuf>,
     pub handler: Option<Arc<dyn OwnerRequestHandler>>,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub test_hooks: Option<OwnerReadTestHooks>,
 }
@@ -81,7 +81,7 @@ impl Default for OwnerReadConfig {
             timeouts: OwnerServiceTimeouts::default(),
             runtime_dir: None,
             handler: None,
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             test_hooks: None,
         }
     }
@@ -153,10 +153,10 @@ pub struct DatabaseOpenOptions {
     pub contexts: Option<BTreeSet<ContextId>>,
     pub scope_labels: Option<BTreeSet<ScopeLabel>>,
     pub principal: Option<Principal>,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub test_observer: Option<Arc<dyn ReadSessionTestObserver>>,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub test_kernel_observer: Option<Arc<dyn ReadKernelTestObserver>>,
 }
@@ -174,9 +174,9 @@ impl Default for DatabaseOpenOptions {
             contexts: None,
             scope_labels: None,
             principal: None,
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             test_observer: None,
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             test_kernel_observer: None,
         }
     }
@@ -336,7 +336,7 @@ mod route_observation {
 
     /// Proof-only handoff from the indexed source after a real residual
     /// rejection and before the walk considers a replacement.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct ReadKernelResidualRejectionEvent {
@@ -354,13 +354,13 @@ mod route_observation {
 
         /// Replace one owner's cursor-fetch page for a proof of client-side
         /// decoding and terminal resource release.
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         fn cursor_fetch_payload_for_test(&self, _payload: &[u8]) -> Option<Vec<u8>> {
             None
         }
 
         /// Replace one owner's cursor-open page before the client decodes it.
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         fn cursor_open_payload_for_test(&self, _payload: &[u8]) -> Option<Vec<u8>> {
             None
         }
@@ -372,7 +372,7 @@ mod route_observation {
     /// kernel invocation, not a route-level preflight copy.
     #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
     pub trait ReadKernelTestObserver: Send + Sync {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         fn registered_snapshot_for_test(
             &self,
             _route: ReadRoute,
@@ -387,7 +387,7 @@ mod route_observation {
             cancellation: OwnerReadCancellation,
         );
 
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         fn after_vector_residual_rejection(
             &self,
             _event: ReadKernelResidualRejectionEvent,
@@ -406,7 +406,7 @@ mod route_observation {
 // Without the doors these names are the engine's own; with them they are the
 // surface a proof observes through.
 // The production-private façade does not consume every proof export itself.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub use route_observation::{
     OwnerHandshakeMismatchForTest, ReadKernelCancellationEvent, ReadKernelResidualRejectionEvent,
@@ -414,14 +414,14 @@ pub use route_observation::{
     ReadSessionEvent, ReadSessionOperation, ReadSessionTestObserver,
 };
 #[cfg_attr(not(feature = "test-seams"), allow(unused_imports))]
-#[cfg(not(feature = "test-seams"))]
+#[cfg(not(any(test, feature = "test-seams")))]
 pub(crate) use route_observation::{
     OwnerHandshakeMismatchForTest, ReadKernelCancellationEvent, ReadKernelSource,
     ReadKernelSourceEvent, ReadKernelTestObserver, ReadRouteOpenFailure, ReadSessionEvent,
     ReadSessionOperation, ReadSessionTestObserver,
 };
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 impl From<TestSourceTouch> for ReadKernelSource {
     fn from(value: TestSourceTouch) -> Self {
         match value {
@@ -441,18 +441,18 @@ impl From<TestSourceTouch> for ReadKernelSource {
     }
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 thread_local! {
     static READ_RUNTIME_DIRECTORY_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
         const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 struct ReadRuntimeDirectoryOverrideGuard {
     previous: Option<PathBuf>,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 impl Drop for ReadRuntimeDirectoryOverrideGuard {
     fn drop(&mut self) {
         let previous = self.previous.take();
@@ -465,7 +465,7 @@ impl Drop for ReadRuntimeDirectoryOverrideGuard {
 /// Return the task-scoped runtime root selected by the surrounding test. The
 /// production route resolver consumes this in place of process environment;
 /// no alternate route selector or transport is exposed.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn runtime_directory_override_for_test() -> Option<PathBuf> {
     READ_RUNTIME_DIRECTORY_OVERRIDE.with(|slot| slot.borrow().clone())
 }
@@ -478,18 +478,18 @@ pub(crate) fn runtime_directory_override_for_test() -> Option<PathBuf> {
 // an observer. Rather than thread one through every writable-open signature
 // for a test-only door, the observer the open was given travels on the thread
 // that is doing the opening. Shipped builds compile this away entirely.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 thread_local! {
     static WRITER_OPEN_OBSERVER: std::cell::RefCell<Option<Arc<dyn ReadSessionTestObserver>>> =
         const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 struct WriterOpenObserverGuard {
     previous: Option<Arc<dyn ReadSessionTestObserver>>,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 impl Drop for WriterOpenObserverGuard {
     fn drop(&mut self) {
         let previous = self.previous.take();
@@ -501,7 +501,7 @@ impl Drop for WriterOpenObserverGuard {
 
 /// Run a writable open with the observer it was given in force for the whole
 /// of it, so milestones reached below the options layer still reach it.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn with_writer_open_observer<T>(
     observer: Option<&Arc<dyn ReadSessionTestObserver>>,
     run: impl FnOnce() -> T,
@@ -514,14 +514,14 @@ pub(crate) fn with_writer_open_observer<T>(
 /// Tell the writable open on this thread that it reached one of its own
 /// milestones. Nothing outside a proof ever listens.
 pub(crate) fn note_writer_open_event(event: ReadSessionEvent) {
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     {
         let observer = WRITER_OPEN_OBSERVER.with(|slot| slot.borrow().clone());
         if let Some(observer) = observer {
             observer.observe_event(event);
         }
     }
-    #[cfg(not(feature = "test-seams"))]
+    #[cfg(not(any(test, feature = "test-seams")))]
     let _ = event;
 }
 
@@ -531,19 +531,19 @@ pub(crate) fn note_writer_open_event(event: ReadSessionEvent) {
 // budgets. A proof drives either one by moving this manual clock rather than
 // sleeping. Route selection reaches those waits through several layers that
 // carry no clock, so the supplied clock travels on the opening thread.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 thread_local! {
     static ROUTE_SELECTION_CLOCK: std::cell::RefCell<
         Option<Arc<dyn contextdb_core::read_contract::DeadlineClock>>,
     > = const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 struct RouteSelectionClockGuard {
     previous: Option<Arc<dyn contextdb_core::read_contract::DeadlineClock>>,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 impl Drop for RouteSelectionClockGuard {
     fn drop(&mut self) {
         let previous = self.previous.take();
@@ -553,7 +553,7 @@ impl Drop for RouteSelectionClockGuard {
     }
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 fn with_route_selection_clock_for_test<T>(
     clock: Arc<dyn contextdb_core::read_contract::DeadlineClock>,
     run: impl FnOnce() -> T,
@@ -567,14 +567,14 @@ fn with_route_selection_clock_for_test<T>(
 /// proof supplied, or the ordinary monotonic clock every other deadline in a
 /// read session already uses.
 fn claim_window_clock() -> Arc<dyn contextdb_core::read_contract::DeadlineClock> {
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     if let Some(clock) = ROUTE_SELECTION_CLOCK.with(|slot| slot.borrow().clone()) {
         return clock;
     }
     read_clock()
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 struct SessionKernelProbe {
     observer: Arc<dyn ReadKernelTestObserver>,
     operation: ReadSessionOperation,
@@ -582,7 +582,7 @@ struct SessionKernelProbe {
     cancellation: OwnerReadCancellation,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 impl ExecutionProbe for SessionKernelProbe {
     fn after_hnsw_residual_rejection(
         &self,
@@ -636,7 +636,7 @@ impl ExecutionProbe for SessionKernelProbe {
 /// Work asked for over the channel runs on the owner's thread, so an observer
 /// attached to the store is the only one that can watch it -- a reader's own
 /// thread-local never touches the kernel the owner runs.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn owner_route_kernel_probe(
     observer: &Arc<dyn ReadKernelTestObserver>,
     operation: ReadSessionOperation,
@@ -653,7 +653,7 @@ pub(crate) fn owner_route_kernel_probe(
 /// Build the sole observer adapter accepted by bounded production execution.
 /// Backend adapters pass this value through; route code cannot manufacture a
 /// source-touch callback without entering the bounded executor probe.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn kernel_probe_for_test(
     observer: Arc<dyn ReadKernelTestObserver>,
     operation: ReadSessionOperation,
@@ -669,7 +669,7 @@ pub(crate) fn kernel_probe_for_test(
 }
 
 /// Resource identity and side-effect counts retained by one selected route.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ReadRouteResourceSnapshot {
@@ -705,13 +705,13 @@ struct RouteResources {
     /// Real source items THIS route's reads have finished inspecting. Kept per
     /// route rather than read from the process-wide probe, so a caller asking
     /// what its own read has done is not told what its neighbours did.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     bounded_source_items: Arc<std::sync::atomic::AtomicU64>,
     /// The owner's own counter for the channel this route selected, when that
     /// owner runs in this process. Work asked for over the channel is done on
     /// the owner's thread, where this reader's counter above is not in force,
     /// so the owner's number is the only true one for this route.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     channel_source_items: Mutex<Option<Arc<std::sync::atomic::AtomicU64>>>,
 }
 
@@ -726,7 +726,7 @@ impl RouteResources {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn snapshot(&self) -> ReadRouteResourceSnapshot {
         use std::sync::atomic::Ordering;
         ReadRouteResourceSnapshot {
@@ -955,12 +955,12 @@ fn read_runtime_directory(
     owner_user: contextdb_core::read_contract::LocalUserIdentity,
     supplied: Option<&Path>,
 ) -> std::result::Result<crate::local_transport::RuntimeDirectory, Error> {
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     let supplied = supplied
         .map(Path::to_path_buf)
         .or_else(runtime_directory_override_for_test)
         .map(std::borrow::Cow::<Path>::Owned);
-    #[cfg(not(feature = "test-seams"))]
+    #[cfg(not(any(test, feature = "test-seams")))]
     let supplied = supplied.map(std::borrow::Cow::Borrowed);
     crate::local_transport::runtime_directory_for_store(supplied.as_deref(), owner_user).map_err(
         |error| {
@@ -1275,7 +1275,7 @@ fn attempt_route_once(
                     .channel_identity
                     .lock()
                     .expect("route channel identity") = Some(address);
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 {
                     *resources
                         .channel_source_items
@@ -1472,11 +1472,11 @@ fn open_direct_route(
 ) -> std::result::Result<SelectedRoute, RouteOpenRefusal> {
     observe(ReadSessionEvent::BeforeDirectBackendOpen { attempt });
     resources.note_direct_backend_open();
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     let coordination_runtime = runtime_dir
         .map(Path::to_path_buf)
         .or_else(runtime_directory_override_for_test);
-    #[cfg(not(feature = "test-seams"))]
+    #[cfg(not(any(test, feature = "test-seams")))]
     let coordination_runtime = runtime_dir.map(Path::to_path_buf);
     // The declaration this session opened with travels with the reader, so
     // the committed image it hydrates is narrowed before a single row is
@@ -1643,19 +1643,19 @@ fn current_read_user()
         .map_err(|error| Error::Other(error.to_string()))
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 thread_local! {
     static SESSION_KERNEL_PROBE: std::cell::RefCell<
         Option<Arc<dyn crate::executor::BoundedExecutionProbe>>,
     > = const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 struct SessionKernelProbeGuard {
     previous: Option<Arc<dyn crate::executor::BoundedExecutionProbe>>,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 impl Drop for SessionKernelProbeGuard {
     fn drop(&mut self) {
         let previous = self.previous.take();
@@ -1672,7 +1672,7 @@ impl Drop for SessionKernelProbeGuard {
 /// doors, and a route may not reach past them; so the observer is left where
 /// the kernel itself picks it up, for exactly the span of one operation, and
 /// is restored even if that operation panics.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn with_session_kernel_probe<T>(
     probe: Option<Arc<dyn crate::executor::BoundedExecutionProbe>>,
     operation: impl FnOnce() -> T,
@@ -1688,7 +1688,7 @@ pub(crate) fn with_session_kernel_probe<T>(
 /// counter the thread it runs on is carrying, so a route that wants to know
 /// what its own reads did puts its counter there for exactly the span of one
 /// operation, and takes it back afterwards even if the operation panics.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 fn with_route_source_counter<T>(
     resources: &Arc<RouteResources>,
     operation: impl FnOnce() -> T,
@@ -1708,7 +1708,7 @@ fn with_route_source_counter<T>(
     operation()
 }
 
-#[cfg(not(feature = "test-seams"))]
+#[cfg(not(any(test, feature = "test-seams")))]
 fn with_route_source_counter<T>(
     _resources: &Arc<RouteResources>,
     operation: impl FnOnce() -> T,
@@ -1718,7 +1718,7 @@ fn with_route_source_counter<T>(
 
 /// The kernel observer in force for the operation this thread is running.
 /// Only the bounded kernel's own callers read this.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn session_kernel_probe_for_test()
 -> Option<Arc<dyn crate::executor::BoundedExecutionProbe>> {
     SESSION_KERNEL_PROBE.with(|slot| slot.borrow().clone())
@@ -1747,15 +1747,15 @@ pub struct ReadSession {
     /// view, which is exactly what route selection has just finished
     /// producing.
     snapshot_at: Option<contextdb_core::Wallclock>,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     observer: Option<Arc<dyn ReadSessionTestObserver>>,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     kernel_observer: Option<Arc<dyn ReadKernelTestObserver>>,
     /// A clock this session's own reads deadline against, so a test can move
     /// time deliberately instead of waiting for it. The owner route already
     /// takes a clock; a live-database session hardcoded the monotonic one,
     /// which left its deadline behaviour unreachable from a test.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     clock: Option<Arc<dyn contextdb_core::read_contract::DeadlineClock>>,
 }
 
@@ -1798,7 +1798,7 @@ fn read_error(error: crate::executor::BoundedExecutionError) -> Error {
 
 /// Wrap one session observer as the bounded kernel's own probe for a single
 /// operation, so what the observer sees is what the kernel actually did.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 fn observed_kernel_probe(
     observer: &Arc<dyn ReadKernelTestObserver>,
     operation: ReadSessionOperation,
@@ -1817,7 +1817,7 @@ impl ReadSession {
     /// The clock this session deadlines against: whatever a test installed,
     /// otherwise the monotonic one every live read has always used.
     fn session_clock(&self) -> Arc<dyn contextdb_core::read_contract::DeadlineClock> {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if let Some(clock) = self.clock.as_ref() {
             return Arc::clone(clock);
         }
@@ -1826,7 +1826,7 @@ impl ReadSession {
 }
 
 pub(crate) fn read_clock() -> Arc<dyn contextdb_core::read_contract::DeadlineClock> {
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     if let Some(clock) = ROUTE_SELECTION_CLOCK.with(|slot| slot.borrow().clone()) {
         return clock;
     }
@@ -1839,7 +1839,7 @@ pub(crate) fn read_clock() -> Arc<dyn contextdb_core::read_contract::DeadlineClo
 struct LiveCursorExecution {
     database: Arc<Database>,
     handle: crate::executor::BoundedCursorHandle,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     kernel_observer: Option<Arc<dyn ReadKernelTestObserver>>,
 }
 
@@ -1853,7 +1853,7 @@ impl OwnedCursorExecution for LiveCursorExecution {
         rows: Option<NonZeroUsize>,
         cancellation: &OwnerReadCancellation,
     ) -> Result<ObservedCursorPage> {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         let probe = self.kernel_observer.as_ref().map(|observer| {
             observed_kernel_probe(
                 observer,
@@ -1866,7 +1866,7 @@ impl OwnedCursorExecution for LiveCursorExecution {
             &mut self.handle,
             rows,
             cancellation.clone(),
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             probe,
         )
         .map_err(read_error)?;
@@ -1897,7 +1897,7 @@ impl ReadSession {
     /// Run an operation through the normal route doors while resolving local
     /// channels below an explicit secure test runtime root. The scoped value
     /// is restored even when the operation panics.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn with_runtime_directory_for_test<T>(
         runtime_dir: impl AsRef<Path>,
@@ -2054,7 +2054,7 @@ impl ReadSession {
 
     /// Open through the production route selector with deterministic route
     /// observation enabled.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn open_with_observer_for_test(
         path: impl AsRef<Path>,
@@ -2075,7 +2075,7 @@ impl ReadSession {
 
     /// Open through the production route selector while a proof drives every
     /// local-channel deadline with its manual clock.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn open_with_clock_for_test(
         path: impl AsRef<Path>,
@@ -2099,7 +2099,7 @@ impl ReadSession {
         Ok(session)
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn open_with_clock_and_observer_for_test(
         path: impl AsRef<Path>,
@@ -2126,7 +2126,7 @@ impl ReadSession {
 
     /// The owner-only door, opened through the production route selector
     /// with deterministic route observation enabled.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn open_owner_only_with_observer_for_test(
         path: impl AsRef<Path>,
@@ -2153,7 +2153,7 @@ impl ReadSession {
     /// is proven by advancing a manual clock, never by sleeping. Route
     /// selection therefore has to carry this clock into the claim wait, so
     /// the wait deadlines against it instead of against `Instant::now()`.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn open_owner_only_with_clock_for_test(
         path: impl AsRef<Path>,
@@ -2176,7 +2176,7 @@ impl ReadSession {
 
     /// Traverse the normal owner route while presenting one deliberately
     /// mismatched identity field to its real authentication boundary.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn open_with_owner_handshake_mismatch_for_test(
         path: impl AsRef<Path>,
@@ -2198,7 +2198,7 @@ impl ReadSession {
 
     /// Open through the production route selector while attaching an observer
     /// that can be called only from the selected backend's bounded kernel.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn open_with_kernel_observer_for_test(
         path: impl AsRef<Path>,
@@ -2219,7 +2219,7 @@ impl ReadSession {
 
     /// Compose the existing observers and manual clock without changing route
     /// selection, request semantics or the runtime protocol.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn open_with_observations_for_test(
         path: impl AsRef<Path>,
@@ -2247,7 +2247,7 @@ impl ReadSession {
 
     /// Only the file backend owns a session-wide committed image today.
     /// Absence on a live-owner route is an observation, never a fabricated root.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn file_snapshot_for_test(&self) -> Option<crate::direct_file_reader::DirectSnapshot> {
         match self.state.as_ref() {
@@ -2258,7 +2258,7 @@ impl ReadSession {
         }
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn file_storage_registration_for_test(
         &self,
@@ -2271,7 +2271,7 @@ impl ReadSession {
         }
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn file_memory_for_test(
         &self,
@@ -2299,7 +2299,7 @@ impl ReadSession {
     /// Bytes this session's accountant took through `charge_retained` -- the
     /// writer's unconditional retention door. A read session must report zero:
     /// see `a_read_only_session_pays_nothing_at_the_writers_retention_door`.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn file_cache_index_charge_for_test(&self) -> Option<(usize, usize)> {
         match self.state.as_ref() {
@@ -2310,7 +2310,7 @@ impl ReadSession {
         }
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn file_retained_charge_bytes_for_test(&self) -> Option<usize> {
         match self.state.as_ref() {
@@ -2321,7 +2321,7 @@ impl ReadSession {
         }
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn file_admitted_bytes_for_test(&self) -> Option<usize> {
         match self.state.as_ref() {
@@ -2334,7 +2334,7 @@ impl ReadSession {
 
     /// Snapshot real vector generation load/eviction receipts without changing
     /// the file reader's cache state.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn file_vector_passive_activity_for_test(
         &self,
@@ -2349,7 +2349,7 @@ impl ReadSession {
 
     /// The vector store a file-route session searches, so a proof can arm a
     /// store seam on the very reader it measures.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn file_vector_store_for_test(&self) -> Option<Arc<contextdb_vector::VectorStore>> {
         match self.state.as_ref() {
@@ -2365,7 +2365,7 @@ impl ReadSession {
     /// bytes are actually accounted for by a session charge or the reader's
     /// free floor (second) -- independent of whatever `charged_bytes`
     /// reports as charged to the declared session.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn file_retained_content_proof_bytes_for_test(&self) -> Option<(usize, usize)> {
         match self.state.as_ref() {
@@ -2383,7 +2383,7 @@ impl ReadSession {
     /// copied out of residency stays reachable at exactly its pre-eviction
     /// bytes while the resident set's charge for it disappears -- the
     /// ownership gap a statement-preserving forced eviction needs to observe.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn file_evict_resident_proof_chunks_only_for_test(&self) -> Option<usize> {
         match self.state.as_ref() {
@@ -2422,7 +2422,7 @@ impl ReadSession {
         mismatch: Option<OwnerHandshakeMismatchForTest>,
         progress: Option<Arc<dyn ReadProgressObserver>>,
     ) -> Result<Self> {
-        #[cfg(not(feature = "test-seams"))]
+        #[cfg(not(any(test, feature = "test-seams")))]
         let _ = (&session_observer, &kernel_observer);
         let mut options = options;
         if let Some(limit) = options.memory_limit {
@@ -2444,14 +2444,14 @@ impl ReadSession {
         // established typed missing-store answer.
         let canonical_path = resolved_route_path(path)?;
         let resources = Arc::new(RouteResources::default());
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         let observed = session_observer.clone();
         let observe = move |event: ReadSessionEvent| {
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             if let Some(observer) = observed.as_ref() {
                 observer.observe_event(event);
             }
-            #[cfg(not(feature = "test-seams"))]
+            #[cfg(not(any(test, feature = "test-seams")))]
             let _ = event;
         };
         // Loading the committed image happens inside route selection, so the
@@ -2512,11 +2512,11 @@ impl ReadSession {
             resources,
             progress,
             snapshot_at,
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             observer: session_observer,
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             kernel_observer,
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             clock: None,
         })
     }
@@ -2534,11 +2534,11 @@ impl ReadSession {
             resources: Arc::new(RouteResources::default()),
             progress: None,
             snapshot_at: None,
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             observer: None,
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             kernel_observer: None,
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             clock: None,
         }
     }
@@ -2557,7 +2557,7 @@ impl ReadSession {
         session
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn from_live_database_with_observer(
         database: Database,
         limits: ReadLimits,
@@ -2578,7 +2578,7 @@ impl ReadSession {
             snapshot_at: None,
             observer: Some(observer),
             kernel_observer: None,
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             clock: None,
         }
     }
@@ -2587,7 +2587,7 @@ impl ReadSession {
     /// caller supplies, so a deadline can be reached deliberately instead of
     /// waited for. The owner route has always taken a clock; this is the same
     /// door for the in-process route.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn from_live_database_with_clock(
         database: Database,
         limits: ReadLimits,
@@ -2598,7 +2598,7 @@ impl ReadSession {
         session
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn from_live_database_with_kernel_observer(
         database: Database,
         limits: ReadLimits,
@@ -2618,7 +2618,7 @@ impl ReadSession {
             snapshot_at: None,
             observer: None,
             kernel_observer: Some(observer),
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             clock: None,
         }
     }
@@ -2646,7 +2646,7 @@ impl ReadSession {
                     self.options.limits,
                     crate::local_transport::LocalRequest::OwnerStatus,
                     None,
-                    #[cfg(feature = "test-seams")]
+                    #[cfg(any(test, feature = "test-seams"))]
                     self.observer.as_ref(),
                 )?;
                 for response in responses {
@@ -2713,7 +2713,7 @@ impl ReadSession {
                     self.options.limits,
                     self.session_clock(),
                     cancellation.clone(),
-                    #[cfg(feature = "test-seams")]
+                    #[cfg(any(test, feature = "test-seams"))]
                     self.kernel_probe(ReadSessionOperation::Execute, cancellation),
                 )
                 .map_err(read_error)?;
@@ -2738,7 +2738,7 @@ impl ReadSession {
                     self.options.limits,
                     self.session_clock(),
                     cancellation.clone(),
-                    #[cfg(feature = "test-seams")]
+                    #[cfg(any(test, feature = "test-seams"))]
                     self.kernel_probe(ReadSessionOperation::Execute, cancellation),
                 )
                 .map_err(read_error)?;
@@ -2759,7 +2759,7 @@ impl ReadSession {
                         params: params.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
                     },
                     Some(cancellation),
-                    #[cfg(feature = "test-seams")]
+                    #[cfg(any(test, feature = "test-seams"))]
                     self.observer.as_ref(),
                 )?;
                 published_query_result(responses, self.options.limits, receiving_memory)
@@ -2808,12 +2808,12 @@ impl ReadSession {
         with_progress_observer(self.progress.as_ref(), || {
             with_route_source_counter(&self.resources, || {
                 let cancellation = OwnerReadCancellation::new();
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 return with_session_kernel_probe(
                     self.kernel_probe(ReadSessionOperation::Metadata, &cancellation),
                     || self.metadata_within_route(request, continuation, &cancellation),
                 );
-                #[cfg(not(feature = "test-seams"))]
+                #[cfg(not(any(test, feature = "test-seams")))]
                 self.metadata_within_route(request, continuation, &cancellation)
             })
         })
@@ -2942,7 +2942,7 @@ impl ReadSession {
             limits,
             crate::local_transport::LocalRequest::Metadata { request: local },
             Some(cancellation),
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             self.observer.as_ref(),
         )?;
         let payload = published_metadata_payload(responses, limits.memory)?;
@@ -2972,7 +2972,7 @@ impl ReadSession {
                     .collect(),
             },
             Some(cancellation),
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             self.observer.as_ref(),
         )?;
         // The owner writes an explained plan through the same canonical
@@ -2990,7 +2990,7 @@ impl ReadSession {
 
     /// Present this session's kernel observer, if a test attached one, in the
     /// only shape the bounded kernel accepts.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn kernel_probe(
         &self,
         operation: ReadSessionOperation,
@@ -3041,7 +3041,7 @@ impl ReadSession {
                         Some(&owner.runtime_dir),
                     )
                     .map_err(|error| direct_error(&owner.path, error.into_direct_reader_error()))?;
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 if let Some(observer) = self.observer.as_ref() {
                     observer.observe_event(ReadSessionEvent::OwnerCursorHandoffStarted);
                 }
@@ -3072,7 +3072,7 @@ impl ReadSession {
                         self.options.limits.memory,
                         &retained_memory,
                     )),
-                    #[cfg(feature = "test-seams")]
+                    #[cfg(any(test, feature = "test-seams"))]
                     self.observer.as_ref(),
                 )?;
                 drop(request_charge);
@@ -3086,7 +3086,7 @@ impl ReadSession {
                     responses,
                     self.options.limits,
                     &retained_memory,
-                    #[cfg(feature = "test-seams")]
+                    #[cfg(any(test, feature = "test-seams"))]
                     self.observer.as_ref(),
                 ) {
                     Ok(published) => published,
@@ -3097,7 +3097,7 @@ impl ReadSession {
                                 self.options.limits,
                                 crate::local_transport::LocalRequest::CursorClose { cursor_id },
                                 None,
-                                #[cfg(feature = "test-seams")]
+                                #[cfg(any(test, feature = "test-seams"))]
                                 self.observer.as_ref(),
                             );
                         }
@@ -3113,7 +3113,7 @@ impl ReadSession {
                     physical_identity,
                     limits,
                 } = published;
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 if let Some(observer) = self.observer.as_ref() {
                     observer.observe_event(ReadSessionEvent::BeforeOwnerCursorHandoffRegistration);
                 }
@@ -3201,7 +3201,7 @@ impl ReadSession {
                             limits,
                             crate::local_transport::LocalRequest::CursorClose { cursor_id },
                             None,
-                            #[cfg(feature = "test-seams")]
+                            #[cfg(any(test, feature = "test-seams"))]
                             self.observer.as_ref(),
                         );
                         return Err(error);
@@ -3215,7 +3215,7 @@ impl ReadSession {
                                 limits,
                                 crate::local_transport::LocalRequest::CursorClose { cursor_id },
                                 None,
-                                #[cfg(feature = "test-seams")]
+                                #[cfg(any(test, feature = "test-seams"))]
                                 self.observer.as_ref(),
                             );
                             return Err(error);
@@ -3256,12 +3256,12 @@ impl ReadSession {
                             closed: complete,
                             expired: None,
                             expiry_waker: Arc::new(Mutex::new(None)),
-                            #[cfg(feature = "test-seams")]
+                            #[cfg(any(test, feature = "test-seams"))]
                             observer: self.observer.as_ref().map(Arc::clone),
                         })),
-                        #[cfg(feature = "test-seams")]
+                        #[cfg(any(test, feature = "test-seams"))]
                         observer: self.observer.as_ref().map(Arc::clone),
-                        #[cfg(feature = "test-seams")]
+                        #[cfg(any(test, feature = "test-seams"))]
                         kernel_observer: self.kernel_observer.as_ref().map(Arc::clone),
                     }),
                 };
@@ -3275,12 +3275,12 @@ impl ReadSession {
                     usize::try_from(self.options.limits.cursor_page_rows).unwrap_or(usize::MAX),
                 )
                 .unwrap_or(NonZeroUsize::MIN);
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 let opened = with_session_kernel_probe(
                     self.kernel_probe(ReadSessionOperation::CursorOpen, cancellation),
                     || reader.open_cursor_with_cancellation(sql, params, rows, cancellation),
                 );
-                #[cfg(not(feature = "test-seams"))]
+                #[cfg(not(any(test, feature = "test-seams")))]
                 let opened = reader.open_cursor_with_cancellation(sql, params, rows, cancellation);
                 let opened = opened.map_err(|error| direct_error(Path::new(""), error))?;
                 self.resources
@@ -3300,12 +3300,12 @@ impl ReadSession {
                         execution: Mutex::new(Box::new(DirectCursorExecution {
                             cursor: opened.cursor,
                             resources: Arc::clone(&self.resources),
-                            #[cfg(feature = "test-seams")]
+                            #[cfg(any(test, feature = "test-seams"))]
                             kernel_observer: self.kernel_observer.as_ref().map(Arc::clone),
                         })),
-                        #[cfg(feature = "test-seams")]
+                        #[cfg(any(test, feature = "test-seams"))]
                         observer: self.observer.as_ref().map(Arc::clone),
-                        #[cfg(feature = "test-seams")]
+                        #[cfg(any(test, feature = "test-seams"))]
                         kernel_observer: self.kernel_observer.as_ref().map(Arc::clone),
                     }),
                 })
@@ -3329,7 +3329,7 @@ impl ReadSession {
                     self.options.limits,
                     self.session_clock(),
                     cancellation.clone(),
-                    #[cfg(feature = "test-seams")]
+                    #[cfg(any(test, feature = "test-seams"))]
                     self.kernel_probe(ReadSessionOperation::CursorOpen, cancellation),
                 )
                 .map_err(read_error)?;
@@ -3352,12 +3352,12 @@ impl ReadSession {
                                 execution: Mutex::new(Box::new(LiveCursorExecution {
                                     database: Arc::clone(database),
                                     handle: opened.cursor,
-                                    #[cfg(feature = "test-seams")]
+                                    #[cfg(any(test, feature = "test-seams"))]
                                     kernel_observer: self.kernel_observer.as_ref().map(Arc::clone),
                                 })),
-                                #[cfg(feature = "test-seams")]
+                                #[cfg(any(test, feature = "test-seams"))]
                                 observer: self.observer.as_ref().map(Arc::clone),
-                                #[cfg(feature = "test-seams")]
+                                #[cfg(any(test, feature = "test-seams"))]
                                 kernel_observer: self.kernel_observer.as_ref().map(Arc::clone),
                             }),
                         })
@@ -3386,7 +3386,7 @@ impl ReadSession {
                         payload: request.to_vec(),
                     },
                     None,
-                    #[cfg(feature = "test-seams")]
+                    #[cfg(any(test, feature = "test-seams"))]
                     self.observer.as_ref(),
                 )?;
                 match responses.into_iter().next() {
@@ -3397,7 +3397,7 @@ impl ReadSession {
         }
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn route_resources_for_test(&self) -> Result<ReadRouteResourceSnapshot> {
         Ok(self.resources.snapshot())
@@ -3412,7 +3412,7 @@ impl ReadSession {
     /// and each resource reads as held for as long as this process still owns
     /// the store's registry entry. Asking is free of side effects — no route
     /// is selected, no channel is dialled, no backend is opened.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn route_resources_for_path_for_test(
         path: impl AsRef<Path>,
@@ -3626,7 +3626,7 @@ impl ReadSession {
     /// Send an owner-status request over the real local channel. Status
     /// bypasses admission but still authenticates the selected listener, so a
     /// draining listener is distinguishable from an unbound or stale path.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn probe_owner_status_for_test(
         path: impl AsRef<Path>,
@@ -3651,14 +3651,14 @@ impl OwnerRoute {
         limits: ReadLimits,
         request: crate::local_transport::LocalRequest,
         cancellation: Option<&OwnerReadCancellation>,
-        #[cfg(feature = "test-seams")] observer: Option<&Arc<dyn ReadSessionTestObserver>>,
+        #[cfg(any(test, feature = "test-seams"))] observer: Option<&Arc<dyn ReadSessionTestObserver>>,
     ) -> Result<Vec<crate::local_transport::LocalResponse>> {
         self.ask_with_cursor_memory(
             limits,
             request,
             cancellation,
             None,
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             observer,
         )
     }
@@ -3669,12 +3669,12 @@ impl OwnerRoute {
         request: crate::local_transport::LocalRequest,
         cancellation: Option<&OwnerReadCancellation>,
         cursor_memory: Option<u64>,
-        #[cfg(feature = "test-seams")] observer: Option<&Arc<dyn ReadSessionTestObserver>>,
+        #[cfg(any(test, feature = "test-seams"))] observer: Option<&Arc<dyn ReadSessionTestObserver>>,
     ) -> Result<Vec<crate::local_transport::LocalResponse>> {
         self.resources.note_channel_operation();
         let progress = crate::read_progress::observer_for_this_read();
         let mut client = self.client.lock().expect("selected owner channel");
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if let Some(observer) = observer {
             let observer = Arc::clone(observer);
             client.observe_response_frames_for_test(Some(Arc::new(move |terminal| {
@@ -3687,7 +3687,7 @@ impl OwnerRoute {
             cancellation,
             cursor_memory,
         ));
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         client.observe_response_frames_for_test(None);
         answered.map_err(owner_error)
     }
@@ -4257,7 +4257,7 @@ fn known_plan_label(label: &str) -> Option<&'static str> {
 struct DirectCursorExecution {
     cursor: crate::direct_file_reader::DirectCursor,
     resources: Arc<RouteResources>,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     kernel_observer: Option<Arc<dyn ReadKernelTestObserver>>,
 }
 
@@ -4268,7 +4268,7 @@ impl OwnedCursorExecution for DirectCursorExecution {
             .map_err(|error| direct_error(Path::new(""), error))
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn file_resource_witness_for_test(
         &self,
     ) -> Result<Option<crate::direct_file_reader::DirectCursorResourceWitness>> {
@@ -4282,7 +4282,7 @@ impl OwnedCursorExecution for DirectCursorExecution {
         rows: Option<NonZeroUsize>,
         cancellation: &OwnerReadCancellation,
     ) -> Result<ObservedCursorPage> {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         let probe = self.kernel_observer.as_ref().map(|observer| {
             observed_kernel_probe(
                 observer,
@@ -4291,11 +4291,11 @@ impl OwnedCursorExecution for DirectCursorExecution {
                 cancellation,
             )
         });
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         let fetched = with_session_kernel_probe(probe, || {
             self.cursor.fetch_with_cancellation(rows, cancellation)
         });
-        #[cfg(not(feature = "test-seams"))]
+        #[cfg(not(any(test, feature = "test-seams")))]
         let fetched = self.cursor.fetch_with_cancellation(rows, cancellation);
         fetched
             .map(ObservedCursorPage::from)
@@ -4503,9 +4503,9 @@ struct SuspendedReadCursorState {
     progress: Option<Arc<dyn ReadProgressObserver>>,
     first_page: CursorPage,
     execution: Mutex<Box<dyn OwnedCursorExecution>>,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     observer: Option<Arc<dyn ReadSessionTestObserver>>,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     kernel_observer: Option<Arc<dyn ReadKernelTestObserver>>,
 }
 
@@ -4579,7 +4579,7 @@ struct OwnerCursorExecution {
     closed: bool,
     expired: Option<contextdb_core::read_contract::CursorExpiryKind>,
     expiry_waker: Arc<Mutex<Option<std::thread::Thread>>>,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     observer: Option<Arc<dyn ReadSessionTestObserver>>,
 }
 
@@ -4917,7 +4917,7 @@ impl OwnerCursorExecution {
             request,
             cancellation,
             cursor_memory,
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             self.observer.as_ref(),
         )
     }
@@ -4998,7 +4998,7 @@ impl OwnedCursorExecution for OwnerCursorExecution {
                     responses,
                     self.limits,
                     &self.retained_memory,
-                    #[cfg(feature = "test-seams")]
+                    #[cfg(any(test, feature = "test-seams"))]
                     self.observer.as_ref(),
                 )
             });
@@ -5158,17 +5158,17 @@ fn published_cursor_open(
     responses: Vec<crate::local_transport::LocalResponse>,
     limits: ReadLimits,
     retained_memory: &Arc<crate::read_image_memory::ImageMemory>,
-    #[cfg(feature = "test-seams")] observer: Option<&Arc<dyn ReadSessionTestObserver>>,
+    #[cfg(any(test, feature = "test-seams"))] observer: Option<&Arc<dyn ReadSessionTestObserver>>,
 ) -> Result<PublishedOwnerCursor> {
     for response in responses {
         match response {
             crate::local_transport::LocalResponse::CursorOpened { opened } => {
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 let replacement = observer
                     .and_then(|observer| observer.cursor_open_payload_for_test(&opened.payload));
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 let payload = replacement.as_deref().unwrap_or(&opened.payload);
-                #[cfg(not(feature = "test-seams"))]
+                #[cfg(not(any(test, feature = "test-seams")))]
                 let payload = &opened.payload;
                 let limits =
                     ReadLimits::stricter_of(limits, opened.effective_limits.unwrap_or(limits))
@@ -5212,7 +5212,7 @@ fn published_cursor_page(
     responses: Vec<crate::local_transport::LocalResponse>,
     limits: ReadLimits,
     retained_memory: &Arc<crate::read_image_memory::ImageMemory>,
-    #[cfg(feature = "test-seams")] observer: Option<&Arc<dyn ReadSessionTestObserver>>,
+    #[cfg(any(test, feature = "test-seams"))] observer: Option<&Arc<dyn ReadSessionTestObserver>>,
 ) -> Result<ObservedCursorPage> {
     for response in responses {
         match response {
@@ -5228,12 +5228,12 @@ fn published_cursor_page(
                 return Ok(observed);
             }
             crate::local_transport::LocalResponse::CursorPage { page } => {
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 let replacement = observer
                     .and_then(|observer| observer.cursor_fetch_payload_for_test(&page.payload));
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 let payload = replacement.as_deref().unwrap_or(&page.payload);
-                #[cfg(not(feature = "test-seams"))]
+                #[cfg(not(any(test, feature = "test-seams")))]
                 let payload = &page.payload;
                 return decode_observed_page(payload, limits.memory, retained_memory);
             }
@@ -5260,7 +5260,7 @@ trait OwnedCursorExecution: Send {
         Ok(None)
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn file_resource_witness_for_test(
         &self,
     ) -> Result<Option<crate::direct_file_reader::DirectCursorResourceWitness>> {
@@ -5335,14 +5335,14 @@ fn start_owner_cursor_expiry_watch(state: &Arc<SuspendedReadCursorState>) {
                 let mut execution = state.execution.lock().expect("read cursor state");
                 let was_live = execution.is_live();
                 execution.expire_from_watch(clock.now_ms());
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 if was_live
                     && !execution.is_live()
                     && let Some(observer) = state.observer.as_ref()
                 {
                     observer.observe_event(ReadSessionEvent::OwnerCursorExpiryReleased);
                 }
-                #[cfg(not(feature = "test-seams"))]
+                #[cfg(not(any(test, feature = "test-seams")))]
                 let _ = was_live;
                 let Some((_, next_deadline, _)) = execution.expiry_watch() else {
                     return;
@@ -5362,7 +5362,7 @@ impl Drop for OwnerCursorExecution {
 impl ReadCursor {
     /// Observe the existing file cursor's privately owned retention resources.
     /// A remote owner cursor has no locally inspectable file-resource witness.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn file_resource_witness_for_test(
         &self,
@@ -5441,7 +5441,7 @@ impl ReadCursor {
     ) -> Result<CursorPage> {
         let mut execution = self.state.execution.lock().expect("read cursor state");
         let _ = &self.state.session;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         let _ = (&self.state.observer, &self.state.kernel_observer);
         let fetched = execution.fetch(rows, cancellation);
         if fetched.is_err()
@@ -5504,13 +5504,13 @@ impl ReadCursor {
             .close()
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn retained_state_owners_for_test(&self) -> usize {
         Arc::strong_count(&self.state)
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn retained_session_owners_for_test(&self) -> usize {
         Arc::strong_count(&self.state.session)
@@ -5518,7 +5518,7 @@ impl ReadCursor {
 }
 
 /// Test-only controls consumed by the owner service once it is assembled.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 #[derive(Clone)]
 pub struct OwnerReadTestHooks {
@@ -5541,7 +5541,7 @@ pub struct OwnerReadTestHooks {
     pub quiescent_stop: Option<Arc<dyn Fn(QuiescentStopPhase) + Send + Sync>>,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QuiescentStopPhase {
@@ -5564,7 +5564,7 @@ pub(crate) fn owner_read_not_implemented_status() -> OwnerReadStatus {
     }
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 impl ReadSession {
     /// Use the Database already installed behind this session's execution
     /// target, preserving its captured root and fallible history capability.

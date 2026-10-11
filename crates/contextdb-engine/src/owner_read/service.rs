@@ -6,7 +6,7 @@ use crate::executor::{
     BoundedCursorHandle, BoundedCursorOpen, BoundedExecutionError, close_bounded_cursor,
     execute_bounded, fetch_bounded_cursor, open_bounded_cursor,
 };
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 use crate::executor::{BoundedExecutionProbe, BoundedSourceTouch, BoundedWorkSource};
 use crate::local_transport::response_is_encodable;
 use crate::local_transport::{
@@ -39,16 +39,16 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::num::{NonZeroU64, NonZeroUsize};
 #[cfg(unix)]
 use std::sync::Weak;
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll, Waker};
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 use crate::executor::bounded_read_test_support::{TestSourceTouch, TestWorkSource};
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 static LIVE_OWNER_READ_SERVICES: AtomicUsize = AtomicUsize::new(0);
 
 /// Private cursor identifiers are allocated behind one deterministic seam so
@@ -79,7 +79,7 @@ impl CursorIdentifierAllocator for SequenceCursorIdentifierAllocator {
     }
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OwnerBoundedOperation {
@@ -90,7 +90,7 @@ pub enum OwnerBoundedOperation {
 
 /// Test-only observation is attached to the production bounded-loop probe;
 /// it does not execute, classify, size, or account for any work itself.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub trait OwnerBoundedExecutionObserver: Send + Sync {
     fn before_operation(
@@ -136,7 +136,7 @@ pub trait OwnerBoundedExecutionObserver: Send + Sync {
 /// Test-only observation of the owner carrier's cursor-page commit point.
 /// The callbacks observe production ordering only; they neither choose an
 /// outcome nor mutate a cursor, cancellation token, or response.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub trait OwnerServicePublicationObserver: Send + Sync {
     /// A cursor entry has been fully prepared but has not yet acquired the
@@ -158,19 +158,19 @@ pub trait OwnerServicePublicationObserver: Send + Sync {
     fn cursor_page_published(&self, request_ordinal: u64);
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 std::thread_local! {
     static OWNER_SERVICE_START_PUBLICATION_OBSERVER: std::cell::RefCell<
         Option<Arc<dyn OwnerServicePublicationObserver>>,
     > = const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 struct OwnerServiceStartPublicationObserverGuard {
     previous: Option<Arc<dyn OwnerServicePublicationObserver>>,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 impl Drop for OwnerServiceStartPublicationObserverGuard {
     fn drop(&mut self) {
         let previous = self.previous.take();
@@ -180,7 +180,7 @@ impl Drop for OwnerServiceStartPublicationObserverGuard {
     }
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 struct OwnerBoundedProbeAdapter {
     observer: Arc<dyn OwnerBoundedExecutionObserver>,
     operation: OwnerBoundedOperation,
@@ -189,7 +189,7 @@ struct OwnerBoundedProbeAdapter {
     started: AtomicBool,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 impl OwnerBoundedProbeAdapter {
     fn observe_start(&self) {
         if self
@@ -206,7 +206,7 @@ impl OwnerBoundedProbeAdapter {
     }
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 impl BoundedExecutionProbe for OwnerBoundedProbeAdapter {
     fn before_work(&self, source: BoundedWorkSource, completed_work: u64) {
         self.observe_start();
@@ -304,9 +304,9 @@ pub struct OwnerServiceSpec {
     configuration_source: LocalConfigurationSource,
     clock: Arc<dyn DeadlineClock>,
     cursor_identifiers: Arc<dyn CursorIdentifierAllocator>,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     execution_observer: Option<Arc<dyn OwnerBoundedExecutionObserver>>,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     publication_observer: Option<Arc<dyn OwnerServicePublicationObserver>>,
 }
 
@@ -329,9 +329,9 @@ impl OwnerServiceSpec {
             configuration_source,
             clock,
             cursor_identifiers: Arc::new(SequenceCursorIdentifierAllocator::default()),
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             execution_observer: None,
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             publication_observer: OWNER_SERVICE_START_PUBLICATION_OBSERVER
                 .with(|slot| slot.borrow().clone()),
         }
@@ -340,7 +340,7 @@ impl OwnerServiceSpec {
     /// Attach a publication observer to the owner service synchronously built
     /// by `start`. The thread-local scope keeps parallel database fixtures
     /// independent and is restored even if construction unwinds.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn with_publication_observer_during_start_for_test<T>(
         observer: Arc<dyn OwnerServicePublicationObserver>,
@@ -352,7 +352,7 @@ impl OwnerServiceSpec {
         start()
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn with_cursor_identifier_allocator_for_test(
         mut self,
@@ -362,7 +362,7 @@ impl OwnerServiceSpec {
         self
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn with_execution_observer_for_test(
         mut self,
@@ -372,7 +372,7 @@ impl OwnerServiceSpec {
         self
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn with_publication_observer_for_test(
         mut self,
@@ -408,7 +408,7 @@ impl OwnerServiceSpec {
         &self.clock
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn metadata_probe(
         &self,
         limits: ReadLimits,
@@ -425,7 +425,7 @@ impl OwnerServiceSpec {
         }
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn bounded_probe(
         &self,
         operation: OwnerBoundedOperation,
@@ -579,7 +579,7 @@ impl CursorEntry {
         &mut self,
         rows: Option<NonZeroUsize>,
         cancellation: OwnerReadCancellation,
-        #[cfg(feature = "test-seams")] probe: Option<Arc<dyn BoundedExecutionProbe>>,
+        #[cfg(any(test, feature = "test-seams"))] probe: Option<Arc<dyn BoundedExecutionProbe>>,
     ) -> std::result::Result<crate::executor::BoundedCursorFetch, BoundedExecutionError> {
         fetch_bounded_cursor(
             self.cursor
@@ -587,7 +587,7 @@ impl CursorEntry {
                 .expect("a live owner cursor retains its bounded handle"),
             rows,
             cancellation,
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             probe,
         )
     }
@@ -758,9 +758,9 @@ pub struct OwnerReadResourceSnapshot {
     pub buffered_bytes: u64,
     pub active_cancellations: u64,
     pub accountant_used_bytes: u64,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub reader_used_bytes: u64,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub reader_control_bytes: u64,
 }
 
@@ -1119,16 +1119,16 @@ pub struct OwnerReadService {
     /// a request that was never sent leave the same trace in every other
     /// meter. Every accepted frame counts, an owner-status probe and an
     /// interrupt included.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     received_requests: Arc<AtomicU64>,
     /// What this owner's kernel has finished inspecting for work asked for
     /// over its channel. A reader on the owner route asks in its own thread
     /// and is answered in the owner's, so the counter the reader installed on
     /// its own thread never sees these items; this one is published for the
     /// channel and read by any reader of it in this process.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     channel_source_items: Arc<AtomicU64>,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     live_service_counted: AtomicBool,
 }
 
@@ -1136,7 +1136,7 @@ impl OwnerReadService {
     /// Bind the owner listener and begin answering authenticated reads.
     /// Database open starts this service once the store is claimed.
     pub fn start(spec: OwnerServiceSpec) -> OwnerReadScaffoldResult<Arc<Self>> {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::read_probe::note_owner_service_start();
         spec.validate()?;
         let admission = OwnerAdmission::new(spec.config.limits)?;
@@ -1187,19 +1187,19 @@ impl OwnerReadService {
             request_drain_waiter: Mutex::new(None),
             cancellation_signals: AtomicU64::new(0),
             declared_connections: Mutex::new(HashMap::new()),
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             received_requests: Arc::new(AtomicU64::new(0)),
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             channel_source_items: Arc::new(AtomicU64::new(0)),
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             live_service_counted: AtomicBool::new(false),
         });
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         {
             LIVE_OWNER_READ_SERVICES.fetch_add(1, Ordering::SeqCst);
             service.live_service_counted.store(true, Ordering::SeqCst);
         }
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if let Some(address) = service.spec.database.store_channel_address_for_test() {
             crate::read_probe::publish_owner_route_source_counter(
                 address,
@@ -1210,7 +1210,7 @@ impl OwnerReadService {
         Ok(service)
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn live_service_count_for_test() -> usize {
         LIVE_OWNER_READ_SERVICES.load(Ordering::SeqCst)
@@ -1404,7 +1404,7 @@ impl OwnerReadService {
         };
 
         let inbox = Arc::new(ConnectionInbox::new(
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             self.spec.publication_observer.clone(),
         ));
         self.workers
@@ -1420,7 +1420,7 @@ impl OwnerReadService {
             OwnerReadScaffoldError::unimplemented("owner connection reader shutdown clone")
         })?;
         let reader_inbox = Arc::clone(&inbox);
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         let reader_received = Arc::clone(&self.received_requests);
         let reader_thread = std::thread::Builder::new()
             .name("contextdb-owner-reader".to_owned())
@@ -1437,7 +1437,7 @@ impl OwnerReadService {
                     );
                     match inbound {
                         Ok(LocalInboundMessage::Request(envelope)) => {
-                            #[cfg(feature = "test-seams")]
+                            #[cfg(any(test, feature = "test-seams"))]
                             let _received = reader_received.fetch_add(1, Ordering::SeqCst);
                             reader_inbox.push(ConnectionEvent::Request(envelope));
                         }
@@ -1639,7 +1639,7 @@ impl OwnerReadService {
                             worker_service.dispatch_authenticated_for_carrier(request)
                         });
                         if completed.cursor_page.is_some() {
-                            #[cfg(feature = "test-seams")]
+                            #[cfg(any(test, feature = "test-seams"))]
                             if let Some(observer) = &worker_service.spec.publication_observer {
                                 observer.before_cursor_page_publication(request_ordinal);
                             }
@@ -1872,7 +1872,7 @@ impl OwnerReadService {
                                     return Ok(());
                                 }
                                 Ok(_guard) => {
-                                    #[cfg(feature = "test-seams")]
+                                    #[cfg(any(test, feature = "test-seams"))]
                                     if let Some(observer) = &self.spec.publication_observer {
                                         observer.publication_authorized(request_ordinal);
                                     }
@@ -1892,7 +1892,7 @@ impl OwnerReadService {
                                     }
                                 }
                             }
-                            #[cfg(feature = "test-seams")]
+                            #[cfg(any(test, feature = "test-seams"))]
                             if let Some(observer) = &self.spec.publication_observer {
                                 observer.cursor_page_published(request_ordinal);
                             }
@@ -1981,7 +1981,7 @@ impl OwnerReadService {
                 return Ok(());
             }
             let _publication = publication.and_then(Result::ok);
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             if _publication.is_some()
                 && let Some(observer) = &self.spec.publication_observer
             {
@@ -2111,13 +2111,13 @@ impl OwnerReadService {
             )
             .unwrap_or(u64::MAX),
             accountant_used_bytes: u64::try_from(usage.used).unwrap_or(u64::MAX),
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
             reader_used_bytes: self
                 .spec
                 .database
                 .declared_read_memory_for_test()
                 .retained_bytes_for_test(),
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             reader_control_bytes: self
                 .spec
                 .database
@@ -2132,7 +2132,7 @@ impl OwnerReadService {
     }
 
     /// How many request frames have arrived at this owner since it started.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub fn received_request_count(&self) -> u64 {
         self.received_requests.load(Ordering::SeqCst)
     }
@@ -2258,7 +2258,7 @@ impl OwnerReadService {
         // close; a request reaching this point afterwards is refused above.
         drop(active);
         drop(state);
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if let Some(hooks) = &self.spec.config.test_hooks
             && let Some(registered) = &hooks.active_request_registered
         {
@@ -2289,7 +2289,7 @@ impl OwnerReadService {
             .lock()
             .expect("owner reader-interrupt registry")
             .remove(&connection_id);
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if let Some(observer) = &self.spec.execution_observer {
             observer.request_finished();
         }
@@ -2398,7 +2398,7 @@ impl OwnerReadService {
                     connection.effective_limits(),
                     Arc::clone(&self.spec.clock),
                     connection.cancellation().clone(),
-                    #[cfg(feature = "test-seams")]
+                    #[cfg(any(test, feature = "test-seams"))]
                     self.spec.bounded_probe(
                         OwnerBoundedOperation::Execute,
                         connection.effective_limits(),
@@ -2433,7 +2433,7 @@ impl OwnerReadService {
                     connection.effective_limits(),
                     Arc::clone(&self.spec.clock),
                     connection.cancellation().clone(),
-                    #[cfg(feature = "test-seams")]
+                    #[cfg(any(test, feature = "test-seams"))]
                     self.spec.bounded_probe(
                         OwnerBoundedOperation::CursorOpen,
                         connection.effective_limits(),
@@ -2596,7 +2596,7 @@ impl OwnerReadService {
                             connection.effective_limits(),
                             Arc::clone(&self.spec.clock),
                             connection.cancellation().clone(),
-                            #[cfg(feature = "test-seams")]
+                            #[cfg(any(test, feature = "test-seams"))]
                             self.spec.metadata_probe(
                                 connection.effective_limits(),
                                 connection.cancellation().clone(),
@@ -2752,7 +2752,7 @@ impl OwnerReadService {
         {
             cancellation.cancel();
             let _ = self.cancellation_signals.fetch_add(1, Ordering::SeqCst);
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             if let Some(observer) = &self.spec.execution_observer {
                 observer.request_deadline_cancellation_signalled();
             }
@@ -2776,7 +2776,7 @@ impl OwnerReadService {
         entry: CursorEntry,
         registration: CursorRegistration,
     ) -> OwnerReadScaffoldResult<()> {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if let Some(observer) = &self.spec.publication_observer {
             observer.before_cursor_registry_publication();
         }
@@ -2981,7 +2981,7 @@ impl OwnerReadService {
                 publication,
             ));
         }
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         let bounded_probe = self.spec.bounded_probe(
             OwnerBoundedOperation::CursorFetch,
             entry.effective_limits,
@@ -2990,7 +2990,7 @@ impl OwnerReadService {
         let fetched = entry.fetch(
             rows,
             fetch_cancellation,
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             bounded_probe,
         );
         // What this cursor holds after the page is what it must now be
@@ -3336,13 +3336,13 @@ impl OwnerReadService {
                 lease.cancellation(),
             )
         };
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         let prepared = crate::read_session::with_session_kernel_probe(
             self.spec
                 .metadata_probe(lease.effective_limits(), lease.cancellation().clone()),
             prepare,
         )?;
-        #[cfg(not(feature = "test-seams"))]
+        #[cfg(not(any(test, feature = "test-seams")))]
         let prepared = prepare()?;
         let payload = match prepared {
             PreparedOwnerMetadata::CanonicalPage(page) => {
@@ -3602,7 +3602,7 @@ impl OwnerReadService {
             .retain(|(owner_connection, _)| *owner_connection != connection_id);
         if newly_disconnected && signalled {
             let _ = self.cancellation_signals.fetch_add(1, Ordering::SeqCst);
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             if let Some(observer) = &self.spec.execution_observer {
                 observer.disconnect_cancellation_signalled();
             }
@@ -3793,7 +3793,7 @@ impl OwnerReadService {
             // discovers the committed file instead of a stopping channel.
             self.remove_own_channel();
             drop(state);
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             if let Some(hooks) = &self.spec.config.test_hooks {
                 let _ = hooks.drain_started.send(());
                 if let Some(observer) = &hooks.quiescent_stop {
@@ -3820,11 +3820,11 @@ impl OwnerReadService {
             drop(state);
             (drained, notify_drain_started)
         };
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if notify_drain_started && let Some(hooks) = &self.spec.config.test_hooks {
             let _ = hooks.drain_started.send(());
         }
-        #[cfg(not(feature = "test-seams"))]
+        #[cfg(not(any(test, feature = "test-seams")))]
         let _ = notify_drain_started;
 
         // Waking bounded work can immediately run completion code that takes
@@ -3858,7 +3858,7 @@ impl OwnerReadService {
                 first_close_error = close.err();
             }
         }
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if signalled && let Some(observer) = &self.spec.execution_observer {
             observer.shutdown_cancellation_signalled();
         }
@@ -3901,7 +3901,7 @@ impl OwnerReadService {
             // final return, so this join cannot outlive the configured drain
             // that already reached that fact.
             let _ = worker.join();
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             if let Some(hooks) = &self.spec.config.test_hooks {
                 if let Some(exited) = &hooks.accept_thread_exited {
                     let _ = exited.send(());
@@ -3923,7 +3923,7 @@ impl OwnerReadService {
         let Some(worker) = worker else {
             return;
         };
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         let accept_thread_exited = self
             .spec
             .config
@@ -3936,7 +3936,7 @@ impl OwnerReadService {
             .name("contextdb-service-reaper".to_owned())
             .spawn(move || {
                 let _ = worker.join();
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 if let Some(exited) = accept_thread_exited {
                     let _ = exited.send(());
                 }
@@ -3946,7 +3946,7 @@ impl OwnerReadService {
     /// Take down the channel this service bound, once and only ours.
     #[cfg(unix)]
     fn remove_own_channel(&self) {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if let Some(address) = self.spec.database.store_channel_address_for_test() {
             crate::read_probe::withdraw_owner_route_source_counter(address);
         }
@@ -3959,13 +3959,13 @@ impl OwnerReadService {
     #[cfg(not(unix))]
     fn remove_own_channel(&self) {}
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn translate_bounded_refusal_for_test(failure: ReadFailure) -> OwnerReadScaffoldError {
         map_bounded_error(BoundedExecutionError::Refused(failure))
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn translate_bounded_cancelled_for_test() -> OwnerReadScaffoldError {
         map_bounded_error(BoundedExecutionError::Cancelled)
@@ -4124,7 +4124,7 @@ impl Drop for OwnerReadService {
         self.remove_own_channel();
         #[cfg(unix)]
         self.reap_accept_worker_without_waiting();
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if self.live_service_counted.swap(false, Ordering::SeqCst) {
             let previous = LIVE_OWNER_READ_SERVICES.fetch_sub(1, Ordering::SeqCst);
             debug_assert!(
@@ -4132,7 +4132,7 @@ impl Drop for OwnerReadService {
                 "live owner-read service count cannot underflow"
             );
         }
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if let Some(hooks) = &self.spec.config.test_hooks
             && let Some(dropped) = &hooks.service_dropped
         {
@@ -4144,7 +4144,7 @@ impl Drop for OwnerReadService {
 /// Run one served request with this owner's channel counter in force, so the
 /// kernel charges the items it finishes where a reader of that channel can
 /// read them. The counter is put back even if the read unwinds.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 fn with_channel_source_counter<T>(service: &OwnerReadService, operation: impl FnOnce() -> T) -> T {
     struct Restore {
         previous: Option<Arc<AtomicU64>>,
@@ -4161,7 +4161,7 @@ fn with_channel_source_counter<T>(service: &OwnerReadService, operation: impl Fn
     operation()
 }
 
-#[cfg(not(feature = "test-seams"))]
+#[cfg(not(any(test, feature = "test-seams")))]
 fn with_channel_source_counter<T>(_service: &OwnerReadService, operation: impl FnOnce() -> T) -> T {
     operation()
 }
@@ -4408,26 +4408,26 @@ struct ConnectionInboxState {
 struct ConnectionInbox {
     state: Mutex<ConnectionInboxState>,
     arrived: Condvar,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     publication_observer: Option<Arc<dyn OwnerServicePublicationObserver>>,
 }
 
 impl ConnectionInbox {
     fn new(
-        #[cfg(feature = "test-seams")] publication_observer: Option<
+        #[cfg(any(test, feature = "test-seams"))] publication_observer: Option<
             Arc<dyn OwnerServicePublicationObserver>,
         >,
     ) -> Self {
         Self {
             state: Mutex::new(ConnectionInboxState::default()),
             arrived: Condvar::new(),
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             publication_observer,
         }
     }
 
     fn push(&self, event: ConnectionEvent) {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         let cancellation = match &event {
             ConnectionEvent::Request(LocalRequestEnvelope {
                 request: LocalRequest::CancelInFlight { request_ordinal },
@@ -4446,7 +4446,7 @@ impl ConnectionInbox {
         if let Some(waker) = waker {
             waker.wake();
         }
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if let (Some(observer), Some(request_ordinal)) =
             (self.publication_observer.as_ref(), cancellation)
         {

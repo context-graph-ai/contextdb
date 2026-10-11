@@ -303,12 +303,9 @@ mod tests {
         let persistence = RedbPersistence::create(&path).unwrap();
         let writer = persistence
             .proof_accountant()
-            .unwrap_or_else(|| Arc::new(crate::memory_accounting::MemoryAccountant::no_limit()));
+            .unwrap_or_else(|| Arc::new(crate::memory_accounting::MemoryAccountant::no_limit()).into());
         persistence.attach_memory_accountant(writer.clone());
-        assert!(Arc::ptr_eq(
-            &persistence.proof_accountant().unwrap(),
-            &writer
-        ));
+        assert_eq!(persistence.proof_accountant().unwrap().as_ptr(), writer.as_ptr());
         let row = VersionedRow {
             row_id: RowId(u64::MAX - 1),
             values: HashMap::from([

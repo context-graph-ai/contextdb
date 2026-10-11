@@ -19,7 +19,7 @@ use std::ops::Bound;
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 mod vector_search_receipt;
 
 mod grouped_count;
@@ -312,7 +312,7 @@ struct RequestContext {
     live_source_pages: Arc<std::sync::atomic::AtomicUsize>,
     /// The caller-supplied budget retained by this executing request.
     reader_budget: Arc<dyn ReadMemoryBudget>,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     probe: Mutex<Option<Arc<dyn BoundedExecutionProbe>>>,
 }
 
@@ -367,7 +367,7 @@ impl ReadOpenContext {
         clock: Arc<dyn DeadlineClock>,
         cancellation: OwnerReadCancellation,
     ) -> contextdb_core::Result<Self> {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::read_work_probe::note_commit_directory_open_funding(&read_memory);
         RequestContext::new(
             read_memory,
@@ -376,7 +376,7 @@ impl ReadOpenContext {
             clock,
             cancellation,
             None,
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             None,
         )
         .map(Self)
@@ -434,7 +434,7 @@ impl RequestContext {
         clock: Arc<dyn DeadlineClock>,
         cancellation: OwnerReadCancellation,
         transaction: Option<TxId>,
-        #[cfg(feature = "test-seams")] probe: Option<Arc<dyn BoundedExecutionProbe>>,
+        #[cfg(any(test, feature = "test-seams"))] probe: Option<Arc<dyn BoundedExecutionProbe>>,
     ) -> std::result::Result<Arc<Self>, BoundedExecutionError> {
         Self::check_effective_limits(&limits)?;
         let started_ms = clock.now_ms();
@@ -468,7 +468,7 @@ impl RequestContext {
             }),
             live_source_pages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             reader_budget,
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             probe: Mutex::new(probe),
         });
         context.replace_final_trace(0, |_| {})?;
@@ -1209,7 +1209,7 @@ impl RequestContext {
     fn begin_fetch(
         &self,
         cancellation: OwnerReadCancellation,
-        #[cfg(feature = "test-seams")] probe: Option<Arc<dyn BoundedExecutionProbe>>,
+        #[cfg(any(test, feature = "test-seams"))] probe: Option<Arc<dyn BoundedExecutionProbe>>,
     ) -> std::result::Result<(), BoundedExecutionError> {
         let mut state = self.state();
         let held = u64::try_from(state.memory.bytes())
@@ -1231,7 +1231,7 @@ impl RequestContext {
         state.bytes_so_far = 0;
         state.reported_work = 0;
         state.reported_rows = 0;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         {
             let mut current = match self.probe.lock() {
                 Ok(current) => current,
@@ -1242,7 +1242,7 @@ impl RequestContext {
         Ok(())
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn probe(&self) -> Option<Arc<dyn BoundedExecutionProbe>> {
         match self.probe.lock() {
             Ok(probe) => probe.clone(),
@@ -1417,14 +1417,14 @@ impl RequestContext {
         destination: &crate::memory_accounting::MemoryAccountant,
         bytes: usize,
     ) -> contextdb_core::Result<()> {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         self.observe_graph_credit_transfer(
             GraphCreditTransferPhase::BeforeDestination,
             destination,
             bytes,
         );
         destination.transfer_vector_load_reservation(bytes, || {
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             self.observe_graph_credit_transfer(
                 GraphCreditTransferPhase::DestinationAdmitted,
                 destination,
@@ -1435,7 +1435,7 @@ impl RequestContext {
                 state.memory.try_split_off(bytes)?
             };
             drop(split);
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             self.observe_graph_credit_transfer(
                 GraphCreditTransferPhase::SourceSplit,
                 destination,
@@ -1449,7 +1449,7 @@ impl RequestContext {
     /// reads this request's credit under a brief `state` lock and the
     /// destination's usage, and calls the probe with no lock of this request
     /// held; it never touches `vector_copies`.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn observe_graph_credit_transfer(
         &self,
         phase: GraphCreditTransferPhase,
@@ -1488,9 +1488,9 @@ impl RequestContext {
         )]
         let completed = state.telemetry.work_units;
         drop(state);
-        #[cfg(not(feature = "test-seams"))]
+        #[cfg(not(any(test, feature = "test-seams")))]
         let _ = (first_observation, completed);
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if first_observation && let Some(probe) = self.probe() {
             probe.cancellation_observed(completed);
         }
@@ -1605,9 +1605,9 @@ impl RequestContext {
                 state.started_ms,
             )
         };
-        #[cfg(not(feature = "test-seams"))]
+        #[cfg(not(any(test, feature = "test-seams")))]
         let _ = completed_source;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if let Some(probe) = self.probe() {
             let _funding = crate::read_work_probe::observe_funding(
                 crate::read_work_probe::funding_owner_name(&self.reader_budget),
@@ -1626,7 +1626,7 @@ impl RequestContext {
             return Err(cancelled);
         }
         self.note_touch(touch);
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         {
             crate::read_probe::note_bounded_source_touch();
             crate::read_probe::note_session_source_touch();
@@ -1669,9 +1669,9 @@ impl RequestContext {
             )
         };
 
-        #[cfg(not(feature = "test-seams"))]
+        #[cfg(not(any(test, feature = "test-seams")))]
         let _ = (completed_work, completed_source);
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if let Some(probe) = self.probe() {
             probe.before_work(source, completed_work);
         }
@@ -1681,7 +1681,7 @@ impl RequestContext {
                 self.limits.active_ms,
             ));
         }
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if let Some(probe) = self.probe() {
             let _funding = crate::read_work_probe::observe_funding(
                 crate::read_work_probe::funding_owner_name(&self.reader_budget),
@@ -1713,7 +1713,7 @@ impl RequestContext {
                 .checked_add(1)
                 .ok_or_else(|| Self::limit_failure(ReadFailureLimit::Work, self.limits.work))?;
         }
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         {
             crate::read_probe::note_bounded_source_touch();
             crate::read_probe::note_session_source_touch();
@@ -1753,9 +1753,9 @@ impl RequestContext {
             }
             (state.telemetry.work_units, state.started_ms)
         };
-        #[cfg(not(feature = "test-seams"))]
+        #[cfg(not(any(test, feature = "test-seams")))]
         let _ = completed_work;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if let Some(probe) = self.probe() {
             probe.before_work(source, completed_work);
         }
@@ -1823,9 +1823,9 @@ impl RequestContext {
             }
             held
         };
-        #[cfg(not(feature = "test-seams"))]
+        #[cfg(not(any(test, feature = "test-seams")))]
         let _ = held;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if let Some(probe) = self.probe() {
             probe.before_temporary_reservation(source, requested_u64, held);
         }
@@ -1858,9 +1858,9 @@ impl RequestContext {
                 .or_insert(held_after);
             held_after
         };
-        #[cfg(not(feature = "test-seams"))]
+        #[cfg(not(any(test, feature = "test-seams")))]
         let _ = held_after;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if let Some(probe) = self.probe() {
             probe.after_temporary_reservation(source, requested_u64, held_after);
         }
@@ -2502,7 +2502,7 @@ impl std::fmt::Debug for SourceDecodeBudget {
 }
 
 impl contextdb_core::read_memory::ReadMemoryBudget for SourceDecodeBudget {
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn funding_owner_for_test(&self) -> Option<&Arc<dyn ReadMemoryBudget>> {
         Some(&self.context.reader_budget)
     }
@@ -3091,7 +3091,7 @@ struct RankedVectorRow {
 }
 
 struct VectorState {
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     receipt: vector_search_receipt::SearchReceiptState,
     table: String,
     index: VectorIndexRef,
@@ -4975,7 +4975,7 @@ fn boxed_pull_bytes(input: &PullNode) -> std::result::Result<usize, BoundedExecu
 /// same walk the settlement uses, so a named part can never disagree with it:
 /// `named` lists the parts a caller can ask about by name and `unnamed` is
 /// whatever is left, so the parts always add up to the total.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContinuationBytes {
     pub total: usize,
@@ -4983,7 +4983,7 @@ pub struct ContinuationBytes {
     pub unnamed: usize,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 impl ContinuationBytes {
     /// What the part by this name holds, or zero when this read holds no such
     /// part. A caller asking about a part a read does not have is asking a
@@ -4998,10 +4998,10 @@ impl ContinuationBytes {
 
 /// The name of the term every index run a list predicate still owes is
 /// counted under.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub const PENDING_INDEX_RUNS: &str = "pending index runs";
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 fn continuation_bytes_breakdown(
     node: &PullNode,
 ) -> std::result::Result<ContinuationBytes, BoundedExecutionError> {
@@ -5033,7 +5033,7 @@ fn continuation_bytes_breakdown(
 /// Walk every source in the tree and add up the parts by name. The scan arm
 /// reads the same fields the settlement reads, so a part named here is the
 /// part the settlement counted.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 fn collect_continuation_parts(
     node: &PullNode,
     pending_runs: &mut usize,
@@ -5068,7 +5068,7 @@ fn collect_continuation_parts(
 
 /// Every node this one reads from. One place says what a source's children
 /// are, so a walk over the tree cannot miss a branch the settlement counts.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 fn pull_node_inputs(kind: &PullKind) -> Vec<&PullNode> {
     match kind {
         PullKind::Graph(state) => state.start_candidates.as_deref().into_iter().collect(),
@@ -6583,7 +6583,7 @@ impl ScanState {
             }
             state.published = sequence;
             let row = staged.clone();
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             if self.vector_candidate_source {
                 db.note_vector_candidate_materialized();
             }
@@ -7147,7 +7147,7 @@ impl ScanState {
                     }
                     continue;
                 };
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 if self.vector_candidate_source && !self.identities_only {
                     db.note_vector_candidate_materialized();
                 }
@@ -8756,12 +8756,12 @@ fn bounded_graph_static_starts(
     }
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 struct BoundedHnswProbeObserver {
     probe: Arc<dyn BoundedExecutionProbe>,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 impl contextdb_vector::hnsw::HnswCandidateObserver for BoundedHnswProbeObserver {
     fn before_candidate_distance(&self, event: contextdb_vector::hnsw::HnswCandidateDistanceEvent) {
         self.probe.before_hnsw_candidate_distance(event);
@@ -9407,7 +9407,7 @@ impl VectorState {
         db: &dyn ReadExecutionTarget,
         context: &Arc<RequestContext>,
     ) -> std::result::Result<Option<PulledRow>, BoundedExecutionError> {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         {
             self.receipt.begin();
             let before = vector_search_receipt::exact_candidates(context);
@@ -9446,7 +9446,7 @@ impl VectorState {
             );
             result
         }
-        #[cfg(not(feature = "test-seams"))]
+        #[cfg(not(any(test, feature = "test-seams")))]
         self.next_unobserved(db, context)
     }
 
@@ -9667,7 +9667,7 @@ impl VectorState {
                                 )
                             })
                         };
-                        #[cfg(feature = "test-seams")]
+                        #[cfg(any(test, feature = "test-seams"))]
                         let searched = if let Some(probe) = context.probe() {
                             contextdb_vector::hnsw::with_hnsw_candidate_observer(
                                 Arc::new(BoundedHnswProbeObserver { probe }),
@@ -9676,7 +9676,7 @@ impl VectorState {
                         } else {
                             hnsw_search()
                         }?;
-                        #[cfg(not(feature = "test-seams"))]
+                        #[cfg(not(any(test, feature = "test-seams")))]
                         let searched = hnsw_search()?;
                         searched
                     };
@@ -13610,7 +13610,7 @@ fn resolve_candidate_delete_membership(
 
 // Proof-only: why one vector candidate source did or did not become
 // identity-only. Production never reads it.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 std::thread_local! {
     static VECTOR_CANDIDATE_IDENTITY_DECISION: std::cell::RefCell<Vec<&'static str>> =
         const { std::cell::RefCell::new(Vec::new()) };
@@ -13640,14 +13640,14 @@ fn predicate_is_answerable_from_one_row(expr: &Expr) -> bool {
 fn note_vector_candidate_identity(
     reason: &'static str,
 ) -> std::result::Result<(), BoundedExecutionError> {
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     VECTOR_CANDIDATE_IDENTITY_DECISION.with(|slot| slot.borrow_mut().push(reason));
     let _ = reason;
     Ok(())
 }
 
 /// Take and clear what this thread's vector candidate sources decided.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub fn take_vector_candidate_identity_decisions_for_test() -> Vec<&'static str> {
     VECTOR_CANDIDATE_IDENTITY_DECISION.with(|slot| std::mem::take(&mut *slot.borrow_mut()))
@@ -14502,7 +14502,7 @@ fn candidate_runs_admit_whole_partitions(
 
 /// Where one cold vector graph load's credit move stands. Test observation
 /// only.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GraphCreditTransferPhase {
@@ -14517,7 +14517,7 @@ pub enum GraphCreditTransferPhase {
 
 /// One observation of a graph credit move: the bytes moving, what this
 /// request's credit holds, and what the destination owner has in use.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GraphCreditTransferCut {
@@ -14923,7 +14923,7 @@ fn build_vector_kernel<'plan>(
         columns,
         trace,
         kind: PullKind::Vector(Box::new(VectorState {
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             receipt: vector_search_receipt::SearchReceiptState::Unstarted,
             supplement_columns: Vec::new(),
             table: table.to_string(),
@@ -16739,7 +16739,7 @@ pub(crate) fn drain_chosen_plan(
     tx: Option<TxId>,
     snapshot: SnapshotId,
     clock: Arc<dyn DeadlineClock>,
-    #[cfg(feature = "test-seams")] probe: Option<Arc<dyn BoundedExecutionProbe>>,
+    #[cfg(any(test, feature = "test-seams"))] probe: Option<Arc<dyn BoundedExecutionProbe>>,
     read_memory: Arc<dyn ReadMemoryBudget>,
 ) -> std::result::Result<crate::database::OwnedQueryResult, BoundedExecutionError> {
     // These fixed control answers remain available when the operator has
@@ -16765,7 +16765,7 @@ pub(crate) fn drain_chosen_plan(
         clock,
         OwnerReadCancellation::new(),
         tx,
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         probe,
     )?;
     let _vector_read = enter_vector_read(db, snapshot, &context, plan_needs_vector_read(plan))?;
@@ -16787,7 +16787,7 @@ pub(crate) fn drain_chosen_plan(
         let named: std::collections::BTreeSet<String> = root.columns.iter().cloned().collect();
         declare_supplemented_columns(db, &mut root, &named);
     }
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     crate::database::Database::observe_pull_kernel_entered_for_test();
     let (result_columns, result_column_bytes) =
         clone_strings_with_reservation(&root.columns, &context, "result columns")?;
@@ -16849,7 +16849,7 @@ pub(crate) fn drain_chosen_plan(
         retained_rows.push(row.retained_bytes);
         result.rows.push(row.values);
     }
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     crate::database::Database::observe_pull_kernel_drained_for_test();
     result.trace.physical_plan = root.published_plan();
     result.trace.vector_search = root.published_vector_search().cloned();
@@ -17042,7 +17042,7 @@ pub(super) fn execute(
     limits: ReadLimits,
     clock: Arc<dyn DeadlineClock>,
     cancellation: OwnerReadCancellation,
-    #[cfg(feature = "test-seams")] probe: Option<Arc<dyn BoundedExecutionProbe>>,
+    #[cfg(any(test, feature = "test-seams"))] probe: Option<Arc<dyn BoundedExecutionProbe>>,
 ) -> std::result::Result<BoundedExecutionResult, BoundedExecutionError> {
     let _release_proofs = StatementProofReuse { db };
     let statement = contextdb_parser::parse(sql)?;
@@ -17058,7 +17058,7 @@ pub(super) fn execute(
             clock,
             cancellation,
             db.active_read_transaction(),
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             probe,
         )?;
         let schema_capture = db.capture_read_schema();
@@ -17080,7 +17080,7 @@ pub(super) fn execute(
         );
         let _vector_read = enter_vector_read(db, snapshot, &context,
             statement_needs_vector_read(&statement))?;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if let Some(probe) = context.probe() {
             probe.registered_snapshot_for_test(snapshot);
             probe.after_snapshot_registration();
@@ -17163,7 +17163,7 @@ pub(super) fn execute(
         }
         drop(membership_capture);
         drop(schema_capture);
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if let Some(probe) = context.probe() {
             probe.after_source_capture();
         }
@@ -17654,7 +17654,7 @@ impl CursorState {
     /// rows through the replay itself.
     /// What this cursor is holding right now, part by part -- the same walk
     /// the settlement above is computed from.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(super) fn continuation_bytes(
         &self,
     ) -> std::result::Result<ContinuationBytes, BoundedExecutionError> {
@@ -18230,7 +18230,7 @@ pub(super) fn open_cursor(
     limits: ReadLimits,
     clock: Arc<dyn DeadlineClock>,
     cancellation: OwnerReadCancellation,
-    #[cfg(feature = "test-seams")] probe: Option<Arc<dyn BoundedExecutionProbe>>,
+    #[cfg(any(test, feature = "test-seams"))] probe: Option<Arc<dyn BoundedExecutionProbe>>,
 ) -> std::result::Result<BoundedCursorOpen, BoundedExecutionError> {
     let statement = contextdb_parser::parse(sql)?;
     db.plugin().on_query(sql)?;
@@ -18244,7 +18244,7 @@ pub(super) fn open_cursor(
             Arc::clone(&clock),
             cancellation,
             db.active_read_transaction(),
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             probe,
         )?;
         if CAPTURE_CURSOR_OPEN_CONTEXT.with(Cell::get) {
@@ -18277,7 +18277,7 @@ pub(super) fn open_cursor(
         );
         let vector_read = statement_needs_vector_read(&statement);
         let _vector_read = enter_vector_read(db.as_ref(), snapshot, &context, vector_read)?;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if let Some(probe) = context.probe() {
             probe.registered_snapshot_for_test(snapshot);
             probe.after_snapshot_registration();
@@ -18364,7 +18364,7 @@ pub(super) fn open_cursor(
         }
         drop(membership_capture);
         drop(schema_capture);
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if let Some(probe) = context.probe() {
             probe.after_source_capture();
         }
@@ -18964,7 +18964,7 @@ pub(super) fn fetch_cursor(
     cursor: &mut BoundedCursorHandle,
     rows: Option<NonZeroUsize>,
     cancellation: OwnerReadCancellation,
-    #[cfg(feature = "test-seams")] probe: Option<Arc<dyn BoundedExecutionProbe>>,
+    #[cfg(any(test, feature = "test-seams"))] probe: Option<Arc<dyn BoundedExecutionProbe>>,
 ) -> std::result::Result<BoundedCursorFetch, BoundedExecutionError> {
     // A request cancelled before it starts consumes no continuation state.
     // Do not attach its already-fired listener to the parked cursor: that
@@ -19048,7 +19048,7 @@ pub(super) fn fetch_cursor(
     }
     if let Err(error) = state.context.begin_fetch(
         cancellation,
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         probe,
     ) {
         if matches!(error, BoundedExecutionError::Cancelled) {

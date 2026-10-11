@@ -334,7 +334,7 @@ pub(crate) fn accepted_identity(
 }
 
 fn observe_probe() {
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     crate::database::resident_history_test_seams::note(|work| work.membership_keys_examined += 1);
 }
 
@@ -381,19 +381,16 @@ mod tests {
         }
     }
 
-    fn open_fixture(path: &Path) -> (Arc<RedbPersistence>, Arc<MemoryAccountant>) {
+    fn open_fixture(path: &Path) -> (Arc<RedbPersistence>, crate::memory_accounting::AccountantHandle) {
         let persistence = Arc::new(RedbPersistence::open_with_cache(path, 0).unwrap());
         // Writable recovery may already have installed the source's accountant.
         // Qualify the actual installed funder, never a rejected later attachment.
         let writer = persistence
             .proof_accountant()
-            .unwrap_or_else(|| Arc::new(MemoryAccountant::with_budget(64 * 1024 * 1024)));
+            .unwrap_or_else(|| Arc::new(MemoryAccountant::with_budget(64 * 1024 * 1024)).into());
         writer.set_budget(Some(64 * 1024 * 1024)).unwrap();
         persistence.attach_memory_accountant(writer.clone());
-        assert!(Arc::ptr_eq(
-            &persistence.proof_accountant().unwrap(),
-            &writer
-        ));
+        assert_eq!(persistence.proof_accountant().unwrap().as_ptr(), writer.as_ptr());
         (persistence, writer)
     }
 
@@ -402,7 +399,7 @@ mod tests {
     ) -> (
         tempfile::TempDir,
         Arc<RedbPersistence>,
-        Arc<MemoryAccountant>,
+        crate::memory_accounting::AccountantHandle,
         VectorPartitionMembershipRecord,
     ) {
         let directory = tempfile::tempdir().unwrap();

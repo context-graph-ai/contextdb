@@ -92,9 +92,12 @@ iroh-mdns-address-lookup = { version = "0.4", optional = true }
 nix = { version = "0.30.1", features = ["fs", "mount", "poll", "socket", "user"] }
 
 [dev-dependencies]
+contextdb-core = { path = "../contextdb-core", version = "1.0", features = ["test-seams"] }
+contextdb-tx = { path = "../contextdb-tx", version = "1.0", features = ["test-seams"] }
+contextdb-relational = { path = "../contextdb-relational", version = "1.0", features = ["test-seams"] }
 contextdb-server = { path = "../contextdb-server", features = ["in-process-test-seams"] }
 contextdb-vector = { path = "../contextdb-vector", version = "1.0", features = ["test-seams"] }
-redb = { package = "contextdb-redb", version = "4.1.0", path = "../contextdb-redb", features = ["test-seams"] }
+redb = { package = "contextdb-redb", version = "4.1.0", path = "../contextdb-redb", features = ["test-seams", "cache_metrics"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
 num_cpus = "1.16"
 criterion = { version = "0.8", features = ["html_reports"] }
@@ -402,4 +405,9 @@ path = "tests/writecost_planner.rs"
 [[test]]
 name = "writecost_cycle_bound"
 path = "tests/writecost_cycle_bound.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "native_backing_allocator"
+path = "tests/native_backing_allocator.rs"
 required-features = ["test-seams"]

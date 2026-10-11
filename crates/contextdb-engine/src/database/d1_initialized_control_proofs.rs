@@ -49,7 +49,7 @@ thread_local! {
 }
 // Read existing census metadata before any observer Arc clone. Observers are
 // inactive for every original row and compiled out of all production builds.
-pub(crate) fn observe_factory_credit_for_test(credit: &Arc<contextdb_vector::VectorCopyAdmission>, accountant: &Arc<MemoryAccountant>) {
+pub(crate) fn observe_factory_credit_for_test(credit: &Arc<contextdb_vector::VectorCopyAdmission>, accountant: &crate::memory_accounting::AccountantHandle) {
     OPEN.with(|slot| { if let Some(capture) = slot.borrow_mut().as_mut() {
         capture.factory_credit = Request::actual();
         contextdb_vector::VectorCopyAdmission::visit_retained_copy_credit(credit, &**accountant,
@@ -57,7 +57,7 @@ pub(crate) fn observe_factory_credit_for_test(credit: &Arc<contextdb_vector::Vec
         capture.callback_users_before = accountant.writer_registration_observation_for_test().3;
     } });
 }
-pub(crate) fn observe_callback_for_test(callback: &DurableLoaderBuilder, accountant: &Arc<MemoryAccountant>) {
+pub(crate) fn observe_callback_for_test(callback: &DurableLoaderBuilder, accountant: &crate::memory_accounting::AccountantHandle) {
     OPEN.with(|slot| { if let Some(capture) = slot.borrow_mut().as_mut() {
         capture.callback = Some((callback.clone(), Request::actual()));
         assert_eq!(accountant.writer_registration_observation_for_test().3, capture.callback_users_before + 1, "whole production callback retains exactly one original writer handle");
@@ -164,7 +164,7 @@ pub(crate) fn mapped_rows_for_test() {
                 "forward.from_owner" | "forward.rename" => {
                     let before = owner.writer_registration_observation_for_test().3;
                     let (original, _, _) = measured(|| DurableMembershipSource::from_owner_admitted(
-                        MembershipOwner::Writable(source.clone()), None, &partition, RawVectorMembershipSummary::default(), owner.clone(), &mut workspace, reader_credit()).unwrap());
+                        MembershipOwner::Writable(source.clone()), None, &partition, RawVectorMembershipSummary::default(), owner.clone().into(), &mut workspace, reader_credit()).unwrap());
                     let original_request = Request::actual();
                     assert_eq!(owner.writer_registration_observation_for_test().3, before + 1, "forward constructor retains exactly one original handle");
                     let (tag, metadata) = original.d1_initialized_observation_for_test();
@@ -184,7 +184,7 @@ pub(crate) fn mapped_rows_for_test() {
                 "reverse.from_owner" | "reverse.rename" => {
                     let before = owner.writer_registration_observation_for_test().3;
                     let (original, _, _) = measured(|| DurableReverseMembershipSource::from_owner_admitted(
-                        MembershipOwner::Writable(source.clone()), &index, owner.clone(), &mut workspace, reader_credit()).unwrap());
+                        MembershipOwner::Writable(source.clone()), &index, owner.clone().into(), &mut workspace, reader_credit()).unwrap());
                     let original_request = Request::actual();
                     assert_eq!(owner.writer_registration_observation_for_test().3, before + 1, "reverse constructor retains exactly one original handle");
                     let (tag, metadata) = original.d1_initialized_observation_for_test();
@@ -247,7 +247,7 @@ pub(crate) fn mapped_rows_for_test() {
                 contextdb_core::read_contract::ReadLimits::default().memory,
             );
             let image = crate::read_image_memory::ImageMemory::charging_reader(
-                owner.clone(), declared.child().unwrap(),
+                owner.clone().into(), declared.child().unwrap(),
             );
             let mut construction = image.vector_copy(0).unwrap();
             let task_vector = VectorStore::default();
@@ -257,7 +257,7 @@ pub(crate) fn mapped_rows_for_test() {
             OPEN.with(|slot| { assert!(slot.borrow().is_none()); *slot.borrow_mut() = Some(OpenCapture::default()); });
             measured(|| register_dormant_raw_vector_partitions(
                 &task_vector, &database.tx_mgr, database.persistence.as_ref().unwrap(),
-                &owner, &mut construction.owner,
+                &crate::memory_accounting::AccountantHandle::from_host(owner.clone()), &mut construction.owner,
             ).unwrap());
             let separate = OPEN.with(|slot| slot.borrow_mut().take().unwrap());
             let (callback, request) = separate.callback.unwrap();
@@ -362,8 +362,8 @@ pub(crate) fn mapped_rows_for_test() {
     let source = Arc::new(RedbPersistence::open(&path).unwrap());
     let owner = Arc::new(MemoryAccountant::no_limit());
     let mut workspace = reader_credit();
-    let forward = DurableMembershipSource::from_owner_admitted(MembershipOwner::Writable(source.clone()), None, &partition, RawVectorMembershipSummary::default(), owner.clone(), &mut workspace, reader_credit()).unwrap();
-    let reverse = DurableReverseMembershipSource::from_owner_admitted(MembershipOwner::Writable(source.clone()), &index, owner.clone(), &mut workspace, reader_credit()).unwrap();
+    let forward = DurableMembershipSource::from_owner_admitted(MembershipOwner::Writable(source.clone()), None, &partition, RawVectorMembershipSummary::default(), owner.clone().into(), &mut workspace, reader_credit()).unwrap();
+    let reverse = DurableReverseMembershipSource::from_owner_admitted(MembershipOwner::Writable(source.clone()), &index, owner.clone().into(), &mut workspace, reader_credit()).unwrap();
     assert!(!forward.d1_initialized_observation_for_test().0);
     assert!(!reverse.d1_initialized_observation_for_test().0);
     let later = crate::memory_accounting::WriterBudget::from_accountant(owner.clone()).unwrap();

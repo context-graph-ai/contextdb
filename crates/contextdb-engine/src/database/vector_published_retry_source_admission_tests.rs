@@ -102,7 +102,7 @@ fn published_retry_admits_cold_sources_and_keeps_cleanup_pending_on_refusal() {
     drop(persistence);
     // Reopen after the copy so no source extent comes from a write buffer.
     let persistence = Arc::new(RedbPersistence::open_with_cache(&copy, 0).unwrap());
-    persistence.attach_memory_accountant(Arc::clone(&db.accountant));
+    persistence.attach_memory_accountant(db.accountant.clone());
     let pending = persistence
         .debug_vector_partition_journal_for_test(&partition)
         .unwrap();
@@ -133,7 +133,7 @@ fn published_retry_admits_cold_sources_and_keeps_cleanup_pending_on_refusal() {
         .flatten()
         .any(|generation| generation.generation_id == selected)
     );
-    let accountant = Arc::clone(&db.accountant);
+    let accountant = db.accountant.clone();
     let baseline = accountant.usage().used;
     let limit = baseline + 1024;
     accountant.set_budget(Some(limit)).unwrap();

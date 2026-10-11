@@ -412,7 +412,7 @@ fn verify_page_set<T: redb::ReadableTable<&'static [u8], &'static [u8]>>(
         root.page(key.value(), value.value())?;
     }
     let walked = (root.pages, root.bytes);
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     note_route_verification(walked.0, walked.1);
     contextdb_core::find_attribution::note_hash_pass(
         "graph_route_page_set_hashed_bytes",
@@ -425,13 +425,13 @@ fn verify_page_set<T: redb::ReadableTable<&'static [u8], &'static [u8]>>(
     Ok(walked)
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 thread_local! {
     static ROUTE_VERIFICATIONS: std::cell::Cell<(u64, u64, u64)> =
         const { std::cell::Cell::new((0, 0, 0)) };
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 fn note_route_verification(pages: u64, bytes: u64) {
     ROUTE_VERIFICATIONS.with(|counters| {
         let (walks, walked, hashed) = counters.get();
@@ -441,7 +441,7 @@ fn note_route_verification(pages: u64, bytes: u64) {
 
 /// (verifications, pages walked, bytes hashed) by route page-set checks on
 /// this thread.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn route_verifications_for_test() -> (u64, u64, u64) {
     ROUTE_VERIFICATIONS.with(std::cell::Cell::get)
 }
@@ -468,7 +468,7 @@ pub(crate) struct SavedGenerationBinding {
 impl PagedGenerationMeta {
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
         let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         contextdb_vector::hnsw::observe_paged_storage_work(
             contextdb_vector::hnsw::PagedVectorStorageWork::DescriptorDecode,
             bytes.len(),
@@ -703,7 +703,7 @@ pub(super) fn seal_value(key: &[u8], payload: &[u8]) -> Vec<u8> {
 }
 
 pub(super) fn open_value<'v>(key: &[u8], value: &'v [u8]) -> Result<&'v [u8]> {
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     contextdb_vector::hnsw::observe_paged_storage_work(
         contextdb_vector::hnsw::PagedVectorStorageWork::Authentication,
         value.len(),
@@ -875,7 +875,7 @@ impl<T: ReadableTable<&'static [u8], &'static [u8]>> PageSource for T {
         let value = self.get(key).map_err(RedbPersistence::storage_error)?;
         match value {
             Some(value) => {
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 contextdb_vector::hnsw::observe_paged_storage_work(
                     contextdb_vector::hnsw::PagedVectorStorageWork::SourceRead,
                     value.value().len(),
@@ -901,7 +901,7 @@ impl<T: ReadableTable<&'static [u8], &'static [u8]>> PageSource for T {
         Ok(match range.next() {
             Some(entry) => {
                 let (key, value) = entry.map_err(RedbPersistence::storage_error)?;
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 contextdb_vector::hnsw::observe_paged_storage_work(
                     contextdb_vector::hnsw::PagedVectorStorageWork::SourceRead,
                     value.value().len(),
@@ -927,7 +927,7 @@ impl<T: ReadableTable<&'static [u8], &'static [u8]>> PageSource for T {
         Ok(match range.next_back() {
             Some(entry) => {
                 let (key, value) = entry.map_err(RedbPersistence::storage_error)?;
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 contextdb_vector::hnsw::observe_paged_storage_work(
                     contextdb_vector::hnsw::PagedVectorStorageWork::SourceRead,
                     value.value().len(),
@@ -1097,7 +1097,7 @@ impl<S: PageSource> PagedLookup<'_, '_, S> {
             .ok_or_else(|| corruption("paged vector graph names a missing point"))?;
         value.try_map(|value| {
             let payload = open_graph_page(&key, value)?;
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             contextdb_vector::hnsw::observe_paged_storage_work(
                 contextdb_vector::hnsw::PagedVectorStorageWork::PageRecordDecode,
                 payload.len(),
@@ -1494,7 +1494,7 @@ pub(crate) struct PagedBuildHooks {
 pub(crate) struct PagedPublication {
     pub(crate) prepared: PreencodedVectorPartitionGenerationCandidate,
     pub(crate) previous_generation_id: u64,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) published_pending: Arc<parking_lot::Mutex<Option<(usize, usize)>>>,
 }
 
@@ -1682,14 +1682,14 @@ impl PagedGenerationPersistence for NativePagedGeneration {
                     )?;
                     let next = batch(&mut transaction)?;
                     let published = transaction.published;
-                    #[cfg(feature = "test-seams")]
+                    #[cfg(any(test, feature = "test-seams"))]
                     let pending = transaction.published_pending;
                     transaction.finish()?;
-                    #[cfg(feature = "test-seams")]
+                    #[cfg(any(test, feature = "test-seams"))]
                     let published = (published, pending);
                     (next, published)
                 };
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 let (published, pending) = published;
                 if published != (next.phase == PagedVectorPhase::Published) {
                     return Err(Error::Other(
@@ -1724,14 +1724,14 @@ impl PagedGenerationPersistence for NativePagedGeneration {
                 bind_pages_root(&write)?;
                 RedbPersistence::write_writer_recovery_bounds_in_write(&write, None)?;
                 (self.hooks.checkpoint)()?;
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 if published {
                     crate::writer_commit_test_seams::reached(
                         crate::writer_commit_test_seams::CommitBoundary::GenerationBeforeRedb,
                     );
                 }
                 write.commit().map_err(RedbPersistence::storage_error)?;
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 if let Some(publication) = &publication {
                     *publication.published_pending.lock() = pending;
                 }
@@ -1763,7 +1763,7 @@ pub(super) struct NativeBatch<'t> {
     hooks: &'t PagedBuildHooks,
     publication: Option<&'t PagedPublication>,
     published: bool,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     published_pending: Option<(usize, usize)>,
     inserted: usize,
 }
@@ -1815,7 +1815,7 @@ impl<'t> NativeBatch<'t> {
             hooks,
             publication,
             published: false,
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             published_pending: None,
             inserted: 0,
         })
@@ -1862,7 +1862,7 @@ impl<'t> NativeBatch<'t> {
     }
 
     fn note_visit(&self) {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::database::resident_history_test_seams::note(|work| {
             work.maintenance_source_visits += 1
         });
@@ -2242,7 +2242,7 @@ impl PagedGenerationTransaction for NativeBatch<'_> {
                 continue;
             }
             let values = self.source_values(&record)?;
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             crate::database::resident_history_test_seams::note(|work| {
                 if work.maintenance_source_keys < work.maintenance_source_identities.len() {
                     work.maintenance_source_identities[work.maintenance_source_keys] =
@@ -2375,11 +2375,11 @@ impl PagedGenerationTransaction for NativeBatch<'_> {
                 self.write,
                 &publication.prepared,
             )?;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         {
             self.published_pending = pending;
         }
-        #[cfg(not(feature = "test-seams"))]
+        #[cfg(not(any(test, feature = "test-seams")))]
         let _ = pending;
         self.published = true;
         Ok(PagedVectorPhase::Published)
@@ -2520,7 +2520,7 @@ impl PagedVectorGraphSource for NativePagedGraphSource {
             }
             Err(error) => return Err(RedbPersistence::storage_error(error)),
         };
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::writer_query_test_seams::note_physical_source(
             crate::writer_query_test_seams::PhysicalFamily::Graph,
             &read,

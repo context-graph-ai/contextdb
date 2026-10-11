@@ -13,9 +13,9 @@ use contextdb_core::read_contract::{
     DeadlineClock, OwnerReadCancellation, ReadFailure, ReadLimits,
 };
 use contextdb_core::{ContextId, Lsn, Principal, ScopeLabel, TxId, Value};
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 use contextdb_core::{RowId, VectorIndexRef};
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 use uuid::Uuid;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
@@ -121,7 +121,7 @@ pub struct DirectTypedImageDigest {
 }
 
 /// One owned relational row in the committed image.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[derive(Debug, Clone, PartialEq)]
 pub struct DirectStoredRow {
     pub table: String,
@@ -130,7 +130,7 @@ pub struct DirectStoredRow {
 }
 
 /// One owned graph edge, including all persisted edge properties.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[derive(Debug, Clone, PartialEq)]
 pub struct DirectStoredEdge {
     pub source: Uuid,
@@ -148,7 +148,7 @@ pub enum DirectVectorQuantization {
 
 /// One decoded vector entry. Quantized stores are reconstructed into their
 /// owned queryable values during hydration, never by consulting the file later.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[derive(Debug, Clone, PartialEq)]
 pub struct DirectStoredVector {
     pub index: VectorIndexRef,
@@ -567,7 +567,7 @@ impl DirectCursorPage {
     }
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 impl DirectCursorPage {
     /// Construct an empty synthetic page fixture without exposing observations.
     #[doc(hidden)]
@@ -655,13 +655,13 @@ pub struct DirectCursor {
 /// Weak, privately constructed evidence for the two production-owned cursor
 /// resources. Tests can observe their destruction but cannot manufacture or
 /// release either resource.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub struct DirectCursorResourceWitness {
     snapshot: std::sync::Weak<DirectCursorSnapshotRetention>,
     memory: std::sync::Weak<DirectCursorMemoryReservation>,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 impl DirectCursorResourceWitness {
     pub fn snapshot_is_retained(&self) -> bool {
         self.snapshot.upgrade().is_some()
@@ -685,7 +685,7 @@ enum HydrationPhase {
 /// `PersistenceReleaseSealed` can only follow consumption of persistence's
 /// privately sealed receipt; `BackendTargetConstructed` can only follow the
 /// private target-construction receipt.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HydrationCheckpoint {
     PersistenceReleaseSealed { breadcrumb_path: Option<PathBuf> },
@@ -693,25 +693,25 @@ pub enum HydrationCheckpoint {
     ExternallyUsable { breadcrumb_path: Option<PathBuf> },
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub trait HydrationObserver: Send + Sync {
     fn checkpoint(&self, checkpoint: HydrationCheckpoint);
 }
 
 struct HydrationObservation {
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     observer: Option<Arc<dyn HydrationObserver>>,
 }
 
 impl HydrationObservation {
     fn disabled() -> Self {
         Self {
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             observer: None,
         }
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn from_test_observer(observer: Arc<dyn HydrationObserver>) -> Self {
         Self {
             observer: Some(observer),
@@ -719,7 +719,7 @@ impl HydrationObservation {
     }
 
     fn checkpoint(&self, phase: HydrationPhase) {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if let Some(observer) = self.observer.as_ref() {
             let checkpoint = match phase {
                 HydrationPhase::PersistenceReleaseSealed { breadcrumb_path } => {
@@ -741,7 +741,7 @@ impl HydrationObservation {
 
 /// Aggregate of persistence, bounded-target, and subsystem-owned probes. The
 /// direct module does not maintain or self-certify any of these counters.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DirectReaderCounters {
     pub persistence_read_only_opens: u64,
@@ -768,7 +768,7 @@ pub struct DirectReaderCounters {
     pub owner_service_starts: u64,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectStorageRegistrationObservation {
     pub physical_device: u64,
@@ -930,7 +930,7 @@ pub struct DirectFileReader {
     image_memory: Arc<crate::read_image_memory::ImageMemory>,
     retained_source: Arc<crate::persistence::RetainedReadSource>,
     read_requests: Arc<dyn crate::vector_read_memory::ReadRequestBudgetProvider>,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     declared_read_memory: Arc<crate::vector_read_memory::DeclaredReadMemory>,
 }
 
@@ -946,7 +946,7 @@ struct BackendTargetConstructionReceipt {
     image_memory: Arc<crate::read_image_memory::ImageMemory>,
     retained_source: Arc<crate::persistence::RetainedReadSource>,
     read_requests: Arc<dyn crate::vector_read_memory::ReadRequestBudgetProvider>,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     declared_read_memory: Arc<crate::vector_read_memory::DeclaredReadMemory>,
 }
 
@@ -966,7 +966,7 @@ impl BackendTargetConstructionReceipt {
             verified_digest: self.verified_digest,
             retained_source: self.retained_source,
             read_requests: self.read_requests,
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             declared_read_memory: self.declared_read_memory,
         })
     }
@@ -987,11 +987,11 @@ fn construct_backend_neutral_target(
         config.principal,
         declared_read_memory.clone(),
     )?;
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     crate::read_work_probe::note_commit_directory_image_memory(&constructed.memory);
     let read_requests = constructed.target.declared_read_request_provider();
     Ok(BackendTargetConstructionReceipt {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         declared_read_memory,
         read_requests,
         image_memory: constructed.memory,
@@ -1235,7 +1235,7 @@ impl DirectFileReader {
     }
 
     /// Obtain the existing reader's operation owner for private page fixtures.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn request_read_memory_for_test(
         &self,
@@ -1301,7 +1301,7 @@ impl DirectFileReader {
         )
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn open_inner(
         path: &Path,
         config: DirectReaderConfig,
@@ -1511,7 +1511,7 @@ impl DirectCursor {
     }
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub mod test_seams {
     use std::path::Path;

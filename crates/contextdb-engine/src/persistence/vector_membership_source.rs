@@ -17,12 +17,12 @@ use std::ops::Bound;
 
 const HINT: &str = "Raise MEMORY_LIMIT to read this vector membership window.";
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 thread_local! {
     static PENDING_SUMMARY_FAILURE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn with_pending_summary_failure_for_test<R>(
     persistence: Option<usize>,
     action: impl FnOnce() -> R,
@@ -105,7 +105,7 @@ impl MembershipOwner {
             Self::Retained(_) => self.capture(),
         }
     }
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn persistence_identity(&self) -> Option<usize> {
         match self {
             Self::Writable(persistence) => Some(Arc::as_ptr(persistence) as usize),
@@ -981,7 +981,7 @@ fn decode_forward(
     key: &[u8],
     value: &[u8],
 ) -> Result<VectorPartitionMembershipRecord> {
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     crate::database::resident_history_test_seams::note(|work| work.membership_keys_examined += 1);
     let record: VectorPartitionMembershipRecord =
         decode_vector_partition_record_payload_checked(VectorPartitionRecordKind::Membership, value)
@@ -1221,9 +1221,9 @@ impl DurableMembershipSource {
         root: &MembershipRoot,
     ) -> Result<vector_membership_pages::MembershipSummary> {
         root.check_scope(&self.partition.index.table)?;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::database::resident_history_test_seams::note(|work| work.pending_summary_reads += 1);
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if self.owner.persistence_identity().is_some_and(|identity| {
             PENDING_SUMMARY_FAILURE.with(|slot| slot.get()) == Some(identity)
         }) {
@@ -2355,7 +2355,7 @@ impl ReverseCursor {
             self.scratch.reserve(growth)?;
             self.admitted_bytes = needed;
         }
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::database::resident_history_test_seams::note(|work| {
             work.membership_keys_examined += 1
         });
@@ -2626,7 +2626,7 @@ impl DurableColumnSourceFactory {
         let loader = self.loader.clone();
         let layout = layout.clone();
         let copy_owner = Arc::new(owner);
-        #[cfg(all(test, feature = "test-seams"))]
+        #[cfg(test)]
         crate::database::d1_initialized_control_proofs::observe_partition_credit_for_test();
         let reverse = Arc::new(DurableReverseMembershipSource {
             owner: MembershipOwner::Writable(self.persistence.clone()),
@@ -2634,7 +2634,7 @@ impl DurableColumnSourceFactory {
             _copy_owner: Some(Arc::new(reverse_owner)),
             accountant: self.accountant.clone(),
         });
-        #[cfg(all(test, feature = "test-seams"))]
+        #[cfg(test)]
         crate::database::d1_initialized_control_proofs::observe_reverse_for_test(&reverse);
         let admitted_loader = AdmittedLayoutLoader {
             loader,
@@ -2837,13 +2837,13 @@ impl RedbPersistence {
     }
 }
 
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 impl DurableMembershipSource {
     pub(crate) fn d1_initialized_observation_for_test(&self) -> (bool, usize) {
         (self.accountant.is_writer(), self.partition.index.table.as_ptr() as usize)
     }
 }
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 impl DurableReverseMembershipSource {
     pub(crate) fn d1_initialized_observation_for_test(&self) -> (bool, usize) {
         (self.accountant.is_writer(), self.index.table.as_ptr() as usize)

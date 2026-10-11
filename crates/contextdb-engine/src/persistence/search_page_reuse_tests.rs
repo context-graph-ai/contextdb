@@ -496,7 +496,7 @@ fn a_read_is_answered_although_a_full_resident_set_is_holding_the_last_declared_
 
     // Take everything still free, so the next walk's proof admissions can only
     // be served by the resident chunks giving their bytes back.
-    let accountant = Arc::clone(&load.source.verified_ordered_runs.memory.accountant);
+    let accountant = load.source.verified_ordered_runs.memory.accountant.clone();
     let available = accountant
         .usage()
         .available

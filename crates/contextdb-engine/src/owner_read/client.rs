@@ -36,7 +36,7 @@ pub struct OwnerClient {
     /// route receives the owner's typed answer instead of reclassifying the
     /// now-closed carrier as an unexpected disconnect.
     terminal_refusal: Option<contextdb_core::read_contract::ReadFailure>,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     response_frames: Option<Arc<dyn Fn(bool) + Send + Sync>>,
     #[cfg(unix)]
     stream: UnixStream,
@@ -93,7 +93,7 @@ impl OwnerClient {
             cancellations: Arc::new(CancelCoordination::default()),
             accepted_status: None,
             terminal_refusal: None,
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             response_frames: None,
             stream,
         };
@@ -178,7 +178,7 @@ impl OwnerClient {
     /// of one answer -- to prove a partial answer is discarded when its owner
     /// dies mid-reply -- has nowhere else to stand, and re-reading the carrier
     /// elsewhere would be a second transport.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn observe_response_frames_for_test(
         &mut self,
@@ -423,7 +423,7 @@ impl OwnerClient {
                 let outcome = receiver
                     .receive(response.clone())
                     .map_err(OwnerReadScaffoldError::from_local)?;
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 if let Some(observe) = self.response_frames.as_ref() {
                     observe(!matches!(outcome, ResultReceiveOutcome::Pending));
                 }
@@ -453,7 +453,7 @@ impl OwnerClient {
                     }
                 }
             } else {
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 if let Some(observe) = self.response_frames.as_ref() {
                     observe(true);
                 }
