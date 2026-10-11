@@ -14032,7 +14032,8 @@ fn candidate_runs_admit_whole_partitions(
             return Ok(None);
         }
         if values.iter().any(|value| {
-            !matches!(value, Value::Bool(_)) && !(declared.nullable && matches!(value, Value::Null))
+            !(matches!(value, Value::Bool(_))
+                || declared.nullable && matches!(value, Value::Null))
         }) {
             return Ok(None);
         }
@@ -14335,7 +14336,7 @@ fn candidate_runs_admit_whole_partitions(
         }
         Ok(())
     }
-    let mut invalid_partition = false;
+    let invalid_partition = Cell::new(false);
     let mut admit_partition = |values: &[Value]| -> std::result::Result<(), BoundedExecutionError> {
         if values.len() != leading {
             return Err(Error::Other("candidate partition tuple arity changed".to_string()).into());
@@ -14351,11 +14352,11 @@ fn candidate_runs_admit_whole_partitions(
             ordered_values.push(values[position].clone());
         }
         let Some(key) = VectorPartitionKey::from_values(&ordered_values) else {
-            invalid_partition = true;
+            invalid_partition.set(true);
             return Ok(());
         };
         if scope.is_some_and(|scope| !scope.contains(&key)) {
-            invalid_partition = true;
+            invalid_partition.set(true);
             return Ok(());
         }
         keys.push(key);
@@ -14416,10 +14417,9 @@ fn candidate_runs_admit_whole_partitions(
     } else {
         visit_leading_shapes(pick, leading, 0, &mut leading_values, &mut admit_partition)?;
     }
-    drop(admit_partition);
     drop(ordered_values);
     drop(leading_values);
-    if invalid_partition {
+    if invalid_partition.get() {
         return Ok(None);
     }
 
