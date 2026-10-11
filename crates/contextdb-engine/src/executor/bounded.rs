@@ -3100,6 +3100,7 @@ struct VectorState {
     k: usize,
     candidate_k: usize,
     partition_prefixes: Option<Vec<VectorPartitionKey>>,
+    partition_prefix_bytes: usize,
     /// The one resolved route contract for this operation. SQL overrides are
     /// resolved against the durable column declaration before the pull state
     /// is created, so a resumed bounded read cannot reinterpret the mode.
@@ -5282,6 +5283,11 @@ fn pull_continuation_bytes(node: &PullNode) -> std::result::Result<usize, Bounde
             state_bytes = checked_size_add(
                 state_bytes,
                 optional_string_capacity(&state.sort_key),
+                "vector continuation",
+            )?;
+            state_bytes = checked_size_add(
+                state_bytes,
+                state.partition_prefix_bytes,
                 "vector continuation",
             )?;
             if let VectorPreparation::Candidates(Some(candidates)) = &state.preparation {
@@ -8846,12 +8852,33 @@ fn vector_candidate_identity(columns: &[String]) -> Option<VectorCandidateIdenti
 }
 
 impl VectorState {
-    fn with_partition_scope<T>(&self, operation: impl FnOnce() -> T) -> T {
+    fn with_partition_scope<T>(
+        &self,
+        context: &Arc<RequestContext>,
+        operation: impl FnOnce() -> std::result::Result<T, BoundedExecutionError>,
+    ) -> std::result::Result<T, BoundedExecutionError> {
         let operation = || match self.sort_key.as_ref() {
             Some(_) => contextdb_vector::mem::with_search_policy_limit(self.k, operation),
             None => operation(),
         };
         match self.partition_prefixes.as_ref() {
+            Some(prefixes) if self.partition_prefix_bytes != 0 => {
+                // The vector scope API owns a clone for the duration of its
+                // consumer. Fund that overlapping allocation before cloning;
+                // the statement's retained copy stays charged independently.
+                context.reserve(
+                    BoundedWorkSource::VectorCandidates,
+                    self.partition_prefix_bytes,
+                )?;
+                let clone_charge = ReservedBytes::new(context, self.partition_prefix_bytes);
+                let result = contextdb_vector::mem::with_selected_partition_prefixes(
+                    &self.index,
+                    prefixes.clone(),
+                    operation,
+                );
+                clone_charge.release()?;
+                result
+            }
             Some(prefixes) => contextdb_vector::mem::with_selected_partition_prefixes(
                 &self.index,
                 prefixes.clone(),
@@ -9558,7 +9585,7 @@ impl VectorState {
                     let candidates = self
                         .candidate_filter
                         .then_some(self.candidate_ids.as_slice());
-                    let groups = self.with_partition_scope(|| {
+                    let groups = self.with_partition_scope(context, || {
                         context.with_vector_copies(|vector_copy_owner| {
                             db.bounded_vector_candidate_groups(
                                 &self.index,
@@ -10188,6 +10215,11 @@ impl VectorState {
         self.vector_overlay = None;
         context.release(self.overlay_bytes)?;
         self.overlay_bytes = 0;
+        // Partition keys remain owned until the vector source and graph have
+        // consumed their scope. Destroy them before refunding their charge.
+        self.partition_prefixes = None;
+        context.release(self.partition_prefix_bytes)?;
+        self.partition_prefix_bytes = 0;
         Ok(())
     }
 
@@ -13939,6 +13971,11 @@ fn select_vector_candidate_identity_source(
 /// `None` whenever any of that is not proved -- a non-boolean residual, a
 /// probe that did not fit, a partition holding a row the filter rejects. The
 /// caller then keeps the scan, which proves its candidates window by window.
+struct WholePartitionAdmission {
+    keys: Vec<VectorPartitionKey>,
+    retained_bytes: usize,
+}
+
 fn candidate_runs_admit_whole_partitions(
     db: &dyn ReadExecutionTarget,
     root: &PullNode,
@@ -13946,7 +13983,7 @@ fn candidate_runs_admit_whole_partitions(
     partition_keys: &[String],
     scope: Option<&[VectorPartitionKey]>,
     context: &Arc<RequestContext>,
-) -> std::result::Result<Option<Vec<VectorPartitionKey>>, BoundedExecutionError> {
+) -> std::result::Result<Option<WholePartitionAdmission>, BoundedExecutionError> {
     let PullKind::Scan(state) = &root.kind else {
         return Ok(None);
     };
@@ -13959,6 +13996,8 @@ fn candidate_runs_admit_whole_partitions(
     let leading = partition_keys.len();
     if leading == 0
         || pick.pushed_columns.len() < leading
+        || pick.columns.len() < pick.pushed_columns.len()
+        || 1usize.saturating_add(pick.suffix_shapes.len()) < pick.pushed_columns.len()
         || !pick.pushed_columns[..leading]
             .iter()
             .all(|column| partition_keys.contains(column))
@@ -13966,93 +14005,457 @@ fn candidate_runs_admit_whole_partitions(
     {
         return Ok(None);
     }
-    let shapes = std::iter::once(&pick.shape)
-        .chain(&pick.suffix_shapes)
-        .collect::<Vec<_>>();
-    // What each boolean suffix column admits, and what it rejects.
-    let mut admitted = Vec::with_capacity(shapes.len() - leading);
-    let mut rejected = Vec::with_capacity(shapes.len() - leading);
-    for (shape, (column, _)) in shapes.iter().zip(&pick.columns).skip(leading) {
+    let shape_at = |position: usize| {
+        if position == 0 {
+            &pick.shape
+        } else {
+            &pick.suffix_shapes[position - 1]
+        }
+    };
+    // Validate every suffix before allocating the proof batch. Its complete
+    // domain is fixed by the declared boolean type, including NULL only when
+    // nullable; the visitors below derive both sides of that domain directly.
+    for position in leading..pick.pushed_columns.len() {
+        let shape = shape_at(position);
         let Some(values) = super::finite_shape_values(shape) else {
             return Ok(None);
         };
+        let (column, _) = &pick.columns[position];
         let Some(declared) = meta
             .columns
             .iter()
-            .find(|candidate| &candidate.name == column)
+            .find(|candidate| candidate.name == *column)
         else {
             return Ok(None);
         };
         if declared.column_type != ColumnType::Boolean {
             return Ok(None);
         }
-        let mut domain = vec![Value::Bool(false), Value::Bool(true)];
-        if declared.nullable {
-            domain.push(Value::Null);
+        if values.iter().any(|value| {
+            !matches!(value, Value::Bool(_)) && !(declared.nullable && matches!(value, Value::Null))
+        }) {
+            return Ok(None);
         }
-        let admits = |candidate: &Value| values.iter().any(|value| value == candidate);
-        rejected.push(
-            domain
-                .iter()
-                .filter(|candidate| !admits(candidate))
-                .cloned()
-                .collect::<Vec<_>>(),
-        );
-        admitted.push(
-            domain
-                .into_iter()
-                .filter(|candidate| admits(candidate))
-                .collect::<Vec<_>>(),
-        );
     }
+
+    let boolean_domain = |nullable: bool| -> &[Value] {
+        static REQUIRED: [Value; 2] = [Value::Bool(false), Value::Bool(true)];
+        static NULLABLE: [Value; 3] = [Value::Bool(false), Value::Bool(true), Value::Null];
+        if nullable { &NULLABLE } else { &REQUIRED }
+    };
+    let suffix_domain = |position: usize| -> &[Value] {
+        let column = &pick.columns[position].0;
+        let declared = meta
+            .columns
+            .iter()
+            .find(|candidate| candidate.name == *column)
+            .expect("boolean suffix metadata was validated");
+        boolean_domain(declared.nullable)
+    };
+    let suffix_admits = |position: usize, candidate: &Value| {
+        super::finite_shape_values(shape_at(position))
+            .expect("finite boolean suffix was validated")
+            .iter()
+            .any(|value| value == candidate)
+    };
+
+    let partition_count = if let Some(tuples) = pick.tuple_prefix() {
+        tuples.len()
+    } else {
+        (0..leading).try_fold(1usize, |count, position| {
+            let values = super::finite_shape_values(shape_at(position)).ok_or_else(|| {
+                Error::Other("finite partition prefix lost its shape".to_string())
+            })?;
+            checked_size_mul(count, values.len(), "candidate partition count")
+        })?
+    };
+    let mut rejected_per_partition = 0usize;
+    let mut admitted_heads = 1usize;
+    for position in leading..pick.pushed_columns.len() {
+        let domain = suffix_domain(position);
+        let admitted_count = domain
+            .iter()
+            .filter(|value| suffix_admits(position, value))
+            .count();
+        let rejected_count = domain.len() - admitted_count;
+        rejected_per_partition = checked_size_add(
+            rejected_per_partition,
+            checked_size_mul(admitted_heads, rejected_count, "candidate rejected prefixes")?,
+            "candidate rejected prefixes",
+        )?;
+        admitted_heads = checked_size_mul(
+            admitted_heads,
+            admitted_count,
+            "candidate admitted prefixes",
+        )?;
+    }
+    let prefix_count = checked_size_mul(
+        partition_count,
+        rejected_per_partition,
+        "candidate proof prefixes",
+    )?;
+
+    // Admit the complete allocation peak before any owned key exists: both
+    // output containers, every key/prefix slot and cloned payload, plus the
+    // two scratch tuples that overlap while a partition key is formed.
+    let key_slots = checked_size_mul(
+        partition_count,
+        std::mem::size_of::<VectorPartitionKey>(),
+        "candidate partition keys",
+    )?;
+    let component_slots = checked_size_mul(
+        checked_size_mul(partition_count, leading, "candidate partition components")?,
+        std::mem::size_of::<contextdb_core::VectorPartitionComponent>(),
+        "candidate partition components",
+    )?;
+    let prefix_headers = checked_size_mul(
+        prefix_count,
+        std::mem::size_of::<IndexKey>(),
+        "candidate proof prefixes",
+    )?;
+    let prefix_value_slots = (leading..pick.pushed_columns.len()).try_fold(
+        0usize,
+        |bytes, position| {
+            let domain = suffix_domain(position);
+            let admitted_before = (leading..position).try_fold(1usize, |count, earlier| {
+                checked_size_mul(
+                    count,
+                    suffix_domain(earlier)
+                        .iter()
+                        .filter(|value| suffix_admits(earlier, value))
+                        .count(),
+                    "candidate proof prefixes",
+                )
+            })?;
+            let rejected_here = domain
+                .iter()
+                .filter(|value| !suffix_admits(position, value))
+                .count();
+            let keys_here = checked_size_mul(
+                partition_count,
+                checked_size_mul(admitted_before, rejected_here, "candidate proof prefixes")?,
+                "candidate proof prefixes",
+            )?;
+            checked_size_add(
+                bytes,
+                checked_size_mul(
+                    checked_size_mul(keys_here, position + 1, "candidate proof key slots")?,
+                    std::mem::size_of::<DirectedValue>(),
+                    "candidate proof key slots",
+                )?,
+                "candidate proof key slots",
+            )
+        },
+    )?;
+    let scratch_slots = checked_size_mul(
+        leading.saturating_mul(2),
+        std::mem::size_of::<Value>(),
+        "candidate partition scratch",
+    )?;
+    let directed_scratch_slots = checked_size_mul(
+        pick.pushed_columns.len(),
+        std::mem::size_of::<DirectedValue>(),
+        "candidate proof scratch",
+    )?;
+    let planned_without_payload = [
+        key_slots,
+        component_slots,
+        prefix_headers,
+        prefix_value_slots,
+        scratch_slots,
+        directed_scratch_slots,
+    ]
+    .into_iter()
+    .try_fold(0usize, |bytes, part| {
+        checked_size_add(bytes, part, "candidate coverage buffers")
+    })?;
+    let mut leading_payload_per_all_runs = 0usize;
+    if let Some(tuples) = pick.tuple_prefix() {
+        for tuple in tuples {
+            if tuple.len() != leading {
+                return Ok(None);
+            }
+            for value in tuple {
+                leading_payload_per_all_runs = checked_size_add(
+                    leading_payload_per_all_runs,
+                    value_capacity_bytes(value)?,
+                    "candidate partition payload",
+                )?;
+            }
+        }
+    } else {
+        for position in 0..leading {
+            let values = super::finite_shape_values(shape_at(position)).ok_or_else(|| {
+                Error::Other("finite partition prefix lost its values".to_string())
+            })?;
+            let repeats = if values.is_empty() {
+                0
+            } else {
+                partition_count / values.len()
+            };
+            let dimension_payload = values.iter().try_fold(0usize, |bytes, value| {
+                checked_size_add(bytes, value_capacity_bytes(value)?, "candidate partition payload")
+            })?;
+            leading_payload_per_all_runs = checked_size_add(
+                leading_payload_per_all_runs,
+                checked_size_mul(repeats, dimension_payload, "candidate partition payload")?,
+                "candidate partition payload",
+            )?;
+        }
+    }
+    let payload_copies_per_partition = checked_size_add(
+        1,
+        rejected_per_partition,
+        "candidate partition payload copies",
+    )?;
+    let maximum_partition_payload = if let Some(tuples) = pick.tuple_prefix() {
+        tuples.iter().try_fold(0usize, |largest, tuple| {
+            let bytes = tuple.iter().try_fold(0usize, |bytes, value| {
+                checked_size_add(
+                    bytes,
+                    value_capacity_bytes(value)?,
+                    "candidate partition scratch",
+                )
+            })?;
+            Ok::<usize, BoundedExecutionError>(largest.max(bytes))
+        })?
+    } else {
+        (0..leading).try_fold(0usize, |bytes, position| {
+            let values = super::finite_shape_values(shape_at(position)).ok_or_else(|| {
+                Error::Other("finite partition prefix lost its values".to_string())
+            })?;
+            let mut largest = 0usize;
+            for value in values {
+                largest = largest.max(value_capacity_bytes(value)?);
+            }
+            checked_size_add(bytes, largest, "candidate partition scratch")
+        })?
+    };
+    let planned_payload = checked_size_add(
+        checked_size_mul(
+            leading_payload_per_all_runs,
+            payload_copies_per_partition,
+            "candidate coverage payload",
+        )?,
+        checked_size_mul(
+            maximum_partition_payload,
+            3,
+            "candidate partition scratch",
+        )?,
+        "candidate coverage payload",
+    )?;
+    let planned = checked_size_add(
+        planned_without_payload,
+        planned_payload,
+        "candidate coverage buffers",
+    )?;
+    context.reserve(BoundedWorkSource::IndexRange, planned)?;
+    let mut coverage_charge = ReservedBytes::new(context, planned);
+
+    let mut keys = Vec::new();
+    keys.try_reserve_exact(partition_count)
+        .map_err(|_| Error::Other("bounded candidate partition allocation failed".to_string()))?;
+    let mut prefixes = Vec::new();
+    prefixes.try_reserve_exact(prefix_count)
+        .map_err(|_| Error::Other("bounded candidate prefix allocation failed".to_string()))?;
+    let mut leading_values = Vec::new();
+    leading_values.try_reserve_exact(leading)
+        .map_err(|_| Error::Other("bounded candidate prefix scratch allocation failed".to_string()))?;
+    let mut ordered_values = Vec::new();
+    ordered_values.try_reserve_exact(leading)
+        .map_err(|_| Error::Other("bounded candidate key scratch allocation failed".to_string()))?;
+
     let directed = |value: &Value, direction: contextdb_core::SortDirection| match direction {
         contextdb_core::SortDirection::Asc => DirectedValue::Asc(TotalOrdAsc(value.clone())),
         contextdb_core::SortDirection::Desc => DirectedValue::Desc(TotalOrdDesc(value.clone())),
     };
-    let mut partitions = BTreeSet::<IndexKey>::new();
-    for (start, _) in super::expanded_index_runs(pick)? {
-        let Bound::Included(key) = start else {
-            return Ok(None);
-        };
-        partitions.insert(key[..leading].to_vec());
-    }
-    // Every prefix the filter rejects inside a named partition: an admitted
-    // value on each earlier suffix column, then a rejected value on this one.
-    let mut probes = Vec::new();
-    for position in 0..rejected.len() {
-        let mut heads = vec![Vec::<DirectedValue>::new()];
-        for (earlier, values) in admitted.iter().enumerate().take(position) {
-            let direction = pick.columns[leading + earlier].1;
-            heads = heads
-                .into_iter()
-                .flat_map(|head| {
-                    values.iter().map(move |value| {
-                        let mut next = head.clone();
-                        next.push(directed(value, direction));
-                        next
-                    })
-                })
-                .collect();
-        }
-        let direction = pick.columns[leading + position].1;
-        for head in heads {
-            for value in &rejected[position] {
-                let mut probe = head.clone();
-                probe.push(directed(value, direction));
-                probes.push(probe);
+    fn visit_suffix_rejections<F>(
+        pick: &IndexPick,
+        meta: &TableMeta,
+        position: usize,
+        target: usize,
+        prefix: &mut IndexKey,
+        visit: &mut F,
+    ) -> std::result::Result<(), BoundedExecutionError>
+    where
+        F: FnMut(&IndexKey) -> std::result::Result<(), BoundedExecutionError>,
+    {
+        let shape_at = |position: usize| {
+            if position == 0 {
+                &pick.shape
+            } else {
+                &pick.suffix_shapes[position - 1]
             }
+        };
+        let (column, direction) = &pick.columns[position];
+        let nullable = meta
+            .columns
+            .iter()
+            .find(|candidate| candidate.name == *column)
+            .expect("boolean suffix metadata was validated")
+            .nullable;
+        let domain: &[Value] = if nullable {
+            static VALUES: [Value; 3] = [Value::Bool(false), Value::Bool(true), Value::Null];
+            &VALUES
+        } else {
+            static VALUES: [Value; 2] = [Value::Bool(false), Value::Bool(true)];
+            &VALUES
+        };
+        let admitted = |candidate: &Value| {
+            super::finite_shape_values(shape_at(position))
+                .expect("finite boolean suffix was validated")
+                .iter()
+                .any(|value| value == candidate)
+        };
+        for value in domain
+            .iter()
+            .filter(|value| admitted(value) == (position < target))
+        {
+            prefix.push(match direction {
+                contextdb_core::SortDirection::Asc => {
+                    DirectedValue::Asc(TotalOrdAsc(value.clone()))
+                }
+                contextdb_core::SortDirection::Desc => {
+                    DirectedValue::Desc(TotalOrdDesc(value.clone()))
+                }
+            });
+            if position == target {
+                visit(prefix)?;
+            } else {
+                visit_suffix_rejections(
+                    pick,
+                    meta,
+                    position + 1,
+                    target,
+                    prefix,
+                    visit,
+                )?;
+            }
+            prefix.pop();
         }
+        Ok(())
     }
-    // Every rejected prefix of every named partition, proved empty together:
-    // one pool and one batch of authenticated pages for the statement.
-    let mut prefixes = Vec::with_capacity(partitions.len().saturating_mul(probes.len()));
-    for partition in &partitions {
-        for probe in &probes {
-            let mut prefix = partition.clone();
-            prefix.extend(probe.iter().cloned());
-            prefixes.push(prefix);
+    let mut invalid_partition = false;
+    let mut admit_partition = |values: &[Value]| -> std::result::Result<(), BoundedExecutionError> {
+        if values.len() != leading {
+            return Err(Error::Other("candidate partition tuple arity changed".to_string()).into());
         }
+        ordered_values.clear();
+        for partition_key in partition_keys {
+            let Some(position) = pick.pushed_columns[..leading]
+                .iter()
+                .position(|column| column == partition_key)
+            else {
+                return Err(Error::Other("candidate partition column disappeared".to_string()).into());
+            };
+            ordered_values.push(values[position].clone());
+        }
+        let Some(key) = VectorPartitionKey::from_values(&ordered_values) else {
+            invalid_partition = true;
+            return Ok(());
+        };
+        if scope.is_some_and(|scope| !scope.contains(&key)) {
+            invalid_partition = true;
+            return Ok(());
+        }
+        keys.push(key);
+        let mut partition_prefix = IndexKey::new();
+        partition_prefix.try_reserve_exact(pick.pushed_columns.len()).map_err(|_| {
+            Error::Other("bounded candidate proof-key allocation failed".to_string())
+        })?;
+        for (value, (_, direction)) in values.iter().zip(&pick.columns) {
+            partition_prefix.push(directed(value, *direction));
+        }
+        for target in leading..pick.pushed_columns.len() {
+            visit_suffix_rejections(
+                pick,
+                meta,
+                leading,
+                target,
+                &mut partition_prefix,
+                &mut |prefix| {
+                    prefixes.push(prefix.clone());
+                    Ok(())
+                },
+            )?;
+        }
+        Ok(())
+    };
+    fn visit_leading_shapes<F>(
+        pick: &IndexPick,
+        leading: usize,
+        position: usize,
+        values: &mut Vec<Value>,
+        visit: &mut F,
+    ) -> std::result::Result<(), BoundedExecutionError>
+    where
+        F: FnMut(&[Value]) -> std::result::Result<(), BoundedExecutionError>,
+    {
+        if position == leading {
+            return visit(values);
+        }
+        let shape = if position == 0 {
+            &pick.shape
+        } else {
+            &pick.suffix_shapes[position - 1]
+        };
+        let choices = super::finite_shape_values(shape).ok_or_else(|| {
+            Error::Other("finite partition prefix lost its shape".to_string())
+        })?;
+        for value in choices {
+            values.push(value.clone());
+            visit_leading_shapes(pick, leading, position + 1, values, visit)?;
+            values.pop();
+        }
+        Ok(())
     }
+    if let Some(tuples) = pick.tuple_prefix() {
+        for tuple in tuples {
+            admit_partition(tuple)?;
+        }
+    } else {
+        visit_leading_shapes(pick, leading, 0, &mut leading_values, &mut admit_partition)?;
+    }
+    drop(admit_partition);
+    drop(ordered_values);
+    drop(leading_values);
+    if invalid_partition {
+        return Ok(None);
+    }
+
+    let prefix_bytes = prefixes.iter().try_fold(
+        checked_size_mul(prefixes.capacity(), std::mem::size_of::<IndexKey>(), "candidate proof prefixes")?,
+        |bytes, prefix| {
+            prefix.iter().try_fold(
+                checked_size_add(
+                    bytes,
+                    checked_size_mul(prefix.capacity(), std::mem::size_of::<DirectedValue>(), "candidate proof key")?,
+                    "candidate proof key",
+                )?,
+                |bytes, value| {
+                    let value = match value {
+                        DirectedValue::Asc(TotalOrdAsc(value)) | DirectedValue::Desc(TotalOrdDesc(value)) => value,
+                    };
+                    checked_size_add(bytes, value_capacity_bytes(value)?, "candidate proof payload")
+                },
+            )
+        },
+    )?;
+    let key_bytes = keys.iter().try_fold(
+        checked_size_mul(keys.capacity(), std::mem::size_of::<VectorPartitionKey>(), "candidate partition keys")?,
+        |bytes, key| {
+            checked_size_add(
+                bytes,
+                key.estimated_bytes().saturating_sub(std::mem::size_of::<VectorPartitionKey>()),
+                "candidate partition payload",
+            )
+        },
+    )?;
+    let actual = checked_size_add(prefix_bytes, key_bytes, "candidate coverage buffers")?;
+    coverage_charge.bytes = 0;
+    reconcile_new_reservation(context, BoundedWorkSource::IndexRange, planned, actual)?;
+    let prefix_charge = ReservedBytes::new(context, prefix_bytes);
+    let mut key_charge = ReservedBytes::new(context, key_bytes);
     if !prefixes.is_empty() {
         let empty = db.bounded_verified_index_prefixes_are_empty(
             &state.table,
@@ -14071,39 +14474,15 @@ fn candidate_runs_admit_whole_partitions(
             return Ok(None);
         }
     }
-    let positions = partition_keys
-        .iter()
-        .map(|key| {
-            pick.pushed_columns[..leading]
-                .iter()
-                .position(|column| column == key)
-        })
-        .collect::<Option<Vec<_>>>();
-    let Some(positions) = positions else {
-        return Ok(None);
-    };
-    let mut keys = Vec::with_capacity(partitions.len());
-    for partition in &partitions {
-        let values = positions
-            .iter()
-            .map(|position| match &partition[*position] {
-                DirectedValue::Asc(TotalOrdAsc(value))
-                | DirectedValue::Desc(TotalOrdDesc(value)) => value.clone(),
-            })
-            .collect::<Vec<_>>();
-        let Some(key) = VectorPartitionKey::from_values(&values) else {
-            return Ok(None);
-        };
-        // The partitions searched are never wider than the statement's own
-        // partition scope.
-        if scope.is_some_and(|scope| !scope.contains(&key)) {
-            return Ok(None);
-        }
-        keys.push(key);
-    }
+    drop(prefixes);
+    prefix_charge.release()?;
     keys.sort();
     keys.dedup();
-    Ok(Some(keys))
+    key_charge.bytes = 0;
+    Ok(Some(WholePartitionAdmission {
+        keys,
+        retained_bytes: key_bytes,
+    }))
 }
 
 /// Where one cold vector graph load's credit move stands. Test observation
@@ -14343,6 +14722,12 @@ fn build_vector_kernel<'plan>(
     // What this handle's own transaction has done to these vectors, decided
     // once here rather than asked per entry. Charged before it is held, like
     // the row overlay a scan takes.
+    let mut whole_partition_charge = ReservedBytes::new(
+        context,
+        whole_partitions
+            .as_ref()
+            .map_or(0, |admission| admission.retained_bytes),
+    );
     let mut overlay_bytes = 0;
     let vector_overlay = match context.transaction() {
         Some(tx) => {
@@ -14532,11 +14917,16 @@ fn build_vector_kernel<'plan>(
             k,
             candidate_k,
             partition_prefixes: match whole_partitions {
-                Some(partitions) => Some(partitions),
+                Some(admission) => Some(admission.keys),
                 None => partition_scope
                     .as_ref()
                     .and_then(super::VectorPartitionScope::resolved_prefixes)
                     .map(<[VectorPartitionKey]>::to_vec),
+            },
+            partition_prefix_bytes: {
+                let bytes = whole_partition_charge.bytes;
+                whole_partition_charge.bytes = 0;
+                bytes
             },
             search_mode,
             force_exact_for_relational_fallback: search_mode
