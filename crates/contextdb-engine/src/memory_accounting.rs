@@ -301,12 +301,14 @@ fn inherited_process_ceiling() -> usize {
         if let Some(ceiling) = cgroup_memory_max() {
             return ceiling;
         }
-        if let Some(total) = std::fs::read_to_string("/proc/meminfo").ok().and_then(|text| {
-            text.lines()
-                .find_map(|line| line.strip_prefix("MemTotal:"))
-                .and_then(|rest| rest.trim().trim_end_matches("kB").trim().parse::<usize>().ok())
-                .and_then(|kib| kib.checked_mul(1024))
-        }) {
+        let mut contents = [0_u8; 4096];
+        if let Some(read) = read_linux_file(b"/proc/meminfo\0", &mut contents)
+            && let Some(rest) = contents[..read]
+                .split(|byte| *byte == b'\n')
+                .find_map(|line| line.strip_prefix(b"MemTotal:"))
+            && let Some(kib) = parse_ascii_usize(rest)
+            && let Some(total) = kib.checked_mul(1024)
+        {
             return total;
         }
     }
@@ -323,25 +325,71 @@ fn inherited_process_ceiling() -> usize {
 
 #[cfg(target_os = "linux")]
 fn cgroup_memory_max() -> Option<usize> {
-    let membership = std::fs::read_to_string("/proc/self/cgroup").ok()?;
-    let path = membership.lines().find_map(|line| line.strip_prefix("0::"))?.trim();
-    let mut current = std::path::PathBuf::from("/sys/fs/cgroup");
+    const ROOT: &[u8] = b"/sys/fs/cgroup";
+    const LIMIT: &[u8] = b"/memory.max\0";
+    let mut membership = [0_u8; 4096];
+    let read = read_linux_file(b"/proc/self/cgroup\0", &mut membership)?;
+    let path = membership[..read]
+        .split(|byte| *byte == b'\n')
+        .find_map(|line| line.strip_prefix(b"0::"))?;
+    let path = trim_ascii(path);
+    let mut current = [0_u8; 4096];
+    current[..ROOT.len()].copy_from_slice(ROOT);
+    let mut current_len = ROOT.len();
     let mut limit: Option<usize> = None;
-    let mut visit = |dir: &std::path::Path| {
-        if let Ok(text) = std::fs::read_to_string(dir.join("memory.max"))
-            && let Ok(bytes) = text.trim().parse::<usize>()
-        {
-            limit = Some(limit.map_or(bytes, |held| held.min(bytes)));
-        }
+    let visit = |dir: &[u8], limit: &mut Option<usize>| {
+        let mut file = [0_u8; 4096];
+        let full_len = dir.len().checked_add(LIMIT.len())?;
+        if full_len > file.len() { return None; }
+        file[..dir.len()].copy_from_slice(dir);
+        file[dir.len()..full_len].copy_from_slice(LIMIT);
+        let mut contents = [0_u8; 64];
+        let read = read_linux_file(&file[..full_len], &mut contents)?;
+        let bytes = parse_ascii_usize(&contents[..read])?;
+        *limit = Some(limit.map_or(bytes, |held| held.min(bytes)));
+        Some(())
     };
-    visit(&current);
-    for component in std::path::Path::new(path).components() {
-        if let std::path::Component::Normal(name) = component {
-            current.push(name);
-            visit(&current);
-        }
+    let _ = visit(&current[..current_len], &mut limit);
+    for component in path.split(|byte| *byte == b'/').filter(|part| !part.is_empty()) {
+        let next_len = current_len.checked_add(1 + component.len())?;
+        if next_len >= current.len() { return limit; }
+        current[current_len] = b'/';
+        current[current_len + 1..next_len].copy_from_slice(component);
+        current_len = next_len;
+        let _ = visit(&current[..current_len], &mut limit);
     }
     limit
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_file(path: &[u8], destination: &mut [u8]) -> Option<usize> {
+    if path.last() != Some(&0) { return None; }
+    // SAFETY: `path` is NUL-terminated, `destination` is writable for its
+    // declared length, and the descriptor is closed on every successful open.
+    let descriptor = unsafe { libc::open(path.as_ptr().cast(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if descriptor < 0 { return None; }
+    let read = unsafe { libc::read(descriptor, destination.as_mut_ptr().cast(), destination.len()) };
+    unsafe { libc::close(descriptor) };
+    (read >= 0).then_some(read as usize)
+}
+
+#[cfg(target_os = "linux")]
+fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
+    while bytes.first().is_some_and(u8::is_ascii_whitespace) { bytes = &bytes[1..]; }
+    while bytes.last().is_some_and(u8::is_ascii_whitespace) { bytes = &bytes[..bytes.len() - 1]; }
+    bytes
+}
+
+#[cfg(target_os = "linux")]
+fn parse_ascii_usize(bytes: &[u8]) -> Option<usize> {
+    let mut value = 0_usize;
+    let mut saw_digit = false;
+    for byte in trim_ascii(bytes) {
+        if !byte.is_ascii_digit() { break; }
+        saw_digit = true;
+        value = value.checked_mul(10)?.checked_add((byte - b'0') as usize)?;
+    }
+    saw_digit.then_some(value)
 }
 
 #[cfg(any(test, feature = "test-seams"))]
