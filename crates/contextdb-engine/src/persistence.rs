@@ -9398,14 +9398,15 @@ impl RetainedReadSource {
         declaration: &IndexDecl,
         prefixes: &[contextdb_core::IndexKey],
         check_boundary: &mut dyn FnMut() -> std::result::Result<(), E>,
-        before_touch: &mut dyn FnMut() -> std::result::Result<(), E>,
+        before_probe: &mut dyn FnMut() -> std::result::Result<(), E>,
+        before_native_touch: &mut dyn FnMut() -> std::result::Result<(), E>,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<Option<bool>, E>
     where
         E: From<Error>,
     {
         check_boundary()?;
-        before_touch()?;
+        before_native_touch()?;
         self.verify_relational_source_roots(
             table,
             &declaration.name,
@@ -9422,11 +9423,13 @@ impl RetainedReadSource {
             Arc::clone(&memory) as Arc<dyn content_identity::ProofPoolGrowth>,
         );
         let mut batch = content_identity::OrderedProofBatch::default();
-        let mut before_page = || {
-            check_boundary()?;
-            before_touch()
-        };
         for prefix in prefixes {
+            check_boundary()?;
+            before_probe()?;
+            let mut before_page = || {
+                check_boundary()?;
+                before_native_touch()
+            };
             let seek = DurableRelationalIndexKey::new(prefix.clone(), RowId(0), TxId(0))?.0;
             let mut inside = None::<bool>;
             self.content_identity.visit_relational_index_postings_in(

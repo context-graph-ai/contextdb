@@ -836,12 +836,22 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         &self,
         table: &str,
         index: &str,
+        snapshot: SnapshotId,
         prefixes: &[IndexKey],
         check_boundary: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
-        before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_probe: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_native_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         _read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<Option<bool>, BoundedExecutionError> {
-        let _ = (table, index, prefixes, check_boundary, before_touch);
+        let _ = (
+            table,
+            index,
+            snapshot,
+            prefixes,
+            check_boundary,
+            before_probe,
+            before_native_touch,
+        );
         Ok(None)
     }
 
@@ -2092,18 +2102,22 @@ impl ReadExecutionTarget for Database {
         &self,
         table: &str,
         index: &str,
+        snapshot: SnapshotId,
         prefixes: &[IndexKey],
         check_boundary: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
-        before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_probe: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_native_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<Option<bool>, BoundedExecutionError> {
         Database::bounded_verified_index_prefixes_are_empty(
             self,
             table,
             index,
+            snapshot,
             prefixes,
             check_boundary,
-            before_touch,
+            before_probe,
+            before_native_touch,
             read_memory,
         )
     }
@@ -20881,17 +20895,21 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         &self,
         table: &str,
         index: &str,
+        snapshot: SnapshotId,
         prefixes: &[IndexKey],
         check_boundary: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
-        before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_probe: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_native_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<Option<bool>, BoundedExecutionError> {
         self.store.bounded_verified_index_prefixes_are_empty(
             table,
             index,
+            snapshot,
             prefixes,
             check_boundary,
-            before_touch,
+            before_probe,
+            before_native_touch,
             read_memory,
         )
     }

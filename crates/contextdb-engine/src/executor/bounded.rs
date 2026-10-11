@@ -14473,6 +14473,7 @@ fn candidate_runs_admit_whole_partitions(
         let empty = db.bounded_verified_index_prefixes_are_empty(
             &state.table,
             &pick.name,
+            state.snapshot,
             &prefixes,
             &mut || context.checkpoint(),
             &mut || {
@@ -14481,6 +14482,7 @@ fn candidate_runs_admit_whole_partitions(
                     BoundedSourceTouch::IndexEntry,
                 )
             },
+            &mut || context.native_source_touch(),
             context.source_read_memory(BoundedWorkSource::IndexRange),
         )?;
         if empty != Some(true) {
@@ -14489,7 +14491,7 @@ fn candidate_runs_admit_whole_partitions(
     }
     drop(prefixes);
     prefix_charge.release()?;
-    keys.sort();
+    keys.sort_unstable();
     keys.dedup();
     key_charge.bytes = 0;
     Ok(Some(WholePartitionAdmission {

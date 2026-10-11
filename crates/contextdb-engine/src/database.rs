@@ -57924,9 +57924,11 @@ impl Database {
         &self,
         table: &str,
         index: &str,
+        snapshot: SnapshotId,
         prefixes: &[contextdb_core::IndexKey],
         check_boundary: &mut dyn FnMut() -> std::result::Result<(), E>,
-        before_touch: &mut dyn FnMut() -> std::result::Result<(), E>,
+        before_probe: &mut dyn FnMut() -> std::result::Result<(), E>,
+        before_native_touch: &mut dyn FnMut() -> std::result::Result<(), E>,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<Option<bool>, E>
     where
@@ -57935,6 +57937,9 @@ impl Database {
         let Some(source) = &self.retained_relational_source else {
             return Ok(None);
         };
+        if !source.ordered_prefix_snapshot_is_current(snapshot) {
+            return Ok(None);
+        }
         let meta = self
             .table_meta(table)
             .ok_or_else(|| E::from(Error::TableNotFound(table.to_owned())))?;
@@ -57950,7 +57955,8 @@ impl Database {
             declaration,
             prefixes,
             check_boundary,
-            before_touch,
+            before_probe,
+            before_native_touch,
             read_memory,
         )
     }
