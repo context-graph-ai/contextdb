@@ -166,7 +166,7 @@ impl PersistentCompositeStore {
             &mut stage_started,
         );
         let mut accepted_row_memory =
-            crate::memory_accounting::OwnedMemoryReservation::new(self.inner.accountant.as_arc());
+            crate::memory_accounting::OwnedMemoryReservation::new(self.inner.accountant.as_handle());
         let deleted_rows =
             self.deleted_rows_snapshot_for_write_set(ws, &mut accepted_row_memory, read_memory.clone())?;
         let log_entries = self.inner.build_change_log_entries_with_snapshots(

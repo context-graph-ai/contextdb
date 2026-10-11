@@ -927,7 +927,7 @@ pub(crate) fn decoder_memory(
         usize::try_from(memory_ceiling).unwrap_or(usize::MAX),
     ));
     let memory =
-        match crate::read_image_memory::ImageMemory::operation_reader(accountant, child.clone()) {
+        match crate::read_image_memory::ImageMemory::operation_reader(accountant.into(), child.clone()) {
             Ok(memory) => memory,
             Err(error) => {
                 child.release(controls);

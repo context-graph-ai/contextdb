@@ -925,7 +925,7 @@ pub(crate) fn note_commit_directory_image_memory(image: &Arc<crate::read_image_m
         if let Some(active) = active.borrow().as_ref()
             && let Some(receipt) = active.commit_directory_funding.lock().unwrap_or_else(|error| error.into_inner()).as_mut() {
             receipt.image = Some(Arc::downgrade(image));
-            receipt.image_accountant = Some(Arc::downgrade(&image.accountant));
+            receipt.image_accountant = Some(Arc::downgrade(&image.accountant.standard_arc().expect("reader image preserves standard Arc observation")));
         }
     });
 }
@@ -945,7 +945,7 @@ pub(crate) fn note_commit_directory_source_registration_funding(
 ) {
     let window = CommitDirectorySourceRegistrationFunding {
         image_owner_identity: Arc::as_ptr(image) as usize,
-        image_accountant_identity: Arc::as_ptr(&image.accountant) as usize,
+        image_accountant_identity: image.accountant.as_ptr() as usize,
         image_held_before_reservation: before.0,
         image_held_after_reservation: image.held(),
         image_accountant_used_before_reservation: before.1,

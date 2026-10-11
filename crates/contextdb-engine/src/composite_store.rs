@@ -599,7 +599,7 @@ impl CompositeStore {
             change_log_lsn_refcounts,
             ddl_log,
             Arc::new(Mutex::new(HashMap::new())),
-            accountant,
+            crate::memory_accounting::AccountantHandle::from_host(accountant),
             Arc::new(ApplyPhasePause::new()),
         )
     }
@@ -614,7 +614,7 @@ impl CompositeStore {
         change_log_lsn_refcounts: Arc<RwLock<ChangeLogLsnRefcounts>>,
         ddl_log: Arc<RwLock<Vec<(Lsn, DdlChange)>>>,
         vector_partition_snapshot_stages: VectorPartitionSnapshotStageRegistry,
-        accountant: Arc<MemoryAccountant>,
+        accountant: crate::memory_accounting::AccountantHandle,
         apply_phase_pause: Arc<ApplyPhasePause>,
     ) -> Self {
         Self {
@@ -1017,7 +1017,7 @@ impl CompositeStore {
     ) -> Result<PreparedVectorPartitionMutationBatch> {
         let mut vector_copy_owner = vector_copy_owner.scratch();
         let mut insert_copy_owner = contextdb_vector::VectorCopyAdmission::new(
-            self.accountant.as_arc().vector_budget()?,
+            self.accountant.as_handle().vector_budget()?,
         );
         let commit_lsn = ws.commit_lsn.unwrap_or(Lsn(0));
         let new_rows = ws
@@ -1330,7 +1330,7 @@ impl CompositeStore {
         let memberships = self.relational.prepare_memberships(
             &ws.relational_deletes,
             &ws.relational_inserts,
-            self.accountant.as_arc(),
+            self.accountant.read_budget()?,
         )?;
         let vector_publication = if mutations.is_empty() {
             None
@@ -1369,7 +1369,7 @@ impl CompositeStore {
             .collect::<Result<Vec<(TableName, RowId, TxId, Lsn)>>>()?;
         let retention_expiries = self
             .relational
-            .prepare_retention_expiries(retention_identities, self.accountant.as_arc())?;
+            .prepare_retention_expiries(retention_identities, self.accountant.read_budget()?)?;
         Ok(PreparedVectorPartitionMutationBatch {
             memberships,
             retention_expiries,

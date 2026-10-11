@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::ptr::NonNull;
+use std::mem::ManuallyDrop;
 use std::alloc::Layout;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
@@ -137,6 +138,155 @@ impl Drop for WriterCounter {
     }
 }
 
+// Every private counter owner participates in the same final-consumer protocol.
+// No raw Arc or Weak leaves this handle. The last contender frees the native
+// Arc block before destroying the moved counter and settling aggregate residue.
+#[derive(Debug, Clone)]
+pub(crate) struct WriterCounterHandle(ManuallyDrop<Arc<ManuallyDrop<WriterCounter>>>);
+impl WriterCounterHandle {
+    fn new(counter: WriterCounter) -> Self { Self(ManuallyDrop::new(Arc::new(ManuallyDrop::new(counter)))) }
+    pub(crate) fn as_ptr(&self) -> *const WriterCounter { Arc::as_ptr(&self.0).cast() }
+}
+impl std::ops::Deref for WriterCounterHandle {
+    type Target = WriterCounter;
+    fn deref(&self) -> &WriterCounter { &self.0 }
+}
+impl Drop for WriterCounterHandle {
+    fn drop(&mut self) {
+        // Move the owned Arc out without adding a contender or dropping twice.
+        let owner = unsafe { ManuallyDrop::take(&mut self.0) };
+        if let Some(counter) = Arc::into_inner(owner) {
+            drop(ManuallyDrop::into_inner(counter));
+        }
+    }
+}
+
+const ACCOUNTANT_ORIGIN: usize = 0b100;
+const ACCOUNTANT_TAGS: usize = 0b111;
+const _: () = assert!(std::mem::align_of::<MemoryAccountant>() >= 8);
+
+// One strong ownership word. Standard mode preserves supplied host and reader
+// Arc/Weak identity. Only engine-created writers use restricted native mode.
+#[derive(Debug)]
+#[repr(transparent)]
+pub(crate) struct AccountantHandle(NonNull<MemoryAccountant>);
+impl AccountantHandle {
+    pub(crate) fn from_host(accountant: Arc<MemoryAccountant>) -> Self {
+        Self::from_standard(accountant)
+    }
+    // Standard representation preserves existing reader-image funding and
+    // identity. It does not declare those allocations host-funded or writers.
+    fn from_standard(accountant: Arc<MemoryAccountant>) -> Self {
+        Self(NonNull::new(Arc::into_raw(accountant).cast_mut()).expect("live accountant"))
+    }
+    fn is_engine(&self) -> bool { self.0.addr().get() & ACCOUNTANT_ORIGIN != 0 }
+    pub(crate) fn as_ptr(&self) -> *const MemoryAccountant {
+        self.0.as_ptr().map_addr(|address| address & !ACCOUNTANT_TAGS)
+    }
+    // Checked clone for genuine standard-Arc observation only. Engine writer
+    // callers cannot manufacture an unrestricted Arc or Weak from this seam.
+    pub(crate) fn standard_arc(&self) -> Option<Arc<MemoryAccountant>> {
+        if self.is_engine() { return None; }
+        let raw = self.as_ptr();
+        Some(unsafe { Arc::increment_strong_count(raw); Arc::from_raw(raw) })
+    }
+    fn into_owned_raw(self) -> *mut MemoryAccountant {
+        ManuallyDrop::new(self).0.as_ptr()
+    }
+    unsafe fn from_owned_raw(raw: *mut MemoryAccountant) -> Self {
+        Self(NonNull::new(raw).expect("owned accountant"))
+    }
+    fn backing_bytes(&self) -> usize {
+        if self.is_engine() { engine_writer_backing_bytes() } else { 0 }
+    }
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn writer_fixed_ownership(&self) -> (usize, usize, usize) {
+        let (node, _, adapters) = (**self).writer_fixed_ownership();
+        (node, self.backing_bytes(), adapters)
+    }
+    #[cfg(test)]
+    pub(crate) fn native_backing_for_test(&self) -> (bool, [(usize, Layout); 3]) {
+        (self.is_engine(), [
+            (self.as_ptr() as usize, writer_adapter_type_layout::<MemoryAccountant>()),
+            (Arc::as_ptr(&self.limit) as usize, writer_adapter_type_layout::<AtomicUsize>()),
+            (self.used.as_ptr() as usize, writer_adapter_type_layout::<WriterCounter>()),
+        ])
+    }
+    fn engine(limit: Option<usize>) -> contextdb_core::Result<Self> {
+        let counter = WriterCounter::default();
+        let backing_bytes = engine_writer_backing_bytes();
+        // Existing unavoidable startup retention, charged and joined BEFORE
+        // any of the accountant's three native control allocations exist.
+        let domain = PROCESS_WRITER_BUDGET_DOMAIN.write();
+        counter.charge(backing_bytes);
+        counter.join_aggregate();
+        drop(domain);
+        let used = WriterCounterHandle::new(counter);
+        let limit_control = Arc::new(AtomicUsize::new(limit.unwrap_or(0)));
+        let accountant = MemoryAccountant::with_controls(limit_control, used, limit);
+        #[cfg(feature = "test-seams")]
+        {
+            accountant.high_water_for_test.store(backing_bytes, Ordering::SeqCst);
+            accountant.admitted_bytes_for_test.store(backing_bytes, Ordering::SeqCst);
+            accountant.retained_charge_bytes_for_test.store(backing_bytes, Ordering::SeqCst);
+            note_budget_ledger("charge_retained", backing_bytes, backing_bytes);
+        }
+        let raw = Arc::into_raw(Arc::new(ManuallyDrop::new(accountant))).cast_mut().cast::<MemoryAccountant>();
+        Ok(Self(NonNull::new(raw.map_addr(|address| address | ACCOUNTANT_ORIGIN)).expect("native accountant")))
+    }
+}
+impl From<Arc<MemoryAccountant>> for AccountantHandle {
+    fn from(accountant: Arc<MemoryAccountant>) -> Self { Self::from_standard(accountant) }
+}
+impl std::ops::Deref for AccountantHandle {
+    type Target = MemoryAccountant;
+    fn deref(&self) -> &MemoryAccountant { unsafe { &*self.as_ptr() } }
+}
+impl AsRef<MemoryAccountant> for AccountantHandle {
+    fn as_ref(&self) -> &MemoryAccountant { self }
+}
+impl Clone for AccountantHandle {
+    fn clone(&self) -> Self {
+        unsafe {
+            if self.is_engine() { Arc::increment_strong_count(self.as_ptr().cast::<ManuallyDrop<MemoryAccountant>>()); }
+            else { Arc::increment_strong_count(self.as_ptr()); }
+        }
+        Self(self.0)
+    }
+}
+impl Drop for AccountantHandle {
+    fn drop(&mut self) {
+        if !self.is_engine() {
+            unsafe { drop(Arc::from_raw(self.as_ptr())); }
+            return;
+        }
+        let owner = unsafe { Arc::from_raw(self.as_ptr().cast::<ManuallyDrop<MemoryAccountant>>()) };
+        if let Some(accountant) = Arc::into_inner(owner) {
+            let accountant = ManuallyDrop::into_inner(accountant);
+            let counter = accountant.used.clone();
+            // Native accountant block is already freed; the stack payload
+            // frees its unique limit block before the original-counter refund.
+            drop(accountant);
+            let domain = PROCESS_WRITER_BUDGET_DOMAIN.read();
+            let refund = counter.release_owned(writer_adapter_type_layout::<MemoryAccountant>().size()
+                + writer_adapter_type_layout::<AtomicUsize>().size());
+            if !std::thread::panicking() { refund.expect("native accountant backing refund is owned"); }
+            drop(domain);
+            drop(counter);
+        }
+    }
+}
+// SAFETY: immutable ownership tags and Arc's Send/Sync pointee bounds; raw
+// custody is never used to expose mutable access or an engine Arc/Weak.
+unsafe impl Send for AccountantHandle {}
+unsafe impl Sync for AccountantHandle {}
+
+fn engine_writer_backing_bytes() -> usize {
+    writer_adapter_type_layout::<MemoryAccountant>().size()
+        + writer_adapter_type_layout::<AtomicUsize>().size()
+        + writer_adapter_type_layout::<WriterCounter>().size()
+}
+
 /// The inherited whole-process memory limit: the effective cgroup v2
 /// `memory.max` (the minimum along this process's cgroup path), else the
 /// host's physical memory. It is never absent. Writer ceilings govern only
@@ -234,8 +384,8 @@ struct WriterRegistration {
     epoch: usize,
     users: usize,
     limit: Arc<AtomicUsize>,
-    used: Arc<WriterCounter>,
-    // The engine's backing for this accountant, refunded at last use.
+    used: WriterCounterHandle,
+    // Observational backing attribution; only the final native handle refunds it.
     engine_backing_bytes: AtomicUsize,
     adapter_control_bytes: AtomicUsize,
     next: Option<Box<WriterRegistration>>,
@@ -280,17 +430,10 @@ impl ProcessWriterBudgetDomain {
                 if record.users != 0 { return; }
                 let mut record = slot.take().expect("last-use registration");
                 *slot = record.next.take();
-                // The engine's custody of this accountant ends with its last
-                // use: the registration and the engine's backing for the
-                // accountant both leave the books here. A holder that keeps
-                // the accountant afterwards holds it outside the engine.
-                let backing = record.engine_backing_bytes.load(Ordering::SeqCst);
-                // Only counter handles and inert receipt state remain in the
-                // detached record. No payload destructor runs under this gate.
+                // Retirement frees/refunds only the registration. Native
+                // accountant and counter blocks have independent final owners.
                 drop(record);
-                accountant.release_under_exclusive_gate(
-                    Layout::new::<WriterRegistration>().size() + backing,
-                );
+                accountant.release_under_exclusive_gate(Layout::new::<WriterRegistration>().size());
                 return;
             }
             slot = &mut slot.as_mut().expect("registration exists").next;
@@ -312,12 +455,12 @@ pub(crate) static RESIDENT_INSERTION_BUILD_LEASE: parking_lot::Mutex<()> =
 // key; the active epoch and count live only in the admitted domain record.
 #[derive(Debug)]
 pub(crate) struct WriterUse {
-    accountant: Arc<MemoryAccountant>,
+    accountant: AccountantHandle,
     stable_identity: usize,
     epoch: usize,
 }
 impl WriterUse {
-    pub(crate) fn retain_if_writer(accountant: &Arc<MemoryAccountant>) -> Option<Self> {
+    pub(crate) fn retain_if_writer(accountant: &AccountantHandle) -> Option<Self> {
         let mut domain = PROCESS_WRITER_BUDGET_DOMAIN.write();
         let stable_identity = accountant.writer_identity.get().copied()?;
         let epoch = domain.lookup_in(stable_identity)?.epoch;
@@ -344,26 +487,26 @@ impl Drop for WriterUse {
 #[derive(Debug)]
 #[repr(transparent)]
 pub(crate) struct StoreAccountantHandle(NonNull<MemoryAccountant>);
-const _: () = assert!(std::mem::align_of::<MemoryAccountant>() >= 2);
+const _: () = assert!(std::mem::align_of::<MemoryAccountant>() >= 8);
 impl StoreAccountantHandle {
     fn decoded(&self) -> NonNull<MemoryAccountant> {
-        self.0.map_addr(|address| std::num::NonZeroUsize::new(address.get() & !1).expect("Arc pointer is non-null"))
+        self.0.map_addr(|address| std::num::NonZeroUsize::new(address.get() & !ACCOUNTANT_TAGS).expect("Arc pointer is non-null"))
     }
     pub(crate) fn is_writer(&self) -> bool { self.0.addr().get() & 1 != 0 }
-    pub(crate) fn retain_if_writer(accountant: &Arc<MemoryAccountant>) -> Option<Self> {
+    pub(crate) fn retain_if_writer(accountant: &AccountantHandle) -> Option<Self> {
         // Construct and check the tag from the same exclusive-gate snapshot.
-        let handle = Self::new(Arc::clone(accountant));
+        let handle = Self::new(accountant.clone());
         handle.is_writer().then_some(handle)
     }
     pub(crate) fn same_allocation(&self, other: &Self) -> bool {
         self.decoded() == other.decoded()
     }
-    pub(crate) fn new(accountant: Arc<MemoryAccountant>) -> Self {
+    pub(crate) fn new(accountant: AccountantHandle) -> Self {
         let mut domain = PROCESS_WRITER_BUDGET_DOMAIN.write();
         let active = accountant.writer_identity.get().copied()
             .and_then(|key| domain.lookup_in(key).map(|record| (key, record.epoch)));
         if let Some((key, epoch)) = active { domain.retain_in(key, epoch); }
-        let raw = NonNull::new(Arc::into_raw(accountant).cast_mut()).expect("Arc pointer is non-null");
+        let raw = NonNull::new(accountant.into_owned_raw()).expect("Arc pointer is non-null");
         Self(if active.is_some() {
             raw.map_addr(|address| std::num::NonZeroUsize::new(address.get() | 1).expect("tagged Arc pointer is non-null"))
         } else { raw })
@@ -394,25 +537,29 @@ impl StoreAccountantHandle {
         operation: &str, hint: &str) -> contextdb_core::Result<()> {
         self.try_allocate_for_provenance(bytes, subsystem, operation, hint, Some(self))
     }
-    pub(crate) fn same_accountant(&self, accountant: &Arc<MemoryAccountant>) -> bool {
-        std::ptr::eq(self.decoded().as_ptr(), Arc::as_ptr(accountant))
+    pub(crate) fn same_accountant(&self, accountant: &AccountantHandle) -> bool {
+        std::ptr::eq(self.decoded().as_ptr(), accountant.as_ptr())
     }
-    pub(crate) fn as_arc(&self) -> Arc<MemoryAccountant> {
-        let raw = self.decoded().as_ptr();
-        // SAFETY: this handle owns a live strong Arc count on the decoded
-        // allocation. Increment before reconstructing the additional owner.
-        unsafe { Arc::increment_strong_count(raw); Arc::from_raw(raw) }
+    pub(crate) fn as_handle(&self) -> AccountantHandle {
+        let original = ManuallyDrop::new(unsafe { AccountantHandle::from_owned_raw(
+            self.0.as_ptr().map_addr(|address| address & !1)) });
+        AccountantHandle::clone(&original)
     }
     pub(crate) fn vector_budget(
         &self,
     ) -> contextdb_core::Result<Arc<dyn contextdb_vector::MemoryBudget>> {
-        let accountant = self.as_arc();
+        let accountant = self.as_handle();
         if !self.is_writer() {
             // An untagged derived owner stays a reader even after a writer
             // later registers this same accountant.
-            return Ok(accountant);
+            return accountant.vector_budget_for_original_reader();
         }
-        let writer_use = {
+        let writer_use = self.original_writer_use(&accountant);
+        Ok(accountant.budget_adapter(Some(writer_use), false)?)
+    }
+    fn original_writer_use(&self, accountant: &AccountantHandle) -> WriterUse {
+        assert!(self.is_writer(), "only an original writer retains its epoch");
+        {
             let mut domain = PROCESS_WRITER_BUDGET_DOMAIN.write();
             let stable_identity = *accountant
                 .writer_identity
@@ -428,9 +575,14 @@ impl StoreAccountantHandle {
                 stable_identity,
                 epoch,
             }
-        };
-        Ok(accountant.budget_adapter(writer_use, false)?)
+        }
     }
+    pub(crate) fn read_budget(&self) -> contextdb_core::Result<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>> {
+        let accountant = self.as_handle();
+        let writer_use = self.is_writer().then(|| self.original_writer_use(&accountant));
+        accountant.read_budget_for_original(writer_use)
+    }
+
 }
 impl std::ops::Deref for StoreAccountantHandle {
     type Target = MemoryAccountant;
@@ -444,14 +596,14 @@ impl Clone for StoreAccountantHandle {
     fn clone(&self) -> Self {
         // The stack Arc rolls its added count back if checked count retention
         // panics. No operation that can panic follows successful retention.
-        let accountant = self.as_arc();
+        let accountant = self.as_handle();
         if self.is_writer() {
             let mut domain = PROCESS_WRITER_BUDGET_DOMAIN.write();
             let key = *accountant.writer_identity.get().expect("tagged handle has a stable key");
             let epoch = domain.lookup_in(key).expect("tagged handle pins its record").epoch;
             domain.retain_in(key, epoch);
         }
-        let raw = NonNull::new(Arc::into_raw(accountant).cast_mut()).expect("Arc pointer is non-null");
+        let raw = NonNull::new(accountant.into_owned_raw()).expect("Arc pointer is non-null");
         Self(if self.is_writer() {
             raw.map_addr(|address| std::num::NonZeroUsize::new(address.get() | 1).expect("tagged Arc pointer is non-null"))
         } else { raw })
@@ -461,7 +613,7 @@ impl Drop for StoreAccountantHandle {
     fn drop(&mut self) {
         // SAFETY: exactly one into_raw ownership is consumed per handle and
         // only the decoded pointer is passed to Arc's ownership operations.
-        let accountant = unsafe { Arc::from_raw(self.decoded().as_ptr()) };
+        let accountant = unsafe { AccountantHandle::from_owned_raw(self.0.as_ptr().map_addr(|address| address & !1)) };
         if self.is_writer() {
             let mut domain = PROCESS_WRITER_BUDGET_DOMAIN.write();
             let key = *accountant.writer_identity.get().expect("tagged handle has a stable key");
@@ -471,7 +623,7 @@ impl Drop for StoreAccountantHandle {
         drop(accountant);
     }
 }
-// SAFETY: the pointee has Arc<MemoryAccountant>'s Send/Sync bounds. The tag is
+// SAFETY: the pointee has AccountantHandle's Send/Sync bounds. The tag is
 // immutable per handle; every mutable registration operation uses the one
 // exclusive process-domain gate. No raw mutable pointee access is provided.
 unsafe impl Send for StoreAccountantHandle {}
@@ -479,15 +631,16 @@ unsafe impl Sync for StoreAccountantHandle {}
 
 #[derive(Debug, Clone)]
 pub(crate) struct WriterBudget {
-    accountant: Arc<MemoryAccountant>,
+    accountant: AccountantHandle,
     writer_use: WriterUse,
     vector_accountant: Arc<dyn contextdb_vector::MemoryBudget>,
 }
 impl WriterBudget {
     pub(crate) fn from_accountant(accountant: Arc<MemoryAccountant>) -> contextdb_core::Result<Self> {
-        Self::from_accountant_with_backing(accountant, 0)
+        Self::from_handle(AccountantHandle::from_host(accountant))
     }
-    fn from_accountant_with_backing(accountant: Arc<MemoryAccountant>, engine_backing_bytes: usize) -> contextdb_core::Result<Self> {
+    pub(crate) fn from_handle(accountant: AccountantHandle) -> contextdb_core::Result<Self> {
+        let engine_backing_bytes = accountant.backing_bytes();
         let mut domain = PROCESS_WRITER_BUDGET_DOMAIN.write();
         let stable_identity = if let Some(key) = accountant.writer_identity.get() { *key } else {
             let key = domain.next_identity;
@@ -498,7 +651,7 @@ impl WriterBudget {
         };
         let epoch = if let Some(record) = domain.lookup_in(stable_identity) {
             let epoch = record.epoch;
-            assert_eq!(engine_backing_bytes, 0, "existing writer backing has one origin");
+            assert_eq!(record.engine_backing_bytes.load(Ordering::SeqCst), engine_backing_bytes, "existing writer backing retains its origin");
             domain.retain_in(stable_identity, epoch);
             epoch
         } else {
@@ -525,14 +678,15 @@ impl WriterBudget {
         let vector_accountant = accountant.vector_budget_for_startup()?;
         Ok(Self { accountant, writer_use, vector_accountant })
     }
-    pub(crate) fn accountant(&self) -> Arc<MemoryAccountant> { self.accountant.clone() }
-    pub(crate) fn into_parts(self) -> (Arc<MemoryAccountant>, WriterUse, Arc<dyn contextdb_vector::MemoryBudget>) { (self.accountant, self.writer_use, self.vector_accountant) }
+    pub(crate) fn accountant(&self) -> AccountantHandle { self.accountant.clone() }
+    pub(crate) fn into_parts(self) -> (AccountantHandle, WriterUse, Arc<dyn contextdb_vector::MemoryBudget>) { (self.accountant, self.writer_use, self.vector_accountant) }
     pub(crate) fn vector_accountant(&self) -> Arc<dyn contextdb_vector::MemoryBudget> { self.vector_accountant.clone() }
 }
 
-// Exact pinned Rust 1.94.1 alloc::sync ArcInner repr(C) layout, sync.rs
-// sync.rs:377-400: #[repr(C, align(2))] ArcInner has two Atomic<usize>
-// header fields and data: T; arcinner_layout_for_value_layout extends and pads. Existing GlobalAlloc witness verifies the request.
+// Pinned Rust 1.94.1 alloc::sync ArcInner layout derivation: repr(C, align(2)),
+// two atomic usize counts followed by T, extended and padded. This computes
+// a typed request; independent allocator observation must verify each native
+// accountant, limit and counter request in its actual compilation profile.
 pub(crate) fn writer_adapter_layout<T>(adapter: &T) -> Layout {
     Layout::new::<[AtomicUsize; 2]>().extend(Layout::for_value(adapter))
         .expect("adapter Arc layout overflow").0.pad_to_align()
@@ -635,7 +789,7 @@ thread_local! {
 /// the resident graph owner. The accountant identity prevents a nested load
 /// for another database from adopting the wrong request's bytes.
 pub(crate) fn with_vector_load_reservation_transfer<T>(
-    accountant: &Arc<MemoryAccountant>,
+    accountant: &AccountantHandle,
     transfer: VectorLoadReservationTransfer,
     operation: impl FnOnce() -> T,
 ) -> T {
@@ -643,7 +797,7 @@ pub(crate) fn with_vector_load_reservation_transfer<T>(
         transfers
             .borrow_mut()
             .push(ActiveVectorLoadReservationTransfer {
-                accountant: Arc::as_ptr(accountant) as usize,
+                accountant: accountant.as_ptr() as usize,
                 transfer,
             });
     });
@@ -721,9 +875,10 @@ impl Drop for TransitionHeadroomScope {
 /// All methods are &self — interior mutability via atomics.
 #[derive(Debug)]
 #[allow(dead_code)]
+#[repr(align(8))]
 pub struct MemoryAccountant {
     limit: Arc<AtomicUsize>,
-    used: Arc<WriterCounter>,
+    used: WriterCounterHandle,
     writer_identity: OnceLock<usize>,
     #[cfg(feature = "test-seams")]
     high_water_for_test: AtomicUsize,
@@ -840,7 +995,7 @@ thread_local! {
 /// unit installed anyway. The reservation is what makes the preflight's answer
 /// still true when the items take it.
 pub(crate) struct SchemaUnitReservation {
-    accountant: Arc<MemoryAccountant>,
+    accountant: AccountantHandle,
     /// Bytes THIS reservation is holding and has not handed to its own items.
     /// Owned here rather than pooled on the accountant, so a second unit's
     /// reservation can neither be spent by this one nor released by it.
@@ -942,7 +1097,7 @@ fn note_budget_admission(subsystem: &str, operation: &str, bytes: usize, used_af
 // payload/use fields; PendingControlRefund is then the last local destroyed.
 #[derive(Debug)]
 pub(crate) struct ControlCredit {
-    accountant: Option<Arc<MemoryAccountant>>,
+    accountant: Option<AccountantHandle>,
     bytes: usize,
     registration: Option<(usize, usize)>,
 }
@@ -963,15 +1118,15 @@ impl ControlCredit {
                 |current| current.checked_add(bytes)).expect("control receipt arithmetic must be owned");
             Some((key, record.epoch))
         } else { None };
-        Ok(Self { accountant: Some(accountant.as_arc()), bytes, registration })
+        Ok(Self { accountant: Some(accountant.as_handle()), bytes, registration })
     }
     pub(crate) fn admit_open_residue(accountant: &StoreAccountantHandle, bytes: usize, operation: &str) -> contextdb_core::Result<Self> {
         admit_open_residue(bytes, operation)?;
-        Ok(Self { accountant: Some(accountant.as_arc()), bytes: bytes | OPEN_RESIDUE_TAG, registration: None })
+        Ok(Self { accountant: Some(accountant.as_handle()), bytes: bytes | OPEN_RESIDUE_TAG, registration: None })
     }
     // Only constant per-assembly controls call this door. Growing write
     // payloads, including staged posting charges, retain ordinary admission.
-    pub(crate) fn admit_assembly(accountant: &Arc<MemoryAccountant>, bytes: usize, operation: &str) -> contextdb_core::Result<Self> {
+    pub(crate) fn admit_assembly(accountant: &AccountantHandle, bytes: usize, operation: &str) -> contextdb_core::Result<Self> {
         let handle = StoreAccountantHandle::new(accountant.clone());
         if handle.is_writer() {
             Self::admit_open_residue(&handle, bytes, operation)
@@ -979,22 +1134,22 @@ impl ControlCredit {
             Self::admit(accountant, bytes, operation)
         }
     }
-    pub(crate) fn admit(accountant: &Arc<MemoryAccountant>, bytes: usize, operation: &str) -> contextdb_core::Result<Self> {
+    pub(crate) fn admit(accountant: &AccountantHandle, bytes: usize, operation: &str) -> contextdb_core::Result<Self> {
         accountant.admit_box_control(bytes, operation, "Raise MEMORY_LIMIT for this fixed writer control.")?;
         Ok(Self { accountant: Some(accountant.clone()), bytes, registration: accountant.prepare_control_refund().1 })
     }
-    pub(crate) fn from_admitted(accountant: &Arc<MemoryAccountant>, bytes: usize) -> Self {
+    pub(crate) fn from_admitted(accountant: &AccountantHandle, bytes: usize) -> Self {
         // Transfer a named portion of an existing control reservation. No
         // admission, refund or payer substitution happens at this handoff.
         accountant.change_adapter_control_receipt(bytes, true);
-        Self { accountant: Some(Arc::clone(accountant)), bytes, registration: accountant.prepare_control_refund().1 }
+        Self { accountant: Some(accountant.clone()), bytes, registration: accountant.prepare_control_refund().1 }
     }
-    pub(crate) fn retained_startup(accountant: &Arc<MemoryAccountant>, bytes: usize) -> Self {
+    pub(crate) fn retained_startup(accountant: &AccountantHandle, bytes: usize) -> Self {
         // Preserve the existing captured-schema startup floor: accounted
         // before allocation, but never refused solely by a persisted limit.
         accountant.charge_retained(bytes);
         accountant.change_adapter_control_receipt(bytes, true);
-        Self { accountant: Some(Arc::clone(accountant)), bytes, registration: accountant.prepare_control_refund().1 }
+        Self { accountant: Some(accountant.clone()), bytes, registration: accountant.prepare_control_refund().1 }
     }
     pub(crate) fn prepare(mut self) -> PendingControlRefund {
         let accountant = self.accountant.take().expect("live control credit has its original funder");
@@ -1027,7 +1182,7 @@ fn refund_invariant_broken(what: &str) {
 }
 
 pub(crate) struct PendingControlRefund {
-    counter: Arc<WriterCounter>,
+    counter: WriterCounterHandle,
     bytes: usize,
     registration: Option<(usize, usize)>,
 }
@@ -1067,14 +1222,14 @@ impl Drop for PendingControlRefund {
 /// are moved here before any fallible invariant destructor can unwind. The
 /// index advances before each operation; a live guard resumes at the next one.
 pub(crate) struct ReservationCleanup {
-    accountant: Option<Arc<MemoryAccountant>>,
+    accountant: Option<AccountantHandle>,
     writer_use: Option<WriterUse>,
     payload: usize,
     refund: Option<PendingControlRefund>,
     next: u8,
 }
 impl ReservationCleanup {
-    pub(crate) fn new(accountant: Option<Arc<MemoryAccountant>>, writer_use: Option<WriterUse>,
+    pub(crate) fn new(accountant: Option<AccountantHandle>, writer_use: Option<WriterUse>,
         payload: usize, refund: Option<PendingControlRefund>) -> Self {
         Self { accountant, writer_use, payload, refund, next: 0 }
     }
@@ -1101,7 +1256,7 @@ impl Drop for ReservationCleanup { fn drop(&mut self) { self.finish(); } }
 /// complete charge exactly once.
 #[derive(Debug)]
 pub(crate) struct OwnedMemoryReservation {
-    accountant: Option<Arc<MemoryAccountant>>,
+    accountant: Option<AccountantHandle>,
     bytes: usize,
 
     _writer_use: Option<crate::memory_accounting::WriterUse>,
@@ -1112,7 +1267,7 @@ pub(crate) struct OwnedMemoryReservation {
 /// writer use through payload destruction. Conversion transfers admitted
 /// bytes exactly once; it never releases and readmits them.
 pub(crate) struct ContainedMemoryReservation {
-    accountant: Arc<MemoryAccountant>,
+    accountant: AccountantHandle,
     bytes: usize,
 }
 impl ContainedMemoryReservation {
@@ -1130,7 +1285,7 @@ impl Drop for ContainedMemoryReservation {
 /// Admission transferred from a displaced ordinary write into mutation undo.
 #[derive(Debug)]
 pub(crate) struct TransferredRowReservation {
-    accountant: Option<Arc<MemoryAccountant>>,
+    accountant: Option<AccountantHandle>,
     bytes: AtomicUsize,
     _writer_use: Option<crate::memory_accounting::WriterUse>,
     own_control: Option<ControlCredit>,
@@ -1139,11 +1294,11 @@ impl TransferredRowReservation {
     pub(crate) fn adopt(&self, bytes: usize) {
         self.bytes.store(bytes, Ordering::Relaxed);
     }
-    pub(crate) fn prepare_control(accountant: &Arc<MemoryAccountant>) -> contextdb_core::Result<ControlCredit> {
+    pub(crate) fn prepare_control(accountant: &AccountantHandle) -> contextdb_core::Result<ControlCredit> {
         ControlCredit::admit(accountant, writer_adapter_type_layout::<Self>().size(), "transferred_row_control")
     }
     pub(crate) fn from_admitted_with_control(
-        accountant: Arc<MemoryAccountant>, bytes: usize, control: ControlCredit,
+        accountant: AccountantHandle, bytes: usize, control: ControlCredit,
     ) -> Arc<Self> {
         Arc::new(Self {
             _writer_use: crate::memory_accounting::WriterUse::retain_if_writer(&accountant),
@@ -1151,7 +1306,7 @@ impl TransferredRowReservation {
             own_control: Some(control),
         })
     }
-    pub(crate) fn try_from_admitted(accountant: Arc<MemoryAccountant>, bytes: usize) -> contextdb_core::Result<Arc<Self>> {
+    pub(crate) fn try_from_admitted(accountant: AccountantHandle, bytes: usize) -> contextdb_core::Result<Arc<Self>> {
         // Admission failure leaves the original payload's credit untouched.
         let control = Self::prepare_control(&accountant)?;
         Ok(Self::from_admitted_with_control(accountant, bytes, control))
@@ -1216,7 +1371,7 @@ impl contextdb_tx::StagedPostingCharge for OwnedMemoryReservation {
 }
 
 impl OwnedMemoryReservation {
-    fn accountant(&self) -> &Arc<MemoryAccountant> {
+    fn accountant(&self) -> &AccountantHandle {
         self.accountant.as_ref().expect("live reservation has its accountant")
     }
     pub(crate) fn with_enclosing_arc_control<T>(mut self, retained_startup: bool) -> contextdb_core::Result<Self> {
@@ -1241,7 +1396,7 @@ impl OwnedMemoryReservation {
         reservation.own_control = Some(ControlCredit::admit(reservation.accountant(), layout.size(), "reservation_mutex_control")?);
         Ok(Arc::new(value))
     }
-    pub(crate) fn from_admitted(accountant: Arc<MemoryAccountant>, bytes: usize) -> Self {
+    pub(crate) fn from_admitted(accountant: AccountantHandle, bytes: usize) -> Self {
         Self { _writer_use: crate::memory_accounting::WriterUse::retain_if_writer(&(accountant)),
 accountant: Some(accountant), bytes, own_control: None }
     }
@@ -1249,7 +1404,7 @@ accountant: Some(accountant), bytes, own_control: None }
         self.bytes = 0;
     }
 
-    pub(crate) fn new(accountant: Arc<MemoryAccountant>) -> Self {
+    pub(crate) fn new(accountant: AccountantHandle) -> Self {
         Self {
             _writer_use: crate::memory_accounting::WriterUse::retain_if_writer(&(accountant)),
 accountant: Some(accountant),
@@ -1336,7 +1491,7 @@ impl OwnedMemoryReservation {
     /// that operation's name the way the same work reports it on any other
     /// path.
     pub(crate) fn try_new_for(
-        accountant: Arc<MemoryAccountant>,
+        accountant: AccountantHandle,
         bytes: usize,
         subsystem: &str,
         operation: &str,
@@ -1381,72 +1536,29 @@ impl MemoryAccountant {
     }
 
     /// No budget enforcement. All allocations succeed. Default behavior.
-    pub fn no_limit() -> Self {
-        Self {
-            limit: Arc::new(AtomicUsize::new(0)),
-            used: Arc::new(WriterCounter::default()),
-            #[cfg(feature = "test-seams")]
-            high_water_for_test: AtomicUsize::new(0),
-            #[cfg(feature = "test-seams")]
-            admitted_bytes_for_test: AtomicUsize::new(0),
-            #[cfg(feature = "test-seams")]
-            retained_charge_bytes_for_test: AtomicUsize::new(0),
-            startup_ceiling: AtomicUsize::new(0),
-            has_ceiling: AtomicBool::new(false),
-            writer_identity: OnceLock::new(),
-            idle_graph_reclaimer: parking_lot::Mutex::new(None),
-            #[cfg(any(test, feature = "test-seams"))]
-            underflow_count: AtomicUsize::new(0),
-            #[cfg(any(test, feature = "test-seams"))]
-            tail_admission_failure: AtomicUsize::new(0),
-            #[cfg(test)]
-            alloc_race_hook: AllocRaceHook::default(),
-            #[cfg(test)]
-            admission_race_hook: AllocRaceHook::default(),
-        }
-    }
+    pub fn no_limit() -> Self { Self::with_initial_budget(None, false) }
 
     /// Set a byte ceiling. Allocations exceeding this fail.
-    pub fn with_budget(bytes: usize) -> Self {
-        Self {
-            limit: Arc::new(AtomicUsize::new(bytes)),
-            used: Arc::new(WriterCounter::default()),
-            #[cfg(feature = "test-seams")]
-            high_water_for_test: AtomicUsize::new(0),
-            #[cfg(feature = "test-seams")]
-            admitted_bytes_for_test: AtomicUsize::new(0),
-            #[cfg(feature = "test-seams")]
-            retained_charge_bytes_for_test: AtomicUsize::new(0),
-            startup_ceiling: AtomicUsize::new(bytes),
-            has_ceiling: AtomicBool::new(true),
-            writer_identity: OnceLock::new(),
-            idle_graph_reclaimer: parking_lot::Mutex::new(None),
-            #[cfg(any(test, feature = "test-seams"))]
-            underflow_count: AtomicUsize::new(0),
-            #[cfg(any(test, feature = "test-seams"))]
-            tail_admission_failure: AtomicUsize::new(0),
-            #[cfg(test)]
-            alloc_race_hook: AllocRaceHook::default(),
-            #[cfg(test)]
-            admission_race_hook: AllocRaceHook::default(),
-        }
-    }
+    pub fn with_budget(bytes: usize) -> Self { Self::with_initial_budget(Some(bytes), true) }
 
-    /// A persisted live setting, not a process-start ceiling. Reopening a
-    /// database must restore enforcement without turning later durable SETs
-    /// into forbidden attempts to cross a ceiling the operator never passed.
-    pub(crate) fn with_runtime_budget(bytes: usize) -> Self {
+    /// Restore a persisted live setting without establishing a startup ceiling.
+    pub(crate) fn with_runtime_budget(bytes: usize) -> Self { Self::with_initial_budget(Some(bytes), false) }
+
+    fn with_initial_budget(limit: Option<usize>, startup: bool) -> Self {
+        Self::with_controls(Arc::new(AtomicUsize::new(limit.unwrap_or(0))),
+            WriterCounterHandle::new(WriterCounter::default()), limit.filter(|_| startup))
+    }
+    fn with_controls(limit: Arc<AtomicUsize>, used: WriterCounterHandle, startup: Option<usize>) -> Self {
         Self {
-            limit: Arc::new(AtomicUsize::new(bytes)),
-            used: Arc::new(WriterCounter::default()),
+            limit, used,
             #[cfg(feature = "test-seams")]
             high_water_for_test: AtomicUsize::new(0),
             #[cfg(feature = "test-seams")]
             admitted_bytes_for_test: AtomicUsize::new(0),
             #[cfg(feature = "test-seams")]
             retained_charge_bytes_for_test: AtomicUsize::new(0),
-            startup_ceiling: AtomicUsize::new(0),
-            has_ceiling: AtomicBool::new(false),
+            startup_ceiling: AtomicUsize::new(startup.unwrap_or(0)),
+            has_ceiling: AtomicBool::new(startup.is_some()),
             writer_identity: OnceLock::new(),
             idle_graph_reclaimer: parking_lot::Mutex::new(None),
             #[cfg(any(test, feature = "test-seams"))]
@@ -1489,16 +1601,13 @@ impl MemoryAccountant {
     }
 
     pub(crate) fn writer_budget(bytes: usize) -> contextdb_core::Result<WriterBudget> {
-        Self::new_engine_writer(Self::with_budget(bytes))
+        Self::new_engine_writer(Some(bytes))
     }
     pub(crate) fn writer_no_limit() -> contextdb_core::Result<WriterBudget> {
-        Self::new_engine_writer(Self::no_limit())
+        Self::new_engine_writer(None)
     }
-    fn new_engine_writer(accountant: Self) -> contextdb_core::Result<WriterBudget> {
-        let bytes = writer_adapter_layout(&accountant).size()
-            + 2 * writer_adapter_layout(&AtomicUsize::new(0)).size();
-        accountant.charge_retained_under_admission(bytes);
-        WriterBudget::from_accountant_with_backing(Arc::new(accountant), bytes)
+    fn new_engine_writer(limit: Option<usize>) -> contextdb_core::Result<WriterBudget> {
+        WriterBudget::from_handle(AccountantHandle::engine(limit)?)
     }
     #[cfg(feature = "test-seams")]
     pub(crate) fn writer_fixed_ownership(&self) -> (usize, usize, usize) {
@@ -1520,18 +1629,18 @@ impl MemoryAccountant {
     }
     // A ControlCredit already captured its original registration. Refund
     // custody needs only that accountant's source counter, never a new epoch.
-    fn original_control_counter(&self) -> Arc<WriterCounter> {
+    fn original_control_counter(&self) -> WriterCounterHandle {
         assert!(self.exclusive_activation().is_none(), "control cleanup is outside borrowed activation");
         self.used.clone()
     }
-    fn prepare_control_refund(&self) -> (Arc<WriterCounter>, Option<(usize, usize)>) {
+    fn prepare_control_refund(&self) -> (WriterCounterHandle, Option<(usize, usize)>) {
         assert!(self.exclusive_activation().is_none(), "control cleanup is outside borrowed activation");
         let domain = PROCESS_WRITER_BUDGET_DOMAIN.read();
         let registration = self.writer_identity.get().and_then(|key|
             domain.lookup_in(*key).map(|record| (*key, record.epoch)));
         (self.used.clone(), registration)
     }
-    pub(crate) fn retain_box_control_refund(&self, bytes: usize) -> Arc<WriterCounter> {
+    pub(crate) fn retain_box_control_refund(&self, bytes: usize) -> WriterCounterHandle {
         self.change_adapter_control_receipt(bytes, false);
         self.used.clone()
     }
@@ -1625,7 +1734,7 @@ impl MemoryAccountant {
         PROCESS_WRITER_AGGREGATE.fetch_add(native_bytes, Ordering::SeqCst);
         domain.ceiling = Some(ceiling);
         domain.native = Some(ResidentInsertionRuntime {
-            width, funder_identity: Arc::as_ptr(&self.used) as usize,
+            width, funder_identity: self.used.as_ptr() as usize,
             reservation: ProcessNativeReservation { bytes: native_bytes },
         });
         // Drop the exclusive gate before bodies, spawn, joins, export or callbacks.
@@ -1920,29 +2029,6 @@ impl MemoryAccountant {
                 .fetch_add(bytes, Ordering::SeqCst);
             note_budget_ledger("charge_retained", bytes, self.used.load(Ordering::SeqCst));
         }
-    }
-
-    /// Hold what a whole arriving schema unit was priced at until that unit is
-    /// installed or refused.
-    ///
-    /// The bytes are admitted the ordinary way, so a unit that does not fit is
-    /// refused here and nothing of it is applied. What the reservation adds is
-    /// that the room it found is still there when the unit's items take it: an
-    /// allocation that lands between this call and the unit's first item can no
-    /// longer spend the headroom the unit was just promised.
-    pub(crate) fn reserve_schema_unit(
-        self: &Arc<Self>,
-        bytes: usize,
-        subsystem: &str,
-        operation: &str,
-        hint: &str,
-    ) -> contextdb_core::Result<SchemaUnitReservation> {
-        self.try_allocate_for(bytes, subsystem, operation, hint)?;
-        Ok(SchemaUnitReservation {
-            _writer_use: crate::memory_accounting::WriterUse::retain_if_writer(&(Arc::clone(self))),
-accountant: Arc::clone(self),
-            remaining: std::cell::Cell::new(bytes),
-        })
     }
 
     /// An allocation inside an admitted schema unit that the ordinary budget
@@ -2308,12 +2394,12 @@ accountant: Arc::clone(self),
 // ordinary Arc; clones/coercions retain the same control allocation.
 #[derive(Debug)]
 pub(crate) struct WriterVectorBudget {
-    accountant: Option<Arc<MemoryAccountant>>,
+    accountant: Option<AccountantHandle>,
     layout: Layout,
     _writer_use: Option<WriterUse>,
 }
 impl WriterVectorBudget {
-    fn accountant(&self) -> &Arc<MemoryAccountant> {
+    fn accountant(&self) -> &AccountantHandle {
         self.accountant.as_ref().expect("live adapter has its accountant")
     }
 }
@@ -2343,8 +2429,7 @@ impl Drop for WriterVectorBudget {
         if !std::thread::panicking() {
             released.expect("adapter control refund is owned");
         }
-        // Only std's AtomicUsize Arc destruction and ArcInner deallocation
-        // follow; all payload fields are empty or Copy.
+        // The bounded original counter owner is the last remaining liability.
     }
 }
 impl contextdb_core::read_memory::ReadMemoryBudget for WriterVectorBudget {
@@ -2355,7 +2440,7 @@ impl contextdb_core::read_memory::ReadMemoryBudget for WriterVectorBudget {
 }
 impl contextdb_vector::MemoryBudget for WriterVectorBudget {
     fn stable_funder_identity(&self) -> usize {
-        Arc::as_ptr(self.accountant()) as usize
+        self.accountant().as_ptr() as usize
     }
     fn transition_reservation_for(&self, old: usize, new: usize, subsystem: &str, operation: &str, hint: &str) -> contextdb_core::Result<()> {
         contextdb_vector::MemoryBudget::transition_reservation_for(&**self.accountant(), old, new, subsystem, operation, hint)
@@ -2372,25 +2457,43 @@ impl MemoryAccountant {
     pub(crate) fn writer_registration_observation_for_test(&self) -> (usize, usize, usize, usize, usize) {
         let domain = PROCESS_WRITER_BUDGET_DOMAIN.read();
         if let Some(record) = self.writer_identity.get().and_then(|key| domain.lookup_in(*key)) {
-            return (record as *const WriterRegistration as usize, Layout::new::<WriterRegistration>().size(), record.epoch, record.users, Arc::as_ptr(&self.used) as usize);
+            return (record as *const WriterRegistration as usize, Layout::new::<WriterRegistration>().size(), record.epoch, record.users, self.used.as_ptr() as usize);
         }
-        (0, 0, 0, 0, Arc::as_ptr(&self.used) as usize)
+        (0, 0, 0, 0, self.used.as_ptr() as usize)
     }
     #[cfg(all(test, feature = "test-seams"))]
     pub(crate) fn writer_vector_adapter_type_layout_for_test() -> Layout {
         writer_adapter_type_layout::<WriterVectorBudget>()
     }
+}
+impl AccountantHandle {
+    /// Hold this unit's admitted bytes until it installs or refuses.
+    pub(crate) fn reserve_schema_unit(
+        &self,
+        bytes: usize,
+        subsystem: &str,
+        operation: &str,
+        hint: &str,
+    ) -> contextdb_core::Result<SchemaUnitReservation> {
+        self.try_allocate_for(bytes, subsystem, operation, hint)?;
+        Ok(SchemaUnitReservation {
+            _writer_use: crate::memory_accounting::WriterUse::retain_if_writer(&(self.clone())),
+accountant: self.clone(),
+            remaining: std::cell::Cell::new(bytes),
+        })
+    }
+
     #[cfg(all(test, feature = "test-seams"))]
-    pub(crate) fn writer_vector_adapter_layout_for_test(self: &Arc<Self>) -> Layout {
+    pub(crate) fn writer_vector_adapter_layout_for_test(&self) -> Layout {
         crate::persistence::returned_loader_rows_for_test();
         crate::persistence::content_identity::proof_allocation_oracle_tests::r1_mapped_control_rows();
         let adapter = WriterVectorBudget { accountant: Some(self.clone()), layout: Layout::new::<()>(), _writer_use: WriterUse::retain_if_writer(self) };
         writer_adapter_layout(&adapter)
     }
-    fn budget_adapter(self: &Arc<Self>, writer_use: WriterUse, open_residue: bool) -> contextdb_core::Result<Arc<WriterVectorBudget>> {
+    fn budget_adapter(&self, writer_use: Option<WriterUse>, open_residue: bool) -> contextdb_core::Result<Arc<WriterVectorBudget>> {
         let mut adapter = WriterVectorBudget {
             accountant: Some(self.clone()), layout: Layout::new::<()>(),
-            _writer_use: Some(writer_use),
+            _writer_use: writer_use,
         };
         let layout = writer_adapter_layout(&adapter);
         if open_residue {
@@ -2404,26 +2507,33 @@ impl MemoryAccountant {
         }
         Ok(Arc::new(adapter))
     }
-    fn vector_budget_for_startup(self: &Arc<Self>) -> contextdb_core::Result<Arc<dyn contextdb_vector::MemoryBudget>> {
+    pub(crate) fn vector_budget_for_original_reader(&self) -> contextdb_core::Result<Arc<dyn contextdb_vector::MemoryBudget>> {
+        match self.standard_arc() { Some(arc) => Ok(arc), None => Ok(self.budget_adapter(None, false)?), }
+    }
+    fn vector_budget_for_startup(&self) -> contextdb_core::Result<Arc<dyn contextdb_vector::MemoryBudget>> {
         let writer_use = WriterUse::retain_if_writer(self).expect("construction root retains the writer epoch");
-        Ok(self.budget_adapter(writer_use, true)?)
+        Ok(self.budget_adapter(Some(writer_use), true)?)
     }
-    pub(crate) fn vector_budget(self: &Arc<Self>) -> contextdb_core::Result<Arc<dyn contextdb_vector::MemoryBudget>> {
+    pub(crate) fn vector_budget(&self) -> contextdb_core::Result<Arc<dyn contextdb_vector::MemoryBudget>> {
         match WriterUse::retain_if_writer(self) {
-            Some(writer_use) => Ok(self.budget_adapter(writer_use, false)?),
-            None => Ok(self.clone()),
+            Some(writer_use) => Ok(self.budget_adapter(Some(writer_use), false)?),
+            None => match self.standard_arc() { Some(arc) => Ok(arc), None => Ok(self.budget_adapter(None, false)?), },
         }
     }
-    pub(crate) fn assembly_read_budget(self: &Arc<Self>) -> contextdb_core::Result<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>> {
+    pub(crate) fn assembly_read_budget(&self) -> contextdb_core::Result<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>> {
         match WriterUse::retain_if_writer(self) {
-            Some(writer_use) => Ok(self.budget_adapter(writer_use, true)?),
-            None => Ok(self.clone()),
+            Some(writer_use) => Ok(self.budget_adapter(Some(writer_use), true)?),
+            None => match self.standard_arc() { Some(arc) => Ok(arc), None => Ok(self.budget_adapter(None, false)?), },
         }
     }
-    pub(crate) fn read_budget(self: &Arc<Self>) -> contextdb_core::Result<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>> {
+    pub(crate) fn read_budget_for_original(&self, writer_use: Option<WriterUse>) -> contextdb_core::Result<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>> {
+        if writer_use.is_none() && let Some(arc) = self.standard_arc() { return Ok(arc); }
+        Ok(self.budget_adapter(writer_use, false)?)
+    }
+    pub(crate) fn read_budget(&self) -> contextdb_core::Result<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>> {
         match WriterUse::retain_if_writer(self) {
-            Some(writer_use) => Ok(self.budget_adapter(writer_use, false)?),
-            None => Ok(self.clone()),
+            Some(writer_use) => Ok(self.budget_adapter(Some(writer_use), false)?),
+            None => match self.standard_arc() { Some(arc) => Ok(arc), None => Ok(self.budget_adapter(None, false)?), },
         }
     }
 
@@ -2822,7 +2932,7 @@ pub(crate) struct RedbAllocatorStateCharge {
 
 #[allow(dead_code)] // Consumed by the separately owned fork integration.
 impl RedbAllocatorStateCharge {
-    pub(crate) fn new(accountant: Arc<MemoryAccountant>) -> Self {
+    pub(crate) fn new(accountant: AccountantHandle) -> Self {
         Self {
             reservation: OwnedMemoryReservation::new(accountant),
             resident_bytes: 0,

@@ -2986,13 +2986,13 @@ fn node_live_bytes(node: &Node) -> usize {
 pub(crate) struct ProofAdmission {
     reader_budget: Option<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>>,
     reader_refusal: Option<Arc<Mutex<Option<Error>>>>,
-    accountant: Option<Arc<crate::memory_accounting::MemoryAccountant>>,
+    accountant: Option<crate::memory_accounting::AccountantHandle>,
     /// A cache this admission may reclaim from before it refuses. A proved
     /// chunk is a cache; a read that needs its bytes gets them.
     reclaim: Option<Arc<ResidentProofChunkSet>>,
     charge_fixed_refusal_control: bool,
     scratch_owner: Option<std::sync::Weak<super::writer_file::LockedWriterFile>>,
-    scratch_accountant: Option<Arc<crate::memory_accounting::MemoryAccountant>>,
+    scratch_accountant: Option<crate::memory_accounting::AccountantHandle>,
     held: usize,
     peak: std::cell::Cell<usize>,
 }
@@ -3029,7 +3029,7 @@ impl ProofAdmission {
         owner
     }
 
-    pub(crate) fn new(accountant: Option<Arc<crate::memory_accounting::MemoryAccountant>>) -> Self {
+    pub(crate) fn new(accountant: Option<crate::memory_accounting::AccountantHandle>) -> Self {
         Self {
             reader_budget: None,
             reader_refusal: None,
@@ -3092,7 +3092,7 @@ impl ProofAdmission {
     /// chunks this verifier is holding. Retained proofs can therefore never be
     /// the reason a read is refused.
     fn reclaiming(
-        accountant: Option<Arc<crate::memory_accounting::MemoryAccountant>>,
+        accountant: Option<crate::memory_accounting::AccountantHandle>,
         reclaim: Arc<ResidentProofChunkSet>,
     ) -> Self {
         Self {
@@ -3112,7 +3112,7 @@ impl ProofAdmission {
     /// exhausted its limit. Charge its proof before allocation; ordinary proof
     /// mutations continue to use admission.
     pub(super) fn fixed_refusal_control(
-        accountant: Option<Arc<crate::memory_accounting::MemoryAccountant>>,
+        accountant: Option<crate::memory_accounting::AccountantHandle>,
     ) -> Self {
         let mut admission = Self::new(accountant);
         admission.charge_fixed_refusal_control = true;
@@ -4275,7 +4275,7 @@ accountant: None,
     ) -> Self {
         Self {
             state: Mutex::new(ResidentProofChunks::default()),
-accountant: Some(crate::memory_accounting::StoreAccountantHandle::new(accountant)),
+accountant: Some(crate::memory_accounting::StoreAccountantHandle::new(accountant.into())),
             free_floor: 0,
             ceiling,
             headroom: 0,
@@ -4389,7 +4389,7 @@ impl ProofMemory {
     /// A walk that admits what it holds itself, for a caller that reserved
     /// nothing up front.
     pub(super) fn admitted(
-        accountant: Option<Arc<crate::memory_accounting::MemoryAccountant>>,
+        accountant: Option<crate::memory_accounting::AccountantHandle>,
         limit: usize,
     ) -> Self {
         Self::new(limit, ProofAdmission::new(accountant))
@@ -4603,7 +4603,7 @@ pub(crate) struct ContentIdentityReadVerifier {
     /// The database accountant that admits what this verifier's own walks
     /// allocate. Callers that reserved a pool up front pass their reservation
     /// instead, so those bytes are not charged twice.
-    admission: Option<Arc<crate::memory_accounting::MemoryAccountant>>,
+    admission: Option<crate::memory_accounting::AccountantHandle>,
     /// Chunks already proved against this verifier's committed root, reused
     /// while they are resident. Bound to this verifier, which is bound to one
     /// pinned storage snapshot, so a chunk can never be reused under another
@@ -4711,7 +4711,7 @@ const CACHED_AUTHENTICATED_LEAF_BYTES: usize =
 impl ReadAuthenticationNodes {
     pub(crate) fn new(
         byte_limit: usize,
-        admission: Option<Arc<crate::memory_accounting::MemoryAccountant>>,
+        admission: Option<crate::memory_accounting::AccountantHandle>,
     ) -> Self {
         Self {
             nodes: BTreeMap::new(),
@@ -4863,7 +4863,7 @@ impl ContentIdentityReadVerifier {
     pub(crate) fn open(
         read_txn: &redb::ReadTransaction,
         source: &std::path::Path,
-        admission: Option<Arc<crate::memory_accounting::MemoryAccountant>>,
+        admission: Option<crate::memory_accounting::AccountantHandle>,
     ) -> Result<Self> {
         let roots_table = read_txn
             .open_table(CONTENT_IDENTITY_ROOTS_TABLE)
@@ -4893,7 +4893,7 @@ impl ContentIdentityReadVerifier {
             .map_err(RedbPersistence::storage_error)?;
         let mut resident = ResidentProofChunkSet::idle();
         resident.accountant = admission.as_ref().map(|accountant|
-            crate::memory_accounting::StoreAccountantHandle::new(Arc::clone(accountant)));
+            crate::memory_accounting::StoreAccountantHandle::new(accountant.clone()));
         Ok(Self {
             roots,
             custody_config_root,
@@ -4913,7 +4913,7 @@ admission,
     /// [`ReadAuthenticationNodes`] set, in particular.
     pub(crate) fn admission_accountant(
         &self,
-    ) -> Option<Arc<crate::memory_accounting::MemoryAccountant>> {
+    ) -> Option<crate::memory_accounting::AccountantHandle> {
         self.admission.clone()
     }
 
@@ -6345,14 +6345,14 @@ impl RedbPersistence {
     /// database is being built, before any write is served.
     pub(crate) fn attach_memory_accountant(
         &self,
-        accountant: Arc<crate::memory_accounting::MemoryAccountant>,
+        accountant: crate::memory_accounting::AccountantHandle,
     ) {
         let _ = self.proof_accountant.set(super::ProofAccountantSlot::attached(accountant));
     }
 
     pub(crate) fn proof_accountant(
         &self,
-    ) -> Option<Arc<crate::memory_accounting::MemoryAccountant>> {
+    ) -> Option<crate::memory_accounting::AccountantHandle> {
         self.proof_accountant.get().map(super::ProofAccountantSlot::accountant)
     }
 
@@ -6360,7 +6360,7 @@ impl RedbPersistence {
     // attach-time role; a mismatched supplied reader remains its own funder.
     pub(crate) fn proof_accountant_handle_for(
         &self,
-        accountant: &Arc<crate::memory_accounting::MemoryAccountant>,
+        accountant: &crate::memory_accounting::AccountantHandle,
     ) -> Option<crate::memory_accounting::StoreAccountantHandle> {
         self.proof_accountant.get().and_then(|slot| slot.original_handle_for(accountant))
     }
@@ -6988,7 +6988,7 @@ impl ProofFixtureDatabase {
 
     fn admission(
         &self,
-        accountant: Option<Arc<crate::memory_accounting::MemoryAccountant>>,
+        accountant: Option<crate::memory_accounting::AccountantHandle>,
     ) -> ProofAdmission {
         ProofAdmission::new(accountant).with_scratch_owner(Some(Arc::downgrade(&self.owner)))
     }

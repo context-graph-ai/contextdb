@@ -12,7 +12,7 @@ use std::sync::{
 
 #[derive(Debug)]
 pub(crate) struct ImageMemory {
-    pub(crate) accountant: Arc<MemoryAccountant>,
+    pub(crate) accountant: crate::memory_accounting::AccountantHandle,
     subsystem: &'static str,
     operation: &'static str,
     hint: &'static str,
@@ -29,7 +29,7 @@ impl ImageMemory {
             accountant: Arc::new(match limit {
                 Some(limit) => MemoryAccountant::with_budget(limit),
                 None => MemoryAccountant::no_limit(),
-            }),
+            }).into(),
             subsystem: "direct_read",
             operation: "hydrate_owned_image",
             hint: "Raise MEMORY_LIMIT to admit the complete committed read image.",
@@ -45,16 +45,16 @@ impl ImageMemory {
     /// where the session's limit sees it, allocation by allocation, and given
     /// back when this charge is dropped.
     #[cfg(any(test, feature = "test-seams"))]
-    pub(crate) fn charging(accountant: Arc<MemoryAccountant>) -> Arc<Self> {
+    pub(crate) fn charging(accountant: impl Into<crate::memory_accounting::AccountantHandle>) -> Arc<Self> {
         Self::charging_for(
-            accountant,
+            accountant.into(),
             "direct_read",
             "hydrate_owned_image",
             "Raise MEMORY_LIMIT to admit the complete committed read image.",
         )
     }
     pub(crate) fn charging_for(
-        accountant: Arc<MemoryAccountant>,
+        accountant: crate::memory_accounting::AccountantHandle,
         subsystem: &'static str,
         operation: &'static str,
         hint: &'static str,
@@ -75,7 +75,7 @@ impl ImageMemory {
     /// A durable source window belongs to the requesting read when present.
     /// Internal writer operations continue to own their scratch directly.
     pub(crate) fn charging_reader(
-        accountant: Arc<MemoryAccountant>,
+        accountant: crate::memory_accounting::AccountantHandle,
         reader_budget: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -95,7 +95,7 @@ impl ImageMemory {
     /// The accountant is retained for image bridge identity only; funding
     /// always uses the required reader capability.
     pub(crate) fn charging_reader_for(
-        accountant: Arc<MemoryAccountant>,
+        accountant: crate::memory_accounting::AccountantHandle,
         reader_budget: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         subsystem: &'static str,
         operation: &'static str,
@@ -123,7 +123,7 @@ impl ImageMemory {
     /// A fallible operation bridge funded by the already declared read child.
     /// Its own Arc control is admitted before creating the scope owner.
     pub(crate) fn operation_reader(
-        accountant: Arc<MemoryAccountant>,
+        accountant: crate::memory_accounting::AccountantHandle,
         reader_budget: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Arc<Self>> {
         let control = std::mem::size_of::<Self>() + 2 * std::mem::size_of::<usize>();
@@ -148,7 +148,7 @@ impl ImageMemory {
 
     /// Actual write-side decoding borrows the existing writer accountant;
     /// the operation owner holds and releases only its own admitted payloads.
-    pub(crate) fn operation_writer(accountant: Arc<MemoryAccountant>) -> Result<Arc<Self>> {
+    pub(crate) fn operation_writer(accountant: crate::memory_accounting::AccountantHandle) -> Result<Arc<Self>> {
         let control = std::mem::size_of::<Self>() + 2 * std::mem::size_of::<usize>();
         // Fixed decode control is named open residue; growing payloads below
         // still use this writer's declared working-memory limit.
@@ -169,12 +169,12 @@ impl ImageMemory {
 
     /// A standalone call uses the engine's default open ceiling and keeps
     /// its accountant private, outside the registered Database writer domain.
-    pub(crate) fn default_decode_accountant() -> Arc<MemoryAccountant> {
+    pub(crate) fn default_decode_accountant() -> crate::memory_accounting::AccountantHandle {
         let limit = crate::read_session::DatabaseOpenOptions::default().memory_limit;
         Arc::new(match limit {
             Some(bytes) => MemoryAccountant::with_budget(bytes),
             None => MemoryAccountant::no_limit(),
-        })
+        }).into()
     }
 
     /// Reuse an operation's owner; otherwise admit a fresh call-local owner.
@@ -186,7 +186,7 @@ impl ImageMemory {
     }
 
     pub(crate) fn enter_writer_operation(
-        accountant: Arc<MemoryAccountant>,
+        accountant: crate::memory_accounting::AccountantHandle,
     ) -> Result<ImageMemoryScope> {
         if let Ok(owner) = active_owner()
             && owner.funded_by_writer(&accountant)
@@ -342,8 +342,8 @@ impl ImageMemory {
         }
     }
 
-    pub(crate) fn funded_by_writer(&self, accountant: &Arc<MemoryAccountant>) -> bool {
-        self.reader_budget.is_none() && Arc::ptr_eq(&self.accountant, accountant)
+    pub(crate) fn funded_by_writer(&self, accountant: &crate::memory_accounting::AccountantHandle) -> bool {
+        self.reader_budget.is_none() && std::ptr::eq(self.accountant.as_ptr(), accountant.as_ptr())
     }
 
     /// Move prepaid payload funding into its next owner. The native image

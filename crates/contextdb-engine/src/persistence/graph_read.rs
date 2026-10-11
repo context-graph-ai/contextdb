@@ -1260,7 +1260,7 @@ pub(super) fn with_graph_proof_in_read<T>(
     crate::read_work_probe::bind_graph_root(read.storage_snapshot_identity());
     let memory: Arc<dyn ReadMemoryBudget> = match owner {
         writer_source::SourceWindowOwner::Read(memory) => memory.clone(),
-        writer_source::SourceWindowOwner::Write(memory, _) => memory.clone(),
+        writer_source::SourceWindowOwner::Write(memory, original_use) => memory.read_budget_for_original(original_use.clone())?,
     };
     with_pages(memory.clone(), || {
         scratch.scope(|| {

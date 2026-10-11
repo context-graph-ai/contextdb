@@ -181,7 +181,7 @@ impl<K: Eq + Hash + Copy, V, P> Drop for Backing<K, V, P> {
 
 pub(crate) struct LocalRegistry(Backing<Lsn, LocalSchemaStage, Pre2LocalSchemaStage>);
 impl LocalRegistry {
-    pub(super) fn new_arc(accountant: &Arc<MemoryAccountant>) -> Result<Arc<Mutex<Self>>> {
+    pub(super) fn new_arc(accountant: &crate::memory_accounting::AccountantHandle) -> Result<Arc<Mutex<Self>>> {
         let final_layout = crate::memory_accounting::writer_adapter_type_layout::<Mutex<Self>>();
         let old_layout = crate::memory_accounting::writer_adapter_type_layout::<Mutex<HashMap<Lsn, Pre2LocalSchemaStage>>>();
         let bytes = final_layout.size().checked_sub(old_layout.size()).ok_or_else(capacity_error)?;
@@ -220,7 +220,7 @@ impl LocalRegistry {
 pub(crate) struct Cell<V> { stage: Option<V>, tokens: usize }
 pub(crate) struct OccupiedRegistry<K: Eq + Hash + Copy, V, P>(Backing<K, Cell<V>, P>);
 impl<K: Eq + Hash + Copy, V, P> OccupiedRegistry<K, V, P> {
-    pub(super) fn new_arc(accountant: &Arc<MemoryAccountant>) -> Result<Arc<Mutex<Self>>> where P: RegistryFamily {
+    pub(super) fn new_arc(accountant: &crate::memory_accounting::AccountantHandle) -> Result<Arc<Mutex<Self>>> where P: RegistryFamily {
         let final_layout = crate::memory_accounting::writer_adapter_type_layout::<Mutex<Self>>();
         let old_layout = crate::memory_accounting::writer_adapter_type_layout::<Mutex<HashMap<K, P>>>();
         let bytes = final_layout.size().checked_sub(old_layout.size()).ok_or_else(capacity_error)?;
@@ -334,13 +334,13 @@ impl Drop for LocalRegistration {
 // independent pre2/final layout receipts must verify that prerequisite.
 #[allow(dead_code)]
 struct Pre2TemporaryMemoryReservation {
-    accountant: Arc<MemoryAccountant>,
+    accountant: crate::memory_accounting::AccountantHandle,
     bytes: usize,
 }
 
 #[allow(dead_code)]
 pub(crate) struct Pre2PreparedMemorySwap {
-    accountant: Arc<MemoryAccountant>,
+    accountant: crate::memory_accounting::AccountantHandle,
     reserved_positive_delta: usize,
     release_after_swap: usize,
     /// What each row version STAGED in a still-open transaction is admitted
@@ -798,7 +798,7 @@ fn clustered_numeric_keys_for_test<K: Eq + Hash + Copy, V, P>(
 #[cfg(all(test, feature = "test-seams"))]
 #[allow(clippy::int_plus_one)] // Preserve the arithmetic threshold used by the registry test.
 fn occupied_tombstone_rehash_for_test<K, V, P>(
-    registry: Arc<Mutex<OccupiedRegistry<K, V, P>>>, owner: &Arc<MemoryAccountant>,
+    registry: Arc<Mutex<OccupiedRegistry<K, V, P>>>, owner: &crate::memory_accounting::AccountantHandle,
     make_key: impl Fn(u64) -> K, family: &'static str,
 ) where K: Eq + Hash + Copy, P: RegistryFamily {
     use crate::persistence::content_identity::proof_allocation_oracle_tests as oracle;
@@ -1543,7 +1543,7 @@ struct Pre2Database {
     #[cfg(feature = "test-seams")]
     snapshot_free_retirement_pass_count: Arc<AtomicUsize>,
     access: AccessConstraints,
-    accountant: Arc<MemoryAccountant>,
+    accountant: crate::memory_accounting::AccountantHandle,
     conflict_policies: RwLock<ConflictPolicies>,
     subscriptions: Arc<Mutex<SubscriptionState>>,
     pruning_runtime: Mutex<PruningRuntime>,

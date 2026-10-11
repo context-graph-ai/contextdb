@@ -147,7 +147,7 @@ pub(super) fn register_paged_build(
     vector: &Arc<VectorStore>,
     tx_mgr: &Arc<TransactionManager<DynStore>>,
     persistence: &Arc<RedbPersistence>,
-    accountant: &Arc<MemoryAccountant>,
+    accountant: &crate::memory_accounting::AccountantHandle,
     resource_closed: &Arc<AtomicBool>,
     publication_interrupted: &Arc<AtomicBool>,
     partition: &VectorPartitionRef,
@@ -779,7 +779,7 @@ impl MaintenanceContext {
         let delete_carriers = graph_count == 0;
         if delete_carriers {
             let mut identities = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
-                Arc::clone(&self.finalization.accountant),
+                crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
                 0,
                 "vector",
                 "prepare_vector_generation",
@@ -1344,14 +1344,14 @@ impl MaintenanceContext {
         };
         self.build_checkpoint()?;
         let work_pending = vector_source_page_admission::with_preparation_source_page_admission(
-            Arc::clone(&self.finalization.accountant),
+            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
             || Ok(persistence.has_vector_repair_fence()? || persistence.has_paged_cleanup()?),
         )?;
         if !work_pending {
             return Ok(());
         }
         let has_fence = vector_source_page_admission::with_preparation_source_page_admission(
-            Arc::clone(&self.finalization.accountant),
+            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
             || persistence.has_vector_repair_fence(),
         )?;
         let audit_scratch = if has_fence { 256 * 1024 } else { 0 };
@@ -1364,7 +1364,7 @@ impl MaintenanceContext {
             self.tx_mgr.with_maintenance_publication(|publication| {
                 self.build_checkpoint()?;
                 vector_source_page_admission::with_preparation_source_page_admission(
-                    Arc::clone(&self.finalization.accountant),
+                    crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
                     || {
                         publication.reserve()?;
                         let status =
@@ -1415,7 +1415,7 @@ impl MaintenanceContext {
             return Ok(());
         };
         vector_source_page_admission::with_preparation_source_page_admission(
-            Arc::clone(&self.finalization.accountant),
+            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
             || {
                 if persistence.has_vector_repair_fence()? || persistence.has_paged_cleanup()? {
                     return Err(crate::persistence::vector_paged::corruption(

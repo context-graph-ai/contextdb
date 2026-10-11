@@ -86,7 +86,7 @@ impl WriterRelationalSource {
 
     pub(crate) fn new_for_write(
         root: Arc<WriterSnapshot>,
-        writer: Arc<crate::memory_accounting::MemoryAccountant>,
+        writer: crate::memory_accounting::AccountantHandle,
     ) -> Result<Self> {
         Self::new_owned(root, SourceWindowOwner::writer(writer))
     }
@@ -536,14 +536,14 @@ impl WriterGraphSnapshot {
     }
     pub(crate) fn new_for_write(
         root: Arc<WriterSnapshot>,
-        writer: Arc<crate::memory_accounting::MemoryAccountant>,
+        writer: crate::memory_accounting::AccountantHandle,
     ) -> Result<Self> {
         Self::new_owned(root, SourceWindowOwner::writer(writer))
     }
     fn new_owned(root: Arc<WriterSnapshot>, owner: SourceWindowOwner) -> Result<Self> {
         let memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget> = match &owner {
             SourceWindowOwner::Read(memory) => memory.clone(),
-            SourceWindowOwner::Write(memory, _) => memory.clone(),
+            SourceWindowOwner::Write(memory, original_use) => memory.read_budget_for_original(original_use.clone())?,
         };
         super::graph_read::with_pages(memory, || {
             let _binding = owner.reserve(130, "graph_root_binding")?;
@@ -557,7 +557,7 @@ impl WriterGraphSnapshot {
                 (SourceWindowOwner::Read(owner), SourceWindowCredit::Read(credit)) =>
                     (crate::read_work_probe::funding_owner_name(owner), crate::read_work_probe::funding_owner_id(owner), credit.bytes()),
                 (SourceWindowOwner::Write(owner, _), SourceWindowCredit::Write(credit)) =>
-                    (crate::read_work_probe::funding_owner_name(owner), crate::read_work_probe::funding_owner_id(owner), credit.bytes()),
+                    (format!("{}@{:p}", std::any::type_name::<crate::memory_accounting::MemoryAccountant>(), owner.as_ptr()), owner.as_ptr() as usize, credit.bytes()),
                 _ => unreachable!("control credit follows its funding owner"),
             };
             crate::read_work_probe::note_graph_snapshot_capture(root.storage_identity(), funding_owner, owner_identity, control_bytes);

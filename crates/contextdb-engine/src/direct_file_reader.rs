@@ -1848,9 +1848,7 @@ pub mod test_seams {
         let mut image = (*reader.image).clone();
         image.sync = reader.target.committed_sync_state(
             &|| Ok(()),
-            &crate::read_image_memory::ImageMemory::charging(Arc::clone(
-                &reader.image_memory.accountant,
-            )),
+            &crate::read_image_memory::ImageMemory::charging(reader.image_memory.accountant.clone()),
         )?;
         Ok(image)
     }

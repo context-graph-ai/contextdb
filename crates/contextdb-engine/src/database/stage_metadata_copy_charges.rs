@@ -1,17 +1,20 @@
 //! Capacity custody for the enlarged inline received-schema metadata charges.
 //! Only CDB-127's element-layout delta is admitted; pre2 backing remains outside
 //! this correction, and individual payload/sole prepaid Box owners are unchanged.
-use super::{Error, MemoryAccountant, Result, StagedCopyCharge};
+use super::{Error, Result, StagedCopyCharge};
+#[cfg(all(test, feature = "test-seams"))]
+use super::MemoryAccountant;
+#[cfg(all(test, feature = "test-seams"))]
+use std::sync::Arc;
 use crate::memory_accounting::{ControlCredit, PendingControlRefund, WriterUse};
 use std::alloc::Layout;
 use std::mem::ManuallyDrop;
-use std::sync::Arc;
 
 // Field-for-field pre2 database.rs StagedCopyCharge. Never constructed: its
 // compiler layout is the same-capacity baseline, not a guessed word count.
 #[allow(dead_code)]
 struct Pre2StagedCopyCharge {
-    accountant: Arc<MemoryAccountant>,
+    accountant: crate::memory_accounting::AccountantHandle,
     bytes: usize,
 }
 
@@ -22,23 +25,23 @@ fn capacity_error() -> Error {
 pub(super) struct MetadataCopyCharges {
     charges: ManuallyDrop<Vec<StagedCopyCharge>>,
     backing: Option<ControlCredit>,
-    accountant: ManuallyDrop<Arc<MemoryAccountant>>,
+    accountant: ManuallyDrop<crate::memory_accounting::AccountantHandle>,
     writer_use: ManuallyDrop<Option<WriterUse>>,
 }
 
 impl MetadataCopyCharges {
-    pub(super) fn new(accountant: &Arc<MemoryAccountant>) -> Self {
+    pub(super) fn new(accountant: &crate::memory_accounting::AccountantHandle) -> Self {
         Self {
             charges: ManuallyDrop::new(Vec::new()),
             backing: None,
-            accountant: ManuallyDrop::new(Arc::clone(accountant)),
+            accountant: ManuallyDrop::new(accountant.clone()),
             writer_use: ManuallyDrop::new(WriterUse::retain_if_writer(accountant)),
         }
     }
 
     /// Preserve vec![a, b, c]'s exact initial capacity in the no-op stage.
     pub(super) fn from_array<const N: usize>(
-        accountant: &Arc<MemoryAccountant>,
+        accountant: &crate::memory_accounting::AccountantHandle,
         charges: [StagedCopyCharge; N],
     ) -> Result<Self> {
         let mut owner = Self::new(accountant);

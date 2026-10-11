@@ -2025,7 +2025,7 @@ impl ReadPersistenceImage {
             let checkpoint = || self.open_context.checkpoint();
             let read_memory = self.open_context.read_memory();
             let history = retained_source.load_history(
-                &Arc::new(crate::memory_accounting::MemoryAccountant::no_limit()),
+                &Arc::new(crate::memory_accounting::MemoryAccountant::no_limit()).into(),
                 &checkpoint,
                 read_memory.clone(),
             )
@@ -6251,7 +6251,7 @@ pub(crate) struct CheckpointReadSource {
     /// The accountant every copied body is admitted through, so an export of
     /// bodies the directory no longer carries is bounded by the same budget
     /// the rest of the database answers to.
-    accountant: Option<Arc<crate::memory_accounting::MemoryAccountant>>,
+    accountant: Option<crate::memory_accounting::AccountantHandle>,
     decode_memory: Arc<crate::read_image_memory::ImageMemory>,
 
     _writer_use: Option<crate::memory_accounting::WriterUse>,
@@ -6343,7 +6343,7 @@ impl CheckpointReadSource {
         let bridge = self
             .accountant
             .clone()
-            .unwrap_or_else(|| Arc::new(crate::memory_accounting::MemoryAccountant::no_limit()));
+            .unwrap_or_else(|| Arc::new(crate::memory_accounting::MemoryAccountant::no_limit()).into());
         let decoded = crate::read_image_memory::ImageMemory::charging_reader(bridge, read_memory);
         let (filled, mut admission) =
             decoded.scope(|| self.load_export_row_values(name, meta, rows))?;
@@ -6455,7 +6455,7 @@ impl CheckpointReadSource {
             .as_ref()
             .map(|accountant| {
                 crate::memory_accounting::OwnedMemoryReservation::try_new_for(
-                    Arc::clone(accountant),
+                    accountant.clone(),
                     prefix_bytes,
                     "checkpoint_export",
                     "membership_identity",
@@ -6494,7 +6494,7 @@ impl CheckpointReadSource {
                 .as_ref()
                 .map(|accountant| {
                     crate::memory_accounting::OwnedMemoryReservation::try_new_for(
-                        Arc::clone(accountant),
+                        accountant.clone(),
                         value.value().len().saturating_mul(16).saturating_add(4096),
                         "checkpoint_export",
                         "membership_identity",
@@ -6565,7 +6565,7 @@ impl CheckpointReadSource {
         let bridge = self
             .accountant
             .clone()
-            .unwrap_or_else(|| Arc::new(crate::memory_accounting::MemoryAccountant::no_limit()));
+            .unwrap_or_else(|| Arc::new(crate::memory_accounting::MemoryAccountant::no_limit()).into());
         let decoded = crate::read_image_memory::ImageMemory::charging_reader(bridge, read_memory);
         decoded.scope(|| self.overlay_export_row_f32_projections(name, meta, rows))?;
         Ok((decoded, controls))
@@ -7057,7 +7057,7 @@ impl RetainedReadSource {
     /// accountant is retained only as the image decoder's bridge identity.
     pub(crate) fn load_history(
         &self,
-        accountant: &Arc<crate::memory_accounting::MemoryAccountant>,
+        accountant: &crate::memory_accounting::AccountantHandle,
         checkpoint: &dyn Fn() -> Result<()>,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> std::result::Result<LoadedReadHistory, crate::database::ImageHistoryError> {
@@ -7076,7 +7076,7 @@ impl RetainedReadSource {
             "Reduce the requested history or raise the declared reader memory limit.",
         )?;
         let decoded = crate::read_image_memory::ImageMemory::charging_reader(
-            Arc::clone(accountant),
+            accountant.clone(),
             read_memory.clone(),
         );
         let diagnosis = std::cell::RefCell::new(None);
@@ -7316,7 +7316,7 @@ impl RetainedReadSource {
                 // Hashing private history validates its codec again; that
                 // transient decode shares this operation and releases here.
                 let hash_decode = crate::read_image_memory::ImageMemory::charging_reader(
-                    Arc::clone(&decoded.accountant),
+                    decoded.accountant.clone(),
                     read_memory.clone(),
                 );
                 let actual = hash_decode.scope(|| value_hash(&record, raw))?;
@@ -10568,7 +10568,7 @@ impl ReadImageSource {
         let mut content_identity = content_identity::ContentIdentityReadVerifier::open(
             &identity_read,
             &self.database_path,
-            Some(Arc::clone(&cache_memory.accountant)),
+            Some(cache_memory.accountant.clone()),
         )
         .map_err(read_image_error)?;
         // This source took `READ_VERIFIER_MEMORY_BYTES` for the verifier's own
@@ -10625,7 +10625,7 @@ impl ReadImageSource {
             read_memory: image.open_context.read_memory(),
             content_proof: Mutex::new(content_identity::ReadAuthenticationNodes::new(
                 RETAINED_CONTENT_PROOF_BYTES,
-                Some(Arc::clone(&cache_memory.accountant)),
+                Some(cache_memory.accountant.clone()),
             )),
             physical_rows: Mutex::new(None),
             image_config_cache: Mutex::new(HashMap::new()),
@@ -19338,11 +19338,11 @@ fn sync_source_kind_to_u8(kind: SyncSourceKind) -> u8 {
 /// A pre2-sized persistence-owned reservation. Its accountant/use custody
 /// is enclosed by PersistenceProofOwner until all persistence fields are freed.
 struct PersistenceBytes {
-    accountant: Arc<crate::memory_accounting::MemoryAccountant>,
+    accountant: crate::memory_accounting::AccountantHandle,
     bytes: usize,
 }
 impl PersistenceBytes {
-    fn try_new_for(accountant: Arc<crate::memory_accounting::MemoryAccountant>,
+    fn try_new_for(accountant: crate::memory_accounting::AccountantHandle,
         bytes: usize, component: &str, operation: &str, hint: &str) -> Result<Self> {
         accountant.try_allocate_for(bytes, component, operation, hint)?;
         Ok(Self { accountant, bytes })
@@ -19416,7 +19416,7 @@ impl Drop for PersistenceProofOwner {
 /// raw readers are immutable and preparation never allocates for them.
 #[repr(transparent)]
 struct ProofAccountantSlot(std::sync::atomic::AtomicPtr<()>);
-const _: () = assert!(std::mem::align_of::<crate::memory_accounting::MemoryAccountant>() >= 4);
+const _: () = assert!(std::mem::align_of::<crate::memory_accounting::MemoryAccountant>() >= 8);
 const _: () = assert!(std::mem::align_of::<PersistenceProofOwner>() >= 4);
 impl ProofAccountantSlot {
     const MASK: usize = 0b11;
@@ -19424,7 +19424,7 @@ impl ProofAccountantSlot {
     const RAW_WRITER: usize = 1;
     const READY_WRITER: usize = 2;
 
-    fn attached(accountant: Arc<crate::memory_accounting::MemoryAccountant>) -> Self {
+    fn attached(accountant: crate::memory_accounting::AccountantHandle) -> Self {
         // Role discovery and checked retention are one exclusive-domain-gate
         // snapshot. Into-raw moves that exact Arc/use into the slot. A rejected
         // OnceLock set drops only this attempted slot after the gate is gone.
@@ -19443,20 +19443,21 @@ impl ProofAccountantSlot {
         pointer.map_addr(|address| address & !Self::MASK).cast()
     }
 
-    fn accountant(&self) -> Arc<crate::memory_accounting::MemoryAccountant> {
+    fn accountant(&self) -> crate::memory_accounting::AccountantHandle {
         let pointer = self.0.load(Ordering::Acquire);
         match pointer.addr() & Self::MASK {
             Self::READY_WRITER => {
                 // Ready is terminal. Borrowing self keeps this owner live.
                 unsafe { (&*Self::ready_pointer(pointer)).accountant.as_ref()
-                    .expect("ready owner has its funder").as_arc() }
+                    .expect("ready owner has its funder").as_handle() }
             }
             Self::RAW_READER | Self::RAW_WRITER => {
-                let raw = pointer.map_addr(|address| address & !Self::MASK)
-                    .cast::<crate::memory_accounting::MemoryAccountant>();
                 // A writer winner owns this same accountant before publishing
                 // and consuming raw custody. A reader never transitions.
-                unsafe { Arc::increment_strong_count(raw); Arc::from_raw(raw) }
+                let original = std::mem::ManuallyDrop::new(unsafe {
+                    crate::memory_accounting::StoreAccountantHandle::from_owned_raw(Self::raw_handle_pointer(pointer))
+                });
+                original.as_handle()
             }
             _ => unreachable!("invalid proof-accountant slot state"),
         }
@@ -19464,7 +19465,7 @@ impl ProofAccountantSlot {
 
     fn original_handle_for(
         &self,
-        accountant: &Arc<crate::memory_accounting::MemoryAccountant>,
+        accountant: &crate::memory_accounting::AccountantHandle,
     ) -> Option<crate::memory_accounting::StoreAccountantHandle> {
         let pointer = self.0.load(Ordering::Acquire);
         match pointer.addr() & Self::MASK {
@@ -19474,9 +19475,9 @@ impl ProofAccountantSlot {
                 handle.same_accountant(accountant).then(|| handle.clone())
             }
             Self::RAW_READER | Self::RAW_WRITER => {
-                let decoded = pointer.map_addr(|address| address & !Self::MASK)
+                let decoded = pointer.map_addr(|address| address & !0b111)
                     .cast::<crate::memory_accounting::MemoryAccountant>();
-                if !std::ptr::eq(decoded, Arc::as_ptr(accountant)) { return None; }
+                if !std::ptr::eq(decoded, accountant.as_ptr()) { return None; }
                 // Even a delayed observation after publication is pinned by
                 // the winner's same-accountant, same-original-epoch chain.
                 Some(unsafe { crate::memory_accounting::StoreAccountantHandle::borrow_owned_raw(
@@ -22054,7 +22055,7 @@ impl RedbPersistence {
     /// a whole empty proof, maintained outside `MEMORY_LIMIT`.
     pub(crate) fn create_with_accountant(
         path: &Path,
-        accountant: Option<Arc<crate::memory_accounting::MemoryAccountant>>,
+        accountant: Option<crate::memory_accounting::AccountantHandle>,
         cache_bytes: usize,
     ) -> Result<Self> {
         Self::create_with_accountant_in_runtime_dir(path, accountant, cache_bytes, None)
@@ -22062,7 +22063,7 @@ impl RedbPersistence {
 
     pub(crate) fn create_with_accountant_in_runtime_dir(
         path: &Path,
-        accountant: Option<Arc<crate::memory_accounting::MemoryAccountant>>,
+        accountant: Option<crate::memory_accounting::AccountantHandle>,
         cache_bytes: usize,
         runtime_dir: Option<&Path>,
     ) -> Result<Self> {
@@ -22276,7 +22277,7 @@ impl RedbPersistence {
     fn create_with_lock(
         path: &Path,
         lock_file: CompanionGuard,
-        accountant: Option<Arc<crate::memory_accounting::MemoryAccountant>>,
+        accountant: Option<crate::memory_accounting::AccountantHandle>,
         cache_bytes: usize,
         runtime_dir: Option<&Path>,
     ) -> Result<Self> {
@@ -23527,7 +23528,7 @@ impl RedbPersistence {
         write_txn: &redb::WriteTransaction,
         image: &CompleteVectorPartitionImage,
         affected_tables: &HashSet<String>,
-        accountant: Arc<crate::memory_accounting::MemoryAccountant>,
+        accountant: crate::memory_accounting::AccountantHandle,
     ) -> Result<()> {
         self.prepare_proof_owner()?;
         let matches = |index: &VectorIndexRef| affected_tables.contains(&index.table);
@@ -25596,7 +25597,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                     &write_txn,
                     partition_image.as_ref().expect("prepared vector image"),
                     &stage.affected_tables,
-                    Arc::clone(&stage.vector_image_memory.accountant),
+                    stage.vector_image_memory.accountant.clone(),
                 )?;
                 for (table, meta) in &stage.table_meta {
                     vector_membership_pages::ensure_declared_routes(
@@ -27967,7 +27968,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         prefix: &str,
         cursor: Option<&str>,
         limit: usize,
-        accountant: Arc<crate::memory_accounting::MemoryAccountant>,
+        accountant: crate::memory_accounting::AccountantHandle,
     ) -> Result<(Vec<(String, T)>, bool)> {
         self.with_db(|db| {
             let read_txn = db.begin_read().map_err(Self::storage_error)?;
@@ -28020,7 +28021,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         &self,
         prefix: &str,
         after: Option<(u64, &str)>,
-        accountant: Arc<crate::memory_accounting::MemoryAccountant>,
+        accountant: crate::memory_accounting::AccountantHandle,
         source_lsn: F,
     ) -> Result<Option<(String, T, Arc<crate::read_image_memory::ImageMemory>)>>
     where
@@ -28043,7 +28044,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                     break;
                 }
                 let memory = crate::read_image_memory::ImageMemory::charging_for(
-                    Arc::clone(&accountant),
+                    accountant.clone(),
                     "sync_policy",
                     "read_held_replay",
                     "Raise MEMORY_LIMIT before replaying this held data unit.",
@@ -28718,7 +28719,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
     pub(crate) fn visit_relational_table_with_admission(
         &self,
         name: &str,
-        accountant: &Arc<crate::memory_accounting::MemoryAccountant>,
+        accountant: &crate::memory_accounting::AccountantHandle,
         visit: impl FnMut(VersionedRow) -> Result<()>,
     ) -> Result<()> {
         self.visit_relational_table_impl(name, accountant, visit)
@@ -28727,11 +28728,11 @@ graph_commit_result }.map_err(Self::storage_error)?;
     fn visit_relational_table_impl(
         &self,
         name: &str,
-        accountant: &Arc<crate::memory_accounting::MemoryAccountant>,
+        accountant: &crate::memory_accounting::AccountantHandle,
         mut visit: impl FnMut(VersionedRow) -> Result<()>,
     ) -> Result<()> {
         let page_memory =
-            crate::read_image_memory::ImageMemory::operation_writer(Arc::clone(accountant))?;
+            crate::read_image_memory::ImageMemory::operation_writer(accountant.clone())?;
         let _page_scope = page_memory.enter();
         // The existing page callback's native Arc control precedes allocation.
         page_memory.reserve(
@@ -33291,7 +33292,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         // comes from the operation child, including proof pool and output.
         let bridge = Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
         let output = crate::read_image_memory::ImageMemory::charging_reader_for(
-            bridge.clone(),
+            bridge.clone().into(),
             read_memory.clone(),
             "history_source",
             "load_change_log",
@@ -33327,7 +33328,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                         "history_proof_window",
                     )?;
                     let scratch = crate::read_image_memory::ImageMemory::charging_reader_for(
-                        bridge.clone(),
+                        bridge.clone().into(),
                         read_memory.clone(),
                         "graph_source",
                         "read_window",
@@ -36274,7 +36275,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
     /// released via `close()`.
     pub(crate) fn compact(
         &self,
-        accountant: Arc<crate::memory_accounting::MemoryAccountant>,
+        accountant: crate::memory_accounting::AccountantHandle,
     ) -> Result<Option<u64>> {
         let fragmentation = self.fragmentation_ratio()?;
         loop {
@@ -36529,7 +36530,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
     /// remains pinned while the maintenance worker yields to foreground work.
     pub(crate) fn compact_incremental(
         &self,
-        accountant: Arc<crate::memory_accounting::MemoryAccountant>,
+        accountant: crate::memory_accounting::AccountantHandle,
         fragmentation_ratio: f64,
     ) -> Result<(redb::CompactionProgress, Option<u64>)> {
         #[cfg(target_os = "linux")]
@@ -40342,7 +40343,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
     fn remove_vector_partition_graph_pages_matching_in_write(
         &self,
         write_txn: &redb::WriteTransaction,
-        accountant: Option<Arc<crate::memory_accounting::MemoryAccountant>>,
+        accountant: Option<crate::memory_accounting::AccountantHandle>,
         matches: &impl Fn(&VectorIndexRef) -> bool,
     ) -> Result<()> {
         let mut cursor = None::<(Vec<u8>, crate::memory_accounting::OwnedMemoryReservation)>;
@@ -40376,7 +40377,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                     // deletion cursors, plus the preceding seek cursor. Price
                     // the borrowed value even for a 36-byte compact root.
                     let memory = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
-                        Arc::clone(owner),
+                        owner.clone(),
                         key.value()
                             .len()
                             .saturating_add(value.value().len())
@@ -41405,7 +41406,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         )
     }
 
-    fn require_decode_accountant(&self) -> Result<Arc<crate::memory_accounting::MemoryAccountant>> {
+    fn require_decode_accountant(&self) -> Result<crate::memory_accounting::AccountantHandle> {
         Ok(self.proof_accountant.get_or_init(|| ProofAccountantSlot::attached(
             crate::read_image_memory::ImageMemory::default_decode_accountant(),
         )).accountant())
@@ -41546,7 +41547,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
     }
 
     fn reserve_compaction_checkpoint_controls(
-        accountant: Arc<crate::memory_accounting::MemoryAccountant>,
+        accountant: crate::memory_accounting::AccountantHandle,
         table: Option<&str>,
         position: &[usize],
     ) -> Result<PersistenceBytes> {

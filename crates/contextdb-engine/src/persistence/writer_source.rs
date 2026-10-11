@@ -1,7 +1,7 @@
 //! Root-pinned writer reads. Decoded records belong to a caller window, never
 //! to the published source; the only retained payload cache is redb's cache.
 use super::*;
-use crate::memory_accounting::{ContainedMemoryReservation, MemoryAccountant, OwnedMemoryReservation};
+use crate::memory_accounting::{ContainedMemoryReservation, OwnedMemoryReservation};
 use crate::read_image_memory::ImageMemory;
 use std::ops::Bound;
 
@@ -40,7 +40,7 @@ pub(crate) struct WriterSnapshot {
     identity: redb::StorageSnapshotIdentity,
     pub(crate) snapshot: SnapshotId,
     pub(crate) lsn: Lsn,
-    accountant: Arc<MemoryAccountant>,
+    accountant: crate::memory_accounting::AccountantHandle,
     _control: ContainedMemoryReservation,
     erasure: parking_lot::RwLock<WriterErasure>,
     schema: Arc<WriterSchema>,
@@ -288,7 +288,7 @@ impl RedbPersistence {
     /// their native image, but cannot decode erased families after publication.
     pub(crate) fn prepare_writer_erasure(
         &self,
-        writer: Arc<MemoryAccountant>,
+        writer: crate::memory_accounting::AccountantHandle,
         tables: &BTreeSet<String>,
         edges: &[AdjEntry],
     ) -> Result<PreparedWriterErasure> {
@@ -325,7 +325,7 @@ impl RedbPersistence {
                 )
                 .saturating_add(std::mem::size_of::<WriterErasure>());
             let memory = OwnedMemoryReservation::try_new_for(
-                Arc::clone(&writer),
+                writer.clone(),
                 bytes,
                 "writer_source",
                 "store_adapter",
@@ -507,7 +507,7 @@ pub(crate) enum WriterCursorFamily {
 #[derive(Clone)]
 pub(crate) enum SourceWindowOwner {
     Read(Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>),
-    Write(Arc<MemoryAccountant>, Option<crate::memory_accounting::WriterUse>),
+    Write(crate::memory_accounting::AccountantHandle, Option<crate::memory_accounting::WriterUse>),
 }
 
 pub(crate) enum SourceWindowCredit {
@@ -516,7 +516,7 @@ pub(crate) enum SourceWindowCredit {
 }
 
 impl SourceWindowOwner {
-    pub(crate) fn writer(writer: Arc<MemoryAccountant>) -> Self {
+    pub(crate) fn writer(writer: crate::memory_accounting::AccountantHandle) -> Self {
         let token = crate::memory_accounting::WriterUse::retain_if_writer(&writer);
         Self::Write(writer, token)
     }
@@ -547,7 +547,7 @@ impl SourceWindowOwner {
                 contextdb_core::read_memory::ReadCredit::new(Arc::clone(read)),
             ),
             Self::Write(writer, _) => {
-                SourceWindowCredit::Write(OwnedMemoryReservation::new(Arc::clone(writer)))
+                SourceWindowCredit::Write(OwnedMemoryReservation::new(writer.clone()))
             }
         };
         match &mut credit {
@@ -605,14 +605,14 @@ impl SourceWindowOwner {
     pub(super) fn image(&self, root: &WriterSnapshot, operation: &'static str) -> Arc<ImageMemory> {
         match self {
             Self::Read(read) => ImageMemory::charging_reader_for(
-                Arc::clone(&root.accountant),
+                root.accountant.clone(),
                 Arc::clone(read),
                 "writer_source",
                 operation,
                 HINT,
             ),
             Self::Write(writer, _) => {
-                ImageMemory::charging_for(Arc::clone(writer), "writer_source", operation, HINT)
+                ImageMemory::charging_for(writer.clone(), "writer_source", operation, HINT)
             }
         }
     }
@@ -831,7 +831,7 @@ impl WriterSnapshot {
                 .check_scope(Some(table), RELATIONAL_INDEX_COUNT_TABLE.name())?;
             let (key, count) = entry.map_err(RedbPersistence::storage_error)?;
             let memory = ImageMemory::charging_reader_for(
-                Arc::clone(&self.accountant),
+                self.accountant.clone(),
                 Arc::clone(&read_memory),
                 "writer_source",
                 "maintained_count_groups",
@@ -2104,10 +2104,10 @@ impl RedbPersistence {
 mod tests {
     use super::*;
 
-    fn store(path: &Path) -> (RedbPersistence, Arc<MemoryAccountant>) {
+    fn store(path: &Path) -> (RedbPersistence, crate::memory_accounting::AccountantHandle) {
         let store = RedbPersistence::create(path).unwrap();
         let accountant = Arc::new(MemoryAccountant::no_limit());
-        store.attach_memory_accountant(Arc::clone(&accountant));
+        store.attach_memory_accountant(accountant.clone());
         (store, accountant)
     }
 
@@ -2816,3 +2816,6 @@ pub(crate) fn r1_schema_control_rows_for_test() {
     println!("CDB127_R1_LAYOUT WriterErasure size={} align={} memory={}",
         std::mem::size_of::<WriterErasure>(), std::mem::align_of::<WriterErasure>(), std::mem::offset_of!(WriterErasure, _memory));
 }
+
+#[cfg(test)]
+use crate::memory_accounting::MemoryAccountant;

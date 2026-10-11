@@ -67,7 +67,7 @@ pub(super) fn transition<const CHECK: bool>(
     write: &redb::WriteTransaction,
     previous: Option<&VectorPartitionMembershipRecord>,
     next: Option<&VectorPartitionMembershipRecord>,
-    accountant: Option<&Arc<crate::memory_accounting::MemoryAccountant>>,
+    accountant: Option<&crate::memory_accounting::AccountantHandle>,
 ) -> Result<()> {
     let Some(route) = previous.or(next) else {
         return Ok(());

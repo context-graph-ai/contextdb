@@ -279,7 +279,7 @@ struct PrepaidTraceCredit {
 }
 impl contextdb_vector::PrepaidVectorCopyCharge for PrepaidTraceCredit {
     fn accountant(&self) -> Arc<dyn contextdb_vector::MemoryBudget> {
-        Arc::clone(&self.owner)
+        self.owner.clone()
     }
     fn retained_bytes(&self) -> usize {
         self.credit.bytes()
@@ -1907,7 +1907,7 @@ impl RequestContext {
         let credit = self.state().memory.try_split_off(bytes)?;
         let owner: Arc<dyn contextdb_vector::MemoryBudget> =
             Arc::new(TraceMemoryOwner(Arc::clone(&self.reader_budget)));
-        Ok(trace.into_owned(Arc::clone(&owner), PrepaidTraceCredit { owner, credit })?)
+        Ok(trace.into_owned(owner.clone(), PrepaidTraceCredit { owner, credit })?)
     }
 
     fn transfer_answer(

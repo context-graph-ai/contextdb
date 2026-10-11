@@ -418,7 +418,7 @@ impl Database {
         let sync_graph_arrivals = self.sync_graph_arrivals.clone();
         let lineage_state_lock = self.lineage_state_lock.clone();
         let custody_cache = self.custody_cache.clone();
-        let accountant = self.accountant.clone();
+        let accountant = self.accountant.vector_budget()?;
         self.local_erasure_stages.lock().insert(
             lsn,
             Stage {

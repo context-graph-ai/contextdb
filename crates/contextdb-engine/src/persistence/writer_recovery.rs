@@ -236,7 +236,7 @@ impl RedbPersistence {
         let SourceWindowOwner::Write(accountant, _) = &owner else {
             unreachable!("internal writer retention owner")
         };
-        let memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget> = accountant.clone();
+        let memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget> = accountant.read_budget()?;
         graph_read::with_pages(memory, || {
         let _controls = owner.reserve(
             2 * std::mem::size_of::<redb::ReadOnlyTable<&[u8], &[u8]>>()

@@ -195,7 +195,7 @@ pub(super) fn ensure_declared_routes(
     write: &redb::WriteTransaction,
     table: &str,
     meta: &TableMeta,
-    accountant: Option<Arc<crate::memory_accounting::MemoryAccountant>>,
+    accountant: Option<crate::memory_accounting::AccountantHandle>,
 ) -> Result<()> {
     for column in &meta.columns {
         if matches!(column.column_type, ColumnType::Vector(_))
@@ -747,7 +747,7 @@ fn validate_body_placement_transition<const CHECK_OVERLAP: bool>(
     reverse: &redb::Table<'_, &[u8], &[u8]>,
     previous: Option<&VectorPartitionMembershipRecord>,
     next: Option<&VectorPartitionMembershipRecord>,
-    accountant: Option<&Arc<crate::memory_accounting::MemoryAccountant>>,
+    accountant: Option<&crate::memory_accounting::AccountantHandle>,
 ) -> Result<u64> {
     #[cfg(test)]
     BODY_PLACEMENT_VALIDATION_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
@@ -768,7 +768,7 @@ fn validate_body_placement_transition<const CHECK_OVERLAP: bool>(
         let _window = accountant
             .map(|accountant| {
                 crate::memory_accounting::OwnedMemoryReservation::try_new_for(
-                    Arc::clone(accountant),
+                    accountant.clone(),
                     value.value().len().saturating_mul(16).saturating_add(4096),
                     "vector",
                     "validate_body_placement",
@@ -812,7 +812,7 @@ pub(super) fn publish_membership(
     write: &redb::WriteTransaction,
     membership_key: &[u8],
     encoded: Option<&[u8]>,
-    accountant: Option<Arc<crate::memory_accounting::MemoryAccountant>>,
+    accountant: Option<crate::memory_accounting::AccountantHandle>,
     pending_transition: bool,
 ) -> Result<()> {
     publish_membership_impl::<true>(
@@ -831,7 +831,7 @@ pub(super) fn publish_corrupt_store_membership_for_test(
     write: &redb::WriteTransaction,
     membership_key: &[u8],
     encoded: Option<&[u8]>,
-    accountant: Option<Arc<crate::memory_accounting::MemoryAccountant>>,
+    accountant: Option<crate::memory_accounting::AccountantHandle>,
     pending_transition: bool,
 ) -> Result<()> {
     publish_membership_impl::<false>(
@@ -847,14 +847,14 @@ fn publish_membership_impl<const CHECK_OVERLAP: bool>(
     write: &redb::WriteTransaction,
     membership_key: &[u8],
     encoded: Option<&[u8]>,
-    accountant: Option<Arc<crate::memory_accounting::MemoryAccountant>>,
+    accountant: Option<crate::memory_accounting::AccountantHandle>,
     pending_transition: bool,
 ) -> Result<()> {
     let _scratch = accountant
         .as_ref()
         .map(|accountant| {
             crate::memory_accounting::OwnedMemoryReservation::try_new_for(
-                Arc::clone(accountant),
+                accountant.clone(),
                 membership_key.len().saturating_mul(32).saturating_add(4096),
                 "vector",
                 "publish_membership_pages",
@@ -1220,12 +1220,12 @@ fn rebuild_route_occupancy(
     write: &redb::WriteTransaction,
     route: &[u8],
     entries: u64,
-    accountant: Option<&Arc<crate::memory_accounting::MemoryAccountant>>,
+    accountant: Option<&crate::memory_accounting::AccountantHandle>,
 ) -> Result<()> {
     let _buffer = accountant
         .map(|accountant| {
             crate::memory_accounting::OwnedMemoryReservation::try_new_for(
-                Arc::clone(accountant),
+                accountant.clone(),
                 usize::try_from(entries)
                     .unwrap_or(usize::MAX)
                     .saturating_mul(2 * std::mem::size_of::<(u64, u64)>())
@@ -1296,7 +1296,7 @@ fn occupancy_transition(
     next: Option<&VectorPartitionMembershipRecord>,
     boundary_before: TxId,
     partition: &MembershipSummary,
-    accountant: Option<&Arc<crate::memory_accounting::MemoryAccountant>>,
+    accountant: Option<&crate::memory_accounting::AccountantHandle>,
 ) -> Result<()> {
     let previous_interval = previous.and_then(membership_interval);
     let next_interval = next.and_then(membership_interval);
@@ -1382,7 +1382,7 @@ fn occupancy_transition(
 /// Rebuild every route a removing pass listed dirty, once each.
 pub(super) fn settle_dirty_occupancy(
     write: &redb::WriteTransaction,
-    accountant: Option<Arc<crate::memory_accounting::MemoryAccountant>>,
+    accountant: Option<crate::memory_accounting::AccountantHandle>,
 ) -> Result<()> {
     loop {
         let dirty = write.open_table(OCCUPANCY_DIRTY).map_err(metadata_error)?;
@@ -1481,7 +1481,7 @@ pub(super) fn rename_pending_routes(
     write: &redb::WriteTransaction,
     from: &VectorIndexRef,
     to: &VectorIndexRef,
-    accountant: Option<Arc<crate::memory_accounting::MemoryAccountant>>,
+    accountant: Option<crate::memory_accounting::AccountantHandle>,
 ) -> Result<()> {
     let _prefix_memory = accountant
         .as_ref()
@@ -1579,7 +1579,7 @@ pub(super) fn remove_routes_matching(
     write: &redb::WriteTransaction,
     table: &str,
     column: Option<&str>,
-    accountant: Option<Arc<crate::memory_accounting::MemoryAccountant>>,
+    accountant: Option<crate::memory_accounting::AccountantHandle>,
 ) -> Result<()> {
     let _prefix_memory = accountant
         .as_ref()

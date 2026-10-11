@@ -8823,7 +8823,7 @@ struct ReceivedSchemaStageRegistration {
     published: bool,
     occupancy: Option<schema_stage_registry::ReceivedToken>,
     vector_store: Arc<VectorStore>,
-    accountant: Arc<MemoryAccountant>,
+    accountant: crate::memory_accounting::AccountantHandle,
     lsn: Lsn,
     armed: bool,
 
@@ -9217,7 +9217,7 @@ impl PublicationInterruptionWatch {
 fn publish_storage_compaction_batch(
     manager: &Arc<TransactionManager<DynStore>>,
     persistence: &Arc<RedbPersistence>,
-    accountant: &Arc<MemoryAccountant>,
+    accountant: &crate::memory_accounting::AccountantHandle,
     interrupted: &Arc<AtomicBool>,
     fragmentation: f64,
 ) -> Result<(redb::CompactionProgress, Option<u64>)> {
@@ -9680,7 +9680,7 @@ pub struct DurableVectorStorageInventoryForTest {
 /// committing is infallible: a positive reservation becomes its permanent
 /// charge and a negative delta releases the retired image's excess.
 pub(crate) struct PreparedMemorySwap {
-    accountant: Arc<MemoryAccountant>,
+    accountant: crate::memory_accounting::AccountantHandle,
     reserved_positive_delta: usize,
     release_after_swap: usize,
     /// What each row version STAGED in a still-open transaction is admitted
@@ -9705,7 +9705,7 @@ struct StagedAdmissionRepricing {
 /// after commit or rollback. Unlike [`PreparedMemorySwap`], none of these
 /// bytes becomes retained database state.
 struct TemporaryMemoryReservation {
-    accountant: Arc<MemoryAccountant>,
+    accountant: crate::memory_accounting::AccountantHandle,
     bytes: usize,
 
     _writer_use: Option<crate::memory_accounting::WriterUse>,
@@ -9713,7 +9713,7 @@ struct TemporaryMemoryReservation {
 
 impl TemporaryMemoryReservation {
     fn reserve(
-        accountant: Arc<MemoryAccountant>,
+        accountant: crate::memory_accounting::AccountantHandle,
         bytes: usize,
         operation: &'static str,
     ) -> Result<Self> {
@@ -9728,7 +9728,7 @@ accountant, bytes })
     }
 
     fn absorb(&mut self, mut other: Self) {
-        debug_assert!(Arc::ptr_eq(&self.accountant, &other.accountant));
+        debug_assert!(std::ptr::eq(self.accountant.as_ptr(), other.accountant.as_ptr()));
         self.bytes = self.bytes.saturating_add(other.bytes);
         other.bytes = 0;
     }
@@ -9752,7 +9752,7 @@ impl Drop for TemporaryMemoryReservation {
 /// hands it over once the store holding the object will release it instead.
 struct StagedCopyCharge {
     vector_accountant: std::mem::ManuallyDrop<Arc<dyn contextdb_vector::MemoryBudget>>,
-    accountant: std::mem::ManuallyDrop<Arc<MemoryAccountant>>,
+    accountant: std::mem::ManuallyDrop<crate::memory_accounting::AccountantHandle>,
     bytes: usize,
     _writer_use: std::mem::ManuallyDrop<Option<crate::memory_accounting::WriterUse>>,
     // Inline charges own no Box. Only the prepaid handoff fills this liability.
@@ -9761,7 +9761,7 @@ struct StagedCopyCharge {
 
 impl StagedCopyCharge {
     fn admit(
-        accountant: &Arc<MemoryAccountant>,
+        accountant: &crate::memory_accounting::AccountantHandle,
         vector_accountant: Arc<dyn contextdb_vector::MemoryBudget>,
         bytes: usize,
         operation: &'static str,
@@ -9878,7 +9878,7 @@ impl Drop for StagedCopyCharge {
 struct ReceivedStagingAccess {
     source: std::mem::ManuallyDrop<Arc<RelationalStore>>,
     staged_tables: std::mem::ManuallyDrop<HashSet<String>>,
-    accountant: std::mem::ManuallyDrop<Arc<MemoryAccountant>>,
+    accountant: std::mem::ManuallyDrop<crate::memory_accounting::AccountantHandle>,
     miss: std::mem::ManuallyDrop<Mutex<Option<ReceivedStagingMiss>>>,
     _charge: std::mem::ManuallyDrop<StagedCopyCharge>,
     _writer_use: std::mem::ManuallyDrop<Option<crate::memory_accounting::WriterUse>>,
@@ -10039,7 +10039,7 @@ impl PreparedMemorySwap {
     /// delta.  Keeping the full old total at this boundary makes that special
     /// release explicit rather than silently under-counting index memory.
     fn prepare(
-        accountant: Arc<MemoryAccountant>,
+        accountant: crate::memory_accounting::AccountantHandle,
         old_bytes: usize,
         new_bytes: usize,
         retired_bytes_released_by_store: usize,
@@ -10056,7 +10056,7 @@ impl PreparedMemorySwap {
     }
 
     fn prepare_for(
-        accountant: Arc<MemoryAccountant>,
+        accountant: crate::memory_accounting::AccountantHandle,
         old_bytes: usize,
         new_bytes: usize,
         retired_bytes_released_by_store: usize,
@@ -13406,7 +13406,7 @@ pub struct Database {
     #[cfg(feature = "test-seams")]
     snapshot_free_retirement_pass_count: Arc<AtomicUsize>,
     access: AccessConstraints,
-    accountant: Arc<MemoryAccountant>,
+    accountant: crate::memory_accounting::AccountantHandle,
     conflict_policies: RwLock<ConflictPolicies>,
     subscriptions: Arc<Mutex<SubscriptionState>>,
     pruning_runtime: Mutex<PruningRuntime>,
@@ -13993,7 +13993,7 @@ struct AdmittedDynStore<T: contextdb_tx::WriteSetApplicator> {
     control: Option<crate::memory_accounting::ControlCredit>,
 }
 impl<T: contextdb_tx::WriteSetApplicator> AdmittedDynStore<T> {
-    fn prepare(payload: T, accountant: &Arc<MemoryAccountant>) -> Result<DynStore>
+    fn prepare(payload: T, accountant: &crate::memory_accounting::AccountantHandle) -> Result<DynStore>
     where T: 'static {
         let mut value = Self { payload: std::mem::ManuallyDrop::new(payload), control: None };
         value.control = Some(crate::memory_accounting::ControlCredit::admit_assembly(
@@ -14045,7 +14045,7 @@ pub(crate) struct StoreFinalization {
     live_holders: AtomicUsize,
     pending: std::mem::ManuallyDrop<Mutex<Option<PendingStoreRelease>>>,
     vector: std::mem::ManuallyDrop<Arc<VectorStore>>,
-    accountant: std::mem::ManuallyDrop<Arc<MemoryAccountant>>,
+    accountant: std::mem::ManuallyDrop<crate::memory_accounting::AccountantHandle>,
     non_vector_memory: std::mem::ManuallyDrop<Mutex<Option<RetainedNonVectorMemoryOwner>>>,
     staged_posting_admission: std::mem::ManuallyDrop<Arc<writer_read::WriterStagedPostingAdmission>>,
     vector_accountant: std::mem::ManuallyDrop<Arc<dyn contextdb_vector::MemoryBudget>>,
@@ -14078,13 +14078,13 @@ impl Drop for OwnerReadStoreHold {
 struct RetainedNonVectorMemoryOwner {
     relational: Arc<RelationalStore>,
     graph: Arc<GraphStore>,
-    accountant: Arc<MemoryAccountant>,
+    accountant: crate::memory_accounting::AccountantHandle,
 
     _writer_use: Option<crate::memory_accounting::WriterUse>,
 }
 
 impl RetainedNonVectorMemoryOwner {
-    fn new(relational: Arc<RelationalStore>, graph: Arc<GraphStore>, accountant: Arc<MemoryAccountant>) -> Self {
+    fn new(relational: Arc<RelationalStore>, graph: Arc<GraphStore>, accountant: crate::memory_accounting::AccountantHandle) -> Self {
         Self {
             _writer_use: crate::memory_accounting::WriterUse::retain_if_writer(&accountant),
             relational, graph, accountant,
@@ -15036,7 +15036,7 @@ fn acquire_registry_and_persistence(
     open_disposition: OpenDisposition,
     cache_bytes: usize,
     runtime_dir: Option<&Path>,
-    accountant: Arc<MemoryAccountant>,
+    accountant: crate::memory_accounting::AccountantHandle,
 ) -> Result<(OpenRegistryReservation, Arc<RedbPersistence>)> {
     let retry_deadline = Instant::now() + SAME_PROCESS_REOPEN_RETRY;
     let cross_process_retry_deadline = Instant::now() + CROSS_PROCESS_LOCK_SETTLE_RETRY;
@@ -15951,7 +15951,7 @@ impl Default for SnapshotFloorRegistry {
 }
 
 impl SnapshotFloorRegistry {
-    fn fund_pin_slots(&self, accountant: Arc<MemoryAccountant>) -> Result<()> {
+    fn fund_pin_slots(&self, accountant: crate::memory_accounting::AccountantHandle) -> Result<()> {
         let mut configured = self.pin_slots.lock();
         if configured.is_some() {
             return Ok(());
@@ -16664,7 +16664,7 @@ pub(crate) enum CurrencyGate {
 /// can leave the same partition evictable without publishing a new loader.
 struct DurableRawVectorPartitionLoader {
     source: DurableRawVectorSource,
-    accountant: Arc<MemoryAccountant>,
+    accountant: crate::memory_accounting::AccountantHandle,
     partition: VectorPartitionRef,
     dimension: usize,
     quantization: VectorQuantization,
@@ -16694,14 +16694,14 @@ impl DurableRawVectorSource {
     // never repurposed by a later first matching writer attachment.
     fn vector_budget(
         &self,
-        accountant: &Arc<MemoryAccountant>,
+        accountant: &crate::memory_accounting::AccountantHandle,
     ) -> Result<Arc<dyn contextdb_vector::MemoryBudget>> {
         if let Self::Writable(persistence) = self
             && let Some(original) = persistence.proof_accountant_handle_for(accountant)
         {
             return original.vector_budget();
         }
-        Ok(accountant.clone())
+        accountant.vector_budget_for_original_reader()
     }
 
     fn stream_memberships<T>(
@@ -17702,7 +17702,7 @@ fn durable_raw_vector_partitions(
     vector: &VectorStore,
     source: DurableRawVectorSource,
     memberships: Vec<VectorPartitionMembershipRecord>,
-    accountant: &Arc<MemoryAccountant>,
+    accountant: &crate::memory_accounting::AccountantHandle,
     copy_owner: &mut contextdb_vector::VectorCopyAdmission,
 ) -> Result<Vec<DormantRawVectorPartition>> {
     // Historical EXACT reads need the same immutable vector identities after
@@ -17816,7 +17816,7 @@ fn durable_raw_vector_partitions(
 fn register_retained_raw_vector_partitions(
     vector: &VectorStore,
     source: &Arc<crate::persistence::RetainedReadSource>,
-    accountant: &Arc<MemoryAccountant>,
+    accountant: &crate::memory_accounting::AccountantHandle,
     copy_owner: &mut contextdb_vector::VectorCopyAdmission,
 ) -> Result<()> {
     use crate::persistence::vector_membership_source::{
@@ -17951,7 +17951,7 @@ impl LoaderCallbackCaptures {
             dimension: layout.dimension,
             quantization: layout.quantization,
             metadata_copy_owner: Some(Arc::new(owner)),
-            accountant: self.accountant.as_arc(),
+            accountant: self.accountant.as_handle(),
         }) as Arc<dyn DormantRawVectorLoader>)
     }
 }
@@ -18002,7 +18002,7 @@ fn register_dormant_raw_vector_partitions(
     vector: &VectorStore,
     manager: &Arc<TransactionManager<DynStore>>,
     persistence: &Arc<RedbPersistence>,
-    accountant: &Arc<MemoryAccountant>,
+    accountant: &crate::memory_accounting::AccountantHandle,
     copy_owner: &mut contextdb_vector::VectorCopyAdmission,
 ) -> Result<()> {
     use crate::persistence::vector_membership_source::{
@@ -18137,7 +18137,7 @@ fn register_dormant_raw_vector_partitions(
 /// entries after the selected sealed boundary.
 struct DurableVectorGenerationLoader {
     source: DurableVectorGenerationSource,
-    accountant: Arc<MemoryAccountant>,
+    accountant: crate::memory_accounting::AccountantHandle,
     partition: VectorPartitionRef,
     descriptor: VectorPartitionGenerationDescriptor,
     base_generation_id: u64,
@@ -18449,6 +18449,18 @@ impl DurableVectorGenerationLoader {
             ));
         }
         Self::load_checkpoint(request)?;
+        // Admit the escaping budget control before any retained graph charge.
+        // The durable source supplies the captured writer role, never a later
+        // association rediscovered from an originally untagged accountant.
+        let vector_accountant = match &self.source {
+            DurableVectorGenerationSource::Writable(persistence) => {
+                match persistence.proof_accountant_handle_for(&self.accountant) {
+                    Some(original) => original.vector_budget()?,
+                    None => self.accountant.vector_budget_for_original_reader()?,
+                }
+            }
+            DurableVectorGenerationSource::CommittedImage(_) | DurableVectorGenerationSource::CapturedRoot(_) => self.accountant.vector_budget_for_original_reader()?,
+        };
         let metadata_workspace = self.route_metadata_workspace()?.max(64 * 1024);
         let _metadata = crate::memory_accounting::ScopedMemoryReservation::try_new_for(
             &self.accountant,
@@ -18825,13 +18837,13 @@ impl DurableVectorGenerationLoader {
         Ok(LoadedVectorGraphGeneration {
             graph,
             resident_bytes,
-            accountant: self.accountant.clone(),
+            accountant: vector_accountant.clone(),
             caller_adopted_bytes: 0,
             fresh_tail: fresh_tail.map(|(graph, resident_bytes, replayed_through_lsn)| {
                 LoadedVectorFreshTail {
                     graph,
                     resident_bytes,
-                    accountant: self.accountant.clone(),
+                    accountant: vector_accountant.clone(),
                     replayed_through_lsn,
                 }
             }),
@@ -19462,7 +19474,7 @@ fn durable_vector_generation_identity(
 fn register_dormant_vector_generations(
     vector: &VectorStore,
     persistence: &Arc<RedbPersistence>,
-    accountant: &Arc<MemoryAccountant>,
+    accountant: &crate::memory_accounting::AccountantHandle,
     declared_serving_cache: DeclaredServingCache,
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
 ) -> Result<()> {
@@ -19482,7 +19494,7 @@ fn register_loaded_dormant_vector_generations(
     vector: &VectorStore,
     loaded: LoadedVectorPartitionGenerationCatalog,
     source: DurableVectorGenerationSource,
-    accountant: &Arc<MemoryAccountant>,
+    accountant: &crate::memory_accounting::AccountantHandle,
     journal_truncation_owner: Option<&RedbPersistence>,
     declared_serving_cache: DeclaredServingCache,
 ) -> Result<()> {
@@ -19729,11 +19741,11 @@ impl MetadataAuthorizedCandidates {
 // image. A raw accountant cannot assemble a writable database.
 enum DatabaseAssemblyBudget {
     Writer(WriterBudget),
-    ReadImage(Arc<MemoryAccountant>),
+    ReadImage(crate::memory_accounting::AccountantHandle),
 }
 impl DatabaseAssemblyBudget {
-    fn into_accountant(self) -> (Arc<MemoryAccountant>, Option<crate::memory_accounting::WriterUse>, Arc<dyn contextdb_vector::MemoryBudget>) {
-        match self { Self::Writer(budget) => { let (accountant, writer_use, vector_accountant) = budget.into_parts(); (accountant, Some(writer_use), vector_accountant) }, Self::ReadImage(accountant) => (accountant.clone(), None, accountant) }
+    fn into_accountant(self) -> (crate::memory_accounting::AccountantHandle, Option<crate::memory_accounting::WriterUse>, Arc<dyn contextdb_vector::MemoryBudget>) {
+        match self { Self::Writer(budget) => { let (accountant, writer_use, vector_accountant) = budget.into_parts(); (accountant, Some(writer_use), vector_accountant) }, Self::ReadImage(accountant) => (accountant.clone(), None, accountant.standard_arc().expect("read image retains standard Arc")) }
     }
 }
 
@@ -20254,7 +20266,7 @@ impl MaintenanceContext {
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<()> {
         vector_source_page_admission::with_source_page_admission(
-            Arc::clone(&self.finalization.accountant),
+            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
             || {
                 self.retry_one_vector_journal_truncation_with_source_admission(
                     persistence,
@@ -20377,7 +20389,7 @@ impl MaintenanceContext {
             }
             let catalog = &entry.catalog;
             let mut route_memory =
-                crate::memory_accounting::OwnedMemoryReservation::new(Arc::clone(&self.finalization.accountant));
+                crate::memory_accounting::OwnedMemoryReservation::new(crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant));
             let heap = RedbPersistence::maintenance_vector_catalog_heap_bytes(catalog);
             let route_admission = route_memory.try_grow_for(
                 heap,
@@ -20427,7 +20439,7 @@ impl MaintenanceContext {
                     || self.vector.partition_route_quarantine(&partition).is_some();
                 let covered = if cleanup_only {
                     vector_source_page_admission::with_preparation_source_page_admission(
-                        Arc::clone(&self.finalization.accountant),
+                        crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
                         || persistence.vector_partition_has_covered_journal_records(catalog),
                     )
                 } else {
@@ -20452,14 +20464,14 @@ impl MaintenanceContext {
                         };
                         if cleanup_only {
                             vector_source_page_admission::with_journal_cleanup_source_page_admission(
-                                Arc::clone(&self.finalization.accountant),
+                                crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
                                 retry,
                             )
                         } else {
                             // Restoring an uninstalled catalog reads and
                             // installs its generation after cleaning the journal.
                             vector_source_page_admission::with_source_page_admission(
-                                Arc::clone(&self.finalization.accountant),
+                                crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
                                 retry,
                             )
                         }
@@ -20575,7 +20587,7 @@ impl MaintenanceContext {
         let base_loader: Arc<dyn DormantVectorGraphLoader> =
             Arc::new(DurableVectorGenerationLoader {
                 source: DurableVectorGenerationSource::Writable(persistence.clone()),
-                accountant: Arc::clone(&self.finalization.accountant),
+                accountant: crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
                 partition: partition.clone(),
                 descriptor: catalog.base,
                 base_generation_id: catalog.base.generation_id,
@@ -20620,7 +20632,7 @@ impl MaintenanceContext {
             let change_loader: Arc<dyn DormantVectorGraphLoader> =
                 Arc::new(DurableVectorGenerationLoader {
                     source: DurableVectorGenerationSource::Writable(persistence.clone()),
-                    accountant: Arc::clone(&self.finalization.accountant),
+                    accountant: crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
                     partition: partition.clone(),
                     descriptor: change,
                     base_generation_id: catalog.base.generation_id,
@@ -20683,7 +20695,7 @@ impl MaintenanceContext {
             .lock()
             .is_none_or(|at| at.elapsed() >= min_interval);
         let previous_sample = vector_source_page_admission::with_preparation_source_page_admission(
-            Arc::clone(&self.finalization.accountant),
+            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
             || persistence.storage_compaction_fragmentation_ratio(),
         )?;
         if !due && previous_sample.is_none() {
@@ -20692,7 +20704,7 @@ impl MaintenanceContext {
         let fragmentation_before = match previous_sample {
             Some(sample) => sample,
             None => vector_source_page_admission::with_preparation_source_page_admission(
-                Arc::clone(&self.finalization.accountant),
+                crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
                 || persistence.fragmentation_ratio(),
             )?,
         };
@@ -20751,7 +20763,7 @@ impl MaintenanceContext {
     ) -> Result<()> {
         let tx = self.tx_mgr.begin();
         let workspace = std::cell::RefCell::new(
-            crate::memory_accounting::OwnedMemoryReservation::new(Arc::clone(&self.finalization.accountant)),
+            crate::memory_accounting::OwnedMemoryReservation::new(crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant)),
         );
         // Armed just before the durable apply; see `PublicationInterruptionWatch`.
         // This commit is durable the moment the manager applies it, and the
@@ -20772,7 +20784,7 @@ impl MaintenanceContext {
                     &self.relational,
                     &self.tx_mgr,
                     crate::persistence::writer_source::SourceWindowOwner::writer(
-                        Arc::clone(&self.finalization.accountant),
+                        crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
                     ),
                 )?
                 .retention_batch(&metas, "expiry", &mut workspace.borrow_mut())?;
@@ -20949,7 +20961,7 @@ impl MaintenanceContext {
         // published owner remains charged; this receipt covers the replacement
         // workspace and is transferred into reclamation rather than duplicated.
         let mut carry_workspace =
-            crate::memory_accounting::OwnedMemoryReservation::new(Arc::clone(&self.finalization.accountant));
+            crate::memory_accounting::OwnedMemoryReservation::new(crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant));
         let prepaid_carry_bytes = {
             let carried = self.retention_deferred_edge_nodes.lock();
             let bytes = carried.nodes.len().saturating_mul(128);
@@ -21306,7 +21318,7 @@ impl MaintenanceContext {
         loop {
             if let Some(outcome) =
                 vector_source_page_admission::with_preparation_source_page_admission(
-                    Arc::clone(&self.finalization.accountant),
+                    crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
                     || {
                         self.advance_paged_vector_build(
                             partition,
@@ -21326,7 +21338,7 @@ impl MaintenanceContext {
                 &mut maintenance_vector_copy_owner,
             )?;
             let info = vector_source_page_admission::with_preparation_source_page_admission(
-                Arc::clone(&self.finalization.accountant),
+                crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
                 || self.vector.try_partition_info(
                     &partition.index,
                     &partition.partition_key,
@@ -21382,7 +21394,7 @@ impl MaintenanceContext {
                 None
             } else {
                 vector_source_page_admission::with_preparation_source_page_admission(
-                    Arc::clone(&self.finalization.accountant),
+                    crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
                     || {
                         persistence.load_vector_partition_generation_descriptors_for(
                             &partition.index,
@@ -21420,7 +21432,7 @@ impl MaintenanceContext {
             // commits remain in the journal suffix and mutable tail.
             let (covered_tx, covered_lsn, snapshot_pin, raw_count, graph_count, delete_carriers) =
                 vector_source_page_admission::with_preparation_source_page_admission(
-                    Arc::clone(&self.finalization.accountant),
+                    crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
                     || {
                         self.tx_mgr.with_commit_lock(|| -> Result<_> {
                     let covered_tx = self.tx_mgr.current_tx_max();
@@ -21658,7 +21670,7 @@ impl MaintenanceContext {
                                     "retire_broken_vector_generation", "Free writer memory before retiring this damaged route.")
                             })?;
                         publication.reserve()?;
-                        vector_source_page_admission::with_preparation_source_page_admission(Arc::clone(&self.finalization.accountant), || {
+                        vector_source_page_admission::with_preparation_source_page_admission(crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant), || {
                             persistence.retire_broken_vector_catalog(partition, || self.build_checkpoint())
                         })?;
                         self.vector.reset_partition_after_broken_catalog_retirement(
@@ -21736,7 +21748,7 @@ impl MaintenanceContext {
                     None
                 } else {
                     vector_source_page_admission::with_preparation_source_page_admission(
-                        Arc::clone(&self.finalization.accountant),
+                        crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
                         || {
                             persistence.load_vector_partition_generation_catalog_for(
                                 &partition.index,
@@ -21759,7 +21771,7 @@ impl MaintenanceContext {
                 // admitted separately during preparation. Keep the source guard
                 // around quarantine inventory, payload, publication and cleanup.
                 let outcome = vector_source_page_admission::with_source_page_admission(
-                    Arc::clone(&self.finalization.accountant),
+                    crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
                     || -> Result<Option<VectorPartitionPublicationOutcome>> {
                         let previous_generation = if quarantined {
                             match persistence.load_vector_partition_generation_catalog_for(
@@ -21824,7 +21836,7 @@ impl MaintenanceContext {
                         } else if current.is_none() {
                             "initial_build"
                         } else if vector_source_page_admission::with_preparation_source_page_admission(
-                            Arc::clone(&self.finalization.accountant),
+                            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
                             || self.vector.try_partition_info(
                                 &partition.index,
                                 &partition.partition_key,
@@ -23599,7 +23611,7 @@ impl Database {
         trigger: Arc<TriggerState>,
         declared_read_memory: Arc<crate::vector_read_memory::DeclaredReadMemory>,
     ) -> Result<Self> {
-        let accountant = Arc::clone(&finalization.accountant);
+        let accountant = crate::memory_accounting::AccountantHandle::clone(&finalization.accountant);
         snapshot_registry.fund_pin_slots(accountant.clone())?;
         let vector_accountant = Arc::clone(&finalization.vector_accountant);
         {
@@ -26003,7 +26015,7 @@ impl Database {
             }
             
             {
-                std::ptr::addr_of_mut!((*construction.source).accountant).write(Arc::clone(&self.finalization.accountant));
+                std::ptr::addr_of_mut!((*construction.source).accountant).write(crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant));
                 construction.initialized[61] = true;
                 #[cfg(all(test, feature = "test-seams"))]
                 r1_database_field_for_test(61);
@@ -26649,7 +26661,7 @@ impl Database {
         // refusal instead of allocating anyway. Attached after the persisted
         // memory limit has settled, so the accountant here is the one the
         // composite store and every other subsystem share.
-        persistence.attach_memory_accountant(Arc::clone(&accountant));
+        persistence.attach_memory_accountant(accountant.clone());
         persistence.restore_storage_compaction()?;
         // The persisted effective limit sizes the actual native cache before
         // source roots are published. Charge that same reserve, including any
@@ -26673,7 +26685,7 @@ impl Database {
                 .writer_cache_stripe_control_bytes()?
                 .min(cache_bytes);
             let writer_bytes = match crate::memory_accounting::ControlCredit::admit_open_residue(
-                &crate::memory_accounting::StoreAccountantHandle::new(Arc::clone(&accountant)),
+                &crate::memory_accounting::StoreAccountantHandle::new(accountant.clone()),
                 stripe_controls,
                 "writer_cache_stripe_controls",
             ) {
@@ -26736,7 +26748,7 @@ impl Database {
                         name,
                         &decl.name,
                         decl.columns.clone(),
-                        accountant.clone(),
+                        accountant.read_budget()?,
                     );
                 }
             }
@@ -26953,7 +26965,7 @@ impl Database {
     pub(crate) fn open_committed_image(
         parts: crate::persistence::ReadPersistenceImageParts,
         plugin: Arc<dyn DatabasePlugin>,
-        mut accountant: Arc<MemoryAccountant>,
+        mut accountant: crate::memory_accounting::AccountantHandle,
         declared_read_memory: Arc<crate::vector_read_memory::DeclaredReadMemory>,
     ) -> Result<Self> {
         parts.open_context.checkpoint()?;
@@ -26964,7 +26976,7 @@ impl Database {
         )?;
         let _decode_scope = decode_memory.enter();
         let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
-        let vector_accountant: Arc<dyn contextdb_vector::MemoryBudget> = accountant.clone();
+        let vector_accountant: Arc<dyn contextdb_vector::MemoryBudget> = accountant.vector_budget()?;
         let crate::persistence::ReadPersistenceImageParts {
             open_context,
             content_identity: _,
@@ -27014,7 +27026,7 @@ impl Database {
             if let Some(ceiling) = startup.startup_ceiling {
                 accountant.set_budget(Some(persisted.min(ceiling)))?;
             } else if startup.limit.is_none() {
-                accountant = Arc::new(MemoryAccountant::with_runtime_budget(persisted));
+                accountant = Arc::new(MemoryAccountant::with_runtime_budget(persisted)).into();
             }
         }
         let disk_limit = match config_value("disk_limit") {
@@ -27055,7 +27067,7 @@ impl Database {
                         name,
                         &decl.name,
                         decl.columns.clone(),
-                        accountant.clone(),
+                        accountant.read_budget()?,
                     );
                 }
             }
@@ -27933,7 +27945,7 @@ impl Database {
 
     fn new_pending_local_schema_stage(&self) -> Result<PendingLocalSchemaStage> {
         let temporary_memory = TemporaryMemoryReservation::reserve(
-            Arc::clone(&self.finalization.accountant),
+            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
             self.local_schema_pending_baseline_bytes(),
             "stage_transactional_schema",
         )?;
@@ -28080,7 +28092,7 @@ impl Database {
             return Err(error);
         }
         let statement_memory = match TemporaryMemoryReservation::reserve(
-            Arc::clone(&self.finalization.accountant),
+            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
             Self::staged_table_ddl_temporary_bytes(sql),
             "grow_transactional_schema_stage",
         ) {
@@ -28198,7 +28210,7 @@ impl Database {
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<OwnedQueryResult> {
         let answer_memory = crate::read_image_memory::ImageMemory::charging_reader(
-            Arc::clone(&self.finalization.accountant),
+            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
             read_memory.clone(),
         );
         let mut answer_copy = answer_memory.vector_copy(0)?;
@@ -30079,7 +30091,7 @@ impl Database {
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<OwnedQueryResult> {
         let answer_memory = crate::read_image_memory::ImageMemory::charging_reader(
-            Arc::clone(&self.finalization.accountant),
+            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
             read_memory.clone(),
         );
         let mut answer_copy = answer_memory.vector_copy(0)?;
@@ -30558,7 +30570,7 @@ impl Database {
             )
         };
         let temporary_memory = TemporaryMemoryReservation::reserve(
-            Arc::clone(&self.finalization.accountant),
+            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
             projection_peak_bytes,
             "commit_transactional_schema",
         )?;
@@ -30685,7 +30697,7 @@ impl Database {
             })
             .transpose()?;
         let memory_swap =
-            PreparedMemorySwap::prepare(Arc::clone(&self.finalization.accountant), old_bytes, new_bytes, 0)?
+            PreparedMemorySwap::prepare(crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant), old_bytes, new_bytes, 0)?
                 .carrying_staged_admissions(StagedAdmissionRepricing {
                     tx_mgr: self.tx_mgr.clone(),
                     per_tx: staged_repricing,
@@ -32720,7 +32732,7 @@ impl Database {
             },
             |bytes| {
                 Some(crate::memory_accounting::TransferredRowReservation::from_admitted_with_control(
-                        Arc::clone(&self.finalization.accountant),
+                        crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
                         bytes,
                         transferred_control.take().expect("one selected staged-row transfer"),
                     )
@@ -32895,7 +32907,7 @@ impl Database {
                         .any(|(name, row)| name == table && row.row_id == row_id))
                 .then(|| {
                     crate::memory_accounting::TransferredRowReservation::try_from_admitted(
-                            Arc::clone(&self.finalization.accountant),
+                            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
                             retired_charge,
                         ).map(|owner| owner as Arc<dyn contextdb_tx::StagedPostingCharge>)
                 }).transpose()?;
@@ -35411,7 +35423,7 @@ impl Database {
         let mut metadata_copy_charges = MetadataCopyCharges::new(&self.finalization.accountant);
         let working = Database::open_memory_internal(
             Arc::new(CorePlugin),
-            WriterBudget::from_accountant(Arc::clone(&self.finalization.accountant))?,
+            WriterBudget::from_handle(crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant))?,
             self.declared_read_memory.clone(),
         )?;
         let generation_bytes = affected_tables.iter().map(|table| table.len() + 128).sum();
@@ -36804,7 +36816,7 @@ impl Database {
                 trigger_audits: Vec::new(),
                 next_trigger_audit_index: 0,
                 mirrors,
-                memory_swap: PreparedMemorySwap::prepare(Arc::clone(&self.finalization.accountant), 0, 0, 0)?,
+                memory_swap: PreparedMemorySwap::prepare(crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant), 0, 0, 0)?,
                 next_row_id: self.relational_store.next_row_id(),
                 persistence,
                 apply_result,
@@ -36818,7 +36830,7 @@ impl Database {
                     affected_graph_edge_types: HashSet::new(),
                     replace_vectors: false,
                     vector_image_memory: crate::read_image_memory::ImageMemory::charging_for(
-                        Arc::clone(&self.finalization.accountant),
+                        crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
                         "sync",
                         "prepare_vector_partition_image",
                         STAGE_RECEIVED_UNIT_COPY_HINT,
@@ -37489,7 +37501,7 @@ impl Database {
             }
         }
         let memory_swap = PreparedMemorySwap::prepare(
-            Arc::clone(&self.finalization.accountant),
+            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
             old_bytes.saturating_add(staged_old),
             new_bytes.saturating_add(staged_new),
             0,
@@ -37655,7 +37667,7 @@ impl Database {
             affected_graph_edge_types: affected_graph_edge_types.clone(),
             replace_vectors: copy_vectors,
             vector_image_memory: crate::read_image_memory::ImageMemory::charging_for(
-                Arc::clone(&self.finalization.accountant),
+                crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
                 "sync",
                 "prepare_vector_partition_image",
                 STAGE_RECEIVED_UNIT_COPY_HINT,
@@ -37792,7 +37804,7 @@ impl Database {
             published: false,
             occupancy: Some(occupancy),
             vector_store: self.vector_store.clone(),
-            accountant: Arc::clone(&self.finalization.accountant),
+            accountant: crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
             lsn: local_lsn,
             armed: true,
         };
@@ -39298,7 +39310,7 @@ impl Database {
             let metadata = pending.entry(tx).or_default();
             if metadata.lineage_generations.is_none() {
                 let control = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
-                    Arc::clone(&self.finalization.accountant),
+                    crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
                     std::mem::size_of::<PendingLineageGenerations>()
                         + 2 * std::mem::size_of::<usize>(),
                     "relational",
@@ -39338,7 +39350,7 @@ impl Database {
             entry = current.next.as_deref_mut();
         }
         let memory = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
-            Arc::clone(&self.finalization.accountant),
+            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
             std::mem::size_of::<PendingLineageGeneration>() + table.len(),
             "relational",
             "lineage_generation_memo",
@@ -42509,7 +42521,7 @@ impl Database {
                 .declared_reader_memory()
                 .expect("test reader memory admission");
             let charge = crate::read_image_memory::ImageMemory::charging_reader(
-                Arc::clone(&self.finalization.accountant),
+                crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
                 memory.clone(),
             );
             let context = contextdb_tx::ReadCommitContext::new(memory, &|| Ok(()));
@@ -42632,7 +42644,7 @@ impl Database {
         // refused here, before either structure exists, and the history
         // charge just taken is released with `read` on the way out.
         let indexes = crate::read_image_memory::ImageMemory::charging_reader(
-            Arc::clone(&self.finalization.accountant),
+            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
             read_memory,
         );
         let (table_index, lsn_refcounts) =
@@ -49739,7 +49751,7 @@ impl Database {
                 )>()),
         );
         let _control = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
-            Arc::clone(&self.finalization.accountant),
+            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
             control_bytes,
             "vector",
             "placement_controls",
@@ -49760,7 +49772,7 @@ impl Database {
                 self.vector_insert_accounted_bytes(index, vector.len(), vector_copy_owner)?;
             reservations.push(
                 crate::memory_accounting::OwnedMemoryReservation::try_new_for(
-                    Arc::clone(&self.finalization.accountant),
+                    crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
                     bytes,
                     "insert",
                     &format!("vector_insert@{}.{}", index.table, index.column),
@@ -49790,7 +49802,7 @@ impl Database {
                     vector,
                     |bytes| {
                         Ok(crate::memory_accounting::OwnedMemoryReservation::try_new_for(
-                                Arc::clone(&self.finalization.accountant),
+                                crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
                                 bytes,
                                 "vector",
                                 "staged_immutable_owner",
@@ -49813,7 +49825,7 @@ impl Database {
                         bytes.map(|bytes| total.saturating_add(bytes))
                     })?;
                 let admission = crate::memory_accounting::TransferredRowReservation::try_from_admitted(
-                        Arc::clone(&self.finalization.accountant),
+                        crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
                         0,
                     )?;
                 // Ownership transfers only on publication, so a failed prepare
@@ -49827,7 +49839,7 @@ impl Database {
                     admission.clone(),
                     |bytes| {
                         Ok(crate::memory_accounting::OwnedMemoryReservation::try_new_for(
-                                Arc::clone(&self.finalization.accountant),
+                                crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
                                 bytes,
                                 "vector",
                                 "mutation_undo",
@@ -50071,7 +50083,7 @@ impl Database {
                     bytes.map(|bytes| total.saturating_add(bytes))
                 })?;
             let admission = crate::memory_accounting::TransferredRowReservation::try_from_admitted(
-                    Arc::clone(&self.finalization.accountant),
+                    crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
                     0,
                 )?;
             let undo = ws.ordered_staged_rows.prepare_vector_undo(
@@ -50083,7 +50095,7 @@ impl Database {
                 admission.clone(),
                 |bytes| {
                     Ok(crate::memory_accounting::OwnedMemoryReservation::try_new_for(
-                            Arc::clone(&self.finalization.accountant),
+                            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
                             bytes,
                             "vector",
                             "mutation_undo",
@@ -50220,7 +50232,7 @@ impl Database {
             if old_key == new_key {
                 self.tx_mgr.with_write_set(tx, |ws| {
                     let admission = crate::memory_accounting::TransferredRowReservation::try_from_admitted(
-                            Arc::clone(&self.finalization.accountant),
+                            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
                             0,
                         )?;
                     let undo = ws.ordered_staged_rows.prepare_vector_move_cancellation(
@@ -50230,7 +50242,7 @@ impl Database {
                         admission,
                         |bytes| {
                             Ok(crate::memory_accounting::OwnedMemoryReservation::try_new_for(
-                                    Arc::clone(&self.finalization.accountant),
+                                    crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
                                     bytes,
                                     "vector",
                                     "mutation_undo",
@@ -50281,7 +50293,7 @@ impl Database {
                     bytes.map(|bytes| total.saturating_add(bytes))
                 })?;
             let admission = crate::memory_accounting::TransferredRowReservation::try_from_admitted(
-                    Arc::clone(&self.finalization.accountant),
+                    crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
                     0,
                 )?;
             let undo = ws.ordered_staged_rows.prepare_vector_move_undo(
@@ -50293,7 +50305,7 @@ impl Database {
                 admission.clone(),
                 |bytes| {
                     Ok(crate::memory_accounting::OwnedMemoryReservation::try_new_for(
-                            Arc::clone(&self.finalization.accountant),
+                            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
                             bytes,
                             "vector",
                             "mutation_undo",
@@ -50307,7 +50319,7 @@ impl Database {
                 new_row_id,
                 |bytes| {
                     Ok(crate::memory_accounting::OwnedMemoryReservation::try_new_for(
-                            Arc::clone(&self.finalization.accountant),
+                            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
                             bytes,
                             "vector",
                             "staged_immutable_owner",
@@ -53105,7 +53117,7 @@ impl Database {
                 "Raise the declared reader memory limit.",
             )?;
             let image = crate::read_image_memory::ImageMemory::charging_reader(
-                Arc::clone(&self.finalization.accountant),
+                crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
                 read_memory.clone(),
             );
             let row = image
@@ -53292,7 +53304,7 @@ impl Database {
         let snapshot = self.snapshot_for_read();
         let mut edge_keys = HashSet::new();
         let mut identities =
-            crate::memory_accounting::OwnedMemoryReservation::new(Arc::clone(&self.finalization.accountant));
+            crate::memory_accounting::OwnedMemoryReservation::new(crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant));
         for row in self.committed_rows_at(table, snapshot, read_memory.clone())? {
             if row.visible_at(snapshot)
                 && let (Some(source), Some(target), Some(edge_type)) = (
@@ -53944,7 +53956,7 @@ impl Database {
         // declared read memory funds only the reads it asked for.
         drop(read_memory);
         let image = crate::read_image_memory::ImageMemory::charging_for(
-            Arc::clone(&self.finalization.accountant),
+            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
             "vector",
             "prepare_authoritative_vector_purge",
             "Raise MEMORY_LIMIT or reduce the selected purge set before preparing its replacement vector image.",
@@ -55163,7 +55175,7 @@ impl Database {
                     )?;
                     let mut vector_workspace = self
                         .reserve_authoritative_erasure_workspace(selections, read_memory.clone())?;
-                    let erasure_accountant = Arc::clone(&self.finalization.accountant);
+                    let erasure_accountant = crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant);
                     let queue_mutation_token = queue_drain
                         .take()
                         .expect("authoritative purge queue drain is consumed by one commit attempt")
@@ -55178,7 +55190,7 @@ impl Database {
                     )?;
 
                     let mut memory_swap = PreparedMemorySwap::prepare(
-                        Arc::clone(&self.finalization.accountant),
+                        crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
                         prepared.publication_replacements.memory_swap.old_bytes,
                         prepared.publication_replacements.memory_swap.new_bytes,
                         prepared
@@ -55379,7 +55391,7 @@ impl Database {
                     };
 
                     let writer_erasure = persistence.prepare_writer_erasure(
-                        Arc::clone(&self.finalization.accountant),
+                        crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
                         &publication_tables,
                         &prepared.canonical_graph_entries,
                     )?;
@@ -55398,7 +55410,7 @@ impl Database {
                         &persistence_projection,
                         marker,
                         frontier,
-                        erasure_accountant.clone(),
+                        erasure_accountant.vector_budget()?,
                         "authoritative_purge",
                     ) {
                         Ok(published) => published,
@@ -57087,8 +57099,13 @@ impl Database {
         self.relational_store.retained_structure_bytes()
     }
 
-    pub(crate) fn bounded_read_accountant(&self) -> Arc<MemoryAccountant> {
-        Arc::clone(&self.finalization.accountant)
+    #[cfg(test)]
+    pub(crate) fn __accountant_handle_for_test(&self) -> crate::memory_accounting::AccountantHandle {
+        crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant)
+    }
+
+    pub(crate) fn bounded_read_accountant(&self) -> crate::memory_accounting::AccountantHandle {
+        crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant)
     }
 
     pub(crate) fn uses_retained_relational_source(&self) -> bool {
@@ -57131,7 +57148,7 @@ impl Database {
     ) -> Result<Option<u64>> {
         if let Some(source) = &self.retained_relational_source {
             let name_memory = crate::read_image_memory::ImageMemory::charging_reader(
-                Arc::clone(&self.finalization.accountant),
+                crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
                 read_memory.clone(),
             );
             let index = {
@@ -57250,7 +57267,7 @@ impl Database {
         // exactly as count_bearing_index_declarations does. Only the chosen
         // name is copied, under the requesting operation's exact byte charge.
         let name_memory = crate::read_image_memory::ImageMemory::charging_reader_for(
-            Arc::clone(&self.finalization.accountant),
+            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
             read_memory.clone(),
             "committed_count",
             "index_name",
@@ -61530,7 +61547,7 @@ impl Database {
         // outside `MEMORY_LIMIT`.
         let artifact = RedbPersistence::create_with_accountant(
             temp_path,
-            Some(Arc::clone(&self.finalization.accountant)),
+            Some(crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant)),
             crate::persistence::redb_writer_cache_bytes_for_limit(self.finalization.accountant.usage().limit),
         )
         .map_err(|err| export_io_error(dest, &err))?;
@@ -61539,7 +61556,7 @@ impl Database {
             .and_then(|report| {
                 // Compact so `bytes_written` (and the artifact itself) reflect
                 // content size, not allocator slack from the batched copy.
-                artifact.compact(Arc::clone(&self.finalization.accountant))?;
+                artifact.compact(crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant))?;
                 Ok(report)
             });
         artifact.close();
@@ -63466,7 +63483,7 @@ impl Database {
         self.finalization.install_loaded_state_owner(RetainedNonVectorMemoryOwner::new(
             self.relational_store.clone(),
             self.graph_store.clone(),
-            Arc::clone(&self.finalization.accountant),
+            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
         ));
 
         Ok(())
@@ -63525,7 +63542,7 @@ impl Database {
         let bytes =
             self.admit_retained_row_bytes(table, values, meta, subsystem, operation, hint)?;
         Ok(OwnedMemoryReservation::from_admitted(
-            Arc::clone(&self.finalization.accountant),
+            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
             bytes,
         ))
     }
@@ -63757,7 +63774,7 @@ impl Database {
                 .sum()
         });
         let charge = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
-            Arc::clone(&self.finalization.accountant),
+            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
             bytes,
             "relational",
             "mutation_checkpoint",
@@ -64264,7 +64281,7 @@ impl Database {
         let (staged_old, staged_new, staged_repricing) =
             self.staged_rows_priced_across_shape_change(name, old_meta, new_meta);
         PreparedMemorySwap::prepare_for(
-            Arc::clone(&self.finalization.accountant),
+            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
             old_bytes.saturating_add(staged_old),
             new_bytes.saturating_add(staged_new),
             0,
@@ -64326,7 +64343,7 @@ impl Database {
         let (staged_old, staged_new, staged_repricing) =
             self.staged_rows_priced_across_shape_change(table, old_meta, new_meta);
         PreparedMemorySwap::prepare_for(
-            Arc::clone(&self.finalization.accountant),
+            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
             retained_table_metadata_bytes(&self.relational_store, old_meta)
                 .saturating_add(old_rows)
                 .saturating_add(staged_old),
@@ -69715,7 +69732,7 @@ impl Database {
                 })
             })
         };
-        let mut owner = OwnedMemoryReservation::new(Arc::clone(&self.finalization.accountant));
+        let mut owner = OwnedMemoryReservation::new(crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant));
         let mut bytes = 0usize;
         for row in &rows {
             let mut key_bytes = 0usize;
@@ -69926,7 +69943,7 @@ impl Database {
         let snapshot = self.snapshot_for_read();
         let mut overlay = HashMap::new();
         let mut memory =
-            crate::memory_accounting::OwnedMemoryReservation::new(Arc::clone(&self.finalization.accountant));
+            crate::memory_accounting::OwnedMemoryReservation::new(crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant));
 
         for edge in &changes.edges {
             if !dag_edge_types.contains(&edge.edge_type) {
@@ -73045,7 +73062,7 @@ impl Database {
         // Inspection is a read of the physical journal, funded by this store's
         // declared reader child even when the writer is at its admission limit.
         let decode_owner = crate::read_image_memory::ImageMemory::operation_reader(
-            Arc::clone(&self.finalization.accountant),
+            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
             self.declared_reader_memory().expect("journal inspection reader admission"),
         ).expect("journal inspection decode-owner admission");
         let _decode_scope = decode_owner.enter();
@@ -75337,7 +75354,7 @@ impl Database {
             .collect::<Vec<_>>();
         if let Some(persistence) = &self.persistence {
             let memory = crate::read_image_memory::ImageMemory::charging_reader_for(
-                Arc::clone(&self.finalization.accountant),
+                crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
                 read_memory.clone(),
                 "sync_policy",
                 "read_local_refusal_facts",
@@ -75348,7 +75365,7 @@ impl Database {
         } else {
             let progress = self.in_memory_sync_progress.lock();
             let memory = crate::read_image_memory::ImageMemory::charging_reader_for(
-                Arc::clone(&self.finalization.accountant),
+                crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
                 read_memory.clone(),
                 "sync_policy",
                 "read_local_refusal_facts",
@@ -75543,7 +75560,7 @@ impl Database {
             .map(|digest| format!("{}{}", prefix, Self::hex_component(digest)))
             .collect::<Vec<_>>();
         let memory = crate::read_image_memory::ImageMemory::charging_reader_for(
-            Arc::clone(&self.finalization.accountant),
+            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
             read_memory.clone(),
             "sync_policy",
             "read_refused_outcome_lookup",
@@ -75816,7 +75833,7 @@ impl Database {
                     .load_next_config_value_by_source::<DurablePolicyHeldData, _>(
                         &prefix,
                         after.as_ref().map(|(lsn, key)| (*lsn, key.as_str())),
-                        Arc::clone(&self.finalization.accountant),
+                        crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
                         |held| {
                             (held.receipt.tenant_id == *tenant
                                 && held.receipt.node_id == node
@@ -76065,7 +76082,7 @@ impl Database {
     const POLICY_HOLD_MIGRATION_CURSOR: &'static str = "sync_policy_hold_index_cursor.v1";
 
     fn policy_hold_memory(
-        accountant: Arc<MemoryAccountant>,
+        accountant: crate::memory_accounting::AccountantHandle,
     ) -> Arc<crate::read_image_memory::ImageMemory> {
         crate::read_image_memory::ImageMemory::charging_for(
             accountant,
@@ -76141,13 +76158,13 @@ impl Database {
     /// and resume cursor commit together; reopening skips already indexed values.
     fn migrate_policy_hold_indexes(
         persistence: &RedbPersistence,
-        accountant: &Arc<MemoryAccountant>,
+        accountant: &crate::memory_accounting::AccountantHandle,
     ) -> Result<()> {
-        let mut cursor_memory = Self::policy_hold_memory(Arc::clone(accountant));
+        let mut cursor_memory = Self::policy_hold_memory(accountant.clone());
         let mut cursor: Option<String> = persistence
             .load_config_value_admitted(Self::POLICY_HOLD_MIGRATION_CURSOR, &cursor_memory)?;
         loop {
-            let memory = Self::policy_hold_memory(Arc::clone(accountant));
+            let memory = Self::policy_hold_memory(accountant.clone());
             let Some(key) = persistence.next_config_key(
                 Self::POLICY_HOLD_PREFIX,
                 cursor.as_deref(),
@@ -76207,7 +76224,7 @@ impl Database {
         tables: &BTreeSet<String>,
         edges: &BTreeSet<String>,
     ) -> Result<ScopedPolicyHolds> {
-        let memory = Self::policy_hold_memory(Arc::clone(&self.finalization.accountant));
+        let memory = Self::policy_hold_memory(crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant));
         let mut entries = if let Some(persistence) = &self.persistence {
             let mut scopes = BTreeSet::new();
             let tenants = [None, identity.map(|(tenant, _)| tenant)];
@@ -84135,7 +84152,7 @@ fn prune_expired_rows(
     let frontier = MaintenanceFrontier::capture(
         relational_store,
         tx_mgr,
-        crate::persistence::writer_source::SourceWindowOwner::writer(Arc::clone(&ctx.finalization.accountant)),
+        crate::persistence::writer_source::SourceWindowOwner::writer(crate::memory_accounting::AccountantHandle::clone(&ctx.finalization.accountant)),
     )?
     .retention_batch(&metas, "prune", &mut workspace)?;
     let mut retention_progress = frontier.retention_progress().to_vec();
@@ -84501,7 +84518,7 @@ fn prune_expired_rows(
 
     let mut deferred_edge_nodes = HashSet::new();
     let mut deferred_edge_memory =
-        crate::memory_accounting::OwnedMemoryReservation::new(Arc::clone(&ctx.finalization.accountant));
+        crate::memory_accounting::OwnedMemoryReservation::new(crate::memory_accounting::AccountantHandle::clone(&ctx.finalization.accountant));
     {
         writer_read::visit_graph_versions_for_nodes(
             graph_store,
@@ -84556,7 +84573,7 @@ fn prune_expired_rows(
         if let Some(root) = writer_read::durable_root(tx_mgr.capture_published_read().handle)? {
             RedbPersistence::pruned_change_counts_at_root(
                 &root,
-                crate::persistence::writer_source::SourceWindowOwner::writer(Arc::clone(&ctx.finalization.accountant)),
+                crate::persistence::writer_source::SourceWindowOwner::writer(crate::memory_accounting::AccountantHandle::clone(&ctx.finalization.accountant)),
                 &pruned_change_keys,
             )?
         } else {
@@ -84570,7 +84587,7 @@ fn prune_expired_rows(
         .map(|(table, row)| (table.clone(), *row, watermark))
         .collect::<Vec<_>>();
     let memberships =
-        relational_store.prepare_memberships(&membership_deletes, &[], Arc::<MemoryAccountant>::clone(&ctx.finalization.accountant))?;
+        relational_store.prepare_memberships(&membership_deletes, &[], ctx.finalization.accountant.read_budget()?)?;
 
     // Commit-index candidate-only removal, shared with the cleanup path —
     // see the function doc. Over-retention remains the deliberate safe
@@ -85261,7 +85278,7 @@ fn compact_currency_versions_inner(
     relational_store: &Arc<RelationalStore>,
     _graph_store: &Arc<GraphStore>,
     vector_store: &Arc<VectorStore>,
-    accountant: &Arc<MemoryAccountant>,
+    accountant: &crate::memory_accounting::AccountantHandle,
     persistence: Option<&Arc<RedbPersistence>>,
     change_log: &Arc<RwLock<Vec<ChangeLogEntry>>>,
     change_log_table_index: &Arc<RwLock<ChangeLogTableIndex>>,
@@ -85762,7 +85779,7 @@ fn compact_currency_versions_inner(
 fn currency_compaction_pending(
     relational_store: &Arc<RelationalStore>,
     manager: &TransactionManager<DynStore>,
-    accountant: &Arc<MemoryAccountant>,
+    accountant: &crate::memory_accounting::AccountantHandle,
     tables: &[&str],
     threshold: usize,
 ) -> Result<bool> {

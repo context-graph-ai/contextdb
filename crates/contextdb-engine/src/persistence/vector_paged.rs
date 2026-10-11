@@ -3294,7 +3294,7 @@ impl RedbPersistence {
     }
 
     fn admit_vector_image_build_route_with_owner(
-        accountant: Option<Arc<crate::memory_accounting::MemoryAccountant>>,
+        accountant: Option<crate::memory_accounting::AccountantHandle>,
         key: &[u8],
         stored_bytes: usize,
     ) -> Result<Option<crate::memory_accounting::OwnedMemoryReservation>> {
@@ -3323,7 +3323,7 @@ impl RedbPersistence {
         &self,
         write: &redb::WriteTransaction,
         affected_tables: &HashSet<String>,
-        accountant: Arc<crate::memory_accounting::MemoryAccountant>,
+        accountant: crate::memory_accounting::AccountantHandle,
     ) -> Result<()> {
         let builds = write.open_table(BUILDS).map_err(Self::storage_error)?;
         for table in affected_tables {

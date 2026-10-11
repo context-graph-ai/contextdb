@@ -2045,12 +2045,12 @@ impl Database {
 }
 
 pub(super) struct WriterStagedPostingAdmission {
-    accountant: Option<Arc<crate::memory_accounting::MemoryAccountant>>,
+    accountant: Option<crate::memory_accounting::AccountantHandle>,
     writer_use: Option<crate::memory_accounting::WriterUse>,
     control: Option<crate::memory_accounting::ControlCredit>,
 }
 impl WriterStagedPostingAdmission {
-    pub(super) fn prepare(accountant: Arc<crate::memory_accounting::MemoryAccountant>) -> Result<Arc<Self>> {
+    pub(super) fn prepare(accountant: crate::memory_accounting::AccountantHandle) -> Result<Arc<Self>> {
         let mut value = Self {
             writer_use: crate::memory_accounting::WriterUse::retain_if_writer(&accountant),
             accountant: Some(accountant),

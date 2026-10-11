@@ -7,7 +7,7 @@
 //! them without the vector store holding any decoded directory. Each record
 //! read is authenticated (checksum, key and route) before it is used.
 use super::*;
-use crate::memory_accounting::{MemoryAccountant, StoreAccountantHandle};
+use crate::memory_accounting::{StoreAccountantHandle};
 use contextdb_vector::store::{
     DormantRawVectorLoader, DormantVectorLoadRequest, RawVectorInspectionSnapshot,
     RawVectorMembershipCursor, RawVectorMembershipSource, RawVectorMembershipSummary,
@@ -1022,7 +1022,7 @@ impl DurableMembershipSource {
         published_root: Option<PublishedMembershipRoot>,
         partition: &VectorPartitionRef,
         summary: RawVectorMembershipSummary,
-        accountant: Arc<MemoryAccountant>,
+        accountant: crate::memory_accounting::AccountantHandle,
         workspace: &mut contextdb_vector::VectorCopyAdmission,
         mut retained: contextdb_vector::VectorCopyAdmission,
     ) -> Result<Arc<Self>> {
@@ -2223,7 +2223,7 @@ impl DurableReverseMembershipSource {
         source_owner: MembershipOwner,
         index: &VectorIndexRef,
 
-        accountant: Arc<MemoryAccountant>,
+        accountant: crate::memory_accounting::AccountantHandle,
         workspace: &mut contextdb_vector::VectorCopyAdmission,
         mut retained: contextdb_vector::VectorCopyAdmission,
     ) -> Result<Arc<Self>> {

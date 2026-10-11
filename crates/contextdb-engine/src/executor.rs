@@ -400,7 +400,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<(Statement, PhysicalPlan)>;
 
-    fn bounded_read_accountant(&self) -> Arc<crate::memory_accounting::MemoryAccountant>;
+    fn bounded_read_accountant(&self) -> crate::memory_accounting::AccountantHandle;
 
     fn declared_read_request_provider(
         &self,
@@ -1581,7 +1581,7 @@ impl ReadExecutionTarget for Database {
         Database::declared_read_request_provider(self)
     }
 
-    fn bounded_read_accountant(&self) -> Arc<crate::memory_accounting::MemoryAccountant> {
+    fn bounded_read_accountant(&self) -> crate::memory_accounting::AccountantHandle {
         Database::bounded_read_accountant(self)
     }
 
@@ -4462,7 +4462,7 @@ fn execute_create_table_plan(
                     &p.name,
                     &idx.name,
                     idx.columns.clone(),
-                    db.bounded_read_accountant(),
+                    db.bounded_read_accountant().read_budget()?,
                 );
             }
             // Publication installs vector layouts from the newly prepared
@@ -4510,7 +4510,7 @@ fn execute_create_table_plan(
                     &p.name,
                     &idx.name,
                     idx.columns.clone(),
-                    db.bounded_read_accountant(),
+                    db.bounded_read_accountant().read_budget()?,
                 );
             }
             Ok(())
@@ -20512,7 +20512,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         self.store.declared_read_request_provider()
     }
 
-    fn bounded_read_accountant(&self) -> Arc<crate::memory_accounting::MemoryAccountant> {
+    fn bounded_read_accountant(&self) -> crate::memory_accounting::AccountantHandle {
         self.store.bounded_read_accountant()
     }
 

@@ -1,6 +1,6 @@
 //! Key-only vector identities for admitted schema and integrity walks.
 use super::*;
-use crate::memory_accounting::{MemoryAccountant, OwnedMemoryReservation};
+use crate::memory_accounting::{OwnedMemoryReservation};
 use std::ops::Bound;
 
 pub(crate) struct VectorBodyIdentity {
@@ -49,7 +49,7 @@ pub(crate) fn decode_key(key: &[u8]) -> Result<VectorBodyIdentity> {
 pub(crate) fn visit_table<T: redb::ReadableTable<&'static [u8], &'static [u8]>>(
     table: &T,
     table_name: Option<&str>,
-    accountant: Arc<MemoryAccountant>,
+    accountant: crate::memory_accounting::AccountantHandle,
     before: &mut dyn FnMut() -> Result<()>,
     visit: &mut dyn FnMut(VectorBodyIdentity) -> Result<()>,
 ) -> Result<()> {
