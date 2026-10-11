@@ -410,7 +410,8 @@ fn check_route(
     };
 
     // (a) Every non-empty layer of every admitted Context is opened by the one
-    // search, and the budget is the same however many Contexts it admits.
+    // request. INDEXED gives each admitted index its declared cap, so the
+    // request reports their aggregate rather than a made-up global cap.
     let open_query = scattered(999_983);
     let narrow = ask("one Context", &[0], open_query.clone(), true);
     let wide = ask("every Context", &every_context(), open_query, true);
@@ -429,14 +430,22 @@ fn check_route(
             ));
         }
     }
-    if let (Some((_, narrow)), Some((_, wide))) = (&narrow, &wide)
-        && narrow.budget != wide.budget
-    {
-        failures.borrow_mut().push(format!(
-            "{route}: the budget is one search's, not one per Context: {} at one Context, {} \
-             at {SEEN}",
-            narrow.budget, wide.budget
-        ));
+    if let (Some((_, narrow)), Some((_, wide))) = (&narrow, &wide) {
+        let per_index_cap = narrow
+            .resolved_ef_search
+            .saturating_mul(narrow.layer_zero_degree);
+        if narrow.budget != 3_200
+            || narrow.budget != per_index_cap
+            || wide.budget != SEEN * per_index_cap
+        {
+            failures.borrow_mut().push(format!(
+                "{route}: INDEXED gives each index its declared cap: expected 3,200 for one \
+                 Context and {} for {SEEN}, got {} and {}; receipts {narrow:?} {wide:?}",
+                SEEN * per_index_cap,
+                narrow.budget,
+                wide.budget
+            ));
+        }
     }
 
     // (b) The nearest row lives only in a sealed change, then only in a live
