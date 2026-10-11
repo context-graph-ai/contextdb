@@ -1,5 +1,8 @@
 //! Vector copies use the requesting reader's existing budget capability.
-use contextdb_core::{Result, read_memory::ReadMemoryBudget};
+use contextdb_core::{
+    Result,
+    read_memory::{ReadMemoryBudget, ReadMemoryOwner},
+};
 use contextdb_vector::{MemoryBudget, VectorCopyAdmission};
 use std::sync::Arc;
 
@@ -32,6 +35,42 @@ pub fn admission(read_memory: Arc<dyn ReadMemoryBudget>) -> VectorCopyAdmission 
 
 pub trait ReadRequestBudgetProvider: std::fmt::Debug + Send + Sync {
     fn request_budget(&self) -> Result<Arc<dyn ReadMemoryBudget>>;
+
+    /// Existing host providers acquire their exact legacy capability once.
+    #[doc(hidden)]
+    fn request_budget_owner(&self) -> Result<RequestReadOwner> {
+        self.request_budget().map(RequestReadOwner::legacy)
+    }
+}
+
+/// An acquired request capability whose native provenance is sealed here.
+#[derive(Debug)]
+#[doc(hidden)]
+pub struct RequestReadOwner(RequestReadRoute);
+
+#[derive(Debug)]
+#[allow(dead_code)] // Consumed by the separately owned native dispatch integration.
+pub(crate) enum RequestReadRoute {
+    Legacy(Arc<dyn ReadMemoryBudget>),
+    Native(NativeReadChildReceipt),
+}
+
+#[derive(Debug)]
+pub(crate) struct NativeReadChildReceipt {
+    #[allow(dead_code)] // Retained now; native dispatch will consume this owner.
+    owner: ReadMemoryOwner,
+}
+impl RequestReadOwner {
+    pub(crate) fn legacy(reader: Arc<dyn ReadMemoryBudget>) -> Self {
+        Self(RequestReadRoute::Legacy(reader))
+    }
+    pub(crate) fn native(receipt: NativeReadChildReceipt) -> Self {
+        Self(RequestReadRoute::Native(receipt))
+    }
+    #[allow(dead_code)] // Additive companion ahead of native dispatch integration.
+    pub(crate) fn into_route(self) -> RequestReadRoute {
+        self.0
+    }
 }
 #[derive(Debug)]
 pub struct DeclaredReadMemory {
@@ -101,6 +140,29 @@ impl DeclaredReadMemory {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Admit the actual native cell against this original declared parent.
+    pub(crate) fn native_child(self: &Arc<Self>) -> Result<NativeReadChildReceipt> {
+        let control_bytes =
+            ReadMemoryOwner::native_layout::<NativeDeclaredChild, NativeChildInvoice>().size();
+        self.try_reserve(
+            control_bytes,
+            "reader",
+            "request_owner",
+            "Reduce simultaneous requests or raise the declared reader memory limit.",
+        )?;
+        self.live_child_control_bytes
+            .fetch_add(control_bytes as u64, std::sync::atomic::Ordering::SeqCst);
+        let invoice = NativeChildInvoice {
+            parent: self.clone(),
+            bytes: control_bytes,
+        };
+        let payload = NativeDeclaredChild {
+            parent: self.clone(),
+            retained: std::sync::atomic::AtomicU64::new(0),
+        };
+        ReadMemoryOwner::try_native(payload, invoice).map(|owner| NativeReadChildReceipt { owner })
+    }
+
     pub fn child(self: &Arc<Self>) -> Result<Arc<dyn ReadMemoryBudget>> {
         let control_bytes =
             std::mem::size_of::<DeclaredReadChild>() + 2 * std::mem::size_of::<usize>();
@@ -130,6 +192,49 @@ struct DeclaredReadChild {
     control_bytes: usize,
     parent: Arc<DeclaredReadMemory>,
     retained: std::sync::atomic::AtomicU64,
+}
+/// The invoice, not the payload, owns the native block's parent debit.
+#[derive(Debug)]
+struct NativeChildInvoice {
+    parent: Arc<DeclaredReadMemory>,
+    bytes: usize,
+}
+impl Drop for NativeChildInvoice {
+    fn drop(&mut self) {
+        self.parent
+            .live_child_control_bytes
+            .fetch_sub(self.bytes as u64, std::sync::atomic::Ordering::SeqCst);
+        self.parent.release(self.bytes);
+    }
+}
+#[derive(Debug)]
+struct NativeDeclaredChild {
+    parent: Arc<DeclaredReadMemory>,
+    retained: std::sync::atomic::AtomicU64,
+}
+impl ReadMemoryBudget for NativeDeclaredChild {
+    fn try_reserve(
+        &self,
+        bytes: usize,
+        subsystem: &'static str,
+        operation: &'static str,
+        hint: &'static str,
+    ) -> Result<()> {
+        self.parent.try_reserve(bytes, subsystem, operation, hint)?;
+        let held = self
+            .retained
+            .fetch_add(bytes as u64, std::sync::atomic::Ordering::SeqCst)
+            + bytes as u64;
+        self.parent
+            .file_child_high_water
+            .fetch_max(held, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+    fn release(&self, bytes: usize) {
+        self.retained
+            .fetch_sub(bytes as u64, std::sync::atomic::Ordering::SeqCst);
+        self.parent.release(bytes);
+    }
 }
 fn reader_memory_refusal(
     limit: u64,
@@ -244,6 +349,9 @@ impl ReadRequestBudgetProvider for Arc<DeclaredReadMemory> {
     fn request_budget(&self) -> Result<Arc<dyn ReadMemoryBudget>> {
         self.child()
     }
+    fn request_budget_owner(&self) -> Result<RequestReadOwner> {
+        self.native_child().map(RequestReadOwner::native)
+    }
 }
 
 #[cfg(any(test, feature = "test-seams"))]
@@ -286,7 +394,7 @@ impl Drop for ReaderAclCacheBudget {
     }
 }
 
-// Weak observation of the native owner, without extending its charge lifetime.
+// Legacy-only Weak observation; it does not certify native physical free.
 #[cfg(any(test, feature = "test-seams"))]
 #[derive(Clone)]
 pub(crate) struct DeclaredReadChildObserver {
@@ -304,16 +412,23 @@ impl DeclaredReadChildObserver {
         crate::read_work_probe::DeclaredReadChildFunding {
             owner_identity: self.owner_identity,
             alive: child.is_some(),
-            charged_bytes: child.as_ref().map_or(0, |child| child.retained.load(Ordering::SeqCst)),
+            charged_bytes: child
+                .as_ref()
+                .map_or(0, |child| child.retained.load(Ordering::SeqCst)),
             parent_identity: self.parent_identity,
             parent_alive: parent.is_some(),
-            parent_charged_bytes: parent.as_ref().map_or(0, |parent| parent.retained.load(Ordering::SeqCst)),
+            parent_charged_bytes: parent
+                .as_ref()
+                .map_or(0, |parent| parent.retained.load(Ordering::SeqCst)),
         }
     }
 }
 #[cfg(any(test, feature = "test-seams"))]
-fn child_observers() -> &'static std::sync::Mutex<std::collections::HashMap<usize, DeclaredReadChildObserver>> {
-    static OBSERVERS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, DeclaredReadChildObserver>>> = std::sync::OnceLock::new();
+fn child_observers()
+-> &'static std::sync::Mutex<std::collections::HashMap<usize, DeclaredReadChildObserver>> {
+    static OBSERVERS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<usize, DeclaredReadChildObserver>>,
+    > = std::sync::OnceLock::new();
     OBSERVERS.get_or_init(Default::default)
 }
 #[cfg(any(test, feature = "test-seams"))]
@@ -325,10 +440,19 @@ fn register_child_observer(child: &Arc<DeclaredReadChild>) {
         owner_identity,
         parent_identity: Arc::as_ptr(&child.parent) as usize,
     };
-    child_observers().lock().unwrap_or_else(|error| error.into_inner()).insert(owner_identity, observer);
+    child_observers()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(owner_identity, observer);
 }
 #[cfg(any(test, feature = "test-seams"))]
-pub(crate) fn declared_child_observer(read_memory: &Arc<dyn ReadMemoryBudget>) -> Option<DeclaredReadChildObserver> {
+pub(crate) fn declared_child_observer(
+    read_memory: &Arc<dyn ReadMemoryBudget>,
+) -> Option<DeclaredReadChildObserver> {
     let identity = Arc::as_ptr(read_memory) as *const () as usize;
-    child_observers().lock().unwrap_or_else(|error| error.into_inner()).get(&identity).cloned()
+    child_observers()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&identity)
+        .cloned()
 }
