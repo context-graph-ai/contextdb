@@ -14260,6 +14260,11 @@ fn candidate_runs_admit_whole_partitions(
     )?;
     context.reserve(BoundedWorkSource::IndexRange, planned)?;
     let mut coverage_charge = ReservedBytes::new(context, planned);
+    // These guards must outlive every buffer they fund.  That makes every
+    // early return and error unwind free the physical allocation before its
+    // exact reservation is refunded.
+    let mut prefix_charge = ReservedBytes::new(context, 0);
+    let mut key_charge = ReservedBytes::new(context, 0);
 
     let mut keys = Vec::new();
     keys.try_reserve_exact(partition_count)
@@ -14462,8 +14467,8 @@ fn candidate_runs_admit_whole_partitions(
     let actual = checked_size_add(prefix_bytes, key_bytes, "candidate coverage buffers")?;
     coverage_charge.bytes = 0;
     reconcile_new_reservation(context, BoundedWorkSource::IndexRange, planned, actual)?;
-    let prefix_charge = ReservedBytes::new(context, prefix_bytes);
-    let mut key_charge = ReservedBytes::new(context, key_bytes);
+    prefix_charge.bytes = prefix_bytes;
+    key_charge.bytes = key_bytes;
     if !prefixes.is_empty() {
         let empty = db.bounded_verified_index_prefixes_are_empty(
             &state.table,
@@ -14704,6 +14709,10 @@ fn build_vector_kernel<'plan>(
     // The row gate and the statement's own predicate still judge every row
     // that is published, and the scan's index still names any row that
     // contradicts it (`materialize_scored_row`).
+    // This guard is deliberately declared before `whole_partitions`: an
+    // identity-note failure drops the returned keys first, then refunds the
+    // credit that was transferred out of the candidate proof.
+    let mut whole_partition_charge = ReservedBytes::new(context, 0);
     let whole_partitions = match (
         candidate_root.as_ref(),
         vector_column.partition_key_columns.as_deref(),
@@ -14722,6 +14731,9 @@ fn build_vector_kernel<'plan>(
         }
         _ => None,
     };
+    whole_partition_charge.bytes = whole_partitions
+        .as_ref()
+        .map_or(0, |admission| admission.retained_bytes);
     let candidate_root_was_kept = whole_partitions.is_none();
     if !candidate_root_was_kept {
         note_vector_candidate_identity("candidate runs admit whole partitions")?;
@@ -14730,12 +14742,6 @@ fn build_vector_kernel<'plan>(
     // What this handle's own transaction has done to these vectors, decided
     // once here rather than asked per entry. Charged before it is held, like
     // the row overlay a scan takes.
-    let mut whole_partition_charge = ReservedBytes::new(
-        context,
-        whole_partitions
-            .as_ref()
-            .map_or(0, |admission| admission.retained_bytes),
-    );
     let mut overlay_bytes = 0;
     let vector_overlay = match context.transaction() {
         Some(tx) => {
