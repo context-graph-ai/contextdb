@@ -285,6 +285,13 @@ pub(crate) fn accepted_identity(
         let native =
             vector_partition_route_native_capacity(payload).map_err(|reason| damage(&reason))?;
         scratch.reserve(native.saturating_mul(8))?;
+        // All decoded fields are transient; only two scalar identities leave
+        // this lookup. Release their codec charges after the record and keys
+        // are freed, rather than retaining them until the enclosing operation.
+        let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
+        let _record_scope = crate::read_image_memory::active_owner()?
+            .row_owner()?
+            .enter();
         let record = vector_membership_pages::decode_reverse_member(&identity, source.value())?;
         if record.index != *index
             || record.row_id != accepted.row_id
@@ -503,6 +510,37 @@ mod tests {
             "last CURRENT metadata owner refunds the executing reader"
         );
         (result, work.membership_keys_examined)
+    }
+
+    #[test]
+    fn repeated_current_probes_release_transient_decode_before_the_next_row() {
+        let (_directory, persistence, writer, record) = fixture(1);
+        let root = persistence
+            .initialize_writer_snapshot(SnapshotId(1), Lsn(1))
+            .unwrap();
+        let decode = persistence.writer_decode_scope().unwrap();
+        assert_eq!(
+            read(&root, &record, &row(&record), 8 * 1024 * 1024)
+                .0
+                .unwrap(),
+            Some((TxId(1), Lsn(1)))
+        );
+        let used = writer.usage().used;
+        writer.set_budget(Some(used + 16 * 1024)).unwrap();
+        for _ in 0..256 {
+            assert_eq!(
+                read(&root, &record, &row(&record), 8 * 1024 * 1024)
+                    .0
+                    .unwrap(),
+                Some((TxId(1), Lsn(1)))
+            );
+            assert_eq!(writer.usage().used, used);
+        }
+        drop(decode);
+        drop(root);
+        drop(persistence);
+        assert_eq!(writer.usage().used, 0);
+        assert_eq!(writer.underflow_count_for_test(), 0);
     }
 
     #[test]
