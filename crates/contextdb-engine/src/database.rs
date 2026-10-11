@@ -37,6 +37,7 @@ mod vector_quarantine_inventory_admission_tests;
 mod vector_retry_frontier_integrity_tests;
 mod vector_source_page_admission;
 mod vector_writer_session;
+mod vector_import_tail;
 #[doc(hidden)]
 pub use vector_writer_session::WriterVectorSession;
 #[cfg(feature = "test-seams")]
@@ -127,8 +128,8 @@ thread_local! {
 
 /// The engine format values written beside the independently versioned HNSW
 /// byte envelope. A loader refuses either mismatch before exposing a route.
-const VECTOR_GRAPH_ALGORITHM_VERSION: u16 = 1;
-const VECTOR_GRAPH_FORMAT_VERSION: u16 = 1;
+pub(crate) const VECTOR_GRAPH_ALGORITHM_VERSION: u16 = 1;
+pub(crate) const VECTOR_GRAPH_FORMAT_VERSION: u16 = 1;
 
 /// One private replay slot per authenticated edge identity. A later request
 /// from the same edge can exist on the ordinary client path only after the
@@ -18916,7 +18917,24 @@ fn paged_generation_graph_from(
     base_covered: (TxId, Lsn),
 ) -> Result<HnswIndex> {
     use crate::persistence::vector_paged::{NativePagedGraphSource, PagedGenerationMeta};
-    let meta = PagedGenerationMeta::decode(meta_bytes)?;
+    let mut backing_owner = contextdb_vector::VectorCopyAdmission::new(accountant.clone());
+    backing_owner.reserve_for(
+        meta_bytes
+            .len()
+            .checked_mul(12)
+            .and_then(|bytes| bytes.checked_add(4096))
+            .ok_or_else(|| {
+                crate::persistence::vector_paged::corruption("saved backing workspace overflow")
+            })?,
+        "vector",
+        "resolve_native_change_backing",
+        "Release idle vector state before resolving a saved backing.",
+    )?;
+    let original = PagedGenerationMeta::decode(meta_bytes)?;
+    let (read, _root) = capture()?;
+    let meta = crate::persistence::vector_paged::import_tail::resolve_native_change_backing(
+        &read, &original,
+    )?;
     let progress = meta.progress()?;
     if progress.generation_id != descriptor.generation_id
         || progress.frontier_tx != descriptor.covered_tx
@@ -21232,7 +21250,14 @@ impl MaintenanceContext {
         };
         // Every retry re-enters format selection. A captured frontier that
         // outgrew an earlier estimate forces the existing paged base route.
-        let mut force_paged = false;
+        let mut force_paged = persistence
+            .load_vector_partition_generation_catalog_for(
+                &partition.index,
+                &partition.partition_key,
+            )?
+            .map(|catalog| persistence.catalog_has_native_import_backing(&catalog))
+            .transpose()?
+            .unwrap_or(false);
         let mut force_base_export = false;
         loop {
             if let Some(outcome) =
@@ -21499,26 +21524,31 @@ impl MaintenanceContext {
                     );
                     if held.is_none() {
                         let native_bytes = resident_insertion_runtime_bytes(workers)?;
-                        if !self.finalization.accountant.activate_resident_insertion_runtime(
-                            workers,
-                            native_bytes,
-                            workspace.retained_bytes(),
-                            peak,
-                            || {
-                                workspace.resize(
+                        if !self
+                            .finalization
+                            .accountant
+                            .activate_resident_insertion_runtime(
+                                workers,
+                                native_bytes,
+                                workspace.retained_bytes(),
+                                peak,
+                                || {
+                                    workspace.resize(
                                     peak,
                                     "prepare_vector_generation",
                                     "Raise MEMORY_LIMIT before compacting this maintained route.",
                                 )
-                            },
-                        )? {
+                                },
+                            )?
+                        {
                             continue;
                         }
                     } else {
                         // Every writer headroom already includes the one held
                         // process reservation. Never debit it in this helper.
                         if self
-                            .finalization.accountant
+                            .finalization
+                            .accountant
                             .available_after_releasing(workspace.retained_bytes())
                             .is_some_and(|available| available < peak)
                         {
@@ -21552,8 +21582,12 @@ impl MaintenanceContext {
                     0
                 };
                 let peak = workspace_plan.complete_peak_bytes().max(export_peak);
-                if self.finalization.accountant.available_after_releasing(workspace.retained_bytes())
-                    .is_some_and(|available| available < peak) {
+                if self
+                    .finalization
+                    .accountant
+                    .available_after_releasing(workspace.retained_bytes())
+                    .is_some_and(|available| available < peak)
+                {
                     force_paged = true;
                     continue;
                 }
@@ -21593,7 +21627,8 @@ impl MaintenanceContext {
                         .saturating_add(cleanup_peak),
                 );
                 let complete_fits = self
-                    .finalization.accountant
+                    .finalization
+                    .accountant
                     .usage()
                     .available
                     .is_none_or(|available| available >= peak);
@@ -22443,8 +22478,7 @@ impl MaintenanceContext {
                                                 &partition.partition_key,
                                             )?
                                             .filter(|durable| {
-                                                durable.base.generation_id
-                                                    == repaired_generation_id
+                                                durable.base.generation_id == repaired_generation_id
                                             })
                                         {
                                             match self.install_published_vector_catalog(
@@ -22453,7 +22487,9 @@ impl MaintenanceContext {
                                             ) {
                                                 Ok(()) => {}
                                                 Err(
-                                                    install @ (Error::MemoryBudgetExceeded { .. }
+                                                    install @ (Error::MemoryBudgetExceeded {
+                                                        ..
+                                                    }
                                                     | Error::DiskBudgetExceeded { .. }),
                                                 ) => {
                                                     self.retain_published_vector_cleanup_failure(

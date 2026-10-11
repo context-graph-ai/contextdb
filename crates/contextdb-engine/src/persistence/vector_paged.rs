@@ -8,6 +8,8 @@
 //! exact-key directories live under a storage identity in `PAGES`; a published
 //! generation is served from those same pages through a reader that holds one
 //! captured writer root. Nothing here keeps a population-sized collection.
+pub(crate) mod import_tail;
+
 use super::vector_membership_pages;
 use super::*;
 use contextdb_vector::hnsw::paged_builder::{
@@ -38,6 +40,20 @@ const FLOORS: TableDefinition<&[u8], u64> = TableDefinition::new("vector_build_f
 pub(crate) const RESIDENT_EXPORT_MARKER: &[u8] = b"resident-export";
 
 const NEXT_STORAGE: &str = "next_storage_id";
+
+// A native import tail owns its byte table. Its catalog authenticates the
+// physical root, so publishing a successor examines no preceding point pages.
+// Reserve a namespace that still fits the existing SQL INTEGER inspection contract.
+pub(crate) const MUTABLE_STORAGE: u64 = 1 << 62;
+pub(crate) const MUTABLE_PAGE_SET: u64 = u64::MAX;
+
+pub(super) fn page_table_name(storage_id: u64) -> String {
+    if storage_id & MUTABLE_STORAGE != 0 {
+        format!("vector_paged_tail_{storage_id:016x}")
+    } else {
+        PAGES.name().to_owned()
+    }
+}
 
 const KIND_POINT: u8 = 1;
 const KIND_IDENTITY: u8 = 2;
@@ -104,7 +120,7 @@ impl PagedBuildReason {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(super) struct ProgressRecord {
+pub(crate) struct ProgressRecord {
     pub(super) generation_id: u64,
     pub(super) declaration_digest: u64,
     pub(super) frontier_tx: u64,
@@ -194,7 +210,7 @@ fn phase_from_code(code: u8) -> Result<PagedVectorPhase> {
 }
 
 impl ProgressRecord {
-    pub(super) fn from_progress(progress: &PagedVectorProgress) -> Self {
+    pub(crate) fn from_progress(progress: &PagedVectorProgress) -> Self {
         Self {
             generation_id: progress.generation_id,
             declaration_digest: progress.declaration_digest,
@@ -245,7 +261,7 @@ pub(crate) struct PagedBuildRecord {
     pub(crate) previous_generation_id: u64,
     pub(crate) reason: PagedBuildReason,
     pub(crate) declaration: PagedDeclaration,
-    pub(super) progress: ProgressRecord,
+    pub(crate) progress: ProgressRecord,
     pub(crate) schema_binding: VectorSchemaBinding,
 }
 
@@ -264,7 +280,7 @@ pub(crate) struct PagedGenerationMeta {
     pub(super) magic: [u8; 8],
     pub(crate) storage_id: u64,
     pub(crate) declaration: PagedDeclaration,
-    pub(super) progress: ProgressRecord,
+    pub(crate) progress: ProgressRecord,
     pub(crate) saved: Option<SavedGenerationBinding>,
     pub(crate) schema_binding: VectorSchemaBinding,
     pub(crate) page_set: PageSetRoot,
@@ -560,7 +576,10 @@ pub(super) fn damage_route_pages_in_write_for_test(
 ) -> Result<()> {
     use crate::persistence::PagedRouteFaultForTest as Fault;
     let storage = storage_prefix(storage_id);
-    let mut pages = write.open_table(PAGES).map_err(RedbPersistence::storage_error)?;
+    let name = page_table_name(storage_id);
+    let mut pages = write
+        .open_table(TableDefinition::<&[u8], &[u8]>::new(&name))
+        .map_err(RedbPersistence::storage_error)?;
     let (key, value) = match fault {
         Fault::FlipFirstPointPage => {
             let (key, mut value) = first_page_in_write(&pages, &storage, Some(KIND_POINT), false)?;
@@ -1762,8 +1781,9 @@ impl<'t> NativeBatch<'t> {
         hooks: &'t PagedBuildHooks,
         publication: Option<&'t PagedPublication>,
     ) -> Result<Self> {
+        let page_name = page_table_name(storage_id);
         let pages = write
-            .open_table(PAGES)
+            .open_table(TableDefinition::<&[u8], &[u8]>::new(&page_name))
             .map_err(RedbPersistence::storage_error)?;
         let scratch = write
             .open_table(SCRATCH)
@@ -2010,9 +2030,7 @@ impl PagedVectorTransaction for NativeBatch<'_> {
             ));
         }
         let key = point_key(&self.storage, id);
-        self.pages
-            .insert(key.as_slice(), seal_value(&key, &bytes).as_slice())
-            .map_err(RedbPersistence::storage_error)?;
+        self.write_graph_page(key.as_slice(), &seal_value(&key, &bytes))?;
         Ok(())
     }
 
@@ -2026,28 +2044,67 @@ impl PagedVectorTransaction for NativeBatch<'_> {
         {
             return Err(corruption("paged identity would overwrite a stored point"));
         }
-        self.pages
-            .insert(
-                key.as_slice(),
-                seal_value(&key, &encode_identity(identity)).as_slice(),
-            )
-            .map_err(RedbPersistence::storage_error)?;
+        self.write_graph_page(
+            key.as_slice(),
+            &seal_value(&key, &encode_identity(identity)),
+        )?;
+        if u64::from_be_bytes(self.storage) & MUTABLE_STORAGE != 0 {
+            let key = import_tail::source_identity_key(
+                u64::from_be_bytes(self.storage),
+                identity.row_id,
+                identity.created_tx,
+                identity.lsn,
+            );
+            let payload = (identity.data_id as u64).to_be_bytes();
+            self.write_graph_page(key.as_slice(), &seal_value(&key, &payload))?;
+        }
+        if u64::from_be_bytes(self.storage) & MUTABLE_STORAGE != 0 {
+            let mut prefix = self.storage.to_vec();
+            prefix.push(KIND_ROW);
+            prefix.extend_from_slice(&identity.row_id.0.to_be_bytes());
+            let upper = writer_source::prefix_end(&prefix)
+                .ok_or_else(|| corruption("native row prefix has no successor"))?;
+            let exists = self
+                .pages
+                .range::<&[u8]>(prefix.as_slice()..upper.as_slice())
+                .map_err(RedbPersistence::storage_error)?
+                .next()
+                .transpose()
+                .map_err(RedbPersistence::storage_error)?
+                .is_some();
+            if !exists {
+                let mut key = self.storage.to_vec();
+                key.push(6);
+                let count = self
+                    .pages
+                    .get(key.as_slice())
+                    .map_err(RedbPersistence::storage_error)?
+                    .map(|value| {
+                        let bytes = open_value(&key, value.value())?;
+                        let bytes: [u8; 8] = bytes
+                            .try_into()
+                            .map_err(|_| corruption("native row counter has the wrong width"))?;
+                        Ok::<_, Error>(u64::from_be_bytes(bytes))
+                    })
+                    .transpose()?
+                    .unwrap_or(0)
+                    .checked_add(1)
+                    .ok_or_else(|| corruption("native row counter overflow"))?;
+                self.write_graph_page(key.as_slice(), &seal_value(&key, &count.to_be_bytes()))?;
+            }
+        }
         let row = row_key(&self.storage, identity.row_id, identity.data_id);
-        self.pages
-            .insert(
-                row.as_slice(),
-                seal_value(&row, &encode_point_id(identity.point)).as_slice(),
-            )
-            .map_err(RedbPersistence::storage_error)?;
+        self.write_graph_page(
+            row.as_slice(),
+            &seal_value(&row, &encode_point_id(identity.point)),
+        )?;
         let exact = exact_key(
             &self.storage,
             &identity.exact_key,
             identity.row_id,
             identity.data_id,
         );
-        self.pages
-            .insert(exact.as_slice(), seal_value(&exact, &[]).as_slice())
-            .map_err(RedbPersistence::storage_error)?;
+        self.write_graph_page(exact.as_slice(), &seal_value(&exact, &[]))?;
         self.inserted += 1;
         (self.hooks.inserted)(self.previous.graph.points + self.inserted);
         Ok(())
@@ -2444,11 +2501,19 @@ impl PagedVectorGraphSource for NativePagedGraphSource {
             self.schema_binding,
         )?;
         validate_pages_root(&read)?;
+        let page_name = page_table_name(self.storage_id);
+        let table = TableDefinition::<&[u8], &[u8]>::new(&page_name);
         let pages_table_root = read
-            .table_root_fingerprint(PAGES)
+            .table_root_fingerprint(table)
             .map_err(RedbPersistence::storage_error)?
             .unwrap_or([0; 32]);
-        let pages = match read.open_table(PAGES) {
+        let mutable = self.storage_id & MUTABLE_STORAGE != 0;
+        if mutable != (self.page_set.pages == MUTABLE_PAGE_SET)
+            || (mutable && pages_table_root != self.page_set.digest)
+        {
+            return Err(route_page_corrupt());
+        }
+        let pages = match read.open_table(table) {
             Ok(table) => table,
             Err(redb::TableError::TableDoesNotExist(_)) => {
                 return Err(corruption("published paged generation has no page table"));
@@ -2525,6 +2590,11 @@ impl PagedVectorReader for NativePagedReader {
             // The first read of this load answers nothing until the route's
             // whole committed page set verifies; later reads reuse that proof.
             let mut verified = self.verified.lock();
+            if self.page_set.pages == MUTABLE_PAGE_SET {
+                // The selected root authenticated the table's Merkle root
+                // before any record was admitted to this reader.
+                *verified = true;
+            }
             if !*verified
                 && page_set_proven(self.storage_id, &self.page_set, self.pages_table_root)
             {
@@ -2763,6 +2833,8 @@ impl RedbPersistence {
             let key = Self::vector_partition_prefix(index, partition);
             saved.route = *blake3::hash(&key).as_bytes();
         }
+        let route = Self::vector_partition_prefix(index, partition);
+        import_tail::rebind_native_change_backing_in_write(write, &graph.bytes, &meta, &route)?;
         graph.bytes = Self::encode(&meta)?;
         graph.checksum = *blake3::hash(&graph.bytes).as_bytes();
         Ok(())
@@ -3377,12 +3449,29 @@ impl RedbPersistence {
             progress.phase = PagedVectorPhase::Encoding;
             progress.last_source_key = Some(RESIDENT_EXPORT_MARKER.to_vec());
         }
+        let selected_native = self
+            .load_vector_partition_generation_catalog_for(
+                &partition.index,
+                &partition.partition_key,
+            )?
+            .map(|catalog| self.catalog_has_native_import_backing(&catalog))
+            .transpose()?
+            .unwrap_or(false);
         self.with_db(|db| {
             let write = db.begin_write().map_err(Self::storage_error)?;
             let schema_binding = Self::vector_schema_binding_in_write(&write, &partition.index)?;
             if expected_binding != schema_binding {
                 return Err(corruption(
                     "saved build selection is stale after schema change",
+                ));
+            }
+            // Purge exports and repair can start a new catalog without a
+            // predecessor while retaining a native generation high-water ID.
+            let native_route =
+                selected_native || (previous_generation_id | generation_id) & MUTABLE_STORAGE != 0;
+            if previous_generation_id > i64::MAX as u64 || generation_id > i64::MAX as u64 {
+                return Err(Error::Other(
+                    "paged vector generation identities are exhausted".into(),
                 ));
             }
             let storage_id = {
@@ -3392,30 +3481,55 @@ impl RedbPersistence {
                     .map_err(Self::storage_error)?
                     .map(|value| value.value())
                     .unwrap_or(1);
-                if next == 0 {
+                if next == 0 || next >= MUTABLE_STORAGE {
                     return Err(corruption("paged storage allocation counter is reserved"));
                 }
                 // Saved exports use this same monotone namespace for their
                 // immutable artifact root. Never reuse the captured source ID.
                 let next = if resident_export {
-                    next.max(generation_id.checked_add(1).ok_or_else(|| {
-                        Error::Other("paged vector generation identities are exhausted".into())
-                    })?)
+                    next.max(
+                        (generation_id & !MUTABLE_STORAGE)
+                            .checked_add(1)
+                            .ok_or_else(|| {
+                                Error::Other(
+                                    "paged vector generation identities are exhausted".into(),
+                                )
+                            })?,
+                    )
                 } else {
                     next
                 };
+                // Recheck after the resident-export high-water adjustment.
+                // Legacy storage must never enter the reserved native namespace.
+                if next == 0 || next >= MUTABLE_STORAGE {
+                    return Err(Error::Other(
+                        "paged vector storage identities are exhausted".into(),
+                    ));
+                }
                 counters
-                    .insert(
-                        NEXT_STORAGE,
-                        next.checked_add(1).ok_or_else(|| {
-                            Error::Other("paged vector storage identities are exhausted".into())
-                        })?,
-                    )
+                    .insert(NEXT_STORAGE, next + 1)
                     .map_err(Self::storage_error)?;
                 next
             };
-            if resident_export {
+            let storage_id = if native_route {
+                storage_id | MUTABLE_STORAGE
+            } else {
+                storage_id
+            };
+            if resident_export || native_route {
                 progress.generation_id = storage_id;
+            }
+            if native_route {
+                let mut marker = storage_id.to_be_bytes().to_vec();
+                marker.push(0);
+                let mut owner = (key.len() as u32).to_be_bytes().to_vec();
+                owner.extend_from_slice(&key);
+                owner.extend_from_slice(&[0; 32]);
+                write
+                    .open_table(PAGES)
+                    .map_err(Self::storage_error)?
+                    .insert(marker.as_slice(), seal_value(&marker, &owner).as_slice())
+                    .map_err(Self::storage_error)?;
             }
             vector_membership_pages::begin_pending_frontier(&write, partition, frontier_tx)?;
             let record = PagedBuildRecord {
@@ -3556,7 +3670,19 @@ impl RedbPersistence {
                     write.commit().map_err(Self::storage_error)?;
                     return Ok(0);
                 }
-                let mut pages = write.open_table(PAGES).map_err(Self::storage_error)?;
+                if storage_id & MUTABLE_STORAGE != 0
+                    && import_tail::native_storage_is_selected_in_write(self, &write, storage_id)?
+                {
+                    cleanup.remove(storage_id).map_err(Self::storage_error)?;
+                    drop(cleanup);
+                    bind_pages_root(&write)?;
+                    Self::write_writer_recovery_bounds_in_write(&write, None)?;
+                    write.commit().map_err(Self::storage_error)?;
+                    return Ok(0);
+                }
+                let page_name = page_table_name(storage_id);
+                let definition = TableDefinition::<&[u8], &[u8]>::new(&page_name);
+                let mut pages = write.open_table(definition).map_err(Self::storage_error)?;
                 let storage = storage_prefix(storage_id);
                 let result = reclaim_storage_keys_with_admission(
                     &mut pages,
@@ -3569,6 +3695,19 @@ impl RedbPersistence {
                     },
                 )?;
                 if result.complete {
+                    drop(pages);
+                    if storage_id & MUTABLE_STORAGE != 0 {
+                        write
+                            .delete_table(definition)
+                            .map_err(Self::storage_error)?;
+                        let mut marker = storage.to_vec();
+                        marker.push(0);
+                        write
+                            .open_table(PAGES)
+                            .map_err(Self::storage_error)?
+                            .remove(marker.as_slice())
+                            .map_err(Self::storage_error)?;
+                    }
                     cleanup.remove(storage_id).map_err(Self::storage_error)?;
                 } else if let Some(last) = &result.last_key {
                     cleanup
@@ -3622,35 +3761,71 @@ impl RedbPersistence {
         let mut pages = write.open_table(PAGES).map_err(Self::storage_error)?;
         let mut cleanup = write.open_table(CLEANUP).map_err(Self::storage_error)?;
         let mut erase_storage = |storage_id: u64| -> Result<()> {
-            let storage = storage_prefix(storage_id);
-            loop {
-                // A batch holds only its high-water seek-key working set. Its
-                // owner releases after the returned cursor has been dropped.
-                let mut owner = contextdb_vector::VectorCopyAdmission::new(accountant.clone());
-                let mut admitted = 0usize;
-                let step = reclaim_storage_keys_with_admission(
-                    &mut pages,
-                    &storage,
-                    None,
-                    4096,
-                    &mut |bytes| {
-                        if bytes > admitted {
-                            owner.reserve_for(
-                                bytes - admitted,
-                                "vector",
-                                operation,
-                                "Raise MEMORY_LIMIT before erasing vector storage.",
-                            )?;
-                            admitted = bytes;
-                        }
-                        Ok(())
-                    },
-                )?;
-                if step.complete {
-                    break;
+            let backing = {
+                let mut table = write
+                    .open_table(import_tail::CHANGE_BACKINGS)
+                    .map_err(Self::storage_error)?;
+                let value = table
+                    .remove(storage_id.to_be_bytes().as_slice())
+                    .map_err(Self::storage_error)?;
+                value
+                    .map(|value| {
+                        import_tail::decode_native_change_backing(storage_id, value.value())
+                    })
+                    .transpose()?
+            };
+            for storage_id in [Some(storage_id), backing.map(|b| b.physical.storage_id)]
+                .into_iter()
+                .flatten()
+            {
+                let storage = storage_prefix(storage_id);
+                let name = page_table_name(storage_id);
+                let definition = TableDefinition::<&[u8], &[u8]>::new(&name);
+                let mut private_pages = if storage_id & MUTABLE_STORAGE != 0 {
+                    Some(write.open_table(definition).map_err(Self::storage_error)?)
+                } else {
+                    None
+                };
+                loop {
+                    // A batch holds only its high-water seek-key working set. Its
+                    // owner releases after the returned cursor has been dropped.
+                    let mut owner = contextdb_vector::VectorCopyAdmission::new(accountant.clone());
+                    let mut admitted = 0usize;
+                    let step = reclaim_storage_keys_with_admission(
+                        private_pages.as_mut().unwrap_or(&mut pages),
+                        &storage,
+                        None,
+                        4096,
+                        &mut |bytes| {
+                            if bytes > admitted {
+                                owner.reserve_for(
+                                    bytes - admitted,
+                                    "vector",
+                                    operation,
+                                    "Raise MEMORY_LIMIT before erasing vector storage.",
+                                )?;
+                                admitted = bytes;
+                            }
+                            Ok(())
+                        },
+                    )?;
+                    if step.complete {
+                        break;
+                    }
                 }
+                drop(private_pages);
+                if storage_id & MUTABLE_STORAGE != 0 {
+                    write
+                        .delete_table(definition)
+                        .map_err(Self::storage_error)?;
+                    let mut marker = storage.to_vec();
+                    marker.push(0);
+                    pages
+                        .remove(marker.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+                cleanup.remove(storage_id).map_err(Self::storage_error)?;
             }
-            cleanup.remove(storage_id).map_err(Self::storage_error)?;
             Ok(())
         };
         {
@@ -3701,6 +3876,35 @@ impl RedbPersistence {
                         if !own_storage.contains(&meta.storage_id) {
                             erase_storage(meta.storage_id)?;
                         }
+                    }
+                }
+            }
+        }
+        {
+            let changes = write
+                .open_table(VECTOR_PARTITION_CHANGE_GENERATION_TABLE)
+                .map_err(Self::storage_error)?;
+            for entry in changes.range(prefix..).map_err(Self::storage_error)? {
+                let (key, value) = entry.map_err(Self::storage_error)?;
+                if !key.value().starts_with(prefix) {
+                    break;
+                }
+                let mut owner = contextdb_vector::VectorCopyAdmission::new(accountant.clone());
+                owner.reserve_for(
+                    value
+                        .value()
+                        .len()
+                        .saturating_mul(4)
+                        .saturating_add(128 * 1024),
+                    "vector",
+                    operation,
+                    "Raise MEMORY_LIMIT before erasing vector storage.",
+                )?;
+                if let Some(storage) =
+                    Self::authenticated_generation_storage(value.value(), key.value(), false)?
+                {
+                    if !own_storage.contains(&storage) {
+                        erase_storage(storage)?;
                     }
                 }
             }
@@ -3809,6 +4013,21 @@ impl RedbPersistence {
     pub(crate) fn paged_storage_page_set_root(&self, storage_id: u64) -> Result<PageSetRoot> {
         self.with_db(|db| {
             let read = db.begin_read().map_err(Self::storage_error)?;
+            if storage_id & MUTABLE_STORAGE != 0 {
+                let name = page_table_name(storage_id);
+                let table = TableDefinition::<&[u8], &[u8]>::new(&name);
+                let digest = read
+                    .table_root_fingerprint(table)
+                    .map_err(Self::storage_error)?
+                    .ok_or_else(|| corruption("native replacement lost its page table"))?;
+                let pages = read.open_table(table).map_err(Self::storage_error)?;
+                let bytes = import_tail::native_bytes_in(&pages, storage_id)?;
+                return Ok(PageSetRoot {
+                    pages: MUTABLE_PAGE_SET,
+                    bytes,
+                    digest,
+                });
+            }
             let pages = read.open_table(PAGES).map_err(Self::storage_error)?;
             page_set_root_in(&pages, storage_id)
         })
@@ -3905,7 +4124,7 @@ impl RedbPersistence {
             .map_err(Self::storage_error)?
             .map(|value| value.value())
             .unwrap_or(1);
-        if next == 0 {
+        if next == 0 || next >= MUTABLE_STORAGE {
             return Err(corruption("repair fence allocation counter is reserved"));
         }
         // Reserve an unused identity so even consecutive retirements without
@@ -4228,9 +4447,24 @@ impl RedbPersistence {
         if super::vector_saved::saved_export_owned_in_write(write, id)? {
             return Ok(());
         }
-        write
-            .open_table(CLEANUP)
-            .map_err(Self::storage_error)?
+        let backing = {
+            let mut table = write
+                .open_table(import_tail::CHANGE_BACKINGS)
+                .map_err(Self::storage_error)?;
+            let value = table
+                .remove(id.to_be_bytes().as_slice())
+                .map_err(Self::storage_error)?;
+            value
+                .map(|value| import_tail::decode_native_change_backing(id, value.value()))
+                .transpose()?
+        };
+        let mut cleanup = write.open_table(CLEANUP).map_err(Self::storage_error)?;
+        if let Some(backing) = backing {
+            cleanup
+                .insert(backing.physical.storage_id, [].as_slice())
+                .map_err(Self::storage_error)?;
+        }
+        cleanup
             .insert(id, [].as_slice())
             .map_err(Self::storage_error)?;
         Ok(())
@@ -4323,7 +4557,7 @@ const AUDIT_REFERENCE_BYTES: usize = 32 * 1024 * 1024;
 /// repeats proof; the durable fence is the sole authority to refuse erasure.
 pub(super) struct RepairAudit {
     cutoff: u64,
-    epoch: [Option<[u8; 32]>; 5],
+    epoch: [Option<[u8; 32]>; 6],
     after_storage: u64,
     candidate: Option<u64>,
     phase: usize,
@@ -4344,7 +4578,7 @@ pub(crate) enum RepairAuditStatus {
 }
 
 impl RedbPersistence {
-    fn repair_reference_epoch(read: &redb::ReadTransaction) -> Result<[Option<[u8; 32]>; 5]> {
+    fn repair_reference_epoch(read: &redb::ReadTransaction) -> Result<[Option<[u8; 32]>; 6]> {
         Ok([
             read.table_root_fingerprint(VECTOR_PARTITION_BASE_GENERATION_TABLE)
                 .map_err(Self::storage_error)?,
@@ -4356,13 +4590,20 @@ impl RedbPersistence {
                 .map_err(Self::storage_error)?,
             read.table_root_fingerprint(VECTOR_PARTITION_GENERATION_CATALOG_TABLE)
                 .map_err(Self::storage_error)?,
+            read.table_root_fingerprint(import_tail::CHANGE_BACKINGS)
+                .map_err(Self::storage_error)?,
         ])
     }
 
-    fn repair_audit_cursor(&self, cutoff: u64, epoch: [Option<[u8; 32]>; 5]) -> Result<RepairAudit> {
+    fn repair_audit_cursor(
+        &self,
+        cutoff: u64,
+        epoch: [Option<[u8; 32]>; 6],
+    ) -> Result<RepairAudit> {
         self.prepare_proof_owner()?;
-        let accountant = self.proof_accountant()
-            .ok_or_else(|| Error::Other("vector ownership audit requires the owning accountant".into()))?;
+        let accountant = self.proof_accountant().ok_or_else(|| {
+            Error::Other("vector ownership audit requires the owning accountant".into())
+        })?;
         let memory = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
             accountant,
             AUDIT_METADATA_BYTES,
@@ -4420,7 +4661,7 @@ impl RedbPersistence {
                 // Independently validate all retired references even when no
                 // PAGES exist. A corrupt whole record keeps restart's fence
                 // until bounded generation cleanup retires that record.
-                if !c.validated_references && c.phase == 4 {
+                if !c.validated_references && c.phase == 5 {
                     c.validated_references = true;
                     c.phase = 0;
                     c.after_key.clear();
@@ -4435,8 +4676,7 @@ impl RedbPersistence {
                         Err(redb::TableError::TableDoesNotExist(_)) => None,
                         Err(error) => return Err(Self::storage_error(error)),
                     };
-                    let lower = c.after_storage.saturating_add(1)
-                        .to_be_bytes();
+                    let lower = c.after_storage.saturating_add(1).to_be_bytes();
                     let next = if let Some(pages) = pages.as_ref() {
                         pages
                             .range(lower.as_slice()..)
@@ -4457,10 +4697,20 @@ impl RedbPersistence {
                         c.finished = true;
                         break;
                     }
-                    let Some(id) = id.filter(|id| *id < cutoff) else {
+                    let Some(id) = id else {
                         c.finished = true;
                         break;
                     };
+                    if id < MUTABLE_STORAGE && id >= cutoff {
+                        // New ordinary storage is outside restart's cutoff;
+                        // seek directly to the native namespace instead.
+                        c.after_storage = MUTABLE_STORAGE - 1;
+                        continue;
+                    }
+                    if id & !MUTABLE_STORAGE >= cutoff {
+                        c.finished = true;
+                        break;
+                    }
                     if id == REPAIR_FENCE {
                         c.unknown = true;
                         c.finished = true;
@@ -4480,7 +4730,7 @@ impl RedbPersistence {
                     }
                 }
                 let id = c.candidate;
-                if c.validated_references && (c.phase == 4 || c.referenced) {
+                if c.validated_references && (c.phase == 5 || c.referenced) {
                     let id = id.unwrap();
                     c.after_storage = id;
                     c.candidate = None;
@@ -4496,7 +4746,60 @@ impl RedbPersistence {
                     0 => VECTOR_PARTITION_BASE_GENERATION_TABLE,
                     1 => VECTOR_PARTITION_CHANGE_GENERATION_TABLE,
                     2 => BUILDS,
-                    _ => VECTOR_PARTITION_JOURNAL_TABLE,
+                    3 => VECTOR_PARTITION_JOURNAL_TABLE,
+                    _ => {
+                        // Backings carry one bounded physical reference under their old storage key.
+                        let table = match read.open_table(import_tail::CHANGE_BACKINGS) {
+                            Ok(table) => table,
+                            Err(redb::TableError::TableDoesNotExist(_)) => {
+                                c.phase += 1;
+                                c.after_key.clear();
+                                continue;
+                            }
+                            Err(error) => return Err(Self::storage_error(error)),
+                        };
+                        let lower = if c.after_key.is_empty() {
+                            0
+                        } else {
+                            u64::from_be_bytes(
+                                c.after_key
+                                    .as_slice()
+                                    .try_into()
+                                    .map_err(|_| corruption("backing audit cursor width"))?,
+                            )
+                            .saturating_add(1)
+                        };
+                        let next = table
+                            .range(lower.to_be_bytes().as_slice()..)
+                            .map_err(Self::storage_error)?
+                            .next()
+                            .transpose()
+                            .map_err(Self::storage_error)?;
+                        if let Some((key, value)) = next {
+                            scanned += 1;
+                            metadata = metadata.saturating_add(value.value().len().min(64 * 1024));
+                            match import_tail::decode_native_change_backing(
+                                u64::from_be_bytes(
+                                    key.value()
+                                        .try_into()
+                                        .map_err(|_| corruption("backing storage key width"))?,
+                                ),
+                                value.value(),
+                            ) {
+                                Ok(binding) => {
+                                    if id == Some(binding.physical.storage_id) {
+                                        c.referenced = true;
+                                    }
+                                }
+                                Err(_) => c.unknown = true,
+                            }
+                            c.after_key = key.value().to_vec();
+                        } else {
+                            c.phase += 1;
+                            c.after_key.clear();
+                        }
+                        continue;
+                    }
                 };
                 let table = match read.open_table(definition) {
                     Ok(table) => table,
@@ -4758,3 +5061,6 @@ impl RedbPersistence {
         Ok(*self.saved_export_recovery_cutoff.get().unwrap())
     }
 }
+
+#[cfg(test)]
+mod native_namespace_tests;

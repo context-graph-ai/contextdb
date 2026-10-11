@@ -27,6 +27,31 @@ impl RedbPersistence {
         schema_binding: VectorSchemaBinding,
         admit: &mut dyn FnMut(usize) -> Result<()>,
     ) -> Result<Option<SavedTopologyCandidate>> {
+        self.prepare_saved_topology_candidate_inner(candidate, schema_binding, false, admit)
+    }
+
+    pub(super) fn prepare_saved_topology_candidate_for_purge(
+        &self,
+        candidate: &VectorPartitionGenerationCandidate,
+        admit: &mut dyn FnMut(usize) -> Result<()>,
+    ) -> Result<Option<SavedTopologyCandidate>> {
+        if candidate.change.is_some() {
+            return Err(corruption("purge replacement must be one new base"));
+        }
+        let binding = self.vector_schema_binding(&candidate.base.index)?;
+        if binding == VectorSchemaBinding::UNBOUND {
+            return Ok(None);
+        }
+        self.prepare_saved_topology_candidate_inner(candidate, binding, true, admit)
+    }
+
+    fn prepare_saved_topology_candidate_inner(
+        &self,
+        candidate: &VectorPartitionGenerationCandidate,
+        schema_binding: VectorSchemaBinding,
+        preserve_purge_identity: bool,
+        admit: &mut dyn FnMut(usize) -> Result<()>,
+    ) -> Result<Option<SavedTopologyCandidate>> {
         let base_saved = candidate.base.graph_format_version == 1
             && !candidate.base.graph.bytes.starts_with(&META_MAGIC);
         let change_saved = candidate.change.as_ref().is_some_and(|c| {
@@ -53,6 +78,7 @@ impl RedbPersistence {
                 candidate.base.generation_id,
                 candidate.base.highest_included_tx,
                 candidate.base.highest_included_lsn,
+                preserve_purge_identity,
                 admit,
                 &mut ownership,
             )?
@@ -107,6 +133,7 @@ impl RedbPersistence {
                         base.generation_id,
                         base.highest_included_tx,
                         base.highest_included_lsn,
+                        preserve_purge_identity,
                         admit,
                         &mut ownership,
                     )?
@@ -160,6 +187,7 @@ impl RedbPersistence {
         base_generation_id: u64,
         base_tx: TxId,
         base_lsn: Lsn,
+        preserve_purge_identity: bool,
         admit: &mut dyn FnMut(usize) -> Result<()>,
         ownership: &mut SavedExportOwnership,
     ) -> Result<VectorPartitionGraphBytes> {
@@ -205,9 +233,14 @@ impl RedbPersistence {
         )?;
         ownership.acquire(record.storage_id)?;
         let original_generation_id = descriptor.generation_id;
-        descriptor.generation_id = record.storage_id;
+        // Purge has already sealed the survivor generation in its prepared
+        // serving image. Keep that identity through its atomic disk publication.
+        // Ordinary exports keep distinct artifact keys across failed retries.
+        if !preserve_purge_identity {
+            descriptor.generation_id = record.storage_id;
+        }
         let base_generation_id = if is_base {
-            record.storage_id
+            descriptor.generation_id
         } else {
             base_generation_id
         };
@@ -217,14 +250,14 @@ impl RedbPersistence {
                 Self::vector_partition_base_generation_key_from_parts(
                     &route.index,
                     &route.partition_key,
-                    record.storage_id,
+                    descriptor.generation_id,
                 )
             } else {
                 Self::vector_partition_change_generation_key_from_parts(
                     &route.index,
                     &route.partition_key,
                     base_generation_id,
-                    record.storage_id,
+                    descriptor.generation_id,
                 )
             };
             let root_key = Self::vector_partition_graph_page_root_key(&generation_key, is_base);
@@ -242,6 +275,7 @@ impl RedbPersistence {
         let _ = original_generation_id;
         let key = Self::vector_partition_prefix(&route.index, &route.partition_key);
         let mut progress = record.progress()?;
+        progress.generation_id = descriptor.generation_id;
         progress.graph = topology.state.clone();
         let plan = PagedVectorBatchPlan {
             max_points: 64,
@@ -377,7 +411,10 @@ impl RedbPersistence {
             // joining neighbours and mappings by the native physical keys.
             let validated = db.begin_read().map_err(Self::storage_error)?;
             validate_pages_root(&validated)?;
-            let pages = validated.open_table(PAGES).map_err(Self::storage_error)?;
+            let name = super::vector_paged::page_table_name(record.storage_id);
+            let pages = validated
+                .open_table(redb::TableDefinition::<&[u8], &[u8]>::new(&name))
+                .map_err(Self::storage_error)?;
             let lookup = PagedLookup {
                 admission: None,
                 pages: &pages,
@@ -505,6 +542,9 @@ impl RedbPersistence {
             Ok(())
         });
         result?;
+        if record.storage_id & super::vector_paged::MUTABLE_STORAGE != 0 {
+            page_set = Some(self.paged_storage_page_set_root(record.storage_id)?);
+        }
         progress.phase = PagedVectorPhase::Complete;
         progress.last_source_key = None;
         let saved = SavedGenerationBinding {
@@ -821,7 +861,7 @@ fn decode_saved_export(storage: u64, encoded: &[u8]) -> Result<SavedExportRecord
     if owner.storage_id != storage
         || storage == 0
         || owner.generation_key.len() < suffix
-        || owner.generation_key[owner.generation_key.len() - 8..] != storage.to_be_bytes()
+        || owner.generation_key[owner.generation_key.len() - 8..] == [0; 8]
     {
         return Err(corruption(
             "saved publication owner names another artifact identity",
@@ -854,13 +894,13 @@ fn retire_saved_export_roots_in_write(
             RedbPersistence::decode_exact::<VectorPartitionGenerationCatalogRecord>(payload)
     {
         let selected = if owner.is_base {
-            catalog.base.generation_id == owner.storage_id
+            owner.generation_key[route_len..] == catalog.base.generation_id.to_be_bytes()
         } else {
-            catalog
-                .change
-                .is_some_and(|change| change.generation_id == owner.storage_id)
-                && owner.generation_key[route_len..route_len + 8]
-                    == catalog.base.generation_id.to_be_bytes()
+            catalog.change.is_some_and(|change| {
+                owner.generation_key[owner.generation_key.len() - 8..]
+                    == change.generation_id.to_be_bytes()
+            }) && owner.generation_key[route_len..route_len + 8]
+                == catalog.base.generation_id.to_be_bytes()
         };
         if selected {
             return Err(corruption(
@@ -963,6 +1003,21 @@ pub(super) fn recover_saved_exports_in_write(
                 .next()
                 .transpose()
                 .map_err(RedbPersistence::storage_error)?;
+            let entry = if entry.is_some() {
+                entry
+            } else {
+                let start = super::vector_paged::MUTABLE_STORAGE;
+                let end = start
+                    .checked_add(cutoff)
+                    .filter(|end| *end <= 2 * start)
+                    .ok_or_else(|| corruption("saved native recovery cutoff is invalid"))?;
+                exports
+                    .range(start..end)
+                    .map_err(RedbPersistence::storage_error)?
+                    .next()
+                    .transpose()
+                    .map_err(RedbPersistence::storage_error)?
+            };
             match entry {
                 Some((id, value)) => {
                     admit(value.value().len().saturating_add(4096))?;
@@ -995,13 +1050,30 @@ impl RedbPersistence {
         self.with_db(|db| {
             let read = db.begin_read().map_err(Self::storage_error)?;
             match read.open_table(SAVED_EXPORTS) {
-                Ok(exports) => Ok(exports
-                    .range(..cutoff)
-                    .map_err(Self::storage_error)?
-                    .next()
-                    .transpose()
-                    .map_err(Self::storage_error)?
-                    .is_some()),
+                Ok(exports) => {
+                    if exports
+                        .range(..cutoff)
+                        .map_err(Self::storage_error)?
+                        .next()
+                        .transpose()
+                        .map_err(Self::storage_error)?
+                        .is_some()
+                    {
+                        return Ok(true);
+                    }
+                    let start = super::vector_paged::MUTABLE_STORAGE;
+                    let end = start
+                        .checked_add(cutoff)
+                        .filter(|end| *end <= 2 * start)
+                        .ok_or_else(|| corruption("saved native recovery cutoff is invalid"))?;
+                    Ok(exports
+                        .range(start..end)
+                        .map_err(Self::storage_error)?
+                        .next()
+                        .transpose()
+                        .map_err(Self::storage_error)?
+                        .is_some())
+                }
                 Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
                 Err(error) => Err(Self::storage_error(error)),
             }
@@ -1185,7 +1257,10 @@ impl RedbPersistence {
         self.with_db(|db| {
             let read = db.begin_read().map_err(Self::storage_error)?;
             validate_pages_root(&read)?;
-            let pages = read.open_table(PAGES).map_err(Self::storage_error)?;
+            let name = super::vector_paged::page_table_name(meta.storage_id);
+            let pages = read
+                .open_table(redb::TableDefinition::<&[u8], &[u8]>::new(&name))
+                .map_err(Self::storage_error)?;
             let lookup = PagedLookup {
                 admission: None,
                 pages: &pages,

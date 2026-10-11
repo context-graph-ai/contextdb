@@ -31505,8 +31505,22 @@ graph_commit_result }.map_err(Self::storage_error)?;
         partition_key: &VectorPartitionKey,
         covered_lsn: Lsn,
     ) -> Result<usize> {
-        let Some((lower, upper)) =
-            Self::vector_partition_journal_suffix_bounds(index, partition_key, covered_lsn, None)?
+        self.vector_partition_tail_entry_count_through(index, partition_key, covered_lsn, None)
+    }
+
+    pub(crate) fn vector_partition_tail_entry_count_through(
+        &self,
+        index: &VectorIndexRef,
+        partition_key: &VectorPartitionKey,
+        covered_lsn: Lsn,
+        through_lsn: Option<Lsn>,
+    ) -> Result<usize> {
+        let Some((lower, upper)) = Self::vector_partition_journal_suffix_bounds(
+            index,
+            partition_key,
+            covered_lsn,
+            through_lsn,
+        )?
         else {
             return Ok(0);
         };
@@ -31738,9 +31752,23 @@ graph_commit_result }.map_err(Self::storage_error)?;
         partition_key: &VectorPartitionKey,
         covered_lsn: Lsn,
     ) -> Result<(Vec<VectorEntry>, Lsn)> {
+        self.load_vector_partition_tail_entries_through(index, partition_key, covered_lsn, None)
+    }
+
+    pub(crate) fn load_vector_partition_tail_entries_through(
+        &self,
+        index: &VectorIndexRef,
+        partition_key: &VectorPartitionKey,
+        covered_lsn: Lsn,
+        through_lsn: Option<Lsn>,
+    ) -> Result<(Vec<VectorEntry>, Lsn)> {
         let _decode_scope = self.reader_decode_scope()?;
-        let Some((lower, upper)) =
-            Self::vector_partition_journal_suffix_bounds(index, partition_key, covered_lsn, None)?
+        let Some((lower, upper)) = Self::vector_partition_journal_suffix_bounds(
+            index,
+            partition_key,
+            covered_lsn,
+            through_lsn,
+        )?
         else {
             return Ok((Vec::new(), covered_lsn));
         };
@@ -32084,11 +32112,23 @@ graph_commit_result }.map_err(Self::storage_error)?;
     pub(crate) fn prepare_vector_partition_generation_candidate_with_admission(
         &self,
         candidate: &VectorPartitionGenerationCandidate,
+        admit_scan: impl FnMut(usize) -> Result<()>,
+    ) -> Result<PreencodedVectorPartitionGenerationCandidate> {
+        self.prepare_vector_partition_generation_candidate_inner(candidate, false, admit_scan)
+    }
+
+    fn prepare_vector_partition_generation_candidate_inner(
+        &self,
+        candidate: &VectorPartitionGenerationCandidate,
+        preserve_purge_identity: bool,
         mut admit_scan: impl FnMut(usize) -> Result<()>,
     ) -> Result<PreencodedVectorPartitionGenerationCandidate> {
         self.validate_vector_partition_generation_candidate(candidate)?;
-        let mut paged_candidate =
-            self.prepare_saved_topology_candidate(candidate, &mut admit_scan)?;
+        let mut paged_candidate = if preserve_purge_identity {
+            self.prepare_saved_topology_candidate_for_purge(candidate, &mut admit_scan)?
+        } else {
+            self.prepare_saved_topology_candidate(candidate, &mut admit_scan)?
+        };
         let candidate = paged_candidate
             .as_ref()
             .map(|saved| &saved.candidate)
@@ -32501,6 +32541,22 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 }
                 drop(actual);
                 Self::resize_vector_cleanup_workspace(workspace, fixed_owned, OPERATION)?;
+            }
+
+            if expected_catalog.change.unwrap_or(expected_catalog.base).generation_id
+                & vector_paged::MUTABLE_STORAGE != 0
+            {
+                Self::resize_vector_cleanup_workspace(
+                    workspace, fixed_owned.saturating_add(64 * 1024), OPERATION,
+                )?;
+                if let Some(complete) = self.truncate_native_tail_journal_in_write(
+                    &write_txn, expected_catalog, &mut checkpoint,
+                )? {
+                    Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
+                    checkpoint()?;
+                    write_txn.commit().map_err(Self::storage_error)?;
+                    return Ok(complete);
+                }
             }
 
             if Self::repair_fence_in_write(&write_txn)? {
@@ -35027,7 +35083,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                             .to_string(),
                     });
                 }
-                self.prepare_vector_partition_generation_candidate(candidate)
+                self.prepare_vector_partition_generation_candidate_inner(candidate, true, |_| Ok(()))
             })
             .collect()
     }

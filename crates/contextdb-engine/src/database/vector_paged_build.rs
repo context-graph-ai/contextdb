@@ -34,7 +34,7 @@ pub(crate) const PAGED_GENERATION_RESIDENT_BYTES: u64 = 4096;
 
 /// Exact batch plan for one declaration. Every term is the vector crate's own
 /// validation minimum, independent of the partition's population.
-pub(super) fn paged_batch_plan(declaration: &PagedDeclaration) -> Result<PagedVectorBatchPlan> {
+pub(crate) fn paged_batch_plan(declaration: &PagedDeclaration) -> Result<PagedVectorBatchPlan> {
     let m = declaration.hnsw_m as usize;
     let ef_construction = declaration.hnsw_ef_construction as usize;
     let dimension = declaration.dimension as usize;
@@ -73,7 +73,7 @@ pub(super) fn paged_batch_plan(declaration: &PagedDeclaration) -> Result<PagedVe
     })
 }
 
-pub(super) fn declaration_for(
+pub(crate) fn declaration_for(
     layout: &VectorIndexLayout,
     policy: &contextdb_vector::store::ResolvedVectorPolicy,
 ) -> Result<PagedDeclaration> {
@@ -227,8 +227,15 @@ impl Database {
                     .release_construction_floor(&partition);
                 continue;
             }
+            let retention = if record.storage_id & crate::persistence::vector_paged::MUTABLE_STORAGE
+                != 0
+            {
+                persistence.native_candidate_retention_floor(&partition, progress.frontier_tx)?
+            } else {
+                progress.frontier_tx
+            };
             self.snapshot_registry
-                .hold_construction_floor(&partition, SnapshotId::from_tx(progress.frontier_tx));
+                .hold_construction_floor(&partition, SnapshotId::from_tx(retention));
             let registered = self.vector_store.contains_index(&partition.index)
                 && self
                     .vector_store
@@ -598,6 +605,17 @@ impl MaintenanceContext {
                     }
                 }
                 PagedVectorPhase::Complete => {
+                    if record.storage_id & crate::persistence::vector_paged::MUTABLE_STORAGE != 0
+                        && self.catch_up_native_import_candidate(
+                            partition,
+                            persistence,
+                            &record,
+                            &progress,
+                            copy_owner,
+                        )?
+                    {
+                        return Ok(Some(VectorPartitionPublicationOutcome::default()));
+                    }
                     return self
                         .publish_paged_vector_build(
                             partition,
@@ -1119,13 +1137,17 @@ impl MaintenanceContext {
         // The build is complete: its last page write has committed, so this
         // root is final for the page set the publication names.
         let page_set = persistence.paged_storage_page_set_root(record.storage_id)?;
-        let meta = RedbPersistence::encode_paged_generation_meta(
-            record.storage_id,
-            &record.declaration,
-            progress,
-            record.schema_binding,
-            page_set,
-        )?;
+        let meta = if record.storage_id & crate::persistence::vector_paged::MUTABLE_STORAGE != 0 {
+            persistence.native_base_meta_bytes(partition, record, progress, page_set)?
+        } else {
+            RedbPersistence::encode_paged_generation_meta(
+                record.storage_id,
+                &record.declaration,
+                progress,
+                record.schema_binding,
+                page_set,
+            )?
+        };
         let durable_bytes = u64::try_from(meta.len())
             .map_err(|_| Error::Other("paged generation metadata exceeds u64".into()))?;
         let state_digest = *blake3::hash(&meta).as_bytes();
