@@ -456,3 +456,356 @@ pub(crate) fn declared_child_observer(
         .get(&identity)
         .cloned()
 }
+
+// Evidence-only rows called by the existing cross-thread allocation oracle test.
+#[cfg(test)]
+pub(crate) mod native_ownership_proof {
+    use super::*;
+    use contextdb_core::read_memory::ReadCredit;
+    use std::alloc::Layout;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Barrier, Mutex, Weak};
+
+    thread_local! {
+        static WATCH_REQUEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    static POINTER: AtomicUsize = AtomicUsize::new(0);
+    static OBSERVATION: Mutex<Option<Observation>> = Mutex::new(None);
+
+    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+    struct Sample {
+        alive: bool,
+        controls: u64,
+        retained: u64,
+    }
+    #[derive(Debug)]
+    struct Observation {
+        parent: Weak<DeclaredReadMemory>,
+        layout: Layout,
+        requests: usize,
+        allocations: usize,
+        frees: usize,
+        pointer: usize,
+        window: usize,
+        free_window: usize,
+        free_layout: Option<Layout>,
+        before_free: Sample,
+        after_free: Sample,
+        null_once: bool,
+    }
+    fn sample(parent: &Weak<DeclaredReadMemory>) -> Sample {
+        parent.upgrade().map_or(Sample::default(), |parent| {
+            let (controls, retained) = parent.standing_control_bytes();
+            Sample {
+                alive: true,
+                controls,
+                retained,
+            }
+        })
+    }
+    fn layout() -> Layout {
+        ReadMemoryOwner::native_layout::<NativeDeclaredChild, NativeChildInvoice>()
+    }
+    fn begin(parent: &Arc<DeclaredReadMemory>, null_once: bool) {
+        assert_eq!(POINTER.load(Ordering::SeqCst), 0);
+        let mut observation = OBSERVATION.lock().unwrap();
+        assert!(observation.is_none());
+        *observation = Some(Observation {
+            parent: Arc::downgrade(parent),
+            layout: layout(),
+            requests: 0,
+            allocations: 0,
+            frees: 0,
+            pointer: 0,
+            window: 0,
+            free_window: 0,
+            free_layout: None,
+            before_free: Sample::default(),
+            after_free: Sample::default(),
+            null_once,
+        });
+        WATCH_REQUEST.with(|watch| watch.set(true));
+    }
+    fn stop_requests() {
+        WATCH_REQUEST.with(|watch| watch.set(false));
+    }
+    fn finish() -> Observation {
+        stop_requests();
+        POINTER.store(0, Ordering::SeqCst);
+        OBSERVATION.lock().unwrap().take().unwrap()
+    }
+    // Called by the real System-backed global allocator, before requesting storage.
+    pub(crate) fn refuse_allocation(request: Layout) -> bool {
+        if !WATCH_REQUEST
+            .try_with(std::cell::Cell::get)
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        let mut slot = OBSERVATION.lock().unwrap();
+        let Some(observation) = slot.as_mut() else {
+            return false;
+        };
+        if request != observation.layout {
+            return false;
+        }
+        observation.requests += 1;
+        std::mem::take(&mut observation.null_once)
+    }
+    pub(crate) fn allocated(pointer: *mut u8, request: Layout, window: usize) {
+        if !WATCH_REQUEST
+            .try_with(std::cell::Cell::get)
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let mut slot = OBSERVATION.lock().unwrap();
+        let Some(observation) = slot.as_mut() else {
+            return;
+        };
+        if request != observation.layout {
+            return;
+        }
+        observation.allocations += 1;
+        observation.pointer = pointer as usize;
+        observation.window = window;
+        POINTER.store(pointer as usize, Ordering::SeqCst);
+    }
+    pub(crate) fn before_free(pointer: *mut u8, request: Layout, window: usize) {
+        if POINTER.load(Ordering::SeqCst) != pointer as usize {
+            return;
+        }
+        let mut slot = OBSERVATION.lock().unwrap();
+        let observation = slot.as_mut().unwrap();
+        observation.frees += 1;
+        observation.free_layout = Some(request);
+        observation.free_window = window;
+        observation.before_free = sample(&observation.parent);
+    }
+    pub(crate) fn after_free(pointer: *mut u8) {
+        if POINTER.load(Ordering::SeqCst) != pointer as usize {
+            return;
+        }
+        let mut slot = OBSERVATION.lock().unwrap();
+        let observation = slot.as_mut().unwrap();
+        observation.after_free = sample(&observation.parent);
+        POINTER.store(0, Ordering::SeqCst);
+    }
+    fn acquire(parent: &Arc<DeclaredReadMemory>) -> ReadMemoryOwner {
+        let (request, requests, count) = crate::persistence::content_identity::proof_allocation_oracle_tests::native_requests_for_test(|| parent.request_budget_owner().unwrap());
+        assert_eq!(
+            count, 1,
+            "provider acquisition must make exactly one allocation request"
+        );
+        assert_eq!(
+            (requests[0].1, requests[0].2),
+            (layout().size(), layout().align())
+        );
+        stop_requests();
+        match request.into_route() {
+            RequestReadRoute::Native(receipt) => receipt.owner,
+            RequestReadRoute::Legacy(_) => {
+                panic!("declared provider must acquire native ownership")
+            }
+        }
+    }
+    fn assert_freed(observation: &Observation) {
+        let bytes = observation.layout.size() as u64;
+        assert_eq!(
+            (
+                observation.requests,
+                observation.allocations,
+                observation.frees
+            ),
+            (1, 1, 1)
+        );
+        assert_ne!(observation.pointer, 0);
+        assert_eq!(observation.pointer % observation.layout.align(), 0);
+        assert_ne!(observation.window, 0);
+        assert_eq!(observation.free_window, observation.window);
+        assert_eq!(observation.free_layout, Some(observation.layout));
+        let funded = Sample {
+            alive: true,
+            controls: bytes,
+            retained: bytes,
+        };
+        assert_eq!(
+            observation.before_free, funded,
+            "parent invoice must survive until physical free begins"
+        );
+        assert_eq!(
+            observation.after_free, funded,
+            "refund must follow System.dealloc, not payload destruction"
+        );
+    }
+
+    pub(crate) fn run_native_rows() {
+        let bytes = layout().size() as u64;
+        // Exact-limit activation, untouched clone identity, split/merge and refusal rows.
+        for external_drop in [false, true] {
+            let parent = DeclaredReadMemory::from_reader_limit(bytes + 17);
+            let weak = Arc::downgrade(&parent);
+            begin(&parent, false);
+            let owner = acquire(&parent);
+            assert_eq!(parent.standing_control_bytes(), (bytes, bytes));
+            let clone = owner.clone();
+            assert!(owner.same_owner(&clone));
+            let mut credit =
+                ReadCredit::try_new_owned(clone, 17, "proof", "activation", "proof").unwrap();
+            assert_eq!(parent.standing_control_bytes(), (bytes, bytes + 17));
+            assert!(credit.try_grow_for(1, "proof", "refusal", "proof").is_err());
+            assert_eq!(credit.bytes(), 17);
+            assert!(credit.try_split_off(18).is_err());
+            assert_eq!(credit.bytes(), 17);
+            let split = credit.try_split_off(7).unwrap();
+            assert_eq!(credit.bytes(), 10);
+            credit.try_merge_prepaid(split).unwrap();
+            assert_eq!(credit.bytes(), 17);
+            let other_parent = DeclaredReadMemory::from_reader_limit(bytes + 3);
+            let other = acquire(&other_parent);
+            assert!(!owner.same_owner(&other));
+            let other_credit =
+                ReadCredit::try_new_owned(other, 3, "proof", "other", "proof").unwrap();
+            assert!(credit.try_merge_prepaid(other_credit).is_err());
+            assert_eq!(credit.bytes(), 17);
+            assert_eq!(other_parent.standing_control_bytes(), (0, 0));
+            drop(owner);
+            assert_eq!(parent.standing_control_bytes(), (bytes, bytes + 17));
+            if external_drop {
+                drop(parent);
+                assert!(weak.upgrade().is_some());
+                drop(credit);
+                assert!(weak.upgrade().is_none());
+            } else {
+                drop(credit);
+                assert_eq!(parent.standing_control_bytes(), (0, 0));
+                drop(parent);
+            }
+            assert_freed(&finish());
+        }
+        // Different native requests remain different capabilities even at one parent.
+        let parent = DeclaredReadMemory::from_reader_limit(2 * bytes + 5);
+        begin(&parent, false);
+        let owner = acquire(&parent);
+        let other = acquire(&parent);
+        assert!(!owner.same_owner(&other));
+        let mut credit =
+            ReadCredit::try_new_owned(owner, 3, "proof", "same-parent", "proof").unwrap();
+        let other_credit =
+            ReadCredit::try_new_owned(other, 2, "proof", "same-parent-other", "proof").unwrap();
+        assert!(credit.try_merge_prepaid(other_credit).is_err());
+        assert_eq!(credit.bytes(), 3);
+        assert_eq!(parent.standing_control_bytes(), (bytes, bytes + 3));
+        drop(credit);
+        assert_freed(&finish());
+        assert_eq!(parent.standing_control_bytes(), (0, 0));
+
+        // A real host provider returning a production legacy child keeps its exact capability.
+        #[derive(Debug)]
+        struct HostProvider(Arc<dyn ReadMemoryBudget>);
+        impl ReadRequestBudgetProvider for HostProvider {
+            fn request_budget(&self) -> Result<Arc<dyn ReadMemoryBudget>> {
+                Ok(self.0.clone())
+            }
+        }
+        let parent = DeclaredReadMemory::from_reader_limit(u64::MAX);
+        let child = parent.child().unwrap();
+        let provider = HostProvider(child.clone());
+        let request = provider.request_budget_owner().unwrap();
+        match request.into_route() {
+            RequestReadRoute::Legacy(actual) => assert!(Arc::ptr_eq(&actual, &child)),
+            RequestReadRoute::Native(_) => {
+                panic!("host provider's legacy capability must stay legacy")
+            }
+        }
+        let owner = ReadMemoryOwner::from_legacy(child.clone());
+        assert!(owner.same_owner(&ReadMemoryOwner::from_legacy(child.clone())));
+        let native = acquire(&parent);
+        assert!(!native.same_owner(&owner));
+        drop(native);
+        drop(owner);
+        drop(provider);
+        drop(child);
+        assert_eq!(parent.standing_control_bytes(), (0, 0));
+
+        // Original parent remains funded even when all external parent handles close.
+        // Barriers make every contender own its credit before any contender releases it.
+        for contenders in [2, 8] {
+            let parent = DeclaredReadMemory::from_reader_limit(bytes + contenders as u64);
+            let weak = Arc::downgrade(&parent);
+            begin(&parent, false);
+            let owner = acquire(&parent);
+            let ready = Arc::new(Barrier::new(contenders + 1));
+            let release = Arc::new(Barrier::new(contenders + 1));
+            let mut threads = Vec::new();
+            for _ in 0..contenders {
+                let credit =
+                    ReadCredit::try_new_owned(owner.clone(), 1, "proof", "concurrent", "proof")
+                        .unwrap();
+                let ready = ready.clone();
+                let release = release.clone();
+                threads.push(std::thread::spawn(move || {
+                    ready.wait();
+                    release.wait();
+                    drop(credit);
+                }));
+            }
+            ready.wait();
+            assert_eq!(
+                parent.standing_control_bytes(),
+                (bytes, bytes + contenders as u64)
+            );
+            drop(owner);
+            drop(parent);
+            assert!(weak.upgrade().is_some());
+            release.wait();
+            for thread in threads {
+                thread.join().unwrap();
+            }
+            assert!(weak.upgrade().is_none());
+            assert_freed(&finish());
+        }
+        // Declared refusal must precede any allocator request.
+        let parent = DeclaredReadMemory::from_reader_limit(bytes - 1);
+        begin(&parent, false);
+        assert!(parent.request_budget_owner().is_err());
+        let refused = finish();
+        assert_eq!(
+            (refused.requests, refused.allocations, refused.frees),
+            (0, 0, 0)
+        );
+        assert_eq!(parent.standing_control_bytes(), (0, 0));
+
+        // Null from the same real allocator drops actual payload/invoice without a free.
+        let parent = DeclaredReadMemory::from_reader_limit(bytes);
+        begin(&parent, true);
+        assert!(parent.request_budget_owner().is_err());
+        let refused = finish();
+        assert_eq!(
+            (refused.requests, refused.allocations, refused.frees),
+            (1, 0, 0)
+        );
+        assert_eq!(parent.standing_control_bytes(), (0, 0));
+
+        // Request cancellation before activation is ordinary owner destruction.
+        let parent = DeclaredReadMemory::from_reader_limit(bytes);
+        begin(&parent, false);
+        let owner = acquire(&parent);
+        drop(owner);
+        assert_freed(&finish());
+        assert_eq!(parent.standing_control_bytes(), (0, 0));
+
+        // Unwind after activation must drop credits and the actual native request.
+        let parent = DeclaredReadMemory::from_reader_limit(bytes + 17);
+        begin(&parent, false);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let owner = acquire(&parent);
+            let _credit =
+                ReadCredit::try_new_owned(owner.clone(), 17, "proof", "unwind", "proof").unwrap();
+            panic!("deterministic request unwind");
+        }));
+        assert!(result.is_err());
+        assert_freed(&finish());
+        assert_eq!(parent.standing_control_bytes(), (0, 0));
+    }
+}

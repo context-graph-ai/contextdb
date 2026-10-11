@@ -151,6 +151,9 @@ fn allocation_layout(layout: Layout) -> (Layout, usize) {
 
 unsafe impl GlobalAlloc for MeasuredAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if crate::vector_read_memory::native_ownership_proof::refuse_allocation(layout) {
+            return std::ptr::null_mut();
+        }
         let (allocation, offset) = allocation_layout(layout);
         let base = unsafe { System.alloc(allocation) };
         if base.is_null() {
@@ -193,6 +196,7 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
             }
         }
         maintenance_payload_allocated(pointer as usize, layout.size());
+        crate::vector_read_memory::native_ownership_proof::allocated(pointer, layout, window);
         pointer
     }
 
@@ -231,9 +235,11 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
             };
             watch.before.store(before, AtomicOrdering::SeqCst);
         }
+        crate::vector_read_memory::native_ownership_proof::before_free(pointer, layout, header.window);
         unsafe {
             System.dealloc(pointer.sub(offset), allocation);
         }
+        crate::vector_read_memory::native_ownership_proof::after_free(pointer);
         maintenance_payload_freed(pointer as usize);
         if let Some(watch) = native_watch {
             let counter = watch.counter.load(AtomicOrdering::SeqCst);
@@ -363,6 +369,7 @@ fn a_cross_thread_free_is_attributed_only_to_its_allocation_window() {
     });
     neighbour.join().unwrap();
     assert_eq!((peak, live), (bytes, 0));
+    crate::vector_read_memory::native_ownership_proof::run_native_rows();
 }
 
 /// The oracle measures this thread and no other. A neighbour allocating
