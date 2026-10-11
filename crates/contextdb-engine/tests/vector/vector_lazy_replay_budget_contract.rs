@@ -9,12 +9,13 @@
 //! request's memory ceiling and the database's standing budget to reject that
 //! residency before a partial graph becomes visible.
 //!
-//! The current test seams expose generation residency, fresh-tail entries,
-//! bounded typed refusals, and the shared accountant. They intentionally do
-//! not expose a separate decode/replay reservation or a "rebuilt from raw
-//! vectors" counter. Consequently this file proves no partial resident state,
-//! no leaked shared charge, the saved generation identity, and the replayed
-//! tail result; it does not claim an unobservable internal allocation order.
+//! The current test seams expose generation residency, captured-source suffix
+//! inspection, bounded typed refusals, and the shared accountant. They
+//! intentionally do not expose a separate decode/replay reservation or a
+//! "rebuilt from raw vectors" counter. Consequently this file proves no
+//! partial resident state, no leaked shared charge, the saved generation
+//! identity, and the replayed tail result; it does not claim an unobservable
+//! internal allocation order.
 
 use contextdb_core::read_contract::{
     DeadlineClock, DeadlineWait, ReadFailureDetail, ReadFailureKind, ReadFailureLimit, ReadLimits,
@@ -105,6 +106,19 @@ fn status(db: &Database) -> VectorGraphGenerationStatus {
     db.vector_store_for_test()
         .partition_graph_generation_status(&partition_ref())
         .expect("the fixture keeps one declared partition state")
+}
+
+fn captured_suffix_points(db: &Database) -> usize {
+    db.inspect_captured_vector_suffix_for_test(
+        &partition_ref(),
+        db.snapshot(),
+        db.declared_reader_memory()
+            .expect("admit the captured-suffix reader"),
+        &mut || Ok(()),
+    )
+    .expect("inspect the operation-owned captured suffix")
+    .expect("the committed post-base journal suffix remains capturable")
+    .points
 }
 
 fn request(limits: ReadLimits) -> bounded::BoundedReadRequest {
@@ -308,8 +322,8 @@ fn first_bounded_restart_query_charges_lazy_decode_and_replay_to_the_request_cei
         "the admitted retry publishes one complete base graph"
     );
     assert!(
-        loaded.fresh_tail_entries >= 1,
-        "the admitted retry replays the post-base journal entry into its fresh mutable tail"
+        captured_suffix_points(&db) >= 1,
+        "the admitted retry preserves the post-base journal entry in its captured source"
     );
 }
 
@@ -397,5 +411,8 @@ fn first_bounded_restart_query_charges_lazy_decode_and_replay_to_the_store_budge
     let loaded = status(&db);
     assert_eq!(loaded.base, Some(expected_base));
     assert!(loaded.base_resident);
-    assert!(loaded.fresh_tail_entries >= 1);
+    assert!(
+        captured_suffix_points(&db) >= 1,
+        "the restored store budget keeps the post-base journal suffix capturable"
+    );
 }
