@@ -1520,10 +1520,19 @@ fn later_mutations_publish_a_new_generation_truncate_only_covered_journal_and_re
         vec![tail],
         "the later journal suffix remains searchable after restart"
     );
+    let suffix = db
+        .inspect_captured_vector_suffix_for_test(
+            &route(scope),
+            db.snapshot(),
+            db.declared_reader_memory()
+                .expect("admit the restarted suffix reader"),
+            &mut || Ok(()),
+        )
+        .expect("inspect the restarted operation-owned captured suffix")
+        .expect("the post-base suffix remains capturable after restart");
     assert_eq!(
-        generation_status(&db, scope).fresh_tail_entries,
-        1,
-        "restart replays only the post-base suffix, not the compacted history"
+        suffix.points, 1,
+        "restart captures only the post-base suffix, not the compacted history"
     );
 }
 
