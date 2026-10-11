@@ -1,6 +1,163 @@
+use super::writer_source::BorrowedRelationalIndexKey;
 use super::*;
 
 impl RedbPersistence {
+    /// Remove the terminal lifetime using a borrowed posting guard and a single
+    /// encoded scalar endpoint. Payload width never multiplies into row copies.
+    pub(super) fn prune_terminal_relational_posting_in_write(
+        &self,
+        write: &redb::WriteTransaction,
+        table: &str,
+        meta: Option<&TableMeta>,
+        body: &[u8],
+    ) -> Result<()> {
+        let Some(meta) = meta else {
+            return Ok(());
+        };
+        let mut measured = bincode::enc::write::SizeWriter::default();
+        bincode::serde::encode_into_writer(meta, &mut measured, bincode::config::standard())
+            .map_err(|e| Error::Other(format!("bincode size error: {e}")))?;
+        let initial = measured
+            .bytes_written
+            .saturating_mul(8)
+            .saturating_add(4096);
+        let memory = crate::read_image_memory::active_owner()?;
+        memory.reserve(initial)?;
+        let declarations = Self::relational_index_declarations(meta);
+        // auto_indexes_for_table_meta has now destroyed its temporary cloned
+        // schema. Keep only the returned declaration capacities funded while
+        // the posting key is allocated; refund no surviving declaration bytes.
+        let retained = declarations.iter().try_fold(
+            declarations
+                .capacity()
+                .checked_mul(std::mem::size_of::<IndexDecl>())
+                .ok_or_else(|| Error::Other("index declarations capacity overflow".into()))?,
+            |bytes, declaration| {
+                let columns = declaration
+                    .columns
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<(String, contextdb_core::SortDirection)>())
+                    .ok_or_else(|| Error::Other("index columns capacity overflow".into()))?;
+                declaration.columns.iter().try_fold(
+                    bytes
+                        .checked_add(declaration.name.capacity())
+                        .and_then(|n| n.checked_add(columns))
+                        .ok_or_else(|| {
+                            Error::Other("index declarations capacity overflow".into())
+                        })?,
+                    |bytes, (column, _)| {
+                        bytes
+                            .checked_add(column.capacity())
+                            .ok_or_else(|| Error::Other("index column capacity overflow".into()))
+                    },
+                )
+            },
+        )?;
+        let released = initial
+            .checked_sub(retained)
+            .ok_or_else(|| Error::Other("index declaration admission bound exceeded".into()))?;
+        memory.release(released);
+        if content_identity::version_manifest::has_indexed_vector(body, &declarations)? {
+            return self.prune_relational_posting_intervals_in_write(
+                write,
+                table,
+                Some(meta),
+                body,
+            );
+        }
+        for declaration in declarations {
+            let _scope = crate::read_image_memory::active_owner()?
+                .row_owner()?
+                .enter();
+            // Both hashed table names and the temporary formatting input are
+            // admitted before construction, independently of payload width.
+            crate::read_image_memory::reserve(3 * (12 + 64 + 8))?;
+            let mut posting =
+                content_identity::version_manifest::scalar_posting_for_body(body, &declaration)?
+                    .ok_or_else(|| {
+                        Error::Other("scalar posting changed during preparation".into())
+                    })?;
+            let Some(end) = posting.deleted else {
+                continue;
+            };
+            let name = Self::relational_index_table_name(table, &declaration.name);
+            let damage = |reason: &str| Error::StoreCorrupted {
+                path: name.clone(),
+                reason: reason.into(),
+            };
+            let definition = TableDefinition::<BorrowedRelationalIndexKey, &[u8]>::new(&name);
+            let mut index = match write.open_table(definition) {
+                Ok(index) => index,
+                Err(redb::TableError::TableDoesNotExist(_)) => continue,
+                Err(e) => return Err(Self::storage_error(e)),
+            };
+            let start = {
+                let mut range = index
+                    .range(..=posting.key.as_slice())
+                    .map_err(Self::storage_error)?;
+                let (key, value) = range
+                    .next_back()
+                    .transpose()
+                    .map_err(Self::storage_error)?
+                    .ok_or_else(|| damage("reclaimed row has no terminal posting"))?;
+                let key = key.value();
+                let (suffix, row_id, created) =
+                    content_identity::version_manifest::scalar_posting_identity(key)?;
+                let closure: Option<TxId> = Self::decode_exact(value.value())?;
+                if row_id != posting.row_id
+                    || key[..suffix] != posting.key[..posting.suffix]
+                    || created > posting.created
+                    || closure != Some(end)
+                    || end <= posting.created
+                {
+                    return Err(damage(
+                        "terminal posting disagrees with reclaimed row lifetime",
+                    ));
+                }
+                created
+            };
+            let current_name = Self::current_relational_index_table_name(table, &declaration.name);
+            let current = write
+                .open_table(TableDefinition::<BorrowedRelationalIndexKey, &[u8]>::new(
+                    &current_name,
+                ))
+                .map_err(Self::storage_error)?;
+            posting.key.truncate(posting.suffix);
+            bincode::serde::encode_into_std_write(
+                (posting.row_id, TxId(0)),
+                &mut posting.key,
+                bincode::config::standard(),
+            )
+            .map_err(|e| Error::Other(format!("posting identity: {e}")))?;
+            if current
+                .get(posting.key.as_slice())
+                .map_err(Self::storage_error)?
+                .is_some()
+            {
+                return Err(damage("terminal posting still has a current identity"));
+            }
+            drop(current);
+            posting.key.truncate(posting.suffix);
+            bincode::serde::encode_into_std_write(
+                (posting.row_id, start),
+                &mut posting.key,
+                bincode::config::standard(),
+            )
+            .map_err(|e| Error::Other(format!("posting identity: {e}")))?;
+            if start < posting.created {
+                let closed = Self::encode(&Some(posting.created))?;
+                index
+                    .insert(posting.key.as_slice(), closed.as_slice())
+                    .map_err(Self::storage_error)?;
+            } else {
+                index
+                    .remove(posting.key.as_slice())
+                    .map_err(Self::storage_error)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Subtract exactly one reclaimed row lifetime from each coalesced posting.
     /// The predecessor seek and at most two replacements do not depend on the
     /// number of retained row versions. The caller removes the row manifest in
@@ -138,6 +295,158 @@ impl RedbPersistence {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn borrowed_terminal_keys_preserve_the_canonical_scalar_codec() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("terminal-codec.db");
+        let persistence = RedbPersistence::create(&path).unwrap();
+        let writer = persistence
+            .proof_accountant()
+            .unwrap_or_else(|| Arc::new(crate::memory_accounting::MemoryAccountant::no_limit()));
+        persistence.attach_memory_accountant(writer.clone());
+        assert!(Arc::ptr_eq(
+            &persistence.proof_accountant().unwrap(),
+            &writer
+        ));
+        let row = VersionedRow {
+            row_id: RowId(u64::MAX - 1),
+            values: HashMap::from([
+                (
+                    "text".into(),
+                    Value::Text("utf8\u{03bb}\u{4e2d}".repeat(1024)),
+                ),
+                ("id".into(), Value::Int64(-123456)),
+                ("real".into(), Value::Float64(-0.25)),
+                ("flag".into(), Value::Bool(true)),
+                ("uuid".into(), Value::Uuid(uuid::Uuid::from_u128(123))),
+                ("stamp".into(), Value::Timestamp(456789)),
+                ("tx".into(), Value::TxId(TxId(789))),
+                ("null".into(), Value::Null),
+            ]),
+            created_tx: TxId(u64::MAX - 3),
+            deleted_tx: Some(TxId(u64::MAX - 2)),
+            lsn: Lsn(4321),
+            created_at: Some(Wallclock(100)),
+        };
+        let names = [
+            "text", "id", "real", "flag", "uuid", "stamp", "tx", "null", "missing",
+        ];
+        let declaration = IndexDecl {
+            name: "scalar_codec".into(),
+            columns: names
+                .iter()
+                .enumerate()
+                .map(|(position, name)| {
+                    (
+                        (*name).into(),
+                        if position % 2 == 0 {
+                            contextdb_core::SortDirection::Asc
+                        } else {
+                            contextdb_core::SortDirection::Desc
+                        },
+                    )
+                })
+                .collect(),
+            kind: IndexKind::UserDeclared,
+        };
+        {
+            let _scope = persistence.writer_decode_scope().unwrap();
+            let body = RedbPersistence::encode_versioned_row(&row, None).unwrap();
+            let key =
+                content_identity::version_manifest::scalar_posting_for_body(&body, &declaration)
+                    .unwrap()
+                    .unwrap();
+            let expected = DurableRelationalIndexKey::new(
+                contextdb_relational::index_key_for_row(&declaration.columns, &row.values),
+                row.row_id,
+                row.created_tx,
+            )
+            .unwrap();
+            assert_eq!(key.key, expected.0);
+            assert_eq!(
+                (key.row_id, key.created, key.deleted),
+                (row.row_id, row.created_tx, row.deleted_tx)
+            );
+            assert_eq!(
+                content_identity::version_manifest::scalar_posting_identity(&key.key).unwrap(),
+                (key.suffix, row.row_id, row.created_tx)
+            );
+            let mut trailing = key.key.clone();
+            trailing.push(0);
+            assert!(
+                content_identity::version_manifest::scalar_posting_identity(&trailing).is_err()
+            );
+            let mut trailing = body.clone();
+            trailing.push(0);
+            assert!(
+                content_identity::version_manifest::scalar_posting_for_body(
+                    &trailing,
+                    &declaration
+                )
+                .is_err()
+            );
+        }
+        drop(persistence);
+        assert_eq!(writer.usage().used, 0);
+        assert_eq!(writer.underflow_count_for_test(), 0);
+    }
+
+    #[test]
+    fn expired_last_indexed_version_stays_absent_from_later_historical_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("expired-posting.db");
+        let _clock = Wallclock::test_clock_guard(|| 1_000_000);
+        let options = crate::DatabaseOpenOptions {
+            maintenance_policy: crate::MaintenancePolicy::CallerDriven,
+            ..crate::DatabaseOpenOptions::default()
+        };
+        let db = crate::Database::open_with_options(&path, options.clone()).unwrap();
+        db.execute(
+            "CREATE TABLE expired (id INT PRIMARY KEY, tag TEXT, expires TIMESTAMP EXPIRES) \
+             RETAIN 1 HOURS SYNC OFF",
+            &HashMap::new(),
+        )
+        .unwrap();
+        db.execute("CREATE INDEX by_tag ON expired(tag)", &HashMap::new())
+            .unwrap();
+        db.execute(
+            "INSERT INTO expired VALUES (1, 'same', $expired), (2, 'other', $live)",
+            &HashMap::from([
+                ("expired".into(), Value::Timestamp(100)),
+                ("live".into(), Value::Timestamp(2_000_000)),
+            ]),
+        )
+        .unwrap();
+        let snapshot = db.snapshot();
+        let read = |db: &crate::Database| {
+            db.__with_snapshot_override_for_test(snapshot, || {
+                db.execute("SELECT id FROM expired WHERE tag = 'same'", &HashMap::new())
+            })
+            .unwrap()
+            .rows
+        };
+        assert_eq!(read(&db), vec![vec![Value::Int64(1)]]);
+        let pin = db.pin_snapshot(snapshot).unwrap();
+        db.run_maintenance_cycle().unwrap();
+        assert_eq!(
+            db.__physical_version_count_for_test("expired"),
+            2,
+            "each row still has exactly one physical version"
+        );
+        assert_eq!(read(&db), vec![vec![Value::Int64(1)]]);
+        drop(pin);
+        for _ in 0..4 {
+            db.run_maintenance_cycle().unwrap();
+        }
+        assert_eq!(db.__physical_version_count_for_test("expired"), 1);
+        assert!(read(&db).is_empty());
+        db.close().unwrap();
+        drop(db);
+        let reopened = crate::Database::open_with_options(&path, options).unwrap();
+        assert!(read(&reopened).is_empty());
+        reopened.close().unwrap();
+    }
 
     #[test]
     fn reclaimed_intervals_split_postings_reanchor_current_and_preserve_old_roots() {

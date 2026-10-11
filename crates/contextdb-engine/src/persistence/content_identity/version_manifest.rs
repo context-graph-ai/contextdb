@@ -1,5 +1,6 @@
 //! A private ordered witness for each retained physical relational version.
 use super::*;
+use contextdb_core::IndexDecl;
 
 const FORMAT: u8 = 1;
 const FIXED_KEY_BYTES: usize = 72;
@@ -243,34 +244,38 @@ impl<'a> Encoded<'a, '_> {
         self.take(bytes)?;
         Ok(())
     }
+    fn scalar_value(&mut self) -> Result<()> {
+        match self.integer()? {
+            0 => (),
+            1 => {
+                if self.byte()? > 1 {
+                    return Err(bad("invalid boolean"));
+                }
+            }
+            2 | 6 | 9 => {
+                self.integer()?;
+            }
+            3 => {
+                self.take(8)?;
+            }
+            4 | 7 => {
+                self.text()?;
+            }
+            5 => {
+                let len = self.length()?;
+                if len != 16 {
+                    return Err(bad("invalid UUID length"));
+                }
+                self.take(len)?;
+            }
+            8 => self.floats()?,
+            _ => return Err(bad("foreign scalar type")),
+        }
+        Ok(())
+    }
     fn value(&mut self) -> Result<()> {
         match self.integer()? {
-            0 => match self.integer()? {
-                0 => (),
-                1 => {
-                    if self.byte()? > 1 {
-                        return Err(bad("invalid boolean"));
-                    }
-                }
-                2 | 6 | 9 => {
-                    self.integer()?;
-                }
-                3 => {
-                    self.take(8)?;
-                }
-                4 | 7 => {
-                    self.text()?;
-                }
-                5 => {
-                    let len = self.length()?;
-                    if len != 16 {
-                        return Err(bad("invalid UUID length"));
-                    }
-                    self.take(len)?;
-                }
-                8 => self.floats()?,
-                _ => return Err(bad("foreign scalar type")),
-            },
+            0 => self.scalar_value()?,
             1 => match self.integer()? {
                 0 => self.floats()?,
                 kind @ (1 | 2) => {
@@ -296,6 +301,144 @@ impl<'a> Encoded<'a, '_> {
         }
         Ok(())
     }
+}
+
+/// Build only the declared scalar posting key, borrowing every payload from
+/// the authenticated body. Quantized vector index keys retain their existing
+/// admitted decoding path; ordinary wide scalar keys need just one buffer.
+pub(in super::super) struct PrunedScalarPosting {
+    pub(in super::super) key: Vec<u8>,
+    pub(in super::super) suffix: usize,
+    pub(in super::super) row_id: RowId,
+    pub(in super::super) created: TxId,
+    pub(in super::super) deleted: Option<TxId>,
+}
+pub(in super::super) fn has_indexed_vector(
+    body: &[u8],
+    declarations: &[IndexDecl],
+) -> Result<bool> {
+    let mut checkpoint = || Ok(());
+    let mut input = Encoded {
+        bytes: body,
+        position: 0,
+        checkpoint: &mut checkpoint,
+    };
+    input.integer()?;
+    let count = input.length()?;
+    let mut found = false;
+    for _ in 0..count {
+        let (name, name_end) = input.text()?;
+        let start = input.position;
+        input.value()?;
+        if body[start] != 0
+            && declarations.iter().any(|declaration| {
+                declaration
+                    .columns
+                    .iter()
+                    .any(|(column, _)| column.as_bytes() == &body[name..name_end])
+            })
+        {
+            found = true;
+        }
+    }
+    Ok(found)
+}
+pub(in super::super) fn scalar_posting_for_body(
+    body: &[u8],
+    declaration: &IndexDecl,
+) -> Result<Option<PrunedScalarPosting>> {
+    let controls = declaration
+        .columns
+        .len()
+        .checked_mul(std::mem::size_of::<Option<&[u8]>>())
+        .and_then(|n| n.checked_add(256))
+        .ok_or_else(|| bad("posting descriptor overflow"))?;
+    crate::read_image_memory::reserve(controls)?;
+    let mut values = vec![None; declaration.columns.len()];
+    let mut checkpoint = || Ok(());
+    let mut input = Encoded {
+        bytes: body,
+        position: 0,
+        checkpoint: &mut checkpoint,
+    };
+    let row_id = RowId(input.integer()?);
+    let count = input.length()?;
+    let mut vector_key = false;
+    for _ in 0..count {
+        let (name, name_end) = input.text()?;
+        let start = input.position;
+        input.value()?;
+        for (position, (column, _)) in declaration.columns.iter().enumerate() {
+            if column.as_bytes() == &body[name..name_end] {
+                if values[position].is_some() {
+                    return Err(bad("duplicate indexed value"));
+                }
+                if body[start] != 0 {
+                    vector_key = true;
+                }
+                values[position] = Some(&body[start + 1..input.position]);
+            }
+        }
+    }
+    let created = TxId(input.integer()?);
+    let deleted = input.option_integer()?.map(TxId);
+    input.integer()?; // lsn, authenticated by the manifest mutation
+    input.option_integer()?;
+    if input.position != body.len() {
+        return Err(bad("trailing body fields"));
+    }
+    if vector_key {
+        return Ok(None);
+    }
+    let capacity = values.iter().try_fold(32usize, |n, value| {
+        n.checked_add(1 + value.map_or(1, <[u8]>::len))
+            .ok_or_else(|| bad("posting key overflow"))
+    })?;
+    crate::read_image_memory::reserve(capacity)?;
+    let mut key = Vec::with_capacity(capacity);
+    bincode::serde::encode_into_std_write(
+        declaration.columns.len() as u64,
+        &mut key,
+        bincode::config::standard(),
+    )
+    .map_err(|e| bad(&format!("posting length: {e}")))?;
+    for ((_, direction), value) in declaration.columns.iter().zip(values) {
+        key.push(u8::from(*direction == contextdb_core::SortDirection::Desc));
+        key.extend_from_slice(value.unwrap_or(&[0])); // Value::Null
+    }
+    let suffix = key.len();
+    bincode::serde::encode_into_std_write((row_id, created), &mut key, bincode::config::standard())
+        .map_err(|e| bad(&format!("posting identity: {e}")))?;
+    Ok(Some(PrunedScalarPosting {
+        key,
+        suffix,
+        row_id,
+        created,
+        deleted,
+    }))
+}
+
+pub(in super::super) fn scalar_posting_identity(key: &[u8]) -> Result<(usize, RowId, TxId)> {
+    let mut checkpoint = || Ok(());
+    let mut input = Encoded {
+        bytes: key,
+        position: 0,
+        checkpoint: &mut checkpoint,
+    };
+    let count = input.length()?;
+    for _ in 0..count {
+        if input.byte()? > 1 {
+            return Err(bad("invalid index direction"));
+        }
+        input.scalar_value()?;
+    }
+    let suffix = input.position;
+    let row = RowId(input.integer()?);
+    let created = TxId(input.integer()?);
+    if input.position != key.len() {
+        return Err(bad("trailing posting fields"));
+    }
+    Ok((suffix, row, created))
 }
 
 /// Parse and hash the exact persisted representation before schema projection.
@@ -655,12 +798,14 @@ impl ContentIdentityReadVerifier {
                     n.checked_add(2 * std::mem::size_of::<EmissionWriter<'_, JsonSink<'_>>>())
                 })
                 .and_then(|n| {
-                    n.checked_add(2 * std::mem::size_of::<
-                        serde_json::Serializer<
-                            &mut EmissionWriter<'_, JsonSink<'_>>,
-                            StringFragmentFormatter,
-                        >,
-                    >())
+                    n.checked_add(
+                        2 * std::mem::size_of::<
+                            serde_json::Serializer<
+                                &mut EmissionWriter<'_, JsonSink<'_>>,
+                                StringFragmentFormatter,
+                            >,
+                        >(),
+                    )
                 })
                 .ok_or_else(|| bad("projection controls overflow"))?,
             "reader",
@@ -1110,15 +1255,23 @@ fn emit_projection<W: std::io::Write>(
     emit_bytes(writer, b"}", checkpoint)
 }
 
-pub(in super::super) fn relation_name_with_checkpoint(table: &str, checkpoint: &mut dyn FnMut() -> Result<()>) -> Result<String> {
-    let capacity = table.len().checked_add(4).ok_or_else(|| bad("relation name overflow"))?;
+pub(in super::super) fn relation_name_with_checkpoint(
+    table: &str,
+    checkpoint: &mut dyn FnMut() -> Result<()>,
+) -> Result<String> {
+    let capacity = table
+        .len()
+        .checked_add(4)
+        .ok_or_else(|| bad("relation name overflow"))?;
     let mut name = String::with_capacity(capacity);
     name.push_str("rel_");
     let mut position = 0;
     while position < table.len() {
         checkpoint()?;
         let mut end = position.saturating_add(64 * 1024).min(table.len());
-        while !table.is_char_boundary(end) { end -= 1; }
+        while !table.is_char_boundary(end) {
+            end -= 1;
+        }
         name.push_str(&table[position..end]);
         position = end;
     }
