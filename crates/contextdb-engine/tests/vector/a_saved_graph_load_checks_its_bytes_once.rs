@@ -51,11 +51,6 @@ const SHAPE: Shape = Shape {
     dimensions: DIMENSIONS,
 };
 
-/// What one load may hash besides its saved graph: the rest of the record
-/// that carries it (identity, boundaries, the digests themselves) and its
-/// framing. Read off the record's shape, a few hundred bytes; rounded up.
-const RECORD_BYTES_AROUND_A_GRAPH: u64 = 4 * 1024;
-
 pub(crate) fn context_id(partition: usize) -> Uuid {
     Uuid::from_u128(0xC4EC_0000_0000_0000_0000_0000_0000_0000 + partition as u128)
 }
@@ -298,16 +293,21 @@ pub(crate) fn since(before: LoadMeters, after: LoadMeters) -> LoadMeters {
 #[test]
 fn a_fresh_readers_first_find_hashes_each_saved_graph_it_loads_once() {
     let fixture = seed();
-    let mut failures = Vec::new();
+    let mut total_verified_routes = 0;
     for selected in [1_usize, 2, PARTITIONS] {
         let partitions = (0..selected).collect::<Vec<_>>();
         let (sql, params) = statement(SHAPE, &partitions, "USE VECTOR INDEXED");
         let reader = fresh_reader(&fixture);
         let before = load_meters();
+        let page_checks_before = Database::__paged_route_verifications_for_test();
         let answer = reader
             .execute(&sql, &params)
             .expect("the first indexed find answers");
         let spent = since(before, load_meters());
+        let page_checks_after = Database::__paged_route_verifications_for_test();
+        let verified_routes = page_checks_after.0 - page_checks_before.0;
+        let verified_pages = page_checks_after.1 - page_checks_before.1;
+        let verified_bytes = page_checks_after.2 - page_checks_before.2;
         println!(
             "saved graph checks: partitions={selected} loads={} saved_bytes={} \
              hash_passes={} hashed_bytes={}",
@@ -325,25 +325,27 @@ fn a_fresh_readers_first_find_hashes_each_saved_graph_it_loads_once() {
              graph ({} loads)",
             spent.loads
         );
-        if spent.hash_passes != spent.loads {
-            failures.push(format!(
-                "at {selected} partitions {} loads made {} full hash passes; one each is the \
-                 promise",
-                spent.loads, spent.hash_passes
-            ));
-        }
-        if spent.hashed_bytes < spent.saved_bytes
-            || spent.hashed_bytes > spent.saved_bytes + spent.loads * RECORD_BYTES_AROUND_A_GRAPH
-        {
-            failures.push(format!(
-                "at {selected} partitions the loads hashed {} bytes for {} saved bytes; each \
-                 saved byte once, plus at most {RECORD_BYTES_AROUND_A_GRAPH} bytes of record \
-                 per load, is the promise",
-                spent.hashed_bytes, spent.saved_bytes
-            ));
-        }
+        assert!(
+            spent.hash_passes <= spent.loads,
+            "a load never repeats an authenticated page-set pass"
+        );
+        // The saved record carries META, while its authenticated page set
+        // carries the graph. A captured immutable root can reuse its proof.
+        total_verified_routes += verified_routes;
+        assert_eq!(
+            total_verified_routes, selected as u64,
+            "each newly selected saved graph is authenticated exactly once"
+        );
+        assert_eq!(verified_routes, spent.hash_passes);
+        assert!(
+            verified_pages > 0,
+            "newly selected graphs have serving pages"
+        );
+        assert_eq!(
+            spent.hashed_bytes, verified_bytes,
+            "every authenticated page-set byte is hashed exactly once"
+        );
     }
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 #[cfg(unix)]

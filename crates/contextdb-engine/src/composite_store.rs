@@ -484,7 +484,7 @@ pub struct CompositeStore {
     vector_partition_snapshot_stages: VectorPartitionSnapshotStageRegistry,
     pub(crate) accountant: crate::memory_accounting::StoreAccountantHandle,
     apply_phase_pause: Arc<ApplyPhasePause>,
-
+    pub(crate) precommit_vector_root: Mutex<std::sync::Weak<crate::persistence::WriterSnapshot>>,
 }
 
 #[derive(Debug, Default)]
@@ -630,6 +630,7 @@ impl CompositeStore {
             vector_partition_snapshot_stages,
             accountant: crate::memory_accounting::StoreAccountantHandle::new(accountant),
             apply_phase_pause,
+            precommit_vector_root: Mutex::new(std::sync::Weak::new()),
         }
     }
 
@@ -844,13 +845,35 @@ impl CompositeStore {
         &self,
         index: &VectorIndexRef,
         partition_key: &VectorPartitionKey,
-        row_id: RowId,
+        accepted: &VersionedRow,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        _read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-    ) -> Result<Option<contextdb_core::VectorEntry>> {
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<Option<(TxId, Lsn)>> {
+        let (root, durable) = {
+            let captured = self.precommit_vector_root.lock();
+            (
+                captured.upgrade(),
+                !std::sync::Weak::ptr_eq(&captured, &std::sync::Weak::new()),
+            )
+        };
+        if let Some(root) = root {
+            return crate::persistence::vector_current_identity::accepted_identity(
+                &root,
+                index,
+                partition_key,
+                accepted,
+                vector_copy_owner,
+                read_memory,
+            );
+        }
+        if durable {
+            return Err(Error::Other(
+                "writer publication no longer owns its commit source".into(),
+            ));
+        }
         let Some(current_key) =
             self.vector
-                .current_partition_for_row(index, row_id, vector_copy_owner)?
+                .current_partition_for_row(index, accepted.row_id, vector_copy_owner)?
         else {
             return Ok(None);
         };
@@ -860,13 +883,15 @@ impl CompositeStore {
                 index.table, index.column
             )));
         }
-        self.vector.try_live_entry_for_row_in_partition(
-            index,
-            partition_key,
-            row_id,
-            SnapshotId::from_raw_wire(u64::MAX),
-            vector_copy_owner,
-        )
+        self.vector
+            .try_live_entry_for_row_in_partition(
+                index,
+                partition_key,
+                accepted.row_id,
+                SnapshotId::from_raw_wire(u64::MAX),
+                vector_copy_owner,
+            )
+            .map(|entry| entry.map(|entry| (entry.created_tx, entry.lsn)))
     }
 
     fn prepared_binding(
@@ -1047,7 +1072,7 @@ impl CompositeStore {
                 .current_vector_for_partition(
                     index,
                     &partition_key,
-                    *row_id,
+                    &row,
                     &mut vector_copy_owner,
                     read_memory.clone(),
                 )?
@@ -1057,8 +1082,8 @@ impl CompositeStore {
                 meta,
                 declaration,
                 row,
-                vector.created_tx,
-                vector.lsn,
+                vector.0,
+                vector.1,
             )?;
             keyed_deletes.push(PartitionedVectorDelete::new(
                 index.clone(),
@@ -1166,7 +1191,7 @@ impl CompositeStore {
                 .current_vector_for_partition(
                     index,
                     &source_key,
-                    *old_row_id,
+                    &old_row,
                     &mut vector_copy_owner,
                     read_memory.clone(),
                 )?
@@ -1176,8 +1201,8 @@ impl CompositeStore {
                 meta,
                 declaration.clone(),
                 old_row,
-                vector.created_tx,
-                vector.lsn,
+                vector.0,
+                vector.1,
             )?;
             let after =
                 Self::prepared_binding(index, meta, declaration, new_row, *moved_tx, commit_lsn)?;
@@ -1248,7 +1273,7 @@ impl CompositeStore {
                 let Some(vector) = self.current_vector_for_partition(
                     &index,
                     &old_key,
-                    new_row.row_id,
+                    &old_row,
                     &mut vector_copy_owner,
                     read_memory.clone(),
                 )?
@@ -1260,8 +1285,8 @@ impl CompositeStore {
                     meta,
                     declaration.clone(),
                     old_row.clone(),
-                    vector.created_tx,
-                    vector.lsn,
+                    vector.0,
+                    vector.1,
                 )?;
                 // No vector payload arrived, but the local move versions the
                 // unchanged bytes at this commit so old and new snapshots keep

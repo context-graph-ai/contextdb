@@ -31,7 +31,6 @@ pub struct PersistentCompositeStore {
     local_schema_stages: LocalSchemaStageRegistry,
     prepared_publication:
         parking_lot::Mutex<Option<Arc<crate::persistence::writer_source::WriterSnapshot>>>,
-    precommit_source: parking_lot::Mutex<std::sync::Weak<crate::persistence::WriterSnapshot>>,
     _precommit_source_memory: PersistentSourceMemory,
     publication_interrupted: std::sync::atomic::AtomicBool,
 }
@@ -67,6 +66,7 @@ impl PersistentCompositeStore {
         let source_bytes = std::mem::size_of::<
             parking_lot::Mutex<std::sync::Weak<crate::persistence::WriterSnapshot>>,
         >();
+        *inner.precommit_vector_root.lock() = Arc::downgrade(&initial_root);
         inner.accountant.charge_retained(source_bytes);
         let source_memory = PersistentSourceMemory {
             accountant: inner.accountant.clone(),
@@ -80,7 +80,6 @@ impl PersistentCompositeStore {
             received_schema_stages,
             local_schema_stages,
             prepared_publication: parking_lot::Mutex::new(None),
-            precommit_source: parking_lot::Mutex::new(Arc::downgrade(&initial_root)),
             _precommit_source_memory: source_memory,
             publication_interrupted: std::sync::atomic::AtomicBool::new(false),
         })
@@ -264,7 +263,7 @@ impl PersistentCompositeStore {
         {
             return Ok(None);
         }
-        let root = self.precommit_source.lock().upgrade().ok_or_else(|| {
+        let root = self.inner.precommit_vector_root.lock().upgrade().ok_or_else(|| {
             Error::Other("writer publication no longer owns its commit source".into())
         })?;
         let source = crate::persistence::writer_adapters::WriterRelationalSource::new_for_read(root, read_memory)?;
@@ -362,7 +361,7 @@ impl PersistentCompositeStore {
                     .store(true, std::sync::atomic::Ordering::SeqCst);
                 panic!("durable publication root preparation failed: {error}");
             });
-        *self.precommit_source.lock() = Arc::downgrade(&root);
+        *self.inner.precommit_vector_root.lock() = Arc::downgrade(&root);
         *self.prepared_publication.lock() = Some(root);
     }
 }

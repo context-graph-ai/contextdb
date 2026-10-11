@@ -2133,6 +2133,16 @@ accountant: Arc::clone(self),
         self.tail_admission_failure.load(Ordering::SeqCst) == 2
     }
 
+    #[cfg(any(test, feature = "test-seams"))]
+    pub(crate) fn arm_current_identity_admission_failure_for_test(&self) {
+        self.tail_admission_failure.store(3, Ordering::SeqCst);
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    pub(crate) fn current_identity_admission_failure_consumed_for_test(&self) -> bool {
+        self.tail_admission_failure.load(Ordering::SeqCst) == 4
+    }
+
     /// Evict idle graphs of partitions the statement on this thread is not
     /// searching until `short` more bytes are free, for a graph it is about
     /// to load. Returns how many graphs were evicted.
@@ -2165,6 +2175,22 @@ accountant: Arc::clone(self),
         &self, bytes: usize, subsystem: &str, operation: &str, hint: &str,
         provenance: Option<&StoreAccountantHandle>,
     ) -> contextdb_core::Result<()> {
+        #[cfg(any(test, feature = "test-seams"))]
+        if operation == "current_identity_delta"
+            && self
+                .tail_admission_failure
+                .compare_exchange(3, 4, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            return Err(contextdb_core::Error::MemoryBudgetExceeded {
+                subsystem: subsystem.to_owned(),
+                operation: operation.to_owned(),
+                requested_bytes: bytes,
+                available_bytes: 0,
+                budget_limit_bytes: self.used.load(Ordering::SeqCst),
+                hint: "Injected current vector identity publication admission exhaustion.".to_owned(),
+            });
+        }
         #[cfg(any(test, feature = "test-seams"))]
         if operation == "prepare_hnsw_tail"
             && self

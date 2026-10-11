@@ -1516,6 +1516,13 @@ impl DurableMembershipSource {
         )?;
         let mut cursor = self.cursor(row)?;
         loop {
+            // This lookup returns only copied scalar identities or visitor
+            // status. The decoded membership dies before the next record; its
+            // codec owner must follow that lifetime in the same reader budget.
+            let _decode = crate::read_image_memory::ImageMemory::enter_decode_call()?;
+            let _record = crate::read_image_memory::active_owner()?
+                .row_owner()?
+                .enter();
             let mut interrupted = None;
             let next = cursor.next_record(&mut |request| match request {
                 DormantVectorLoadRequest::Reserve(bytes) => match admit(
@@ -1832,9 +1839,9 @@ impl RawVectorMembershipSource for DurableMembershipSource {
             .or(inspection.base)
             .is_some_and(|generation| generation.covered_tx > TxId::from_snapshot(snapshot))
         {
-            return Err(damage(
-                "captured serving frontier is newer than the requested snapshot",
-            ));
+            return Err(Error::VectorIndexedRouteUnavailable {
+                index: self.partition.index.clone(),
+            });
         }
         if generations.is_none() {
             let summary = self.read_pending_metadata(&root)?;

@@ -19,6 +19,8 @@ mod published_vector_install_tests;
 #[doc(hidden)]
 pub mod resident_history_test_seams;
 pub(crate) mod vector_captured_serving;
+#[cfg(all(test, feature = "test-seams"))]
+mod vector_suffix_inspection_tests;
 #[cfg(test)]
 mod vector_frontier_metadata_admission_tests;
 #[cfg(test)]
@@ -11091,6 +11093,7 @@ pub struct WriterMemoryOwnershipReceiptForTest {
     pub captured_root_charge: usize,
     pub commit_source_reference_charge: usize,
     pub storage_maintenance_control_charge: usize,
+    pub snapshot_pin_capacity_charge: usize,
 }
 
 #[cfg(any(test, feature = "test-seams"))]
@@ -15886,18 +15889,21 @@ struct SnapshotPinPool {
 }
 
 impl SnapshotPinPool {
-    fn acquire(self: &Arc<Self>) -> contextdb_core::Result<SnapshotPinSlot> {
+    fn acquire(
+        self: &Arc<Self>,
+        reader: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> contextdb_core::Result<SnapshotPinSlot> {
         let mut available = self.available.load(Ordering::SeqCst);
         loop {
             if available == 0 {
-                return Err(contextdb_core::Error::MemoryBudgetExceeded {
-                    subsystem: "snapshot_pin".into(),
-                    operation: "admit_pin".into(),
-                    requested_bytes: self.slot_bytes,
-                    available_bytes: 0,
-                    budget_limit_bytes: self.slots.saturating_mul(self.slot_bytes),
-                    hint: "drop a SnapshotPin before pinning another snapshot".into(),
-                });
+                return contextdb_core::read_memory::ReadCredit::try_new(
+                    reader,
+                    self.slot_bytes,
+                    "snapshot_pin",
+                    "admit_pin",
+                    "Drop a SnapshotPin or raise the declared reader memory limit.",
+                )
+                .map(|credit| SnapshotPinSlot::Reader { _credit: credit });
             }
             match self.available.compare_exchange(
                 available,
@@ -15905,20 +15911,25 @@ impl SnapshotPinPool {
                 Ordering::SeqCst,
                 Ordering::SeqCst,
             ) {
-                Ok(_) => return Ok(SnapshotPinSlot { pool: self.clone() }),
+                Ok(_) => return Ok(SnapshotPinSlot::Prepaid(self.clone())),
                 Err(observed) => available = observed,
             }
         }
     }
 }
 
-struct SnapshotPinSlot {
-    pool: Arc<SnapshotPinPool>,
+enum SnapshotPinSlot {
+    Prepaid(Arc<SnapshotPinPool>),
+    Reader {
+        _credit: contextdb_core::read_memory::ReadCredit,
+    },
 }
 
 impl Drop for SnapshotPinSlot {
     fn drop(&mut self) {
-        self.pool.available.fetch_add(1, Ordering::SeqCst);
+        if let Self::Prepaid(pool) = self {
+            pool.available.fetch_add(1, Ordering::SeqCst);
+        }
     }
 }
 
@@ -15967,12 +15978,15 @@ impl SnapshotFloorRegistry {
         Ok(())
     }
 
-    fn acquire_pin_slot(&self) -> contextdb_core::Result<SnapshotPinSlot> {
+    fn acquire_pin_slot(
+        &self,
+        reader: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> contextdb_core::Result<SnapshotPinSlot> {
         self.pin_slots
             .lock()
             .as_ref()
             .expect("snapshot pin pool is funded when the database opens")
-            .acquire()
+            .acquire(reader)
     }
 }
 
@@ -19608,7 +19622,9 @@ fn register_loaded_dormant_vector_generations(
                 layout: layout.clone(),
                 live_rows,
                 declared_serving_cache: declared_serving_cache.clone(),
-                tail_covered_lsn: catalog.change.is_none().then_some(catalog.base.covered_lsn),
+                // Captured serving owns journal replay at its selected root. The
+                // shared retained loader installs only this sealed generation.
+                tail_covered_lsn: None,
             });
         vector.register_dormant_partition_generation(
             &partition,
@@ -19670,7 +19686,7 @@ fn register_loaded_dormant_vector_generations(
                     layout: layout.clone(),
                     live_rows,
                     declared_serving_cache: declared_serving_cache.clone(),
-                    tail_covered_lsn: Some(change.covered_lsn),
+                    tail_covered_lsn: None,
                 });
             vector.register_dormant_partition_generation(
                 &partition,
@@ -20572,7 +20588,9 @@ impl MaintenanceContext {
                 declared_serving_cache: DeclaredServingCache::Live(
                     self.vector_serving_cache_bytes.clone(),
                 ),
-                tail_covered_lsn: catalog.change.is_none().then_some(catalog.base.covered_lsn),
+                // Captured serving owns journal replay at its selected root. The
+                // shared retained loader installs only this sealed generation.
+                tail_covered_lsn: None,
             });
         self.vector.register_dormant_partition_generation(
             &partition,
@@ -20615,7 +20633,7 @@ impl MaintenanceContext {
                     declared_serving_cache: DeclaredServingCache::Live(
                         self.vector_serving_cache_bytes.clone(),
                     ),
-                    tail_covered_lsn: Some(change.covered_lsn),
+                    tail_covered_lsn: None,
                 });
             self.vector.register_dormant_partition_generation(
                 &partition,
@@ -21544,6 +21562,13 @@ impl MaintenanceContext {
                     .min(16)
                     .min(graph_count);
                 let width = held.map_or(host_width, |(width, _, _)| host_width.min(width));
+                #[cfg(any(test, feature = "test-seams"))]
+                let width = if self.vector.has_maintenance_progress_pause_for_test(partition) {
+                    // An exact insertion boundary must not be crossed by a parallel wave.
+                    1
+                } else {
+                    width
+                };
                 for workers in (2..=width).rev() {
                     let extra =
                         HnswIndex::parallel_insertion_extra_bytes(graph_count, policy, workers)?;
@@ -55868,10 +55893,14 @@ impl Database {
     /// cannot come back — that is the pre-existing, documented unpinned-
     /// held-snapshot boundary above, unchanged. A pin whose `snapshot` is
     /// not older than any in-flight pass's own floor never blocks.
-    /// The store's fixed `ReadLimits::SHIPPED_SNAPSHOT_PIN_SLOTS` pool bounds
-    /// caller-held registrations; exhaustion returns a typed memory refusal.
+    /// The first `ReadLimits::SHIPPED_SNAPSHOT_PIN_SLOTS` registrations use
+    /// prepaid capacity. Further pins reserve their exact registration bytes
+    /// from the store's declared reader memory until unpin; insufficient
+    /// memory returns a typed `snapshot_pin` refusal.
     pub fn pin_snapshot(&self, snapshot: SnapshotId) -> contextdb_core::Result<SnapshotPin<'_>> {
-        let slot = self.snapshot_registry.acquire_pin_slot()?;
+        let slot = self
+            .snapshot_registry
+            .acquire_pin_slot(self.declared_read_memory.clone())?;
         let root = self.snapshot_registry.pinned_root(snapshot).or_else(|| {
             self.writer_read_root()
                 .expect("an open database has a published read root")
@@ -62766,6 +62795,8 @@ impl Database {
                 vector: self.vector_memory_ownership_receipt_for_test(),
                 relational_inventory: self.relational_store.retained_structure_bytes(),
                 commit_source_reference_charge: self.commit_source_reference_charge,
+                snapshot_pin_capacity_charge: self.snapshot_registry.pin_slots.lock().as_ref()
+                    .map_or(0, |pool| pool.slots.saturating_mul(pool.slot_bytes)),
                 ..WriterMemoryOwnershipReceiptForTest::default()
             };
             let metadata = self.relational_store.table_meta.read();
@@ -62932,6 +62963,7 @@ impl Database {
             receipt.named_owner_total = registration + backing + adapters + receipt.pending_lineage_generation_charge
                 + receipt.storage_maintenance_control_charge
                 + receipt.commit_source_reference_charge
+                + receipt.snapshot_pin_capacity_charge
                 + receipt.published_root_charge
                 + receipt.captured_root_charge
                 + receipt.staged_index_postings
@@ -62960,6 +62992,40 @@ impl Database {
     #[doc(hidden)]
     pub fn writer_memory_underflow_count_for_test(&self) -> usize {
         self.finalization.accountant.underflow_count_for_test()
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn arm_vector_current_identity_admission_failure_for_test(&self) {
+        self.finalization
+            .accountant
+            .arm_current_identity_admission_failure_for_test();
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn vector_current_identity_admission_failure_consumed_for_test(&self) -> bool {
+        self.finalization
+            .accountant
+            .current_identity_admission_failure_consumed_for_test()
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn inspect_captured_vector_suffix_for_test(
+        &self,
+        partition: &contextdb_vector::VectorPartitionRef,
+        snapshot: SnapshotId,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        checkpoint: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Option<contextdb_vector::store::CapturedVectorSuffixInspectionForTest>> {
+        let _operation = self.open_operation()?;
+        let _schema = self.vector_schema_read(&partition.index);
+        let _source = self.writer_read_scope(read_memory.clone())?;
+        let mut owner = crate::vector_read_memory::admission(read_memory);
+        self.vector_store.inspect_captured_vector_suffix_for_test(
+            partition, snapshot, &mut owner, checkpoint,
+        )
     }
 
     #[cfg(any(test, feature = "test-seams"))]

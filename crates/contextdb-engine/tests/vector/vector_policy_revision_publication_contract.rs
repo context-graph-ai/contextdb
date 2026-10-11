@@ -194,6 +194,30 @@ fn alter_hnsw(db: &Database, members: &str) {
     .expect("declared HNSW policy updates atomically");
 }
 
+fn captured_topology(db: &Database) -> u64 {
+    db.inspect_captured_vector_suffix_for_test(
+        &partition(),
+        db.snapshot(),
+        db.declared_reader_memory()
+            .expect("admit the captured-topology reader"),
+        &mut || Ok(()),
+    )
+    .expect("inspect the current operation-owned captured source")
+    .expect("the complete maintained route has a captured serving source")
+    .topology_digest
+}
+
+fn append_unchanged_captured_suffix(db: &Database) {
+    db.execute(
+        "UPDATE revision_docs SET embedding = $embedding WHERE id = $id",
+        &params([
+            ("id", Value::Uuid(Uuid::from_u128(0x6111))),
+            ("embedding", Value::Vector(axis(0))),
+        ]),
+    )
+    .expect("rewrite one unchanged vector into the captured suffix");
+}
+
 #[test]
 fn online_vector_policy_revisions_keep_the_complete_graph_serving_and_reject_stale_publication() {
     let root = TempDir::new().expect("temporary durable revision store");
@@ -201,9 +225,17 @@ fn online_vector_policy_revisions_keep_the_complete_graph_serving_and_reject_sta
     let db = Arc::new(Database::open(&path).expect("open durable revision fixture"));
     create_current_control(&db);
     let serving_serial = assert_current_control(&db);
-    let serving_topology = db
-        .__debug_vector_hnsw_topology_digest_for_test(index())
-        .expect("current complete graph has a topology digest");
+    append_unchanged_captured_suffix(&db);
+    assert_eq!(
+        indexed_query(&db),
+        vec![
+            Uuid::from_u128(0x6111),
+            Uuid::from_u128(0x6112),
+            Uuid::from_u128(0x6113),
+        ],
+        "the same-value suffix mutation preserves the complete serving answer"
+    );
+    let serving_topology = captured_topology(&db);
 
     // The control above has already executed real caller-driven
     // maintenance and an INDEXED search before this new SQL.
@@ -240,9 +272,9 @@ fn online_vector_policy_revisions_keep_the_complete_graph_serving_and_reject_sta
         "AUTO_INDEX_AT changes query routing, never HNSW topology"
     );
     assert_eq!(
-        db.__debug_vector_hnsw_topology_digest_for_test(index()),
-        Some(serving_topology),
-        "AUTO_INDEX_AT changes query routing, never HNSW topology"
+        captured_topology(&db),
+        serving_topology,
+        "AUTO_INDEX_AT changes query routing, never the captured serving topology"
     );
 
     alter_hnsw(&db, "EF_SEARCH = 2");

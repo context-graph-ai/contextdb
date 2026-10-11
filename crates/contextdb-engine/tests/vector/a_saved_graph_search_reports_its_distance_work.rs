@@ -273,10 +273,9 @@ fn a_saved_graph_search_reports_its_distance_work() {
         .iter()
         .map(|receipt| receipt.admission_evaluations + receipt.expansion_evaluations)
         .sum::<usize>() as u64;
-    // Every vector the file route read out of the saved graph's pages that
-    // the walk did not evaluate is a returned candidate scored for its
-    // published answer.
-    let rescored = indexed.decoded.saturating_sub(walk_evaluations);
+    // Native scoring reports returned candidates on every saved-page codec.
+    // The old paged decoder observer does not cover native topology pages.
+    let rescored = indexed.native;
     println!(
         "saved_graph_distance_work rows={ROWS} indexed_graph={} indexed_native={} \
          indexed_decoded={} walk_evaluations={walk_evaluations} rescored={rescored} \
@@ -356,10 +355,8 @@ fn a_saved_graph_search_reports_its_distance_work() {
         "the graph observer sees exactly the walk's evaluations"
     );
     assert_eq!(
-        indexed.native, rescored,
-        "each candidate scored out of the saved graph's pages is reported as a native score: \
-         observed {} against {rescored} re-scored",
-        indexed.native
+        indexed.native, in_memory.native,
+        "both routes report the same returned-candidate scoring work"
     );
     assert_eq!(
         indexed.graph + indexed.native,

@@ -1555,6 +1555,17 @@ impl RequestContext {
         self.check_final_boundary()
     }
 
+    /// Report native directory, body and navigation steps separately from logical work.
+    /// Their page admission remains governed by the source memory budget.
+    fn native_source_touch(&self) -> std::result::Result<(), BoundedExecutionError> {
+        self.checkpoint()?;
+        contextdb_core::find_attribution::count("bounded_native_source_touches", 1);
+        let mut state = self.state();
+        state.telemetry.native_source_touches =
+            state.telemetry.native_source_touches.saturating_add(1);
+        Ok(())
+    }
+
     /// Count one thing the read looked at, without charging for looking.
     ///
     /// The work a source does over an item is charged where it is done; this
@@ -8934,6 +8945,7 @@ impl VectorState {
                 source: BoundedWorkSource::TableScan,
             }));
         let mut retained = 0usize;
+        context.charge_operator(BoundedWorkSource::TableScan)?;
         let row = context.with_source_page_admission(BoundedWorkSource::TableScan, || {
             db.bounded_row_by_identity(
                 context.source_read_memory(BoundedWorkSource::TableScan),
@@ -8949,7 +8961,7 @@ impl VectorState {
                 // other door resolves the same row through the version index
                 // (`RelationalStore::row_by_id`) and counts nothing, and
                 // `rows_examined` is one figure both doors owe the same answer to.
-                &mut || context.charge_operator(BoundedWorkSource::TableScan),
+                &mut || context.native_source_touch(),
                 &mut |bytes| {
                     retained = context.admit_source_row(BoundedWorkSource::TableScan, bytes)?;
                     Ok(())
@@ -9308,7 +9320,7 @@ impl VectorState {
                         from,
                         self.snapshot,
                         &self.query,
-                        &mut || context.charge_operator(BoundedWorkSource::VectorCandidates),
+                        &mut || context.native_source_touch(),
                         &mut || context.charge_operator(BoundedWorkSource::VectorCandidates),
                         &mut |bytes| context.reserve(BoundedWorkSource::VectorCandidates, bytes),
                         &mut |bytes| context.release_parked(bytes),
@@ -9552,7 +9564,7 @@ impl VectorState {
                                 &self.index,
                                 candidates,
                                 self.snapshot,
-                                &mut || context.checkpoint(),
+                                &mut || context.native_source_touch(),
                                 &mut || {
                                     context.charge_operator(BoundedWorkSource::VectorCandidates)
                                 },
@@ -9574,7 +9586,7 @@ impl VectorState {
                                 self.k,
                                 self.sort_key.as_deref(),
                                 groups.get(),
-                                &mut || context.checkpoint(),
+                                &mut || context.native_source_touch(),
                                 vector_copy_owner,
                                 context.reader_budget.clone(),
                             )
@@ -9608,7 +9620,7 @@ impl VectorState {
                                     },
                                     &reader_memory_refusal,
                                     allowed_search_limits,
-                                    &mut || context.checkpoint(),
+                                    &mut || context.native_source_touch(),
                                     &mut || {
                                         context.charge(
                                             BoundedWorkSource::VectorCandidates,
@@ -9748,7 +9760,7 @@ impl VectorState {
                             &self.query,
                             exact_candidate_k,
                             groups.take(),
-                            &mut || context.checkpoint(),
+                            &mut || context.native_source_touch(),
                             &mut |bytes| {
                                 context
                                     .reserve(BoundedWorkSource::VectorCandidates, bytes)
@@ -9794,7 +9806,7 @@ impl VectorState {
                             context.with_vector_copies(|vector_copy_owner| {
                                 db.bounded_brute_force_vector_step(
                                     cursor,
-                                    &mut || context.checkpoint(),
+                                    &mut || context.native_source_touch(),
                                     &mut || {
                                         context.observe_precharged_touch(
                                             BoundedSourceTouch::BruteForceVectorCandidate,
@@ -14376,7 +14388,7 @@ fn build_vector_kernel<'plan>(
                         table,
                         row_id,
                         snapshot,
-                        &mut || context.charge_operator(BoundedWorkSource::VectorCandidates),
+                        &mut || context.native_source_touch(),
                         &mut |bytes| {
                             retained = context
                                 .admit_source_row(BoundedWorkSource::VectorCandidates, bytes)?;
@@ -14430,7 +14442,7 @@ fn build_vector_kernel<'plan>(
                 db.bounded_vector_visit_visible_ids(
                     &index,
                     snapshot,
-                    &mut || context.charge_operator(BoundedWorkSource::VectorCandidates),
+                    &mut || context.native_source_touch(),
                     &mut |bytes| context.reserve(BoundedWorkSource::VectorCandidates, bytes),
                     &mut |bytes| context.release_parked(bytes),
                     &mut admit,

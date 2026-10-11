@@ -1249,7 +1249,7 @@ pub(crate) fn graph_work_cannot_beat_exact(
 }
 
 /// Run each partition's own search (its base, change and tail together, as
-/// one partition's layers always were) in turn against one shared evaluation
+/// one partition's layers always were) in turn against its declared evaluation
 /// cap and merge their kept rows by distance. A layer search that stops on a limit
 /// (the cap included) makes the union Incomplete; a refused layer refuses it.
 pub(crate) fn merge_layer_searches<E>(
@@ -1261,7 +1261,7 @@ pub(crate) fn merge_layer_searches<E>(
     let mut merged: Option<HnswUnionSearchResult> = None;
     let mut spent = 0usize;
     for position in 0..layers {
-        let remaining = cap.saturating_sub(spent);
+        let remaining = cap;
         let one = search_layer(position, remaining, spent)?;
         spent = spent
             .saturating_add(one.admission_evaluations)
@@ -1308,7 +1308,7 @@ pub(crate) fn merge_layer_searches<E>(
         layers_admitted: 0,
         frontier_exhausted: true,
     });
-    all.budget = cap;
+    all.budget = cap.saturating_mul(layers);
     // Nearest first across layers, ties by partition then row, exactly as
     // one walk's kept rows are ordered.
     all.candidates.sort_by(|left, right| {
@@ -1711,10 +1711,9 @@ where
         )));
     }
 
-    // Opening the layers is a floor on top of the one budget, bounded only by
-    // the declared limit; the walk after it may spend the whole budget. The
-    // cap is set again once the layers are open.
-    let evaluation_cap = limits.max_vector_evaluations;
+    // Opening and expanding the layers share the declared per-index cap,
+    // additionally bounded by the request's remaining logical work.
+    let evaluation_cap = budget.min(limits.max_vector_evaluations);
     // Every frontier entry is one evaluation, so the frontier never outgrows
     // what the budget can pay for, however many partitions were admitted.
     let frontier_capacity = total_points
@@ -1841,12 +1840,8 @@ where
                 break;
             }
             let before_expansion = walk.evaluations;
-            // The walk spends what is left of the one budget -- all of it on
-            // the first pass, whatever opening the layers cost -- and never
-            // past the declared limit.
-            walk.evaluation_cap = before_expansion
-                .saturating_add(budget.saturating_sub(expansion_evaluations))
-                .min(limits.max_vector_evaluations);
+            // Admission and both expansion passes spend the same per-index
+            // cap. Advancing the phase must not replenish its spent credit.
             #[cfg(feature = "test-seams")]
             expansion_cap.get_or_insert(walk.evaluation_cap.saturating_sub(before_expansion));
             let expanded = expand(
@@ -2483,6 +2478,27 @@ where
                 });
             }
         };
+        // Admission already funded this point's distance. Admit it to the
+        // candidate heap/frontier now, rather than discarding every observed
+        // point except the final greedy pivot.
+        if let Some(stop) = consider(
+            layer,
+            position,
+            entry_id,
+            walk,
+            query,
+            allow_bridges,
+            is_allowed,
+            before_source_entry,
+            before_distance,
+            acquire,
+            release,
+        )? {
+            return Ok(Admitted {
+                layers,
+                stop: Some(stop),
+            });
+        }
         for level in (0..=entry_id.0).rev() {
             loop {
                 let mut changed = false;
@@ -2525,6 +2541,24 @@ where
                             });
                         }
                     };
+                    if let Some(stop) = consider(
+                        layer,
+                        position,
+                        neighbour_id,
+                        walk,
+                        query,
+                        allow_bridges,
+                        is_allowed,
+                        before_source_entry,
+                        before_distance,
+                        acquire,
+                        release,
+                    )? {
+                        return Ok(Admitted {
+                            layers,
+                            stop: Some(stop),
+                        });
+                    }
                     if distance < pivot_distance {
                         pivot_id = neighbour_id;
                         pivot_distance = distance;
@@ -2535,31 +2569,6 @@ where
                     break;
                 }
             }
-        }
-        let pivot_origin = layer
-            .origin(pivot_id, before_source_entry)?
-            .ok_or_else(|| E::from(Error::Other("graph entry point".to_string())))?;
-        if let Some(bit) = layer.bit(pivot_id) {
-            walk.mark(bit, acquire)?;
-        }
-        let reached = Reached {
-            distance: pivot_distance,
-            row_id: layer
-                .row(pivot_origin, before_source_entry)?
-                .unwrap_or(RowId(u64::MAX)),
-            layer: position as u32,
-            point: pivot_id,
-            origin: pivot_origin,
-        };
-        walk.push_frontier(reached, acquire)?;
-        if let Some(row_id) = layer.row(pivot_origin, before_source_entry)?
-            && is_allowed(partition, row_id)
-        {
-            walk.keep(Kept {
-                reached,
-                partition,
-                row_id,
-            });
         }
         let seeds = std::mem::take(&mut layer.seeds);
         let seeded = (|| -> std::result::Result<Option<Stop>, E> {
@@ -2985,6 +2994,84 @@ mod canonical_tie_tests {
     use super::*;
 
     #[test]
+    fn opening_and_expansion_share_the_original_per_index_cap() {
+        use contextdb_core::{Lsn, TxId};
+
+        let vector = |ordinal: usize| {
+            (0..16)
+                .map(|axis| {
+                    let mixed = (ordinal as u64 + 17)
+                        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                        .wrapping_add((axis as u64 + 31).wrapping_mul(0xbf58_476d_1ce4_e5b9));
+                    ((mixed ^ (mixed >> 29)) % 100_003) as f32 / 100_003.0 - 0.5
+                })
+                .collect::<Vec<_>>()
+        };
+        let entries = (0..96)
+            .map(|ordinal| StoredVectorEntry {
+                membership: crate::store::VectorMembershipProvenance::new(
+                    TxId(1),
+                    Lsn(1),
+                    TxId(1),
+                    None,
+                ),
+                canonical_deleted_tx: None,
+                row_id: RowId(ordinal as u64 + 1),
+                vector: StoredVector::from_f32(&vector(ordinal), VectorQuantization::F32),
+                created_tx: TxId(1),
+                deleted_tx: None,
+                lsn: Lsn(1),
+            })
+            .collect::<Vec<_>>();
+        let graph = HnswIndex::new(&entries, 16, VectorQuantization::F32);
+        let layers = [HnswUnionLayer {
+            graph: &graph,
+            partition: 0,
+            allowed_count: entries.len(),
+            live_count: entries.len(),
+            seed_rows: None,
+        }];
+        let query = vector(1000);
+        let mut saw_expansion = false;
+        let mut saw_refusal = false;
+        for budget in 1..=96 {
+            let mut query_scores = BoundedHnswQuerySelfScores::new(&query);
+            let distances = std::cell::Cell::new(0usize);
+            let answer = search_union_allowed_bounded(
+                &layers,
+                &query,
+                10,
+                32,
+                budget,
+                HnswAllowedSearchLimits {
+                    max_visited_nodes: usize::MAX,
+                    max_vector_evaluations: usize::MAX,
+                },
+                true,
+                false,
+                &mut query_scores,
+                |_, _| true,
+                |_, _, _, _| Ok::<_, Error>(None),
+                || Ok::<(), Error>(()),
+                || {
+                    distances.set(distances.get() + 1);
+                    Ok::<(), Error>(())
+                },
+                |_| Ok::<(), Error>(()),
+                |_| {},
+            )
+            .unwrap();
+            let spent = answer.admission_evaluations + answer.expansion_evaluations;
+            assert!(spent <= budget, "budget={budget}, spent={spent}");
+            assert_eq!(distances.get(), spent, "all distances use the same cap");
+            saw_expansion |= answer.expansion_evaluations > 0;
+            saw_refusal |= answer.terminal == UnionTerminal::Refused;
+        }
+        assert!(saw_expansion, "the cap includes an actual expansion");
+        assert!(saw_refusal, "an unfunded walk refuses");
+    }
+
+    #[test]
     fn a_full_result_heap_replaces_larger_row_ids_at_equal_distance() {
         let mut walk = Walk {
             reached: HashMap::new(),
@@ -3099,5 +3186,40 @@ mod canonical_tie_tests {
                 "a tied plateau of {breadth} needs no retained-heap scan per pop: {comparisons} comparisons"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod partition_cap_tests {
+    use super::*;
+
+    #[test]
+    fn each_partition_receives_its_full_declared_cap() {
+        let mut grants = Vec::new();
+        let result = merge_layer_searches(2, 10, 0, |position, cap, spent| {
+            grants.push((position, cap, spent));
+            Ok::<_, ()>(HnswUnionSearchResult {
+                terminal: UnionTerminal::FrontierExhausted,
+                candidates: Vec::new(),
+                retained_bytes: 0,
+                status: HnswAllowedSearchStatus::Complete,
+                below_admission_floor: None,
+                budget: cap,
+                admission_evaluations: 2,
+                expansion_evaluations: 6,
+                allowed_admissions: 2,
+                #[cfg(feature = "test-seams")]
+                expansion_cap: cap,
+                layers_admitted: 1,
+                frontier_exhausted: true,
+            })
+        })
+        .unwrap();
+        assert_eq!(grants, [(0, 10, 0), (1, 10, 8)]);
+        assert_eq!(result.budget, 20);
+        assert_eq!(
+            result.admission_evaluations + result.expansion_evaluations,
+            16
+        );
     }
 }

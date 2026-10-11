@@ -1444,6 +1444,18 @@ pub struct LoadedVectorFreshTail {
     pub replayed_through_lsn: Lsn,
 }
 
+#[cfg(any(test, feature = "test-seams"))]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapturedVectorSuffixInspectionForTest {
+    pub base: Option<VectorGraphGeneration>,
+    pub change: Option<VectorGraphGeneration>,
+    pub points: usize,
+    pub policy: (usize, usize, usize),
+    pub topology_digest: u64,
+    pub replayed_through_lsn: Lsn,
+}
+
 /// A persistence-owned loader asks its caller either to check cancellation or
 /// to admit an additional load allocation learned after lightweight metadata
 /// I/O and before that allocation is materialized.
@@ -5398,14 +5410,13 @@ impl IndexState {
                 "dormant raw vector candidate has no loader".to_string(),
             ))
         })?;
-        // Exact fallback touches the partition membership and then its stored
-        // body. Both are physical work in addition to the distance calculation
-        // charged below; a bounded caller pays once for each touch.
+        // Membership and body reads are native source steps. Only scoring is
+        // logical distance work; page admission bounds these physical reads.
         if caller_charged && bodies.is_some() {
             if !membership_streamed {
-                before_distance()?;
+                before_checkpoint()?;
             }
-            before_distance()?;
+            before_checkpoint()?;
         }
         let mut interrupted = None;
         let mut caller_reserved = 0usize;
@@ -6283,12 +6294,17 @@ impl IndexState {
                 Self::layer_identity(change, dormant_change),
             )
         };
-        let mut selection = source.capture_serving_selection(
+        let mut selection = match source.capture_serving_selection(
             snapshot,
             frozen_registry.4.as_ref(),
             frozen_registry.5.as_ref(),
             owner,
-        )?;
+        ) {
+            // A valid newer catalog cannot serve this old snapshot. Its raw
+            // memberships still can, after compatible graphs are reclaimed.
+            Err(Error::VectorIndexedRouteUnavailable { .. }) => return Ok(None),
+            result => result?,
+        };
         selection._copy_owner = Some(retained);
         let dormant = if selection.inspection.captured_catalog || owner.historical_durable_reads() {
             None
@@ -7271,6 +7287,17 @@ impl IndexState {
         } else {
             None
         };
+        let mut roots = HashSet::new();
+        let mut retained_bytes = |generation: &SealedHnswGeneration| {
+            generation.bytes().saturating_add(
+                generation.graph().paged_tail_snapshot().map_or(0, |tail| {
+                    tail.retained_control_receipts().into_iter()
+                        .filter(|(owner, _)| roots.insert(*owner))
+                        .map(|(_, bytes)| bytes)
+                        .fold(0usize, usize::saturating_add)
+                }),
+            )
+        };
         (
             sealed
                 .retired
@@ -7290,20 +7317,20 @@ impl IndexState {
                             chain
                                 .base
                                 .as_ref()
-                                .map(SealedHnswGeneration::bytes)
+                                .map(&mut retained_bytes)
                                 .unwrap_or(0),
                         )
                         .saturating_add(
                             chain
                                 .change
                                 .as_ref()
-                                .map(SealedHnswGeneration::bytes)
+                                .map(&mut retained_bytes)
                                 .unwrap_or(0),
                         )
                 })
                 .saturating_add(
                     superseded_base
-                        .map(SealedHnswGeneration::bytes)
+                        .map(&mut retained_bytes)
                         .unwrap_or(0),
                 ),
         )
@@ -8154,6 +8181,13 @@ impl IndexState {
                 };
                 Ok((base, change, false))
             }
+        }
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    pub(crate) fn pause_graph_callback_for_test(&self) {
+        if let Some(slot) = self.graph_callback_pause.lock().clone() {
+            slot.pause_after(0);
         }
     }
 
@@ -12085,6 +12119,13 @@ impl VectorStore {
     #[cfg(not(any(test, feature = "test-seams")))]
     fn note_cap_work(&self, _note: impl FnOnce(&VectorCapWork)) {}
 
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn has_maintenance_progress_pause_for_test(&self, partition: &VectorPartitionRef) -> bool {
+        self.maintenance_progress_pauses.lock().get(partition)
+            .is_some_and(|slot| slot.requested_vectors().is_some())
+    }
+
     /// Arm one partition's next maintenance build to pause after the requested
     /// number of actual stored vectors has been traversed.
     #[doc(hidden)]
@@ -13506,6 +13547,86 @@ impl VectorStore {
             Ok(())
         })
     }
+    /// Inspect only the suffix owned by this operation's captured source.
+    /// This test seam never installs a graph or changes resident inspection.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn inspect_captured_vector_suffix_for_test(
+        &self,
+        partition: &VectorPartitionRef,
+        snapshot: SnapshotId,
+        owner: &mut VectorCopyAdmission,
+        checkpoint: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Option<CapturedVectorSuffixInspectionForTest>> {
+        checkpoint()?;
+        let Some(state) = self.try_partition_state(&partition.index, &partition.partition_key)
+        else {
+            return Ok(None);
+        };
+        let Some(selection) = state.capture_serving_selection(snapshot, owner)? else {
+            return Ok(None);
+        };
+        checkpoint()?;
+        let suffix = selection
+            .suffix
+            .as_ref()
+            .expect("captured suffix was bound once");
+        let mut scratch = owner.scratch();
+        scratch.reserve(suffix.load_bytes)?;
+        let mut interrupted = None;
+        let loaded = suffix.loader.load(suffix.load_bytes, &mut |request| {
+            let result = checkpoint().and_then(|()| match request {
+                DormantVectorLoadRequest::Reserve(bytes) => scratch.reserve(bytes),
+                _ => Ok(()),
+            });
+            if let Err(error) = result {
+                interrupted = Some(error);
+                false
+            } else {
+                true
+            }
+        });
+        let loaded = match loaded {
+            Ok(loaded) => loaded,
+            Err(error) => return Err(interrupted.unwrap_or(error)),
+        };
+        if let Some(error) = interrupted {
+            return Err(error);
+        }
+        let Some(tail) = loaded.tail else {
+            return Ok(None);
+        };
+        checkpoint()?;
+        // The existing mutable-graph digest copies one point's finite
+        // neighborhood at a time (sixteen levels, at most 2M each).
+        scratch.reserve(
+            16usize.saturating_mul(
+                std::mem::size_of::<Vec<usize>>().saturating_add(
+                    tail.graph
+                        .policy_values()
+                        .0
+                        .saturating_mul(2)
+                        .saturating_mul(32),
+                ),
+            ),
+        )?;
+        let inspected = CapturedVectorSuffixInspectionForTest {
+            base: selection.inspection.base,
+            change: selection.inspection.change,
+            points: tail.graph.len(),
+            policy: tail.graph.policy_values(),
+            topology_digest: tail.graph.graph_topology_digest_for_test(),
+            replayed_through_lsn: tail.replayed_through_lsn,
+        };
+        // LoadedVectorFreshTail is a plain transfer record. Keep the complete
+        // caller reservation until its actual graph is freed; no adoption or
+        // resident registry charge is created by this one-shot inspection.
+        drop(tail);
+        drop(selection);
+        drop(scratch);
+        Ok(Some(inspected))
+    }
+
     /// The callback must commit row bodies/MVCC, journal, graph pages and the
     /// successor root together. No vector registry/publication lock is held
     /// during admission or that callback. The engine serializes this operation

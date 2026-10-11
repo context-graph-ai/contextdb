@@ -431,7 +431,11 @@ fn run_concurrent_staged_delete(mode: StagedDeleteRaceModeForTest) -> (ReleaseOn
         staged_controls_released: before
             .staged_index_postings
             .checked_sub(after.staged_index_postings)
-            .unwrap(),
+            .unwrap()
+            + before
+                .writer_adapter_controls
+                .checked_sub(after.writer_adapter_controls)
+                .unwrap(),
     };
     assert_eq!(before.table_metadata, after.table_metadata);
     assert_eq!(
@@ -453,12 +457,16 @@ fn run_concurrent_staged_delete(mode: StagedDeleteRaceModeForTest) -> (ReleaseOn
             .vector
             .accountant_total
             .checked_sub(rolled_back.vector.accountant_total),
-        Some(after.staged_index_postings),
+        Some(
+            after.staged_index_postings + after.writer_adapter_controls
+                - rolled_back.writer_adapter_controls
+        ),
         "rollback releases the actual remaining staged declaration controls"
     );
     assert_eq!(
         after.named_owner_total - rolled_back.named_owner_total,
-        after.staged_index_postings
+        after.staged_index_postings + after.writer_adapter_controls
+            - rolled_back.writer_adapter_controls
     );
     assert_eq!(rolled_back.staged_row_versions, 0);
     assert_eq!(rolled_back.staged_row_admissions, 0);
@@ -468,6 +476,11 @@ fn run_concurrent_staged_delete(mode: StagedDeleteRaceModeForTest) -> (ReleaseOn
     assert_eq!(rolled_back.reconciliation_gap, after.reconciliation_gap);
     if mode == StagedDeleteRaceModeForTest::Repaired {
         assert_eq!(db.writer_memory_underflow_count_for_test(), 0);
+    }
+    if mode == StagedDeleteRaceModeForTest::SplitLock {
+        // This negative control deliberately corrupted custody. Strict lifecycle
+        // cleanup must reject its duplicate refund rather than certify it.
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(db))).is_err());
     }
     (outcome, admitted)
 }

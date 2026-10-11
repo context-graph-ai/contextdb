@@ -586,7 +586,9 @@ fn assert_executed_default_boundary(
 fn default_crossovers_execute_both_sides_without_a_normal_write_availability_gap() {
     use contextdb_core::VectorIndexRef;
 
-    let db = Database::open_memory();
+    let mut options = contextdb_engine::DatabaseOpenOptions::default();
+    options.owner_reads.limits.limits.memory = roomy_limits().memory;
+    let db = Database::open_with_options(":memory:", options).unwrap();
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     db.execute(
         "CREATE TABLE boundary_defaults (id UUID PRIMARY KEY, f32 VECTOR(3), sq8 VECTOR(3) WITH (quantization = 'SQ8'), sq4 VECTOR(3) WITH (quantization = 'SQ4'))",

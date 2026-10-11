@@ -217,6 +217,7 @@ impl TestSourceTouch {
 #[derive(Debug, Clone, Default)]
 pub struct TestTelemetry {
     pub work_units: u64,
+    pub native_source_touches: u64,
     pub source_work: BTreeMap<TestWorkSource, u64>,
     pub source_peak_temporary_bytes: BTreeMap<TestWorkSource, u64>,
     pub encoded_bytes: u64,
@@ -228,6 +229,7 @@ impl From<BoundedExecutionTelemetry> for TestTelemetry {
     fn from(value: BoundedExecutionTelemetry) -> Self {
         Self {
             work_units: value.work_units,
+            native_source_touches: value.native_source_touches,
             source_work: value
                 .source_work
                 .into_iter()

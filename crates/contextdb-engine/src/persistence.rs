@@ -69,11 +69,13 @@ pub(crate) mod purge_publication;
 pub(crate) mod read_commit_directory;
 #[cfg(target_os = "linux")]
 mod reader_presence;
+mod relational_posting_prune;
 mod relational_version_manifest;
 #[cfg(feature = "test-seams")]
 mod resident_history_test_seams;
 mod schema_binding;
 mod transaction_repair;
+pub(crate) mod vector_current_identity;
 pub(crate) mod vector_identity_range;
 mod vector_membership_pages;
 pub(crate) mod vector_membership_source;
@@ -11667,21 +11669,24 @@ fn stream_raw_partition_memberships<T>(
             &partition.partition_key,
         )
         .map_err(&corruption)?;
-        // The decoded route is local to this visit; retained identities and
-        // vector bodies are admitted by the callback's own owner.
-        let scratch = crate::read_image_memory::active_owner()?.row_owner()?;
-        let _scratch_scope = scratch.enter();
-        let membership: VectorPartitionMembershipRecord = RedbPersistence::decode_exact(payload)
-            .map_err(|error| {
-                corruption(format!("raw membership payload decode failed: {error}"))
-            })?;
-        if RedbPersistence::vector_partition_membership_key(&membership).as_slice() != key.value() {
-            return Err(corruption(
-                "raw-vector membership key disagrees with its checksummed payload".into(),
-            ));
-        }
-        vector_membership_source::operation_checkpoint()?;
-        visit(&mut state, membership)?;
+        // Each callback consumes this one metadata window. Its decoded route
+        // and temporary body decodes must release before the next membership,
+        // rather than accumulating in the enclosing operation's image owner.
+        let window = crate::read_image_memory::active_owner()?.row_owner()?;
+        window.scope(|| -> Result<()> {
+            let membership: VectorPartitionMembershipRecord = RedbPersistence::decode_exact(payload)
+                .map_err(|error| {
+                    if preserves_typed_read_refusal(&error) { error }
+                    else { corruption(format!("raw membership payload decode failed: {error}")) }
+                })?;
+            if RedbPersistence::vector_partition_membership_key(&membership).as_slice() != key.value() {
+                return Err(corruption(
+                    "raw-vector membership key disagrees with its checksummed payload".into(),
+                ));
+            }
+            vector_membership_source::operation_checkpoint()?;
+            visit(&mut state, membership)
+        })?;
     }
     vector_membership_source::operation_checkpoint()?;
     Ok(state)
@@ -34576,6 +34581,30 @@ graph_commit_result }.map_err(Self::storage_error)?;
                     let predecessor = redb_table
                         .get(key.as_slice())
                         .map_err(Self::storage_error)?;
+                    if let Some(body) = predecessor.as_ref() {
+                        let _row_scope = crate::read_image_memory::active_owner()?
+                            .row_owner()?
+                            .enter();
+                        if self.relational_manifest_has_successor_in_write(
+                            write_txn,
+                            table,
+                            key.as_slice(),
+                        )? {
+                            self.prune_relational_posting_intervals_in_write(
+                                write_txn,
+                                table,
+                                table_meta.get(table),
+                                body.value(),
+                            )?;
+                        } else {
+                            self.prune_terminal_relational_posting_in_write(
+                                write_txn,
+                                table,
+                                table_meta.get(table),
+                                body.value(),
+                            )?;
+                        }
+                    }
                     self.replace_relational_manifest_in_write(
                         write_txn,
                         table,
@@ -37659,6 +37688,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         &self,
         records: &[VectorPartitionMembershipRecord],
     ) -> Result<()> {
+        let _decode_scope = self.writer_decode_scope()?;
         self.prepare_proof_owner()?;
         if records.is_empty() {
             return Ok(());
@@ -37706,6 +37736,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         &self,
         records: &[VectorPartitionMembershipRecord],
     ) -> Result<()> {
+        let _decode_scope = self.writer_decode_scope()?;
         self.prepare_proof_owner()?;
         if records.is_empty() {
             return Ok(());

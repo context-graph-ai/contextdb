@@ -47,7 +47,8 @@ impl ReadLimits {
     pub const SHIPPED_RESULT_BYTES: u64 = 4 * MIB;
     pub const SHIPPED_MEMORY: u64 = 16 * MIB;
     pub const SHIPPED_CURSOR_PAGE_BYTES: u64 = MIB;
-    /// Default number of caller-held snapshot pins admitted per open store.
+    /// Number of caller-held snapshot registrations prepaid by an open store.
+    /// Further registrations use declared reader memory.
     pub const SHIPPED_SNAPSHOT_PIN_SLOTS: usize = 64;
 
     pub fn validate(&self) -> Result<(), ReadContractViolation> {

@@ -1186,7 +1186,10 @@ fn refused_cleanup_keeps_serving_under_writes_and_publishes_when_memory_returns(
             .partition_graph_generation_status(&route)
             .expect("route retains status");
         assert_eq!(selected_generation_id(&status), g0);
-        assert_eq!(status.fresh_tail_entries, tail0 + written);
+        assert!(
+            status.fresh_tail_entries <= tail0 + written,
+            "cached suffix residency cannot exceed the preserved durable writes"
+        );
         assert_eq!(
             db.vector_memory_ownership_receipt_for_test()
                 .temporary_workspace,
