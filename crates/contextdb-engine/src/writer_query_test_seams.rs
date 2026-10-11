@@ -122,6 +122,7 @@ pub(crate) fn note_staged_sort(rows: usize) {
 }
 
 // graph_delete_seeks_only_its_edge_identity counts the actual durable delete probe.
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn note_graph_delete_decode() {
     WORK.with(|work| {
         if let Some(mut counters) = work.get() {
@@ -184,6 +185,9 @@ pub enum PhysicalFamily {
 }
 
 pub(crate) fn note_physical_source(family: PhysicalFamily, read: &redb::ReadTransaction) {
+    #[cfg(not(any(test, feature = "test-seams")))]
+    let _ = (family, read);
+    #[cfg(any(test, feature = "test-seams"))]
     WORK.with(|slot| {
         if let Some(mut work) = slot.get() {
             let index = work.physical_source_calls;
@@ -197,6 +201,7 @@ pub(crate) fn note_physical_source(family: PhysicalFamily, read: &redb::ReadTran
 }
 
 pub(crate) fn note_ddl_occurrence() {
+    #[cfg(any(test, feature = "test-seams"))]
     WORK.with(|slot| {
         if let Some(mut work) = slot.get() {
             work.history.ddl_occurrences += 1;
@@ -226,6 +231,7 @@ pub(crate) fn note_capability_summary_read() {
 }
 
 // Called after successful enumeration, immediately before the existing decoder.
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn note_config_enumeration(key: &str) {
     const PREFIXES: [&str; 8] = [
         "sync_ddl_received_arrival.v1.",
@@ -267,6 +273,9 @@ pub fn observe_target<T>(table: &str, operation: impl FnOnce() -> T) -> (T, Writ
     observe(operation)
 }
 pub(crate) fn note_target_entry(table: &str) {
+    #[cfg(not(any(test, feature = "test-seams")))]
+    let _ = table;
+    #[cfg(any(test, feature = "test-seams"))]
     if TARGET.with(|slot| slot.get()) == Some(target_id(table)) {
         WORK.with(|slot| {
             if let Some(mut work) = slot.get() {
@@ -287,27 +296,36 @@ fn physical_operation_selected(
     table: &str,
     matches: bool,
 ) -> redb::BackendReadObservation {
-    let selected = matches && TARGET.with(|slot| slot.get()) == Some(target_id(table));
-    let index = family as usize;
-    if selected {
-        WORK.with(|slot| {
-            if let Some(mut work) = slot.get() {
-                work.target_source_calls[index] += 1;
-                slot.set(Some(work));
-            }
-        });
-    }
-    redb::observe_backend_reads(std::sync::Arc::new(move |bytes| {
+    #[cfg(any(test, feature = "test-seams"))]
+    {
+        let selected = matches && TARGET.with(|slot| slot.get()) == Some(target_id(table));
+        let index = family as usize;
         if selected {
             WORK.with(|slot| {
                 if let Some(mut work) = slot.get() {
-                    work.target_backend_bytes[index] += bytes as u64;
+                    work.target_source_calls[index] += 1;
                     slot.set(Some(work));
                 }
             });
         }
-    }))
+        redb::observe_backend_reads(std::sync::Arc::new(move |bytes| {
+            if selected {
+                WORK.with(|slot| {
+                    if let Some(mut work) = slot.get() {
+                        work.target_backend_bytes[index] += bytes as u64;
+                        slot.set(Some(work));
+                    }
+                });
+            }
+        }))
+    }
+    #[cfg(not(any(test, feature = "test-seams")))]
+    {
+        let _ = (family, table, matches);
+        redb::observe_backend_reads(std::sync::Arc::new(|_| {}))
+    }
 }
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn note_selection_entry() {
     WORK.with(|slot| {
         if let Some(mut work) = slot.get() {
@@ -316,6 +334,7 @@ pub(crate) fn note_selection_entry() {
         }
     });
 }
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn note_config_decode(key: &str) {
     let family = sidecar_family(key);
     WORK.with(|slot| {
@@ -325,6 +344,7 @@ pub(crate) fn note_config_decode(key: &str) {
         }
     });
 }
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn sidecar_family(key: &str) -> Option<usize> {
     [
         "sync_ddl_received_arrival.v1.",
