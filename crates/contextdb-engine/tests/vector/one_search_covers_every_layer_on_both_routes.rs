@@ -6,8 +6,8 @@
 //! what was committed since. A find over many Contexts is answered by ONE
 //! search: one bounded candidate budget spent best-first over one frontier and
 //! one result heap, across every non-empty layer of every admitted Context.
-//! That has to hold on the owner route, whose graphs are resident, exactly as
-//! on the file route, whose sealed graphs are paged -- and it has to hold in
+//! That has to hold on the owner route exactly as on the file route, whose
+//! sealed graphs are paged -- and it has to hold in
 //! the ordinary window after a commit, when a Context carries a live tail. A
 //! Context that falls back to its own per-layer walks spends a whole breadth
 //! per layer per Context again, which is the defect the one search exists to
@@ -248,6 +248,29 @@ fn seed(db: &Database, extra_tail: usize) {
             tail + TAIL_ROWS..tail + TAIL_ROWS + extra_tail,
         );
     }
+    for context in 0..contexts {
+        let suffix = db
+            .inspect_captured_vector_suffix_for_test(
+                &partition(context),
+                db.snapshot(),
+                db.declared_reader_memory()
+                    .expect("admit the suffix reader"),
+                &mut || Ok(()),
+            )
+            .expect("inspect the captured suffix")
+            .expect("each seeded Context has its committed suffix");
+        assert!(suffix.points >= TAIL_ROWS);
+        let status = db
+            .vector_store_for_test()
+            .partition_graph_generation_status(&partition(context))
+            .expect("each seeded Context has a partition");
+        assert_eq!(status.fresh_tail_entries, 0);
+        assert!(
+            db.vector_store_for_test()
+                .with_partition_fresh_tail(&partition(context), |graph| graph.len())
+                .is_none()
+        );
+    }
 }
 
 fn seen() -> BTreeSet<ContextId> {
@@ -300,7 +323,9 @@ fn nonempty_layers(store: &VectorStore, context: usize) -> usize {
         .expect("every seeded Context has a partition");
     usize::from(status.base.is_some() || status.dormant_base.is_some())
         + usize::from(status.change.is_some() || status.dormant_change.is_some())
-        + usize::from(status.fresh_tail_entries != 0)
+        // `seed` inspected the actual captured suffix under an operation
+        // reader. It is deliberately not a resident mutable graph.
+        + 1
 }
 
 fn every_context() -> Vec<usize> {
