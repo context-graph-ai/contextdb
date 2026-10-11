@@ -2046,6 +2046,8 @@ impl WriteTransaction {
             span_started = std::time::Instant::now();
         }
 
+        #[cfg(all(feature = "test-seams", unix))]
+        self.pause_reclaim_step_before_durable_publication_from_env()?;
         self.mem.commit(
             user_root,
             system_root,
@@ -2068,6 +2070,29 @@ impl WriteTransaction {
             self.mem.free(page, &mut PageTrackerPolicy::Ignore);
         }
 
+        Ok(())
+    }
+
+    /// Stop an explicitly armed reclaim transaction after its mutations are
+    /// staged but immediately before durable publication so an integration test
+    /// can terminate the process there.
+    /// This is compiled only into the test-seams Unix test surface.
+    #[cfg(all(feature = "test-seams", unix))]
+    fn pause_reclaim_step_before_durable_publication_from_env(&self) -> Result {
+        const SOCKET_ENV: &str = "WRITECOST_REDB_PAUSE_BEFORE_DURABLE_COMMIT_SOCKET";
+        const MARKER: &[u8] = b"RECLAIM_MUTATIONS_STAGED";
+
+        if self.reclaim_ceiling.is_none() {
+            return Ok(());
+        }
+        let Some(socket) = std::env::var_os(SOCKET_ENV) else {
+            return Ok(());
+        };
+        let stream = std::os::unix::net::UnixDatagram::unbound()?;
+        stream.connect(socket)?;
+        stream.send(MARKER)?;
+        let mut release = [0];
+        stream.recv(&mut release)?;
         Ok(())
     }
 

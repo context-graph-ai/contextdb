@@ -3107,10 +3107,11 @@
  
          if self.quick_repair {
              system_tree.create_table_and_flush_table_root(
-@@ -1680,6 +2037,14 @@
+@@ -1680,7 +2037,17 @@
          }
  
          let system_root = system_tree.finalize_dirty_checksums()?;
+-
 +        #[cfg(feature = "test-seams")]
 +        {
 +            crate::commit_work::observe_commit_span(
@@ -3119,10 +3120,13 @@
 +            );
 +            span_started = std::time::Instant::now();
 +        }
- 
++
++        #[cfg(all(feature = "test-seams", unix))]
++        self.pause_reclaim_step_before_durable_publication_from_env()?;
          self.mem.commit(
              user_root,
-@@ -1688,6 +2053,11 @@
+             system_root,
+@@ -1688,6 +2055,11 @@
              self.two_phase_commit,
              self.shrink_policy,
          )?;
@@ -3134,7 +3138,37 @@
  
          // Mark any pending non-durable commits as fully committed.
          self.transaction_tracker.clear_pending_non_durable_commits();
-@@ -1766,6 +2136,9 @@
+@@ -1698,6 +2070,29 @@
+             self.mem.free(page, &mut PageTrackerPolicy::Ignore);
+         }
+ 
++        Ok(())
++    }
++
++    /// Stop an explicitly armed reclaim transaction after its mutations are
++    /// staged but immediately before durable publication so an integration test
++    /// can terminate the process there.
++    /// This is compiled only into the test-seams Unix test surface.
++    #[cfg(all(feature = "test-seams", unix))]
++    fn pause_reclaim_step_before_durable_publication_from_env(&self) -> Result {
++        const SOCKET_ENV: &str = "WRITECOST_REDB_PAUSE_BEFORE_DURABLE_COMMIT_SOCKET";
++        const MARKER: &[u8] = b"RECLAIM_MUTATIONS_STAGED";
++
++        if self.reclaim_ceiling.is_none() {
++            return Ok(());
++        }
++        let Some(socket) = std::env::var_os(SOCKET_ENV) else {
++            return Ok(());
++        };
++        let stream = std::os::unix::net::UnixDatagram::unbound()?;
++        stream.connect(socket)?;
++        stream.send(MARKER)?;
++        let mut release = [0];
++        stream.recv(&mut release)?;
+         Ok(())
+     }
+ 
+@@ -1766,6 +2161,9 @@
      // Relocate pages to lower number regions/pages
      // Returns true if a page(s) was moved
      pub(crate) fn compact_pages(&mut self) -> Result<bool> {
@@ -3144,7 +3178,7 @@
          let mut progress = false;
  
          // Find the 1M highest pages
-@@ -1823,46 +2196,384 @@
+@@ -1823,46 +2221,384 @@
          Ok(progress)
      }
  
@@ -3559,7 +3593,7 @@
      }
  
      fn process_freed_pages_nondurable_helper(
-@@ -2037,6 +2748,18 @@
+@@ -2037,6 +2773,18 @@
          })
      }
  
@@ -3578,7 +3612,7 @@
      #[allow(dead_code)]
      pub(crate) fn print_debug(&self) -> Result {
          // Flush any pending updates to make sure we get the latest root
-@@ -2107,18 +2830,148 @@
+@@ -2107,18 +2855,148 @@
      tree: TableTree,
  }
  
@@ -3728,7 +3762,7 @@
      }
  
      /// Open the given table
-@@ -2135,12 +2988,69 @@
+@@ -2135,12 +3013,69 @@
              InternalTableDefinition::Normal { table_root, .. } => Ok(ReadOnlyTable::new(
                  definition.name().to_string(),
                  table_root,
@@ -3799,7 +3833,7 @@
      }
  
      /// Open the given table without a type
-@@ -2161,7 +3071,7 @@
+@@ -2161,7 +3096,7 @@
                  ..
              } => Ok(ReadOnlyUntypedTable::new(
                  table_root,
@@ -3808,7 +3842,7 @@
                  fixed_key_size,
                  fixed_value_size,
                  self.mem.clone(),
-@@ -2189,7 +3099,7 @@
+@@ -2189,7 +3124,7 @@
              } => Ok(ReadOnlyMultimapTable::new(
                  table_root,
                  table_length,
@@ -3817,7 +3851,7 @@
                  self.tree.transaction_guard().clone(),
                  self.mem.clone(),
              )?),
-@@ -2217,7 +3127,7 @@
+@@ -2217,7 +3152,7 @@
              } => Ok(ReadOnlyUntypedMultimapTable::new(
                  table_root,
                  table_length,
@@ -3826,7 +3860,7 @@
                  fixed_key_size,
                  fixed_value_size,
                  self.mem.clone(),
-@@ -2263,7 +3173,15 @@
+@@ -2263,7 +3198,15 @@
  
  #[cfg(test)]
  mod test {
@@ -3843,7 +3877,7 @@
  
      const X: TableDefinition<&str, &str> = TableDefinition::new("x");
  
-@@ -2284,4 +3202,840 @@
+@@ -2284,4 +3227,840 @@
          let write_txn = db2.begin_write().unwrap();
          assert!(write_txn.transaction_id > first_txn_id);
      }
