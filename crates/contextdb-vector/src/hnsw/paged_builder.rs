@@ -923,6 +923,38 @@ impl PagedVectorTail {
     /// must include its row publication in this same transaction. On failure,
     /// both the durable state and this handle retain the previous progress.
     pub fn append(&mut self, entries: &[VectorEntry], plan: PagedVectorBatchPlan) -> Result<()> {
+        self.append_at_frontier(entries, plan, None)
+    }
+
+    /// Append one complete committed journal cohort, including its delete-only
+    /// frontier. The caller must supply every upsert selected from that cohort.
+    #[doc(hidden)]
+    pub fn append_committed_cohort(
+        &mut self,
+        entries: &[VectorEntry],
+        plan: PagedVectorBatchPlan,
+        through_tx: TxId,
+        through_lsn: Lsn,
+    ) -> Result<()> {
+        if through_tx < self.progress.frontier_tx
+            || through_lsn < self.progress.frontier_lsn
+            || entries
+                .iter()
+                .any(|entry| entry.created_tx > through_tx || entry.lsn > through_lsn)
+        {
+            return Err(Error::Other(
+                "native tail cohort has an invalid frontier".into(),
+            ));
+        }
+        self.append_at_frontier(entries, plan, Some((through_tx, through_lsn)))
+    }
+
+    fn append_at_frontier(
+        &mut self,
+        entries: &[VectorEntry],
+        plan: PagedVectorBatchPlan,
+        through: Option<(TxId, Lsn)>,
+    ) -> Result<()> {
         if self.progress.phase != PagedVectorPhase::Inserting {
             return Err(Error::Other(
                 "sealed paged generation cannot accept tail inserts".into(),
@@ -968,6 +1000,10 @@ impl PagedVectorTail {
             for entry in entries {
                 next.frontier_lsn = next.frontier_lsn.max(entry.lsn);
                 next.frontier_tx = next.frontier_tx.max(entry.created_tx);
+            }
+            if let Some((through_tx, through_lsn)) = through {
+                next.frontier_tx = through_tx;
+                next.frontier_lsn = through_lsn;
             }
             produced = Some(next.clone());
             Ok(next)

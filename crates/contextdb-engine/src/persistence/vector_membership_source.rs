@@ -1134,6 +1134,27 @@ impl DurableMembershipSource {
         } else {
             serving_covered.unwrap_or(covered)
         };
+        let mut frontier = frontier;
+        if let (Some(base), Some(change)) = (base, change)
+            && change.generation_id & super::vector_paged::MUTABLE_STORAGE != 0
+        {
+            let mut native_metadata =
+                contextdb_vector::VectorCopyAdmission::new(self.accountant.vector_budget()?);
+            native_metadata.reserve(16 * 1024 + self.window_bytes())?;
+            let record = RedbPersistence::load_vector_partition_change_generation_in_read(
+                &root.read,
+                &self.partition.index,
+                &self.partition.partition_key,
+                base.generation_id,
+                change.generation_id,
+            )?;
+            let meta = super::vector_paged::PagedGenerationMeta::decode(&record.graph.bytes)?;
+            if meta.page_set.pages == super::vector_paged::MUTABLE_PAGE_SET {
+                // Native tail publication advances serving coverage while
+                // retaining the base's default consolidation counters.
+                frontier = base.covered_tx;
+            }
+        }
         let (pending_inserts, tombstones) = Self::pending_counts_for(&summary, Some(frontier))?;
         Ok(RawVectorInspectionSnapshot {
             captured_catalog,
@@ -1278,6 +1299,26 @@ impl DurableMembershipSource {
         } else {
             covered
         };
+        let mut covered = covered;
+        if let Some((base, Some(change))) = self.catalog_generations(&root)?
+            && change.generation_id & super::vector_paged::MUTABLE_STORAGE != 0
+            && covered == Some(change.covered_tx)
+        {
+            let mut metadata =
+                contextdb_vector::VectorCopyAdmission::new(self.accountant.vector_budget()?);
+            metadata.reserve(16 * 1024 + self.window_bytes())?;
+            let record = RedbPersistence::load_vector_partition_change_generation_in_read(
+                &root.read,
+                &self.partition.index,
+                &self.partition.partition_key,
+                base.generation_id,
+                change.generation_id,
+            )?;
+            let meta = super::vector_paged::PagedGenerationMeta::decode(&record.graph.bytes)?;
+            if meta.page_set.pages == super::vector_paged::MUTABLE_PAGE_SET {
+                covered = Some(base.covered_tx);
+            }
+        }
         Self::pending_counts_for(&summary, covered).map(Some)
     }
 

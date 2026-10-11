@@ -491,6 +491,17 @@ exact work only within the active budget. Repair and first build run through mai
 query path, so an older valid route and ordinary relational/graph reads remain usable.
 <!-- enforced by: vector_partition_restart_contract::partitioned_indexed_search_survives_two_clean_restarts_without_a_query_rebuild, vector_lazy_replay_budget_contract::first_bounded_restart_query_charges_lazy_decode_and_replay_to_the_request_ceiling, vector_generation_quarantine_compaction_lock_contract::corrupt_lazy_base_becomes_typed_unavailable_then_repairs_from_raw_vectors, vector_generation_quarantine_compaction_lock_contract::newer_catalog_format_quarantines_only_that_route, vector_generation_quarantine_compaction_lock_contract::corrupt_journal_quarantines_and_repairs_one_route_while_a_cold_neighbour_builds, vector_generation_quarantine_compaction_lock_contract::caller_driven_repair_replaces_the_quarantined_generation_and_survives_restart, vector_generation_quarantine_compaction_lock_contract::engine_owned_worker_repairs_the_quarantined_route_without_a_caller_cycle -->
 
+A logical import can carry an owned mutable vector tail across physical writer closes. Each reopen
+validates the committed generation, journal frontier, schema and store identity, then charges the
+working set to that writer; a mismatch or refused cache admission drops it and uses ordinary recovery.
+The carried tail holds no store source or lock and is released at import end, error or eviction.
+<!-- enforced by: writer_tail_reuse_is_bounded_across_physical_opens::repeated_writer_opens_reuse_tail_without_reexamining_n_or_four_n_history, writer_tail_reuse_is_bounded_across_physical_opens::another_writer_between_opens_invalidates_tail_and_its_answer_is_exact, writer_tail_reuse_is_bounded_across_physical_opens::optional_tail_never_refuses_an_open_that_fits_without_it -->
+
+Journal suffix admission and replay seek past the entire covered LSN cohort. They authenticate
+selected records without decoding already-covered history; a finite upper frontier includes every
+ordinal of its LSN, and a maximal covered frontier has an empty suffix.
+<!-- enforced by: persistence::bounded_journal_suffix_tests::fixed_journal_suffix_selection_does_not_examine_n_or_four_n_covered_records, persistence::bounded_journal_suffix_tests::suffix_seek_includes_all_ordinals_and_excludes_later_cohorts, persistence::bounded_journal_suffix_tests::suffix_seek_still_authenticates_each_selected_record, persistence::bounded_journal_suffix_tests::both_tail_loaders_and_delete_carrier_selection_seek_past_covered_history -->
+
 Raw vectors, base graphs, change graphs, and compaction workspace are independently accounted for.
 Generation admission counts raw versions separately from selected live graph points at one committed
 frontier. Ordinary resident generations price and copy only their consumed frontier-live entries,

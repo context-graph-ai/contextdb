@@ -35,7 +35,7 @@ pub use store::{
     VectorTeardownReceipt, VectorVersionIdentity,
 };
 #[doc(hidden)]
-pub use store::VectorMemoryOwnershipSnapshot;
+pub use store::{VectorMemoryOwnershipSnapshot, WriterVectorTail};
 #[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub use store::{VectorCapWorkCountersForTest, VectorPartitionLimitAuditForTest};

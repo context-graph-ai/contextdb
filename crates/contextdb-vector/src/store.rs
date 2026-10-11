@@ -1468,6 +1468,17 @@ pub trait DormantVectorGraphLoader: Send + Sync {
         request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool,
     ) -> Result<LoadedVectorGraphGeneration>;
 
+    /// A writable loader may omit suffix reconstruction when the registry
+    /// already owns its authenticated fresh tail. Captured readers still use load.
+    fn load_reusing_fresh_tail(
+        &self,
+        generation: DormantVectorGraphGeneration,
+        caller_reserved_load_bytes: usize,
+        request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool,
+        _fresh_tail_present: bool,
+    ) -> Result<LoadedVectorGraphGeneration> {
+        self.load(generation, caller_reserved_load_bytes, request)
+    }
 }
 
 /// An immutable layer supplier retained by one serving operation. The loader
@@ -2695,6 +2706,62 @@ impl Drop for PagedBuildOperation {
     }
 }
 
+/// A detached owned tail. Its charge survives a physical close, but no storage
+/// source, root, file handle, sealed graph or membership directory travels with it.
+#[doc(hidden)]
+pub struct WriterVectorTail {
+    graph: Option<HnswIndex>,
+    bytes: usize,
+    accountant: Arc<dyn MemoryBudget>,
+    metadata_bytes: usize,
+    sealed_identity: Option<VectorGraphGeneration>,
+    replayed_through_lsn: u64,
+    mutated_through_lsn: u64,
+    replay_frontier_active: bool,
+    dimension: usize,
+    quantization: VectorQuantization,
+}
+
+impl WriterVectorTail {
+    pub fn take_metadata_charge(&mut self) -> (Arc<dyn MemoryBudget>, usize) {
+        (
+            self.accountant.clone(),
+            std::mem::take(&mut self.metadata_bytes),
+        )
+    }
+    pub fn admit_metadata(&mut self, bytes: usize) -> Result<()> {
+        self.accountant.try_allocate_for(
+            bytes,
+            "vector_index",
+            "detach_writer_tail",
+            "Discard an optional tail when its route cannot fit.",
+        )?;
+        self.metadata_bytes += bytes;
+        Ok(())
+    }
+
+    pub fn reattach_budget(&mut self, accountant: Arc<dyn MemoryBudget>) -> Result<()> {
+        if !crate::memory_budget::same_funder(self.accountant.as_ref(), accountant.as_ref()) {
+            accountant.try_allocate_for(
+                self.bytes + self.metadata_bytes,
+                "vector_index",
+                "reattach_writer_tail",
+                "Discard the optional import tail when it cannot fit.",
+            )?;
+            self.accountant.release(self.bytes + self.metadata_bytes);
+        }
+        self.accountant = accountant;
+        Ok(())
+    }
+}
+
+impl Drop for WriterVectorTail {
+    fn drop(&mut self) {
+        drop(self.graph.take());
+        self.accountant.release(self.bytes + self.metadata_bytes);
+    }
+}
+
 pub struct IndexState {
     dimension: usize,
     quantization: VectorQuantization,
@@ -2756,6 +2823,7 @@ pub struct IndexState {
     /// candidate is admitted only if `fresh_tail_revision` is unchanged.
     generation_publication: Mutex<()>,
     fresh_tail_revision: AtomicU64,
+    carried_tail_identity: RwLock<Option<VectorGraphGeneration>>,
     fresh_tail_preparations: AtomicUsize,
     fresh_tail_replay_frontier_active: AtomicBool,
     fresh_tail_replayed_through_lsn: AtomicU64,
@@ -2893,6 +2961,7 @@ impl IndexState {
             maintenance_policy_revision: AtomicU64::new(0),
             generation_publication: Mutex::new(()),
             fresh_tail_revision: AtomicU64::new(0),
+            carried_tail_identity: RwLock::new(None),
             fresh_tail_preparations: AtomicUsize::new(0),
             fresh_tail_replay_frontier_active: AtomicBool::new(false),
             fresh_tail_replayed_through_lsn: AtomicU64::new(0),
@@ -7379,9 +7448,13 @@ impl IndexState {
                     }
                 }
             };
-            dormant
-                .loader
-                .load(dormant.descriptor, initial_caller_reservation, &mut request)
+            dormant.loader.load_reusing_fresh_tail(
+                dormant.descriptor,
+                initial_caller_reservation,
+                &mut request,
+                *self.carried_tail_identity.read() == Some(dormant.descriptor.identity)
+                    && self.hnsw.get().is_some_and(|tail| tail.read().is_some()),
+            )
         };
         match loaded {
             Err(error) => {
@@ -9729,13 +9802,20 @@ impl Drop for PreparedTailInsertion {
     }
 }
 
+struct PreparedTailInsertionBatch {
+    pending: VecDeque<PreparedTailInsertion>,
+    // Publication is serialized by the batch lock, so one admitted workspace
+    // covers the largest insertion and outlives every prepared payload.
+    _publication_scratch: VectorCopyAdmission,
+}
+
 #[derive(Clone)]
-struct PreparedTailInsertions(Arc<Mutex<VecDeque<PreparedTailInsertion>>>);
+struct PreparedTailInsertions(Arc<Mutex<PreparedTailInsertionBatch>>);
 
 impl std::fmt::Debug for PreparedTailInsertions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("PreparedTailInsertions")
-            .field(&self.0.lock().len())
+            .field(&self.0.lock().pending.len())
             .finish()
     }
 }
@@ -9748,19 +9828,20 @@ impl PartialEq for PreparedTailInsertions {
 
 impl PreparedTailInsertions {
     fn publish(&self, state: &Arc<IndexState>, row_id: RowId, lsn: Lsn) {
-        let mut pending = self.0.lock();
-        if let Some(at) = pending
+        let mut batch = self.0.lock();
+        if let Some(at) = batch
+            .pending
             .iter()
             .position(|item| Arc::ptr_eq(&item.state, state) && item.row_id == row_id)
         {
-            pending
+            batch
+                .pending
                 .remove(at)
                 .expect("prepared insertion position exists")
                 .publish(lsn);
         }
     }
 }
-
 #[derive(Clone)]
 struct PreparedDirectoryReservation {
     charge: Arc<Mutex<Option<RetainedMemoryCharge>>>,
@@ -14764,6 +14845,7 @@ impl VectorStore {
         rows
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn prepare_tail_insertion(
         &self,
         pending: &mut Vec<PreparedTailInsertion>,
@@ -14771,6 +14853,8 @@ impl VectorStore {
         lsn: Lsn,
         prepare_entry: impl FnOnce(&mut VectorCopyAdmission) -> Result<StoredVectorEntry>,
         owner: &mut VectorCopyAdmission,
+        publication_scratch: &mut VectorCopyAdmission,
+        publication_workspace_bytes: &mut usize,
     ) -> Result<()> {
         let _publication = state.generation_publication.lock();
         if state
@@ -14816,8 +14900,15 @@ impl VectorStore {
         let scratch_bytes =
             crate::quantized::stored_vector_resident_bytes(state.dimension, state.quantization)
                 .saturating_mul(3)
-                .saturating_add(2 * std::mem::size_of::<PreparedTailInsertion>())
-                .saturating_add(ef_construction.saturating_mul(8 * std::mem::size_of::<usize>()));
+                .saturating_add(2 * std::mem::size_of::<PreparedTailInsertion>());
+        let workspace_bytes = ef_construction.saturating_mul(8 * std::mem::size_of::<usize>());
+        if workspace_bytes > *publication_workspace_bytes {
+            if *publication_workspace_bytes == 0 {
+                publication_scratch.reserve(std::mem::size_of::<VectorCopyAdmission>() + 32)?;
+            }
+            publication_scratch.reserve(workspace_bytes - *publication_workspace_bytes)?;
+            *publication_workspace_bytes = workspace_bytes;
+        }
         let accountant =
             state.hnsw_accountant.read().clone().ok_or_else(|| {
                 Error::Other("resident HNSW tail has no retained graph owner".into())
@@ -14857,6 +14948,8 @@ impl VectorStore {
         owner: &mut VectorCopyAdmission,
     ) -> Result<PreparedTailInsertions> {
         let mut pending = Vec::<PreparedTailInsertion>::new();
+        let mut publication_scratch = owner.scratch();
+        let mut publication_workspace_bytes = 0;
         for insert in inserts {
             if insert.entry.deleted_tx.is_none()
                 && let Some(state) =
@@ -14868,6 +14961,8 @@ impl VectorStore {
                     insert.entry.lsn,
                     |_owner| Ok(state.stored_entry_ref(&insert.entry)),
                     owner,
+                    &mut publication_scratch,
+                    &mut publication_workspace_bytes,
                 )?;
             }
         }
@@ -14905,10 +15000,17 @@ impl VectorStore {
                         Ok(entry)
                     },
                     owner,
+                    &mut publication_scratch,
+                    &mut publication_workspace_bytes,
                 )?;
             }
         }
-        Ok(PreparedTailInsertions(Arc::new(Mutex::new(pending.into()))))
+        Ok(PreparedTailInsertions(Arc::new(Mutex::new(
+            PreparedTailInsertionBatch {
+                pending: pending.into(),
+                _publication_scratch: publication_scratch,
+            },
+        ))))
     }
 
     /// Validate one keyed batch without mutating the store. The engine calls
@@ -20153,6 +20255,98 @@ impl VectorStore {
         self.with_partition_maintenance(&partition.index, &partition.partition_key, || {
             let state = self.partition_state(&partition.index, &partition.partition_key)?;
             state.publish_replacement_base_generation(identity, loaded)
+        })
+    }
+
+    /// Move only an owned mutable graph out of a writer, under its publication
+    /// boundary. The engine authenticates the durable frontier before reuse.
+    #[doc(hidden)]
+    pub fn detach_writer_tail(&self, partition: &VectorPartitionRef) -> Option<WriterVectorTail> {
+        self.with_partition_maintenance(&partition.index, &partition.partition_key, || {
+            let state = self.try_partition_state(&partition.index, &partition.partition_key)?;
+            let _publication = state.generation_publication.lock();
+            if state.fresh_tail_preparations.load(Ordering::SeqCst) != 0
+                || state.maintenance_sample_active.load(Ordering::SeqCst)
+                || state.route_quarantine().is_some()
+            {
+                return None;
+            }
+            let mut slot = state.hnsw.get()?.try_write()?;
+            if !slot.as_ref()?.is_owned_mutable() {
+                return None;
+            }
+            let accountant = state.hnsw_accountant.write().take()?;
+            let tail = WriterVectorTail {
+                graph: slot.take(),
+                metadata_bytes: 0,
+                sealed_identity: {
+                    let sealed = state.sealed_hnsw.read();
+                    IndexState::layer_identity(
+                        sealed.change.as_ref(),
+                        sealed.dormant_change.as_ref(),
+                    )
+                    .or_else(|| {
+                        IndexState::layer_identity(
+                            sealed.base.as_ref(),
+                            sealed.dormant_base.as_ref(),
+                        )
+                    })
+                },
+                bytes: state.hnsw_bytes.swap(0, Ordering::SeqCst),
+                accountant,
+                replayed_through_lsn: state.fresh_tail_replayed_through_lsn.load(Ordering::SeqCst),
+                mutated_through_lsn: state.fresh_tail_mutated_through_lsn.load(Ordering::SeqCst),
+                replay_frontier_active: state
+                    .fresh_tail_replay_frontier_active
+                    .load(Ordering::SeqCst),
+                dimension: state.dimension,
+                quantization: state.quantization,
+            };
+            state.fresh_tail_revision.fetch_add(1, Ordering::SeqCst);
+            Some(tail)
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn reattach_writer_tail(
+        &self,
+        partition: &VectorPartitionRef,
+        mut tail: WriterVectorTail,
+    ) -> bool {
+        self.with_partition_maintenance(&partition.index, &partition.partition_key, || {
+            let Some(state) = self.try_partition_state(&partition.index, &partition.partition_key)
+            else {
+                return false;
+            };
+            let _publication = state.generation_publication.lock();
+            if state.dimension != tail.dimension
+                || state.quantization != tail.quantization
+                || state.route_quarantine().is_some()
+                || state.fresh_tail_preparations.load(Ordering::SeqCst) != 0
+                || state.maintenance_sample_active.load(Ordering::SeqCst)
+            {
+                return false;
+            }
+            let mut slot = state.hnsw.get_or_init(|| RwLock::new(None)).write();
+            if slot.is_some() {
+                return false;
+            }
+            *slot = tail.graph.take();
+            state.hnsw_bytes.store(tail.bytes, Ordering::SeqCst);
+            *state.carried_tail_identity.write() = tail.sealed_identity;
+            *state.hnsw_accountant.write() = Some(tail.accountant.clone());
+            tail.bytes = 0;
+            state
+                .fresh_tail_replayed_through_lsn
+                .store(tail.replayed_through_lsn, Ordering::SeqCst);
+            state
+                .fresh_tail_mutated_through_lsn
+                .store(tail.mutated_through_lsn, Ordering::SeqCst);
+            state
+                .fresh_tail_replay_frontier_active
+                .store(tail.replay_frontier_active, Ordering::SeqCst);
+            state.fresh_tail_revision.fetch_add(1, Ordering::SeqCst);
+            true
         })
     }
 

@@ -253,6 +253,71 @@ pub(super) fn begin_pending_frontier(
     })
 }
 
+/// Publish complete import coverage without disturbing a replacement's counters.
+/// The raw frontier and native graph are committed in the same transaction.
+pub(super) fn publish_native_tail_frontier(
+    write: &redb::WriteTransaction,
+    partition: &VectorPartitionRef,
+    frontier: TxId,
+    base_frontier: TxId,
+) -> Result<()> {
+    update_pending_summary(write, partition, |summary| {
+        if summary.max_tx > frontier {
+            return Err(corruption(
+                "native tail frontier is behind committed membership",
+            ));
+        }
+        if summary
+            .base_pending
+            .as_ref()
+            .map(|counts| counts.covered_tx)
+            != Some(base_frontier)
+        {
+            let base = [
+                &summary.pending,
+                summary
+                    .candidate_pending
+                    .as_ref()
+                    .unwrap_or(&summary.pending),
+            ]
+            .into_iter()
+            .find(|counts| counts.covered_tx == base_frontier)
+            .cloned()
+            .ok_or_else(|| corruption("native tail base frontier has no maintained counters"))?;
+            summary.base_pending = Some(base);
+        }
+        summary.pending = PendingCounts {
+            covered_tx: frontier,
+            pending_inserts: 0,
+            tombstones: 0,
+        };
+        Ok(())
+    })
+}
+
+/// The complete replacement has absorbed the later upserts. Its retained
+/// tombstones still count toward the ordinary consolidation policy.
+pub(super) fn advance_native_candidate_frontier(
+    write: &redb::WriteTransaction,
+    partition: &VectorPartitionRef,
+    previous: TxId,
+    next: TxId,
+) -> Result<()> {
+    update_pending_summary(write, partition, |summary| {
+        let candidate = summary
+            .candidate_pending
+            .as_mut()
+            .filter(|counts| counts.covered_tx == previous)
+            .ok_or_else(|| corruption("native candidate lost its maintained frontier"))?;
+        if summary.max_tx > next || next < previous {
+            return Err(corruption("native candidate has stale membership coverage"));
+        }
+        candidate.covered_tx = next;
+        candidate.pending_inserts = 0;
+        Ok(())
+    })
+}
+
 pub(super) fn publish_pending_frontier(
     write: &redb::WriteTransaction,
     partition: &VectorPartitionRef,

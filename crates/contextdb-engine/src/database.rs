@@ -36,6 +36,10 @@ mod vector_quarantine_inventory_admission_tests;
 #[cfg(all(test, feature = "test-seams"))]
 mod vector_retry_frontier_integrity_tests;
 mod vector_source_page_admission;
+mod vector_writer_session;
+mod vector_import_tail;
+#[doc(hidden)]
+pub use vector_writer_session::WriterVectorSession;
 #[cfg(feature = "test-seams")]
 pub(crate) mod writer_ownership_receipt;
 pub(crate) mod writer_read;
@@ -124,8 +128,8 @@ thread_local! {
 
 /// The engine format values written beside the independently versioned HNSW
 /// byte envelope. A loader refuses either mismatch before exposing a route.
-const VECTOR_GRAPH_ALGORITHM_VERSION: u16 = 1;
-const VECTOR_GRAPH_FORMAT_VERSION: u16 = 1;
+pub(crate) const VECTOR_GRAPH_ALGORITHM_VERSION: u16 = 1;
+pub(crate) const VECTOR_GRAPH_FORMAT_VERSION: u16 = 1;
 
 /// One private replay slot per authenticated edge identity. A later request
 /// from the same edge can exist on the ordinary client path only after the
@@ -18939,7 +18943,24 @@ fn paged_generation_graph_from(
     base_covered: (TxId, Lsn),
 ) -> Result<HnswIndex> {
     use crate::persistence::vector_paged::{NativePagedGraphSource, PagedGenerationMeta};
-    let meta = PagedGenerationMeta::decode(meta_bytes)?;
+    let mut backing_owner = contextdb_vector::VectorCopyAdmission::new(accountant.clone());
+    backing_owner.reserve_for(
+        meta_bytes
+            .len()
+            .checked_mul(12)
+            .and_then(|bytes| bytes.checked_add(4096))
+            .ok_or_else(|| {
+                crate::persistence::vector_paged::corruption("saved backing workspace overflow")
+            })?,
+        "vector",
+        "resolve_native_change_backing",
+        "Release idle vector state before resolving a saved backing.",
+    )?;
+    let original = PagedGenerationMeta::decode(meta_bytes)?;
+    let (read, _root) = capture()?;
+    let meta = crate::persistence::vector_paged::import_tail::resolve_native_change_backing(
+        &read, &original,
+    )?;
     let progress = meta.progress()?;
     if progress.generation_id != descriptor.generation_id
         || progress.frontier_tx != descriptor.covered_tx
@@ -19021,12 +19042,38 @@ fn paged_generation_graph_from(
 }
 
 impl DormantVectorGraphLoader for DurableVectorGenerationLoader {
-
     fn load(
         &self,
         generation: DormantVectorGraphGeneration,
         caller_reserved_load_bytes: usize,
         request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool,
+    ) -> Result<LoadedVectorGraphGeneration> {
+        self.load_selected_tail(generation, caller_reserved_load_bytes, request, self.tail_covered_lsn)
+    }
+
+    fn load_reusing_fresh_tail(
+        &self,
+        generation: DormantVectorGraphGeneration,
+        caller_reserved_load_bytes: usize,
+        request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool,
+        fresh_tail_present: bool,
+    ) -> Result<LoadedVectorGraphGeneration> {
+        let tail_covered_lsn = if fresh_tail_present && matches!(self.source, DurableVectorGenerationSource::Writable(_)) {
+            None
+        } else {
+            self.tail_covered_lsn
+        };
+        self.load_selected_tail(generation, caller_reserved_load_bytes, request, tail_covered_lsn)
+    }
+}
+
+impl DurableVectorGenerationLoader {
+    fn load_selected_tail(
+        &self,
+        generation: DormantVectorGraphGeneration,
+        caller_reserved_load_bytes: usize,
+        request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool,
+        tail_covered_lsn: Option<Lsn>,
     ) -> Result<LoadedVectorGraphGeneration> {
         if self.source.is_committed_image() {
             return self.load_retained(generation, caller_reserved_load_bytes, request);
@@ -19070,7 +19117,7 @@ impl DormantVectorGraphLoader for DurableVectorGenerationLoader {
             self.base_generation_id,
             (!self.is_base).then_some(self.descriptor.generation_id),
         )?;
-        let tail_count = match self.tail_covered_lsn {
+        let tail_count = match tail_covered_lsn {
             Some(covered_lsn) => self.source.tail_entry_count(
                 &self.partition.index,
                 &self.partition.partition_key,
@@ -19079,7 +19126,7 @@ impl DormantVectorGraphLoader for DurableVectorGenerationLoader {
             None => 0,
         };
         Self::load_checkpoint(request)?;
-        let (tail_resident_reservation, tail_workspace) = if self.tail_covered_lsn.is_some() {
+        let (tail_resident_reservation, tail_workspace) = if tail_covered_lsn.is_some() {
             self.tail_reservation(tail_count)?
         } else {
             (0, 0)
@@ -19238,7 +19285,7 @@ impl DormantVectorGraphLoader for DurableVectorGenerationLoader {
                 ));
             }
 
-            let fresh_tail = match self.tail_covered_lsn {
+            let fresh_tail = match tail_covered_lsn {
                 None => None,
                 Some(covered_lsn) => {
                     Self::load_checkpoint(request)?;
@@ -19338,7 +19385,7 @@ impl DormantVectorGraphLoader for DurableVectorGenerationLoader {
                 })
             }
         }
-    }
+        }
 }
 
 /// What a statement keeps for one committed-image layer it has still to
@@ -21229,7 +21276,14 @@ impl MaintenanceContext {
         };
         // Every retry re-enters format selection. A captured frontier that
         // outgrew an earlier estimate forces the existing paged base route.
-        let mut force_paged = false;
+        let mut force_paged = persistence
+            .load_vector_partition_generation_catalog_for(
+                &partition.index,
+                &partition.partition_key,
+            )?
+            .map(|catalog| persistence.catalog_has_native_import_backing(&catalog))
+            .transpose()?
+            .unwrap_or(false);
         let mut force_base_export = false;
         loop {
             if let Some(outcome) =
@@ -21501,26 +21555,31 @@ impl MaintenanceContext {
                     );
                     if held.is_none() {
                         let native_bytes = resident_insertion_runtime_bytes(workers)?;
-                        if !self.finalization.accountant.activate_resident_insertion_runtime(
-                            workers,
-                            native_bytes,
-                            workspace.retained_bytes(),
-                            peak,
-                            || {
-                                workspace.resize(
+                        if !self
+                            .finalization
+                            .accountant
+                            .activate_resident_insertion_runtime(
+                                workers,
+                                native_bytes,
+                                workspace.retained_bytes(),
+                                peak,
+                                || {
+                                    workspace.resize(
                                     peak,
                                     "prepare_vector_generation",
                                     "Raise MEMORY_LIMIT before compacting this maintained route.",
                                 )
-                            },
-                        )? {
+                                },
+                            )?
+                        {
                             continue;
                         }
                     } else {
                         // Every writer headroom already includes the one held
                         // process reservation. Never debit it in this helper.
                         if self
-                            .finalization.accountant
+                            .finalization
+                            .accountant
                             .available_after_releasing(workspace.retained_bytes())
                             .is_some_and(|available| available < peak)
                         {
@@ -21554,8 +21613,12 @@ impl MaintenanceContext {
                     0
                 };
                 let peak = workspace_plan.complete_peak_bytes().max(export_peak);
-                if self.finalization.accountant.available_after_releasing(workspace.retained_bytes())
-                    .is_some_and(|available| available < peak) {
+                if self
+                    .finalization
+                    .accountant
+                    .available_after_releasing(workspace.retained_bytes())
+                    .is_some_and(|available| available < peak)
+                {
                     force_paged = true;
                     continue;
                 }
@@ -21595,7 +21658,8 @@ impl MaintenanceContext {
                         .saturating_add(cleanup_peak),
                 );
                 let complete_fits = self
-                    .finalization.accountant
+                    .finalization
+                    .accountant
                     .usage()
                     .available
                     .is_none_or(|available| available >= peak);
@@ -22445,8 +22509,7 @@ impl MaintenanceContext {
                                                 &partition.partition_key,
                                             )?
                                             .filter(|durable| {
-                                                durable.base.generation_id
-                                                    == repaired_generation_id
+                                                durable.base.generation_id == repaired_generation_id
                                             })
                                         {
                                             match self.install_published_vector_catalog(
@@ -22455,7 +22518,9 @@ impl MaintenanceContext {
                                             ) {
                                                 Ok(()) => {}
                                                 Err(
-                                                    install @ (Error::MemoryBudgetExceeded { .. }
+                                                    install @ (Error::MemoryBudgetExceeded {
+                                                        ..
+                                                    }
                                                     | Error::DiskBudgetExceeded { .. }),
                                                 ) => {
                                                     self.retain_published_vector_cleanup_failure(
@@ -24566,7 +24631,37 @@ impl Database {
             .damage_checkpoint_f32_projection_for_test()
     }
 
+    #[doc(hidden)]
+    pub fn open_with_writer_vector_session(path: impl AsRef<Path>, options: DatabaseOpenOptions, session: &WriterVectorSession) -> Result<Self> {
+        #[cfg(feature = "test-seams")]
+        {
+            let interceptor = COMMON_OPTIONS_OPEN_INTERCEPTOR.with(|slot| slot.borrow().clone());
+            if let Some(interceptor) = interceptor {
+                let result = interceptor.intercept(path.as_ref(), &options);
+                match &result {
+                    Ok(db) => db.reattach_writer_vector_session(session),
+                    Err(_) => session.clear(),
+                }
+                return result;
+            }
+        }
+        let saved = session.take();
+        let had_saved = saved.is_some();
+        let retry_options = options.clone();
+        match Self::open_configured_carrying(path.as_ref(), options, saved) {
+            Err(Error::MemoryBudgetExceeded { .. }) if had_saved => {
+                // The optional cache must never cause an open refusal.
+                Self::open_configured(path.as_ref(), retry_options)
+            }
+            result => result,
+        }
+    }
+
     fn open_configured(path: &Path, options: DatabaseOpenOptions) -> Result<Self> {
+        Self::open_configured_carrying(path, options, None)
+    }
+
+    fn open_configured_carrying(path: &Path, options: DatabaseOpenOptions, mut carried: Option<vector_writer_session::CarriedWriterTail>) -> Result<Self> {
         let in_memory = path.as_os_str() == ":memory:";
         // A throwaway database has no file, so a ceiling on file growth is a
         // configuration mistake rather than a limit to enforce. Saying so
@@ -24598,6 +24693,9 @@ impl Database {
             Some(bytes) => MemoryAccountant::writer_budget(bytes)?,
             None => MemoryAccountant::writer_no_limit()?,
         };
+        if carried.as_mut().is_some_and(|tail| tail.recharge(accountant.vector_accountant()).is_err()) {
+            carried = None;
+        }
         let declared_read_memory = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(
             owner_reads.limits.limits.memory,
         );
@@ -24698,6 +24796,7 @@ impl Database {
                 crate::persistence::redb_writer_cache_bytes_for_limit(db.accountant.usage().limit),
             )?;
         }
+        db.reattach_carried_writer_tail(carried);
         Ok(db)
     }
 

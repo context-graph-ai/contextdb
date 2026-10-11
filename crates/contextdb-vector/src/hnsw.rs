@@ -3427,6 +3427,14 @@ pub struct HnswGraphStats {
 }
 
 impl HnswIndex {
+    /// Only these graphs own all their data and can outlive a physical writer.
+    pub(crate) fn is_owned_mutable(&self) -> bool {
+        matches!(
+            self.hnsw,
+            HnswInner::F32Mutable(_) | HnswInner::QuantizedMutable(_)
+        )
+    }
+
     /// Install a root-bound paged graph. Its topology and lookup directories
     /// remain in durable point pages; the three legacy maps stay empty.
     pub fn from_paged_tail(tail: paged_builder::PagedVectorTail) -> Self {

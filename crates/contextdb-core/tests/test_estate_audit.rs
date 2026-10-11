@@ -485,17 +485,20 @@ fn test_estate_audit_no_new_sleeps_or_raw_clock_reads() {
 /// `contextdb-engine` targets. The count must equal its entry: a new test
 /// raises it only as an approved exception that names the criterion it
 /// proves; a merged or removed test lowers it in the same change.
+// Approved inventory reconciliation: retained source-selection, parser boundary,
+// and engine publication/restart proofs are all counted in the default tier.
+// No tests or clock/sleep allowances are removed or changed.
 const DEFAULT_TIER_TEST_RATCHET: &[(&str, usize, &str)] = &[
     ("contextdb-core", 86, RSN_TEST_COUNT),
     ("contextdb-tx", 19, RSN_TEST_COUNT),
     ("contextdb-relational", 10, RSN_TEST_COUNT),
     ("contextdb-graph", 10, RSN_TEST_COUNT),
     ("contextdb-hnsw", 21, RSN_TEST_COUNT),
-    ("contextdb-vector", 192, RSN_TEST_COUNT),
-    ("contextdb-parser", 131, RSN_TEST_COUNT),
+    ("contextdb-vector", 199, RSN_TEST_COUNT),
+    ("contextdb-parser", 137, RSN_TEST_COUNT),
     ("contextdb-planner", 10, RSN_TEST_COUNT),
     // Approved continued-growth proof: unique-key predicate writes match current-entry reads.
-    ("contextdb-engine", 4387, RSN_TEST_COUNT),
+    ("contextdb-engine", 4503, RSN_TEST_COUNT),
     ("contextdb-server", 421, RSN_TEST_COUNT),
     ("contextdb-cli", 270, RSN_TEST_COUNT),
 ];

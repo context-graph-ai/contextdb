@@ -178,6 +178,10 @@ pub use database::{reclaim_steps_last_cycle_for_test, set_reclaim_steps_per_cycl
 pub use database::MemoryHeldReceivedSchemaUnit;
 pub use database::PolicyHeldReceivedTable;
 pub use database::TriggerProgressTelemetrySnapshot;
+#[doc(hidden)]
+pub use database::WriterVectorSession;
+#[doc(hidden)]
+pub use contextdb_vector::VectorPartitionRef;
 pub use database::{
     ApplyPhasePauseGuard, CronAuditEntry, CronAuditKind, CronPauseGuard, CronScheduleStatus,
     EventBusStatus, EventTypeStatus, RouteStatus, SinkError, SinkEvent, SinkMetrics, SinkStatus,
