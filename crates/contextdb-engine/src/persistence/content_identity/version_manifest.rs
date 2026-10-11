@@ -1277,3 +1277,69 @@ pub(in super::super) fn relation_name_with_checkpoint(
     }
     Ok(name)
 }
+
+/// Overlay admitted unpublished deltas on the unchanged authenticated root.
+/// Rooted seeks still authenticate every stored candidate, including removed
+/// predecessors; the overlay cannot make a damaged stored member disappear.
+pub(in super::super) fn writer_manifest_next_pending(
+    write: &redb::WriteTransaction,
+    start: &[u8],
+    exclusive: bool,
+    admission: &mut ProofAdmission,
+    pending: &[ContentIdentityMutation],
+) -> Result<Option<Vec<u8>>> {
+    fn coordinate(mutation: &ContentIdentityMutation) -> &[u8] {
+        &mutation.logical_key[ORDERED_HISTORY_MAGIC.len() + 1..]
+    }
+    let latest = |key: &[u8]| {
+        pending
+            .iter()
+            .rev()
+            .find(|mutation| coordinate(mutation) == key)
+    };
+    let mut stored = writer_manifest_next(write, start, exclusive, admission)?;
+    while stored
+        .as_deref()
+        .is_some_and(|key| latest(key).is_some_and(|mutation| mutation.logical_value.is_none()))
+    {
+        let key = stored.take().expect("selected predecessor");
+        stored = writer_manifest_next(write, &key, true, admission)?;
+        let bytes = key.capacity();
+        drop(key);
+        admission.release(bytes);
+    }
+    let mut selected: Option<&[u8]> = None;
+    for mutation in pending {
+        let key = coordinate(mutation);
+        if mutation.logical_value.is_none()
+            || !std::ptr::eq(latest(key).expect("overlay member"), mutation)
+            || key < start
+            || (exclusive && key == start)
+            || stored.as_deref().is_some_and(|stored| key >= stored)
+            || selected.is_some_and(|selected| key >= selected)
+        {
+            continue;
+        }
+        selected = Some(key);
+    }
+    if let Some(key) = selected {
+        admission.admit(key.len())?;
+        let selected = key.to_vec();
+        if let Some(stored) = stored {
+            let bytes = stored.capacity();
+            drop(stored);
+            admission.release(bytes);
+        }
+        Ok(Some(selected))
+    } else {
+        Ok(stored)
+    }
+}
+
+pub(in super::super) fn manifest_mutation_bytes(coordinate: &[u8], present: bool) -> Result<usize> {
+    coordinate
+        .len()
+        .checked_add(ORDERED_HISTORY_MAGIC.len() + 1)
+        .and_then(|bytes| bytes.checked_add(usize::from(present)))
+        .ok_or_else(|| bad("mutation layout overflow"))
+}

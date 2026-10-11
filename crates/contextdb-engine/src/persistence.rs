@@ -23851,6 +23851,7 @@ let mut graph_publication_attempt = crate::read_work_probe::GraphPublicationAtte
             let graph_commit_support=Self::capture_graph_commit_support(&write_txn,ws.commit_lsn)?;
             #[cfg(any(test, feature = "test-seams"))]
             let mut stage_started = std::time::Instant::now();
+            let mut pending_manifests = relational_version_manifest::PendingManifestPublication::new(self.proof_admission());
             let mut identity_mutations = Vec::new();
             for (table, row_id, _) in &ws.relational_deletes {
                 identity_mutations.push(content_identity::remove_row_mutation(table, *row_id));
@@ -24028,7 +24029,7 @@ let mut graph_publication_attempt = crate::read_work_probe::GraphPublicationAtte
                     .map_err(Self::storage_error)?;
                 let mut encoded = Vec::new();
                 for (row_id, deleted_tx) in deletes {
-                    self.verify_relational_group_in_write(&write_txn, table, row_id, &*redb_table)?;
+                    self.verify_relational_group_pending_in_write(&write_txn, table, row_id, &*redb_table, &pending_manifests.mutations)?;
                     let _row_scope = crate::read_image_memory::active_owner()?.row_owner()?.enter();
                     if let Some(row) = deleted_rows_snapshot
                         .as_ref()
@@ -24067,7 +24068,7 @@ let mut graph_publication_attempt = crate::read_work_probe::GraphPublicationAtte
                         )?;
                         {
                             let predecessor = redb_table.get(key.as_slice()).map_err(Self::storage_error)?;
-                            self.replace_relational_manifest_in_write(&write_txn, table, key.as_slice(), predecessor.as_ref().map(|body| body.value()), Some(encoded.as_slice()))?;
+                            self.replace_relational_manifest_pending_in_write(&write_txn, table, key.as_slice(), predecessor.as_ref().map(|body| body.value()), Some(encoded.as_slice()), Some(&mut pending_manifests))?;
                         }
                         redb_table
                             .insert(key.as_slice(), encoded.as_slice())
@@ -24102,7 +24103,7 @@ let mut graph_publication_attempt = crate::read_work_probe::GraphPublicationAtte
                     Self::encode_versioned_row_into(&row, table_meta.get(table), &mut encoded)?;
                     {
                         let predecessor = redb_table.get(key.as_slice()).map_err(Self::storage_error)?;
-                        self.replace_relational_manifest_in_write(&write_txn, table, key.as_slice(), predecessor.as_ref().map(|body| body.value()), Some(encoded.as_slice()))?;
+                        self.replace_relational_manifest_pending_in_write(&write_txn, table, key.as_slice(), predecessor.as_ref().map(|body| body.value()), Some(encoded.as_slice()), Some(&mut pending_manifests))?;
                     }
                     redb_table
                         .insert(key.as_slice(), encoded.as_slice())
@@ -24191,7 +24192,7 @@ let mut graph_publication_attempt = crate::read_work_probe::GraphPublicationAtte
                     let key = Self::rel_row_key(row);
                     {
                         let predecessor = redb_table.get(key.as_slice()).map_err(Self::storage_error)?;
-                        self.replace_relational_manifest_in_write(&write_txn, table, key.as_slice(), predecessor.as_ref().map(|body| body.value()), Some(encoded.as_slice()))?;
+                        self.replace_relational_manifest_pending_in_write(&write_txn, table, key.as_slice(), predecessor.as_ref().map(|body| body.value()), Some(encoded.as_slice()), Some(&mut pending_manifests))?;
                     }
                     redb_table
                         .insert(key.as_slice(), encoded.as_slice())
@@ -24891,11 +24892,13 @@ let mut graph_publication_attempt = crate::read_work_probe::GraphPublicationAtte
             {
                 observe_append_stage(AppendStage::RowsIndexesAndLogs, &mut stage_started);
             }
-            Self::apply_content_identity_mutations_in_write(
+            Self::apply_content_identity_with_manifests_in_write(
                 &write_txn,
                 &identity_mutations,
+                &pending_manifests.mutations,
                 &mut self.proof_admission(),
             )?;
+            drop(pending_manifests);
             #[cfg(any(test, feature = "test-seams"))]
             {
                 observe_append_stage(AppendStage::ContentIdentity, &mut stage_started);

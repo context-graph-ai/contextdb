@@ -21306,14 +21306,22 @@ impl MaintenanceContext {
         };
         // Every retry re-enters format selection. A captured frontier that
         // outgrew an earlier estimate forces the existing paged base route.
-        let mut force_paged = persistence
-            .load_vector_partition_generation_catalog_for(
-                &partition.index,
-                &partition.partition_key,
-            )?
-            .map(|catalog| persistence.catalog_has_native_import_backing(&catalog))
-            .transpose()?
-            .unwrap_or(false);
+        // A quarantined catalog is not a serving-format source. Repair must
+        // reach the admitted retirement/rebuild path without decoding that
+        // damaged pointer; canonical membership and body authentication still
+        // decide whether a replacement can be built.
+        let mut force_paged = if self.vector.partition_route_quarantine(partition).is_some() {
+            false
+        } else {
+            persistence
+                .load_vector_partition_generation_catalog_for(
+                    &partition.index,
+                    &partition.partition_key,
+                )?
+                .map(|catalog| persistence.catalog_has_native_import_backing(&catalog))
+                .transpose()?
+                .unwrap_or(false)
+        };
         let mut force_base_export = false;
         loop {
             if let Some(outcome) =
@@ -64039,6 +64047,28 @@ impl Database {
         &self,
     ) -> Result<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>> {
         self.declared_read_memory.child()
+    }
+
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __visit_committed_change_and_ddl_members_for_test(
+        &self,
+        tx: contextdb_core::TxId,
+        tables: &[&str],
+        visitor: impl FnMut(&[u8]) -> contextdb_core::Result<()>,
+    ) -> contextdb_core::Result<()> {
+        let _operation = self.assert_open_operation();
+        let memory = self.declared_reader_memory()?;
+        let persistence = self.persistence.as_ref().ok_or_else(|| {
+            contextdb_core::Error::Other("committed member visitor requires persistence".into())
+        })?;
+        persistence.visit_committed_change_and_ddl_members_for_test(
+            tx,
+            tables,
+            memory,
+            self.accountant.clone(),
+            visitor,
+        )
     }
 
     /// Bytes the declared reader memory currently holds for reads.

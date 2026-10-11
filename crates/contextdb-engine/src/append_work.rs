@@ -166,3 +166,40 @@ pub fn take_untagged_totals() -> (u64, u64, u64, u64, u64) {
 pub fn last_directory_binding_work() -> DirectoryBindingWork {
     content_identity::last_directory_binding_work_for_test()
 }
+
+type CoalescedMutationObserver = fn(&'static str, &[u8], bool);
+
+thread_local! {
+    static COALESCED_MUTATION_OBSERVER: std::cell::Cell<Option<CoalescedMutationObserver>> = const { std::cell::Cell::new(None) };
+}
+
+/// Observe the borrowed final members of successful content-identity applies.
+/// The caller must discard observations if its enclosing commit fails. Nested
+/// calls and unwinding restore the previous observer. The emitter allocates no
+/// storage and retains neither keys nor callback results.
+#[doc(hidden)]
+pub fn with_coalesced_mutation_observer_for_test<R>(
+    observer: fn(&'static str, &[u8], bool),
+    action: impl FnOnce() -> R,
+) -> R {
+    struct Restore(Option<CoalescedMutationObserver>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            COALESCED_MUTATION_OBSERVER.with(|slot| slot.set(self.0));
+        }
+    }
+    let _restore = Restore(COALESCED_MUTATION_OBSERVER.with(|slot| slot.replace(Some(observer))));
+    action()
+}
+
+pub(crate) fn observe_coalesced_mutation(family: &'static str, key: &[u8], present: bool) {
+    COALESCED_MUTATION_OBSERVER.with(|slot| {
+        if let Some(observer) = slot.get() {
+            observer(family, key, present);
+        }
+    });
+}
+
+pub(crate) fn coalesced_mutation_observer_is_active() -> bool {
+    COALESCED_MUTATION_OBSERVER.with(|slot| slot.get().is_some())
+}

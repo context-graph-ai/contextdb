@@ -51,6 +51,22 @@ impl RedbPersistence {
         old: Option<&[u8]>,
         new: Option<&[u8]>,
     ) -> Result<()> {
+        self.replace_relational_manifest_pending_in_write(write, table, physical, old, new, None)
+    }
+
+    pub(super) fn replace_relational_manifest_pending_in_write(
+        &self,
+        write: &redb::WriteTransaction,
+        table: &str,
+        physical: &[u8],
+        old: Option<&[u8]>,
+        new: Option<&[u8]>,
+        mut pending: Option<&mut PendingManifestPublication>,
+    ) -> Result<()> {
+        #[cfg(any(test, feature = "test-seams"))]
+        let _family_scope = content_identity::enter_passive_family(
+            content_identity::LogicalFamily::ChangeAndDdl,
+        );
         let mut admission = self.proof_admission();
         admission.admit(
             table
@@ -60,8 +76,14 @@ impl RedbPersistence {
         )?;
         let mut prefix = manifest::manifest_prefix(table)?;
         prefix.extend_from_slice(physical);
-        let expected = manifest::writer_manifest_next(write, &prefix, false, &mut admission)
-            .map_err(|e| self.relational_manifest_error(e))?;
+        let expected = manifest::writer_manifest_next_pending(
+            write,
+            &prefix,
+            false,
+            &mut admission,
+            pending.as_ref().map_or(&[], |p| p.mutations.as_slice()),
+        )
+        .map_err(|e| self.relational_manifest_error(e))?;
         let old_coordinate = old
             .map(|body| manifest::manifest_for_body(table, physical, body, &mut admission))
             .transpose()
@@ -73,8 +95,14 @@ impl RedbPersistence {
             ));
         }
         if let Some(coordinate) = &old_coordinate {
-            let next = manifest::writer_manifest_next(write, coordinate, true, &mut admission)
-                .map_err(|e| self.relational_manifest_error(e))?;
+            let next = manifest::writer_manifest_next_pending(
+                write,
+                coordinate,
+                true,
+                &mut admission,
+                pending.as_ref().map_or(&[], |p| p.mutations.as_slice()),
+            )
+            .map_err(|e| self.relational_manifest_error(e))?;
             if next.as_deref().is_some_and(|key| key.starts_with(&prefix)) {
                 return Err(self.relational_manifest_damage("duplicate physical version member"));
             }
@@ -84,6 +112,15 @@ impl RedbPersistence {
             .transpose()
             .map_err(|e| self.relational_manifest_error(e))?;
         if old_coordinate == new_coordinate {
+            return Ok(());
+        }
+        if let Some(pending) = pending.as_mut() {
+            if let Some(key) = &old_coordinate {
+                pending.push(key, false)?;
+            }
+            if let Some(key) = &new_coordinate {
+                pending.push(key, true)?;
+            }
             return Ok(());
         }
         let capacity = old_coordinate
@@ -889,6 +926,17 @@ impl RedbPersistence {
         row_id: RowId,
         relation: &impl ReadableTable<&'static [u8], &'static [u8]>,
     ) -> Result<()> {
+        self.verify_relational_group_pending_in_write(write, table, row_id, relation, &[])
+    }
+
+    pub(super) fn verify_relational_group_pending_in_write(
+        &self,
+        write: &redb::WriteTransaction,
+        table: &str,
+        row_id: RowId,
+        relation: &impl ReadableTable<&'static [u8], &'static [u8]>,
+        pending: &[content_identity::ContentIdentityMutation],
+    ) -> Result<()> {
         let mut admission = self.proof_admission();
         admission.admit(
             table
@@ -908,8 +956,14 @@ impl RedbPersistence {
         let mut previous = None;
         loop {
             let mut window = self.proof_admission();
-            let next = manifest::writer_manifest_next(write, &after, exclusive, &mut window)
-                .map_err(|e| self.relational_manifest_error(e))?;
+            let next = manifest::writer_manifest_next_pending(
+                write,
+                &after,
+                exclusive,
+                &mut window,
+                pending,
+            )
+            .map_err(|e| self.relational_manifest_error(e))?;
             let Some(coordinate) = next.filter(|key| key.starts_with(&prefix)) else {
                 if physical
                     .next()
@@ -1101,6 +1155,350 @@ impl RetainedReadSource {
             let deleted = RedbPersistence::decode_exact::<Option<TxId>>(value)
                 .map_err(|error| self.content_identity_error(error))?;
             Ok((position, deleted))
+        })
+    }
+}
+
+/// Finite writer-funded publication deltas. Field order frees every mutation
+/// and the native container before its original proof invoices are returned.
+pub(super) struct PendingManifestPublication {
+    pub(super) mutations: Vec<content_identity::ContentIdentityMutation>,
+    admission: content_identity::OwnedProofAdmission,
+}
+impl PendingManifestPublication {
+    pub(super) fn new(admission: content_identity::OwnedProofAdmission) -> Self {
+        Self {
+            mutations: Vec::new(),
+            admission,
+        }
+    }
+    fn push(&mut self, coordinate: &[u8], present: bool) -> Result<()> {
+        if self.mutations.len() == self.mutations.capacity() {
+            let old = self.mutations.capacity();
+            let capacity = old
+                .checked_mul(2)
+                .map(|n| n.max(4))
+                .ok_or_else(|| Error::Other("manifest publication capacity overflow".into()))?;
+            let bytes = capacity
+                .checked_mul(std::mem::size_of::<content_identity::ContentIdentityMutation>())
+                .ok_or_else(|| Error::Other("manifest publication layout overflow".into()))?;
+            self.admission.admit(bytes)?;
+            let mut next = Vec::with_capacity(capacity);
+            next.extend(std::mem::take(&mut self.mutations));
+            self.mutations = next;
+            self.admission
+                .release(old * std::mem::size_of::<content_identity::ContentIdentityMutation>());
+        }
+        let bytes = manifest::manifest_mutation_bytes(coordinate, present)?;
+        self.admission.admit(bytes)?;
+        let mutation = manifest::manifest_mutation(coordinate, present)?;
+        debug_assert_eq!(
+            mutation.logical_key.capacity()
+                + mutation.logical_value.as_ref().map_or(0, Vec::capacity),
+            bytes
+        );
+        self.mutations.push(mutation);
+        Ok(())
+    }
+}
+
+#[cfg(feature = "test-seams")]
+impl RedbPersistence {
+    pub(crate) fn visit_committed_change_and_ddl_members_for_test(
+        &self,
+        tx: TxId,
+        tables: &[&str],
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        accountant: crate::memory_accounting::AccountantHandle,
+        mut visitor: impl FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let owner = writer_source::SourceWindowOwner::Read(read_memory.clone());
+        let _controls = owner.reserve(
+            std::mem::size_of::<content_identity::ContentIdentityReadVerifier>()
+                + std::mem::size_of::<redb::ReadTransaction>()
+                + 3 * std::mem::size_of::<redb::ReadOnlyTable<&str, &[u8]>>()
+                + 3 * std::mem::size_of::<redb::Range<'_, &str, &[u8]>>()
+                + 2 * std::mem::size_of::<crate::read_image_memory::ImageMemory>()
+                + 512,
+            "committed_member_controls",
+        )?;
+        graph_read::with_pages(read_memory.clone(), || {
+            self.with_db(|db| {
+                let read = db.begin_read().map_err(Self::storage_error)?;
+                let decode = crate::read_image_memory::ImageMemory::charging_reader_for(
+                    accountant.clone(),
+                    read_memory.clone(),
+                    "history_source",
+                    "committed_member_controls",
+                    "Raise the declared reader memory limit.",
+                );
+                decode.scope(|| {
+                    let captured = Self::read_authenticated_bounds_in_read(&read)?;
+                    let verifier = content_identity::ContentIdentityReadVerifier::open(
+                        &read,
+                        Path::new("committed member diagnostic"),
+                        None,
+                    )?;
+                    let commits = read
+                        .open_table(COMMIT_INDEX_TABLE)
+                        .map_err(Self::storage_error)?;
+                    let mut committed_lsn = None;
+                    for entry in commits.iter().map_err(Self::storage_error)? {
+                        let (key, value) = entry.map_err(Self::storage_error)?;
+                        if value.value() == tx.0 {
+                            if committed_lsn.is_some() {
+                                return Err(
+                                    verifier.corrupt("transaction has duplicate committed LSNs")
+                                );
+                            }
+                            let _key_credit = owner.reserve(128, "committed_member_key")?;
+                            let mutation =
+                                content_identity::commit_index_mutation(Lsn(key.value()), tx);
+                            verifier.verify_with_read_memory(&mutation, read_memory.clone())?;
+                            visitor(&mutation.logical_key)?;
+                            committed_lsn = Some(Lsn(key.value()));
+                        }
+                    }
+                    let lsn = committed_lsn.ok_or_else(|| {
+                        verifier.corrupt("requested transaction is not committed")
+                    })?;
+                    let proof_owner = ReadHistoryProofOwner::new(read_memory.clone())?;
+                    let proof = content_identity::ProofMemory::growable(0, proof_owner.clone());
+                    for (kind, definition) in [
+                        (content_identity::HistoryKind::ChangeLog, CHANGE_LOG_TABLE),
+                        (content_identity::HistoryKind::DdlLog, DDL_LOG_TABLE),
+                    ] {
+                        let table = match read.open_table(definition) {
+                            Ok(table) => Some(table),
+                            Err(redb::TableError::TableDoesNotExist(_)) => None,
+                            Err(error) => return Err(Self::storage_error(error)),
+                        };
+                        let mut physical = table
+                            .as_ref()
+                            .map(|table| table.iter())
+                            .transpose()
+                            .map_err(Self::storage_error)?;
+                        let complete = verifier.visit_history::<Error>(
+                            kind,
+                            false,
+                            &proof,
+                            &mut || Ok(()),
+                            &mut |coordinate, expected| {
+                                let (key, body) = physical
+                                    .as_mut()
+                                    .and_then(|range| range.next())
+                                    .transpose()
+                                    .map_err(Self::storage_error)?
+                                    .ok_or_else(|| {
+                                        verifier.corrupt(
+                                            "committed history member is physically missing",
+                                        )
+                                    })?;
+                                if key.value().as_bytes() != coordinate {
+                                    return Err(
+                                        verifier.corrupt("committed history physical key mismatch")
+                                    );
+                                }
+                                let _window = owner.reserve(
+                                    std::mem::size_of::<crate::read_image_memory::ImageMemory>()
+                                        + 64,
+                                    "committed_member_decode",
+                                )?;
+                                let scratch =
+                                    crate::read_image_memory::ImageMemory::charging_reader_for(
+                                        accountant.clone(),
+                                        read_memory.clone(),
+                                        "history_source",
+                                        "committed_member",
+                                        "Raise the declared reader memory limit.",
+                                    );
+                                scratch.scope(|| {
+                                    let (actual, member_lsn) = if kind
+                                        == content_identity::HistoryKind::ChangeLog
+                                    {
+                                        let record = Self::decode_stored_change_log(body.value())?;
+                                        let actual =
+                                            Self::stored_change_log_value_hash(body.value())?;
+                                        (actual, record.entry.lsn())
+                                    } else {
+                                        let change: DdlChange = Self::decode(body.value())?;
+                                        let actual =
+                                            content_identity::history_record_value_hash(&change)?;
+                                        let raw_lsn = key
+                                            .value()
+                                            .split_once(':')
+                                            .map(|(lsn, _)| lsn)
+                                            .unwrap_or(key.value());
+                                        let member_lsn = raw_lsn
+                                            .parse::<u64>()
+                                            .map(Lsn)
+                                            .map_err(|error| verifier.corrupt(error))?;
+                                        (actual, member_lsn)
+                                    };
+                                    if actual != expected {
+                                        return Err(verifier.corrupt(
+                                            "committed history body does not authenticate",
+                                        ));
+                                    }
+                                    if member_lsn == lsn {
+                                        if kind == content_identity::HistoryKind::ChangeLog {
+                                            graph_read::with_graph_proof_in_read(
+                                                &read,
+                                                None,
+                                                &owner,
+                                                scratch.clone(),
+                                                |context, read, memory| {
+                                                    context.verify_stored_graph_history(
+                                                        read,
+                                                        key.value(),
+                                                        body.value(),
+                                                        memory,
+                                                    )
+                                                },
+                                            )?;
+                                        }
+                                        let mut admission =
+                                            content_identity::ProofAdmission::for_reader(
+                                                read_memory.clone(),
+                                            );
+                                        content_identity::visit_history_logical_key_for_test(
+                                            kind,
+                                            key.value().as_bytes(),
+                                            &mut admission,
+                                            &mut visitor,
+                                        )?;
+                                    }
+                                    Ok(true)
+                                })
+                            },
+                        )?;
+                        if let Some(error) = proof_owner.refusal.lock().take() {
+                            return Err(error);
+                        }
+                        if !complete
+                            || physical
+                                .as_mut()
+                                .and_then(|range| range.next())
+                                .transpose()
+                                .map_err(Self::storage_error)?
+                                .is_some()
+                        {
+                            return Err(
+                                verifier.corrupt("committed history contains unwitnessed members")
+                            );
+                        }
+                    }
+                    for table in tables {
+                        let mut bounds =
+                            content_identity::ProofAdmission::for_reader(read_memory.clone());
+                        bounds.admit(3 * (table.len() + 72) + table.len() + 4)?;
+                        let prefix = manifest::manifest_prefix(table)?;
+                        let name = Self::rel_table_name(table);
+                        let relation = read
+                            .open_table(TableDefinition::<&[u8], &[u8]>::new(&name))
+                            .map_err(|error| Self::relational_table_error(table, error))?;
+                        let mut physical = relation
+                            .iter()
+                            .map_err(|error| Self::relational_storage_error(table, error))?;
+                        let mut previous = None;
+                        let complete = verifier.visit_history_from::<Error>(
+                            content_identity::HistoryKind::RelationalVersion,
+                            std::ops::Bound::Included(prefix.clone()),
+                            false,
+                            &proof,
+                            &mut || Ok(()),
+                            &mut |coordinate, marker| {
+                                if !coordinate.starts_with(&prefix) {
+                                    return Ok(false);
+                                }
+                                let witness = manifest::parse_manifest(coordinate)?;
+                                if marker != manifest::manifest_marker_hash()
+                                    || previous.is_some_and(|old| old >= witness.identity)
+                                {
+                                    return Err(verifier.corrupt(
+                                        "version manifest duplicate, order or marker mismatch",
+                                    ));
+                                }
+                                previous = Some(witness.identity);
+                                let (key, body) = physical
+                                    .next()
+                                    .transpose()
+                                    .map_err(|error| Self::relational_storage_error(table, error))?
+                                    .ok_or_else(|| {
+                                        verifier.corrupt(
+                                            "version manifest member is physically missing",
+                                        )
+                                    })?;
+                                if key.value() != witness.identity {
+                                    return Err(
+                                        verifier.corrupt("version manifest physical key mismatch")
+                                    );
+                                }
+                                let mut admission = content_identity::ProofAdmission::for_reader(
+                                    read_memory.clone(),
+                                );
+                                let actual = manifest::manifest_for_body(
+                                    table,
+                                    key.value(),
+                                    body.value(),
+                                    &mut admission,
+                                )?;
+                                if actual != coordinate {
+                                    return Err(verifier
+                                        .corrupt("version manifest body does not authenticate"));
+                                }
+                                let actual_witness = manifest::parse_manifest(&actual)?;
+                                let created = TxId(u64::from_be_bytes(
+                                    actual_witness.identity[8..16]
+                                        .try_into()
+                                        .expect("manifest identity"),
+                                ));
+                                let version_lsn = Lsn(u64::from_be_bytes(
+                                    actual_witness.identity[16..]
+                                        .try_into()
+                                        .expect("manifest identity"),
+                                ));
+                                validate_read_version_bounds(
+                                    &read,
+                                    table,
+                                    version_lsn,
+                                    created,
+                                    actual_witness.deleted_tx,
+                                    TxId(captured.identity_tx_floor),
+                                    Lsn(captured.source_lsn_floor),
+                                )
+                                .map_err(|error| {
+                                    verifier.corrupt(format!("version bounds: {error:?}"))
+                                })?;
+                                if created == tx || actual_witness.deleted_tx == Some(tx) {
+                                    content_identity::visit_history_logical_key_for_test(
+                                        content_identity::HistoryKind::RelationalVersion,
+                                        &actual,
+                                        &mut admission,
+                                        &mut visitor,
+                                    )?;
+                                }
+                                Ok(true)
+                            },
+                        )?;
+                        if let Some(error) = proof_owner.refusal.lock().take() {
+                            return Err(error);
+                        }
+                        if !complete
+                            || physical
+                                .next()
+                                .transpose()
+                                .map_err(|error| Self::relational_storage_error(table, error))?
+                                .is_some()
+                        {
+                            return Err(
+                                verifier.corrupt("version table contains unwitnessed members")
+                            );
+                        }
+                    }
+                    Ok(())
+                })
+            })
         })
     }
 }

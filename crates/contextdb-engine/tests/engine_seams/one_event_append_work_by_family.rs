@@ -28,9 +28,97 @@
 mod pinned;
 
 use contextdb_core::{TxId, Value};
-use contextdb_engine::append_work::{self, FamilyWork, IndexPrefixCountTouch};
+use contextdb_engine::append_work::{
+    self, with_coalesced_mutation_observer_for_test, FamilyWork, IndexPrefixCountTouch,
+};
 use contextdb_engine::{Database, MaintenancePolicy};
+use std::cell::RefCell;
 use std::collections::HashMap;
+
+const COMMITTED_MEMBER_CAPACITY: usize = 16;
+const COMMITTED_MEMBER_BYTES: usize = 4_096;
+
+#[derive(Clone, Copy)]
+struct CommittedMembers {
+    keys: [[u8; COMMITTED_MEMBER_BYTES]; COMMITTED_MEMBER_CAPACITY],
+    lengths: [usize; COMMITTED_MEMBER_CAPACITY],
+    len: usize,
+    overflow: bool,
+    absent: bool,
+}
+
+impl CommittedMembers {
+    const fn empty() -> Self {
+        Self {
+            keys: [[0; COMMITTED_MEMBER_BYTES]; COMMITTED_MEMBER_CAPACITY],
+            lengths: [0; COMMITTED_MEMBER_CAPACITY],
+            len: 0,
+            overflow: false,
+            absent: false,
+        }
+    }
+
+    fn push(&mut self, key: &[u8]) -> bool {
+        if self.len == COMMITTED_MEMBER_CAPACITY || key.len() > COMMITTED_MEMBER_BYTES {
+            self.overflow = true;
+            return false;
+        }
+        self.keys[self.len][..key.len()].copy_from_slice(key);
+        self.lengths[self.len] = key.len();
+        self.len += 1;
+        true
+    }
+
+    fn key(&self, index: usize) -> &[u8] {
+        &self.keys[index][..self.lengths[index]]
+    }
+
+    fn remove_last(&mut self) {
+        assert!(
+            self.len > 0,
+            "the committed-member fixture produced a member"
+        );
+        self.len -= 1;
+    }
+}
+
+thread_local! {
+    static OBSERVED_CHANGE_AND_DDL_MEMBERS: RefCell<CommittedMembers> =
+        const { RefCell::new(CommittedMembers::empty()) };
+}
+
+fn observe_change_and_ddl_member(family: &'static str, key: &[u8], present: bool) {
+    if family != "ChangeAndDdl" {
+        return;
+    }
+    OBSERVED_CHANGE_AND_DDL_MEMBERS.with(|members| {
+        let mut members = members.borrow_mut();
+        if present {
+            members.push(key);
+        } else {
+            members.absent = true;
+        }
+    });
+}
+
+fn observed_change_and_ddl_members(db: &Database, event: usize) -> (TxId, CommittedMembers) {
+    OBSERVED_CHANGE_AND_DDL_MEMBERS.with(|members| {
+        *members.borrow_mut() = CommittedMembers::empty();
+    });
+    let members = with_coalesced_mutation_observer_for_test(observe_change_and_ddl_member, || {
+        append_event(db, event)
+    });
+    let observed = OBSERVED_CHANGE_AND_DDL_MEMBERS.with(|members| *members.borrow());
+    assert!(
+        !observed.overflow,
+        "the finite caller-owned committed-member receiver overflowed"
+    );
+    assert!(
+        !observed.absent,
+        "the append's committed ChangeAndDdl member was absent from the final coalesced set"
+    );
+    (members, observed)
+}
 
 fn context_uuid() -> uuid::Uuid {
     uuid::Uuid::from_u128(0xc0de_0000_0000_0000_0000_0000_0000_0001)
@@ -91,7 +179,7 @@ pub(crate) fn declare_all_prefixes_on_the_append_tables(db: &Database) {
 /// transaction — the consumer's one-event append
 /// (`context-graph/crates/context-graph/src/store/event.rs:2190`, `:2218`,
 /// `:2276`).
-pub(crate) fn append_event(db: &Database, event: usize) {
+pub(crate) fn append_event(db: &Database, event: usize) -> TxId {
     let tx = db.begin().expect("begin the append transaction");
     db.execute_in_tx(
         tx,
@@ -155,6 +243,7 @@ pub(crate) fn append_event(db: &Database, event: usize) {
     )
     .expect("insert the local-commit marker");
     db.commit(tx).expect("commit the one-event append");
+    tx
 }
 
 struct AppendWork {
@@ -234,6 +323,19 @@ impl AppendWork {
 fn observe_append(db: &Database, event: usize) -> AppendWork {
     append_work::reset();
     append_event(db, event);
+    observed_work()
+}
+
+fn observe_append_with_committed_members(
+    db: &Database,
+    event: usize,
+) -> (AppendWork, TxId, CommittedMembers) {
+    append_work::reset();
+    let (tx, observed) = observed_change_and_ddl_members(db, event);
+    (observed_work(), tx, observed)
+}
+
+fn observed_work() -> AppendWork {
     let (untagged_reads, untagged_writes, _removes, untagged_bytes_read, untagged_bytes_written) =
         append_work::take_untagged_totals();
     let pages = append_work::take_commit_pages_for_test();
@@ -267,6 +369,60 @@ fn observe_append(db: &Database, event: usize) -> AppendWork {
         allocated_pages: pages.allocated_pages,
         commits: pages.commits,
     }
+}
+
+fn committed_change_and_ddl_members(db: &Database, tx: TxId) -> CommittedMembers {
+    let mut expected = CommittedMembers::empty();
+    db.__visit_committed_change_and_ddl_members_for_test(
+        tx,
+        &["events", "event_anchors", "event_local_commits"],
+        |key| {
+            if expected.push(key) {
+                Ok(())
+            } else {
+                Err(contextdb_core::Error::Other(
+                    "the finite caller-owned expected-member receiver overflowed".into(),
+                ))
+            }
+        },
+    )
+    .expect("derive committed ChangeAndDdl members from authenticated physical data");
+    assert!(
+        !expected.overflow,
+        "the finite caller-owned expected-member receiver overflowed"
+    );
+    expected
+}
+
+fn has_exact_committed_members(expected: &CommittedMembers, observed: &CommittedMembers) -> bool {
+    if expected.overflow
+        || observed.overflow
+        || expected.absent
+        || observed.absent
+        || expected.len != observed.len
+    {
+        return false;
+    }
+    for members in [expected, observed] {
+        for left in 0..members.len {
+            if (left + 1..members.len).any(|right| members.key(left) == members.key(right)) {
+                return false;
+            }
+        }
+    }
+    (0..expected.len).all(|index| {
+        (0..observed.len)
+            .filter(|candidate| expected.key(index) == observed.key(*candidate))
+            .count()
+            == 1
+    })
+}
+
+fn assert_committed_member_contract(expected: &CommittedMembers, observed: &CommittedMembers) {
+    assert!(
+        has_exact_committed_members(expected, observed),
+        "the final ChangeAndDdl keys differ from the committed physical members"
+    );
 }
 
 /// A family tag that leaks past its walk, or is dropped before one, shows up
@@ -319,7 +475,7 @@ fn one_event_append_work_by_family() {
     for event in 2..10 {
         append_event(&db, event);
     }
-    let deep = observe_append(&db, 10);
+    let (deep, deep_tx, observed_members) = observe_append_with_committed_members(&db, 10);
 
     eprintln!("{}", shallow.report("one-event append at 2 events"));
     eprintln!("{}", deep.report("one-event append at 10 events"));
@@ -357,10 +513,52 @@ fn one_event_append_work_by_family() {
             ("Relational", 3),
             ("SchemaAndIndexes", 22),
             ("Sync", 3),
-            ("ChangeAndDdl", 4),
+            ("ChangeAndDdl", 7),
             ("Configuration", 3),
         ],
         "the per-family coalesced mutation vector of a one-event append"
+    );
+    let expected_members = committed_change_and_ddl_members(&db, deep_tx);
+    assert_committed_member_contract(&expected_members, &observed_members);
+
+    let mut missing_member = observed_members;
+    missing_member.remove_last();
+    assert!(
+        !has_exact_committed_members(&expected_members, &missing_member),
+        "removing one actual committed member must fail the exact-member contract"
+    );
+    let mut duplicate_member = observed_members;
+    assert!(
+        duplicate_member.len > 1,
+        "the fixture has distinct committed members"
+    );
+    duplicate_member.keys[1] = duplicate_member.keys[0];
+    duplicate_member.lengths[1] = duplicate_member.lengths[0];
+    assert!(
+        !has_exact_committed_members(&expected_members, &duplicate_member),
+        "duplicating one actual committed member must fail the exact-member contract"
+    );
+    let mut wrong_member = observed_members;
+    assert!(
+        wrong_member.lengths[0] > 0,
+        "a committed member key is nonempty before the wrong-member control"
+    );
+    let original = wrong_member.keys[0][0];
+    let replacement = (0_u8..=u8::MAX)
+        .find(|candidate| {
+            *candidate != original
+                && !(0..expected_members.len).any(|index| {
+                    expected_members.lengths[index] == wrong_member.lengths[0]
+                        && expected_members.keys[index][0] == *candidate
+                        && expected_members.keys[index][1..wrong_member.lengths[0]]
+                            == wrong_member.keys[0][1..wrong_member.lengths[0]]
+                })
+        })
+        .expect("a byte value outside the authenticated expected member set");
+    wrong_member.keys[0][0] = replacement;
+    assert!(
+        !has_exact_committed_members(&expected_members, &wrong_member),
+        "replacing one actual committed member with a non-member must fail the exact-member contract"
     );
     // Every Status member of an ordinary append is an authenticated index
     // prefix count over a column list no declared constraint already bounds,

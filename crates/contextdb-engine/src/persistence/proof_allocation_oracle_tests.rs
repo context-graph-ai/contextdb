@@ -1522,7 +1522,10 @@ impl contextdb_core::read_memory::ReadMemoryBudget for MaintenanceReaderSpy {
             if crate::read_image_memory::current_reader_budget().is_some() {
                 let owner = crate::read_image_memory::active_owner()?;
                 let funder = owner.reader_budget().expect("reader-funded image");
-                if Arc::as_ptr(&funder) as *const () as usize != self as *const Self as usize {
+                if !std::ptr::eq(
+                    Arc::as_ptr(&funder) as *const (),
+                    self as *const Self as *const (),
+                ) {
                     self.wrong_funder.fetch_add(1, AtomicOrdering::SeqCst);
                 }
                 maintenance_owner_control(Arc::as_ptr(&owner) as usize, self);

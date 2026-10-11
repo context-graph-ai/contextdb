@@ -84,10 +84,34 @@ fn with_current_family(note: impl FnOnce(&mut FamilyWork)) {
 }
 
 #[cfg(any(test, feature = "test-seams"))]
+pub(super) struct PassiveFamilyScope {
+    prior_family: Option<u8>,
+    prior_tag: u8,
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+impl Drop for PassiveFamilyScope {
+    fn drop(&mut self) {
+        CURRENT_FAMILY.with(|slot| slot.set(self.prior_family));
+        redb::commit_work::set_tag(self.prior_tag);
+    }
+}
+
+#[cfg(any(test, feature = "test-seams"))]
 fn enter_family(family: LogicalFamily, mutations: usize) {
     CURRENT_FAMILY.with(|slot| slot.set(Some(family as u8)));
     redb::commit_work::set_tag(family as u8);
     with_current_family(|work| work.mutations = work.mutations.saturating_add(mutations as u64));
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+pub(super) fn enter_passive_family(family: LogicalFamily) -> PassiveFamilyScope {
+    let prior_family = CURRENT_FAMILY.with(|slot| slot.replace(Some(family as u8)));
+    let prior_tag = redb::commit_work::set_tag(family as u8);
+    PassiveFamilyScope {
+        prior_family,
+        prior_tag,
+    }
 }
 
 #[cfg(any(test, feature = "test-seams"))]
@@ -1091,6 +1115,18 @@ fn history_logical_key(kind: HistoryKind, coordinate: &[u8]) -> Vec<u8> {
     key.push(kind as u8);
     key.extend_from_slice(coordinate);
     key
+}
+
+#[cfg(feature = "test-seams")]
+pub(super) fn visit_history_logical_key_for_test(
+    kind: HistoryKind,
+    coordinate: &[u8],
+    admission: &mut ProofAdmission,
+    visitor: &mut dyn FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    admission.admit(ORDERED_HISTORY_MAGIC.len() + 1 + coordinate.len())?;
+    let key = history_logical_key(kind, coordinate);
+    visitor(&key)
 }
 
 pub(super) fn history_tree_key(kind: HistoryKind, coordinate: &[u8]) -> Vec<u8> {
@@ -3372,7 +3408,7 @@ impl MutationKeyNode {
     fn insert(
         link: &mut Option<Box<Self>>,
         ordinal: usize,
-        mutations: &[ContentIdentityMutation],
+        mutations: MutationInputs<'_>,
         admission: &mut ProofAdmission,
         node_bytes: &mut usize,
     ) -> Result<bool> {
@@ -3418,6 +3454,15 @@ impl MutationKeyNode {
         Ok(replaced)
     }
 
+    fn allocation_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.left.as_ref().map_or(0, |node| node.allocation_bytes())
+            + self
+                .right
+                .as_ref()
+                .map_or(0, |node| node.allocation_bytes())
+    }
+
     fn visit(&self, visitor: &mut impl FnMut(&Self) -> Result<()>) -> Result<()> {
         if let Some(left) = &self.left {
             left.visit(visitor)?;
@@ -3427,6 +3472,53 @@ impl MutationKeyNode {
             right.visit(visitor)?;
         }
         Ok(())
+    }
+}
+
+/// Return the existing directory's credit on success and on a later root
+/// publication refusal, always after freeing its native boxes.
+struct CoalescedDirectory<'a> {
+    root: Option<Box<MutationKeyNode>>,
+    admission: &'a mut ProofAdmission,
+    bytes: usize,
+}
+impl<'a> CoalescedDirectory<'a> {
+    fn new(root: Option<Box<MutationKeyNode>>, admission: &'a mut ProofAdmission) -> Self {
+        let bytes = root.as_ref().map_or(0, |node| node.allocation_bytes());
+        Self {
+            root,
+            admission,
+            bytes,
+        }
+    }
+}
+impl Drop for CoalescedDirectory<'_> {
+    fn drop(&mut self) {
+        drop(self.root.take());
+        self.admission.release(self.bytes);
+    }
+}
+
+/// Two existing admitted owners feed one canonical fold without a copied
+/// combined container. Manifest entries have no schema/config side effects.
+#[derive(Clone, Copy)]
+struct MutationInputs<'a> {
+    primary: &'a [ContentIdentityMutation],
+    manifests: &'a [ContentIdentityMutation],
+}
+impl<'a> MutationInputs<'a> {
+    fn iter(self) -> impl Iterator<Item = &'a ContentIdentityMutation> {
+        self.primary.iter().chain(self.manifests.iter())
+    }
+}
+impl std::ops::Index<usize> for MutationInputs<'_> {
+    type Output = ContentIdentityMutation;
+    fn index(&self, ordinal: usize) -> &Self::Output {
+        if ordinal < self.primary.len() {
+            &self.primary[ordinal]
+        } else {
+            &self.manifests[ordinal - self.primary.len()]
+        }
     }
 }
 
@@ -6559,6 +6651,15 @@ impl RedbPersistence {
         mutations: &[ContentIdentityMutation],
         admission: &mut ProofAdmission,
     ) -> Result<DirectTypedImageDigest> {
+        Self::apply_content_identity_with_manifests_in_write(write_txn, mutations, &[], admission)
+    }
+
+    pub(super) fn apply_content_identity_with_manifests_in_write(
+        write_txn: &redb::WriteTransaction,
+        mutations: &[ContentIdentityMutation],
+        manifests: &[ContentIdentityMutation],
+        admission: &mut ProofAdmission,
+    ) -> Result<DirectTypedImageDigest> {
         Self::reconcile_ddl_selectors_in_write(write_txn, mutations, admission)?;
         super::content_size::reconcile_row_heads(write_txn, mutations)?;
         Self::apply_writer_row_heads_in_write(write_txn, mutations)?;
@@ -6710,8 +6811,12 @@ impl RedbPersistence {
         // same logical record (an UPDATE commonly contributes a remove and a
         // replacement). The Merkle representation is canonical for the final
         // key/value set, so collapse those entries before walking the tree.
+        let mutations = MutationInputs {
+            primary: mutations,
+            manifests,
+        };
         let coalescing_admission_start = admission.held();
-        let coalescing_result = (|| -> Result<()> {
+        let coalescing_result = (|| -> Result<Option<Box<MutationKeyNode>>> {
             // Retain only unique-key boxes. Every input still receives the
             // original parser validation, including entries later overwritten.
             let mut unique = None;
@@ -6742,7 +6847,7 @@ impl RedbPersistence {
             }
             let mut coalesced_bytes = 0usize;
             let Some(unique) = unique else {
-                return Ok(());
+                return Ok(None);
             };
 
             // The coalesced directory borrows source records; grouping allocates
@@ -6807,8 +6912,20 @@ impl RedbPersistence {
                 family_positions[family] += 1;
                 Ok(())
             })?;
-            drop(unique);
-            admission.release(node_bytes);
+            #[cfg(feature = "test-seams")]
+            let observe_mutations = crate::append_work::coalesced_mutation_observer_is_active();
+            #[cfg(not(feature = "test-seams"))]
+            let observe_mutations = false;
+            // Unobserved applies keep the directory's original lifetime and
+            // credit exactly: no observation extends production residency.
+            let observed_directory = if observe_mutations {
+                Some(unique)
+            } else {
+                drop(unique);
+                admission.release(node_bytes);
+                None
+            };
+
 
             #[cfg(any(test, feature = "test-seams"))]
             observe_identity_span(IdentitySpan::CoalesceAndGroup, group_started);
@@ -6891,7 +7008,7 @@ impl RedbPersistence {
             admission.release(grouped_bytes);
             admission.release(coalesced_bytes);
 
-            Ok(())
+            Ok(observed_directory)
         })();
         // Every local allocation has dropped before a refusal escapes this
         // scope. Settle only this scope's remaining admission; caller-owned
@@ -6899,7 +7016,7 @@ impl RedbPersistence {
         if coalescing_result.is_err() {
             admission.release(admission.held() - coalescing_admission_start);
         }
-        coalescing_result?;
+        let coalesced = CoalescedDirectory::new(coalescing_result?, admission);
 
         assign_open_projections(
             &mut roots,
@@ -6917,6 +7034,22 @@ impl RedbPersistence {
         tails[LogicalFamily::Configuration as usize].vector_pages_root =
             Some(vector_schema_pages_root_in_write(write_txn)?);
         persist_changed_family_roots(write_txn, &roots, &original_roots, &tails, &original_tails)?;
+        #[cfg(feature = "test-seams")]
+        if let Some(unique) = &coalesced.root {
+            unique.visit(&mut |node| {
+                let mutation = &mutations[node.last];
+                crate::append_work::observe_coalesced_mutation(
+                    family_name_for_tag(mutation.family as u8),
+                    &mutation.logical_key,
+                    mutation.logical_value.is_some(),
+                );
+                Ok(())
+            })?;
+        }
+        // Directory boxes own borrowed ordinals only. Free the actual boxes
+        // before returning their original proof admission.
+        drop(coalesced);
+
         #[cfg(any(test, feature = "test-seams"))]
         publish_directory_binding_work();
         Ok(digest_from_roots(std::array::from_fn(|family| {
@@ -7014,8 +7147,78 @@ impl std::ops::DerefMut for ProofFixtureDatabase {
 mod read_authentication_batch_tests {
     use super::*;
 
+    fn passive_scope_state() -> (Option<u8>, u8) {
+        let family = CURRENT_FAMILY.with(|slot| slot.get());
+        // `set_tag` returns the old tag. Restore it immediately without doing
+        // work between the two calls so this test observes the native tag
+        // without adding a production diagnostic seam.
+        let tag = redb::commit_work::set_tag(redb::commit_work::TAG_UNTAGGED);
+        assert_eq!(
+            redb::commit_work::set_tag(tag),
+            redb::commit_work::TAG_UNTAGGED,
+            "tag observation restores its temporary untagged value"
+        );
+        (family, tag)
+    }
+
+    fn assert_passive_family_scope_restoration() {
+        let original = passive_scope_state();
+        assert_eq!(
+            original,
+            (None, redb::commit_work::TAG_UNTAGGED),
+            "the test thread begins without a passive family"
+        );
+
+        let prior_scope = enter_passive_family(LogicalFamily::Policy);
+        let prior = passive_scope_state();
+        assert_eq!(prior, (Some(LogicalFamily::Policy as u8), LogicalFamily::Policy as u8));
+
+        {
+            let outer = enter_passive_family(LogicalFamily::Relational);
+            let outer_state = (Some(LogicalFamily::Relational as u8), LogicalFamily::Relational as u8);
+            assert_eq!(passive_scope_state(), outer_state);
+
+            {
+                let _inner = enter_passive_family(LogicalFamily::Graph);
+                assert_eq!(
+                    passive_scope_state(),
+                    (Some(LogicalFamily::Graph as u8), LogicalFamily::Graph as u8)
+                );
+            }
+            assert_eq!(passive_scope_state(), outer_state, "normal inner drop restores outer state");
+
+            let result: std::result::Result<(), ()> = {
+                let _inner = enter_passive_family(LogicalFamily::Configuration);
+                assert_eq!(
+                    passive_scope_state(),
+                    (Some(LogicalFamily::Configuration as u8), LogicalFamily::Configuration as u8)
+                );
+                Err(())
+            };
+            assert_eq!(result, Err(()));
+            assert_eq!(passive_scope_state(), outer_state, "error-path drop restores outer state");
+
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _inner = enter_passive_family(LogicalFamily::Status);
+                assert_eq!(
+                    passive_scope_state(),
+                    (Some(LogicalFamily::Status as u8), LogicalFamily::Status as u8)
+                );
+                panic!("passive-family scope panic probe");
+            }));
+            assert!(panic.is_err());
+            assert_eq!(passive_scope_state(), outer_state, "panic-path drop restores outer state");
+
+            drop(outer);
+        }
+        assert_eq!(passive_scope_state(), prior, "outer drop restores the nondefault prior pair");
+        drop(prior_scope);
+        assert_eq!(passive_scope_state(), original, "final drop restores the original pair");
+    }
+
     #[test]
     fn bounded_batch_reuses_proofs_without_trusting_changed_values() {
+        assert_passive_family_scope_restoration();
         let root = tempfile::tempdir().unwrap();
         let database = ProofFixtureDatabase::create(root.path().join("proofs.db")).unwrap();
         let mutations = (0..2048_u64)
