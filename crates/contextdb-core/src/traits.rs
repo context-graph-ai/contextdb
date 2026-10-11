@@ -30,6 +30,7 @@ pub trait RelationalExecutor: Send + Sync {
 }
 
 pub trait GraphExecutor: Send + Sync {
+    #[allow(clippy::too_many_arguments)]
     fn bfs(
         &self,
         start: NodeId,
