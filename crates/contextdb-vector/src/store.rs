@@ -9793,13 +9793,20 @@ impl Drop for PreparedTailInsertion {
     }
 }
 
+struct PreparedTailInsertionBatch {
+    pending: VecDeque<PreparedTailInsertion>,
+    // Publication is serialized by the batch lock, so one admitted workspace
+    // covers the largest insertion and outlives every prepared payload.
+    _publication_scratch: VectorCopyAdmission,
+}
+
 #[derive(Clone)]
-struct PreparedTailInsertions(Arc<Mutex<VecDeque<PreparedTailInsertion>>>);
+struct PreparedTailInsertions(Arc<Mutex<PreparedTailInsertionBatch>>);
 
 impl std::fmt::Debug for PreparedTailInsertions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("PreparedTailInsertions")
-            .field(&self.0.lock().len())
+            .field(&self.0.lock().pending.len())
             .finish()
     }
 }
@@ -9812,19 +9819,20 @@ impl PartialEq for PreparedTailInsertions {
 
 impl PreparedTailInsertions {
     fn publish(&self, state: &Arc<IndexState>, row_id: RowId, lsn: Lsn) {
-        let mut pending = self.0.lock();
-        if let Some(at) = pending
+        let mut batch = self.0.lock();
+        if let Some(at) = batch
+            .pending
             .iter()
             .position(|item| Arc::ptr_eq(&item.state, state) && item.row_id == row_id)
         {
-            pending
+            batch
+                .pending
                 .remove(at)
                 .expect("prepared insertion position exists")
                 .publish(lsn);
         }
     }
 }
-
 #[derive(Clone)]
 struct PreparedDirectoryReservation {
     charge: Arc<Mutex<Option<RetainedMemoryCharge>>>,
@@ -14794,6 +14802,7 @@ impl VectorStore {
         rows
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn prepare_tail_insertion(
         &self,
         pending: &mut Vec<PreparedTailInsertion>,
@@ -14801,6 +14810,8 @@ impl VectorStore {
         lsn: Lsn,
         prepare_entry: impl FnOnce(&mut VectorCopyAdmission) -> Result<StoredVectorEntry>,
         owner: &mut VectorCopyAdmission,
+        publication_scratch: &mut VectorCopyAdmission,
+        publication_workspace_bytes: &mut usize,
     ) -> Result<()> {
         let _publication = state.generation_publication.lock();
         if state
@@ -14846,8 +14857,15 @@ impl VectorStore {
         let scratch_bytes =
             crate::quantized::stored_vector_resident_bytes(state.dimension, state.quantization)
                 .saturating_mul(3)
-                .saturating_add(2 * std::mem::size_of::<PreparedTailInsertion>())
-                .saturating_add(ef_construction.saturating_mul(8 * std::mem::size_of::<usize>()));
+                .saturating_add(2 * std::mem::size_of::<PreparedTailInsertion>());
+        let workspace_bytes = ef_construction.saturating_mul(8 * std::mem::size_of::<usize>());
+        if workspace_bytes > *publication_workspace_bytes {
+            if *publication_workspace_bytes == 0 {
+                publication_scratch.reserve(std::mem::size_of::<VectorCopyAdmission>() + 32)?;
+            }
+            publication_scratch.reserve(workspace_bytes - *publication_workspace_bytes)?;
+            *publication_workspace_bytes = workspace_bytes;
+        }
         let accountant =
             state.hnsw_accountant.read().clone().ok_or_else(|| {
                 Error::Other("resident HNSW tail has no retained graph owner".into())
@@ -14887,6 +14905,8 @@ impl VectorStore {
         owner: &mut VectorCopyAdmission,
     ) -> Result<PreparedTailInsertions> {
         let mut pending = Vec::<PreparedTailInsertion>::new();
+        let mut publication_scratch = owner.scratch();
+        let mut publication_workspace_bytes = 0;
         for insert in inserts {
             if insert.entry.deleted_tx.is_none()
                 && let Some(state) =
@@ -14898,6 +14918,8 @@ impl VectorStore {
                     insert.entry.lsn,
                     |_owner| Ok(state.stored_entry_ref(&insert.entry)),
                     owner,
+                    &mut publication_scratch,
+                    &mut publication_workspace_bytes,
                 )?;
             }
         }
@@ -14935,10 +14957,17 @@ impl VectorStore {
                         Ok(entry)
                     },
                     owner,
+                    &mut publication_scratch,
+                    &mut publication_workspace_bytes,
                 )?;
             }
         }
-        Ok(PreparedTailInsertions(Arc::new(Mutex::new(pending.into()))))
+        Ok(PreparedTailInsertions(Arc::new(Mutex::new(
+            PreparedTailInsertionBatch {
+                pending: pending.into(),
+                _publication_scratch: publication_scratch,
+            },
+        ))))
     }
 
     /// Validate one keyed batch without mutating the store. The engine calls
