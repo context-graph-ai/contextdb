@@ -36061,6 +36061,8 @@ graph_commit_result }.map_err(Self::storage_error)?;
                         "Raise MEMORY_LIMIT to prepare retention vector membership records.",
                     )?;
                 }
+                let row_memory = crate::read_image_memory::active_owner()?.row_owner()?;
+                let _row_scope = row_memory.enter();
                 let record: VectorPartitionMembershipRecord = self.decode_vector_partition_record(
                     VectorPartitionRecordKind::Membership,
                     value.value(),
@@ -36077,14 +36079,22 @@ graph_commit_result }.map_err(Self::storage_error)?;
                     record.vector_created_tx,
                     record.vector_lsn,
                 )) {
-                    removed.push((record, copy_bytes));
-                } else if let Some(workspace) = workspace.as_mut() {
+                    // Tuple order drops the payload before its decode credit
+                    // on an error while later selected records are retained.
+                    removed.push((record, copy_bytes, row_memory));
+                } else {
                     drop(record);
-                    workspace.try_shrink(copy_bytes)?;
+                    if let Some(workspace) = workspace.as_mut() {
+                        workspace.try_shrink(copy_bytes)?;
+                    }
                 }
             }
-            for (record, copy_bytes) in removed {
-                let mut key = Self::vector_partition_membership_key(&record);
+            for selected in removed {
+                // Keep the tuple intact across every fallible deletion so
+                // error unwinding also drops the record before its owner.
+                let (record, copy_bytes, _) = &selected;
+                let copy_bytes = *copy_bytes;
+                let mut key = Self::vector_partition_membership_key(record);
                 memberships
                     .remove(key.as_slice())
                     .map_err(Self::storage_error)?;
@@ -36097,7 +36107,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                         .map_err(Self::storage_error)?;
                 }
                 drop(key);
-                drop(record);
+                drop(selected);
                 if let Some(workspace) = workspace.as_mut() {
                     workspace.try_shrink(copy_bytes)?;
                 }
@@ -36125,6 +36135,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                         "Raise MEMORY_LIMIT to prepare retention vector journal keys.",
                     )?;
                 }
+                let _row_scope = crate::read_image_memory::active_owner()?.row_owner()?.enter();
                 let record: VectorPartitionJournalRecord = self.decode_vector_partition_record(
                     VectorPartitionRecordKind::Journal,
                     value.value(),
@@ -36146,9 +36157,11 @@ graph_commit_result }.map_err(Self::storage_error)?;
                     membership.vector_lsn,
                 )) {
                     journal_keys.push((key.value().to_vec(), copy_bytes));
-                } else if let Some(workspace) = workspace.as_mut() {
+                } else {
                     drop(record);
-                    workspace.try_shrink(copy_bytes)?;
+                    if let Some(workspace) = workspace.as_mut() {
+                        workspace.try_shrink(copy_bytes)?;
+                    }
                 }
             }
             for (key, copy_bytes) in journal_keys {

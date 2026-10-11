@@ -850,6 +850,10 @@ fn publish_membership_impl<const CHECK_OVERLAP: bool>(
     accountant: Option<crate::memory_accounting::AccountantHandle>,
     pending_transition: bool,
 ) -> Result<()> {
+    let _call_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
+    // Authenticated previous/next records are temporary to this transition;
+    // their payloads drop before this scope returns their reader credits.
+    let _decode_scope = crate::read_image_memory::active_owner()?.row_owner()?.enter();
     let _scratch = accountant
         .as_ref()
         .map(|accountant| {
@@ -1222,6 +1226,7 @@ fn rebuild_route_occupancy(
     entries: u64,
     accountant: Option<&crate::memory_accounting::AccountantHandle>,
 ) -> Result<()> {
+    let _call_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
     let _buffer = accountant
         .map(|accountant| {
             crate::memory_accounting::OwnedMemoryReservation::try_new_for(
@@ -1242,6 +1247,7 @@ fn rebuild_route_occupancy(
         let source = write.open_table(SOURCE).map_err(metadata_error)?;
         for entry in source.prefix_bounded(route).map_err(metadata_error)? {
             let (key, value) = entry.map_err(metadata_error)?;
+            let _row_scope = crate::read_image_memory::active_owner()?.row_owner()?.enter();
             let record = decode_member(key.value(), value.value())?;
             if let Some(interval) = membership_interval(&record) {
                 intervals.push(interval);
