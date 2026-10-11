@@ -34409,12 +34409,25 @@ graph_commit_result }.map_err(Self::storage_error)?;
                         let _row_scope = crate::read_image_memory::active_owner()?
                             .row_owner()?
                             .enter();
-                        self.prune_relational_posting_intervals_in_write(
+                        if self.relational_manifest_has_successor_in_write(
                             write_txn,
                             table,
-                            table_meta.get(table),
-                            body.value(),
-                        )?;
+                            key.as_slice(),
+                        )? {
+                            self.prune_relational_posting_intervals_in_write(
+                                write_txn,
+                                table,
+                                table_meta.get(table),
+                                body.value(),
+                            )?;
+                        } else {
+                            self.prune_terminal_relational_posting_in_write(
+                                write_txn,
+                                table,
+                                table_meta.get(table),
+                                body.value(),
+                            )?;
+                        }
                     }
                     self.replace_relational_manifest_in_write(
                         write_txn,

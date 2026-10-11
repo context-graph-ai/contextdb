@@ -5,6 +5,44 @@ use content_identity::version_manifest as manifest;
 use super::writer_source::BorrowedRelationalIndexKey;
 
 impl RedbPersistence {
+    /// Coalesced postings need an interval subtraction only when another
+    /// physical version of this row survives. Fully retired postings keep the
+    /// existing manifest reconciliation path and require no payload copy.
+    pub(super) fn relational_manifest_has_successor_in_write(
+        &self,
+        write: &redb::WriteTransaction,
+        table: &str,
+        physical: &[u8],
+    ) -> Result<bool> {
+        if physical.len() != 24 {
+            return Err(self.relational_manifest_damage("invalid physical version identity"));
+        }
+        let mut admission = self.proof_admission();
+        admission.admit(
+            table
+                .len()
+                .checked_add(72)
+                .ok_or_else(|| self.relational_manifest_damage("identity allocation overflow"))?,
+        )?;
+        let mut prefix = manifest::manifest_prefix(table)?;
+        prefix.extend_from_slice(physical);
+        let coordinate = manifest::writer_manifest_next(write, &prefix, false, &mut admission)
+            .map_err(|e| self.relational_manifest_error(e))?
+            .filter(|key| key.starts_with(&prefix))
+            .ok_or_else(|| self.relational_manifest_damage("physical version member is missing"))?;
+        let next = manifest::writer_manifest_next(write, &coordinate, true, &mut admission)
+            .map_err(|e| self.relational_manifest_error(e))?;
+        let Some(next) = next else {
+            return Ok(false);
+        };
+        if next.starts_with(&prefix) {
+            return Err(self.relational_manifest_damage("duplicate physical version member"));
+        }
+        let witness =
+            manifest::parse_manifest(&next).map_err(|e| self.relational_manifest_error(e))?;
+        Ok(witness.table == table && witness.identity[..8] == physical[..8])
+    }
+
     pub(super) fn replace_relational_manifest_in_write(
         &self,
         write: &redb::WriteTransaction,
