@@ -24,8 +24,8 @@ const SLACK: isize = 16 * 1024;
 static BASE: AtomicUsize = AtomicUsize::new(0);
 static EXCESS: AtomicIsize = AtomicIsize::new(isize::MIN);
 static PROBES: AtomicUsize = AtomicUsize::new(0);
-/// Measure from the start of commit validation (or, failing that, its first
-/// admission point) instead of from `BASE`.
+/// Measure from the start of commit validation instead of from `BASE`; the
+/// custody reads a commit makes before validation are not measured.
 static FROM_FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static FIRST: AtomicIsize = AtomicIsize::new(0);
 /// The writer whose accountant also funds commit validation's verifier and
@@ -62,7 +62,9 @@ fn probe(held: usize) {
     };
     let unadmitted = live - held as isize - writer_grown;
     if FROM_FIRST.load(Ordering::SeqCst) && PROBES.load(Ordering::SeqCst) == 0 {
-        FIRST.store(unadmitted, Ordering::SeqCst);
+        // Custody reads before validation starts are another operation's,
+        // funded by its own memory: not this measurement.
+        return;
     }
     let start = if FROM_FIRST.load(Ordering::SeqCst) {
         FIRST.load(Ordering::SeqCst)
