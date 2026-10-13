@@ -252,3 +252,86 @@ fn emit_graph_workspace_for_test(event: VectorGraphWorkspaceEventForTest) {
         observer(&event);
     }
 }
+
+/// One boundary of an import-tail suffix load, as the writer accountant and
+/// the active decode owner see it.
+#[cfg(any(test, feature = "test-seams"))]
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImportTailLoadForTest {
+    /// `persist_import_vector_tail` or `catch_up_native_import_candidate`.
+    pub site: &'static str,
+    pub boundary: ImportTailLoadBoundaryForTest,
+    /// The writer accountant's live charge at this boundary.
+    pub writer_used: usize,
+    pub writer_limit: Option<usize>,
+    /// Upserts admitted into this cohort's workspace.
+    pub cohort_vectors: usize,
+    /// The cohort's decoded-body workspace, admitted before the load.
+    pub workspace_bytes: usize,
+    /// `subsystem/operation` of the decode owner the load runs under.
+    pub decode_owner: (&'static str, &'static str),
+    pub decode_owner_funded_by_writer: bool,
+    pub decode_owner_per_call: bool,
+    /// Bytes that owner still holds, its current per-call owner included.
+    pub decode_held: usize,
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ImportTailLoadBoundaryForTest {
+    /// The cohort workspace is admitted and its decode owner entered.
+    Enter,
+    /// The load returned this many vectors; its decode owner is gone.
+    Loaded { vectors: usize },
+    /// The load refused with this display text; its decode owner is gone.
+    Refused { error: String },
+}
+
+/// The observer may return a writer memory limit to install at this boundary.
+#[cfg(any(test, feature = "test-seams"))]
+type ImportTailLoadObserver =
+    Arc<dyn Fn(&ImportTailLoadForTest) -> Option<Option<usize>> + Send + Sync>;
+#[cfg(any(test, feature = "test-seams"))]
+thread_local! {
+    static IMPORT_TAIL_LOAD_OBSERVER: RefCell<Option<ImportTailLoadObserver>> = const { RefCell::new(None) };
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+#[doc(hidden)]
+pub fn observe_import_tail_loads_for_test(
+    observer: ImportTailLoadObserver,
+) -> ImportTailLoadObservationForTest {
+    let previous = IMPORT_TAIL_LOAD_OBSERVER.with(|slot| slot.replace(Some(observer)));
+    ImportTailLoadObservationForTest {
+        previous,
+        _thread: PhantomData,
+    }
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+#[doc(hidden)]
+pub struct ImportTailLoadObservationForTest {
+    previous: Option<ImportTailLoadObserver>,
+    _thread: PhantomData<Rc<()>>,
+}
+#[cfg(any(test, feature = "test-seams"))]
+impl Drop for ImportTailLoadObservationForTest {
+    fn drop(&mut self) {
+        IMPORT_TAIL_LOAD_OBSERVER.with(|slot| slot.replace(self.previous.take()));
+    }
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+pub(crate) fn import_tail_load_observed() -> bool {
+    IMPORT_TAIL_LOAD_OBSERVER.with(|slot| slot.borrow().is_some())
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+pub(crate) fn emit_import_tail_load_for_test(
+    event: &ImportTailLoadForTest,
+) -> Option<Option<usize>> {
+    let observer = IMPORT_TAIL_LOAD_OBSERVER.with(|slot| slot.borrow().clone());
+    observer.and_then(|observer| observer(event))
+}

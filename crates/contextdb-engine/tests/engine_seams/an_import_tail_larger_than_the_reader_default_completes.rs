@@ -38,9 +38,10 @@ const DECODE: &str = "writer_source/decode_stored_value";
 // the remaining 4,107 bytes are the vector's journal record, index name,
 // decode control and its share of the native append's page decodes.
 const DECODE_BYTES_PER_VECTOR: usize = 34_859;
-const DECODE_BYTES_FIXED: usize = 51_993;
+// The fixed part includes the final pass that finds the route covered.
+const DECODE_BYTES_FIXED: usize = 57_128;
 const DECODE_ADMISSIONS_PER_VECTOR: usize = 1_554;
-const DECODE_ADMISSIONS_FIXED: usize = 362;
+const DECODE_ADMISSIONS_FIXED: usize = 369;
 
 fn vector_for(id: i64) -> Vec<f32> {
     (0..DIMENSION)
