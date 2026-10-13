@@ -209,8 +209,13 @@ fn prepare(dir: &Path, n: usize) {
             .unwrap();
         let (shutdown, task) = start_server(&broker, &hub, &dir.join("hub.key")).await;
         let (edge, client) = bound_edge(&broker, dir, "edge").await;
+        // Delivered in exchanges of 16 units: one exchange carrying hundreds
+        // of pending units exceeds the default reader limit.
         for unit in 0..n {
             commit_unit(&edge, unit);
+            if (unit + 1).is_multiple_of(16) {
+                client.push().await.expect("deliver the fixture units");
+            }
         }
         client.push().await.expect("deliver every fixture unit");
         cache_pressure(&edge);

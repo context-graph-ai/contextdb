@@ -56,14 +56,14 @@ async fn custody_commit_validation_admits_before_it_allocates() {
     // admission: nothing was decoded.
     Database::__limit_custody_validation_for_test(Some(1));
     let staged = stage_unit(&edge, 1).unwrap();
-    let decoded_before = edge.__custody_writer_work_for_test().1;
+    let decoded_before = Database::__custody_thread_decodes_for_test();
     let refused = edge.commit(staged);
     assert!(
         matches!(refused, Err(Error::MemoryBudgetExceeded { .. })),
         "{refused:?}"
     );
     assert_eq!(
-        edge.__custody_writer_work_for_test().1,
+        Database::__custody_thread_decodes_for_test(),
         decoded_before,
         "the refusal came before any custody record was decoded"
     );

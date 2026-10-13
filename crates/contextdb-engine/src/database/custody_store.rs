@@ -311,6 +311,12 @@ impl Database {
             LAST_CUSTODY_RETAINED_BYTES_FOR_TEST.with(std::cell::Cell::get),
         )
     }
+    /// Measurement only: custody record decodes performed on the calling thread.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __custody_thread_decodes_for_test() -> u64 {
+        crate::custody::store::work::thread_decoded()
+    }
     /// Measurement only: drop the custody group index completion marker.
     /// Takes effect for roots captured after the next open.
     #[cfg(feature = "test-seams")]

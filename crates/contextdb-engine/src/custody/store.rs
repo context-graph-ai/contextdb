@@ -175,6 +175,14 @@ pub(crate) mod work {
     }
     pub(crate) fn decoded(n: u64) {
         DECODED.fetch_add(n, Ordering::Relaxed);
+        THREAD_DECODED.with(|count| count.set(count.get() + n));
+    }
+    thread_local! {
+        static THREAD_DECODED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+    /// Decodes performed on the calling thread only.
+    pub(crate) fn thread_decoded() -> u64 {
+        THREAD_DECODED.with(std::cell::Cell::get)
     }
     pub(crate) fn read() -> (u64, u64) {
         (
