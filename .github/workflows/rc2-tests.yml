@@ -1,0 +1,124 @@
+name: rc2-tests
+
+on:
+  push:
+    branches: [dev, 'bounded-storage-*']
+  workflow_dispatch:
+
+concurrency:
+  group: rc2-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: lint
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo fmt --manifest-path crates/contextdb-redb/Cargo.toml --check
+      - run: cargo clippy --manifest-path crates/contextdb-redb/Cargo.toml --all-targets -- -D warnings
+
+  test:
+    name: test (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { shard: contextdb-core, crate: contextdb-core, features: "" }
+          - { shard: contextdb-core-test-seams, crate: contextdb-core, features: "test-seams" }
+          - { shard: contextdb-tx, crate: contextdb-tx, features: "" }
+          - { shard: contextdb-tx-test-seams, crate: contextdb-tx, features: "test-seams" }
+          - { shard: contextdb-engine, crate: contextdb-engine, features: "" }
+          - { shard: contextdb-engine-test-seams, crate: contextdb-engine, features: "test-seams" }
+          - { shard: contextdb-server, crate: contextdb-server, features: "" }
+          - { shard: contextdb-server-test-seams, crate: contextdb-server, features: "test-seams" }
+          - { shard: contextdb-cli, crate: contextdb-cli, features: "" }
+          - { shard: contextdb-vector, crate: contextdb-vector, features: "" }
+          - { shard: contextdb-hnsw, crate: contextdb-hnsw, features: "" }
+          - { shard: contextdb-graph, crate: contextdb-graph, features: "" }
+          - { shard: contextdb-parser, crate: contextdb-parser, features: "" }
+          - { shard: contextdb-planner, crate: contextdb-planner, features: "" }
+          - { shard: contextdb-relational, crate: contextdb-relational, features: "" }
+          # contextdb-redb is excluded from the workspace, so it is addressed by manifest path.
+          - { shard: contextdb-redb, crate: contextdb-redb, features: "", standalone: "true" }
+    steps:
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo docker image prune -a -f || true
+          sudo docker system prune -a -f --volumes || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/go /opt/az /opt/ghc \
+            /usr/local/lib/android /usr/share/dotnet /usr/local/share/boost
+          df -h /
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: rc2-${{ matrix.shard }}
+          workspaces: |
+            . -> target
+            crates/contextdb-redb -> target
+      - name: Run shard (one test process per test binary, one test thread)
+        id: run
+        run: |
+          mkdir -p shard-out
+          start=$(date +%s)
+          args=()
+          if [[ "${{ matrix.standalone }}" == "true" ]]; then
+            args+=(--manifest-path crates/contextdb-redb/Cargo.toml)
+          else
+            args+=(-p "${{ matrix.crate }}")
+          fi
+          if [[ -n "${{ matrix.features }}" ]]; then
+            args+=(--features "${{ matrix.features }}")
+          fi
+          set +e
+          cargo test --locked "${args[@]}" --all-targets -- --test-threads=1 2>&1 | tee "shard-out/${{ matrix.shard }}.log"
+          status=${PIPESTATUS[0]}
+          set -e
+          end=$(date +%s)
+          echo "${{ matrix.shard }} $((end - start))s exit=$status" > "shard-out/${{ matrix.shard }}.time"
+          df -h / | tee -a "shard-out/${{ matrix.shard }}.time"
+          exit "$status"
+      - name: Upload shard log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shard-${{ matrix.shard }}
+          path: shard-out/
+          if-no-files-found: warn
+
+  summary:
+    needs: test
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: shard-*
+          path: shards
+      - name: Disk and per-shard wall clock
+        run: |
+          df -h
+          echo "== per-shard wall clock =="
+          for f in shards/*/*.time; do head -n 1 "$f"; done | sort
