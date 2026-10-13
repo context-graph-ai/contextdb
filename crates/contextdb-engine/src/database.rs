@@ -42127,11 +42127,23 @@ impl Database {
             // The detached image supplies final schema/rows; custody authority
             // remains the receiver's current committed view until publication.
             *working.sync_incarnations.lock() = self.sync_incarnations.lock().clone();
-            *working.custody_metadata.lock() = self
-                .custody_records(read_memory.clone())?
-                .iter()
-                .map(|record| Ok((record.key()?, crate::custody::records::encode(record)?)))
-                .collect::<Result<BTreeMap<_, _>>>()?;
+            match &self.persistence {
+                // The working image reads the receiver's committed journal
+                // durably; nothing of the journal is copied into it.
+                Some(persistence) if persistence.custody_groups_complete()? => {
+                    *working.custody_cache.lock() = Some(crate::custody::store::Store::durable(
+                        persistence.clone(),
+                        BTreeMap::new(),
+                    )?);
+                }
+                _ => {
+                    *working.custody_metadata.lock() = self
+                        .custody_records(read_memory.clone())?
+                        .iter()
+                        .map(|record| Ok((record.key()?, crate::custody::records::encode(record)?)))
+                        .collect::<Result<BTreeMap<_, _>>>()?;
+                }
+            }
             for record in prepare(&working, &mut finalized_write_set)? {
                 record.verify()?;
                 finalized_write_set

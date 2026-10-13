@@ -85,7 +85,18 @@ impl Database {
         let mut cache = self.custody_cache.lock();
         if cache.is_none() {
             let mut entries = BTreeMap::new();
-            if let Some(persistence) = &self.persistence {
+            if let Some(persistence) = &self.persistence
+                && persistence.custody_groups_complete()?
+            {
+                // The delivery journal stays durable and is read through the
+                // derived group index. Only the bounded tenant policy and
+                // binding records are mirrored.
+                for prefix in ["tenant_table_policy.v1.", "tenant_policy_binding.v1."] {
+                    entries.extend(persistence.load_config_values_raw_with_prefix(prefix)?);
+                }
+                *cache = Some(Store::durable(persistence.clone(), entries)?);
+                return f(cache.as_mut().expect("loaded custody metadata"));
+            } else if let Some(persistence) = &self.persistence {
                 // Never dump unrelated config; each owned journal is a Redb prefix range.
                 for prefix in [
                     "tenant_table_policy.v1.",
@@ -146,6 +157,105 @@ impl Database {
             .as_ref()
             .map_or(Ok(0), |p| p.count_config_keys_with_prefix_for_test(prefix))
     }
+    /// Measurement only: answer the same custody selections from a freshly
+    /// loaded resident journal and from the durable group index, as encoded
+    /// records. `None` when this store has no complete durable index.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    #[allow(clippy::type_complexity)]
+    pub fn __custody_selection_parity_for_test(
+        &self,
+        root_table: &str,
+        root_keys: &[crate::sync_types::NaturalKey],
+    ) -> Result<Option<Vec<(String, Vec<Vec<u8>>, Vec<Vec<u8>>)>>> {
+        use crate::custody::{canonical::hex, records::RowRef};
+        let Some(persistence) = &self.persistence else {
+            return Ok(None);
+        };
+        if !persistence.custody_groups_complete()? {
+            return Ok(None);
+        }
+        let mut all = BTreeMap::new();
+        let mut tenant = BTreeMap::new();
+        for prefix in [
+            "tenant_table_policy.v1.",
+            "tenant_policy_binding.v1.",
+            "delivery_",
+        ] {
+            for (key, value) in persistence.load_config_values_raw_with_prefix(prefix)? {
+                if prefix.starts_with("tenant_") {
+                    tenant.insert(key.clone(), value.clone());
+                }
+                all.insert(key, value);
+            }
+        }
+        let mut resident = Store::from_entries(all)?;
+        let mut durable = Store::durable(persistence.clone(), tenant)?;
+        let read_memory = self.declared_reader_memory()?;
+        let memory = || {
+            crate::read_image_memory::ImageMemory::charging_reader(
+                self.accountant.clone(),
+                read_memory.clone(),
+            )
+        };
+        let encoded = |records: &[Record]| records.iter().map(encode).collect::<Result<Vec<_>>>();
+        let rows = root_keys
+            .iter()
+            .map(|key| RowRef {
+                table: root_table.to_owned(),
+                key: key.clone(),
+            })
+            .collect::<Vec<_>>();
+        let mut selectors = vec![
+            "delivery_".to_owned(),
+            "tenant_".to_owned(),
+            "delivery_root.v1.".to_owned(),
+            "@authority".to_owned(),
+            "@policies".to_owned(),
+        ];
+        for row in &rows {
+            selectors.push(format!("@row:{}", hex(&row.bytes())));
+            selectors.push(format!("@{}", crate::custody::store::root_group(row)));
+        }
+        for record in resident.select(&selectors[..1], memory())?.iter() {
+            if let Record::Manifest(m) = record {
+                selectors.push(format!(
+                    "@{}",
+                    crate::custody::store::submission_group(m.id)
+                ));
+            }
+        }
+        let mut out = Vec::new();
+        for selector in &selectors {
+            let one = std::slice::from_ref(selector);
+            out.push((
+                selector.clone(),
+                encoded(&resident.select(one, memory())?)?,
+                encoded(&durable.select(one, memory())?)?,
+            ));
+        }
+        out.push((
+            "union".into(),
+            encoded(&resident.select(&selectors, memory())?)?,
+            encoded(&durable.select(&selectors, memory())?)?,
+        ));
+        out.push((
+            format!("table:{root_table}"),
+            encoded(&resident.select_table(root_table, memory())?)?,
+            encoded(&durable.select_table(root_table, memory())?)?,
+        ));
+        out.push((
+            "rows".into(),
+            encoded(&resident.select_rows(&rows, memory())?)?,
+            encoded(&durable.select_rows(&rows, memory())?)?,
+        ));
+        out.push((
+            "pending".into(),
+            encoded(&resident.pending(memory())?)?,
+            encoded(&durable.pending(memory())?)?,
+        ));
+        Ok(Some(out))
+    }
     pub(crate) fn custody_records(
         &self,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
@@ -168,6 +278,10 @@ impl Database {
         })
     }
     fn verify_selected_custody_records(&self, store: &Store, records: &[Record]) -> Result<()> {
+        // A durable answer was decoded and verified from the persisted bytes.
+        if store.is_durable() {
+            return Ok(());
+        }
         if let Some(persistence) = &self.persistence {
             let checking = store.publications.load(Ordering::SeqCst) == 0;
             let keys = records
@@ -453,8 +567,16 @@ impl Database {
         {
             return Ok(None);
         }
+        // Validation scratch is writer work for this commit, so it is admitted
+        // to the writer accountant rather than the reader that requested it.
+        let memory = crate::read_image_memory::ImageMemory::charging_for(
+            self.accountant.clone(),
+            "writer",
+            "validate_custody_commit",
+            "Reduce the custody records one commit touches or raise MEMORY_LIMIT.",
+        );
         let (records, publication) = self.with_custody_store(|store| {
-            let records = store.validate_delta(&ws.config_writes, &ws.config_deletes)?;
+            let records = store.validate_delta(&ws.config_writes, &ws.config_deletes, memory)?;
             Ok((
                 records,
                 crate::custody::store::Publication::begin(&store.publications),
@@ -752,9 +874,16 @@ impl Database {
         let mut cache = self.custody_cache.lock();
         // Initialization is a separate original-funded route prerequisite.
         // Do not rebuild a shadow cache or invoke an unpriced initializer here.
-        f(cache
+        let store = cache
             .as_mut()
-            .ok_or_else(crate::custody::canonical::invalid)?)
+            .ok_or_else(crate::custody::canonical::invalid)?;
+        // This route reads the resident maps directly. A durable store keeps
+        // no delivery record resident, so it refuses rather than answer from
+        // an empty journal.
+        if store.is_durable() {
+            return Err(crate::custody::canonical::invalid());
+        }
+        f(store)
     }
 
     fn committed_custody_row_owned(
