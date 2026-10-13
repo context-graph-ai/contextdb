@@ -502,6 +502,45 @@ impl Database {
         }
         encode(&record)
     }
+    /// Measurement only: the stored edge terminal at `key` with `elements`
+    /// small JSON values appended to its root key: a canonical record whose
+    /// decoded size far exceeds its encoding (its signature no longer holds).
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __custody_inflated_terminal_for_test(
+        &self,
+        key: &str,
+        elements: usize,
+    ) -> Result<Vec<u8>> {
+        let bytes = self
+            .__custody_record_bytes_for_test(key)?
+            .ok_or_else(crate::custody::canonical::invalid)?;
+        let mut record = crate::custody::records::decode(&bytes)?;
+        let Record::Terminal {
+            record: terminal, ..
+        } = &mut record
+        else {
+            return Err(Error::Other(format!("{key} is not a terminal")));
+        };
+        terminal.root.key.rest.push((
+            "inflated".into(),
+            contextdb_core::Value::Json(serde_json::Value::Array(vec![
+                serde_json::Value::from(0);
+                elements
+            ])),
+        ));
+        encode(&record)
+    }
+    /// Measurement only: one durable probe (decode, canonical and key check,
+    /// signature) of `bytes` at `key` under a standalone memory of `limit`.
+    /// Answers the outcome and the bytes still admitted afterwards.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __custody_probe_for_test(key: &str, bytes: &[u8], limit: usize) -> (Result<()>, usize) {
+        let memory = crate::read_image_memory::ImageMemory::new(Some(limit));
+        let probed = crate::custody::store::probe_for_test(&memory, key, bytes);
+        (probed, memory.held())
+    }
     /// Measurement only: whether the committed custody group index is complete.
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]

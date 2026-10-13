@@ -101,6 +101,18 @@ mod writer_recycle_baseline_cost;
 #[path = "engine_seams/writer_file_ownership_survives_recycle.rs"]
 mod writer_file_ownership_survives_recycle;
 
+#[path = "engine_seams/a_damaged_delivered_terminal_is_refused_never_excluded.rs"]
+mod a_damaged_delivered_terminal_is_refused_never_excluded;
+#[cfg(target_os = "linux")]
+#[path = "engine_seams/custody_reads_admit_every_buffer_before_allocating.rs"]
+mod custody_reads_admit_every_buffer_before_allocating;
+#[path = "engine_seams/durable_reads_validate_the_whole_evidence_closure.rs"]
+mod durable_reads_validate_the_whole_evidence_closure;
+#[path = "engine_seams/pending_delivery_pages_resume_without_gaps.rs"]
+mod pending_delivery_pages_resume_without_gaps;
+#[cfg(target_os = "linux")]
+#[path = "engine_seams/custody_decoding_charges_what_it_allocates.rs"]
+mod custody_decoding_charges_what_it_allocates;
 #[path = "engine_seams/a_malformed_custody_record_refuses_with_the_custody_codec_diagnostic.rs"]
 mod a_malformed_custody_record_refuses_with_the_custody_codec_diagnostic;
 #[path = "engine_seams/an_incomplete_custody_index_refuses_without_loading_the_journal.rs"]

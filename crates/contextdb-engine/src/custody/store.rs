@@ -365,6 +365,17 @@ pub(crate) fn admission_probe(_held: usize) {
     }
 }
 
+/// Measurement only: one transient durable probe of `bytes` stored at `key`
+/// under `memory`. Answers the outcome; the probe is dropped before return.
+#[cfg(feature = "test-seams")]
+pub(crate) fn probe_for_test(
+    memory: &Arc<crate::read_image_memory::ImageMemory>,
+    key: &str,
+    bytes: &[u8],
+) -> Result<()> {
+    durable::probe_for_test(memory, key, bytes)
+}
+
 pub(crate) fn decode_refusals_for_test(
     key: &str,
     bytes: &[u8],
@@ -1173,6 +1184,11 @@ mod durable {
         }
     }
 
+    #[cfg(feature = "test-seams")]
+    pub(super) fn probe_for_test(memory: &Arc<ImageMemory>, key: &str, bytes: &[u8]) -> Result<()> {
+        probe_stored(memory, key, bytes).map(drop)
+    }
+
     /// The committed record at `key`, transiently.
     fn load(r: &CustodyReader, memory: &Arc<ImageMemory>, key: &str) -> Result<Option<Probed>> {
         r.get(key, |value| {
@@ -1596,7 +1612,12 @@ mod durable {
 
     /// Manifests of local roots still pending delivery, in submission order,
     /// read from the durable pending index page by page: the work is
-    /// proportional to the pending roots, never to delivered history.
+    /// proportional to the pending roots, never to delivered history. Two
+    /// bounds differ here. The visit is bounded: each page examines at most
+    /// `PENDING_PAGE` index entries and resumes strictly after the last one.
+    /// The answer is not: it materializes every pending manifest, each key
+    /// and decoded record admitted to the reader's memory, so a large pending
+    /// set is refused by the reader limit rather than held unadmitted.
     pub(super) fn pending(
         r: &CustodyReader,
         memory: Arc<ImageMemory>,
