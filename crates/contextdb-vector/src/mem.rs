@@ -2376,13 +2376,59 @@ struct UnionSearchResult {
     receipt: VectorSearchBudgetReceipt,
 }
 
+enum ExecutorTransactions<S: WriteSetApplicator> {
+    Legacy(Arc<TransactionManager<S>>),
+    Owned(contextdb_tx::manager::EngineTransactionHandle<S>),
+}
+impl<S: WriteSetApplicator> ExecutorTransactions<S> {
+    fn snapshot(&self) -> SnapshotId {
+        match self {
+            Self::Legacy(manager) => manager.snapshot(),
+            Self::Owned(handle) => handle.with_transactions(|transactions| transactions.snapshot()),
+        }
+    }
+    // Existing standalone/public mutations retain their genuine Legacy route.
+    fn with_write_set<R>(&self, tx: TxId, f: impl FnOnce(&mut contextdb_tx::WriteSet) -> R) -> Result<R> {
+        match self {
+            Self::Legacy(manager) => manager.with_write_set(tx, f),
+            Self::Owned(_) => Err(Error::InvalidStateTransition(
+                "owned executor requires its admitted engine producer".into(),
+            )),
+        }
+    }
+}
+
 pub struct MemVectorExecutor<S: WriteSetApplicator> {
     store: Arc<VectorStore>,
-    tx_mgr: Arc<TransactionManager<S>>,
+    tx_mgr: ExecutorTransactions<S>,
     _accountant: Arc<dyn MemoryBudget>,
 }
 
 impl<S: WriteSetApplicator> MemVectorExecutor<S> {
+    #[doc(hidden)]
+    pub fn new_engine(store: Arc<VectorStore>, transactions: contextdb_tx::manager::EngineTransactionHandle<S>,
+        _hnsw: Arc<OnceLock<RwLock<Option<HnswIndex>>>>, accountant: Arc<dyn MemoryBudget>) -> Self {
+        Self { store, tx_mgr: ExecutorTransactions::Owned(transactions), _accountant: accountant }
+    }
+    #[doc(hidden)]
+    pub fn stage_engine_vector(&self, tx: TxId, entry: VectorEntry, scalar: Option<(RowId, ColName)>,
+        invoice: contextdb_tx::staged_source::OriginalVectorInvoice) -> Result<()> {
+        struct Original {
+            entry: VectorEntry,
+            invoice: contextdb_tx::staged_source::OriginalVectorInvoice,
+        }
+        let original = Original { entry, invoice };
+        let ExecutorTransactions::Owned(handle) = &self.tx_mgr else {
+            return Err(Error::InvalidStateTransition("engine vector requires owned executor".into()));
+        };
+        self.store.validate_vector(&original.entry.index, original.entry.vector.len())?;
+        handle.with_transactions(|transactions| transactions.with_engine(tx, |guard| {
+            let prepared = guard.prepare_vector(original.entry, scalar, original.invoice)?;
+            guard.publish(prepared);
+            Ok(())
+        }))
+    }
+
     /// The accountant must belong to the actual executing statement.
     pub fn new(
         store: Arc<VectorStore>,
@@ -2401,7 +2447,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     ) -> Self {
         Self {
             store,
-            tx_mgr,
+            tx_mgr: ExecutorTransactions::Legacy(tx_mgr),
             _accountant: accountant,
         }
     }

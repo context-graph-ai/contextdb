@@ -268,6 +268,8 @@ pub struct SyncServer {
     db: Arc<Database>,
     transport: Arc<dyn ServerTransport>,
     lineage_signer: Option<LineageSigner>,
+    // Standing server identity; this Arc is not allocated from a request invoice.
+    lineage_identity: Option<Arc<crate::identity::FabricIdentity>>,
     local_node_id: Option<String>,
     tenant_id: TenantId,
     /// Highest edge-LSN applied from pushes for this tenant. `Lsn(0)`
@@ -313,6 +315,7 @@ impl SyncServer {
             db,
             endpoint.transport(),
             Some(endpoint.lineage_signer()),
+            Some(endpoint.lineage_identity()),
             tenant_id,
             Some(endpoint.node_id()),
             read_budget_provider,
@@ -324,6 +327,7 @@ impl SyncServer {
         db: Arc<Database>,
         transport: Arc<dyn ServerTransport>,
         lineage_signer: Option<LineageSigner>,
+        lineage_identity: Option<Arc<crate::identity::FabricIdentity>>,
         tenant_id: TenantId,
         local_node_id: Option<String>,
         read_budget_provider: Arc<dyn crate::vector_read_memory::ReadRequestBudgetProvider>,
@@ -365,6 +369,7 @@ impl SyncServer {
             db,
             transport,
             lineage_signer,
+            lineage_identity,
             local_node_id,
             tenant_id,
             applied_push_watermark: Arc::new(AtomicLsn::new(applied_push_watermark)),
@@ -404,7 +409,7 @@ impl SyncServer {
         tenant_id: TenantId,
         read_budget_provider: Arc<dyn crate::vector_read_memory::ReadRequestBudgetProvider>,
     ) -> Result<Self, Error> {
-        Self::build(db, transport, None, tenant_id, None, read_budget_provider)
+        Self::build(db, transport, None, None, tenant_id, None, read_budget_provider)
     }
 
     /// Test-only construction with a fabric key matching the hub identity
@@ -439,11 +444,13 @@ impl SyncServer {
         identity: Arc<crate::identity::FabricIdentity>,
         read_budget_provider: Arc<dyn crate::vector_read_memory::ReadRequestBudgetProvider>,
     ) -> Result<Self, Error> {
+        let lineage_identity = identity.clone();
         let signer: LineageSigner = Arc::new(move |bytes| Ok(identity.sign_lineage(bytes)));
         Self::build(
             db,
             transport,
             Some(signer),
+            Some(lineage_identity),
             tenant_id,
             Some(local_node_id),
             read_budget_provider,
@@ -522,6 +529,28 @@ impl SyncServer {
             tracing::error!(error = %err, "sync server transport loop failed");
         }
 
+        apply_tasks.wait_idle().await;
+    }
+
+    /// Stop-handle sibling. Real Native registration awaits the five subject
+    /// companions; until then this uses the transport's genuine Legacy branch.
+    #[doc(hidden)]
+    pub async fn run_until_stopped(&self, stop: crate::transport::NativeStop) {
+        let apply_tasks = Arc::new(ApplyTracker::new());
+        let in_flight_push_applies: InFlightPushApplies =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let apply_permits = Arc::new(Semaphore::new(MAX_CONCURRENT_PUSH_APPLIES));
+        let handlers = self.handlers(apply_tasks.clone(), in_flight_push_applies, apply_permits);
+        match self.transport.serve_native_installation(
+            handlers, crate::transport::ReadBoundStreamInstallation::empty(), stop,
+        ) {
+            Ok(serving) => {
+                if let Err(err) = serving.await {
+                    tracing::error!(error = %err, "sync server transport loop failed");
+                }
+            }
+            Err(err) => tracing::error!(error = %err, "sync server transport installation failed"),
+        }
         apply_tasks.wait_idle().await;
     }
 
@@ -3195,5 +3224,86 @@ mod tests {
             rmp_serde::from_slice(&decode(&second).expect("second envelope").payload)
                 .expect("second response");
         assert!(second.result.is_some(), "{second:?}");
+    }
+}
+
+// Explicit-owner delivery companion. The native installation's Legacy branch
+// supplies begin_request's exact capability; this sibling never reacquires it.
+// Original run/serve handlers remain untouched, including their existing errors.
+impl SyncServer {
+    pub(crate) fn outcomes_handler_with_read_owner(
+        &self,
+        req: IncomingRequest,
+        selected: crate::vector_read_memory::RequestReadOwner,
+    ) -> crate::transport::WireResult<crate::transport::DispatchedWireFuture<'static, ()>> {
+        let read_memory = match selected.into_route() {
+            crate::vector_read_memory::RequestReadRoute::Legacy(reader) => reader,
+            crate::vector_read_memory::RequestReadRoute::Native(_) => {
+                return Err(TransportError::NoResponder.into());
+            }
+        };
+        let owner = contextdb_core::read_memory::ReadMemoryOwner::from_legacy(read_memory.clone());
+        let db = self.db.clone();
+        let tenant = self.tenant_id.clone();
+        let hub = self.local_node_id.clone();
+        crate::transport::admit_wire_future(owner, async move {
+                    let decoded_memory = crate::read_image_memory::ImageMemory::charging_reader_for(
+                        db.bounded_read_accountant(),
+                        read_memory.clone(),
+                        "reader",
+                        "decode_sync_request",
+                        "Reduce the request or raise the declared reader memory limit.",
+                    );
+                    use crate::protocol::*;
+                    let envelope =
+                        crate::sync_client::decode_sync_envelope(&decoded_memory, &req.bytes, None)
+                            .map_err(to_transport_error)?;
+                    let request: FetchDeliveryOutcomesRequest = decoded_memory
+                        .decode_msgpack(&envelope.payload)
+                        .map_err(to_transport_error)?;
+                    if envelope.message_type != MessageType::FetchDeliveryOutcomesRequest
+                        || request.format != 1
+                        || request.tenant_id != tenant.as_str()
+                    {
+                        return Err(TransportError::Other(
+                            "invalid authenticated outcome request".into(),
+                        ).into());
+                    }
+                    let hub = hub.ok_or_else(|| {
+                        TransportError::Other("authenticated hub required".into())
+                    })?;
+                    let edge = req.node_id.ok_or_else(|| {
+                        TransportError::Other("authenticated edge required".into())
+                    })?;
+                    let outcomes = crate::custody::delivery::fetch(
+                        &db,
+                        &tenant,
+                        &hub,
+                        &edge,
+                        request.edge_incarnation,
+                        request.since.as_deref(),
+                        read_memory.clone(),
+                    )
+                    .map_err(|e| TransportError::Other(e.to_string()))?;
+                    let response = FetchDeliveryOutcomesResponse {
+                        format: 1,
+                        request_nonce: request.request_nonce,
+                        hub_node_id: hub,
+                        hub_incarnation: db
+                            .existing_sync_incarnation(&tenant, read_memory.clone())
+                            .map_err(|e| TransportError::Other(e.to_string()))?
+                            .ok_or_else(|| {
+                                TransportError::Other("hub authority is not initialized".into())
+                            })?,
+                        tenant_id: tenant.as_str().into(),
+                        edge_node_id: edge,
+                        edge_incarnation: request.edge_incarnation,
+                        result: Some(DeliveryOutcomePage { outcomes }),
+                        error: None,
+                    };
+                    let bytes = encode_named(MessageType::FetchDeliveryOutcomesResponse, &response)
+                        .map_err(|e| TransportError::Other(e.to_string()))?;
+                    (req.responder)(bytes).await.map_err(Into::into)
+        }).map(crate::transport::DispatchedWireFuture::native)
     }
 }

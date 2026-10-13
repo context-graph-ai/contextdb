@@ -54,7 +54,7 @@ impl<'a> MaintenanceFrontier<'a> {
     /// probe may retain the immutable published frontier without that guard.
     pub(super) fn capture(
         store: &'a RelationalStore,
-        manager: &TransactionManager<DynStore>,
+        manager: &DatabaseTransactionHost,
         owner: crate::persistence::writer_source::SourceWindowOwner,
     ) -> Result<Self> {
         let root = writer_read::durable_root(manager.capture_published_read().handle)?;

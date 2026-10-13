@@ -828,9 +828,34 @@ where
     Ok(false)
 }
 
+/// Construction retains the same lower transaction owner. Public standalone
+/// mutations continue through Legacy; Owned mutation needs its admitted producer.
+enum ExecutorTransactions<S: WriteSetApplicator> {
+    Legacy(Arc<TransactionManager<S>>),
+    Owned(contextdb_tx::manager::EngineTransactionHandle<S>),
+}
+impl<S: WriteSetApplicator> ExecutorTransactions<S> {
+    fn snapshot(&self) -> SnapshotId {
+        match self {
+            Self::Legacy(manager) => manager.snapshot(),
+            Self::Owned(handle) => handle.with_transactions(|transactions| transactions.snapshot()),
+        }
+    }
+    fn with_write_set<R>(&self, tx: TxId,
+        f: impl FnOnce(&mut contextdb_tx::WriteSet) -> R,
+    ) -> Result<R> {
+        match self {
+            Self::Legacy(manager) => manager.with_write_set(tx, f),
+            Self::Owned(_) => Err(Error::InvalidStateTransition(
+                "owned graph mutation requires its admitted engine producer".into(),
+            )),
+        }
+    }
+}
+
 pub struct MemGraphExecutor<S: WriteSetApplicator> {
     store: Arc<GraphStore>,
-    tx_mgr: Arc<TransactionManager<S>>,
+    tx_mgr: ExecutorTransactions<S>,
     dag_edge_types: parking_lot::RwLock<HashSet<String>>,
     // The active BFS visited cap. Production value is always `MAX_VISITED`;
     // only the #[doc(hidden)] test seam below ever lowers it, so the boundary
@@ -845,10 +870,20 @@ pub struct PreparedDagEdgeTypes {
 }
 
 impl<S: WriteSetApplicator> MemGraphExecutor<S> {
+    #[doc(hidden)]
+    pub fn new_engine(store: Arc<GraphStore>, transactions: contextdb_tx::manager::EngineTransactionHandle<S>) -> Self {
+        Self {
+            store,
+            tx_mgr: ExecutorTransactions::Owned(transactions),
+            dag_edge_types: parking_lot::RwLock::new(HashSet::new()),
+            bfs_visited_cap: std::sync::atomic::AtomicUsize::new(MAX_VISITED),
+        }
+    }
+
     pub fn new(store: Arc<GraphStore>, tx_mgr: Arc<TransactionManager<S>>) -> Self {
         Self {
             store,
-            tx_mgr,
+            tx_mgr: ExecutorTransactions::Legacy(tx_mgr),
             dag_edge_types: parking_lot::RwLock::new(HashSet::new()),
             bfs_visited_cap: std::sync::atomic::AtomicUsize::new(MAX_VISITED),
         }

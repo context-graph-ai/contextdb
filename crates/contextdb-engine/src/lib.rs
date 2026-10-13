@@ -142,6 +142,8 @@ pub mod sync_client;
 #[cfg(feature = "sync-orchestration")]
 pub mod sync_server;
 #[cfg(feature = "sync-orchestration")]
+mod sync_native_delivery;
+#[cfg(feature = "sync-orchestration")]
 mod sync_system_tables;
 #[cfg(feature = "sync-orchestration")]
 pub mod transfer_receipts;

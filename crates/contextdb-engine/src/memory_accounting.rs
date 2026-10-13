@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::mem::ManuallyDrop;
 use std::alloc::Layout;
@@ -281,6 +282,104 @@ impl Drop for AccountantHandle {
 unsafe impl Send for AccountantHandle {}
 unsafe impl Sync for AccountantHandle {}
 
+impl contextdb_tx::staged_source::RetainedControlSource for AccountantHandle {
+    fn retained_control_identity(
+        &self,
+        kind: contextdb_tx::staged_source::RetainedControlKind,
+    ) -> Option<contextdb_tx::staged_source::RetainedControlIdentity> {
+        if !self.is_engine() {
+            return None;
+        }
+        use contextdb_tx::staged_source::{RetainedControlIdentity, RetainedControlKind};
+        Some(match kind {
+            RetainedControlKind::Accountant => RetainedControlIdentity::from_borrowed(&**self),
+            RetainedControlKind::Limit => RetainedControlIdentity::from_borrowed(&*self.limit),
+            RetainedControlKind::Counter => RetainedControlIdentity::from_borrowed(&*self.used),
+            RetainedControlKind::WriterRegistration => return None,
+        })
+    }
+}
+impl contextdb_tx::staged_source::RetainedControlSource for WriterUse {
+    fn retained_control_identity(
+        &self,
+        kind: contextdb_tx::staged_source::RetainedControlKind,
+    ) -> Option<contextdb_tx::staged_source::RetainedControlIdentity> {
+        use contextdb_tx::staged_source::{
+            RetainedControlIdentity, RetainedControlKind, RetainedControlSource,
+        };
+        if kind != RetainedControlKind::WriterRegistration {
+            return self.accountant.retained_control_identity(kind);
+        }
+        let domain = PROCESS_WRITER_BUDGET_DOMAIN.read();
+        let record = domain.lookup_in(self.stable_identity)?;
+        if record.epoch != self.epoch
+            || record.users == 0
+            || !Arc::ptr_eq(&record.limit, &self.accountant.limit)
+            || record.used.as_ptr() != self.accountant.used.as_ptr()
+        {
+            return None;
+        }
+        // The use pins this actual typed Box record after the gate is released.
+        Some(RetainedControlIdentity::from_borrowed(record))
+    }
+}
+impl AccountantHandle {
+    fn visit_retained_source_controls<'a>(
+        &'a self,
+        visit: &mut dyn FnMut(contextdb_tx::staged_source::RetainedControl<'a>),
+    ) -> Option<()> {
+        // Supplied host backing has its original Arc/Weak lifetime and is not
+        // charged as native engine backing. Its census remains unknown.
+        if !self.is_engine() {
+            return None;
+        }
+        use contextdb_tx::staged_source::{RetainedControl, RetainedControlKind};
+        visit(RetainedControl::from_borrowed(
+            RetainedControlKind::Accountant,
+            self,
+            writer_adapter_type_layout::<MemoryAccountant>().size(),
+        ));
+        visit(RetainedControl::from_borrowed(
+            RetainedControlKind::Limit,
+            self,
+            writer_adapter_type_layout::<AtomicUsize>().size(),
+        ));
+        visit(RetainedControl::from_borrowed(
+            RetainedControlKind::Counter,
+            self,
+            writer_adapter_type_layout::<WriterCounter>().size(),
+        ));
+        Some(())
+    }
+}
+impl WriterUse {
+    fn visit_retained_source_controls<'a>(
+        &'a self,
+        visit: &mut dyn FnMut(contextdb_tx::staged_source::RetainedControl<'a>),
+    ) -> Option<()> {
+        {
+            let domain = PROCESS_WRITER_BUDGET_DOMAIN.read();
+            let record = domain.lookup_in(self.stable_identity)?;
+            if record.epoch != self.epoch
+                || record.users == 0
+                || !Arc::ptr_eq(&record.limit, &self.accountant.limit)
+                || record.used.as_ptr() != self.accountant.used.as_ptr()
+            {
+                return None;
+            }
+        }
+        // The borrowed use pins this actual record across the callbacks. Drop
+        // the domain guard first: a repeated census walk may visit it again.
+        self.accountant.visit_retained_source_controls(visit)?;
+        use contextdb_tx::staged_source::{RetainedControl, RetainedControlKind};
+        visit(RetainedControl::from_borrowed(
+            RetainedControlKind::WriterRegistration,
+            self,
+            Layout::new::<WriterRegistration>().size(),
+        ));
+        Some(())
+    }
+}
 fn engine_writer_backing_bytes() -> usize {
     writer_adapter_type_layout::<MemoryAccountant>().size()
         + writer_adapter_type_layout::<AtomicUsize>().size()
@@ -821,6 +920,43 @@ impl Drop for WriterUse {
 pub(crate) struct StoreAccountantHandle(NonNull<MemoryAccountant>);
 const _: () = assert!(std::mem::align_of::<MemoryAccountant>() >= 8);
 impl StoreAccountantHandle {
+    /// Project the exact pinned original use, never rediscover a writer epoch.
+    pub(crate) fn from_writer_use(original: &WriterUse) -> Self {
+        let accountant = original.accountant.clone();
+        let mut domain = PROCESS_WRITER_BUDGET_DOMAIN.write();
+        assert_eq!(
+            accountant.writer_identity.get().copied(),
+            Some(original.stable_identity),
+            "original use has its accountant key"
+        );
+        assert_ne!(original.stable_identity, 0, "writer identity is nonzero");
+        assert_ne!(original.epoch, 0, "writer epoch is nonzero");
+        let record = domain
+            .lookup_in(original.stable_identity)
+            .expect("original use pins its record");
+        assert_eq!(record.epoch, original.epoch, "original use pins its epoch");
+        assert!(
+            Arc::ptr_eq(&record.limit, &accountant.limit),
+            "original record has its accountant limit"
+        );
+        assert_eq!(
+            record.used.as_ptr(),
+            accountant.used.as_ptr(),
+            "original record has its accountant counter"
+        );
+        domain.retain_in(original.stable_identity, original.epoch);
+        let raw = NonNull::new(accountant.into_owned_raw()).expect("owned accountant is non-null");
+        Self(raw.map_addr(|address| {
+            std::num::NonZeroUsize::new(address.get() | 1).expect("tagged accountant is non-null")
+        }))
+    }
+    /// An original nonwriter stays untagged even after later registration.
+    pub(crate) fn from_original_nonwriter(accountant: &AccountantHandle) -> Self {
+        Self(
+            NonNull::new(accountant.clone().into_owned_raw())
+                .expect("owned accountant is non-null"),
+        )
+    }
     fn decoded(&self) -> NonNull<MemoryAccountant> {
         self.0.map_addr(|address| std::num::NonZeroUsize::new(address.get() & !ACCOUNTANT_TAGS).expect("Arc pointer is non-null"))
     }
@@ -968,6 +1104,39 @@ pub(crate) struct WriterBudget {
     vector_accountant: Arc<dyn contextdb_vector::MemoryBudget>,
 }
 impl WriterBudget {
+    pub(crate) fn prepare_source_funder(
+        &self,
+    ) -> contextdb_core::Result<contextdb_tx::SourceFunder> {
+        if !self.accountant.is_engine() {
+            // Move a clone of the exact supplied standard allocation; no native
+            // relabelling, replacement shell or Weak identity change occurs.
+            let receiver = self
+                .accountant
+                .standard_arc()
+                .expect("supplied accountant has its standard Arc");
+            return Ok(contextdb_tx::SourceFunder::from_host(receiver));
+        }
+        let writer = self.writer_use.clone();
+        assert_eq!(
+            self.accountant.as_ptr(),
+            writer.accountant.as_ptr(),
+            "writer budget retains its original accountant"
+        );
+        let control = ControlCredit::admit_for_use(
+            &writer,
+            writer_adapter_type_layout::<NativeSourceProvider>().size(),
+            "staged_source_provider_control",
+        )?;
+        let provider = NativeSourceProvider {
+            accountant: Some(self.accountant.clone()),
+            writer: Some(writer),
+            control: Some(control),
+        };
+        let origin = provider.native_origin()?;
+        // SAFETY: this preadmitted exact concrete provider starts with one
+        // paired count; it never makes Weak or exposes a permanent raw count.
+        Ok(unsafe { contextdb_tx::SourceFunder::from_prepared_native(provider, origin) })
+    }
     pub(crate) fn from_accountant(accountant: Arc<MemoryAccountant>) -> contextdb_core::Result<Self> {
         Self::from_handle(AccountantHandle::from_host(accountant))
     }
@@ -1434,6 +1603,20 @@ pub(crate) struct ControlCredit {
     registration: Option<(usize, usize)>,
 }
 impl ControlCredit {
+    pub(crate) fn admit_for_use(
+        original: &WriterUse,
+        bytes: usize,
+        operation: &str,
+    ) -> contextdb_core::Result<Self> {
+        let handle = StoreAccountantHandle::from_writer_use(original);
+        Self::admit_from_handle(
+            &handle,
+            bytes,
+            "vector_maintenance",
+            operation,
+            "Raise MEMORY_LIMIT for this fixed writer control.",
+        )
+    }
     // CDB127 private static-map extension: registry controls inherit the
     // creating handle's provenance and the existing family's refusal door.
     // An untagged reader never acquires a later writer's receipt/epoch.
@@ -1687,7 +1870,39 @@ impl Drop for ScopedMemoryReservation<'_> {
 }
 
 // Ordered staged postings retain the same engine admission owner.
+#[derive(Debug)]
+struct NativeCopyCharge {
+    grant: contextdb_tx::OriginalCopyGrant,
+}
+
+impl contextdb_tx::StagedPostingCharge for NativeCopyCharge {
+    fn retained_bytes(&self) -> usize {
+        self.grant.retained_bytes()
+    }
+    fn reserve_copy(
+        &self,
+        bytes: usize,
+    ) -> contextdb_core::Result<Arc<dyn contextdb_tx::StagedPostingCharge>> {
+        self.grant.reserve_terminal_copy(bytes)
+    }
+}
+
 impl contextdb_tx::StagedPostingCharge for OwnedMemoryReservation {
+    fn retained_control_bytes(&self) -> Option<usize> {
+        Some(self.own_control.as_ref().map_or(0, |control| control.bytes))
+    }
+    fn visit_retained_controls<'a>(
+        &'a self,
+        visit: &mut dyn FnMut(contextdb_tx::staged_source::RetainedControl<'a>),
+    ) -> Option<()> {
+        self.visit_retained_source_controls(visit)
+    }
+    fn reserve_private_original_copy(
+        &self,
+        bytes: usize,
+    ) -> contextdb_core::Result<contextdb_tx::OriginalCopyGrant> {
+        self.reserve_original_grant(bytes)
+    }
     fn retained_bytes(&self) -> usize {
         self.bytes()
     }
@@ -1695,15 +1910,224 @@ impl contextdb_tx::StagedPostingCharge for OwnedMemoryReservation {
         &self,
         bytes: usize,
     ) -> contextdb_core::Result<Arc<dyn contextdb_tx::StagedPostingCharge>> {
-        Self::try_new_for(
-            self.accountant().clone(), bytes, "relational", "statement_overlay",
-            "Reduce staged rows or raise MEMORY_LIMIT.",
-        )?.into_admitted_arc().map(|owner| owner as Arc<dyn contextdb_tx::StagedPostingCharge>)
+        // Legacy/public output remains a standard Arc. Native internal holders
+        // use reserve_private_original_copy and retain the opaque grant instead.
+        let owner = if let Some(original) = &self._writer_use {
+            Self::try_new_arc_for_original(
+                original,
+                bytes,
+                "relational",
+                "statement_overlay",
+                "Reduce staged rows or raise MEMORY_LIMIT.",
+            )?
+        } else {
+            Self::try_new_arc_for_nonwriter(
+                self.accountant(),
+                bytes,
+                "relational",
+                "statement_overlay",
+                "Reduce staged rows or raise MEMORY_LIMIT.",
+            )?
+        };
+        Ok(owner)
+    }
+    fn reserve_terminal_copy(
+        &self,
+        bytes: usize,
+    ) -> contextdb_core::Result<Arc<dyn contextdb_tx::StagedPostingCharge>> {
+        let grant = self.reserve_original_grant(bytes)?;
+        Ok(Arc::new(NativeCopyCharge { grant }))
     }
 }
 
 impl OwnedMemoryReservation {
-    fn accountant(&self) -> &AccountantHandle {
+    /// Call only after election has physically freed this reservation's ArcInner.
+    /// The payload and its original writer registration remain untouched.
+    fn finish_freed_enclosing_control(&mut self) {
+        drop(self.own_control.take());
+    }
+    fn visit_retained_source_controls<'a>(
+        &'a self,
+        visit: &mut dyn FnMut(contextdb_tx::staged_source::RetainedControl<'a>),
+    ) -> Option<()> {
+        let writer = self._writer_use.as_ref()?;
+        if writer.accountant.as_ptr() != self.accountant().as_ptr() {
+            return None;
+        }
+        if let Some(control) = &self.own_control {
+            if control
+                .accountant
+                .as_ref()
+                .is_none_or(|owner| owner.as_ptr() != self.accountant().as_ptr())
+                || control.registration != Some((writer.stable_identity, writer.epoch))
+            {
+                return None;
+            }
+        }
+        writer.visit_retained_source_controls(visit)
+    }
+    /// Actual original reservation kernel: header control first, payload next,
+    /// concrete allocation last. No epoch discovery follows payload admission.
+    pub(crate) fn try_new_arc_for_original(
+        original: &WriterUse,
+        bytes: usize,
+        subsystem: &str,
+        operation: &str,
+        hint: &str,
+    ) -> contextdb_core::Result<Arc<Self>> {
+        let writer = original.clone();
+        let projection = StoreAccountantHandle::from_writer_use(&writer);
+        let control = ControlCredit::admit_for_use(
+            &writer,
+            writer_adapter_type_layout::<Self>().size(),
+            "reservation_control",
+        )?;
+        if control.bytes != writer_adapter_type_layout::<Self>().size()
+            || control.registration != Some((writer.stable_identity, writer.epoch))
+            || control
+                .accountant
+                .as_ref()
+                .is_none_or(|owner| owner.as_ptr() != writer.accountant.as_ptr())
+        {
+            return Err(contextdb_core::Error::Other(
+                "original reservation control origin mismatch".into(),
+            ));
+        }
+        let accountant = projection.as_handle();
+        projection.try_allocate_for_original(bytes, subsystem, operation, hint)?;
+        let value = Self {
+            accountant: Some(accountant),
+            bytes,
+            _writer_use: Some(writer),
+            own_control: Some(control),
+        };
+        Ok(Arc::new(value))
+    }
+    fn try_new_arc_for_nonwriter(
+        original: &AccountantHandle,
+        bytes: usize,
+        subsystem: &str,
+        operation: &str,
+        hint: &str,
+    ) -> contextdb_core::Result<Arc<Self>> {
+        let projection = StoreAccountantHandle::from_original_nonwriter(original);
+        let control = ControlCredit::admit_from_handle(
+            &projection,
+            writer_adapter_type_layout::<Self>().size(),
+            "vector_maintenance",
+            "reservation_control",
+            "Raise MEMORY_LIMIT for this fixed writer control.",
+        )?;
+        if control.bytes != writer_adapter_type_layout::<Self>().size()
+            || control.registration.is_some()
+            || control
+                .accountant
+                .as_ref()
+                .is_none_or(|owner| owner.as_ptr() != original.as_ptr())
+        {
+            return Err(contextdb_core::Error::Other(
+                "nonwriter reservation control origin mismatch".into(),
+            ));
+        }
+        let accountant = projection.as_handle();
+        projection.try_allocate_for_original(bytes, subsystem, operation, hint)?;
+        let value = Self {
+            accountant: Some(accountant),
+            bytes,
+            _writer_use: None,
+            own_control: Some(control),
+        };
+        Ok(Arc::new(value))
+    }
+    /// Only the genuine original reservation can supply an opaque native O grant.
+    fn reserve_original_grant(
+        &self,
+        bytes: usize,
+    ) -> contextdb_core::Result<contextdb_tx::OriginalCopyGrant> {
+        if !self.accountant().is_engine() {
+            return <Self as contextdb_tx::StagedPostingCharge>::reserve_copy(self, bytes)
+                .map(contextdb_tx::OriginalCopyGrant::from_host);
+        }
+        let writer = self._writer_use.as_ref().ok_or_else(|| {
+            contextdb_core::Error::Other("native original copy requires its held writer use".into())
+        })?;
+        if writer.accountant.as_ptr() != self.accountant().as_ptr()
+            || writer.stable_identity == 0
+            || writer.epoch == 0
+        {
+            return Err(contextdb_core::Error::Other(
+                "native original copy origin mismatch".into(),
+            ));
+        }
+        let origin = contextdb_tx::NativeSourceOrigin::new(
+            self.accountant().as_ptr() as usize,
+            contextdb_tx::SourceLease {
+                identity: writer.stable_identity,
+                epoch: writer.epoch,
+            },
+        );
+        let receiver = Self::try_new_arc_for_original(
+            writer,
+            bytes,
+            "relational",
+            "statement_overlay",
+            "Reduce staged rows or raise MEMORY_LIMIT.",
+        )?;
+        // SAFETY: the kernel checks the held original, preadmits its actual
+        // header, allocates exactly Self, and returns its sole private count.
+        Ok(unsafe { contextdb_tx::OriginalCopyGrant::from_native(receiver, origin) })
+    }
+    fn source_invoice_for(
+        &mut self,
+        funder: &contextdb_tx::SourceFunder,
+    ) -> contextdb_core::Result<contextdb_tx::SourceCharge> {
+        let writer = self._writer_use.as_ref().ok_or_else(|| {
+            contextdb_core::Error::Other(
+                "native source transfer requires its held writer use".into(),
+            )
+        })?;
+        let lease = contextdb_tx::SourceLease {
+            identity: writer.stable_identity,
+            epoch: writer.epoch,
+        };
+        if !self.accountant().is_engine()
+            || writer.accountant.as_ptr() != self.accountant().as_ptr()
+            || lease.identity == 0
+            || lease.epoch == 0
+            || !funder.matches_native_origin(self.accountant().as_ptr() as usize, lease)
+        {
+            return Err(contextdb_core::Error::Other(
+                "native source transfer origin mismatch".into(),
+            ));
+        }
+        let charge = contextdb_tx::SourceCharge::adopt_funded(funder.clone(), self.bytes, lease)?;
+        self.bytes = 0;
+        Ok(charge)
+    }
+    pub(crate) fn into_source_row_invoice_for(
+        &mut self,
+        funder: &contextdb_tx::SourceFunder,
+    ) -> contextdb_core::Result<contextdb_tx::OriginalRowInvoice> {
+        self.source_invoice_for(funder)
+            .map(contextdb_tx::OriginalRowInvoice::from_charge)
+    }
+    pub(crate) fn into_source_vector_invoice_for(
+        &mut self,
+        funder: &contextdb_tx::SourceFunder,
+    ) -> contextdb_core::Result<contextdb_tx::OriginalVectorInvoice> {
+        self.source_invoice_for(funder)
+            .map(contextdb_tx::OriginalVectorInvoice::from_charge)
+    }
+    /// Auxiliary bodies transfer the original reservation rather than a
+    /// post-mutation byte estimate.
+    pub(crate) fn into_source_aux_invoice_for(
+        &mut self,
+        funder: &contextdb_tx::SourceFunder,
+    ) -> contextdb_core::Result<contextdb_tx::OriginalAuxInvoice> {
+        self.source_invoice_for(funder)
+            .map(contextdb_tx::OriginalAuxInvoice::from_charge)
+    }
+    pub(crate) fn accountant(&self) -> &AccountantHandle {
         self.accountant.as_ref().expect("live reservation has its accountant")
     }
     pub(crate) fn with_enclosing_arc_control<T>(mut self, retained_startup: bool) -> contextdb_core::Result<Self> {
@@ -2765,6 +3189,14 @@ impl Drop for WriterVectorBudget {
     }
 }
 impl contextdb_core::read_memory::ReadMemoryBudget for WriterVectorBudget {
+    fn try_reserve_native(
+        &self, bytes: usize, subsystem: &'static str,
+        operation: &'static str, hint: &'static str,
+    ) -> std::result::Result<(), contextdb_core::read_memory::NativeRefusal> {
+        self.accountant().try_allocate_for_native(bytes, subsystem, operation, hint)
+    }
+
+
     fn try_reserve(&self, bytes: usize, subsystem: &'static str, operation: &'static str, hint: &'static str) -> contextdb_core::Result<()> {
         self.accountant().try_allocate_for(bytes, subsystem, operation, hint)
     }
@@ -2930,6 +3362,14 @@ impl contextdb_vector::MemoryBudget for MemoryAccountant {
 }
 
 impl contextdb_core::read_memory::ReadMemoryBudget for MemoryAccountant {
+    fn try_reserve_native(
+        &self, bytes: usize, subsystem: &'static str,
+        operation: &'static str, hint: &'static str,
+    ) -> std::result::Result<(), contextdb_core::read_memory::NativeRefusal> {
+        self.try_allocate_for_native(bytes, subsystem, operation, hint)
+    }
+
+
     fn try_reserve(
         &self,
         bytes: usize,
@@ -3335,5 +3775,3606 @@ mod redb_allocator_state_tests {
         assert_eq!(accountant.usage().used, 40);
         drop(owner);
         assert_eq!(accountant.usage().used, 0);
+    }
+}
+
+/// A fixed native provider pins the actual original writer, not a current role.
+/// It has no payload/root/invoice back-reference, so retained sources are acyclic.
+struct NativeSourceProvider {
+    accountant: Option<AccountantHandle>,
+    writer: Option<WriterUse>,
+    control: Option<ControlCredit>,
+}
+impl NativeSourceProvider {
+    fn native_origin(&self) -> contextdb_core::Result<contextdb_tx::NativeSourceOrigin> {
+        let accountant = self
+            .accountant
+            .as_ref()
+            .expect("live native source accountant");
+        let writer = self.writer.as_ref().expect("live native source writer");
+        let control = self.control.as_ref().expect("live native source control");
+        if !accountant.is_engine()
+            || writer.accountant.as_ptr() != accountant.as_ptr()
+            || writer.stable_identity == 0
+            || writer.epoch == 0
+            || accountant.writer_identity.get().copied() != Some(writer.stable_identity)
+            || control
+                .accountant
+                .as_ref()
+                .is_none_or(|owner| owner.as_ptr() != accountant.as_ptr())
+            || control.bytes != writer_adapter_type_layout::<Self>().size()
+            || control.registration != Some((writer.stable_identity, writer.epoch))
+        {
+            return Err(contextdb_core::Error::Other(
+                "native source provider origin mismatch".into(),
+            ));
+        }
+        Ok(contextdb_tx::NativeSourceOrigin::new(
+            accountant.as_ptr() as usize,
+            contextdb_tx::SourceLease {
+                identity: writer.stable_identity,
+                epoch: writer.epoch,
+            },
+        ))
+    }
+    fn paired_receiver(self: &Arc<Self>) -> contextdb_core::Result<contextdb_tx::SourceFunder> {
+        let origin = self.native_origin()?;
+        // SAFETY: the synchronous dispatch's paired guard dominates this
+        // ordinary temporary receiver. This new count is immediately paired;
+        // only that opaque count enters returned invoices and bridges.
+        Ok(unsafe { contextdb_tx::SourceFunder::adopt_native_receiver(self.clone(), origin) })
+    }
+    fn lease(&self) -> contextdb_tx::SourceLease {
+        let writer = self.writer.as_ref().expect("live native source writer");
+        contextdb_tx::SourceLease {
+            identity: writer.stable_identity,
+            epoch: writer.epoch,
+        }
+    }
+    fn assert_lease(&self, lease: contextdb_tx::SourceLease) {
+        let original = self.lease();
+        assert_eq!(
+            lease.identity, original.identity,
+            "source lease retains its original writer key"
+        );
+        assert_eq!(
+            lease.epoch, original.epoch,
+            "source lease retains its original writer epoch"
+        );
+    }
+}
+impl Drop for NativeSourceProvider {
+    fn drop(&mut self) {
+        let refund = self.control.take().map(ControlCredit::prepare);
+        let mut cleanup =
+            ReservationCleanup::new(self.accountant.take(), self.writer.take(), 0, refund);
+        cleanup.finish();
+    }
+}
+impl contextdb_tx::SourceFunding for NativeSourceProvider {
+    fn copy_aux(
+        self: Arc<Self>,
+        bodies: contextdb_tx::staged_source::AuxBorrow<'_>,
+    ) -> contextdb_core::Result<contextdb_tx::staged_source::AdmittedAuxBatch> {
+        source_copy_aux(bodies, self.paired_receiver()?)
+    }
+    fn copy_sidecars(
+        self: Arc<Self>,
+        maps: contextdb_tx::staged_source::SidecarsBorrow<'_>,
+        change: Option<(
+            &str,
+            contextdb_core::RowId,
+            Option<(contextdb_core::Lsn, u8)>,
+            Option<usize>,
+        )>,
+    ) -> contextdb_core::Result<contextdb_tx::staged_source::AdmittedSidecars> {
+        source_copy_sidecars(maps, change, self.paired_receiver()?)
+    }
+
+    fn retained_control_bytes(&self) -> Option<usize> {
+        self.control.as_ref().map(|control| control.bytes)
+    }
+    fn visit_retained_controls<'a>(
+        &'a self,
+        visit: &mut dyn FnMut(contextdb_tx::staged_source::RetainedControl<'a>),
+    ) -> Option<()> {
+        self.native_origin().ok()?;
+        self.writer.as_ref()?.visit_retained_source_controls(visit)
+    }
+    fn admit_source(&self, bytes: usize) -> contextdb_core::Result<contextdb_tx::SourceLease> {
+        let original = self.writer.as_ref().expect("live native source writer");
+        let projection = StoreAccountantHandle::from_writer_use(original);
+        projection.try_allocate_for_original(
+            bytes,
+            "relational",
+            "staged_source",
+            "Reduce staged rows or raise MEMORY_LIMIT.",
+        )?;
+        let lease = self.lease();
+        PROCESS_WRITER_BUDGET_DOMAIN
+            .write()
+            .retain_in(lease.identity, lease.epoch);
+        Ok(lease)
+    }
+    fn retain_source_lease(&self, lease: contextdb_tx::SourceLease) {
+        self.assert_lease(lease);
+        PROCESS_WRITER_BUDGET_DOMAIN
+            .write()
+            .retain_in(lease.identity, lease.epoch);
+    }
+    fn release_source(&self, bytes: usize, lease: contextdb_tx::SourceLease) {
+        self.assert_lease(lease);
+        let accountant = self
+            .accountant
+            .as_ref()
+            .expect("live native source accountant");
+        accountant.release(bytes);
+        PROCESS_WRITER_BUDGET_DOMAIN
+            .write()
+            .release_in(accountant, lease.identity, lease.epoch);
+    }
+    fn copy_row(
+        self: Arc<Self>,
+        row: &contextdb_core::VersionedRow,
+    ) -> contextdb_core::Result<contextdb_tx::staged_source::AdmittedSourceRow> {
+        let bytes = row.values.iter().try_fold(
+            source_row_map_bytes(row.values.len())?,
+            |bytes, (name, value)| {
+                source_add(
+                    source_add(bytes, name.len())?,
+                    source_value_copy_bytes(value)?,
+                )
+            },
+        )?;
+        let funder = self.paired_receiver()?;
+        // Use the actual original control-first reservation kernel before copying.
+        let writer = self.writer.as_ref().expect("live native source writer");
+        let grant = OwnedMemoryReservation::try_new_arc_for_original(
+            writer, bytes, "relational", "staged_index_posting",
+            "Reduce staged rows or raise MEMORY_LIMIT.",
+        )?;
+        let mut original = Arc::into_inner(grant).expect("private copy grant has one owner");
+        original.finish_freed_enclosing_control();
+        let charge = original.source_invoice_for(&funder)?;
+        let mut values = std::collections::HashMap::with_capacity(row.values.len());
+        for (name, value) in &row.values {
+            values.insert(name.as_str().to_owned(), source_copy_value(value));
+        }
+        let copied = contextdb_core::VersionedRow {
+            row_id: row.row_id,
+            values,
+            created_tx: row.created_tx,
+            deleted_tx: row.deleted_tx,
+            lsn: row.lsn,
+            created_at: row.created_at,
+        };
+        if let Err(error) = source_check_row_capacity(&copied) {
+            drop(copied);
+            return Err(error);
+        }
+        Ok(contextdb_tx::staged_source::AdmittedSourceRow::new(
+            copied,
+            contextdb_tx::staged_source::OriginalRowInvoice::from_charge(charge),
+        ))
+    }
+    fn copy_eager_row(
+        self: Arc<Self>,
+        row: &contextdb_core::VersionedRow,
+    ) -> contextdb_core::Result<contextdb_tx::staged_source::AdmittedEagerSourceRow> {
+        let bytes = row.values.iter().try_fold(
+            source_row_map_bytes(row.values.len())?,
+            |bytes, (name, value)| {
+                source_add(
+                    source_add(bytes, name.len())?,
+                    source_value_copy_bytes(value)?,
+                )
+            },
+        )?;
+        // This is the same actual typed kernel used by the existing staged
+        // posting provider: native reservation control precedes its debit.
+        let funder = self.paired_receiver()?;
+        let writer = self.writer.as_ref().expect("live native source writer");
+        let grant = OwnedMemoryReservation::try_new_arc_for_original(
+            writer,
+            bytes,
+            "relational",
+            "staged_index_posting",
+            "Reduce staged rows or raise MEMORY_LIMIT.",
+        )?;
+        // The sole typed grant is private. Election yields its metadata only
+        // AFTER the temporary reservation ArcInner has been deallocated.
+        let mut original = Arc::into_inner(grant).expect("private eager grant has one owner");
+        original.finish_freed_enclosing_control();
+        let invoice = original.into_source_row_invoice_for(&funder)?;
+        let bridge =
+            contextdb_tx::staged_source::OriginalCopyBridge::prepare_funded(original, funder)?;
+        let mut values = std::collections::HashMap::with_capacity(row.values.len());
+        for (name, value) in &row.values {
+            values.insert(name.as_str().to_owned(), source_copy_value(value));
+        }
+        let copied = contextdb_core::VersionedRow {
+            row_id: row.row_id,
+            values,
+            created_tx: row.created_tx,
+            deleted_tx: row.deleted_tx,
+            lsn: row.lsn,
+            created_at: row.created_at,
+        };
+        if let Err(error) = source_check_row_capacity(&copied) {
+            drop(copied);
+            return Err(error);
+        }
+        Ok(contextdb_tx::staged_source::AdmittedEagerSourceRow::new(
+            copied, invoice, bridge,
+        ))
+    }
+    fn copy_vector(
+        self: Arc<Self>,
+        entry: &contextdb_core::VectorEntry,
+    ) -> contextdb_core::Result<contextdb_tx::staged_source::AdmittedSourceVector> {
+        let bytes = source_add(
+            source_add(entry.index.table.len(), entry.index.column.len())?,
+            source_array::<f32>(entry.vector.len())?,
+        )?;
+        let funder = self.paired_receiver()?;
+        // Use the actual original control-first reservation kernel before copying.
+        let writer = self.writer.as_ref().expect("live native source writer");
+        let grant = OwnedMemoryReservation::try_new_arc_for_original(
+            writer, bytes, "relational", "staged_index_posting",
+            "Reduce staged rows or raise MEMORY_LIMIT.",
+        )?;
+        let mut original = Arc::into_inner(grant).expect("private copy grant has one owner");
+        original.finish_freed_enclosing_control();
+        let charge = original.source_invoice_for(&funder)?;
+        let copied = contextdb_core::VectorEntry {
+            index: contextdb_core::VectorIndexRef {
+                table: entry.index.table.as_str().to_owned(),
+                column: entry.index.column.as_str().to_owned(),
+            },
+            row_id: entry.row_id,
+            vector: entry.vector.as_slice().to_vec(),
+            created_tx: entry.created_tx,
+            deleted_tx: entry.deleted_tx,
+            lsn: entry.lsn,
+        };
+        if copied.vector.capacity() != copied.vector.len()
+            || copied.index.table.capacity() != copied.index.table.len()
+            || copied.index.column.capacity() != copied.index.column.len()
+        {
+            drop(copied);
+            return Err(contextdb_core::Error::Other(
+                "source native capacity mismatch".into(),
+            ));
+        }
+        Ok(contextdb_tx::staged_source::AdmittedSourceVector::new(
+            copied,
+            contextdb_tx::staged_source::OriginalVectorInvoice::from_charge(charge),
+        ))
+    }
+    fn copy_eager_vector(
+        self: Arc<Self>,
+        entry: &contextdb_core::VectorEntry,
+    ) -> contextdb_core::Result<contextdb_tx::AdmittedEagerSourceVector> {
+        let bytes = source_add(
+            source_add(entry.index.table.len(), entry.index.column.len())?,
+            source_array::<f32>(entry.vector.len())?,
+        )?;
+        // Validate the paired receiver before genuine original admission or
+        // any fallible key/root preparation. This pins the original epoch.
+        let funder = self.paired_receiver()?;
+        let writer = self.writer.as_ref().expect("live native source writer");
+        let grant = OwnedMemoryReservation::try_new_arc_for_original(
+            writer,
+            bytes,
+            "relational",
+            "staged_index_posting",
+            "Reduce staged rows or raise MEMORY_LIMIT.",
+        )?;
+        let mut original =
+            Arc::into_inner(grant).expect("private eager vector grant has one owner");
+        original.finish_freed_enclosing_control();
+        let invoice = original.into_source_vector_invoice_for(&funder)?;
+        let bridge = contextdb_tx::OriginalCopyBridge::prepare_funded(original, funder)?;
+        // The original body debit, invoice and bridge all precede allocation.
+        let copied = source_copy_vector(entry);
+        source_check_vector_capacity(&copied)?;
+        Ok(contextdb_tx::AdmittedEagerSourceVector::new(
+            copied, invoice, bridge,
+        ))
+    }
+    fn copy_key(
+        self: Arc<Self>,
+        key: &contextdb_core::IndexKey,
+    ) -> contextdb_core::Result<contextdb_tx::staged_source::AdmittedSourceKey> {
+        let bytes = key.iter().try_fold(
+            source_array::<contextdb_core::DirectedValue>(key.len())?,
+            |bytes, value| {
+                let value = match value {
+                    contextdb_core::DirectedValue::Asc(value) => &value.0,
+                    contextdb_core::DirectedValue::Desc(value) => &value.0,
+                };
+                source_add(bytes, source_value_copy_bytes(value)?)
+            },
+        )?;
+        let funder = self.paired_receiver()?;
+        // Use the actual original control-first reservation kernel before copying.
+        let writer = self.writer.as_ref().expect("live native source writer");
+        let grant = OwnedMemoryReservation::try_new_arc_for_original(
+            writer, bytes, "relational", "staged_index_posting",
+            "Reduce staged rows or raise MEMORY_LIMIT.",
+        )?;
+        let mut original = Arc::into_inner(grant).expect("private copy grant has one owner");
+        original.finish_freed_enclosing_control();
+        let charge = original.source_invoice_for(&funder)?;
+        let mut copied = Vec::with_capacity(key.len());
+        for value in key {
+            copied.push(match value {
+                contextdb_core::DirectedValue::Asc(value) => contextdb_core::DirectedValue::Asc(
+                    contextdb_core::TotalOrdAsc(source_copy_value(&value.0)),
+                ),
+                contextdb_core::DirectedValue::Desc(value) => contextdb_core::DirectedValue::Desc(
+                    contextdb_core::TotalOrdDesc(source_copy_value(&value.0)),
+                ),
+            });
+        }
+        for value in &copied {
+            let value = match value {
+                contextdb_core::DirectedValue::Asc(v) => &v.0,
+                contextdb_core::DirectedValue::Desc(v) => &v.0,
+            };
+            if let Err(error) = source_check_value_capacity(value) {
+                drop(copied);
+                return Err(error);
+            }
+        }
+        if copied.capacity() != copied.len() {
+            drop(copied);
+            return Err(contextdb_core::Error::Other(
+                "source native capacity mismatch".into(),
+            ));
+        }
+        Ok(contextdb_tx::staged_source::AdmittedSourceKey::new(
+            copied, charge,
+        ))
+    }
+}
+
+impl contextdb_tx::staged_source::SourceFunding for MemoryAccountant {
+    fn copy_aux(
+        self: Arc<Self>,
+        bodies: contextdb_tx::staged_source::AuxBorrow<'_>,
+    ) -> contextdb_core::Result<contextdb_tx::staged_source::AdmittedAuxBatch> {
+        source_copy_aux(bodies, contextdb_tx::SourceFunder::from_host(self))
+    }
+    fn copy_sidecars(
+        self: Arc<Self>,
+        maps: contextdb_tx::staged_source::SidecarsBorrow<'_>,
+        change: Option<(
+            &str,
+            contextdb_core::RowId,
+            Option<(contextdb_core::Lsn, u8)>,
+            Option<usize>,
+        )>,
+    ) -> contextdb_core::Result<contextdb_tx::staged_source::AdmittedSidecars> {
+        source_copy_sidecars(maps, change, contextdb_tx::SourceFunder::from_host(self))
+    }
+
+    fn matches_original_source_origin(
+        &self,
+        origin: contextdb_tx::NativeSourceOrigin,
+        lease: contextdb_tx::SourceLease,
+    ) -> Option<bool> {
+        let actual =
+            contextdb_tx::NativeSourceOrigin::new(std::ptr::from_ref(self) as usize, lease);
+        Some(actual.same_origin(&origin))
+    }
+    fn admit_source(
+        &self,
+        bytes: usize,
+    ) -> contextdb_core::Result<contextdb_tx::staged_source::SourceLease> {
+        self.try_allocate_for(
+            bytes,
+            "relational",
+            "staged_source",
+            "Release staged captures or raise MEMORY_LIMIT.",
+        )?;
+        let mut domain = PROCESS_WRITER_BUDGET_DOMAIN.write();
+        let registered = self
+            .writer_identity
+            .get()
+            .copied()
+            .and_then(|identity| domain.lookup_in(identity).map(|r| (identity, r.epoch)));
+        let (identity, epoch) = registered.unwrap_or((0, 0));
+        if identity != 0 {
+            domain.retain_in(identity, epoch);
+        }
+        Ok(contextdb_tx::staged_source::SourceLease { identity, epoch })
+    }
+    fn retain_source_lease(&self, lease: contextdb_tx::staged_source::SourceLease) {
+        if lease.identity != 0 {
+            PROCESS_WRITER_BUDGET_DOMAIN
+                .write()
+                .retain_in(lease.identity, lease.epoch);
+        }
+    }
+    fn release_source(&self, bytes: usize, lease: contextdb_tx::staged_source::SourceLease) {
+        self.release(bytes);
+        if lease.identity != 0 {
+            PROCESS_WRITER_BUDGET_DOMAIN
+                .write()
+                .release_in(self, lease.identity, lease.epoch);
+        }
+    }
+    fn copy_row(
+        self: Arc<Self>,
+        row: &contextdb_core::VersionedRow,
+    ) -> contextdb_core::Result<contextdb_tx::staged_source::AdmittedSourceRow> {
+        let bytes = row.values.iter().try_fold(
+            source_row_map_bytes(row.values.len())?,
+            |bytes, (name, value)| {
+                source_add(
+                    source_add(bytes, name.len())?,
+                    source_value_copy_bytes(value)?,
+                )
+            },
+        )?;
+        let accountant = AccountantHandle::from_host(self.clone());
+        let held_writer = WriterUse::retain_if_writer(&accountant);
+        let grant = if let Some(writer) = &held_writer {
+            OwnedMemoryReservation::try_new_arc_for_original(
+                writer, bytes, "relational", "staged_index_posting",
+                "Reduce staged rows or raise MEMORY_LIMIT.",
+            )?
+        } else {
+            OwnedMemoryReservation::try_new_arc_for_nonwriter(
+                &accountant, bytes, "relational", "staged_index_posting",
+                "Reduce staged rows or raise MEMORY_LIMIT.",
+            )?
+        };
+        let mut original = Arc::into_inner(grant).expect("private copy grant has one owner");
+        original.finish_freed_enclosing_control();
+        let charge = original.into_source_charge()?;
+        let mut values = std::collections::HashMap::with_capacity(row.values.len());
+        for (name, value) in &row.values {
+            values.insert(name.as_str().to_owned(), source_copy_value(value));
+        }
+        let copied = contextdb_core::VersionedRow {
+            row_id: row.row_id,
+            values,
+            created_tx: row.created_tx,
+            deleted_tx: row.deleted_tx,
+            lsn: row.lsn,
+            created_at: row.created_at,
+        };
+        if let Err(error) = source_check_row_capacity(&copied) {
+            drop(copied);
+            return Err(error);
+        }
+        Ok(contextdb_tx::staged_source::AdmittedSourceRow::new(
+            copied,
+            contextdb_tx::staged_source::OriginalRowInvoice::from_charge(charge),
+        ))
+    }
+    fn copy_eager_row(
+        self: Arc<Self>,
+        row: &contextdb_core::VersionedRow,
+    ) -> contextdb_core::Result<contextdb_tx::staged_source::AdmittedEagerSourceRow> {
+        let bytes = row.values.iter().try_fold(
+            source_row_map_bytes(row.values.len())?,
+            |bytes, (name, value)| {
+                source_add(
+                    source_add(bytes, name.len())?,
+                    source_value_copy_bytes(value)?,
+                )
+            },
+        )?;
+        // This is the same actual typed kernel used by the existing staged
+        // posting provider: native reservation control precedes its debit.
+        let accountant = AccountantHandle::from_host(self.clone());
+        let held_writer = WriterUse::retain_if_writer(&accountant);
+        let grant = if let Some(original) = &held_writer {
+            OwnedMemoryReservation::try_new_arc_for_original(
+                original,
+                bytes,
+                "relational",
+                "staged_index_posting",
+                "Reduce staged rows or raise MEMORY_LIMIT.",
+            )?
+        } else {
+            OwnedMemoryReservation::try_new_arc_for_nonwriter(
+                &accountant,
+                bytes,
+                "relational",
+                "staged_index_posting",
+                "Reduce staged rows or raise MEMORY_LIMIT.",
+            )?
+        };
+        // The sole typed grant is private. Election yields its metadata only
+        // AFTER the temporary reservation ArcInner has been deallocated.
+        let mut original = Arc::into_inner(grant).expect("private eager grant has one owner");
+        original.finish_freed_enclosing_control();
+        let invoice = original.into_source_invoice()?;
+        let funder = contextdb_tx::SourceFunder::from_host(self);
+        let bridge =
+            contextdb_tx::staged_source::OriginalCopyBridge::prepare_funded(original, funder)?;
+        let mut values = std::collections::HashMap::with_capacity(row.values.len());
+        for (name, value) in &row.values {
+            values.insert(name.as_str().to_owned(), source_copy_value(value));
+        }
+        let copied = contextdb_core::VersionedRow {
+            row_id: row.row_id,
+            values,
+            created_tx: row.created_tx,
+            deleted_tx: row.deleted_tx,
+            lsn: row.lsn,
+            created_at: row.created_at,
+        };
+        if let Err(error) = source_check_row_capacity(&copied) {
+            drop(copied);
+            return Err(error);
+        }
+        Ok(contextdb_tx::staged_source::AdmittedEagerSourceRow::new(
+            copied, invoice, bridge,
+        ))
+    }
+    fn copy_vector(
+        self: Arc<Self>,
+        entry: &contextdb_core::VectorEntry,
+    ) -> contextdb_core::Result<contextdb_tx::staged_source::AdmittedSourceVector> {
+        let bytes = source_add(
+            source_add(entry.index.table.len(), entry.index.column.len())?,
+            source_array::<f32>(entry.vector.len())?,
+        )?;
+        let accountant = AccountantHandle::from_host(self.clone());
+        let held_writer = WriterUse::retain_if_writer(&accountant);
+        let grant = if let Some(writer) = &held_writer {
+            OwnedMemoryReservation::try_new_arc_for_original(
+                writer, bytes, "relational", "staged_index_posting",
+                "Reduce staged rows or raise MEMORY_LIMIT.",
+            )?
+        } else {
+            OwnedMemoryReservation::try_new_arc_for_nonwriter(
+                &accountant, bytes, "relational", "staged_index_posting",
+                "Reduce staged rows or raise MEMORY_LIMIT.",
+            )?
+        };
+        let mut original = Arc::into_inner(grant).expect("private copy grant has one owner");
+        original.finish_freed_enclosing_control();
+        let charge = original.into_source_charge()?;
+        let copied = contextdb_core::VectorEntry {
+            index: contextdb_core::VectorIndexRef {
+                table: entry.index.table.as_str().to_owned(),
+                column: entry.index.column.as_str().to_owned(),
+            },
+            row_id: entry.row_id,
+            vector: entry.vector.as_slice().to_vec(),
+            created_tx: entry.created_tx,
+            deleted_tx: entry.deleted_tx,
+            lsn: entry.lsn,
+        };
+        if copied.vector.capacity() != copied.vector.len()
+            || copied.index.table.capacity() != copied.index.table.len()
+            || copied.index.column.capacity() != copied.index.column.len()
+        {
+            drop(copied);
+            return Err(contextdb_core::Error::Other(
+                "source native capacity mismatch".into(),
+            ));
+        }
+        Ok(contextdb_tx::staged_source::AdmittedSourceVector::new(
+            copied,
+            contextdb_tx::staged_source::OriginalVectorInvoice::from_charge(charge),
+        ))
+    }
+    fn copy_eager_vector(
+        self: Arc<Self>,
+        entry: &contextdb_core::VectorEntry,
+    ) -> contextdb_core::Result<contextdb_tx::AdmittedEagerSourceVector> {
+        let bytes = source_add(
+            source_add(entry.index.table.len(), entry.index.column.len())?,
+            source_array::<f32>(entry.vector.len())?,
+        )?;
+        let accountant = AccountantHandle::from_host(self.clone());
+        let held_writer = WriterUse::retain_if_writer(&accountant);
+        let grant = if let Some(original) = &held_writer {
+            OwnedMemoryReservation::try_new_arc_for_original(
+                original,
+                bytes,
+                "relational",
+                "staged_index_posting",
+                "Reduce staged rows or raise MEMORY_LIMIT.",
+            )?
+        } else {
+            OwnedMemoryReservation::try_new_arc_for_nonwriter(
+                &accountant,
+                bytes,
+                "relational",
+                "staged_index_posting",
+                "Reduce staged rows or raise MEMORY_LIMIT.",
+            )?
+        };
+        let mut original =
+            Arc::into_inner(grant).expect("private eager vector grant has one owner");
+        original.finish_freed_enclosing_control();
+        let charge = original.into_source_charge()?;
+        let invoice = contextdb_tx::OriginalVectorInvoice::from_charge(charge);
+        let funder = contextdb_tx::SourceFunder::from_host(self);
+        let bridge = contextdb_tx::OriginalCopyBridge::prepare_funded(original, funder)?;
+        let copied = source_copy_vector(entry);
+        source_check_vector_capacity(&copied)?;
+        Ok(contextdb_tx::AdmittedEagerSourceVector::new(
+            copied, invoice, bridge,
+        ))
+    }
+    fn copy_key(
+        self: Arc<Self>,
+        key: &contextdb_core::IndexKey,
+    ) -> contextdb_core::Result<contextdb_tx::staged_source::AdmittedSourceKey> {
+        let bytes = key.iter().try_fold(
+            source_array::<contextdb_core::DirectedValue>(key.len())?,
+            |bytes, value| {
+                let value = match value {
+                    contextdb_core::DirectedValue::Asc(value) => &value.0,
+                    contextdb_core::DirectedValue::Desc(value) => &value.0,
+                };
+                source_add(bytes, source_value_copy_bytes(value)?)
+            },
+        )?;
+        let accountant = AccountantHandle::from_host(self.clone());
+        let held_writer = WriterUse::retain_if_writer(&accountant);
+        let grant = if let Some(writer) = &held_writer {
+            OwnedMemoryReservation::try_new_arc_for_original(
+                writer, bytes, "relational", "staged_index_posting",
+                "Reduce staged rows or raise MEMORY_LIMIT.",
+            )?
+        } else {
+            OwnedMemoryReservation::try_new_arc_for_nonwriter(
+                &accountant, bytes, "relational", "staged_index_posting",
+                "Reduce staged rows or raise MEMORY_LIMIT.",
+            )?
+        };
+        let mut original = Arc::into_inner(grant).expect("private copy grant has one owner");
+        original.finish_freed_enclosing_control();
+        let charge = original.into_source_charge()?;
+        let mut copied = Vec::with_capacity(key.len());
+        for value in key {
+            copied.push(match value {
+                contextdb_core::DirectedValue::Asc(value) => contextdb_core::DirectedValue::Asc(
+                    contextdb_core::TotalOrdAsc(source_copy_value(&value.0)),
+                ),
+                contextdb_core::DirectedValue::Desc(value) => contextdb_core::DirectedValue::Desc(
+                    contextdb_core::TotalOrdDesc(source_copy_value(&value.0)),
+                ),
+            });
+        }
+        for value in &copied {
+            let value = match value {
+                contextdb_core::DirectedValue::Asc(v) => &v.0,
+                contextdb_core::DirectedValue::Desc(v) => &v.0,
+            };
+            if let Err(error) = source_check_value_capacity(value) {
+                drop(copied);
+                return Err(error);
+            }
+        }
+        if copied.capacity() != copied.len() {
+            drop(copied);
+            return Err(contextdb_core::Error::Other(
+                "source native capacity mismatch".into(),
+            ));
+        }
+        Ok(contextdb_tx::staged_source::AdmittedSourceKey::new(
+            copied, charge,
+        ))
+    }
+}
+impl OwnedMemoryReservation {
+    /// Host transfer preserves the original standard receiver allocation.
+    pub(crate) fn into_source_invoice(
+        &mut self,
+    ) -> contextdb_core::Result<contextdb_tx::OriginalRowInvoice> {
+        self.into_source_charge()
+            .map(contextdb_tx::OriginalRowInvoice::from_charge)
+    }
+    fn into_source_charge(&mut self) -> contextdb_core::Result<contextdb_tx::SourceCharge> {
+        let receiver = self.accountant().standard_arc().ok_or_else(|| {
+            contextdb_core::Error::Other("native source transfer requires an opaque funder".into())
+        })?;
+        let lease = self._writer_use.as_ref().map_or(
+            contextdb_tx::SourceLease {
+                identity: 0,
+                epoch: 0,
+            },
+            |writer| contextdb_tx::SourceLease {
+                identity: writer.stable_identity,
+                epoch: writer.epoch,
+            },
+        );
+        let charge = contextdb_tx::SourceCharge::adopt(receiver, self.bytes, lease)?;
+        self.bytes = 0;
+        Ok(charge)
+    }
+}
+impl contextdb_tx::OriginalCopyChargeSource for OwnedMemoryReservation {
+    fn copy_original_row_for(
+        &self,
+        row: &contextdb_core::VersionedRow,
+        funder: &contextdb_tx::SourceFunder,
+    ) -> Option<contextdb_core::Result<contextdb_tx::staged_source::AdmittedSourceRow>> {
+        Some(self.copy_retained_original_row_for(row, funder))
+    }
+    fn copy_original_vector_for(
+        &self, entry: &contextdb_core::VectorEntry, funder: &contextdb_tx::SourceFunder,
+    ) -> Option<contextdb_core::Result<contextdb_tx::AdmittedSourceVector>> {
+        Some(self.copy_retained_original_vector_parts_for(
+            &entry.index.table, &entry.index.column, &entry.vector, entry.row_id,
+            entry.created_tx, entry.deleted_tx, entry.lsn, funder,
+        ))
+    }
+    fn copy_original_vector_input_for(
+        &self, input: contextdb_tx::staged_source::BorrowedOriginalVectorCopyInput<'_>,
+        funder: &contextdb_tx::SourceFunder,
+    ) -> Option<contextdb_core::Result<contextdb_tx::AdmittedSourceVector>> {
+        Some(self.copy_retained_original_vector_parts_for(
+            input.table(), input.column(), input.vector(), input.row_id(),
+            input.created_tx(), input.deleted_tx(), input.lsn(), funder,
+        ))
+    }
+    fn original_source_origin(&self) -> Option<contextdb_tx::NativeSourceOrigin> {
+        let lease = if let Some(writer) = &self._writer_use {
+            if writer.accountant.as_ptr() != self.accountant().as_ptr()
+                || writer.stable_identity == 0
+                || writer.epoch == 0
+            {
+                return None;
+            }
+            contextdb_tx::SourceLease {
+                identity: writer.stable_identity,
+                epoch: writer.epoch,
+            }
+        } else {
+            // This is the genuine original nonwriter, not a fabricated native owner.
+            if self.accountant().is_engine() {
+                return None;
+            }
+            contextdb_tx::SourceLease {
+                identity: 0,
+                epoch: 0,
+            }
+        };
+        Some(contextdb_tx::NativeSourceOrigin::new(
+            self.accountant().as_ptr() as usize,
+            lease,
+        ))
+    }
+    fn retained_control_bytes(&self) -> Option<usize> {
+        <Self as contextdb_tx::StagedPostingCharge>::retained_control_bytes(self)
+    }
+    fn visit_retained_controls<'a>(
+        &'a self,
+        visit: &mut dyn FnMut(contextdb_tx::staged_source::RetainedControl<'a>),
+    ) -> Option<()> {
+        self.visit_retained_source_controls(visit)
+    }
+    fn reserve_original_copy(
+        &self,
+        bytes: usize,
+    ) -> contextdb_core::Result<Arc<dyn contextdb_tx::StagedPostingCharge>> {
+        if self.accountant().is_engine() {
+            // This standard output is terminal-only. Private native holders
+            // dispatch the opaque grant companion below, never this shell.
+            <Self as contextdb_tx::StagedPostingCharge>::reserve_terminal_copy(self, bytes)
+        } else {
+            <Self as contextdb_tx::StagedPostingCharge>::reserve_copy(self, bytes)
+        }
+    }
+    fn reserve_private_original_copy(
+        &self,
+        bytes: usize,
+    ) -> contextdb_core::Result<contextdb_tx::OriginalCopyGrant> {
+        self.reserve_original_grant(bytes)
+    }
+}
+
+fn source_copy_vector(entry: &contextdb_core::VectorEntry) -> contextdb_core::VectorEntry {
+    contextdb_core::VectorEntry {
+        index: contextdb_core::VectorIndexRef {
+            table: entry.index.table.as_str().to_owned(),
+            column: entry.index.column.as_str().to_owned(),
+        },
+        row_id: entry.row_id,
+        vector: entry.vector.as_slice().to_vec(),
+        created_tx: entry.created_tx,
+        deleted_tx: entry.deleted_tx,
+        lsn: entry.lsn,
+    }
+}
+fn source_check_vector_capacity(entry: &contextdb_core::VectorEntry) -> contextdb_core::Result<()> {
+    if entry.vector.capacity() != entry.vector.len()
+        || entry.index.table.capacity() != entry.index.table.len()
+        || entry.index.column.capacity() != entry.index.column.len()
+    {
+        return Err(contextdb_core::Error::Other(
+            "source native capacity mismatch".into(),
+        ));
+    }
+    Ok(())
+}
+
+// Native clone builders use the effective standard-library allocation shape,
+// rather than the row's historical admission estimate. JSON objects are rebuilt
+// in lexical order so every B-tree split is known before construction. The
+// independent allocator gate must witness these layouts on its actual compiler.
+struct SourceJsonLeaf {
+    _parent: Option<std::ptr::NonNull<SourceJsonInternal>>,
+    _parent_index: std::mem::MaybeUninit<u16>,
+    _len: u16,
+    _keys: [std::mem::MaybeUninit<String>; 11],
+    _values: [std::mem::MaybeUninit<serde_json::Value>; 11],
+}
+#[repr(C)]
+struct SourceJsonInternal {
+    _data: SourceJsonLeaf,
+    _edges: [std::mem::MaybeUninit<std::ptr::NonNull<SourceJsonLeaf>>; 12],
+}
+fn source_size_overflow() -> contextdb_core::Error {
+    contextdb_core::Error::Other("source allocation size overflow".into())
+}
+fn source_add(a: usize, b: usize) -> contextdb_core::Result<usize> {
+    a.checked_add(b).ok_or_else(source_size_overflow)
+}
+// Private preparation copies use the same native layout and exact copy kernels
+// as source funding. A caller must admit the returned plan BEFORE this copy.
+pub(crate) fn preparation_row_copy_bytes(row: &contextdb_core::VersionedRow) -> contextdb_core::Result<usize> {
+    row.values.iter().try_fold(source_row_map_bytes(row.values.len())?, |bytes, (name, value)| {
+        source_add(source_add(bytes, name.len())?, source_value_copy_bytes(value)?)
+    })
+}
+pub(crate) fn preparation_copy_row(row: &contextdb_core::VersionedRow) -> contextdb_core::Result<contextdb_core::VersionedRow> {
+    let mut values = HashMap::with_capacity(row.values.len());
+    for (name, value) in &row.values {
+        values.insert(name.as_str().to_owned(), source_copy_value(value));
+    }
+    let copied = contextdb_core::VersionedRow {
+        row_id: row.row_id, values, created_tx: row.created_tx,
+        deleted_tx: row.deleted_tx, lsn: row.lsn, created_at: row.created_at,
+    };
+    source_check_row_capacity(&copied)?;
+    Ok(copied)
+}
+pub(crate) fn preparation_value_copy_bytes(value: &contextdb_core::Value) -> contextdb_core::Result<usize> {
+    source_value_copy_bytes(value)
+}
+pub(crate) fn preparation_copy_value(value: &contextdb_core::Value) -> contextdb_core::Result<contextdb_core::Value> {
+    let copied = source_copy_value(value);
+    source_check_value_capacity(&copied)?;
+    Ok(copied)
+}
+pub(crate) fn preparation_row_map_bytes(members: usize) -> contextdb_core::Result<usize> {
+    source_row_map_bytes(members)
+}
+
+pub(crate) fn preparation_check_row_capacity(row: &contextdb_core::VersionedRow) -> contextdb_core::Result<()> {
+    source_check_row_capacity(row)
+}
+
+fn source_array<T>(len: usize) -> contextdb_core::Result<usize> {
+    Layout::array::<T>(len)
+        .map(|layout| layout.size())
+        .map_err(|_| source_size_overflow())
+}
+fn source_json_map_bytes(members: usize) -> contextdb_core::Result<usize> {
+    if members == 0 {
+        return Ok(0);
+    }
+    // alloc::collections::btree::node::splitpoint(11) promotes index six;
+    // its rightmost successor has five entries after the pending insertion.
+    let mut rightmost = [0u8; usize::BITS as usize];
+    let mut height = 0usize;
+    let mut leaf_nodes = 1usize;
+    let mut internal_nodes = 0usize;
+    for _ in 0..members {
+        let mut level = 0usize;
+        loop {
+            if rightmost[level] < 11 {
+                rightmost[level] += 1;
+                break;
+            }
+            rightmost[level] = 5;
+            if level == 0 {
+                leaf_nodes = source_add(leaf_nodes, 1)?
+            } else {
+                internal_nodes = source_add(internal_nodes, 1)?
+            }
+            level += 1;
+            if level > height {
+                height = level;
+                if height == rightmost.len() {
+                    return Err(source_size_overflow());
+                }
+                rightmost[height] = 1;
+                internal_nodes = source_add(internal_nodes, 1)?;
+                break;
+            }
+        }
+    }
+    source_add(
+        source_array::<SourceJsonLeaf>(leaf_nodes)?,
+        source_array::<SourceJsonInternal>(internal_nodes)?,
+    )
+}
+fn source_json_copy_bytes(value: &serde_json::Value) -> contextdb_core::Result<usize> {
+    match value {
+        serde_json::Value::String(text) => Ok(text.len()),
+        serde_json::Value::Array(items) => items.iter().try_fold(
+            source_array::<serde_json::Value>(items.len())?,
+            |bytes, child| source_add(bytes, source_json_copy_bytes(child)?),
+        ),
+        serde_json::Value::Object(members) => members.iter().try_fold(
+            source_json_map_bytes(members.len())?,
+            |bytes, (name, child)| {
+                source_add(
+                    source_add(bytes, name.len())?,
+                    source_json_copy_bytes(child)?,
+                )
+            },
+        ),
+        _ => Ok(0),
+    }
+}
+fn source_value_copy_bytes(value: &contextdb_core::Value) -> contextdb_core::Result<usize> {
+    match value {
+        contextdb_core::Value::Text(text) => Ok(text.len()),
+        contextdb_core::Value::Vector(values) => source_array::<f32>(values.len()),
+        contextdb_core::Value::Json(json) => source_json_copy_bytes(json),
+        _ => Ok(0),
+    }
+}
+fn source_copy_json(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(text) => serde_json::Value::String(text.as_str().to_owned()),
+        serde_json::Value::Array(items) => {
+            let mut copied = Vec::with_capacity(items.len());
+            for child in items {
+                copied.push(source_copy_json(child));
+            }
+            serde_json::Value::Array(copied)
+        }
+        serde_json::Value::Object(members) => {
+            let mut copied = serde_json::Map::new();
+            // The pinned serde_json Map is a lexical BTreeMap; these insertions
+            // follow the exact split sequence priced above, with no sort buffer.
+            for (name, child) in members {
+                copied.insert(name.as_str().to_owned(), source_copy_json(child));
+            }
+            serde_json::Value::Object(copied)
+        }
+        _ => value.clone(),
+    }
+}
+fn source_copy_value(value: &contextdb_core::Value) -> contextdb_core::Value {
+    match value {
+        contextdb_core::Value::Text(text) => contextdb_core::Value::Text(text.as_str().to_owned()),
+        contextdb_core::Value::Vector(values) => {
+            contextdb_core::Value::Vector(values.as_slice().to_vec())
+        }
+        contextdb_core::Value::Json(json) => contextdb_core::Value::Json(source_copy_json(json)),
+        _ => value.clone(),
+    }
+}
+fn source_row_map_bytes(members: usize) -> contextdb_core::Result<usize> {
+    if members == 0 {
+        return Ok(0);
+    }
+    // std's pinned hashbrown TableLayout: the row entry is larger than the
+    // small-item minimum. Preserve the target's control-group width/alignment.
+    let group = if cfg!(all(
+        target_feature = "sse2",
+        any(target_arch = "x86", target_arch = "x86_64")
+    )) {
+        16usize
+    } else if cfg!(any(
+        target_pointer_width = "64",
+        target_arch = "aarch64",
+        target_arch = "wasm32"
+    )) {
+        8usize
+    } else {
+        4usize
+    };
+    let buckets = if members < 4 {
+        4
+    } else if members < 8 {
+        8
+    } else if members < 15 {
+        16
+    } else {
+        members
+            .checked_mul(8)
+            .ok_or_else(source_size_overflow)?
+            .checked_div(7)
+            .unwrap()
+            .checked_next_power_of_two()
+            .ok_or_else(source_size_overflow)?
+    };
+    let item = Layout::new::<(String, contextdb_core::Value)>();
+    let alignment = item.align().max(group);
+    let data = source_array::<(String, contextdb_core::Value)>(buckets)?;
+    let control_offset = source_add(data, alignment - 1)? & !(alignment - 1);
+    let size = source_add(source_add(control_offset, buckets)?, group)?;
+    Layout::from_size_align(size, alignment)
+        .map(|layout| layout.size())
+        .map_err(|_| source_size_overflow())
+}
+
+fn source_check_value_capacity(value: &contextdb_core::Value) -> contextdb_core::Result<()> {
+    let valid = match value {
+        contextdb_core::Value::Text(text) => text.capacity() == text.len(),
+        contextdb_core::Value::Vector(values) => values.capacity() == values.len(),
+        contextdb_core::Value::Json(json) => return source_check_json_capacity(json),
+        _ => true,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(contextdb_core::Error::Other(
+            "source native capacity mismatch".into(),
+        ))
+    }
+}
+fn source_check_json_capacity(json: &serde_json::Value) -> contextdb_core::Result<()> {
+    match json {
+        serde_json::Value::String(text) if text.capacity() != text.len() => Err(
+            contextdb_core::Error::Other("source native capacity mismatch".into()),
+        ),
+        serde_json::Value::Array(items) => {
+            if items.capacity() != items.len() {
+                return Err(contextdb_core::Error::Other(
+                    "source native capacity mismatch".into(),
+                ));
+            }
+            for value in items {
+                source_check_json_capacity(value)?;
+            }
+            Ok(())
+        }
+        serde_json::Value::Object(members) => {
+            for (name, value) in members {
+                if name.capacity() != name.len() {
+                    return Err(contextdb_core::Error::Other(
+                        "source native capacity mismatch".into(),
+                    ));
+                }
+                source_check_json_capacity(value)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+fn source_check_row_capacity(row: &contextdb_core::VersionedRow) -> contextdb_core::Result<()> {
+    let members = row.values.len();
+    let expected = if members == 0 {
+        0
+    } else if members < 4 {
+        3
+    } else if members < 8 {
+        7
+    } else if members < 15 {
+        14
+    } else {
+        (members * 8 / 7).next_power_of_two() / 8 * 7
+    };
+    if row.values.capacity() != expected {
+        return Err(contextdb_core::Error::Other(
+            "source native capacity mismatch".into(),
+        ));
+    }
+    for (name, value) in &row.values {
+        if name.capacity() != name.len() {
+            return Err(contextdb_core::Error::Other(
+                "source native capacity mismatch".into(),
+            ));
+        }
+        source_check_value_capacity(value)?;
+    }
+    Ok(())
+}
+
+// Copy only private auxiliary bodies. All native arrays/keys/recursive values
+// are priced under the actual receiver before their respective allocation.
+fn source_copy_aux(
+    input: contextdb_tx::staged_source::AuxBorrow<'_>,
+    funder: contextdb_tx::SourceFunder,
+) -> contextdb_core::Result<contextdb_tx::staged_source::AdmittedAuxBatch> {
+    use contextdb_tx::staged_source::{
+        AdmittedAuxBatch, AuxBodies, AuxBorrow, OriginalAuxInvoice, SourceCharge,
+    };
+    match input {
+        AuxBorrow::RelationalDeletes(source) => {
+            let buffers = source_add(
+                source_array::<(
+                    contextdb_core::TableName,
+                    contextdb_core::RowId,
+                    contextdb_core::TxId,
+                )>(source.len())?,
+                source_array::<OriginalAuxInvoice>(source.len())?,
+            )?;
+            let credit = SourceCharge::admit_funded(funder.clone(), buffers)?;
+            let mut invoices = Vec::with_capacity(source.len());
+            let mut bodies = Vec::with_capacity(source.len());
+            for body in source {
+                let bytes: contextdb_core::Result<usize> = (|| Ok(body.0.len()))();
+                let charge = SourceCharge::admit_funded(funder.clone(), bytes?)?;
+                invoices.push(OriginalAuxInvoice::from_charge(charge));
+                bodies.push((body.0.as_str().to_owned(), body.1, body.2));
+            }
+            let valid = bodies
+                .iter()
+                .try_for_each(|body| -> contextdb_core::Result<()> {
+                    source_check_aux_string(&body.0)
+                });
+            if let Err(error) = valid {
+                drop(bodies);
+                drop(invoices);
+                return Err(error);
+            }
+            if bodies.capacity() != bodies.len() || invoices.capacity() != invoices.len() {
+                drop(bodies);
+                drop(invoices);
+                return Err(contextdb_core::Error::Other(
+                    "source native capacity mismatch".into(),
+                ));
+            }
+            Ok(AdmittedAuxBatch::from_parts(
+                AuxBodies::RelationalDeletes(bodies),
+                invoices,
+                credit,
+            ))
+        }
+        AuxBorrow::Predicates(source) => {
+            let buffers = source_add(
+                source_array::<contextdb_tx::RelationalDeletePredicate>(source.len())?,
+                source_array::<OriginalAuxInvoice>(source.len())?,
+            )?;
+            let credit = SourceCharge::admit_funded(funder.clone(), buffers)?;
+            let mut invoices = Vec::with_capacity(source.len());
+            let mut bodies = Vec::with_capacity(source.len());
+            for body in source {
+                let bytes: contextdb_core::Result<usize> = (|| {
+                    body.predicates.iter().try_fold(
+                        source_add(
+                            body.table.len(),
+                            source_array::<(String, contextdb_core::Value)>(body.predicates.len())?,
+                        )?,
+                        |bytes, (name, value)| {
+                            source_add(
+                                source_add(bytes, name.len())?,
+                                source_value_copy_bytes(value)?,
+                            )
+                        },
+                    )
+                })();
+                let charge = SourceCharge::admit_funded(funder.clone(), bytes?)?;
+                invoices.push(OriginalAuxInvoice::from_charge(charge));
+                bodies.push({
+                    let mut predicates = Vec::with_capacity(body.predicates.len());
+                    for (name, value) in &body.predicates {
+                        predicates.push((name.as_str().to_owned(), source_copy_value(value)));
+                    }
+                    contextdb_tx::RelationalDeletePredicate {
+                        table: body.table.as_str().to_owned(),
+                        predicates,
+                    }
+                });
+            }
+            let valid = bodies
+                .iter()
+                .try_for_each(|body| -> contextdb_core::Result<()> {
+                    {
+                        source_check_aux_string(&body.table)?;
+                        if body.predicates.capacity() != body.predicates.len() {
+                            return Err(source_native_capacity_error());
+                        }
+                        for (name, value) in &body.predicates {
+                            source_check_aux_string(name)?;
+                            source_check_value_capacity(value)?;
+                        }
+                        Ok(())
+                    }
+                });
+            if let Err(error) = valid {
+                drop(bodies);
+                drop(invoices);
+                return Err(error);
+            }
+            if bodies.capacity() != bodies.len() || invoices.capacity() != invoices.len() {
+                drop(bodies);
+                drop(invoices);
+                return Err(contextdb_core::Error::Other(
+                    "source native capacity mismatch".into(),
+                ));
+            }
+            Ok(AdmittedAuxBatch::from_parts(
+                AuxBodies::Predicates(bodies),
+                invoices,
+                credit,
+            ))
+        }
+        AuxBorrow::AdjInserts(source) => {
+            let buffers = source_add(
+                source_array::<contextdb_core::AdjEntry>(source.len())?,
+                source_array::<OriginalAuxInvoice>(source.len())?,
+            )?;
+            let credit = SourceCharge::admit_funded(funder.clone(), buffers)?;
+            let mut invoices = Vec::with_capacity(source.len());
+            let mut bodies = Vec::with_capacity(source.len());
+            for body in source {
+                let bytes: contextdb_core::Result<usize> = (|| {
+                    body.properties.iter().try_fold(
+                        source_add(
+                            body.edge_type.len(),
+                            source_row_map_bytes(body.properties.len())?,
+                        )?,
+                        |bytes, (name, value)| {
+                            source_add(
+                                source_add(bytes, name.len())?,
+                                source_value_copy_bytes(value)?,
+                            )
+                        },
+                    )
+                })();
+                let charge = SourceCharge::admit_funded(funder.clone(), bytes?)?;
+                invoices.push(OriginalAuxInvoice::from_charge(charge));
+                bodies.push({
+                    let mut properties =
+                        std::collections::HashMap::with_capacity(body.properties.len());
+                    for (name, value) in &body.properties {
+                        properties.insert(name.as_str().to_owned(), source_copy_value(value));
+                    }
+                    contextdb_core::AdjEntry {
+                        source: body.source,
+                        target: body.target,
+                        edge_type: body.edge_type.as_str().to_owned(),
+                        properties,
+                        created_tx: body.created_tx,
+                        deleted_tx: body.deleted_tx,
+                        lsn: body.lsn,
+                    }
+                });
+            }
+            let valid = bodies
+                .iter()
+                .try_for_each(|body| -> contextdb_core::Result<()> {
+                    {
+                        source_check_aux_string(&body.edge_type)?;
+                        source_check_aux_map(&body.properties)?;
+                        for (name, value) in &body.properties {
+                            source_check_aux_string(name)?;
+                            source_check_value_capacity(value)?;
+                        }
+                        Ok(())
+                    }
+                });
+            if let Err(error) = valid {
+                drop(bodies);
+                drop(invoices);
+                return Err(error);
+            }
+            if bodies.capacity() != bodies.len() || invoices.capacity() != invoices.len() {
+                drop(bodies);
+                drop(invoices);
+                return Err(contextdb_core::Error::Other(
+                    "source native capacity mismatch".into(),
+                ));
+            }
+            Ok(AdmittedAuxBatch::from_parts(
+                AuxBodies::AdjInserts(bodies),
+                invoices,
+                credit,
+            ))
+        }
+        AuxBorrow::AdjDeletes(source) => {
+            let buffers = source_add(
+                source_array::<(
+                    contextdb_core::NodeId,
+                    contextdb_core::EdgeType,
+                    contextdb_core::NodeId,
+                    contextdb_core::TxId,
+                )>(source.len())?,
+                source_array::<OriginalAuxInvoice>(source.len())?,
+            )?;
+            let credit = SourceCharge::admit_funded(funder.clone(), buffers)?;
+            let mut invoices = Vec::with_capacity(source.len());
+            let mut bodies = Vec::with_capacity(source.len());
+            for body in source {
+                let bytes: contextdb_core::Result<usize> = (|| Ok(body.1.len()))();
+                let charge = SourceCharge::admit_funded(funder.clone(), bytes?)?;
+                invoices.push(OriginalAuxInvoice::from_charge(charge));
+                bodies.push((body.0, body.1.as_str().to_owned(), body.2, body.3));
+            }
+            let valid = bodies
+                .iter()
+                .try_for_each(|body| -> contextdb_core::Result<()> {
+                    source_check_aux_string(&body.1)
+                });
+            if let Err(error) = valid {
+                drop(bodies);
+                drop(invoices);
+                return Err(error);
+            }
+            if bodies.capacity() != bodies.len() || invoices.capacity() != invoices.len() {
+                drop(bodies);
+                drop(invoices);
+                return Err(contextdb_core::Error::Other(
+                    "source native capacity mismatch".into(),
+                ));
+            }
+            Ok(AdmittedAuxBatch::from_parts(
+                AuxBodies::AdjDeletes(bodies),
+                invoices,
+                credit,
+            ))
+        }
+        AuxBorrow::VectorDeletes(source) => {
+            let buffers = source_add(
+                source_array::<(
+                    contextdb_core::VectorIndexRef,
+                    contextdb_core::RowId,
+                    contextdb_core::TxId,
+                )>(source.len())?,
+                source_array::<OriginalAuxInvoice>(source.len())?,
+            )?;
+            let credit = SourceCharge::admit_funded(funder.clone(), buffers)?;
+            let mut invoices = Vec::with_capacity(source.len());
+            let mut bodies = Vec::with_capacity(source.len());
+            for body in source {
+                let bytes: contextdb_core::Result<usize> =
+                    (|| source_add(body.0.table.len(), body.0.column.len()))();
+                let charge = SourceCharge::admit_funded(funder.clone(), bytes?)?;
+                invoices.push(OriginalAuxInvoice::from_charge(charge));
+                bodies.push((
+                    contextdb_core::VectorIndexRef {
+                        table: body.0.table.as_str().to_owned(),
+                        column: body.0.column.as_str().to_owned(),
+                    },
+                    body.1,
+                    body.2,
+                ));
+            }
+            let valid = bodies
+                .iter()
+                .try_for_each(|body| -> contextdb_core::Result<()> {
+                    {
+                        source_check_aux_string(&body.0.table)?;
+                        source_check_aux_string(&body.0.column)
+                    }
+                });
+            if let Err(error) = valid {
+                drop(bodies);
+                drop(invoices);
+                return Err(error);
+            }
+            if bodies.capacity() != bodies.len() || invoices.capacity() != invoices.len() {
+                drop(bodies);
+                drop(invoices);
+                return Err(contextdb_core::Error::Other(
+                    "source native capacity mismatch".into(),
+                ));
+            }
+            Ok(AdmittedAuxBatch::from_parts(
+                AuxBodies::VectorDeletes(bodies),
+                invoices,
+                credit,
+            ))
+        }
+        AuxBorrow::VectorMoves(source) => {
+            let buffers = source_add(
+                source_array::<(
+                    contextdb_core::VectorIndexRef,
+                    contextdb_core::RowId,
+                    contextdb_core::RowId,
+                    contextdb_core::TxId,
+                )>(source.len())?,
+                source_array::<OriginalAuxInvoice>(source.len())?,
+            )?;
+            let credit = SourceCharge::admit_funded(funder.clone(), buffers)?;
+            let mut invoices = Vec::with_capacity(source.len());
+            let mut bodies = Vec::with_capacity(source.len());
+            for body in source {
+                let bytes: contextdb_core::Result<usize> =
+                    (|| source_add(body.0.table.len(), body.0.column.len()))();
+                let charge = SourceCharge::admit_funded(funder.clone(), bytes?)?;
+                invoices.push(OriginalAuxInvoice::from_charge(charge));
+                bodies.push((
+                    contextdb_core::VectorIndexRef {
+                        table: body.0.table.as_str().to_owned(),
+                        column: body.0.column.as_str().to_owned(),
+                    },
+                    body.1,
+                    body.2,
+                    body.3,
+                ));
+            }
+            let valid = bodies
+                .iter()
+                .try_for_each(|body| -> contextdb_core::Result<()> {
+                    {
+                        source_check_aux_string(&body.0.table)?;
+                        source_check_aux_string(&body.0.column)
+                    }
+                });
+            if let Err(error) = valid {
+                drop(bodies);
+                drop(invoices);
+                return Err(error);
+            }
+            if bodies.capacity() != bodies.len() || invoices.capacity() != invoices.len() {
+                drop(bodies);
+                drop(invoices);
+                return Err(contextdb_core::Error::Other(
+                    "source native capacity mismatch".into(),
+                ));
+            }
+            Ok(AdmittedAuxBatch::from_parts(
+                AuxBodies::VectorMoves(bodies),
+                invoices,
+                credit,
+            ))
+        }
+        AuxBorrow::Provenance(source) => {
+            let buffers = source_add(
+                source_array::<(
+                    contextdb_core::TableName,
+                    contextdb_core::RowId,
+                    contextdb_core::Lsn,
+                    u8,
+                )>(source.len())?,
+                source_array::<OriginalAuxInvoice>(source.len())?,
+            )?;
+            let credit = SourceCharge::admit_funded(funder.clone(), buffers)?;
+            let mut invoices = Vec::with_capacity(source.len());
+            let mut bodies = Vec::with_capacity(source.len());
+            for body in source {
+                let bytes: contextdb_core::Result<usize> = (|| Ok(body.0.len()))();
+                let charge = SourceCharge::admit_funded(funder.clone(), bytes?)?;
+                invoices.push(OriginalAuxInvoice::from_charge(charge));
+                bodies.push((body.0.as_str().to_owned(), body.1, body.2, body.3));
+            }
+            let valid = bodies
+                .iter()
+                .try_for_each(|body| -> contextdb_core::Result<()> {
+                    source_check_aux_string(&body.0)
+                });
+            if let Err(error) = valid {
+                drop(bodies);
+                drop(invoices);
+                return Err(error);
+            }
+            if bodies.capacity() != bodies.len() || invoices.capacity() != invoices.len() {
+                drop(bodies);
+                drop(invoices);
+                return Err(contextdb_core::Error::Other(
+                    "source native capacity mismatch".into(),
+                ));
+            }
+            Ok(AdmittedAuxBatch::from_parts(
+                AuxBodies::Provenance(bodies),
+                invoices,
+                credit,
+            ))
+        }
+        AuxBorrow::ConfigWrites(source) => {
+            let buffers = source_add(
+                source_array::<(String, Vec<u8>)>(source.len())?,
+                source_array::<OriginalAuxInvoice>(source.len())?,
+            )?;
+            let credit = SourceCharge::admit_funded(funder.clone(), buffers)?;
+            let mut invoices = Vec::with_capacity(source.len());
+            let mut bodies = Vec::with_capacity(source.len());
+            for body in source {
+                let bytes: contextdb_core::Result<usize> =
+                    (|| source_add(body.0.len(), body.1.len()))();
+                let charge = SourceCharge::admit_funded(funder.clone(), bytes?)?;
+                invoices.push(OriginalAuxInvoice::from_charge(charge));
+                bodies.push((body.0.as_str().to_owned(), body.1.as_slice().to_vec()));
+            }
+            let valid = bodies
+                .iter()
+                .try_for_each(|body| -> contextdb_core::Result<()> {
+                    {
+                        source_check_aux_string(&body.0)?;
+                        if body.1.capacity() != body.1.len() {
+                            return Err(source_native_capacity_error());
+                        }
+                        Ok(())
+                    }
+                });
+            if let Err(error) = valid {
+                drop(bodies);
+                drop(invoices);
+                return Err(error);
+            }
+            if bodies.capacity() != bodies.len() || invoices.capacity() != invoices.len() {
+                drop(bodies);
+                drop(invoices);
+                return Err(contextdb_core::Error::Other(
+                    "source native capacity mismatch".into(),
+                ));
+            }
+            Ok(AdmittedAuxBatch::from_parts(
+                AuxBodies::ConfigWrites(bodies),
+                invoices,
+                credit,
+            ))
+        }
+        AuxBorrow::ConfigDeletes(source) => {
+            let buffers = source_add(
+                source_array::<String>(source.len())?,
+                source_array::<OriginalAuxInvoice>(source.len())?,
+            )?;
+            let credit = SourceCharge::admit_funded(funder.clone(), buffers)?;
+            let mut invoices = Vec::with_capacity(source.len());
+            let mut bodies = Vec::with_capacity(source.len());
+            for body in source {
+                let bytes: contextdb_core::Result<usize> = (|| Ok(body.len()))();
+                let charge = SourceCharge::admit_funded(funder.clone(), bytes?)?;
+                invoices.push(OriginalAuxInvoice::from_charge(charge));
+                bodies.push(body.as_str().to_owned());
+            }
+            let valid = bodies
+                .iter()
+                .try_for_each(|body| -> contextdb_core::Result<()> {
+                    source_check_aux_string(body)
+                });
+            if let Err(error) = valid {
+                drop(bodies);
+                drop(invoices);
+                return Err(error);
+            }
+            if bodies.capacity() != bodies.len() || invoices.capacity() != invoices.len() {
+                drop(bodies);
+                drop(invoices);
+                return Err(contextdb_core::Error::Other(
+                    "source native capacity mismatch".into(),
+                ));
+            }
+            Ok(AdmittedAuxBatch::from_parts(
+                AuxBodies::ConfigDeletes(bodies),
+                invoices,
+                credit,
+            ))
+        }
+        AuxBorrow::ConfigMaxU64Keys(source) => {
+            let buffers = source_add(
+                source_array::<String>(source.len())?,
+                source_array::<OriginalAuxInvoice>(source.len())?,
+            )?;
+            let credit = SourceCharge::admit_funded(funder.clone(), buffers)?;
+            let mut invoices = Vec::with_capacity(source.len());
+            let mut bodies = Vec::with_capacity(source.len());
+            for body in source {
+                let bytes: contextdb_core::Result<usize> = (|| Ok(body.len()))();
+                let charge = SourceCharge::admit_funded(funder.clone(), bytes?)?;
+                invoices.push(OriginalAuxInvoice::from_charge(charge));
+                bodies.push(body.as_str().to_owned());
+            }
+            let valid = bodies
+                .iter()
+                .try_for_each(|body| -> contextdb_core::Result<()> {
+                    source_check_aux_string(body)
+                });
+            if let Err(error) = valid {
+                drop(bodies);
+                drop(invoices);
+                return Err(error);
+            }
+            if bodies.capacity() != bodies.len() || invoices.capacity() != invoices.len() {
+                drop(bodies);
+                drop(invoices);
+                return Err(contextdb_core::Error::Other(
+                    "source native capacity mismatch".into(),
+                ));
+            }
+            Ok(AdmittedAuxBatch::from_parts(
+                AuxBodies::ConfigMaxU64Keys(bodies),
+                invoices,
+                credit,
+            ))
+        }
+    }
+}
+// The same pinned hashbrown layout as the existing row builder, parameterized
+// by the actual sidecar bucket type. No reported admission value is a credit.
+fn source_native_map_bytes<K, V>(members: usize) -> contextdb_core::Result<usize> {
+    if members == 0 {
+        return Ok(0);
+    }
+    let group = if cfg!(all(
+        target_feature = "sse2",
+        any(target_arch = "x86", target_arch = "x86_64")
+    )) {
+        16usize
+    } else if cfg!(any(
+        target_pointer_width = "64",
+        target_arch = "aarch64",
+        target_arch = "wasm32"
+    )) {
+        8usize
+    } else {
+        4usize
+    };
+    let buckets = if members < 4 {
+        4
+    } else if members < 8 {
+        8
+    } else if members < 15 {
+        16
+    } else {
+        members
+            .checked_mul(8)
+            .ok_or_else(source_size_overflow)?
+            .checked_div(7)
+            .unwrap()
+            .checked_next_power_of_two()
+            .ok_or_else(source_size_overflow)?
+    };
+    let alignment = Layout::new::<(K, V)>().align().max(group);
+    let data = source_array::<(K, V)>(buckets)?;
+    let offset = source_add(data, alignment - 1)? & !(alignment - 1);
+    let size = source_add(source_add(offset, buckets)?, group)?;
+    Layout::from_size_align(size, alignment)
+        .map(|l| l.size())
+        .map_err(|_| source_size_overflow())
+}
+fn source_sidecar_count<V>(
+    map: &std::collections::HashMap<contextdb_core::RowId, V>,
+    change: Option<(contextdb_core::RowId, Option<V>)>,
+) -> contextdb_core::Result<usize> {
+    match change {
+        None => Ok(map.len()),
+        Some((row, Some(_))) => map
+            .len()
+            .checked_add(usize::from(!map.contains_key(&row)))
+            .ok_or_else(source_size_overflow),
+        Some((row, None)) => map
+            .len()
+            .checked_sub(usize::from(map.contains_key(&row)))
+            .ok_or_else(source_size_overflow),
+    }
+}
+fn source_sidecar_price<V: Copy>(
+    maps: &std::collections::HashMap<String, std::collections::HashMap<contextdb_core::RowId, V>>,
+    change: Option<(&str, contextdb_core::RowId, Option<V>)>,
+) -> contextdb_core::Result<usize> {
+    let mut count = 0usize;
+    let mut bytes = 0usize;
+    for (table, map) in maps {
+        let selected = change
+            .filter(|(name, _, _)| *name == table.as_str())
+            .map(|(_, row, value)| (row, value));
+        let len = source_sidecar_count(map, selected)?;
+        if len != 0 || selected.is_none() {
+            count = source_add(count, 1)?;
+            bytes = source_add(
+                source_add(bytes, table.len())?,
+                source_native_map_bytes::<contextdb_core::RowId, V>(len)?,
+            )?;
+        }
+    }
+    if let Some((table, _, Some(_))) = change {
+        if !maps.contains_key(table) {
+            count = source_add(count, 1)?;
+            bytes = source_add(
+                source_add(bytes, table.len())?,
+                source_native_map_bytes::<contextdb_core::RowId, V>(1)?,
+            )?;
+        }
+    }
+    source_add(
+        bytes,
+        source_native_map_bytes::<String, std::collections::HashMap<contextdb_core::RowId, V>>(
+            count,
+        )?,
+    )
+}
+fn source_sidecar_copy<V: Copy>(
+    maps: &std::collections::HashMap<String, std::collections::HashMap<contextdb_core::RowId, V>>,
+    change: Option<(&str, contextdb_core::RowId, Option<V>)>,
+) -> std::collections::HashMap<String, std::collections::HashMap<contextdb_core::RowId, V>> {
+    let count = maps
+        .iter()
+        .filter(|(table, map)| {
+            change.is_none_or(|(name, _, _)| name != table.as_str())
+                || source_sidecar_count(
+                    map,
+                    change
+                        .filter(|(name, _, _)| *name == table.as_str())
+                        .map(|(_, row, value)| (row, value)),
+                )
+                .expect("priced sidecar count")
+                    != 0
+        })
+        .count()
+        .checked_add(usize::from(change.is_some_and(|(table, _, value)| {
+            value.is_some() && !maps.contains_key(table)
+        })))
+        .expect("priced sidecar table count");
+    let mut copied = std::collections::HashMap::with_capacity(count);
+    for (table, map) in maps {
+        let selected = change
+            .filter(|(name, _, _)| *name == table.as_str())
+            .map(|(_, row, value)| (row, value));
+        let len = source_sidecar_count(map, selected).expect("priced sidecar count");
+        if len == 0 && selected.is_some() {
+            continue;
+        }
+        let mut inner = std::collections::HashMap::with_capacity(len);
+        for (row, value) in map {
+            if !selected.is_some_and(|(id, _)| id == *row) {
+                inner.insert(*row, *value);
+            }
+        }
+        if let Some((row, Some(value))) = selected {
+            inner.insert(row, value);
+        }
+        copied.insert(table.as_str().to_owned(), inner);
+    }
+    if let Some((table, row, Some(value))) = change {
+        if !maps.contains_key(table) {
+            let mut inner = std::collections::HashMap::with_capacity(1);
+            inner.insert(row, value);
+            copied.insert(table.to_owned(), inner);
+        }
+    }
+    copied
+}
+fn source_copy_sidecars(
+    maps: contextdb_tx::staged_source::SidecarsBorrow<'_>,
+    change: Option<(
+        &str,
+        contextdb_core::RowId,
+        Option<(contextdb_core::Lsn, u8)>,
+        Option<usize>,
+    )>,
+    funder: contextdb_tx::SourceFunder,
+) -> contextdb_core::Result<contextdb_tx::staged_source::AdmittedSidecars> {
+    let lsns = change.map(|(table, row, source, _)| (table, row, source.map(|v| v.0)));
+    let kinds = change.map(|(table, row, source, _)| (table, row, source.map(|v| v.1)));
+    let admitted = change.map(|(table, row, _, admitted)| (table, row, admitted));
+    let bytes = source_add(
+        source_add(
+            source_sidecar_price(maps.lsns, lsns)?,
+            source_sidecar_price(maps.kinds, kinds)?,
+        )?,
+        source_sidecar_price(maps.admitted, admitted)?,
+    )?;
+    let credit = contextdb_tx::SourceCharge::admit_funded(funder, bytes)?;
+    let lsns = source_sidecar_copy(maps.lsns, lsns);
+    let kinds = source_sidecar_copy(maps.kinds, kinds);
+    let admitted = source_sidecar_copy(maps.admitted, admitted);
+    if let Err(error) = source_check_sidecars(&lsns)
+        .and_then(|()| source_check_sidecars(&kinds))
+        .and_then(|()| source_check_sidecars(&admitted))
+    {
+        drop(lsns);
+        drop(kinds);
+        drop(admitted);
+        return Err(error);
+    }
+    Ok(contextdb_tx::staged_source::AdmittedSidecars::from_parts(
+        lsns, kinds, admitted, credit,
+    ))
+}
+
+fn source_native_capacity_error() -> contextdb_core::Error {
+    contextdb_core::Error::Other("source native capacity mismatch".into())
+}
+fn source_check_aux_string(text: &String) -> contextdb_core::Result<()> {
+    if text.capacity() == text.len() {
+        Ok(())
+    } else {
+        Err(source_native_capacity_error())
+    }
+}
+fn source_check_aux_map<K, V>(map: &std::collections::HashMap<K, V>) -> contextdb_core::Result<()> {
+    let members = map.len();
+    let expected = if members == 0 {
+        0
+    } else if members < 4 {
+        3
+    } else if members < 8 {
+        7
+    } else if members < 15 {
+        14
+    } else {
+        members
+            .checked_mul(8)
+            .ok_or_else(source_size_overflow)?
+            .checked_div(7)
+            .unwrap()
+            .checked_next_power_of_two()
+            .ok_or_else(source_size_overflow)?
+            / 8
+            * 7
+    };
+    if map.capacity() == expected {
+        Ok(())
+    } else {
+        Err(source_native_capacity_error())
+    }
+}
+fn source_check_sidecars<V>(
+    maps: &std::collections::HashMap<String, std::collections::HashMap<contextdb_core::RowId, V>>,
+) -> contextdb_core::Result<()> {
+    source_check_aux_map(maps)?;
+    for (name, map) in maps {
+        source_check_aux_string(name)?;
+        source_check_aux_map(map)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn general_checkpoint_native_rows() {
+    general_checkpoint_native_fixture::run();
+}
+
+#[cfg(test)]
+mod general_checkpoint_native_fixture {
+    use super::*;
+    use crate::persistence::content_identity::proof_allocation_oracle_tests as oracle;
+    use contextdb_core::{AdjEntry, DirectedValue, Error, Lsn, NodeId, Result, RowId,
+        TableMeta, TotalOrdAsc, TxId, Value, VectorEntry, VectorIndexRef, VersionedRow};
+    use contextdb_tx::{EngineCapturedWriteSet, EngineFlags, WriteSet, WriteSetApplicator};
+    use contextdb_tx::manager::{EngineGuard, EngineRead, EngineTransactions};
+    use contextdb_tx::staged_source::{AuxBodies, CanonicalStatementRows, SourceFunder};
+    use std::collections::{BTreeSet, HashMap};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    // Real transaction manager, source trees and providers. The applicator is
+    // never invoked: these are staging/rollback proofs, not Database activation.
+    struct StagingOnly;
+    impl WriteSetApplicator for StagingOnly {
+        fn apply(&self, _: &WriteSet, _: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>) -> Result<()> {
+            panic!("checkpoint proof must not publish to a durable store")
+        }
+        fn new_row_id(&self) -> RowId { RowId(91) }
+    }
+    type Transactions = EngineTransactions<StagingOnly>;
+
+    #[derive(Debug, PartialEq)]
+    struct Image {
+        base: Option<(contextdb_core::SnapshotId, Lsn, usize)>,
+        rows: Vec<(String, VersionedRow)>,
+        relational_deletes: Vec<(String, RowId, TxId)>,
+        predicates: Vec<contextdb_tx::write_set::RelationalDeletePredicate>,
+        adj_inserts: Vec<AdjEntry>,
+        adj_deletes: Vec<(NodeId, String, NodeId, TxId)>,
+        vectors: Vec<VectorEntry>,
+        vector_deletes: Vec<(VectorIndexRef, RowId, TxId)>,
+        vector_moves: Vec<(VectorIndexRef, RowId, RowId, TxId)>,
+        lsns: HashMap<String, HashMap<RowId, Lsn>>,
+        kinds: HashMap<String, HashMap<RowId, u8>>,
+        admitted: HashMap<String, HashMap<RowId, usize>>,
+        provenance: Vec<(String, RowId, Lsn, u8)>,
+        config_writes: Vec<(String, Vec<u8>)>,
+        config_deletes: Vec<String>,
+        config_max: Vec<String>,
+        flags: (Option<Lsn>, Option<TxId>, bool, Option<TxId>, bool),
+        capacities: [usize; 12],
+        sidecar_capacities: [(usize, usize); 3],
+    }
+    fn image(r: EngineRead<'_>) -> Image {
+        Image {
+            base: r.base_read.as_ref().map(|b| (b.snapshot, b.lsn,
+                b.handle.as_ref().map_or(0, |h| Arc::as_ptr(h) as *const () as usize))),
+            rows: r.relational_inserts.clone(), relational_deletes: r.relational_deletes.clone(),
+            predicates: r.relational_delete_predicates.clone(), adj_inserts: r.adj_inserts.clone(),
+            adj_deletes: r.adj_deletes.clone(), vectors: r.vector_inserts.clone(),
+            vector_deletes: r.vector_deletes.clone(), vector_moves: r.vector_moves.clone(),
+            lsns: r.relational_insert_source_lsns.clone(), kinds: r.relational_insert_source_kinds.clone(),
+            admitted: r.relational_insert_admitted_bytes.clone(), provenance: r.sync_source_provenance_marks.clone(),
+            config_writes: r.config_writes.clone(), config_deletes: r.config_deletes.clone(),
+            config_max: r.config_max_u64_keys.clone(),
+            flags: (*r.commit_lsn, *r.finalized_tx, *r.requires_commit_lsn, *r.visibility_floor, *r.propagation_in_progress),
+            capacities: [r.relational_inserts.capacity(), r.relational_deletes.capacity(),
+                r.relational_delete_predicates.capacity(), r.adj_inserts.capacity(), r.adj_deletes.capacity(),
+                r.vector_inserts.capacity(), r.vector_deletes.capacity(), r.vector_moves.capacity(),
+                r.sync_source_provenance_marks.capacity(), r.config_writes.capacity(),
+                r.config_deletes.capacity(), r.config_max_u64_keys.capacity()],
+            sidecar_capacities: [
+                (r.relational_insert_source_lsns.capacity(), r.relational_insert_source_lsns.values().map(HashMap::capacity).sum()),
+                (r.relational_insert_source_kinds.capacity(), r.relational_insert_source_kinds.values().map(HashMap::capacity).sum()),
+                (r.relational_insert_admitted_bytes.capacity(), r.relational_insert_admitted_bytes.values().map(HashMap::capacity).sum()),
+            ],
+        }
+    }
+    fn snapshot(t: &Transactions, tx: TxId) -> Image { t.with_read(tx, image).unwrap() }
+    fn row(tx: TxId, id: u64, value: u64) -> VersionedRow {
+        VersionedRow { row_id: RowId(id), values: [
+            ("text".into(), Value::Text(format!("body-{value}-{}", "p".repeat(83)))),
+            ("rank".into(), Value::Int64(value as i64)),
+        ].into(), created_tx: tx, deleted_tx: Some(TxId(811)), lsn: Lsn(43),
+            created_at: Some(contextdb_core::Wallclock::now()) }
+    }
+    fn index() -> VectorIndexRef { VectorIndexRef { table: "table".into(), column: "embedding".into() } }
+    fn original_row(writer: &WriterBudget, funder: &SourceFunder, template: &VersionedRow)
+        -> Result<(VersionedRow, contextdb_tx::OriginalRowInvoice)> {
+        let bytes = template.values.iter().try_fold(source_row_map_bytes(template.values.len())?,
+            |bytes, (name, value)| source_add(source_add(bytes, name.len())?, source_value_copy_bytes(value)?))?;
+        let reservation = OwnedMemoryReservation::try_new_arc_for_original(&writer.writer_use,
+            bytes, "relational", "statement_overlay", "checkpoint proof original row")?;
+        let mut original = Arc::into_inner(reservation).expect("one genuine original owner");
+        original.finish_freed_enclosing_control();
+        let invoice = original.into_source_row_invoice_for(funder)?;
+        let mut values = HashMap::with_capacity(template.values.len());
+        for (name, value) in &template.values { values.insert(name.as_str().to_owned(), source_copy_value(value)); }
+        let body = VersionedRow { row_id:template.row_id, values, created_tx:template.created_tx,
+            deleted_tx:template.deleted_tx, lsn:template.lsn, created_at:template.created_at };
+        source_check_row_capacity(&body)?;
+        Ok((body, invoice))
+    }
+    fn original_vector(writer: &WriterBudget, funder: &SourceFunder, template: &VectorEntry)
+        -> Result<(VectorEntry, contextdb_tx::OriginalVectorInvoice)> {
+        let bytes = source_add(source_add(template.index.table.len(), template.index.column.len())?,
+            source_array::<f32>(template.vector.len())?)?;
+        let reservation = OwnedMemoryReservation::try_new_arc_for_original(&writer.writer_use,
+            bytes, "vector", "statement_overlay", "checkpoint proof original vector")?;
+        let mut original = Arc::into_inner(reservation).expect("one genuine original owner");
+        original.finish_freed_enclosing_control();
+        let invoice = original.into_source_vector_invoice_for(funder)?;
+        let body = source_copy_vector(template); source_check_vector_capacity(&body)?;
+        Ok((body, invoice))
+    }
+    fn duplicate_checkpoint_id(id: &contextdb_tx::TxCheckpointId) -> contextdb_tx::TxCheckpointId {
+        // SAFETY: this opaque handle has only Copy scalar fields and no Drop.
+        // This private replay constructor is authorized solely for invalid-id
+        // tests; every source handle came from actual checkpoint operations.
+        unsafe { std::ptr::read(id) }
+    }
+    fn meta() -> TableMeta {
+        TableMeta { indexes: vec![contextdb_core::IndexDecl {
+            name:"by_rank".into(), columns:vec![("rank".into(), contextdb_core::SortDirection::Asc)],
+            kind:contextdb_core::IndexKind::UserDeclared,
+        }], ..TableMeta::default() }
+    }
+    fn stage(g: &mut EngineGuard<'_>, f: &SourceFunder, writer: &WriterBudget, tx: TxId, id: u64, value: u64) -> Result<()> {
+        let (body, invoice) = original_row(writer, f, &row(tx, id, value))?;
+        let schema = g.prepare_schema("table", &meta())?;
+        let keys = [("by_rank".into(), vec![DirectedValue::Asc(TotalOrdAsc(Value::Int64(value as i64)))])];
+        let p = g.prepare_eager_row("table", body, &keys, schema, invoice)?;
+        g.publish(p);
+        let p = g.prepare_sidecars("table", RowId(id), Some((Lsn(value + 10), 3)), Some(value as usize + 19))?;
+        g.publish_tx(p);
+        Ok(())
+    }
+    fn populate_aux(g: &mut EngineGuard<'_>, tx: TxId, value: u64, replace: bool, count: usize) -> Result<()> {
+        let a = NodeId::from_u128(11); let b = NodeId::from_u128(13);
+        let batches = vec![
+            AuxBodies::RelationalDeletes(vec![(format!("delete-{value}"), RowId(value), tx); count]),
+            AuxBodies::Predicates(vec![contextdb_tx::write_set::RelationalDeletePredicate {
+                table: format!("predicate-{value}"), predicates: vec![("text".into(), Value::Text(format!("predicate-body-{value}")))] }; count]),
+            AuxBodies::AdjInserts(vec![AdjEntry { source:a, target:b, edge_type:format!("edge-{value}"),
+                properties:[("property".into(), Value::Text(format!("edge-body-{value}")))].into(),
+                created_tx:tx, deleted_tx:Some(TxId(812)), lsn:Lsn(value) }; count]),
+            AuxBodies::AdjDeletes(vec![(a, format!("removed-edge-{value}"), b, tx); count]),
+            AuxBodies::VectorDeletes(vec![(index(), RowId(value), tx); count]),
+            AuxBodies::VectorMoves(vec![(index(), RowId(value), RowId(value+1), tx); count]),
+            AuxBodies::Provenance(vec![(format!("provenance-{value}"), RowId(value), Lsn(value), 5); count]),
+            AuxBodies::ConfigWrites(vec![(format!("config-{value}"), vec![value as u8; 73]); count]),
+            AuxBodies::ConfigDeletes(vec![format!("config-delete-{value}"); count]),
+            AuxBodies::ConfigMaxU64Keys(vec![format!("frontier-{value}"); count]),
+        ];
+        for batch in batches {
+            let copied = g.copy_aux(batch.borrow())?;
+            let p = g.prepare_aux_splice(0, if replace { &[0] } else { &[] }, copied)?;
+            g.publish_tx(p);
+        }
+        Ok(())
+    }
+    fn populate(g: &mut EngineGuard<'_>, f: &SourceFunder, writer: &WriterBudget, tx: TxId, value: u64) -> Result<()> {
+        stage(g, f, writer, tx, 1, value)?; stage(g, f, writer, tx, 2, value+1)?; stage(g, f, writer, tx, 3, value+2)?;
+        let v = VectorEntry { index:index(), row_id:RowId(1), vector:vec![value as f32; 17],
+            created_tx:tx, deleted_tx:Some(TxId(813)), lsn:Lsn(value) };
+        let (v, invoice) = original_vector(writer, f, &v)?;
+        let p = g.prepare_eager_vector(v, None, invoice)?; g.publish(p);
+        populate_aux(g, tx, value, false, 1)?;
+        let p = g.prepare_flags(EngineFlags { commit_lsn:Some(Lsn(value)), finalized_tx:Some(TxId(value+50)),
+            requires_commit_lsn:true, visibility_floor:Some(TxId(value+70)), propagation_in_progress:true })?;
+        g.publish_tx(p);
+        Ok(())
+    }
+    fn mutate(g: &mut EngineGuard<'_>, f: &SourceFunder, writer: &WriterBudget, tx: TxId) -> Result<()> {
+        // Same-length displaced bodies in ten auxiliary lanes, then growth.
+        populate_aux(g, tx, 211, true, 1)?;
+        populate_aux(g, tx, 311, false, 4)?;
+        let p = g.prepare_remove("table", RowId(2))?; g.publish(p);
+        let selected = [("table".into(), RowId(1)), ("table".into(), RowId(3))].into();
+        let p = g.prepare_remove_rows(&selected)?; g.publish(p);
+        for id in 4..=8 { stage(g, f, writer, tx, id, 411+id)?; }
+        let p = g.prepare_remove_vector(&index(), RowId(1))?; g.publish(p);
+        for id in 4..=5 {
+            let template = VectorEntry { index:index(), row_id:RowId(id), vector:vec![id as f32; 19],
+                created_tx:tx, deleted_tx:Some(TxId(814)), lsn:Lsn(419) };
+            let (body, invoice) = original_vector(writer, f, &template)?;
+            let p = g.prepare_eager_vector(body, None, invoice)?; g.publish(p);
+        }
+        let p = g.prepare_flags(EngineFlags { commit_lsn:Some(Lsn(511)), finalized_tx:Some(TxId(512)),
+            requires_commit_lsn:false, visibility_floor:Some(TxId(513)), propagation_in_progress:false })?;
+        g.publish_tx(p);
+        let p = g.prepare_identity(tx, TxId(611), Lsn(612))?; g.publish_identity(p);
+        let p = g.prepare_canonicalize()?; g.publish(p);
+        Ok(())
+    }
+    fn no_admission<T>(o: &AccountantHandle, c: &AccountantHandle, operation: impl FnOnce() -> T) -> T {
+        let before = (o.admitted_bytes_for_test(), c.admitted_bytes_for_test(),
+            o.retained_charge_bytes_for_test(), c.retained_charge_bytes_for_test());
+        // Fixed allocator storage counts every request even if more than 32;
+        // assertions and snapshot creation are outside the observed interval.
+        let (result, _, allocations) = oracle::native_requests_for_test(operation);
+        assert_eq!(allocations, 0, "inverse rollback/abort must request no allocation");
+        assert_eq!((o.admitted_bytes_for_test(), c.admitted_bytes_for_test(),
+            o.retained_charge_bytes_for_test(), c.retained_charge_bytes_for_test()), before,
+            "inverse rollback/abort must neither admit nor unconditionally retain");
+        result
+    }
+    fn assert_canonical(source: &CanonicalStatementRows, tx: TxId, value: u64) {
+        assert_eq!(source.len(), 3);
+        assert!(source.has_index_for("by_rank", &meta()));
+        let mut changed_schema = meta(); changed_schema.indexes[0].columns[0].1 = contextdb_core::SortDirection::Desc;
+        assert!(!source.has_index_for("by_rank", &changed_schema));
+        let mut after_key = None;
+        for id in 1..=3 {
+            after_key = source.with_next_ordered("by_rank", false, after_key.as_ref(),
+                &std::ops::Bound::Unbounded, &std::ops::Bound::Unbounded, 0, |next| {
+                    let (key, found) = next.unwrap(); assert_eq!(found, RowId(id));
+                    assert_eq!(key.0, vec![DirectedValue::Asc(TotalOrdAsc(Value::Int64((value+id-1) as i64)))]);
+                    Ok(Some(key.clone()))
+                }).unwrap();
+        }
+        let mut after = None;
+        for (sequence, id) in [(0,1), (1,2), (2,3)] {
+            assert_eq!(source.next_unordered(after), Some((sequence, RowId(id))));
+            source.with_row(RowId(id), |r| { let r = r.unwrap();
+                assert_eq!(r.created_tx, tx); assert_eq!(r.lsn, Lsn(43));
+                assert_eq!(r.values["rank"], Value::Int64((value+id-1) as i64));
+                assert_eq!(r.deleted_tx, Some(TxId(811))); Ok(()) }).unwrap();
+            after = Some(sequence);
+        }
+        assert_eq!(source.next_unordered(after), None);
+    }
+    fn assert_eager(capture: &EngineCapturedWriteSet, expected: &Image) {
+        capture.with_legacy(|ws| {
+            let rows = ws.ordered_staged_rows.statement_rows("table").unwrap();
+            assert_eq!(rows.len(), expected.rows.len());
+            let mut after = None;
+            for (_, row) in &expected.rows {
+                assert_eq!(rows.row(row.row_id), Some(row));
+                let (key, ordered) = rows.next_ordered("by_rank", false, after.as_ref()).unwrap();
+                assert_eq!(ordered, row); after = Some(key.clone());
+            }
+            assert!(rows.next_ordered("by_rank", false, after.as_ref()).is_none());
+            let v = ws.ordered_staged_rows.vector_capability(&index(), RowId(1)).unwrap();
+            assert_eq!(v.vector(), expected.vectors[0].vector.as_slice());
+        });
+    }
+    fn typed_refusal(error: Error) {
+        match error { Error::MemoryBudgetExceeded { requested_bytes, available_bytes, .. } => {
+            assert!(requested_bytes > available_bytes);
+        }, other => panic!("expected actual typed original/caller refusal, got {other:?}") }
+    }
+    fn removal_admission_cuts(t: &Transactions, tx: TxId, owner: &AccountantHandle,
+        expected: &Image, retained: &CanonicalStatementRows, eager: &EngineCapturedWriteSet) {
+        for bulk in [false, true] {
+            let prepare = |g: &mut EngineGuard<'_>| {
+                if bulk { g.prepare_remove_rows(&[("table".into(), RowId(1)), ("table".into(), RowId(3))].into()) }
+                else { g.prepare_remove("table", RowId(2)) }
+            };
+            let base = owner.usage().used;
+            watch_budget_ledger_for_test();
+            let prepared = t.with_engine(tx, prepare).unwrap();
+            let ledger = take_budget_ledger_for_test();
+            drop(prepared); assert_eq!(owner.usage().used, base);
+            let first_c = ledger.iter().position(|entry| entry.what == "relational/staged_source")
+                .expect("real caller source admission after original grants");
+            let original = &ledger[..first_c];
+            assert!(!original.is_empty());
+            assert!(original.iter().filter(|entry| entry.what != "release").all(|entry|
+                entry.what == "vector_maintenance/reservation_control" || entry.what == "relational/statement_overlay"));
+            let original_credit = original.iter().filter(|entry| entry.what != "release").map(|entry| entry.bytes).sum::<usize>();
+            assert!(original_credit > 0);
+            // Limit at the observed O boundary, never at a fabricated balance:
+            // every actual original reservation fits, first actual C refuses.
+            owner.set_budget(Some(base + original_credit)).unwrap();
+            watch_budget_ledger_for_test();
+            let outcome = t.with_engine(tx, prepare);
+            let cut = take_budget_ledger_for_test();
+            owner.set_budget(None).unwrap();
+            typed_refusal(outcome.err().expect("caller refusal after genuine original grant"));
+            let admitted: Vec<_> = cut.iter().filter(|entry| entry.what != "release").collect();
+            assert_eq!(admitted.iter().map(|entry| entry.bytes).sum::<usize>(), original_credit);
+            assert!(admitted.iter().all(|entry| entry.what != "relational/staged_source"));
+            assert_eq!(owner.usage().used, base);
+            assert_eq!(snapshot(t, tx), *expected); assert_canonical(retained, tx, 101); assert_eager(eager, expected);
+            // Original refuses with no caller source admission at all.
+            owner.set_budget(Some(base)).unwrap(); watch_budget_ledger_for_test();
+            let outcome = t.with_engine(tx, prepare); let cut = take_budget_ledger_for_test();
+            owner.set_budget(None).unwrap(); typed_refusal(outcome.err().expect("original refuses first"));
+            assert!(cut.iter().all(|entry| entry.what == "release"));
+            assert_eq!(owner.usage().used, base); assert_eq!(snapshot(t, tx), *expected);
+        }
+    }
+    fn run_frames(owner: &AccountantHandle, writer: &WriterBudget, funder: &SourceFunder,
+        caller_owner: &AccountantHandle, caller_funder: &SourceFunder) {
+        let t = Arc::new(Transactions::new_funded(StagingOnly, funder.clone()));
+        let tx = t.try_begin().unwrap();
+        t.with_engine(tx, |g| populate(g, funder, writer, tx, 101)).unwrap();
+        let expected = snapshot(&t, tx);
+        assert!(expected.base.is_some());
+        assert!(expected.capacities.iter().all(|capacity| *capacity > 0));
+        assert!(expected.sidecar_capacities.iter().all(|(outer, inner)| *outer > 0 && *inner > 0));
+        let reader = Arc::new(MemoryAccountant::no_limit());
+        let retained = t.capture(tx, "table", reader.clone()).unwrap();
+        let eager = t.with_engine(tx, |g| g.capture_private()).unwrap();
+        assert_canonical(&retained, tx, 101); assert_eager(&eager, &expected);
+        removal_admission_cuts(&t, tx, owner, &expected, &retained, &eager);
+
+        // The retained rows were funded by O. Reborrow the same live guard with
+        // a separately registered native C only through the test-seam bridge.
+        // The bridge itself proves O's reserve-copy runs before C's refusal,
+        // restoration preserves this exact body, single/bulk publication, and
+        // the isolated checkpoint-generation refusal path.
+        t.with_engine(tx, |g| {
+            g.__test_distinct_native_checkpoint_rows(
+                caller_funder,
+                "table",
+                [RowId(1), RowId(3)],
+                &|| owner.usage().used,
+                &|| caller_owner.usage().used,
+                &|| owner.admitted_bytes_for_test(),
+                &|| caller_owner.admitted_bytes_for_test(),
+                &|limit| owner.set_budget(limit).unwrap(),
+                &|limit| caller_owner.set_budget(limit).unwrap(),
+            )
+        }).unwrap();
+        assert_eq!(snapshot(&t, tx), expected);
+        assert_canonical(&retained, tx, 101); assert_eager(&eager, &expected);
+
+        // Both inner scopes settle; the outer scope must still own all inverses.
+        let outer = t.checkpoint(tx).unwrap();
+        t.with_engine(tx, |g| g.with_tx_checkpoint(|g| {
+            mutate(g, funder, writer, tx)?;
+            g.with_tx_checkpoint(|g| {
+                let p = g.prepare_general_adoption(|candidate| populate(candidate, funder, writer, tx, 701))?;
+                g.publish_general_adoption(p); Ok(())
+            })
+        })).unwrap();
+        assert_ne!(snapshot(&t, tx), expected);
+        assert_canonical(&retained, tx, 101); assert_eager(&eager, &expected);
+        no_admission(owner, owner, || outer.restore());
+        assert_eq!(snapshot(&t, tx), expected);
+        let current_eager = t.with_engine(tx, |g| g.capture_private()).unwrap();
+        assert_eager(&current_eager, &expected); drop(current_eager);
+        let current = t.capture(tx, "table", reader.clone()).unwrap();
+        assert_canonical(&current, tx, 101); drop(current);
+
+        // Err and panic restore after every mutation has completed. Allocation
+        // assertions observe only restore/abort, never the user's panic machinery.
+        let outer = t.checkpoint(tx).unwrap();
+        let inner = t.checkpoint(tx).unwrap();
+        t.with_engine(tx, |g| mutate(g, funder, writer, tx)).unwrap();
+        no_admission(owner, owner, || drop(inner));
+        assert_eq!(snapshot(&t, tx), expected);
+        no_admission(owner, owner, || outer.settle());
+        let refusal = Error::Other("inner refusal".into());
+        let admissions = owner.admitted_bytes_for_test();
+        let admission_at_abort = std::cell::Cell::new(admissions);
+        let outcome: Result<()> = t.with_engine(tx, |g| g.with_tx_checkpoint(|g| {
+            mutate(g, funder, writer, tx)?;
+            admission_at_abort.set(owner.admitted_bytes_for_test());
+            oracle::arm_inverse_window(); Err(refusal)
+        }));
+        let allocations = oracle::disarm_inverse_window();
+        assert!(outcome.is_err()); assert_eq!(allocations, 0);
+        assert_eq!(owner.admitted_bytes_for_test(), admission_at_abort.get());
+        assert_eq!(snapshot(&t, tx), expected);
+        let panic_payload: Box<dyn std::any::Any + Send> = Box::new("inner callback unwind");
+        assert!(catch_unwind(AssertUnwindSafe(|| {
+            t.with_engine(tx, |g| g.with_tx_checkpoint::<()>(|g| {
+                mutate(g, funder, writer, tx)?;
+                admission_at_abort.set(owner.admitted_bytes_for_test());
+                oracle::arm_inverse_window(); std::panic::resume_unwind(panic_payload)
+            })).unwrap();
+        })).is_err());
+        let allocations = oracle::disarm_inverse_window();
+        assert_eq!(allocations, 0);
+        assert_eq!(owner.admitted_bytes_for_test(), admission_at_abort.get());
+        assert_eq!(snapshot(&t, tx), expected);
+
+        // Retired nonce and non-LIFO attempts use real handles first, then the
+        // authorized private replay constructor, never invented field layouts.
+        t.with_engine(tx, |g| {
+            let prepared = g.prepare_checkpoint()?; let outer = g.begin_checkpoint(prepared);
+            let stale_outer = duplicate_checkpoint_id(&outer);
+            let prepared = g.prepare_checkpoint()?; let inner = g.begin_checkpoint(prepared);
+            assert!(catch_unwind(AssertUnwindSafe(|| g.restore_checkpoint(stale_outer))).is_err());
+            let retired_inner = duplicate_checkpoint_id(&inner);
+            g.settle_checkpoint(inner);
+            let prepared = g.prepare_checkpoint()?; let new_inner = g.begin_checkpoint(prepared);
+            assert!(catch_unwind(AssertUnwindSafe(|| g.restore_checkpoint(retired_inner))).is_err());
+            no_admission(owner, owner, || g.restore_checkpoint(new_inner));
+            no_admission(owner, owner, || g.restore_checkpoint(outer)); Ok(())
+        }).unwrap();
+        assert_eq!(snapshot(&t, tx), expected);
+
+        // Prepared token stale in the same guard after a real rollback, avoiding
+        // an accidental proof only of preparation-scope mismatch.
+        t.with_engine(tx, |g| {
+            let p = g.prepare_flags(EngineFlags { commit_lsn:None, finalized_tx:None,
+                requires_commit_lsn:false, visibility_floor:None, propagation_in_progress:false })?;
+            let checkpoint = g.prepare_checkpoint()?; let id = g.begin_checkpoint(checkpoint);
+            no_admission(owner, owner, || g.restore_checkpoint(id));
+            assert!(catch_unwind(AssertUnwindSafe(|| g.publish_tx(p))).is_err()); Ok(())
+        }).unwrap();
+        assert_eq!(snapshot(&t, tx), expected);
+
+        // Refused checkpoint, adoption, single and real lower bulk preparation
+        // preserve all installed ordinary values/capacities and retained views.
+        for operation in 0..4 {
+            let held = owner.usage().used;
+            owner.set_budget(Some(held)).unwrap();
+            let outcome = t.with_engine(tx, |g| match operation {
+                0 => g.prepare_checkpoint().map(drop),
+                1 => g.prepare_general_adoption(|candidate| populate(candidate, funder, writer, tx, 901)).map(drop),
+                2 => g.prepare_remove("table", RowId(2)).map(drop),
+                _ => g.prepare_remove_rows(&[("table".into(), RowId(1)), ("table".into(), RowId(3))].into()).map(drop),
+            });
+            owner.set_budget(None).unwrap();
+            typed_refusal(outcome.unwrap_err());
+            assert_eq!(owner.usage().used, held);
+            assert_eq!(snapshot(&t, tx), expected);
+            assert_canonical(&retained, tx, 101); assert_eager(&eager, &expected);
+        }
+
+        // Publication coherence at each actual single/bulk removal boundary.
+        let frame = t.checkpoint(tx).unwrap();
+        t.with_engine(tx, |g| { let p = g.prepare_remove("table", RowId(2))?; g.publish(p); Ok(()) }).unwrap();
+        let single = snapshot(&t, tx);
+        assert_eq!(single.rows.iter().map(|(_, r)| r.row_id).collect::<Vec<_>>(), vec![RowId(1), RowId(3)]);
+        let single_source = t.capture(tx, "table", reader.clone()).unwrap();
+        assert_eq!(single_source.len(), 2); assert!(!single_source.contains(&RowId(2)));
+        for maps_row in [single.lsns["table"].contains_key(&RowId(2)), single.kinds["table"].contains_key(&RowId(2)),
+            single.admitted["table"].contains_key(&RowId(2))] { assert!(!maps_row); }
+        t.with_engine(tx, |g| {
+            let selected: BTreeSet<_> = [("table".into(), RowId(1)), ("table".into(), RowId(3))].into();
+            let p = g.prepare_remove_rows(&selected)?; g.publish(p); Ok(())
+        }).unwrap();
+        let bulk = snapshot(&t, tx); assert!(bulk.rows.is_empty());
+        assert!(bulk.lsns.is_empty() && bulk.kinds.is_empty() && bulk.admitted.is_empty());
+        let bulk_source = t.capture(tx, "table", reader.clone()).unwrap(); assert!(bulk_source.is_empty());
+        let bulk_eager = t.with_engine(tx, |g| g.capture_private()).unwrap();
+        bulk_eager.with_legacy(|ws| assert!(ws.ordered_staged_rows.statement_rows("table").is_none_or(|rows| rows.is_empty())));
+        assert_eq!(single_source.len(), 2); assert_canonical(&retained, tx, 101);
+        no_admission(owner, owner, || frame.restore()); assert_eq!(snapshot(&t, tx), expected);
+        drop(bulk_eager); drop(bulk_source); drop(single_source);
+
+        // Real cross-transaction handles must refuse before touching either host.
+        let other = t.try_begin().unwrap();
+        let id = t.with_engine(tx, |g| { let p = g.prepare_checkpoint()?; Ok(g.begin_checkpoint(p)) }).unwrap();
+        let valid_id = duplicate_checkpoint_id(&id);
+        let other_frame = t.checkpoint(other).unwrap();
+        let other_image = snapshot(&t, other);
+        assert!(catch_unwind(AssertUnwindSafe(|| {
+            t.with_engine(other, |g| { g.restore_checkpoint(id); Ok(()) }).unwrap();
+        })).is_err());
+        assert_eq!(snapshot(&t, tx), expected); assert_eq!(snapshot(&t, other), other_image);
+        other_frame.restore();
+        t.with_engine(tx, |g| { no_admission(owner, owner, || g.restore_checkpoint(valid_id)); Ok(()) }).unwrap();
+        assert_eq!(snapshot(&t, tx), expected);
+        drop(t.rollback_owned(tx).unwrap());
+        drop(t.rollback_owned(other).unwrap());
+        drop(eager); drop(retained); drop(t); assert_eq!(reader.usage().used, 0);
+    }
+    fn physical_originals(owner: &AccountantHandle, writer: &WriterBudget, funder: &SourceFunder) {
+        let counter = owner.used.as_ptr() as usize;
+        let template = row(TxId(17), 19, 23);
+        let before = owner.usage().used;
+        let (body, requests, count) = oracle::source_requests_for_test(counter, || funder.copy_row(&template).unwrap());
+        assert!(count > 1 && count <= 32);
+        let held = owner.usage().used;
+        assert_eq!(held-before, requests[..count].iter().map(|r| r.1).sum::<usize>());
+        assert!(oracle::source_request_credit_for_test()[..count].iter().all(|credit| *credit == held));
+        oracle::watch_source_free_for_test(&requests[..count], counter);
+        drop(body);
+        let frees = oracle::source_free_for_test(count);
+        // Disarm live raw addresses before any assertion or accountant cleanup.
+        oracle::disarm_source_free_watch();
+        assert!(frees[..count].iter().all(|free| *free == (held, held, 1)));
+        assert_eq!(owner.usage().used, before);
+
+        let payload: Box<dyn std::any::Any + Send> = Box::new("positive native cleanup unwind");
+        let before = owner.usage().used;
+        let (body, requests, count) = oracle::source_requests_for_test(counter, || funder.copy_row(&template).unwrap());
+        assert!(count > 1 && count <= 32); let held = owner.usage().used;
+        oracle::watch_source_free_for_test(&requests[..count], counter);
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            let _original_body = body; std::panic::resume_unwind(payload)
+        }));
+        let frees = oracle::source_free_for_test(count); oracle::disarm_source_free_watch();
+        assert!(outcome.is_err()); assert!(frees[..count].iter().all(|free| *free == (held, held, 1)));
+        assert_eq!(owner.usage().used, before);
+        macro_rules! physical_copy {
+            ($operation:expr) => {{
+                let before = owner.usage().used;
+                let (copy, requests, count) = oracle::source_requests_for_test(counter, || $operation.unwrap());
+                assert!(count > 1 && count <= 32); let held = owner.usage().used;
+                assert_eq!(held-before, requests[..count].iter().map(|r| r.1).sum::<usize>());
+                assert!(oracle::source_request_credit_for_test()[..count].iter().all(|credit| *credit == held));
+                oracle::watch_source_free_for_test(&requests[..count], counter);
+                drop(copy); let frees = oracle::source_free_for_test(count); oracle::disarm_source_free_watch();
+                assert!(frees[..count].iter().all(|free| *free == (held, held, 1)));
+                assert_eq!(owner.usage().used, before);
+            }};
+        }
+        let key = vec![DirectedValue::Asc(TotalOrdAsc(Value::Text("positive-key".repeat(7))))];
+        physical_copy!(funder.copy_key(&key));
+        let vector = VectorEntry { index:index(), row_id:RowId(19), vector:vec![0.5; 17],
+            created_tx:TxId(17), deleted_tx:None, lsn:Lsn(23) };
+        physical_copy!(funder.copy_vector(&vector));
+
+        let reservation = OwnedMemoryReservation::try_new_arc_for_original(&writer.writer_use,
+            17, "relational", "statement_overlay", "actual original copy proof").unwrap();
+        let mut reservation = Arc::into_inner(reservation).unwrap(); reservation.finish_freed_enclosing_control();
+        let before = owner.usage().used;
+        let (grant, requests, count) = oracle::source_requests_for_test(counter, ||
+            <OwnedMemoryReservation as contextdb_tx::OriginalCopyChargeSource>::reserve_private_original_copy(&reservation, 148).unwrap());
+        assert_eq!(count, 1); assert_eq!(grant.retained_bytes(), 148);
+        let held = owner.usage().used;
+        assert_eq!(held-before, 148 + writer_adapter_type_layout::<OwnedMemoryReservation>().size());
+        oracle::watch_source_free_for_test(&requests[..count], counter);
+        let retained = grant.clone(); drop(grant); assert_eq!(oracle::source_free_for_test(1)[0].2, 0);
+        drop(retained); let frees = oracle::source_free_for_test(count); oracle::disarm_source_free_watch();
+        assert_eq!(frees[0], (held, held, 1)); assert_eq!(owner.usage().used, before);
+        drop(reservation);
+    }
+    pub(super) fn run() {
+        let aggregate = process_aggregate_snapshot().0;
+        let owner = AccountantHandle::engine(None).unwrap();
+        let writer = WriterBudget::from_handle(owner.clone()).unwrap();
+        let caller_owner = AccountantHandle::engine(None).unwrap();
+        let caller_writer = WriterBudget::from_handle(caller_owner.clone()).unwrap();
+        let counter = owner.used.as_ptr() as usize;
+        let (funder, provider_requests, provider_count) = oracle::source_requests_for_test(counter,
+            || writer.prepare_source_funder().unwrap());
+        assert_eq!(provider_count, 1);
+        assert_eq!((provider_requests[0].1, provider_requests[0].2),
+            (writer_adapter_type_layout::<NativeSourceProvider>().size(), writer_adapter_type_layout::<NativeSourceProvider>().align()));
+        let epoch = owner.writer_registration_observation_for_test().2;
+        assert_ne!(epoch, 0);
+        let caller_funder = caller_writer.prepare_source_funder().unwrap();
+        physical_originals(&owner, &writer, &funder);
+        run_frames(&owner, &writer, &funder, &caller_owner, &caller_funder);
+        assert_eq!(owner.writer_registration_observation_for_test().2, epoch);
+        drop(writer);
+        assert_eq!(owner.writer_registration_observation_for_test().2, epoch);
+        let held = owner.usage().used;
+        oracle::watch_source_free_for_test(&provider_requests[..provider_count], counter);
+        drop(funder);
+        let frees = oracle::source_free_for_test(provider_count); oracle::disarm_source_free_watch();
+        assert_eq!(frees[0], (held, held, 1), "actual original provider remains funded through its physical free");
+        assert_eq!(owner.writer_registration_observation_for_test().2, 0);
+        assert_eq!(owner.usage().used, owner.backing_bytes());
+        drop(caller_funder);
+        drop(caller_writer);
+        assert_eq!(caller_owner.writer_registration_observation_for_test().2, 0);
+        assert_eq!(caller_owner.usage().used, caller_owner.backing_bytes());
+        drop(caller_owner);
+        drop(owner); assert_eq!(process_aggregate_snapshot().0, aggregate);
+    }
+}
+
+pub(crate) fn preparation_copy_values(
+    values: &HashMap<String, contextdb_core::Value>,
+) -> contextdb_core::Result<HashMap<String, contextdb_core::Value>> {
+    let mut copied = HashMap::with_capacity(values.len());
+    for (name, value) in values {
+        copied.insert(name.as_str().to_owned(), source_copy_value(value));
+    }
+    let members = copied.len();
+    let expected = if members == 0 {
+        0
+    } else if members < 4 {
+        3
+    } else if members < 8 {
+        7
+    } else if members < 15 {
+        14
+    } else {
+        members
+            .checked_mul(8)
+            .ok_or_else(source_size_overflow)?
+            .checked_div(7)
+            .ok_or_else(source_size_overflow)?
+            .checked_next_power_of_two()
+            .ok_or_else(source_size_overflow)?
+            / 8
+            * 7
+    };
+    if copied.capacity() != expected {
+        return Err(contextdb_core::Error::Other(
+            "source native capacity mismatch".into(),
+        ));
+    }
+    for (name, value) in &copied {
+        if name.capacity() != name.len() {
+            return Err(contextdb_core::Error::Other(
+                "source native capacity mismatch".into(),
+            ));
+        }
+        source_check_value_capacity(value)?;
+    }
+    Ok(copied)
+}
+
+impl OwnedMemoryReservation {
+    fn copy_retained_original_row_for(
+        &self,
+        row: &contextdb_core::VersionedRow,
+        funder: &contextdb_tx::SourceFunder,
+    ) -> contextdb_core::Result<contextdb_tx::staged_source::AdmittedSourceRow> {
+        if self._writer_use.is_none() {
+            return self.copy_retained_original_nonwriter_row_for(row, funder);
+        }
+        let writer = self._writer_use.as_ref().ok_or_else(|| {
+            contextdb_core::Error::Other("native source transfer requires its held writer use".into())
+        })?;
+        let lease = contextdb_tx::SourceLease {
+            identity: writer.stable_identity, epoch: writer.epoch,
+        };
+        if !self.accountant().is_engine()
+            || writer.accountant.as_ptr() != self.accountant().as_ptr()
+            || lease.identity == 0 || lease.epoch == 0
+            || !funder.matches_native_origin(self.accountant().as_ptr() as usize, lease)
+        {
+            return Err(contextdb_core::Error::Other("native source transfer origin mismatch".into()));
+        }
+        let bytes = contextdb_tx::OriginalRowInvoice::original_copy_allocation_bytes(
+            preparation_row_copy_bytes(row)?)?;
+        // The retained O admits both payload and invoice header before copying.
+        // The current producer is only the validated recipient of that debit.
+        let allocation = Self::try_new_arc_for_original(writer, bytes, "relational",
+            "staged_index_posting", "Reduce staged rows or raise MEMORY_LIMIT.")?;
+        let mut original = Arc::into_inner(allocation).expect("private copy grant has one owner");
+        original.finish_freed_enclosing_control();
+        let origin = contextdb_tx::NativeSourceOrigin::new(self.accountant().as_ptr() as usize, lease);
+        // SAFETY: the genuine O kernel holds the full measured allocation; the
+        // invoice's control is included, and success disarms its sole debit.
+        let invoice = unsafe {
+            contextdb_tx::OriginalRowInvoice::from_original_copy_allocation(
+                funder, original.bytes, origin, lease)?
+        };
+        original.bytes = 0;
+        // Refusal/unwind frees an incomplete body inside this kernel before
+        // the invoice on this stack can refund the original allocation.
+        let copied = preparation_copy_row(row)?;
+        Ok(contextdb_tx::staged_source::AdmittedSourceRow::new(copied, invoice))
+    }
+}
+
+impl OwnedMemoryReservation {
+    #[allow(clippy::too_many_arguments)]
+    fn copy_retained_original_vector_parts_for(
+        &self, table: &str, column: &str, vector: &[f32],
+        row_id: contextdb_core::RowId, created_tx: contextdb_core::TxId,
+        deleted_tx: Option<contextdb_core::TxId>, lsn: contextdb_core::Lsn,
+        funder: &contextdb_tx::SourceFunder,
+    ) -> contextdb_core::Result<contextdb_tx::AdmittedSourceVector> {
+        if self._writer_use.is_none() {
+            return self.copy_retained_original_nonwriter_vector_parts_for(
+                table, column, vector, row_id, created_tx, deleted_tx, lsn, funder,
+            );
+        }
+        let writer = self._writer_use.as_ref().ok_or_else(|| {
+            contextdb_core::Error::Other("native source transfer requires its held writer use".into())
+        })?;
+        let lease = contextdb_tx::SourceLease { identity: writer.stable_identity, epoch: writer.epoch };
+        if !self.accountant().is_engine()
+            || writer.accountant.as_ptr() != self.accountant().as_ptr()
+            || lease.identity == 0 || lease.epoch == 0
+            || !funder.matches_native_origin(self.accountant().as_ptr() as usize, lease)
+        { return Err(contextdb_core::Error::Other("native source transfer origin mismatch".into())); }
+        let payload = source_add(source_add(table.len(), column.len())?, source_array::<f32>(vector.len())?)?;
+        let bytes = contextdb_tx::OriginalVectorInvoice::original_copy_allocation_bytes(payload)?;
+        let allocation = Self::try_new_arc_for_original(writer, bytes, "relational",
+            "staged_index_posting", "Reduce staged rows or raise MEMORY_LIMIT.")?;
+        let mut original = Arc::into_inner(allocation).expect("private copy grant has one owner");
+        original.finish_freed_enclosing_control();
+        let origin = contextdb_tx::NativeSourceOrigin::new(self.accountant().as_ptr() as usize, lease);
+        // SAFETY: O holds the complete measured allocation; success transfers
+        // its sole debit into the invoice and the stack reservation is disarmed.
+        let invoice = unsafe { contextdb_tx::OriginalVectorInvoice::from_original_copy_allocation(
+            funder, original.bytes, origin, lease)? };
+        original.bytes = 0;
+        // The partially constructed entry is dropped before the invoice during
+        // refusal or unwind. No unadmitted owned input precedes this reservation.
+        let copied = contextdb_core::VectorEntry {
+            index: contextdb_core::VectorIndexRef { table: table.to_owned(), column: column.to_owned() },
+            row_id, vector: vector.to_vec(), created_tx, deleted_tx, lsn,
+        };
+        if copied.index.table.capacity() != table.len()
+            || copied.index.column.capacity() != column.len()
+            || copied.vector.capacity() != vector.len()
+        {
+            drop(copied);
+            return Err(contextdb_core::Error::Other("source native capacity mismatch".into()));
+        }
+        Ok(contextdb_tx::AdmittedSourceVector::new(copied, invoice))
+    }
+}
+
+// Count borrowed debug projections without building a String. Each field,
+// element and escaped payload contributes to the conservative clone envelope.
+pub(crate) fn preparation_debug_len<T: std::fmt::Debug + ?Sized>(value: &T) -> contextdb_core::Result<usize> {
+    struct Count { bytes: usize }
+    impl std::fmt::Write for Count {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            self.bytes = self.bytes.checked_add(text.len()).ok_or(std::fmt::Error)?;
+            Ok(())
+        }
+    }
+    use std::fmt::Write;
+    let mut count = Count { bytes: 0 };
+    write!(&mut count, "{value:?}").map_err(|_| source_size_overflow())?;
+    Ok(count.bytes)
+}
+
+pub(crate) fn preparation_debug_native_bound<T: std::fmt::Debug + ?Sized>(value: &T) -> contextdb_core::Result<usize> {
+    // One printed element includes at least one byte; the largest constituent
+    // slot accounts for nested AST/metadata containers and allocation overlap.
+    let slot = std::mem::size_of::<contextdb_parser::ast::Expr>()
+        .max(std::mem::size_of::<contextdb_core::TableMeta>())
+        .max(std::mem::size_of::<contextdb_core::Value>());
+    preparation_debug_len(value)?.checked_mul(slot)
+        .and_then(|n| n.checked_mul(2)).ok_or_else(source_size_overflow)
+}
+
+pub(crate) fn preparation_values_copy_bytes(
+    values: &HashMap<String, contextdb_core::Value>,
+) -> contextdb_core::Result<usize> {
+    values.iter().try_fold(source_row_map_bytes(values.len())?, |bytes, (name, value)|
+        source_add(source_add(bytes, name.len())?, source_value_copy_bytes(value)?))
+}
+
+pub(crate) fn preparation_assignment_sizes(
+    expr: &contextdb_parser::ast::Expr,
+    values: &HashMap<String, contextdb_core::Value>,
+    params: &HashMap<String, contextdb_core::Value>,
+) -> contextdb_core::Result<(usize, usize, usize)> {
+    use contextdb_parser::ast::{Expr, Literal};
+    let slot = std::mem::size_of::<Expr>();
+    match expr {
+        Expr::Literal(literal) => {
+            let bytes = match literal {
+                Literal::Text(text) => text.len(),
+                Literal::Vector(vector) => source_array::<f32>(vector.len())?,
+                _ => 0,
+            };
+            Ok((bytes, bytes, bytes))
+        }
+        Expr::Parameter(name) => {
+            let bytes = params.get(name).map_or(Ok(0), source_value_copy_bytes)?;
+            Ok((name.len(), bytes, bytes))
+        }
+        Expr::Column(column) => {
+            let plan = source_add(column.column.len(), column.table.as_ref().map_or(0, String::len))?;
+            let bytes = values.get(&column.column).map_or(Ok(0), source_value_copy_bytes)?;
+            Ok((plan, bytes, bytes))
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            let left = preparation_assignment_sizes(left, values, params)?;
+            let right = preparation_assignment_sizes(right, values, params)?;
+            Ok((source_add(source_add(left.0, right.0)?, source_array::<Expr>(2)?)?,
+                source_add(left.1, right.1)?, 0))
+        }
+        Expr::UnaryOp { operand, .. } => {
+            let child = preparation_assignment_sizes(operand, values, params)?;
+            Ok((source_add(child.0, slot)?, child.1, 0))
+        }
+        Expr::FunctionCall { name, args } => {
+            let mut plan = source_add(name.len(), source_array::<Expr>(args.len())?)?;
+            let capacity = if args.is_empty() { 0 } else {
+                args.len().max(4).checked_next_power_of_two().ok_or_else(source_size_overflow)?
+            };
+            let mut working = source_add(name.len(), source_array::<contextdb_core::Value>(
+                capacity.checked_mul(2).ok_or_else(source_size_overflow)?)?)?;
+            let mut output = 0;
+            for argument in args {
+                let child = preparation_assignment_sizes(argument, values, params)?;
+                plan = source_add(plan, child.0)?;
+                working = source_add(working, child.1)?;
+                output = output.max(child.2);
+            }
+            // COALESCE clones at most one evaluated argument. Arithmetic and
+            // NOW produce scalar values and fit this same upper envelope.
+            Ok((plan, source_add(working, output)?, output))
+        }
+        _ => {
+            // Preserve the original evaluator's unsupported-expression error;
+            // count its copied AST before constructing the original plan.
+            Ok((preparation_debug_len(expr)?.checked_mul(slot)
+                .and_then(|n| n.checked_mul(2)).ok_or_else(source_size_overflow)?, 0, 0))
+        }
+    }
+}
+
+impl OwnedMemoryReservation {
+    fn prepare_original_nonwriter_copy(
+        &self, bytes: usize, funder: &contextdb_tx::SourceFunder,
+    ) -> contextdb_core::Result<(Self, contextdb_tx::NativeSourceOrigin, contextdb_tx::SourceLease)> {
+        if self._writer_use.is_some() || self.accountant().is_engine() {
+            return Err(contextdb_core::Error::Other("original nonwriter copy origin mismatch".into()));
+        }
+        let lease = contextdb_tx::SourceLease { identity: 0, epoch: 0 };
+        let origin = contextdb_tx::NativeSourceOrigin::new(self.accountant().as_ptr() as usize, lease);
+        if !funder.accepts_retained_original_copy(origin, lease) {
+            return Err(contextdb_core::Error::Other("original nonwriter copy recipient mismatch".into()));
+        }
+        // Use this exact untagged original, even if a writer was registered
+        // later. No WriterUse lookup or current provider supplies its debit.
+        let allocation = Self::try_new_arc_for_nonwriter(self.accountant(), bytes,
+            "relational", "staged_index_posting", "Reduce staged rows or raise MEMORY_LIMIT.")?;
+        let mut original = Arc::into_inner(allocation).expect("private original copy has one owner");
+        original.finish_freed_enclosing_control();
+        Ok((original, origin, lease))
+    }
+
+    fn copy_retained_original_nonwriter_row_for(
+        &self, row: &contextdb_core::VersionedRow, funder: &contextdb_tx::SourceFunder,
+    ) -> contextdb_core::Result<contextdb_tx::AdmittedSourceRow> {
+        let bytes = contextdb_tx::OriginalRowInvoice::original_copy_allocation_bytes(preparation_row_copy_bytes(row)?)?;
+        let (mut original, origin, lease) = self.prepare_original_nonwriter_copy(bytes, funder)?;
+        // SAFETY: this genuine original holds payload plus invoice control.
+        // Transfer retains its zero reader lease and disarms the sole debit.
+        let invoice = unsafe { contextdb_tx::OriginalRowInvoice::from_original_copy_allocation(
+            funder, original.bytes, origin, lease)? };
+        original.bytes = 0;
+        let copied = preparation_copy_row(row)?;
+        Ok(contextdb_tx::AdmittedSourceRow::new(copied, invoice))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn copy_retained_original_nonwriter_vector_parts_for(
+        &self, table: &str, column: &str, vector: &[f32], row_id: contextdb_core::RowId,
+        created_tx: contextdb_core::TxId, deleted_tx: Option<contextdb_core::TxId>, lsn: contextdb_core::Lsn,
+        funder: &contextdb_tx::SourceFunder,
+    ) -> contextdb_core::Result<contextdb_tx::AdmittedSourceVector> {
+        let payload = source_add(source_add(table.len(), column.len())?, source_array::<f32>(vector.len())?)?;
+        let bytes = contextdb_tx::OriginalVectorInvoice::original_copy_allocation_bytes(payload)?;
+        let (mut original, origin, lease) = self.prepare_original_nonwriter_copy(bytes, funder)?;
+        // SAFETY: the original reader reserve owns the complete measured
+        // allocation, and success transfers rather than refunds that debit.
+        let invoice = unsafe { contextdb_tx::OriginalVectorInvoice::from_original_copy_allocation(
+            funder, original.bytes, origin, lease)? };
+        original.bytes = 0;
+        let copied = contextdb_core::VectorEntry {
+            index: contextdb_core::VectorIndexRef { table: table.to_owned(), column: column.to_owned() },
+            row_id, vector: vector.to_vec(), created_tx, deleted_tx, lsn,
+        };
+        source_check_vector_capacity(&copied)?;
+        Ok(contextdb_tx::AdmittedSourceVector::new(copied, invoice))
+    }
+}
+
+// Private original-funded preparation. These helpers never select a current
+// writer: the caller lends the use already held by terminal finalization.
+fn validate_preparation_writer(
+    original: &WriterUse,
+    expected: &AccountantHandle,
+) -> contextdb_core::Result<()> {
+    if !expected.is_engine()
+        || !original.accountant.is_engine()
+        || original.accountant.as_ptr() != expected.as_ptr()
+        || original.stable_identity == 0
+        || original.epoch == 0
+        || expected.writer_identity.get().copied() != Some(original.stable_identity)
+    {
+        return Err(contextdb_core::Error::Other(
+            "preparation requires its pinned native original writer".into(),
+        ));
+    }
+    let domain = PROCESS_WRITER_BUDGET_DOMAIN.read();
+    let valid = domain
+        .lookup_in(original.stable_identity)
+        .is_some_and(|record| {
+            record.epoch == original.epoch
+                && record.users != 0
+                && Arc::ptr_eq(&record.limit, &expected.limit)
+                && record.used.as_ptr() == expected.used.as_ptr()
+        });
+    if !valid {
+        return Err(contextdb_core::Error::Other(
+            "preparation original writer registration mismatch".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn preparation_original_writer(
+    original: &OwnedMemoryReservation,
+) -> contextdb_core::Result<&WriterUse> {
+    let accountant = original.accountant.as_ref().ok_or_else(|| {
+        contextdb_core::Error::Other("preparation original has no accountant".into())
+    })?;
+    let writer = original._writer_use.as_ref().ok_or_else(|| {
+        contextdb_core::Error::Other("preparation original has no held writer use".into())
+    })?;
+    validate_preparation_writer(writer, accountant)?;
+    if original.own_control.as_ref().is_some_and(|control| {
+        control.registration != Some((writer.stable_identity, writer.epoch))
+            || control
+                .accountant
+                .as_ref()
+                .is_none_or(|owner| !owner.is_engine() || owner.as_ptr() != accountant.as_ptr())
+    }) {
+        return Err(contextdb_core::Error::Other(
+            "preparation original control origin mismatch".into(),
+        ));
+    }
+    Ok(writer)
+}
+
+fn validate_preparation_funder(
+    writer: &WriterUse,
+    funder: &contextdb_tx::SourceFunder,
+) -> contextdb_core::Result<()> {
+    let lease = contextdb_tx::SourceLease {
+        identity: writer.stable_identity,
+        epoch: writer.epoch,
+    };
+    if !funder.matches_native_origin(writer.accountant.as_ptr() as usize, lease) {
+        return Err(contextdb_core::Error::Other(
+            "preparation funder does not match its pinned native original".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_owned_original(
+    original: &OwnedMemoryReservation,
+    expected: &AccountantHandle,
+    funder: &contextdb_tx::SourceFunder,
+) -> contextdb_core::Result<()> {
+    let writer = preparation_original_writer(original)?;
+    validate_preparation_writer(writer, expected)?;
+    validate_preparation_funder(writer, funder)
+}
+
+fn reserve_preparation_for_use(
+    original: &WriterUse,
+    bytes: usize,
+    subsystem: &str,
+    operation: &str,
+    hint: &str,
+) -> contextdb_core::Result<OwnedMemoryReservation> {
+    validate_preparation_writer(original, &original.accountant)?;
+    let writer = original.clone();
+    let projection = StoreAccountantHandle::from_writer_use(&writer);
+    let accountant = projection.as_handle();
+    projection.try_allocate_for_original(bytes, subsystem, operation, hint)?;
+    Ok(OwnedMemoryReservation {
+        accountant: Some(accountant),
+        bytes,
+        _writer_use: Some(writer),
+        own_control: None,
+    })
+}
+
+pub(crate) fn reserve_preparation_from_writer_use(
+    original: &WriterUse,
+    expected: &AccountantHandle,
+    funder: &contextdb_tx::SourceFunder,
+    bytes: usize,
+    subsystem: &str,
+    operation: &str,
+    hint: &str,
+) -> contextdb_core::Result<OwnedMemoryReservation> {
+    validate_preparation_writer(original, expected)?;
+    validate_preparation_funder(original, funder)?;
+    reserve_preparation_for_use(original, bytes, subsystem, operation, hint)
+}
+
+/// Called only after the owning scope has validated the genuine original and
+/// projected this tagged handle from that same held use. This private companion
+/// never rediscovers a current registration or constructs a typed heap error.
+/// Keeps the existing give-back-then-excess admission policy through scalar kernels.
+#[allow(dead_code)] // Staged until the funded typed error can retain its backing credit.
+pub(crate) fn reserve_native_storage_from_writer_use(
+    original: &WriterUse,
+    projection: &StoreAccountantHandle,
+    bytes: usize,
+) -> Result<OwnedMemoryReservation, contextdb_core::read_memory::NativeRefusal> {
+    assert!(projection.is_writer() && projection.same_accountant(&original.accountant),
+        "native storage projection belongs to its held original writer");
+    // from_writer_use created this projection while the original pins its epoch;
+    // neither clone retags or selects a different writer registration.
+    let writer = original.clone();
+    let accountant = projection.as_handle();
+    projection.try_allocate_for_provenance_native(
+        bytes, "redb", "exact_byte_read",
+        "Reduce the selected read or raise its declared memory limit.", Some(projection),
+    )?;
+    Ok(OwnedMemoryReservation {
+        accountant: Some(accountant), bytes, _writer_use: Some(writer), own_control: None,
+    })
+}
+
+pub(crate) fn reserve_preparation_from_original(
+    original: &OwnedMemoryReservation,
+    bytes: usize,
+    subsystem: &str,
+    operation: &str,
+    hint: &str,
+) -> contextdb_core::Result<OwnedMemoryReservation> {
+    let writer = preparation_original_writer(original)?;
+    reserve_preparation_for_use(writer, bytes, subsystem, operation, hint)
+}
+
+// std in the pinned compiler uses hashbrown 0.16.1. Keep bucket count
+// distinct from usable capacity and use the concrete consumer entry layout.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct NativeMapPlan {
+    pub(crate) members: usize,
+    pub(crate) buckets: usize,
+    pub(crate) capacity: usize,
+    pub(crate) layout: Layout,
+}
+
+fn native_map_group_width() -> usize {
+    if cfg!(all(
+        target_feature = "sse2",
+        any(target_arch = "x86", target_arch = "x86_64"),
+        not(miri),
+    )) || cfg!(all(
+        target_arch = "loongarch64",
+        target_feature = "lsx",
+        not(miri)
+    )) {
+        16
+    } else if cfg!(any(
+        target_pointer_width = "64",
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "wasm32",
+    )) {
+        8
+    } else {
+        4
+    }
+}
+
+pub(crate) fn native_map_plan<K, V>(members: usize) -> contextdb_core::Result<NativeMapPlan> {
+    let item = Layout::new::<(K, V)>();
+    let group = native_map_group_width();
+    let alignment = item.align().max(group);
+    if members == 0 {
+        return Ok(NativeMapPlan {
+            members,
+            buckets: 0,
+            capacity: 0,
+            layout: Layout::from_size_align(0, alignment).map_err(|_| source_size_overflow())?,
+        });
+    }
+    // Hashbrown raises small-table minima for tiny entries so the data
+    // region covers the control alignment. Event tuples exceed these minima.
+    let minimum = match (group, item.size()) {
+        (16, 0..=1) => 14,
+        (16, 2..=3) | (8, 0..=1) => 7,
+        _ => 3,
+    };
+    let adjusted = members.max(minimum);
+    let buckets = if adjusted < 4 {
+        4
+    } else if adjusted < 8 {
+        8
+    } else if adjusted < 15 {
+        16
+    } else {
+        adjusted
+            .checked_mul(8)
+            .ok_or_else(source_size_overflow)?
+            .checked_div(7)
+            .ok_or_else(source_size_overflow)?
+            .checked_next_power_of_two()
+            .ok_or_else(source_size_overflow)?
+    };
+    let capacity = if buckets <= 8 {
+        buckets - 1
+    } else {
+        buckets / 8 * 7
+    };
+    let data = item
+        .size()
+        .checked_mul(buckets)
+        .ok_or_else(source_size_overflow)?;
+    let control_offset = source_add(data, alignment - 1)? & !(alignment - 1);
+    let size = source_add(source_add(control_offset, buckets)?, group)?;
+    let layout = Layout::from_size_align(size, alignment).map_err(|_| source_size_overflow())?;
+    Ok(NativeMapPlan {
+        members,
+        buckets,
+        capacity,
+        layout,
+    })
+}
+
+fn native_capacity_mismatch() -> contextdb_core::Error {
+    contextdb_core::Error::Other("preparation native capacity mismatch".into())
+}
+
+pub(crate) fn validate_native_map_capacity<K, V>(
+    map: &HashMap<K, V>,
+    plan: &NativeMapPlan,
+) -> contextdb_core::Result<()> {
+    if *plan != native_map_plan::<K, V>(plan.members)? || map.capacity() != plan.capacity {
+        return Err(native_capacity_mismatch());
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_native_set_capacity<K>(
+    set: &std::collections::HashSet<K>,
+    plan: &NativeMapPlan,
+) -> contextdb_core::Result<()> {
+    if *plan != native_map_plan::<K, ()>(plan.members)? || set.capacity() != plan.capacity {
+        return Err(native_capacity_mismatch());
+    }
+    Ok(())
+}
+
+pub(crate) fn native_ring_plan<T>(required: usize) -> contextdb_core::Result<(usize, Layout)> {
+    if std::mem::size_of::<T>() == 0 {
+        return Err(contextdb_core::Error::Other(
+            "preparation exact ring capacity requires a nonzero entry layout".into(),
+        ));
+    }
+    let capacity = if required == 0 {
+        0
+    } else {
+        required
+            .checked_next_power_of_two()
+            .ok_or_else(source_size_overflow)?
+    };
+    let layout = Layout::array::<T>(capacity).map_err(|_| source_size_overflow())?;
+    Ok((capacity, layout))
+}
+
+pub(crate) fn validate_native_ring_capacity<T>(
+    ring: &std::collections::VecDeque<T>,
+    capacity: usize,
+) -> contextdb_core::Result<()> {
+    let (expected, _) = native_ring_plan::<T>(capacity)?;
+    if capacity != expected || ring.capacity() != capacity {
+        return Err(native_capacity_mismatch());
+    }
+    Ok(())
+}
+
+fn reserve_native_container(
+    original: &OwnedMemoryReservation,
+    bytes: usize,
+) -> contextdb_core::Result<OwnedMemoryReservation> {
+    reserve_preparation_from_original(
+        original,
+        bytes,
+        "relational",
+        "statement_overlay",
+        "Reduce prepared bodies or raise MEMORY_LIMIT.",
+    )
+}
+
+pub(crate) fn new_owned_native_map<K, V>(
+    original: &OwnedMemoryReservation,
+    members: usize,
+) -> contextdb_core::Result<(HashMap<K, V>, OwnedMemoryReservation)> {
+    let plan = native_map_plan::<K, V>(members)?;
+    let memory = reserve_native_container(original, plan.layout.size())?;
+    let map = HashMap::with_capacity(members);
+    if let Err(error) = validate_native_map_capacity(&map, &plan) {
+        drop(map);
+        return Err(error);
+    }
+    Ok((map, memory))
+}
+
+pub(crate) fn new_owned_native_set<K>(
+    original: &OwnedMemoryReservation,
+    members: usize,
+) -> contextdb_core::Result<(std::collections::HashSet<K>, OwnedMemoryReservation)> {
+    let plan = native_map_plan::<K, ()>(members)?;
+    let memory = reserve_native_container(original, plan.layout.size())?;
+    let set = std::collections::HashSet::with_capacity(members);
+    if let Err(error) = validate_native_set_capacity(&set, &plan) {
+        drop(set);
+        return Err(error);
+    }
+    Ok((set, memory))
+}
+
+pub(crate) fn new_owned_native_ring<T>(
+    original: &OwnedMemoryReservation,
+    required: usize,
+) -> contextdb_core::Result<(std::collections::VecDeque<T>, OwnedMemoryReservation)> {
+    let (capacity, layout) = native_ring_plan::<T>(required)?;
+    let memory = reserve_native_container(original, layout.size())?;
+    let ring = std::collections::VecDeque::with_capacity(capacity);
+    if let Err(error) = validate_native_ring_capacity(&ring, capacity) {
+        drop(ring);
+        return Err(error);
+    }
+    Ok((ring, memory))
+}
+
+fn validate_native_vec_capacity<T>(values: &Vec<T>, capacity: usize) -> contextdb_core::Result<()> {
+    let expected = if std::mem::size_of::<T>() == 0 {
+        usize::MAX
+    } else {
+        capacity
+    };
+    if values.capacity() != expected {
+        return Err(native_capacity_mismatch());
+    }
+    Ok(())
+}
+
+pub(crate) fn new_owned_native_vec<T>(
+    original: &OwnedMemoryReservation,
+    capacity: usize,
+) -> contextdb_core::Result<(Vec<T>, OwnedMemoryReservation)> {
+    let layout = Layout::array::<T>(capacity).map_err(|_| source_size_overflow())?;
+    let memory = reserve_native_container(original, layout.size())?;
+    let values = Vec::with_capacity(capacity);
+    if let Err(error) = validate_native_vec_capacity(&values, capacity) {
+        drop(values);
+        return Err(error);
+    }
+    Ok((values, memory))
+}
+
+pub(crate) fn copy_owned_native_slice<T: Copy>(
+    original: &OwnedMemoryReservation,
+    source: &[T],
+) -> contextdb_core::Result<(Vec<T>, OwnedMemoryReservation)> {
+    let (mut values, memory) = new_owned_native_vec(original, source.len())?;
+    values.extend_from_slice(source);
+    if let Err(error) = validate_native_vec_capacity(&values, source.len()) {
+        drop(values);
+        return Err(error);
+    }
+    Ok((values, memory))
+}
+
+fn copy_prepaid_native_string(source: &str) -> contextdb_core::Result<String> {
+    let value = source.to_owned();
+    if value.capacity() != source.len() {
+        return Err(native_capacity_mismatch());
+    }
+    Ok(value)
+}
+
+pub(crate) fn copy_owned_native_string(
+    original: &OwnedMemoryReservation,
+    source: &str,
+) -> contextdb_core::Result<(String, OwnedMemoryReservation)> {
+    let layout = Layout::array::<u8>(source.len()).map_err(|_| source_size_overflow())?;
+    let memory = reserve_native_container(original, layout.size())?;
+    let value = copy_prepaid_native_string(source)?;
+    Ok((value, memory))
+}
+
+// This recursion is entered only after a genuine original grant admitted the
+// entire nested plan. Verify each container before inserting its children.
+fn copy_prepaid_native_json(
+    value: &serde_json::Value,
+) -> contextdb_core::Result<serde_json::Value> {
+    Ok(match value {
+        serde_json::Value::String(text) => {
+            serde_json::Value::String(copy_prepaid_native_string(text)?)
+        }
+        serde_json::Value::Array(items) => {
+            let mut copied = Vec::with_capacity(items.len());
+            validate_native_vec_capacity(&copied, items.len())?;
+            for child in items {
+                copied.push(copy_prepaid_native_json(child)?);
+            }
+            validate_native_vec_capacity(&copied, items.len())?;
+            serde_json::Value::Array(copied)
+        }
+        serde_json::Value::Object(members) => {
+            let mut copied = serde_json::Map::new();
+            // Lexical BTree insertion is the existing source_json_map_bytes
+            // split plan. The enclosing original grant covers all nodes/keys.
+            for (name, child) in members {
+                copied.insert(
+                    copy_prepaid_native_string(name)?,
+                    copy_prepaid_native_json(child)?,
+                );
+            }
+            serde_json::Value::Object(copied)
+        }
+        _ => value.clone(),
+    })
+}
+
+fn copy_prepaid_native_value(
+    value: &contextdb_core::Value,
+) -> contextdb_core::Result<contextdb_core::Value> {
+    Ok(match value {
+        contextdb_core::Value::Text(text) => {
+            contextdb_core::Value::Text(copy_prepaid_native_string(text)?)
+        }
+        contextdb_core::Value::Vector(values) => {
+            let mut copied = Vec::with_capacity(values.len());
+            validate_native_vec_capacity(&copied, values.len())?;
+            copied.extend_from_slice(values);
+            validate_native_vec_capacity(&copied, values.len())?;
+            contextdb_core::Value::Vector(copied)
+        }
+        contextdb_core::Value::Json(json) => {
+            contextdb_core::Value::Json(copy_prepaid_native_json(json)?)
+        }
+        _ => value.clone(),
+    })
+}
+
+fn reserve_preparation_original_copy(
+    original: &OwnedMemoryReservation,
+    bytes: usize,
+) -> contextdb_core::Result<contextdb_tx::OriginalCopyGrant> {
+    preparation_original_writer(original)?;
+    // Validation excludes the host fallback of this existing typed receiver.
+    <OwnedMemoryReservation as contextdb_tx::StagedPostingCharge>::reserve_private_original_copy(
+        original, bytes,
+    )
+}
+
+pub(crate) fn copy_owned_event_row_values(
+    original: &OwnedMemoryReservation,
+    row: &contextdb_core::VersionedRow,
+) -> contextdb_core::Result<(
+    HashMap<String, contextdb_core::Value>,
+    contextdb_tx::OriginalCopyGrant,
+)> {
+    let plan = native_map_plan::<String, contextdb_core::Value>(row.values.len())?;
+    let bytes = row
+        .values
+        .iter()
+        .try_fold(plan.layout.size(), |bytes, (name, value)| {
+            source_add(
+                source_add(bytes, name.len())?,
+                source_value_copy_bytes(value)?,
+            )
+        })?;
+    let credit = reserve_preparation_original_copy(original, bytes)?;
+    let mut values = HashMap::with_capacity(plan.members);
+    validate_native_map_capacity(&values, &plan)?;
+    for (name, value) in &row.values {
+        values.insert(
+            copy_prepaid_native_string(name)?,
+            copy_prepaid_native_value(value)?,
+        );
+    }
+    validate_native_map_capacity(&values, &plan)?;
+    for value in values.values() {
+        source_check_value_capacity(value)?;
+    }
+    Ok((values, credit))
+}
+
+pub(crate) fn copy_owned_native_value(
+    original: &OwnedMemoryReservation,
+    value: &contextdb_core::Value,
+) -> contextdb_core::Result<(contextdb_core::Value, contextdb_tx::OriginalCopyGrant)> {
+    let credit = reserve_preparation_original_copy(original, source_value_copy_bytes(value)?)?;
+    let copied = copy_prepaid_native_value(value)?;
+    source_check_value_capacity(&copied)?;
+    Ok((copied, credit))
+}
+
+/// Exact original projection. This never discovers a writer registration.
+pub(crate) fn persistence_original_projection(
+    original: &OwnedMemoryReservation,
+) -> contextdb_core::Result<StoreAccountantHandle> {
+    Ok(StoreAccountantHandle::from_writer_use(preparation_original_writer(original)?))
+}
+
+pub(crate) fn grow_preparation_from_original(
+    original: &mut OwnedMemoryReservation,
+    bytes: usize,
+    subsystem: &str,
+    operation: &str,
+    hint: &str,
+) -> contextdb_core::Result<()> {
+    let next = original.bytes.checked_add(bytes).ok_or_else(source_size_overflow)?;
+    let projection = persistence_original_projection(original)?;
+    projection.try_allocate_for_original(bytes, subsystem, operation, hint)?;
+    original.bytes = next;
+    Ok(())
+}
+
+pub(crate) fn release_preparation_original(original: &mut OwnedMemoryReservation, bytes: usize) {
+    let bytes = bytes.min(original.bytes);
+    original.accountant.as_ref().expect("validated original").release(bytes);
+    original.bytes -= bytes;
+}
+
+pub(crate) fn detach_preparation_original(
+    original: &mut OwnedMemoryReservation,
+    bytes: usize,
+) -> contextdb_core::Result<OwnedMemoryReservation> {
+    if bytes > original.bytes { return Err(source_size_overflow()); }
+    // Clone precisely the held use before transferring any debit. Failure
+    // therefore leaves the caller's charge and lifetime completely intact.
+    let mut detached = reserve_preparation_from_original(original, 0,
+        "content_identity", "maintain_committed_proof", "Raise MEMORY_LIMIT to admit the proof this transaction maintains.")?;
+    original.bytes -= bytes;
+    detached.bytes = bytes;
+    Ok(detached)
+}
+
+pub(crate) fn merge_preparation_original(
+    original: &mut OwnedMemoryReservation,
+    credit: &mut OwnedMemoryReservation,
+) -> contextdb_core::Result<()> {
+    let left = preparation_original_writer(original)?;
+    let right = preparation_original_writer(credit)?;
+    if left.stable_identity != right.stable_identity || left.epoch != right.epoch
+        || left.accountant.as_ptr() != right.accountant.as_ptr() {
+        return Err(contextdb_core::Error::Other("original persistence credit origin mismatch".into()));
+    }
+    let next = original.bytes.checked_add(credit.bytes).ok_or_else(source_size_overflow)?;
+    original.bytes = next;
+    credit.bytes = 0;
+    Ok(())
+}
+
+pub(crate) fn clone_persistence_original_writer(
+    original:&OwnedMemoryReservation,
+)->contextdb_core::Result<WriterUse>{Ok(preparation_original_writer(original)?.clone())}
+
+// Native siblings preserve the original counter, gates and reclamation order.
+// Legacy kernels above remain byte-identical. Only the refusal representation
+// is static; no owned Error is constructed and subsequently mapped.
+impl MemoryAccountant {
+    pub(crate) fn try_allocate_native(&self, bytes: usize)
+        -> std::result::Result<(), contextdb_core::read_memory::NativeRefusal>
+    {
+        self.try_allocate_with_provenance_native(bytes, None)
+    }
+    pub(crate) fn try_allocate_for_native(
+        &self, bytes: usize, subsystem: &'static str,
+        operation: &'static str, hint: &'static str,
+    ) -> std::result::Result<(), contextdb_core::read_memory::NativeRefusal> {
+        self.try_allocate_for_provenance_native(bytes, subsystem, operation, hint, None)
+    }
+    fn admit_to_process_aggregate_native(
+        &self, admission: &WriterAdmission, bytes: usize, operation: &'static str, hint: &'static str,
+    ) -> std::result::Result<(), contextdb_core::read_memory::NativeRefusal> {
+        if !self.used.is_member() {
+            return Ok(());
+        }
+        let Some(ceiling) = admission.ceiling else {
+            PROCESS_WRITER_AGGREGATE.fetch_add(bytes, Ordering::SeqCst);
+            return Ok(());
+        };
+        if let Err(available) = aggregate_try_reserve(bytes, ceiling) {
+            self.used.rollback_local_only(bytes);
+            return Err(contextdb_core::read_memory::NativeRefusal::ProcessMemoryBudgetExceeded {
+                operation: operation,
+                requested_bytes: bytes,
+                available_bytes: available,
+                budget_limit_bytes: ceiling,
+                hint,
+            });
+        }
+        Ok(())
+    }
+    fn try_allocate_with_provenance_native(&self, bytes: usize, provenance: Option<&StoreAccountantHandle>) -> std::result::Result<(), contextdb_core::read_memory::NativeRefusal> {
+        if bytes == 0 {
+            return Ok(());
+        }
+
+        let admission = self.writer_admission_for_provenance(provenance);
+        #[cfg(test)]
+        let mut admission = admission;
+        loop {
+            let used = self.used.load(Ordering::SeqCst);
+            let published = self.limit.load(Ordering::SeqCst);
+            let limit = if published == 0 {
+                0
+            } else {
+                published
+                    .saturating_add(self.private_transition_headroom())
+            };
+            if limit != 0 {
+                let available = writer_headroom(limit, used, 0, 0)
+                    .available
+                    .unwrap_or(usize::MAX - used);
+                if bytes > available {
+                    // TOCTOU window: `limit` was loaded above; a concurrent
+                    // `set_budget(None)` may have cleared it since. The re-check
+                    // below closes that window. In test builds a hook lets a
+                    // unit test land exactly that interleaving deterministically.
+                    #[cfg(test)]
+                    if self.fire_accounting_hook_without_gate_for_provenance(&mut admission, provenance, false) { continue; }
+                    if self.limit.load(Ordering::SeqCst) != published {
+                        continue;
+                    }
+                    return Err(contextdb_core::read_memory::NativeRefusal::MemoryBudgetExceeded {
+                        subsystem: "memory",
+                        operation: "allocate",
+                        requested_bytes: bytes,
+                        available_bytes: available,
+                        budget_limit_bytes: limit,
+                        hint:
+                            "Reduce retained data, lower working-set size, or raise MEMORY_LIMIT.",
+                    });
+                }
+            }
+
+            let Some(next) = used.checked_add(bytes) else {
+                return Err(contextdb_core::read_memory::NativeRefusal::MemoryBudgetExceeded {
+                    subsystem: "memory",
+                    operation: "allocate",
+                    requested_bytes: bytes,
+                    available_bytes: usize::MAX - used,
+                    budget_limit_bytes: usize::MAX,
+                    hint: "Reduce retained data or working-set size.",
+                });
+            };
+            // The interleaving a narrowing limit has to survive: this
+            // allocator has already read `published` and decided the request
+            // fits it; a concurrent narrowing publishes a smaller limit right
+            // here, and the CAS below still runs. In test builds a hook lands
+            // exactly that order deterministically.
+            #[cfg(test)]
+            if self.fire_accounting_hook_without_gate_for_provenance(&mut admission, provenance, true) { continue; }
+            if self.used.compare_exchange_local(used, next) {
+                // Admission and publication share ONE linearization boundary,
+                // and it is this load. An admission is not SUCCESSFUL until it
+                // has been validated against a published limit read that
+                // happens-after its own CAS. A narrowing that linearizes before
+                // this load is therefore always seen: the CAS is undone and the
+                // loop produces the ordinary typed refusal under the new limit.
+                // A narrowing that linearizes after it is a publication this
+                // admission genuinely preceded. Either way no request returns
+                // success having been admitted under a limit already superseded,
+                // and `used` is never left above the published ceiling by an
+                // allocator that read a stale one.
+                let current = self.limit.load(Ordering::SeqCst);
+                let admissible = if current == 0 {
+                    0
+                } else {
+                    current
+                        .saturating_add(self.private_transition_headroom())
+                };
+                if writer_headroom(admissible, used, 0, 0)
+                    .available
+                    .is_some_and(|available| bytes > available)
+                {
+                    // Still inside local admission: the aggregate step below
+                    // has not run, so these bytes never entered it.
+                    self.used.rollback_local_only(bytes);
+                    continue;
+                }
+                self.admit_to_process_aggregate_native(&admission, bytes, "allocate",
+                    "Reduce retained data, lower working-set size, or raise MEMORY_LIMIT.")?;
+                #[cfg(any(test, feature = "test-seams"))]
+                self.high_water_for_test.fetch_max(next, Ordering::SeqCst);
+                #[cfg(any(test, feature = "test-seams"))]
+                self.admitted_bytes_for_test
+                    .fetch_add(bytes, Ordering::SeqCst);
+                return Ok(());
+            }
+        }
+    }
+    fn try_allocate_for_provenance_native(
+        &self, bytes: usize, subsystem: &'static str, operation: &'static str, hint: &'static str,
+        provenance: Option<&StoreAccountantHandle>,
+    ) -> std::result::Result<(), contextdb_core::read_memory::NativeRefusal> {
+        let native_reclaim_meters =
+            contextdb_core::find_attribution::native_reclaim_meter_scope();
+        let allocation = (|| {
+        #[cfg(any(test, feature = "test-seams"))]
+        if operation == "current_identity_delta"
+            && self
+                .tail_admission_failure
+                .compare_exchange(3, 4, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            return Err(contextdb_core::read_memory::NativeRefusal::MemoryBudgetExceeded {
+                subsystem: subsystem,
+                operation: operation,
+                requested_bytes: bytes,
+                available_bytes: 0,
+                budget_limit_bytes: self.used.load(Ordering::SeqCst),
+                hint: "Injected current vector identity publication admission exhaustion.",
+            });
+        }
+        #[cfg(any(test, feature = "test-seams"))]
+        if operation == "prepare_hnsw_tail"
+            && self
+                .tail_admission_failure
+                .compare_exchange(1, 2, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            return Err(contextdb_core::read_memory::NativeRefusal::MemoryBudgetExceeded {
+                subsystem: subsystem,
+                operation: operation,
+                requested_bytes: bytes,
+                available_bytes: 0,
+                budget_limit_bytes: self.used.load(Ordering::SeqCst),
+                hint: "Injected fresh-tail admission exhaustion.",
+            });
+        }
+        let mut allocation = self.try_allocate_with_provenance_native(bytes, provenance);
+        #[cfg(any(test, feature = "test-seams"))]
+        if allocation.is_ok() {
+            note_budget_admission(subsystem, operation, bytes, self.used.load(Ordering::SeqCst));
+        }
+        // A saved graph whose topology does not fit is admitted once the
+        // serving pages already resident give way to it: they are re-readable,
+        // the topology is what makes its partition searchable at all.
+        // Idle graphs of partitions the statement is not searching go first;
+        // serving pages give way only after them.
+        if allocation.is_err() && operation == "load_retained_vector_generation" {
+            let vector = self
+                .idle_graph_reclaimer
+                .lock()
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade);
+            if let Some(vector) = vector {
+                let short = || bytes.saturating_sub(self.available_for_provenance(provenance).unwrap_or(usize::MAX));
+                if vector.make_room_for_graph_load_native(short()) != 0 {
+                    allocation = self.try_allocate_with_provenance_native(bytes, provenance);
+                }
+                if allocation.is_err() && vector.give_back_serving_pages_native(short()) != 0 {
+                    allocation = self.try_allocate_with_provenance_native(bytes, provenance);
+                }
+            }
+        }
+        // Serving pages are a cache a read can always refill, so nothing is
+        // refused while they hold the memory it needs: they give way to any
+        // allocation exactly as they give way to a graph load. The give-back
+        // only tries its locks, so it is safe from inside any caller.
+        if allocation.is_err() && operation != "load_retained_vector_generation" {
+            let vector = self
+                .idle_graph_reclaimer
+                .lock()
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade);
+            let short = bytes.saturating_sub(self.available_for_provenance(provenance).unwrap_or(usize::MAX));
+            if vector.is_some_and(|vector| vector.give_back_serving_pages_native(short) != 0) {
+                allocation = self.try_allocate_with_provenance_native(bytes, provenance);
+            }
+        }
+        if allocation.is_err() && matches!(operation, "read/table_scan" | "read/index_range") {
+            let vector = self
+                .idle_graph_reclaimer
+                .lock()
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade);
+            let graphs = vector
+                .as_ref()
+                .map_or(0, |vector| vector.evict_idle_graphs());
+            if graphs != 0 {
+                allocation = self.try_allocate_with_provenance_native(bytes, provenance);
+            }
+        }
+        // A received schema unit that was already ADMITTED AS A WHOLE is
+        // applying against THIS accountant, and an allocation it did not model
+        // does not fit. It draws on the reservation the preflight is holding
+        // for it, and past that on a BOUNDED excess.
+        //
+        // The unit was priced and admitted before its first item mutated
+        // anything, so a limit genuinely too small for it was already refused
+        // there, leaving the receiver's old complete state. Refusing at the
+        // first byte the model got slightly wrong would instead leave a proper
+        // subset of an arriving schema installed and durable -- the one outcome
+        // the design's "Atomic schema installation" row forbids outright -- and
+        // there is no way back: a received DROP TABLE cannot be taken back at
+        // all, and compensating DDL written to undo it lands in the REPLICATED
+        // log, so one node's memory shortfall would propagate a schema revert
+        // to every peer.
+        //
+        // But the model's error is driven by what a PEER sent, so absorbing it
+        // without a ceiling would hand the peer the operator's declared limit.
+        // Past `ADMITTED_SCHEMA_UNIT_EXCESS_BYTES` the ordinary typed refusal
+        // fires: the limit the operator declared bounds the process, and the
+        // most a unit can take past what it was priced at is that constant.
+        if allocation.is_err() && self.charge_admitted_unit_excess(bytes) {
+            return Ok(());
+        }
+        allocation.map_err(|err| match err {
+            contextdb_core::read_memory::NativeRefusal::MemoryBudgetExceeded {
+                requested_bytes,
+                budget_limit_bytes,
+                available_bytes,
+                ..
+            } | contextdb_core::read_memory::NativeRefusal::ProcessMemoryBudgetExceeded {
+                requested_bytes, budget_limit_bytes, available_bytes, ..
+            } => contextdb_core::read_memory::NativeRefusal::MemoryBudgetExceeded {
+                subsystem: subsystem,
+                operation: operation,
+                requested_bytes,
+                budget_limit_bytes,
+                available_bytes,
+                hint: hint,
+            },
+            other => other,
+        })
+        })();
+        // The fixed scope binds observations to the currently open record on
+        // completion and on unwind, or drops them when no record is open.
+        // Its bookkeeping cannot change the original allocation result.
+        let _meters = native_reclaim_meters.finish();
+        allocation
+    }
+}
+
+impl StoreAccountantHandle {
+    pub(crate) fn try_allocate_for_original_native(
+        &self, bytes: usize, subsystem: &'static str,
+        operation: &'static str, hint: &'static str,
+    ) -> std::result::Result<(), contextdb_core::read_memory::NativeRefusal> {
+        self.try_allocate_for_provenance_native(
+            bytes,
+            subsystem,
+            operation,
+            hint,
+            Some(self),
+        )
+    }
+}
+
+impl OwnedMemoryReservation {
+    /// A genuine new grant from the originating reservation, retaining its
+    /// existing writer epoch rather than discovering a later registration.
+    pub(crate) fn reserve_copy_native(
+        &self, bytes: usize, subsystem: &'static str,
+        operation: &'static str, hint: &'static str,
+    ) -> std::result::Result<Self, contextdb_core::read_memory::NativeRefusal> {
+        let mut copy = Self {
+            accountant: Some(self.accountant().clone()), bytes: 0,
+            _writer_use: self._writer_use.clone(), own_control: None,
+        };
+        copy.try_grow_for_native(bytes, subsystem, operation, hint)?;
+        Ok(copy)
+    }
+
+    pub(crate) fn try_new_for_native(
+        accountant: AccountantHandle, bytes: usize, subsystem: &'static str,
+        operation: &'static str, hint: &'static str,
+    ) -> std::result::Result<Self, contextdb_core::read_memory::NativeRefusal> {
+        // Capture the epoch before admission, as a zero-byte guard. It remains
+        // pinned through success, refusal, and later body destruction.
+        let mut reservation = Self::new(accountant);
+        reservation.try_grow_for_native(bytes, subsystem, operation, hint)?;
+        Ok(reservation)
+    }
+
+    pub(crate) fn try_grow_for_native(
+        &mut self, bytes: usize, subsystem: &'static str,
+        operation: &'static str, hint: &'static str,
+    ) -> std::result::Result<(), contextdb_core::read_memory::NativeRefusal> {
+        let next = self.bytes.checked_add(bytes).ok_or(
+            contextdb_core::read_memory::NativeRefusal::MemoryBudgetExceeded {
+                subsystem, operation, requested_bytes: bytes,
+                available_bytes: usize::MAX - self.bytes,
+                budget_limit_bytes: usize::MAX, hint,
+            })?;
+        self.accountant().try_allocate_for_native(bytes, subsystem, operation, hint)?;
+        self.bytes = next;
+        Ok(())
     }
 }

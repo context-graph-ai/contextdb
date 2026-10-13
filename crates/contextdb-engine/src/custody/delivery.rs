@@ -978,3 +978,22 @@ fn merge_result(total: &mut ApplyResult, part: ApplyResult) {
     total.conflicts.extend(part.conflicts);
     total.new_lsn = total.new_lsn.max(part.new_lsn);
 }
+
+/// Native cursor producer and the original seven-field custody tuple check.
+/// The caller supplies the FIRST original committed-view incarnation read.
+/// The handler's response must independently perform its SECOND original read.
+pub(crate) fn native_outcome_cursor_after(
+    memory: &crate::read_image_memory::NativeDeliveryImage,
+    tenant: &TenantId,
+    hub: &str,
+    hub_incarnation: contextdb_core::Incarnation,
+    edge: &str,
+    edge_incarnation: contextdb_core::Incarnation,
+    since: Option<&[u8]>,
+) -> std::result::Result<Option<(contextdb_core::Lsn, u32)>, crate::sync_native_delivery::DecodeError> {
+    since.map(|bytes| {
+        crate::sync_native_delivery::validate_cursor_after(
+            memory, bytes, tenant.as_str(), hub, hub_incarnation, edge, edge_incarnation,
+        )
+    }).transpose()
+}

@@ -9,6 +9,8 @@
 pub(crate) mod custody_pull;
 mod custody_remainder;
 mod custody_store;
+#[cfg(feature = "sync-orchestration")]
+pub(crate) mod native_custody_selection;
 mod maintenance_frontier;
 use contextdb_relational::source::RelationalCursor as _;
 use maintenance_frontier::MaintenanceFrontier;
@@ -228,6 +230,7 @@ use contextdb_tx::{
     RelationalDeletePredicate, TransactionManager, WriteSet, WriteSetApplicator,
     row_matches_delete_predicates,
 };
+use contextdb_tx::manager::EngineTransactionHandle;
 #[cfg(any(test, feature = "test-seams"))]
 use contextdb_vector::HnswGraphStats;
 use contextdb_vector::store::{
@@ -9215,7 +9218,7 @@ impl PublicationInterruptionWatch {
 /// predecessor before another batch begins. A commit that lands between the
 /// batch and that publication already published a root that contains it.
 fn publish_storage_compaction_batch(
-    manager: &Arc<TransactionManager<DynStore>>,
+    manager: &DatabaseTransactionHost,
     persistence: &Arc<RedbPersistence>,
     accountant: &crate::memory_accounting::AccountantHandle,
     interrupted: &Arc<AtomicBool>,
@@ -9697,7 +9700,7 @@ pub(crate) struct PreparedMemorySwap {
 
 /// The staged row versions one shape change re-prices, per open transaction.
 struct StagedAdmissionRepricing {
-    tx_mgr: Arc<TransactionManager<DynStore>>,
+    tx_mgr: DatabaseTransactionHost,
     per_tx: HashMap<TxId, Vec<(String, RowId, usize)>>,
 }
 
@@ -11093,6 +11096,7 @@ pub struct WriterMemoryOwnershipReceiptForTest {
     pub captured_root_charge: usize,
     pub commit_source_reference_charge: usize,
     pub storage_maintenance_control_charge: usize,
+    /// Process open-residue capacity; observed here, outside named writer liabilities.
     pub snapshot_pin_capacity_charge: usize,
 }
 
@@ -13228,12 +13232,687 @@ impl Drop for CloseOwnerGuard<'_> {
 #[cfg(all(feature = "test-seams", feature = "sync-orchestration"))]
 type OutboundPushBatchProvenance = (OutboundRowLineages, Vec<crate::protocol::WireDdlProvenance>);
 
+/// The construction route retains whether the plugin receiver was created by
+/// the built-in factory or supplied by an embedder.  This is deliberately
+/// private: the active transaction host is not selected in this slice.
+#[derive(Clone)]
+enum PluginBinding {
+    Builtin(Arc<CorePlugin>),
+    Supplied(Arc<dyn DatabasePlugin>),
+}
+
+impl PluginBinding {
+    fn builtin() -> Self {
+        Self::Builtin(Arc::new(CorePlugin))
+    }
+
+    fn supplied(plugin: Arc<dyn DatabasePlugin>) -> Self {
+        Self::Supplied(plugin)
+    }
+
+    fn as_plugin(&self) -> &dyn DatabasePlugin {
+        match self {
+            Self::Builtin(plugin) => plugin.as_ref(),
+            Self::Supplied(plugin) => plugin.as_ref(),
+        }
+    }
+
+    fn erased(&self) -> Arc<dyn DatabasePlugin> {
+        match self {
+            Self::Builtin(plugin) => plugin.clone(),
+            Self::Supplied(plugin) => plugin.clone(),
+        }
+    }
+}
+
+/// The private half of an open request.  `PluginBinding` deliberately carries
+/// the receiver separately so public options continue to mean exactly what
+/// they meant before construction reaches the transaction-host selection.
+struct OpenConfiguration {
+    owner_reads: OwnerReadConfig,
+    open_disposition: OpenDisposition,
+    memory_limit: Option<usize>,
+    disk_limit: Option<u64>,
+    maintenance_policy: MaintenancePolicy,
+    maintenance_poll_interval: Option<Duration>,
+    contexts: Option<BTreeSet<ContextId>>,
+    scope_labels: Option<BTreeSet<ScopeLabel>>,
+    principal: Option<Principal>,
+    #[cfg(any(test, feature = "test-seams"))]
+    test_observer: Option<Arc<dyn ReadSessionTestObserver>>,
+    #[cfg(any(test, feature = "test-seams"))]
+    test_kernel_observer: Option<Arc<dyn ReadKernelTestObserver>>,
+}
+
+impl OpenConfiguration {
+    fn take_options(options: DatabaseOpenOptions) -> (Self, PluginBinding) {
+        let DatabaseOpenOptions {
+            owner_reads,
+            open_disposition,
+            plugin,
+            memory_limit,
+            disk_limit,
+            maintenance_policy,
+            maintenance_poll_interval,
+            contexts,
+            scope_labels,
+            principal,
+            #[cfg(any(test, feature = "test-seams"))]
+            test_observer,
+            #[cfg(any(test, feature = "test-seams"))]
+            test_kernel_observer,
+        } = options;
+        (
+            Self {
+                owner_reads,
+                open_disposition,
+                memory_limit,
+                disk_limit,
+                maintenance_policy,
+                maintenance_poll_interval,
+                contexts,
+                scope_labels,
+                principal,
+                #[cfg(any(test, feature = "test-seams"))]
+                test_observer,
+                #[cfg(any(test, feature = "test-seams"))]
+                test_kernel_observer,
+            },
+            PluginBinding::supplied(plugin),
+        )
+    }
+}
+
+/// The actual transaction owner shared by Database and its private contexts.
+/// Production factories wrap their genuine Legacy manager; Owned operations
+/// borrow the paired restricted host and never extract its lower manager.
+#[derive(Clone)]
+enum DatabaseTransactionHost {
+    Legacy(Arc<TransactionManager<DynStore>>),
+    Owned(EngineDatabaseHandle),
+}
+
+impl DatabaseTransactionHost {
+    fn legacy(transactions: Arc<TransactionManager<DynStore>>) -> Self {
+        Self::Legacy(transactions)
+    }
+
+    fn capture_published_read(&self) -> contextdb_tx::PublishedRead {
+        match self {
+            Self::Legacy(transactions) => transactions.capture_published_read(),
+            Self::Owned(handle) => handle.with_host(|host| {
+                host.transactions.with_transactions(|transactions| transactions.capture_published_read())
+            }),
+        }
+    }
+
+    fn published_read_snapshot(&self) -> (SnapshotId, Lsn) {
+        match self {
+            Self::Legacy(transactions) => transactions.published_read_snapshot(),
+            Self::Owned(handle) => handle.with_host(|host| {
+                host.transactions.with_transactions(|transactions| transactions.published_read_snapshot())
+            }),
+        }
+    }
+
+    fn snapshot(&self) -> SnapshotId {
+        match self {
+            Self::Legacy(transactions) => transactions.snapshot(),
+            Self::Owned(handle) => handle.with_host(|host| {
+                host.transactions.with_transactions(|transactions| transactions.snapshot())
+            }),
+        }
+    }
+
+    fn current_lsn(&self) -> Lsn {
+        match self {
+            Self::Legacy(transactions) => transactions.current_lsn(),
+            Self::Owned(handle) => handle.with_host(|host| {
+                host.transactions.with_transactions(|transactions| transactions.current_lsn())
+            }),
+        }
+    }
+
+    fn current_tx_max(&self) -> TxId {
+        match self {
+            Self::Legacy(transactions) => transactions.current_tx_max(),
+            Self::Owned(handle) => handle.with_host(|host| {
+                host.transactions.with_transactions(|transactions| transactions.current_tx_max())
+            }),
+        }
+    }
+    fn peek_next_tx(&self) -> TxId {
+        match self {
+            Self::Legacy(manager) => manager.peek_next_tx(),
+            Self::Owned(handle) => handle.with_host(|host| host.transactions.with_transactions(|transactions| transactions.peek_next_tx())),
+        }
+    }
+
+    fn store(&self) -> &DynStore {
+        match self {
+            Self::Legacy(manager) => manager.store(),
+            Self::Owned(handle) => handle.with_host(|host| host.transactions.with_transactions(|transactions| transactions.store())),
+        }
+    }
+
+    fn release_publication_handle(&self) {
+        match self {
+            Self::Legacy(manager) => manager.release_publication_handle(),
+            Self::Owned(handle) => handle.with_host(|host| host.transactions.with_transactions(|transactions| transactions.release_publication_handle())),
+        }
+    }
+
+    fn read_commit_directory_cursor(
+        &self,
+        lower: std::ops::Bound<Lsn>,
+        upper: std::ops::Bound<Lsn>,
+        context: &contextdb_tx::ReadCommitContext<'_>,
+    ) -> Result<Box<dyn contextdb_tx::ReadCommitCursor>> {
+        match self {
+            Self::Legacy(manager) => manager.read_commit_directory_cursor(lower, upper, context),
+            Self::Owned(handle) => handle.with_host(|host| host.transactions.with_transactions(|transactions| transactions.read_commit_directory_cursor(lower, upper, context))),
+        }
+    }
+
+    fn try_commit_index_prefix(&self, up_to: Lsn) -> Result<BTreeMap<Lsn, TxId>> {
+        match self {
+            Self::Legacy(manager) => manager.try_commit_index_prefix(up_to),
+            Self::Owned(handle) => handle.with_host(|host| host.transactions.with_transactions(|transactions| transactions.try_commit_index_prefix(up_to))),
+        }
+    }
+
+    fn commit_index_snapshot(&self) -> BTreeMap<Lsn, TxId> {
+        match self {
+            Self::Legacy(manager) => manager.commit_index_snapshot(),
+            Self::Owned(handle) => handle.with_host(|host| host.transactions.with_transactions(|transactions| transactions.commit_index_snapshot())),
+        }
+    }
+
+    fn commit_index_len(&self) -> usize {
+        match self {
+            Self::Legacy(manager) => manager.commit_index_len(),
+            Self::Owned(handle) => handle.with_host(|host| host.transactions.with_transactions(|transactions| transactions.commit_index_len())),
+        }
+    }
+
+    fn try_commit_index_census(&self) -> Result<(usize, Lsn)> {
+        match self {
+            Self::Legacy(manager) => manager.try_commit_index_census(),
+            Self::Owned(handle) => handle.with_host(|host| host.transactions.with_transactions(|transactions| transactions.try_commit_index_census())),
+        }
+    }
+
+    fn try_commit_index_census_with_context(
+        &self,
+        context: &contextdb_tx::ReadCommitContext<'_>,
+    ) -> Result<(usize, Lsn)> {
+        match self {
+            Self::Legacy(manager) => manager.try_commit_index_census_with_context(context),
+            Self::Owned(handle) => handle.with_host(|host| host.transactions.with_transactions(|transactions| transactions.try_commit_index_census_with_context(context))),
+        }
+    }
+
+    fn try_commit_index_contains(&self, lsn: Lsn) -> Result<bool> {
+        match self {
+            Self::Legacy(manager) => manager.try_commit_index_contains(lsn),
+            Self::Owned(handle) => handle.with_host(|host| host.transactions.with_transactions(|transactions| transactions.try_commit_index_contains(lsn))),
+        }
+    }
+
+    fn try_commit_index_contains_with_context(
+        &self,
+        lsn: Lsn,
+        context: &contextdb_tx::ReadCommitContext<'_>,
+    ) -> Result<bool> {
+        match self {
+            Self::Legacy(manager) => manager.try_commit_index_contains_with_context(lsn, context),
+            Self::Owned(handle) => handle.with_host(|host| host.transactions.with_transactions(|transactions| transactions.try_commit_index_contains_with_context(lsn, context))),
+        }
+    }
+
+    fn try_commit_index_floor(&self, upper: std::ops::Bound<Lsn>) -> Result<Option<(Lsn, TxId)>> {
+        match self {
+            Self::Legacy(manager) => manager.try_commit_index_floor(upper),
+            Self::Owned(handle) => handle.with_host(|host| host.transactions.with_transactions(|transactions| transactions.try_commit_index_floor(upper))),
+        }
+    }
+
+    fn try_commit_index_floor_with_context(
+        &self,
+        upper: std::ops::Bound<Lsn>,
+        context: &contextdb_tx::ReadCommitContext<'_>,
+    ) -> Result<Option<(Lsn, TxId)>> {
+        match self {
+            Self::Legacy(manager) => manager.try_commit_index_floor_with_context(upper, context),
+            Self::Owned(handle) => handle.with_host(|host| host.transactions.with_transactions(|transactions| transactions.try_commit_index_floor_with_context(upper, context))),
+        }
+    }
+
+    fn try_commit_index_get_with_context(
+        &self,
+        lsn: Lsn,
+        context: &contextdb_tx::ReadCommitContext<'_>,
+    ) -> Result<Option<TxId>> {
+        match self {
+            Self::Legacy(manager) => manager.try_commit_index_get_with_context(lsn, context),
+            Self::Owned(handle) => handle.with_host(|host| host.transactions.with_transactions(|transactions| transactions.try_commit_index_get_with_context(lsn, context))),
+        }
+    }
+
+    fn try_snapshot_at_lsn_with_context(
+        &self,
+        lsn: Lsn,
+        context: &contextdb_tx::ReadCommitContext<'_>,
+    ) -> Result<SnapshotId> {
+        match self {
+            Self::Legacy(manager) => manager.try_snapshot_at_lsn_with_context(lsn, context),
+            Self::Owned(handle) => handle.with_host(|host| host.transactions.with_transactions(|transactions| transactions.try_snapshot_at_lsn_with_context(lsn, context))),
+        }
+    }
+
+    fn snapshot_at_lsn(&self, lsn: Lsn) -> SnapshotId {
+        match self {
+            Self::Legacy(manager) => manager.snapshot_at_lsn(lsn),
+            Self::Owned(handle) => handle.with_host(|host| host.transactions.with_transactions(|transactions| transactions.snapshot_at_lsn(lsn))),
+        }
+    }
+
+    fn try_remove_commit_index_entries(&self, lsns: &[Lsn]) -> Result<u64> {
+        match self {
+            Self::Legacy(manager) => manager.try_remove_commit_index_entries(lsns),
+            Self::Owned(handle) => handle.with_host(|host| host.transactions.with_transactions(|transactions| transactions.try_remove_commit_index_entries(lsns))),
+        }
+    }
+
+    fn allocate_ddl_lsn<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(Lsn) -> Result<R>,
+    {
+        match self {
+            Self::Legacy(manager) => manager.allocate_ddl_lsn(f),
+            Self::Owned(handle) => handle.with_host(|host| host.transactions.with_transactions(|transactions| transactions.allocate_ddl_lsn(f))),
+        }
+    }
+
+    fn allocate_ddl_lsn_maybe<F, R>(&self, f: F) -> Result<Option<R>>
+    where
+        F: FnOnce(Lsn) -> Result<Option<R>>,
+    {
+        match self {
+            Self::Legacy(manager) => manager.allocate_ddl_lsn_maybe(f),
+            Self::Owned(handle) => handle.with_host(|host| host.transactions.with_transactions(|transactions| transactions.allocate_ddl_lsn_maybe(f))),
+        }
+    }
+
+    fn with_commit_lock<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        match self {
+            Self::Legacy(manager) => manager.with_commit_lock(f),
+            Self::Owned(handle) => handle.with_host(|host| host.transactions.with_transactions(|transactions| transactions.with_commit_lock(f))),
+        }
+    }
+
+    fn try_with_commit_lock_for<F, R>(&self, duration: std::time::Duration, f: F) -> Option<R>
+    where
+        F: FnOnce() -> R,
+    {
+        match self {
+            Self::Legacy(manager) => manager.try_with_commit_lock_for(duration, f),
+            Self::Owned(handle) => handle.with_host(|host| host.transactions.with_transactions(|transactions| transactions.try_with_commit_lock_for(duration, f))),
+        }
+    }
+
+    fn try_with_commit_lock_cancellable_for<F, R, D>(
+        &self,
+        duration: Duration,
+        cancelled: &OwnerReadCancellation,
+        deadline_expired: D,
+        f: F,
+    ) -> Option<R>
+    where
+        F: FnOnce() -> R,
+        D: Fn() -> bool,
+    {
+        match self {
+            Self::Legacy(manager) => manager.try_with_commit_lock_cancellable_for(duration, cancelled, deadline_expired, f),
+            Self::Owned(handle) => handle.with_host(|host| host.transactions.with_transactions(|transactions| transactions.try_with_commit_lock_cancellable_for(duration, cancelled, deadline_expired, f))),
+        }
+    }
+
+    fn with_maintenance_publication<F, R>(&self, f: F) -> Result<R>
+    where
+        F: for<'guard> FnOnce(&mut contextdb_tx::manager::MaintenancePublication<'guard, DynStore>) -> Result<R>,
+    {
+        match self {
+            Self::Legacy(manager) => manager.with_maintenance_publication(f),
+            Self::Owned(handle) => handle.with_host(|host| host.transactions.with_transactions(|transactions| transactions.with_maintenance_publication(f))),
+        }
+    }
+
+    fn commit_boundary_held_by_current_thread(&self) -> bool {
+        match self {
+            Self::Legacy(manager) => manager.commit_boundary_held_by_current_thread(),
+            Self::Owned(handle) => handle.with_host(|host| host.transactions.with_transactions(|transactions| transactions.commit_boundary_held_by_current_thread())),
+        }
+    }
+
+    fn reserve_deferred_metadata_publication(&self) -> Result<Option<Box<dyn std::any::Any + Send>>> {
+        match self {
+            Self::Legacy(manager) => manager.reserve_deferred_metadata_publication(),
+            Self::Owned(handle) => handle.with_host(|host| host.transactions.with_transactions(|transactions| transactions.reserve_deferred_metadata_publication())),
+        }
+    }
+
+    fn owe_metadata_publication(&self, reservation: Option<Box<dyn std::any::Any + Send>>) {
+        match self {
+            Self::Legacy(manager) => manager.owe_metadata_publication(reservation),
+            Self::Owned(handle) => handle.with_host(|host| host.transactions.with_transactions(|transactions| transactions.owe_metadata_publication(reservation))),
+        }
+    }
+
+    fn transaction_read(&self, tx: TxId) -> Result<contextdb_tx::PublishedRead> {
+        match self {
+            Self::Legacy(manager) => manager.transaction_read(tx),
+            Self::Owned(handle) => handle.with_host(|host| host.transactions.with_transactions(|transactions| transactions.transaction_read(tx))),
+        }
+    }
+
+    fn row_shadows_committed(&self, tx: TxId, table: &str, row: RowId) -> Result<bool> {
+        match self {
+            Self::Legacy(manager) => manager.row_shadows_committed(tx, table, row),
+            Self::Owned(handle) => handle.with_host(|host| host.transactions.with_transactions(|transactions| transactions.row_shadows_committed(tx, table, row))),
+        }
+    }
+
+    fn advance_for_sync(&self, tx: TxId, table: &str, incoming: TxId) -> Result<()> {
+        match self {
+            Self::Legacy(manager) => manager.advance_for_sync(tx, table, incoming),
+            Self::Owned(handle) => handle.with_host(|host| host.transactions.with_transactions(|transactions| transactions.advance_for_sync(tx, table, incoming))),
+        }
+    }
+
+    fn rollback_empty_without_commit_lock(&self, tx: TxId) -> Result<()> {
+        match self {
+            Self::Legacy(manager) => manager.rollback_empty_without_commit_lock(tx),
+            // Even an empty lower image may have paired engine metadata.
+            // Retain both owners until their terminal route consumes them
+            // together under the original transaction boundary.
+            Self::Owned(_) => Err(Self::producer_gap("coupled empty rollback terminal owner")),
+        }
+    }
+
+    fn try_begin(&self) -> Result<TxId> {
+        match self {
+            Self::Legacy(manager) => manager.try_begin(),
+            Self::Owned(handle) => handle.with_host(|host| host.transactions.with_transactions(|transactions| transactions.try_begin())),
+        }
+    }
+
+    fn with_write_set<F, R>(&self, tx: TxId, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut WriteSet) -> R,
+    {
+        match self {
+            Self::Legacy(manager) => manager.with_write_set(tx, f),
+            Self::Owned(_) => Err(Self::producer_gap("with_write_set")),
+        }
+    }
+
+    fn cloned_write_set(&self, tx: TxId) -> Result<WriteSet> {
+        match self {
+            Self::Legacy(manager) => manager.cloned_write_set(tx),
+            Self::Owned(_) => Err(Self::producer_gap("cloned_write_set")),
+        }
+    }
+
+    fn rollback_write_set(&self, tx: TxId) -> Result<WriteSet> {
+        match self {
+            Self::Legacy(manager) => manager.rollback_write_set(tx),
+            Self::Owned(_) => Err(Self::producer_gap("rollback_write_set")),
+        }
+    }
+
+    fn drain_active_write_sets(&self) -> Vec<WriteSet> {
+        match self {
+            Self::Legacy(manager) => manager.drain_active_write_sets(),
+            Self::Owned(_) => panic!("owned transaction host requires migrated drain_active_write_sets caller"),
+        }
+    }
+
+    fn with_active_write_sets<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut HashMap<TxId, WriteSet>) -> R,
+    {
+        match self {
+            Self::Legacy(manager) => manager.with_active_write_sets(f),
+            Self::Owned(_) => panic!("owned transaction host requires migrated with_active_write_sets caller"),
+        }
+    }
+
+    fn commit_with_reserved_lsn_callback_mut<F, G>(
+        &self,
+        tx: TxId,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        before_commit: F,
+        prepare: G,
+    ) -> std::result::Result<(Lsn, WriteSet), contextdb_tx::manager::CommitFailure>
+    where
+        F: FnOnce(Lsn) -> Result<()>,
+        G: FnOnce(&mut WriteSet) -> Result<()>,
+    {
+        match self {
+            Self::Legacy(manager) => manager.commit_with_reserved_lsn_callback_mut(tx, read_memory, before_commit, prepare),
+            Self::Owned(_) => Err(contextdb_tx::manager::CommitFailure { error: Self::producer_gap("commit_with_reserved_lsn_callback_mut"), write_set: None }),
+        }
+    }
+
+    fn commit_with_lsn_precanonicalized_active_prepare_and_applied_mut<F, G>(
+        &self,
+        tx: TxId,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        requires_commit: impl FnOnce() -> Result<bool>,
+        active_prepare: F,
+        prepare: G,
+        after_apply: impl FnOnce(Lsn, &WriteSet),
+    ) -> std::result::Result<(Lsn, WriteSet), contextdb_tx::manager::CommitFailure>
+    where
+        F: FnOnce(Lsn, TxId) -> Result<()>,
+        G: FnOnce(&mut WriteSet) -> Result<()>,
+    {
+        match self {
+            Self::Legacy(manager) => manager.commit_with_lsn_precanonicalized_active_prepare_and_applied_mut(tx, read_memory, requires_commit, active_prepare, prepare, after_apply),
+            Self::Owned(_) => Err(contextdb_tx::manager::CommitFailure { error: Self::producer_gap("commit_with_lsn_precanonicalized_active_prepare_and_applied_mut"), write_set: None }),
+        }
+    }
+
+    fn with_ordered_staged_cursor<F, R>(
+        &self,
+        tx: TxId,
+        table: &str,
+        index: &str,
+        bounds: contextdb_tx::ordered_staged::OrderedStagedBounds<'_>,
+        reverse: bool,
+        f: F,
+    ) -> Result<R>
+    where
+        F: FnOnce(Option<contextdb_tx::ordered_staged::OrderedStagedCursor<'_>>, &WriteSet) -> R,
+    {
+        match self {
+            Self::Legacy(manager) => manager.with_ordered_staged_cursor(tx, table, index, bounds, reverse, f),
+            Self::Owned(_) => Err(Self::producer_gap("with_ordered_staged_cursor")),
+        }
+    }
+
+    fn producer_gap(operation: &str) -> Error {
+        Error::InvalidStateTransition(format!(
+            "owned transaction host requires a migrated {operation} producer"
+        ))
+    }
+
+    fn begin(&self) -> TxId {
+        match self {
+            Self::Legacy(manager) => manager.begin(),
+            Self::Owned(_) => self.try_begin().expect("transaction begin must be admitted"),
+        }
+    }
+
+    fn rollback(&self, tx: TxId) -> Result<()> {
+        match self {
+            Self::Legacy(manager) => manager.rollback(tx),
+            Self::Owned(handle) => handle.with_host(|host| host.rollback_terminal(tx).map(drop)),
+        }
+    }
+
+    fn identity(&self) -> usize {
+        match self {
+            Self::Legacy(manager) => Arc::as_ptr(manager) as usize,
+            Self::Owned(handle) => handle.identity(),
+        }
+    }
+
+    fn as_ref(&self) -> &Self { self }
+
+    fn downgrade(&self) -> DatabaseTransactionWeak {
+        match self {
+            Self::Legacy(manager) => DatabaseTransactionWeak::Legacy(Arc::downgrade(manager)),
+            Self::Owned(handle) => DatabaseTransactionWeak::Owned(handle.downgrade()),
+        }
+    }
+
+    fn relational_executor(&self, store: Arc<RelationalStore>) -> MemRelationalExecutor<DynStore> {
+        match self {
+            Self::Legacy(manager) => MemRelationalExecutor::new(store, manager.clone()),
+            Self::Owned(handle) => handle.with_host(|host| {
+                MemRelationalExecutor::new_engine(store, host.transactions.clone())
+            }),
+        }
+    }
+
+    fn graph_executor(&self, store: Arc<GraphStore>) -> MemGraphExecutor<DynStore> {
+        match self {
+            Self::Legacy(manager) => MemGraphExecutor::new(store, manager.clone()),
+            Self::Owned(handle) => handle.with_host(|host| {
+                MemGraphExecutor::new_engine(store, host.transactions.clone())
+            }),
+        }
+    }
+
+    fn vector_executor(&self, store: Arc<VectorStore>,
+        hnsw: Arc<OnceLock<RwLock<Option<HnswIndex>>>>,
+        accountant: Arc<dyn MemoryBudget>,
+    ) -> MemVectorExecutor<DynStore> {
+        match self {
+            Self::Legacy(manager) => MemVectorExecutor::new_with_accountant(store, manager.clone(), hnsw, accountant),
+            Self::Owned(handle) => handle.with_host(|host| {
+                MemVectorExecutor::new_engine(store, host.transactions.clone(), hnsw, accountant)
+            }),
+        }
+    }
+
+    /// Borrow only immutable ordinary fields while holding this exact manager's
+    /// active-map lock. Owned callers cannot obtain a bare WriteSet.
+    fn with_read<R>(&self, tx: TxId,
+        f: impl FnOnce(contextdb_tx::manager::EngineRead<'_>) -> R,
+    ) -> Result<R> {
+        match self {
+            Self::Legacy(manager) => manager.with_write_set(tx, |ws| f(Self::legacy_read(ws))),
+            Self::Owned(handle) => handle.with_host(|host| {
+                host.transactions.with_transactions(|transactions| transactions.with_read(tx, f))
+            }),
+        }
+    }
+
+    fn legacy_read(ws: &WriteSet) -> contextdb_tx::manager::EngineRead<'_> {
+        contextdb_tx::manager::EngineRead {
+            base_read: &ws.base_read,
+            relational_inserts: &ws.relational_inserts,
+            relational_deletes: &ws.relational_deletes,
+            relational_delete_predicates: &ws.relational_delete_predicates,
+            adj_inserts: &ws.adj_inserts,
+            adj_deletes: &ws.adj_deletes,
+            vector_inserts: &ws.vector_inserts,
+            vector_deletes: &ws.vector_deletes,
+            vector_moves: &ws.vector_moves,
+            commit_lsn: &ws.commit_lsn,
+            finalized_tx: &ws.finalized_tx,
+            relational_insert_source_lsns: &ws.relational_insert_source_lsns,
+            relational_insert_source_kinds: &ws.relational_insert_source_kinds,
+            relational_insert_admitted_bytes: &ws.relational_insert_admitted_bytes,
+            sync_source_provenance_marks: &ws.sync_source_provenance_marks,
+            config_writes: &ws.config_writes,
+            config_deletes: &ws.config_deletes,
+            config_max_u64_keys: &ws.config_max_u64_keys,
+            requires_commit_lsn: &ws.requires_commit_lsn,
+            visibility_floor: &ws.visibility_floor,
+            propagation_in_progress: &ws.propagation_in_progress,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    fn write_set_lock_is_held_for_test(&self) -> bool {
+        match self {
+            Self::Legacy(manager) => manager.write_set_lock_is_held_for_test(),
+            Self::Owned(handle) => handle.with_host(|host| host.transactions.with_transactions(
+                |transactions| transactions.write_set_lock_is_held_for_test())),
+        }
+    }
+    fn with_write_set_detached<F, R>(&self, tx: TxId, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut WriteSet) -> R,
+    {
+        match self {
+            Self::Legacy(manager) => manager.with_write_set_detached(tx, f),
+            Self::Owned(_) => Err(Self::producer_gap("with_write_set_detached")),
+        }
+    }
+    #[cfg(feature = "test-seams")]
+    fn has_captured_commit_directory_for_test(&self) -> bool {
+        match self {
+            Self::Legacy(manager) => manager.has_captured_commit_directory_for_test(),
+            Self::Owned(handle) => handle.with_host(|host| host.transactions.with_transactions(|transactions| transactions.has_captured_commit_directory_for_test())),
+        }
+    }
+    #[cfg(feature = "test-seams")]
+    fn visit_captured_read_memory_for_test(
+        &self,
+        visit: impl FnOnce(&Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>),
+    ) {
+        match self {
+            Self::Legacy(manager) => manager.visit_captured_read_memory_for_test(visit),
+            Self::Owned(handle) => handle.with_host(|host| host.transactions.with_transactions(|transactions| transactions.visit_captured_read_memory_for_test(visit))),
+        }
+    }
+    #[cfg(feature = "test-seams")]
+    fn retained_commit_directory_bytes_for_test(&self) -> usize {
+        match self {
+            Self::Legacy(manager) => manager.retained_commit_directory_bytes_for_test(),
+            Self::Owned(handle) => handle.with_host(|host| host.transactions.with_transactions(|transactions| transactions.retained_commit_directory_bytes_for_test())),
+        }
+    }
+}
+
+#[derive(Clone)]
+enum DatabaseTransactionWeak {
+    Legacy(std::sync::Weak<TransactionManager<DynStore>>),
+    Owned(EngineDatabaseWeak),
+}
+impl DatabaseTransactionWeak {
+    fn upgrade(&self) -> Option<DatabaseTransactionHost> {
+        match self {
+            Self::Legacy(manager) => manager.upgrade().map(DatabaseTransactionHost::Legacy),
+            Self::Owned(handle) => handle.upgrade().map(DatabaseTransactionHost::Owned),
+        }
+    }
+}
+
 pub struct Database {
     /// This handle's identity, never an address. Every handle gets its own,
     /// including one derived by narrowing another's access, exactly as each
     /// had its own address before.
     id: DatabaseId,
-    tx_mgr: Arc<TransactionManager<DynStore>>,
+    tx_mgr: DatabaseTransactionHost,
     relational_store: Arc<RelationalStore>,
     graph_store: Arc<GraphStore>,
     vector_store: Arc<VectorStore>,
@@ -13752,7 +14431,7 @@ struct PendingCommitMetadata {
     lineage_generations: Option<Arc<PendingLineageGenerations>>,
 }
 
-pub(crate) struct WriteSetCheckpoint<'a> {
+struct LegacyWriteSetCheckpoint<'a> {
     database: &'a Database,
     tx: TxId,
     counts: [usize; 13],
@@ -13765,7 +14444,7 @@ pub(crate) struct WriteSetCheckpoint<'a> {
     _charge: crate::memory_accounting::OwnedMemoryReservation,
     active: bool,
 }
-impl Drop for WriteSetCheckpoint<'_> {
+impl Drop for LegacyWriteSetCheckpoint<'_> {
     fn drop(&mut self) {
         if self.active {
             let _ = self
@@ -13773,6 +14452,1782 @@ impl Drop for WriteSetCheckpoint<'_> {
                 .tx_mgr
                 .with_write_set(self.tx, |ws| ws.ordered_staged_rows.settle_checkpoint());
         }
+    }
+}
+
+// This private host is deliberately not constructed by Database's Legacy opens.
+// Activation requires every producer to use EngineGuard and admitted metadata.
+/// Field order keeps a rejected original body ahead of its reservation.
+struct OriginalRowValues {
+    values: HashMap<ColName, Value>,
+    admission: OwnedMemoryReservation,
+}
+
+struct OriginalOptionalRowValues {
+    values: HashMap<ColName, Value>,
+    admission: Option<OwnedMemoryReservation>,
+}
+
+struct OriginalDatabaseRow {
+    row: VersionedRow,
+    admission: OwnedMemoryReservation,
+}
+
+struct EngineDatabaseTransactions {
+    transactions: EngineTransactionHandle<DynStore>,
+    metadata: EngineMetadataJournal,
+    // Retain the original provider last so the journal and lower facade have
+    // released their native allocations before its source receiver can end.
+    funder: contextdb_tx::SourceFunder,
+}
+
+impl EngineDatabaseTransactions {
+    fn rollback_terminal(&self, tx: TxId) -> Result<OwnedDatabaseTerminal> {
+        self.transactions.with_transactions(|lower| lower.rollback_owned_with_peer(
+            tx, |identity| self.metadata.validate_terminal(identity),
+            ValidatedMetadataTerminal::consume_nonfallible,
+        ))
+    }
+
+    fn rollback_empty_terminal(&self, tx: TxId) -> Result<OwnedDatabaseTerminal> {
+        self.transactions.with_transactions(|lower| lower.rollback_empty_owned_with_peer(
+            tx, |identity| self.metadata.validate_terminal(identity),
+            ValidatedMetadataTerminal::consume_nonfallible,
+        ))
+    }
+
+    fn drain_terminals(&self) -> OwnedDatabaseDrain {
+        self.transactions.with_transactions(|lower| lower.drain_owned_with_peer(
+            |sources| self.metadata.validate_drain(sources),
+            ValidatedMetadataDrain::consume_nonfallible,
+            OwnedTerminalMetadataChain::take_front_nonfallible,
+        ))
+    }
+
+    // Restricted prepared mutations are the only writable preparation door.
+    // Callers must migrate their entire payload/delivery bodies before using
+    // these forwards; the immutable ordinary image is never a mutable adapter.
+    fn commit_terminal(
+        &self, tx: TxId,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        requires_commit: impl FnOnce() -> Result<bool>,
+        active_prepare: impl FnOnce(Lsn, TxId) -> Result<()>,
+        prepare: impl for<'g, 'h, 'p> FnOnce(
+            &'g mut contextdb_tx::manager::EngineGuard<'h>, &'p mut OwnedTerminalMetadata,
+        ) -> Result<()>,
+        after_apply: impl for<'w> FnOnce(Lsn, &'w WriteSet),
+    ) -> std::result::Result<(Lsn, OwnedDatabaseTerminal), OwnedDatabaseTerminalFailure> {
+        self.transactions.with_transactions(|lower|
+            lower.commit_owned_active_prepare_and_applied_with_peer(
+                tx, read_memory, requires_commit, active_prepare, prepare, after_apply,
+                |identity| self.metadata.validate_terminal(identity),
+                ValidatedMetadataTerminal::consume_nonfallible,
+            ))
+    }
+
+    fn commit_reserved_terminal(
+        &self, tx: TxId,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        before_commit: impl FnOnce(Lsn) -> Result<()>,
+        prepare: impl for<'g, 'h, 'p> FnOnce(
+            &'g mut contextdb_tx::manager::EngineGuard<'h>, &'p mut OwnedTerminalMetadata,
+        ) -> Result<()>,
+    ) -> std::result::Result<(Lsn, OwnedDatabaseTerminal), OwnedDatabaseTerminalFailure> {
+        self.transactions.with_transactions(|lower|
+            lower.commit_owned_with_reserved_lsn_callback_with_peer(
+                tx, read_memory, before_commit, prepare,
+                |identity| self.metadata.validate_terminal(identity),
+                ValidatedMetadataTerminal::consume_nonfallible,
+            ))
+    }
+
+    /// Consume the actual producer debit through this host's original funder.
+    /// Validation and the caller's row identity/time selection precede this
+    /// door; native preparation retains sealed and distinct ordinary bodies.
+    fn stage_original_row(
+        &self,
+        store: Arc<RelationalStore>,
+        tx: TxId,
+        table: &str,
+        row: VersionedRow,
+        admission: OwnedMemoryReservation,
+    ) -> Result<RowId> {
+        let mut original = OriginalDatabaseRow { row, admission };
+        let invoice = original.admission.into_source_row_invoice_for(&self.funder)?;
+        let relational = MemRelationalExecutor::new_engine(store, self.transactions.clone());
+        relational.stage_engine_row(tx, table, original.row, invoice)
+    }
+
+    fn try_new(
+        transactions: EngineTransactionHandle<DynStore>,
+        writer: &WriterBudget,
+        funder: contextdb_tx::SourceFunder,
+    ) -> Result<Self> {
+        if !transactions.matches_funder(&funder) {
+            return Err(Error::InvalidStateTransition(
+                "engine database host requires the lower handle's original source funder".into(),
+            ));
+        }
+        Ok(Self {
+            transactions,
+            metadata: EngineMetadataJournal {
+                accountant: writer.accountant(),
+                records: Mutex::new(None),
+            },
+            funder,
+        })
+    }
+}
+
+
+impl EngineDatabaseTransactions {
+    fn commit_terminal_scoped(
+        &self, tx: TxId,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        requires_commit: impl FnOnce() -> Result<bool>,
+        active_prepare: impl FnOnce(&DatabaseCommitScope<'_, '_, '_>, Lsn, TxId) -> PreparationResult<()>,
+        prepare: impl for<'g, 'h, 'p> FnOnce(
+            &'g mut contextdb_tx::manager::EngineGuard<'h>, &'p mut OwnedTerminalMetadata,
+        ) -> Result<()>,
+        after_apply: impl for<'w> FnOnce(Lsn, &'w WriteSet),
+    ) -> std::result::Result<(Lsn, OwnedDatabaseTerminal), OwnedDatabaseTerminalFailure> {
+        let result = self.transactions.with_transactions(|lower| {
+            lower.commit_owned_active_prepare_and_applied_with_peer_scoped(
+                tx, read_memory, requires_commit,
+                |scope, lsn, visibility_tx| active_prepare(
+                    &DatabaseCommitScope { host: self, lower: scope }, lsn, visibility_tx,
+                ),
+                |guard, peer: &mut OwnedTemporaryMetadata| prepare(guard, &mut peer.original),
+                after_apply,
+                |identity| {
+                    let terminal = self.metadata.validate_terminal(identity);
+                    let original_present = EngineMetadataJournal::record(
+                        &terminal.records, identity.original_tx,
+                    ).is_some();
+                    ValidatedTemporaryMetadata { terminal, original_present }
+                },
+                consume_temporary_nonfallible,
+            )
+        });
+        result.map(|(lsn, pair)| (lsn, pair.map_peer(unwrap_temporary_peer)))
+            .map_err(|failure| failure.map_peer(unwrap_temporary_peer))
+    }
+
+    fn commit_reserved_terminal_scoped(
+        &self, tx: TxId,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        before_commit: impl FnOnce(&DatabaseCommitScope<'_, '_, '_>, Lsn) -> PreparationResult<()>,
+        prepare: impl for<'g, 'h, 'p> FnOnce(
+            &'g mut contextdb_tx::manager::EngineGuard<'h>, &'p mut OwnedTerminalMetadata,
+        ) -> Result<()>,
+    ) -> std::result::Result<(Lsn, OwnedDatabaseTerminal), OwnedDatabaseTerminalFailure> {
+        let result = self.transactions.with_transactions(|lower| {
+            lower.commit_owned_with_reserved_lsn_callback_with_peer_scoped(
+                tx, read_memory,
+                |scope, lsn| before_commit(&DatabaseCommitScope { host: self, lower: scope }, lsn),
+                |guard, peer: &mut OwnedTemporaryMetadata| prepare(guard, &mut peer.original),
+                |identity| {
+                    let terminal = self.metadata.validate_terminal(identity);
+                    let original_present = EngineMetadataJournal::record(
+                        &terminal.records, identity.original_tx,
+                    ).is_some();
+                    ValidatedTemporaryMetadata { terminal, original_present }
+                },
+                consume_temporary_nonfallible,
+            )
+        });
+        result.map(|(lsn, pair)| (lsn, pair.map_peer(unwrap_temporary_peer)))
+            .map_err(|failure| failure.map_peer(unwrap_temporary_peer))
+    }
+}
+
+/// A private paired strong owner for the engine-only host.  It deliberately
+/// exposes only a scoped borrow, so no raw manager, `Arc`, or mutable write
+/// set can cross the engine boundary.
+struct EngineDatabaseHandle {
+    data: Option<Arc<EngineDatabaseTransactions>>,
+    credit: Option<contextdb_tx::SourceCharge>,
+}
+
+impl EngineDatabaseHandle {
+    fn try_new(
+        host: EngineDatabaseTransactions,
+        funder: &contextdb_tx::SourceFunder,
+    ) -> Result<Self> {
+        if !host.transactions.matches_funder(&host.funder)
+            || !host.transactions.matches_funder(funder)
+        {
+            return Err(Error::InvalidStateTransition(
+                "engine database handle requires one matching original source funder".into(),
+            ));
+        }
+        // The charge is admitted while `host` remains a stack value.  A
+        // refusal therefore drops the complete lower facade and metadata
+        // before its temporary invoice is released.
+        let credit = contextdb_tx::SourceCharge::admit_funded(
+            funder.clone(),
+            contextdb_tx::staged_source::source_arc_layout::<EngineDatabaseTransactions>().size(),
+        )?;
+        Ok(Self {
+            data: Some(Arc::new(host)),
+            credit: Some(credit),
+        })
+    }
+
+    fn with_host<'h, R>(
+        &'h self,
+        f: impl FnOnce(&'h EngineDatabaseTransactions) -> R,
+    ) -> R {
+        f(self.data.as_deref().expect("live engine database handle"))
+    }
+
+    fn identity(&self) -> usize {
+        self.with_host(|host| host.transactions.identity())
+    }
+
+    fn downgrade(&self) -> EngineDatabaseWeak {
+        // Clone credit before making the matching native weak count visible.
+        let credit = self.credit.as_ref().expect("live engine database credit").clone();
+        let data = Arc::downgrade(self.data.as_ref().expect("live engine database handle"));
+        EngineDatabaseWeak {
+            data: Some(data),
+            credit: Some(credit),
+        }
+    }
+}
+
+impl Clone for EngineDatabaseHandle {
+    fn clone(&self) -> Self {
+        let credit = self.credit.as_ref().expect("live engine database credit").clone();
+        let data = self.data.as_ref().expect("live engine database handle").clone();
+        Self {
+            data: Some(data),
+            credit: Some(credit),
+        }
+    }
+}
+
+impl Drop for EngineDatabaseHandle {
+    fn drop(&mut self) {
+        drop(self.data.take());
+        drop(self.credit.take());
+    }
+}
+
+/// The weak half retains the same external invoice until std's last weak
+/// header is physically freed.  It is private so no uncredited `Weak` can
+/// leave the engine.
+struct EngineDatabaseWeak {
+    data: Option<std::sync::Weak<EngineDatabaseTransactions>>,
+    credit: Option<contextdb_tx::SourceCharge>,
+}
+
+impl EngineDatabaseWeak {
+    fn upgrade(&self) -> Option<EngineDatabaseHandle> {
+        // The tentative invoice is intentionally acquired before upgrade.  On
+        // failure it simply drops; on success it accompanies the new count.
+        let credit = self.credit.as_ref().expect("live engine database credit").clone();
+        let data = self.data.as_ref().expect("live engine database weak").upgrade()?;
+        Some(EngineDatabaseHandle {
+            data: Some(data),
+            credit: Some(credit),
+        })
+    }
+}
+
+impl Clone for EngineDatabaseWeak {
+    fn clone(&self) -> Self {
+        let credit = self.credit.as_ref().expect("live engine database credit").clone();
+        let data = self.data.as_ref().expect("live engine database weak").clone();
+        Self {
+            data: Some(data),
+            credit: Some(credit),
+        }
+    }
+}
+
+impl Drop for EngineDatabaseWeak {
+    fn drop(&mut self) {
+        drop(self.data.take());
+        drop(self.credit.take());
+    }
+}
+
+/// Pair each actual metadata body with its producer's original admission before
+/// validation, locking or any fallible work. There is no refund-by-byte-count.
+struct AdmittedMetadataValue<T> {
+    body: Option<T>,
+    invoice: Option<OwnedMemoryReservation>,
+}
+impl<T> AdmittedMetadataValue<T> {
+    fn new(body: T, invoice: OwnedMemoryReservation) -> Self {
+        Self {
+            body: Some(body),
+            invoice: Some(invoice),
+        }
+    }
+}
+impl<T> Drop for AdmittedMetadataValue<T> {
+    fn drop(&mut self) {
+        drop(self.body.take());
+        drop(self.invoice.take());
+    }
+}
+/// Native capacity and its actual reservation move as one owner. A replacement
+/// buffer is independently admitted; an old buffer stays alive for rollback.
+struct MetadataBuffer<T> {
+    values: Vec<T>,
+    credit: Option<OwnedMemoryReservation>,
+}
+impl<T> MetadataBuffer<T> {
+    fn empty() -> Self {
+        Self {
+            values: Vec::new(),
+            credit: None,
+        }
+    }
+    fn prepare(
+        capacity: usize,
+        accountant: &crate::memory_accounting::AccountantHandle,
+    ) -> Result<Self> {
+        let layout = std::alloc::Layout::array::<T>(capacity)
+            .map_err(|_| EngineMetadataJournal::identity_error())?;
+        let credit = if layout.size() == 0 {
+            None
+        } else {
+            Some(OwnedMemoryReservation::try_new_for(
+                accountant.clone(),
+                layout.size(),
+                "relational",
+                "mutation_checkpoint",
+                "Reduce staged metadata or raise MEMORY_LIMIT.",
+            )?)
+        };
+        let values = Vec::with_capacity(capacity);
+        if std::mem::size_of::<T>() != 0 && values.capacity() != capacity {
+            drop(values);
+            return Err(EngineMetadataJournal::identity_error());
+        }
+        Ok(Self { values, credit })
+    }
+    fn push(&mut self, value: T) {
+        assert!(
+            self.values.len() < self.values.capacity(),
+            "prepared metadata capacity"
+        );
+        self.values.push(value);
+    }
+    fn move_into(&mut self, target: &mut Self) {
+        assert!(
+            target.values.capacity() - target.values.len() >= self.values.len(),
+            "preserved metadata capacity"
+        );
+        target.values.append(&mut self.values);
+    }
+}
+
+impl<T> Drop for MetadataBuffer<T> {
+    fn drop(&mut self) {
+        drop(std::mem::take(&mut self.values));
+        drop(self.credit.take());
+    }
+}
+
+impl<T> MetadataBuffer<AdmittedMetadataValue<T>> {
+    fn prepare_one(
+        body: T,
+        invoice: OwnedMemoryReservation,
+        accountant: &crate::memory_accounting::AccountantHandle,
+    ) -> Result<Self> {
+        let body = AdmittedMetadataValue::new(body, invoice);
+        let mut buffer = Self::prepare(1, accountant)?;
+        buffer.push(body);
+        Ok(buffer)
+    }
+}
+
+/// The owned counterpart of the seven Legacy pending fields. Each vector entry
+/// owns its actual body admission independently from its native vector buffer.
+/// Epoch maps retain their complete native keys, values, hasher and bucket debit.
+struct EnginePendingCommitMetadata {
+    discard_selections: MetadataBuffer<AdmittedMetadataValue<AuthoritativePurgeSelection>>,
+    delivery_registrations:
+        MetadataBuffer<AdmittedMetadataValue<crate::custody::preparation::SourceRegistration>>,
+    conditional_update_guards: MetadataBuffer<AdmittedMetadataValue<PendingConditionalUpdateGuard>>,
+    sync_lineage_guards: MetadataBuffer<AdmittedMetadataValue<PendingSyncLineageGuard>>,
+    upsert_intents: MetadataBuffer<AdmittedMetadataValue<PendingUpsertIntent>>,
+    vector_schema_epochs: Option<AdmittedMetadataValue<HashMap<VectorIndexRef, u64>>>,
+    lineage_generations: Option<Arc<PendingLineageGenerations>>,
+}
+impl EnginePendingCommitMetadata {
+    fn empty() -> Self {
+        Self {
+            discard_selections: MetadataBuffer::empty(),
+            delivery_registrations: MetadataBuffer::empty(),
+            conditional_update_guards: MetadataBuffer::empty(),
+            sync_lineage_guards: MetadataBuffer::empty(),
+            upsert_intents: MetadataBuffer::empty(),
+            vector_schema_epochs: None,
+            lineage_generations: None,
+        }
+    }
+}
+
+enum AdmittedMetadataBatch {
+    Discard(MetadataBuffer<AdmittedMetadataValue<AuthoritativePurgeSelection>>),
+    Delivery(
+        MetadataBuffer<AdmittedMetadataValue<crate::custody::preparation::SourceRegistration>>,
+    ),
+    Conditional(MetadataBuffer<AdmittedMetadataValue<PendingConditionalUpdateGuard>>),
+    SyncLineage(MetadataBuffer<AdmittedMetadataValue<PendingSyncLineageGuard>>),
+    Upsert(MetadataBuffer<AdmittedMetadataValue<PendingUpsertIntent>>),
+}
+struct MetadataSplice<T> {
+    at: usize,
+    installed: usize,
+    original_len: usize,
+    original_capacity: usize,
+    selections: MetadataBuffer<usize>,
+    inserted: MetadataBuffer<AdmittedMetadataValue<T>>,
+    removed: MetadataBuffer<(usize, AdmittedMetadataValue<T>)>,
+    storage: Option<MetadataBuffer<AdmittedMetadataValue<T>>>,
+}
+impl<T> MetadataSplice<T> {
+    fn prepare(
+        at: usize,
+        selections: &[usize],
+        inserted: MetadataBuffer<AdmittedMetadataValue<T>>,
+        original_len: usize,
+        original_capacity: usize,
+        accountant: &crate::memory_accounting::AccountantHandle,
+    ) -> Result<Self> {
+        if selections.iter().any(|position| *position >= original_len)
+            || selections
+                .windows(2)
+                .any(|positions| positions[0] >= positions[1])
+        {
+            return Err(EngineMetadataJournal::identity_error());
+        }
+        let remaining = original_len
+            .checked_sub(selections.len())
+            .ok_or_else(EngineMetadataJournal::identity_error)?;
+        if at > remaining {
+            return Err(EngineMetadataJournal::identity_error());
+        }
+        let installed = inserted.values.len();
+        let new_len = remaining
+            .checked_add(installed)
+            .ok_or_else(EngineMetadataJournal::identity_error)?;
+        let mut selection_buffer = MetadataBuffer::prepare(selections.len(), accountant)?;
+        for position in selections {
+            selection_buffer.push(*position);
+        }
+        let removed = MetadataBuffer::prepare(selections.len(), accountant)?;
+        let storage = if new_len > original_capacity {
+            Some(MetadataBuffer::prepare(new_len, accountant)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            at,
+            installed,
+            original_len,
+            original_capacity,
+            selections: selection_buffer,
+            inserted,
+            removed,
+            storage,
+        })
+    }
+    fn validate(&self, field: &MetadataBuffer<AdmittedMetadataValue<T>>) {
+        assert!(
+            field.values.len() == self.original_len
+                && field.values.capacity() == self.original_capacity
+                && self.inserted.values.len() == self.installed
+                && self.removed.values.is_empty(),
+            "prepared metadata image"
+        );
+        assert!(
+            self.selections
+                .values
+                .iter()
+                .all(|position| *position < self.original_len)
+                && self
+                    .selections
+                    .values
+                    .windows(2)
+                    .all(|positions| positions[0] < positions[1]),
+            "prepared metadata selections"
+        );
+        let remaining = self.original_len - self.selections.values.len();
+        let required = remaining
+            .checked_add(self.installed)
+            .expect("prepared metadata length");
+        assert!(self.at <= remaining, "prepared metadata insertion position");
+        let capacity = self
+            .storage
+            .as_ref()
+            .map_or(self.original_capacity, |buffer| {
+                assert!(
+                    buffer.values.is_empty() && buffer.values.capacity() >= self.original_len,
+                    "prepared metadata growth"
+                );
+                buffer.values.capacity()
+            });
+        assert!(
+            capacity >= required
+                && self
+                    .inserted
+                    .values
+                    .iter()
+                    .all(|value| value.body.is_some() && value.invoice.is_some()),
+            "prepared metadata bodies and capacity"
+        );
+    }
+    fn publish(&mut self, field: &mut MetadataBuffer<AdmittedMetadataValue<T>>) {
+        if let Some(mut working) = self.storage.take() {
+            field.move_into(&mut working);
+            self.storage = Some(std::mem::replace(field, working));
+        }
+        // Original positions descend on removal and ascend on inverse replay.
+        for position in self.selections.values.iter().rev() {
+            self.removed
+                .push((*position, field.values.remove(*position)));
+        }
+        for (offset, value) in self.inserted.values.drain(..).enumerate() {
+            field.values.insert(self.at + offset, value);
+        }
+    }
+    fn validate_restore(&self, field: &mut (usize, usize)) {
+        let (len, capacity) = *field;
+        assert!(
+            self.at <= len && self.installed <= len - self.at,
+            "installed metadata splice range"
+        );
+        assert!(
+            self.inserted.values.is_empty() && self.inserted.values.capacity() >= self.installed,
+            "prepaid metadata retirement capacity"
+        );
+        let remaining = len - self.installed;
+        let original_capacity = self
+            .storage
+            .as_ref()
+            .map_or(capacity, |storage| storage.values.capacity());
+        assert!(
+            self.storage
+                .as_ref()
+                .is_none_or(|storage| storage.values.is_empty()),
+            "preserved metadata storage"
+        );
+        assert!(
+            original_capacity >= self.original_len && remaining <= original_capacity,
+            "original metadata storage capacity"
+        );
+        let mut restored = remaining;
+        for (position, _) in self.removed.values.iter().rev() {
+            assert!(
+                *position <= restored && restored < original_capacity,
+                "original metadata inverse position"
+            );
+            restored += 1;
+        }
+        assert_eq!(
+            restored, self.original_len,
+            "original metadata inverse length"
+        );
+        *field = (restored, original_capacity);
+    }
+    fn restore(&mut self, field: &mut MetadataBuffer<AdmittedMetadataValue<T>>) {
+        for _ in 0..self.installed {
+            self.inserted.push(field.values.remove(self.at));
+        }
+        if let Some(mut original) = self.storage.take() {
+            field.move_into(&mut original);
+            self.storage = Some(std::mem::replace(field, original));
+        }
+        while let Some((position, value)) = self.removed.values.pop() {
+            assert!(
+                field.values.len() < field.values.capacity(),
+                "original metadata capacity"
+            );
+            field.values.insert(position, value);
+        }
+        assert_eq!(
+            field.values.len(),
+            self.original_len,
+            "restored metadata length"
+        );
+    }
+}
+struct MetadataEpochChange {
+    candidate: Option<AdmittedMetadataValue<HashMap<VectorIndexRef, u64>>>,
+    prior: Option<AdmittedMetadataValue<HashMap<VectorIndexRef, u64>>>,
+    displaced: Option<AdmittedMetadataValue<HashMap<VectorIndexRef, u64>>>,
+}
+struct MetadataMemoChange {
+    candidate: Option<Arc<PendingLineageGenerations>>,
+    prior: Option<Arc<PendingLineageGenerations>>,
+    displaced: Option<Arc<PendingLineageGenerations>>,
+}
+enum EngineMetadataChange {
+    Discard(MetadataSplice<AuthoritativePurgeSelection>),
+    Delivery(MetadataSplice<crate::custody::preparation::SourceRegistration>),
+    Conditional(MetadataSplice<PendingConditionalUpdateGuard>),
+    SyncLineage(MetadataSplice<PendingSyncLineageGuard>),
+    Upsert(MetadataSplice<PendingUpsertIntent>),
+    Epochs(MetadataEpochChange),
+    Memo(MetadataMemoChange),
+}
+impl EngineMetadataChange {
+    fn validate(&self, metadata: &EnginePendingCommitMetadata) {
+        match self {
+            Self::Discard(splice) => splice.validate(&metadata.discard_selections),
+            Self::Delivery(splice) => splice.validate(&metadata.delivery_registrations),
+            Self::Conditional(splice) => splice.validate(&metadata.conditional_update_guards),
+            Self::SyncLineage(splice) => splice.validate(&metadata.sync_lineage_guards),
+            Self::Upsert(splice) => splice.validate(&metadata.upsert_intents),
+            Self::Epochs(change) => assert!(
+                change.prior.is_none()
+                    && change.displaced.is_none()
+                    && change
+                        .candidate
+                        .as_ref()
+                        .is_some_and(|map| map.body.is_some() && map.invoice.is_some()),
+                "prepared complete epoch map"
+            ),
+            Self::Memo(change) => assert!(
+                change.prior.is_none() && change.displaced.is_none(),
+                "prepared lineage memo"
+            ),
+        }
+    }
+    fn publish(&mut self, metadata: &mut EnginePendingCommitMetadata) {
+        match self {
+            Self::Discard(splice) => splice.publish(&mut metadata.discard_selections),
+            Self::Delivery(splice) => splice.publish(&mut metadata.delivery_registrations),
+            Self::Conditional(splice) => splice.publish(&mut metadata.conditional_update_guards),
+            Self::SyncLineage(splice) => splice.publish(&mut metadata.sync_lineage_guards),
+            Self::Upsert(splice) => splice.publish(&mut metadata.upsert_intents),
+            Self::Epochs(change) => {
+                change.prior = metadata.vector_schema_epochs.take();
+                metadata.vector_schema_epochs = change.candidate.take();
+            }
+            Self::Memo(change) => {
+                change.prior = metadata.lineage_generations.take();
+                metadata.lineage_generations = change.candidate.take();
+            }
+        }
+    }
+    fn restore(&mut self, metadata: &mut EnginePendingCommitMetadata) {
+        match self {
+            Self::Discard(splice) => splice.restore(&mut metadata.discard_selections),
+            Self::Delivery(splice) => splice.restore(&mut metadata.delivery_registrations),
+            Self::Conditional(splice) => splice.restore(&mut metadata.conditional_update_guards),
+            Self::SyncLineage(splice) => splice.restore(&mut metadata.sync_lineage_guards),
+            Self::Upsert(splice) => splice.restore(&mut metadata.upsert_intents),
+            Self::Epochs(change) => {
+                change.displaced = metadata.vector_schema_epochs.take();
+                metadata.vector_schema_epochs = change.prior.take();
+            }
+            Self::Memo(change) => {
+                change.displaced = metadata.lineage_generations.take();
+                // The original memo remains physical inverse custody, never
+                // becomes current again after rollback of a schema attempt.
+            }
+        }
+    }
+}
+
+/// Keep the Box allocation itself alive until after its value is destroyed;
+/// only then may its original control credit be returned.
+struct MetadataNode<T> {
+    value: Option<Box<T>>,
+    credit: Option<OwnedMemoryReservation>,
+}
+impl<T> MetadataNode<T> {
+    fn prepare(value: T, accountant: &crate::memory_accounting::AccountantHandle) -> Result<Self> {
+        let credit = OwnedMemoryReservation::try_new_for(
+            accountant.clone(),
+            std::mem::size_of::<T>(),
+            "relational",
+            "mutation_checkpoint",
+            "Reduce staged metadata or raise MEMORY_LIMIT.",
+        )?;
+        Ok(Self {
+            value: Some(Box::new(value)),
+            credit: Some(credit),
+        })
+    }
+    fn get(&self) -> &T {
+        self.value.as_deref().expect("metadata node")
+    }
+    fn get_mut(&mut self) -> &mut T {
+        self.value.as_deref_mut().expect("metadata node")
+    }
+}
+impl<T> Drop for MetadataNode<T> {
+    fn drop(&mut self) {
+        drop(self.value.take());
+        drop(self.credit.take());
+    }
+}
+
+struct EngineMetadataInverse {
+    change: EngineMetadataChange,
+    next: Option<MetadataNode<EngineMetadataInverse>>,
+}
+struct EngineMetadataFrame {
+    identity: (TxId, u64, u64, usize),
+    marker: usize,
+    existed: bool,
+    stale_memo: Option<Arc<PendingLineageGenerations>>,
+    previous: Option<MetadataNode<EngineMetadataFrame>>,
+}
+struct EngineMetadataRecord {
+    tx: TxId,
+    generation: u64,
+    revision: u64,
+    metadata: EnginePendingCommitMetadata,
+    existed: bool,
+    undo: Option<MetadataNode<EngineMetadataInverse>>,
+    undo_len: usize,
+    frames: Option<MetadataNode<EngineMetadataFrame>>,
+    depth: usize,
+    next: Option<MetadataNode<EngineMetadataRecord>>,
+}
+struct EngineMetadataJournal {
+    accountant: crate::memory_accounting::AccountantHandle,
+    records: Mutex<Option<MetadataNode<EngineMetadataRecord>>>,
+}
+// Terminal custody reuses the journal's original nodes and reservations.
+type MetadataHead = Option<MetadataNode<EngineMetadataRecord>>;
+type OwnedDatabaseTerminal =
+    contextdb_tx::manager::EngineTerminalWriteSet<OwnedTerminalMetadata>;
+type OwnedDatabaseTerminalFailure =
+    contextdb_tx::manager::EngineTerminalFailure<OwnedTerminalMetadata>;
+type OwnedDatabaseDrain = contextdb_tx::manager::EnginePairedOwnedDrain<
+    OwnedTerminalMetadataChain, OwnedTerminalMetadata,
+>;
+
+
+// Temporary preparation holds the exact original optional peer and its identity.
+// The lower owner remains source-first; no replacement invoice is admitted.
+struct OwnedTemporaryMetadata {
+    identity: contextdb_tx::manager::EngineTerminalIdentity,
+    original_present: bool,
+    original: OwnedTerminalMetadata,
+}
+type TemporaryFailure = contextdb_tx::manager::EngineTerminalFailure<OwnedTemporaryMetadata>;
+type PreparationResult<R> = std::result::Result<R, TemporaryFailure>;
+type ConditionalBuffer = MetadataBuffer<AdmittedMetadataValue<PendingConditionalUpdateGuard>>;
+
+struct ValidatedTemporaryMetadata<'j> {
+    terminal: ValidatedMetadataTerminal<'j>,
+    original_present: bool,
+}
+struct ValidatedMetadataReturn<'j> {
+    records: parking_lot::MutexGuard<'j, MetadataHead>,
+    original_present: bool,
+}
+
+fn validate_temporary_detach(
+    journal: &EngineMetadataJournal,
+    identity: contextdb_tx::manager::EngineTerminalIdentity,
+) -> Result<ValidatedTemporaryMetadata<'_>> {
+    let records = journal.records.lock();
+    let mut cursor = records.as_ref();
+    let mut original_present = false;
+    while let Some(node) = cursor {
+        if node.credit.is_none() {
+            return Err(EngineMetadataJournal::identity_error());
+        }
+        let record = node.value.as_deref().ok_or_else(EngineMetadataJournal::identity_error)?;
+        if record.tx == identity.original_tx {
+            if original_present || record.generation != identity.generation
+                || record.depth != 0 || record.frames.is_some()
+                || record.undo.is_some() || record.undo_len != 0
+            {
+                return Err(EngineMetadataJournal::identity_error());
+            }
+        macro_rules! validate_buffer {
+            ($buffer:expr) => {{
+                let buffer = &$buffer;
+                if (buffer.values.capacity() != 0 && buffer.credit.is_none())
+                    || buffer.values.iter().any(|entry| entry.body.is_none() || entry.invoice.is_none())
+                {
+                    return Err(EngineMetadataJournal::identity_error());
+                }
+            }};
+        }
+        validate_buffer!(record.metadata.discard_selections);
+        validate_buffer!(record.metadata.delivery_registrations);
+        validate_buffer!(record.metadata.conditional_update_guards);
+        validate_buffer!(record.metadata.sync_lineage_guards);
+        validate_buffer!(record.metadata.upsert_intents);
+        if record.metadata.vector_schema_epochs.as_ref()
+            .is_some_and(|entry| entry.body.is_none() || entry.invoice.is_none())
+        {
+            return Err(EngineMetadataJournal::identity_error());
+        }
+
+            original_present = true;
+        }
+        cursor = record.next.as_ref();
+    }
+    Ok(ValidatedTemporaryMetadata {
+        terminal: ValidatedMetadataTerminal { records, identity }, original_present,
+    })
+}
+
+fn consume_temporary_nonfallible(ticket: ValidatedTemporaryMetadata<'_>) -> OwnedTemporaryMetadata {
+    let ValidatedTemporaryMetadata { terminal, original_present } = ticket;
+    let identity = terminal.identity;
+    let original = terminal.consume_nonfallible();
+    OwnedTemporaryMetadata { identity, original_present, original }
+}
+
+fn validate_temporary_return<'j>(
+    journal: &'j EngineMetadataJournal,
+    identity: contextdb_tx::manager::EngineTerminalIdentity,
+    peer: &OwnedTemporaryMetadata,
+) -> Result<ValidatedMetadataReturn<'j>> {
+    // The caller holds active_txs before this guard. Both tickets stay live
+    // until the original source and optional journal singleton are installed.
+    let records = journal.records.lock();
+    if peer.identity != identity || peer.original_present != peer.original.node.is_some() {
+        return Err(EngineMetadataJournal::identity_error());
+    }
+    if let Some(node) = peer.original.node.as_ref() {
+        if node.credit.is_none() {
+            return Err(EngineMetadataJournal::identity_error());
+        }
+        let record = node.value.as_deref().ok_or_else(EngineMetadataJournal::identity_error)?;
+        if record.tx != identity.original_tx || record.generation != identity.generation
+            || record.depth != 0 || record.frames.is_some() || record.undo.is_some()
+            || record.undo_len != 0 || record.next.is_some()
+        {
+            return Err(EngineMetadataJournal::identity_error());
+        }
+        macro_rules! validate_buffer {
+            ($buffer:expr) => {{
+                let buffer = &$buffer;
+                if (buffer.values.capacity() != 0 && buffer.credit.is_none())
+                    || buffer.values.iter().any(|entry| entry.body.is_none() || entry.invoice.is_none())
+                {
+                    return Err(EngineMetadataJournal::identity_error());
+                }
+            }};
+        }
+        validate_buffer!(record.metadata.discard_selections);
+        validate_buffer!(record.metadata.delivery_registrations);
+        validate_buffer!(record.metadata.conditional_update_guards);
+        validate_buffer!(record.metadata.sync_lineage_guards);
+        validate_buffer!(record.metadata.upsert_intents);
+        if record.metadata.vector_schema_epochs.as_ref()
+            .is_some_and(|entry| entry.body.is_none() || entry.invoice.is_none())
+        {
+            return Err(EngineMetadataJournal::identity_error());
+        }
+
+    }
+    let mut cursor = records.as_ref();
+    while let Some(node) = cursor {
+        if node.credit.is_none() {
+            return Err(EngineMetadataJournal::identity_error());
+        }
+        let record = node.value.as_deref().ok_or_else(EngineMetadataJournal::identity_error)?;
+        if record.tx == identity.original_tx {
+            return Err(EngineMetadataJournal::identity_error());
+        }
+        cursor = record.next.as_ref();
+    }
+    Ok(ValidatedMetadataReturn { records, original_present: peer.original_present })
+}
+
+fn reinstall_temporary_nonfallible(
+    mut ticket: ValidatedMetadataReturn<'_>, peer: OwnedTemporaryMetadata,
+) {
+    if ticket.original_present {
+        terminal_metadata_push(&mut ticket.records, peer.original.node);
+    }
+    // For original absence there is no node, allocation, or invoice to move.
+}
+
+fn unwrap_temporary_peer(peer: OwnedTemporaryMetadata) -> OwnedTerminalMetadata {
+    peer.original
+}
+
+fn take_owned_conditions(peer: &mut OwnedTemporaryMetadata) -> Result<ConditionalBuffer> {
+    match peer.original.node.as_mut() {
+        None if !peer.original_present => Ok(MetadataBuffer::empty()),
+        None => Err(EngineMetadataJournal::identity_error()),
+        Some(node) => {
+            if node.credit.is_none() { return Err(EngineMetadataJournal::identity_error()); }
+            let record = node.value.as_deref_mut().ok_or_else(EngineMetadataJournal::identity_error)?;
+            if !peer.original_present || record.tx != peer.identity.original_tx
+                || record.generation != peer.identity.generation
+            {
+                return Err(EngineMetadataJournal::identity_error());
+            }
+            let buffer = &mut record.metadata.conditional_update_guards;
+            if (buffer.values.capacity() != 0 && buffer.credit.is_none())
+                || buffer.values.iter().any(|entry| entry.body.is_none() || entry.invoice.is_none())
+            {
+                return Err(EngineMetadataJournal::identity_error());
+            }
+            Ok(std::mem::replace(buffer, MetadataBuffer::empty()))
+        }
+    }
+}
+
+struct DatabaseCommitScope<'s, 'b, 'm> {
+    host: &'s EngineDatabaseTransactions,
+    lower: &'s contextdb_tx::manager::EngineCommitScope<'b, 'm, DynStore>,
+}
+impl DatabaseCommitScope<'_, '_, '_> {
+    fn prepare_temporary<R, A>(
+        &self, tx: TxId,
+        before_guard: impl for<'p> FnOnce(&'p mut OwnedTemporaryMetadata) -> Result<A>,
+        prepare: impl for<'g, 'h, 'p> FnOnce(
+            &'g mut contextdb_tx::manager::EngineGuard<'h>, &'p mut OwnedTemporaryMetadata, A,
+        ) -> Result<R>,
+    ) -> PreparationResult<R> {
+        self.lower.with_engine_peer_detached(
+            tx, |identity| validate_temporary_detach(&self.host.metadata, identity),
+            consume_temporary_nonfallible, before_guard, prepare,
+            |identity, peer| validate_temporary_return(&self.host.metadata, identity, peer),
+            reinstall_temporary_nonfallible,
+        )
+    }
+}
+
+struct OwnedTerminalMetadata {
+    node: MetadataHead,
+}
+struct ValidatedMetadataTerminal<'j> {
+    records: parking_lot::MutexGuard<'j, MetadataHead>,
+    identity: contextdb_tx::manager::EngineTerminalIdentity,
+}
+struct ValidatedMetadataDrain<'j> {
+    records: parking_lot::MutexGuard<'j, MetadataHead>,
+    len: usize,
+}
+struct OwnedTerminalMetadataChain {
+    head: MetadataHead,
+}
+
+impl EngineMetadataJournal {
+    fn validate_terminal(
+        &self, identity: contextdb_tx::manager::EngineTerminalIdentity,
+    ) -> ValidatedMetadataTerminal<'_> {
+        let records = self.records.lock();
+        let mut cursor = records.as_ref();
+        while let Some(node) = cursor {
+            // Every traversed body is checked before either source/peer unlink.
+            assert!(node.credit.is_some(), "original metadata node reservation");
+            let record = node.value.as_deref().expect("original metadata node body");
+            if record.tx == identity.original_tx {
+                Self::validate_terminal_record(record, identity);
+            }
+            cursor = record.next.as_ref();
+        }
+        ValidatedMetadataTerminal { records, identity }
+    }
+
+    fn validate_terminal_record(
+        record: &EngineMetadataRecord,
+        identity: contextdb_tx::manager::EngineTerminalIdentity,
+    ) {
+        assert!(record.tx == identity.original_tx && record.generation == identity.generation,
+            "terminal metadata original identity");
+        assert!(record.depth == 0 && record.frames.is_none()
+            && record.undo.is_none() && record.undo_len == 0,
+            "terminal metadata requires consumed coupled checkpoints");
+    }
+
+    fn validate_drain<'j>(
+        &'j self, sources: contextdb_tx::manager::EngineTerminalInventory<'_>,
+    ) -> ValidatedMetadataDrain<'j> {
+        let records = self.records.lock();
+        let mut cursor = records.as_ref();
+        let mut len = 0usize;
+        while let Some(node) = cursor {
+            assert!(node.credit.is_some(), "original metadata node reservation");
+            let record = node.value.as_deref().expect("original metadata node body");
+            let identity = sources.identity(record.tx).expect("terminal metadata has no source");
+            Self::validate_terminal_record(record, identity);
+            len = len.checked_add(1).expect("terminal metadata count");
+            cursor = record.next.as_ref();
+        }
+        // The sole insertion door checks absence under records before linking.
+        // That private uniqueness invariant avoids a quadratic duplicate scan.
+        assert!(len <= sources.len(), "terminal metadata subset count");
+        ValidatedMetadataDrain { records, len }
+    }
+}
+
+impl ValidatedMetadataTerminal<'_> {
+    fn consume_nonfallible(mut self) -> OwnedTerminalMetadata {
+        let mut cursor = &mut *self.records;
+        loop {
+            let matches = cursor.as_ref().and_then(|node| node.value.as_deref())
+                .is_some_and(|record| record.tx == self.identity.original_tx);
+            if matches {
+                let node = terminal_metadata_pop(cursor);
+                return OwnedTerminalMetadata { node };
+            }
+            match cursor {
+                Some(node) => match node.value.as_deref_mut() {
+                    Some(record) => cursor = &mut record.next,
+                    None => return OwnedTerminalMetadata { node: None },
+                },
+                None => return OwnedTerminalMetadata { node: None },
+            }
+        }
+    }
+}
+
+// These kernels only move Option links. Validation precedes all movement;
+// no original node/value/credit is replaced, unwrapped, freed or re-admitted.
+fn terminal_metadata_pop(head: &mut MetadataHead) -> MetadataHead {
+    let mut node = head.take();
+    if let Some(record) = node.as_mut().and_then(|node| node.value.as_deref_mut()) {
+        *head = record.next.take();
+    }
+    node
+}
+
+fn terminal_metadata_push(head: &mut MetadataHead, mut node: MetadataHead) {
+    if let Some(record) = node.as_mut().and_then(|node| node.value.as_deref_mut()) {
+        record.next = head.take();
+    }
+    *head = node;
+}
+
+fn terminal_metadata_reverse(mut input: MetadataHead) -> MetadataHead {
+    let mut output = None;
+    while input.is_some() {
+        let node = terminal_metadata_pop(&mut input);
+        terminal_metadata_push(&mut output, node);
+    }
+    output
+}
+
+fn terminal_metadata_split(head: &mut MetadataHead, width: usize) -> MetadataHead {
+    let mut cursor = head;
+    for _ in 0..width {
+        match cursor {
+            Some(node) => match node.value.as_deref_mut() {
+                Some(record) => cursor = &mut record.next,
+                None => return None,
+            },
+            None => return None,
+        }
+    }
+    cursor.take()
+}
+
+fn terminal_metadata_sort(mut head: MetadataHead, len: usize) -> MetadataHead {
+    let mut width = 1usize;
+    while width < len {
+        let mut input = head;
+        let mut reversed = None;
+        while input.is_some() {
+            let mut left = input;
+            let mut right = terminal_metadata_split(&mut left, width);
+            input = terminal_metadata_split(&mut right, width);
+            while left.is_some() || right.is_some() {
+                let left_key = left.as_ref().and_then(|node| node.value.as_deref())
+                    .map(|record| record.tx);
+                let right_key = right.as_ref().and_then(|node| node.value.as_deref())
+                    .map(|record| record.tx);
+                let from_left = right.is_none() || (left.is_some() && left_key <= right_key);
+                let node = if from_left {
+                    terminal_metadata_pop(&mut left)
+                } else {
+                    terminal_metadata_pop(&mut right)
+                };
+                terminal_metadata_push(&mut reversed, node);
+            }
+        }
+        head = terminal_metadata_reverse(reversed);
+        if width >= len - width { break; }
+        width += width;
+    }
+    head
+}
+
+impl ValidatedMetadataDrain<'_> {
+    fn consume_nonfallible(mut self) -> OwnedTerminalMetadataChain {
+        let head = self.records.take();
+        OwnedTerminalMetadataChain { head: terminal_metadata_sort(head, self.len) }
+    }
+}
+impl OwnedTerminalMetadataChain {
+    fn take_front_nonfallible(
+        &mut self, identity: contextdb_tx::manager::EngineTerminalIdentity,
+    ) -> OwnedTerminalMetadata {
+        let matches = self.head.as_ref().and_then(|node| node.value.as_deref())
+            .is_some_and(|record| record.tx == identity.original_tx
+                && record.generation == identity.generation);
+        OwnedTerminalMetadata { node: if matches {
+            terminal_metadata_pop(&mut self.head)
+        } else { None } }
+    }
+}
+// A stack cleanup guard empties the remaining chain iteratively if one
+// metadata payload destructor unwinds. A second destructor panic aborts,
+// following Rust's ordinary double-panic behavior.
+struct TerminalMetadataCleanup {
+    head: MetadataHead,
+}
+impl Drop for TerminalMetadataCleanup {
+    fn drop(&mut self) {
+        while self.head.is_some() {
+            let node = terminal_metadata_pop(&mut self.head);
+            drop(node);
+        }
+    }
+}
+impl Drop for OwnedTerminalMetadataChain {
+    fn drop(&mut self) {
+        // The paired drain's source field has already retired. Keep self's
+        // field empty during cleanup, including cleanup after a first panic.
+        let mut cleanup = TerminalMetadataCleanup { head: self.head.take() };
+        while cleanup.head.is_some() {
+            let node = terminal_metadata_pop(&mut cleanup.head);
+            drop(node);
+        }
+    }
+}
+
+struct PreparedMetadataCheckpoint {
+    expected_revision: u64,
+    record: Option<MetadataNode<EngineMetadataRecord>>,
+    frame: MetadataNode<EngineMetadataFrame>,
+}
+struct PreparedMetadataMutation {
+    identity: (TxId, u64, u64, usize),
+    expected_revision: u64,
+    next_revision: u64,
+    next_undo_len: usize,
+    inverse: Option<MetadataNode<EngineMetadataInverse>>,
+}
+
+/// Retired allocations leave the journal lock before any native destructor or
+/// accountant is invoked. Reuse the already admitted links as cleanup storage.
+#[derive(Default)]
+struct RetiredEngineMetadata {
+    inverses: Option<MetadataNode<EngineMetadataInverse>>,
+    frame: Option<MetadataNode<EngineMetadataFrame>>,
+    record: Option<MetadataNode<EngineMetadataRecord>>,
+}
+impl Drop for RetiredEngineMetadata {
+    fn drop(&mut self) {
+        while let Some(mut inverse) = self.inverses.take() {
+            self.inverses = inverse.get_mut().next.take();
+            drop(inverse);
+        }
+        drop(self.frame.take());
+        drop(self.record.take());
+    }
+}
+impl EngineMetadataJournal {
+    fn record<'a>(
+        head: &'a Option<MetadataNode<EngineMetadataRecord>>,
+        tx: TxId,
+    ) -> Option<&'a EngineMetadataRecord> {
+        let mut cursor = head.as_ref();
+        while let Some(node) = cursor {
+            if node.get().tx == tx {
+                return Some(node.get());
+            }
+            cursor = node.get().next.as_ref();
+        }
+        None
+    }
+    fn record_mut<'a>(
+        head: &'a mut Option<MetadataNode<EngineMetadataRecord>>,
+        tx: TxId,
+    ) -> Option<&'a mut EngineMetadataRecord> {
+        let mut cursor = head.as_mut();
+        while let Some(node) = cursor {
+            if node.get().tx == tx {
+                return Some(node.get_mut());
+            }
+            cursor = node.get_mut().next.as_mut();
+        }
+        None
+    }
+    fn take_record(
+        head: &mut Option<MetadataNode<EngineMetadataRecord>>,
+        tx: TxId,
+    ) -> Option<MetadataNode<EngineMetadataRecord>> {
+        let mut cursor = head;
+        loop {
+            if cursor.as_ref()?.get().tx == tx {
+                let mut node = cursor.take().expect("located record");
+                *cursor = node.get_mut().next.take();
+                return Some(node);
+            }
+            cursor = &mut cursor.as_mut().expect("record link").get_mut().next;
+        }
+    }
+    fn identity_error() -> Error {
+        Error::Other("metadata checkpoint identity mismatch".into())
+    }
+
+    fn prepare_metadata_checkpoint(
+        &self,
+        identity: (TxId, u64, u64, usize),
+    ) -> Result<PreparedMetadataCheckpoint> {
+        let (tx, generation, nonce, depth) = identity;
+        if nonce == 0 {
+            return Err(Self::identity_error());
+        }
+        let (revision, marker, existed, needs_record) = {
+            let records = self.records.lock();
+            match Self::record(&records, tx) {
+                Some(record)
+                    if record.generation == generation
+                        && record.depth.checked_add(1) == Some(depth) =>
+                {
+                    Some((record.revision, record.undo_len, record.existed, false))
+                }
+                None if depth == 1 => Some((0, 0, false, true)),
+                _ => None,
+            }
+        }
+        .ok_or_else(Self::identity_error)?;
+        // Preserve enough monotonic revision space to close every live frame.
+        revision
+            .checked_add(u64::try_from(depth).map_err(|_| Self::identity_error())?)
+            .and_then(|revision| revision.checked_add(1))
+            .ok_or_else(Self::identity_error)?;
+        let record = if needs_record {
+            Some(MetadataNode::prepare(
+                EngineMetadataRecord {
+                    tx,
+                    generation,
+                    revision,
+                    metadata: EnginePendingCommitMetadata::empty(),
+                    existed: false,
+                    undo: None,
+                    undo_len: 0,
+                    frames: None,
+                    depth: 0,
+                    next: None,
+                },
+                &self.accountant,
+            )?)
+        } else {
+            None
+        };
+        let frame = MetadataNode::prepare(
+            EngineMetadataFrame {
+                identity,
+                marker,
+                existed,
+                stale_memo: None,
+                previous: None,
+            },
+            &self.accountant,
+        )?;
+        Ok(PreparedMetadataCheckpoint {
+            expected_revision: revision,
+            record,
+            frame,
+        })
+    }
+
+    fn begin_metadata_checkpoint(
+        &self,
+        mut prepared: PreparedMetadataCheckpoint,
+    ) -> InstalledMetadataCheckpoint<'_> {
+        let identity = prepared.frame.get().identity;
+        let mut records = self.records.lock();
+        {
+            match Self::record(&records, identity.0) {
+                Some(record) => assert!(
+                    prepared.record.is_none()
+                        && record.generation == identity.1
+                        && record.revision == prepared.expected_revision
+                        && record.depth + 1 == identity.3,
+                    "prepared metadata frame changed"
+                ),
+                None => assert!(
+                    prepared.record.is_some() && identity.3 == 1,
+                    "prepared metadata node disappeared"
+                ),
+            }
+            if let Some(mut node) = prepared.record.take() {
+                node.get_mut().next = records.take();
+                *records = Some(node);
+            }
+            let record = Self::record_mut(&mut records, identity.0).expect("prepared record");
+            prepared.frame.get_mut().previous = record.frames.take();
+            record.frames = Some(prepared.frame);
+            record.depth = identity.3;
+            record.revision += 1;
+        }
+        InstalledMetadataCheckpoint {
+            checkpoint: EngineMetadataCheckpoint {
+                journal: self,
+                identity,
+            },
+            records,
+        }
+    }
+
+    fn mutation_binding(&self, tx: TxId) -> Result<((TxId, u64, u64, usize), u64, u64, usize)> {
+        let binding = {
+            let records = self.records.lock();
+            Self::record(&records, tx).and_then(|record| {
+                record
+                    .frames
+                    .as_ref()
+                    .map(|frame| (frame.get().identity, record.revision, record.undo_len))
+            })
+        }
+        .ok_or_else(Self::identity_error)?;
+        let (identity, revision, undo_len) = binding;
+        let next_revision = revision.checked_add(1).ok_or_else(Self::identity_error)?;
+        next_revision
+            .checked_add(u64::try_from(identity.3).map_err(|_| Self::identity_error())?)
+            .ok_or_else(Self::identity_error)?;
+        let next_len = undo_len.checked_add(1).ok_or_else(Self::identity_error)?;
+        Ok((identity, revision, next_revision, next_len))
+    }
+    fn prepare_change(
+        &self,
+        binding: ((TxId, u64, u64, usize), u64, u64, usize),
+        change: EngineMetadataChange,
+    ) -> Result<PreparedMetadataMutation> {
+        let (identity, expected_revision, next_revision, next_undo_len) = binding;
+        let inverse = MetadataNode::prepare(
+            EngineMetadataInverse { change, next: None },
+            &self.accountant,
+        )?;
+        Ok(PreparedMetadataMutation {
+            identity,
+            expected_revision,
+            next_revision,
+            next_undo_len,
+            inverse: Some(inverse),
+        })
+    }
+    fn prepare_metadata_splice(
+        &self,
+        tx: TxId,
+        at: usize,
+        remove: &[usize],
+        batch: AdmittedMetadataBatch,
+    ) -> Result<PreparedMetadataMutation> {
+        let binding = self.mutation_binding(tx)?;
+        let shape = {
+            let records = self.records.lock();
+            Self::record(&records, tx)
+                .filter(|record| record.revision == binding.1)
+                .map(|record| {
+                    let metadata = &record.metadata;
+                    match &batch {
+                        AdmittedMetadataBatch::Discard(_) => (
+                            metadata.discard_selections.values.len(),
+                            metadata.discard_selections.values.capacity(),
+                        ),
+                        AdmittedMetadataBatch::Delivery(_) => (
+                            metadata.delivery_registrations.values.len(),
+                            metadata.delivery_registrations.values.capacity(),
+                        ),
+                        AdmittedMetadataBatch::Conditional(_) => (
+                            metadata.conditional_update_guards.values.len(),
+                            metadata.conditional_update_guards.values.capacity(),
+                        ),
+                        AdmittedMetadataBatch::SyncLineage(_) => (
+                            metadata.sync_lineage_guards.values.len(),
+                            metadata.sync_lineage_guards.values.capacity(),
+                        ),
+                        AdmittedMetadataBatch::Upsert(_) => (
+                            metadata.upsert_intents.values.len(),
+                            metadata.upsert_intents.values.capacity(),
+                        ),
+                    }
+                })
+        }
+        .ok_or_else(Self::identity_error)?;
+        let (len, capacity) = shape;
+        let change = match batch {
+            AdmittedMetadataBatch::Discard(values) => EngineMetadataChange::Discard(
+                MetadataSplice::prepare(at, remove, values, len, capacity, &self.accountant)?,
+            ),
+            AdmittedMetadataBatch::Delivery(values) => EngineMetadataChange::Delivery(
+                MetadataSplice::prepare(at, remove, values, len, capacity, &self.accountant)?,
+            ),
+            AdmittedMetadataBatch::Conditional(values) => EngineMetadataChange::Conditional(
+                MetadataSplice::prepare(at, remove, values, len, capacity, &self.accountant)?,
+            ),
+            AdmittedMetadataBatch::SyncLineage(values) => EngineMetadataChange::SyncLineage(
+                MetadataSplice::prepare(at, remove, values, len, capacity, &self.accountant)?,
+            ),
+            AdmittedMetadataBatch::Upsert(values) => EngineMetadataChange::Upsert(
+                MetadataSplice::prepare(at, remove, values, len, capacity, &self.accountant)?,
+            ),
+        };
+        self.prepare_change(binding, change)
+    }
+    fn prepare_metadata_epochs(
+        &self,
+        tx: TxId,
+        map: HashMap<VectorIndexRef, u64>,
+        invoice: OwnedMemoryReservation,
+    ) -> Result<PreparedMetadataMutation> {
+        // Pair the actual complete prepared native map and its debit FIRST.
+        let candidate = AdmittedMetadataValue::new(map, invoice);
+        let binding = self.mutation_binding(tx)?;
+        self.prepare_change(
+            binding,
+            EngineMetadataChange::Epochs(MetadataEpochChange {
+                candidate: Some(candidate),
+                prior: None,
+                displaced: None,
+            }),
+        )
+    }
+    fn prepare_metadata_memo(
+        &self,
+        tx: TxId,
+        candidate: Option<Arc<PendingLineageGenerations>>,
+    ) -> Result<PreparedMetadataMutation> {
+        // These existing memo owners already carry their actual node/control
+        // reservations; no new Arc or replacement owner is manufactured here.
+        let binding = self.mutation_binding(tx)?;
+        self.prepare_change(
+            binding,
+            EngineMetadataChange::Memo(MetadataMemoChange {
+                candidate,
+                prior: None,
+                displaced: None,
+            }),
+        )
+    }
+
+    fn publish_metadata(&self, mut prepared: PreparedMetadataMutation) {
+        let mut records = self.records.lock();
+        let record =
+            Self::record_mut(&mut records, prepared.identity.0).expect("metadata transaction");
+        assert!(
+            record.generation == prepared.identity.1
+                && record.revision == prepared.expected_revision
+                && record
+                    .frames
+                    .as_ref()
+                    .is_some_and(|frame| frame.get().identity == prepared.identity),
+            "metadata token must publish into its original top frame"
+        );
+        assert_eq!(
+            record.undo_len.checked_add(1),
+            Some(prepared.next_undo_len),
+            "prepared journal length"
+        );
+        prepared
+            .inverse
+            .as_ref()
+            .expect("prepared inverse")
+            .get()
+            .change
+            .validate(&record.metadata);
+        let mut inverse = prepared.inverse.take().expect("prepared inverse");
+        inverse.get_mut().change.publish(&mut record.metadata);
+        inverse.get_mut().next = record.undo.take();
+        record.undo = Some(inverse);
+        record.undo_len = prepared.next_undo_len;
+        record.existed = true;
+        record.revision = prepared.next_revision;
+    }
+
+    fn take_settled_metadata(
+        &self,
+        tx: TxId,
+        generation: u64,
+    ) -> Result<Option<MetadataNode<EngineMetadataRecord>>> {
+        let mut records = self.records.lock();
+        if let Some(record) = Self::record(&records, tx) {
+            if record.generation != generation {
+                drop(records);
+                return Err(Self::identity_error());
+            }
+            assert!(
+                record.depth == 0 && record.frames.is_none() && record.undo.is_none(),
+                "terminal metadata custody requires consumed coupled checkpoints"
+            );
+        }
+        Ok(Self::take_record(&mut records, tx))
+    }
+
+    fn validate_checkpoint(
+        &self,
+        identity: (TxId, u64, u64, usize),
+        settle: bool,
+    ) -> ValidatedMetadataClose<'_> {
+        let records = self.records.lock();
+        let record = Self::record(&records, identity.0).expect("metadata transaction");
+        assert!(
+            record.generation == identity.1
+                && record.depth == identity.3
+                && identity.3 != 0
+                && record
+                    .frames
+                    .as_ref()
+                    .is_some_and(|frame| frame.get().identity == identity),
+            "metadata checkpoint must consume its original top frame"
+        );
+        let frame = record
+            .frames
+            .as_ref()
+            .expect("validated metadata frame")
+            .get();
+        assert!(
+            record.revision < u64::MAX
+                && frame.marker <= record.undo_len
+                && frame.stale_memo.is_none(),
+            "prepaid metadata close"
+        );
+        let mut frames = record.frames.as_ref();
+        let mut depth = record.depth;
+        while let Some(node) = frames {
+            let saved = node.get();
+            assert!(
+                saved.identity.0 == identity.0
+                    && saved.identity.1 == identity.1
+                    && saved.identity.3 == depth,
+                "original metadata frame stack"
+            );
+            assert!(
+                depth != 0 && saved.marker <= record.undo_len,
+                "metadata frame depth and marker"
+            );
+            depth -= 1;
+            frames = saved.previous.as_ref();
+        }
+        assert_eq!(depth, 0, "original metadata depth");
+        let mut inverses = record.undo.as_ref();
+        let mut count = record.undo_len;
+        while let Some(node) = inverses {
+            assert!(count != 0, "original metadata inverse length");
+            count -= 1;
+            inverses = node.get().next.as_ref();
+        }
+        assert_eq!(count, 0, "original metadata inverse count");
+        // Check the complete replay's lengths/capacities before lower consumption.
+        // This visits existing nodes only and neither allocates nor restores data.
+        if !settle {
+            let metadata = &record.metadata;
+            let mut fields = [
+                (
+                    metadata.discard_selections.values.len(),
+                    metadata.discard_selections.values.capacity(),
+                ),
+                (
+                    metadata.delivery_registrations.values.len(),
+                    metadata.delivery_registrations.values.capacity(),
+                ),
+                (
+                    metadata.conditional_update_guards.values.len(),
+                    metadata.conditional_update_guards.values.capacity(),
+                ),
+                (
+                    metadata.sync_lineage_guards.values.len(),
+                    metadata.sync_lineage_guards.values.capacity(),
+                ),
+                (
+                    metadata.upsert_intents.values.len(),
+                    metadata.upsert_intents.values.capacity(),
+                ),
+            ];
+            let mut cursor = record.undo.as_ref();
+            for _ in frame.marker..record.undo_len {
+                let inverse = cursor.expect("prepared metadata inverse").get();
+                match &inverse.change {
+                    EngineMetadataChange::Discard(splice) => {
+                        splice.validate_restore(&mut fields[0])
+                    }
+                    EngineMetadataChange::Delivery(splice) => {
+                        splice.validate_restore(&mut fields[1])
+                    }
+                    EngineMetadataChange::Conditional(splice) => {
+                        splice.validate_restore(&mut fields[2])
+                    }
+                    EngineMetadataChange::SyncLineage(splice) => {
+                        splice.validate_restore(&mut fields[3])
+                    }
+                    EngineMetadataChange::Upsert(splice) => splice.validate_restore(&mut fields[4]),
+                    EngineMetadataChange::Epochs(change) => assert!(
+                        change.candidate.is_none() && change.displaced.is_none(),
+                        "installed epoch inverse"
+                    ),
+                    EngineMetadataChange::Memo(change) => assert!(
+                        change.candidate.is_none() && change.displaced.is_none(),
+                        "installed memo inverse"
+                    ),
+                }
+                cursor = inverse.next.as_ref();
+            }
+        }
+        ValidatedMetadataClose {
+            records,
+            identity,
+            settle,
+        }
+    }
+
+}
+impl Drop for EngineMetadataJournal {
+    fn drop(&mut self) {
+        while let Some(mut record) = self.records.get_mut().take() {
+            *self.records.get_mut() = record.get_mut().next.take();
+            let mut cleanup = RetiredEngineMetadata {
+                inverses: record.get_mut().undo.take(),
+                frame: None,
+                record: None,
+            };
+            while let Some(mut frame) = record.get_mut().frames.take() {
+                record.get_mut().frames = frame.get_mut().previous.take();
+                drop(frame);
+            }
+            cleanup.record = Some(record);
+            drop(cleanup);
+        }
+    }
+}
+struct ValidatedMetadataClose<'a> {
+    records: MutexGuard<'a, Option<MetadataNode<EngineMetadataRecord>>>,
+    identity: (TxId, u64, u64, usize),
+    settle: bool,
+}
+impl ValidatedMetadataClose<'_> {
+    fn consume(mut self) -> RetiredEngineMetadata {
+        let mut retired = RetiredEngineMetadata::default();
+        let record = EngineMetadataJournal::record_mut(&mut self.records, self.identity.0)
+            .expect("validated metadata transaction");
+        let mut frame = record.frames.take().expect("validated metadata frame");
+        record.frames = frame.get_mut().previous.take();
+        if !self.settle {
+            while record.undo_len > frame.get().marker {
+                let mut inverse = record.undo.take().expect("validated metadata inverse");
+                record.undo = inverse.get_mut().next.take();
+                inverse.get_mut().change.restore(&mut record.metadata);
+                record.undo_len -= 1;
+                inverse.get_mut().next = retired.inverses.take();
+                retired.inverses = Some(inverse);
+            }
+            frame.get_mut().stale_memo = record.metadata.lineage_generations.take();
+            record.existed = frame.get().existed;
+        }
+        record.depth -= 1;
+        record.revision += 1;
+        if record.depth == 0 && self.settle {
+            // Child settle retains its entire inverse prefix in the parent.
+            retired.inverses = record.undo.take();
+            record.undo_len = 0;
+        }
+        let remove_record = record.depth == 0 && !record.existed;
+        retired.frame = Some(frame);
+        if remove_record {
+            retired.record = EngineMetadataJournal::take_record(&mut self.records, self.identity.0);
+        }
+        // Only the lock dies here. P carries every native allocation to the
+        // caller after the protected lower door has released the active map.
+        retired
+    }
+}
+// Metadata has no independent consuming destructor. Installed tokens belong
+// exclusively to the paired owner, including errors and unwinding exits.
+struct EngineMetadataCheckpoint<'a> {
+    journal: &'a EngineMetadataJournal,
+    identity: (TxId, u64, u64, usize),
+}
+// The prepare-peer return retains the pending lock while the lower frame
+// installs. It has no independent close destructor and owns no new allocation.
+struct InstalledMetadataCheckpoint<'a> {
+    checkpoint: EngineMetadataCheckpoint<'a>,
+    records: MutexGuard<'a, Option<MetadataNode<EngineMetadataRecord>>>,
+}
+struct OwnedCheckpointPair<'a> {
+    transaction: std::mem::ManuallyDrop<contextdb_tx::EngineCheckpoint<'a, DynStore>>,
+    metadata: EngineMetadataCheckpoint<'a>,
+}
+struct OwnedWriteSetCheckpoint<'a> {
+    pair: Option<OwnedCheckpointPair<'a>>,
+}
+impl OwnedWriteSetCheckpoint<'_> {
+    fn consume(&mut self, settle: bool) {
+        let Some(pair) = self.pair.take() else {
+            return;
+        };
+        let metadata = pair.metadata;
+        let lower_identity = pair.transaction.identity();
+        let transaction = std::mem::ManuallyDrop::into_inner(pair.transaction);
+        let validate = || {
+            assert_eq!(
+                lower_identity, metadata.identity,
+                "paired checkpoint identity"
+            );
+            metadata
+                .journal
+                .validate_checkpoint(metadata.identity, settle)
+        };
+        let retired = if settle {
+            transaction.settle_with_peer(validate, ValidatedMetadataClose::consume)
+        } else {
+            transaction.restore_with_peer(validate, ValidatedMetadataClose::consume)
+        };
+        drop(retired);
+    }
+    fn restore_for_tx(mut self, tx: TxId) {
+        // Detach before checking the caller's identity: a rejected restore must
+        // not run either token's destructor as an accidental close.
+        let pair = self.pair.take().expect("active coupled checkpoint");
+        assert_eq!(
+            pair.metadata.identity.0, tx,
+            "coupled checkpoint transaction"
+        );
+        assert_eq!(
+            pair.transaction.identity(),
+            pair.metadata.identity,
+            "paired checkpoint identity"
+        );
+        self.pair = Some(pair);
+        self.consume(false);
+    }
+    fn finish(mut self, settle: bool) {
+        self.consume(settle);
+    }
+}
+impl Drop for OwnedWriteSetCheckpoint<'_> {
+    fn drop(&mut self) {
+        self.consume(false);
+    }
+}
+
+enum WriteSetCheckpointBranch<'a> {
+    Legacy(LegacyWriteSetCheckpoint<'a>),
+    Owned(OwnedWriteSetCheckpoint<'a>),
+}
+pub(crate) struct WriteSetCheckpoint<'a> {
+    branch: Option<WriteSetCheckpointBranch<'a>>,
+}
+impl WriteSetCheckpoint<'_> {
+    pub(crate) fn settle(mut self) {
+        match self.branch.take().expect("active coupled checkpoint") {
+            WriteSetCheckpointBranch::Legacy(legacy) => drop(legacy),
+            WriteSetCheckpointBranch::Owned(owned) => owned.finish(true),
+        }
+    }
+}
+impl Drop for WriteSetCheckpoint<'_> {
+    fn drop(&mut self) {
+        // Legacy Drop still settles; Owned Drop restores both halves.
+        drop(self.branch.take());
     }
 }
 
@@ -18000,7 +20455,7 @@ impl Drop for LoaderCallbackCaptures {
 /// retained. Every later operation reads its captured writer root.
 fn register_dormant_raw_vector_partitions(
     vector: &VectorStore,
-    manager: &Arc<TransactionManager<DynStore>>,
+    manager: &DatabaseTransactionHost,
     persistence: &Arc<RedbPersistence>,
     accountant: &crate::memory_accounting::AccountantHandle,
     copy_owner: &mut contextdb_vector::VectorCopyAdmission,
@@ -18038,7 +20493,7 @@ fn register_dormant_raw_vector_partitions(
     #[cfg(test)]
     d1_initialized_control_proofs::observe_callback_for_test(&loader_for, accountant);
     let published_root: crate::persistence::vector_membership_source::PublishedMembershipRoot = {
-        let manager = Arc::downgrade(manager);
+        let manager = manager.downgrade();
         Arc::new(move || {
             let manager = manager
                 .upgrade()
@@ -19982,7 +22437,7 @@ pub(crate) struct MaintenanceContext {
     change_log_table_index: Arc<RwLock<ChangeLogTableIndex>>,
     change_log_lsn_refcounts: Arc<RwLock<ChangeLogLsnRefcounts>>,
     trigger: Arc<trigger::TriggerState>,
-    tx_mgr: Arc<TransactionManager<DynStore>>,
+    tx_mgr: DatabaseTransactionHost,
     sync_watermark: Arc<AtomicLsn>,
     /// Shared with `Database::trigger_audit_retention_secs` (same `Arc`,
     /// cloned at context-build time) and re-read on every
@@ -20002,6 +22457,7 @@ pub(crate) struct MaintenanceContext {
     #[cfg(any(test, feature = "test-seams"))]
     snapshot_free_retirement_pass_count: Arc<AtomicUsize>,
     finalization: Arc<StoreFinalization>,
+    pending_local_schema_stages: Arc<Mutex<schema_stage_registry::PendingRegistry>>,
 
 
 }
@@ -20037,7 +22493,7 @@ impl VectorPartitionPublicationOutcome {
 }
 
 fn publish_direct_metadata<R>(
-    tx_mgr: &TransactionManager<DynStore>,
+    tx_mgr: &DatabaseTransactionHost,
     write: impl FnOnce() -> Result<R>,
 ) -> Result<R> {
     // Dual-use helpers inherit their actual caller's commit guard. Their
@@ -20058,11 +22514,11 @@ fn publish_direct_metadata<R>(
 
 struct MaintenanceCleanup {
     source: *mut MaintenanceContext,
-    initialized: [bool; 26],
+    initialized: [bool; 27],
 }
 impl MaintenanceCleanup {
     fn finish(&mut self) {
-        for step in 0..26 {
+        for step in 0..27 {
             if !std::mem::replace(&mut self.initialized[step], false) { continue; }
             unsafe { match step {
                 0 => { 
@@ -20143,6 +22599,9 @@ impl MaintenanceCleanup {
                 25 => { 
                     { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).finalization)); }
                 },
+                26 => {
+                    { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).pending_local_schema_stages)); }
+                },
                 _ => unreachable!(),
             }}
         }
@@ -20160,6 +22619,24 @@ impl Drop for MaintenanceContext {
 }
 
 impl MaintenanceContext {
+    fn remove_original_terminal_stages(&self, original_tx: TxId) {
+        self.pending_local_schema_stages.lock().remove(&original_tx);
+    }
+
+    fn rollback_without_callback_tx_control(&self, tx: TxId) -> Result<()> {
+        match &self.tx_mgr {
+            DatabaseTransactionHost::Owned(handle) => {
+                let terminal = handle.with_host(|host| host.rollback_terminal(tx))?;
+                self.remove_original_terminal_stages(terminal.identity().original_tx);
+                drop(terminal);
+                Ok(())
+            }
+            DatabaseTransactionHost::Legacy(_) => Err(DatabaseTransactionHost::producer_gap(
+                "maintenance_owned_retention_rollback",
+            )),
+        }
+    }
+
     fn publish_direct_metadata<R>(&self, write: impl FnOnce() -> Result<R>) -> Result<R> {
         publish_direct_metadata(&self.tx_mgr, write)
     }
@@ -20761,6 +23238,9 @@ impl MaintenanceContext {
         now: Wallclock,
         preparation: RetentionPreparation,
     ) -> Result<()> {
+        if let DatabaseTransactionHost::Owned(handle) = &self.tx_mgr {
+            return handle.with_host(|host| self.stamp_expired_rows_owned(host, now, preparation));
+        }
         let tx = self.tx_mgr.begin();
         let workspace = std::cell::RefCell::new(
             crate::memory_accounting::OwnedMemoryReservation::new(crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant)),
@@ -20945,6 +23425,303 @@ impl MaintenanceContext {
                 Err(retention_source_admission_error(failure.error, preparation))
             }
         }
+    }
+
+    /// Retention's reserved callback owns every produced body before the
+    /// paired terminal extracts the original source and journal nodes.
+    fn stamp_expired_rows_owned(
+        &self,
+        host: &EngineDatabaseTransactions,
+        now: Wallclock,
+        preparation: RetentionPreparation,
+    ) -> Result<()> {
+        let tx = self.tx_mgr.try_begin()?;
+        let workspace = std::cell::RefCell::new(
+            crate::memory_accounting::OwnedMemoryReservation::new(crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant)),
+        );
+        // Armed just before the durable apply; see `PublicationInterruptionWatch`.
+        // This commit is durable the moment the manager applies it, and the
+        // in-memory commit bookkeeping that makes it visible happens after --
+        // so an unwind in between leaves this handle behind its own durable
+        // image, exactly as it does on the local and received doors.
+        let publication_watch = std::cell::RefCell::new(None::<PublicationInterruptionWatch>);
+        let maintenance_read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget> =
+            self.finalization.accountant.read_budget()?;
+        let result = host.commit_reserved_terminal(
+            tx,
+            maintenance_read_memory.clone(),
+            |expiry_lsn| {
+                // The reserved-LSN callback holds the commit frontier. Borrow
+                // authoritative rows there; copy only admitted mutation identities.
+                let metas = self.relational.table_meta.read();
+                let frontier = MaintenanceFrontier::capture(
+                    &self.relational,
+                    &self.tx_mgr,
+                    crate::persistence::writer_source::SourceWindowOwner::writer(
+                        crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
+                    ),
+                )?
+                .retention_batch(&metas, "expiry", &mut workspace.borrow_mut())?;
+                let watermark = self.sync_watermark.load(Ordering::SeqCst);
+                let candidates = retention_prune_candidates(
+                    &metas,
+                    &frontier,
+                    now,
+                    watermark,
+                    &mut workspace.borrow_mut(),
+                    RetentionPreparation::Expiry,
+                )?;
+                let protected = fk_protected_prune_candidates(&metas, &frontier, &candidates)?;
+                let cohort = frontier
+                    .cohort_progress(|table, key| protected.contains_physical(table, key))?;
+                host.transactions.with_transactions(|transactions| transactions.with_engine(tx, |guard| {
+                    if !frontier.retention_progress().is_empty() {
+                        let progress = guard.copy_aux(
+                            contextdb_tx::staged_source::AuxBorrow::ConfigWrites(frontier.retention_progress()),
+                        )?;
+                        let at = guard.read().config_writes.len();
+                        let prepared = guard.prepare_aux_splice(at, &[], progress)?;
+                        guard.publish_tx(prepared);
+                    }
+                    if let Some(cohort) = &cohort {
+                        let cohort = guard.copy_aux(
+                            contextdb_tx::staged_source::AuxBorrow::ConfigWrites(std::slice::from_ref(cohort)),
+                        )?;
+                        let at = guard.read().config_writes.len();
+                        let prepared = guard.prepare_aux_splice(at, &[], cohort)?;
+                        guard.publish_tx(prepared);
+                    }
+                    let mut expired_nodes = HashSet::new();
+                    for table in metas.keys() {
+                        if metas
+                            .get(table)
+                            .is_none_or(|meta| meta.default_ttl_seconds.is_none())
+                        {
+                            continue;
+                        }
+                        frontier.visit(table, |row| {
+                            #[cfg(any(test, feature = "test-seams"))]
+                            resident_history_test_seams::note(|work| {
+                                work.retention_keys_examined += 1
+                            });
+                            if row.deleted_tx.is_some() || !candidates.contains(table, row) {
+                                return Ok(true);
+                            }
+                            if prune_blocker_for_referenced_parent(
+                                table,
+                                row,
+                                &metas,
+                                &frontier,
+                                &candidates,
+                                &protected,
+                            )?
+                            .is_some()
+                            {
+                                return Ok(true);
+                            }
+                            // Own the write-set strings, config encoding, node
+                            // set and vector deletion identities before allocating.
+                            let vector_bytes = metas.get(table).map_or(0, |meta| {
+                                meta.columns
+                                    .iter()
+                                    .filter(|column| {
+                                        matches!(column.column_type, ColumnType::Vector(_))
+                                    })
+                                    .fold(0usize, |bytes, column| {
+                                        bytes.saturating_add(256 + table.len() + column.name.len())
+                                    })
+                            });
+                            workspace.borrow_mut().try_grow_for(
+                                1024usize
+                                    .saturating_add(table.len().saturating_mul(8))
+                                    .saturating_add(vector_bytes),
+                                "retention",
+                                "prepare_expiry",
+                                "Raise MEMORY_LIMIT to admit the expiry transaction workspace.",
+                            )?;
+                            self.stage_retention_aux(host, guard, table.len(), || {
+                                Ok(contextdb_tx::staged_source::AuxBody::RelationalDelete(
+                                    (table.clone(), row.row_id, tx),
+                                ))
+                            })?;
+                            if let Some(Value::Uuid(id)) = row.values.get("id") {
+                                expired_nodes.insert(*id);
+                            }
+                            if let Some(meta) = metas.get(table) {
+                                for column in &meta.columns {
+                                    if matches!(column.column_type, ColumnType::Vector(_)) {
+                                        self.stage_retention_aux(
+                                            host, guard, table.len().saturating_add(column.name.len()),
+                                            || Ok(contextdb_tx::staged_source::AuxBody::VectorDelete((
+                                                VectorIndexRef::new(table, &column.name), row.row_id, tx,
+                                            ))),
+                                        )?;
+                                    }
+                                }
+                            }
+                            self.stage_retention_expiry_config(
+                                host, guard, table, row.row_id, row.created_tx, expiry_lsn,
+                            )?;
+                            Ok(true)
+                        })?;
+                    }
+                    writer_read::visit_graph_versions_for_nodes(
+                        &self.graph,
+                        writer_read::durable_root(self.tx_mgr.capture_published_read().handle)?,
+                        &expired_nodes,
+                        |entry| {
+                            if entry.deleted_tx.is_none()
+                                && (expired_nodes.contains(&entry.source)
+                                    || expired_nodes.contains(&entry.target))
+                            {
+                                workspace.borrow_mut().try_grow_for(
+                                    128usize.saturating_add(entry.edge_type.len()),
+                                    "retention",
+                                    "prepare_expiry",
+                                    "Raise MEMORY_LIMIT to admit the expiry transaction workspace.",
+                                )?;
+                                self.stage_retention_aux(host, guard, entry.edge_type.len(), || {
+                                    Ok(contextdb_tx::staged_source::AuxBody::AdjDelete((
+                                        entry.source, entry.edge_type.clone(), entry.target, tx,
+                                    )))
+                                })?;
+                            }
+                            Ok(())
+                        },
+                        maintenance_read_memory.clone(),
+                    )?;
+                    Ok(())
+                }))
+            },
+            |_, _| {
+                *publication_watch.borrow_mut() = Some(PublicationInterruptionWatch::arm(
+                    &self.publication_interrupted,
+                ));
+                Ok(())
+            },
+        );
+        #[cfg(test)]
+        take_local_commit_stage_fault_for_test(
+            LocalCommitStageFaultPoint::AfterReservedLsnDurableCommit,
+        );
+        #[cfg(any(test, feature = "test-seams"))]
+        let writer_checkpoint = result
+            .as_ref()
+            .is_ok_and(|committed| committed.1.commit_lsn().is_some());
+        let watch_completed = publication_watch.borrow_mut().take();
+        match result {
+            Ok((_, terminal)) => {
+                self.remove_original_terminal_stages(terminal.identity().original_tx);
+                drop(terminal);
+                if let Some(watch) = watch_completed {
+                    watch.completed();
+                }
+                #[cfg(any(test, feature = "test-seams"))]
+                if writer_checkpoint && let Some(observer) = &self.writer_receipt_observer {
+                    observer.emit_writer_memory_ownership_receipt_for_test("commit");
+                }
+                Ok(())
+            }
+            Err(failure) => {
+                // A failure before the manager takes the write set leaves the
+                // transaction active; both failure paths publish no expiry.
+                if let Some(watch) = watch_completed {
+                    watch.completed();
+                }
+                let (error, terminal) = failure.into_parts();
+                if let Some(terminal) = terminal {
+                    self.remove_original_terminal_stages(terminal.identity().original_tx);
+                    drop(terminal);
+                } else {
+                    // Before-commit refusal leaves the original source and
+                    // journal installed; only paired rollback may retire them.
+                    let _ = self.rollback_without_callback_tx_control(tx);
+                }
+                Err(retention_source_admission_error(error, preparation))
+            }
+        }
+    }
+
+    fn stage_retention_aux(
+        &self,
+        host: &EngineDatabaseTransactions,
+        guard: &mut contextdb_tx::manager::EngineGuard<'_>,
+        bytes: usize,
+        produce: impl FnOnce() -> Result<contextdb_tx::staged_source::AuxBody>,
+    ) -> Result<()> {
+        let mut admission = OwnedMemoryReservation::try_new_for(
+            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
+            bytes, "retention", "prepare_expiry",
+            "Raise MEMORY_LIMIT to admit the expiry transaction workspace.",
+        )?;
+        // Admission precedes the original native allocation. Keep its body
+        // local until the actual funder accepts this original reservation.
+        let body = produce()?;
+        let read = guard.read();
+        let at = match &body {
+            contextdb_tx::staged_source::AuxBody::RelationalDelete(_) => read.relational_deletes.len(),
+            contextdb_tx::staged_source::AuxBody::VectorDelete(_) => read.vector_deletes.len(),
+            contextdb_tx::staged_source::AuxBody::AdjDelete(_) => read.adj_deletes.len(),
+            contextdb_tx::staged_source::AuxBody::ConfigWrite(_) => read.config_writes.len(),
+            _ => return Err(Error::Other("unsupported retention mutation".into())),
+        };
+        let invoice = admission.into_source_aux_invoice_for(&host.funder)?;
+        let batch = guard.prepare_owned_aux(body, invoice)?;
+        let prepared = guard.prepare_aux_splice(at, &[], batch)?;
+        guard.publish_tx(prepared);
+        Ok(())
+    }
+
+    fn stage_retention_expiry_config(
+        &self,
+        host: &EngineDatabaseTransactions,
+        guard: &mut contextdb_tx::manager::EngineGuard<'_>,
+        table: &str,
+        row: RowId,
+        created: TxId,
+        lsn: Lsn,
+    ) -> Result<()> {
+        struct ByteCount(usize);
+        impl std::fmt::Write for ByteCount {
+            fn write_str(&mut self, value: &str) -> std::fmt::Result {
+                self.0 = self.0.checked_add(value.len()).ok_or(std::fmt::Error)?;
+                Ok(())
+            }
+        }
+        impl std::io::Write for ByteCount {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0 = self.0.checked_add(bytes.len()).ok_or_else(|| {
+                    std::io::Error::other("retention config size overflow")
+                })?;
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let prefix = crate::composite_store::RETENTION_EXPIRY_PREFIX;
+        let mut key_count = ByteCount(0);
+        std::fmt::Write::write_fmt(&mut key_count, format_args!(
+            "{prefix}{}:{table}:{}:{}", table.len(), row.0, created.0,
+        )).map_err(|_| Error::Other("retention config size overflow".into()))?;
+        // Serde encodes borrowed str and the original String identically;
+        // count without allocating the temporary String from the Legacy body.
+        let identity = (table, row, created, lsn);
+        let mut encoded_count = ByteCount(0);
+        bincode::serde::encode_into_std_write(
+            &identity, &mut encoded_count, bincode::config::standard(),
+        ).map_err(|error| Error::Other(format!("bincode encode error: {error}")))?;
+        let bytes = key_count.0.checked_add(encoded_count.0)
+            .ok_or_else(|| Error::Other("retention config size overflow".into()))?;
+        self.stage_retention_aux(host, guard, bytes, || {
+            let mut key = String::with_capacity(key_count.0);
+            std::fmt::Write::write_fmt(&mut key, format_args!(
+                "{prefix}{}:{table}:{}:{}", table.len(), row.0, created.0,
+            )).map_err(|_| Error::Other("retention config formatting failed".into()))?;
+            let mut encoded = Vec::with_capacity(encoded_count.0);
+            bincode::serde::encode_into_std_write(
+                &identity, &mut encoded, bincode::config::standard(),
+            ).map_err(|error| Error::Other(format!("bincode encode error: {error}")))?;
+            Ok(contextdb_tx::staged_source::AuxBody::ConfigWrite((key, encoded)))
+        })
     }
 
     fn run_pruning(
@@ -23590,7 +26367,7 @@ pub fn open_with_startup_limits(
 impl Database {
     #[allow(clippy::too_many_arguments)]
     fn build_db(
-        tx_mgr: Arc<TransactionManager<DynStore>>,
+        tx_mgr: DatabaseTransactionHost,
         relational: Arc<RelationalStore>,
         graph: Arc<GraphStore>,
         vector_store: Arc<VectorStore>,
@@ -23942,7 +26719,7 @@ impl Database {
             }
             
             {
-                std::ptr::addr_of_mut!((*construction.source).relational).write(MemRelationalExecutor::new(relational, tx_mgr.clone())
+                std::ptr::addr_of_mut!((*construction.source).relational).write(tx_mgr.relational_executor(relational)
                 .with_staged_posting_admission(Arc::<writer_read::WriterStagedPostingAdmission>::clone(&finalization.staged_posting_admission)));
                 construction.initialized[44] = true;
                 #[cfg(test)]
@@ -23950,16 +26727,15 @@ impl Database {
             }
             
             {
-                std::ptr::addr_of_mut!((*construction.source).graph).write(MemGraphExecutor::new(graph, tx_mgr.clone()));
+                std::ptr::addr_of_mut!((*construction.source).graph).write(tx_mgr.graph_executor(graph));
                 construction.initialized[45] = true;
                 #[cfg(test)]
                 r1_database_field_for_test(45);
             }
             
             {
-                std::ptr::addr_of_mut!((*construction.source).vector).write(MemVectorExecutor::new_with_accountant(
+                std::ptr::addr_of_mut!((*construction.source).vector).write(tx_mgr.vector_executor(
                 vector_store,
-                tx_mgr.clone(),
                 hnsw,
                 vector_accountant.clone(),
             ));
@@ -24618,7 +27394,23 @@ impl Database {
     /// "Store ownership and concurrency" section on [`Database`]. Use
     /// [`Database::open_memory`] for an ephemeral instance.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open_with_options(path, DatabaseOpenOptions::default())
+        Self::open_builtin_with_options(path, DatabaseOpenOptions::default())
+    }
+
+    fn open_builtin_with_options(
+        path: impl AsRef<Path>,
+        options: DatabaseOpenOptions,
+    ) -> Result<Self> {
+        let path = path.as_ref();
+        #[cfg(any(test, feature = "test-seams"))]
+        {
+            let interceptor = COMMON_OPTIONS_OPEN_INTERCEPTOR.with(|slot| slot.borrow().clone());
+            if let Some(interceptor) = interceptor {
+                return interceptor.intercept(path, &options);
+            }
+        }
+        let (config, _) = OpenConfiguration::take_options(options);
+        Self::open_constructed(path, config, PluginBinding::builtin())
     }
 
     /// Open a database through the common writable-open configuration path.
@@ -24634,7 +27426,8 @@ impl Database {
                 return interceptor.intercept(path.as_ref(), &options);
             }
         }
-        Self::open_configured(path.as_ref(), options)
+        let (config, binding) = OpenConfiguration::take_options(options);
+        Self::open_constructed(path.as_ref(), config, binding)
     }
 
     #[cfg(any(test, feature = "test-seams"))]
@@ -24693,13 +27486,66 @@ impl Database {
         let saved = session.take();
         let had_saved = saved.is_some();
         let retry_options = options.clone();
-        match Self::open_configured_carrying(path.as_ref(), options, saved) {
+        let (config, binding) = OpenConfiguration::take_options(options);
+        match Self::open_constructed_carrying(path.as_ref(), config, binding, saved) {
             Err(Error::MemoryBudgetExceeded { .. }) if had_saved => {
                 // The optional cache must never cause an open refusal.
-                Self::open_configured(path.as_ref(), retry_options)
+                let (config, binding) = OpenConfiguration::take_options(retry_options);
+                Self::open_constructed(path.as_ref(), config, binding)
             }
             result => result,
         }
+    }
+
+    fn open_constructed(
+        path: &Path,
+        config: OpenConfiguration,
+        binding: PluginBinding,
+    ) -> Result<Self> {
+        Self::open_constructed_carrying(path, config, binding, None)
+    }
+
+    fn open_constructed_carrying(
+        path: &Path,
+        config: OpenConfiguration,
+        binding: PluginBinding,
+        carried: Option<vector_writer_session::CarriedWriterTail>,
+    ) -> Result<Self> {
+        let OpenConfiguration {
+            owner_reads,
+            open_disposition,
+            memory_limit,
+            disk_limit,
+            maintenance_policy,
+            maintenance_poll_interval,
+            contexts,
+            scope_labels,
+            principal,
+            #[cfg(any(test, feature = "test-seams"))]
+            test_observer,
+            #[cfg(any(test, feature = "test-seams"))]
+            test_kernel_observer,
+        } = config;
+        Self::open_configured_carrying(
+            path,
+            DatabaseOpenOptions {
+                owner_reads,
+                open_disposition,
+                plugin: binding.erased(),
+                memory_limit,
+                disk_limit,
+                maintenance_policy,
+                maintenance_poll_interval,
+                contexts,
+                scope_labels,
+                principal,
+                #[cfg(any(test, feature = "test-seams"))]
+                test_observer,
+                #[cfg(any(test, feature = "test-seams"))]
+                test_kernel_observer,
+            },
+            carried,
+        )
     }
 
     fn open_configured(path: &Path, options: DatabaseOpenOptions) -> Result<Self> {
@@ -25425,7 +28271,7 @@ impl Database {
     }
 
     pub fn open_memory() -> Self {
-        Self::open_with_options(MEMORY_DATABASE_PATH, DatabaseOpenOptions::default())
+        Self::open_builtin_with_options(MEMORY_DATABASE_PATH, DatabaseOpenOptions::default())
             .expect("failed to open in-memory database")
     }
 
@@ -25502,7 +28348,7 @@ impl Database {
         scope_labels: Option<std::collections::BTreeSet<contextdb_core::types::ScopeLabel>>,
         principal: Option<contextdb_core::types::Principal>,
     ) -> Result<Self> {
-        Self::open_with_options(
+        Self::open_builtin_with_options(
             path,
             DatabaseOpenOptions {
                 contexts,
@@ -25891,10 +28737,7 @@ impl Database {
             }
             
             {
-                std::ptr::addr_of_mut!((*construction.source).relational).write(MemRelationalExecutor::new(
-                self.relational_store.clone(),
-                self.tx_mgr.clone(),
-            )
+                std::ptr::addr_of_mut!((*construction.source).relational).write(self.tx_mgr.relational_executor(self.relational_store.clone())
             .with_staged_posting_admission(Arc::<writer_read::WriterStagedPostingAdmission>::clone(&self.finalization.staged_posting_admission)));
                 construction.initialized[44] = true;
                 #[cfg(test)]
@@ -25902,16 +28745,14 @@ impl Database {
             }
             
             {
-                std::ptr::addr_of_mut!((*construction.source).graph).write(MemGraphExecutor::new(self.graph_store.clone(), self.tx_mgr.clone()));
+                std::ptr::addr_of_mut!((*construction.source).graph).write(self.tx_mgr.graph_executor(self.graph_store.clone()));
                 construction.initialized[45] = true;
                 #[cfg(test)]
                 r1_database_field_for_test(45);
             }
             
             {
-                std::ptr::addr_of_mut!((*construction.source).vector).write(MemVectorExecutor::new_with_accountant(
-                self.vector_store.clone(),
-                self.tx_mgr.clone(),
+                std::ptr::addr_of_mut!((*construction.source).vector).write(self.tx_mgr.vector_executor(self.vector_store.clone(),
                 Arc::new(OnceLock::new()),
                 Arc::clone(&self.finalization.vector_accountant),
             ));
@@ -26857,10 +29698,10 @@ impl Database {
             persistence.clone(),
             Some(initial_root),
         ));
-        graph_source.bind(&tx_mgr);
+        graph_source.bind(&DatabaseTransactionHost::legacy(tx_mgr.clone()));
         register_dormant_raw_vector_partitions(
             &vector,
-            &tx_mgr,
+            &DatabaseTransactionHost::legacy(tx_mgr.clone()),
             &persistence,
             &accountant,
             vector_copy_owner,
@@ -26876,7 +29717,7 @@ impl Database {
         let blob_repository = BlobRepository::shared(persistence.clone());
 
         let db = Self::build_db(
-            tx_mgr,
+            DatabaseTransactionHost::legacy(tx_mgr),
             relational,
             graph,
             vector,
@@ -27243,7 +30084,7 @@ impl Database {
         let trigger = Arc::new(TriggerState::new());
 
         let mut db = Self::build_db(
-            tx_mgr,
+            DatabaseTransactionHost::legacy(tx_mgr),
             relational,
             graph,
             vector,
@@ -27362,7 +30203,7 @@ impl Database {
         let blob_repository = BlobRepository::ephemeral()?;
 
         let db = Self::build_db(
-            tx_mgr,
+            DatabaseTransactionHost::legacy(tx_mgr),
             relational,
             graph,
             vector,
@@ -27876,6 +30717,14 @@ impl Database {
     }
 
     fn rollback_without_callback_tx_control(&self, tx: TxId) -> Result<()> {
+        if let DatabaseTransactionHost::Owned(handle) = &self.tx_mgr {
+            let terminal = handle.with_host(|host| host.rollback_terminal(tx))?;
+            self.remove_original_terminal_stages(terminal.identity().original_tx);
+            // Original source invoices retire by physical owner destruction.
+            // Legacy logical release would refund the same body a second time.
+            drop(terminal);
+            return Ok(());
+        }
         let read_memory = self.declared_reader_memory()?;
         let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
         let ws = self.tx_mgr.rollback_write_set(tx)?;
@@ -27884,6 +30733,80 @@ impl Database {
         self.pending_commit_metadata.lock().remove(&tx);
         self.release_insert_allocations(&ws, &mut vector_copy_owner)?;
         Ok(())
+    }
+
+    fn remove_original_terminal_stages(&self, original_tx: TxId) {
+        self.pending_event_bus_ddl.lock().remove(&original_tx);
+        self.pending_local_schema_stages.lock().remove(&original_tx);
+        self.pending_commit_metadata.lock().remove(&original_tx);
+    }
+
+    /// Admit preparation payload against this database's original writer.
+    pub(crate) fn reserve_owned_preparation(&self, bytes: usize) -> Result<OwnedMemoryReservation> {
+        OwnedMemoryReservation::try_new_for(
+            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
+            bytes,
+            "delivery",
+            "prepare_owned_records",
+            "Reduce delivery metadata or raise MEMORY_LIMIT.",
+        )
+    }
+
+    pub(crate) fn with_owned_delivery_meta<R>(
+        &self, table: &str, f: impl for<'m> FnOnce(&'m TableMeta) -> Result<R>,
+    ) -> Result<R> {
+        let _operation = self.assert_open_operation();
+        if let Some(root) = self.scoped_writer_root() {
+            let meta = root.borrow_captured_table_meta(table)
+                .ok_or_else(crate::custody::canonical::invalid)?;
+            f(meta)
+        } else {
+            let catalog = self.relational_store.table_meta.read();
+            let meta = catalog.get(table).ok_or_else(crate::custody::canonical::invalid)?;
+            f(meta)
+        }
+    }
+
+    /// Stage one delivery-owned configuration body through the paired
+    /// transaction host after the original source reservation is admitted.
+    pub(crate) fn stage_owned_delivery_aux(
+        &self,
+        guard: &mut contextdb_tx::manager::EngineGuard<'_>,
+        bytes: usize,
+        produce: impl FnOnce() -> Result<contextdb_tx::staged_source::AuxBody>,
+    ) -> Result<()> {
+        let mut admission = OwnedMemoryReservation::try_new_for(
+            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
+            bytes,
+            "delivery",
+            "prepare_owned_config",
+            "Reduce delivery metadata or raise MEMORY_LIMIT.",
+        )?;
+        let body = produce()?;
+        if !matches!(
+            body,
+            contextdb_tx::staged_source::AuxBody::ConfigWrite(_)
+                | contextdb_tx::staged_source::AuxBody::ConfigDelete(_)
+        ) {
+            return Err(Error::Other("owned delivery accepts config mutations only".into()));
+        }
+        let at = match &body {
+            contextdb_tx::staged_source::AuxBody::ConfigWrite(_) => guard.read().config_writes.len(),
+            contextdb_tx::staged_source::AuxBody::ConfigDelete(_) => guard.read().config_deletes.len(),
+            _ => unreachable!("body was checked above"),
+        };
+        match &self.tx_mgr {
+            DatabaseTransactionHost::Owned(handle) => handle.with_host(|host| {
+                let invoice = admission.into_source_aux_invoice_for(&host.funder)?;
+                let batch = guard.prepare_owned_aux(body, invoice)?;
+                let prepared = guard.prepare_aux_splice(at, &[], batch)?;
+                guard.publish_tx(prepared);
+                Ok(())
+            }),
+            DatabaseTransactionHost::Legacy(_) => Err(DatabaseTransactionHost::producer_gap(
+                "stage_owned_delivery_aux",
+            )),
+        }
     }
 
     fn is_staged_local_schema_statement(stmt: &Statement) -> bool {
@@ -30141,6 +33064,8 @@ impl Database {
         );
         if result.is_err() {
             let _ = self.restore_write_set_checkpoint(tx, checkpoint);
+        } else {
+            checkpoint.settle();
         }
         result
     }
@@ -31920,10 +34845,12 @@ impl Database {
                         read_memory.clone(),
                     )
                 });
-                if let Some(checkpoint) = checkpoint
-                    && result.is_err()
-                {
-                    let _ = self.restore_write_set_checkpoint(tx, checkpoint);
+                if let Some(checkpoint) = checkpoint {
+                    if result.is_err() {
+                        let _ = self.restore_write_set_checkpoint(tx, checkpoint);
+                    } else {
+                        checkpoint.settle();
+                    }
                 }
                 result
             }
@@ -32034,6 +34961,9 @@ impl Database {
             }
         };
 
+        if let Some(checkpoint) = checkpoint {
+            checkpoint.settle();
+        }
         if auto_commit {
             self.with_current_statement_snapshot_excluded_from_terminal_commit(|| {
                 self.commit_with_source(
@@ -32420,15 +35350,34 @@ impl Database {
         )
     }
 
+    /// Carry the SQL producer's original reservation into the row caller.
+    /// Host selection preserves the Legacy caller and routes Owned through
+    /// the paired original producer before any native factory is enabled.
+    pub(crate) fn insert_row_prepaid_owned(
+        &self,
+        tx: TxId,
+        table: &str,
+        values: HashMap<ColName, Value>,
+        admission: OwnedMemoryReservation,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<RowId> {
+        let original = OriginalRowValues { values, admission };
+        self.insert_row_with_admission(
+            tx, table, original.values, Some(original.admission), vector_copy_owner, read_memory,
+        )
+    }
+
     fn insert_row_with_admission(
         &self,
         tx: TxId,
         table: &str,
         values: HashMap<ColName, Value>,
-        mut admission: Option<OwnedMemoryReservation>,
+        admission: Option<OwnedMemoryReservation>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
         read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<RowId> {
+        let mut original = OriginalOptionalRowValues { values, admission };
         self.ensure_no_mixed_local_schema_dml(tx)?;
         let trigger_callback_bound = self.trigger_callback_tx_bound_matches(tx);
         let _operation = if trigger_callback_bound {
@@ -32440,19 +35389,155 @@ impl Database {
             self.ensure_trigger_table_ready(table, "insert_row")?;
         }
         let checkpoint = self.write_set_checkpoint(tx)?;
-        let result = self.insert_row_within_operation(
-            tx,
-            table,
-            values,
-            trigger_callback_bound,
-            &mut admission,
-            vector_copy_owner,
-            read_memory.clone(),
-        );
+        let result = match &self.tx_mgr {
+            DatabaseTransactionHost::Legacy(_) => self.insert_row_within_operation(
+                tx, table, original.values, trigger_callback_bound,
+                &mut original.admission, vector_copy_owner, read_memory.clone(),
+            ),
+            DatabaseTransactionHost::Owned(handle) => handle.with_host(|host| {
+                self.insert_row_within_operation_owned(
+                    host, tx, table, original.values, trigger_callback_bound,
+                    &mut original.admission, read_memory.clone(),
+                )
+            }),
+        };
         if result.is_err() {
             let _ = self.restore_write_set_checkpoint(tx, checkpoint);
+        } else {
+            checkpoint.settle();
         }
         result
+    }
+
+    /// The ordinary Owned row producer consumes the caller's existing debit.
+    /// Row lineage uses its own original auxiliary producer. Vector placement
+    /// remains a prerequisite; refusal restores the coupled checkpoint.
+    fn insert_row_within_operation_owned(
+        &self,
+        host: &EngineDatabaseTransactions,
+        tx: TxId,
+        table: &str,
+        values: HashMap<ColName, Value>,
+        trigger_callback_bound: bool,
+        admission: &mut Option<OwnedMemoryReservation>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<RowId> {
+        let mut values = self.coerce_row_for_insert(
+            table, values, Some(self.committed_watermark()), Some(tx),
+        )?;
+        self.complete_insert_access_values(table, &mut values)?;
+        self.validate_primary_key_values_present(table, &values)?;
+        let creation_key = self.table_meta(table)
+            .and_then(|meta| natural_key_from_row_values(&meta, &values));
+        if !trigger_callback_bound {
+            self.validate_row_constraints(tx, table, &values, None, read_memory.clone())?;
+        }
+        self.ensure_owned_row_vector_producer(table, &values)?;
+        self.blank_quantized_vector_values(table, &mut values);
+        let assume_no_state_machine = if trigger_callback_bound && !self.has_access_constraints_for_query() {
+            !self.trigger_insert_table_has_state_machine(table)?
+        } else { false };
+        let row_id = self.relational_store.new_row_id();
+        self.assert_row_write_allowed(
+            table, row_id, &values, self.snapshot_for_read(), read_memory.clone(),
+        )?;
+        let inserted = self.insert_original_relational_row(
+            host, tx, table, row_id, values, self.snapshot_for_read(),
+            assume_no_state_machine.then(|| self.trigger_callback_wallclock()),
+            assume_no_state_machine, admission, read_memory.clone(),
+        )?;
+        if let Some(key) = creation_key {
+            self.stage_local_creation_lineage(tx, table, key, inserted, read_memory)?;
+        }
+        Ok(inserted)
+    }
+
+    fn ensure_owned_row_vector_producer(
+        &self, table: &str, values: &HashMap<ColName, Value>,
+    ) -> Result<()> {
+        let meta = self.table_meta(table).ok_or_else(|| Error::TableNotFound(table.into()))?;
+        if meta.columns.iter().any(|column| {
+            matches!(column.column_type, contextdb_core::ColumnType::Vector(_))
+                && matches!(values.get(&column.name), Some(Value::Vector(_)))
+        }) {
+            return Err(DatabaseTransactionHost::producer_gap("row vector placement"));
+        }
+        Ok(())
+    }
+
+    /// Identity and time stay at the original caller. Only publication changes:
+    /// the original invoice is adopted before the hidden relational producer.
+    fn insert_original_relational_row(
+        &self,
+        host: &EngineDatabaseTransactions,
+        tx: TxId,
+        table: &str,
+        row_id: RowId,
+        values: HashMap<ColName, Value>,
+        snapshot: SnapshotId,
+        created_at: Option<Wallclock>,
+        assume_no_state_machine: bool,
+        admission: &mut Option<OwnedMemoryReservation>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<RowId> {
+        let meta = self.table_meta(table).ok_or_else(|| Error::TableNotFound(table.into()))?;
+        if !assume_no_state_machine
+            && let Some(sm) = &meta.state_machine
+            && let Some(Value::Text(new_status)) = values.get(&sm.column)
+            && let Some(id @ Value::Uuid(_)) = values.get("id")
+            && let Some(existing) = self.relational_point_with_tx(
+                Some(tx), table, "id", id, snapshot, read_memory,
+            )?
+        {
+            let old_status = existing.values.get(&sm.column).and_then(Value::as_text).unwrap_or("");
+            if !RelationalStore::validate_state_transition_for_meta(&meta, &sm.column, old_status, new_status) {
+                return Err(Error::InvalidStateTransition(format!("{old_status} -> {new_status}")));
+            }
+        }
+        let row = VersionedRow {
+            row_id, values, created_tx: tx, deleted_tx: None, lsn: Lsn(0),
+            created_at: Some(created_at.unwrap_or_else(Wallclock::now)),
+        };
+        let invoice = admission.take().ok_or_else(|| {
+            DatabaseTransactionHost::producer_gap("original row reservation")
+        })?;
+        host.stage_original_row(self.relational_store.clone(), tx, table, row, invoice)
+    }
+
+    /// SQL keeps an unused reservation on its duplicate-UNIQUE no-op path.
+    pub(crate) fn insert_row_with_unique_noop_owned(
+        &self,
+        tx: TxId,
+        table: &str,
+        mut values: HashMap<ColName, Value>,
+        admission: &mut Option<OwnedMemoryReservation>,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<InsertRowResult> {
+        let DatabaseTransactionHost::Owned(handle) = &self.tx_mgr else {
+            return self.insert_row_with_unique_noop(tx, table, values, vector_copy_owner, read_memory);
+        };
+        self.ensure_trigger_table_ready(table, "insert_row")?;
+        self.complete_insert_access_values(table, &mut values)?;
+        let allow_duplicate_unique_noop = !self.table_meta(table).is_some_and(|meta| meta.immutable);
+        match self.check_row_constraints(tx, table, &values, None, allow_duplicate_unique_noop, read_memory.clone())? {
+            RowConstraintCheck::DuplicateUniqueNoOp => Ok(InsertRowResult::NoOp),
+            RowConstraintCheck::Valid => {
+                self.ensure_owned_row_vector_producer(table, &values)?;
+                let row_id = self.relational_store.new_row_id();
+                self.assert_row_write_allowed(table, row_id, &values, self.snapshot_for_read(), read_memory.clone())?;
+                let natural_key = self.table_meta(table).and_then(|meta| natural_key_from_row_values(&meta, &values));
+                self.blank_quantized_vector_values(table, &mut values);
+                let inserted = handle.with_host(|host| self.insert_original_relational_row(
+                    host, tx, table, row_id, values, self.snapshot_for_read(), None,
+                    false, admission, read_memory.clone(),
+                ))?;
+                if let Some(key) = natural_key {
+                    self.stage_local_creation_lineage(tx, table, key, inserted, read_memory)?;
+                }
+                Ok(InsertRowResult::Inserted(inserted))
+            }
+        }
     }
 
     fn insert_row_within_operation(
@@ -32652,6 +35737,193 @@ impl Database {
             read_memory.clone(),
         )?;
         Ok(inserted)
+    }
+
+    pub(crate) fn insert_row_replacing_owned(
+        &self,
+        tx: TxId,
+        table: &str,
+        values: HashMap<ColName, Value>,
+        old_row_id: RowId,
+        place_vectors: bool,
+        admission: OwnedMemoryReservation,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<RowId> {
+        let original = OriginalRowValues { values, admission };
+        let DatabaseTransactionHost::Owned(_) = &self.tx_mgr else {
+            let inserted = self.insert_row_replacing(
+                tx, table, original.values, old_row_id, place_vectors,
+                vector_copy_owner, read_memory,
+            )?;
+            self.record_owned_row_admission(tx, table, inserted, original.admission);
+            return Ok(inserted);
+        };
+        self.ensure_trigger_table_ready(table, "insert_row_replacing")?;
+        let mut values = self.coerce_row_for_insert(
+            table, original.values, Some(self.committed_watermark()), Some(tx),
+        )?;
+        self.complete_insert_access_values(table, &mut values)?;
+        self.validate_primary_key_values_present(table, &values)?;
+        if !self.trigger_callback_tx_bound_matches(tx) {
+            self.validate_row_constraints(tx, table, &values, Some(old_row_id), read_memory.clone())?;
+        }
+        self.assert_row_write_allowed(table, old_row_id, &values, self.snapshot_for_read(), read_memory.clone())?;
+        // The row-only leg places no vector. UPDATE's vector placement remains
+        // a separately inventoried producer even when place_vectors is false.
+        self.ensure_owned_row_vector_producer(table, &values)?;
+        self.blank_quantized_vector_values(table, &mut values);
+        self.replace_row_after_update_validation_owned(
+            tx, table, old_row_id, values, self.snapshot_for_read(),
+            original.admission, read_memory,
+        )
+    }
+
+    pub(crate) fn replace_row_after_update_validation_owned(
+        &self,
+        tx: TxId,
+        table: &str,
+        row_id: RowId,
+        values: HashMap<ColName, Value>,
+        snapshot: SnapshotId,
+        admission: OwnedMemoryReservation,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<RowId> {
+        let original = OriginalRowValues { values, admission };
+        let DatabaseTransactionHost::Owned(_) = &self.tx_mgr else {
+            let inserted = self.replace_row_after_update_validation(
+                tx, table, row_id, original.values, snapshot, read_memory,
+            )?;
+            self.record_owned_row_admission(tx, table, inserted, original.admission);
+            return Ok(inserted);
+        };
+        let meta = self.table_meta(table).ok_or_else(|| Error::TableNotFound(table.into()))?;
+        if !self.trigger_callback_tx_bound_matches(tx) {
+            self.validate_row_constraints(tx, table, &original.values, Some(row_id), read_memory.clone())?;
+        }
+        let committed_row_exists = self.committed_row_at(table, row_id, snapshot, read_memory)?.is_some();
+        self.replace_row_after_update_validation_counted_owned(
+            tx, table, row_id, original.values,
+            UpdateReplacementContext { meta: &meta, committed_row_exists, created_at: Wallclock::now() },
+            original.admission,
+        ).map(|(row, _, _)| row)
+    }
+
+    pub(crate) fn replace_row_after_update_validation_counted_owned(
+        &self,
+        tx: TxId,
+        table: &str,
+        row_id: RowId,
+        values: HashMap<ColName, Value>,
+        context: UpdateReplacementContext<'_>,
+        admission: OwnedMemoryReservation,
+    ) -> Result<(RowId, WriteSetCounts, WriteSetCounts)> {
+        let original = OriginalRowValues { values, admission };
+        match &self.tx_mgr {
+            DatabaseTransactionHost::Legacy(_) => {
+                let outcome = self.replace_row_after_update_validation_counted(
+                    tx, table, row_id, original.values, context,
+                )?;
+                self.record_owned_row_admission(tx, table, outcome.0, original.admission);
+                Ok(outcome)
+            }
+            DatabaseTransactionHost::Owned(handle) => handle.with_host(|host| {
+                self.replace_original_row_counted(host, tx, table, row_id, original, context)
+            }),
+        }
+    }
+
+    /// Sequential replacement keeps every inverse in the existing paired
+    /// checkpoint. No empty-current candidate or bare WriteSet is imported.
+    fn replace_original_row_counted(
+        &self,
+        host: &EngineDatabaseTransactions,
+        tx: TxId,
+        table: &str,
+        row_id: RowId,
+        mut original: OriginalRowValues,
+        context: UpdateReplacementContext<'_>,
+    ) -> Result<(RowId, WriteSetCounts, WriteSetCounts)> {
+        self.validate_primary_key_values_present(table, &original.values)?;
+        if context.meta.immutable {
+            return Err(Error::ImmutableTable(table.to_string()));
+        }
+        self.ensure_owned_row_vector_producer(table, &original.values)?;
+        if context.meta.columns.iter().any(|column| {
+            matches!(column.column_type, contextdb_core::ColumnType::Vector(_))
+        }) {
+            return Err(DatabaseTransactionHost::producer_gap("replacement vector ownership"));
+        }
+
+        // A separately produced provenance/admitted sidecar needs its exact
+        // successor owner. This packet never clears it as a row-only shortcut.
+        let sidecars = self.tx_mgr.with_read(tx, |read| {
+            read.relational_insert_source_lsns.get(table).is_some_and(|rows| rows.contains_key(&row_id))
+                || read.relational_insert_source_kinds.get(table).is_some_and(|rows| rows.contains_key(&row_id))
+                || read.relational_insert_admitted_bytes.get(table).is_some_and(|rows| rows.contains_key(&row_id))
+        })?;
+        if sidecars {
+            return Err(DatabaseTransactionHost::producer_gap("replacement provenance sidecar successor"));
+        }
+        self.blank_quantized_vector_values(table, &mut original.values);
+        let checkpoint = self.write_set_checkpoint_owned(host, tx)?;
+        let result = (|| {
+            let before = self.write_set_counts(tx)?;
+            host.transactions.with_transactions(|transactions| transactions.with_engine(tx, |guard| {
+                let removed = guard.prepare_remove(table, row_id)?;
+                guard.publish(removed);
+                Ok(())
+            }))?;
+            if context.committed_row_exists {
+                self.stage_original_relational_delete(host, tx, table, row_id)?;
+            }
+            let row = VersionedRow {
+                row_id, values: original.values, created_tx: tx, deleted_tx: None,
+                lsn: Lsn(0), created_at: Some(context.created_at),
+            };
+            let inserted = host.stage_original_row(
+                self.relational_store.clone(), tx, table, row, original.admission,
+            )?;
+            let after = self.write_set_counts(tx)?;
+            Ok((inserted, before, after))
+        })();
+        if result.is_err() {
+            self.restore_write_set_checkpoint(tx, checkpoint)?;
+        } else {
+            checkpoint.settle();
+        }
+        result
+    }
+
+    /// The deletion's own original string is admitted before allocation; the
+    /// guarded splice also admits its controls before native publication.
+    fn stage_original_relational_delete(
+        &self, host: &EngineDatabaseTransactions, tx: TxId, table: &str, row_id: RowId,
+    ) -> Result<()> {
+        host.transactions.with_transactions(|transactions| transactions.with_engine(tx, |guard| {
+            let read = guard.read();
+            if read.relational_deletes.iter().any(|(name, id, _)| name == table && *id == row_id) {
+                return Ok(());
+            }
+            let at = read.relational_deletes.len();
+            struct OriginalDelete {
+                body: (TableName, RowId, TxId),
+                admission: OwnedMemoryReservation,
+            }
+            let admission = OwnedMemoryReservation::try_new_for(
+                crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
+                table.len(), "relational", "staged_row_delete",
+                "Reduce staged deletions or raise MEMORY_LIMIT.",
+            )?;
+            let mut original = OriginalDelete { body: (table.to_owned(), row_id, tx), admission };
+            let invoice = original.admission.into_source_aux_invoice_for(&host.funder)?;
+            let batch = guard.prepare_owned_aux(
+                contextdb_tx::staged_source::AuxBody::RelationalDelete(original.body), invoice,
+            )?;
+            let prepared = guard.prepare_aux_splice(at, &[], batch)?;
+            guard.publish_tx(prepared);
+            Ok(())
+        }))
     }
 
     pub(crate) fn replace_row_after_update_validation(
@@ -38298,9 +41570,10 @@ impl Database {
         })??;
         let committed = self
             .tx_mgr
-            .commit_with_lsn_active_prepare_and_applied_mut(
+            .commit_with_lsn_precanonicalized_active_prepare_and_applied_mut(
                 tx,
                 read_memory.clone(),
+                || Ok(false),
                 |lsn, receiver_tx| {
                     #[cfg(any(test, feature = "test-seams"))]
                     let prepare_started = std::time::Instant::now();
@@ -38627,6 +41900,12 @@ impl Database {
         local_row_id: RowId,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<()> {
+        if let DatabaseTransactionHost::Owned(handle) = &self.tx_mgr {
+            return handle.with_host(|host| self.stage_original_creation_lineage(
+                host, tx, table, &natural_key, local_row_id, read_memory,
+            ));
+        }
+
         let generation =
             self.transaction_lineage_table_generation(tx, table, read_memory.clone())?;
         let record = DurableUnboundCreationLineage {
@@ -38648,6 +41927,114 @@ impl Database {
             ));
             Ok(())
         })?
+    }
+
+    /// Encode the existing config record directly into its original admitted
+    /// buffers. The borrowed serialization has the same field order and bytes
+    /// as DurableUnboundCreationLineage; no transient identity Vec is copied.
+    fn stage_original_creation_lineage(
+        &self, host: &EngineDatabaseTransactions, tx: TxId, table: &str,
+        natural_key: &NaturalKey, local_row_id: RowId,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<()> {
+        #[derive(serde::Serialize)]
+        struct BorrowedLineage<'a> {
+            table: &'a str,
+            natural_key: &'a NaturalKey,
+            table_generation: u64,
+            local_row_id: RowId,
+            creation_lsn: Option<Lsn>,
+        }
+        struct ByteCount(usize);
+        impl std::io::Write for ByteCount {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0 = self.0.checked_add(bytes.len()).ok_or_else(|| {
+                    std::io::Error::from(std::io::ErrorKind::OutOfMemory)
+                })?;
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        // Stream the exact existing identity bytes as hex, avoiding an
+        // allocate-first sync_identity_key/hex_component temporary.
+        struct HexWriter<'a>(&'a mut String);
+        impl std::io::Write for HexWriter<'_> {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                for byte in bytes {
+                    self.0.push(HEX[(byte >> 4) as usize] as char);
+                    self.0.push(HEX[(byte & 15) as usize] as char);
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        self.tx_mgr.with_read(tx, |_| ())?;
+        let root = self.writer_read_root()?;
+        let _scope = self.enter_writer_read(root, read_memory.clone());
+        let generation = self.durable_lineage_table_generation(table, read_memory)?;
+        let record = BorrowedLineage {
+            table, natural_key, table_generation: generation,
+            local_row_id, creation_lsn: None,
+        };
+        let mut encoded_count = ByteCount(0);
+        bincode::serde::encode_into_std_write(
+            &record, &mut encoded_count, bincode::config::standard(),
+        ).map_err(|error| Error::Other(format!("bincode encode error: {error}")))?;
+        let mut identity_count = ByteCount(0);
+        serde::Serialize::serialize(natural_key, &mut rmp_serde::Serializer::new(&mut identity_count))
+            .map_err(|error| Error::Other(format!("sync natural key encode error: {error}")))?;
+        let key_bytes = 8usize.checked_add(table.len())
+            .and_then(|bytes| bytes.checked_add(identity_count.0))
+            .and_then(|bytes| bytes.checked_mul(2))
+            .and_then(|bytes| bytes.checked_add("sync_creation_lineage.v1.".len() + 16 + 1 + 16 + 1))
+            .ok_or_else(|| Error::Other("creation lineage key size overflow".into()))?;
+        let body_bytes = key_bytes.checked_add(encoded_count.0)
+            .ok_or_else(|| Error::Other("creation lineage body size overflow".into()))?;
+        struct OriginalConfig {
+            body: (String, Vec<u8>),
+            admission: OwnedMemoryReservation,
+        }
+        // The reservation precedes both original native allocations. It
+        // follows the same actual writer use retained by the paired host.
+        let admission = OwnedMemoryReservation::try_new_for(
+            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
+            body_bytes, "relational", "creation_lineage_config",
+            "Reduce staged lineage records or raise MEMORY_LIMIT.",
+        )?;
+        let mut original = OriginalConfig {
+            body: (String::with_capacity(key_bytes), Vec::with_capacity(encoded_count.0)), admission,
+        };
+        std::fmt::Write::write_fmt(&mut original.body.0, format_args!(
+            "sync_creation_lineage.v1.{generation:016x}.{:016x}.", local_row_id.0,
+        )).map_err(|_| Error::Other("creation lineage key formatting failed".into()))?;
+        {
+            let mut hex = HexWriter(&mut original.body.0);
+            std::io::Write::write_all(&mut hex, &(table.len() as u64).to_be_bytes())
+                .map_err(|error| Error::Other(format!("creation lineage key encode error: {error}")))?;
+            std::io::Write::write_all(&mut hex, table.as_bytes())
+                .map_err(|error| Error::Other(format!("creation lineage key encode error: {error}")))?;
+            serde::Serialize::serialize(natural_key, &mut rmp_serde::Serializer::new(&mut hex))
+                .map_err(|error| Error::Other(format!("sync natural key encode error: {error}")))?;
+        }
+        bincode::serde::encode_into_std_write(
+            &record, &mut original.body.1, bincode::config::standard(),
+        ).map_err(|error| Error::Other(format!("bincode encode error: {error}")))?;
+        if original.body.0.len() != key_bytes || original.body.0.capacity() != key_bytes
+            || original.body.1.len() != encoded_count.0 || original.body.1.capacity() != encoded_count.0
+        {
+            return Err(Error::Other("creation lineage original capacity mismatch".into()));
+        }
+        let invoice = original.admission.into_source_aux_invoice_for(&host.funder)?;
+        host.transactions.with_transactions(|transactions| transactions.with_engine(tx, |guard| {
+            let at = guard.read().config_writes.len();
+            let batch = guard.prepare_owned_aux(
+                contextdb_tx::staged_source::AuxBody::ConfigWrite(original.body), invoice,
+            )?;
+            let prepared = guard.prepare_aux_splice(at, &[], batch)?;
+            guard.publish_tx(prepared);
+            Ok(())
+        }))
     }
 
     fn stamp_unbound_creation_lineages_at_commit(
@@ -38878,7 +42265,7 @@ impl Database {
     ) -> Result<Option<DurableUnboundCreationLineage>> {
         let key =
             Self::durable_unbound_creation_config_key(table, natural_key, generation, local_row_id);
-        self.tx_mgr.with_write_set(tx, |ws| {
+        self.tx_mgr.with_read(tx, |ws| {
             ws.config_writes
                 .iter()
                 .rev()
@@ -39312,7 +42699,7 @@ impl Database {
             return self.durable_lineage_table_generation(table, read_memory);
         };
         let identity = root.storage_identity();
-        self.tx_mgr.with_write_set(tx, |_| ())?;
+        self.tx_mgr.with_read(tx, |_| ())?;
         let memo = {
             let mut pending = self.pending_commit_metadata.lock();
             let metadata = pending.entry(tx).or_default();
@@ -42952,8 +46339,11 @@ impl Database {
             );
             if result.is_err() {
                 let _ = self.restore_write_set_checkpoint(tx, checkpoint);
-            } else if let (Some(admission), Some(row)) = (admission.take(), staged_row) {
-                self.record_owned_row_admission(tx, table, row, admission);
+            } else {
+                if let (Some(admission), Some(row)) = (admission.take(), staged_row) {
+                    self.record_owned_row_admission(tx, table, row, admission);
+                }
+                checkpoint.settle();
             }
             result
         })()
@@ -43490,7 +46880,7 @@ impl Database {
     }
 
     fn row_id_is_staged_insert(&self, tx: TxId, table: &str, row_id: RowId) -> Result<bool> {
-        self.tx_mgr.with_write_set(tx, |ws| {
+        self.tx_mgr.with_read(tx, |ws| {
             ws.relational_inserts
                 .iter()
                 .any(|(staged_table, staged_row)| {
@@ -43569,7 +46959,7 @@ impl Database {
         }
         use contextdb_core::{DirectedValue, TotalOrdAsc};
         let (tx_staged_deletes, tx_delete_predicates, staged_overlap) =
-            self.tx_mgr.with_write_set(tx, |ws| {
+            self.tx_mgr.with_read(tx, |ws| {
                 // Rows this tx has already staged for delete must not be treated as
                 // obstructions by the constraint probe. The old index entry still
                 // looks visible at the committed-watermark snapshot until commit.
@@ -43715,7 +47105,7 @@ impl Database {
         let (tx_staged_deletes, tx_delete_predicates): (
             std::collections::HashSet<RowId>,
             Vec<RelationalDeletePredicate>,
-        ) = self.tx_mgr.with_write_set(tx, |ws| {
+        ) = self.tx_mgr.with_read(tx, |ws| {
             let deletes = ws
                 .relational_deletes
                 .iter()
@@ -43796,8 +47186,8 @@ impl Database {
             }
         }
         // Tx-staged inserts.
-        let overlap = self.tx_mgr.with_write_set(tx, |ws| {
-            for (t, row) in &ws.relational_inserts {
+        let overlap = self.tx_mgr.with_read(tx, |ws| {
+            for (t, row) in ws.relational_inserts {
                 #[cfg(any(test, feature = "test-seams"))]
                 crate::writer_query_test_seams::note_target_entry(t);
                 if t != table {
@@ -47916,6 +51306,8 @@ impl Database {
         })();
         if result.is_err() {
             let _ = self.restore_write_set_checkpoint(tx, checkpoint);
+        } else {
+            checkpoint.settle();
         }
         result
     }
@@ -49723,7 +53115,7 @@ impl Database {
     /// How many rows this transaction has staged, read before one more is.
     pub(crate) fn staged_row_count(&self, tx: TxId) -> usize {
         self.tx_mgr
-            .with_write_set(tx, |ws| ws.relational_inserts.len())
+            .with_read(tx, |ws| ws.relational_inserts.len())
             .unwrap_or(0)
     }
 
@@ -50000,6 +53392,8 @@ impl Database {
             });
         if result.is_err() {
             let _ = self.restore_write_set_checkpoint(tx, checkpoint);
+        } else {
+            checkpoint.settle();
         }
         result
     }
@@ -50057,6 +53451,8 @@ impl Database {
         );
         if result.is_err() {
             let _ = self.restore_write_set_checkpoint(tx, checkpoint);
+        } else {
+            checkpoint.settle();
         }
         result
     }
@@ -60866,7 +64262,7 @@ impl Database {
         {
         let mut storage = std::mem::MaybeUninit::<MaintenanceContext>::uninit();
         let mut construction = MaintenanceCleanup {
-            source: storage.as_mut_ptr(), initialized: [false; 26],
+            source: storage.as_mut_ptr(), initialized: [false; 27],
         };
         unsafe {
             
@@ -60933,6 +64329,10 @@ impl Database {
             {
                 std::ptr::addr_of_mut!((*construction.source).finalization).write(Arc::clone(&self.finalization));
                 construction.initialized[25] = true;
+            }
+            {
+                std::ptr::addr_of_mut!((*construction.source).pending_local_schema_stages).write(self.pending_local_schema_stages.clone());
+                construction.initialized[26] = true;
             }
             
             {
@@ -62288,7 +65688,8 @@ impl Database {
         let already_closed = {
             let _operation_barrier = self.operation_gate.write();
             let already_closed = self.closed.swap(true, Ordering::SeqCst);
-            if !already_closed && self.resource_owner {
+            if !already_closed && self.resource_owner
+                && matches!(&self.tx_mgr, DatabaseTransactionHost::Legacy(_)) {
                 self.pending_local_schema_stages.lock().clear();
                 self.local_schema_stages.lock().clear();
             }
@@ -62300,6 +65701,16 @@ impl Database {
         if !already_closed {
             let tx = self.session_tx.lock().take();
             if let Some(tx) = tx {
+                if let DatabaseTransactionHost::Owned(handle) = &self.tx_mgr {
+                    match handle.with_host(|host| host.rollback_terminal(tx)) {
+                        Ok(terminal) => {
+                            self.remove_original_terminal_stages(terminal.identity().original_tx);
+                            drop(terminal);
+                        }
+                        Err(Error::TxNotFound(_)) => self.remove_original_terminal_stages(tx),
+                        Err(error) => return Err(error),
+                    }
+                } else {
                 if let Ok(ws) = self.tx_mgr.cloned_write_set(tx) {
                     self.release_insert_allocations(&ws, &mut vector_copy_owner)?;
                 }
@@ -62307,6 +65718,7 @@ impl Database {
                 self.pending_local_schema_stages.lock().remove(&tx);
                 self.pending_commit_metadata.lock().remove(&tx);
                 let _ = self.tx_mgr.rollback(tx);
+                }
             }
             // A resource-owner close can also follow direct `begin()` /
             // `execute_in_tx()` use, whose TxId is not stored in `session_tx`.
@@ -62317,10 +65729,21 @@ impl Database {
             // committed left its whole admission charged against a limit that
             // nothing was holding memory for any more.
             if self.resource_owner {
+                if matches!(&self.tx_mgr, DatabaseTransactionHost::Legacy(_)) {
                 self.pending_local_schema_stages.lock().clear();
                 self.local_schema_stages.lock().clear();
+                }
+                if let DatabaseTransactionHost::Owned(handle) = &self.tx_mgr {
+                    for terminal in handle.with_host(EngineDatabaseTransactions::drain_terminals) {
+                        self.remove_original_terminal_stages(terminal.identity().original_tx);
+                        drop(terminal);
+                    }
+                    self.pending_local_schema_stages.lock().clear();
+                    self.local_schema_stages.lock().clear();
+                } else {
                 for write_set in self.tx_mgr.drain_active_write_sets() {
                     self.release_insert_allocations(&write_set, &mut vector_copy_owner)?;
+                }
                 }
                 // The change log and the commit index go with the store. They are
                 // charged as they grow, and a reopen charges what it rehydrates,
@@ -63003,7 +66426,6 @@ impl Database {
             receipt.named_owner_total = registration + backing + adapters + receipt.pending_lineage_generation_charge
                 + receipt.storage_maintenance_control_charge
                 + receipt.commit_source_reference_charge
-                + receipt.snapshot_pin_capacity_charge
                 + receipt.published_root_charge
                 + receipt.captured_root_charge
                 + receipt.staged_index_postings
@@ -63576,6 +66998,9 @@ impl Database {
         row_id: RowId,
         admission: OwnedMemoryReservation,
     ) {
+        assert!(matches!(&self.tx_mgr, DatabaseTransactionHost::Legacy(_)),
+            "owned rows must consume their original invoice before publication");
+
         self.record_staged_row_admission(tx, table, row_id, admission.bytes());
         admission.transfer_to_staged();
     }
@@ -63784,6 +67209,10 @@ impl Database {
     }
 
     pub(crate) fn write_set_checkpoint(&self, tx: TxId) -> Result<WriteSetCheckpoint<'_>> {
+        if let DatabaseTransactionHost::Owned(handle) = &self.tx_mgr {
+            return handle.with_host(|host| self.write_set_checkpoint_owned(host, tx));
+        }
+
         let metadata = self.pending_commit_metadata.lock();
         let prior = metadata.get(&tx);
         let bytes = prior.map_or(0, |m| {
@@ -63844,7 +67273,7 @@ impl Database {
                     ws.propagation_in_progress,
                 )
             })?;
-        Ok(WriteSetCheckpoint {
+        Ok(WriteSetCheckpoint { branch: Some(WriteSetCheckpointBranch::Legacy(LegacyWriteSetCheckpoint {
             database: self,
             tx,
             counts,
@@ -63856,12 +67285,51 @@ impl Database {
             vector_epochs,
             _charge: charge,
             active: true,
-        })
+        })) })
+    }
+
+    /// Both frames prepare before either installs. Metadata installs inside
+    /// the lower preparation peer while the active-map lock still excludes a
+    /// competing lower operation; no user callback runs in that peer.
+    /// No Database open constructs this host. The existing operation read gate
+    /// prevents close, not concurrent same-tx access: protected paired close
+    /// now retains both locks; activation still needs complete producer migrations.
+    fn write_set_checkpoint_owned<'a>(
+        &'a self,
+        host: &'a EngineDatabaseTransactions,
+        tx: TxId,
+    ) -> Result<WriteSetCheckpoint<'a>> {
+        let (transaction, metadata) = host.transactions.with_transactions(|transactions| {
+            transactions.checkpoint_with_peer(tx, |lower| {
+                let prepared = host
+                    .metadata
+                    .prepare_metadata_checkpoint(lower.identity())?;
+                Ok(host.metadata.begin_metadata_checkpoint(prepared))
+            })
+        })?;
+        let checkpoint = WriteSetCheckpoint {
+            branch: Some(WriteSetCheckpointBranch::Owned(OwnedWriteSetCheckpoint {
+                pair: Some(OwnedCheckpointPair {
+                    transaction: std::mem::ManuallyDrop::new(transaction),
+                    metadata: metadata.checkpoint,
+                }),
+            })),
+        };
+        drop(metadata.records);
+        Ok(checkpoint)
     }
 
     pub(crate) fn write_set_counts(&self, tx: TxId) -> Result<WriteSetCounts> {
         self.tx_mgr
-            .with_write_set(tx, |ws| current_write_set_counts(ws))
+            .with_read(tx, |ws| WriteSetCounts {
+                relational_inserts: ws.relational_inserts.len(),
+                relational_deletes: ws.relational_deletes.len(),
+                adj_inserts: ws.adj_inserts.len(),
+                adj_deletes: ws.adj_deletes.len(),
+                vector_inserts: ws.vector_inserts.len(),
+                vector_deletes: ws.vector_deletes.len(),
+                vector_moves: ws.vector_moves.len(),
+            })
     }
 
     // 8th parameter `fail_on_conflict` is load-bearing: it differentiates
@@ -63956,6 +67424,22 @@ impl Database {
         &self,
         tx: TxId,
         mut checkpoint: WriteSetCheckpoint<'_>,
+    ) -> Result<()> {
+        match checkpoint.branch.take().expect("active coupled checkpoint") {
+            WriteSetCheckpointBranch::Legacy(legacy) => {
+                self.restore_legacy_write_set_checkpoint(tx, legacy)
+            }
+            WriteSetCheckpointBranch::Owned(owned) => {
+                owned.restore_for_tx(tx);
+                Ok(())
+            }
+        }
+    }
+
+    fn restore_legacy_write_set_checkpoint(
+        &self,
+        tx: TxId,
+        mut checkpoint: LegacyWriteSetCheckpoint<'_>,
     ) -> Result<()> {
         self.tx_mgr.with_write_set(tx, |ws| {
             ws.ordered_staged_rows.restore_checkpoint(
@@ -84963,7 +88447,7 @@ fn prepare_cleanup_generations<'a>(
 /// Select without mutating either durable or in-memory state. Currency cleanup
 /// includes these candidates in the same transaction as their last references.
 fn scoped_commit_index_candidates(
-    tx_mgr: &TransactionManager<DynStore>,
+    tx_mgr: &DatabaseTransactionHost,
     lsn_refcounts: &ChangeLogLsnRefcounts,
     removed_lsn_counts: &HashMap<Lsn, u64>,
     affected_lsns: &HashSet<Lsn>,
@@ -84974,7 +88458,7 @@ fn scoped_commit_index_candidates(
     if let Some(root) = writer_read::durable_root(tx_mgr.capture_published_read().handle)? {
         return RedbPersistence::commit_candidates_at_root(
             &root,
-            tx_mgr,
+            |upper| tx_mgr.try_commit_index_floor(upper),
             removed_lsn_counts,
             affected_lsns,
         );
@@ -85178,7 +88662,7 @@ impl ChangeLogAuxIndexFixtureForTest {
 /// `scoped_commit_index_removal` needs to know which LSNs the change log
 /// still covers after this pass.
 fn count_pruned_change_log_entries_at_root(
-    tx_mgr: &TransactionManager<DynStore>,
+    tx_mgr: &DatabaseTransactionHost,
     resident: &ChangeLogTableIndex,
     pruned: &HashMap<String, HashSet<(RowId, Lsn)>>,
     read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
@@ -85335,7 +88819,7 @@ fn compact_currency_versions_inner(
     change_log: &Arc<RwLock<Vec<ChangeLogEntry>>>,
     change_log_table_index: &Arc<RwLock<ChangeLogTableIndex>>,
     change_log_lsn_refcounts: &Arc<RwLock<ChangeLogLsnRefcounts>>,
-    tx_mgr: &Arc<TransactionManager<DynStore>>,
+    tx_mgr: &DatabaseTransactionHost,
     snapshot_registry: &Arc<SnapshotFloorRegistry>,
     publication: &mut contextdb_tx::manager::MaintenancePublication<'_, DynStore>,
     publication_interrupted: &Arc<AtomicBool>,
@@ -85837,7 +89321,7 @@ fn compact_currency_versions_inner(
 /// node does near-zero work per tick.
 fn currency_compaction_pending(
     relational_store: &Arc<RelationalStore>,
-    manager: &TransactionManager<DynStore>,
+    manager: &DatabaseTransactionHost,
     accountant: &crate::memory_accounting::AccountantHandle,
     tables: &[&str],
     threshold: usize,
@@ -91677,3 +95161,2867 @@ mod cdb126_reader_history_tests {
 #[cfg(test)]
 #[path = "database/writecost_reclaim_cancellation_tests.rs"]
 mod writecost_reclaim_cancellation_tests;
+
+impl Database {
+    fn lineage_attestation_owned(
+        &self,
+        tenant: &TenantId,
+        table: &str,
+        key: &NaturalKey,
+        generation: u64,
+        node: &str,
+        incarnation: Incarnation,
+        lsn: Lsn,
+        root: &str,
+    ) -> Result<crate::custody::preparation::OwnedPreparationValue<Vec<u8>>> {
+        use crate::custody::records::{BorrowedKeyPairs, prepare_positional_encoding_owned};
+        // Same 32-character lowercase incarnation spelling, with stack backing.
+        let mut hex = [0u8; 32];
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        for (i, byte) in incarnation.0.to_be_bytes().iter().enumerate() {
+            hex[2 * i] = DIGITS[(byte >> 4) as usize];
+            hex[2 * i + 1] = DIGITS[(byte & 15) as usize];
+        }
+        let incarnation = std::str::from_utf8(&hex).expect("hex ASCII");
+        prepare_positional_encoding_owned(
+            self,
+            &(
+                "contextdb.row-lineage-attestation.v1",
+                tenant.as_str(),
+                table,
+                BorrowedKeyPairs(key),
+                generation,
+                node,
+                incarnation,
+                lsn.0,
+                root,
+            ),
+        )
+    }
+    pub(crate) fn verify_lineage_attestation_owned(
+        &self,
+        tenant: &TenantId,
+        table: &str,
+        key: &NaturalKey,
+        lineage: &crate::protocol::WireRowLineage,
+    ) -> Result<()> {
+        if lineage.attestation.is_empty() {
+            return Err(Error::SyncError(
+                "authenticated row lineage is missing its creator signature".to_string(),
+            ));
+        }
+        let bytes = self.lineage_attestation_owned(
+            tenant,
+            table,
+            key,
+            lineage.table_generation,
+            &lineage.author_node_id,
+            lineage.author_database_incarnation,
+            lineage.author_local_mutation_position,
+            &lineage.lineage_root,
+        )?;
+        bytes.with_value(|bytes| {
+            crate::identity::FabricIdentity::verify_lineage_by_node_id(
+                &lineage.author_node_id,
+                bytes,
+                &lineage.attestation,
+            )
+        })
+    }
+    pub(crate) fn prepare_delivery_row_lineages_owned(
+        &self,
+        guard: &mut contextdb_tx::manager::EngineGuard<'_>,
+        changes: &ChangeSet,
+        tenant: &TenantId,
+        node: &str,
+        incarnation: Incarnation,
+        signer: &dyn Fn(&[u8]) -> Result<Vec<u8>>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<crate::custody::preparation::OwnedDeliveryLineages> {
+        use crate::custody::{canonical::*, preparation::*, records::*};
+        let mut result = OwnedDeliveryLineages::try_new(self, changes.rows.len())?;
+        let decode_owner = crate::read_image_memory::ImageMemory::operation_reader(
+            self.bounded_read_accountant(),
+            read_memory.clone(),
+        )?;
+        let _decode_scope = decode_owner.enter();
+        let state = self.lineage_state_lock.lock();
+        for change in &changes.rows {
+            let (row_id, offline) = self.with_owned_delivery_meta(&change.table, |meta| {
+                let view = guard.read();
+                let row = view
+                    .relational_inserts
+                    .iter()
+                    .find_map(|(table, row)| {
+                        (*table == change.table
+                            && row_matches_key_owned(meta, &row.values, &change.natural_key))
+                        .then_some(row)
+                    })
+                    .ok_or_else(invalid)?;
+                Ok((
+                    row.row_id,
+                    meta.sync_direction == Some(contextdb_core::SyncDirection::None),
+                ))
+            })?;
+            let generation =
+                self.durable_lineage_table_generation(&change.table, read_memory.clone())?;
+            let encoded_key = prepare_positional_encoding_owned(self, &change.natural_key)?;
+            let identity = encoded_key.with_value(|key| {
+                OwnedPreparationValue::try_produce(
+                    self,
+                    8usize
+                        .checked_add(change.table.len())
+                        .and_then(|n| n.checked_add(key.len()))
+                        .ok_or_else(invalid)?,
+                    || {
+                        let mut bytes = Vec::with_capacity(8 + change.table.len() + key.len());
+                        bytes.extend_from_slice(&(change.table.len() as u64).to_be_bytes());
+                        bytes.extend_from_slice(change.table.as_bytes());
+                        bytes.extend_from_slice(key);
+                        Ok(bytes)
+                    },
+                )
+            })?;
+            let sidecar_key = identity.with_value(|bytes| {
+                prepare_string_owned(
+                    self,
+                    format_args!(
+                        "sync_row_lineage.v1.{generation:016x}.{}",
+                        BorrowedHex(bytes)
+                    ),
+                )
+            })?;
+            let creation_key = identity.with_value(|bytes| {
+                prepare_string_owned(
+                    self,
+                    format_args!(
+                        "sync_creation_lineage.v1.{generation:016x}.{:016x}.{}",
+                        row_id.0,
+                        BorrowedHex(bytes)
+                    ),
+                )
+            })?;
+            let creation: Option<DurableUnboundCreationLineage> =
+                creation_key.with_value(|key| {
+                    guard
+                        .read()
+                        .config_writes
+                        .iter()
+                        .rev()
+                        .find(|(k, _)| k == key)
+                        .map(|(_, bytes)| RedbPersistence::decode_config_value(bytes))
+                        .transpose()
+                })?;
+            let local_creation = creation.is_some() || offline;
+            if let Some(creation) = &creation {
+                if creation.creation_lsn != *guard.read().commit_lsn
+                    || creation.local_row_id != row_id
+                    || creation.table_generation != generation
+                {
+                    return Err(invalid());
+                }
+            }
+            let sidecar = if local_creation {
+                let lsn = creation
+                    .as_ref()
+                    .and_then(|c| c.creation_lsn)
+                    .or_else(|| offline.then_some(*guard.read().commit_lsn).flatten())
+                    .ok_or_else(invalid)?;
+                // A staged creation has precedence even for SYNC OFF.
+                let root = prepare_string_owned(
+                    self,
+                    format_args!("author:{}:{:032x}:{}", node, incarnation.0, lsn.0),
+                )?;
+                let bytes = root.with_value(|root| {
+                    self.lineage_attestation_owned(
+                        tenant,
+                        &change.table,
+                        &change.natural_key,
+                        generation,
+                        node,
+                        incarnation,
+                        lsn,
+                        root,
+                    )
+                })?;
+                let signature =
+                    bytes.with_value(|bytes| sign_preparation_owned(self, signer, bytes))?;
+                let sidecar = root.with_value(|root| {
+                    signature.with_value(|signature| {
+                        OwnedPreparationValue::try_produce(
+                            self,
+                            node.len()
+                                .checked_add(root.len())
+                                .and_then(|n| n.checked_add(signature.len()))
+                                .ok_or_else(invalid)?,
+                            || {
+                                Ok(DurableRowLineageSidecar {
+                                    author_node_id: node.into(),
+                                    author_database_incarnation: incarnation,
+                                    author_local_mutation_position: lsn,
+                                    table_generation: generation,
+                                    lineage_root: root.clone(),
+                                    lineage_attestation: signature.clone(),
+                                    local_row_id: Some(row_id),
+                                    locally_created: true,
+                                })
+                            },
+                        )
+                    })
+                })?;
+                sidecar.with_value(|sidecar| {
+                    sidecar_key.with_value(|key| {
+                        let bytes = count_config_encoding(sidecar)?;
+                        self.stage_owned_delivery_aux(
+                            guard,
+                            key.len().checked_add(bytes).ok_or_else(invalid)?,
+                            || {
+                                let mut encoded = Vec::with_capacity(bytes);
+                                emit_config_encoding(sidecar, &mut encoded)?;
+                                Ok(contextdb_tx::staged_source::AuxBody::ConfigWrite((
+                                    key.clone(),
+                                    encoded,
+                                )))
+                            },
+                        )
+                    })
+                })?;
+                sidecar
+            } else {
+                sidecar_key.with_value(|key| {
+                    if let Some(persistence) = &self.persistence {
+                        let selected: DurableRowLineageSidecar =
+                            persistence.load_config_value(key)?.ok_or_else(invalid)?;
+                        copy_sidecar_preparation_owned(self, &selected)
+                    } else {
+                        copy_sidecar_preparation_owned(
+                            self,
+                            state.row_sidecars.get(key).ok_or_else(invalid)?,
+                        )
+                    }
+                })?
+            };
+            sidecar.with_value(|sidecar| {
+                if sidecar.local_row_id != Some(row_id) {
+                    return Err(invalid());
+                }
+                let lineage = OwnedPreparationValue::try_produce(
+                    self,
+                    sidecar
+                        .author_node_id
+                        .len()
+                        .checked_add(sidecar.lineage_root.len())
+                        .and_then(|n| n.checked_add(sidecar.lineage_attestation.len()))
+                        .ok_or_else(invalid)?,
+                    || {
+                        Ok(crate::protocol::WireRowLineage {
+                            table_generation: sidecar.table_generation,
+                            author_node_id: sidecar.author_node_id.clone(),
+                            author_database_incarnation: sidecar.author_database_incarnation,
+                            author_local_mutation_position: sidecar.author_local_mutation_position,
+                            lineage_root: sidecar.lineage_root.clone(),
+                            attestation: sidecar.lineage_attestation.clone(),
+                        })
+                    },
+                )?;
+                lineage.with_value(|lineage| {
+                    self.verify_lineage_attestation_owned(
+                        tenant,
+                        &change.table,
+                        &change.natural_key,
+                        lineage,
+                    )
+                })?;
+                result.insert(self, &change.table, encoded_key, change.lsn, lineage)
+            })?;
+        }
+        Ok(result)
+    }
+}
+fn copy_sidecar_preparation_owned(
+    db: &Database,
+    value: &DurableRowLineageSidecar,
+) -> Result<crate::custody::preparation::OwnedPreparationValue<DurableRowLineageSidecar>> {
+    crate::custody::preparation::OwnedPreparationValue::try_produce(
+        db,
+        value
+            .author_node_id
+            .len()
+            .checked_add(value.lineage_root.len())
+            .and_then(|n| n.checked_add(value.lineage_attestation.len()))
+            .ok_or_else(crate::custody::canonical::invalid)?,
+        || Ok(value.clone()),
+    )
+}
+
+impl Database {
+    fn accepted_sync_row_author_owned(
+        &self,
+        table: &str,
+        key: &NaturalKey,
+    ) -> Result<Option<crate::custody::preparation::OwnedPreparationValue<String>>> {
+        use crate::custody::{canonical::*, preparation::*, records::*};
+        let encoded = prepare_positional_encoding_owned(self, key)?;
+        let identity = encoded.with_value(|key| {
+            OwnedPreparationValue::try_produce(
+                self,
+                8usize
+                    .checked_add(table.len())
+                    .and_then(|n| n.checked_add(key.len()))
+                    .ok_or_else(invalid)?,
+                || {
+                    let mut bytes = Vec::with_capacity(8 + table.len() + key.len());
+                    bytes.extend_from_slice(&(table.len() as u64).to_be_bytes());
+                    bytes.extend_from_slice(table.as_bytes());
+                    bytes.extend_from_slice(key);
+                    Ok(bytes)
+                },
+            )
+        })?;
+        let cache = self.accepted_sync_row_authors.read();
+        let selected = identity.with_value(|identity| {
+            cache
+                .iter()
+                .find(|((name, bytes), _)| name == table && bytes == identity)
+                .map(|(_, author)| {
+                    OwnedPreparationValue::try_produce(self, author.len(), || Ok(author.clone()))
+                })
+                .transpose()
+        })?;
+        drop(cache);
+        if selected.is_some() {
+            return Ok(selected);
+        }
+        let Some(persistence) = &self.persistence else {
+            return Ok(None);
+        };
+        let config = identity.with_value(|identity| {
+            prepare_string_owned(
+                self,
+                format_args!("sync_row_author.{}", BorrowedHex(identity)),
+            )
+        })?;
+        let selected: Option<String> =
+            config.with_value(|key| persistence.load_config_value(key))?;
+        selected
+            .as_ref()
+            .map(|author| {
+                OwnedPreparationValue::try_produce(self, author.len(), || Ok(author.clone()))
+            })
+            .transpose()
+    }
+    pub(crate) fn dependency_unit_refusal_conflicts_owned(
+        &self,
+        rows: &[RowChange],
+        hub: &str,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<
+        crate::custody::preparation::OwnedPreparationValue<
+            Vec<crate::custody::preparation::OwnedPreparationValue<Conflict>>,
+        >,
+    > {
+        use crate::custody::{canonical::*, preparation::*, records::*};
+        let memory = crate::read_image_memory::ImageMemory::operation_reader(
+            self.bounded_read_accountant(),
+            read_memory.clone(),
+        )?;
+        let _scope = memory.enter();
+        let snapshot = self.snapshot();
+        let no_deleted = HashSet::new();
+        let remaining = OwnedPreparationValue::try_produce(
+            self,
+            preparation_array_bytes::<(
+                &RowChange,
+                crate::custody::preparation::OwnedPreparationValue<Vec<u8>>,
+            )>(rows.len())?,
+            || {
+                let mut remaining = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let key = prepare_positional_encoding_owned(self, &row.natural_key)?;
+                    let identity = key.with_value(|key| {
+                        OwnedPreparationValue::try_produce(
+                            self,
+                            8usize
+                                .checked_add(row.table.len())
+                                .and_then(|n| n.checked_add(key.len()))
+                                .ok_or_else(invalid)?,
+                            || {
+                                let mut identity =
+                                    Vec::with_capacity(8 + row.table.len() + key.len());
+                                identity.extend_from_slice(&(row.table.len() as u64).to_be_bytes());
+                                identity.extend_from_slice(row.table.as_bytes());
+                                identity.extend_from_slice(key);
+                                Ok(identity)
+                            },
+                        )
+                    })?;
+                    remaining.push((row, identity));
+                }
+                Ok(remaining)
+            },
+        )?;
+        let mut ordered: OwnedPreparationValue<Vec<usize>> = OwnedPreparationValue::try_produce(
+            self,
+            preparation_array_bytes::<usize>(rows.len())?,
+            || Ok(Vec::with_capacity(rows.len())),
+        )?;
+        while ordered.with_value(|v| v.len()) < rows.len() {
+            let references_parent = |child: &RowChange, parent: &RowChange| {
+                self.with_owned_delivery_meta_if_present(&child.table, |meta| {
+                    let direct = meta.columns.iter().any(|column| {
+                        column.references.as_ref().is_some_and(|fk| {
+                            fk.table == parent.table
+                                && child.values.get(&column.name).is_some_and(|v| {
+                                    !matches!(v, Value::Null)
+                                        && parent.values.get(&fk.column) == Some(v)
+                                })
+                        })
+                    });
+                    let composite = meta.composite_foreign_keys.iter().any(|fk| {
+                        fk.parent_table == parent.table
+                            && fk
+                                .child_columns
+                                .iter()
+                                .zip(&fk.parent_columns)
+                                .all(|(c, p)| {
+                                    child.values.get(c).is_some_and(|v| {
+                                        !matches!(v, Value::Null) && parent.values.get(p) == Some(v)
+                                    })
+                                })
+                    });
+                    Ok(direct || composite)
+                })
+                .map(|value| value.unwrap_or(false))
+            };
+            let mut selected: Option<usize> = None;
+            for index in 0..rows.len() {
+                if ordered.with_value(|v| v.contains(&index)) {
+                    continue;
+                }
+                let mut eligible = true;
+                for parent in 0..rows.len() {
+                    if !ordered.with_value(|v| v.contains(&parent))
+                        && references_parent(&rows[index], &rows[parent])?
+                    {
+                        eligible = false;
+                        break;
+                    }
+                }
+                if eligible
+                    && selected.is_none_or(|prior| {
+                        remaining.with_value(|v| {
+                            v[index].1.with_value(|a| v[prior].1.with_value(|b| a < b))
+                        })
+                    })
+                {
+                    selected = Some(index);
+                }
+            }
+            if selected.is_none() {
+                for index in 0..rows.len() {
+                    if !ordered.with_value(|v| v.contains(&index))
+                        && selected.is_none_or(|prior| {
+                            remaining.with_value(|v| {
+                                v[index].1.with_value(|a| v[prior].1.with_value(|b| a < b))
+                            })
+                        })
+                    {
+                        selected = Some(index);
+                    }
+                }
+            }
+            ordered.push_slot(selected.ok_or_else(invalid)?);
+        }
+        let mut cause = None;
+        ordered.with_value(|ordered| -> Result<()> {
+            for index in ordered {
+                let row = &rows[*index];
+                if self
+                    .visible_row_by_natural_key(
+                        &row.table,
+                        &row.natural_key,
+                        snapshot,
+                        &no_deleted,
+                        read_memory.clone(),
+                    )?
+                    .is_some()
+                {
+                    cause = Some(*index);
+                    break;
+                }
+            }
+            Ok(())
+        })?;
+        OwnedPreparationValue::try_produce(
+            self,
+            preparation_array_bytes::<OwnedPreparationValue<Conflict>>(rows.len())?,
+            || {
+                let mut conflicts = Vec::with_capacity(rows.len());
+                ordered.with_value(|ordered| -> Result<()> {
+                for index in ordered {
+                    let row=&rows[*index];
+                    let policy=self.with_owned_delivery_meta_if_present(&row.table,|meta|Ok(if meta.conflict_policy==Some(contextdb_core::ConflictPolicy::KEEP_LATEST){ConflictPolicy::LatestWins}else{ConflictPolicy::InsertIfNotExists}))?.unwrap_or(ConflictPolicy::InsertIfNotExists);
+                    let winner=self.visible_row_by_natural_key(&row.table,&row.natural_key,snapshot,&no_deleted,read_memory.clone())?;
+                    let (author,position,refusal)=if let Some(winner)=winner {
+                        let accepted=self.accepted_sync_row_author_owned(&row.table,&row.natural_key)?;
+                        let provenance=self.relational_sync_source_at_read_root(&row.table,winner.row_id,read_memory.clone())?;
+                        let author=match provenance.1 {
+                            Some(contextdb_relational::store::SyncSourceKind::Pulled)|Some(contextdb_relational::store::SyncSourceKind::AcceptedLocalPending)=>accepted,
+                            Some(contextdb_relational::store::SyncSourceKind::AcceptedLocal)|None=>match accepted {Some(a)=>Some(a),None=>Some(OwnedPreparationValue::try_produce(self,hub.len(),||Ok(hub.to_owned()))?)},
+                        };
+                        let position=self.relational_sync_source_at_read_root(&row.table,winner.row_id,read_memory.clone())?.0
+                            .and_then(|lsn|Self::resolve_sync_source_lsn(Some(lsn),winner.lsn)).or(Some(winner.lsn));
+                        (author,position,None)
+                    } else {let Some(cause)=cause else{continue;};(None,None,Some(&rows[cause]))};
+                    let bytes=count_key_native(&row.natural_key)?.checked_add(row.table.len()).and_then(|n|n.checked_add("keep_first_refused".len()))
+                        .and_then(|n|n.checked_add(if row.deleted{"delete".len()}else{"edit".len()}))
+                        .and_then(|n|n.checked_add(author.as_ref().map_or(0,|a|a.with_value(|a|a.len())))).ok_or_else(invalid)?;
+                    let bytes=bytes.checked_add(refusal.map_or(Ok(0),|cause|cause.table.len().checked_add(count_key_native(&cause.natural_key)?).ok_or_else(invalid))?).ok_or_else(invalid)?;
+                    conflicts.push(OwnedPreparationValue::try_produce(self,bytes,||Ok(Conflict {natural_key:copy_key_native(&row.natural_key)?,resolution:policy,
+                        reason:Some("keep_first_refused".into()),table:Some(row.table.clone()),mutation_kind:Some(if row.deleted{"delete"}else{"edit"}.into()),
+                        winning_author_node_id:author.as_ref().map(|a|a.with_value(|a|a.clone())),hub_acceptance_position:position,
+                        refusal_cause:refusal.map(|cause|Ok::<RefusalCause, Error>(RefusalCause {table:cause.table.clone(),natural_key:copy_key_native(&cause.natural_key)?})).transpose()?}))?);
+                }Ok(())
+            })?;
+                Ok(conflicts)
+            },
+        )
+    }
+}
+
+impl Database {
+    pub(crate) fn with_owned_delivery_meta_if_present<R>(
+        &self,
+        table: &str,
+        f: impl for<'m> FnOnce(&'m TableMeta) -> Result<R>,
+    ) -> Result<Option<R>> {
+        let _operation = self.assert_open_operation();
+        if let Some(root) = self.scoped_writer_root() {
+            root.borrow_captured_table_meta(table).map(f).transpose()
+        } else {
+            let catalog = self.relational_store.table_meta.read();
+            catalog.get(table).map(f).transpose()
+        }
+    }
+}
+
+impl Database {
+    // The iterator borrows the original one-shot bodies inside the detached
+    // HRTB callback. Never collect, clone, or reload those guards here.
+    fn revalidate_conditional_updates_in_prepared_write_set<'conditions>(
+        &self,
+        held: &mut contextdb_tx::manager::EngineGuard<'_>,
+        snapshot: SnapshotId,
+        guards: impl DoubleEndedIterator<Item = &'conditions PendingConditionalUpdateGuard>,
+        mut stats: Option<&mut CommitStageStats>,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<CommitValidationOutcome> {
+        use crate::custody::preparation::{OwnedPreparationValue, preparation_array_bytes};
+        let mut guards = guards.rev().peekable();
+        if guards.peek().is_none() {
+            return Ok(CommitValidationOutcome::default());
+        }
+        // All published removals retain their original bodies and invoices in
+        // the same guard's inverse until this complete pass settles. Refusal or
+        // unwind restores even a removal published for an earlier guard.
+        held.with_tx_checkpoint(|held| {
+            let mut outcome = CommitValidationOutcome::default();
+            for guard in guards {
+                let mut read_credit =
+                    contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
+                if let Some(stats) = stats.as_deref_mut() {
+                    stats.rows_validated = stats.rows_validated.saturating_add(1);
+                }
+                let matches = self.with_owned_delivery_meta_if_present(&guard.table, |meta| {
+                    // The vector supplement consumes owned column names. Admit
+                    // their native buffer and strings before constructing any.
+                    let bytes = guard.predicates.iter().try_fold(
+                        preparation_array_bytes::<String>(guard.predicates.len())?,
+                        |bytes, (column, _)| bytes.checked_add(column.len()).ok_or_else(|| {
+                            Error::Other("conditional column allocation size overflow".into())
+                        }),
+                    )?;
+                    let predicate_columns = OwnedPreparationValue::try_produce(self, bytes, || {
+                        let mut columns = Vec::with_capacity(guard.predicates.len());
+                        if columns.capacity() != guard.predicates.len() {
+                            return Err(Error::Other("conditional column capacity mismatch".into()));
+                        }
+                        for (column, _) in &guard.predicates {
+                            let copied = column.as_str().to_owned();
+                            if copied.capacity() != column.len() {
+                                return Err(Error::Other("conditional column capacity mismatch".into()));
+                            }
+                            columns.push(copied);
+                        }
+                        Ok(columns)
+                    })?;
+                    predicate_columns.with_value(|predicate_columns| {
+                        let resident = self.committed_row_at_admitted(
+                            &guard.table,
+                            guard.row_id,
+                            snapshot,
+                            &mut read_credit,
+                            read_memory.clone(),
+                        )?;
+                        let needs_body = resident.as_ref().is_some_and(|row| {
+                            predicate_columns.iter().any(|column| {
+                                !meta.columns.iter().any(|declared| {
+                                    declared.name == *column
+                                        && matches!(declared.column_type, ColumnType::Vector(_))
+                                }) && !row.values.contains_key(column)
+                            })
+                        });
+                        let row = if needs_body {
+                            self.committed_row_at_admitted(
+                                &guard.table,
+                                guard.row_id,
+                                snapshot,
+                                &mut read_credit,
+                                read_memory.clone(),
+                            )?
+                        } else {
+                            resident
+                        };
+                        match row {
+                            Some(mut row) => {
+                                self.supplement_selected_vector_columns(
+                                    &guard.table,
+                                    snapshot,
+                                    None,
+                                    Some(predicate_columns),
+                                    std::slice::from_mut(&mut row),
+                                    vector_copy_owner,
+                                    read_memory.clone(),
+                                )?;
+                                Ok(row_conditions_match(&row, meta, &guard.predicates))
+                            }
+                            None => Ok(false),
+                        }
+                    })
+                })?;
+                let matches = match matches {
+                    Some(matches) => matches,
+                    None => {
+                        // Preserve table_meta's missing received-schema observation
+                        // while borrowing the captured metadata above.
+                        if let Some(access) = &self.received_staging_access {
+                            access.record(&guard.table);
+                        }
+                        false
+                    }
+                };
+                if matches {
+                    continue;
+                }
+                let removal = held.prepare_remove_conditional_slice(
+                    Self::conditional_counts_for_preparation(guard.before),
+                    Self::conditional_counts_for_preparation(guard.after),
+                )?;
+                // The prepared removal owns the actual invoice and inverse;
+                // refunding the accountant here would release a live body twice.
+                held.publish_tx(removal);
+                if guard.fail_on_conflict {
+                    outcome.conditional_conflict_count =
+                        outcome.conditional_conflict_count.saturating_add(1);
+                } else {
+                    outcome.conditional_noop_count =
+                        outcome.conditional_noop_count.saturating_add(1);
+                }
+            }
+            Ok(outcome)
+        })
+    }
+
+    fn conditional_counts_for_preparation(
+        counts: WriteSetCounts,
+    ) -> contextdb_tx::manager::WriteSetCounts {
+        contextdb_tx::manager::WriteSetCounts {
+            relational_inserts: counts.relational_inserts,
+            relational_deletes: counts.relational_deletes,
+            adj_inserts: counts.adj_inserts,
+            adj_deletes: counts.adj_deletes,
+            vector_inserts: counts.vector_inserts,
+            vector_deletes: counts.vector_deletes,
+            vector_moves: counts.vector_moves,
+        }
+    }
+}
+
+impl Database {
+    fn rewrite_txid_placeholders_in_prepared_write_set(
+        &self,
+        origin_tx: TxId,
+        held: &mut contextdb_tx::manager::EngineGuard<'_>,
+    ) -> Result<()> {
+        let length = held.read().relational_inserts.len();
+        if length == 0 {
+            return Ok(());
+        }
+        held.with_tx_checkpoint(|held| {
+            for position in 0..length {
+                let prepared = {
+                    let read = held.read();
+                    let (table, row) = &read.relational_inserts[position];
+                    let prepared = self.with_owned_delivery_meta_if_present(table, |meta| {
+                        let changes = meta.columns.iter().any(|column|
+                            matches!(column.column_type, ColumnType::TxId)
+                                && matches!(row.values.get(&column.name),
+                                    Some(Value::TxId(tx)) if *tx == origin_tx
+                                        && *tx != row.created_tx));
+                        if !changes {
+                            return Ok(None);
+                        }
+                        let mut original = held.copy_existing_row_at(position)?;
+                        original.rewrite_txid_placeholders(origin_tx, meta);
+                        held.prepare_replace_admitted_row_at_from_meta(position, table, original, meta)
+                            .map(Some)
+                    })?;
+                    if prepared.is_none()
+                        && let Some(access) = &self.received_staging_access
+                    {
+                        access.record(table);
+                    }
+                    prepared.flatten()
+                };
+                if let Some(prepared) = prepared {
+                    held.publish(prepared);
+                }
+            }
+            Ok(())
+        })
+    }
+}
+
+impl Database {
+    /// Original slot winners are copied before any exact source removal. This
+    /// consumer is called before the corresponding row slot is replaced.
+    #[allow(clippy::too_many_arguments)]
+    fn reconcile_commit_time_upsert_vectors_in_restricted_source(
+        &self, held: &mut contextdb_tx::manager::EngineGuard<'_>,
+        row_position: usize, table: &str, incoming_row_id: RowId, conflict_row_id: RowId,
+        replacement_values: &HashMap<ColName, Value>, replacement_tx: TxId, replacement_lsn: Lsn,
+        snapshot: SnapshotId, vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+    ) -> Result<()> {
+        use crate::custody::preparation::{OwnedPreparationValue, preparation_array_bytes};
+        self.with_owned_delivery_meta_if_present(table, |meta| {
+            if !meta.columns.iter().any(|column| matches!(column.column_type, ColumnType::Vector(_))) {
+                return Ok(());
+            }
+            held.with_tx_checkpoint(|held| {
+                struct OriginalCommitVectorPlan {
+                    actions: Vec<(usize, Option<contextdb_tx::AdmittedEagerSourceVector>, bool)>,
+                    _credit: OwnedMemoryReservation,
+                }
+                let credit = self.reserve_owned_preparation(preparation_array_bytes::<(
+                    usize, Option<contextdb_tx::AdmittedEagerSourceVector>, bool,
+                )>(meta.columns.len())?)?;
+                let mut plan = OriginalCommitVectorPlan {
+                    actions: Vec::with_capacity(meta.columns.len()), _credit: credit,
+                };
+                if plan.actions.capacity() != meta.columns.len() {
+                    return Err(Error::Other("source native capacity mismatch".into()));
+                }
+                // The last pending entry for each column wins, as in the
+                // original reconciliation. Losing bodies remain in the inverse
+                // until the complete checkpoint settles; no manual refund.
+                for (ordinal, column) in meta.columns.iter().enumerate() {
+                    if !matches!(column.column_type, ColumnType::Vector(_)) { continue; }
+                    let index = OwnedPreparationValue::try_produce(self,
+                        table.len().checked_add(column.name.len()).ok_or_else(||
+                            Error::Other("source allocation size overflow".into()))?,
+                        || {
+                            let index = VectorIndexRef::new(table, &column.name);
+                            if index.table.capacity() != table.len()
+                                || index.column.capacity() != column.name.len()
+                            { return Err(Error::Other("source native capacity mismatch".into())); }
+                            Ok(index)
+                        },
+                    )?;
+                    let existing = index.with_value(|index| self.vector_store.load_live_entry_for_row(
+                        index, conflict_row_id, snapshot, vector_copy_owner,
+                    ))?;
+                    let final_vector = match replacement_values.get(&column.name) {
+                        Some(Value::Vector(values)) => Some(values), _ => None,
+                    };
+                    let Some(final_vector) = final_vector else {
+                        plan.actions.push((ordinal, None, existing.is_some()));
+                        continue;
+                    };
+                    if existing.as_ref().is_some_and(|entry| entry.vector == *final_vector) {
+                        plan.actions.push((ordinal, None, false));
+                        continue;
+                    }
+                    let read = held.read();
+                    let winner = read.vector_inserts.iter().enumerate().rev().find(
+                        |(_, entry)| entry.index.table == table && entry.row_id == incoming_row_id
+                            && entry.index.column == column.name,
+                    );
+                    let original = match winner {
+                        Some((position, entry)) if entry.vector == *final_vector => {
+                            held.copy_existing_vector_at(position)?
+                        }
+                        _ => held.copy_vector_from_original_row_at(
+                            row_position, &column.name, final_vector, meta,
+                        )?,
+                    };
+                    plan.actions.push((ordinal, Some(original), existing.is_some()));
+                }
+                self.remove_vector_positions_in_restricted_source(held, |entry|
+                    entry.index.table == table && entry.row_id == incoming_row_id)?;
+                for (ordinal, original, delete_existing) in plan.actions.drain(..) {
+                    let column = &meta.columns[ordinal];
+                    if delete_existing {
+                        let already_deleted = held.read().vector_deletes.iter().any(|(index, row, _)|
+                            index.table == table && index.column == column.name && *row == conflict_row_id);
+                        if !already_deleted {
+                            let input = OwnedPreparationValue::try_produce(self,
+                                table.len().checked_add(column.name.len()).ok_or_else(||
+                                    Error::Other("source allocation size overflow".into()))?,
+                                || {
+                                    let index = VectorIndexRef::new(table, &column.name);
+                                    if index.table.capacity() != table.len()
+                                        || index.column.capacity() != column.name.len()
+                                    { return Err(Error::Other("source native capacity mismatch".into())); }
+                                    Ok((index, conflict_row_id, replacement_tx))
+                                },
+                            )?;
+                            let prepared = input.with_value(|input| {
+                                let batch = held.copy_aux(contextdb_tx::staged_source::AuxBorrow::VectorDeletes(
+                                    std::slice::from_ref(input)))?;
+                                held.prepare_aux_splice(held.read().vector_deletes.len(), &[], batch)
+                            })?;
+                            held.publish_tx(prepared);
+                        }
+                    }
+                    if let Some(original) = original {
+                        self.remove_vector_positions_in_restricted_source(held, |entry|
+                            entry.index.table == table && entry.index.column == column.name
+                                && entry.row_id == conflict_row_id)?;
+                        let prepared = held.prepare_append_retargeted_original_vector(
+                            original, conflict_row_id, replacement_tx, replacement_lsn,
+                        )?;
+                        held.publish(prepared);
+                    }
+                }
+                Ok(())
+            })
+        })?.map_or(Ok(()), Ok)
+    }
+
+    fn remove_vector_positions_in_restricted_source(
+        &self, held: &mut contextdb_tx::manager::EngineGuard<'_>,
+        matches: impl Fn(&VectorEntry) -> bool,
+    ) -> Result<()> {
+        use crate::custody::preparation::{OwnedPreparationValue, preparation_array_bytes};
+        let read = held.read();
+        let count = read.vector_inserts.iter().filter(|entry| matches(entry)).count();
+        if count == 0 { return Ok(()); }
+        let positions = OwnedPreparationValue::try_produce(self,
+            preparation_array_bytes::<usize>(count)?, || {
+                let mut positions = Vec::with_capacity(count);
+                if positions.capacity() != count {
+                    return Err(Error::Other("source native capacity mismatch".into()));
+                }
+                for (position, entry) in read.vector_inserts.iter().enumerate() {
+                    if matches(entry) { positions.push(position); }
+                }
+                Ok(positions)
+            },
+        )?;
+        let removal = positions.with_value(|positions| held.prepare_remove_vector_positions(positions))?;
+        held.publish(removal);
+        Ok(())
+    }
+}
+
+impl Database {
+    fn collect_commit_upsert_refs<'a>(
+        &self, intents: impl DoubleEndedIterator<Item = &'a PendingUpsertIntent>,
+    ) -> Result<MetadataBuffer<&'a PendingUpsertIntent>> {
+        let mut held = MetadataBuffer::empty();
+        for intent in intents {
+            let capacity = held.values.len().checked_add(1)
+                .ok_or_else(EngineMetadataJournal::identity_error)?;
+            let mut next = MetadataBuffer::prepare(capacity, &self.finalization.accountant)?;
+            held.move_into(&mut next);
+            next.push(intent);
+            held = next;
+        }
+        Ok(held)
+    }
+
+    fn commit_meta_owned(
+        &self, table: &str,
+    ) -> Result<crate::custody::preparation::OwnedPreparationValue<TableMeta>> {
+        use crate::custody::preparation::OwnedPreparationValue;
+        self.with_owned_delivery_meta_if_present(table, |meta| {
+            let bytes = crate::memory_accounting::preparation_debug_native_bound(meta)?;
+            OwnedPreparationValue::try_produce(self, bytes, || Ok(meta.clone()))
+        })?.ok_or_else(|| Error::TableNotFound(table.to_owned()))
+    }
+
+    fn commit_preparation_read_bytes(
+        &self, held: &contextdb_tx::manager::EngineGuard<'_>,
+    ) -> Result<usize> {
+        let invalid = EngineMetadataJournal::identity_error;
+        let read = held.read();
+        let mut bytes = {
+            let catalog = self.relational_store().table_meta.read();
+            crate::memory_accounting::preparation_debug_native_bound(&*catalog)?
+                .checked_mul(4).ok_or_else(invalid)?
+        };
+        // Each borrowed ordinary row may contribute tuple-key clones and
+        // schema clones to read-only validators. Reserve them before entry.
+        for (table, row) in read.relational_inserts {
+            let body = crate::memory_accounting::preparation_row_copy_bytes(row)?;
+            let meta = self.with_owned_delivery_meta_if_present(table, |meta| {
+                let count = meta.columns.len().checked_add(meta.indexes.len())
+                    .and_then(|n| n.checked_add(meta.enforced_unique_tuples().count()))
+                    .and_then(|n| n.checked_add(1)).ok_or_else(invalid)?;
+                let copies = body.checked_add(table.len()).and_then(|n| n.checked_add(
+                    std::mem::size_of::<StagedTupleKey>() + std::mem::size_of::<VersionedRow>(),
+                )).and_then(|n| n.checked_mul(count)).ok_or_else(invalid)?;
+                copies.checked_add(crate::memory_accounting::preparation_debug_native_bound(meta)?)
+                    .ok_or_else(invalid)
+            })?.unwrap_or(body);
+            bytes = bytes.checked_add(meta.checked_mul(4).ok_or_else(invalid)?)
+                .ok_or_else(invalid)?;
+        }
+        for (table, _, _) in read.relational_deletes {
+            bytes = bytes.checked_add(table.len().checked_mul(8).ok_or_else(invalid)?)
+                .and_then(|n| n.checked_add(8 * std::mem::size_of::<VersionedRow>()))
+                .ok_or_else(invalid)?;
+        }
+        for entry in read.vector_inserts {
+            let names = entry.index.table.len().checked_add(entry.index.column.len())
+                .ok_or_else(invalid)?;
+            bytes = bytes.checked_add(names.checked_mul(8).ok_or_else(invalid)?)
+                .and_then(|n| n.checked_add(8 * std::mem::size_of::<VectorEntry>()))
+                .ok_or_else(invalid)?;
+        }
+        for (index, _, _) in read.vector_deletes {
+            bytes = bytes.checked_add(index.table.len()).and_then(|n| n.checked_add(index.column.len()))
+                .and_then(|n| n.checked_add(8 * std::mem::size_of::<VectorEntry>()))
+                .ok_or_else(invalid)?;
+        }
+        for (index, _, _, _) in read.vector_moves {
+            bytes = bytes.checked_add(index.table.len()).and_then(|n| n.checked_add(index.column.len()))
+                .and_then(|n| n.checked_add(8 * std::mem::size_of::<VectorEntry>()))
+                .ok_or_else(invalid)?;
+        }
+        Ok(bytes)
+    }
+
+    fn build_commit_upsert_row_owned(
+        &self, table: &str, incoming: &VersionedRow, conflict: &VersionedRow,
+        intent: &PendingUpsertIntent,
+    ) -> Result<crate::custody::preparation::OwnedPreparationValue<VersionedRow>> {
+        use crate::custody::preparation::OwnedPreparationValue;
+        use crate::memory_accounting::{preparation_debug_native_bound, preparation_row_copy_bytes};
+        let invalid = EngineMetadataJournal::identity_error;
+        // Count borrowed inputs without making an expression, plan or value
+        // clone. The evaluator only returns cloned inputs or scalar values;
+        // its coercions additionally parse text vectors. The admitted envelope
+        // includes all expression scratch and overlapping map replacements.
+        let input = preparation_row_copy_bytes(incoming)?
+            .checked_add(preparation_row_copy_bytes(conflict)?)
+            .and_then(|n| n.checked_add(crate::memory_accounting::preparation_values_copy_bytes(&intent.insert_values).ok()?))
+            .ok_or_else(invalid)?;
+        let mut working = input.checked_mul(4).ok_or_else(invalid)?;
+        working = working.checked_add(std::mem::size_of::<(ColName, Expr)>()
+            .checked_mul(intent.update_columns.len()).ok_or_else(invalid)?)
+            .and_then(|n| n.checked_add(std::mem::size_of::<String>().checked_mul(intent.conflict_columns.len())?))
+            .ok_or_else(invalid)?;
+        for column in &intent.conflict_columns {
+            working = working.checked_add(column.len()).ok_or_else(invalid)?;
+        }
+        for (column, expression) in &intent.update_columns {
+            let sizes = crate::memory_accounting::preparation_assignment_sizes(expression, &conflict.values, &intent.params)?;
+            working = working.checked_add(column.len()).and_then(|n| n.checked_add(sizes.0))
+                .and_then(|n| n.checked_add(sizes.1))
+                .and_then(|n| n.checked_add(sizes.2.checked_mul(8)?)).ok_or_else(invalid)?;
+        }
+        let meta_bytes = self.with_owned_delivery_meta_if_present(table, |meta|
+            preparation_debug_native_bound(meta))?.unwrap_or(0);
+        let members = incoming.values.len().checked_add(conflict.values.len())
+            .and_then(|n| n.checked_add(intent.insert_values.len()))
+            .and_then(|n| n.checked_add(intent.update_columns.len())).ok_or_else(invalid)?;
+        let bytes = working.checked_add(meta_bytes.checked_mul(4).ok_or_else(invalid)?)
+            .and_then(|n| n.checked_add(crate::memory_accounting::preparation_row_map_bytes(members).ok()?.checked_mul(4)?))
+            .ok_or_else(invalid)?;
+        OwnedPreparationValue::try_produce(self, bytes, || {
+            let on_conflict = OnConflictPlan {
+                columns: intent.conflict_columns.clone(), update_columns: intent.update_columns.clone(),
+            };
+            let mut inserted = crate::memory_accounting::preparation_copy_values(&intent.insert_values)?;
+            self.rewrite_txid_placeholders_in_values(table, intent.active_tx, incoming.created_tx, &mut inserted);
+            let mut values = apply_on_conflict_updates(self, table, inserted.clone(), conflict,
+                &on_conflict, &intent.params, Some(intent.active_tx))?;
+            self.rewrite_txid_placeholders_in_values(table, intent.active_tx, incoming.created_tx, &mut values);
+            for (column, value) in &incoming.values {
+                if inserted.get(column) != Some(value) {
+                    values.insert(column.clone(), value.clone());
+                }
+            }
+            Ok(VersionedRow {
+                row_id: conflict.row_id, values, created_tx: incoming.created_tx,
+                deleted_tx: incoming.deleted_tx, lsn: incoming.lsn, created_at: incoming.created_at,
+            })
+        })
+    }
+
+    fn append_commit_relational_delete(
+        &self, held: &mut contextdb_tx::manager::EngineGuard<'_>,
+        table: &str, row: RowId, tx: TxId,
+    ) -> Result<()> {
+        use crate::custody::preparation::OwnedPreparationValue;
+        if held.read().relational_deletes.iter().any(|(name, id, _)| name == table && *id == row) {
+            return Ok(());
+        }
+        let input = OwnedPreparationValue::try_produce(self, table.len(), || Ok((table.to_owned(), row, tx)))?;
+        let prepared = input.with_value(|input| {
+            let batch = held.copy_aux(contextdb_tx::staged_source::AuxBorrow::RelationalDeletes(
+                std::slice::from_ref(input)))?;
+            held.prepare_aux_splice(held.read().relational_deletes.len(), &[], batch)
+        })?;
+        held.publish_tx(prepared);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_commit_time_upsert_in_restricted_source(
+        &self, held: &mut contextdb_tx::manager::EngineGuard<'_>, insert_index: usize,
+        conflict: &VersionedRow, intent: &PendingUpsertIntent, snapshot: SnapshotId,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<Option<RowId>> {
+        use crate::custody::preparation::copy_row_owned;
+        let incoming = {
+            let read = held.read();
+            let Some((table, row)) = read.relational_inserts.get(insert_index) else {
+                return Err(EngineMetadataJournal::identity_error());
+            };
+            if intent.table != *table || intent.row_id != row.row_id { return Ok(None); }
+            copy_row_owned(self, row)?
+        };
+        incoming.with_value(|incoming| {
+            let replacement = self.build_commit_upsert_row_owned(&intent.table, incoming, conflict, intent)?;
+            replacement.with_value(|replacement| {
+                self.validate_commit_time_upsert_replacement(&intent.table, conflict, &replacement.values,
+                    snapshot, read_memory.clone())?;
+                // O must accept both changed bodies before any publication.
+                // Vector reconciliation changes the root/revision, so prepare
+                // the row against the exact post-vector guard after that pass.
+                held.with_tx_checkpoint(|held| {
+                    self.reconcile_commit_time_upsert_vectors_in_restricted_source(
+                        held, insert_index, &intent.table, incoming.row_id, conflict.row_id,
+                        &replacement.values, replacement.created_tx, replacement.lsn,
+                        snapshot, vector_copy_owner,
+                    )?;
+                    let prepared = self.with_owned_delivery_meta_if_present(&intent.table, |meta|
+                        held.prepare_changed_row_at_from_meta(insert_index, &intent.table, incoming, replacement, meta)
+                    )?.ok_or_else(|| Error::TableNotFound(intent.table.clone()))?;
+                    held.publish(prepared);
+                    self.append_commit_relational_delete(held, &intent.table, conflict.row_id, replacement.created_tx)?;
+                    let changed = replacement.values.iter().any(|(name, value)| conflict.values.get(name) != Some(value));
+                    if changed {
+                        let meta = self.commit_meta_owned(&intent.table)?;
+                        meta.with_value(|meta| {
+                            let state = meta.state_machine.as_ref()
+                                .and_then(|sm| replacement.values.get(&sm.column))
+                                .and_then(Value::as_text);
+                            let uuid = replacement.values.get("id").and_then(Value::as_uuid).copied();
+                            self.propagate_state_change_in_restricted_source(held, &intent.table, uuid, state,
+                                replacement.created_tx, snapshot, vector_copy_owner, read_memory.clone())
+                        })?;
+                    }
+                    Ok(Some(conflict.row_id))
+                })
+            })
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_original_commit_time_upsert_in_restricted_source(
+        &self, held: &mut contextdb_tx::manager::EngineGuard<'_>, position: usize,
+        skip_deleted: &HashSet<RowId>, intents: &[&PendingUpsertIntent], snapshot: SnapshotId,
+        mut stats: Option<&mut CommitStageStats>,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<Option<RowId>> {
+        use crate::custody::preparation::{OwnedPreparationValue, copy_row_owned};
+        let read = held.read();
+        let (table, row) = &read.relational_inserts[position];
+        let row = copy_row_owned(self, row)?;
+        let table = OwnedPreparationValue::try_produce(self, table.len(), || Ok(table.clone()))?;
+        table.with_value(|table| row.with_value(|row| {
+            for intent in intents.iter().filter(|intent| intent.table == *table && intent.row_id == row.row_id) {
+                if intent.conflict_columns.is_empty() { continue; }
+                let input_bytes = crate::memory_accounting::preparation_debug_native_bound(*intent)?;
+                let keys = OwnedPreparationValue::try_produce(self, input_bytes, || {
+                    let mut values = crate::memory_accounting::preparation_copy_values(&intent.insert_values)?;
+                    self.rewrite_txid_placeholders_in_values(table, intent.active_tx, row.created_tx, &mut values);
+                    let mut keys = Vec::with_capacity(intent.conflict_columns.len());
+                    for column in &intent.conflict_columns {
+                        match values.get(column) {
+                            Some(Value::Null) | None => return Ok(None),
+                            Some(value) => keys.push(value.clone()),
+                        }
+                    }
+                    Ok(Some(keys))
+                })?;
+                let replacement = keys.with_value(|keys| {
+                    let Some(keys) = keys else { return Ok(None); };
+                    let id = self.committed_unique_conflict_row_id_in_restricted_source(table, &intent.conflict_columns, keys,
+                        snapshot, skip_deleted, stats.as_deref_mut(), read_memory.clone())?;
+                    let Some(id) = id else { return Ok(None); };
+                    let mut credit = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
+                    let conflict = self.committed_row_at_admitted(table, id, snapshot, &mut credit, read_memory.clone())?;
+                    match conflict {
+                        Some(conflict) => self.apply_commit_time_upsert_in_restricted_source(held, position,
+                            &conflict, intent, snapshot, vector_copy_owner, read_memory.clone()),
+                        None => Ok(None),
+                    }
+                })?;
+                if replacement.is_some() { return Ok(replacement); }
+            }
+            Ok(None)
+        }))
+    }
+
+    fn rewrite_commit_time_upserts_in_prepared_write_set<'a>(
+        &self, held: &mut contextdb_tx::manager::EngineGuard<'_>, snapshot: SnapshotId,
+        intents: impl DoubleEndedIterator<Item = &'a PendingUpsertIntent>,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<()> {
+        use crate::custody::preparation::OwnedPreparationValue;
+        let intents = self.collect_commit_upsert_refs(intents)?;
+        if intents.values.is_empty() { return Ok(()); }
+        held.with_tx_checkpoint(|held| {
+            let mut position = 0;
+            while position < held.read().relational_inserts.len() {
+                let table = &held.read().relational_inserts[position].0;
+                let table = OwnedPreparationValue::try_produce(self, table.len(), || Ok(table.clone()))?;
+                let rewritten = table.with_value(|table| {
+                    let bytes = self.commit_preparation_read_bytes(held)?;
+                    let skip = OwnedPreparationValue::try_produce(self, bytes, ||
+                        Ok(held.with_legacy(|ws| Self::deleted_row_ids_for_table(ws, table))))?;
+                    skip.with_value(|skip| self.apply_original_commit_time_upsert_in_restricted_source(
+                        held, position, skip, &intents.values, snapshot, None,
+                        vector_copy_owner, read_memory.clone()))
+                })?;
+                if let Some(id) = rewritten {
+                    position = table.with_value(|table| held.with_legacy(|ws|
+                        Self::relational_insert_index_by_row(ws, table, id, position)))
+                        .unwrap_or_else(|| position.min(held.read().relational_inserts.len()));
+                } else { position += 1; }
+            }
+            Ok(())
+        })
+    }
+}
+
+struct NativeCommitUniqueScratch {
+    _columns: HashMap<String, Vec<Vec<String>>>,
+    lookup: StagedTupleLookup,
+    deleted: HashMap<String, HashSet<RowId>>,
+    deleted_rows: HashMap<String, HashMap<RowId, VersionedRow>>,
+    _selected_reader_credit: contextdb_core::read_memory::ReadCredit,
+    _credit: OwnedMemoryReservation,
+}
+
+impl Database {
+    fn prepare_commit_unique_scratch(
+        &self, held: &contextdb_tx::manager::EngineGuard<'_>, snapshot: SnapshotId,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<NativeCommitUniqueScratch> {
+        let credit = self.reserve_owned_preparation(self.commit_preparation_read_bytes(held)?)?;
+        let columns = self.staged_tuple_key_columns_by_table();
+        let lookup = held.with_legacy(|ws| StagedTupleLookup::from_write_set(&columns, ws));
+        let deleted = held.with_legacy(Self::deleted_row_ids_by_table);
+        let mut selected_reader_credit = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
+        let mut deleted_rows = HashMap::<String, HashMap<RowId, VersionedRow>>::new();
+        for (table, row, _) in held.read().relational_deletes {
+            if deleted_rows.get(table).is_some_and(|rows| rows.contains_key(row)) { continue; }
+            let selected = columns.get(table).map_or(&[][..], Vec::as_slice);
+            let original = if self.persistence.is_some() {
+                self.constraint_row_at_admitted(table, *row, snapshot, selected,
+                    &mut selected_reader_credit, read_memory.clone())?
+            } else {
+                self.committed_row_at_admitted(table, *row, snapshot,
+                    &mut selected_reader_credit, read_memory.clone())?
+            };
+            if let Some(original) = original {
+                deleted_rows.entry(table.clone()).or_default().insert(*row, original);
+            }
+        }
+        Ok(NativeCommitUniqueScratch { _columns: columns, lookup, deleted, deleted_rows,
+            _selected_reader_credit: selected_reader_credit, _credit: credit })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn validate_unique_constraints_in_restricted_source(
+        &self, held: &mut contextdb_tx::manager::EngineGuard<'_>, snapshot: SnapshotId,
+        intents: &[&PendingUpsertIntent], stats: &mut CommitStageStats,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<()> {
+        use crate::custody::preparation::{OwnedPreparationValue, copy_row_owned};
+        if held.read().relational_inserts.is_empty() { return Ok(()); }
+        held.with_tx_checkpoint(|held| {
+            let mut scratch = self.prepare_commit_unique_scratch(held, snapshot, read_memory.clone())?;
+            let empty_deleted = HashSet::new();
+            let mut position = 0;
+            while position < held.read().relational_inserts.len() {
+                let (table, incoming) = &held.read().relational_inserts[position];
+                let table = OwnedPreparationValue::try_produce(self, table.len(), || Ok(table.clone()))?;
+                let row = copy_row_owned(self, incoming)?;
+                let rewritten = table.with_value(|table| row.with_value(|row| {
+                    let meta = self.commit_meta_owned(table)?;
+                    let skip = scratch.deleted.get(table).unwrap_or(&empty_deleted);
+                    stats.rows_validated = stats.rows_validated.saturating_add(1);
+                    if let Some(id) = self.apply_original_commit_time_upsert_in_restricted_source(
+                        held, position, skip, intents, snapshot, Some(stats), vector_copy_owner, read_memory.clone(),
+                    )? { return Ok(Some(id)); }
+                    meta.with_value(|meta| {
+                        // The scalar declaration order precedes enforced tuple
+                        // order exactly as in the original uniqueness pass.
+                        for columns in meta.columns.iter().filter(|column| column.primary_key || column.unique)
+                            .map(|column| vec![column.name.clone()])
+                            .chain(meta.enforced_unique_tuples().cloned())
+                        {
+                            let mut values = Vec::with_capacity(columns.len());
+                            let mut has_null = false;
+                            for column in &columns {
+                                match row.values.get(column) {
+                                    Some(Value::Null) | None => { has_null = true; break; }
+                                    Some(value) => values.push(value.clone()),
+                                }
+                            }
+                            if has_null { continue; }
+                            let staged = if Self::values_can_be_tuple_key(&values) {
+                                scratch.lookup.staged_unique_conflict(table, row.row_id, &columns, &values, stats)
+                            } else {
+                                held.with_legacy(|ws| Self::staged_unique_conflict_in_write_set(
+                                    ws, position, table, &columns, &values, Some(stats)))
+                            };
+                            if staged.is_some() {
+                                return Err(Error::UniqueViolation {
+                                    table: table.clone(), column: columns.first().cloned().unwrap_or_default(),
+                                });
+                            }
+                            if !self.committed_unique_probe_required_for_replacement(
+                                row.row_id, &columns, &values, skip, scratch.deleted_rows.get(table),
+                            ) { continue; }
+                            let conflict = self.committed_unique_conflict_row_id_in_restricted_source(table, &columns, &values,
+                                snapshot, skip, Some(stats), read_memory.clone())?;
+                            let Some(id) = conflict else { continue; };
+                            // The original conflict index selects the first
+                            // recorded matching intent, never the last one.
+                            let intent = intents.iter().copied().find(|intent|
+                                intent.table == *table && intent.row_id == row.row_id && intent.conflict_columns == columns);
+                            if let Some(intent) = intent {
+                                let mut credit = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
+                                let conflict = self.committed_row_at_admitted(table, id, snapshot,
+                                    &mut credit, read_memory.clone())?;
+                                if let Some(conflict) = conflict
+                                    && let Some(id) = self.apply_commit_time_upsert_in_restricted_source(
+                                        held, position, &conflict, intent, snapshot, vector_copy_owner, read_memory.clone(),
+                                    )?
+                                { return Ok(Some(id)); }
+                            }
+                            return Err(Error::UniqueViolation {
+                                table: table.clone(), column: columns.first().cloned().unwrap_or_default(),
+                            });
+                        }
+                        Ok(None)
+                    })
+                }))?;
+                if let Some(id) = rewritten {
+                    // Build a paid successor before retiring old lookup keys;
+                    // no changed row clone is installed into an old envelope.
+                    scratch = self.prepare_commit_unique_scratch(held, snapshot, read_memory.clone())?;
+                    position = table.with_value(|table| held.with_legacy(|ws|
+                        Self::relational_insert_index_by_row(ws, table, id, position)))
+                        .unwrap_or_else(|| position.min(held.read().relational_inserts.len()));
+                } else { position += 1; }
+            }
+            Ok(())
+        })
+    }
+}
+
+impl Database {
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue_commit_propagation_entry(
+        &self, queue: &mut MetadataBuffer<crate::custody::preparation::OwnedPreparationValue<PropagationQueueEntry>>,
+        table: &str, uuid: uuid::Uuid, target: &str, depth: u32, abort: bool,
+    ) -> Result<()> {
+        use crate::custody::preparation::OwnedPreparationValue;
+        let bytes = table.len().checked_add(target.len()).ok_or_else(EngineMetadataJournal::identity_error)?;
+        let entry = OwnedPreparationValue::try_produce(self, bytes, || Ok(PropagationQueueEntry {
+            table: table.to_owned(), uuid, target_state: target.to_owned(), depth, abort_on_failure: abort,
+        }))?;
+        if queue.values.len() == queue.values.capacity() {
+            let capacity = queue.values.len().checked_add(1).and_then(|n| n.checked_next_power_of_two())
+                .ok_or_else(EngineMetadataJournal::identity_error)?;
+            let mut next = MetadataBuffer::prepare(capacity, &self.finalization.accountant)?;
+            queue.move_into(&mut next);
+            *queue = next;
+        }
+        queue.push(entry);
+        Ok(())
+    }
+
+    fn append_commit_vector_delete(
+        &self, held: &mut contextdb_tx::manager::EngineGuard<'_>,
+        index: &VectorIndexRef, row: RowId, tx: TxId,
+    ) -> Result<()> {
+        use crate::custody::preparation::OwnedPreparationValue;
+        if held.read().vector_deletes.iter().any(|(have, id, _)| have == index && *id == row) { return Ok(()); }
+        let bytes = index.table.len().checked_add(index.column.len()).ok_or_else(EngineMetadataJournal::identity_error)?;
+        let input = OwnedPreparationValue::try_produce(self, bytes, || Ok((index.clone(), row, tx)))?;
+        let prepared = input.with_value(|input| {
+            let batch = held.copy_aux(contextdb_tx::staged_source::AuxBorrow::VectorDeletes(std::slice::from_ref(input)))?;
+            held.prepare_aux_splice(held.read().vector_deletes.len(), &[], batch)
+        })?;
+        held.publish_tx(prepared);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn delete_vector_in_restricted_source(
+        &self, held: &mut contextdb_tx::manager::EngineGuard<'_>, tx: TxId,
+        index: &VectorIndexRef, row: RowId, snapshot: SnapshotId,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<()> {
+        use crate::custody::preparation::{OwnedPreparationValue, preparation_array_bytes};
+        self.vector_store.with_index_layout(index, |_| ())?;
+        let _scratch = self.reserve_owned_preparation(self.commit_preparation_read_bytes(held)?)?;
+        let existing = self.point_commit_row_in_restricted_source(held, &index.table, snapshot,
+            &|have| have.row_id == row, read_memory.clone())?;
+        let Some(existing) = existing else {
+            return Err(Error::NotFound(format!("row {row} in table {}", index.table)));
+        };
+        existing.with_value(|existing| self.assert_row_write_allowed(&index.table, row, &existing.values,
+            snapshot, read_memory.clone()))?;
+        let live = self.vector_store.has_live_entry_for_row(index, row, snapshot, vector_copy_owner)?;
+        held.with_tx_checkpoint(|held| {
+            let canceled = held.read().vector_inserts.iter().any(|entry| entry.index == *index && entry.row_id == row);
+            self.remove_vector_positions_in_restricted_source(held, |entry| entry.index == *index && entry.row_id == row)?;
+            let read = held.read();
+            let count = read.vector_moves.iter().filter(|(have, _, target, _)| have == index && *target == row).count();
+            let moves = OwnedPreparationValue::try_produce(self,
+                preparation_array_bytes::<(usize, RowId)>(count)?, || {
+                    let mut moves = Vec::with_capacity(count);
+                    for (position, (have, source, target, _)) in read.vector_moves.iter().enumerate() {
+                        if have == index && *target == row { moves.push((position, *source)); }
+                    }
+                    Ok(moves)
+                })?;
+            moves.with_value(|moves| {
+                let positions = OwnedPreparationValue::try_produce(self, preparation_array_bytes::<usize>(moves.len())?, ||
+                    Ok(moves.iter().map(|(position, _)| *position).collect::<Vec<_>>()))?;
+                if !moves.is_empty() {
+                    let prepared = positions.with_value(|positions| {
+                        let empty = held.copy_aux(contextdb_tx::staged_source::AuxBorrow::VectorMoves(&[]))?;
+                        held.prepare_aux_splice(0, positions, empty)
+                    })?;
+                    held.publish_tx(prepared);
+                }
+                let pending_move_from = held.read().vector_moves.iter()
+                    .any(|(have, source, _, _)| have == index && *source == row);
+                for (_, source) in moves { self.append_commit_vector_delete(held, index, *source, tx)?; }
+                if !pending_move_from && ((!canceled && moves.is_empty()) || live) {
+                    self.append_commit_vector_delete(held, index, row, tx)?;
+                }
+                Ok(())
+            })
+        })
+    }
+
+    fn remove_commit_prior_row_slots(
+        &self, held: &mut contextdb_tx::manager::EngineGuard<'_>,
+        table: &str, row: RowId, prior_length: usize,
+    ) -> Result<()> {
+        for position in (0..prior_length).rev() {
+            let read = held.read();
+            if read.relational_inserts[position].0 != table || read.relational_inserts[position].1.row_id != row { continue; }
+            let before = contextdb_tx::manager::WriteSetCounts {
+                relational_inserts: position, relational_deletes: read.relational_deletes.len(),
+                adj_inserts: read.adj_inserts.len(), adj_deletes: read.adj_deletes.len(),
+                vector_inserts: read.vector_inserts.len(), vector_deletes: read.vector_deletes.len(), vector_moves: read.vector_moves.len(),
+            };
+            let after = contextdb_tx::manager::WriteSetCounts { relational_inserts: position + 1, ..before };
+            let prepared = held.prepare_remove_conditional_slice(before, after)?;
+            held.publish_tx(prepared);
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn upsert_state_row_in_restricted_source(
+        &self, held: &mut contextdb_tx::manager::EngineGuard<'_>, table: &str,
+        state_column: &str, existing: &VersionedRow, target: &str, tx: TxId, snapshot: SnapshotId,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<bool> {
+        use crate::custody::preparation::{OwnedPreparationValue, copy_row_owned};
+        let bytes = crate::memory_accounting::preparation_row_copy_bytes(existing)?
+            .checked_add(crate::memory_accounting::preparation_row_map_bytes(existing.values.len().checked_add(1)
+                .ok_or_else(EngineMetadataJournal::identity_error)?)?)
+            .and_then(|n| n.checked_add(state_column.len())).and_then(|n| n.checked_add(target.len()))
+            .and_then(|n| n.checked_mul(2)).ok_or_else(EngineMetadataJournal::identity_error)?;
+        let replacement = OwnedPreparationValue::try_produce(self, bytes, || {
+            let mut values = crate::memory_accounting::preparation_copy_values(&existing.values)?;
+            values.insert(state_column.to_owned(), Value::Text(target.to_owned()));
+            Ok(VersionedRow { row_id: existing.row_id, values, created_tx: tx,
+                deleted_tx: None, lsn: held.read().commit_lsn.unwrap_or(Lsn(0)), created_at: Some(current_wallclock()) })
+        })?;
+        replacement.with_value(|replacement| {
+            self.assert_row_write_allowed(table, existing.row_id, &existing.values, snapshot, read_memory.clone())?;
+            self.assert_row_write_allowed(table, existing.row_id, &replacement.values, snapshot, read_memory.clone())?;
+            if self.relational_store().is_immutable(table) { return Err(Error::ImmutableTable(table.to_owned())); }
+            let old = existing.values.get(state_column).and_then(Value::as_text).unwrap_or("");
+            if !self.relational_store().validate_state_transition(table, state_column, old, target) {
+                return Err(Error::InvalidStateTransition(format!("{old} -> {target}")));
+            }
+            if existing.values.get(state_column).and_then(Value::as_text) == Some(target) { return Ok(false); }
+            self.validate_primary_key_values_present(table, &replacement.values)?;
+            let prior_length = held.read().relational_inserts.len();
+            let selected = held.read().relational_inserts.iter().rposition(|(name, row)| name == table && row.row_id == existing.row_id);
+            let prepared = if let Some(position) = selected {
+                let expected = copy_row_owned(self, &held.read().relational_inserts[position].1)?;
+                expected.with_value(|expected| self.with_owned_delivery_meta_if_present(table, |meta|
+                    held.prepare_append_changed_row_at_from_meta(position, table, expected, replacement, meta)))?
+            } else {
+                self.with_owned_delivery_meta_if_present(table, |meta|
+                    held.prepare_new_commit_row_from_meta(table, replacement, meta))?
+            }.ok_or_else(|| Error::TableNotFound(table.to_owned()))?;
+            held.publish(prepared);
+            self.remove_commit_prior_row_slots(held, table, existing.row_id, prior_length)?;
+            let mut credit = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
+            let committed = self.committed_row_at_admitted(table, existing.row_id, self.snapshot_for_read(), &mut credit, read_memory.clone())?;
+            if committed.is_some() { self.append_commit_relational_delete(held, table, existing.row_id, tx)?; }
+            Ok(true)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue_propagation_in_restricted_source(
+        &self, held: &mut contextdb_tx::manager::EngineGuard<'_>, metas: &HashMap<String, TableMeta>,
+        queue: &mut MetadataBuffer<crate::custody::preparation::OwnedPreparationValue<PropagationQueueEntry>>,
+        source: PropagationSource<'_>, fk_first: bool, tx: TxId, snapshot: SnapshotId,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<()> {
+        let fk = |held: &mut contextdb_tx::manager::EngineGuard<'_>, queue: &mut MetadataBuffer<_>| -> Result<()> {
+            for (table, meta) in metas {
+                for rule in &meta.propagation_rules {
+                    let PropagationRule::ForeignKey { fk_column, referenced_table, trigger_state, target_state,
+                        max_depth, abort_on_failure, .. } = rule else { continue; };
+                    if referenced_table != source.table || trigger_state != source.state || source.depth >= *max_depth { continue; }
+                    let _credit = self.reserve_owned_preparation(self.commit_preparation_read_bytes(held)?)?;
+                    let before = queue.values.len();
+                    let mut admission_failure = None;
+                    let scanned = self.visit_commit_rows_in_restricted_source(held, table, snapshot,
+                        &|row| row.values.get(fk_column) == Some(&Value::Uuid(source.uuid)), &mut |row| {
+                            if let Some(uuid) = row.values.get("id").and_then(Value::as_uuid).copied()
+                                && let Err(error) = self.enqueue_commit_propagation_entry(queue, table, uuid,
+                                    target_state, source.depth + 1, *abort_on_failure)
+                            {
+                                admission_failure = Some(error);
+                                return Ok(std::ops::ControlFlow::Break(()));
+                            }
+                            Ok(std::ops::ControlFlow::Continue(()))
+                        }, read_memory.clone());
+                    if let Some(error) = admission_failure { return Err(error); }
+                    if let Err(error) = scanned {
+                        queue.values.truncate(before);
+                        eprintln!("warning: propagation scan failed for {table}.{fk_column}: {error}");
+                    }
+                }
+            }
+            Ok(())
+        };
+        if fk_first { fk(held, queue)?; }
+        if let Some(meta) = metas.get(source.table) {
+            for rule in &meta.propagation_rules {
+                let PropagationRule::Edge { edge_type, direction, trigger_state, target_state, max_depth, abort_on_failure } = rule
+                    else { continue; };
+                if trigger_state != source.state || source.depth >= *max_depth { continue; }
+                let bfs = self.query_bfs_with_read_memory(source.uuid, Some(std::slice::from_ref(edge_type)), *direction,
+                    1, snapshot, read_memory.clone())?;
+                for node in bfs.nodes {
+                    let _credit = self.reserve_owned_preparation(self.commit_preparation_read_bytes(held)?)?;
+                    let row = self.point_commit_row_in_restricted_source(held, source.table, snapshot,
+                        &|row| row.values.get("id") == Some(&Value::Uuid(node.id)), read_memory.clone())?;
+                    if row.is_some() {
+                        self.enqueue_commit_propagation_entry(queue, source.table, node.id, target_state, source.depth + 1, *abort_on_failure)?;
+                    }
+                }
+            }
+            for rule in &meta.propagation_rules {
+                let PropagationRule::VectorExclusion { trigger_state } = rule else { continue; };
+                if trigger_state != source.state { continue; }
+                let Some(column) = meta.columns.iter().find(|column| matches!(column.column_type, ColumnType::Vector(_))) else { continue; };
+                use crate::custody::preparation::OwnedPreparationValue;
+                let names = source.table.len().checked_add(column.name.len()).ok_or_else(EngineMetadataJournal::identity_error)?;
+                let index = OwnedPreparationValue::try_produce(self, names, || Ok(VectorIndexRef::new(source.table, &column.name)))?;
+                let _credit = self.reserve_owned_preparation(self.commit_preparation_read_bytes(held)?)?;
+                let rows = self.commit_row_ids_for_uuid_in_restricted_source(held, source.table, source.uuid,
+                    snapshot, read_memory.clone())?;
+                for row in rows.values.iter().copied() {
+                    index.with_value(|index| self.delete_vector_in_restricted_source(held, tx, index, row,
+                        snapshot, vector_copy_owner, read_memory.clone()))?;
+                }
+            }
+        }
+        if !fk_first { fk(held, queue)?; }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn propagate_state_change_in_restricted_source(
+        &self, held: &mut contextdb_tx::manager::EngineGuard<'_>, table: &str,
+        row_uuid: Option<uuid::Uuid>, new_state: Option<&str>, tx: TxId, snapshot: SnapshotId,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<()> {
+        use crate::custody::preparation::OwnedPreparationValue;
+        let (Some(uuid), Some(state)) = (row_uuid, new_state) else { return Ok(()); };
+        if !self.propagation_rules_can_react(table, state) || *held.read().propagation_in_progress { return Ok(()); }
+        let metas = {
+            let catalog = self.relational_store().table_meta.read();
+            let bytes = crate::memory_accounting::preparation_debug_native_bound(&*catalog)?;
+            OwnedPreparationValue::try_produce(self, bytes, || Ok(catalog.clone()))?
+        };
+        held.with_tx_checkpoint(|held| metas.with_value(|metas| {
+            let flags = |held: &contextdb_tx::manager::EngineGuard<'_>, active| {
+                let read = held.read();
+                contextdb_tx::manager::EngineFlags { commit_lsn: *read.commit_lsn, finalized_tx: *read.finalized_tx,
+                    requires_commit_lsn: *read.requires_commit_lsn, visibility_floor: *read.visibility_floor,
+                    propagation_in_progress: active }
+            };
+            let prepared = held.prepare_flags(flags(held, true))?;
+            held.publish_tx(prepared);
+            let mut queue = MetadataBuffer::empty();
+            let mut visited: MetadataBuffer<(OwnedPreparationValue<String>, uuid::Uuid)> = MetadataBuffer::empty();
+            let mut abort_violation = None;
+            self.enqueue_propagation_in_restricted_source(held, metas, &mut queue,
+                PropagationSource { table, uuid, state, depth: 0 }, true, tx, snapshot, vector_copy_owner, read_memory.clone())?;
+            while !queue.values.is_empty() {
+                let entry = queue.values.remove(0);
+                entry.with_value(|entry| -> Result<()> {
+                    if visited.values.iter().any(|(table, uuid)| *uuid == entry.uuid && table.with_value(|table| *table == entry.table)) { return Ok(()); }
+                    let name = OwnedPreparationValue::try_produce(self, entry.table.len(), || Ok(entry.table.clone()))?;
+                    if visited.values.len() == visited.values.capacity() {
+                        let capacity = visited.values.len().checked_add(1).and_then(|n| n.checked_next_power_of_two())
+                            .ok_or_else(EngineMetadataJournal::identity_error)?;
+                        let mut next = MetadataBuffer::prepare(capacity, &self.finalization.accountant)?;
+                        visited.move_into(&mut next); visited = next;
+                    }
+                    visited.push((name, entry.uuid));
+                    let Some(meta) = metas.get(&entry.table) else { return Ok(()); };
+                    let Some(sm) = &meta.state_machine else {
+                        eprintln!("warning: propagation target table {} has no state machine", entry.table);
+                        if entry.abort_on_failure && abort_violation.is_none() {
+                            abort_violation = Some(Error::PropagationAborted { table: entry.table.clone(), column: String::new(),
+                                from: String::new(), to: entry.target_state.clone() });
+                        }
+                        return Ok(());
+                    };
+                    let _credit = self.reserve_owned_preparation(self.commit_preparation_read_bytes(held)?)?;
+                    let existing = self.point_commit_row_in_restricted_source(held, &entry.table, snapshot,
+                        &|row| row.values.get("id") == Some(&Value::Uuid(entry.uuid)), read_memory.clone())?;
+                    let Some(existing) = existing else { return Ok(()); };
+                    existing.with_value(|existing| {
+                    let from = existing.values.get(&sm.column).and_then(Value::as_text).unwrap_or("");
+                    match self.upsert_state_row_in_restricted_source(held, &entry.table, &sm.column, &existing,
+                        &entry.target_state, tx, snapshot, read_memory.clone()) {
+                        Ok(false) => return Ok(()), Ok(true) => (),
+                        Err(Error::InvalidStateTransition(_)) => {
+                            eprintln!("warning: skipped invalid propagated transition {}.{} {} -> {}", entry.table, sm.column, from, entry.target_state);
+                            if entry.abort_on_failure && abort_violation.is_none() {
+                                abort_violation = Some(Error::PropagationAborted { table: entry.table.clone(), column: sm.column.clone(),
+                                    from: from.to_owned(), to: entry.target_state.clone() });
+                            }
+                            return Ok(());
+                        }
+                        Err(error) => return Err(error),
+                    }
+                    self.enqueue_propagation_in_restricted_source(held, metas, &mut queue,
+                        PropagationSource { table: &entry.table, uuid: entry.uuid, state: &entry.target_state, depth: entry.depth },
+                        false, tx, snapshot, vector_copy_owner, read_memory.clone())
+                    })
+                })?;
+            }
+            if let Some(error) = abort_violation { return Err(error); }
+            let prepared = held.prepare_flags(flags(held, false))?;
+            held.publish_tx(prepared);
+            Ok(())
+        }))
+    }
+}
+
+impl Database {
+    fn discard_gone_deletes_in_restricted_source(
+        &self, held: &mut contextdb_tx::manager::EngineGuard<'_>, snapshot: SnapshotId,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<()> {
+        use crate::custody::preparation::{OwnedPreparationValue, preparation_array_bytes};
+        let count = held.read().relational_deletes.len();
+        if count == 0 { return Ok(()); }
+        let mut bytes = preparation_array_bytes::<(usize, String, RowId)>(count)?;
+        for (table, _, _) in held.read().relational_deletes {
+            bytes = bytes.checked_add(table.len()).ok_or_else(EngineMetadataJournal::identity_error)?;
+        }
+        let discarded = OwnedPreparationValue::try_produce(self, bytes, || {
+            let mut discarded = Vec::with_capacity(count);
+            let read = held.read();
+            for (position, (table, row, _)) in read.relational_deletes.iter().enumerate() {
+                if read.relational_inserts.iter().any(|(name, incoming)| name == table && incoming.row_id == *row) { continue; }
+                let mut credit = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
+                let live = self.committed_row_at_admitted(table, *row, snapshot, &mut credit, read_memory.clone())?;
+                if live.is_none() { discarded.push((position, table.clone(), *row)); }
+            }
+            Ok(discarded)
+        })?;
+        discarded.with_value(|discarded| {
+            if discarded.is_empty() { return Ok(()); }
+            let positions = OwnedPreparationValue::try_produce(self, preparation_array_bytes::<usize>(discarded.len())?, ||
+                Ok(discarded.iter().map(|(position, _, _)| *position).collect::<Vec<_>>()))?;
+            let prepared = positions.with_value(|positions| {
+                let empty = held.copy_aux(contextdb_tx::staged_source::AuxBorrow::RelationalDeletes(&[]))?;
+                held.prepare_aux_splice(0, positions, empty)
+            })?;
+            held.publish_tx(prepared);
+            let count = held.read().config_writes.len();
+            let positions = OwnedPreparationValue::try_produce(self, preparation_array_bytes::<usize>(count)?, || {
+                let mut selected = Vec::with_capacity(count);
+                for (position, (key, encoded)) in held.read().config_writes.iter().enumerate() {
+                    if !key.starts_with(Self::DURABLE_LINEAGE_CONFIG_PREFIX) { continue; }
+                    let bytes = encoded.len().checked_mul(std::mem::size_of::<DurableLineageRecord>())
+                        .and_then(|n| n.checked_mul(2)).ok_or_else(EngineMetadataJournal::identity_error)?;
+                    let _credit = self.reserve_owned_preparation(bytes)?;
+                    let Ok(record) = RedbPersistence::decode_config_value::<DurableLineageRecord>(encoded) else { continue; };
+                    if record.delete_obligation == DurableDeleteObligation::Pending
+                        && record.local_row_id.is_some_and(|id| discarded.iter().any(|(_, table, row)| *table == record.table && *row == id))
+                    { selected.push(position); }
+                }
+                Ok(selected)
+            })?;
+            positions.with_value(|positions| {
+                if positions.is_empty() { return Ok(()); }
+                let empty = held.copy_aux(contextdb_tx::staged_source::AuxBorrow::ConfigWrites(&[]))?;
+                let prepared = held.prepare_aux_splice(0, positions, empty)?;
+                held.publish_tx(prepared);
+                Ok(())
+            })
+        })
+    }
+
+    fn commit_validate_in_prepared_write_set(
+        &self, origin_tx: TxId, held: &mut contextdb_tx::manager::EngineGuard<'_>,
+        peer: &mut OwnedTerminalMetadata, vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<CommitValidationOutcome> {
+        let mut empty = EnginePendingCommitMetadata::empty();
+        let metadata = if let Some(node) = peer.node.as_mut() {
+            let record = node.get_mut();
+            if record.tx != origin_tx || record.depth != 0 || record.next.is_some() {
+                return Err(EngineMetadataJournal::identity_error());
+            }
+            &mut record.metadata
+        } else { &mut empty };
+        // These original buffers are one-shot. Move their complete paid
+        // owners, leaving epochs in the exact singleton across callback passes.
+        let conditional = std::mem::replace(&mut metadata.conditional_update_guards, MetadataBuffer::empty());
+        let lineage = std::mem::replace(&mut metadata.sync_lineage_guards, MetadataBuffer::empty());
+        let upserts = std::mem::replace(&mut metadata.upsert_intents, MetadataBuffer::empty());
+        let published = self.tx_mgr.capture_published_read();
+        let snapshot = published.snapshot;
+        let root = writer_read::durable_root(published.handle)?;
+        let _writer_read = self.enter_writer_read(root, read_memory.clone());
+        let mut stats = CommitStageStatsGuard::new(self);
+        #[cfg(any(test, feature = "test-seams"))]
+        let mut timer = CommitStageTimer::new();
+        held.with_tx_checkpoint(|held| {
+            for entry in &lineage.values {
+                let guard = entry.body.as_ref().ok_or_else(EngineMetadataJournal::identity_error)?;
+                let mut credit = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
+                let row = self.committed_row_at_admitted(&guard.table, guard.row_id, snapshot, &mut credit, read_memory.clone())?;
+                if !row.is_some_and(|row| row.values == guard.values) {
+                    return Err(Error::SyncError(format!("authenticated creator delete target {} row {} changed before commit; retry the sync unit",
+                        guard.table, guard.row_id.0)));
+                }
+            }
+            let conditions = conditional.values.iter().map(|entry|
+                entry.body.as_ref().expect("validated original conditional body"));
+            let outcome = self.revalidate_conditional_updates_in_prepared_write_set(held, snapshot, conditions,
+                Some(stats.stats_mut()), vector_copy_owner, read_memory.clone())?;
+            #[cfg(any(test, feature = "test-seams"))]
+            timer.record(stats.stats_mut(), 0);
+            let check_vectors = |held: &contextdb_tx::manager::EngineGuard<'_>, owner: &mut contextdb_vector::VectorCopyAdmission| {
+                let _credit = self.reserve_owned_preparation(self.commit_preparation_read_bytes(held)?)?;
+                let empty_epochs = HashMap::new();
+                let epochs = metadata.vector_schema_epochs.as_ref()
+                    .and_then(|entry| entry.body.as_ref()).unwrap_or(&empty_epochs);
+                held.with_legacy(|ws| {
+                    self.validate_vector_schema_epochs(ws, epochs)?;
+                    self.validate_vector_write_set_schema(ws, owner, read_memory.clone())
+                })
+            };
+            check_vectors(held, vector_copy_owner)?;
+            self.discard_gone_deletes_in_restricted_source(held, snapshot, read_memory.clone())?;
+            let intents = self.collect_commit_upsert_refs(upserts.values.iter().map(|entry|
+                entry.body.as_ref().expect("validated original upsert body")))?;
+            self.validate_unique_constraints_in_restricted_source(held, snapshot, &intents.values,
+                stats.stats_mut(), vector_copy_owner, read_memory.clone())?;
+            #[cfg(any(test, feature = "test-seams"))]
+            timer.record(stats.stats_mut(), 1);
+            let scratch = self.prepare_commit_unique_scratch(held, snapshot, read_memory.clone())?;
+            held.with_legacy(|ws| self.validate_foreign_keys_in_restricted_read_source(ws, snapshot,
+                &scratch.deleted_rows, stats.stats_mut(), read_memory.clone()))?;
+            #[cfg(any(test, feature = "test-seams"))]
+            timer.record(stats.stats_mut(), 2);
+            held.with_legacy(|ws| self.validate_composite_foreign_keys_in_write_set(ws, snapshot,
+                &scratch.deleted_rows, stats.stats_mut(), read_memory.clone()))?;
+            #[cfg(any(test, feature = "test-seams"))]
+            timer.record(stats.stats_mut(), 3);
+            check_vectors(held, vector_copy_owner)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            timer.record(stats.stats_mut(), 4);
+            stats.flush();
+            Ok(outcome)
+        })
+    }
+}
+
+impl Database {
+    fn visit_commit_rows_in_restricted_source(
+        &self, held: &contextdb_tx::manager::EngineGuard<'_>, table: &str, snapshot: SnapshotId,
+        predicate: &dyn Fn(&VersionedRow) -> bool,
+        visit: &mut dyn FnMut(&VersionedRow) -> Result<std::ops::ControlFlow<()>>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<()> {
+        let read = held.read();
+        let mut cursor = self.bounded_physical_table_cursor(table)?;
+        loop {
+            let mut credit = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
+            let row = self.bounded_physical_table_row_next::<Error>(read_memory.clone(), table, snapshot,
+                &mut cursor, || Ok(()), |bytes| credit.try_grow_for(bytes, "reader", "commit_row_source",
+                    "Reduce selected rows or raise the declared read memory limit."))?;
+            let Some(row) = row else { break; };
+            if !row.visible_at(snapshot)
+                || read.relational_deletes.iter().any(|(name, id, _)| name == table && *id == row.row_id)
+                || row_matches_delete_predicates(read.relational_delete_predicates, table, &row)
+                || !predicate(&row)
+            { continue; }
+            if visit(&row)?.is_break() { return Ok(()); }
+        }
+        // Original final staged order is the ascending ordinal of each last
+        // row-id winner. Deleted staged rows stay only when that identity was
+        // present in the original committed snapshot, before delete filtering.
+        for (position, (name, row)) in read.relational_inserts.iter().enumerate() {
+            if name != table || read.relational_inserts[position + 1..].iter()
+                .any(|(later_name, later)| later_name == table && later.row_id == row.row_id)
+            { continue; }
+            if read.relational_deletes.iter().any(|(name, id, _)| name == table && *id == row.row_id) {
+                let mut credit = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
+                let committed = self.committed_row_at_admitted(table, row.row_id, snapshot, &mut credit, read_memory.clone())?;
+                if committed.is_none() { continue; }
+            }
+            if predicate(row) && visit(row)?.is_break() { return Ok(()); }
+        }
+        Ok(())
+    }
+
+    fn point_commit_row_in_restricted_source(
+        &self, held: &contextdb_tx::manager::EngineGuard<'_>, table: &str, snapshot: SnapshotId,
+        predicate: &dyn Fn(&VersionedRow) -> bool,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<Option<crate::custody::preparation::OwnedPreparationValue<VersionedRow>>> {
+        let mut selected = None;
+        self.visit_commit_rows_in_restricted_source(held, table, snapshot, predicate, &mut |row| {
+            selected = Some(crate::custody::preparation::copy_row_owned(self, row)?);
+            Ok(std::ops::ControlFlow::Break(()))
+        }, read_memory)?;
+        Ok(selected)
+    }
+
+    fn commit_row_ids_for_uuid_in_restricted_source(
+        &self, held: &contextdb_tx::manager::EngineGuard<'_>, table: &str, uuid: uuid::Uuid,
+        snapshot: SnapshotId, read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<MetadataBuffer<RowId>> {
+        let mut rows = MetadataBuffer::empty();
+        self.visit_commit_rows_in_restricted_source(held, table, snapshot,
+            &|row| row.values.get("id") == Some(&Value::Uuid(uuid)), &mut |row| {
+                if rows.values.len() == rows.values.capacity() {
+                    let capacity = rows.values.len().checked_add(1).and_then(|n| n.checked_next_power_of_two())
+                        .ok_or_else(EngineMetadataJournal::identity_error)?;
+                    let mut next = MetadataBuffer::prepare(capacity, &self.finalization.accountant)?;
+                    rows.move_into(&mut next); rows = next;
+                }
+                rows.push(row.row_id);
+                Ok(std::ops::ControlFlow::Continue(()))
+            }, read_memory)?;
+        Ok(rows)
+    }
+}
+
+impl Database {
+fn validate_foreign_keys_in_restricted_read_source(
+        &self,
+        ws: &WriteSet,
+        snapshot: SnapshotId,
+        deleted_rows_by_table: &HashMap<String, HashMap<RowId, VersionedRow>>,
+        stats: &mut CommitStageStats,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<()> {
+        let staged_lookup = StagedTupleLookup::rebuild(self, ws)?;
+        let deleted_by_table = Self::deleted_row_ids_by_table(ws);
+        let empty_deleted = HashSet::new();
+        for (table, row) in &ws.relational_inserts {
+            stats.rows_validated = stats.rows_validated.saturating_add(1);
+            let meta = self
+                .table_meta(table)
+                .ok_or_else(|| Error::TableNotFound(table.clone()))?;
+            for column in &meta.columns {
+                let Some(reference) = &column.references else {
+                    continue;
+                };
+                let Some(value) = row.values.get(&column.name) else {
+                    continue;
+                };
+                if *value == Value::Null {
+                    continue;
+                }
+                let staged_deletes = deleted_by_table
+                    .get(&reference.table)
+                    .unwrap_or(&empty_deleted);
+                let parent_columns = vec![reference.column.clone()];
+                let parent_values = std::slice::from_ref(value);
+                let staged_match = if Self::values_can_be_tuple_key(parent_values) {
+                    staged_lookup.contains_tuple(
+                        &reference.table,
+                        &parent_columns,
+                        parent_values,
+                        Some(stats),
+                    )
+                } else {
+                    staged_tuple_exists(ws, &reference.table, &parent_columns, parent_values)
+                };
+                let committed_match = if staged_match {
+                    true
+                } else {
+                    self.visible_commit_row_exists_by_column(
+                        &reference.table,
+                        &reference.column,
+                        value,
+                        snapshot,
+                        staged_deletes,
+                        Some(stats),
+                        read_memory.clone(),
+                    )?
+                };
+                if !staged_match && !committed_match {
+                    return Err(Error::ForeignKeyViolation {
+                        child_table: table.clone(),
+                        child_columns: vec![column.name.clone()],
+                        parent_table: reference.table.clone(),
+                        parent_columns: vec![reference.column.clone()],
+                    });
+                }
+            }
+        }
+
+        let reverse_refs = {
+            let metas = self.relational_store.table_meta.read();
+            metas
+                .iter()
+                .flat_map(|(child_table, meta)| {
+                    meta.columns.iter().filter_map(|column| {
+                        column.references.as_ref().map(|reference| {
+                            (
+                                reference.table.clone(),
+                                reference.column.clone(),
+                                child_table.clone(),
+                                column.name.clone(),
+                            )
+                        })
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+
+        for (parent_table, parent_row_id, _) in &ws.relational_deletes {
+            stats.rows_validated = stats.rows_validated.saturating_add(1);
+            let Some(parent_row) = deleted_rows_by_table
+                .get(parent_table)
+                .and_then(|rows| rows.get(parent_row_id))
+            else {
+                continue;
+            };
+            for (ref_table, ref_column, child_table, child_column) in &reverse_refs {
+                if ref_table != parent_table {
+                    continue;
+                }
+                let Some(parent_value) = parent_row.values.get(ref_column) else {
+                    continue;
+                };
+                if *parent_value == Value::Null {
+                    continue;
+                }
+                let parent_columns = vec![ref_column.clone()];
+                let parent_values = std::slice::from_ref(parent_value);
+                let parent_replaced_with_same_key = if Self::values_can_be_tuple_key(parent_values)
+                {
+                    staged_lookup.contains_tuple(
+                        parent_table,
+                        &parent_columns,
+                        parent_values,
+                        Some(stats),
+                    )
+                } else {
+                    staged_tuple_exists(ws, parent_table, &parent_columns, parent_values)
+                };
+                if parent_replaced_with_same_key {
+                    continue;
+                }
+                let child_deletes = deleted_by_table.get(child_table).unwrap_or(&empty_deleted);
+                if self.visible_commit_row_exists_by_column(
+                    child_table,
+                    child_column,
+                    parent_value,
+                    snapshot,
+                    child_deletes,
+                    Some(stats),
+                    read_memory.clone(),
+                )? {
+                    return Err(Error::ForeignKeyViolation {
+                        child_table: child_table.clone(),
+                        child_columns: vec![child_column.clone()],
+                        parent_table: parent_table.clone(),
+                        parent_columns: vec![ref_column.clone()],
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl Database {
+    #[allow(clippy::too_many_arguments)]
+    fn committed_unique_conflict_row_id_in_restricted_source(
+        &self, table: &str, columns: &[String], values: &[Value], snapshot: SnapshotId,
+        skip_deleted: &HashSet<RowId>, mut stats: Option<&mut CommitStageStats>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<Option<RowId>> {
+        if columns.is_empty() || columns.len() != values.len() { return Ok(None); }
+        if let Some(row) = self.indexed_visible_row_id_by_columns(table, columns, values, snapshot,
+            skip_deleted, stats.as_deref_mut(), read_memory.clone())? { return Ok(row); }
+        let mut cursor = self.bounded_physical_table_cursor(table)?;
+        let before = self.relational_store.scan_rows_touched();
+        let mut selected = None;
+        // Finish the original complete scan even after selecting its first
+        // match. This preserves scan/refusal and work-counter semantics while
+        // retaining only one admitted source body at any time.
+        loop {
+            let mut credit = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
+            let row = self.bounded_physical_table_row_next::<Error>(read_memory.clone(), table, snapshot,
+                &mut cursor, || Ok(()), |bytes| credit.try_grow_for(bytes, "reader", "commit_unique_source",
+                    "Reduce selected rows or raise the declared read memory limit."))?;
+            let Some(row) = row else { break; };
+            if selected.is_none() && row.visible_at(snapshot) && !skip_deleted.contains(&row.row_id)
+                && columns.iter().zip(values).all(|(column, value)| row.values.get(column) == Some(value))
+            { selected = Some(row.row_id); }
+        }
+        if let Some(stats) = stats {
+            stats.scan_rows_touched = stats.scan_rows_touched.saturating_add(
+                self.relational_store.scan_rows_touched().saturating_sub(before));
+        }
+        Ok(selected)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn visible_commit_row_exists_by_column(
+        &self, table: &str, column: &str, value: &Value, snapshot: SnapshotId,
+        skip_deleted: &HashSet<RowId>, stats: Option<&mut CommitStageStats>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<bool> {
+        use crate::custody::preparation::OwnedPreparationValue;
+        let columns = OwnedPreparationValue::try_produce(self,
+            column.len().checked_add(std::mem::size_of::<String>()).ok_or_else(EngineMetadataJournal::identity_error)?,
+            || Ok(vec![column.to_owned()]))?;
+        columns.with_value(|columns| self.committed_unique_conflict_row_id_in_restricted_source(table, columns,
+            std::slice::from_ref(value), snapshot, skip_deleted, stats, read_memory).map(|row| row.is_some()))
+    }
+}
+
+impl Database {
+    /// Borrow the original resident version through reply sizing and writing.
+    /// Durable bodies require their own unactivated native source companion;
+    /// a resident projection must never stand in for their complete row.
+    pub(crate) fn with_native_point_row<T>(
+        &self,
+        key: &(TableName, RowId),
+        snapshot: SnapshotId,
+        context: &crate::executor::bounded::NativeReadOpenContext,
+        consume: impl FnOnce(Option<&VersionedRow>) -> std::result::Result<T, crate::executor::BoundedExecutionError>,
+    ) -> std::result::Result<T, crate::executor::BoundedExecutionError> {
+        context.checkpoint()?;
+        if self.relational_store.uses_disk_backed_committed_bodies() {
+            return Err(crate::executor::BoundedExecutionError::Unimplemented);
+        }
+        // This one addressed version probe spends the original request's
+        // work unit before touching resident row/version storage.
+        context.touch_row()?;
+        let tables = self.relational_store.tables.read();
+        let row = tables.get(key.0.as_str()).and_then(|rows| {
+            self.relational_store
+                .visible_version_position_with_key(rows, key, snapshot)
+                .and_then(|position| rows.get(position))
+        });
+        context.checkpoint()?;
+        // Keep the table guard alive across both output passes. The selector
+        // holds its existing version-position guard during the ordered probe.
+        consume(row)
+    }
+}
+
+struct OriginalPurgeNonEventPublication {
+    relational: PreparedRelationalPublication,
+    change_log: Vec<ChangeLogEntry>,
+    change_log_table_index: ChangeLogTableIndex,
+    change_log_lsn_refcounts: ChangeLogLsnRefcounts,
+    graph: PreparedGraphPublication,
+    vector: PreparedVectorPublication,
+    accepted_author_memory_mirror: HashMap<(String, Vec<u8>), String>,
+    graph_arrival_memory_mirror: HashMap<GraphIdentity, DurableGraphArrival>,
+    memory_swap: PreparedMemorySwapAccounting,
+}
+struct OriginalPurgeNonEventPreparedSet {
+    row_version_keys: Vec<AuthoritativePurgeRowVersionKey>,
+    change_log_entries: Vec<ChangeLogEntry>,
+    vector_entries: Vec<VectorEntry>,
+    vector_partition_identities: Vec<VectorPartitionVersionIdentity>,
+    vector_generation_candidates: Vec<VectorPartitionGenerationCandidate>,
+    canonical_graph_entries: Vec<AdjEntry>,
+    disk_source_provenance: Vec<(String, RowId, Lsn, u8)>,
+    lineage_config_owners: Vec<AuthoritativePurgeLineageConfigOwners>,
+    durable_sink_entries: Vec<AuthoritativePurgeSinkEntryKey>,
+    graph_arrival_config_keys: Vec<String>,
+    publication_replacements: OriginalPurgeNonEventPublication,
+    survivor_report: OwnedQueryResult,
+}
+impl Database {
+fn prepare_original_discard_non_event_set_batch(
+        &self,
+        selections: &[AuthoritativePurgeSelection],
+        frame:&crate::persistence::OriginalPersistenceFrame<'_>,
+        encoded_source:&crate::persistence::OwnedEncodedEventSource<'_>,
+        sink_names:&BTreeSet<String>,
+        report_shape: crate::custody::erasure::PurgeReportShape,
+        frontier: Lsn,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<OriginalPurgeNonEventPreparedSet> {
+        use crate::custody::erasure::PurgeReportShape;
+        let report_requested = report_shape != PurgeReportShape::None;
+        let _operation = self.open_operation()?;
+        // An explicit node-local instruction may have no hub rows.
+
+        // Ownership is a (table,row) pair throughout one union.
+        frame.tree::<String,HashSet<RowId>>(selections.len())?;
+        frame.array::<AuthoritativePurgeLineageConfigOwners>(selections.len())?;
+        for candidate in selections {
+            frame.reserve(candidate.table.len())?;frame.record(&candidate.natural_key)?;
+            frame.map::<RowId,()>(selections.iter().filter(|s|s.table==candidate.table).count())?;
+        }
+        let mut selected_by_table = BTreeMap::<String, HashSet<RowId>>::new();
+        for candidate in selections {
+            if !selected_by_table
+                .entry(candidate.table.clone())
+                .or_default()
+                .insert(candidate.local_row_id)
+            {
+                return Err(Error::SyncError(
+                    "erasure selected one pinned row twice".into(),
+                ));
+            }
+        }
+        let selected = |table: &str, row_id: &RowId| {
+            selected_by_table
+                .get(table)
+                .is_some_and(|ids| ids.contains(row_id))
+        };
+        let lifecycle_templates = selections
+            .iter()
+            .map(|candidate| {
+                self.validate_authoritative_purge_selection(candidate, read_memory.clone())
+                    .and_then(|witness| {
+                        Self::authoritative_purge_lifecycle_template(candidate, &witness)
+                            .map(|template| (template, witness.lifecycle.is_some()))
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let prepared_snapshot = self.snapshot();
+        let selected_table_rows = selected_by_table
+            .iter()
+            .map(|(table, ids)| {
+                self.authoritative_purge_selected_row_versions(table, ids, read_memory.clone())
+                    .map(|rows| (table.clone(), rows))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        frame.array::<AuthoritativePurgeRowVersionKey>(selected_table_rows.values().map(Vec::len).sum())?;
+        for rows in selected_table_rows.values(){for row in rows{frame.record(row)?;}}
+        let mut row_versions = Vec::new();
+        let mut selected_versions = Vec::new();
+        for candidate in selections {
+            let mut found = false;
+            for row in &selected_table_rows[&candidate.table] {
+                if row.row_id != candidate.local_row_id {
+                    continue;
+                }
+                found = true;
+                row_versions.push(AuthoritativePurgeRowVersionKey {
+                    table: candidate.table.clone(),
+                    table_generation: candidate.table_generation,
+                    key: candidate.natural_key.pairs(),
+                    lineage_root: candidate.lineage_root.clone(),
+                    row_id: row.row_id,
+                    created_tx: row.created_tx,
+                    lsn: row.lsn,
+                });
+                selected_versions.push(row);
+            }
+            if !found {
+                return Err(Error::SyncError("erasure lost a pinned row".into()));
+            }
+        }
+        let selected_edge_variants = selected_versions
+            .iter()
+            .filter_map(|row| {
+                Some((
+                    row.values.get("source_id")?.as_uuid().copied()?,
+                    row.values.get("target_id")?.as_uuid().copied()?,
+                    row.values.get("edge_type")?.as_text()?.to_string(),
+                    row.created_tx,
+                    row.lsn,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let mut surviving_forward_entries =
+            self.collect_graph_versions(|_| true, read_memory.clone())?;
+        for edge in &surviving_forward_entries{frame.record(edge)?;}
+        let mut canonical_graph_entries = Vec::with_capacity(selected_edge_variants.len());
+        for (source, target, edge_type, created_tx, creation_lsn) in &selected_edge_variants {
+            let Some(position) = surviving_forward_entries.iter().position(|entry| {
+                entry.source == *source
+                    && entry.target == *target
+                    && entry.edge_type == *edge_type
+                    && entry.created_tx == *created_tx
+                    && entry.lsn == *creation_lsn
+            }) else {
+                return Err(Error::SyncError(
+                    "authoritative purge edge-row witness has no exact forward adjacency"
+                        .to_string(),
+                ));
+            };
+            canonical_graph_entries.push(surviving_forward_entries.remove(position));
+        }
+        let change_log = self.collect_change_log_versions(read_memory.clone())?;
+        for entry in &change_log{frame.record(entry)?;}
+        let mut edge_insert_witnesses = canonical_graph_entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.source,
+                    entry.target,
+                    entry.edge_type.clone(),
+                    entry.lsn,
+                )
+            })
+            .collect::<Vec<_>>();
+        let commit_index = self
+            .tx_mgr
+            .try_commit_index_prefix(self.tx_mgr.current_lsn())?;
+        let mut edge_delete_witnesses = canonical_graph_entries
+            .iter()
+            .filter_map(|entry| {
+                entry.deleted_tx.map(|deleted_tx| {
+                    let deletion_lsn = commit_index
+                        .iter()
+                        .find_map(|(lsn, tx)| (*tx == deleted_tx).then_some(*lsn))
+                        .ok_or_else(|| {
+                            Error::SyncError(
+                                "authoritative purge edge deletion lacks its commit-index LSN"
+                                    .to_string(),
+                            )
+                        })?;
+                    Ok((
+                        entry.source,
+                        entry.target,
+                        entry.edge_type.clone(),
+                        deletion_lsn,
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let selected_graph_occurrences = edge_insert_witnesses
+            .iter()
+            .map(|(source, target, edge_type, lsn)| {
+                (*source, *target, edge_type.clone(), *lsn, false)
+            })
+            .chain(
+                edge_delete_witnesses
+                    .iter()
+                    .map(|(source, target, edge_type, lsn)| {
+                        (*source, *target, edge_type.clone(), *lsn, true)
+                    }),
+            )
+            .collect::<HashSet<_>>();
+        frame.map::<GraphIdentity,DurableGraphArrival>(self.sync_graph_arrivals.read().len())?;
+        for (_,marker) in self.sync_graph_arrivals.read().iter(){frame.record(marker)?;}
+        let mut graph_arrival_memory_mirror = self.sync_graph_arrivals.read().clone();
+        let removed_graph_arrivals = if self.persistence.is_some() {
+            let mut removed = Vec::new();
+            for (source, target, edge_type, lsn, deleted) in &selected_graph_occurrences {
+                let identity = (*source, *target, edge_type.clone());
+                self.with_graph_arrival(
+                    &identity,
+                    |marker| {
+                        if let Some(marker) = marker
+                            && marker.local_lsn == *lsn
+                            && marker.deleted == *deleted
+                        {
+                            removed.push((identity.clone(), marker.clone()));
+                        }
+                        Ok(())
+                    },
+                    read_memory.clone(),
+                )?;
+            }
+            removed
+        } else {
+            graph_arrival_memory_mirror
+                .iter()
+                .filter(|((source, target, edge_type), marker)| {
+                    selected_graph_occurrences.contains(&(
+                        *source,
+                        *target,
+                        edge_type.clone(),
+                        marker.local_lsn,
+                        marker.deleted,
+                    ))
+                })
+                .map(|(identity, marker)| (identity.clone(), marker.clone()))
+                .collect::<Vec<_>>()
+        };
+        let graph_arrival_config_keys = removed_graph_arrivals
+            .iter()
+            .map(|(_, marker)| Self::graph_arrival_config_key(marker))
+            .collect::<Result<Vec<_>>>()?;
+        for (identity, _) in removed_graph_arrivals {
+            graph_arrival_memory_mirror.remove(&identity);
+        }
+        let selected_change_log_positions = change_log
+            .iter()
+            .enumerate()
+            .filter_map(|(position, entry)| match entry {
+                ChangeLogEntry::RowInsert { table, row_id, .. }
+                | ChangeLogEntry::RowDelete { table, row_id, .. } => {
+                    selected(table, row_id).then_some(position)
+                }
+                ChangeLogEntry::VectorInsert { index, row_id, .. }
+                | ChangeLogEntry::VectorDelete { index, row_id, .. } => {
+                    selected(&index.table, row_id).then_some(position)
+                }
+                ChangeLogEntry::EdgeInsert {
+                    source,
+                    target,
+                    edge_type,
+                    lsn,
+                } => edge_insert_witnesses
+                    .iter()
+                    .position(
+                        |(witness_source, witness_target, witness_type, witness_lsn)| {
+                            source == witness_source
+                                && target == witness_target
+                                && edge_type == witness_type
+                                && lsn == witness_lsn
+                        },
+                    )
+                    .map(|witness_position| {
+                        edge_insert_witnesses.remove(witness_position);
+                        position
+                    }),
+                ChangeLogEntry::EdgeDelete {
+                    source,
+                    target,
+                    edge_type,
+                    lsn,
+                } => edge_delete_witnesses
+                    .iter()
+                    .position(
+                        |(witness_source, witness_target, witness_type, witness_lsn)| {
+                            source == witness_source
+                                && target == witness_target
+                                && edge_type == witness_type
+                                && lsn == witness_lsn
+                        },
+                    )
+                    .map(|witness_position| {
+                        edge_delete_witnesses.remove(witness_position);
+                        position
+                    }),
+            })
+            .collect::<Vec<_>>();
+        if !edge_insert_witnesses.is_empty() || !edge_delete_witnesses.is_empty() {
+            return Err(Error::SyncError(
+                "authoritative purge edge change-log ownership is incomplete".to_string(),
+            ));
+        }
+        let selected_change_log_position_set = selected_change_log_positions
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let change_log_entries = selected_change_log_positions
+            .iter()
+            .copied()
+            .map(|position| change_log[position].clone())
+            .collect::<Vec<_>>();
+        // The relational selector names rows, not vector partitions. Resolve
+        // those rows through the lightweight vector directories and fault in
+        // only partitions that contain a selected lineage before building the
+        // purge image. Reading every registered partition here would turn a
+        // one-row forget into a whole-database memory spike.
+        for (table, row_ids) in &selected_by_table {
+            self.vector_store.ensure_raw_partitions_containing_rows(
+                table,
+                row_ids,
+                vector_copy_owner,
+            )?;
+        }
+        let mut all_partitioned_vector_entries = Vec::new();
+        for (table, row_ids) in &selected_by_table {
+            all_partitioned_vector_entries.extend(
+                self.vector_store
+                    .durable_entries_of_partitions_containing_rows(
+                        table,
+                        row_ids,
+                        vector_copy_owner,
+                    )?,
+            );
+        }
+        let selected_partitioned_vector_entries = all_partitioned_vector_entries
+            .iter()
+            .filter(|entry| selected(&entry.entry.index.table, &entry.entry.row_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        for entry in &all_partitioned_vector_entries{frame.record(&entry.entry)?;}
+        let mut vector_entries = Vec::new();
+        let mut vector_partition_selectors = Vec::new();
+        for selected in &selected_partitioned_vector_entries {
+            if !vector_entries.contains(&selected.entry) {
+                vector_entries.push(selected.entry.clone());
+            }
+            let selector = VectorPartitionVersionSelector {
+                index: selected.entry.index.clone(),
+                partition_key: selected.partition_key.clone(),
+                row_id: selected.entry.row_id,
+                vector_created_tx: selected.entry.created_tx,
+                vector_lsn: selected.entry.lsn,
+            };
+            if !vector_partition_selectors.contains(&selector) {
+                vector_partition_selectors.push(selector);
+            }
+        }
+        let persistence = self.persistence.as_ref().ok_or_else(|| {
+            Error::SyncError("authoritative purge requires a file-backed database".to_string())
+        })?;
+        let vector_partition_identities =
+            persistence.resolve_vector_partition_version_identities(&vector_partition_selectors)?;
+        let mut affected_vector_partitions = selected_partitioned_vector_entries
+            .iter()
+            .map(|entry| {
+                VectorPartitionRef::new(entry.entry.index.clone(), entry.partition_key.clone())
+            })
+            .collect::<Vec<_>>();
+        affected_vector_partitions.sort_by(|left, right| {
+            left.index
+                .table
+                .cmp(&right.index.table)
+                .then(left.index.column.cmp(&right.index.column))
+                .then(left.partition_key.cmp(&right.partition_key))
+        });
+        affected_vector_partitions.dedup();
+
+        let mut disk_source_provenance = Vec::new();
+        for (table, ids) in &selected_by_table {
+            disk_source_provenance
+                .extend(self.authoritative_purge_disk_source_provenance(table, ids)?);
+        }
+        let lineage_config_owners = selections
+            .iter()
+            .zip(lifecycle_templates)
+            .map(
+                |(candidate, (lifecycle_template, lifecycle_record_is_selected_life))| {
+                    AuthoritativePurgeLineageConfigOwners {
+                        row_sidecar_key: Self::durable_row_lineage_config_key(
+                            &candidate.table,
+                            &candidate.natural_key,
+                            candidate.table_generation,
+                        ),
+                        creation_lineage_key: Self::durable_unbound_creation_config_key(
+                            &candidate.table,
+                            &candidate.natural_key,
+                            candidate.table_generation,
+                            candidate.local_row_id,
+                        ),
+                        accepted_author_key: format!(
+                            "sync_row_author.{}",
+                            Self::hex_component(&sync_identity_key(
+                                &candidate.table,
+                                &candidate.natural_key
+                            ))
+                        ),
+                        accepted_author_memory_key: (
+                            candidate.table.clone(),
+                            sync_identity_key(&candidate.table, &candidate.natural_key),
+                        ),
+                        lifecycle_record_key: Self::durable_lineage_config_key(
+                            &candidate.table,
+                            &candidate.natural_key,
+                            candidate.table_generation,
+                        ),
+                        lifecycle_record_is_selected_life,
+                        lifecycle_template,
+                    }
+                },
+            )
+            .collect::<Vec<_>>();
+        // The future purge kernel consumed its phase-one drain guard only
+        // after acquiring the transaction commit mutex. This phase-two token
+        // already freezes queue mutation and remains in `event_bus` through
+        // the matching durable purge commit/direct swap.
+        let mut durable_sink_entries = Vec::new();
+        let mut survivor_report = OwnedQueryResult::empty();
+        if report_shape == PurgeReportShape::PerTable {
+            survivor_report.columns =
+                vec!["table".into(), "rows_affected".into(), "survivors".into()];
+        }
+        let mut projections = Vec::new();
+        let mut affected_rows = BTreeMap::new();
+        let source_sidecars = self
+            .authoritative_purge_all_memory_source_provenance()
+            .into_iter()
+            .filter(|(table, row_id, _, _)| !selected(table, row_id))
+            .map(|(table, row_id, lsn, kind)| ((table, row_id), (lsn, kind)))
+            .collect::<HashMap<_, _>>();
+        for (table, ids) in &selected_by_table {
+            durable_sink_entries.extend(self.original_discard_durable_sink_entries(frame,encoded_source,table,ids,sink_names)?);
+            let before = &selected_table_rows[table];
+            let after = if self.relational_store.uses_disk_backed_committed_bodies() {
+                if report_requested && table == "work_jobs" {
+                    self.committed_rows_at(table, prepared_snapshot, read_memory.clone())?
+                        .into_iter()
+                        .filter(|row| !ids.contains(&row.row_id))
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                }
+            } else {
+                self.relational_store
+                    .tables
+                    .read()
+                    .get(table)
+                    .into_iter()
+                    .flatten()
+                    .filter(|row| !ids.contains(&row.row_id))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            let report = Self::prepare_authoritative_purge_survivor_report(
+                report_requested,
+                table,
+                ids,
+                before,
+                &after,
+                prepared_snapshot,
+            )?;
+            if report_shape == PurgeReportShape::PerTable {
+                survivor_report.rows.push(vec![
+                    Value::Text(table.clone()),
+                    Value::Int64(ids.len() as i64),
+                    Value::Json(
+                        serde_json::from_slice::<serde_json::Value>(&frame.canonical(&report.rows)?)
+                            .map_err(|e| Error::Other(e.to_string()))?,
+                    ),
+                ]);
+            } else if report_shape == PurgeReportShape::Single {
+                // A single-table selection preserves the established single-table report.
+                survivor_report = report;
+            }
+            let meta = self
+                .table_meta(table)
+                .ok_or_else(|| Error::TableNotFound(table.clone()))?;
+            let sources = source_sidecars
+                .iter()
+                .filter(|((name, _), _)| name == table)
+                .map(|((_, row_id), (lsn, kind))| {
+                    let kind = match *kind {
+                        0 => contextdb_relational::store::SyncSourceKind::Pulled,
+                        1 => contextdb_relational::store::SyncSourceKind::AcceptedLocal,
+                        2 => contextdb_relational::store::SyncSourceKind::AcceptedLocalPending,
+                        _ => unreachable!("closed source kind"),
+                    };
+                    (*row_id, *lsn, kind)
+                })
+                .collect::<Vec<_>>();
+            projections.push(RelationalStore::with_sync_sources(
+                RelationalStore::table_projection(table.clone(), meta, after.clone()),
+                sources,
+            ));
+            affected_rows.insert(
+                table.clone(),
+                if self.relational_store.uses_disk_backed_committed_bodies() {
+                    Vec::new()
+                } else {
+                    after
+                },
+            );
+        }
+        let mut relational = self
+            .relational_store
+            .prepare_received_schema_publication(projections, std::iter::empty::<String>());
+        relational.admit_current_memberships(crate::memory_accounting::persistence_original_projection(frame.original)?.read_budget()?)?;
+        let replacement_change_log = if self.persistence.is_some() {
+            Vec::new()
+        } else {
+            change_log
+                .into_iter()
+                .enumerate()
+                .filter_map(|(position, entry)| {
+                    (!selected_change_log_position_set.contains(&position)).then_some(entry)
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut replacement_change_log_table_index = ChangeLogTableIndex::new();
+        let mut replacement_change_log_lsn_refcounts = ChangeLogLsnRefcounts::new();
+        record_change_log_entries(
+            &mut replacement_change_log_table_index,
+            &mut replacement_change_log_lsn_refcounts,
+            &replacement_change_log,
+        );
+        let survivor_graph_entries = surviving_forward_entries;
+        let graph = GraphStore::prepare_received_schema_publication(
+            if self.graph_store.is_source_backed() {
+                Vec::new()
+            } else {
+                survivor_graph_entries.clone()
+            },
+        );
+        let vector_registry_entries = all_partitioned_vector_entries
+            .into_iter()
+            .filter(|entry| !selected(&entry.entry.index.table, &entry.entry.row_id))
+            .collect::<Vec<_>>();
+        for meta in self.relational_store.table_meta.read().values(){frame.record(meta)?;}
+        let all_table_meta = self.relational_store.table_meta.read().clone();
+        let vector_schemas = vector_layouts_from_meta(&all_table_meta);
+        let materialized_vector_partitions = self
+            .vector_store
+            .materialized_hnsw_partitions(vector_copy_owner)?
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let mut replacement_generation_plans = Vec::<(VectorPartitionRef, u64)>::new();
+        for partition in &affected_vector_partitions {
+            let has_live_survivor = vector_registry_entries.iter().any(|entry| {
+                entry.entry.index == partition.index
+                    && entry.partition_key == partition.partition_key
+                    && entry.entry.deleted_tx.is_none()
+            });
+            if !has_live_survivor {
+                continue;
+            }
+            let current = persistence.load_vector_partition_generation_catalog_for(
+                &partition.index,
+                &partition.partition_key,
+            )?;
+            if current.is_none() && !materialized_vector_partitions.contains(partition) {
+                // A partition that had no maintained route before purge stays
+                // unavailable; maintenance remains responsible for its first
+                // generation. Purge must replace every route that did exist.
+                continue;
+            }
+            let previous_generation = current
+                .as_ref()
+                .map(|catalog| {
+                    catalog
+                        .change
+                        .map(|change| change.generation_id)
+                        .unwrap_or(catalog.base.generation_id)
+                        .max(catalog.base.generation_id)
+                })
+                .unwrap_or(0);
+            let generation_id = previous_generation.checked_add(1).ok_or_else(|| {
+                Error::Other(format!(
+                    "vector generation identity exhausted for {}.{}",
+                    partition.index.table, partition.index.column
+                ))
+            })?;
+            replacement_generation_plans.push((partition.clone(), generation_id));
+        }
+        let replacement_generation_partitions = replacement_generation_plans
+            .iter()
+            .map(|(partition, _)| partition.clone())
+            .collect::<Vec<_>>();
+        let vector = self
+            .vector_store
+            .prepare_partitioned_authoritative_purge_publication(
+                vector_schemas.clone(),
+                vector_registry_entries.clone(),
+                affected_vector_partitions.clone(),
+                replacement_generation_partitions,
+                crate::memory_accounting::persistence_original_projection(frame.original)?.vector_budget()?,
+                vector_copy_owner,
+            )?;
+        let covered_tx = self.tx_mgr.current_tx_max();
+        let mut vector_generation_candidates =
+            Vec::with_capacity(replacement_generation_plans.len());
+        for (partition, generation_id) in replacement_generation_plans {
+            let layout = vector_schemas
+                .iter()
+                .find(|(index, _)| *index == partition.index)
+                .map(|(_, layout)| layout)
+                .ok_or_else(|| Error::UnknownVectorIndex {
+                    index: partition.index.clone(),
+                })?;
+            let live_count = vector_registry_entries
+                .iter()
+                .filter(|entry| {
+                    entry.entry.index == partition.index
+                        && entry.partition_key == partition.partition_key
+                        && entry.entry.deleted_tx.is_none()
+                })
+                .count();
+            let policy = layout.resolve_policy(live_count, 1);
+            let identity = VectorGraphGeneration {
+                generation_id,
+                covered_tx,
+                covered_lsn: frontier,
+                durable_bytes: 0,
+                policy_revision: policy.policy_revision,
+                hnsw_m: u32::try_from(policy.hnsw_m).map_err(|_| {
+                    Error::Other("resolved HNSW M exceeds the durable range".to_string())
+                })?,
+                hnsw_ef_construction: u32::try_from(policy.hnsw_ef_construction).map_err(|_| {
+                    Error::Other(
+                        "resolved HNSW EF_CONSTRUCTION exceeds the durable range".to_string(),
+                    )
+                })?,
+            };
+            let (encoded_graph, resident_bytes) =
+                vector.prepare_partition_base_generation(&partition, identity)?;
+            let durable_bytes = u64::try_from(encoded_graph.len()).map_err(|_| {
+                Error::Other("vector generation bytes exceed the durable range".to_string())
+            })?;
+            let resident_bytes = u64::try_from(resident_bytes).map_err(|_| {
+                Error::Other("vector generation residency exceeds the durable range".to_string())
+            })?;
+            let mut live_entries = vector_registry_entries
+                .iter()
+                .filter(|entry| {
+                    entry.entry.index == partition.index
+                        && entry.partition_key == partition.partition_key
+                        && entry.entry.deleted_tx.is_none()
+                })
+                .map(|entry| &entry.entry)
+                .collect::<Vec<_>>();
+            live_entries.sort_by_key(|entry| (entry.row_id, entry.created_tx, entry.lsn));
+            let state_bytes =
+                frame.encode(&live_entries).map_err(
+                    |error| {
+                        Error::Other(format!(
+                            "could not encode vector generation state digest: {error}"
+                        ))
+                    },
+                )?;
+            let descriptor = VectorPartitionGenerationDescriptor {
+                generation_id,
+                covered_tx,
+                covered_lsn: frontier,
+                resident_bytes,
+                durable_bytes,
+                policy_revision: policy.policy_revision,
+                hnsw_m: identity.hnsw_m,
+                hnsw_ef_construction: identity.hnsw_ef_construction,
+            };
+            let base = VectorPartitionBaseGenerationRecord {
+                index: partition.index.clone(),
+                partition_key: partition.partition_key.clone(),
+                generation_id,
+                base_tx: covered_tx,
+                base_lsn: frontier,
+                highest_included_tx: covered_tx,
+                highest_included_lsn: frontier,
+                dimension: u32::try_from(layout.dimension).map_err(|_| {
+                    Error::Other(
+                        "vector dimension exceeds the durable generation range".to_string(),
+                    )
+                })?,
+                quantization: layout.quantization,
+                algorithm_version: VECTOR_GRAPH_ALGORITHM_VERSION,
+                graph_format_version: VECTOR_GRAPH_FORMAT_VERSION,
+                graph: VectorPartitionGraphBytes::verified(encoded_graph),
+                state_digest: *blake3::hash(&state_bytes).as_bytes(),
+            };
+            let catalog = VectorPartitionGenerationCatalogRecord {
+                index: partition.index,
+                partition_key: partition.partition_key,
+                base: descriptor,
+                change: None,
+                published_tx: covered_tx,
+                published_lsn: frontier,
+            };
+            vector_generation_candidates.push(VectorPartitionGenerationCandidate {
+                base,
+                change: None,
+                catalog,
+            });
+        }
+        let old_tables = all_table_meta;
+        for rows in self.relational_store.tables.read().values(){for row in rows{frame.record(row)?;}}
+        let old_rows = self.relational_store.tables.read().clone();
+        let old_edges = self.collect_graph_versions(|_| true, read_memory.clone())?;
+        let mut replacement_rows = old_rows.clone();
+        replacement_rows.extend(affected_rows);
+        let old_bytes = self.received_schema_replacement_bytes(&old_tables, &old_rows, &old_edges);
+        let new_bytes = self.received_schema_replacement_bytes(
+            &old_tables,
+            &replacement_rows,
+            &survivor_graph_entries,
+        );
+        let memory_swap = PreparedMemorySwap::accounting(old_bytes, new_bytes, 0);
+        frame.map::<(String,Vec<u8>),String>(self.accepted_sync_row_authors.read().len())?;
+        for ((table,key),author) in self.accepted_sync_row_authors.read().iter(){frame.reserve(table.len()+key.len()+author.len())?;}
+        let mut accepted_author_memory_mirror = self.accepted_sync_row_authors.read().clone();
+        for owner in &lineage_config_owners {
+            accepted_author_memory_mirror.remove(&owner.accepted_author_memory_key);
+        }
+        let publication_replacements = OriginalPurgeNonEventPublication {
+            relational,
+            change_log: replacement_change_log,
+            change_log_table_index: replacement_change_log_table_index,
+            change_log_lsn_refcounts: replacement_change_log_lsn_refcounts,
+            graph,
+            vector,
+            accepted_author_memory_mirror,
+            graph_arrival_memory_mirror,
+            memory_swap,
+        };
+        Ok(OriginalPurgeNonEventPreparedSet {
+            row_version_keys: row_versions,
+            change_log_entries,
+            vector_entries,
+            vector_partition_identities,
+            vector_generation_candidates,
+            canonical_graph_entries,
+            disk_source_provenance,
+            lineage_config_owners,
+            durable_sink_entries,
+            graph_arrival_config_keys,
+            publication_replacements,
+            survivor_report,
+        })
+    }
+
+    fn original_discard_durable_sink_entries(&self,frame:&crate::persistence::OriginalPersistenceFrame<'_>,source:&crate::persistence::OwnedEncodedEventSource<'_>,table:&str,selected:&HashSet<RowId>,names:&BTreeSet<String>)->Result<Vec<AuthoritativePurgeSinkEntryKey>>{
+        let mut count=0usize;
+        for sink in names {source.visit(sink,|_,bytes|{let entry=RedbPersistence::decode_owned_event::<event_bus::SinkQueueEntry>(frame.original,bytes)?;if entry.value.event.table==table&&selected.contains(&entry.value.row_id){count=count.checked_add(1).ok_or_else(||Error::Other("discard sink entry count overflow".into()))?;}Ok(())})?;}
+        frame.array::<AuthoritativePurgeSinkEntryKey>(count)?;let mut entries=Vec::with_capacity(count);
+        for sink in names {source.visit(sink,|id,bytes|{let entry=RedbPersistence::decode_owned_event::<event_bus::SinkQueueEntry>(frame.original,bytes)?;if entry.value.event.table==table&&selected.contains(&entry.value.row_id){entries.push(AuthoritativePurgeSinkEntryKey{sink:frame.copy_text(sink)?,queue_id:id,row_id:entry.value.row_id,durable_bytes:Some(frame.copy_bytes(bytes)?)});}Ok(())})?;}
+        Ok(entries)
+    }
+
+}
+
+impl PreparedMemorySwap {
+    fn prepare_original(original:&crate::memory_accounting::OwnedMemoryReservation,old_bytes:usize,new_bytes:usize,retired_bytes_released_by_store:usize)->Result<Self>{
+        debug_assert!(retired_bytes_released_by_store<=old_bytes);
+        let continuing=old_bytes.saturating_sub(retired_bytes_released_by_store);
+        let delta=new_bytes.saturating_sub(continuing);
+        let writer=crate::memory_accounting::clone_persistence_original_writer(original)?;
+        let projection=crate::memory_accounting::persistence_original_projection(original)?;
+        projection.try_allocate_for_original(delta,"sync","prepare_received_schema_replacement",
+            "Reduce the replicated schema/data working set or raise MEMORY_LIMIT before receiving schema.")?;
+        Ok(Self {accountant:original.accountant().clone(),reserved_positive_delta:delta,release_after_swap:continuing.saturating_sub(new_bytes),staged_admissions:None,_writer_use:Some(writer)})
+    }
+}
+
+impl EngineDatabaseTransactions {
+    /// The original existing full host gate, with a concrete non-event discard
+    /// holder returned by preparation and exact peer identity forwarded before
+    /// any registration. No mutable WriteSet/root or raw host escapes.
+    fn commit_discard_terminal_scoped(
+        &self,tx:TxId,read_memory:Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        requires_commit:impl FnOnce()->Result<bool>,
+        active_prepare:impl FnOnce(&DatabaseCommitScope<'_,'_,'_>,Lsn,TxId)->PreparationResult<()>,
+        prepare:impl for<'g,'h,'p> FnOnce(&'g mut contextdb_tx::manager::EngineGuard<'h>,&'p mut OwnedTerminalMetadata,contextdb_tx::manager::EngineTerminalIdentity)->Result<Option<discard::OriginalDiscardStageHolder>>,
+        after_apply:impl for<'w> FnOnce(Lsn,&'w WriteSet),
+    )->std::result::Result<(Lsn,OwnedDatabaseTerminal),OwnedDatabaseTerminalFailure>{
+        let mut terminal=discard::OriginalDiscardTerminal::new();
+        let result=discard::with_original_discard_terminal(&mut terminal,||self.transactions.with_transactions(|lower| {
+            lower.commit_owned_active_prepare_and_applied_with_peer_scoped(tx,read_memory,requires_commit,
+                |scope,lsn,visibility_tx|active_prepare(&DatabaseCommitScope{host:self,lower:scope},lsn,visibility_tx),
+                |guard,peer:&mut OwnedTemporaryMetadata| {
+                    discard::bind_original_discard_identity(peer.identity)?;
+                    let holder=prepare(guard,&mut peer.original,peer.identity)?;
+                    if let Some(holder)=holder{discard::install_original_discard_stage(holder)?;}Ok(())
+                },after_apply,
+                |identity| {let terminal=self.metadata.validate_terminal(identity);let original_present=EngineMetadataJournal::record(&terminal.records,identity.original_tx).is_some();ValidatedTemporaryMetadata{terminal,original_present}},
+                consume_temporary_nonfallible)
+        }));
+        // Scope restoration precedes holder/registry/closure destruction on
+        // both error and unwind; exact cleanup cannot reenter a dead stack slot.
+        drop(terminal);
+        result.map(|(lsn,pair)|(lsn,pair.map_peer(unwrap_temporary_peer)))
+            .map_err(|failure|failure.map_peer(unwrap_temporary_peer))
+    }
+}
+
+#[cfg(feature = "sync-orchestration")]
+impl Database {
+    /// Read a committed incarnation with the SAME begin_request identity.
+    /// The delivery caller must call this independently before fetch/cursor
+    /// validation and again for its response, as its Legacy handler does.
+    pub(crate) fn existing_sync_incarnation_native(
+        &self,
+        tenant: &TenantId,
+        operation: &crate::owner_read::NativeReadRequest,
+        context: &crate::executor::bounded::NativeReadOpenContext,
+    ) -> std::result::Result<Option<Incarnation>, crate::persistence::writer_source::NativeConfigFailure> {
+        use crate::persistence::writer_source::NativeConfigFailure;
+        use crate::persistence::native_storage_admission::NativeStorageFailure;
+        let _operation = self.open_operation()
+            .map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?;
+        context.checkpoint().map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?;
+        if !operation.owner().same_owner(&context.owner().map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?) {
+            return Err(NativeConfigFailure::OwnerMismatch);
+        }
+        if let Some(incarnation) = self.sync_incarnations.lock().get(tenant.as_str()).copied() {
+            return Ok(Some(incarnation));
+        }
+        if self.persistence.is_none() {
+            return Ok(None);
+        }
+        self.read_native_committed_config_text("sync_incarnation", tenant, operation, context)?
+            .map(|window| window.incarnation()).transpose()
+    }
+}

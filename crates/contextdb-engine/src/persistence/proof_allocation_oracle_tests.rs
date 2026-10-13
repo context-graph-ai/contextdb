@@ -32,7 +32,9 @@ thread_local! {
     static WATCH_PAYLOAD_ACCOUNTANT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static PAYLOAD_FREE_CENSUS: std::cell::Cell<(usize, usize, usize, usize)> = const { std::cell::Cell::new((0, 0, 0, 0)) };
     static LAST_REQUEST_POINTER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static NATIVE_REQUESTS: std::cell::Cell<[(usize, usize, usize); 3]> = const { std::cell::Cell::new([(0, 0, 0); 3]) };
+    static NATIVE_REQUESTS: std::cell::Cell<[(usize, usize, usize); 32]> = const { std::cell::Cell::new([(0, 0, 0); 32]) };
+    static SOURCE_REQUEST_COUNTER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SOURCE_REQUEST_CREDIT: std::cell::Cell<[usize; 32]> = const { std::cell::Cell::new([0; 32]) };
     static NATIVE_REQUEST_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static NATIVE_REQUEST_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -59,11 +61,40 @@ impl NativeFreeWatch {
         }
     }
 }
-static NATIVE_FREE: [NativeFreeWatch; 3] = [
-    NativeFreeWatch::new(),
-    NativeFreeWatch::new(),
-    NativeFreeWatch::new(),
-];
+static NATIVE_FREE: [NativeFreeWatch; 32] = [const { NativeFreeWatch::new() }; 32];
+
+// Extend the mapped oracle's fixed storage; no allocating observation ledger.
+pub(crate) fn source_requests_for_test<T>(counter: usize, operation: impl FnOnce() -> T)
+    -> (T, [(usize, usize, usize); 32], usize) {
+    struct Guard;
+    impl Drop for Guard { fn drop(&mut self) { SOURCE_REQUEST_COUNTER.with(|c| c.set(0)); } }
+    SOURCE_REQUEST_CREDIT.with(|credits| credits.set([0;32]));
+    SOURCE_REQUEST_COUNTER.with(|c| c.set(counter));
+    let guard=Guard;
+    let (value, _, count) = native_requests_for_test(operation);
+    drop(guard);
+    (value, NATIVE_REQUESTS.with(std::cell::Cell::get), count)
+}
+pub(crate) fn source_request_credit_for_test() -> [usize;32] { SOURCE_REQUEST_CREDIT.with(std::cell::Cell::get) }
+pub(crate) fn watch_source_free_for_test(requests: &[(usize, usize, usize)], counter: usize) {
+    for watch in &NATIVE_FREE { watch.pointer.store(0, AtomicOrdering::SeqCst); }
+    for (request, watch) in requests.iter().zip(&NATIVE_FREE) {
+        assert_ne!(request.0, 0);
+        let header = unsafe { (request.0 as *const u8).sub(std::mem::size_of::<Header>()).cast::<Header>().read() };
+        assert_ne!(header.window, 0);
+        watch.window.store(header.window, AtomicOrdering::SeqCst);
+        watch.before.store(0, AtomicOrdering::SeqCst);
+        watch.after.store(0, AtomicOrdering::SeqCst);
+        watch.count.store(0, AtomicOrdering::SeqCst);
+        watch.counter.store(counter, AtomicOrdering::SeqCst);
+        watch.pointer.store(request.0, AtomicOrdering::SeqCst);
+    }
+}
+pub(crate) fn source_free_for_test(count: usize) -> [(usize, usize, usize); 32] {
+    assert!(count <= NATIVE_FREE.len());
+    std::array::from_fn(|index| { let w=&NATIVE_FREE[index];
+        (w.before.load(AtomicOrdering::SeqCst), w.after.load(AtomicOrdering::SeqCst), w.count.load(AtomicOrdering::SeqCst)) })
+}
 
 pub(crate) fn native_requests_for_test<T>(
     operation: impl FnOnce() -> T,
@@ -74,7 +105,7 @@ pub(crate) fn native_requests_for_test<T>(
             NATIVE_REQUEST_ACTIVE.with(|active| active.set(false));
         }
     }
-    NATIVE_REQUESTS.with(|requests| requests.set([(0, 0, 0); 3]));
+    NATIVE_REQUESTS.with(|requests| requests.set([(0, 0, 0); 32]));
     NATIVE_REQUEST_COUNT.with(|count| count.set(0));
     NATIVE_REQUEST_ACTIVE.with(|active| active.set(true));
     let guard = Guard;
@@ -82,13 +113,13 @@ pub(crate) fn native_requests_for_test<T>(
     drop(guard);
     (
         value,
-        NATIVE_REQUESTS.with(std::cell::Cell::get),
+        NATIVE_REQUESTS.with(|requests| requests.get()[..3].try_into().unwrap()),
         NATIVE_REQUEST_COUNT.with(std::cell::Cell::get),
     )
 }
 
 pub(crate) fn watch_native_free_for_test(requests: [(usize, usize, usize); 3], counter: usize) {
-    for (index, watch) in NATIVE_FREE.iter().enumerate() {
+    for (index, watch) in NATIVE_FREE.iter().take(3).enumerate() {
         // This is our oracle's own header, read while the allocation is live.
         // Pair address with its unique window so address reuse on a contender
         // thread cannot manufacture an extra free for a previous owner.
@@ -155,6 +186,15 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
             return std::ptr::null_mut();
         }
         let (allocation, offset) = allocation_layout(layout);
+        let source_counter=SOURCE_REQUEST_COUNTER.try_with(std::cell::Cell::get).unwrap_or(0);
+        if source_counter!=0 {
+            let index=NATIVE_REQUEST_COUNT.with(std::cell::Cell::get);
+            if index<32 { SOURCE_REQUEST_CREDIT.with(|credits| {
+                let mut entries=credits.get();
+                entries[index]=unsafe { &*(source_counter as *const AtomicUsize) }.load(AtomicOrdering::SeqCst);
+                credits.set(entries);
+            }); }
+        }
         let base = unsafe { System.alloc(allocation) };
         if base.is_null() {
             return base;
@@ -167,7 +207,7 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
         {
             NATIVE_REQUEST_COUNT.with(|count| {
                 let index = count.get();
-                if index < 3 {
+                if index < 32 {
                     NATIVE_REQUESTS.with(|requests| {
                         let mut entries = requests.get();
                         entries[index] = (pointer as usize, layout.size(), layout.align());
@@ -1741,4 +1781,28 @@ fn maintenance_owner_refund(owner: usize, spy: &MaintenanceReaderSpy) {
         spy.early_payload_refunds
             .fetch_add(live, AtomicOrdering::SeqCst);
     });
+}
+
+// Manager-authorized declaration: complete general frames and actual native
+// original/caller invoices cannot be represented by the adapter-layout row.
+#[test]
+#[serial]
+fn general_checkpoint_preserves_original_native_ownership() {
+    crate::memory_accounting::general_checkpoint_native_rows();
+}
+
+pub(crate) fn disarm_source_free_watch() {
+    for watch in &NATIVE_FREE {
+        watch.pointer.store(0, AtomicOrdering::SeqCst);
+        watch.counter.store(0, AtomicOrdering::SeqCst);
+    }
+}
+
+pub(crate) fn arm_inverse_window() {
+    NATIVE_REQUEST_COUNT.with(|count| count.set(0));
+    NATIVE_REQUEST_ACTIVE.with(|active| { assert!(!active.get()); active.set(true); });
+}
+pub(crate) fn disarm_inverse_window() -> usize {
+    NATIVE_REQUEST_ACTIVE.with(|active| active.set(false));
+    NATIVE_REQUEST_COUNT.with(std::cell::Cell::get)
 }

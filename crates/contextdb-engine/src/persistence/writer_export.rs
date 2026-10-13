@@ -85,13 +85,16 @@ impl RedbPersistence {
     fn append_encoded_config_occurrence(&self, key: &str, encoded: &[u8]) -> Result<()> {
         self.prepare_proof_owner()?;
         let mut admission = self.proof_admission();
+        let group_plan_bytes = custody_groups::plan_bytes(key, encoded)?;
         admission.admit(
             encoded
                 .len()
                 .saturating_mul(64)
                 .saturating_add(key.len().saturating_mul(8))
-                .saturating_add(4096),
+                .saturating_add(4096)
+                .saturating_add(group_plan_bytes),
         )?;
+        let group_plan = custody_groups::GroupPlan::single_prepaid(key, encoded)?;
         self.with_db(|db| {
             let write = Self::begin_history_write(db)?;
             Self::raise_config_identity_floors_in_write(&write, key, encoded)?;
@@ -102,7 +105,7 @@ impl RedbPersistence {
                 .insert(key, encoded)
                 .map_err(Self::storage_error)?;
             let mutations = content_identity::config_mutations(key, Some(encoded));
-            Self::apply_content_identity_mutations_in_write(&write, &mutations, &mut admission)?;
+            Self::apply_content_identity_with_manifests_and_groups_in_write(&write, &mutations, &[], &mut admission, Some(&group_plan))?;
             Self::write_writer_recovery_bounds_in_write(&write, None)?;
             write.commit().map_err(Self::storage_error)
         })

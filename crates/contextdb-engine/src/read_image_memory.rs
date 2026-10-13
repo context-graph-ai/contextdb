@@ -1399,3 +1399,123 @@ impl RowReadAdmission<'_> {
         }
     }
 }
+
+// Native delivery decoding has no Arc<ImageMemory> bridge or thread-local scope.
+// Each payload owns its exact allocation invoice; this paid control holds only
+// the original owner and the execution entry's weak checkpoint link.
+#[cfg(feature = "sync-orchestration")]
+pub(crate) struct NativeDeliveryImage {
+    owner: contextdb_core::read_memory::ReadMemoryOwner,
+    context: crate::executor::bounded::NativeReadOpenContext,
+}
+#[cfg(feature = "sync-orchestration")]
+impl NativeDeliveryImage {
+    pub(crate) fn try_new(
+        context: crate::executor::bounded::NativeReadOpenContext,
+    ) -> Result<contextdb_core::read_memory::ReadShared<Self>> {
+        use contextdb_core::read_memory::{ReadCredit, ReadShared};
+        let owner = context.owner()?;
+        let invoice = ReadCredit::try_new_owned(
+            owner.clone(), ReadShared::<Self>::layout().size(), "reader",
+            "decode_sync_owner", "Reduce simultaneous requests or raise the declared reader memory limit.",
+        )?;
+        ReadShared::try_from_prepaid_with(invoice, || Ok(Self { owner, context }))
+    }
+    pub(crate) fn checkpoint(&self) -> Result<()> { self.context.checkpoint() }
+    pub(crate) fn allocate(&self, length: usize) -> std::result::Result<NativeDeliveryBytes, NativeDeliveryAllocationError> {
+        use contextdb_core::read_memory::ReadCredit;
+        self.checkpoint()?;
+        let layout = std::alloc::Layout::array::<u8>(length)
+            .map_err(|_| NativeDeliveryAllocationError::Layout)?;
+        let invoice = ReadCredit::try_new_owned(
+            self.owner.clone(), layout.size(), "reader", "decode_sync_bytes",
+            "Reduce the request or raise the declared reader memory limit.",
+        )?;
+        let bytes = if length == 0 { Vec::new() } else {
+            // SAFETY: the exact u8 layout is prepaid. A null allocation is a
+            // fallible result. Every byte is initialized before Vec takes it;
+            // this buffer is never grown, shrunk or reallocated.
+            let storage = unsafe { std::alloc::alloc(layout) };
+            let Some(storage) = std::ptr::NonNull::new(storage) else {
+                return Err(NativeDeliveryAllocationError::Allocation);
+            };
+            unsafe {
+                std::ptr::write_bytes(storage.as_ptr(), 0, length);
+                Vec::from_raw_parts(storage.as_ptr(), length, length)
+            }
+        };
+        Ok(NativeDeliveryBytes { bytes, invoice })
+    }
+    pub(crate) fn owns(&self, bytes: &NativeDeliveryBytes) -> bool {
+        bytes.invoice.is_funded_by(&self.owner)
+    }
+}
+#[cfg(feature = "sync-orchestration")]
+pub(crate) struct NativeDeliveryBytes {
+    // The physical buffer is freed before its invoice settles, including
+    // partially filled or rejected decodes. No Vec or invoice escapes alone.
+    bytes: Vec<u8>,
+    invoice: contextdb_core::read_memory::ReadCredit,
+}
+#[cfg(feature = "sync-orchestration")]
+impl NativeDeliveryBytes {
+    pub(crate) fn as_slice(&self) -> &[u8] { &self.bytes }
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] { &mut self.bytes }
+}
+
+#[cfg(feature = "sync-orchestration")]
+pub(crate) enum NativeDeliveryAllocationError {
+    Resource(Error),
+    Layout,
+    Allocation,
+}
+#[cfg(feature = "sync-orchestration")]
+impl From<Error> for NativeDeliveryAllocationError {
+    fn from(error: Error) -> Self { Self::Resource(error) }
+}
+
+/// Fixed native selection storage, paid by the concrete existing request owner.
+/// This sibling owns only the physical slots; each selected record's nested
+/// strings/buffers must arrive with its own producer credit. No outer-frame
+/// certification, Arc budget adapter or implicit owner acquisition exists.
+#[cfg(feature = "sync-orchestration")]
+pub(crate) struct NativeSelectionHold<T> {
+    values: Vec<T>,
+    invoice: contextdb_core::read_memory::ReadCredit,
+    slots: usize,
+}
+#[cfg(feature = "sync-orchestration")]
+impl<T> NativeSelectionHold<T> {
+    pub(crate) fn try_new(
+        owner: &contextdb_core::read_memory::ReadMemoryOwner,
+        slots: usize,
+    ) -> std::result::Result<Self, NativeDeliveryAllocationError> {
+        let layout = std::alloc::Layout::array::<T>(slots).map_err(|_| NativeDeliveryAllocationError::Layout)?;
+        let invoice = contextdb_core::read_memory::ReadCredit::try_new_owned(
+            owner.clone(), layout.size(), "reader", "retain_custody_selection",
+            "Reduce custody metadata selected by this operation.",
+        )?;
+        let values = if layout.size() == 0 { Vec::new() } else {
+            // SAFETY: exact prepaid T-array storage. Vec owns capacity only;
+            // the initialized prefix starts empty and grows without allocation.
+            let storage = unsafe { std::alloc::alloc(layout) };
+            let Some(storage) = std::ptr::NonNull::new(storage.cast::<T>()) else {
+                return Err(NativeDeliveryAllocationError::Allocation);
+            };
+            unsafe { Vec::from_raw_parts(storage.as_ptr(), 0, slots) }
+        };
+        Ok(Self { values, invoice, slots })
+    }
+    pub(crate) fn retain(&mut self, value: T) -> std::result::Result<(), T> {
+        if self.values.len() == self.slots { return Err(value); }
+        // For nonzero T the exact fixed capacity was allocated above. For a
+        // zero-sized T push cannot allocate and slots still bounds its count.
+        self.values.push(value);
+        Ok(())
+    }
+    pub(crate) fn as_slice(&self) -> &[T] { &self.values }
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [T] { &mut self.values }
+    pub(crate) fn is_funded_by(&self, owner: &contextdb_core::read_memory::ReadMemoryOwner) -> bool {
+        self.invoice.is_funded_by(owner)
+    }
+}

@@ -919,6 +919,66 @@ pub struct WriteTransaction {
     table_root_hook_error: Mutex<Option<StorageError>>,
 }
 
+/// Caller-owned observation of one actual write's publication interval.
+/// Construct with `WriteTransaction::durable_publication` and retain across
+/// the consuming `commit_publishing` call, including Err and unwind.
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub struct DurablePublication {
+    // Retain identity: a dropped database's address cannot be recycled while
+    // this marker is alive. Cloning this existing Arc allocates nothing.
+    mem: Arc<TransactionalMemory>,
+    transaction_id: TransactionId,
+    state: std::sync::atomic::AtomicU8,
+}
+
+#[cfg(feature = "contextdb-internal")]
+impl DurablePublication {
+    const UNSTARTED: u8 = 0;
+    const HEADER_BEGUN: u8 = 1;
+    const DURABLE: u8 = 2;
+
+    #[doc(hidden)]
+    pub fn is_unstarted(&self) -> bool {
+        self.state.load(Ordering::Acquire) == Self::UNSTARTED
+    }
+
+    #[doc(hidden)]
+    pub fn is_header_begun(&self) -> bool {
+        self.state.load(Ordering::Acquire) == Self::HEADER_BEGUN
+    }
+
+    #[doc(hidden)]
+    pub fn is_durable(&self) -> bool {
+        self.state.load(Ordering::Acquire) == Self::DURABLE
+    }
+
+    pub(crate) fn validate(
+        &self,
+        mem: &TransactionalMemory,
+        transaction_id: TransactionId,
+    ) -> Result {
+        if !std::ptr::eq(self.mem.as_ref(), mem)
+            || self.transaction_id != transaction_id
+            || !self.is_unstarted()
+        {
+            return Err(StorageError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "durable publication marker does not identify this unstarted write",
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn header_begun(&self) {
+        self.state.store(Self::HEADER_BEGUN, Ordering::Release);
+    }
+
+    pub(crate) fn durable(&self) {
+        self.state.store(Self::DURABLE, Ordering::Release);
+    }
+}
+
 impl WriteTransaction {
     pub(crate) fn new(
         guard: TransactionGuard,
@@ -1762,6 +1822,32 @@ impl WriteTransaction {
         self.commit_inner()
     }
 
+    /// Bind a stack marker to this database instance and actual write id.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn durable_publication(&self) -> DurablePublication {
+        DurablePublication {
+            mem: Arc::clone(&self.mem),
+            transaction_id: self.transaction_id,
+            state: std::sync::atomic::AtomicU8::new(DurablePublication::UNSTARTED),
+        }
+    }
+
+    /// Commit while exposing the exact lower durable-publication point.
+    /// A HeaderBegun error retains its original storage error; Durable on Err
+    /// or unwind must be settled by the caller without rollback or rewind.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn commit_publishing(mut self, marker: &DurablePublication) -> Result<(), CommitError> {
+        marker.validate(&self.mem, self.transaction_id)?;
+        if let Some(error) = self.table_root_hook_error.lock().unwrap().take() {
+            return Err(error.into());
+        }
+        // Match consuming commit: no abort of possibly published pages on drop.
+        self.completed = true;
+        self.commit_inner_publishing(marker)
+    }
+
     fn commit_inner(&mut self) -> Result<(), CommitError> {
         // Quick-repair requires 2-phase commit
         if self.quick_repair {
@@ -1816,6 +1902,99 @@ impl WriteTransaction {
         match self.durability {
             InternalDurability::None => self.non_durable_commit(user_root)?,
             InternalDurability::Immediate => self.durable_commit(user_root)?,
+        }
+
+        #[cfg(feature = "test-seams")]
+        crate::commit_work::set_tag(restore_tag);
+
+        self.savepoint_state
+            .lock()
+            .unwrap()
+            .apply_on_commit(&self.transaction_tracker);
+
+        assert!(
+            self.system_tables
+                .lock()
+                .unwrap()
+                .system_freed_pages()
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            self.tables
+                .lock()
+                .unwrap()
+                .freed_pages
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+
+        #[cfg(feature = "logging")]
+        debug!(
+            "Finished commit of transaction id={:?}",
+            self.transaction_id
+        );
+
+        Ok(())
+    }
+
+    #[cfg(feature = "contextdb-internal")]
+    fn commit_inner_publishing(&mut self, marker: &DurablePublication) -> Result<(), CommitError> {
+        // Quick-repair requires 2-phase commit
+        if self.quick_repair {
+            self.two_phase_commit = true;
+        }
+
+        #[cfg(feature = "test-seams")]
+        let mut span_started = std::time::Instant::now();
+        let (user_root, allocated_pages, data_freed) =
+            self.tables.lock().unwrap().table_tree.flush_and_close()?;
+        #[cfg(feature = "test-seams")]
+        {
+            crate::commit_work::observe_commit_span_count();
+            crate::commit_work::observe_commit_span(
+                crate::commit_work::CommitSpan::FlushAndClose,
+                u64::try_from(span_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            );
+            span_started = std::time::Instant::now();
+        }
+
+        let allocated_pages: Vec<_> = allocated_pages.into_iter().collect();
+        // Everything from here to the end of the commit is the commit's own
+        // system-table bookkeeping, and the pages it copies belong to the next
+        // commit's freed list rather than to the one just taken.
+        #[cfg(feature = "test-seams")]
+        let restore_tag = {
+            crate::commit_work::observe_commit(data_freed.len(), allocated_pages.len());
+            crate::commit_work::set_tag(crate::commit_work::TAG_COMMIT_BOOKKEEPING)
+        };
+        if self.transaction_tracker.keep_pace_reclaim {
+            // Reclaim at least as much as this commit frees, so an active writer's backlog does not
+            // grow while eligible older work exists. Explicit budgets above this stay in force.
+            let own = data_freed.len();
+            self.deferred_free_budget = (
+                self.deferred_free_budget.0.max(own),
+                self.deferred_free_budget.1.max(own),
+            );
+        }
+        self.store_data_freed_pages(data_freed)?;
+        self.store_allocated_pages(allocated_pages)?;
+        #[cfg(feature = "test-seams")]
+        crate::commit_work::observe_commit_span(
+            crate::commit_work::CommitSpan::StorePageLists,
+            u64::try_from(span_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        );
+
+        #[cfg(feature = "logging")]
+        debug!(
+            "Committing transaction id={:?} with durability={:?} two_phase={} quick_repair={}",
+            self.transaction_id, self.durability, self.two_phase_commit, self.quick_repair
+        );
+        match self.durability {
+            InternalDurability::None => self.non_durable_commit(user_root)?,
+            InternalDurability::Immediate => self.durable_commit_publishing(user_root, marker)?,
         }
 
         #[cfg(feature = "test-seams")]
@@ -2054,6 +2233,123 @@ impl WriteTransaction {
             self.transaction_id,
             self.two_phase_commit,
             self.shrink_policy,
+        )?;
+        #[cfg(feature = "test-seams")]
+        crate::commit_work::observe_commit_span(
+            crate::commit_work::CommitSpan::StorageCommit,
+            u64::try_from(span_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        );
+
+        // Mark any pending non-durable commits as fully committed.
+        self.transaction_tracker.clear_pending_non_durable_commits();
+
+        // Immediately free the pages that were freed from the system-tree. These are only
+        // accessed by write transactions, so it's safe to free them as soon as the commit is done.
+        for page in system_freed_pages.lock().unwrap().drain(..) {
+            self.mem.free(page, &mut PageTrackerPolicy::Ignore);
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "contextdb-internal")]
+    fn durable_commit_publishing(
+        &mut self,
+        user_root: Option<BtreeHeader>,
+        marker: &DurablePublication,
+    ) -> Result {
+        #[cfg(feature = "test-seams")]
+        let mut span_started = std::time::Instant::now();
+        let mut free_until_transaction = self
+            .transaction_tracker
+            .oldest_live_read_transaction()
+            .map_or(self.transaction_id, |x| x.next());
+        if let Some(ceiling) = self.reclaim_ceiling {
+            free_until_transaction = TransactionId::min(free_until_transaction, ceiling);
+        }
+        self.process_freed_pages(free_until_transaction)?;
+        #[cfg(feature = "test-seams")]
+        {
+            crate::commit_work::observe_commit_span(
+                crate::commit_work::CommitSpan::ProcessFreedPages,
+                u64::try_from(span_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            );
+            span_started = std::time::Instant::now();
+        }
+
+        let mut system_tables = self.system_tables.lock().unwrap();
+        let system_freed_pages = system_tables.system_freed_pages();
+        let system_tree = system_tables.table_tree.flush_table_root_updates()?;
+        let retire_saved_allocator = if self.quick_repair {
+            self.mem.materialize_allocator_source()?;
+            true
+        } else {
+            self.mem.materialize_small_allocator_source()?
+        };
+        if retire_saved_allocator {
+            system_tree
+                .delete_table(ALLOCATOR_STATE_TABLE_NAME, TableType::Normal)
+                .map_err(|e| e.into_storage_error_or_corrupted("Unexpected TableError"))?;
+        }
+
+        if self.quick_repair {
+            system_tree.create_table_and_flush_table_root(
+                ALLOCATOR_STATE_TABLE_NAME,
+                |system_tree_ref, tree: &mut AllocatorStateTreeMut| {
+                    let mut pagination_counter = 0;
+
+                    loop {
+                        let num_regions = self
+                            .mem
+                            .reserve_allocator_state(tree, self.transaction_id)?;
+
+                        // We can't free pages after the commit, because that would invalidate our
+                        // saved allocator state. Everything needs to go through the transactional
+                        // free mechanism
+                        self.store_system_freed_pages(
+                            system_tree_ref,
+                            system_freed_pages.clone(),
+                            None,
+                            &mut pagination_counter,
+                        )?;
+
+                        if self.mem.try_save_allocator_state(tree, num_regions)? {
+                            return Ok(());
+                        }
+
+                        // Clear out the table before retrying, just in case the number of regions
+                        // has somehow shrunk. Don't use retain_in() for this, since it doesn't
+                        // free the pages immediately -- we need to reuse those pages to guarantee
+                        // that our retry loop will eventually terminate
+                        while let Some(guards) = tree.last()? {
+                            let key = guards.0.value();
+                            drop(guards);
+                            tree.remove(&key)?;
+                        }
+                    }
+                },
+            )?;
+        }
+
+        let system_root = system_tree.finalize_dirty_checksums()?;
+        #[cfg(feature = "test-seams")]
+        {
+            crate::commit_work::observe_commit_span(
+                crate::commit_work::CommitSpan::SystemTree,
+                u64::try_from(span_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            );
+            span_started = std::time::Instant::now();
+        }
+
+        #[cfg(all(feature = "test-seams", unix))]
+        self.pause_reclaim_step_before_durable_publication_from_env()?;
+        self.mem.commit_publishing(
+            user_root,
+            system_root,
+            self.transaction_id,
+            self.two_phase_commit,
+            self.shrink_policy,
+            marker,
         )?;
         #[cfg(feature = "test-seams")]
         crate::commit_work::observe_commit_span(
@@ -4062,5 +4358,56 @@ mod bounded_reclamation_tests {
                 .value(),
             &[16; 8192]
         );
+    }
+}
+
+#[cfg(feature = "contextdb-internal")]
+impl ReadTransaction {
+    /// Internal exact lookup over THIS transaction's captured directory.
+    /// Native qualification is restricted to clean misses; legacy cache cells
+    /// are refused rather than retroactively assigned native receipt ownership.
+    #[doc(hidden)]
+    pub fn get_native_byte_value(
+        &self, physical_name: &str, key: &[u8],
+    ) -> std::result::Result<Option<AccessGuard<'static, &'static [u8]>>, crate::NativeColdReadError> {
+        self.tree.get_native_byte_value(physical_name, key)
+    }
+}
+
+#[cfg(feature = "contextdb-internal")]
+impl ReadTransaction {
+    /// Dependency-internal text-key sibling over THIS captured directory.
+    /// Existing byte lookup and all ordinary/public table APIs are unchanged.
+    #[doc(hidden)]
+    pub fn get_native_text_value(
+        &self, physical_name: &str, key: &str,
+    ) -> std::result::Result<Option<AccessGuard<'static, &'static [u8]>>, crate::NativeColdReadError> {
+        self.tree.get_native_text_value(physical_name, key)
+    }
+}
+
+#[cfg(feature = "contextdb-internal")]
+impl ReadTransaction {
+    /// Hidden text-key/byte-value range sibling over THIS captured transaction.
+    /// Returns the first key >= lower (or > lower), strictly below upper.
+    /// Raw endpoint bytes support a non-UTF-8 exclusive prefix successor.
+    #[doc(hidden)]
+    pub fn next_native_text_range(
+        &self, physical_name: &str, lower: &[u8], exclusive: bool, upper: Option<&[u8]>,
+        before_page: &mut dyn FnMut() -> std::result::Result<(), crate::NativeColdReadError>,
+    ) -> std::result::Result<Option<(AccessGuard<'static, &'static [u8]>, AccessGuard<'static, &'static [u8]>)>, crate::NativeColdReadError> {
+        self.tree.next_native_text_range(physical_name, lower, exclusive, upper, before_page)
+    }
+}
+
+#[cfg(feature = "contextdb-internal")]
+impl ReadTransaction {
+    /// Internal byte-key range over this captured transaction; exact raw bounds.
+    #[doc(hidden)]
+    pub fn next_native_byte_range(
+        &self, physical_name: &str, lower: &[u8], exclusive: bool, upper: Option<&[u8]>,
+        before_page: &mut dyn FnMut() -> std::result::Result<(), crate::NativeColdReadError>,
+    ) -> std::result::Result<Option<(AccessGuard<'static, &'static [u8]>, AccessGuard<'static, &'static [u8]>)>, crate::NativeColdReadError> {
+        self.tree.next_native_byte_range(physical_name, lower, exclusive, upper, before_page)
     }
 }

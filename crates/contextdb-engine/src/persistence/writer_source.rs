@@ -38,6 +38,7 @@ pub(crate) fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
 pub(crate) struct WriterSnapshot {
     pub(super) read: parking_lot::RwLock<Option<Arc<redb::ReadTransaction>>>,
     identity: redb::StorageSnapshotIdentity,
+    custody_groups_complete: bool,
     pub(crate) snapshot: SnapshotId,
     pub(crate) lsn: Lsn,
     accountant: crate::memory_accounting::AccountantHandle,
@@ -154,7 +155,7 @@ impl RedbPersistence {
     /// operator once declared a limit below this floor, with no way back in
     /// to raise it. The limit sees the bytes, and the ordinary typed refusal
     /// fires on the next admission (the same rule as the writer page cache).
-    fn prepared_writer_schema(&self) -> Result<Arc<WriterSchema>> {
+    pub(super) fn prepared_writer_schema(&self) -> Result<Arc<WriterSchema>> {
         if let Some(schema) = self.writer_schema.lock().as_ref().cloned() {
             return Ok(schema);
         }
@@ -437,9 +438,18 @@ impl RedbPersistence {
             db.install_local_snapshot_provider(self.writer_root_provider());
             let read = Arc::new(db.begin_verified_read().map_err(Self::storage_error)?);
             let identity = read.storage_snapshot_identity();
+            // The scalar fact is captured from this exact immutable root during
+            // publication, never inferred from a newer writer or resident image.
+            let custody_groups_complete = match read.open_table(super::custody_groups::GROUP_TABLE) {
+                Ok(table) => table.get(super::custody_groups::COMPLETE).map_err(Self::storage_error)?
+                    .is_some_and(|v| v.value() == super::custody_groups::COMPLETE_VALUE),
+                Err(redb::TableError::TableDoesNotExist(_)) => false,
+                Err(error) => return Err(Self::storage_error(error)),
+            };
             let root = Arc::new(WriterSnapshot {
                 read: parking_lot::RwLock::new(Some(read)),
                 identity,
+                custody_groups_complete,
                 snapshot,
                 lsn,
                 accountant,
@@ -2819,3 +2829,395 @@ pub(crate) fn r1_schema_control_rows_for_test() {
 
 #[cfg(test)]
 use crate::memory_accounting::MemoryAccountant;
+
+// Private cold companions deliberately do not certify the existing window
+// APIs: lower storage admission and publication markers remain prerequisites.
+#[path = "cold_provider.rs"]
+#[allow(dead_code)] // Staged cold provider is inactive until its integration prerequisites land.
+pub(crate) mod cold_provider;
+
+/// Closed committed-config decoder errors own no diagnostic allocation.
+/// Storage/cache/backend/bootstrap failures remain explicitly unqualified.
+#[cfg(feature = "sync-orchestration")]
+#[derive(Debug)]
+pub(crate) enum NativeConfigFailure {
+    Storage(super::native_storage_admission::NativeStorageFailure),
+    ColdUnqualified(redb::NativeColdReadError),
+    InvalidStoredText,
+    InvalidIncarnation,
+    InvalidCanonicalIndex,
+    OwnerMismatch,
+}
+#[cfg(feature = "sync-orchestration")]
+impl From<super::native_storage_admission::NativeStorageFailure> for NativeConfigFailure {
+    fn from(error: super::native_storage_admission::NativeStorageFailure) -> Self { Self::Storage(error) }
+}
+
+/// Fixed physical byte allocation followed by its original child's invoice.
+#[cfg(feature = "sync-orchestration")]
+pub(crate) struct NativeConfigBytes {
+    bytes: Vec<u8>,
+    _invoice: contextdb_core::read_memory::ReadCredit,
+}
+#[cfg(feature = "sync-orchestration")]
+impl NativeConfigBytes {
+    fn join(
+        owner: &contextdb_core::read_memory::ReadMemoryOwner,
+        parts: &[&[u8]],
+    ) -> std::result::Result<Self, NativeConfigFailure> {
+        use contextdb_core::read_memory::{NativeRefusal, ReadCredit};
+        use super::native_storage_admission::NativeStorageFailure;
+        let refuse = |message| NativeConfigFailure::Storage(NativeStorageFailure::Refused(NativeRefusal::Other(message)));
+        let length = parts.iter().try_fold(0usize, |n, p| n.checked_add(p.len()))
+            .ok_or_else(|| refuse("native config byte length overflow"))?;
+        let layout = std::alloc::Layout::array::<u8>(length)
+            .map_err(|_| refuse("native config byte layout overflow"))?;
+        let invoice = ReadCredit::try_new_owned_native(
+            owner.clone(), layout.size(), "writer_source", "config_bytes", HINT,
+        ).map_err(|r| NativeConfigFailure::Storage(NativeStorageFailure::Refused(r)))?;
+        let bytes = if length == 0 { Vec::new() } else {
+            let pointer = std::ptr::NonNull::new(unsafe { std::alloc::alloc(layout) })
+                .ok_or_else(|| refuse("native config byte allocation failed"))?;
+            let mut offset = 0;
+            for part in parts {
+                // Exact prepaid u8 layout; all bytes initialized, no growth.
+                unsafe { std::ptr::copy_nonoverlapping(part.as_ptr(), pointer.as_ptr().add(offset), part.len()); }
+                offset += part.len();
+            }
+            unsafe { Vec::from_raw_parts(pointer.as_ptr(), length, length) }
+        };
+        Ok(Self { bytes, _invoice: invoice })
+    }
+    pub(crate) fn as_slice(&self) -> &[u8] { &self.bytes }
+}
+
+/// Full original stored bytes and independent decoded text remain admitted
+/// while this returned window lives. The general serde-owned decoder is intact.
+#[cfg(feature = "sync-orchestration")]
+pub(crate) struct NativeConfigWindow {
+    stored: NativeConfigBytes,
+    text: NativeConfigBytes,
+    metadata: contextdb_core::read_memory::ReadShared<super::native_storage_admission::ColdSnapshotMetadata>,
+}
+#[cfg(feature = "sync-orchestration")]
+impl NativeConfigWindow {
+    pub(crate) fn stored_bytes(&self) -> &[u8] { self.stored.as_slice() }
+    pub(crate) fn text(&self) -> &str {
+        // Borrowed bincode String decoder validated UTF-8 before the copy.
+        std::str::from_utf8(self.text.as_slice()).expect("decoded config UTF-8")
+    }
+    pub(crate) fn incarnation(&self) -> std::result::Result<contextdb_core::Incarnation, NativeConfigFailure> {
+        contextdb_core::Incarnation::from_hex(self.text()).ok_or(NativeConfigFailure::InvalidIncarnation)
+    }
+    pub(crate) fn committed_view(&self) -> (redb::StorageSnapshotIdentity, SnapshotId, Lsn) {
+        (self.metadata.identity, self.metadata.snapshot, self.metadata.lsn)
+    }
+}
+
+/// Private singleton sibling: a concrete owner, a weak execution context and
+/// the actual immutable cold provider. No SourceWindowOwner::Read adapter.
+#[cfg(feature = "sync-orchestration")]
+struct NativeConfigCursor<'root> {
+    source: cold_provider::ColdCommittedProvider<'root>,
+    key: NativeConfigBytes,
+    metadata: contextdb_core::read_memory::ReadShared<super::native_storage_admission::ColdSnapshotMetadata>,
+    storage: super::native_storage_admission::StorageAdmissionScope,
+    owner: contextdb_core::read_memory::ReadMemoryOwner,
+    context: crate::executor::bounded::NativeReadOpenContext,
+    finished: bool,
+}
+#[cfg(feature = "sync-orchestration")]
+impl NativeConfigCursor<'_> {
+    fn next_text(&mut self) -> std::result::Result<Option<NativeConfigWindow>, NativeConfigFailure> {
+        use super::native_storage_admission::NativeStorageFailure;
+        if self.finished { return Ok(None); }
+        self.context.checkpoint().map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?;
+        let key = std::str::from_utf8(self.key.as_slice()).expect("prefix and tenant are UTF-8");
+        let owner = &self.owner;
+        let metadata = &self.metadata;
+        let context = &self.context;
+        let value = self.source.lend_native_read(
+            &self.storage, metadata, key, &mut || context.checkpoint(),
+            |bytes| -> std::result::Result<NativeConfigWindow, NativeConfigFailure> {
+                // This uses the exact standard bincode serde String codec,
+                // borrowing text without any nested allocation. Like the
+                // original decode_config_value<String>, trailing bytes remain
+                // accepted; stored bytes are retained unchanged, never normalized.
+                let (text, _) = bincode::serde::borrow_decode_from_slice::<&str, _>(
+                    bytes, bincode::config::standard(),
+                ).map_err(|_| NativeConfigFailure::InvalidStoredText)?;
+                let stored = NativeConfigBytes::join(owner, &[bytes])?;
+                let text = NativeConfigBytes::join(owner, &[text.as_bytes()])?;
+                Ok(NativeConfigWindow { stored, text, metadata: metadata.clone() })
+            },
+        ).map_err(NativeConfigFailure::Storage)?
+            .map_err(NativeConfigFailure::ColdUnqualified)??;
+        self.finished = true;
+        Ok(value)
+    }
+}
+#[cfg(feature = "sync-orchestration")]
+impl WriterSnapshot {
+    pub(crate) fn native_config_text(
+        &self,
+        operation: &crate::owner_read::NativeReadRequest,
+        context: &crate::executor::bounded::NativeReadOpenContext,
+        prefix: &str,
+        tenant: &contextdb_core::TenantId,
+    ) -> std::result::Result<Option<NativeConfigWindow>, NativeConfigFailure> {
+        use contextdb_core::read_memory::{ReadCredit, ReadShared};
+        use super::native_storage_admission::{NativeStorageFailure, StorageAdmissionScope};
+        let owner = operation.owner();
+        context.checkpoint().map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?;
+        let context_owner = context.owner().map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?;
+        if !owner.same_owner(&context_owner) { return Err(NativeConfigFailure::OwnerMismatch); }
+        let control = ReadCredit::try_new_owned_native(
+            owner.clone(), ReadShared::<std::sync::Mutex<NativeConfigCursor<'_>>>::layout().size(),
+            "writer_source", "config_cursor", HINT,
+        ).map_err(|r| NativeConfigFailure::Storage(NativeStorageFailure::Refused(r)))?;
+        let source = cold_provider::ColdCommittedProvider::capture(self)
+            .map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?;
+        let metadata = source.native_read_metadata(&owner)?;
+        // Same <prefix>:<tenant> bytes as TenantId::config_key, without an
+        // unadmitted format!/String. This singleton owns its complete endpoint.
+        let key = NativeConfigBytes::join(&owner, &[prefix.as_bytes(), b":", tenant.as_str().as_bytes()])?;
+        let storage = StorageAdmissionScope::reader_native_owner(owner.clone())?;
+        let cursor = ReadShared::try_from_prepaid_native(std::sync::Mutex::new(NativeConfigCursor {
+            source, key, metadata, storage, owner, context: context.clone(),
+            finished: false,
+        }), control).map_err(|r| NativeConfigFailure::Storage(NativeStorageFailure::Refused(r)))?;
+        let result = cursor.lock().unwrap_or_else(|p| p.into_inner()).next_text();
+        result
+    }
+}
+
+/// Untouched committed config page loan. Payload guards precede all counted
+/// handles on drop. Its views can only be borrowed through a live checkpoint
+/// and authoritative erasure fence; no owned Record/JSON decoder runs here.
+#[cfg(feature = "sync-orchestration")]
+pub(crate) struct NativeRawConfigWindow {
+    key: redb::AccessGuard<'static, &'static [u8]>,
+    value: redb::AccessGuard<'static, &'static [u8]>,
+    metadata: contextdb_core::read_memory::ReadShared<super::native_storage_admission::ColdSnapshotMetadata>,
+    context: crate::executor::bounded::NativeReadOpenContext,
+    root: Arc<WriterSnapshot>,
+}
+#[cfg(feature = "sync-orchestration")]
+pub(crate) struct NativeRawConfigView<'window> {
+    key: &'window str,
+    value: &'window [u8],
+    _fence: parking_lot::RwLockReadGuard<'window, WriterErasure>,
+}
+#[cfg(feature = "sync-orchestration")]
+impl NativeRawConfigView<'_> {
+    pub(crate) fn key(&self) -> &str { self.key }
+    pub(crate) fn stored_bytes(&self) -> &[u8] { self.value }
+}
+#[cfg(feature = "sync-orchestration")]
+impl NativeRawConfigWindow {
+    pub(crate) fn view(&self) -> std::result::Result<NativeRawConfigView<'_>, NativeConfigFailure> {
+        use super::native_storage_admission::NativeStorageFailure;
+        self.context.checkpoint().map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?;
+        // A producer callback already holds this fence; recursive reads avoid
+        // deadlocking behind a queued erasure writer. The returned view holds it.
+        let fence = self.root.erasure.read_recursive();
+        fence.check_scope(None, CONFIG_TABLE.name()).map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?;
+        fence.check_key(CONFIG_TABLE.name(), self.key.value()).map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?;
+        let key = std::str::from_utf8(self.key.value()).map_err(|_| NativeConfigFailure::InvalidStoredText)?;
+        Ok(NativeRawConfigView { key, value: self.value.value(), _fence: fence })
+    }
+    pub(crate) fn committed_view(&self) -> (redb::StorageSnapshotIdentity, SnapshotId, Lsn) {
+        (self.metadata.identity, self.metadata.snapshot, self.metadata.lsn)
+    }
+}
+
+/// Same-request sorted prefix cursor, retained inside its exact prepaid cell.
+/// Failed checkpoint/admission/callback never commits the next resume key.
+#[cfg(feature = "sync-orchestration")]
+pub(crate) struct NativeRawConfigCursor {
+    source: cold_provider::NativeConfigRangeSource,
+    group: bool,
+    prefix: NativeConfigBytes,
+    upper: Option<NativeConfigBytes>,
+    after: Option<NativeConfigBytes>,
+    metadata: contextdb_core::read_memory::ReadShared<super::native_storage_admission::ColdSnapshotMetadata>,
+    storage: super::native_storage_admission::StorageAdmissionScope,
+    owner: contextdb_core::read_memory::ReadMemoryOwner,
+    context: crate::executor::bounded::NativeReadOpenContext,
+    finished: bool,
+}
+#[cfg(feature = "sync-orchestration")]
+impl NativeRawConfigCursor {
+    fn visit_next_group<T>(
+        &mut self, visit: impl FnOnce(NativeRawConfigWindow) -> std::result::Result<T, NativeConfigFailure>,
+    ) -> std::result::Result<Option<T>, NativeConfigFailure> {
+        use super::native_storage_admission::NativeStorageFailure;
+        let lower = self.after.as_ref().unwrap_or(&self.prefix).as_slice();
+        let context = &self.context;
+        let next = self.source.lend_next_native_group(
+            &self.storage, &self.metadata, lower, self.after.is_some(),
+            self.upper.as_ref().map(NativeConfigBytes::as_slice),
+            &mut || context.checkpoint(),
+            |index, empty| -> std::result::Result<_, NativeConfigFailure> {
+                if !empty.value().is_empty() || !index.value().starts_with(self.prefix.as_slice()) {
+                    return Err(NativeConfigFailure::InvalidCanonicalIndex);
+                }
+                let key = &index.value()[self.prefix.as_slice().len()..];
+                std::str::from_utf8(key).map_err(|_| NativeConfigFailure::InvalidCanonicalIndex)?;
+                if key.is_empty() { return Err(NativeConfigFailure::InvalidCanonicalIndex); }
+                let resume = NativeConfigBytes::join(&self.owner, &[index.value()])?;
+                let record = self.source.lend_next_native_config(
+                    &self.storage, &self.metadata, key, false, None,
+                    &mut || context.checkpoint(),
+                    |actual, value| -> std::result::Result<_, NativeConfigFailure> {
+                        if actual.value() != key { return Err(NativeConfigFailure::InvalidCanonicalIndex); }
+                        visit(NativeRawConfigWindow { key: actual, value,
+                            metadata: self.metadata.clone(), context: context.clone(), root: self.source.root().clone() })
+                    },
+                ).map_err(NativeConfigFailure::Storage)?.map_err(NativeConfigFailure::ColdUnqualified)??
+                    .ok_or(NativeConfigFailure::InvalidCanonicalIndex)?;
+                context.checkpoint().map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?;
+                Ok((resume, record))
+            },
+        ).map_err(NativeConfigFailure::Storage)?.map_err(NativeConfigFailure::ColdUnqualified)??;
+        match next {
+            Some((resume, result)) => { self.after = Some(resume); Ok(Some(result)) }
+            None => { self.finished = true; Ok(None) }
+        }
+    }
+
+    /// Exact persisted-byte comparison loan on this cursor's original owner,
+    /// metadata and captured transaction. It never changes prefix resume state.
+    pub(crate) fn visit_exact<T>(
+        &self, key: &str,
+        visit: impl FnOnce(NativeRawConfigWindow) -> std::result::Result<T, NativeConfigFailure>,
+    ) -> std::result::Result<Option<T>, NativeConfigFailure> {
+        use super::native_storage_admission::NativeStorageFailure;
+        let context = &self.context;
+        let root = self.source.root();
+        context.checkpoint().map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?;
+        // Own the full input key on the original owner before descent.
+        let key = NativeConfigBytes::join(&self.owner, &[key.as_bytes()])?;
+        let next = self.source.lend_next_native_config(
+            &self.storage, &self.metadata, key.as_slice(), false, None,
+            &mut || context.checkpoint(),
+            |actual, value| -> std::result::Result<Option<T>, NativeConfigFailure> {
+                if actual.value() != key.as_slice() { return Ok(None); }
+                let result = visit(NativeRawConfigWindow { key: actual, value,
+                    metadata: self.metadata.clone(), context: context.clone(), root: root.clone() })?;
+                context.checkpoint().map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?;
+                Ok(Some(result))
+            },
+        ).map_err(NativeConfigFailure::Storage)?.map_err(NativeConfigFailure::ColdUnqualified)??;
+        Ok(next.flatten())
+    }
+
+    /// Consume one admitted raw window privately. A retained window can be the
+    /// callback result; every later field borrow still checks its weak context.
+    pub(crate) fn visit_next<T>(
+        &mut self,
+        visit: impl FnOnce(NativeRawConfigWindow) -> std::result::Result<T, NativeConfigFailure>,
+    ) -> std::result::Result<Option<T>, NativeConfigFailure> {
+        use super::native_storage_admission::NativeStorageFailure;
+        self.context.checkpoint().map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?;
+        if self.finished { return Ok(None); }
+        if self.group { return self.visit_next_group(visit); }
+        let lower = self.after.as_ref().unwrap_or(&self.prefix).as_slice();
+        let owner = &self.owner;
+        let context = &self.context;
+        let root = self.source.root();
+        let metadata = &self.metadata;
+        // A re-seek from the same captured root is O(height), not a scan of
+        // previously returned keys. Full raw prefix endpoints never change.
+        let next = self.source.lend_next_native_config(
+            &self.storage, metadata, lower, self.after.is_some(),
+            self.upper.as_ref().map(NativeConfigBytes::as_slice),
+            &mut || context.checkpoint(),
+            |key, value| -> std::result::Result<_, NativeConfigFailure> {
+                let resume = NativeConfigBytes::join(owner, &[key.value()])?;
+                let window = NativeRawConfigWindow { key, value,
+                    metadata: metadata.clone(), context: context.clone(), root: root.clone() };
+                let result = visit(window)?;
+                context.checkpoint().map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?;
+                Ok((resume, result))
+            },
+        ).map_err(NativeConfigFailure::Storage)?.map_err(NativeConfigFailure::ColdUnqualified)??;
+        match next {
+            Some((resume, value)) => { self.after = Some(resume); Ok(Some(value)) }
+            None => { self.finished = true; Ok(None) }
+        }
+    }
+}
+#[cfg(feature = "sync-orchestration")]
+impl WriterSnapshot {
+    pub(crate) fn native_raw_config_prefix(
+        self: &Arc<Self>,
+        operation: &crate::owner_read::NativeReadRequest,
+        context: &crate::executor::bounded::NativeReadOpenContext,
+        prefix: &str,
+    ) -> std::result::Result<contextdb_core::read_memory::ReadShared<std::sync::Mutex<NativeRawConfigCursor>>, NativeConfigFailure> {
+        self.native_raw_config_prefix_after(operation, context, prefix, None)
+    }
+    pub(crate) fn native_raw_config_prefix_after(
+        self: &Arc<Self>, operation: &crate::owner_read::NativeReadRequest,
+        context: &crate::executor::bounded::NativeReadOpenContext,
+        prefix: &str, after: Option<&str>,
+    ) -> std::result::Result<contextdb_core::read_memory::ReadShared<std::sync::Mutex<NativeRawConfigCursor>>, NativeConfigFailure> {
+        if after.is_some_and(|key| !key.starts_with(prefix)) { return Err(NativeConfigFailure::InvalidCanonicalIndex); }
+        self.native_raw_cursor(operation, context, &[prefix.as_bytes()], after, false)
+    }
+    pub(crate) fn native_raw_custody_group(
+        self: &Arc<Self>, operation: &crate::owner_read::NativeReadRequest,
+        context: &crate::executor::bounded::NativeReadOpenContext, group: &str,
+    ) -> std::result::Result<contextdb_core::read_memory::ReadShared<std::sync::Mutex<NativeRawConfigCursor>>, NativeConfigFailure> {
+        // Refuse from the captured scalar before any cursor/control/key/storage
+        // allocation or CONFIG examination. No lazy index and no fallback.
+        self.require_native_custody_groups()?;
+        let len = u64::try_from(group.len()).map_err(|_| NativeConfigFailure::InvalidCanonicalIndex)?.to_be_bytes();
+        self.native_raw_cursor(operation, context, &[&len, group.as_bytes()], None, true)
+    }
+    pub(crate) fn require_native_custody_groups(&self) -> std::result::Result<(), NativeConfigFailure> {
+        if !self.custody_groups_complete {
+            return Err(NativeConfigFailure::Storage(super::native_storage_admission::NativeStorageFailure::Refused(
+                contextdb_core::read_memory::NativeRefusal::NativeUnsupported {
+                    subsystem: "custody", operation: "durable_group_index",
+                })));
+        }
+        Ok(())
+    }
+    fn native_raw_cursor(
+        self: &Arc<Self>, operation: &crate::owner_read::NativeReadRequest,
+        context: &crate::executor::bounded::NativeReadOpenContext,
+        prefix: &[&[u8]], after: Option<&str>, group: bool,
+    ) -> std::result::Result<contextdb_core::read_memory::ReadShared<std::sync::Mutex<NativeRawConfigCursor>>, NativeConfigFailure> {
+        use contextdb_core::read_memory::{ReadCredit, ReadShared};
+        use super::native_storage_admission::{NativeStorageFailure, StorageAdmissionScope};
+        let owner = operation.owner();
+        context.checkpoint().map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?;
+        let context_owner = context.owner().map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?;
+        if !owner.same_owner(&context_owner) { return Err(NativeConfigFailure::OwnerMismatch); }
+        let control = ReadCredit::try_new_owned_native(
+            owner.clone(), ReadShared::<std::sync::Mutex<NativeRawConfigCursor>>::layout().size(),
+            "writer_source", "raw_config_cursor", HINT,
+        ).map_err(|r| NativeConfigFailure::Storage(NativeStorageFailure::Refused(r)))?;
+        let captured = cold_provider::ColdCommittedProvider::capture(self)
+            .map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?;
+        let metadata = captured.native_read_metadata(&owner)?;
+        let source = captured.into_native_config_range(self.clone())?;
+        let prefix = NativeConfigBytes::join(&owner, prefix)?;
+        let after = after.map(|key| NativeConfigBytes::join(&owner, &[key.as_bytes()])).transpose()?;
+        // Exclusive successor is bytewise, including a last UTF-8 byte of 0xbf.
+        // Never reinterpret CONFIG_TABLE text as a fixed relational identity.
+        let mut end = prefix.as_slice().len();
+        while end > 0 && prefix.as_slice()[end - 1] == u8::MAX { end -= 1; }
+        let upper = if end == 0 { None } else {
+            let last = [prefix.as_slice()[end - 1] + 1];
+            Some(NativeConfigBytes::join(&owner, &[&prefix.as_slice()[..end - 1], &last])?)
+        };
+        let storage = StorageAdmissionScope::reader_native_owner(owner.clone())?;
+        ReadShared::try_from_prepaid_native(std::sync::Mutex::new(NativeRawConfigCursor {
+            source, group, prefix, upper, after, metadata, storage, owner,
+            context: context.clone(), finished: false,
+        }), control).map_err(|r| NativeConfigFailure::Storage(NativeStorageFailure::Refused(r)))
+    }
+}

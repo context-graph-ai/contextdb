@@ -6660,6 +6660,15 @@ impl RedbPersistence {
         manifests: &[ContentIdentityMutation],
         admission: &mut ProofAdmission,
     ) -> Result<DirectTypedImageDigest> {
+        Self::apply_content_identity_with_manifests_and_groups_in_write(write_txn, mutations, manifests, admission, None)
+    }
+    pub(super) fn apply_content_identity_with_manifests_and_groups_in_write(
+        write_txn: &redb::WriteTransaction,
+        mutations: &[ContentIdentityMutation],
+        manifests: &[ContentIdentityMutation],
+        admission: &mut ProofAdmission,
+        groups: Option<&super::custody_groups::GroupPlan>,
+    ) -> Result<DirectTypedImageDigest> {
         Self::reconcile_ddl_selectors_in_write(write_txn, mutations, admission)?;
         super::content_size::reconcile_row_heads(write_txn, mutations)?;
         Self::apply_writer_row_heads_in_write(write_txn, mutations)?;
@@ -6727,6 +6736,10 @@ impl RedbPersistence {
                         write_txn,
                         key,
                         mutation.logical_value.as_deref(),
+                        match groups {
+                            Some(plan) => super::custody_groups::Funding::Prepaid(plan),
+                            None => super::custody_groups::Funding::Legacy(admission),
+                        },
                     )?;
                 }
             }
@@ -8022,3 +8035,4786 @@ use history_open_control::history_control_damage;
 
 #[path = "content_identity/version_manifest.rs"]
 pub(super) mod version_manifest;
+
+/// Private original-funded sibling. Its reservation retains the exact source
+/// identity, epoch and writer use through every admitted workspace allocation.
+pub(crate) mod original_writer {
+    use super::*;
+    use crate::memory_accounting::{OwnedMemoryReservation, reserve_preparation_from_original,
+        grow_preparation_from_original, release_preparation_original, detach_preparation_original};
+
+    pub(crate) struct ProofAdmission {
+        pub(super) original: OwnedMemoryReservation,
+        // Observation only; allocations use original, never this projection.
+        accountant: Option<crate::memory_accounting::AccountantHandle>,
+        scratch_owner: Option<std::sync::Weak<super::super::writer_file::LockedWriterFile>>,
+        held: usize,
+        peak: std::cell::Cell<usize>,
+    }
+    pub(crate) struct AdmittedBytes {
+        bytes: usize,
+        reservation: OwnedMemoryReservation,
+    }
+    impl ProofAdmission {
+        pub(crate) fn new(original: &OwnedMemoryReservation,
+            scratch_owner: Option<std::sync::Weak<super::super::writer_file::LockedWriterFile>>) -> Result<Self> {
+            let original = reserve_preparation_from_original(original, 0, "content_identity",
+                "maintain_committed_proof", "Raise MEMORY_LIMIT to admit the proof this transaction maintains.")?;
+            Ok(Self { accountant: Some(original.accountant().clone()), original,
+                scratch_owner, held: 0, peak: std::cell::Cell::new(0) })
+        }
+        pub(super) fn absorb_output(&mut self, credit: &mut OwnedMemoryReservation, bytes: usize) -> Result<()> {
+            let next=self.held.checked_add(bytes).ok_or_else(||proof_allocation_overflow(self))?;
+            crate::memory_accounting::merge_preparation_original(&mut self.original,credit)?;
+            self.held=next;self.peak.set(self.peak.get().max(next));Ok(())
+        }
+        fn fork(&self) -> Result<Self> { Self::new(&self.original, self.scratch_owner.clone()) }
+        pub(crate) fn admit(&mut self, bytes: usize) -> Result<()> {
+            let next = self.held.checked_add(bytes).ok_or_else(|| proof_allocation_overflow(self))?;
+            grow_preparation_from_original(&mut self.original, bytes, "content_identity",
+                "maintain_committed_proof", "Raise MEMORY_LIMIT to admit the proof this transaction maintains.")?;
+            self.held = next;
+            self.peak.set(self.peak.get().max(next));
+            Ok(())
+        }
+        pub(crate) fn release(&mut self, bytes: usize) {
+            let bytes = bytes.min(self.held);
+            release_preparation_original(&mut self.original, bytes);
+            self.held -= bytes;
+        }
+        fn detach(&mut self, bytes: usize) -> AdmittedBytes {
+            let bytes = bytes.min(self.held);
+            let reservation = detach_preparation_original(&mut self.original, bytes)
+                .expect("admitted original debit retains its held writer use");
+            self.held -= bytes;
+            AdmittedBytes { bytes, reservation }
+        }
+        pub(crate) fn original(&self)->&OwnedMemoryReservation{&self.original}
+        pub(crate) fn detach_original(&mut self,bytes:usize)->OwnedMemoryReservation{self.detach(bytes).reservation}
+        pub(crate) fn held(&self) -> usize { self.held }
+        pub(crate) fn peak(&self) -> usize { self.peak.get() }
+        fn is_accounted(&self) -> bool { true }
+        fn open_scratch(&mut self) -> Result<(Box<dyn redb::ScratchBackend>, AdmittedBytes)> {
+            let bytes = redb::scratch_backend_allocation_size();
+            self.admit(bytes)?;
+            let charge = self.detach(bytes);
+            let owner = self.scratch_owner.as_ref().and_then(std::sync::Weak::upgrade)
+                .ok_or_else(|| Error::ScratchWorkingStorageUnavailable {
+                    operation: "create_content_identity_scratch".into(), io_kind: std::io::ErrorKind::Unsupported })?;
+            let backend = owner.scratch_backend().map_err(|error| Error::ScratchWorkingStorageUnavailable {
+                operation: "create_content_identity_scratch".into(), io_kind: error.kind() })?;
+            Ok((backend, charge))
+        }
+    }
+
+pub(super) fn proof_allocation_overflow(admission: &ProofAdmission) -> Error {
+    let usage = admission.accountant.as_ref().map(|owner| owner.usage());
+    Error::MemoryBudgetExceeded {
+        subsystem: "content_identity".into(),
+        operation: "maintain_committed_proof".into(),
+        requested_bytes: usize::MAX,
+        available_bytes: usage
+            .as_ref()
+            .and_then(|usage| usage.available)
+            .unwrap_or(0),
+        budget_limit_bytes: usage.and_then(|usage| usage.limit).unwrap_or(usize::MAX),
+        hint: "Proof allocation capacity overflowed.".into(),
+    }
+}
+
+pub(super) fn resolve_key_charged_checkpoint<'a>(table: &impl ReadableTable<&'static [u8], &'static [u8]>, family: LogicalFamily, key: &'a [u8], admission: &mut ProofAdmission, checkpoint: &mut dyn FnMut() -> Result<()>) -> Result<(std::borrow::Cow<'a, [u8]>, usize)> {
+    if key.first() != Some(&KEY_REFERENCE_TAG) { checkpoint()?; return Ok((key.into(), 0)); }
+    if key.len() != KEY_REFERENCE_BYTES { return Err(Error::Other("invalid authenticated key reference".into())); }
+    let charge = u32::from_be_bytes(key[1..5].try_into().expect("length")) as usize;
+    admission.admit(charge)?;
+    match resolve_key_checkpoint(table, family, key, checkpoint) {
+        Ok(key) => Ok((key, charge)),
+        Err(error) => { admission.release(charge); Err(error) }
+    }
+}
+
+pub(super) fn resolve_key_charged<'a>(
+    table: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    family: LogicalFamily,
+    key: &'a [u8],
+    admission: &mut ProofAdmission,
+) -> Result<(std::borrow::Cow<'a, [u8]>, usize)> {
+    if key.first() != Some(&KEY_REFERENCE_TAG) {
+        return Ok((key.into(), 0));
+    }
+    if key.len() != KEY_REFERENCE_BYTES {
+        return Err(Error::Other("invalid authenticated key reference".into()));
+    }
+    let charge = u32::from_be_bytes(key[1..5].try_into().expect("length")) as usize;
+    admission.admit(charge)?;
+    match resolve_key(table, family, key) {
+        Ok(resolved) => Ok((resolved, charge)),
+        Err(error) => {
+            admission.release(charge);
+            Err(error)
+        }
+    }
+}
+
+pub(super) fn read_node_charged(
+    table: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    family: LogicalFamily,
+    id: [u8; 32],
+    admission: &mut ProofAdmission,
+) -> Result<(Node, usize)> {
+    #[cfg(any(test, feature = "test-seams"))]
+    let read_started = std::time::Instant::now();
+    let stored_key = node_storage_key(family, &id);
+    let encoded = table
+        .get(stored_key.as_slice())
+        .map_err(RedbPersistence::storage_error)?
+        .ok_or_else(|| Error::Other("logical identity tree references a missing chunk".into()))?;
+    #[cfg(any(test, feature = "test-seams"))]
+    crate::read_work_probe::note_proof_node_read();
+    #[cfg(any(test, feature = "test-seams"))]
+    observe_node_read(encoded.value().len());
+    // The decoded chunk owns a copy of every key it holds plus its entry
+    // vector; charge that before `decode_node` allocates any of it. The entry
+    // count is in the stored header, which Redb hands back borrowed, so the
+    // charge is the exact decoded size rather than a worst case.
+    let decoded_bytes = precharged_node_bytes(encoded.value());
+    admission.admit(decoded_bytes)?;
+    let node = match decode_node(family, encoded.value()) {
+        Ok(node) => node,
+        Err(error) => {
+            admission.release(decoded_bytes);
+            return Err(error);
+        }
+    };
+    if chunk_id(node.level, &node.entries.last().expect("chunk").key) != id {
+        admission.release(decoded_bytes);
+        return Err(Error::Other(
+            "logical identity chunk id disagrees with its separator".into(),
+        ));
+    }
+    // The charge above was read from the stored header before anything was
+    // allocated, and it rounds up so the allocation can never outrun it. The
+    // chunk now exists and says exactly what it occupies, so the transaction
+    // keeps that and hands the rounding back: a write is never refused for
+    // headroom no allocation ever took.
+    let live_bytes = node_live_bytes(&node);
+    if live_bytes > decoded_bytes {
+        if let Err(error) = admission.admit(live_bytes - decoded_bytes) {
+            admission.release(decoded_bytes);
+            return Err(error);
+        }
+    } else {
+        admission.release(decoded_bytes - live_bytes);
+    }
+    #[cfg(any(test, feature = "test-seams"))]
+    observe_identity_span(IdentitySpan::ReadAndDecode, read_started);
+    Ok((node, live_bytes))
+}
+
+pub(super) fn mutation_key_capacity(
+    mutation: &ContentIdentityMutation,
+    admission: &ProofAdmission,
+) -> Result<usize> {
+    let raw_len = if mutation.family == LogicalFamily::SchemaAndIndexes
+        && mutation.logical_key.starts_with(ORDERED_POSTING_MAGIC)
+    {
+        Some(mutation.logical_key.len() - ORDERED_POSTING_MAGIC.len())
+    } else if mutation.family == LogicalFamily::ChangeAndDdl
+        && mutation.logical_key.starts_with(ORDERED_HISTORY_MAGIC)
+    {
+        Some(mutation.logical_key.len() - ORDERED_HISTORY_MAGIC.len())
+    } else {
+        None
+    };
+    raw_len.map_or(Ok(1 + std::mem::size_of::<[u8; 32]>()), |len| {
+        len.checked_add(1)
+            .ok_or_else(|| proof_allocation_overflow(admission))
+    })
+}
+
+pub(super) fn resolving_key_cmp(
+    table: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    family: LogicalFamily,
+    left: &[u8],
+    right: &[u8],
+    admission: &mut ProofAdmission,
+) -> Result<Ordering> {
+    let left_reference = left.first() == Some(&KEY_REFERENCE_TAG);
+    let right_reference = right.first() == Some(&KEY_REFERENCE_TAG);
+    if !left_reference && !right_reference {
+        return identity_key_cmp(left, right);
+    }
+    // Equal keys hash equally, and a key reference carries that hash, so the
+    // common case of an edit landing exactly on a separator costs no read.
+    if key_hash(left) == key_hash(right) {
+        return Ok(Ordering::Equal);
+    }
+    // Both keys are live at once for this one comparison, so both are charged
+    // before either is copied and both are given back before the next.
+    let (left, left_charge) = resolve_key_charged(table, family, left, admission)?;
+    let (right, right_charge) = match resolve_key_charged(table, family, right, admission) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            admission.release(left_charge);
+            return Err(error);
+        }
+    };
+    let ordering = identity_key_cmp(&left, &right);
+    drop(left);
+    drop(right);
+    admission.release(left_charge);
+    admission.release(right_charge);
+    ordering
+}
+
+pub(super) fn resolving_entry_search(
+    table: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    family: LogicalFamily,
+    entries: &[PageEntry],
+    key: &[u8],
+    admission: &mut ProofAdmission,
+) -> Result<std::result::Result<usize, usize>> {
+    let mut left = 0;
+    let mut right = entries.len();
+    while left < right {
+        let mid = (left + right) / 2;
+        match resolving_key_cmp(table, family, &entries[mid].key, key, admission)? {
+            Ordering::Less => left = mid + 1,
+            Ordering::Greater => right = mid,
+            Ordering::Equal => return Ok(Ok(mid)),
+        }
+    }
+    Ok(Err(left))
+}
+struct MutationKeyNode {
+    first: usize,
+    last: usize,
+    left: Option<Box<MutationKeyNode>>,
+    right: Option<Box<MutationKeyNode>>,
+    height: u8,
+}
+
+impl MutationKeyNode {
+    fn height(link: &Option<Box<Self>>) -> u8 {
+        link.as_ref().map_or(0, |node| node.height)
+    }
+
+    fn refresh(&mut self) {
+        self.height = 1 + Self::height(&self.left).max(Self::height(&self.right));
+    }
+
+    fn rotate_left(mut node: Box<Self>) -> Box<Self> {
+        let mut root = node.right.take().expect("AVL right child");
+        node.right = root.left.take();
+        node.refresh();
+        root.left = Some(node);
+        root.refresh();
+        root
+    }
+
+    fn rotate_right(mut node: Box<Self>) -> Box<Self> {
+        let mut root = node.left.take().expect("AVL left child");
+        node.left = root.right.take();
+        node.refresh();
+        root.right = Some(node);
+        root.refresh();
+        root
+    }
+
+    fn rebalance(mut node: Box<Self>) -> Box<Self> {
+        node.refresh();
+        let balance = i16::from(Self::height(&node.left)) - i16::from(Self::height(&node.right));
+        if balance > 1 {
+            let left = node.left.as_ref().expect("AVL left child");
+            if Self::height(&left.left) < Self::height(&left.right) {
+                node.left = node.left.take().map(Self::rotate_left);
+            }
+            Self::rotate_right(node)
+        } else if balance < -1 {
+            let right = node.right.as_ref().expect("AVL right child");
+            if Self::height(&right.right) < Self::height(&right.left) {
+                node.right = node.right.take().map(Self::rotate_right);
+            }
+            Self::rotate_left(node)
+        } else {
+            node
+        }
+    }
+
+    fn insert(
+        link: &mut Option<Box<Self>>,
+        ordinal: usize,
+        mutations: MutationInputs<'_>,
+        admission: &mut ProofAdmission,
+        node_bytes: &mut usize,
+    ) -> Result<bool> {
+        let Some(node) = link.as_mut() else {
+            let bytes = std::alloc::Layout::new::<Self>().size();
+            let total = node_bytes
+                .checked_add(bytes)
+                .ok_or_else(|| proof_allocation_overflow(admission))?;
+            admission.admit(bytes)?;
+            *link = Some(Box::new(Self {
+                first: ordinal,
+                last: ordinal,
+                left: None,
+                right: None,
+                height: 1,
+            }));
+            *node_bytes = total;
+            return Ok(false);
+        };
+        let incoming = &mutations[ordinal];
+        let stored = &mutations[node.first];
+        let replaced = match incoming
+            .family
+            .cmp(&stored.family)
+            .then_with(|| mutation_encoded_key_cmp(incoming, stored))
+        {
+            Ordering::Less => {
+                Self::insert(&mut node.left, ordinal, mutations, admission, node_bytes)?
+            }
+            Ordering::Greater => {
+                Self::insert(&mut node.right, ordinal, mutations, admission, node_bytes)?
+            }
+            Ordering::Equal => {
+                // The former map retained the first key, including its namespace,
+                // while replacing its value. Duplicate updates allocate nothing.
+                node.last = ordinal;
+                return Ok(true);
+            }
+        };
+        // No fallible work occurs while the owning link is detached. A refused
+        // child admission leaves the entire previously balanced tree attached.
+        *link = link.take().map(Self::rebalance);
+        Ok(replaced)
+    }
+
+    fn allocation_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.left.as_ref().map_or(0, |node| node.allocation_bytes())
+            + self
+                .right
+                .as_ref()
+                .map_or(0, |node| node.allocation_bytes())
+    }
+
+    fn visit(&self, visitor: &mut impl FnMut(&Self) -> Result<()>) -> Result<()> {
+        if let Some(left) = &self.left {
+            left.visit(visitor)?;
+        }
+        visitor(self)?;
+        if let Some(right) = &self.right {
+            right.visit(visitor)?;
+        }
+        Ok(())
+    }
+}
+
+/// Return the existing directory's credit on success and on a later root
+/// publication refusal, always after freeing its native boxes.
+struct CoalescedDirectory<'a> {
+    root: Option<Box<MutationKeyNode>>,
+    admission: &'a mut ProofAdmission,
+    bytes: usize,
+}
+impl<'a> CoalescedDirectory<'a> {
+    fn new(root: Option<Box<MutationKeyNode>>, admission: &'a mut ProofAdmission) -> Self {
+        let bytes = root.as_ref().map_or(0, |node| node.allocation_bytes());
+        Self {
+            root,
+            admission,
+            bytes,
+        }
+    }
+}
+impl Drop for CoalescedDirectory<'_> {
+    fn drop(&mut self) {
+        drop(self.root.take());
+        self.admission.release(self.bytes);
+    }
+}
+
+/// Two existing admitted owners feed one canonical fold without a copied
+/// combined container. Manifest entries have no schema/config side effects.
+#[derive(Clone, Copy)]
+struct MutationInputs<'a> {
+    primary: &'a [ContentIdentityMutation],
+    manifests: &'a [ContentIdentityMutation],
+}
+impl<'a> MutationInputs<'a> {
+    fn iter(self) -> impl Iterator<Item = &'a ContentIdentityMutation> {
+        self.primary.iter().chain(self.manifests.iter())
+    }
+}
+impl std::ops::Index<usize> for MutationInputs<'_> {
+    type Output = ContentIdentityMutation;
+    fn index(&self, ordinal: usize) -> &Self::Output {
+        if ordinal < self.primary.len() {
+            &self.primary[ordinal]
+        } else {
+            &self.manifests[ordinal - self.primary.len()]
+        }
+    }
+}
+
+/// The exact payload capacity mutation_tree_key requests for this encoding.
+
+impl RedbPersistence {
+pub(crate) fn apply_owned_content_identity_with_manifests_in_write(
+        write_txn: &redb::WriteTransaction,
+        mutations: &[ContentIdentityMutation],
+        manifests: &[ContentIdentityMutation],
+        admission: &mut ProofAdmission,
+    ) -> Result<DirectTypedImageDigest> {
+        Self::apply_owned_content_identity_with_manifests_and_groups_in_write(write_txn, mutations, manifests, admission, None)
+    }
+    pub(crate) fn apply_owned_content_identity_with_manifests_and_groups_in_write(
+        write_txn: &redb::WriteTransaction,
+        mutations: &[ContentIdentityMutation],
+        manifests: &[ContentIdentityMutation],
+        admission: &mut ProofAdmission,
+        groups: Option<&super::super::custody_groups::GroupPlan>,
+    ) -> Result<DirectTypedImageDigest> {
+        Self::reconcile_owned_ddl_selectors_in_write(write_txn, mutations, admission)?;
+        super::super::content_size::reconcile_row_heads(write_txn, mutations)?;
+        Self::apply_writer_row_heads_in_write(write_txn, mutations)?;
+        for (ordinal, mutation) in mutations.iter().enumerate() {
+            if mutation.family == SCHEMA_RECORD_FAMILY {
+                if mutations[ordinal + 1..].iter().any(|later| {
+                    later.family == SCHEMA_RECORD_FAMILY
+                        && later.logical_key == mutation.logical_key
+                }) {
+                    continue;
+                }
+                let name = std::str::from_utf8(&mutation.logical_key)
+                    .map_err(|_| Error::Other("invalid content-size schema name".into()))?;
+                if mutation.logical_value.is_some() {
+                    super::super::content_size::ensure_table(write_txn, name)?;
+                } else {
+                    write_txn
+                        .open_table(super::super::content_size::TOTALS)
+                        .map_err(Self::storage_error)?
+                        .remove(name)
+                        .map_err(Self::storage_error)?;
+                }
+            }
+        }
+        let metadata = write_txn
+            .open_table(CONTENT_IDENTITY_METADATA_TABLE)
+            .map_err(Self::storage_error)?;
+        let version = metadata
+            .get(IDENTITY_VERSION_KEY)
+            .map_err(Self::storage_error)?
+            .ok_or_else(|| {
+                Error::Other("logical content identity is not initialized".to_owned())
+            })?;
+        if version.value() != IDENTITY_VERSION {
+            return Err(Error::Other(
+                "logical content identity has an unsupported version".to_owned(),
+            ));
+        }
+        drop(version);
+        drop(metadata);
+
+        if mutations.iter().any(|mutation| {
+            matches!(
+                mutation.family,
+                LogicalFamily::F32Vectors | LogicalFamily::Sq8Vectors | LogicalFamily::Sq4Vectors
+            )
+        }) {
+            Self::write_vector_body_root_fingerprint(write_txn)?;
+        }
+
+        for mutation in mutations {
+            if mutation.family != LogicalFamily::Configuration {
+                continue;
+            }
+            if let Ok(key) = std::str::from_utf8(&mutation.logical_key) {
+                if super::super::read_image_open_config_key(key) {
+                    Self::write_read_open_config_entry(
+                        write_txn,
+                        key,
+                        mutation.logical_value.as_deref(),
+                    )?;
+                }
+                if crate::custody::records::owned_key(key) {
+                    Self::write_read_custody_config_entry(
+                        write_txn,
+                        key,
+                        mutation.logical_value.as_deref(),
+                        match groups {
+                            Some(plan) => super::super::custody_groups::Funding::Prepaid(plan),
+                            None => super::super::custody_groups::Funding::Unavailable,
+                        },
+                    )?;
+                }
+            }
+        }
+
+        let roots_table = write_txn
+            .open_table(CONTENT_IDENTITY_ROOTS_TABLE)
+            .map_err(Self::storage_error)?;
+        let mut roots: [FamilyRoot; 11] =
+            std::array::from_fn(|family| empty_root(LogicalFamily::ALL[family]));
+        let mut tails: [RootTail; 11] = std::array::from_fn(|_| RootTail {
+            history_open: None,
+            custody_config_root: None,
+            vector_directory_root: None,
+            ddl_selector_roots: None,
+            content_size_root: None,
+            vector_pages_root: None,
+        });
+        for family in LogicalFamily::ALL {
+            let encoded = roots_table
+                .get(family as u8)
+                .map_err(Self::storage_error)?
+                .ok_or_else(|| Error::Other("logical content family root is absent".to_owned()))?;
+            let published = decode_published_root(family, encoded.value())?;
+            roots[family as usize] = published.identity;
+            tails[family as usize] = RootTail {
+                history_open: published.history_open,
+                custody_config_root: published.custody_config_root,
+                vector_directory_root: published.vector_directory_root,
+                ddl_selector_roots: published.ddl_selector_roots,
+                content_size_root: published.content_size_root,
+                vector_pages_root: published.vector_pages_root,
+            };
+        }
+        drop(roots_table);
+        let original_roots = roots.clone();
+        let original_tails = tails.clone();
+        tails[LogicalFamily::ChangeAndDdl as usize].ddl_selector_roots =
+            Some(Self::ddl_selector_fingerprints_in_write(write_txn)?);
+        // This is the small writer-maintained projection, never the full
+        // Configuration table. Read it after all copy updates in this same
+        // write transaction and publish its digest with the canonical root.
+        let open_config_root = (mutations.is_empty()
+            || mutations.iter().any(|mutation| {
+                mutation.family == LogicalFamily::Configuration
+                    && std::str::from_utf8(&mutation.logical_key)
+                        .is_ok_and(super::super::read_image_open_config_key)
+            }))
+        .then(|| {
+            let table = write_txn
+                .open_table(super::super::READ_OPEN_CONFIG_TABLE)
+                .map_err(Self::storage_error)?;
+            let mut digest = OpenConfigDigest::new();
+            for entry in table.iter().map_err(Self::storage_error)? {
+                let (key, value) = entry.map_err(Self::storage_error)?;
+                if key.value() != super::super::READ_OPEN_CONFIG_ROOT_KEY {
+                    digest.push(key.value(), value.value());
+                }
+            }
+            Ok::<_, Error>(digest.finish())
+        })
+        .transpose()?;
+        // Every membership and custody-copy write in this transaction has
+        // already folded its changed records into the running set commitments
+        // (`write_open_directory_entry`, `write_read_custody_config_entry`,
+        // and the rebuilds that clear and re-add them). Publishing reads one
+        // fixed-size state per copy, so the cost does not grow with the number
+        // of memberships or custody records. It runs for every transaction, so
+        // no write path that changes a copy can leave its root behind.
+        // Membership-only image-export commits also publish companion roots.
+        super::super::vector_membership_pages::write_fingerprints(write_txn)?;
+        let vector_directory_root = Some(
+            SetCommitment::load_in_write(write_txn, CompactIndexSet::VectorDirectory)?
+                .root_with_vector_body_count(
+                    super::super::vector_membership_pages::referenced_body_count_in_write(write_txn)?,
+                ),
+        );
+        let custody_config_root =
+            Some(SetCommitment::load_in_write(write_txn, CompactIndexSet::CustodyIndex)?.root());
+
+        // One durable transaction can stage several physical versions of the
+        // same logical record (an UPDATE commonly contributes a remove and a
+        // replacement). The Merkle representation is canonical for the final
+        // key/value set, so collapse those entries before walking the tree.
+        let mutations = MutationInputs {
+            primary: mutations,
+            manifests,
+        };
+        let coalescing_admission_start = admission.held();
+        let coalescing_result = (|| -> Result<Option<Box<MutationKeyNode>>> {
+            // Retain only unique-key boxes. Every input still receives the
+            // original parser validation, including entries later overwritten.
+            let mut unique = None;
+            let mut node_bytes = 0usize;
+            for (ordinal, mutation) in mutations.iter().enumerate() {
+                let key_bytes = mutation_key_capacity(mutation, admission)?;
+                admission.admit(key_bytes)?;
+                let key = mutation_tree_key(mutation)?;
+                debug_assert_eq!(key.capacity(), key_bytes);
+                drop(key);
+                admission.release(key_bytes);
+                let replaced = MutationKeyNode::insert(
+                    &mut unique,
+                    ordinal,
+                    mutations,
+                    admission,
+                    &mut node_bytes,
+                )?;
+                #[cfg(any(test, feature = "test-seams"))]
+                if mutation.family == LogicalFamily::Status {
+                    observe_status_namespace(&mutation.logical_key);
+                    if replaced {
+                        forget_status_namespace(&mutation.logical_key);
+                    }
+                }
+                #[cfg(not(any(test, feature = "test-seams")))]
+                let _ = replaced;
+            }
+            let mut coalesced_bytes = 0usize;
+            let Some(unique) = unique else {
+                return Ok(None);
+            };
+
+            // The coalesced directory borrows source records; grouping allocates
+            // only exact tuple slices and the selected keys' actual payloads.
+            #[cfg(any(test, feature = "test-seams"))]
+            let group_started = std::time::Instant::now();
+            type GroupEntry = (Vec<u8>, Option<[u8; 32]>);
+            let mut family_counts = [0usize; LogicalFamily::ALL.len()];
+            unique.visit(&mut |node| {
+                let family = mutations[node.first].family as usize;
+                family_counts[family] = family_counts[family]
+                    .checked_add(1)
+                    .ok_or_else(|| proof_allocation_overflow(admission))?;
+                Ok(())
+            })?;
+            // The fixed family directory lives on the stack. Each nonempty list
+            // gets one exact slice allocation, including the tuple's alignment;
+            // neither map nodes nor geometric Vec growth are needed for grouping.
+            let mut grouped_bytes = 0usize;
+            for count in family_counts {
+                let layout = std::alloc::Layout::array::<GroupEntry>(count)
+                    .map_err(|_| proof_allocation_overflow(admission))?;
+                grouped_bytes = grouped_bytes
+                    .checked_add(layout.size())
+                    .ok_or_else(|| proof_allocation_overflow(admission))?;
+            }
+            admission.admit(grouped_bytes)?;
+            let mut grouped: [EntryEdits; LogicalFamily::ALL.len()] =
+                std::array::from_fn(|family| {
+                    let count = family_counts[family];
+                    let mut entries = Box::<[GroupEntry]>::new_uninit_slice(count);
+                    for entry in &mut entries {
+                        entry.write((Vec::new(), None));
+                    }
+                    // SAFETY: every slot was initialized above, with no fallible
+                    // work between initialization and conversion. A boxed slice
+                    // converts without reallocating and gives Vec capacity equal
+                    // to its length, exactly the layout admitted before allocation.
+                    let entries = unsafe { entries.assume_init() }.into_vec();
+                    debug_assert_eq!(entries.capacity(), count);
+                    entries
+                });
+            let mut family_positions = [0usize; LogicalFamily::ALL.len()];
+            unique.visit(&mut |node| {
+                // First-key ownership and final-value replacement match the map.
+                let mutation = &mutations[node.first];
+                let final_mutation = &mutations[node.last];
+                let key_bytes = mutation_key_capacity(mutation, admission)?;
+                let next_bytes = coalesced_bytes
+                    .checked_add(key_bytes)
+                    .ok_or_else(|| proof_allocation_overflow(admission))?;
+                admission.admit(key_bytes)?;
+                let key = mutation_tree_key(mutation)?;
+                debug_assert_eq!(key.capacity(), key_bytes);
+                coalesced_bytes = next_bytes;
+                let value = final_mutation
+                    .logical_value
+                    .as_deref()
+                    .map(|value| value_hash(mutation.family, value));
+                let family = mutation.family as usize;
+                grouped[family][family_positions[family]] = (key, value);
+                family_positions[family] += 1;
+                Ok(())
+            })?;
+            #[cfg(feature = "test-seams")]
+            let observe_mutations = crate::append_work::coalesced_mutation_observer_is_active();
+            #[cfg(not(feature = "test-seams"))]
+            let observe_mutations = false;
+            // Unobserved applies keep the directory's original lifetime and
+            // credit exactly: no observation extends production residency.
+            let observed_directory = if observe_mutations {
+                Some(unique)
+            } else {
+                drop(unique);
+                admission.release(node_bytes);
+                None
+            };
+
+
+            #[cfg(any(test, feature = "test-seams"))]
+            observe_identity_span(IdentitySpan::CoalesceAndGroup, group_started);
+            let mut nodes = write_txn
+                .open_table(CONTENT_IDENTITY_NODES_TABLE)
+                .map_err(Self::storage_error)?;
+            for family in LogicalFamily::ALL {
+                let mut mutations = std::mem::take(&mut grouped[family as usize]);
+                if mutations.is_empty() {
+                    continue;
+                }
+                // One family's frames stop being held the moment its update has
+                // consumed them, so the next family starts from the lower peak.
+                // The walk itself returns them, because it is what consumes the
+                // list: holding them until it came back reserved the list twice
+                // over for the whole of the deepest walk.
+                let frames = mutations.capacity() * std::mem::size_of::<GroupEntry>();
+                grouped_bytes = grouped_bytes.saturating_sub(frames);
+                #[cfg(any(test, feature = "test-seams"))]
+                let sort_started = std::time::Instant::now();
+                sort_canonical_from_coalesced(&mut mutations)?;
+                #[cfg(any(test, feature = "test-seams"))]
+                {
+                    observe_identity_span(IdentitySpan::CoalesceAndGroup, sort_started);
+                    enter_family(family, mutations.len());
+                }
+                let mut history = tails[family as usize].history_open;
+                let mut refresh = [false;3];
+                if let Some(publication) = history.as_mut() {
+                    for (key, value) in &mutations {
+                        if key.starts_with(&[ORDERED_HISTORY_KEY_TAG, HistoryKind::CommitIndex as u8]) {
+                            let raw: [u8;8] = key[2..].try_into().map_err(|_|history_control_damage("invalid changed commit coordinate"))?;
+                            let lsn = Lsn(u64::from_be_bytes(raw));
+                            let old = writer_window::history_member(&nodes,admission,&roots[family as usize],key)?;
+                            publication.control.commit_count = match (old.is_some(), value.is_some()) {
+                                (false, true) => publication.control.commit_count.checked_add(1),
+                                (true, false) => publication.control.commit_count.checked_sub(1),
+                                _ => Some(publication.control.commit_count),
+                            }.ok_or_else(|| history_control_damage("history member count overflow"))?;
+                            if let Some(hash) = value {
+                                if publication.control.first.is_none_or(|pair|lsn <= pair.0) { publication.control.first = Some((lsn,*hash)); }
+                                if publication.control.last.is_none_or(|pair|lsn >= pair.0) { publication.control.last = Some((lsn,*hash)); }
+                            } else {
+                                refresh[0] |= publication.control.first.is_some_and(|pair|pair.0==lsn);
+                                refresh[1] |= publication.control.last.is_some_and(|pair|pair.0==lsn);
+                            }
+                        } else if key.starts_with(&[ORDERED_HISTORY_KEY_TAG, HistoryKind::DdlLog as u8]) {
+                            // DDL's variable coordinate stays in the proof window; retain only fixed facts.
+                            writer_window::history_member(&nodes,admission,&roots[family as usize],key)?;
+                            refresh[2] = true;
+                        }
+                    }
+                }
+                let updated = writer_window::update_family_consuming_keys(
+                    &mut nodes,
+                    admission,
+                    family,
+                    &roots[family as usize],
+                    mutations,
+                    frames,
+                    &mut coalesced_bytes,
+                );
+                #[cfg(any(test, feature = "test-seams"))]
+                leave_family();
+                roots[family as usize] = updated?;
+                if let Some(publication) = history.as_mut() {
+                    let root = &roots[family as usize];
+                    publication.control.tree = root.root;
+                    publication.control.tree_hash = root.hash;
+                    if refresh[0] { publication.control.first = writer_window::history_commit_extreme(&nodes, admission, root, false)?; }
+                    if refresh[1] { publication.control.last = writer_window::history_commit_extreme(&nodes, admission, root, true)?; }
+                    if refresh[2] { publication.control.ddl = writer_window::history_ddl_extreme(&nodes, admission, root)?; }
+                    if publication.control.commit_count == 0 { publication.control.first = None; publication.control.last = None; }
+                    publication.control.validate()?;
+                    publication.control_hash = publication.control.digest();
+                    tails[family as usize].history_open = history;
+                }
+            }
+            drop(nodes);
+            admission.release(grouped_bytes);
+            admission.release(coalesced_bytes);
+
+            Ok(observed_directory)
+        })();
+        // Every local allocation has dropped before a refusal escapes this
+        // scope. Settle only this scope's remaining admission; caller-owned
+        // charges present on entry stay with their original lifetime.
+        if coalescing_result.is_err() {
+            admission.release(admission.held() - coalescing_admission_start);
+        }
+        let mut coalesced = CoalescedDirectory::new(coalescing_result?, admission);
+
+        assign_open_projections(
+            &mut roots,
+            &mut tails,
+            open_config_root,
+            custody_config_root,
+            vector_directory_root,
+        );
+        tails[LogicalFamily::Configuration as usize].content_size_root = Some(
+            write_txn
+                .table_root_fingerprint(super::super::content_size::TOTALS)
+                .map_err(Self::storage_error)?
+                .unwrap_or([0; 32]),
+        );
+        tails[LogicalFamily::Configuration as usize].vector_pages_root =
+            Some(vector_schema_pages_root_in_write(write_txn)?);
+        coalesced.admission.admit(ENCODED_ROOT_BYTES * LogicalFamily::ALL.len())?;
+        persist_changed_family_roots(write_txn, &roots, &original_roots, &tails, &original_tails)?;
+        coalesced.admission.release(ENCODED_ROOT_BYTES * LogicalFamily::ALL.len());
+        #[cfg(feature = "test-seams")]
+        if let Some(unique) = &coalesced.root {
+            unique.visit(&mut |node| {
+                let mutation = &mutations[node.last];
+                crate::append_work::observe_coalesced_mutation(
+                    family_name_for_tag(mutation.family as u8),
+                    &mutation.logical_key,
+                    mutation.logical_value.is_some(),
+                );
+                Ok(())
+            })?;
+        }
+        // Directory boxes own borrowed ordinals only. Free the actual boxes
+        // before returning their original proof admission.
+        drop(coalesced);
+
+        #[cfg(any(test, feature = "test-seams"))]
+        publish_directory_binding_work();
+        Ok(digest_from_roots(std::array::from_fn(|family| {
+            roots[family].hash
+        })))
+    }
+}
+
+mod writer_window {
+//! Invocation-local proof planning over borrowed originals and disposable working storage.
+use super::*;
+use std::cell::{Cell, RefCell};
+
+const NONE: u64 = u64::MAX;
+const RECORD_BUFFER_BYTES: usize = Parent::BYTES + 32;
+const STREAM_BLOCK_BYTES: usize = MAX_NODE_BYTES;
+const STREAM_HEADER_BYTES: usize = 16;
+
+impl Window<'_, '_, '_> {
+    /// A bounded authenticated writer descent, retaining only its proof path.
+    fn history_search<T>(
+        &self,
+        address: ([u8; 32], [u8; 32]),
+        level: Option<u32>,
+        bounds: (&[u8], &[u8], bool),
+        reverse: bool,
+        take: &mut impl FnMut(&[u8], [u8; 32]) -> Result<T>,
+    ) -> Result<Option<T>> {
+        let original = self.original(address.0, address.1)?;
+        if original.level > MAX_CHUNK_LEVEL
+            || level.is_some_and(|parent| original.level.checked_add(1) != Some(parent))
+        {
+            return Err(history_control_damage(
+                "history writer proof depth mismatch",
+            ));
+        }
+        self.validate_order(&original)?;
+        let (low, high, exact) = bounds;
+        let count = original.entries.entries.len();
+        for step in 0..count {
+            let index = if reverse { count - 1 - step } else { step };
+            let entry = &original.entries.entries[index];
+            let key = &original.guard.value()
+                [entry.start as usize..entry.start as usize + entry.len as usize];
+            let lower_ok =
+                self.with_referenced(key, |raw| Ok(identity_key_cmp(raw, low)? != Ordering::Less))?;
+            if !lower_ok {
+                continue;
+            }
+            if original.level == 0 {
+                let in_range = self.with_referenced(key, |raw| {
+                    let order = identity_key_cmp(raw, high)?;
+                    Ok(if exact {
+                        order == Ordering::Equal
+                    } else {
+                        order == Ordering::Less
+                    })
+                })?;
+                if in_range {
+                    return self
+                        .with_referenced(key, |raw| take(raw, entry.hash))
+                        .map(Some);
+                }
+                continue;
+            }
+            if index > 0 {
+                let previous = &original.entries.entries[index - 1];
+                let key = &original.guard.value()
+                    [previous.start as usize..previous.start as usize + previous.len as usize];
+                let too_high = self.with_referenced(key, |raw| {
+                    Ok(identity_key_cmp(raw, high)? != Ordering::Less)
+                })?;
+                if too_high {
+                    continue;
+                }
+            }
+            let child = chunk_id(original.level - 1, key);
+            if let Some(value) = self.history_search(
+                (child, entry.hash),
+                Some(original.level),
+                bounds,
+                reverse,
+                take,
+            )? {
+                return Ok(Some(value));
+            }
+        }
+        Ok(None)
+    }
+}
+
+fn with_history_window<T>(
+    table: &redb::Table<'_, &'static [u8], &'static [u8]>,
+    admission: &mut ProofAdmission,
+    root: &FamilyRoot,
+    bounds: (&[u8], &[u8], bool),
+    reverse: bool,
+    mut take: impl FnMut(&[u8], [u8; 32]) -> Result<T>,
+) -> Result<Option<T>> {
+    let Some(id) = root.root else {
+        return Ok(None);
+    };
+    let scratch = Scratch::open(admission)?;
+    let base = admission
+        .held
+        .checked_add(scratch._charge.bytes)
+        .ok_or_else(overflow)?;
+    let ledger = Ledger {
+        live: Cell::new(0),
+        base,
+        caller_peak: &admission.peak,
+    };
+    let workspace = Workspace {
+        admission: RefCell::new(admission.fork()?),
+        ledger: &ledger,
+    };
+    Window::open(
+        table,
+        LogicalFamily::ChangeAndDdl,
+        Vec::new(),
+        scratch,
+        &workspace,
+    )
+    .history_search((id, root.hash), None, bounds, reverse, &mut take)
+}
+
+pub(super) fn history_member(
+    table: &redb::Table<'_, &'static [u8], &'static [u8]>,
+    admission: &mut ProofAdmission,
+    root: &FamilyRoot,
+    key: &[u8],
+) -> Result<Option<[u8; 32]>> {
+    with_history_window(
+        table,
+        admission,
+        root,
+        (key, key, true),
+        false,
+        |_, hash| Ok(hash),
+    )
+}
+pub(super) fn history_commit_extreme(
+    table: &redb::Table<'_, &'static [u8], &'static [u8]>,
+    admission: &mut ProofAdmission,
+    root: &FamilyRoot,
+    reverse: bool,
+) -> Result<Option<(Lsn, [u8; 32])>> {
+    with_history_window(
+        table,
+        admission,
+        root,
+        (
+            &[ORDERED_HISTORY_KEY_TAG, 0],
+            &[ORDERED_HISTORY_KEY_TAG, 1],
+            false,
+        ),
+        reverse,
+        |key, hash| {
+            let raw: [u8; 8] = key[2..]
+                .try_into()
+                .map_err(|_| history_control_damage("invalid committed LSN coordinate"))?;
+            Ok((Lsn(u64::from_be_bytes(raw)), hash))
+        },
+    )
+}
+pub(super) fn history_ddl_extreme(
+    table: &redb::Table<'_, &'static [u8], &'static [u8]>,
+    admission: &mut ProofAdmission,
+    root: &FamilyRoot,
+) -> Result<Option<(u64, Lsn, [u8; 32], [u8; 32])>> {
+    with_history_window(
+        table,
+        admission,
+        root,
+        (
+            &[ORDERED_HISTORY_KEY_TAG, 2],
+            &[ORDERED_HISTORY_KEY_TAG, 3],
+            false,
+        ),
+        true,
+        |key, value| {
+            let coordinate = &key[2..];
+            let text = std::str::from_utf8(coordinate)
+                .map_err(|_| history_control_damage("invalid DDL coordinate encoding"))?;
+            validate_history_key(text)?;
+            let lsn = text
+                .split_once(':')
+                .map_or(text, |(lsn, _)| lsn)
+                .parse()
+                .map_err(|_| history_control_damage("invalid DDL coordinate LSN"))?;
+            Ok((
+                u64::try_from(coordinate.len()).map_err(|_| overflow())?,
+                Lsn(lsn),
+                history_open_control::ddl_coordinate_digest(coordinate, None)?,
+                value,
+            ))
+        },
+    )
+}
+
+fn overflow() -> Error {
+    Error::Other("proof scratch offset overflow".into())
+}
+fn scratch_error(operation: &str, error: std::io::Error) -> Error {
+    Error::ScratchWorkingStorageUnavailable {
+        operation: operation.into(),
+        io_kind: error.kind(),
+    }
+}
+fn position(value: u64) -> Result<usize> {
+    usize::try_from(value).map_err(|_| overflow())
+}
+
+/// No buffered IO owner exists beside the admitted backend. All variable
+/// bodies and directories live in its immediately unlinked file.
+struct Scratch {
+    backend: Box<dyn redb::ScratchBackend>,
+    end: Cell<u64>,
+    _charge: AdmittedBytes,
+}
+impl Scratch {
+    fn open(admission: &mut ProofAdmission) -> Result<Self> {
+        let (backend, charge) = admission.open_scratch()?;
+        Ok(Self {
+            backend,
+            end: Cell::new(0),
+            _charge: charge,
+        })
+    }
+    fn reserve(&self, bytes: usize) -> Result<u64> {
+        let start = self.end.get();
+        let end = start
+            .checked_add(u64::try_from(bytes).map_err(|_| overflow())?)
+            .ok_or_else(overflow)?;
+        self.backend
+            .set_len(end)
+            .map_err(|e| scratch_error("extend_content_identity_scratch", e))?;
+        self.end.set(end);
+        Ok(start)
+    }
+    fn read(&self, offset: u64, bytes: &mut [u8]) -> Result<()> {
+        if offset
+            .checked_add(bytes.len() as u64)
+            .is_none_or(|end| end > self.end.get())
+        {
+            return Err(scratch_error(
+                "read_content_identity_scratch",
+                std::io::Error::from(std::io::ErrorKind::UnexpectedEof),
+            ));
+        }
+        self.backend
+            .read(offset, bytes)
+            .map_err(|e| scratch_error("read_content_identity_scratch", e))
+    }
+    fn write(&self, offset: u64, bytes: &[u8]) -> Result<()> {
+        if offset
+            .checked_add(bytes.len() as u64)
+            .is_none_or(|end| end > self.end.get())
+        {
+            return Err(overflow());
+        }
+        self.backend
+            .write(offset, bytes)
+            .map_err(|e| scratch_error("write_content_identity_scratch", e))
+    }
+    fn append(&self, bytes: &[u8]) -> Result<u64> {
+        let offset = self.reserve(bytes.len())?;
+        self.write(offset, bytes)?;
+        Ok(offset)
+    }
+    fn get<T: DiskRecord>(&self, offset: u64) -> Result<T> {
+        let mut bytes = [0; RECORD_BUFFER_BYTES];
+        self.read(offset, &mut bytes[..T::BYTES + 32])?;
+        if blake3::hash(&bytes[..T::BYTES]).as_bytes() != &bytes[T::BYTES..T::BYTES + 32] {
+            return Err(scratch_error(
+                "authenticate_content_identity_scratch_record",
+                std::io::Error::from(std::io::ErrorKind::InvalidData),
+            ));
+        }
+        T::decode(&bytes[..T::BYTES])
+    }
+    fn put<T: DiskRecord>(&self, offset: u64, record: T) -> Result<()> {
+        let mut bytes = [0; RECORD_BUFFER_BYTES];
+        record.encode(&mut bytes[..T::BYTES]);
+        let hash = *blake3::hash(&bytes[..T::BYTES]).as_bytes();
+        bytes[T::BYTES..T::BYTES + 32].copy_from_slice(&hash);
+        self.write(offset, &bytes[..T::BYTES + 32])
+    }
+    fn push<T: DiskRecord>(&self, record: T) -> Result<u64> {
+        let offset = self.reserve(T::BYTES + 32)?;
+        self.put(offset, record)?;
+        Ok(offset)
+    }
+}
+
+trait DiskRecord: Copy {
+    const BYTES: usize;
+    fn encode(self, bytes: &mut [u8]);
+    fn decode(bytes: &[u8]) -> Result<Self>;
+}
+struct Encoder<'a> {
+    bytes: &'a mut [u8],
+    at: usize,
+}
+impl Encoder<'_> {
+    fn bytes(&mut self, value: &[u8]) {
+        self.bytes[self.at..self.at + value.len()].copy_from_slice(value);
+        self.at += value.len();
+    }
+    fn u64(&mut self, value: u64) {
+        self.bytes(&value.to_be_bytes());
+    }
+    fn hash(&mut self, value: Option<[u8; 32]>) {
+        self.bytes(&[u8::from(value.is_some())]);
+        self.bytes(&value.unwrap_or([0; 32]));
+    }
+    fn locator(&mut self, loc: Locator) {
+        self.u64(loc.kind);
+        self.bytes(&loc.id);
+        self.bytes(&loc.hash);
+        self.u64(loc.start);
+        self.u64(loc.len);
+    }
+    fn key(&mut self, key: Key) {
+        self.locator(key.encoded);
+        self.locator(key.raw);
+        self.bytes(&key.inline);
+    }
+}
+struct Decoder<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+impl Decoder<'_> {
+    fn array<const N: usize>(&mut self) -> [u8; N] {
+        let value = self.bytes[self.at..self.at + N]
+            .try_into()
+            .expect("fixed scratch field");
+        self.at += N;
+        value
+    }
+    fn u64(&mut self) -> u64 {
+        u64::from_be_bytes(self.array())
+    }
+    fn hash(&mut self) -> Result<Option<[u8; 32]>> {
+        let flag = self.array::<1>()[0];
+        let hash = self.array();
+        match flag {
+            0 => Ok(None),
+            1 => Ok(Some(hash)),
+            _ => Err(Error::Other("invalid scratch optional hash".into())),
+        }
+    }
+    fn locator(&mut self) -> Result<Locator> {
+        let loc = Locator {
+            kind: self.u64(),
+            id: self.array(),
+            hash: self.array(),
+            start: self.u64(),
+            len: self.u64(),
+        };
+        if loc.kind > 2 {
+            return Err(Error::Other("invalid scratch key locator".into()));
+        }
+        Ok(loc)
+    }
+    fn key(&mut self) -> Result<Key> {
+        Ok(Key {
+            encoded: self.locator()?,
+            raw: self.locator()?,
+            inline: self.array(),
+        })
+    }
+}
+
+/// Raw provenance points to a complete caller key, authenticated original,
+/// or a byte-identical resident inline copy. Wide separators keep
+/// their complete original slice, including accepted equal encodings.
+#[derive(Clone, Copy)]
+struct Locator {
+    kind: u64,
+    id: [u8; 32],
+    hash: [u8; 32],
+    start: u64,
+    len: u64,
+}
+impl Locator {
+    fn input(index: usize, len: usize) -> Self {
+        Self {
+            kind: 0,
+            id: [0; 32],
+            hash: [0; 32],
+            start: index as u64,
+            len: len as u64,
+        }
+    }
+    fn inline(bytes: &[u8]) -> Self {
+        Self {
+            kind: 2,
+            id: [0; 32],
+            hash: [0; 32],
+            start: 0,
+            len: bytes.len() as u64,
+        }
+    }
+}
+#[derive(Clone, Copy)]
+struct Key {
+    encoded: Locator,
+    raw: Locator,
+    inline: [u8; INLINE_SEPARATOR_BYTES],
+}
+
+#[derive(Clone, Copy)]
+struct Edit {
+    key: Key,
+    value: Option<[u8; 32]>,
+}
+impl DiskRecord for Edit {
+    const BYTES: usize = 176 + INLINE_SEPARATOR_BYTES + 33;
+    fn encode(self, bytes: &mut [u8]) {
+        let mut e = Encoder { bytes, at: 0 };
+        e.key(self.key);
+        e.hash(self.value);
+    }
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut d = Decoder { bytes, at: 0 };
+        Ok(Self {
+            key: d.key()?,
+            value: d.hash()?,
+        })
+    }
+}
+
+/// Parent submissions preserve the old map's operation order, independently
+/// of semantic key order. A tombstone precedes processing its source chunk;
+/// every real finish receives its later ordinal, including an equal raw key.
+#[derive(Clone, Copy)]
+struct Parent {
+    edit: Edit,
+    sequence: u64,
+}
+impl DiskRecord for Parent {
+    const BYTES: usize = Edit::BYTES + 8;
+    fn encode(self, bytes: &mut [u8]) {
+        self.edit.encode(&mut bytes[..Edit::BYTES]);
+        bytes[Edit::BYTES..].copy_from_slice(&self.sequence.to_be_bytes());
+    }
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        Ok(Self {
+            edit: Edit::decode(&bytes[..Edit::BYTES])?,
+            sequence: u64::from_be_bytes(bytes[Edit::BYTES..].try_into().expect("parent ordinal")),
+        })
+    }
+}
+
+/// Operations remain distinct until sorted by (physical key, operation ordinal).
+/// A seen-only operation never changes a staged body, and a body never invents
+/// original authority. This is the former directory's replacement order.
+#[derive(Clone, Copy)]
+struct Write {
+    key: [u8; 33],
+    original: Option<[u8; 32]>,
+    hash: Option<[u8; 32]>,
+    body: u64,
+    len: u64,
+    remove: bool,
+    sequence: u64,
+    operation: u8,
+}
+impl Write {
+    fn seen(key: [u8; 33], hash: [u8; 32]) -> Self {
+        Self {
+            key,
+            original: Some(hash),
+            hash: None,
+            body: NONE,
+            len: 0,
+            remove: false,
+            sequence: 0,
+            operation: 0,
+        }
+    }
+    fn removal(key: [u8; 33]) -> Self {
+        Self {
+            key,
+            original: None,
+            hash: None,
+            body: NONE,
+            len: 0,
+            remove: true,
+            sequence: 0,
+            operation: 1,
+        }
+    }
+    fn finished(key: [u8; 33], hash: [u8; 32], body: u64, len: usize) -> Self {
+        Self {
+            key,
+            original: None,
+            hash: Some(hash),
+            body,
+            len: len as u64,
+            remove: false,
+            sequence: 0,
+            operation: 2,
+        }
+    }
+    fn fold(&mut self, later: Self) -> Result<()> {
+        if self.key != later.key {
+            return Err(Error::Other("proof write fold key mismatch".into()));
+        }
+        if let Some(hash) = later.original {
+            if self.original.is_some_and(|original| original != hash) {
+                return Err(Error::Other(
+                    "logical identity original hash changed".into(),
+                ));
+            }
+            self.original = Some(hash);
+        }
+        if later.operation != 0 {
+            self.hash = later.hash;
+            self.body = later.body;
+            self.len = later.len;
+            self.remove = later.remove;
+            self.operation = later.operation;
+        }
+        self.sequence = later.sequence;
+        Ok(())
+    }
+    fn order(&self, other: &Self) -> Ordering {
+        self.key
+            .cmp(&other.key)
+            .then(self.sequence.cmp(&other.sequence))
+    }
+}
+impl DiskRecord for Write {
+    const BYTES: usize = 33 + 66 + 16 + 1 + 8 + 1;
+    fn encode(self, bytes: &mut [u8]) {
+        let mut e = Encoder { bytes, at: 0 };
+        e.bytes(&self.key);
+        e.hash(self.original);
+        e.hash(self.hash);
+        e.u64(self.body);
+        e.u64(self.len);
+        e.bytes(&[u8::from(self.remove)]);
+        e.u64(self.sequence);
+        e.bytes(&[self.operation]);
+    }
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut d = Decoder { bytes, at: 0 };
+        let key = d.array();
+        let original = d.hash()?;
+        let hash = d.hash()?;
+        let body = d.u64();
+        let len = d.u64();
+        let flag = d.array::<1>()[0];
+        let sequence = d.u64();
+        let operation = d.array::<1>()[0];
+        if flag > 1 || operation > 2 {
+            return Err(Error::Other("invalid proof write operation".into()));
+        }
+        Ok(Self {
+            key,
+            original,
+            hash,
+            body,
+            len,
+            remove: flag != 0,
+            sequence,
+            operation,
+        })
+    }
+}
+
+/// Bounded-block sequential streams share the one admitted unlinked backend.
+/// Bodies may be interleaved in that file. Only a block boundary has a link;
+/// records have no links, record checksums, trees or random access directory.
+#[derive(Clone, Copy)]
+struct Stream {
+    first: u64,
+    tail: u64,
+    tail_count: usize,
+    count: u64,
+}
+impl Stream {
+    fn new() -> Self {
+        Self {
+            first: NONE,
+            tail: NONE,
+            tail_count: 0,
+            count: 0,
+        }
+    }
+    fn record_offset<T: DiskRecord>(block: u64, index: usize) -> Result<u64> {
+        let offset = index.checked_mul(T::BYTES).ok_or_else(overflow)?;
+        block
+            .checked_add(STREAM_HEADER_BYTES as u64)
+            .and_then(|start| start.checked_add(offset as u64))
+            .ok_or_else(overflow)
+    }
+    fn push<T: DiskRecord>(&mut self, scratch: &Scratch, record: T) -> Result<()> {
+        let slots = (STREAM_BLOCK_BYTES - STREAM_HEADER_BYTES) / T::BYTES;
+        if slots == 0 {
+            return Err(overflow());
+        }
+        if self.tail == NONE || self.tail_count == slots {
+            let block = scratch.reserve(STREAM_BLOCK_BYTES)?;
+            let mut header = [0; STREAM_HEADER_BYTES];
+            header[..8].copy_from_slice(&NONE.to_be_bytes());
+            header[8..].copy_from_slice(&(slots as u64).to_be_bytes());
+            scratch.write(block, &header)?;
+            if self.tail == NONE {
+                self.first = block;
+            } else {
+                scratch.write(self.tail, &block.to_be_bytes())?;
+            }
+            self.tail = block;
+            self.tail_count = 0;
+        }
+        let mut bytes = [0; RECORD_BUFFER_BYTES];
+        record.encode(&mut bytes[..T::BYTES]);
+        scratch.write(
+            Self::record_offset::<T>(self.tail, self.tail_count)?,
+            &bytes[..T::BYTES],
+        )?;
+        self.tail_count += 1;
+        self.count = self.count.checked_add(1).ok_or_else(overflow)?;
+        Ok(())
+    }
+    fn reader(self) -> StreamReader {
+        StreamReader {
+            block: self.first,
+            next: NONE,
+            index: 0,
+            count: 0,
+            remaining: self.count,
+        }
+    }
+}
+#[derive(Clone, Copy)]
+struct StreamReader {
+    block: u64,
+    next: u64,
+    index: usize,
+    count: usize,
+    remaining: u64,
+}
+impl StreamReader {
+    fn read<T: DiskRecord>(&mut self, scratch: &Scratch) -> Result<Option<T>> {
+        if self.remaining == 0 {
+            return Ok(None);
+        }
+        if self.index == self.count {
+            if self.count != 0 {
+                self.block = self.next;
+            }
+            if self.block == NONE {
+                return Err(overflow());
+            }
+            let mut header = [0; STREAM_HEADER_BYTES];
+            scratch.read(self.block, &mut header)?;
+            self.next = u64::from_be_bytes(header[..8].try_into().expect("stream next"));
+            self.count = position(u64::from_be_bytes(
+                header[8..].try_into().expect("stream count"),
+            ))?;
+            self.index = 0;
+            if self.count == 0 || self.count > (STREAM_BLOCK_BYTES - STREAM_HEADER_BYTES) / T::BYTES
+            {
+                return Err(Error::Other("invalid proof stream block".into()));
+            }
+            self.count = self
+                .count
+                .min(position(self.remaining.min(usize::MAX as u64))?);
+        }
+        let mut bytes = [0; RECORD_BUFFER_BYTES];
+        scratch.read(
+            Stream::record_offset::<T>(self.block, self.index)?,
+            &mut bytes[..T::BYTES],
+        )?;
+        self.index += 1;
+        self.remaining -= 1;
+        Ok(Some(T::decode(&bytes[..T::BYTES])?))
+    }
+}
+
+/// A stack ledger covers every detached window lease concurrently with all
+/// remaining grouped families. Its base is sampled before detaching scratch;
+/// dynamic allocation overlap updates the same caller peak before allocation.
+struct Ledger<'a> {
+    live: Cell<usize>,
+    base: usize,
+    caller_peak: &'a Cell<usize>,
+}
+impl Ledger<'_> {
+    fn add(&self, bytes: usize) -> Result<()> {
+        let live = self.live.get().checked_add(bytes).ok_or_else(overflow)?;
+        let total = self.base.checked_add(live).ok_or_else(overflow)?;
+        self.live.set(live);
+        self.caller_peak.set(self.caller_peak.get().max(total));
+        Ok(())
+    }
+}
+struct Lease<'a> {
+    charge: AdmittedBytes,
+    ledger: &'a Ledger<'a>,
+}
+impl Drop for Lease<'_> {
+    fn drop(&mut self) {
+        // The owning payload/guard is an earlier field and has already dropped.
+        self.ledger
+            .live
+            .set(self.ledger.live.get() - self.charge.bytes);
+    }
+}
+struct Workspace<'a> {
+    admission: RefCell<ProofAdmission>,
+    ledger: &'a Ledger<'a>,
+}
+impl<'a> Workspace<'a> {
+    fn charge(&self, bytes: usize) -> Result<Lease<'a>> {
+        let mut admission = self.admission.borrow_mut();
+        admission.admit(bytes)?;
+        let charge = admission.detach(bytes);
+        self.ledger
+            .add(bytes)
+            .map_err(|_| proof_allocation_overflow(&admission))?;
+        Ok(Lease {
+            charge,
+            ledger: self.ledger,
+        })
+    }
+    fn array<T>(
+        &self,
+        count: usize,
+        mut init: impl FnMut(usize) -> T,
+    ) -> Result<OwnedArray<'a, T>> {
+        let layout = std::alloc::Layout::array::<T>(count)
+            .map_err(|_| proof_allocation_overflow(&self.admission.borrow()))?;
+        let charge = self.charge(layout.size())?;
+        let mut entries = Box::<[T]>::new_uninit_slice(count);
+        for (index, entry) in entries.iter_mut().enumerate() {
+            entry.write(init(index));
+        }
+        // SAFETY: every element above is initialized, and there is no fallible
+        // work between allocation, initialization and conversion.
+        let entries = unsafe { entries.assume_init() };
+        Ok(OwnedArray {
+            entries,
+            _charge: charge,
+        })
+    }
+}
+struct OwnedArray<'a, T> {
+    entries: Box<[T]>,
+    _charge: Lease<'a>,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DecodedEntry {
+    start: u32,
+    len: u32,
+    hash: [u8; 32],
+}
+struct VerifiedOriginal<'a, 'mem> {
+    id: [u8; 32],
+    hash: [u8; 32],
+    guard: redb::AccessGuard<'a, &'static [u8]>,
+    entries: OwnedArray<'mem, DecodedEntry>,
+    level: u32,
+    seen: Cell<bool>,
+    order_verified: Cell<bool>,
+    _page_charge: Lease<'mem>,
+}
+#[derive(Clone, Copy)]
+struct Frame {
+    slot: usize,
+    index: usize,
+}
+
+enum Edits {
+    Inputs { next: usize },
+    Stream(StreamReader),
+}
+#[derive(Clone, Copy)]
+struct Action {
+    key: [u8; 33],
+    hash: [u8; 32],
+    body: u64,
+    len: u64,
+    kind: u64,
+    next: u64,
+}
+impl DiskRecord for Action {
+    const BYTES: usize = 97;
+    fn encode(self, bytes: &mut [u8]) {
+        let mut e = Encoder { bytes, at: 0 };
+        e.bytes(&self.key);
+        e.bytes(&self.hash);
+        e.u64(self.body);
+        e.u64(self.len);
+        e.u64(self.kind);
+        e.u64(self.next);
+    }
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut d = Decoder { bytes, at: 0 };
+        let a = Self {
+            key: d.array(),
+            hash: d.array(),
+            body: d.u64(),
+            len: d.u64(),
+            kind: d.u64(),
+            next: d.u64(),
+        };
+        if a.kind > 2 {
+            return Err(Error::Other("invalid scratch action".into()));
+        }
+        Ok(a)
+    }
+}
+struct Journal {
+    first: u64,
+    last: u64,
+}
+impl Journal {
+    fn new() -> Self {
+        Self {
+            first: NONE,
+            last: NONE,
+        }
+    }
+    fn push(&mut self, s: &Scratch, mut action: Action) -> Result<()> {
+        action.next = NONE;
+        let at = s.push(action)?;
+        if self.last == NONE {
+            self.first = at;
+        } else {
+            let mut prior = s.get::<Action>(self.last)?;
+            prior.next = at;
+            s.put(self.last, prior)?;
+        }
+        self.last = at;
+        Ok(())
+    }
+}
+
+struct OperandBorrow<'a> {
+    count: &'a Cell<usize>,
+}
+impl<'a> OperandBorrow<'a> {
+    fn enter(count: &'a Cell<usize>) -> Result<Self> {
+        if count.get() >= 2 {
+            return Err(Error::Other(
+                "proof comparison exhausted its operand guards".into(),
+            ));
+        }
+        count.set(count.get() + 1);
+        Ok(Self { count })
+    }
+}
+impl Drop for OperandBorrow<'_> {
+    fn drop(&mut self) {
+        self.count.set(self.count.get() - 1);
+    }
+}
+
+struct Window<'a, 'txn, 'mem> {
+    table: &'a redb::Table<'txn, &'static [u8], &'static [u8]>,
+    family: LogicalFamily,
+    inputs: EntryEdits,
+    scratch: Scratch,
+    workspace: &'mem Workspace<'mem>,
+    slots: Option<OwnedArray<'mem, RefCell<Option<VerifiedOriginal<'a, 'mem>>>>>,
+    cache_next: Cell<usize>,
+    operand_borrows: Cell<usize>,
+    wide_borrows: Cell<usize>,
+    current: Cell<Option<usize>>,
+    path: Option<OwnedArray<'mem, Frame>>,
+    path_len: usize,
+    edits: Edits,
+    next_edit: Option<Edit>,
+    parents: Stream,
+    writes: Stream,
+    journal: Journal,
+    retirements: Journal,
+    builder: Option<OwnedArray<'mem, u8>>,
+    build_len: usize,
+    build_count: usize,
+    build_last: Option<Key>,
+    build_hash: blake3::Hasher,
+}
+impl<'a, 'txn, 'mem> Window<'a, 'txn, 'mem> {
+    fn open(
+        table: &'a redb::Table<'txn, &'static [u8], &'static [u8]>,
+        family: LogicalFamily,
+        inputs: EntryEdits,
+        scratch: Scratch,
+        workspace: &'mem Workspace<'mem>,
+    ) -> Self {
+        Self {
+            table,
+            family,
+            inputs,
+            scratch,
+            workspace,
+            slots: None,
+            cache_next: Cell::new(0),
+            operand_borrows: Cell::new(0),
+            wide_borrows: Cell::new(0),
+            current: Cell::new(None),
+            path: None,
+            path_len: 0,
+            edits: Edits::Inputs { next: 0 },
+            next_edit: None,
+            parents: Stream::new(),
+            writes: Stream::new(),
+            journal: Journal::new(),
+            retirements: Journal::new(),
+            builder: None,
+            build_len: 9,
+            build_count: 0,
+            build_last: None,
+            build_hash: blake3::Hasher::new(),
+        }
+    }
+    fn with_referenced<R>(&self, key: &[u8], f: impl FnOnce(&[u8]) -> Result<R>) -> Result<R> {
+        if key.first() != Some(&KEY_REFERENCE_TAG) {
+            return f(key);
+        }
+        let _operand = OperandBorrow::enter(&self.wide_borrows)?;
+        referenced_key_live_bytes(key)?;
+        let expected = u32::from_be_bytes(key[1..5].try_into().expect("length")) as usize;
+        let id = key_hash(key);
+        let stored = node_storage_key(self.family, &id);
+        let guard = self
+            .table
+            .get(stored.as_slice())
+            .map_err(RedbPersistence::storage_error)?
+            .ok_or_else(|| Error::Other("authenticated separator key is missing".into()))?;
+        #[cfg(feature = "test-seams")]
+        observe_node_read(guard.value().len());
+        // Acquire only a transient storage guard before this admission. Its
+        // retained backing pages remain charged through both nested operands.
+        let charge = self.workspace.charge(guard.retained_page_bytes())?;
+        struct Wide<'a, 'mem> {
+            guard: redb::AccessGuard<'a, &'static [u8]>,
+            _charge: Lease<'mem>,
+        }
+        let wide = Wide {
+            guard,
+            _charge: charge,
+        };
+        let expected = expected.checked_add(1).ok_or_else(overflow)?;
+        if wide.guard.value().len() != expected
+            || wide.guard.value().first() != Some(&0)
+            || key_hash(&wide.guard.value()[1..]) != id
+        {
+            return Err(Error::Other(
+                "authenticated separator key is damaged".into(),
+            ));
+        }
+        f(&wide.guard.value()[1..])
+    }
+    fn compare_encoded(&self, left: &[u8], right: &[u8]) -> Result<Ordering> {
+        self.with_referenced(left, |left| {
+            self.with_referenced(right, |right| identity_key_cmp(left, right))
+        })
+    }
+    fn original(&self, id: [u8; 32], expected: [u8; 32]) -> Result<VerifiedOriginal<'a, 'mem>> {
+        let stored = node_storage_key(self.family, &id);
+        let guard = self
+            .table
+            .get(stored.as_slice())
+            .map_err(RedbPersistence::storage_error)?
+            .ok_or_else(|| {
+                Error::Other("logical identity tree references a missing chunk".into())
+            })?;
+        #[cfg(feature = "test-seams")]
+        {
+            crate::read_work_probe::note_proof_node_read();
+            observe_node_read(guard.value().len());
+        }
+        let page_charge = self.workspace.charge(guard.retained_page_bytes())?;
+        // Construct an owner before authentication or decoding, so every
+        // refusal drops the borrowed page before its detached credit.
+        struct Page<'a, 'mem> {
+            guard: redb::AccessGuard<'a, &'static [u8]>,
+            charge: Lease<'mem>,
+        }
+        let page = Page {
+            guard,
+            charge: page_charge,
+        };
+        let node = EncodedNode::authenticate(self.family, page.guard.value())?;
+        if node.subtree_hash != expected {
+            return Err(Error::Other(
+                "logical identity chunk disagrees with committed parent".into(),
+            ));
+        }
+        let mut entries = self.workspace.array(node.count, |_| DecodedEntry {
+            start: 0,
+            len: 0,
+            hash: [0; 32],
+        })?;
+        let mut cursor = 9;
+        let mut last = &[][..];
+        for entry in &mut entries.entries {
+            let value = node.entry_at(&mut cursor)?;
+            let start = value.key.as_ptr() as usize - node.bytes.as_ptr() as usize;
+            *entry = DecodedEntry {
+                start: u32::try_from(start).map_err(|_| overflow())?,
+                len: u32::try_from(value.key.len()).map_err(|_| overflow())?,
+                hash: value.value_hash,
+            };
+            last = value.key;
+        }
+        if chunk_id(node.level, last) != id {
+            return Err(Error::Other(
+                "logical identity chunk id disagrees with its separator".into(),
+            ));
+        }
+        let level = node.level;
+        Ok(VerifiedOriginal {
+            id,
+            hash: expected,
+            guard: page.guard,
+            entries,
+            level,
+            seen: Cell::new(false),
+            order_verified: Cell::new(false),
+            _page_charge: page.charge,
+        })
+    }
+    fn validate_order(&self, original: &VerifiedOriginal<'_, '_>) -> Result<()> {
+        if original.order_verified.get() {
+            return Ok(());
+        }
+        let mut prior: Option<&[u8]> = None;
+        for entry in &original.entries.entries {
+            let start = entry.start as usize;
+            let key = &original.guard.value()[start..start + entry.len as usize];
+            if let Some(prior) = prior
+                && (prior.first() == Some(&KEY_REFERENCE_TAG)
+                    || key.first() == Some(&KEY_REFERENCE_TAG))
+                && self.compare_encoded(prior, key)? != Ordering::Less
+            {
+                return Err(Error::Other("internal separator order is invalid".into()));
+            }
+            prior = Some(key);
+        }
+        original.order_verified.set(true);
+        Ok(())
+    }
+    fn initialize(&mut self, root: &FamilyRoot) -> Result<u32> {
+        let original = root
+            .root
+            .map(|id| self.original(id, root.hash))
+            .transpose()?;
+        if let Some(original) = original.as_ref() {
+            self.observe_residency_with_extra(
+                original.guard.value().len(),
+                original.entries._charge.charge.bytes,
+            );
+        }
+        let height = original.as_ref().map_or(0, |node| node.level);
+        if height > MAX_CHUNK_LEVEL {
+            return Err(Error::Other(
+                "logical identity internal chunks exceed permitted depth".into(),
+            ));
+        }
+        self.slots = Some(
+            self.workspace
+                .array(height as usize + 3, |_| RefCell::new(None))?,
+        );
+        self.path = Some(
+            self.workspace
+                .array(height as usize + 1, |_| Frame { slot: 0, index: 0 })?,
+        );
+        if let Some(original) = original {
+            self.validate_order(&original)?;
+            self.writes.push(
+                &self.scratch,
+                Write::seen(node_storage_key(self.family, &original.id), original.hash),
+            )?;
+            original.seen.set(true);
+            *self.slots.as_ref().expect("slots").entries[0].borrow_mut() = Some(original);
+            self.current.set(Some(0));
+            self.cache_next.set(1);
+        }
+        self.observe_residency();
+        Ok(height)
+    }
+    fn pinned(&self, index: usize) -> bool {
+        self.current.get() == Some(index)
+            || self.path.as_ref().is_some_and(|path| {
+                path.entries[..self.path_len]
+                    .iter()
+                    .any(|frame| frame.slot == index)
+            })
+    }
+    fn cached(&self, id: [u8; 32], expected: [u8; 32]) -> Result<usize> {
+        let slots = &self.slots.as_ref().expect("initialized slots").entries;
+        for (index, slot) in slots.iter().enumerate() {
+            let Ok(entry) = slot.try_borrow() else {
+                continue;
+            };
+            if entry
+                .as_ref()
+                .is_some_and(|node| node.id == id && node.hash == expected)
+            {
+                #[cfg(feature = "test-seams")]
+                observe_cache_hit();
+                self.cache_next.set((index + 1) % slots.len());
+                return Ok(index);
+            }
+        }
+        for offset in 0..slots.len() {
+            let index = (self.cache_next.get() + offset) % slots.len();
+            if self.pinned(index) {
+                continue;
+            }
+            let Ok(mut entry) = slots[index].try_borrow_mut() else {
+                continue;
+            };
+            *entry = None;
+            let original = self.original(id, expected)?;
+            self.observe_residency_with_extra(
+                original.guard.value().len(),
+                original.entries._charge.charge.bytes,
+            );
+            *entry = Some(original);
+            self.cache_next.set((index + 1) % slots.len());
+            drop(entry);
+            self.observe_residency();
+            return Ok(index);
+        }
+        Err(Error::Other(
+            "proof comparison exhausted its operand guards".into(),
+        ))
+    }
+    fn load(&mut self, id: [u8; 32], expected: [u8; 32]) -> Result<()> {
+        let prior = self.current.replace(None);
+        let result = self.cached(id, expected);
+        if result.is_err() {
+            self.current.set(prior);
+        }
+        let index = result?;
+        self.current.set(Some(index));
+        // Seen authority is recorded independently even if a comparison had
+        // loaded this node into the cache before the cursor first visited it.
+        let already_seen = {
+            let entry = self.slots.as_ref().expect("slots").entries[index].borrow();
+            let original = entry.as_ref().expect("authenticated original");
+            self.validate_order(original)?;
+            original.seen.replace(true)
+        };
+        if !already_seen {
+            let mut write = Write::seen(node_storage_key(self.family, &id), expected);
+            write.sequence = self.writes.count;
+            self.writes.push(&self.scratch, write)?;
+        }
+        Ok(())
+    }
+    fn with_locator<R>(&self, loc: Locator, f: impl FnOnce(&[u8]) -> Result<R>) -> Result<R> {
+        let len = position(loc.len)?;
+        match loc.kind {
+            0 => {
+                let bytes = &self
+                    .inputs
+                    .get(position(loc.start)?)
+                    .ok_or_else(|| Error::Other("invalid caller key locator".into()))?
+                    .0;
+                if bytes.len() != len {
+                    return Err(Error::Other("caller key locator length mismatch".into()));
+                }
+                f(bytes)
+            }
+            1 => {
+                let _operand = OperandBorrow::enter(&self.operand_borrows)?;
+                let start = position(loc.start)?;
+                let end = start.checked_add(len).ok_or_else(overflow)?;
+                let index = self.cached(loc.id, loc.hash)?;
+                let original = self.slots.as_ref().expect("slots").entries[index].borrow();
+                f(original
+                    .as_ref()
+                    .expect("authenticated original")
+                    .guard
+                    .value()
+                    .get(start..end)
+                    .ok_or_else(|| Error::Other("original key locator out of bounds".into()))?)
+            }
+            _ => Err(Error::Other("invalid proof key locator".into())),
+        }
+    }
+    fn with_key<R>(&self, key: Key, raw: bool, f: impl FnOnce(&[u8]) -> Result<R>) -> Result<R> {
+        let loc = if raw { key.raw } else { key.encoded };
+        if loc.kind == 2 {
+            let len = position(loc.len)?;
+            f(key
+                .inline
+                .get(..len)
+                .ok_or_else(|| Error::Other("proof separator exceeds inline bound".into()))?)
+        } else {
+            self.with_locator(loc, f)
+        }
+    }
+    fn with_encoded<R>(&self, key: Key, f: impl FnOnce(&[u8]) -> Result<R>) -> Result<R> {
+        self.with_key(key, false, f)
+    }
+    fn with_semantic<R>(&self, key: Key, f: impl FnOnce(&[u8]) -> Result<R>) -> Result<R> {
+        self.with_key(key, true, |bytes| self.with_referenced(bytes, f))
+    }
+    fn compare_keys(&self, left: Key, right: Key) -> Result<Ordering> {
+        self.with_semantic(left, |left| {
+            self.with_semantic(right, |right| identity_key_cmp(left, right))
+        })
+    }
+    fn current_meta(&self) -> (usize, u32, usize, [u8; 32], [u8; 32]) {
+        let slot = self.current.get().expect("current original");
+        let original = self.slots.as_ref().expect("slots").entries[slot].borrow();
+        let node = original.as_ref().expect("current original");
+        (
+            slot,
+            node.level,
+            node.entries.entries.len(),
+            node.id,
+            node.hash,
+        )
+    }
+    fn entry(&self, index: usize) -> Result<(Key, [u8; 32])> {
+        let slot = self.current.get().expect("current original");
+        let original = self.slots.as_ref().expect("slots").entries[slot].borrow();
+        let node = original.as_ref().expect("current original");
+        let entry = node
+            .entries
+            .entries
+            .get(index)
+            .ok_or_else(|| Error::Other("proof source entry out of bounds".into()))?;
+        let loc = Locator {
+            kind: 1,
+            id: node.id,
+            hash: node.hash,
+            start: entry.start as u64,
+            len: entry.len as u64,
+        };
+        Ok((
+            Key {
+                encoded: loc,
+                raw: loc,
+                inline: [0; INLINE_SEPARATOR_BYTES],
+            },
+            entry.hash,
+        ))
+    }
+    fn push_frame(&mut self, slot: usize, index: usize) -> Result<()> {
+        let path = self.path.as_mut().expect("path");
+        let frame = path.entries.get_mut(self.path_len).ok_or_else(|| {
+            Error::Other("logical identity cursor exceeds authenticated height".into())
+        })?;
+        *frame = Frame { slot, index };
+        self.path_len += 1;
+        Ok(())
+    }
+    fn seek(&mut self, root: &FamilyRoot, target: u32, edit: Edit) -> Result<bool> {
+        self.path_len = 0;
+        let Some(id) = root.root else {
+            self.current.set(None);
+            return Ok(false);
+        };
+        self.load(id, root.hash)?;
+        while self.current_meta().1 > target {
+            let (slot, level, count, _, _) = self.current_meta();
+            let mut left = 0;
+            let mut right = count;
+            while left < right {
+                let mid = (left + right) / 2;
+                match self.compare_keys(self.entry(mid)?.0, edit.key)? {
+                    Ordering::Less => left = mid + 1,
+                    Ordering::Greater => right = mid,
+                    Ordering::Equal => {
+                        left = mid;
+                        break;
+                    }
+                }
+            }
+            let index = left.min(count - 1);
+            let (key, hash) = self.entry(index)?;
+            let child = self.with_encoded(key, |key| Ok(chunk_id(level - 1, key)))?;
+            self.push_frame(slot, index)?;
+            self.load(child, hash)?;
+            if self.current_meta().1 + 1 != level {
+                return Err(Error::Other("logical identity child level mismatch".into()));
+            }
+        }
+        if self.current_meta().1 != target {
+            return Err(Error::Other("logical identity child level mismatch".into()));
+        }
+        Ok(true)
+    }
+    fn has_next(&self) -> bool {
+        self.path.as_ref().expect("path").entries[..self.path_len]
+            .iter()
+            .any(|frame| {
+                let node = self.slots.as_ref().expect("slots").entries[frame.slot].borrow();
+                frame.index + 1 < node.as_ref().expect("pinned parent").entries.entries.len()
+            })
+    }
+    fn advance(&mut self, target: u32) -> Result<bool> {
+        while self.path_len != 0 {
+            self.path_len -= 1;
+            let mut frame = self.path.as_ref().expect("path").entries[self.path_len];
+            self.current.set(Some(frame.slot));
+            frame.index += 1;
+            let (_, level, count, _, _) = self.current_meta();
+            if frame.index == count {
+                continue;
+            }
+            let (key, hash) = self.entry(frame.index)?;
+            let id = self.with_encoded(key, |key| Ok(chunk_id(level - 1, key)))?;
+            self.push_frame(frame.slot, frame.index)?;
+            self.load(id, hash)?;
+            if self.current_meta().1 + 1 != level {
+                return Err(Error::Other("logical identity child level mismatch".into()));
+            }
+            while self.current_meta().1 > target {
+                let (slot, level, _, _, _) = self.current_meta();
+                let (key, hash) = self.entry(0)?;
+                let id = self.with_encoded(key, |key| Ok(chunk_id(level - 1, key)))?;
+                self.push_frame(slot, 0)?;
+                self.load(id, hash)?;
+                if self.current_meta().1 + 1 != level {
+                    return Err(Error::Other("logical identity child level mismatch".into()));
+                }
+            }
+            return Ok(true);
+        }
+        self.current.set(None);
+        Ok(false)
+    }
+    fn separator(&self, key: Key) -> Result<Key> {
+        self.with_encoded(key, |bytes| {
+            let mut reference = [0; KEY_REFERENCE_BYTES];
+            let encoded = encoded_key_in(1, bytes, &mut reference);
+            if key.raw.kind == 1 {
+                self.with_referenced(encoded, |_| Ok(()))?;
+            }
+            let inline_raw = encoded.len() <= INLINE_SEPARATOR_BYTES
+                && encoded.first() != Some(&KEY_REFERENCE_TAG)
+                && self.with_key(key, true, |raw| Ok(raw == encoded))?;
+            if encoded.len() > INLINE_SEPARATOR_BYTES {
+                return Err(Error::Other("proof separator exceeds inline bound".into()));
+            }
+            let copied = Locator::inline(encoded);
+            let mut inline = [0; INLINE_SEPARATOR_BYTES];
+            inline[..encoded.len()].copy_from_slice(encoded);
+            Ok(Key {
+                encoded: copied,
+                raw: if inline_raw { copied } else { key.raw },
+                inline,
+            })
+        })
+    }
+    fn parent(&mut self, edit: Edit) -> Result<()> {
+        let sequence = self.parents.count;
+        self.parents.push(&self.scratch, Parent { edit, sequence })
+    }
+    fn parent_order(&self, left: &Parent, right: &Parent) -> Result<Ordering> {
+        Ok(self
+            .compare_keys(left.edit.key, right.edit.key)?
+            .then(left.sequence.cmp(&right.sequence)))
+    }
+    fn fold_parent(
+        &self,
+        output: &mut Stream,
+        pending: &mut Option<Parent>,
+        parent: Parent,
+    ) -> Result<()> {
+        if let Some(prior) = *pending {
+            match self.compare_keys(prior.edit.key, parent.edit.key)? {
+                Ordering::Greater => {
+                    return Err(Error::Other(
+                        "generated parent stream is not ordered".into(),
+                    ));
+                }
+                Ordering::Equal => {
+                    if prior.sequence >= parent.sequence {
+                        return Err(Error::Other(
+                            "generated parent ordinal is not ordered".into(),
+                        ));
+                    }
+                }
+                Ordering::Less => output.push(&self.scratch, prior.edit)?,
+            }
+        }
+        // The complete later key, including raw locator and inline bytes,
+        // replaces the prior key along with its value, exactly as the old map.
+        *pending = Some(parent);
+        Ok(())
+    }
+    fn end_parents(&mut self) -> Result<Stream> {
+        let count = self.parents.count;
+        if count == 0 {
+            return Ok(self.parents);
+        }
+        let capacity = (MAX_NODE_BYTES / std::mem::size_of::<Parent>())
+            .min(position(count.min(usize::MAX as u64))?);
+        if capacity == 0 {
+            return Err(overflow());
+        }
+        let mut reader = self.parents.reader();
+        let first = reader.read::<Parent>(&self.scratch)?.ok_or_else(overflow)?;
+        let mut buffer = self.workspace.array(capacity, |_| first)?;
+        self.observe_residency_with_extra(0, buffer._charge.charge.bytes);
+        let mut output = Stream::new();
+        let mut pending = None;
+        if count <= capacity as u64 {
+            buffer.entries[0] = first;
+            for record in &mut buffer.entries[1..] {
+                *record = reader.read(&self.scratch)?.ok_or_else(overflow)?;
+            }
+            heapsort(&mut buffer.entries, |a, b| self.parent_order(a, b))?;
+            for parent in buffer.entries.iter().copied() {
+                self.fold_parent(&mut output, &mut pending, parent)?;
+            }
+        } else {
+            // Fixed-sized sorted runs need no resident run directory. The
+            // operation stream may decrease after arbitrarily many deletions,
+            // or after a seek revisits accepted semantically equal encodings.
+            reader = self.parents.reader();
+            let mut runs = Stream::new();
+            while reader.remaining != 0 {
+                let len = capacity.min(position(reader.remaining.min(usize::MAX as u64))?);
+                for record in &mut buffer.entries[..len] {
+                    *record = reader.read(&self.scratch)?.ok_or_else(overflow)?;
+                }
+                heapsort(&mut buffer.entries[..len], |a, b| self.parent_order(a, b))?;
+                for parent in &buffer.entries[..len] {
+                    runs.push(&self.scratch, *parent)?;
+                }
+            }
+            // Comparisons can retain charged original/wide guards, but only
+            // two current parent records and constant cursors remain here.
+            drop(buffer);
+            let mut width = capacity as u64;
+            while width < count {
+                let mut input = runs.reader();
+                let mut merged = Stream::new();
+                while input.remaining != 0 {
+                    let left_count = width.min(input.remaining);
+                    let right_count = width.min(input.remaining - left_count);
+                    let mut left = input;
+                    let mut right = input;
+                    right.skip::<Parent>(left_count, &self.scratch)?;
+                    input = right;
+                    input.skip::<Parent>(right_count, &self.scratch)?;
+                    let mut left_remaining = left_count;
+                    let mut right_remaining = right_count;
+                    let mut a = left.read::<Parent>(&self.scratch)?;
+                    let mut b = if right_remaining == 0 {
+                        None
+                    } else {
+                        right.read::<Parent>(&self.scratch)?
+                    };
+                    while a.is_some() || b.is_some() {
+                        let take_left = match (a, b) {
+                            (Some(a), Some(b)) => self.parent_order(&a, &b)? != Ordering::Greater,
+                            (Some(_), None) => true,
+                            _ => false,
+                        };
+                        if take_left {
+                            merged.push(&self.scratch, a.ok_or_else(overflow)?)?;
+                            left_remaining -= 1;
+                            a = if left_remaining == 0 {
+                                None
+                            } else {
+                                left.read(&self.scratch)?
+                            };
+                        } else {
+                            merged.push(&self.scratch, b.ok_or_else(overflow)?)?;
+                            right_remaining -= 1;
+                            b = if right_remaining == 0 {
+                                None
+                            } else {
+                                right.read(&self.scratch)?
+                            };
+                        }
+                    }
+                    if left_remaining != 0 || right_remaining != 0 {
+                        return Err(overflow());
+                    }
+                }
+                if merged.count != count {
+                    return Err(overflow());
+                }
+                runs = merged;
+                width = width.checked_mul(2).ok_or_else(overflow)?;
+            }
+            let mut reader = runs.reader();
+            while let Some(parent) = reader.read::<Parent>(&self.scratch)? {
+                self.fold_parent(&mut output, &mut pending, parent)?;
+            }
+        }
+        if let Some(parent) = pending {
+            output.push(&self.scratch, parent.edit)?;
+        }
+        self.parents = output;
+        Ok(output)
+    }
+    fn begin(&mut self, level: u32) {
+        self.build_len = 9;
+        self.build_count = 0;
+        self.build_last = None;
+        self.build_hash = blake3::Hasher::new();
+        self.build_hash.update(b"contextdb-prolly-chunk");
+        self.build_hash.update(&[self.family as u8]);
+        self.build_hash.update(&level.to_be_bytes());
+    }
+    fn grow_builder(&mut self, needed: usize) -> Result<()> {
+        let capacity = self
+            .builder
+            .as_ref()
+            .map_or(0, |builder| builder.entries.len());
+        if needed <= capacity {
+            return Ok(());
+        }
+        let capacity = needed
+            .checked_next_power_of_two()
+            .ok_or_else(|| proof_allocation_overflow(&self.workspace.admission.borrow()))?
+            .min(MAX_NODE_BYTES);
+        if capacity < needed {
+            return Err(overflow());
+        }
+        let mut next = self.workspace.array(capacity, |_| 0u8)?;
+        if let Some(prior) = self.builder.as_ref() {
+            let copied = self.build_len.min(prior.entries.len());
+            next.entries[..copied].copy_from_slice(&prior.entries[..copied]);
+        }
+        // Include the real old-plus-new body peak before freeing the old buffer.
+        self.observe_residency_with_extra(next.entries.len(), 0);
+        // New capacity is wholly admitted while the old allocation is alive.
+        self.builder = Some(next);
+        self.observe_residency();
+        Ok(())
+    }
+    fn push(&mut self, level: u32, key: Key, value: [u8; 32]) -> Result<()> {
+        let bytes = self.with_encoded(key, |key| Ok(36 + encoded_key_len(level, key)))?;
+        if NODE_HEADER_BYTES + bytes > MAX_NODE_BYTES {
+            return Err(Error::Other(
+                "logical identity key exceeds authenticated chunk capacity".into(),
+            ));
+        }
+        if self.build_len + 32 + bytes > MAX_NODE_BYTES {
+            self.finish(level)?;
+        }
+        let start = self.build_len + 32;
+        let end = start + bytes;
+        let cut = self.with_encoded(key, |key| {
+            Ok(chunk_cut(level, key, start, end, self.build_count + 1))
+        })?;
+        self.grow_builder(end)?;
+        let mut builder = self.builder.take().expect("builder capacity");
+        let mut hash = std::mem::replace(&mut self.build_hash, blake3::Hasher::new());
+        let written = self.with_encoded(key, |key| {
+            let mut reference = [0; KEY_REFERENCE_BYTES];
+            let key = encoded_key_in(level, key, &mut reference);
+            let at = self.build_len;
+            builder.entries[at..at + 4].copy_from_slice(&(key.len() as u32).to_be_bytes());
+            builder.entries[at + 4..at + 4 + key.len()].copy_from_slice(key);
+            builder.entries[at + 4 + key.len()..at + bytes].copy_from_slice(&value);
+            hash.update(&(key.len() as u64).to_be_bytes());
+            hash.update(key);
+            hash.update(&value);
+            Ok(())
+        });
+        self.builder = Some(builder);
+        self.build_hash = hash;
+        written?;
+        self.build_len += bytes;
+        self.build_count += 1;
+        self.build_last = Some(key);
+        if cut {
+            self.finish(level)?;
+        }
+        Ok(())
+    }
+    fn finish(&mut self, level: u32) -> Result<()> {
+        if self.build_count == 0 {
+            return Ok(());
+        }
+        #[cfg(feature = "test-seams")]
+        let started = std::time::Instant::now();
+        let hash = *self.build_hash.finalize().as_bytes();
+        let len = self.build_len + 32;
+        let builder = self.builder.as_mut().expect("nonempty builder");
+        builder.entries[0] = NODE_VERSION;
+        builder.entries[1..5].copy_from_slice(&level.to_be_bytes());
+        builder.entries[5..9].copy_from_slice(&(self.build_count as u32).to_be_bytes());
+        builder.entries[self.build_len..len].copy_from_slice(&hash);
+        let body = self.scratch.append(&builder.entries[..len])?;
+        let last = self.build_last.expect("nonempty builder");
+        let separator = self.separator(last)?;
+        let id = self.with_encoded(last, |key| Ok(chunk_id(level, key)))?;
+        let mut write = Write::finished(node_storage_key(self.family, &id), hash, body, len);
+        write.sequence = self.writes.count;
+        self.writes.push(&self.scratch, write)?;
+        // Only a real finished chunk creates a live parent separator. Internal
+        // chunk_cut still refuses cuts with fewer than two entries.
+        self.parent(Edit {
+            key: separator,
+            value: Some(hash),
+        })?;
+        self.begin(level);
+        #[cfg(feature = "test-seams")]
+        observe_identity_span(IdentitySpan::BuildAndHash, started);
+        Ok(())
+    }
+    fn read_edit(&mut self) -> Result<Option<Edit>> {
+        match &mut self.edits {
+            Edits::Inputs { next } => {
+                let Some((key, value)) = self.inputs.get(*next) else {
+                    return Ok(None);
+                };
+                let loc = Locator::input(*next, key.len());
+                *next += 1;
+                Ok(Some(Edit {
+                    key: Key {
+                        encoded: loc,
+                        raw: loc,
+                        inline: [0; INLINE_SEPARATOR_BYTES],
+                    },
+                    value: *value,
+                }))
+            }
+            Edits::Stream(reader) => reader.read(&self.scratch),
+        }
+    }
+    fn step_edit(&mut self) -> Result<()> {
+        self.next_edit = self.read_edit()?;
+        Ok(())
+    }
+    fn edit_level(&mut self, root: &FamilyRoot, level: u32) -> Result<()> {
+        self.parents = Stream::new();
+        self.step_edit()?;
+        while let Some(edit) = self.next_edit {
+            let mut current = self.seek(root, level, edit)?;
+            self.begin(level);
+            loop {
+                if current {
+                    let (_, _, count, id, _) = self.current_meta();
+                    let mut removal = Write::removal(node_storage_key(self.family, &id));
+                    removal.sequence = self.writes.count;
+                    self.writes.push(&self.scratch, removal)?;
+                    let last = self.entry(count - 1)?.0;
+                    self.with_encoded(last, |key| self.with_referenced(key, |_| Ok(())))?;
+                    let tombstone = self.separator(last)?;
+                    self.parent(Edit {
+                        key: tombstone,
+                        value: None,
+                    })?;
+                    for source_index in 0..count {
+                        let source = self.entry(source_index)?;
+                        let mut replaced = false;
+                        while let Some(edit) = self.next_edit {
+                            let order = self.compare_keys(edit.key, source.0)?;
+                            if order == Ordering::Greater {
+                                break;
+                            }
+                            self.step_edit()?;
+                            if let Some(value) = edit.value {
+                                self.push(level, edit.key, value)?;
+                            }
+                            if order == Ordering::Equal {
+                                replaced = true;
+                                break;
+                            }
+                        }
+                        if !replaced {
+                            self.push(level, source.0, source.1)?;
+                        }
+                    }
+                    // Preserve the synchronized-boundary stop exactly. A
+                    // partially filled builder must continue through successors.
+                    if self.build_count == 0 && self.has_next() {
+                        break;
+                    }
+                    current = self.advance(level)?;
+                    if current {
+                        continue;
+                    }
+                }
+                while let Some(edit) = self.next_edit {
+                    self.step_edit()?;
+                    if let Some(value) = edit.value {
+                        self.push(level, edit.key, value)?;
+                    }
+                }
+                self.finish(level)?;
+                break;
+            }
+        }
+        let parents = self.end_parents()?;
+        self.edits = Edits::Stream(parents.reader());
+        self.next_edit = None;
+        Ok(())
+    }
+    fn observe_residency(&self) {
+        self.observe_residency_with_extra(0, 0);
+    }
+    #[cfg(feature = "test-seams")]
+    fn observe_residency_with_extra(&self, extra_bodies: usize, extra_records: usize) {
+        let mut bodies = self
+            .builder
+            .as_ref()
+            .map_or(0, |builder| builder.entries.len());
+        let mut records = self
+            .path
+            .as_ref()
+            .map_or(0, |path| path._charge.charge.bytes);
+        if let Some(slots) = &self.slots {
+            records += slots._charge.charge.bytes;
+            for slot in &slots.entries {
+                let Ok(slot) = slot.try_borrow() else {
+                    continue;
+                };
+                if let Some(node) = slot.as_ref() {
+                    bodies += node.guard.value().len();
+                    records += node.entries._charge.charge.bytes;
+                }
+            }
+        }
+        observe_proof_memory(bodies + extra_bodies, records + extra_records);
+    }
+    #[cfg(not(feature = "test-seams"))]
+    fn observe_residency_with_extra(&self, _extra_bodies: usize, _extra_records: usize) {}
+}
+
+impl StreamReader {
+    /// Skip to a run boundary by whole blocks and offsets, never by allocating
+    /// a directory or reading each record being skipped.
+    fn skip<T: DiskRecord>(&mut self, mut count: u64, scratch: &Scratch) -> Result<()> {
+        if count > self.remaining {
+            return Err(overflow());
+        }
+        while count != 0 {
+            if self.index == self.count {
+                if self.count != 0 {
+                    self.block = self.next;
+                }
+                if self.block == NONE {
+                    return Err(overflow());
+                }
+                let mut header = [0; STREAM_HEADER_BYTES];
+                scratch.read(self.block, &mut header)?;
+                self.next = u64::from_be_bytes(header[..8].try_into().expect("stream next"));
+                self.count = position(u64::from_be_bytes(
+                    header[8..].try_into().expect("stream count"),
+                ))?;
+                self.index = 0;
+                if self.count == 0
+                    || self.count > (STREAM_BLOCK_BYTES - STREAM_HEADER_BYTES) / T::BYTES
+                {
+                    return Err(Error::Other("invalid proof stream block".into()));
+                }
+                self.count = self
+                    .count
+                    .min(position(self.remaining.min(usize::MAX as u64))?);
+            }
+            let step = count.min((self.count - self.index) as u64);
+            self.index += position(step)?;
+            self.remaining -= step;
+            count -= step;
+        }
+        Ok(())
+    }
+}
+
+/// Sort inside the exact admitted record array. No recursion, stable-sort
+/// workspace, auxiliary heap, or platform-dependent equal-key ordering.
+fn heapsort<T>(
+    records: &mut [T],
+    mut compare: impl FnMut(&T, &T) -> Result<Ordering>,
+) -> Result<()> {
+    fn sift<T>(
+        records: &mut [T],
+        mut root: usize,
+        len: usize,
+        compare: &mut impl FnMut(&T, &T) -> Result<Ordering>,
+    ) -> Result<()> {
+        loop {
+            let Some(mut child) = root.checked_mul(2).and_then(|v| v.checked_add(1)) else {
+                return Ok(());
+            };
+            if child >= len {
+                return Ok(());
+            }
+            if child + 1 < len && compare(&records[child], &records[child + 1])? == Ordering::Less {
+                child += 1;
+            }
+            if compare(&records[root], &records[child])? != Ordering::Less {
+                return Ok(());
+            }
+            records.swap(root, child);
+            root = child;
+        }
+    }
+    for root in (0..records.len() / 2).rev() {
+        sift(records, root, records.len(), &mut compare)?;
+    }
+    for end in (1..records.len()).rev() {
+        records.swap(0, end);
+        sift(records, 0, end, &mut compare)?;
+    }
+    Ok(())
+}
+
+impl Window<'_, '_, '_> {
+    fn planned_write(&self, key: [u8; 33]) -> Result<Option<Write>> {
+        let mut reader = self.writes.reader();
+        let mut result: Option<Write> = None;
+        while let Some(write) = reader.read::<Write>(&self.scratch)? {
+            if write.key != key {
+                continue;
+            }
+            if let Some(prior) = result.as_mut() {
+                prior.fold(write)?;
+            } else {
+                result = Some(write);
+            }
+        }
+        Ok(result)
+    }
+    fn emit_write(&mut self, write: Write) -> Result<()> {
+        if write.body != NONE {
+            if write.original != write.hash {
+                self.journal.push(
+                    &self.scratch,
+                    Action {
+                        key: write.key,
+                        hash: write.hash.expect("planned body hash"),
+                        body: write.body,
+                        len: write.len,
+                        kind: 0,
+                        next: NONE,
+                    },
+                )?;
+            }
+        } else if write.remove && write.original.is_some() {
+            self.journal.push(
+                &self.scratch,
+                Action {
+                    key: write.key,
+                    hash: [0; 32],
+                    body: NONE,
+                    len: 0,
+                    kind: 2,
+                    next: NONE,
+                },
+            )?;
+        }
+        Ok(())
+    }
+    fn fold_sorted(&mut self, records: impl IntoIterator<Item = Write>) -> Result<()> {
+        let mut pending: Option<Write> = None;
+        for write in records {
+            if let Some(prior) = pending.as_mut() {
+                if prior.key == write.key {
+                    prior.fold(write)?;
+                    continue;
+                }
+                if prior.key > write.key {
+                    return Err(Error::Other("proof directory order is invalid".into()));
+                }
+                self.emit_write(*prior)?;
+            }
+            pending = Some(write);
+        }
+        if let Some(write) = pending {
+            self.emit_write(write)?;
+        }
+        Ok(())
+    }
+    fn finalize_directory(&mut self) -> Result<()> {
+        let count = self.writes.count;
+        if count == 0 {
+            return Ok(());
+        }
+        let capacity = (MAX_NODE_BYTES / std::mem::size_of::<Write>())
+            .min(position(count.min(usize::MAX as u64))?);
+        if capacity == 0 {
+            return Err(overflow());
+        }
+        let mut buffer = self
+            .workspace
+            .array(capacity, |_| Write::removal([0; 33]))?;
+        #[cfg(feature = "test-seams")]
+        observe_proof_memory(0, buffer._charge.charge.bytes);
+        let mut reader = self.writes.reader();
+        if count <= capacity as u64 {
+            for record in &mut buffer.entries {
+                *record = reader.read(&self.scratch)?.ok_or_else(overflow)?;
+            }
+            heapsort(&mut buffer.entries, |a, b| Ok(a.order(b)))?;
+            return self.fold_sorted(buffer.entries.iter().copied());
+        }
+        let mut runs = Stream::new();
+        while reader.remaining != 0 {
+            let len = capacity.min(position(reader.remaining.min(usize::MAX as u64))?);
+            for record in &mut buffer.entries[..len] {
+                *record = reader.read(&self.scratch)?.ok_or_else(overflow)?;
+            }
+            heapsort(&mut buffer.entries[..len], |a, b| Ok(a.order(b)))?;
+            for record in &buffer.entries[..len] {
+                runs.push(&self.scratch, *record)?;
+            }
+        }
+        // The array is no longer needed. Merging holds exactly two current
+        // records and block cursors on the stack; no run directory grows with Q.
+        drop(buffer);
+        let mut width = capacity as u64;
+        while width < count {
+            let mut input = runs.reader();
+            let mut output = Stream::new();
+            while input.remaining != 0 {
+                let left_count = width.min(input.remaining);
+                let right_count = width.min(input.remaining - left_count);
+                let mut left = input;
+                let mut right = input;
+                right.skip::<Write>(left_count, &self.scratch)?;
+                input = right;
+                input.skip::<Write>(right_count, &self.scratch)?;
+                let mut left_remaining = left_count;
+                let mut right_remaining = right_count;
+                let mut a = if left_remaining == 0 {
+                    None
+                } else {
+                    left.read::<Write>(&self.scratch)?
+                };
+                let mut b = if right_remaining == 0 {
+                    None
+                } else {
+                    right.read::<Write>(&self.scratch)?
+                };
+                while a.is_some() || b.is_some() {
+                    let take_left = match (a, b) {
+                        (Some(a), Some(b)) => a.order(&b) != Ordering::Greater,
+                        (Some(_), None) => true,
+                        _ => false,
+                    };
+                    if take_left {
+                        output.push(&self.scratch, a.ok_or_else(overflow)?)?;
+                        left_remaining -= 1;
+                        a = if left_remaining == 0 {
+                            None
+                        } else {
+                            left.read(&self.scratch)?
+                        };
+                    } else {
+                        output.push(&self.scratch, b.ok_or_else(overflow)?)?;
+                        right_remaining -= 1;
+                        b = if right_remaining == 0 {
+                            None
+                        } else {
+                            right.read(&self.scratch)?
+                        };
+                    }
+                }
+                if left_remaining != 0 || right_remaining != 0 {
+                    return Err(overflow());
+                }
+            }
+            if output.count != count {
+                return Err(overflow());
+            }
+            runs = output;
+            width = width.checked_mul(2).ok_or_else(overflow)?;
+        }
+        let mut reader = runs.reader();
+        let mut pending: Option<Write> = None;
+        while let Some(write) = reader.read::<Write>(&self.scratch)? {
+            if let Some(prior) = pending.as_mut() {
+                if prior.key == write.key {
+                    prior.fold(write)?;
+                    continue;
+                }
+                if prior.key > write.key {
+                    return Err(Error::Other("proof directory order is invalid".into()));
+                }
+                self.emit_write(*prior)?;
+            }
+            pending = Some(write);
+        }
+        if let Some(write) = pending {
+            self.emit_write(write)?;
+        }
+        Ok(())
+    }
+    fn plan(&mut self, root: &FamilyRoot) -> Result<FamilyRoot> {
+        // The full admitted input keys remain borrowed; wide bodies are
+        // sequentially spooled before any durable table mutation is allowed.
+        for (key, value) in &self.inputs {
+            if key.len() <= INLINE_SEPARATOR_BYTES {
+                continue;
+            }
+            let hash = key_hash(key);
+            let stored = node_storage_key(self.family, &hash);
+            if value.is_some() {
+                let len = key.len().checked_add(1).ok_or_else(overflow)?;
+                let body = self.scratch.reserve(len)?;
+                self.scratch.write(body, &[0])?;
+                self.scratch.write(body + 1, key)?;
+                self.journal.push(
+                    &self.scratch,
+                    Action {
+                        key: stored,
+                        hash,
+                        body,
+                        len: len as u64,
+                        kind: 1,
+                        next: NONE,
+                    },
+                )?;
+            } else {
+                self.retirements.push(
+                    &self.scratch,
+                    Action {
+                        key: stored,
+                        hash: [0; 32],
+                        body: NONE,
+                        len: 0,
+                        kind: 2,
+                        next: NONE,
+                    },
+                )?;
+            }
+        }
+        let height = self.initialize(root)?;
+        #[cfg(feature = "test-seams")]
+        observe_tree_height(height);
+        for level in 0..=height {
+            self.edit_level(root, level)?;
+        }
+        let mut level = height;
+        let mut final_stream = self.parents;
+        let mut count = 0u64;
+        let mut first = None;
+        let mut reader = final_stream.reader();
+        while let Some(edit) = reader.read::<Edit>(&self.scratch)? {
+            if edit.value.is_none() {
+                continue;
+            }
+            count = count.checked_add(1).ok_or_else(overflow)?;
+            if first.is_none() {
+                first = Some(edit);
+            }
+        }
+        while count > 1 {
+            level += 1;
+            if level > MAX_CHUNK_LEVEL {
+                return Err(Error::Other(
+                    "logical identity internal chunks exceed permitted depth".into(),
+                ));
+            }
+            self.parents = Stream::new();
+            self.begin(level);
+            let mut reader = final_stream.reader();
+            while let Some(edit) = reader.read::<Edit>(&self.scratch)? {
+                if let Some(value) = edit.value {
+                    self.push(level, edit.key, value)?;
+                }
+            }
+            self.finish(level)?;
+            final_stream = self.end_parents()?;
+            if final_stream.count >= count {
+                return Err(Error::Other(
+                    "logical identity internal chunks cannot reduce oversized separators".into(),
+                ));
+            }
+            count = final_stream.count;
+            first = final_stream.reader().read::<Edit>(&self.scratch)?;
+        }
+        let mut result = if let Some(edit) = first {
+            FamilyRoot {
+                root: Some(self.with_encoded(edit.key, |key| Ok(chunk_id(level, key)))?),
+                hash: edit.value.expect("live final separator"),
+                open_config_root: root.open_config_root,
+            }
+        } else {
+            empty_root(self.family)
+        };
+        while level > 0 {
+            let Some(id) = result.root else {
+                break;
+            };
+            let stored = node_storage_key(self.family, &id);
+            let staged = self.planned_write(stored)?;
+            let child = if let Some(write) = staged.filter(|write| write.body != NONE) {
+                let mut header = [0; 9];
+                self.scratch.read(write.body, &mut header)?;
+                if header[0] != NODE_VERSION
+                    || u32::from_be_bytes(header[1..5].try_into().expect("level")) != level
+                {
+                    return Err(Error::Other("scratch root level mismatch".into()));
+                }
+                if u32::from_be_bytes(header[5..9].try_into().expect("count")) != 1 {
+                    break;
+                }
+                let len = position(write.len)?;
+                const SINGLETON_BYTES: usize = 9 + 4 + INLINE_SEPARATOR_BYTES + 32 + 32;
+                if len > SINGLETON_BYTES {
+                    return Err(Error::Other(
+                        "scratch singleton root exceeds separator bound".into(),
+                    ));
+                }
+                let mut bytes = [0; SINGLETON_BYTES];
+                self.scratch.read(write.body, &mut bytes[..len])?;
+                let node = EncodedNode::authenticate(self.family, &bytes[..len])?;
+                if node.subtree_hash != result.hash {
+                    return Err(Error::Other("scratch root hash mismatch".into()));
+                }
+                let mut cursor = 9;
+                let entry = node.entry_at(&mut cursor)?;
+                (chunk_id(level - 1, entry.key), entry.value_hash)
+            } else {
+                self.load(id, result.hash)?;
+                if self.current_meta().2 != 1 {
+                    break;
+                }
+                let (key, hash) = self.entry(0)?;
+                self.with_encoded(key, |key| {
+                    self.with_referenced(key, |_| Ok((chunk_id(level - 1, key), hash)))
+                })?
+            };
+            let mut write = Write::removal(stored);
+            write.sequence = self.writes.count;
+            self.writes.push(&self.scratch, write)?;
+            level -= 1;
+            result.root = Some(child.0);
+            result.hash = child.1;
+        }
+        // Original guards, descriptor arrays, the path and the chunk builder
+        // stop being resident before the separate bounded directory sort phase.
+        self.current.set(None);
+        self.path_len = 0;
+        self.slots = None;
+        self.path = None;
+        self.builder = None;
+        self.finalize_directory()?;
+        let mut at = self.retirements.first;
+        while at != NONE {
+            let action = self.scratch.get::<Action>(at)?;
+            self.journal.push(&self.scratch, action)?;
+            at = action.next;
+        }
+        Ok(result)
+    }
+    fn plan_for_replay(mut self, root: &FamilyRoot) -> Result<(FamilyRoot, Scratch, u64)> {
+        let result = self.plan(root)?;
+        let Self {
+            scratch,
+            inputs,
+            journal,
+            ..
+        } = self;
+        // Everything borrowing the original table drops before scratch escapes.
+        drop(inputs);
+        Ok((result, scratch, journal.first))
+    }
+}
+fn replay(
+    scratch: &Scratch,
+    first: u64,
+    table: &mut redb::Table<'_, &'static [u8], &'static [u8]>,
+    family: LogicalFamily,
+) -> Result<()> {
+    let mut at = first;
+    while at != NONE {
+        let action = scratch.get::<Action>(at)?;
+        if action.kind == 2 {
+            table
+                .remove(action.key.as_slice())
+                .map_err(RedbPersistence::storage_error)?;
+            #[cfg(feature = "test-seams")]
+            observe_node_remove();
+        } else {
+            let len = position(action.len)?;
+            #[cfg(feature = "test-seams")]
+            let before = redb::commit_work::freed_pages_so_far();
+            // The zeroed guard owns the destination pages. Reading directly
+            // into them avoids a full-body zero Vec and a duplicate IO buffer.
+            // Any error after reservation propagates to the owning transaction;
+            // dropping this guard alone is deliberately not a rollback.
+            let mut destination = table
+                .insert_zeroed_reserve(action.key.as_slice(), len)
+                .map_err(RedbPersistence::storage_error)?;
+            scratch.read(action.body, destination.as_mut())?;
+            let bytes = destination.as_mut();
+            if action.kind == 1 {
+                if bytes.first() != Some(&0) || key_hash(&bytes[1..]) != action.key[1..] {
+                    return Err(Error::Other(
+                        "scratch separator blob does not authenticate".into(),
+                    ));
+                }
+            } else {
+                let node = EncodedNode::authenticate(family, bytes)?;
+                if node.subtree_hash != action.hash {
+                    return Err(Error::Other("scratch planned chunk hash mismatch".into()));
+                }
+                let mut cursor = 9;
+                let mut last = &[][..];
+                for _ in 0..node.count {
+                    last = node.entry_at(&mut cursor)?.key;
+                }
+                if node_storage_key(family, &chunk_id(node.level, last)) != action.key {
+                    return Err(Error::Other(
+                        "scratch chunk id disagrees with its separator".into(),
+                    ));
+                }
+            }
+            drop(destination);
+            #[cfg(feature = "test-seams")]
+            {
+                observe_node_write(len);
+                observe_written_key(&action.key, action.kind == 1);
+                if action.kind == 0 {
+                    let copied = redb::commit_work::freed_pages_so_far() - before;
+                    WRITES_BY_LEVEL.with(|levels| {
+                        levels.borrow_mut().entry(action.key[1]).or_default().1 += copied
+                    });
+                }
+            }
+        }
+        at = action.next;
+    }
+    Ok(())
+}
+
+pub(super) fn update_family_consuming_keys(
+    table: &mut redb::Table<'_, &'static [u8], &'static [u8]>,
+    admission: &mut ProofAdmission,
+    family: LogicalFamily,
+    root: &FamilyRoot,
+    edits: EntryEdits,
+    list_frames: usize,
+    coalesced_key_bytes: &mut usize,
+) -> Result<FamilyRoot> {
+    let input_bytes = edits.iter().try_fold(0usize, |sum, (key, _)| {
+        sum.checked_add(key.capacity())
+            .ok_or_else(|| proof_allocation_overflow(admission))
+    })?;
+    let scratch = Scratch::open(admission)?;
+    let base = admission
+        .held
+        .checked_add(scratch._charge.bytes)
+        .ok_or_else(|| proof_allocation_overflow(admission))?;
+    let ledger = Ledger {
+        live: Cell::new(0),
+        base,
+        caller_peak: &admission.peak,
+    };
+    let workspace = Workspace {
+        admission: RefCell::new(admission.fork()?),
+        ledger: &ledger,
+    };
+    let (result, scratch, first) =
+        Window::open(table, family, edits, scratch, &workspace).plan_for_replay(root)?;
+    drop(workspace);
+    debug_assert_eq!(ledger.live.get(), 0);
+    drop(ledger);
+    admission.release(input_bytes);
+    *coalesced_key_bytes = coalesced_key_bytes.saturating_sub(input_bytes);
+    admission.release(list_frames);
+    replay(&scratch, first, table, family)?;
+    #[cfg(feature = "test-seams")]
+    observe_proof_memory(scratch._charge.bytes, 0);
+    Ok(result)
+}
+
+
+}
+}
+
+mod original_ddl_occurrences {
+//! Exact declaration selectors reconciled at authenticated publication.
+use crate::persistence::*;
+use std::ops::Bound;
+
+const SELECTORS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ddl_eligible_occurrences");
+const COUNTS: TableDefinition<u64, u64> = TableDefinition::new("ddl_unmarked_lsn_count");
+const GENERATION: &str = "sync_ddl_generation.v1.";
+const ARRIVAL: &str = "sync_ddl_received_arrival.v1.";
+const SUPERSEDED: &str = "sync_ddl_superseded.v1.";
+
+fn damage(reason: &str) -> Error {
+    Error::StoreCorrupted {
+        path: "ddl_eligible_occurrences".into(),
+        reason: reason.into(),
+    }
+}
+
+fn coordinate(key: &str) -> Result<(Lsn, u32)> {
+    let (lsn, ordinal) = key.split_once(':').unwrap_or((key, "000000"));
+    let lsn = Lsn(lsn.parse().map_err(|_| damage("invalid occurrence LSN"))?);
+    let ordinal: u32 = ordinal
+        .parse()
+        .map_err(|_| damage("invalid occurrence ordinal"))?;
+    validate_ordinal(ordinal)?;
+    let canonical = if key.contains(':') {
+        format!("{:020}:{ordinal:06}", lsn.0)
+    } else {
+        format!("{:020}", lsn.0)
+    };
+    if canonical != key {
+        return Err(damage("noncanonical occurrence coordinate"));
+    }
+    Ok((lsn, ordinal))
+}
+
+fn validate_ordinal(ordinal: u32) -> Result<()> {
+    if ordinal > 999_999 {
+        return Err(damage(
+            "occurrence ordinal exceeds canonical six-digit width",
+        ));
+    }
+    Ok(())
+}
+
+fn suffix(at: (Lsn, u32)) -> [u8; 12] {
+    let mut bytes = [0; 12];
+    bytes[..8].copy_from_slice(&at.0.0.to_be_bytes());
+    bytes[8..].copy_from_slice(&at.1.to_be_bytes());
+    bytes
+}
+
+fn state_key(at: (Lsn, u32)) -> [u8; 13] {
+    let mut bytes = [0; 13];
+    bytes[0] = 0;
+    bytes[1..].copy_from_slice(&suffix(at));
+    bytes
+}
+
+fn prefix(change: &DdlChange) -> Result<Vec<u8>> {
+    let (kind, name) = match change {
+        DdlChange::CreateTable { name, .. } => (0, name),
+        DdlChange::DropTable { name } => (1, name),
+        DdlChange::AlterTable { name, .. } => (2, name),
+        DdlChange::CreateIndex { name, .. } => (3, name),
+        DdlChange::DropIndex { name, .. } => (4, name),
+        DdlChange::CreateTrigger { name, .. } => (5, name),
+        DdlChange::DropTrigger { name } => (6, name),
+        DdlChange::CreateEventType { name, .. } => (7, name),
+        DdlChange::CreateSink { name, .. } => (8, name),
+        DdlChange::CreateRoute { name, .. } => (9, name),
+        DdlChange::DropRoute { name, .. } => (10, name),
+        DdlChange::CreateTriggerIncludingSync { name, .. } => (11, name),
+    };
+    let mut key = Vec::with_capacity(name.len() + 42);
+    key.extend_from_slice(&[1, kind]);
+    key.extend_from_slice(&(name.len() as u64).to_be_bytes());
+    key.extend_from_slice(name.as_bytes());
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"contextdb-exact-ddl-selector\0");
+    struct HashWriter<'a>(&'a mut blake3::Hasher);
+    impl std::io::Write for HashWriter<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.update(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    bincode::serde::encode_into_std_write(
+        change,
+        &mut HashWriter(&mut hash),
+        bincode::config::standard(),
+    )
+    .map_err(|_| damage("declaration selector encoding failed"))?;
+    key.extend_from_slice(hash.finalize().as_bytes());
+    Ok(key)
+}
+
+#[derive(Serialize, Deserialize)]
+struct State {
+    primary: String,
+    selector: Vec<u8>,
+    eligible: bool,
+    unmarked: bool,
+}
+
+fn config_occurrence(key: &str) -> Result<Option<(Lsn, u32)>> {
+    for prefix in [GENERATION, ARRIVAL, SUPERSEDED] {
+        if let Some(rest) = key.strip_prefix(prefix) {
+            let (lsn, ordinal) = rest
+                .split_once('.')
+                .ok_or_else(|| damage("invalid occurrence configuration key"))?;
+            return coordinate(&format!("{lsn}:{ordinal}")).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+impl RedbPersistence {
+    pub(crate) fn owned_validate_ddl_occurrence_ordinal(ordinal: u32) -> Result<()> {
+        validate_ordinal(ordinal)
+    }
+
+    pub(crate) fn owned_ddl_config_occurrence_coordinate(key: &str) -> Result<(Lsn, u32)> {
+        config_occurrence(key)?.ok_or_else(|| damage("invalid occurrence configuration namespace"))
+    }
+
+    pub(super) fn owned_initialize_ddl_selectors_in_write(write: &redb::WriteTransaction) -> Result<()> {
+        write.delete_table(SELECTORS).map_err(Self::storage_error)?;
+        write.delete_table(COUNTS).map_err(Self::storage_error)?;
+        write.open_table(SELECTORS).map_err(Self::storage_error)?;
+        write.open_table(COUNTS).map_err(Self::storage_error)?;
+        Ok(())
+    }
+
+    pub(super) fn owned_ddl_selector_fingerprints_in_write(
+        write: &redb::WriteTransaction,
+    ) -> Result<[[u8; 32]; 2]> {
+        if !write.table_exists(SELECTORS).map_err(Self::storage_error)?
+            || !write.table_exists(COUNTS).map_err(Self::storage_error)?
+        {
+            return Err(damage("missing mandatory declaration selector table"));
+        }
+        Ok([
+            write
+                .table_root_fingerprint(SELECTORS)
+                .map_err(Self::storage_error)?
+                .unwrap_or([0; 32]),
+            write
+                .table_root_fingerprint(COUNTS)
+                .map_err(Self::storage_error)?
+                .unwrap_or([0; 32]),
+        ])
+    }
+
+    pub(super) fn reconcile_owned_ddl_selectors_in_write(
+        write: &redb::WriteTransaction,
+        mutations: &[content_identity::ContentIdentityMutation],
+        admission: &mut content_identity::original_writer::ProofAdmission,
+    ) -> Result<()> {
+        // Retain the exact held original on the stack without copying any debit.
+        // The frame borrows this local owner, so accounting can mutate admission;
+        // both locals stay inside this call and drop after the frame's values.
+        let original_control = crate::memory_accounting::reserve_preparation_from_original(
+            admission.original(),
+            0,
+            "persistence",
+            "prepare_commit",
+            "Raise MEMORY_LIMIT to admit commit preparation.",
+        )?;
+        let frame = crate::persistence::OriginalPersistenceFrame::new(&original_control)?;
+frame.reserve(mutations.len().checked_mul(32).ok_or_else(||Error::Other("DDL coordinate work overflow".into()))?)?;
+        Self::owned_validate_ddl_selectors_in_write(write)?;
+        let mut affected = BTreeMap::<(Lsn, u32), Option<&str>>::new();
+        let mut charged = 0;
+        for mutation in mutations {
+            let primary = content_identity::ddl_mutation_coordinate(mutation);
+            let at = if let Some(key) = primary {
+                Some(coordinate(key)?)
+            } else if mutation.family == content_identity::LogicalFamily::Configuration {
+                config_occurrence(
+                    std::str::from_utf8(&mutation.logical_key)
+                        .map_err(|_| damage("configuration key is not UTF-8"))?,
+                )?
+            } else {
+                None
+            };
+            if let Some(at) = at {
+                if !affected.contains_key(&at) {
+                    admission.admit(128)?;
+                    charged += 128;
+                }
+                let slot = affected.entry(at).or_default();
+                if let Some(key) = primary {
+                    if slot.is_some_and(|old| old != key) {
+                        return Err(damage("two primary keys name one occurrence"));
+                    }
+                    *slot = Some(key);
+                }
+            }
+        }
+        if affected.is_empty() {
+            return Ok(());
+        }
+        let mut selectors = write.open_table(SELECTORS).map_err(Self::storage_error)?;
+        let mut counts = write.open_table(COUNTS).map_err(Self::storage_error)?;
+        let primary = write
+            .open_table(DDL_LOG_TABLE)
+            .map_err(Self::storage_error)?;
+        let config = write
+            .open_table(CONFIG_TABLE)
+            .map_err(Self::storage_error)?;
+        for (at, changed_key) in affected {
+            let state_key = state_key(at);
+            let old_guard = selectors
+                .get(state_key.as_slice())
+                .map_err(Self::storage_error)?;
+            let old_bytes = old_guard.as_ref().map_or(0, |value| {
+                value.value().len().saturating_mul(4).saturating_add(256)
+            });
+            admission.admit(old_bytes)?;
+            let old: Option<State> = old_guard
+                .as_ref()
+                .map(|value| frame.decode(value.value()))
+                .transpose()?;
+            drop(old_guard);
+            if let Some(old) = &old {
+                if coordinate(&old.primary)? != at
+                    || (old.eligible && !old.unmarked)
+                    || old.selector.len() < 54
+                    || old.selector[0] != 1
+                    || old.selector[1] > 11
+                    || old.selector[old.selector.len() - 12..] != suffix(at)
+                {
+                    return Err(damage("invalid occurrence reconciliation state"));
+                }
+                let name_len = u64::from_be_bytes(old.selector[2..10].try_into().unwrap());
+                if usize::try_from(name_len)
+                    .ok()
+                    .and_then(|length| length.checked_add(54))
+                    != Some(old.selector.len())
+                {
+                    return Err(damage("invalid occurrence selector name framing"));
+                }
+                if old.eligible {
+                    let selected = selectors
+                        .get(old.selector.as_slice())
+                        .map_err(Self::storage_error)?
+                        .ok_or_else(|| damage("eligible occurrence lacks its selector"))?;
+                    if selected.value() != old.primary.as_bytes() {
+                        return Err(damage(
+                            "eligible selector disagrees with reconciliation state",
+                        ));
+                    }
+                }
+            }
+            let key_bytes = changed_key
+                .map_or_else(
+                    || old.as_ref().map_or(32, |state| state.primary.len()),
+                    str::len,
+                )
+                .saturating_mul(4)
+                .saturating_add(256);
+            admission.admit(key_bytes)?;
+            let primary_key = changed_key
+                .map(str::to_owned)
+                .or_else(|| old.as_ref().map(|state| state.primary.clone()))
+                .unwrap_or_else(|| format!("{:020}:{:06}", at.0.0, at.1));
+            // A singleton and an indexed zero must never coexist.
+            let bare = format!("{:020}", at.0.0);
+            let indexed = format!("{:020}:{:06}", at.0.0, at.1);
+            let bare_value = if at.1 == 0 {
+                primary.get(bare.as_str()).map_err(Self::storage_error)?
+            } else {
+                None
+            };
+            let indexed_value = primary.get(indexed.as_str()).map_err(Self::storage_error)?;
+            if bare_value.is_some() && indexed_value.is_some() {
+                return Err(damage("ambiguous singleton occurrence"));
+            }
+            let found = bare_value.as_ref().or(indexed_value.as_ref());
+            let chosen_key = if bare_value.is_some() {
+                bare.as_str()
+            } else {
+                indexed.as_str()
+            };
+            if found.is_some()
+                && chosen_key != primary_key
+                && (changed_key.is_some() || old.is_some())
+            {
+                return Err(damage("occurrence primary key changed spelling"));
+            }
+            let body_bytes = found.map_or(0, |value| {
+                value.value().len().saturating_mul(64).saturating_add(512)
+            });
+            admission.admit(body_bytes)?;
+            let next = if let Some(value) = found {
+                let change: DdlChange = frame.decode(value.value())?;
+                let mut selector = prefix(&change)?;
+                selector.extend_from_slice(&suffix(at));
+                let mut marker = |namespace: &str| -> Result<bool> {
+                    let key = format!("{namespace}{:020}.{:06}", at.0.0, at.1);
+                    let value = config.get(key.as_str()).map_err(Self::storage_error)?;
+                    let Some(value) = value else {
+                        return Ok(false);
+                    };
+                    let bytes = value.value().len().saturating_mul(64).saturating_add(256);
+                    admission.admit(bytes)?;
+                    crate::database::Database::validate_ddl_occurrence_config(
+                        &key,
+                        at,
+                        value.value(),
+                    )
+                    .map_err(|_| damage("invalid exact occurrence configuration record"))?;
+                    admission.release(bytes);
+                    Ok(true)
+                };
+                let unmarked = !marker(ARRIVAL)? && !marker(SUPERSEDED)?;
+                Some(State {
+                    primary: chosen_key.to_owned(),
+                    selector,
+                    eligible: unmarked && marker(GENERATION)?,
+                    unmarked,
+                })
+            } else {
+                None
+            };
+            let count = counts
+                .get(at.0.0)
+                .map_err(Self::storage_error)?
+                .map_or(0, |value| value.value());
+            let count = count
+                .checked_sub(u64::from(old.as_ref().is_some_and(|state| state.unmarked)))
+                .ok_or_else(|| damage("unmarked count underflow"))?
+                .checked_add(u64::from(next.as_ref().is_some_and(|state| state.unmarked)))
+                .ok_or_else(|| damage("unmarked count overflow"))?;
+            if let Some(old) = &old
+                && old.eligible {
+                    selectors
+                        .remove(old.selector.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+            if let Some(next) = next {
+                if next.eligible {
+                    selectors
+                        .insert(next.selector.as_slice(), next.primary.as_bytes())
+                        .map_err(Self::storage_error)?;
+                }
+                let encoded = frame.encode(&next)?;
+                selectors
+                    .insert(state_key.as_slice(), encoded.as_slice())
+                    .map_err(Self::storage_error)?;
+            } else {
+                selectors
+                    .remove(state_key.as_slice())
+                    .map_err(Self::storage_error)?;
+            }
+            if count == 0 {
+                counts.remove(at.0.0).map_err(Self::storage_error)?;
+            } else {
+                counts.insert(at.0.0, count).map_err(Self::storage_error)?;
+            }
+            admission.release(body_bytes + old_bytes + key_bytes);
+        }
+        admission.release(charged);
+        Ok(())
+    }
+
+    fn owned_validate_ddl_selectors_in_write(write: &redb::WriteTransaction) -> Result<()> {
+        let actual = Self::owned_ddl_selector_fingerprints_in_write(write)?;
+        let expected = content_identity::ddl_selector_roots_in_write(write)?;
+        if actual != expected {
+            return Err(damage("declaration selector root binding mismatch"));
+        }
+        Ok(())
+    }
+
+    pub(super) fn owned_validate_ddl_selectors_in_read(read: &redb::ReadTransaction) -> Result<()> {
+        match read.open_table(SELECTORS) {
+            Ok(_) => {}
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                return Err(damage("missing mandatory declaration selector table"));
+            }
+            Err(error) => return Err(Self::storage_error(error)),
+        }
+        match read.open_table(COUNTS) {
+            Ok(_) => {}
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                return Err(damage("missing mandatory declaration count table"));
+            }
+            Err(error) => return Err(Self::storage_error(error)),
+        }
+        let actual = [
+            read.table_root_fingerprint(SELECTORS)
+                .map_err(Self::storage_error)?
+                .unwrap_or([0; 32]),
+            read.table_root_fingerprint(COUNTS)
+                .map_err(Self::storage_error)?
+                .unwrap_or([0; 32]),
+        ];
+        if actual != content_identity::ddl_selector_roots_in_read(read)? {
+            return Err(damage("declaration selector root binding mismatch"));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn owned_first_eligible_ddl_occurrence(
+        root: &Arc<WriterSnapshot>,
+        owner: writer_source::SourceWindowOwner,
+        change: &DdlChange,
+        after: Option<(Lsn, u32)>,
+    ) -> Result<Option<(Lsn, u32)>> {
+        if let Some((_, ordinal)) = after {
+            validate_ordinal(ordinal)?;
+        }
+        // The borrowed declaration is already owned by the received vector.
+        // Only key/control allocations are new; streaming serialization retains no body copy.
+        let name = match change {
+            DdlChange::CreateTable { name, .. }
+            | DdlChange::DropTable { name }
+            | DdlChange::AlterTable { name, .. }
+            | DdlChange::CreateIndex { name, .. }
+            | DdlChange::DropIndex { name, .. }
+            | DdlChange::CreateTrigger { name, .. }
+            | DdlChange::DropTrigger { name }
+            | DdlChange::CreateEventType { name, .. }
+            | DdlChange::CreateSink { name, .. }
+            | DdlChange::CreateRoute { name, .. }
+            | DdlChange::DropRoute { name, .. }
+            | DdlChange::CreateTriggerIncludingSync { name, .. } => name,
+        };
+        let _charge =
+            root.adapter_control(&owner, name.len().saturating_mul(8).saturating_add(2048))?;
+        let prefix = prefix(change)?;
+        let mut lower = prefix.clone();
+        lower.extend_from_slice(&suffix(after.unwrap_or((Lsn(0), 0))));
+        let mut upper = prefix.clone();
+        upper.extend_from_slice(&[255; 12]);
+        let read = root.owner_read()?;
+        Self::owned_validate_ddl_selectors_in_read(&read)?;
+        let selectors = read.open_table(SELECTORS).map_err(Self::storage_error)?;
+        let entry = selectors
+            .range::<&[u8]>((
+                if after.is_some() {
+                    Bound::Excluded(lower.as_slice())
+                } else {
+                    Bound::Included(lower.as_slice())
+                },
+                Bound::Included(upper.as_slice()),
+            ))
+            .map_err(Self::storage_error)?
+            .next()
+            .transpose()
+            .map_err(Self::storage_error)?;
+        let Some((key, value)) = entry else {
+            return Ok(None);
+        };
+        if key.value().len() != prefix.len() + 12 || !key.value().starts_with(&prefix) {
+            return Err(damage("invalid declaration selector key"));
+        }
+        let key_bytes = &key.value()[prefix.len()..];
+        let at = (
+            Lsn(u64::from_be_bytes(key_bytes[..8].try_into().unwrap())),
+            u32::from_be_bytes(key_bytes[8..].try_into().unwrap()),
+        );
+        let primary = std::str::from_utf8(value.value())
+            .map_err(|_| damage("invalid declaration primary key"))?;
+        if coordinate(primary)? != at {
+            return Err(damage("selector coordinate does not bind primary key"));
+        }
+        let state = selectors
+            .get(state_key(at).as_slice())
+            .map_err(Self::storage_error)?
+            .ok_or_else(|| damage("selector occurrence state is absent"))?;
+        let state: State = Self::decode_config_value_exact(state.value())
+            .map_err(|_| damage("invalid selector occurrence state"))?;
+        if !state.eligible
+            || !state.unmarked
+            || state.selector != key.value()
+            || state.primary.as_bytes() != value.value()
+        {
+            return Err(damage("selector disagrees with exact occurrence state"));
+        }
+        let mut cursor = root.cursor(
+            owner,
+            "ddl_log",
+            writer_source::WriterCursorFamily::Text,
+            Bound::Included(primary.as_bytes()),
+            Bound::Included(primary.as_bytes()),
+            false,
+        )?;
+        let local = cursor
+            .next(|_, bytes| {
+                crate::read_image_memory::reserve(
+                    bytes.len().saturating_mul(64).saturating_add(4096),
+                )?;
+                Self::decode_config_value_exact::<DdlChange>(bytes)
+                    .map_err(|_| damage("invalid exact declaration primary encoding"))
+            })?
+            .ok_or_else(|| damage("selector primary is absent"))?;
+        if &local.value != change {
+            return Err(damage("exact declaration selector disagrees with primary"));
+        }
+        Ok(Some(at))
+    }
+
+    pub(crate) fn owned_unmarked_ddl_occurrences(
+        root: &WriterSnapshot,
+        owner: writer_source::SourceWindowOwner,
+        lsn: Lsn,
+    ) -> Result<u64> {
+        let _charge = root.adapter_control(&owner, 256)?;
+        let read = root.owner_read()?;
+        Self::owned_validate_ddl_selectors_in_read(&read)?;
+        let counts = read.open_table(COUNTS).map_err(Self::storage_error)?;
+        Ok(counts
+            .get(lsn.0)
+            .map_err(Self::storage_error)?
+            .map_or(0, |value| value.value()))
+    }
+}
+
+}
+
+/// A no-allocation serialization pass prices the recursively owned JSON graph,
+/// its canonical object-entry/sort work and array successor coexistence before
+/// serde constructs any of them. Unknown-length compounds are counted too.
+mod original_canonical_measure {
+    use serde::ser::*;
+    use serde::Serialize;
+    type E = serde_json::Error;
+    fn add(a: usize, b: usize) -> Result<usize, E> {
+        a.checked_add(b).ok_or_else(|| E::custom("logical identity allocation overflow"))
+    }
+    fn mul(a: usize, b: usize) -> Result<usize, E> {
+        a.checked_mul(b).ok_or_else(|| E::custom("logical identity allocation overflow"))
+    }
+    pub(super) struct Measure;
+    pub(super) struct Compound { bytes: usize, count: usize, object: bool }
+    impl Compound {
+        fn new(object: bool) -> Self { Self { bytes: 0, count: 0, object } }
+        fn child<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), E> {
+            self.bytes = add(self.bytes, value.serialize(Measure)?)?;
+            Ok(())
+        }
+        fn member(&mut self) -> Result<(), E> { self.count = add(self.count, 1)?; Ok(()) }
+        fn finish(self) -> Result<usize, E> {
+            if self.object {
+                // One BTree node per insertion is a checked bound for every
+                // insertion/split order, in both original and rebuilt maps.
+                let node = std::mem::size_of::<(String, serde_json::Value)>();
+                let btree = mul(self.count, add(mul(11, node)?, 128)?)?;
+                let entries = mul(self.count, node)?;
+                // Stable sort and collect may coexist with both map graphs.
+                add(self.bytes, add(mul(2, btree)?, mul(4, entries)?)?)
+            } else {
+                // Value serializer Vec growth, old/new coexistence and the
+                // canonical collect successor, including minimum capacity.
+                let count = if self.count == 0 { 0 } else { self.count.max(4) };
+                add(self.bytes, mul(mul(count, 6)?, std::mem::size_of::<serde_json::Value>())?)
+            }
+        }
+    }
+    macro_rules! scalar {
+        ($($name:ident($ty:ty)),*) => {$(fn $name(self, _: $ty) -> Result<usize,E> { Ok(0) })*};
+    }
+    impl Serializer for Measure {
+        type Ok=usize; type Error=E;
+        type SerializeSeq=Compound; type SerializeTuple=Compound;
+        type SerializeTupleStruct=Compound; type SerializeTupleVariant=Compound;
+        type SerializeMap=Compound; type SerializeStruct=Compound;
+        type SerializeStructVariant=Compound;
+        scalar!(serialize_bool(bool),serialize_i8(i8),serialize_i16(i16),serialize_i32(i32),serialize_i64(i64),serialize_i128(i128),serialize_u8(u8),serialize_u16(u16),serialize_u32(u32),serialize_u64(u64),serialize_u128(u128),serialize_f32(f32),serialize_f64(f64));
+        fn serialize_char(self,c:char)->Result<usize,E>{Ok(c.len_utf8())}
+        fn serialize_str(self,v:&str)->Result<usize,E>{Ok(v.len())}
+        fn serialize_bytes(self,v:&[u8])->Result<usize,E>{let mut c=Compound::new(false);c.count=v.len();c.finish()}
+        fn serialize_none(self)->Result<usize,E>{Ok(0)}
+        fn serialize_some<T:Serialize+?Sized>(self,v:&T)->Result<usize,E>{v.serialize(self)}
+        fn serialize_unit(self)->Result<usize,E>{Ok(0)}
+        fn serialize_unit_struct(self,_:&'static str)->Result<usize,E>{Ok(0)}
+        fn serialize_unit_variant(self,_:&'static str,_:u32,v:&'static str)->Result<usize,E>{Ok(v.len())}
+        fn serialize_newtype_struct<T:Serialize+?Sized>(self,_:&'static str,v:&T)->Result<usize,E>{v.serialize(self)}
+        fn serialize_newtype_variant<T:Serialize+?Sized>(self,_:&'static str,_:u32,key:&'static str,v:&T)->Result<usize,E>{
+            let mut c=Compound::new(true);c.bytes=key.len();c.member()?;c.child(v)?;c.finish()
+        }
+        fn serialize_seq(self,_:Option<usize>)->Result<Compound,E>{Ok(Compound::new(false))}
+        fn serialize_tuple(self,_:usize)->Result<Compound,E>{Ok(Compound::new(false))}
+        fn serialize_tuple_struct(self,_:&'static str,_:usize)->Result<Compound,E>{Ok(Compound::new(false))}
+        fn serialize_tuple_variant(self,_:&'static str,_:u32,key:&'static str,_:usize)->Result<Compound,E>{
+            let mut c=Compound::new(false);let mut outer=Compound::new(true);outer.bytes=key.len();outer.count=1;c.bytes=outer.finish()?;Ok(c)
+        }
+        fn serialize_map(self,_:Option<usize>)->Result<Compound,E>{Ok(Compound::new(true))}
+        fn serialize_struct(self,_:&'static str,_:usize)->Result<Compound,E>{Ok(Compound::new(true))}
+        fn serialize_struct_variant(self,_:&'static str,_:u32,key:&'static str,_:usize)->Result<Compound,E>{
+            let mut c=Compound::new(true);let mut outer=Compound::new(true);outer.bytes=key.len();outer.count=1;c.bytes=outer.finish()?;Ok(c)
+        }
+        fn collect_str<T: std::fmt::Display + ?Sized>(self,v:&T)->Result<usize,E>{
+            struct Length(usize);
+            impl std::fmt::Write for Length {fn write_str(&mut self,s:&str)->std::fmt::Result{self.0=self.0.checked_add(s.len()).ok_or(std::fmt::Error)?;Ok(())}}
+            let mut length=Length(0);std::fmt::write(&mut length,format_args!("{v}")).map_err(E::custom)?;Ok(length.0)
+        }
+    }
+    macro_rules! sequential {
+        ($trait:ident,$method:ident) => {impl $trait for Compound {
+            type Ok=usize;type Error=E;
+            fn $method<T:Serialize+?Sized>(&mut self,v:&T)->Result<(),E>{self.member()?;self.child(v)}
+            fn end(self)->Result<usize,E>{self.finish()}
+        }};
+    }
+    sequential!(SerializeSeq,serialize_element);sequential!(SerializeTuple,serialize_element);
+    sequential!(SerializeTupleStruct,serialize_field);sequential!(SerializeTupleVariant,serialize_field);
+    impl SerializeMap for Compound {
+        type Ok=usize;type Error=E;
+        fn serialize_key<T:Serialize+?Sized>(&mut self,key:&T)->Result<(),E>{
+            self.member()?;
+            // JSON map integer/boolean/char keys become text. The largest
+            // integer key is 40 bytes; strings retain their measured length.
+            self.bytes=add(self.bytes,key.serialize(Measure)?.max(40))?;Ok(())
+        }
+        fn serialize_value<T:Serialize+?Sized>(&mut self,v:&T)->Result<(),E>{self.child(v)}
+        fn end(self)->Result<usize,E>{self.finish()}
+    }
+    macro_rules! fields {
+        ($trait:ident) => {impl $trait for Compound {
+            type Ok=usize;type Error=E;
+            fn serialize_field<T:Serialize+?Sized>(&mut self,key:&'static str,v:&T)->Result<(),E>{self.member()?;self.bytes=add(self.bytes,key.len())?;self.child(v)}
+            fn end(self)->Result<usize,E>{self.finish()}
+        }};
+    }
+    fields!(SerializeStruct);fields!(SerializeStructVariant);
+}
+
+pub(crate) struct OriginalCanonicalBytes {
+    pub(crate) bytes: Vec<u8>,
+    allocation: crate::memory_accounting::OwnedMemoryReservation,
+}
+
+pub(crate) fn canonical_json_from_original<T: Serialize + ?Sized>(
+    original: &crate::memory_accounting::OwnedMemoryReservation,
+    value: &T,
+) -> Result<OriginalCanonicalBytes> {
+    let encoding_failure = |error: serde_json::Error| Error::Other(format!("cannot encode logical identity leaf: {error}"));
+    let recursive = value.serialize(original_canonical_measure::Measure).map_err(encoding_failure)?;
+    // Reservation is established before Value/entry/sort construction and
+    // remains external to all graphs until their physical destruction.
+    let work = crate::memory_accounting::reserve_preparation_from_original(original, recursive,
+        "content_identity", "maintain_committed_proof", "Raise MEMORY_LIMIT to admit the proof this transaction maintains.")?;
+    let value = canonicalize_json_value(serde_json::to_value(value).map_err(encoding_failure)?);
+    let mut measured = EncodedLength(0);
+    serde_json::to_writer(&mut measured, &value).map_err(encoding_failure)?;
+    let allocation = crate::memory_accounting::reserve_preparation_from_original(original, measured.0,
+        "content_identity", "maintain_committed_proof", "Raise MEMORY_LIMIT to admit the proof this transaction maintains.")?;
+    let mut bytes = Vec::with_capacity(measured.0);
+    serde_json::to_writer(&mut bytes, &value).map_err(encoding_failure)?;
+    if bytes.capacity() != measured.0 || bytes.len() != measured.0 {
+        return Err(Error::Other("logical identity encoder capacity mismatch".into()));
+    }
+    drop(value);drop(work);
+    Ok(OriginalCanonicalBytes { bytes, allocation })
+}
+
+/// Every escaping mutation retains its original key/value/container invoice.
+pub(crate) struct OriginalIdentityMutations {
+    pub(crate) mutations: Vec<ContentIdentityMutation>,
+    admission: original_writer::ProofAdmission,
+}
+impl OriginalIdentityMutations {
+    pub(crate) fn new(original: &crate::memory_accounting::OwnedMemoryReservation,
+        capacity: usize) -> Result<Self> {
+        let mut admission=original_writer::ProofAdmission::new(original,None)?;
+        let bytes=std::alloc::Layout::array::<ContentIdentityMutation>(capacity)
+            .map_err(|_|Error::Other("logical identity mutation capacity overflow".into()))?.size();
+        admission.admit(bytes)?;
+        let mutations=Vec::with_capacity(capacity);
+        if mutations.capacity()!=capacity{return Err(Error::Other("logical identity mutation capacity mismatch".into()));}
+        Ok(Self { mutations, admission })
+    }
+    pub(crate) fn push_status<T:Serialize>(&mut self,namespace:&[u8],key:&[u8],value:Option<&T>)->Result<()> {
+        let key_bytes=16usize.checked_add(namespace.len()).and_then(|n|n.checked_add(key.len()))
+            .ok_or_else(||Error::Other("logical identity status key overflow".into()))?;
+        self.admission.admit(key_bytes)?;
+        let mut logical_key=Vec::with_capacity(key_bytes);
+        logical_key.extend_from_slice(&(namespace.len() as u64).to_le_bytes());logical_key.extend_from_slice(namespace);
+        logical_key.extend_from_slice(&(key.len() as u64).to_le_bytes());logical_key.extend_from_slice(key);
+        let logical_value=if let Some(value)=value {
+            let mut encoded=canonical_json_from_original(&self.admission.original,value)?;
+            // Transfer, never release/readmit, the output's original debit.
+            let bytes=encoded.bytes.len();
+            self.admission.absorb_output(&mut encoded.allocation,bytes)?;
+            let data=std::mem::take(&mut encoded.bytes);
+            Some(data)
+        } else { None };
+        if self.mutations.len()==self.mutations.capacity(){return Err(Error::Other("logical identity mutation count exceeded preparation".into()));}
+        self.mutations.push(ContentIdentityMutation {family:LogicalFamily::Status,logical_key,logical_value,row_head:None});
+        Ok(())
+    }
+    pub(crate) fn push_config(&mut self,key:&str,value:Option<&[u8]>)->Result<()> {
+        self.admission.admit(key.len().checked_add(value.map_or(0,<[u8]>::len))
+            .ok_or_else(||Error::Other("logical identity config capacity overflow".into()))?)?;
+        if self.mutations.len()==self.mutations.capacity(){return Err(Error::Other("logical identity mutation count exceeded preparation".into()));}
+        self.mutations.push(ContentIdentityMutation {family:LogicalFamily::Configuration,logical_key:key.as_bytes().to_vec(),logical_value:value.map(<[u8]>::to_vec),row_head:None});
+        Ok(())
+    }
+}
+
+pub(crate) struct OriginalIdentityMutation {
+    pub(crate) mutation: ContentIdentityMutation,
+    allocation: crate::memory_accounting::OwnedMemoryReservation,
+}
+
+pub(crate) fn fund_identity_mutation_from_original(
+    original:&crate::memory_accounting::OwnedMemoryReservation,bytes:usize,
+    build:impl FnOnce()->Result<ContentIdentityMutation>,
+)->Result<OriginalIdentityMutation>{
+    let allocation=crate::memory_accounting::reserve_preparation_from_original(original,bytes,
+        "content_identity","maintain_committed_proof","Raise MEMORY_LIMIT to admit the proof this transaction maintains.")?;
+    let mutation=build()?;
+    let retained=mutation.logical_key.capacity().checked_add(mutation.logical_value.as_ref().map_or(0,Vec::capacity))
+        .ok_or_else(||Error::Other("logical identity mutation capacity overflow".into()))?;
+    if retained>bytes{return Err(Error::Other("logical identity mutation exceeded its original allocation plan".into()));}
+    Ok(OriginalIdentityMutation {mutation,allocation})
+}
+
+fn original_key_parts_bytes(parts:&[&[u8]])->Result<usize>{
+    parts.iter().try_fold(0usize,|n,p|n.checked_add(8).and_then(|n|n.checked_add(p.len()))
+        .ok_or_else(||Error::Other("logical identity key capacity overflow".into())))
+}
+
+fn canonical_identity_mutation_from_original<T:Serialize+?Sized>(
+    original:&crate::memory_accounting::OwnedMemoryReservation,family:LogicalFamily,
+    parts:&[&[u8]],value:&T,
+)->Result<OriginalIdentityMutation>{
+    let mut allocation=crate::memory_accounting::reserve_preparation_from_original(original,original_key_parts_bytes(parts)?,
+        "content_identity","maintain_committed_proof","Raise MEMORY_LIMIT to admit the proof this transaction maintains.")?;
+    let mut key=Vec::with_capacity(original_key_parts_bytes(parts)?);
+    for part in parts{key.extend_from_slice(&(part.len() as u64).to_le_bytes());key.extend_from_slice(part);}
+    let mut encoded=canonical_json_from_original(original,value)?;
+    crate::memory_accounting::merge_preparation_original(&mut allocation,&mut encoded.allocation)?;
+    let bytes=std::mem::take(&mut encoded.bytes);
+    Ok(OriginalIdentityMutation {mutation:ContentIdentityMutation::put(family,key,bytes),allocation})
+}
+
+pub(crate) fn row_mutation_from_original(
+    original:&crate::memory_accounting::OwnedMemoryReservation,table:&str,row:&VersionedRow,meta:Option<&TableMeta>,
+)->Result<OriginalIdentityMutation>{
+    if row.deleted_tx.is_some(){
+        let bytes=original_key_parts_bytes(&[table.as_bytes(),&row.row_id.0.to_le_bytes()])?;
+        return fund_identity_mutation_from_original(original,bytes,|| {
+            let mut m=remove_row_mutation(table,row.row_id);m.row_head=Some(Some(RedbPersistence::rel_row_key(row).try_into().unwrap()));Ok(m)
+        });
+    }
+    let count=row.values.iter().filter(|(name,value)|!matches!(value,Value::Vector(_))
+        && !meta.is_some_and(|meta|meta.columns.iter().any(|column|column.name.as_str()==name.as_str()
+            && matches!(column.column_type,contextdb_core::ColumnType::Vector(_))))).count();
+    let nodes=count.checked_mul(128+11*std::mem::size_of::<(&String,&Value)>())
+        .ok_or_else(||Error::Other("logical identity row projection overflow".into()))?;
+    let _projection=crate::memory_accounting::reserve_preparation_from_original(original,nodes,
+        "content_identity","maintain_committed_proof","Raise MEMORY_LIMIT to admit the proof this transaction maintains.")?;
+    let values=row.values.iter().filter(|(name,value)|!matches!(value,Value::Vector(_))
+        && !meta.is_some_and(|meta|meta.columns.iter().any(|column|column.name.as_str()==name.as_str()
+            && matches!(column.column_type,contextdb_core::ColumnType::Vector(_))))).collect::<BTreeMap<&String,&Value>>();
+    let mut m=canonical_identity_mutation_from_original(original,LogicalFamily::Relational,
+        &[table.as_bytes(),&row.row_id.0.to_le_bytes()],&values)?;
+    m.mutation.row_head=Some(Some(RedbPersistence::rel_row_key(row).try_into().unwrap()));
+    Ok(m)
+}
+
+pub(crate) fn edge_mutation_from_original(original:&crate::memory_accounting::OwnedMemoryReservation,edge:&AdjEntry)->Result<OriginalIdentityMutation>{
+    let parts=[edge.edge_type.as_bytes(),edge.source.as_bytes(),edge.target.as_bytes()];
+    if edge.deleted_tx.is_some(){return fund_identity_mutation_from_original(original,original_key_parts_bytes(&parts)?,||Ok(ContentIdentityMutation::remove(LogicalFamily::Graph,key_parts(&parts))));}
+    // Borrowed values serialize identically to the Legacy cloned map. The
+    // native path never constructs a second unowned property body.
+    let nodes=edge.properties.len().checked_mul(128+11*std::mem::size_of::<(&String,&Value)>())
+        .ok_or_else(||Error::Other("logical identity edge projection overflow".into()))?;
+    let _projection=crate::memory_accounting::reserve_preparation_from_original(original,nodes,
+        "content_identity","maintain_committed_proof","Raise MEMORY_LIMIT to admit the proof this transaction maintains.")?;
+    let properties=edge.properties.iter().collect::<BTreeMap<_,_>>();
+    canonical_identity_mutation_from_original(original,LogicalFamily::Graph,&parts,&properties)
+}
+
+pub(crate) fn schema_mutation_from_original(original:&crate::memory_accounting::OwnedMemoryReservation,name:&str,meta:&TableMeta)->Result<OriginalIdentityMutation>{
+    let mut allocation=crate::memory_accounting::reserve_preparation_from_original(original,name.len(),
+        "content_identity","maintain_committed_proof","Raise MEMORY_LIMIT to admit the proof this transaction maintains.")?;
+    let key=name.as_bytes().to_vec();let mut encoded=canonical_json_from_original(original,meta)?;
+    crate::memory_accounting::merge_preparation_original(&mut allocation,&mut encoded.allocation)?;
+    let bytes=std::mem::take(&mut encoded.bytes);
+    Ok(OriginalIdentityMutation{mutation:ContentIdentityMutation::put(SCHEMA_RECORD_FAMILY,key,bytes),allocation})
+}
+
+pub(crate) fn status_mutation_from_original<T:Serialize>(original:&crate::memory_accounting::OwnedMemoryReservation,namespace:&[u8],key:&[u8],value:&T)->Result<OriginalIdentityMutation>{
+    canonical_identity_mutation_from_original(original,LogicalFamily::Status,&[namespace,key],value)
+}
+
+impl OriginalIdentityMutations {
+    pub(crate) fn push_original(&mut self,mut value:OriginalIdentityMutation)->Result<()> {
+        if self.mutations.len()==self.mutations.capacity(){
+            let old=self.mutations.capacity();let next=old.checked_mul(2).map(|n|n.max(4))
+                .ok_or_else(||Error::Other("logical identity mutation count overflow".into()))?;
+            self.admission.admit(std::alloc::Layout::array::<ContentIdentityMutation>(next)
+                .map_err(|_|Error::Other("logical identity mutation capacity overflow".into()))?.size())?;
+            let mut successor=Vec::with_capacity(next);successor.append(&mut self.mutations);
+            let retired=std::mem::replace(&mut self.mutations,successor);drop(retired);
+            self.admission.release(old*std::mem::size_of::<ContentIdentityMutation>());
+        }
+        let bytes=value.allocation.bytes();
+        self.admission.absorb_output(&mut value.allocation,bytes)?;
+        self.mutations.push(value.mutation);Ok(())
+    }
+    pub(crate) fn original(&self)->&crate::memory_accounting::OwnedMemoryReservation{&self.admission.original}
+}
+
+pub(crate) fn retain_original_identity_mutation(frame:&crate::persistence::OriginalPersistenceFrame<'_>,owned:&mut OriginalIdentityMutation)->Result<()> {
+    frame.retain(&mut owned.allocation)
+}
+pub(crate) fn retain_original_canonical<T:Serialize+?Sized>(frame:&crate::persistence::OriginalPersistenceFrame<'_>,value:&T)->Result<Vec<u8>>{
+    let mut encoded=canonical_json_from_original(frame.original,value)?;
+    frame.retain(&mut encoded.allocation)?;Ok(encoded.bytes)
+}
+pub(crate) fn original_record_work_bytes<T:Serialize+?Sized>(value:&T)->Result<usize>{
+    value.serialize(original_canonical_measure::Measure).map_err(|e|Error::Other(format!("cannot encode logical identity leaf: {e}")))
+}
+
+pub(crate) mod original_producers {
+use super::*;
+use crate::persistence::OriginalPersistenceFrame;
+fn size(parts:&[usize])->Result<usize>{parts.iter().try_fold(0usize,|n,v|n.checked_add(*v).ok_or_else(||Error::Other("logical identity allocation overflow".into())))}
+fn key(frame:&OriginalPersistenceFrame<'_>,parts:&[&[u8]])->Result<Vec<u8>>{let bytes=original_key_parts_bytes(parts)?;frame.reserve(bytes)?;let mut v=Vec::with_capacity(bytes);for p in parts{v.extend_from_slice(&(p.len() as u64).to_le_bytes());v.extend_from_slice(p);}Ok(v)}
+pub(crate) fn put(frame:&OriginalPersistenceFrame<'_>,family:LogicalFamily,k:impl AsRef<[u8]>,v:impl AsRef<[u8]>)->Result<ContentIdentityMutation>{frame.reserve(size(&[k.as_ref().len(),v.as_ref().len()])?)?;Ok(ContentIdentityMutation::put(family,k.as_ref(),v.as_ref()))}
+pub(crate) fn remove(frame:&OriginalPersistenceFrame<'_>,family:LogicalFamily,k:impl AsRef<[u8]>)->Result<ContentIdentityMutation>{frame.reserve(k.as_ref().len())?;Ok(ContentIdentityMutation::remove(family,k.as_ref()))}
+pub(crate) fn row_mutation(frame:&OriginalPersistenceFrame<'_>,table:&str,row:&VersionedRow,meta:Option<&TableMeta>)->Result<ContentIdentityMutation>{frame.take_mutation(row_mutation_from_original(frame.original,table,row,meta)?)}
+pub(crate) fn edge_mutation(frame:&OriginalPersistenceFrame<'_>,edge:&AdjEntry)->Result<ContentIdentityMutation>{frame.take_mutation(edge_mutation_from_original(frame.original,edge)?)}
+pub(crate) fn schema_mutations(frame:&OriginalPersistenceFrame<'_>,name:&str,meta:&TableMeta)->Result<Vec<ContentIdentityMutation>>{frame.array::<ContentIdentityMutation>(1)?;Ok(vec![frame.take_mutation(schema_mutation_from_original(frame.original,name,meta)?)?])}
+pub(crate) fn remove_schema_mutations(frame:&OriginalPersistenceFrame<'_>,name:&str)->Result<Vec<ContentIdentityMutation>>{frame.array::<ContentIdentityMutation>(1)?;Ok(vec![remove(frame,SCHEMA_RECORD_FAMILY,name.as_bytes())?])}
+pub(crate) fn config_mutations(frame:&OriginalPersistenceFrame<'_>,name:&str,value:Option<&[u8]>)->Result<Vec<ContentIdentityMutation>>{frame.array::<ContentIdentityMutation>(1)?;Ok(vec![match value{Some(v)=>put(frame,LogicalFamily::Configuration,name.as_bytes(),v)?,None=>remove(frame,LogicalFamily::Configuration,name.as_bytes())?}])}
+pub(crate) fn encoded_status_mutation<T:Serialize>(frame:&OriginalPersistenceFrame<'_>,namespace:&[u8],k:&[u8],value:&T)->Result<ContentIdentityMutation>{frame.take_mutation(status_mutation_from_original(frame.original,namespace,k,value)?)}
+pub(crate) fn status_mutation(frame:&OriginalPersistenceFrame<'_>,namespace:&[u8],k:&[u8],value:&[u8])->Result<ContentIdentityMutation>{let logical_key=key(frame,&[namespace,k])?;frame.reserve(value.len())?;Ok(ContentIdentityMutation::put(LogicalFamily::Status,logical_key,value))}
+pub(crate) fn remove_status_mutation(frame:&OriginalPersistenceFrame<'_>,namespace:&[u8],k:&[u8])->Result<ContentIdentityMutation>{Ok(ContentIdentityMutation::remove(LogicalFamily::Status,key(frame,&[namespace,k])?))}
+pub(crate) fn encoded_history_mutation<T:HistoryRecord>(frame:&OriginalPersistenceFrame<'_>,coordinate:&str,value:&T)->Result<ContentIdentityMutation>{validate_history_key(coordinate)?;frame.reserve(size(&[ORDERED_HISTORY_MAGIC.len(),1,coordinate.len()])?)?;let k=history_logical_key(T::KIND,coordinate.as_bytes());let v=frame.canonical(value)?;Ok(ContentIdentityMutation::put(LogicalFamily::ChangeAndDdl,k,v))}
+pub(crate) fn remove_encoded_history_mutation<T:HistoryRecord>(frame:&OriginalPersistenceFrame<'_>,coordinate:&str,value:&T)->Result<ContentIdentityMutation>{frame.reserve(size(&[ORDERED_HISTORY_MAGIC.len(),1,coordinate.len()])?)?;super::remove_encoded_history_mutation(coordinate,value)}
+pub(crate) fn private_history_mutation(frame:&OriginalPersistenceFrame<'_>,coordinate:&str,value:&[u8])->Result<ContentIdentityMutation>{validate_history_key(coordinate)?;frame.reserve(size(&[ORDERED_HISTORY_MAGIC.len(),1,coordinate.len(),value.len()])?)?;Ok(ContentIdentityMutation::put(LogicalFamily::ChangeAndDdl,history_logical_key(HistoryKind::ChangeLog,coordinate.as_bytes()),value))}
+pub(crate) fn remove_row_mutation(frame:&OriginalPersistenceFrame<'_>,table:&str,row_id:RowId)->Result<ContentIdentityMutation>{frame.reserve(original_key_parts_bytes(&[table.as_bytes(),&row_id.0.to_le_bytes()])? * 4)?;Ok(super::remove_row_mutation(table,row_id))}
+pub(crate) fn remove_edge_mutation(frame:&OriginalPersistenceFrame<'_>,source:uuid::Uuid,edge_type:&str,target:uuid::Uuid)->Result<ContentIdentityMutation>{frame.reserve(original_key_parts_bytes(&[edge_type.as_bytes(),source.as_bytes(),target.as_bytes()])? * 4)?;Ok(super::remove_edge_mutation(source,edge_type,target))}
+pub(crate) fn commit_index_mutation(frame:&OriginalPersistenceFrame<'_>,lsn:Lsn,tx:TxId)->Result<ContentIdentityMutation>{frame.reserve(ORDERED_HISTORY_MAGIC.len()+1+8+8)?;Ok(super::commit_index_mutation(lsn,tx))}
+pub(crate) fn remove_commit_index_mutation(frame:&OriginalPersistenceFrame<'_>,lsn:Lsn)->Result<ContentIdentityMutation>{frame.reserve(ORDERED_HISTORY_MAGIC.len()+1+8)?;Ok(super::remove_commit_index_mutation(lsn))}
+pub(crate) fn sync_source_mutation(frame:&OriginalPersistenceFrame<'_>,table:&str,row_id:RowId,source_lsn:u64,kind:u8)->Result<ContentIdentityMutation>{frame.reserve(size(&[table.len(),8,9])? * 4)?;Ok(super::sync_source_mutation(table,row_id,source_lsn,kind))}
+pub(crate) fn remove_sync_source_mutation(frame:&OriginalPersistenceFrame<'_>,table:&str,row_id:RowId)->Result<ContentIdentityMutation>{frame.reserve(size(&[table.len(),8])? * 4)?;Ok(super::remove_sync_source_mutation(table,row_id))}
+pub(crate) fn relational_index_posting_mutation(frame:&OriginalPersistenceFrame<'_>,table:&str,index:&str,order_key:&[u8])->Result<ContentIdentityMutation>{frame.reserve(size(&[ORDERED_POSTING_MAGIC.len(),4,table.len(),4,index.len(),1,order_key.len()])? * 4)?;Ok(super::relational_index_posting_mutation(table,index,order_key))}
+pub(crate) fn remove_relational_index_posting_mutation(frame:&OriginalPersistenceFrame<'_>,table:&str,index:&str,order_key:&[u8])->Result<ContentIdentityMutation>{frame.reserve(size(&[ORDERED_POSTING_MAGIC.len(),4,table.len(),4,index.len(),1,order_key.len()])? * 4)?;Ok(super::remove_relational_index_posting_mutation(table,index,order_key))}
+pub(crate) fn remove_vector_mutation(frame:&OriginalPersistenceFrame<'_>,index:&VectorIndexRef,row_id:RowId,quantization:VectorQuantization)->Result<ContentIdentityMutation>{frame.reserve(size(&[index.table.len(),index.column.len(),32])? * 4)?;Ok(super::remove_vector_mutation(index,row_id,quantization))}
+pub(crate) fn remove_vector_version_mutation(frame:&OriginalPersistenceFrame<'_>,index:&VectorIndexRef,row_id:RowId,created_tx:TxId,lsn:Lsn,quantization:VectorQuantization)->Result<ContentIdentityMutation>{frame.reserve(32)?;Ok(super::remove_vector_version_mutation(index,row_id,created_tx,lsn,quantization))}
+pub(crate) fn vector_mutation(frame:&OriginalPersistenceFrame<'_>,entry:&VectorEntry,quantization:VectorQuantization)->Result<ContentIdentityMutation>{frame.reserve(size(&[entry.index.table.len(),entry.index.column.len(),64,entry.vector.len().checked_mul(24).ok_or_else(||Error::Other("vector identity layout overflow".into()))?])? * 4)?;Ok(super::vector_mutation(entry,quantization))}
+pub(crate) fn vector_version_mutation(frame:&OriginalPersistenceFrame<'_>,entry:&VectorEntry,quantization:VectorQuantization)->Result<ContentIdentityMutation>{frame.reserve(size(&[64,entry.vector.len().checked_mul(24).ok_or_else(||Error::Other("vector identity layout overflow".into()))?])? * 4)?;Ok(super::vector_version_mutation(entry,quantization))}
+}
+
+pub(crate) mod original_version_manifest {
+//! A private ordered witness for each retained physical relational version.
+use super::*;
+use super::original_writer::{ProofAdmission,read_node_charged,resolve_key_charged};
+use contextdb_core::IndexDecl;
+
+const FORMAT: u8 = 1;
+const FIXED_KEY_BYTES: usize = 72;
+
+#[derive(Clone, Copy)]
+pub(crate) struct VersionManifest<'a> {
+    pub(crate) table: &'a str,
+    pub(crate) identity: [u8; 24],
+    pub(crate) deleted_tx: Option<TxId>,
+    pub(crate) digest: [u8; 32],
+}
+
+fn bad(reason: &str) -> Error {
+    Error::Other(format!("relational version manifest: {reason}"))
+}
+
+pub(crate) fn manifest_prefix(table: &str) -> Result<Vec<u8>> {
+    let len = u32::try_from(table.len()).map_err(|_| bad("table length overflow"))?;
+    let capacity = (FIXED_KEY_BYTES - 2)
+        .checked_add(table.len())
+        .ok_or_else(|| bad("key length overflow"))?;
+    let mut key = Vec::with_capacity(capacity);
+    key.push(FORMAT);
+    key.extend_from_slice(&len.to_be_bytes());
+    key.extend_from_slice(table.as_bytes());
+    Ok(key)
+}
+
+pub(crate) fn parse_manifest(coordinate: &[u8]) -> Result<VersionManifest<'_>> {
+    if coordinate.len() < FIXED_KEY_BYTES - 2 || coordinate[0] != FORMAT {
+        return Err(bad("invalid format or truncated key"));
+    }
+    let length = u32::from_be_bytes(coordinate[1..5].try_into().expect("length")) as usize;
+    if length.checked_add(FIXED_KEY_BYTES - 2) != Some(coordinate.len()) {
+        return Err(bad("invalid table length or trailing fields"));
+    }
+    let table =
+        std::str::from_utf8(&coordinate[5..5 + length]).map_err(|_| bad("table is not UTF-8"))?;
+    let p = 5 + length;
+    let identity = coordinate[p..p + 24].try_into().expect("identity");
+    let closure = u64::from_be_bytes(coordinate[p + 25..p + 33].try_into().expect("closure"));
+    let deleted_tx = match coordinate[p + 24] {
+        0 if closure == 0 => None,
+        1 => Some(TxId(closure)),
+        _ => return Err(bad("invalid closure marker")),
+    };
+    let digest = coordinate[p + 33..].try_into().expect("digest");
+    Ok(VersionManifest {
+        table,
+        identity,
+        deleted_tx,
+        digest,
+    })
+}
+
+pub(crate) fn parse_manifest_with_checkpoint<'a>(
+    coordinate: &'a [u8],
+    checkpoint: &mut dyn FnMut() -> Result<()>,
+) -> Result<VersionManifest<'a>> {
+    if coordinate.len() < FIXED_KEY_BYTES - 2 || coordinate[0] != FORMAT {
+        return Err(bad("invalid format or truncated key"));
+    }
+    let length = u32::from_be_bytes(coordinate[1..5].try_into().expect("length")) as usize;
+    if length.checked_add(FIXED_KEY_BYTES - 2) != Some(coordinate.len()) {
+        return Err(bad("invalid table length or trailing fields"));
+    }
+    let raw = &coordinate[5..5 + length];
+    let mut at = 0;
+    while at < raw.len() {
+        checkpoint()?;
+        let mut end = raw.len().min(at.saturating_add(64 * 1024));
+        if end < raw.len() {
+            while end > at && raw[end] & 0xc0 == 0x80 {
+                end -= 1;
+            }
+        }
+        if end == at {
+            return Err(bad("table is not UTF-8"));
+        }
+        std::str::from_utf8(&raw[at..end]).map_err(|_| bad("table is not UTF-8"))?;
+        at = end;
+    }
+    // Every span was validated above; avoid a second whole-table scan.
+    // SAFETY: the entire slice is the concatenation of the valid UTF-8
+    // windows checked above, each ending before a complete character.
+    let table = unsafe { std::str::from_utf8_unchecked(raw) };
+    let p = 5 + length;
+    let identity = coordinate[p..p + 24].try_into().expect("identity");
+    let closure = u64::from_be_bytes(coordinate[p + 25..p + 33].try_into().expect("closure"));
+    let deleted_tx = match coordinate[p + 24] {
+        0 if closure == 0 => None,
+        1 => Some(TxId(closure)),
+        _ => return Err(bad("invalid closure marker")),
+    };
+    Ok(VersionManifest {
+        table,
+        identity,
+        deleted_tx,
+        digest: coordinate[p + 33..].try_into().expect("digest"),
+    })
+}
+pub(crate) fn prefix_with_checkpoint(
+    table: &str,
+    checkpoint: &mut dyn FnMut() -> Result<()>,
+) -> Result<Vec<u8>> {
+    let len = u32::try_from(table.len()).map_err(|_| bad("table length overflow"))?;
+    let capacity = (FIXED_KEY_BYTES - 2)
+        .checked_add(table.len())
+        .ok_or_else(|| bad("key length overflow"))?;
+    let mut key = Vec::with_capacity(capacity);
+    key.push(FORMAT);
+    key.extend_from_slice(&len.to_be_bytes());
+    for window in table.as_bytes().chunks(64 * 1024) {
+        checkpoint()?;
+        key.extend_from_slice(window);
+    }
+    Ok(key)
+}
+pub(crate) fn copy_with_checkpoint(
+    bytes: &[u8],
+    checkpoint: &mut dyn FnMut() -> Result<()>,
+) -> Result<Vec<u8>> {
+    let mut copy = Vec::with_capacity(bytes.len());
+    for window in bytes.chunks(64 * 1024) {
+        checkpoint()?;
+        copy.extend_from_slice(window);
+    }
+    Ok(copy)
+}
+pub(crate) fn starts_with_checkpoint(
+    bytes: &[u8],
+    prefix: &[u8],
+    checkpoint: &mut dyn FnMut() -> Result<()>,
+) -> Result<bool> {
+    if bytes.len() < prefix.len() {
+        return Ok(false);
+    }
+    Ok(bytes_cmp_checkpoint(&bytes[..prefix.len()], prefix, checkpoint)? == Ordering::Equal)
+}
+pub(crate) fn equal_with_checkpoint(
+    left: &[u8],
+    right: &[u8],
+    checkpoint: &mut dyn FnMut() -> Result<()>,
+) -> Result<bool> {
+    Ok(bytes_cmp_checkpoint(left, right, checkpoint)? == Ordering::Equal)
+}
+
+/// Four offsets per named value; no decoded map or canonical body copy.
+#[derive(Clone, Copy)]
+struct Span {
+    name: usize,
+    name_end: usize,
+    value: usize,
+    value_end: usize,
+}
+struct Encoded<'a, 'c> {
+    bytes: &'a [u8],
+    position: usize,
+    checkpoint: &'c mut dyn FnMut() -> Result<()>,
+}
+impl<'a> Encoded<'a, '_> {
+    fn take(&mut self, len: usize) -> Result<&'a [u8]> {
+        let end = self
+            .position
+            .checked_add(len)
+            .ok_or_else(|| bad("body offset overflow"))?;
+        let raw = self
+            .bytes
+            .get(self.position..end)
+            .ok_or_else(|| bad("truncated body"))?;
+        for _ in raw.chunks(64 * 1024) {
+            (self.checkpoint)()?;
+        }
+        self.position = end;
+        Ok(raw)
+    }
+    fn byte(&mut self) -> Result<u8> {
+        Ok(self.take(1)?[0])
+    }
+    fn integer(&mut self) -> Result<u64> {
+        let tag = self.byte()?;
+        let (value, minimum) = match tag {
+            0..=250 => return Ok(tag as u64),
+            251 => (
+                u16::from_le_bytes(self.take(2)?.try_into().expect("u16")) as u64,
+                251,
+            ),
+            252 => (
+                u32::from_le_bytes(self.take(4)?.try_into().expect("u32")) as u64,
+                65536,
+            ),
+            253 => (
+                u64::from_le_bytes(self.take(8)?.try_into().expect("u64")),
+                4294967296,
+            ),
+            _ => return Err(bad("invalid integer encoding")),
+        };
+        if value < minimum {
+            return Err(bad("noncanonical integer encoding"));
+        }
+        Ok(value)
+    }
+    fn length(&mut self) -> Result<usize> {
+        usize::try_from(self.integer()?).map_err(|_| bad("length overflow"))
+    }
+    fn text(&mut self) -> Result<(usize, usize)> {
+        let len = self.length()?;
+        let start = self.position;
+        let raw = self.take(len)?;
+        let mut at = 0;
+        while at < raw.len() {
+            (self.checkpoint)()?;
+            let mut end = raw.len().min(at + 64 * 1024);
+            if end < raw.len() {
+                // A UTF-8 codepoint uses at most four bytes. Validate complete
+                // windows while preserving the trailing codepoint for the next.
+                while end > at && raw[end] & 0xc0 == 0x80 {
+                    end -= 1;
+                }
+            }
+            if end == at {
+                return Err(bad("body text is not UTF-8"));
+            }
+            std::str::from_utf8(&raw[at..end]).map_err(|_| bad("body text is not UTF-8"))?;
+            at = end;
+        }
+        Ok((start, self.position))
+    }
+    fn option_integer(&mut self) -> Result<Option<u64>> {
+        match self.byte()? {
+            0 => Ok(None),
+            1 => Ok(Some(self.integer()?)),
+            _ => Err(bad("invalid option marker")),
+        }
+    }
+    fn floats(&mut self) -> Result<()> {
+        let bytes = self
+            .length()?
+            .checked_mul(4)
+            .ok_or_else(|| bad("vector size overflow"))?;
+        self.take(bytes)?;
+        Ok(())
+    }
+    fn scalar_value(&mut self) -> Result<()> {
+        match self.integer()? {
+            0 => (),
+            1 => {
+                if self.byte()? > 1 {
+                    return Err(bad("invalid boolean"));
+                }
+            }
+            2 | 6 | 9 => {
+                self.integer()?;
+            }
+            3 => {
+                self.take(8)?;
+            }
+            4 | 7 => {
+                self.text()?;
+            }
+            5 => {
+                let len = self.length()?;
+                if len != 16 {
+                    return Err(bad("invalid UUID length"));
+                }
+                self.take(len)?;
+            }
+            8 => self.floats()?,
+            _ => return Err(bad("foreign scalar type")),
+        }
+        Ok(())
+    }
+    fn value(&mut self) -> Result<()> {
+        match self.integer()? {
+            0 => self.scalar_value()?,
+            1 => match self.integer()? {
+                0 => self.floats()?,
+                kind @ (1 | 2) => {
+                    self.take(8)?;
+                    let dimension = self.integer()?;
+                    if dimension > u32::MAX as u64 {
+                        return Err(bad("vector dimension overflow"));
+                    }
+                    let len = self.length()?;
+                    let expected = if kind == 1 {
+                        dimension
+                    } else {
+                        dimension.div_ceil(2)
+                    };
+                    if len as u64 != expected {
+                        return Err(bad("quantized payload length disagrees with dimension"));
+                    }
+                    self.take(len)?;
+                }
+                _ => return Err(bad("foreign vector representation")),
+            },
+            _ => return Err(bad("foreign persisted value")),
+        }
+        Ok(())
+    }
+}
+
+/// Build only the declared scalar posting key, borrowing every payload from
+/// the authenticated body. Quantized vector index keys retain their existing
+/// admitted decoding path; ordinary wide scalar keys need just one buffer.
+pub(crate) struct PrunedScalarPosting {
+    pub(crate) key: Vec<u8>,
+    pub(crate) suffix: usize,
+    pub(crate) row_id: RowId,
+    pub(crate) created: TxId,
+    pub(crate) deleted: Option<TxId>,
+}
+pub(crate) fn has_indexed_vector(
+    body: &[u8],
+    declarations: &[IndexDecl],
+) -> Result<bool> {
+    let mut checkpoint = || Ok(());
+    let mut input = Encoded {
+        bytes: body,
+        position: 0,
+        checkpoint: &mut checkpoint,
+    };
+    input.integer()?;
+    let count = input.length()?;
+    let mut found = false;
+    for _ in 0..count {
+        let (name, name_end) = input.text()?;
+        let start = input.position;
+        input.value()?;
+        if body[start] != 0
+            && declarations.iter().any(|declaration| {
+                declaration
+                    .columns
+                    .iter()
+                    .any(|(column, _)| column.as_bytes() == &body[name..name_end])
+            })
+        {
+            found = true;
+        }
+    }
+    Ok(found)
+}
+pub(crate) fn scalar_posting_for_body(
+    body: &[u8],
+    declaration: &IndexDecl,
+) -> Result<Option<PrunedScalarPosting>> {
+    let controls = declaration
+        .columns
+        .len()
+        .checked_mul(std::mem::size_of::<Option<&[u8]>>())
+        .and_then(|n| n.checked_add(256))
+        .ok_or_else(|| bad("posting descriptor overflow"))?;
+    crate::read_image_memory::reserve(controls)?;
+    let mut values = vec![None; declaration.columns.len()];
+    let mut checkpoint = || Ok(());
+    let mut input = Encoded {
+        bytes: body,
+        position: 0,
+        checkpoint: &mut checkpoint,
+    };
+    let row_id = RowId(input.integer()?);
+    let count = input.length()?;
+    let mut vector_key = false;
+    for _ in 0..count {
+        let (name, name_end) = input.text()?;
+        let start = input.position;
+        input.value()?;
+        for (position, (column, _)) in declaration.columns.iter().enumerate() {
+            if column.as_bytes() == &body[name..name_end] {
+                if values[position].is_some() {
+                    return Err(bad("duplicate indexed value"));
+                }
+                if body[start] != 0 {
+                    vector_key = true;
+                }
+                values[position] = Some(&body[start + 1..input.position]);
+            }
+        }
+    }
+    let created = TxId(input.integer()?);
+    let deleted = input.option_integer()?.map(TxId);
+    input.integer()?; // lsn, authenticated by the manifest mutation
+    input.option_integer()?;
+    if input.position != body.len() {
+        return Err(bad("trailing body fields"));
+    }
+    if vector_key {
+        return Ok(None);
+    }
+    let capacity = values.iter().try_fold(32usize, |n, value| {
+        n.checked_add(1 + value.map_or(1, <[u8]>::len))
+            .ok_or_else(|| bad("posting key overflow"))
+    })?;
+    crate::read_image_memory::reserve(capacity)?;
+    let mut key = Vec::with_capacity(capacity);
+    bincode::serde::encode_into_std_write(
+        declaration.columns.len() as u64,
+        &mut key,
+        bincode::config::standard(),
+    )
+    .map_err(|e| bad(&format!("posting length: {e}")))?;
+    for ((_, direction), value) in declaration.columns.iter().zip(values) {
+        key.push(u8::from(*direction == contextdb_core::SortDirection::Desc));
+        key.extend_from_slice(value.unwrap_or(&[0])); // Value::Null
+    }
+    let suffix = key.len();
+    bincode::serde::encode_into_std_write((row_id, created), &mut key, bincode::config::standard())
+        .map_err(|e| bad(&format!("posting identity: {e}")))?;
+    Ok(Some(PrunedScalarPosting {
+        key,
+        suffix,
+        row_id,
+        created,
+        deleted,
+    }))
+}
+
+pub(crate) fn scalar_posting_identity(key: &[u8]) -> Result<(usize, RowId, TxId)> {
+    let mut checkpoint = || Ok(());
+    let mut input = Encoded {
+        bytes: key,
+        position: 0,
+        checkpoint: &mut checkpoint,
+    };
+    let count = input.length()?;
+    for _ in 0..count {
+        if input.byte()? > 1 {
+            return Err(bad("invalid index direction"));
+        }
+        input.scalar_value()?;
+    }
+    let suffix = input.position;
+    let row = RowId(input.integer()?);
+    let created = TxId(input.integer()?);
+    if input.position != key.len() {
+        return Err(bad("trailing posting fields"));
+    }
+    Ok((suffix, row, created))
+}
+
+/// Parse and hash the exact persisted representation before schema projection.
+/// Scratch is admitted before the descriptor vector is allocated and refunded
+/// after the hash, including every parse/admission failure.
+pub(crate) fn manifest_for_body(
+    table: &str,
+    physical: &[u8],
+    body: &[u8],
+    admission: &mut ProofAdmission,
+) -> Result<Vec<u8>> {
+    manifest_for_body_with_checkpoint(table, physical, body, admission, &mut || Ok(()))
+}
+
+pub(crate) fn manifest_for_body_with_checkpoint(
+    table: &str,
+    physical: &[u8],
+    body: &[u8],
+    admission: &mut ProofAdmission,
+    checkpoint: &mut dyn FnMut() -> Result<()>,
+) -> Result<Vec<u8>> {
+    checkpoint()?;
+    if physical.len() != 24 {
+        return Err(bad("physical key width"));
+    }
+    let mut input = Encoded {
+        bytes: body,
+        position: 0,
+        checkpoint,
+    };
+    let row_id = input.integer()?;
+    let count = input.length()?;
+    if count > body.len() / 3 {
+        return Err(bad("impossible value count"));
+    }
+    let descriptor_bytes = std::alloc::Layout::array::<Span>(count)
+        .map_err(|_| bad("descriptor layout overflow"))?
+        .size();
+    let key_bytes = FIXED_KEY_BYTES
+        .checked_add(table.len())
+        .ok_or_else(|| bad("key length overflow"))?;
+    let scratch = descriptor_bytes
+        .checked_add(std::mem::size_of::<blake3::Hasher>())
+        .and_then(|n| n.checked_add(32))
+        .ok_or_else(|| bad("scratch overflow"))?;
+    admission.admit(scratch)?;
+    let result = (|| {
+        let mut spans = Vec::with_capacity(count);
+        for _ in 0..count {
+            (input.checkpoint)()?;
+            let (name, name_end) = input.text()?;
+            let value = input.position;
+            input.value()?;
+            spans.push(Span {
+                name,
+                name_end,
+                value,
+                value_end: input.position,
+            });
+        }
+        let created = input.integer()?;
+        let deleted = input.option_integer()?;
+        let lsn = input.integer()?;
+        let created_at = input.option_integer()?;
+        if input.position != body.len() {
+            return Err(bad("trailing body fields"));
+        }
+        let mut identity = [0u8; 24];
+        for (offset, value) in [(0, row_id), (8, created), (16, lsn)] {
+            identity[offset..offset + 8].copy_from_slice(&value.to_be_bytes());
+        }
+        if identity != physical {
+            return Err(bad("body disagrees with physical identity"));
+        }
+        let checkpoint = input.checkpoint;
+        // Unstable sorting is in-place and allocates no population-sized work.
+        fn compare_names(
+            body: &[u8],
+            a: Span,
+            b: Span,
+            checkpoint: &mut dyn FnMut() -> Result<()>,
+        ) -> Result<Ordering> {
+            let a = &body[a.name..a.name_end];
+            let b = &body[b.name..b.name_end];
+            for (left, right) in a.chunks(64 * 1024).zip(b.chunks(64 * 1024)) {
+                checkpoint()?;
+                let order = left.cmp(right);
+                if order != Ordering::Equal {
+                    return Ok(order);
+                }
+            }
+            Ok(a.len().cmp(&b.len()))
+        }
+        fn sift(
+            spans: &mut [Span],
+            body: &[u8],
+            mut root: usize,
+            end: usize,
+            checkpoint: &mut dyn FnMut() -> Result<()>,
+        ) -> Result<()> {
+            loop {
+                checkpoint()?;
+                let Some(mut child) = root
+                    .checked_mul(2)
+                    .and_then(|n| n.checked_add(1))
+                    .filter(|n| *n < end)
+                else {
+                    return Ok(());
+                };
+                if child + 1 < end
+                    && compare_names(body, spans[child], spans[child + 1], checkpoint)?
+                        == Ordering::Less
+                {
+                    child += 1;
+                }
+                if compare_names(body, spans[root], spans[child], checkpoint)? != Ordering::Less {
+                    return Ok(());
+                }
+                spans.swap(root, child);
+                root = child;
+            }
+        }
+        for root in (0..count / 2).rev() {
+            sift(&mut spans, body, root, count, checkpoint)?;
+        }
+        for end in (1..count).rev() {
+            spans.swap(0, end);
+            sift(&mut spans, body, 0, end, checkpoint)?;
+        }
+        for pair in spans.windows(2) {
+            if compare_names(body, pair[0], pair[1], checkpoint)? == Ordering::Equal {
+                return Err(bad("duplicate named value"));
+            }
+        }
+        let mut hash = blake3::Hasher::new();
+        let mut hash_bytes = 0usize;
+        let mut update = |bytes: &[u8]| -> Result<()> {
+            for window in bytes.chunks(64 * 1024) {
+                checkpoint()?;
+                hash.update(window);
+                hash_bytes = hash_bytes
+                    .checked_add(window.len())
+                    .ok_or_else(|| bad("hash byte count overflow"))?;
+            }
+            Ok(())
+        };
+        update(b"contextdb.relational.version.v1")?;
+        update(
+            &u32::try_from(table.len())
+                .map_err(|_| bad("table length overflow"))?
+                .to_be_bytes(),
+        )?;
+        update(table.as_bytes())?;
+        update(&identity)?;
+        for value in [created_at, deleted] {
+            update(&[u8::from(value.is_some())])?;
+            update(&value.unwrap_or(0).to_be_bytes())?;
+        }
+        update(&(count as u64).to_be_bytes())?;
+        for span in &spans {
+            update(
+                &u32::try_from(span.name_end - span.name)
+                    .map_err(|_| bad("name length overflow"))?
+                    .to_be_bytes(),
+            )?;
+            update(&body[span.name..span.name_end])?;
+            update(&body[span.value..span.value + 1])?;
+            update(&((span.value_end - span.value - 1) as u64).to_be_bytes())?;
+            update(&body[span.value + 1..span.value_end])?;
+        }
+        #[cfg(feature = "test-seams")]
+        crate::read_work_probe::note_hashed_bytes(hash_bytes);
+        let digest = *hash.finalize().as_bytes();
+        admission.admit(key_bytes)?;
+        let mut coordinate = Vec::with_capacity(key_bytes - 2);
+        coordinate.push(FORMAT);
+        coordinate.extend_from_slice(&(table.len() as u32).to_be_bytes());
+        for window in table.as_bytes().chunks(64 * 1024) {
+            checkpoint()?;
+            coordinate.extend_from_slice(window);
+        }
+        coordinate.extend_from_slice(&identity);
+        coordinate.push(u8::from(deleted.is_some()));
+        coordinate.extend_from_slice(&deleted.unwrap_or(0).to_be_bytes());
+        coordinate.extend_from_slice(&digest);
+        Ok(coordinate)
+    })();
+    admission.release(scratch);
+    result
+}
+
+pub(crate) fn manifest_mutation(
+    coordinate: &[u8],
+    present: bool,
+) -> Result<ContentIdentityMutation> {
+    parse_manifest(coordinate)?;
+    let key = history_logical_key(HistoryKind::RelationalVersion, coordinate);
+    Ok(if present {
+        ContentIdentityMutation::put(LogicalFamily::ChangeAndDdl, key, [1])
+    } else {
+        ContentIdentityMutation::remove(LogicalFamily::ChangeAndDdl, key)
+    })
+}
+
+/// An authenticated successor under the current writer transaction's root.
+/// Only a path and one resolved separator exist at a time.
+pub(crate) fn writer_manifest_next(
+    write: &redb::WriteTransaction,
+    start: &[u8],
+    exclusive: bool,
+    admission: &mut ProofAdmission,
+) -> Result<Option<Vec<u8>>> {
+    let family = LogicalFamily::ChangeAndDdl;
+    let roots = write
+        .open_table(CONTENT_IDENTITY_ROOTS_TABLE)
+        .map_err(RedbPersistence::storage_error)?;
+    let encoded = roots
+        .get(family as u8)
+        .map_err(RedbPersistence::storage_error)?
+        .ok_or_else(|| bad("missing family root"))?;
+    let root = decode_published_root(family, encoded.value())?.identity;
+    drop(encoded);
+    drop(roots);
+    let nodes = write
+        .open_table(CONTENT_IDENTITY_NODES_TABLE)
+        .map_err(RedbPersistence::storage_error)?;
+    let target_bytes = start
+        .len()
+        .checked_add(2)
+        .ok_or_else(|| bad("seek layout overflow"))?;
+    admission.admit(target_bytes)?;
+    let target = history_tree_key(HistoryKind::RelationalVersion, start);
+    fn descend(
+        nodes: &impl ReadableTable<&'static [u8], &'static [u8]>,
+        id: Option<[u8; 32]>,
+        expected: [u8; 32],
+        target: &[u8],
+        exclusive: bool,
+        depth: usize,
+        admission: &mut ProofAdmission,
+    ) -> Result<Option<Vec<u8>>> {
+        let Some(id) = id else { return Ok(None) };
+        if depth > 64 {
+            return Err(bad("proof path exceeds maximum height"));
+        }
+        let family = LogicalFamily::ChangeAndDdl;
+        let (node, charged) = read_node_charged(nodes, family, id, admission)?;
+        let result = (|| {
+            if node.subtree_hash != expected {
+                return Err(bad("writer proof root mismatch"));
+            }
+            for entry in &node.entries {
+                let (key, key_charge) = resolve_key_charged(nodes, family, &entry.key, admission)?;
+                let ordering = identity_key_cmp(&key, target)?;
+                if ordering == Ordering::Less
+                    || (node.level == 0 && exclusive && ordering == Ordering::Equal)
+                {
+                    admission.release(key_charge);
+                    continue;
+                }
+                if node.level == 0 {
+                    if key.starts_with(&[
+                        ORDERED_HISTORY_KEY_TAG,
+                        HistoryKind::RelationalVersion as u8,
+                    ]) {
+                        parse_manifest(&key[2..])?;
+                        if entry.value_hash != value_hash(family, &[1]) {
+                            return Err(bad("marker hash mismatch"));
+                        }
+                        admission.admit(key.len() - 2)?;
+                        let coordinate = key[2..].to_vec();
+                        admission.release(key_charge);
+                        return Ok(Some(coordinate));
+                    }
+                    admission.release(key_charge);
+                    return Ok(None);
+                }
+                let child = chunk_id(node.level - 1, &entry.key);
+                admission.release(key_charge);
+                if let Some(found) = descend(
+                    nodes,
+                    Some(child),
+                    entry.value_hash,
+                    target,
+                    exclusive,
+                    depth + 1,
+                    admission,
+                )? {
+                    return Ok(Some(found));
+                }
+            }
+            Ok(None)
+        })();
+        drop(node);
+        admission.release(charged);
+        result
+    }
+    let result = descend(
+        &nodes, root.root, root.hash, &target, exclusive, 0, admission,
+    );
+    drop(target);
+    admission.release(target_bytes);
+    result
+}
+pub(crate) fn writer_manifest_next_pending(
+    write: &redb::WriteTransaction,
+    start: &[u8],
+    exclusive: bool,
+    admission: &mut ProofAdmission,
+    pending: &[ContentIdentityMutation],
+) -> Result<Option<Vec<u8>>> {
+    fn coordinate(mutation: &ContentIdentityMutation) -> &[u8] {
+        &mutation.logical_key[ORDERED_HISTORY_MAGIC.len() + 1..]
+    }
+    let latest = |key: &[u8]| {
+        pending
+            .iter()
+            .rev()
+            .find(|mutation| coordinate(mutation) == key)
+    };
+    let mut stored = writer_manifest_next(write, start, exclusive, admission)?;
+    while stored
+        .as_deref()
+        .is_some_and(|key| latest(key).is_some_and(|mutation| mutation.logical_value.is_none()))
+    {
+        let key = stored.take().expect("selected predecessor");
+        stored = writer_manifest_next(write, &key, true, admission)?;
+        let bytes = key.capacity();
+        drop(key);
+        admission.release(bytes);
+    }
+    let mut selected: Option<&[u8]> = None;
+    for mutation in pending {
+        let key = coordinate(mutation);
+        if mutation.logical_value.is_none()
+            || !std::ptr::eq(latest(key).expect("overlay member"), mutation)
+            || key < start
+            || (exclusive && key == start)
+            || stored.as_deref().is_some_and(|stored| key >= stored)
+            || selected.is_some_and(|selected| key >= selected)
+        {
+            continue;
+        }
+        selected = Some(key);
+    }
+    if let Some(key) = selected {
+        admission.admit(key.len())?;
+        let selected = key.to_vec();
+        if let Some(stored) = stored {
+            let bytes = stored.capacity();
+            drop(stored);
+            admission.release(bytes);
+        }
+        Ok(Some(selected))
+    } else {
+        Ok(stored)
+    }
+}
+pub(crate) fn manifest_mutation_bytes(coordinate: &[u8], present: bool) -> Result<usize> {
+    coordinate
+        .len()
+        .checked_add(ORDERED_HISTORY_MAGIC.len() + 1)
+        .and_then(|bytes| bytes.checked_add(usize::from(present)))
+        .ok_or_else(|| bad("mutation layout overflow"))
+}
+
+}

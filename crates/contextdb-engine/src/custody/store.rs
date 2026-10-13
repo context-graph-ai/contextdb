@@ -615,3 +615,74 @@ impl Store {
         Ok(delta)
     }
 }
+
+/// A borrowed record cannot outlive the checked raw view's erasure fence.
+/// Retained windows themselves hold pages, metadata and the original weak
+/// checkpoint context; they do not keep an erasure read lock between calls.
+#[cfg(feature = "sync-orchestration")]
+pub(crate) struct NativeCustodyView<'a> {
+    raw: crate::persistence::writer_source::NativeRawConfigView<'a>,
+}
+#[cfg(feature = "sync-orchestration")]
+impl NativeCustodyView<'_> {
+    pub(crate) fn key(&self) -> &str { self.raw.key() }
+    pub(crate) fn stored_bytes(&self) -> &[u8] { self.raw.stored_bytes() }
+    pub(crate) fn record(&self) -> super::native_decode::Decoded<super::native_records::RecordView<'_>> {
+        super::native_record_codec::decode_record(self.raw.stored_bytes())
+    }
+}
+#[cfg(feature = "sync-orchestration")]
+pub(crate) struct NativeCustodyWindow {
+    // Physical guards and key storage precede counted owners on drop.
+    raw: crate::persistence::writer_source::NativeRawConfigWindow,
+    key: super::native_selection::NativeBuffer,
+}
+#[cfg(feature = "sync-orchestration")]
+impl NativeCustodyWindow {
+    pub(crate) fn admit(
+        raw: crate::persistence::writer_source::NativeRawConfigWindow,
+        owner: &contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> super::native_selection::Selected<Self> {
+        let key = {
+            let view = raw.view()?;
+            let record = super::native_record_codec::decode_record(view.stored_bytes())?;
+            let key = record.key_native(owner)?;
+            if key.text()? != view.key() { return Err(super::native_decode::Invalid::Key.into()); }
+            record.verify_native(owner)?;
+            key
+        };
+        Ok(Self { raw, key })
+    }
+    pub(crate) fn key(&self) -> &str { self.key.text().expect("admitted UTF-8 canonical custody key") }
+    pub(crate) fn view(&self) -> super::native_selection::Selected<NativeCustodyView<'_>> {
+        Ok(NativeCustodyView { raw: self.raw.view()? })
+    }
+    pub(crate) fn committed_view(&self) -> (redb::StorageSnapshotIdentity, contextdb_core::SnapshotId, contextdb_core::Lsn) {
+        self.raw.committed_view()
+    }
+}
+#[cfg(feature = "sync-orchestration")]
+pub(crate) struct NativeCustodySelection {
+    windows: super::native_selection::NativeSelectionHold<NativeCustodyWindow>,
+}
+#[cfg(feature = "sync-orchestration")]
+impl NativeCustodySelection {
+    pub(crate) fn try_new(owner: &contextdb_core::read_memory::ReadMemoryOwner, slots: usize)
+        -> super::native_selection::Selected<Self> {
+        Ok(Self { windows: super::native_selection::NativeSelectionHold::try_new(owner, slots)? })
+    }
+    pub(crate) fn retain(&mut self, window: NativeCustodyWindow) -> super::native_selection::Selected<()> { self.windows.retain(window) }
+    pub(crate) fn windows(&self) -> &[NativeCustodyWindow] { self.windows.as_slice() }
+    pub(crate) fn sort_dedup(&mut self) {
+        let windows = self.windows.as_mut_slice();
+        windows.sort_unstable_by(|a,b| a.key().cmp(b.key()));
+        let mut used = 0;
+        for i in 0..windows.len() {
+            if used == 0 || windows[i].key() != windows[used-1].key() {
+                windows.swap(used,i); used += 1;
+            }
+        }
+        self.windows.truncate(used);
+    }
+    pub(crate) fn is_funded_by(&self, owner: &contextdb_core::read_memory::ReadMemoryOwner) -> bool { self.windows.is_funded_by(owner) }
+}

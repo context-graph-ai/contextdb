@@ -32,6 +32,8 @@ pub(crate) enum PageMemory {
     /// (counted there), or one read outside a charging admission that the
     /// cache could not take, which the caller's own admission covers.
     Plain(Arc<[u8]>),
+    #[cfg(feature = "contextdb-internal")]
+    Native(crate::native_storage_admission::NativeStorageShared<crate::native_storage_admission::NativePagePayload>),
 }
 
 /// A page admitted to the read cache. Its bytes leave the cache's count when
@@ -123,6 +125,8 @@ impl PageMemory {
         let slot = match self {
             Self::Cached(page) => &page.byte_node_checksum,
             Self::Charged(page) => &page.byte_node_checksum,
+            #[cfg(feature = "contextdb-internal")]
+            Self::Native(page) => &page.get().checksum,
             Self::Plain(_) => {
                 #[cfg(test)]
                 BYTE_CHECKSUM_COUNTS.with(|counts| {
@@ -171,6 +175,8 @@ impl std::fmt::Debug for PageMemory {
             PageMemory::Cached(page) => ("cached", page.len()),
             PageMemory::Charged(page) => ("charged", page.bytes.len()),
             PageMemory::Plain(bytes) => ("plain", bytes.len()),
+            #[cfg(feature = "contextdb-internal")]
+            PageMemory::Native(page) => ("native", page.get().bytes.as_slice().len()),
         };
         write!(f, "PageMemory({kind}, {len} bytes)")
     }
@@ -184,6 +190,8 @@ impl std::ops::Deref for PageMemory {
             PageMemory::Cached(page) => &page.bytes,
             PageMemory::Charged(page) => &page.bytes,
             PageMemory::Plain(bytes) => bytes,
+            #[cfg(feature = "contextdb-internal")]
+            PageMemory::Native(page) => page.get().bytes.as_slice(),
         }
     }
 }
@@ -1894,5 +1902,47 @@ impl PagedCachedFile {
     pub(crate) fn write_map_for_test(&self) -> (usize, usize) {
         let write = self.write_buffer.lock().unwrap();
         (write.cache.len(), write.cache.map_capacity_for_test())
+    }
+}
+
+#[cfg(feature = "contextdb-internal")]
+impl PagedCachedFile {
+    /// A paid native page copies an original clean warm-cache hit; it never
+    /// borrows or adopts a legacy cell and never probes the write buffer.
+    pub(super) fn read_native_clean_miss(
+        &self, offset: u64, len: usize,
+    ) -> std::result::Result<PageMemory, crate::NativeColdReadError> {
+        use crate::native_storage_admission::{NativeColdFault, NativeColdReadError, NativePagePayload, NativeStorageBuffer, NativeStorageShared};
+        if !crate::native_storage_admission::native_storage_active() {
+            return Err(NativeColdReadError::AdmissionRefused);
+        }
+        if self.file.io_failed.load(Ordering::Acquire) {
+            return Err(NativeColdReadError::Corrupt(NativeColdFault::new("native read requires an available backend")));
+        }
+        // Admit both owners on the original scope before taking a cache lock.
+        let bytes = NativeStorageBuffer::zeroed(len)?;
+        let mut page = NativeStorageShared::new(NativePagePayload { bytes, checksum: Mutex::new(None) })?;
+        let stripe = (offset % Self::lock_stripes()) as usize;
+        {
+            let cache = self.read_cache[stripe].read().unwrap();
+            if let Some(cell) = cache.get(offset) {
+                if cell.bytes.len() != len {
+                    let mut fault = NativeColdFault::new("native cache page length does not match the requested extent");
+                    fault.expected = len as u128;
+                    fault.actual = cell.bytes.len() as u128;
+                    return Err(NativeColdReadError::Corrupt(fault));
+                }
+                page.get_mut().expect("unpublished native page is unique").bytes.as_mut_slice().copy_from_slice(&cell.bytes);
+                return Ok(PageMemory::Native(page));
+            }
+        }
+        // Every page allocation and its receipt is admitted before backend I/O.
+        let result = self.file.file.read(offset, page.get_mut().expect("unpublished native page is unique").bytes.as_mut_slice());
+        if let Err(error) = result {
+            self.file.io_failed.store(true, Ordering::Release);
+            return Err(NativeColdReadError::Io(error));
+        }
+        crate::read_admission::record_backend_read(len);
+        Ok(PageMemory::Native(page))
     }
 }

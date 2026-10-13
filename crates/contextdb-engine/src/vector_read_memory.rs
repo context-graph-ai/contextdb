@@ -1,7 +1,7 @@
 //! Vector copies use the requesting reader's existing budget capability.
 use contextdb_core::{
     Result,
-    read_memory::{ReadMemoryBudget, ReadMemoryOwner},
+    read_memory::{NativeRefusal, ReadMemoryBudget, ReadMemoryOwner},
 };
 use contextdb_vector::{MemoryBudget, VectorCopyAdmission};
 use std::sync::Arc;
@@ -60,7 +60,24 @@ pub(crate) struct NativeReadChildReceipt {
     #[allow(dead_code)] // Retained now; native dispatch will consume this owner.
     owner: ReadMemoryOwner,
 }
+impl NativeReadChildReceipt {
+    pub(crate) fn into_owner(self) -> ReadMemoryOwner {
+        self.owner
+    }
+}
+
 impl RequestReadOwner {
+    /// Alias the acquired capability without allocating or acquiring a child.
+    /// The native alias increments the same physical block's strong count;
+    /// a legacy alias retains the host's exact Arc identity.
+    pub(crate) fn share(&self) -> Self {
+        match &self.0 {
+            RequestReadRoute::Legacy(reader) => Self::legacy(reader.clone()),
+            RequestReadRoute::Native(receipt) => Self::native(NativeReadChildReceipt {
+                owner: receipt.owner.clone(),
+            }),
+        }
+    }
     pub(crate) fn legacy(reader: Arc<dyn ReadMemoryBudget>) -> Self {
         Self(RequestReadRoute::Legacy(reader))
     }
@@ -81,6 +98,16 @@ pub struct DeclaredReadMemory {
     live_acl_cache_bytes: std::sync::atomic::AtomicU64,
 }
 impl DeclaredReadMemory {
+    // Both doors use the same real parent counter and the same admission boundary.
+    fn try_count(&self, bytes: usize) -> std::result::Result<(), u64> {
+        use std::sync::atomic::Ordering;
+        self.retained
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
+                held.checked_add(bytes as u64)
+                    .filter(|after| *after <= self.limit)
+            })
+            .map(|_| ())
+    }
     pub fn from_reader_limit(limit: u64) -> Arc<Self> {
         Arc::new(Self {
             limit,
@@ -141,7 +168,30 @@ impl DeclaredReadMemory {
     }
 
     /// Admit the actual native cell against this original declared parent.
-    pub(crate) fn native_child(self: &Arc<Self>) -> Result<NativeReadChildReceipt> {
+    pub(crate) fn native_child(self: &Arc<Self>) -> std::result::Result<NativeReadChildReceipt, NativeRefusal> {
+        let control_bytes =
+            ReadMemoryOwner::native_layout::<NativeDeclaredChild, NativeChildInvoice>().size();
+        self.try_reserve_native(
+            control_bytes,
+            "reader",
+            "request_owner",
+            "Reduce simultaneous requests or raise the declared reader memory limit.",
+        )?;
+        self.live_child_control_bytes
+            .fetch_add(control_bytes as u64, std::sync::atomic::Ordering::SeqCst);
+        let invoice = NativeChildInvoice {
+            parent: self.clone(),
+            bytes: control_bytes,
+        };
+        let payload = NativeDeclaredChild {
+            parent: self.clone(),
+            retained: std::sync::atomic::AtomicU64::new(0),
+        };
+        ReadMemoryOwner::try_native_reserving(payload, invoice).map(|owner| NativeReadChildReceipt { owner })
+    }
+
+    /// Existing public provider result remains unqualified at its Error terminal.
+    fn native_child_unqualified(self: &Arc<Self>) -> Result<NativeReadChildReceipt> {
         let control_bytes =
             ReadMemoryOwner::native_layout::<NativeDeclaredChild, NativeChildInvoice>().size();
         self.try_reserve(
@@ -213,6 +263,24 @@ struct NativeDeclaredChild {
     retained: std::sync::atomic::AtomicU64,
 }
 impl ReadMemoryBudget for NativeDeclaredChild {
+    fn native_reserve_supported(&self) -> bool { true }
+    fn try_reserve_native(
+        &self,
+        bytes: usize,
+        subsystem: &'static str,
+        operation: &'static str,
+        hint: &'static str,
+    ) -> std::result::Result<(), NativeRefusal> {
+        self.parent.try_reserve_native(bytes, subsystem, operation, hint)?;
+        let held = self
+            .retained
+            .fetch_add(bytes as u64, std::sync::atomic::Ordering::SeqCst)
+            + bytes as u64;
+        self.parent
+            .file_child_high_water
+            .fetch_max(held, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
     fn try_reserve(
         &self,
         bytes: usize,
@@ -271,6 +339,16 @@ pub fn take_reader_budget_ledger_for_test() -> Vec<crate::memory_accounting::Bud
 }
 
 impl ReadMemoryBudget for DeclaredReadMemory {
+    fn try_reserve_native(
+        &self, bytes: usize, subsystem: &'static str,
+        operation: &'static str, hint: &'static str,
+    ) -> std::result::Result<(), NativeRefusal> {
+        self.try_count(bytes).map_err(|held| NativeRefusal::MemoryBudgetExceeded {
+            subsystem, operation, requested_bytes: bytes,
+            available_bytes: usize::try_from(self.limit.saturating_sub(held)).unwrap_or(usize::MAX),
+            budget_limit_bytes: usize::try_from(self.limit).unwrap_or(usize::MAX), hint,
+        })
+    }
     fn try_reserve(
         &self,
         bytes: usize,
@@ -279,14 +357,9 @@ impl ReadMemoryBudget for DeclaredReadMemory {
         hint: &'static str,
     ) -> Result<()> {
         use std::sync::atomic::Ordering;
-        self.retained
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
-                held.checked_add(bytes as u64)
-                    .filter(|after| *after <= self.limit)
-            })
-            .map_err(|held| {
-                reader_memory_refusal(self.limit, held, bytes, subsystem, operation, hint)
-            })?;
+        self.try_count(bytes).map_err(|held| {
+            reader_memory_refusal(self.limit, held, bytes, subsystem, operation, hint)
+        })?;
         #[cfg(any(test, feature = "test-seams"))]
         READER_BUDGET_LEDGER.with(|ledger| {
             if let Some(entries) = ledger.borrow_mut().as_mut() {
@@ -350,7 +423,7 @@ impl ReadRequestBudgetProvider for Arc<DeclaredReadMemory> {
         self.child()
     }
     fn request_budget_owner(&self) -> Result<RequestReadOwner> {
-        self.native_child().map(RequestReadOwner::native)
+        self.native_child_unqualified().map(RequestReadOwner::native)
     }
 }
 

@@ -23,3 +23,13 @@ pub fn binding_subject(tenant_id: &str) -> String {
 pub fn delivery_outcomes_subject(tenant_id: &str) -> String {
     format!("sync.{tenant_id}.delivery.outcomes")
 }
+
+/// Format a native subject from borrowed pieces under its original invoice.
+/// Existing public subject constructors retain their legacy signatures.
+pub(crate) fn read_bound_subject(
+    owner: contextdb_core::read_memory::ReadMemoryOwner,
+    tenant_id: &str,
+    suffix: &str,
+) -> crate::transport::WireResult<crate::transport::NativeWireString> {
+    crate::transport::NativeWireString::try_from_parts(owner, &["sync.", tenant_id, ".", suffix])
+}

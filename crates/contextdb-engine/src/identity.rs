@@ -100,6 +100,14 @@ impl FabricIdentity {
             .to_vec()
     }
 
+    /// Native sibling: the original fabric seed, with a stack-only signature.
+    pub(crate) fn sign_lineage_fixed(&self, bytes: &[u8]) -> [u8; 64] {
+        use ed25519_dalek::Signer as _;
+        ed25519_dalek::SigningKey::from_bytes(&self.seed)
+            .sign(bytes)
+            .to_bytes()
+    }
+
     /// Sign as this identity from a test that stands in for a peer holding
     /// this key -- the same signature a transport-owned signer would make.
     #[cfg(feature = "test-seams")]

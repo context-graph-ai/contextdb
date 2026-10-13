@@ -19648,3 +19648,321 @@ fn window_capacity_bytes(
     }
     Ok(bytes)
 }
+
+// Private native control prototype. Logical strong lifetimes own T; every
+// strong or weak alias owns one physical count in the unchanged shared cell.
+// No caller is switched to this kernel until request/cursor integration exists.
+struct NativeControlCell<T> {
+    strong: std::sync::atomic::AtomicUsize,
+    payload: std::cell::UnsafeCell<Option<contextdb_core::read_memory::OwnedReadBox<T>>>,
+}
+
+// SAFETY: weak aliases never inspect payload. Initialization happens before
+// Release publication; successful upgrades acquire it. Only the final logical
+// strong takes payload after its Release decrement and Acquire fence. Every
+// borrowed T is protected by a logical strong; T handles its own shared mutation.
+unsafe impl<T: Send + Sync> Sync for NativeControlCell<T> {}
+
+struct NativeControlStrong<T> {
+    cell: contextdb_core::read_memory::ReadShared<NativeControlCell<T>>,
+}
+
+struct NativeControlWeak<T> {
+    cell: contextdb_core::read_memory::ReadShared<NativeControlCell<T>>,
+}
+
+impl<T> NativeControlStrong<T> {
+    fn try_new_with(
+        owner: contextdb_core::read_memory::ReadMemoryOwner,
+        make: impl FnOnce() -> contextdb_core::Result<T>,
+    ) -> contextdb_core::Result<Self> {
+        Self::try_new_cyclic_with(owner, |_| make())
+    }
+
+    fn try_new_cyclic_with(
+        owner: contextdb_core::read_memory::ReadMemoryOwner,
+        make: impl FnOnce(&NativeControlWeak<T>) -> contextdb_core::Result<T>,
+    ) -> contextdb_core::Result<Self> {
+        use contextdb_core::read_memory::{OwnedReadBox, ReadShared};
+        // Both exact layouts are admitted against the supplied original q
+        // before either allocation or producer invocation. No operation child
+        // is acquired here; nested allocations in T need independent invoices.
+        let control_invoice = ReadCredit::try_new_owned(
+            owner.clone(),
+            ReadShared::<NativeControlCell<T>>::layout().size(),
+            "reader",
+            "native_control_cell",
+            "release retained request controls",
+        )?;
+        let payload_invoice = ReadCredit::try_new_owned(
+            owner,
+            std::alloc::Layout::new::<T>().size(),
+            "reader",
+            "native_control_payload",
+            "release retained request payloads",
+        )?;
+        let cell = ReadShared::try_from_prepaid_with(control_invoice, || {
+            Ok(NativeControlCell {
+                strong: std::sync::atomic::AtomicUsize::new(0),
+                payload: std::cell::UnsafeCell::new(None),
+            })
+        })?;
+        let weak = NativeControlWeak { cell: cell.clone() };
+        // During make, every weak upgrade fails. Err/panic leaves logical zero
+        // and None, so escaped weak aliases retain only their paid control cell.
+        let payload = OwnedReadBox::try_from_prepaid_with(payload_invoice, || make(&weak))?;
+        // SAFETY: logical zero forbids all T access. This is the sole initial
+        // writer; after initialization, only final logical Drop can take it.
+        unsafe { *cell.payload.get() = Some(payload) };
+        // An escaped weak's successful Acquire CAS observes initialized T.
+        // There is no fallible step between this store and the strong return.
+        cell.strong.store(1, std::sync::atomic::Ordering::Release);
+        Ok(Self { cell })
+    }
+
+    fn downgrade(&self) -> NativeControlWeak<T> {
+        // The borrowed strong prevents logical final Drop; cloning the physical
+        // count alone gives the weak identity its independent storage lifetime.
+        NativeControlWeak { cell: self.cell.clone() }
+    }
+}
+
+impl<T> Clone for NativeControlStrong<T> {
+    fn clone(&self) -> Self {
+        use std::sync::atomic::Ordering;
+        // Acquire a physical owner first. The borrowed source strong already
+        // protects T throughout logical registration, so Relaxed is sufficient.
+        let cell = self.cell.clone();
+        let retained = cell.strong.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            if count != 0 && count < isize::MAX as usize {
+                Some(count + 1)
+            } else {
+                None
+            }
+        });
+        if retained.is_err() {
+            // Match the existing shared-count exhaustion contract. Never wrap,
+            // unwind with an unregistered logical owner, or resurrect zero.
+            std::process::abort();
+        }
+        Self { cell }
+    }
+}
+
+impl<T> std::ops::Deref for NativeControlStrong<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        // SAFETY: this borrow retains one logical strong for the entire result
+        // lifetime. Therefore final Drop cannot take or destroy this Some(T).
+        unsafe { (&*self.cell.payload.get()).as_ref() }
+            .expect("live native control must retain its payload")
+            .as_ref()
+    }
+}
+
+impl<T> Drop for NativeControlStrong<T> {
+    fn drop(&mut self) {
+        use std::sync::atomic::{Ordering, fence};
+        if self.cell.strong.fetch_sub(1, Ordering::Release) != 1 {
+            return;
+        }
+        // This zero is permanent. A CAS either won a logical strong before it
+        // or cannot upgrade; Acquire observes earlier owners' completed uses.
+        fence(Ordering::Acquire);
+        // SAFETY: zero excludes all strong borrows and all future upgrades.
+        // Take leaves None BEFORE user Drop. Our physical cell field remains
+        // alive through payload destruction and its invoice, including unwind.
+        let payload = unsafe { (&mut *self.cell.payload.get()).take() };
+        drop(payload);
+        // Automatic field cleanup now releases our physical count. Existing
+        // ReadShared frees final control storage before its external invoice.
+    }
+}
+
+impl<T> Clone for NativeControlWeak<T> {
+    fn clone(&self) -> Self {
+        Self { cell: self.cell.clone() }
+    }
+}
+
+impl<T> NativeControlWeak<T> {
+    fn upgrade(&self) -> Option<NativeControlStrong<T>> {
+        use std::sync::atomic::Ordering;
+        // The borrowed weak and this new physical owner keep the cell alive
+        // independently of payload expiry; neither is a logical strong yet.
+        let cell = self.cell.clone();
+        let mut count = cell.strong.load(Ordering::Relaxed);
+        loop {
+            if count == 0 {
+                return None;
+            }
+            if count >= isize::MAX as usize {
+                std::process::abort();
+            }
+            match cell.strong.compare_exchange_weak(
+                count,
+                count + 1,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(NativeControlStrong { cell }),
+                Err(observed) => count = observed,
+            }
+        }
+    }
+
+    fn ptr_eq(&self, other: &Self) -> bool {
+        // Compare live cell objects, including expired controls. Each physical
+        // owner prevents address reuse; payload pointers are never consulted.
+        std::ptr::eq(&*self.cell, &*other.cell)
+    }
+
+    fn belongs_to(&self, control: &NativeControlStrong<T>) -> bool {
+        std::ptr::eq(&*self.cell, &*control.cell)
+    }
+}
+
+// Generic identity/checkpoint prototype only: NativeRequestControl is absent.
+// Later integration must pass that same executing control's checkpoint method,
+// preserving its cancellation, deadline and aggregate work without a new owner.
+struct NativeVectorReadCheckpoint<T>(NativeControlWeak<T>);
+
+impl<T> NativeVectorReadCheckpoint<T> {
+    fn from_control(control: &NativeControlStrong<T>) -> Self {
+        Self(control.downgrade())
+    }
+
+    fn checkpoint(
+        &self,
+        check: impl FnOnce(&T) -> contextdb_core::Result<()>,
+    ) -> contextdb_core::Result<()> {
+        let control = self.0.upgrade().ok_or(Error::ReadCancelled)?;
+        check(&control)
+    }
+
+    fn belongs_to(&self, control: &NativeControlStrong<T>) -> bool {
+        self.0.belongs_to(control)
+    }
+}
+
+// Private resident point-read specialization. Its owning entry is captured by
+// the single dispatched operation frame; decode/source links are weak-only.
+struct NativeRequestControl {
+    limits: ReadLimits,
+    clock: Arc<dyn DeadlineClock>,
+    owner: contextdb_core::read_memory::ReadMemoryOwner,
+    cancellation: contextdb_core::read_contract::NativeReadCancellation,
+    state: Mutex<NativeRequestState>,
+}
+struct NativeRequestState {
+    started_ms: u64,
+    work_units: u64,
+    rows_so_far: u64,
+    bytes_so_far: u64,
+}
+
+pub(crate) struct NativeReadExecutionEntry {
+    control: NativeControlStrong<NativeRequestControl>,
+}
+#[derive(Clone)]
+pub(crate) struct NativeReadOpenContext {
+    control: NativeControlWeak<NativeRequestControl>,
+}
+impl NativeReadExecutionEntry {
+    pub(crate) fn try_new(
+        operation: &crate::owner_read::NativeReadRequest,
+        limits: ReadLimits,
+        clock: Arc<dyn DeadlineClock>,
+    ) -> contextdb_core::Result<Self> {
+        RequestContext::check_effective_limits(&limits).map_err(ReadOpenContext::engine_error)?;
+        // Same initialization cut as RequestContext::new: limits validated,
+        // start observed, then control construction. The clock is the supplied
+        // standing producer, never a substituted timer or fresh epoch.
+        let started_ms = clock.now_ms();
+        let owner = operation.owner();
+        let cancellation = operation.cancellation().clone();
+        let control = NativeControlStrong::try_new_with(owner.clone(), || Ok(NativeRequestControl {
+            limits, clock, owner, cancellation,
+            state: Mutex::new(NativeRequestState {
+                started_ms, work_units: 0, rows_so_far: 0, bytes_so_far: 0,
+            }),
+        }))?;
+        Ok(Self { control })
+    }
+    pub(crate) fn open_context(&self) -> NativeReadOpenContext {
+        NativeReadOpenContext { control: self.control.downgrade() }
+    }
+    pub(crate) fn belongs_to(&self, context: &NativeReadOpenContext) -> bool {
+        context.control.belongs_to(&self.control)
+    }
+}
+impl NativeRequestControl {
+    fn checkpoint(&self) -> contextdb_core::Result<()> {
+        if self.cancellation.is_cancelled() { return Err(Error::ReadCancelled); }
+        let started = self.state.lock().unwrap_or_else(|p| p.into_inner()).started_ms;
+        let now = self.clock.now_ms();
+        // A backwards clock cannot authorize more work. Use the existing
+        // deadline refusal; no allocating diagnostic is built in this slice.
+        if now < started || now - started > self.limits.active_ms {
+            return Err(ReadOpenContext::engine_error(RequestContext::limit_failure(
+                ReadFailureLimit::ActiveMs, self.limits.active_ms,
+            )));
+        }
+        Ok(())
+    }
+}
+impl NativeReadOpenContext {
+    pub(crate) fn checkpoint(&self) -> contextdb_core::Result<()> {
+        self.control.upgrade().ok_or(Error::ReadCancelled)?.checkpoint()
+    }
+    pub(crate) fn same_control(&self, other: &Self) -> bool {
+        self.control.ptr_eq(&other.control)
+    }
+    pub(crate) fn owner(&self) -> contextdb_core::Result<contextdb_core::read_memory::ReadMemoryOwner> {
+        Ok(self.control.upgrade().ok_or(Error::ReadCancelled)?.owner.clone())
+    }
+    pub(crate) fn touch_row(&self) -> contextdb_core::Result<()> {
+        let control = self.control.upgrade().ok_or(Error::ReadCancelled)?;
+        control.checkpoint()?;
+        let mut state = control.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.work_units >= control.limits.work {
+            return Err(ReadOpenContext::engine_error(RequestContext::limit_failure(
+                ReadFailureLimit::Work, control.limits.work,
+            )));
+        }
+        state.work_units += 1;
+        Ok(())
+    }
+    pub(crate) fn admit_result(&self, present: bool, bytes: usize) -> contextdb_core::Result<()> {
+        let control = self.control.upgrade().ok_or(Error::ReadCancelled)?;
+        control.checkpoint()?;
+        let mut state = control.state.lock().unwrap_or_else(|p| p.into_inner());
+        let rows = state.rows_so_far.checked_add(u64::from(present));
+        let total = u64::try_from(bytes).ok().and_then(|b| state.bytes_so_far.checked_add(b));
+        for (exceeded, limit, value) in [
+            (rows.is_none_or(|n| n > control.limits.result_rows), ReadFailureLimit::ResultRows, control.limits.result_rows),
+            (total.is_none_or(|n| n > control.limits.result_bytes), ReadFailureLimit::ResultBytes, control.limits.result_bytes),
+            (u64::try_from(bytes).map_or(true, |n| n > control.limits.memory), ReadFailureLimit::Memory, control.limits.memory),
+        ] {
+            if exceeded { return Err(ReadOpenContext::engine_error(RequestContext::limit_failure(limit, value))); }
+        }
+        state.rows_so_far = rows.expect("checked result rows");
+        state.bytes_so_far = total.expect("checked result bytes");
+        Ok(())
+    }
+}
+
+#[cfg(feature = "sync-orchestration")]
+pub(super) fn execute_native_point_read(
+    database: &Database,
+    key: &(contextdb_core::TableName, RowId),
+    snapshot: SnapshotId,
+    entry: &NativeReadExecutionEntry,
+) -> std::result::Result<Option<crate::transport::AdmittedWireVec>, BoundedExecutionError> {
+    let context = entry.open_context();
+    context.checkpoint()?;
+    database.with_native_point_row(key, snapshot, &context, |row| {
+        crate::transport::encode_native_point_row(row, &context)
+    })
+}

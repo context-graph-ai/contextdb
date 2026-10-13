@@ -226,12 +226,15 @@ impl RedbPersistence {
         Ok((total, counts))
     }
 
-    pub(crate) fn commit_candidates_at_root(
+    pub(crate) fn commit_candidates_at_root<F>(
         root: &WriterSnapshot,
-        manager: &contextdb_tx::TransactionManager<Box<dyn contextdb_tx::WriteSetApplicator>>,
+        floor_probe: F,
         removed: &HashMap<Lsn, u64>,
         affected: &HashSet<Lsn>,
-    ) -> Result<Vec<Lsn>> {
+    ) -> Result<Vec<Lsn>>
+    where
+        F: FnOnce(std::ops::Bound<Lsn>) -> Result<Option<(Lsn, TxId)>>,
+    {
         let owner = root.internal_source_owner();
         let SourceWindowOwner::Write(accountant, _) = &owner else {
             unreachable!("internal writer retention owner")
@@ -272,10 +275,9 @@ impl RedbPersistence {
                 break;
             }
         }
-        let anchor = manager
-            .try_commit_index_floor(
-                floor.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded),
-            )?
+        let anchor = floor_probe(
+            floor.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded),
+        )?
             .map(|(lsn, _)| lsn);
         let mut candidates = Vec::new();
         for lsn in affected {

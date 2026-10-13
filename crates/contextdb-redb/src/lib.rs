@@ -131,6 +131,12 @@ fn create_tempfile() -> tempfile::NamedTempFile {
     }
 }
 
+#[cfg(feature = "contextdb-internal")]
+mod native_storage_admission;
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub use native_storage_admission::{NativeColdFault, NativeColdReadError, NativeStorageAdmission, NativeStorageCredit, NativeStorageRefused, with_native_storage_admission};
+
 mod read_admission;
 #[doc(hidden)]
 pub use read_admission::{BackendReadObservation, observe_backend_reads};

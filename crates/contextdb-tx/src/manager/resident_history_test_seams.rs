@@ -30,6 +30,13 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
     pub fn retained_commit_directory_bytes_for_test(&self) -> usize {
         match &self.commit_index {
             CommitHistoryCapability::Writable(directory) => directory.retained_entry_bytes(),
+            CommitHistoryCapability::EngineMemory(directory) => directory
+                .census()
+                .0
+                .saturating_mul(
+                    std::mem::size_of::<contextdb_core::Lsn>()
+                        + std::mem::size_of::<contextdb_core::TxId>(),
+                ),
             CommitHistoryCapability::Captured { directory, .. } => directory.retained_entry_bytes(),
         }
     }

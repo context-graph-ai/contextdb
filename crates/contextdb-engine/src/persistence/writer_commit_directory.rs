@@ -298,3 +298,163 @@ impl CommitDirectory for RedbPersistence {
         // Never perform a second, fallible write after successful apply.
     }
 }
+
+/// Private cursor over the caller's SAME retained immutable published read.
+/// Its entire directory state is fixed scalars on the caller's stack. It never
+/// owns a full-history map, opens a transaction, or allocates a cursor Box.
+/// Lower open_table/range control admission remains an explicit prerequisite.
+#[allow(dead_code)] // Staged cold provider cursor is inactive until its integration prerequisites land.
+pub(crate) struct ColdCommitCursor<'root> {
+    read: &'root redb::ReadTransaction,
+    lower: Bound<u64>,
+    upper: Bound<u64>,
+    after: Option<u64>,
+    finished: bool,
+}
+impl<'root> ColdCommitCursor<'root> {
+    pub(crate) fn new(
+        read: &'root redb::ReadTransaction,
+        lower: Bound<Lsn>,
+        upper: Bound<Lsn>,
+    ) -> Self {
+        let lower = lower.map(|lsn| lsn.0);
+        let upper = upper.map(|lsn| lsn.0);
+        Self {
+            read,
+            lower,
+            upper,
+            after: None,
+            finished: empty_bounds(&lower, &upper),
+        }
+    }
+    pub(crate) fn next_unqualified(
+        &mut self,
+        before: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Option<(Lsn, TxId)>> {
+        if self.finished {
+            return Ok(None);
+        }
+        before()?;
+        let lower = self.after.map_or(self.lower, Bound::Excluded);
+        if empty_bounds(&lower, &self.upper) {
+            self.finished = true;
+            return Ok(None);
+        }
+        let table = self
+            .read
+            .open_table(COMMIT_INDEX_TABLE)
+            .map_err(RedbPersistence::storage_error)?;
+        let next = table
+            .range((lower, self.upper))
+            .map_err(RedbPersistence::storage_error)?
+            .next()
+            .transpose()
+            .map_err(RedbPersistence::storage_error)?
+            .map(|(lsn, tx)| (Lsn(lsn.value()), TxId(tx.value())));
+        before()?;
+        match next {
+            Some((lsn, _)) => self.after = Some(lsn.0),
+            None => self.finished = true,
+        }
+        Ok(next)
+    }
+}
+
+pub(crate) fn cold_commit_floor(
+    read: &redb::ReadTransaction,
+    upper: Bound<Lsn>,
+) -> Result<Option<(Lsn, TxId)>> {
+    let upper = upper.map(|lsn| lsn.0);
+    if empty_bounds(&Bound::Unbounded, &upper) {
+        return Ok(None);
+    }
+    let table = read
+        .open_table(COMMIT_INDEX_TABLE)
+        .map_err(RedbPersistence::storage_error)?;
+    table
+        .range((Bound::<u64>::Unbounded, upper))
+        .map_err(RedbPersistence::storage_error)?
+        .next_back()
+        .transpose()
+        .map_err(RedbPersistence::storage_error)
+        .map(|entry| entry.map(|(lsn, tx)| (Lsn(lsn.value()), TxId(tx.value()))))
+}
+
+/// Startup needs only directory census and its end keys. Transaction maxima
+/// require the authenticated recovery floor: LSN order alone does not establish
+/// maximum imported TxId. This type intentionally does not invent that maximum.
+pub(crate) struct ColdCommitBounds {
+    pub(crate) count: u64,
+    pub(crate) first: Option<(Lsn, TxId)>,
+    pub(crate) last: Option<(Lsn, TxId)>,
+}
+pub(crate) fn cold_commit_bounds(read: &redb::ReadTransaction) -> Result<ColdCommitBounds> {
+    let table = read
+        .open_table(COMMIT_INDEX_TABLE)
+        .map_err(RedbPersistence::storage_error)?;
+    let count = table.len().map_err(RedbPersistence::storage_error)?;
+    let first = table
+        .first()
+        .map_err(RedbPersistence::storage_error)?
+        .map(|(lsn, tx)| (Lsn(lsn.value()), TxId(tx.value())));
+    let last = table
+        .last()
+        .map_err(RedbPersistence::storage_error)?
+        .map(|(lsn, tx)| (Lsn(lsn.value()), TxId(tx.value())));
+    Ok(ColdCommitBounds { count, first, last })
+}
+
+impl RedbPersistence {
+    /// Integration foundation, not a native certified write API. The caller
+    /// supplies the existing single storage transaction containing bodies/logs.
+    /// This stages directory identity and recovery bounds inside that transaction
+    /// and neither opens another transaction nor commits one. A failure requires
+    /// the caller to abort the WHOLE transaction, never publish a partial root.
+    /// Lower table/control/name allocations and the durable outcome marker must
+    /// be supplied by the storage owner before this can be activated.
+    pub(crate) fn stage_cold_commit_directory_in_write_unqualified(
+        &self,
+        original: &OwnedMemoryReservation,
+        funder: &contextdb_tx::SourceFunder,
+        write: &redb::WriteTransaction,
+        lsn: Lsn,
+        tx: TxId,
+    ) -> Result<()> {
+        let accountant = self.proof_accountant().ok_or_else(|| {
+            Error::Other("cold directory write requires its attached accountant".into())
+        })?;
+        crate::memory_accounting::validate_owned_original(original, &accountant, funder)?;
+        let frame = OriginalPersistenceFrame::new(original)?;
+        // Original frame is declared before the mutation: the mutation's heap
+        // is physically freed first on success, error, and unwinding.
+        let mutation =
+            content_identity::original_producers::commit_index_mutation(&frame, lsn, tx)?;
+        {
+            let mut table = write
+                .open_table(COMMIT_INDEX_TABLE)
+                .map_err(Self::storage_error)?;
+            let old = table
+                .get(lsn.0)
+                .map_err(Self::storage_error)?
+                .map(|tx| tx.value());
+            if old.is_some_and(|old| old != tx.0) {
+                return Err(Error::StoreCorrupted {
+                    path: "commit_index".into(),
+                    reason: "cold commit LSN already names a different transaction".into(),
+                });
+            }
+            table.insert(lsn.0, tx.0).map_err(Self::storage_error)?;
+        }
+        Self::apply_owned_content_identity_with_manifests_in_write(
+            write,
+            std::slice::from_ref(&mutation),
+            &[],
+            &mut content_identity::original_writer::ProofAdmission::new(
+                &frame.original,
+                self.proof_scratch_owner(),
+            )?,
+        )?;
+        Self::write_writer_recovery_bounds_in_write(write, None)?;
+        Ok(())
+    }
+}

@@ -11,9 +11,31 @@ pub trait StagedPostingAdmission: Send + Sync {
     fn reserve(&self, bytes: usize) -> Result<Arc<dyn contextdb_tx::StagedPostingCharge>>;
 }
 
+enum ExecutorTransactions<S: WriteSetApplicator> {
+    Legacy(Arc<TransactionManager<S>>),
+    Owned(contextdb_tx::manager::EngineTransactionHandle<S>),
+}
+impl<S: WriteSetApplicator> ExecutorTransactions<S> {
+    fn snapshot(&self) -> SnapshotId {
+        match self {
+            Self::Legacy(manager) => manager.snapshot(),
+            Self::Owned(handle) => handle.with_transactions(|transactions| transactions.snapshot()),
+        }
+    }
+    // Existing standalone/public mutations retain their genuine Legacy route.
+    fn with_write_set<R>(&self, tx: TxId, f: impl FnOnce(&mut contextdb_tx::WriteSet) -> R) -> Result<R> {
+        match self {
+            Self::Legacy(manager) => manager.with_write_set(tx, f),
+            Self::Owned(_) => Err(Error::InvalidStateTransition(
+                "owned executor requires its admitted engine producer".into(),
+            )),
+        }
+    }
+}
+
 pub struct MemRelationalExecutor<S: WriteSetApplicator> {
     store: Arc<RelationalStore>,
-    tx_mgr: Arc<TransactionManager<S>>,
+    tx_mgr: ExecutorTransactions<S>,
     staged_posting_admission: Option<Arc<dyn StagedPostingAdmission>>,
 }
 
@@ -990,10 +1012,35 @@ fn push_admitted_source_row(
 }
 
 impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
+    #[doc(hidden)]
+    pub fn new_engine(store: Arc<RelationalStore>, transactions: contextdb_tx::manager::EngineTransactionHandle<S>) -> Self {
+        Self { store, tx_mgr: ExecutorTransactions::Owned(transactions), staged_posting_admission: None }
+    }
+    #[doc(hidden)]
+    pub fn stage_engine_row(&self, tx: TxId, table: &str, row: VersionedRow,
+        invoice: contextdb_tx::staged_source::OriginalRowInvoice) -> Result<RowId> {
+        struct Original {
+            row: VersionedRow,
+            invoice: contextdb_tx::staged_source::OriginalRowInvoice,
+        }
+        let original = Original { row, invoice };
+        let row_id = original.row.row_id;
+        let ExecutorTransactions::Owned(handle) = &self.tx_mgr else {
+            return Err(Error::InvalidStateTransition("engine row requires owned executor".into()));
+        };
+        let meta = self.store.table_meta.read();
+        let meta = meta.get(table).ok_or_else(|| Error::TableNotFound(table.into()))?;
+        handle.with_transactions(|transactions| transactions.with_engine(tx, |guard| {
+            let prepared = guard.prepare_row_from_meta(table, original.row, meta, original.invoice)?;
+            guard.publish(prepared);
+            Ok(row_id)
+        }))
+    }
+
     pub fn new(store: Arc<RelationalStore>, tx_mgr: Arc<TransactionManager<S>>) -> Self {
         Self {
             store,
-            tx_mgr,
+            tx_mgr: ExecutorTransactions::Legacy(tx_mgr),
             staged_posting_admission: None,
         }
     }
@@ -2167,6 +2214,11 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         table: &str,
         snapshot: SnapshotId,
     ) -> Result<Vec<VersionedRow>> {
+        if tx.is_some() && matches!(&self.tx_mgr, ExecutorTransactions::Owned(_)) {
+            return Err(Error::InvalidStateTransition(
+                "owned staged reads require a sealed statement capture".into(),
+            ));
+        }
         self.ensure_memory_reads()?;
         let mut result: Vec<VersionedRow> = {
             let tables = self.store.tables.read();

@@ -1459,12 +1459,18 @@ impl Database {
             );
             return Err(TransactionError::Storage(StorageError::DatabaseClosed));
         }
+        #[cfg(feature = "contextdb-internal")]
+        self.mem.check_publication_recovery()?;
         // Fail early if there has been an I/O error -- nothing can be committed in that case
         self.mem.check_io_errors()?;
         let guard = TransactionGuard::new_write(
             self.transaction_tracker.start_write_transaction(),
             self.transaction_tracker.clone(),
         );
+        // A writer that waited for the previous transaction must check again
+        // after taking exclusive ownership and before touching the live header.
+        #[cfg(feature = "contextdb-internal")]
+        self.mem.check_publication_recovery()?;
         self.transaction_tracker
             .refresh_external_snapshots(&self.mem)?;
         WriteTransaction::new(guard, self.transaction_tracker.clone(), self.mem.clone())

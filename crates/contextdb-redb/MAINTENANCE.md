@@ -29,8 +29,14 @@ registration, and this note are separate from the source diff.
 `crates/contextdb-core/tests/redb_fork_patch_matches_its_sources.rs::the_redb_fork_patch_produces_the_sources_it_names`
 binds every recorded source hunk to the maintained file it produces.
 
+The internal byte-key range sibling uses the existing native range navigation and
+complete-node checksum kernel. It validates byte keys without requiring UTF-8;
+the text-key sibling retains UTF-8 validation and the same exclusive bounds.
+The engine owns the table names, membership encoding and admission policy.
+
 | Changed source | Reason |
 |---|---|
+| `src/transactions.rs`, `src/tree_store/table_tree.rs`, `src/tree_store/btree.rs` | Add a feature-gated, hidden byte-key range sibling over the same captured transaction and admitted navigation. Validate the byte-table header, share the existing range descent, and retain text-key UTF-8 checks through an explicit private validation flag. |
 | `src/error.rs`, `src/read_admission.rs`, `src/lib.rs`, `src/transactions.rs` | Retain opaque caller admission refusals as a non-I/O storage variant, including relocation and typed hidden scoped/charging entry points. Existing I/O admission interfaces adapt actual I/O unchanged; the engine alone interprets the payload and owns memory policy. |
 | `src/db/allocator_metadata_test_seams.rs` (added), `src/tree_store/page_store/bitmap.rs`, `src/tree_store/page_store/buddy_allocator.rs`, `src/tree_store/page_store/region.rs` | Page both region-tracker and buddy bitmap words through fixed scratch windows for file-backed writers. Region views and descriptor arrays are reconstructed from scalar geometry, with only one active region retained; the previous descriptor owner drops before its successor is constructed. Bitmap reads mask stale tail bits after shrink and visit only words in the current geometry. The existing `test-seams` accessor delegates to the production resident-byte count; opaque backends without scratch keep the resident allocator. |
 | `src/tree_store/page_store/allocator_pager.rs` (added) | Keep 32 resident 4096-byte windows and fixed control state; spill dirty windows to non-durable arithmetic slots beside the database and lazily load saved or virtual bitmap words. Detaching a replaced saved tree preserves the virtual initializer for future regions. A scratch I/O fault is sticky and preserves its original cause. The allocator operation envelope is `W * P + H + C`, with W=32, P=4096, H=4096 bytes of fixed hashing scratch, and C<32 KiB for window tags, descriptors, and control, independent of region count and under 256 KiB. B-tree source pages and OS page cache are accounted separately. |
@@ -49,7 +55,7 @@ binds every recorded source hunk to the maintained file it produces.
 | `src/tree_store/table_tree.rs` | Advance a finite compaction cursor past a protected allocator source without reading its payload. Enumerate and relocate the selected page batch, expose consistent statistics, the read transaction's user-tree root and its read hint; authenticate just the root page for bounded external admission; pop a deferred-free list tail in place without a scratch collection; report actual user-directory inserts/removals, and each copy-on-write page the table tree makes unreachable, under `test-seams`. |
 | `src/tree_store/btree_base.rs` | Let an access guard hold a read page as `PageMemory`, keeping any charge the page carries alive while the guard is; allow crate-private mutation of an existing copy-on-write value so partial free-list cleanup needs no temporary page vector. |
 | `src/tree_store/table_tree_base.rs` | Forward bounded page traversal for the table root. |
-| `src/tree_store/page_store/cached_file.rs` | Use one shared fixed read-entry arena across all cache stripes; an exhausted read index returns an uncached page without allocation. The write buffer retains its original growable map and releases its capacity at each flush. Rebuild indexes under startup exclusion, preserving held entries, and expose exact index allocation bytes separately from the page cap.  Memoize only successful variable-width byte-node checksum computations in one object-local mutex on each immutable CachedPage/ChargedPage, leaving Plain bytes uncached; explicitly count immutable wrapper, slot, alignment and Arc controls in the unchanged native cache share, preadmit those controls independently of the existing directory/window allowance, and preserve charges through eviction until the last holder drops. Admit page/cache-entry bytes before allocation and observe successful backend reads; hand readers a `PageMemory` that, for a page the read cache does not keep, carries the charge its admission returned until the last holder drops the page; count a cached page against the cache budget until the page itself is dropped (`CachedPage`), so a page evicted while a reader still holds it stays counted, eviction frees only pages no reader holds, and a miss is cached only when its count fits the budget; keep caller quota refusals recoverable while real backend I/O failures still poison the handle; read private allocator and contextdb-internal bounded windows with admission before allocation and backend I/O, copying cached or buffered sources without installing a partial cache page; on resize invalidate only cached pages that reach past the new end, so a truncating compaction step keeps the valid working set instead of dropping the whole read cache; under one-pass scan reads a miss may use free cache room only within the scan's 16 KiB growth allowance; past it a miss first evicts as many bytes as it needs and enters the cache at lowest priority only if that eviction made room, otherwise it is returned uncached (hits are still served), so an exhaustive scan grows the cache by at most the allowance and replaces its own pages before the warm working set. Size the fixed read arena with one extra slot for the sole sub-page entry, the 320-byte database header at offset zero. Construction and startup settlement share overflow-safe sizing and retain the held-entry floor. Debug assertions at every native cache admission enforce the header exception; the fixed arena's actual bytes remain charged by the existing index observation. |
+| `src/tree_store/page_store/cached_file.rs` | The private native clean read prepays fresh byte/header owners before cache locks, copies exact-length original warm read-cache bytes under the stripe read lock, and otherwise uses the backend without consulting dirty write cells. Its paid native page never borrows or adopts a legacy cell and never probes the write buffer. Use one shared fixed read-entry arena across all cache stripes; an exhausted read index returns an uncached page without allocation. The write buffer retains its original growable map and releases its capacity at each flush. Rebuild indexes under startup exclusion, preserving held entries, and expose exact index allocation bytes separately from the page cap.  Memoize only successful variable-width byte-node checksum computations in one object-local mutex on each immutable CachedPage/ChargedPage, leaving Plain bytes uncached; explicitly count immutable wrapper, slot, alignment and Arc controls in the unchanged native cache share, preadmit those controls independently of the existing directory/window allowance, and preserve charges through eviction until the last holder drops. Admit page/cache-entry bytes before allocation and observe successful backend reads; hand readers a `PageMemory` that, for a page the read cache does not keep, carries the charge its admission returned until the last holder drops the page; count a cached page against the cache budget until the page itself is dropped (`CachedPage`), so a page evicted while a reader still holds it stays counted, eviction frees only pages no reader holds, and a miss is cached only when its count fits the budget; keep caller quota refusals recoverable while real backend I/O failures still poison the handle; read private allocator and contextdb-internal bounded windows with admission before allocation and backend I/O, copying cached or buffered sources without installing a partial cache page; on resize invalidate only cached pages that reach past the new end, so a truncating compaction step keeps the valid working set instead of dropping the whole read cache; under one-pass scan reads a miss may use free cache room only within the scan's 16 KiB growth allowance; past it a miss first evicts as many bytes as it needs and enters the cache at lowest priority only if that eviction made room, otherwise it is returned uncached (hits are still served), so an exhaustive scan grows the cache by at most the allowance and replaces its own pages before the warm working set. Size the fixed read arena with one extra slot for the sole sub-page entry, the 320-byte database header at offset zero. Construction and startup settlement share overflow-safe sizing and retain the held-entry floor. Debug assertions at every native cache admission enforce the header exception; the fixed arena's actual bytes remain charged by the existing index observation. |
 | `src/tree_store/page_store/lru_cache.rs` | Insert a page at the front of the eviction order without a second chance (`insert_lowest_priority`), so a page a one-pass scan installs is the next one evicted unless it is read again, and a scan replaces its own pages rather than the warm working set. Keep pinned read entries linked during a bounded two-pass CLOCK victim search, so only reclaimable entries leave the map. Maintain per-stripe eviction order and collision chains with fixed u32 links in one shared entry arena; allocate arena slots, a free stack and stripe heads once, return slots on eviction and clear, and count their exact allocations outside the page cap. Retain held entries and their second chances when rebuilding indexes for a settled startup cap. |
 | `src/tree_store/page_store/mod.rs` | Re-export `PageMemory` to the tree code that holds read pages and register the allocator pager. |
 | `src/tree_store/page_store/page_manager.rs` | Forward the exact fixed cache-index allocation to the database owner.  Leave the allocator layout and recovery state unchanged when a caller refuses projected file growth before resize; allow caller-retained external readers to use file geometry while a live writer has marked the current header dirty, without recovery or allocator writes, and without asserting that a concurrently growing file still matches the captured header length; publish the clean committed header before a graceful read-only handoff without closing the writer backend; validate byte-window ranges against their allocation extent before storage access. Choose paged allocators when the backend supplies scratch, locate saved fixed-key allocator values through header/key windows and read only requested bitmap header/word windows (including the region tracker), preserving full retained-root checksum authentication; lazily read saved allocator words, preserve repair and growth ordering, and refuse publication or clean Drop after a sticky scratch fault. Before explicit integrity repair, align an aborted writer's free tail to the committed header geometry. |
@@ -398,3 +404,64 @@ The guard and retained-root lifetime are unchanged; every consumed page verifies
 its parent/root checksum, without scanning unvisited pages or retaining another
 reader object. `transactions.rs` shares construction through `new_with_hint`;
 ordinary upstream reads continue using `Clean`.
+
+
+## Internal exact byte-read companion (source qualification pending)
+
+`src/native_storage_admission.rs` adds a paid owned receipt interface, fixed
+`Option` TLS scope with unwind restoration, exact fresh buffers and an all-owner
+shared page header without Weak. Its lower implementation depends only on std.
+`ReadTransaction::get_native_byte_value` traverses the captured directory,
+validates borrowed byte-table types/widths/alignments, and performs an iterative
+exact lookup with admitted ancestor storage. It validates every node offset,
+ordered key and child encoding, checks cycles and authenticates complete pages.
+`page_manager.rs` checks extent geometry and reads native immutable PageMemory;
+this path does not construct PageImpl or insert a debug reference-map entry.
+`cached_file.rs` admits fresh byte backing and its shared header on the original
+native scope before any cache lock. A clean committed read copies an exact-length
+read-cache hit under its stripe read lock; a miss uses the unchanged backend read.
+It never probes the write buffer, clones a cache owner, inserts a native page or
+falls through after refusal. Native pages stay operation-funded and do not enter
+the legacy fixed arena; Entry/index layout is unchanged. Copied pages retain the
+same caller snapshot, page identity and complete checksum verification; physical
+buffer/header destruction still precedes release of their original credits.
+
+This is an additive non-default internal seam, not a qualified production read
+route. Writer/read kernel failure construction, native cache adoption with a
+retained fixed reserve, engine error adaptation, typed row decoding, snapshot
+factory/publication and allocator/runtime proofs remain open. Generic APIs,
+legacy admission function bodies, file format and all upstream tests are
+unchanged. No compiler or runtime result is asserted by this source record.
+
+The hidden `contextdb-internal` `ReadTransaction::get_native_text_value` sibling
+reads the existing text-key/byte-value descriptor from the same committed
+user-directory root. It shares the byte descriptor validator's width, alignment,
+root and type checks, selecting exactly the existing `&str` key identity; UTF-8
+text keys use the same lexicographic native descent and complete-page checksum
+validation. No default table API or byte-lookup signature/body changes. Private
+native buffer/control null allocations return an inline out-of-memory I/O fault;
+the engine keeps these unqualified, while original admission refusals remain
+scalar. The exact fork delta is recorded in `upstream-4.1.0.patch`.
+
+
+## Internal committed text-prefix range companion (source qualification pending)
+
+The hidden, non-default `ReadTransaction::next_native_text_range` sibling seeks
+one variable text key at or above a raw lower endpoint (exclusive when requested)
+and strictly below an optional raw upper endpoint. It uses THIS retained transaction's
+user-directory root and the existing true `&str`/`&[u8]` descriptor validator; raw
+endpoints permit a UTF-8 prefix successor that is not itself valid UTF-8.
+`src/transactions.rs` and `src/tree_store/table_tree.rs` forward the operation;
+`src/tree_store/btree.rs` adds a monotone boundary descent and the next sibling's
+left descent, sharing the existing node validator and complete-page checksums.
+Navigation identities and sibling headers use admitted `NativeStorageBuffer`
+backing; `src/native_storage_admission.rs` adds only its nonallocating pop.
+Both returned byte guards share the actual prepaid complete immutable leaf page.
+A checkpoint callback runs before the directory lookup and each range-page read.
+Admission is installed by the original owner; checkpoint/backend/bootstrap/cache
+faults stay unqualified. No ordinary table iterator, owned metadata decoder,
+fixed relational-key reinterpretation or source-record serialization is used.
+The engine owns prefix/resume policy and advances only after callback/checkpoint
+success; default APIs, formats and the previous exact lookup bodies are unchanged.
+Compiler, runtime, races and outside-family review remain unrun. The maintained
+patch reproduces every current src byte, including this companion.

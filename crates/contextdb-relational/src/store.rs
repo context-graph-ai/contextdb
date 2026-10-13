@@ -3534,3 +3534,27 @@ mod tests {
         );
     }
 }
+
+impl RelationalStore {
+    /// Resolve an already admitted identity in rows held by the caller without
+    /// allocating another table key. This companion shares the ordered version
+    /// probe and snapshot predicate of `visible_version_position`.
+    #[doc(hidden)]
+    pub fn visible_version_position_with_key(
+        &self,
+        rows: &[VersionedRow],
+        key: &(TableName, RowId),
+        snapshot: contextdb_core::SnapshotId,
+    ) -> Option<usize> {
+        let version_positions = self.row_version_positions.read();
+        let positions = version_positions.get(key)?;
+        let candidate_count = positions.partition_point(|position| {
+            rows.get(*position)
+                .is_some_and(|row| row.row_id == key.1 && row.created_tx.0 <= snapshot.0)
+        });
+        let position = *positions.get(candidate_count.checked_sub(1)?)?;
+        rows.get(position)
+            .filter(|row| row.row_id == key.1 && row.visible_at(snapshot))
+            .map(|_| position)
+    }
+}

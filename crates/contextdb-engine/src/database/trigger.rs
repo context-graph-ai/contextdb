@@ -2297,3 +2297,765 @@ mod sync_effect_tests {
         db.rollback(tx).unwrap();
     }
 }
+
+
+// Scoped consumers keep exceptional temporary custody through callbacks and audits.
+impl Database {
+    pub(super) fn dispatch_triggers_for_tx_owned(
+        &self,
+        scope: &DatabaseCommitScope<'_, '_, '_>,
+        tx: TxId,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> std::result::Result<
+        TriggerDispatchOutcome,
+        (TemporaryFailure, Vec<TriggerCallbackThreadGuard>),
+    > {
+        self.dispatch_triggers_for_tx_from_owned(
+            scope,
+            tx,
+            None,
+            TriggerDispatchMode::Local,
+            vector_copy_owner,
+            read_memory.clone(),
+        )
+    }
+
+    pub(super) fn dispatch_sync_triggers_for_tx_owned(
+        &self,
+        scope: &DatabaseCommitScope<'_, '_, '_>,
+        tx: TxId,
+        declarations: Option<&BTreeMap<String, TriggerDeclaration>>,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> std::result::Result<
+        TriggerDispatchOutcome,
+        (TemporaryFailure, Vec<TriggerCallbackThreadGuard>),
+    > {
+        self.dispatch_triggers_for_tx_from_owned(
+            scope,
+            tx,
+            declarations,
+            TriggerDispatchMode::IncludingSync,
+            vector_copy_owner,
+            read_memory.clone(),
+        )
+    }
+
+    fn dispatch_triggers_for_tx_from_owned(
+        &self,
+        scope: &DatabaseCommitScope<'_, '_, '_>,
+        tx: TxId,
+        declarations: Option<&BTreeMap<String, TriggerDeclaration>>,
+        mode: TriggerDispatchMode,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> std::result::Result<
+        TriggerDispatchOutcome,
+        (TemporaryFailure, Vec<TriggerCallbackThreadGuard>),
+    > {
+        if self
+            .trigger_declarations_from(declarations)
+            .iter()
+            .all(|declaration| !mode.includes(declaration))
+        {
+            return Ok(TriggerDispatchOutcome {
+                pending: Vec::new(),
+                active_guards: Vec::new(),
+            });
+        }
+        let mut run = TriggerDispatchRun {
+            processed: HashSet::new(),
+            pending: Vec::new(),
+            active_guards: Vec::new(),
+        };
+        let initial_len = match self.tx_mgr.with_read(tx, |ws| ws.relational_inserts.len()) {
+            Ok(len) => len,
+            Err(error) => return Err((TemporaryFailure::from_error(error), run.active_guards)),
+        };
+        if let Err(error) = self.dispatch_trigger_range_owned(
+            scope,
+            tx,
+            0,
+            initial_len,
+            1,
+            &mut run,
+            declarations,
+            mode,
+            vector_copy_owner,
+            read_memory.clone(),
+        ) {
+            let reason = error.error().to_string();
+            if let Err(audit_error) =
+                self.append_rolled_back_trigger_audits(&run.pending, tx, &reason)
+            {
+                return Err((error.map_error(|_| audit_error), run.active_guards));
+            }
+            return Err((error, run.active_guards));
+        }
+        Ok(TriggerDispatchOutcome {
+            pending: run.pending,
+            active_guards: run.active_guards,
+        })
+    }
+
+    pub(super) fn prepare_active_trigger_write_set_for_dispatch_owned(
+        &self,
+        scope: &DatabaseCommitScope<'_, '_, '_>,
+        tx: TxId,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> PreparationResult<CommitValidationOutcome> {
+        scope.prepare_temporary(
+            tx,
+            take_owned_conditions,
+            |guard, peer, conditional_update_guards| {
+                let published = self.tx_mgr.capture_published_read();
+                let snapshot = published.snapshot;
+                let _writer_read = self.enter_writer_read(
+                    super::writer_read::durable_root(published.handle)?,
+                    read_memory.clone(),
+                );
+                self.with_snapshot_override(snapshot, || {
+                    let canonical = guard.prepare_canonicalize()?;
+                    guard.publish(canonical);
+                    if guard.read().is_empty() {
+                        return Ok(CommitValidationOutcome::default());
+                    }
+                    self.rewrite_txid_placeholders_in_prepared_write_set(tx, guard)?;
+                    // The validator checked each original body and invoice before detach.
+                    // The moved buffer keeps both live while the producer borrows its bodies.
+                    let conditions = conditional_update_guards.values.iter().map(|entry| {
+                        entry
+                            .body
+                            .as_ref()
+                            .expect("validated original conditional body")
+                    });
+                    let validation = self.revalidate_conditional_updates_in_prepared_write_set(
+                        guard,
+                        snapshot,
+                        conditions,
+                        None,
+                        vector_copy_owner,
+                        read_memory.clone(),
+                    )?;
+                    // Borrow only inside this HRTB callback; no intent reference escapes it.
+                    let upserts = peer
+                        .original
+                        .node
+                        .as_ref()
+                        .and_then(|node| node.value.as_deref())
+                        .into_iter()
+                        .flat_map(|record| record.metadata.upsert_intents.values.iter())
+                        .map(|entry| entry.body.as_ref().expect("validated original upsert body"));
+                    self.rewrite_commit_time_upserts_in_prepared_write_set(
+                        guard,
+                        snapshot,
+                        upserts,
+                        vector_copy_owner,
+                        read_memory.clone(),
+                    )?;
+                    let canonical = guard.prepare_canonicalize()?;
+                    guard.publish(canonical);
+                    Ok(CommitValidationOutcome {
+                        committed_tx: None,
+                        conditional_noop_count: validation.conditional_noop_count,
+                        conditional_conflict_count: validation.conditional_conflict_count,
+                    })
+                })
+            },
+        )
+    }
+
+    pub(super) fn prepare_active_sync_trigger_write_set_for_dispatch_owned(
+        &self,
+        scope: &DatabaseCommitScope<'_, '_, '_>,
+        tx: TxId,
+    ) -> PreparationResult<CommitValidationOutcome> {
+        scope.prepare_temporary(
+            tx,
+            |_| Ok(()),
+            |guard, _peer, ()| {
+                let canonical = guard.prepare_canonicalize()?;
+                guard.publish(canonical);
+                if guard.read().is_empty() {
+                    return Ok(CommitValidationOutcome::default());
+                }
+                Ok(CommitValidationOutcome::default())
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_trigger_range_owned(
+        &self,
+        scope: &DatabaseCommitScope<'_, '_, '_>,
+        tx: TxId,
+        start: usize,
+        end: usize,
+        depth: u32,
+        run: &mut TriggerDispatchRun,
+        declarations: Option<&BTreeMap<String, TriggerDeclaration>>,
+        mode: TriggerDispatchMode,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> PreparationResult<()> {
+        let mut snapshot = self
+            .trigger_dispatch_snapshot_owned(tx, declarations, mode)
+            .map_err(TemporaryFailure::from_error)?;
+        let mut index = start;
+        while index < end {
+            let maybe_row = self
+                .tx_mgr
+                .with_read(tx, |ws| {
+                    ws.relational_inserts
+                        .get(index)
+                        .map(|(table, row)| (table.clone(), row.clone()))
+                })
+                .map_err(TemporaryFailure::from_error)?;
+            let Some((table, row)) = maybe_row else {
+                break;
+            };
+            if !snapshot.triggered_tables.contains(&table) {
+                index += 1;
+                continue;
+            }
+            if snapshot
+                .latest_insert_index
+                .get(&(table.clone(), row.row_id))
+                != Some(&index)
+            {
+                index += 1;
+                continue;
+            }
+            let event = if snapshot.deleted_rows.contains(&(table.clone(), row.row_id))
+                && self
+                    .committed_row_exists_at_current_frontier(
+                        &table,
+                        row.row_id,
+                        read_memory.clone(),
+                    )
+                    .map_err(TemporaryFailure::from_error)?
+            {
+                TriggerEvent::Update
+            } else {
+                TriggerEvent::Insert
+            };
+            for declaration in
+                self.triggers_for_table_event_for_dispatch(declarations, &table, event, mode)
+            {
+                if !run
+                    .processed
+                    .insert((table.clone(), row.row_id, declaration.name.clone()))
+                {
+                    continue;
+                }
+                self.fire_trigger_owned(
+                    scope,
+                    tx,
+                    declaration,
+                    TriggerFiring {
+                        event,
+                        row: row.clone(),
+                    },
+                    depth,
+                    run,
+                    &snapshot.triggered_tables,
+                    declarations,
+                    mode,
+                    vector_copy_owner,
+                    read_memory.clone(),
+                )?;
+                if index.saturating_add(1) < end {
+                    snapshot = self
+                        .trigger_dispatch_snapshot_owned(tx, declarations, mode)
+                        .map_err(TemporaryFailure::from_error)?;
+                }
+            }
+            index += 1;
+        }
+        Ok(())
+    }
+
+    fn trigger_dispatch_snapshot_owned(
+        &self,
+        tx: TxId,
+        declarations: Option<&BTreeMap<String, TriggerDeclaration>>,
+        mode: TriggerDispatchMode,
+    ) -> Result<TriggerDispatchSnapshot> {
+        let triggered_tables = self
+            .trigger_declarations_from(declarations)
+            .into_iter()
+            .filter(|declaration| mode.includes(declaration))
+            .map(|declaration| declaration.table.clone())
+            .collect::<HashSet<_>>();
+        let (latest_insert_index, deleted_rows) = self.tx_mgr.with_read(tx, |ws| {
+            let latest_insert_index = ws
+                .relational_inserts
+                .iter()
+                .enumerate()
+                .map(|(index, (table, row))| ((table.clone(), row.row_id), index))
+                .collect::<HashMap<_, _>>();
+            let deleted_rows = ws
+                .relational_deletes
+                .iter()
+                .map(|(table, row_id, _)| (table.clone(), *row_id))
+                .collect::<TriggerRowKeySet>();
+            (latest_insert_index, deleted_rows)
+        })?;
+        Ok(TriggerDispatchSnapshot {
+            triggered_tables,
+            latest_insert_index,
+            deleted_rows,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fire_trigger_owned(
+        &self,
+        scope: &DatabaseCommitScope<'_, '_, '_>,
+        tx: TxId,
+        declaration: TriggerDeclaration,
+        firing: TriggerFiring,
+        depth: u32,
+        run: &mut TriggerDispatchRun,
+        triggered_tables: &HashSet<String>,
+        declarations: Option<&BTreeMap<String, TriggerDeclaration>>,
+        mode: TriggerDispatchMode,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> PreparationResult<()> {
+        if depth > TRIGGER_CASCADE_DEPTH_CAP {
+            let entry = TriggerAuditEntry {
+                trigger_name: declaration.name.clone(),
+                firing_tx: tx,
+                firing_lsn: Lsn(0),
+                depth,
+                cascade_row_count: 0,
+                status: TriggerAuditStatus::DepthExceeded,
+            };
+            self.append_trigger_audit(entry)
+                .map_err(TemporaryFailure::from_error)?;
+            return Err(TemporaryFailure::from_error(
+                Error::TriggerCascadeDepthExceeded {
+                    trigger_name: declaration.name,
+                    depth,
+                },
+            ));
+        }
+        let callback = self
+            .trigger
+            .callbacks
+            .read()
+            .get(&declaration.name)
+            .cloned()
+            .ok_or_else(|| Error::TriggerCallbackMissing {
+                trigger_name: declaration.name.clone(),
+            })
+            .map_err(TemporaryFailure::from_error)?;
+        let before = self
+            .write_set_counts(tx)
+            .map_err(TemporaryFailure::from_error)?;
+        let before_write_set = (mode == TriggerDispatchMode::IncludingSync)
+            .then(|| {
+                scope.prepare_temporary(tx, |_| Ok(()), |guard, _peer, ()| guard.capture_private())
+            })
+            .transpose()?;
+        let ctx = TriggerContext {
+            trigger_name: declaration.name.clone(),
+            table: declaration.table.clone(),
+            event: firing.event,
+            tx,
+            depth,
+            row_values: firing.row.values.clone(),
+        };
+        let callback_thread =
+            TriggerState::enter_callback_thread_scope(&self.trigger, &ctx.trigger_name, tx);
+        run.active_guards.push(callback_thread);
+        let callback_result = self
+            .run_trigger_callback(tx, &ctx, callback)
+            .map_err(|error| {
+                let effect = if mode == TriggerDispatchMode::IncludingSync {
+                    match &error {
+                        Error::TriggerRequiresAdmin { .. } => Some("DDL"),
+                        Error::CallbackReentry {
+                            kind: CallbackKind::Trigger,
+                        } => Some("DDL/control operation"),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                effect.map_or(error, |effect| Error::SyncTriggerEffectNotAllowed {
+                    trigger_name: declaration.name.clone(),
+                    effect: effect.to_owned(),
+                })
+            });
+        if let Err(error) = callback_result {
+            let error = TemporaryFailure::from_error(error);
+            let entry = TriggerAuditEntry {
+                trigger_name: declaration.name,
+                firing_tx: tx,
+                firing_lsn: Lsn(0),
+                depth,
+                cascade_row_count: 0,
+                status: TriggerAuditStatus::RolledBack {
+                    reason: error.error().to_string(),
+                },
+            };
+            if let Err(audit_error) = self.append_trigger_audit(entry) {
+                return Err(error.map_error(|_| audit_error));
+            }
+            return Err(error);
+        }
+        if let Some(before_write_set) = before_write_set.as_ref() {
+            // Classify raw callback effects before schema/vector validation
+            // can obscure the dedicated effect error. Then normalize and
+            // prove the normalized delta remains append-only. Derived TXID
+            // placeholders are rewritten later, after final Tx reassignment.
+            let validation = self
+                .validate_sync_trigger_effects_owned(tx, &declaration.name, before_write_set)
+                .map_err(TemporaryFailure::from_error)
+                .and_then(|_| {
+                    self.prepare_active_sync_trigger_write_set_for_dispatch_owned(scope, tx)
+                })
+                .and_then(|_| {
+                    self.validate_sync_trigger_effects_owned(
+                        tx,
+                        &declaration.name,
+                        before_write_set,
+                    )
+                    .map_err(TemporaryFailure::from_error)
+                });
+            if let Err(error) = validation {
+                let entry = TriggerAuditEntry {
+                    trigger_name: declaration.name,
+                    firing_tx: tx,
+                    firing_lsn: Lsn(0),
+                    depth,
+                    cascade_row_count: 0,
+                    status: TriggerAuditStatus::RolledBack {
+                        reason: error.error().to_string(),
+                    },
+                };
+                if let Err(audit_error) = self.append_trigger_audit(entry) {
+                    return Err(error.map_error(|_| audit_error));
+                }
+                return Err(error);
+            }
+        }
+
+        let after = self.write_set_counts(tx).unwrap_or(before);
+        let nested_start = before.relational_inserts;
+        let nested_end = after.relational_inserts;
+        if nested_end <= nested_start
+            || !self
+                .trigger_range_has_triggered_table_owned(
+                    tx,
+                    nested_start,
+                    nested_end,
+                    triggered_tables,
+                )
+                .map_err(TemporaryFailure::from_error)?
+        {
+            run.pending.push(PendingTriggerAudit {
+                trigger_name: declaration.name,
+                depth,
+                cascade_row_count: before.delta_to(after),
+            });
+            return Ok(());
+        }
+
+        let preparation = if mode == TriggerDispatchMode::IncludingSync {
+            self.prepare_active_sync_trigger_write_set_for_dispatch_owned(scope, tx)
+        } else {
+            self.prepare_active_trigger_write_set_for_dispatch_owned(
+                scope,
+                tx,
+                vector_copy_owner,
+                read_memory.clone(),
+            )
+        };
+        if let Err(error) = preparation {
+            let entry = TriggerAuditEntry {
+                trigger_name: declaration.name,
+                firing_tx: tx,
+                firing_lsn: Lsn(0),
+                depth,
+                cascade_row_count: 0,
+                status: TriggerAuditStatus::RolledBack {
+                    reason: error.error().to_string(),
+                },
+            };
+            if let Err(audit_error) = self.append_trigger_audit(entry) {
+                return Err(error.map_error(|_| audit_error));
+            }
+            return Err(error);
+        }
+        let after = self.write_set_counts(tx).unwrap_or(before);
+        let nested_start = before.relational_inserts;
+        let nested_end = after.relational_inserts;
+        run.pending.push(PendingTriggerAudit {
+            trigger_name: declaration.name,
+            depth,
+            cascade_row_count: before.delta_to(after),
+        });
+        if nested_end > nested_start {
+            self.dispatch_trigger_range_owned(
+                scope,
+                tx,
+                nested_start,
+                nested_end,
+                depth.saturating_add(1),
+                run,
+                declarations,
+                mode,
+                vector_copy_owner,
+                read_memory.clone(),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn validate_sync_trigger_effects_owned(
+        &self,
+        tx: TxId,
+        trigger_name: &str,
+        before: &contextdb_tx::manager::EngineCapturedWriteSet,
+    ) -> Result<()> {
+        before.with_legacy(|before| {
+            self.tx_mgr.with_read(tx, |after| {
+        let forbidden = if after.relational_inserts.len() < before.relational_inserts.len()
+            || !after
+                .relational_inserts
+                .starts_with(&before.relational_inserts)
+            || after.relational_deletes != &before.relational_deletes
+            || after.relational_delete_predicates != &before.relational_delete_predicates
+        {
+            Some("relational update/delete")
+        } else if after.relational_inserts[before.relational_inserts.len()..]
+            .iter()
+            .any(|(table, row)| {
+                self.table_meta(table)
+                    .and_then(|meta| natural_key_columns_for_meta(&meta))
+                    .is_some_and(|columns| {
+                        columns.iter().any(|column| {
+                            matches!(row.values.get(column), Some(Value::TxId(value)) if *value == tx)
+                        })
+                    })
+            })
+        {
+            Some("TXID identity placeholder")
+        } else if after.adj_inserts != &before.adj_inserts || after.adj_deletes != &before.adj_deletes
+        {
+            Some("graph insert/delete")
+        } else if after.vector_inserts != &before.vector_inserts
+            || after.vector_deletes != &before.vector_deletes
+            || after.vector_moves != &before.vector_moves
+        {
+            Some("vector insert/delete/move")
+        } else if after.config_max_u64_keys != &before.config_max_u64_keys
+            || after.config_writes.len() < before.config_writes.len()
+            || !after.config_writes.starts_with(&before.config_writes)
+            || after
+                .config_writes
+                .get(before.config_writes.len()..)
+                .is_none_or(|writes| {
+                    writes
+                        .iter()
+                        .any(|(key, _)| !key.starts_with("sync_creation_lineage.v1."))
+                })
+        {
+            Some("non-owned configuration")
+        } else {
+            None
+        };
+        if let Some(effect) = forbidden {
+            return Err(Error::SyncTriggerEffectNotAllowed {
+                trigger_name: trigger_name.to_string(),
+                effect: effect.to_owned(),
+            });
+        }
+        Ok(())
+            })?
+        })
+    }
+
+    fn trigger_range_has_triggered_table_owned(
+        &self,
+        tx: TxId,
+        start: usize,
+        end: usize,
+        triggered_tables: &HashSet<String>,
+    ) -> Result<bool> {
+        if triggered_tables.is_empty() || start >= end {
+            return Ok(false);
+        }
+        let only_triggered_table = if triggered_tables.len() == 1 {
+            triggered_tables.iter().next()
+        } else {
+            None
+        };
+        self.tx_mgr.with_read(tx, |ws| {
+            let capped_end = end.min(ws.relational_inserts.len());
+            ws.relational_inserts
+                .get(start..capped_end)
+                .is_some_and(|rows| match only_triggered_table {
+                    Some(triggered_table) => rows.iter().any(|(table, _)| table == triggered_table),
+                    None => rows
+                        .iter()
+                        .any(|(table, _)| triggered_tables.contains(table)),
+                })
+        })
+    }
+}
+
+impl Database {
+    pub(super) fn has_matching_sync_trigger_for_tx_owned(
+        &self,
+        tx: TxId,
+        declarations: Option<&BTreeMap<String, TriggerDeclaration>>,
+    ) -> Result<bool> {
+        let tables = self.tx_mgr.with_read(tx, |ws| {
+            ws.relational_inserts
+                .iter()
+                .map(|(table, _)| table.clone())
+                .collect::<HashSet<_>>()
+        })?;
+        Ok(self
+            .trigger_declarations_from(declarations)
+            .iter()
+            .any(|declaration| {
+                declaration.including_sync
+                    && tables.contains(&declaration.table)
+                    && declaration
+                        .on_events
+                        .iter()
+                        .any(|event| matches!(event, TriggerEvent::Insert | TriggerEvent::Update))
+            }))
+    }
+
+    pub(super) fn has_matching_local_trigger_for_tx_owned(
+        &self,
+        tx: TxId,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<bool> {
+        let declarations = self.trigger_declarations_from(None);
+        if declarations.is_empty() {
+            return Ok(false);
+        }
+        let mut events_by_table = HashMap::new();
+        for declaration in declarations {
+            let events = events_by_table
+                .entry(declaration.table)
+                .or_insert((false, false));
+            events.0 |= declaration.on_events.contains(&TriggerEvent::Insert);
+            events.1 |= declaration.on_events.contains(&TriggerEvent::Update);
+        }
+        let snapshot =
+            self.trigger_dispatch_snapshot_owned(tx, None, TriggerDispatchMode::Local)?;
+        let _order_memory = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+            self.accountant.clone(),
+            snapshot
+                .latest_insert_index
+                .len()
+                .saturating_mul(std::mem::size_of::<(&TriggerRowKey, &usize)>())
+                .saturating_add(held::ALLOCATION_BYTES),
+            "writer_source",
+            "trigger_identities",
+            "Raise MEMORY_LIMIT to inspect these trigger identities.",
+        )?;
+        let mut latest = snapshot.latest_insert_index.iter().collect::<Vec<_>>();
+        latest.sort_unstable_by_key(|(_, index)| **index);
+        for ((table, row_id), index) in latest {
+            if !snapshot.triggered_tables.contains(table)
+                || !self.tx_mgr.with_read(tx, |ws| {
+                    ws.relational_inserts
+                        .get(*index)
+                        .is_some_and(|(name, row)| name == table && row.row_id == *row_id)
+                })?
+            {
+                continue;
+            }
+            let event = if snapshot.deleted_rows.contains(&(table.clone(), *row_id))
+                && self.committed_row_exists_at_current_frontier(
+                    table,
+                    *row_id,
+                    read_memory.clone(),
+                )? {
+                TriggerEvent::Update
+            } else {
+                TriggerEvent::Insert
+            };
+            if events_by_table
+                .get(table)
+                .is_some_and(|events| match event {
+                    TriggerEvent::Insert => events.0,
+                    TriggerEvent::Update => events.1,
+                })
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
+// The native table-drop route prepares this event component before its durable
+// trigger/table/graph write, then publishes at the original event-definition
+// position. The unchanged Legacy table-drop helper remains selected today.
+pub(super) struct OwnedTableDropEventCompanion {
+    definitions: Option<event_bus::OwnedDefinitionPublication>,
+    events: event_bus::OwnedPreparedSinkEvents,
+}
+impl Database {
+    pub(super) fn prepare_owned_table_drop_event_companion(
+        &self,
+        events: &event_bus::OwnedEventBusHandle,
+        table: &str,
+    ) -> Result<OwnedTableDropEventCompanion> {
+        match &self.tx_mgr {
+            DatabaseTransactionHost::Owned(handle) => handle.with_host(|host| {
+                crate::memory_accounting::validate_owned_original(
+                    &events.data().original,
+                    &self.finalization.accountant,
+                    &host.funder,
+                )
+            })?,
+            DatabaseTransactionHost::Legacy(_) => {
+                return Err(Error::Other(
+                    "owning table drop requires its actual native database host".into(),
+                ));
+            }
+        }
+        let definitions = events.prepare_owned_event_bus_without_table(table)?;
+        let prepared_events = events.prepare_owned_sink_events(&[])?;
+        Ok(OwnedTableDropEventCompanion {
+            definitions,
+            events: prepared_events,
+        })
+    }
+    pub(super) fn with_owned_table_drop_event_config<R>(
+        &self,
+        stage: &OwnedTableDropEventCompanion,
+        flush: impl for<'e> FnOnce(Option<&'e [(String, Vec<u8>)]>) -> Result<R>,
+    ) -> Result<R> {
+        flush(
+            stage
+                .definitions
+                .as_ref()
+                .map(|definitions| definitions.config.values.as_slice()),
+        )
+    }
+    pub(super) fn publish_owned_table_drop_event_companion(
+        &self,
+        events: &event_bus::OwnedEventBusHandle,
+        stage: OwnedTableDropEventCompanion,
+    ) {
+        if let Some(definitions) = stage.definitions {
+            events.publish_owned_definition_publication(definitions, stage.events);
+        } else {
+            events.publish_owned_sink_events_to_memory(stage.events);
+        }
+    }
+}

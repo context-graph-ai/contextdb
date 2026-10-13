@@ -107,12 +107,12 @@ type ScopedRoot = (usize, Option<Arc<WriterSnapshot>>, OutputOwners);
 thread_local! { static ROOT: std::cell::RefCell<Option<ScopedRoot>> = const { std::cell::RefCell::new(None) }; }
 
 pub(super) fn scoped_root_for_manager(
-    manager: &Arc<TransactionManager<DynStore>>,
+    manager: &DatabaseTransactionHost,
 ) -> Option<Arc<WriterSnapshot>> {
     ROOT.with(|slot| {
         slot.borrow()
             .as_ref()
-            .filter(|(id, _, _)| *id == Arc::as_ptr(manager) as usize)
+            .filter(|(id, _, _)| *id == manager.identity())
             .and_then(|(_, root, _)| root.clone())
     })
 }
@@ -120,13 +120,13 @@ pub(super) fn scoped_root_for_manager(
 /// Publication preloads its newly committed generation, before the enclosing
 /// maintenance operation's earlier root can see it. Restore that root afterward.
 pub(super) fn suspend_root_for_manager(
-    manager: &Arc<TransactionManager<DynStore>>,
+    manager: &DatabaseTransactionHost,
 ) -> Option<WriterRootScope> {
     ROOT.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot
             .as_ref()
-            .is_some_and(|(id, _, _)| *id == Arc::as_ptr(manager) as usize)
+            .is_some_and(|(id, _, _)| *id == manager.identity())
         {
             Some(WriterRootScope {
                 prior: slot.take(),
@@ -757,7 +757,7 @@ impl Database {
         ROOT.with(|slot| {
             slot.borrow()
                 .as_ref()
-                .filter(|(id, _, _)| *id == Arc::as_ptr(&self.tx_mgr) as usize)
+                .filter(|(id, _, _)| *id == self.tx_mgr.identity())
                 .and_then(|(_, root, _)| root.clone())
         })
     }
@@ -776,7 +776,7 @@ impl Database {
         if self.persistence.is_none() {
             return Ok(None);
         }
-        let owner = Arc::as_ptr(&self.tx_mgr) as usize;
+        let owner = self.tx_mgr.identity();
         if let Some(root) = ROOT.with(|slot| {
             slot.borrow()
                 .as_ref()
@@ -794,7 +794,7 @@ impl Database {
         root: Option<Arc<WriterSnapshot>>,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> WriterReadScope {
-        let owner = Arc::as_ptr(&self.tx_mgr) as usize;
+        let owner = self.tx_mgr.identity();
         let owners = ROOT
             .with(|slot| {
                 slot.borrow()
@@ -813,7 +813,7 @@ impl Database {
         }
     }
     pub(super) fn writer_root_scope(&self) -> Result<WriterRootScope> {
-        let owner = Arc::as_ptr(&self.tx_mgr) as usize;
+        let owner = self.tx_mgr.identity();
         let owners = ROOT
             .with(|slot| {
                 slot.borrow()
@@ -852,7 +852,7 @@ impl Database {
             read_memory.clone(),
         )?;
         let next = Some((
-            Arc::as_ptr(&self.tx_mgr) as usize,
+            self.tx_mgr.identity(),
             self.writer_read_root()?,
             OutputOwners::default(),
         ));
@@ -879,7 +879,7 @@ impl Database {
         ROOT.with(|slot| {
             let root = slot.borrow();
             if let Some((manager, _, owners)) = root.as_ref()
-                && *manager == Arc::as_ptr(&self.tx_mgr) as usize
+                && *manager == self.tx_mgr.identity()
             {
                 for owner in owners.borrow().iter() {
                     if let Some(image) =
@@ -899,7 +899,7 @@ impl Database {
     pub(crate) fn retain_writer_image(&self, image: Arc<crate::read_image_memory::ImageMemory>) {
         ROOT.with(|slot| {
             if let Some((owner, _, owners)) = slot.borrow().as_ref()
-                && *owner == Arc::as_ptr(&self.tx_mgr) as usize
+                && *owner == self.tx_mgr.identity()
             {
                 owners.borrow_mut().push(Box::new(image));
             }
@@ -985,7 +985,7 @@ impl Database {
             let owners = slot
                 .borrow()
                 .as_ref()
-                .filter(|(owner, _, _)| *owner == Arc::as_ptr(&self.tx_mgr) as usize)
+                .filter(|(owner, _, _)| *owner == self.tx_mgr.identity())
                 .map(|(_, _, owners)| owners.clone());
             let start = owners.as_ref().map_or(0, |owners| owners.borrow().len());
             WriterOutputScope { owners, start }
@@ -995,7 +995,7 @@ impl Database {
     pub(crate) fn retain_writer_output(&self, output: contextdb_core::read_memory::ReadCredit) {
         ROOT.with(|slot| {
             if let Some((owner, _, owners)) = slot.borrow().as_ref()
-                && *owner == Arc::as_ptr(&self.tx_mgr) as usize
+                && *owner == self.tx_mgr.identity()
             {
                 owners.borrow_mut().push(Box::new(output));
             }
@@ -1490,7 +1490,7 @@ impl Database {
                     continue;
                 }
                 let hidden = match tx {
-                    Some(tx) => self.tx_mgr.with_write_set(tx, |ws| {
+                    Some(tx) => self.tx_mgr.with_read(tx, |ws| {
                         ws.relational_deletes
                             .iter()
                             .any(|(t, row, _)| t == table && *row == posting.value().entry.row_id)
@@ -1507,7 +1507,7 @@ impl Database {
                     visible_row(&source, table, posting.value().entry.row_id, snapshot)?
                 {
                     if let Some(tx) = tx
-                        && self.tx_mgr.with_write_set(tx, |ws| {
+                        && self.tx_mgr.with_read(tx, |ws| {
                             row_matches_delete_predicates(
                                 &ws.relational_delete_predicates,
                                 table,
@@ -1638,6 +1638,49 @@ impl Database {
             "Raise MEMORY_LIMIT to validate this key.",
         )?;
         let key = index.map(|index| index_key_from_values(&index.columns[..columns.len()], values));
+        if let DatabaseTransactionHost::Owned(handle) = &self.tx_mgr {
+            let rows = handle.with_host(|host| host.transactions.with_transactions(
+                |transactions| transactions.capture_sealed(tx, table, read_memory.clone()),
+            ))?;
+            if let (Some(index), Some(key)) = (index, key.as_ref())
+                && rows.has_index_for(&index.name, &meta)
+            {
+                let start = std::ops::Bound::Included(key.clone());
+                let end = std::ops::Bound::Included(key.clone());
+                return rows.with_next_ordered(
+                    &index.name, false, None, &start, &end, columns.len(),
+                    |entry| {
+                        let Some((position, id)) = entry else { return Ok(None); };
+                        #[cfg(feature = "in-process-test-seams")]
+                        crate::writer_query_test_seams::note_constraint_staged_row();
+                        #[cfg(feature = "test-seams")]
+                        crate::writer_query_test_seams::note_target_entry(table);
+                        if Some(id) != skip { return Ok(Some(id)); }
+                        rows.with_next_ordered(
+                            &index.name, false, Some(position), &start, &end, columns.len(),
+                            |entry| {
+                                if entry.is_some() {
+                                    #[cfg(feature = "in-process-test-seams")]
+                                    crate::writer_query_test_seams::note_constraint_staged_row();
+                                    #[cfg(feature = "test-seams")]
+                                    crate::writer_query_test_seams::note_target_entry(table);
+                                }
+                                Ok(entry.map(|(_, id)| id))
+                            },
+                        )
+                    },
+                );
+            }
+            if rows.next_unordered(None).is_none() {
+                return Ok(None);
+            }
+            // Legacy resolves an unindexed conflict by original reverse
+            // insertion position. The sealed table view does not expose that
+            // ordering, so this route needs an approved restricted selector.
+            return Err(DatabaseTransactionHost::producer_gap(
+                "unindexed constraint reverse-insertion selector",
+            ));
+        }
         self.tx_mgr.with_write_set(tx, |ws| {
             if let (Some(index), Some(key)) = (index, key.as_ref())
                 && ws
@@ -1800,14 +1843,7 @@ impl Database {
             }
             if let Some((tx, skip)) = overlay
                 && (skip == Some(posting.entry.row_id)
-                    || self.tx_mgr.with_write_set(tx, |ws| {
-                        ws.ordered_staged_rows
-                            .contains_row(table, posting.entry.row_id)
-                            || ws
-                                .relational_deletes
-                                .iter()
-                                .any(|(name, row, _)| name == table && *row == posting.entry.row_id)
-                    })?)
+                    || self.tx_mgr.row_shadows_committed(tx, table, posting.entry.row_id)?)
             {
                 continue;
             }
@@ -1827,7 +1863,7 @@ impl Database {
                         reason: "indexed point posting differs from its captured row".into() });
                 }
                 if let Some((tx, _)) = overlay
-                    && self.tx_mgr.with_write_set(tx, |ws| {
+                    && self.tx_mgr.with_read(tx, |ws| {
                         row_matches_delete_predicates(
                             &ws.relational_delete_predicates,
                             table,
@@ -1897,7 +1933,7 @@ impl Database {
         if let Some(root) = ROOT.with(|slot| {
             slot.borrow()
                 .as_ref()
-                .filter(|(owner, _, _)| *owner == Arc::as_ptr(&self.tx_mgr) as usize)
+                .filter(|(owner, _, _)| *owner == self.tx_mgr.identity())
                 .and_then(|(_, root, _)| root.clone())
         }) {
             let snapshot = SNAPSHOT_OVERRIDE.with(|cell| cell.borrow().unwrap_or(root.snapshot));
@@ -2083,10 +2119,43 @@ impl Drop for WriterStagedPostingAdmission {
     }
 }
 
+/// The private cycle-breaking publication owner.  The owned form preserves the
+/// external source credit paired with the actual weak count; it never projects
+/// a raw weak manager.
+pub(super) enum GraphPublicationWeak {
+    Legacy(std::sync::Weak<TransactionManager<DynStore>>),
+    Owned(EngineDatabaseWeak),
+}
+
+impl GraphPublicationWeak {
+    fn owned(handle: &EngineDatabaseHandle) -> Self {
+        Self::Owned(handle.downgrade())
+    }
+
+    fn capture_published_read(&self) -> Option<(usize, contextdb_tx::PublishedRead)> {
+        match self {
+            Self::Legacy(manager) => manager.upgrade().map(|manager| {
+                let identity = Arc::as_ptr(&manager) as usize;
+                let published = manager.capture_published_read();
+                (identity, published)
+            }),
+            Self::Owned(host) => host.upgrade().map(|host| {
+                let identity = host.identity();
+                let published = host.with_host(|host| {
+                    host.transactions
+                        .with_transactions(|transactions| transactions.capture_published_read())
+                });
+                // `host` ends here, before a graph snapshot carries the root.
+                (identity, published)
+            }),
+        }
+    }
+}
+
 /// Storage consumers capture the same root as the statement currently running
-/// on this thread. The weak manager breaks the store/manager ownership cycle.
+/// on this thread. The weak publication owner breaks the store/host cycle.
 pub(super) struct ScopedGraphSource {
-    manager: OnceLock<std::sync::Weak<TransactionManager<DynStore>>>,
+    manager: OnceLock<GraphPublicationWeak>,
 }
 impl ScopedGraphSource {
     pub(super) fn new() -> Self {
@@ -2094,10 +2163,26 @@ impl ScopedGraphSource {
             manager: OnceLock::new(),
         }
     }
-    pub(super) fn bind(&self, manager: &Arc<TransactionManager<DynStore>>) {
-        self.manager
-            .set(Arc::downgrade(manager))
-            .expect("graph source bound once");
+    pub(super) fn bind(&self, manager: &DatabaseTransactionHost) {
+        assert!(
+            self.manager
+                .set(match manager {
+                    DatabaseTransactionHost::Legacy(manager) => GraphPublicationWeak::Legacy(Arc::downgrade(manager)),
+                    DatabaseTransactionHost::Owned(handle) => GraphPublicationWeak::owned(handle),
+                })
+                .is_ok(),
+            "graph source bound once"
+        );
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn bind_owned(&self, host: &EngineDatabaseHandle) {
+        assert!(
+            self.manager
+                .set(GraphPublicationWeak::owned(host))
+                .is_ok(),
+            "graph source bound once"
+        );
     }
 }
 impl contextdb_graph::source::GraphReadSource for ScopedGraphSource {
@@ -2106,12 +2191,11 @@ impl contextdb_graph::source::GraphReadSource for ScopedGraphSource {
         snapshot: SnapshotId,
         read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Arc<dyn contextdb_graph::source::GraphSnapshot>> {
-        let manager = self
+        let (owner, published) = self
             .manager
             .get()
-            .and_then(std::sync::Weak::upgrade)
+            .and_then(GraphPublicationWeak::capture_published_read)
             .ok_or_else(|| Error::Other("graph publication is unavailable".into()))?;
-        let owner = Arc::as_ptr(&manager) as usize;
         let scoped = ROOT.with(|slot| {
             slot.borrow()
                 .as_ref()
@@ -2120,7 +2204,7 @@ impl contextdb_graph::source::GraphReadSource for ScopedGraphSource {
         });
         let root = match scoped {
             Some(root) => root,
-            None => durable_root(manager.capture_published_read().handle)?
+            None => durable_root(published.handle)?
                 .ok_or_else(|| Error::Other("graph publication has no durable root".into()))?,
         };
         if snapshot.0 > root.snapshot.0 {
@@ -2575,5 +2659,79 @@ mod vector_write_copy_budget_tests {
         assert!(matches!(db.rollback(tx), Err(Error::TxNotFound(_))));
         let rows = db.execute("SELECT COUNT(*) FROM vectors", &HashMap::new()).unwrap();
         assert_eq!(rows.rows, vec![vec![Value::Int64(0)]]);
+    }
+}
+
+#[cfg(feature = "sync-orchestration")]
+impl Database {
+    /// Each invocation independently captures the actual committed descriptor.
+    /// Neither the Legacy ROOT TLS nor a current-config cache substitutes for it.
+    pub(super) fn read_native_committed_config_text(
+        &self,
+        prefix: &str,
+        tenant: &TenantId,
+        operation: &crate::owner_read::NativeReadRequest,
+        context: &crate::executor::bounded::NativeReadOpenContext,
+    ) -> std::result::Result<Option<crate::persistence::writer_source::NativeConfigWindow>,
+        crate::persistence::writer_source::NativeConfigFailure> {
+        use crate::persistence::writer_source::NativeConfigFailure;
+        use crate::persistence::native_storage_admission::NativeStorageFailure;
+        let published = self.tx_mgr.capture_published_read();
+        let root = durable_root(published.handle)
+            .map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?
+            .ok_or_else(|| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(
+                Error::Other("writer publication has no durable root".into()),
+            )))?;
+        root.native_config_text(operation, context, prefix, tenant)
+    }
+}
+
+#[cfg(feature = "sync-orchestration")]
+impl Database {
+    /// Independently capture the committed publication for THIS raw prefix call.
+    /// The returned cursor pins that exact root while using the original request.
+    pub(super) fn read_native_committed_config_prefix(
+        &self, prefix: &str,
+        operation: &crate::owner_read::NativeReadRequest,
+        context: &crate::executor::bounded::NativeReadOpenContext,
+    ) -> std::result::Result<contextdb_core::read_memory::ReadShared<std::sync::Mutex<crate::persistence::writer_source::NativeRawConfigCursor>>,
+        crate::persistence::writer_source::NativeConfigFailure> {
+        use crate::persistence::writer_source::NativeConfigFailure;
+        use crate::persistence::native_storage_admission::NativeStorageFailure;
+        let published = self.tx_mgr.capture_published_read();
+        let root = durable_root(published.handle)
+            .map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?
+            .ok_or_else(|| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(
+                Error::Other("writer publication has no durable root".into()),
+            )))?;
+        root.native_raw_config_prefix(operation, context, prefix)
+    }
+}
+
+#[cfg(feature = "sync-orchestration")]
+impl Database {
+    /// Pin once for both custody count and construction passes. Each cursor
+    /// remains funded by the same request/context; no Legacy TLS is consulted.
+    pub(super) fn read_native_custody_root(
+        &self,
+        operation: &crate::owner_read::NativeReadRequest,
+        context: &crate::executor::bounded::NativeReadOpenContext,
+    ) -> std::result::Result<Arc<crate::persistence::writer_source::WriterSnapshot>,
+        crate::persistence::writer_source::NativeConfigFailure> {
+        use crate::persistence::writer_source::NativeConfigFailure;
+        use crate::persistence::native_storage_admission::NativeStorageFailure;
+        context.checkpoint().map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?;
+        if !operation.owner().same_owner(&context.owner().map_err(|e|
+            NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?) {
+            return Err(NativeConfigFailure::OwnerMismatch);
+        }
+        let published = self.tx_mgr.capture_published_read();
+        durable_root(published.handle)
+            .map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?
+            .ok_or(NativeConfigFailure::Storage(NativeStorageFailure::Refused(
+                contextdb_core::read_memory::NativeRefusal::NativeUnsupported {
+                    subsystem: "custody", operation: "durable_root",
+                },
+            )))
     }
 }

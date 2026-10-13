@@ -91,11 +91,14 @@ mod writer_commit_directory;
 mod writer_ddl_occurrences;
 mod writer_ddl_summary;
 mod writer_export;
+mod custody_groups;
 mod writer_file;
 mod writer_history;
 mod writer_recovery;
 mod writer_row_heads;
 pub(crate) mod writer_source;
+#[allow(dead_code)] // Staged native storage admission is inactive until its integration prerequisites land.
+pub(crate) mod native_storage_admission;
 use writer_file::{LockedWriterFile, OpenedWriterDatabase};
 #[allow(unused_imports)] // Recovery types are consumed by writer integration.
 pub(crate) use writer_recovery::{WriterOpenBounds, WriterRecoveryBounds};
@@ -23142,6 +23145,7 @@ impl RedbPersistence {
         admission: &mut content_identity::ProofAdmission,
     ) -> Result<()> {
         let write_txn = db.begin_write().map_err(Self::storage_error)?;
+        custody_groups::initialize_empty(&write_txn)?;
         Self::initialize_history_witnesses(&write_txn)?;
         let write_txn = write_txn.with_table_root_hook(Self::historical_root_event);
         #[cfg(any(test, feature = "test-seams"))]
@@ -41119,7 +41123,9 @@ graph_commit_result }.map_err(Self::storage_error)?;
         write_txn: &redb::WriteTransaction,
         key: &str,
         value: Option<&[u8]>,
+        funding: custody_groups::Funding<'_>,
     ) -> Result<()> {
+        custody_groups::maintain(write_txn, key, value, funding)?;
         Self::write_compact_config_entry(
             write_txn,
             READ_CUSTODY_CONFIG_TABLE,
@@ -41141,22 +41147,18 @@ graph_commit_result }.map_err(Self::storage_error)?;
         let mut table = write_txn
             .open_table(definition)
             .map_err(Self::storage_error)?;
-        let previous = table
-            .get(key)
-            .map_err(Self::storage_error)?
-            .map(|stored| stored.value().to_vec());
-        let root = table
+        let root_guard = table
             .get(READ_OPEN_CONFIG_ROOT_KEY)
             .map_err(Self::storage_error)?
-            .map(|stored| stored.value().to_vec())
             .ok_or_else(|| Error::Other("read-open config index root is absent".into()))?;
-        if root.len() != 40 {
+        if root_guard.value().len() != 40 {
             return Err(Error::Other(
                 "read-open config index root has invalid size".into(),
             ));
         }
-        let mut count = u64::from_be_bytes(root[..8].try_into().unwrap());
-        let mut xor: [u8; 32] = root[8..].try_into().unwrap();
+        let mut count = u64::from_be_bytes(root_guard.value()[..8].try_into().unwrap());
+        let mut xor: [u8; 32] = root_guard.value()[8..].try_into().unwrap();
+        drop(root_guard);
         let digest = |bytes: &[u8]| {
             let mut hasher = blake3::Hasher::new();
             hasher.update(key.as_bytes());
@@ -41168,8 +41170,8 @@ graph_commit_result }.map_err(Self::storage_error)?;
         let mut set = bound_set
             .map(|set| content_identity::SetCommitment::load_in_write(write_txn, set))
             .transpose()?;
-        if let Some(previous) = &previous {
-            let witness = digest(previous);
+        if let Some(previous) = table.get(key).map_err(Self::storage_error)? {
+            let witness = digest(previous.value());
             for (dst, src) in xor.iter_mut().zip(witness.as_bytes()) {
                 *dst ^= src;
             }
@@ -41240,6 +41242,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
     pub(super) fn rebuild_read_custody_config_in_write(
         write_txn: &redb::WriteTransaction,
     ) -> Result<()> {
+        custody_groups::invalidate(write_txn)?;
         match write_txn.delete_table(READ_CUSTODY_CONFIG_TABLE) {
             Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
             Err(error) => return Err(Self::storage_error(error)),
@@ -41266,7 +41269,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         for entry in config.iter().map_err(Self::storage_error)? {
             let (key, value) = entry.map_err(Self::storage_error)?;
             if crate::custody::records::owned_key(key.value()) {
-                Self::write_read_custody_config_entry(write_txn, key.value(), Some(value.value()))?;
+                Self::write_read_custody_config_entry(write_txn, key.value(), Some(value.value()), custody_groups::Funding::Unavailable)?;
             }
         }
         Ok(())
@@ -47602,3 +47605,5168 @@ pub(crate) fn returned_loader_rows_for_test() {
 
 #[cfg(test)]
 mod bounded_journal_suffix_tests;
+
+/// A synchronous loan from one captured storage transaction. Repeated count,
+/// decode and export passes use this same root and declared operation reader.
+pub(crate) struct OwnedEncodedEventSource<'s> {
+    read: &'s redb::ReadTransaction,
+    loaded: Option<&'s BTreeMap<String, Vec<(u64, Vec<u8>)>>>,
+    read_memory: &'s Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+}
+
+struct OwnedEventReadKey {
+    value: String,
+    memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    bytes: usize,
+}
+
+impl OwnedEventReadKey {
+    fn queue_table(
+        sink: &str,
+        memory: &Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<Self> {
+        let bytes = "__sink_queue_".len().checked_add(sink.len()).ok_or_else(|| {
+            Error::Other("sink queue table name size overflow".into())
+        })?;
+        memory.try_reserve(bytes, "reader", "sink_queue_source", "Reduce concurrent queue reads or raise the declared reader memory limit.")?;
+        // Install the refund before any fallible construction or validation.
+        let mut key = Self { value: String::new(), memory: memory.clone(), bytes };
+        key.value = String::with_capacity(bytes);
+        if key.value.capacity() != bytes {
+            return Err(Error::Other("sink queue source key capacity differs from its admission".into()));
+        }
+        key.value.push_str("__sink_queue_");
+        key.value.push_str(sink);
+        Ok(key)
+    }
+}
+
+impl Drop for OwnedEventReadKey {
+    fn drop(&mut self) {
+        // The concrete String allocation must disappear before its invoice.
+        drop(std::mem::take(&mut self.value));
+        self.memory.release(self.bytes);
+    }
+}
+
+impl OwnedEncodedEventSource<'_> {
+    pub(crate) fn visit(
+        &self,
+        sink: &str,
+        mut visit: impl for<'e> FnMut(u64, &'e [u8]) -> Result<()>,
+    ) -> Result<()> {
+        if let Some(entries) = self.loaded.and_then(|loaded| loaded.get(sink)) {
+            for (id, bytes) in entries {
+                visit(*id, bytes)?;
+            }
+            return Ok(());
+        }
+        let name = OwnedEventReadKey::queue_table(sink, self.read_memory)?;
+        let definition: TableDefinition<u64, &[u8]> = TableDefinition::new(&name.value);
+        let table = match self.read.open_table(definition) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+            Err(error) => return Err(RedbPersistence::storage_error(error)),
+        };
+        for entry in table.iter().map_err(RedbPersistence::storage_error)? {
+            let (id, encoded) = entry.map_err(RedbPersistence::storage_error)?;
+            // No encoded buffer is copied. The storage guard and captured
+            // transaction own these bytes until the synchronous visit ends.
+            visit(id.value(), encoded.value())?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn visit_sinks(
+        &self,
+        mut visit: impl for<'e> FnMut(&'e str) -> Result<()>,
+    ) -> Result<()> {
+        if let Some(loaded) = self.loaded {
+            for name in loaded.keys() {
+                visit(name)?;
+            }
+        }
+        for handle in self.read.list_tables().map_err(RedbPersistence::storage_error)? {
+            if let Some(name) = handle.name().strip_prefix("__sink_queue_")
+                && !self.loaded.is_some_and(|loaded| loaded.contains_key(name))
+            {
+                visit(name)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl RedbPersistence {
+    pub(crate) fn with_owned_encoded_event_source<R>(
+        &self,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        f: impl for<'s> FnOnce(&'s OwnedEncodedEventSource<'s>) -> Result<R>,
+    ) -> Result<R> {
+        self.with_db(|db| {
+            let read = db.begin_read().map_err(Self::storage_error)?;
+            let source = OwnedEncodedEventSource { read: &read, loaded: None, read_memory: &read_memory };
+            f(&source)
+        })
+    }
+}
+
+impl RetainedReadSource {
+    pub(crate) fn with_owned_encoded_image_source<R>(
+        &self,
+        loaded: &BTreeMap<String, Vec<(u64, Vec<u8>)>>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        f: impl for<'s> FnOnce(&'s OwnedEncodedEventSource<'s>) -> Result<R>,
+    ) -> Result<R> {
+        // begin_read verifies this transaction against the registered image
+        // snapshot; unloaded queues never reopen the latest writer root.
+        let read = self.begin_read()?;
+        let source = OwnedEncodedEventSource { read: &read, loaded: Some(loaded), read_memory: &read_memory };
+        f(&source)
+    }
+}
+
+pub(crate) struct OwnedEncodedBytes {
+    pub(crate) bytes: Vec<u8>,
+    allocation: crate::memory_accounting::OwnedMemoryReservation,
+}
+
+struct OwnedEventEncodedLength(usize);
+impl std::io::Write for OwnedEventEncodedLength {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.checked_add(bytes.len()).ok_or_else(|| {
+            std::io::Error::from(std::io::ErrorKind::InvalidInput)
+        })?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+
+pub(crate) struct OwnedEventKey {
+    pub(crate) value: String,
+    allocation: crate::memory_accounting::OwnedMemoryReservation,
+}
+
+fn owned_event_decimal_width(mut value: u64) -> usize {
+    let mut width = 1;
+    while value >= 10 {
+        value /= 10;
+        width += 1;
+    }
+    width
+}
+
+impl OwnedEventKey {
+    fn queue_identity(
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        sink: &str,
+        id: u64,
+    ) -> Result<Self> {
+        use std::fmt::Write;
+        let sink_length = u64::try_from(sink.len()).map_err(|_| Error::Other("sink name size overflow".into()))?;
+        let bytes = owned_event_decimal_width(sink_length)
+            .checked_add(sink.len()).and_then(|n| n.checked_add(2))
+            .and_then(|n| n.checked_add(owned_event_decimal_width(id)))
+            .ok_or_else(|| Error::Other("sink queue identity size overflow".into()))?;
+        let allocation = crate::memory_accounting::reserve_preparation_from_original(
+            original, bytes, "events", "sink_queue_identity", "Reduce pending deliveries or raise MEMORY_LIMIT.",
+        )?;
+        let mut value = String::with_capacity(bytes);
+        if value.capacity() != bytes {
+            drop(value);
+            return Err(Error::Other("sink queue identity capacity differs from its admission".into()));
+        }
+        if write!(&mut value, "{}:{sink}:{id}", sink.len()).is_err() {
+            drop(value);
+            return Err(Error::Other("cannot format sink queue identity".into()));
+        }
+        if value.len() != bytes || value.capacity() != bytes {
+            drop(value);
+            return Err(Error::Other("sink queue identity differs from its measured size".into()));
+        }
+        Ok(Self { value, allocation })
+    }
+}
+
+pub(crate) struct OwnedSinkQueueRemovals {
+    pub(crate) mutations: Vec<content_identity::ContentIdentityMutation>,
+    credits: Vec<crate::memory_accounting::OwnedMemoryReservation>,
+    mutations_allocation: crate::memory_accounting::OwnedMemoryReservation,
+    credits_allocation: crate::memory_accounting::OwnedMemoryReservation,
+}
+
+impl RedbPersistence {
+    /// Encode into one concretely priced buffer; a length mismatch refuses
+    /// before any durable write rather than growing a naked Vec.
+    pub(crate) fn encode_owned_event<T: serde::Serialize>(
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        value: &T,
+    ) -> Result<OwnedEncodedBytes> {
+        let mut measured = OwnedEventEncodedLength(0);
+        bincode::serde::encode_into_std_write(value, &mut measured, bincode::config::standard())
+            .map_err(|err| Error::Other(format!("bincode encode error: {err}")))?;
+        let buffer = crate::memory_accounting::new_owned_native_vec::<u8>(original, measured.0)?;
+        // Establish body-before-invoice custody before invoking Serialize,
+        // which can return an error or unwind on its second pass.
+        let mut encoded = OwnedEncodedBytes { bytes: buffer.0, allocation: buffer.1 };
+        encoded.bytes.resize(measured.0, 0);
+        let written = bincode::serde::encode_into_slice(value, encoded.bytes.as_mut_slice(), bincode::config::standard())
+            .map_err(|err| Error::Other(format!("bincode encode error: {err}")))?;
+        if written != measured.0 || encoded.bytes.capacity() != measured.0 {
+            return Err(Error::Other("sink event encoding differs from its measured size".into()));
+        }
+        Ok(encoded)
+    }
+
+    /// Prepare the exact original status-removal wire keys without invoking
+    /// the Legacy key constructors or an unowned temporary mutation vector.
+    pub(crate) fn prepare_owned_sink_queue_removals(
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        sink: &str,
+        ids: &[u64],
+    ) -> Result<OwnedSinkQueueRemovals> {
+        // Keep each factory's body-first tuple intact across the next
+        // fallible admission; split locals would refund before buffer Drop.
+        let mutations = crate::memory_accounting::new_owned_native_vec(original, ids.len())?;
+        let credits = crate::memory_accounting::new_owned_native_vec(original, ids.len())?;
+        // Aggregate ownership is established before the first key is copied,
+        // including all error/unwind paths through this loop.
+        let mut prepared = OwnedSinkQueueRemovals {
+            mutations: mutations.0,
+            credits: credits.0,
+            mutations_allocation: mutations.1,
+            credits_allocation: credits.1,
+        };
+        for id in ids {
+            let key = OwnedEventKey::queue_identity(original, sink, *id)?;
+            let namespace = b"sink-queue";
+            let length = 16_usize.checked_add(namespace.len()).and_then(|n| n.checked_add(key.value.len()))
+                .ok_or_else(|| Error::Other("sink queue logical key size overflow".into()))?;
+            let (mut logical_key, allocation) = crate::memory_accounting::new_owned_native_vec::<u8>(original, length)?;
+            logical_key.extend_from_slice(&(namespace.len() as u64).to_le_bytes());
+            logical_key.extend_from_slice(namespace);
+            logical_key.extend_from_slice(&(key.value.len() as u64).to_le_bytes());
+            logical_key.extend_from_slice(key.value.as_bytes());
+            prepared.mutations.push(content_identity::ContentIdentityMutation {
+                family: content_identity::LogicalFamily::Status,
+                logical_key,
+                logical_value: None,
+                row_head: None,
+            });
+            prepared.credits.push(allocation);
+        }
+        Ok(prepared)
+    }
+}
+
+pub(crate) struct OriginalDecoded<T> {
+    pub(crate) value: T,
+    pub(crate) allocation: crate::memory_accounting::OwnedMemoryReservation,
+}
+
+/// A synchronous, stack-scoped native seed. Its pointer cannot leave this
+/// private codec: all access occurs before decode returns, including unwind.
+/// The returned typed value keeps its own exact original reservation.
+mod original_event_decode {
+    use super::*;
+    use serde::de::{self, DeserializeSeed, Visitor};
+    use std::marker::PhantomData;
+    struct Ledger {
+        allocation: crate::memory_accounting::OwnedMemoryReservation,
+        failure: Option<Error>,
+    }
+    thread_local! { static ACTIVE: std::cell::Cell<*mut Ledger> = const { std::cell::Cell::new(std::ptr::null_mut()) }; }
+    struct Scope(*mut Ledger);
+    impl Drop for Scope { fn drop(&mut self) { ACTIVE.with(|slot|slot.set(self.0)); } }
+    fn admit<E:de::Error>(bytes:usize)->std::result::Result<(),E>{
+        ACTIVE.with(|slot| {
+            let ptr=slot.get();
+            if ptr.is_null(){return Err(E::custom("original decode requires its pinned seed"));}
+            // SAFETY: only decode installs this stack address; Scope restores
+            // it before stack teardown. Serde invokes admission synchronously
+            // and this function never retains a borrow across a nested call.
+            let ledger=unsafe { &mut *ptr };
+            if ledger.failure.is_some(){return Err(E::custom("read image admission refused"));}
+            if let Err(error)=crate::memory_accounting::grow_preparation_from_original(
+                &mut ledger.allocation,bytes,"events","decode_sink_queue_entry",
+                "Reduce pending deliveries or raise MEMORY_LIMIT.") {
+                ledger.failure=Some(error);return Err(E::custom("read image admission refused"));
+            }
+            Ok(())
+        })
+    }
+    pub(super) fn decode<T:de::DeserializeOwned>(original:&crate::memory_accounting::OwnedMemoryReservation,bytes:&[u8])->Result<OriginalDecoded<T>>{
+        let control=std::mem::size_of::<T>().checked_mul(4).and_then(|n|n.checked_add(128))
+            .ok_or_else(||Error::Other("decode control size overflow".into()))?;
+        let _control=crate::memory_accounting::reserve_preparation_from_original(original,control,
+            "events","decode_sink_queue_entry","Reduce pending deliveries or raise MEMORY_LIMIT.")?;
+        let mut ledger=Ledger { allocation:crate::memory_accounting::reserve_preparation_from_original(original,0,
+            "events","decode_sink_queue_entry","Reduce pending deliveries or raise MEMORY_LIMIT.")?,failure:None };
+        let old=ACTIVE.with(|slot|slot.replace(&mut ledger));let scope=Scope(old);
+        let result=bincode::serde::seed_decode_from_slice(Seed(PhantomData::<T>),bytes,bincode::config::standard());
+        drop(scope);
+        if let Some(error)=ledger.failure.take(){drop(result);return Err(error);}
+        let (value,consumed)=result.map_err(|error|Error::Other(format!("bincode decode error: {error}")))?;
+        if consumed!=bytes.len(){drop(value);return Err(Error::Other("bincode exact decode left trailing bytes".into()));}
+        Ok(OriginalDecoded { value,allocation:ledger.allocation })
+    }
+struct Seed<S>(S);
+impl<'de, S: DeserializeSeed<'de>> DeserializeSeed<'de> for Seed<S> {
+    type Value = S::Value;
+    fn deserialize<D: de::Deserializer<'de>>(
+        self,
+        d: D,
+    ) -> std::result::Result<Self::Value, D::Error> {
+        self.0.deserialize(Admitted(d))
+    }
+}
+struct Admitted<D>(D);
+struct V<VV> {
+    inner: VV,
+    heap: bool,
+}
+impl<'de, VV: Visitor<'de>> Visitor<'de> for V<VV> {
+    type Value = VV::Value;
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.inner.expecting(f)
+    }
+    fn visit_bool<E: de::Error>(self, value: bool) -> std::result::Result<Self::Value, E> {
+        self.inner.visit_bool(value)
+    }
+    fn visit_i8<E: de::Error>(self, value: i8) -> std::result::Result<Self::Value, E> {
+        self.inner.visit_i8(value)
+    }
+    fn visit_i16<E: de::Error>(self, value: i16) -> std::result::Result<Self::Value, E> {
+        self.inner.visit_i16(value)
+    }
+    fn visit_i32<E: de::Error>(self, value: i32) -> std::result::Result<Self::Value, E> {
+        self.inner.visit_i32(value)
+    }
+    fn visit_i64<E: de::Error>(self, value: i64) -> std::result::Result<Self::Value, E> {
+        self.inner.visit_i64(value)
+    }
+    fn visit_i128<E: de::Error>(self, value: i128) -> std::result::Result<Self::Value, E> {
+        self.inner.visit_i128(value)
+    }
+    fn visit_u8<E: de::Error>(self, value: u8) -> std::result::Result<Self::Value, E> {
+        self.inner.visit_u8(value)
+    }
+    fn visit_u16<E: de::Error>(self, value: u16) -> std::result::Result<Self::Value, E> {
+        self.inner.visit_u16(value)
+    }
+    fn visit_u32<E: de::Error>(self, value: u32) -> std::result::Result<Self::Value, E> {
+        self.inner.visit_u32(value)
+    }
+    fn visit_u64<E: de::Error>(self, value: u64) -> std::result::Result<Self::Value, E> {
+        self.inner.visit_u64(value)
+    }
+    fn visit_u128<E: de::Error>(self, value: u128) -> std::result::Result<Self::Value, E> {
+        self.inner.visit_u128(value)
+    }
+    fn visit_f32<E: de::Error>(self, value: f32) -> std::result::Result<Self::Value, E> {
+        self.inner.visit_f32(value)
+    }
+    fn visit_f64<E: de::Error>(self, value: f64) -> std::result::Result<Self::Value, E> {
+        self.inner.visit_f64(value)
+    }
+    fn visit_char<E: de::Error>(self, value: char) -> std::result::Result<Self::Value, E> {
+        self.inner.visit_char(value)
+    }
+    fn visit_unit<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+        self.inner.visit_unit()
+    }
+    fn visit_none<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+        self.inner.visit_none()
+    }
+    fn visit_some<D: de::Deserializer<'de>>(
+        self,
+        d: D,
+    ) -> std::result::Result<Self::Value, D::Error> {
+        self.inner.visit_some(Admitted(d))
+    }
+    fn visit_newtype_struct<D: de::Deserializer<'de>>(
+        self,
+        d: D,
+    ) -> std::result::Result<Self::Value, D::Error> {
+        self.inner.visit_newtype_struct(Admitted(d))
+    }
+    fn visit_str<E: de::Error>(self, value: &str) -> std::result::Result<Self::Value, E> {
+        admit(value.len())?;
+        self.inner.visit_str(value)
+    }
+    fn visit_borrowed_str<E: de::Error>(
+        self,
+        value: &'de str,
+    ) -> std::result::Result<Self::Value, E> {
+        admit(value.len())?;
+        self.inner.visit_borrowed_str(value)
+    }
+    fn visit_bytes<E: de::Error>(self, value: &[u8]) -> std::result::Result<Self::Value, E> {
+        admit(value.len())?;
+        self.inner.visit_bytes(value)
+    }
+    fn visit_borrowed_bytes<E: de::Error>(
+        self,
+        value: &'de [u8],
+    ) -> std::result::Result<Self::Value, E> {
+        admit(value.len())?;
+        self.inner.visit_borrowed_bytes(value)
+    }
+    fn visit_seq<A: de::SeqAccess<'de>>(self, a: A) -> std::result::Result<Self::Value, A::Error> {
+        self.inner.visit_seq(Seq {
+            inner: a,
+            heap: self.heap,
+            first: true,
+        })
+    }
+    fn visit_map<A: de::MapAccess<'de>>(self, a: A) -> std::result::Result<Self::Value, A::Error> {
+        self.inner.visit_map(Map {
+            inner: a,
+            first_key: true,
+            first_value: true,
+        })
+    }
+    fn visit_enum<A: de::EnumAccess<'de>>(
+        self,
+        a: A,
+    ) -> std::result::Result<Self::Value, A::Error> {
+        self.inner.visit_enum(Enum(a))
+    }
+}
+struct Seq<A> {
+    inner: A,
+    heap: bool,
+    first: bool,
+}
+impl<'de, A: de::SeqAccess<'de>> de::SeqAccess<'de> for Seq<A> {
+    type Error = A::Error;
+    fn next_element_seed<S: DeserializeSeed<'de>>(
+        &mut self,
+        seed: S,
+    ) -> std::result::Result<Option<S::Value>, A::Error> {
+        if self.heap && self.inner.size_hint() != Some(0) {
+            // With size_hint hidden, Vec grows geometrically. Include its
+            // minimum capacity and both allocations during a reallocation.
+            let slots = if self.first { 12 } else { 4 };
+            admit(std::mem::size_of::<S::Value>().saturating_mul(slots))?;
+            self.first = false;
+        }
+        self.inner.next_element_seed(Seed(seed))
+    }
+    fn size_hint(&self) -> Option<usize> {
+        if self.heap {
+            Some(0)
+        } else {
+            self.inner.size_hint()
+        }
+    }
+}
+struct Map<A> {
+    inner: A,
+    first_key: bool,
+    first_value: bool,
+}
+impl<'de, A: de::MapAccess<'de>> de::MapAccess<'de> for Map<A> {
+    type Error = A::Error;
+    fn next_key_seed<S: DeserializeSeed<'de>>(
+        &mut self,
+        seed: S,
+    ) -> std::result::Result<Option<S::Value>, A::Error> {
+        if self.inner.size_hint() != Some(0) {
+            let slots = if self.first_key { 16 } else { 4 };
+            admit(
+                std::mem::size_of::<S::Value>()
+                    .saturating_mul(slots)
+                    .saturating_add(128 + 11 * std::mem::size_of::<S::Value>()),
+            )?;
+            self.first_key = false;
+        }
+        self.inner.next_key_seed(Seed(seed))
+    }
+    fn next_value_seed<S: DeserializeSeed<'de>>(
+        &mut self,
+        seed: S,
+    ) -> std::result::Result<S::Value, A::Error> {
+        let slots = if self.first_value { 16 } else { 4 };
+        admit(
+            std::mem::size_of::<S::Value>()
+                .saturating_mul(slots)
+                .saturating_add(128 + 11 * std::mem::size_of::<S::Value>()),
+        )?;
+        self.first_value = false;
+        self.inner.next_value_seed(Seed(seed))
+    }
+    fn size_hint(&self) -> Option<usize> {
+        Some(0)
+    }
+}
+struct Enum<A>(A);
+impl<'de, A: de::EnumAccess<'de>> de::EnumAccess<'de> for Enum<A> {
+    type Error = A::Error;
+    type Variant = Variant<A::Variant>;
+    fn variant_seed<S: DeserializeSeed<'de>>(
+        self,
+        seed: S,
+    ) -> std::result::Result<(S::Value, Self::Variant), A::Error> {
+        self.0
+            .variant_seed(Seed(seed))
+            .map(|(value, variant)| (value, Variant(variant)))
+    }
+}
+struct Variant<A>(A);
+impl<'de, A: de::VariantAccess<'de>> de::VariantAccess<'de> for Variant<A> {
+    type Error = A::Error;
+    fn unit_variant(self) -> std::result::Result<(), A::Error> {
+        self.0.unit_variant()
+    }
+    fn newtype_variant_seed<S: DeserializeSeed<'de>>(
+        self,
+        seed: S,
+    ) -> std::result::Result<S::Value, A::Error> {
+        self.0.newtype_variant_seed(Seed(seed))
+    }
+    fn tuple_variant<VV: Visitor<'de>>(
+        self,
+        len: usize,
+        visitor: VV,
+    ) -> std::result::Result<VV::Value, A::Error> {
+        self.0.tuple_variant(
+            len,
+            V {
+                inner: visitor,
+                heap: false,
+            },
+        )
+    }
+    fn struct_variant<VV: Visitor<'de>>(
+        self,
+        fields: &'static [&'static str],
+        visitor: VV,
+    ) -> std::result::Result<VV::Value, A::Error> {
+        self.0.struct_variant(
+            fields,
+            V {
+                inner: visitor,
+                heap: false,
+            },
+        )
+    }
+}
+impl<'de, D: de::Deserializer<'de>> de::Deserializer<'de> for Admitted<D> {
+    type Error = D::Error;
+    fn deserialize_any<VV: Visitor<'de>>(
+        self,
+        visitor: VV,
+    ) -> std::result::Result<VV::Value, D::Error> {
+        self.0.deserialize_any(V {
+            inner: visitor,
+            heap: false,
+        })
+    }
+    fn deserialize_bool<VV: Visitor<'de>>(
+        self,
+        visitor: VV,
+    ) -> std::result::Result<VV::Value, D::Error> {
+        self.0.deserialize_bool(V {
+            inner: visitor,
+            heap: false,
+        })
+    }
+    fn deserialize_i8<VV: Visitor<'de>>(
+        self,
+        visitor: VV,
+    ) -> std::result::Result<VV::Value, D::Error> {
+        self.0.deserialize_i8(V {
+            inner: visitor,
+            heap: false,
+        })
+    }
+    fn deserialize_i16<VV: Visitor<'de>>(
+        self,
+        visitor: VV,
+    ) -> std::result::Result<VV::Value, D::Error> {
+        self.0.deserialize_i16(V {
+            inner: visitor,
+            heap: false,
+        })
+    }
+    fn deserialize_i32<VV: Visitor<'de>>(
+        self,
+        visitor: VV,
+    ) -> std::result::Result<VV::Value, D::Error> {
+        self.0.deserialize_i32(V {
+            inner: visitor,
+            heap: false,
+        })
+    }
+    fn deserialize_i64<VV: Visitor<'de>>(
+        self,
+        visitor: VV,
+    ) -> std::result::Result<VV::Value, D::Error> {
+        self.0.deserialize_i64(V {
+            inner: visitor,
+            heap: false,
+        })
+    }
+    fn deserialize_i128<VV: Visitor<'de>>(
+        self,
+        visitor: VV,
+    ) -> std::result::Result<VV::Value, D::Error> {
+        self.0.deserialize_i128(V {
+            inner: visitor,
+            heap: false,
+        })
+    }
+    fn deserialize_u8<VV: Visitor<'de>>(
+        self,
+        visitor: VV,
+    ) -> std::result::Result<VV::Value, D::Error> {
+        self.0.deserialize_u8(V {
+            inner: visitor,
+            heap: false,
+        })
+    }
+    fn deserialize_u16<VV: Visitor<'de>>(
+        self,
+        visitor: VV,
+    ) -> std::result::Result<VV::Value, D::Error> {
+        self.0.deserialize_u16(V {
+            inner: visitor,
+            heap: false,
+        })
+    }
+    fn deserialize_u32<VV: Visitor<'de>>(
+        self,
+        visitor: VV,
+    ) -> std::result::Result<VV::Value, D::Error> {
+        self.0.deserialize_u32(V {
+            inner: visitor,
+            heap: false,
+        })
+    }
+    fn deserialize_u64<VV: Visitor<'de>>(
+        self,
+        visitor: VV,
+    ) -> std::result::Result<VV::Value, D::Error> {
+        self.0.deserialize_u64(V {
+            inner: visitor,
+            heap: false,
+        })
+    }
+    fn deserialize_u128<VV: Visitor<'de>>(
+        self,
+        visitor: VV,
+    ) -> std::result::Result<VV::Value, D::Error> {
+        self.0.deserialize_u128(V {
+            inner: visitor,
+            heap: false,
+        })
+    }
+    fn deserialize_f32<VV: Visitor<'de>>(
+        self,
+        visitor: VV,
+    ) -> std::result::Result<VV::Value, D::Error> {
+        self.0.deserialize_f32(V {
+            inner: visitor,
+            heap: false,
+        })
+    }
+    fn deserialize_f64<VV: Visitor<'de>>(
+        self,
+        visitor: VV,
+    ) -> std::result::Result<VV::Value, D::Error> {
+        self.0.deserialize_f64(V {
+            inner: visitor,
+            heap: false,
+        })
+    }
+    fn deserialize_char<VV: Visitor<'de>>(
+        self,
+        visitor: VV,
+    ) -> std::result::Result<VV::Value, D::Error> {
+        self.0.deserialize_char(V {
+            inner: visitor,
+            heap: false,
+        })
+    }
+    fn deserialize_str<VV: Visitor<'de>>(
+        self,
+        visitor: VV,
+    ) -> std::result::Result<VV::Value, D::Error> {
+        self.0.deserialize_str(V {
+            inner: visitor,
+            heap: false,
+        })
+    }
+    fn deserialize_string<VV: Visitor<'de>>(
+        self,
+        visitor: VV,
+    ) -> std::result::Result<VV::Value, D::Error> {
+        self.0.deserialize_str(V {
+            inner: visitor,
+            heap: false,
+        })
+    }
+    fn deserialize_bytes<VV: Visitor<'de>>(
+        self,
+        visitor: VV,
+    ) -> std::result::Result<VV::Value, D::Error> {
+        self.0.deserialize_bytes(V {
+            inner: visitor,
+            heap: false,
+        })
+    }
+    fn deserialize_byte_buf<VV: Visitor<'de>>(
+        self,
+        visitor: VV,
+    ) -> std::result::Result<VV::Value, D::Error> {
+        self.0.deserialize_bytes(V {
+            inner: visitor,
+            heap: false,
+        })
+    }
+    fn deserialize_option<VV: Visitor<'de>>(
+        self,
+        visitor: VV,
+    ) -> std::result::Result<VV::Value, D::Error> {
+        self.0.deserialize_option(V {
+            inner: visitor,
+            heap: false,
+        })
+    }
+    fn deserialize_unit<VV: Visitor<'de>>(
+        self,
+        visitor: VV,
+    ) -> std::result::Result<VV::Value, D::Error> {
+        self.0.deserialize_unit(V {
+            inner: visitor,
+            heap: false,
+        })
+    }
+    fn deserialize_seq<VV: Visitor<'de>>(
+        self,
+        visitor: VV,
+    ) -> std::result::Result<VV::Value, D::Error> {
+        self.0.deserialize_seq(V {
+            inner: visitor,
+            heap: true,
+        })
+    }
+    fn deserialize_map<VV: Visitor<'de>>(
+        self,
+        visitor: VV,
+    ) -> std::result::Result<VV::Value, D::Error> {
+        self.0.deserialize_map(V {
+            inner: visitor,
+            heap: true,
+        })
+    }
+    fn deserialize_identifier<VV: Visitor<'de>>(
+        self,
+        visitor: VV,
+    ) -> std::result::Result<VV::Value, D::Error> {
+        self.0.deserialize_identifier(V {
+            inner: visitor,
+            heap: false,
+        })
+    }
+    fn deserialize_ignored_any<VV: Visitor<'de>>(
+        self,
+        visitor: VV,
+    ) -> std::result::Result<VV::Value, D::Error> {
+        self.0.deserialize_ignored_any(V {
+            inner: visitor,
+            heap: false,
+        })
+    }
+    fn deserialize_unit_struct<VV: Visitor<'de>>(
+        self,
+        name: &'static str,
+        visitor: VV,
+    ) -> std::result::Result<VV::Value, D::Error> {
+        self.0.deserialize_unit_struct(
+            name,
+            V {
+                inner: visitor,
+                heap: false,
+            },
+        )
+    }
+    fn deserialize_newtype_struct<VV: Visitor<'de>>(
+        self,
+        name: &'static str,
+        visitor: VV,
+    ) -> std::result::Result<VV::Value, D::Error> {
+        self.0.deserialize_newtype_struct(
+            name,
+            V {
+                inner: visitor,
+                heap: false,
+            },
+        )
+    }
+    fn deserialize_tuple<VV: Visitor<'de>>(
+        self,
+        len: usize,
+        visitor: VV,
+    ) -> std::result::Result<VV::Value, D::Error> {
+        self.0.deserialize_tuple(
+            len,
+            V {
+                inner: visitor,
+                heap: false,
+            },
+        )
+    }
+    fn deserialize_tuple_struct<VV: Visitor<'de>>(
+        self,
+        name: &'static str,
+        len: usize,
+        visitor: VV,
+    ) -> std::result::Result<VV::Value, D::Error> {
+        self.0.deserialize_tuple_struct(
+            name,
+            len,
+            V {
+                inner: visitor,
+                heap: false,
+            },
+        )
+    }
+    fn deserialize_struct<VV: Visitor<'de>>(
+        self,
+        name: &'static str,
+        fields: &'static [&'static str],
+        visitor: VV,
+    ) -> std::result::Result<VV::Value, D::Error> {
+        self.0.deserialize_struct(
+            name,
+            fields,
+            V {
+                inner: visitor,
+                heap: false,
+            },
+        )
+    }
+    fn deserialize_enum<VV: Visitor<'de>>(
+        self,
+        name: &'static str,
+        variants: &'static [&'static str],
+        visitor: VV,
+    ) -> std::result::Result<VV::Value, D::Error> {
+        self.0.deserialize_enum(
+            name,
+            variants,
+            V {
+                inner: visitor,
+                heap: false,
+            },
+        )
+    }
+    fn is_human_readable(&self) -> bool {
+        self.0.is_human_readable()
+    }
+}
+
+
+}
+
+impl OwnedEventKey {
+    fn concatenated(original:&crate::memory_accounting::OwnedMemoryReservation,prefix:&str,suffix:&str)->Result<Self>{
+        let bytes=prefix.len().checked_add(suffix.len()).ok_or_else(||Error::Other("sink queue key size overflow".into()))?;
+        let allocation=crate::memory_accounting::reserve_preparation_from_original(original,bytes,"events","sink_queue_identity","Reduce pending deliveries or raise MEMORY_LIMIT.")?;
+        let mut value=String::with_capacity(bytes);value.push_str(prefix);value.push_str(suffix);
+        if value.capacity()!=bytes{return Err(Error::Other("sink queue key capacity differs from admission".into()));}
+        Ok(Self {value,allocation})
+    }
+}
+
+impl RedbPersistence {
+    pub(crate) fn decode_owned_event<T:serde::de::DeserializeOwned>(
+        original:&crate::memory_accounting::OwnedMemoryReservation,bytes:&[u8],
+    )->Result<OriginalDecoded<T>>{ original_event_decode::decode(original,bytes) }
+
+    pub(crate) fn update_owned_sink_queue_entry<T:serde::Serialize>(
+        &self,original:&crate::memory_accounting::OwnedMemoryReservation,sink:&str,
+        remove_id:Option<u64>,put:Option<(u64,&T)>,uncertain:bool,unconfirmed_delta:i8,
+    )->Result<()> {
+        if remove_id.is_none() && put.is_none(){return Ok(());}
+        // All escaping serialization/key controls are paid by this immutable
+        // seed before the transaction can publish their corresponding writes.
+        let table_name=OwnedEventKey::concatenated(original,"__sink_queue_",sink)?;
+        let remove_key=remove_id.map(|id|OwnedEventKey::queue_identity(original,sink,id)).transpose()?;
+        let put_key=put.map(|(id,_)|OwnedEventKey::queue_identity(original,sink,id)).transpose()?;
+        let encoded_put=put.map(|(_,entry)|Self::encode_owned_event(original,entry)).transpose()?;
+        let uncertain_key=uncertain.then(||OwnedEventKey::concatenated(original,
+            crate::database::event_bus::UNCERTAIN_COUNT_CONFIG_PREFIX,sink)).transpose()?;
+        let unconfirmed_key=(unconfirmed_delta!=0).then(||OwnedEventKey::concatenated(original,
+            crate::database::event_bus::UNCONFIRMED_COUNT_CONFIG_PREFIX,sink)).transpose()?;
+        let mut identity=content_identity::OriginalIdentityMutations::new(original,4)?;
+        let mut proof=content_identity::original_writer::ProofAdmission::new(original,self.proof_scratch_owner())?;
+        if let Some(key)=&remove_key {identity.push_status::<u64>(b"sink-queue",key.value.as_bytes(),None)?;}
+        if let (Some(key),Some((_,entry)))=(&put_key,put){identity.push_status(b"sink-queue",key.value.as_bytes(),Some(entry))?;}
+        self.with_db(|db| {
+            let write_txn=Self::begin_history_write(db)?;
+            #[cfg(any(test,feature="test-seams"))]
+            let mut graph_publication_attempt=crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
+            {
+                let definition:TableDefinition<u64,&[u8]>=TableDefinition::new(&table_name.value);
+                let mut table=write_txn.open_table(definition).map_err(Self::storage_error)?;
+                if let Some(id)=remove_id {table.remove(id).map_err(Self::storage_error)?;}
+                if let (Some((id,_)),Some(encoded))=(put,&encoded_put){table.insert(id,encoded.bytes.as_slice()).map_err(Self::storage_error)?;}
+            }
+            if let Some(key)=&uncertain_key {
+                let mut table=write_txn.open_table(CONFIG_TABLE).map_err(Self::storage_error)?;
+                let previous:u64=match table.get(key.value.as_str()).map_err(Self::storage_error)? {
+                    Some(value)=>Self::decode_owned_event::<u64>(original,value.value())?.value,None=>0,
+                };
+                let encoded=Self::encode_owned_event(original,&previous.saturating_add(1))?;
+                table.insert(key.value.as_str(),encoded.bytes.as_slice()).map_err(Self::storage_error)?;
+                identity.push_config(&key.value,Some(&encoded.bytes))?;
+            }
+            if let Some(key)=&unconfirmed_key {
+                let mut table=write_txn.open_table(CONFIG_TABLE).map_err(Self::storage_error)?;
+                let previous:u64=match table.get(key.value.as_str()).map_err(Self::storage_error)? {
+                    Some(value)=>Self::decode_owned_event::<u64>(original,value.value())?.value,None=>0,
+                };
+                let next=if unconfirmed_delta>0{previous.checked_add(1)}else{previous.checked_sub(1)}
+                    .ok_or_else(||Error::Other("sink attempt summary overflow".to_owned()))?;
+                let encoded=Self::encode_owned_event(original,&next)?;
+                table.insert(key.value.as_str(),encoded.bytes.as_slice()).map_err(Self::storage_error)?;
+                identity.push_config(&key.value,Some(&encoded.bytes))?;
+            }
+            Self::apply_owned_content_identity_with_manifests_in_write(&write_txn,&identity.mutations,&[],&mut proof)?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn,None)?;
+            {
+                #[cfg(any(test,feature="test-seams"))] graph_observation_checkpoint(10)?;
+                let graph_commit_result=write_txn.commit();
+                #[cfg(any(test,feature="test-seams"))] if graph_commit_result.is_ok(){graph_publication_attempt.committed();graph_observation_checkpoint(11)?;}
+                graph_commit_result
+            }.map_err(Self::storage_error)?;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn remove_owned_sink_queue_entries(
+        &self,original:&crate::memory_accounting::OwnedMemoryReservation,sink:&str,
+        remove_ids:&[u64],unconfirmed:u64,
+    )->Result<()> {
+        if remove_ids.is_empty(){return Ok(());}
+        let table_name=OwnedEventKey::concatenated(original,"__sink_queue_",sink)?;
+        let removals=Self::prepare_owned_sink_queue_removals(original,sink,remove_ids)?;
+        let summary_key=(unconfirmed>0).then(||OwnedEventKey::concatenated(original,
+            crate::database::event_bus::UNCONFIRMED_COUNT_CONFIG_PREFIX,sink)).transpose()?;
+        let mut identity=content_identity::OriginalIdentityMutations::new(original,1)?;
+        let mut proof=content_identity::original_writer::ProofAdmission::new(original,self.proof_scratch_owner())?;
+        self.with_db(|db| {
+            let write_txn=Self::begin_history_write(db)?;
+            #[cfg(any(test,feature="test-seams"))]
+            let mut graph_publication_attempt=crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
+            {
+                let definition:TableDefinition<u64,&[u8]>=TableDefinition::new(&table_name.value);
+                let mut table=write_txn.open_table(definition).map_err(Self::storage_error)?;
+                for id in remove_ids {table.remove(*id).map_err(Self::storage_error)?;}
+            }
+            if let Some(key)=&summary_key {
+                let mut table=write_txn.open_table(CONFIG_TABLE).map_err(Self::storage_error)?;
+                let previous:u64=match table.get(key.value.as_str()).map_err(Self::storage_error)? {
+                    Some(value)=>Self::decode_owned_event::<u64>(original,value.value())?.value,None=>0,
+                };
+                let next=previous.checked_sub(unconfirmed).ok_or_else(||Error::Other("sink attempt summary overflow".to_owned()))?;
+                let encoded=Self::encode_owned_event(original,&next)?;
+                table.insert(key.value.as_str(),encoded.bytes.as_slice()).map_err(Self::storage_error)?;
+                identity.push_config(&key.value,Some(&encoded.bytes))?;
+            }
+            Self::apply_owned_content_identity_with_manifests_in_write(&write_txn,&removals.mutations,&identity.mutations,&mut proof)?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn,None)?;
+            {
+                #[cfg(any(test,feature="test-seams"))] graph_observation_checkpoint(10)?;
+                let graph_commit_result=write_txn.commit();
+                #[cfg(any(test,feature="test-seams"))] if graph_commit_result.is_ok(){graph_publication_attempt.committed();graph_observation_checkpoint(11)?;}
+                graph_commit_result
+            }.map_err(Self::storage_error)?;
+            Ok(())
+        })
+    }
+
+    // Dormant private queue companions retain the original methods above.
+    pub(crate) fn update_owned_sink_queue_entry_at_boundary<T:serde::Serialize>(
+        &self,original:&crate::memory_accounting::OwnedMemoryReservation,sink:&str,
+        remove_id:Option<u64>,put:Option<(u64,&T)>,uncertain:bool,unconfirmed_delta:i8,
+        completion:&crate::database::event_bus::OwnedQueueCommitToken<'_>,
+        failure:&mut crate::database::event_bus::OwnedNativeQueueFailure,
+    ) {
+        if remove_id.is_none() && put.is_none(){return;}
+        let prepared = (|| -> Result<_> {
+        // All escaping serialization/key controls are paid by this immutable
+        // seed before the transaction can publish their corresponding writes.
+        let table_name=OwnedEventKey::concatenated(original,"__sink_queue_",sink)?;
+        let remove_key=remove_id.map(|id|OwnedEventKey::queue_identity(original,sink,id)).transpose()?;
+        let put_key=put.map(|(id,_)|OwnedEventKey::queue_identity(original,sink,id)).transpose()?;
+        let encoded_put=put.map(|(_,entry)|Self::encode_owned_event(original,entry)).transpose()?;
+        let uncertain_key=uncertain.then(||OwnedEventKey::concatenated(original,
+            crate::database::event_bus::UNCERTAIN_COUNT_CONFIG_PREFIX,sink)).transpose()?;
+        let unconfirmed_key=(unconfirmed_delta!=0).then(||OwnedEventKey::concatenated(original,
+            crate::database::event_bus::UNCONFIRMED_COUNT_CONFIG_PREFIX,sink)).transpose()?;
+        let mut identity=content_identity::OriginalIdentityMutations::new(original,4)?;
+        let proof=content_identity::original_writer::ProofAdmission::new(original,self.proof_scratch_owner())?;
+        if let Some(key)=&remove_key {identity.push_status::<u64>(b"sink-queue",key.value.as_bytes(),None)?;}
+        if let (Some(key),Some((_,entry)))=(&put_key,put){identity.push_status(b"sink-queue",key.value.as_bytes(),Some(entry))?;}
+        Ok((table_name,remove_key,put_key,encoded_put,uncertain_key,unconfirmed_key,identity,proof))
+        })();
+        let (table_name,_remove_key,_put_key,encoded_put,uncertain_key,unconfirmed_key,mut identity,mut proof) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => { failure.capture(Err(error)); return; }
+        };
+        // Retain the actual paid preparation controls until the original
+        // result is captured; no diagnostic dies in a postcommit refund gap.
+        let result = self.with_db(|db| {
+            let write_txn=Self::begin_history_write(db)?;
+            #[cfg(any(test,feature="test-seams"))]
+            let mut graph_publication_attempt=crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
+            {
+                let definition:TableDefinition<u64,&[u8]>=TableDefinition::new(&table_name.value);
+                let mut table=write_txn.open_table(definition).map_err(Self::storage_error)?;
+                if let Some(id)=remove_id {table.remove(id).map_err(Self::storage_error)?;}
+                if let (Some((id,_)),Some(encoded))=(put,&encoded_put){table.insert(id,encoded.bytes.as_slice()).map_err(Self::storage_error)?;}
+            }
+            if let Some(key)=&uncertain_key {
+                let mut table=write_txn.open_table(CONFIG_TABLE).map_err(Self::storage_error)?;
+                let previous:u64=match table.get(key.value.as_str()).map_err(Self::storage_error)? {
+                    Some(value)=>Self::decode_owned_event::<u64>(original,value.value())?.value,None=>0,
+                };
+                let encoded=Self::encode_owned_event(original,&previous.saturating_add(1))?;
+                table.insert(key.value.as_str(),encoded.bytes.as_slice()).map_err(Self::storage_error)?;
+                identity.push_config(&key.value,Some(&encoded.bytes))?;
+            }
+            if let Some(key)=&unconfirmed_key {
+                let mut table=write_txn.open_table(CONFIG_TABLE).map_err(Self::storage_error)?;
+                let previous:u64=match table.get(key.value.as_str()).map_err(Self::storage_error)? {
+                    Some(value)=>Self::decode_owned_event::<u64>(original,value.value())?.value,None=>0,
+                };
+                let next=if unconfirmed_delta>0{previous.checked_add(1)}else{previous.checked_sub(1)}
+                    .ok_or_else(||Error::Other("sink attempt summary overflow".to_owned()))?;
+                let encoded=Self::encode_owned_event(original,&next)?;
+                table.insert(key.value.as_str(),encoded.bytes.as_slice()).map_err(Self::storage_error)?;
+                identity.push_config(&key.value,Some(&encoded.bytes))?;
+            }
+            Self::apply_owned_content_identity_with_manifests_in_write(&write_txn,&identity.mutations,&[],&mut proof)?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn,None)?;
+            {
+                #[cfg(any(test,feature="test-seams"))] graph_observation_checkpoint(10)?;
+                let graph_commit_result=write_txn.commit();
+                // This is the first owning-engine action after redb reports
+                // success. It is not proof against redb's inner postflush gap.
+                if graph_commit_result.is_ok() {
+                    completion.mark_success();
+                    #[cfg(any(test,feature="test-seams"))] {
+                        graph_publication_attempt.committed();
+                        if let Err(error) = graph_observation_checkpoint(11) {
+                            failure.capture(Err(error));
+                        }
+                    }
+                }
+                graph_commit_result
+            }.map_err(Self::storage_error)?;
+            Ok(())
+        });
+        failure.capture(result);
+    }
+
+    pub(crate) fn remove_owned_sink_queue_entries_at_boundary(
+        &self,original:&crate::memory_accounting::OwnedMemoryReservation,sink:&str,
+        remove_ids:&[u64],unconfirmed:u64,
+        completion:&crate::database::event_bus::OwnedQueueCommitToken<'_>,
+        failure:&mut crate::database::event_bus::OwnedNativeQueueFailure,
+    ) {
+        if remove_ids.is_empty(){return;}
+        let prepared = (|| -> Result<_> {
+        let table_name=OwnedEventKey::concatenated(original,"__sink_queue_",sink)?;
+        let removals=Self::prepare_owned_sink_queue_removals(original,sink,remove_ids)?;
+        let summary_key=(unconfirmed>0).then(||OwnedEventKey::concatenated(original,
+            crate::database::event_bus::UNCONFIRMED_COUNT_CONFIG_PREFIX,sink)).transpose()?;
+        let identity=content_identity::OriginalIdentityMutations::new(original,1)?;
+        let proof=content_identity::original_writer::ProofAdmission::new(original,self.proof_scratch_owner())?;
+        Ok((table_name,removals,summary_key,identity,proof))
+        })();
+        let (table_name,removals,summary_key,mut identity,mut proof) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => { failure.capture(Err(error)); return; }
+        };
+        let result = self.with_db(|db| {
+            let write_txn=Self::begin_history_write(db)?;
+            #[cfg(any(test,feature="test-seams"))]
+            let mut graph_publication_attempt=crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
+            {
+                let definition:TableDefinition<u64,&[u8]>=TableDefinition::new(&table_name.value);
+                let mut table=write_txn.open_table(definition).map_err(Self::storage_error)?;
+                for id in remove_ids {table.remove(*id).map_err(Self::storage_error)?;}
+            }
+            if let Some(key)=&summary_key {
+                let mut table=write_txn.open_table(CONFIG_TABLE).map_err(Self::storage_error)?;
+                let previous:u64=match table.get(key.value.as_str()).map_err(Self::storage_error)? {
+                    Some(value)=>Self::decode_owned_event::<u64>(original,value.value())?.value,None=>0,
+                };
+                let next=previous.checked_sub(unconfirmed).ok_or_else(||Error::Other("sink attempt summary overflow".to_owned()))?;
+                let encoded=Self::encode_owned_event(original,&next)?;
+                table.insert(key.value.as_str(),encoded.bytes.as_slice()).map_err(Self::storage_error)?;
+                identity.push_config(&key.value,Some(&encoded.bytes))?;
+            }
+            Self::apply_owned_content_identity_with_manifests_in_write(&write_txn,&removals.mutations,&identity.mutations,&mut proof)?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn,None)?;
+            {
+                #[cfg(any(test,feature="test-seams"))] graph_observation_checkpoint(10)?;
+                let graph_commit_result=write_txn.commit();
+                // This is the first owning-engine action after redb reports
+                // success. It is not proof against redb's inner postflush gap.
+                if graph_commit_result.is_ok() {
+                    completion.mark_success();
+                    #[cfg(any(test,feature="test-seams"))] {
+                        graph_publication_attempt.committed();
+                        if let Err(error) = graph_observation_checkpoint(11) {
+                            failure.capture(Err(error));
+                        }
+                    }
+                }
+                graph_commit_result
+            }.map_err(Self::storage_error)?;
+            Ok(())
+        });
+        failure.capture(result);
+    }
+}
+
+/// Operation-local preparation custody. All values produced by its private
+/// helpers are consumed inside the enclosing synchronous flush; this frame
+/// is declared before them and refunds only after their physical destruction.
+pub(crate) struct OriginalPersistenceFrame<'o> {
+    pub(crate) original: &'o crate::memory_accounting::OwnedMemoryReservation,
+    work: std::cell::RefCell<crate::memory_accounting::OwnedMemoryReservation>,
+}
+impl<'o> OriginalPersistenceFrame<'o> {
+    pub(crate) fn new(original:&'o crate::memory_accounting::OwnedMemoryReservation)->Result<Self>{
+        Ok(Self {original,work:std::cell::RefCell::new(crate::memory_accounting::reserve_preparation_from_original(original,0,
+            "persistence","prepare_commit","Raise MEMORY_LIMIT to admit commit preparation.")?)})
+    }
+    pub(crate) fn into_reservation(self)->crate::memory_accounting::OwnedMemoryReservation{self.work.into_inner()}
+    pub(crate) fn reserve(&self,bytes:usize)->Result<()> {
+        crate::memory_accounting::grow_preparation_from_original(&mut self.work.borrow_mut(),bytes,
+            "persistence","prepare_commit","Raise MEMORY_LIMIT to admit commit preparation.")
+    }
+    pub(crate) fn retain(&self,credit:&mut crate::memory_accounting::OwnedMemoryReservation)->Result<()> {
+        crate::memory_accounting::merge_preparation_original(&mut self.work.borrow_mut(),credit)
+    }
+    pub(crate) fn take_mutation(&self,mut owned:content_identity::OriginalIdentityMutation)->Result<content_identity::ContentIdentityMutation>{
+        content_identity::retain_original_identity_mutation(self,&mut owned)?;
+        Ok(owned.mutation)
+    }
+    pub(crate) fn canonical<T:serde::Serialize+?Sized>(&self,value:&T)->Result<Vec<u8>>{
+        content_identity::retain_original_canonical(self,value)
+    }
+    pub(crate) fn record<T:serde::Serialize+?Sized>(&self,value:&T)->Result<()> {
+        self.reserve(content_identity::original_record_work_bytes(value)?)
+    }
+    pub(crate) fn encode<T:serde::Serialize>(&self,value:&T)->Result<Vec<u8>>{
+        let mut encoded=RedbPersistence::encode_owned_event(self.original,value)?;
+        self.retain(&mut encoded.allocation)?;Ok(encoded.bytes)
+    }
+    pub(crate) fn decode<T:serde::de::DeserializeOwned>(&self,bytes:&[u8])->Result<T>{
+        let mut decoded=RedbPersistence::decode_owned_event(self.original,bytes)?;
+        self.retain(&mut decoded.allocation)?;Ok(decoded.value)
+    }
+    pub(crate) fn copy_bytes(&self,bytes:&[u8])->Result<Vec<u8>>{self.reserve(bytes.len())?;Ok(bytes.to_vec())}
+    pub(crate) fn copy_text(&self,text:&str)->Result<String>{self.reserve(text.len())?;Ok(text.to_owned())}
+    pub(crate) fn array<T>(&self,count:usize)->Result<()> {
+        self.reserve(std::alloc::Layout::array::<T>(count).map_err(|_|Error::Other("commit preparation array overflow".into()))?.size())
+    }
+    pub(crate) fn map<K,V>(&self,count:usize)->Result<()> {
+        self.reserve(crate::memory_accounting::native_map_plan::<K,V>(count)?.layout.size())
+    }
+    pub(crate) fn tree<K,V>(&self,count:usize)->Result<()> {
+        let node=std::mem::size_of::<(K,V)>().checked_mul(11).and_then(|n|n.checked_add(128))
+            .ok_or_else(||Error::Other("commit preparation tree overflow".into()))?;
+        self.reserve(node.checked_mul(count).ok_or_else(||Error::Other("commit preparation tree overflow".into()))?)
+    }
+    fn plan_config(&self, key: &str, value: &[u8]) -> Result<()> {
+        let derived = custody_groups::plan_bytes(key, value)?;
+        self.reserve(key.len().checked_add(value.len())
+            .and_then(|n| n.checked_add(derived))
+            .ok_or_else(||Error::Other("configuration copy overflow".into()))?)
+    }
+    fn plan_write_set(&self,ws:&WriteSet,sink_events:&[PreparedSinkEvent],trigger_audits:&[(u64,TriggerAuditEntry)])->Result<()> {
+        // Concrete per-branch directories coexist with their input bodies.
+        let rows=ws.relational_inserts.len().checked_add(ws.relational_deletes.len())
+            .ok_or_else(||Error::Other("commit row count overflow".into()))?;
+        self.tree::<&str,Vec<&VersionedRow>>(rows)?;
+        self.map::<(String,RowId,TxId,Lsn),HashMap<String,Vec<f32>>>(ws.vector_inserts.len().checked_add(ws.vector_deletes.len()).and_then(|n|n.checked_add(ws.vector_moves.len()*2)).ok_or_else(||Error::Other("commit vector count overflow".into()))?)?;
+        self.array::<Option<(Vec<u8>,TxId,u64)>>(ws.adj_deletes.len())?;
+        self.array::<&DdlChange>(sink_events.len().checked_add(trigger_audits.len()).ok_or_else(||Error::Other("commit event count overflow".into()))?)?;
+        self.tree::<&str,Vec<(usize,&SinkQueueEntry)>>(sink_events.len())?;
+        self.array::<(usize,&SinkQueueEntry)>(sink_events.len().checked_mul(4).ok_or_else(||Error::Other("sink event directory overflow".into()))?)?;
+        for (table,row) in &ws.relational_inserts {self.reserve(table.len())?;self.record(row)?;}
+        for (table,_,_) in &ws.relational_deletes {self.reserve(table.len().checked_mul(4).ok_or_else(||Error::Other("row delete key overflow".into()))?)?;}
+        for edge in &ws.adj_inserts {self.record(edge)?;}
+        for (_,kind,_,_) in &ws.adj_deletes {self.reserve(kind.len().checked_mul(4).and_then(|n|n.checked_add(256)).ok_or_else(||Error::Other("edge delete key overflow".into()))?)?;}
+        for vector in &ws.vector_inserts {self.record(vector)?;}
+        for (sink,entry) in sink_events {self.reserve(sink.len())?;self.record(entry)?;}
+        for (_,audit) in trigger_audits {self.record(audit)?;}
+        for (key,value) in &ws.config_writes {self.plan_config(key, value)?;}
+        Ok(())
+    }
+}
+
+struct OriginalMutationVector<'f,'o> {
+    values:Vec<content_identity::ContentIdentityMutation>,
+    frame:&'f OriginalPersistenceFrame<'o>,
+}
+impl<'f,'o> OriginalMutationVector<'f,'o> {
+    fn new(frame:&'f OriginalPersistenceFrame<'o>)->Self{Self{values:Vec::new(),frame}}
+    fn from_vec(frame:&'f OriginalPersistenceFrame<'o>,values:Vec<content_identity::ContentIdentityMutation>)->Self{Self{values,frame}}
+    fn push(&mut self,value:content_identity::ContentIdentityMutation)->Result<()> {
+        if self.values.len()==self.values.capacity(){
+            let next=self.values.capacity().checked_mul(2).map(|n|n.max(4)).ok_or_else(||Error::Other("logical identity mutation capacity overflow".into()))?;
+            self.frame.array::<content_identity::ContentIdentityMutation>(next)?;
+            let mut successor=Vec::with_capacity(next);successor.append(&mut self.values);
+            let prior=std::mem::replace(&mut self.values,successor);drop(prior);
+        }
+        self.values.push(value);Ok(())
+    }
+    fn extend(&mut self,values:impl IntoIterator<Item=content_identity::ContentIdentityMutation>)->Result<()> {for value in values{self.push(value)?;}Ok(())}
+    fn into_vec(self)->Vec<content_identity::ContentIdentityMutation>{self.values}
+}
+impl std::ops::Deref for OriginalMutationVector<'_,'_>{type Target=Vec<content_identity::ContentIdentityMutation>;fn deref(&self)->&Self::Target{&self.values}}
+impl IntoIterator for OriginalMutationVector<'_,'_>{type Item=content_identity::ContentIdentityMutation;type IntoIter=std::vec::IntoIter<Self::Item>;fn into_iter(self)->Self::IntoIter{self.values.into_iter()}}
+
+struct OriginalWindowMemory(std::cell::RefCell<crate::memory_accounting::OwnedMemoryReservation>);
+impl OriginalWindowMemory {
+    fn new(original:&crate::memory_accounting::OwnedMemoryReservation)->Result<Self>{Ok(Self(std::cell::RefCell::new(crate::memory_accounting::reserve_preparation_from_original(original,0,"writer_source","graph_delete_window","Raise MEMORY_LIMIT to decode the selected edge version.")?)))}
+    fn reserve(&self,bytes:usize)->Result<()>{crate::memory_accounting::grow_preparation_from_original(&mut self.0.borrow_mut(),bytes,"writer_source","graph_delete_window","Raise MEMORY_LIMIT to decode the selected edge version.")}
+    fn scope<T>(&self,f:impl FnOnce()->T)->T{f()}
+}
+
+fn original_schema_config_values<'a>(
+    non_event:&'a [(String,Vec<u8>)],events:Option<&'a [(String,Vec<u8>)]>,cut:usize,
+)->Result<impl Iterator<Item=&'a (String,Vec<u8>)> + Clone> {
+    if cut>non_event.len(){return Err(Error::Other("native schema config insertion point exceeds projection".into()));}
+    Ok(non_event[..cut].iter().chain(events.into_iter().flatten()).chain(non_event[cut..].iter()))
+}
+
+pub(crate) fn original_schema_event_config_position(non_event:&[(String,Vec<u8>)])->usize {
+    // These are the existing private wire keys, not a consumer policy list.
+    // The original builder appends the event config immediately before its
+    // optional trigger projection; source-order and duplicate-key precedence
+    // are therefore preserved without regrouping either projection.
+    non_event.iter().position(|(key,_)|key=="__trigger_declarations"||key=="__trigger_including_sync").unwrap_or(non_event.len())
+}
+
+impl RedbPersistence {
+    fn encode_into_original<T:serde::Serialize>(frame:&OriginalPersistenceFrame<'_>,value:&T,encoded:&mut Vec<u8>)->Result<()> {
+        let next=frame.encode(value)?;let old=std::mem::replace(encoded,next);drop(old);Ok(())
+    }
+    pub(crate) fn reserve_owned_writer_snapshot(&self,original:&crate::memory_accounting::OwnedMemoryReservation)->Result<crate::memory_accounting::OwnedMemoryReservation>{
+        self.prepare_proof_owner()?;let _schema=self.prepared_writer_schema()?;
+        crate::memory_accounting::reserve_preparation_from_original(original,std::mem::size_of::<WriterSnapshot>()+56,
+            "writer_source","published_root","Raise MEMORY_LIMIT to admit the published writer root.")
+    }
+}
+
+/// Actual startup queue decoding over the already captured encoded root.
+/// Count and decode never open a second reader transaction. Raw action ids,
+/// attempts and row identities are preserved for the companion's sanitization
+/// and next-id recovery at the original startup publication positions.
+pub(crate) struct OriginalLoadedSinkQueue {
+    pub(crate) entries:Vec<(u64,SinkQueueEntry)>,
+    _allocation:crate::memory_accounting::OwnedMemoryReservation,
+}
+impl OwnedEncodedEventSource<'_> {
+    pub(crate) fn decode_owned_sink_queue(&self,original:&crate::memory_accounting::OwnedMemoryReservation,sink:&str)->Result<OriginalLoadedSinkQueue>{
+        let mut count=0usize;self.visit(sink,|_,_|{count=count.checked_add(1).ok_or_else(||Error::Other("sink queue startup count overflow".into()))?;Ok(())})?;
+        let (entries,allocation)=crate::memory_accounting::new_owned_native_vec::<(u64,SinkQueueEntry)>(original,count)?;
+        let mut loaded=OriginalLoadedSinkQueue{entries,_allocation:allocation};
+        self.visit(sink,|id,bytes| {
+            let mut entry=RedbPersistence::decode_owned_event::<SinkQueueEntry>(original,bytes)?;
+            crate::memory_accounting::merge_preparation_original(&mut loaded._allocation,&mut entry.allocation)?;
+            loaded.entries.push((id,entry.value));Ok(())
+        })?;
+        if loaded.entries.len()!=count{return Err(Error::Other("captured sink queue changed between count and decode".into()));}
+        Ok(loaded)
+    }
+}
+
+mod original_relational_manifest {
+use super::*;
+use content_identity::original_version_manifest as manifest;
+struct OriginalManifestResume {bytes:Vec<u8>,credit:Option<crate::memory_accounting::OwnedMemoryReservation>}
+pub(super) struct OriginalPendingManifestPublication {
+    pub(super) mutations: Vec<content_identity::ContentIdentityMutation>,
+    admission: content_identity::original_writer::ProofAdmission,
+}
+impl OriginalPendingManifestPublication {
+    pub(super) fn new(admission: content_identity::original_writer::ProofAdmission) -> Self {
+        Self {
+            mutations: Vec::new(),
+            admission,
+        }
+    }
+    fn push(&mut self, coordinate: &[u8], present: bool) -> Result<()> {
+        if self.mutations.len() == self.mutations.capacity() {
+            let old = self.mutations.capacity();
+            let capacity = old
+                .checked_mul(2)
+                .map(|n| n.max(4))
+                .ok_or_else(|| Error::Other("manifest publication capacity overflow".into()))?;
+            let bytes = capacity
+                .checked_mul(std::mem::size_of::<content_identity::ContentIdentityMutation>())
+                .ok_or_else(|| Error::Other("manifest publication layout overflow".into()))?;
+            self.admission.admit(bytes)?;
+            let mut next = Vec::with_capacity(capacity);
+            next.extend(std::mem::take(&mut self.mutations));
+            self.mutations = next;
+            self.admission
+                .release(old * std::mem::size_of::<content_identity::ContentIdentityMutation>());
+        }
+        let bytes = manifest::manifest_mutation_bytes(coordinate, present)?;
+        self.admission.admit(bytes)?;
+        let mutation = manifest::manifest_mutation(coordinate, present)?;
+        debug_assert_eq!(
+            mutation.logical_key.capacity()
+                + mutation.logical_value.as_ref().map_or(0, Vec::capacity),
+            bytes
+        );
+        self.mutations.push(mutation);
+        Ok(())
+    }
+}
+
+
+impl RedbPersistence {
+pub(crate) fn relational_manifest_has_successor_in_write_original(
+        &self,
+        original:&crate::memory_accounting::OwnedMemoryReservation,
+        write: &redb::WriteTransaction,
+        table: &str,
+        physical: &[u8],
+    ) -> Result<bool> {
+        if physical.len() != 24 {
+            return Err(self.relational_manifest_damage("invalid physical version identity"));
+        }
+        let mut admission = content_identity::original_writer::ProofAdmission::new(original,self.proof_scratch_owner())?;
+        admission.admit(
+            table
+                .len()
+                .checked_add(72)
+                .ok_or_else(|| self.relational_manifest_damage("identity allocation overflow"))?,
+        )?;
+        let mut prefix = manifest::manifest_prefix(table)?;
+        prefix.extend_from_slice(physical);
+        let coordinate = manifest::writer_manifest_next(write, &prefix, false, &mut admission)
+            .map_err(|e| self.relational_manifest_error(e))?
+            .filter(|key| key.starts_with(&prefix))
+            .ok_or_else(|| self.relational_manifest_damage("physical version member is missing"))?;
+        let next = manifest::writer_manifest_next(write, &coordinate, true, &mut admission)
+            .map_err(|e| self.relational_manifest_error(e))?;
+        let Some(next) = next else {
+            return Ok(false);
+        };
+        if next.starts_with(&prefix) {
+            return Err(self.relational_manifest_damage("duplicate physical version member"));
+        }
+        let witness =
+            manifest::parse_manifest(&next).map_err(|e| self.relational_manifest_error(e))?;
+        Ok(witness.table == table && witness.identity[..8] == physical[..8])
+    }
+pub(crate) fn replace_relational_manifest_in_write_original(
+        &self,
+        original:&crate::memory_accounting::OwnedMemoryReservation,
+        write: &redb::WriteTransaction,
+        table: &str,
+        physical: &[u8],
+        old: Option<&[u8]>,
+        new: Option<&[u8]>,
+    ) -> Result<()> {
+        self.replace_relational_manifest_pending_in_write_original(original,write, table, physical, old, new, None)
+    }
+pub(crate) fn replace_relational_manifest_pending_in_write_original(
+        &self,
+        original:&crate::memory_accounting::OwnedMemoryReservation,
+        write: &redb::WriteTransaction,
+        table: &str,
+        physical: &[u8],
+        old: Option<&[u8]>,
+        new: Option<&[u8]>,
+        mut pending: Option<&mut OriginalPendingManifestPublication>,
+    ) -> Result<()> {
+        #[cfg(any(test, feature = "test-seams"))]
+        let _family_scope = content_identity::enter_passive_family(
+            content_identity::LogicalFamily::ChangeAndDdl,
+        );
+        let mut admission = content_identity::original_writer::ProofAdmission::new(original,self.proof_scratch_owner())?;
+        admission.admit(
+            table
+                .len()
+                .checked_add(72)
+                .ok_or_else(|| self.relational_manifest_damage("identity allocation overflow"))?,
+        )?;
+        let mut prefix = manifest::manifest_prefix(table)?;
+        prefix.extend_from_slice(physical);
+        let expected = manifest::writer_manifest_next_pending(
+            write,
+            &prefix,
+            false,
+            &mut admission,
+            pending.as_ref().map_or(&[], |p| p.mutations.as_slice()),
+        )
+        .map_err(|e| self.relational_manifest_error(e))?;
+        let old_coordinate = old
+            .map(|body| manifest::manifest_for_body(table, physical, body, &mut admission))
+            .transpose()
+            .map_err(|e| self.relational_manifest_error(e))?;
+        let addressed = expected.as_deref().filter(|key| key.starts_with(&prefix));
+        if addressed != old_coordinate.as_deref() {
+            return Err(self.relational_manifest_damage(
+                "persisted predecessor and rooted version member disagree",
+            ));
+        }
+        if let Some(coordinate) = &old_coordinate {
+            let next = manifest::writer_manifest_next_pending(
+                write,
+                coordinate,
+                true,
+                &mut admission,
+                pending.as_ref().map_or(&[], |p| p.mutations.as_slice()),
+            )
+            .map_err(|e| self.relational_manifest_error(e))?;
+            if next.as_deref().is_some_and(|key| key.starts_with(&prefix)) {
+                return Err(self.relational_manifest_damage("duplicate physical version member"));
+            }
+        }
+        let new_coordinate = new
+            .map(|body| manifest::manifest_for_body(table, physical, body, &mut admission))
+            .transpose()
+            .map_err(|e| self.relational_manifest_error(e))?;
+        if old_coordinate == new_coordinate {
+            return Ok(());
+        }
+        if let Some(pending) = pending.as_mut() {
+            if let Some(key) = &old_coordinate {
+                pending.push(key, false)?;
+            }
+            if let Some(key) = &new_coordinate {
+                pending.push(key, true)?;
+            }
+            return Ok(());
+        }
+        let capacity = old_coordinate
+            .iter()
+            .chain(new_coordinate.iter())
+            .try_fold(
+                2 * std::mem::size_of::<content_identity::ContentIdentityMutation>(),
+                |n, key| {
+                    n.checked_add(key.len())
+                        .and_then(|n| n.checked_add(64))
+                        .ok_or_else(|| {
+                            self.relational_manifest_damage("mutation allocation overflow")
+                        })
+                },
+            )?;
+        admission.admit(capacity)?;
+        let mut mutations = Vec::with_capacity(2);
+        if let Some(key) = old_coordinate {
+            mutations.push(manifest::manifest_mutation(&key, false)?);
+        }
+        if let Some(key) = new_coordinate {
+            mutations.push(manifest::manifest_mutation(&key, true)?);
+        }
+        Self::apply_owned_content_identity_with_manifests_in_write(write, &mutations, &[], &mut admission)?;
+        Ok(())
+    }
+pub(crate) fn verify_relational_group_in_write_original(
+        &self,
+        original:&crate::memory_accounting::OwnedMemoryReservation,
+        write: &redb::WriteTransaction,
+        table: &str,
+        row_id: RowId,
+        relation: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    ) -> Result<()> {
+        self.verify_relational_group_pending_in_write_original(original,write, table, row_id, relation, &[])
+    }
+pub(crate) fn verify_relational_group_pending_in_write_original(
+        &self,
+        original:&crate::memory_accounting::OwnedMemoryReservation,
+        write: &redb::WriteTransaction,
+        table: &str,
+        row_id: RowId,
+        relation: &impl ReadableTable<&'static [u8], &'static [u8]>,
+        pending: &[content_identity::ContentIdentityMutation],
+    ) -> Result<()> {
+        let mut admission = content_identity::original_writer::ProofAdmission::new(original,self.proof_scratch_owner())?;
+        admission.admit(
+            table
+                .len()
+                .checked_add(72)
+                .and_then(|n| n.checked_mul(3))
+                .ok_or_else(|| self.relational_manifest_damage("writer group bound overflow"))?,
+        )?;
+        let mut prefix = manifest::manifest_prefix(table)?;
+        prefix.extend_from_slice(&row_id.0.to_be_bytes());
+        let mut after = OriginalManifestResume {bytes:prefix.clone(),credit:None};
+        let mut exclusive = false;
+        let (low, high) = Self::rel_row_key_range(row_id);
+        let mut physical = relation
+            .range(low.as_slice()..high.as_slice())
+            .map_err(Self::storage_error)?;
+        let mut previous = None;
+        loop {
+            let mut window = content_identity::original_writer::ProofAdmission::new(original,self.proof_scratch_owner())?;
+            let next = manifest::writer_manifest_next_pending(
+                write,
+                &after.bytes,
+                exclusive,
+                &mut window,
+                pending,
+            )
+            .map_err(|e| self.relational_manifest_error(e))?;
+            let Some(coordinate) = next.filter(|key| key.starts_with(&prefix)) else {
+                if physical
+                    .next()
+                    .transpose()
+                    .map_err(Self::storage_error)?
+                    .is_some()
+                {
+                    return Err(self.relational_manifest_damage("unwitnessed writer group suffix"));
+                }
+                return Ok(());
+            };
+            let witness = manifest::parse_manifest(&coordinate)
+                .map_err(|e| self.relational_manifest_error(e))?;
+            if previous.is_some_and(|old| old >= witness.identity) {
+                return Err(
+                    self.relational_manifest_damage("duplicate or reordered writer version")
+                );
+            }
+            previous = Some(witness.identity);
+            let Some((key, body)) = physical.next().transpose().map_err(Self::storage_error)?
+            else {
+                return Err(
+                    self.relational_manifest_damage("writer group version is physically missing")
+                );
+            };
+            if key.value() != witness.identity {
+                return Err(
+                    self.relational_manifest_damage("writer group physical order disagrees")
+                );
+            }
+            let actual = manifest::manifest_for_body(table, key.value(), body.value(), &mut window)
+                .map_err(|e| self.relational_manifest_error(e))?;
+            if actual != coordinate {
+                return Err(self.relational_manifest_damage(
+                    "writer group body or closure is unauthenticated",
+                ));
+            }
+            let next_credit=window.detach_original(coordinate.capacity());
+            let old=std::mem::replace(&mut after.bytes,coordinate);drop(old);drop(after.credit.replace(next_credit));
+            exclusive = true;
+        }
+    }
+}
+}
+
+impl RedbPersistence {
+pub(crate) fn flush_owned_data_with_logs_and_sink_events(
+        &self,
+original:&crate::memory_accounting::OwnedMemoryReservation,
+        ws: &WriteSet,
+        change_log: &[ChangeLogEntry],
+        options: FlushDataOptions<'_>, schema_config:Option<&[(String,Vec<u8>)]>, config_cut:usize) -> Result<()> {
+        let frame=OriginalPersistenceFrame::new(original)?;
+        frame.plan_write_set(ws,options.sink_events,options.trigger_audits)?;
+
+
+
+        let deleted_rows_snapshot = options.snapshots.deleted_rows;
+        let sink_events = options.sink_events;
+        let trigger_audits = options.trigger_audits;
+        let schema_ddl = options.schema_ddl;
+        let max_sink_queue_depth = options.max_sink_queue_depth;
+        let partition_mutations = options.partition_mutations;
+        if let Some(received_schema) = options.received_schema {
+            return self.flush_owned_received_schema_stage(original,
+                ws,
+                change_log,
+                received_schema,
+                sink_events,
+                trigger_audits,
+                max_sink_queue_depth,schema_config,config_cut);
+        }
+        let loaded_table_meta;
+        let table_meta = match options.snapshots.table_meta {
+            Some(table_meta) => table_meta,
+            None => {
+                loaded_table_meta = self.load_all_table_meta()?;
+                &loaded_table_meta
+            }
+        };
+        let write_set_has_vector_changes = !ws.vector_deletes.is_empty()
+            || !ws.vector_inserts.is_empty()
+            || !ws.vector_moves.is_empty();
+        if write_set_has_vector_changes
+            && partition_mutations.is_none_or(PreparedVectorPartitionMutationBatch::is_empty)
+        {
+            return Err(Error::Other(
+                "vector persistence requires a prepared partition mutation batch".to_string(),
+            ));
+        }
+        let has_vector_changes = write_set_has_vector_changes
+            || partition_mutations.is_some_and(|batch| !batch.is_empty());
+        let vector_quantization = if has_vector_changes {
+            Self::vector_quantization_map(table_meta)
+        } else {
+            HashMap::new()
+        };
+        // Runtime rows deliberately retain no vector body, but the durable
+        // F32 row value is the independent half of the direct-reader
+        // divergence proof. Rejoin the staged vector with the exact row
+        // occurrence while both are still inside this commit; quantized
+        // columns continue to persist only their vector-store body.
+        let mut f32_row_vectors =
+            HashMap::<(String, RowId, TxId, Lsn), HashMap<String, Vec<f32>>>::new();
+        for entry in &ws.vector_inserts {
+            if !matches!(
+                vector_quantization.get(&entry.index),
+                Some(VectorQuantization::F32)
+            ) {
+                continue;
+            }
+            f32_row_vectors
+                .entry((
+                    entry.index.table.clone(),
+                    entry.row_id,
+                    entry.created_tx,
+                    entry.lsn,
+                ))
+                .or_default()
+                .insert(entry.index.column.clone(), entry.vector.clone());
+        }
+        let prepared_local_erasure_vector_generations = options
+            .local_erasure
+            .as_ref()
+            .map(|erasure| self.prepare_authoritative_purge_vector_generations(erasure.projection))
+            .transpose()?
+            .unwrap_or_default();
+        for (key, value) in schema_ddl.event_bus.into_iter().flat_map(|ddl| ddl.config_values.iter())
+            .chain(schema_ddl.trigger.into_iter().flat_map(|ddl| ddl.config_values.iter())) {
+            frame.plan_config(key, value)?;
+        }
+        let group_plan = custody_groups::GroupPlan::prepaid(ws.config_writes.iter()
+            .chain(schema_ddl.event_bus.into_iter().flat_map(|ddl| ddl.config_values.iter()))
+            .chain(schema_ddl.trigger.into_iter().flat_map(|ddl| ddl.config_values.iter())))?;
+        self.with_db(|db| {
+            let write_txn = Self::begin_history_write(db)?;
+#[cfg(any(test, feature = "test-seams"))]
+let mut graph_publication_attempt = crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
+            let graph_commit_support=Self::capture_graph_commit_support(&write_txn,ws.commit_lsn)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut stage_started = std::time::Instant::now();
+            let mut pending_manifests = original_relational_manifest::OriginalPendingManifestPublication::new(content_identity::original_writer::ProofAdmission::new(&frame.original,self.proof_scratch_owner())?);
+            let mut identity_mutations = OriginalMutationVector::new(&frame);
+            for (table, row_id, _) in &ws.relational_deletes {
+                identity_mutations.push(content_identity::original_producers::remove_row_mutation(&frame,table, *row_id)?)?;
+            }
+            for (table, row) in &ws.relational_inserts {
+                identity_mutations.push(content_identity::original_producers::row_mutation(&frame,
+                    table,
+                    row,
+                    table_meta.get(table),
+                )?)?;
+            }
+            for (source, edge_type, target, _) in &ws.adj_deletes {
+                identity_mutations.push(content_identity::original_producers::remove_edge_mutation(&frame,
+                    *source, edge_type, *target,
+                )?)?;
+            }
+            for edge in &ws.adj_inserts {
+                identity_mutations.push(content_identity::original_producers::edge_mutation(&frame,edge)?)?;
+            }
+            if let Some(batch) = partition_mutations {
+                for mutation in &batch.mutations {
+                    match mutation {
+                        PreparedVectorPartitionMutation::Delete { index, before, .. } => {
+                            let quantization = vector_quantization
+                                .get(index)
+                                .copied()
+                                .unwrap_or_default();
+                            identity_mutations.push(content_identity::original_producers::remove_vector_mutation(&frame,
+                                index,
+                                before.row.row_id,
+                                quantization,
+                            )?)?;
+                        }
+                        PreparedVectorPartitionMutation::Insert { index, entry, .. } => {
+                            let quantization = vector_quantization
+                                .get(index)
+                                .copied()
+                                .unwrap_or_default();
+                            identity_mutations
+                                .push(content_identity::original_producers::vector_mutation(&frame,entry, quantization)?);
+                            identity_mutations.push(content_identity::original_producers::vector_version_mutation(&frame,
+                                entry,
+                                quantization,
+                            )?)?;
+                        }
+                        PreparedVectorPartitionMutation::Move {
+                            index,
+                            before,
+                            after,
+                            moved_tx,
+                        } => {
+                            let quantization = vector_quantization
+                                .get(index)
+                                .copied()
+                                .unwrap_or_default();
+                            identity_mutations.push(content_identity::original_producers::remove_vector_mutation(&frame,
+                                index,
+                                before.row.row_id,
+                                quantization,
+                            )?)?;
+                            let mut moved = VectorEntry {
+                                index: index.clone(),
+                                row_id: after.row.row_id,
+                                vector: Vec::new(),
+                                created_tx: *moved_tx,
+                                deleted_tx: None,
+                                lsn: batch.commit_lsn,
+                            };
+                            if let PreparedVectorPartitionMutation::Move { before, .. } = mutation {
+                                let vectors = content_size::open_vectors(&write_txn)
+                                    .map_err(Self::storage_error)?;
+                                let source_key = Self::vector_identity_key(
+                                    index,
+                                    before.row.row_id,
+                                    before.vector_created_tx,
+                                    before.vector_lsn,
+                                );
+                                let source = vectors
+                                    .get(source_key.as_slice())
+                                    .map_err(Self::storage_error)?
+                                    .ok_or_else(|| {
+                                        self.vector_partition_corruption(
+                                            "a prepared move has no durable source vector",
+                                        )
+                                    })?;
+                                moved.vector = Self::decode_vector_entry_original(&frame,source.value())?.vector;
+                            }
+                            identity_mutations
+                                .push(content_identity::original_producers::vector_mutation(&frame,&moved, quantization)?);
+                            identity_mutations.push(content_identity::original_producers::vector_version_mutation(&frame,
+                                &moved,
+                                quantization,
+                            )?)?;
+                        }
+                    }
+                }
+            }
+
+            // Deletes and key-only replacements do not carry a new vector
+            // body in the WriteSet. Their prepared bindings identify the
+            // exact already-durable body, so preserve that witness on both
+            // the retired row occurrence and any moved successor.
+            if let Some(batch) = partition_mutations {
+                let vectors = content_size::open_vectors(&write_txn)
+                    .map_err(Self::storage_error)?;
+                for mutation in &batch.mutations {
+                    let (index, before, after) = match mutation {
+                        PreparedVectorPartitionMutation::Delete { index, before, .. } => {
+                            (index, before, None)
+                        }
+                        PreparedVectorPartitionMutation::Move {
+                            index,
+                            before,
+                            after,
+                            ..
+                        } => (index, before, Some(after)),
+                        PreparedVectorPartitionMutation::Insert { .. } => continue,
+                    };
+                    if !matches!(
+                        vector_quantization.get(index),
+                        Some(VectorQuantization::F32)
+                    ) {
+                        continue;
+                    }
+                    let key = Self::vector_identity_key(
+                        index,
+                        before.row.row_id,
+                        before.vector_created_tx,
+                        before.vector_lsn,
+                    );
+                    let stored = vectors
+                        .get(key.as_slice())
+                        .map_err(Self::storage_error)?
+                        .ok_or_else(|| {
+                            self.vector_partition_corruption(
+                                "a prepared row publication has no durable source vector",
+                            )
+                        })?;
+                    let entry = Self::decode_vector_entry_original(&frame,stored.value())?;
+                    f32_row_vectors
+                        .entry((
+                            index.table.clone(),
+                            before.row.row_id,
+                            before.row.created_tx,
+                            before.row.lsn,
+                        ))
+                        .or_default()
+                        .insert(index.column.clone(), entry.vector.clone());
+                    if let Some(after) = after {
+                        f32_row_vectors
+                            .entry((
+                                index.table.clone(),
+                                after.row.row_id,
+                                after.row.created_tx,
+                                after.row.lsn,
+                            ))
+                            .or_default()
+                            .insert(index.column.clone(), entry.vector);
+                    }
+                }
+            }
+
+            let mut relational_deletes_by_table = BTreeMap::<&str, Vec<(RowId, TxId)>>::new();
+            for (table, row_id, deleted_tx) in &ws.relational_deletes {
+                relational_deletes_by_table
+                    .entry(table.as_str())
+                    .or_default()
+                    .push((*row_id, *deleted_tx));
+            }
+            for (table, deletes) in relational_deletes_by_table {
+                let table_name = Self::rel_table_name(table);
+                let table_def: TableDefinition<&[u8], &[u8]> =
+                    TableDefinition::new(table_name.as_str());
+                let mut redb_table = content_size::open_rows(&write_txn, table_def)
+                    .map_err(Self::storage_error)?;
+                let mut encoded = Vec::new();
+                for (row_id, deleted_tx) in deletes {
+                    self.verify_relational_group_pending_in_write_original(&frame.original,&write_txn, table, row_id, &*redb_table, &pending_manifests.mutations)?;
+                    let _row_scope = crate::read_image_memory::active_owner()?.row_owner()?.enter();
+                    if let Some(row) = deleted_rows_snapshot
+                        .as_ref()
+                        .and_then(|by_table| by_table.get(table))
+                        .and_then(|by_row| by_row.get(&row_id))
+                    {
+                        if row.deleted_tx.is_some() {
+                            continue;
+                        }
+                        let key = Self::rel_row_key(row);
+                        let mut overlay = redb_table
+                            .get(key.as_slice())
+                            .map_err(Self::storage_error)?
+                            .map(|stored| {
+                                Self::decode_versioned_row_original(&frame,stored.value(), table_meta.get(table))
+                            })
+                            .transpose()?
+                            .map(|stored| {
+                                Self::f32_vectors_from_row_original(&frame,&stored, table_meta.get(table))
+                            }).transpose()?.unwrap_or_default();
+                        if let Some(staged) = f32_row_vectors.get(&(
+                            table.to_owned(),
+                            row.row_id,
+                            row.created_tx,
+                            row.lsn,
+                        )) {
+                            overlay.extend(staged.clone());
+                        }
+                        Self::encode_versioned_row_with_f32_overlay_into_original(&frame,
+                            row,
+                            Some(deleted_tx),
+                            table_meta.get(table),
+                            Some(&overlay),
+                            &mut encoded,
+                        )?;
+                        {
+                            let predecessor = redb_table.get(key.as_slice()).map_err(Self::storage_error)?;
+                            self.replace_relational_manifest_pending_in_write_original(&frame.original,&write_txn, table, key.as_slice(), predecessor.as_ref().map(|body| body.value()), Some(encoded.as_slice()), Some(&mut pending_manifests))?;
+                        }
+                        redb_table
+                            .insert(key.as_slice(), encoded.as_slice())
+                            .map_err(Self::storage_error)?;
+                        continue;
+                    }
+                    let (lower, upper) = Self::rel_row_key_range(row_id);
+                    let latest_version = {
+                        let mut range = redb_table
+                            .range(lower.as_slice()..upper.as_slice())
+                            .map_err(Self::storage_error)?;
+                        range
+                            .next_back()
+                            .transpose()
+                            .map_err(Self::storage_error)?
+                            .map(|(key, value)| {
+                                let row = Self::decode_versioned_row_original(&frame,
+                                    value.value(),
+                                    table_meta.get(table),
+                                )?;
+                                Ok::<_, Error>((key.value().to_vec(), row))
+                            })
+                            .transpose()?
+                    };
+                    let Some((key, mut row)) = latest_version else {
+                        continue;
+                    };
+                    if row.row_id != row_id || row.deleted_tx.is_some() {
+                        continue;
+                    }
+                    row.deleted_tx = Some(deleted_tx);
+                    Self::encode_versioned_row_into_original(&frame,&row, table_meta.get(table), &mut encoded)?;
+                    {
+                        let predecessor = redb_table.get(key.as_slice()).map_err(Self::storage_error)?;
+                        self.replace_relational_manifest_pending_in_write_original(&frame.original,&write_txn, table, key.as_slice(), predecessor.as_ref().map(|body| body.value()), Some(encoded.as_slice()), Some(&mut pending_manifests))?;
+                    }
+                    redb_table
+                        .insert(key.as_slice(), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+            }
+
+            let _replacement_lookup_charge = Some(crate::memory_accounting::persistence_original_projection(frame.original)?.as_handle()).map(|accountant| {
+                crate::memory_accounting::reserve_preparation_from_original(frame.original, ws.relational_deletes.len().saturating_mul(128).saturating_add(64),
+                    "writer_source", "replacement_lookup", "Raise MEMORY_LIMIT to prepare row replacement identities.",
+                )
+            }).transpose()?;
+            let replaced_rows = ws.relational_deletes.iter()
+                .map(|(table, row_id, _)| (table.as_str(), *row_id))
+                .collect::<HashSet<_>>();
+            let mut relational_inserts_by_table = BTreeMap::<&str, Vec<&VersionedRow>>::new();
+            for (table, row) in &ws.relational_inserts {
+                relational_inserts_by_table
+                    .entry(table.as_str())
+                    .or_default()
+                    .push(row);
+            }
+            for (table, rows) in relational_inserts_by_table {
+                let table_name = Self::rel_table_name(table);
+                let table_def: TableDefinition<&[u8], &[u8]> =
+                    TableDefinition::new(table_name.as_str());
+                let mut redb_table = content_size::open_rows(&write_txn, table_def)
+                    .map_err(Self::storage_error)?;
+                let mut encoded = Vec::new();
+                for row in rows {
+                    let _row_scope = crate::read_image_memory::active_owner()?.row_owner()?.enter();
+                    // An ordinary update reopens with body-free runtime rows
+                    // and need not stage an unchanged vector again. Carry the
+                    // independent F32 witness from the exact prior row id into
+                    // its successor; explicitly staged vectors win when the
+                    // update did change a vector.
+                    let replaces_same_row = replaced_rows.contains(&(table, row.row_id));
+                    let mut overlay = if replaces_same_row {
+                        let (lower, upper) = Self::rel_row_key_range(row.row_id);
+                        let mut range = redb_table
+                            .range(lower.as_slice()..upper.as_slice())
+                            .map_err(Self::storage_error)?;
+                        range
+                            .next_back()
+                            .transpose()
+                            .map_err(Self::storage_error)?
+                            .map(|(_, stored)| {
+                                Self::decode_versioned_row_original(&frame,
+                                    stored.value(),
+                                    table_meta.get(table),
+                                )
+                            })
+                            .transpose()?
+                            .map(|stored| {
+                                Self::f32_vectors_from_row_original(&frame,&stored, table_meta.get(table))
+                            }).transpose()?.unwrap_or_default()
+                    } else {
+                        HashMap::new()
+                    };
+                    // A clear removes the prior body's witness from this
+                    // successor. A replacement may stage a new body below.
+                    overlay.retain(|column, _| {
+                        !ws.vector_deletes.iter().any(|(index, deleted_row, _)| {
+                            index.table == table
+                                && *deleted_row == row.row_id
+                                && index.column == *column
+                        })
+                    });
+                    if let Some(staged) = f32_row_vectors.get(&(
+                        table.to_owned(),
+                        row.row_id,
+                        row.created_tx,
+                        row.lsn,
+                    )) {
+                        overlay.extend(staged.clone());
+                    }
+                    Self::encode_versioned_row_with_f32_overlay_into_original(&frame,
+                        row,
+                        row.deleted_tx,
+                        table_meta.get(table),
+                        Some(&overlay),
+                        &mut encoded,
+                    )?;
+                    let key = Self::rel_row_key(row);
+                    {
+                        let predecessor = redb_table.get(key.as_slice()).map_err(Self::storage_error)?;
+                        self.replace_relational_manifest_pending_in_write_original(&frame.original,&write_txn, table, key.as_slice(), predecessor.as_ref().map(|body| body.value()), Some(encoded.as_slice()), Some(&mut pending_manifests))?;
+                    }
+                    redb_table
+                        .insert(key.as_slice(), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+            }
+
+            identity_mutations.extend(Self::flush_relational_index_changes_in_write_original(&frame,
+                &write_txn,
+                ws,
+                table_meta,
+                deleted_rows_snapshot.as_ref(),
+            )?)?;
+
+            let (clear_source_lsns, set_source_lsns) = sync_source_lsn_updates(ws);
+            if !clear_source_lsns.is_empty() || !set_source_lsns.is_empty() {
+                let mut source_lsn_table = write_txn
+                    .open_table(SYNC_ROW_SOURCE_LSN_TABLE)
+                    .map_err(Self::storage_error)?;
+                let mut source_kind_table = write_txn
+                    .open_table(SYNC_ROW_SOURCE_KIND_TABLE)
+                    .map_err(Self::storage_error)?;
+                for (table, row_id) in clear_source_lsns {
+                    let key = Self::sync_row_source_lsn_key(&table, row_id);
+                    source_lsn_table
+                        .remove(key.as_slice())
+                        .map_err(Self::storage_error)?;
+                    source_kind_table
+                        .remove(key.as_slice())
+                        .map_err(Self::storage_error)?;
+                    identity_mutations.push(content_identity::original_producers::remove(&frame,
+                        content_identity::LogicalFamily::Sync,
+                        key,
+                    )?)?;
+                }
+                for (table, row_id, source_lsn, kind) in set_source_lsns {
+                    let key = Self::sync_row_source_lsn_key(&table, row_id);
+                    source_lsn_table
+                        .insert(key.as_slice(), source_lsn.0)
+                        .map_err(Self::storage_error)?;
+                    source_kind_table
+                        .insert(key.as_slice(), kind)
+                        .map_err(Self::storage_error)?;
+                    let mut value = source_lsn.0.to_le_bytes().to_vec();
+                    value.push(kind);
+                    identity_mutations.push(content_identity::original_producers::put(&frame,
+                        content_identity::LogicalFamily::Sync,
+                        key,
+                        value,
+                    )?)?;
+                }
+            }
+
+            // Retain only this write set's actually tombstoned predecessors,
+            // independently of older imported tombstones or retired receipts.
+            let selected_deletion_memory = OriginalWindowMemory::new(frame.original)?;
+            type SelectedDeletion = Option<(Vec<u8>, TxId, (Lsn, TxId))>;
+            selected_deletion_memory.reserve(
+                ws.adj_deletes.len().saturating_mul(std::mem::size_of::<SelectedDeletion>()),
+            )?;
+            let mut selected_deletions: Vec<SelectedDeletion> =
+                (0..ws.adj_deletes.len()).map(|_| None).collect();
+            if !ws.adj_deletes.is_empty() || !ws.adj_inserts.is_empty() {
+                let mut fwd_table = write_txn
+                    .open_table(GRAPH_FWD_TABLE)
+                    .map_err(Self::storage_error)?;
+                let mut rev_table = write_txn
+                    .open_table(GRAPH_REV_TABLE)
+                    .map_err(Self::storage_error)?;
+
+                let mut encoded = Vec::new();
+                for (delete_index, (source, edge_type, target, deleted_tx)) in
+                    ws.adj_deletes.iter().enumerate()
+                {
+                    let mut key_charge = Some(crate::memory_accounting::persistence_original_projection(frame.original)?.as_handle()).map(|accountant| {
+                        crate::memory_accounting::reserve_preparation_from_original(frame.original, (33 + edge_type.len()).saturating_mul(2), "writer_source",
+                            "graph_delete_keys", "Raise MEMORY_LIMIT to prepare the selected edge identity.",
+                        )
+                    }).transpose()?;
+                    let mut prefix = Vec::with_capacity(33 + edge_type.len());
+                    prefix.extend_from_slice(source.as_bytes());
+                    prefix.extend_from_slice(target.as_bytes());
+                    prefix.extend_from_slice(edge_type.as_bytes());
+                    prefix.push(0);
+                    let upper = writer_source::prefix_end(&prefix);
+                    let mut after = None::<Vec<u8>>;
+                    let mut found = false;
+                    loop {
+                        let lower = after.as_deref().map_or(
+                            std::ops::Bound::Included(prefix.as_slice()),
+                            std::ops::Bound::Excluded,
+                        );
+                        let upper = upper.as_deref().map_or(
+                            std::ops::Bound::Unbounded,
+                            std::ops::Bound::Excluded,
+                        );
+                        // End the range borrow before changing either direction.
+                        // Only this version's key/body is live in scratch.
+                        let memory = Some(OriginalWindowMemory::new(frame.original)?);
+                        let next = {
+                            let mut range = fwd_table.range::<&[u8]>((lower, upper))
+                                .map_err(Self::storage_error)?.inspect(|_entry| { #[cfg(any(test, feature = "test-seams"))] if let Ok((key, _)) = _entry { crate::read_work_probe::graph_storage_key("graph_fwd", "iteration_step", key.value()); } });
+                            range.next().transpose().map_err(Self::storage_error)?
+                                .map(|(key, value)| {
+                                    if let Some(memory) = &memory {
+                                        memory.reserve(key.value().len().saturating_mul(2)
+                                            .saturating_add(value.value().len().saturating_mul(2)).saturating_add(64))?;
+                                    }
+                                    #[cfg(any(test, feature = "test-seams"))]
+                                    crate::writer_query_test_seams::note_graph_delete_decode();
+                                    #[cfg(any(test, feature = "test-seams"))]
+                                    crate::read_work_probe::note_graph("graph_payload", "payload_decode", key.value(), None, Some("ordinary_deletion"));
+                                    let edge: AdjEntry = match &memory {
+                                        Some(memory) => memory.scope(|| frame.decode(value.value())),
+                                        None => frame.decode(value.value()),
+                                    }?;
+                                    Ok::<_, Error>((key.value().to_vec(), edge))
+                                }).transpose()?
+                        };
+                        let Some((key, mut edge)) = next else { break; };
+                        if edge.source != *source || edge.target != *target
+                            || edge.edge_type != *edge_type {
+                            return Err(Error::StoreCorrupted {
+                                path: self.path.display().to_string(),
+                                reason: "graph posting is outside its edge identity".into(),
+                            });
+                        }
+                        if edge.deleted_tx.is_none() {
+                            found = true;
+                            let order = (edge.lsn, edge.created_tx);
+                            let selected = &mut selected_deletions[delete_index];
+                            if selected.as_ref().is_none_or(|(_, _, prior)| order > *prior) {
+                                if let Some((p, d, prior)) = selected {
+                                    if p.len() != key.len() {
+                                        return Err(Error::StoreCorrupted {
+                                            path: self.path.display().to_string(),
+                                            reason: "selected graph predecessor width changed".into(),
+                                        });
+                                    }
+                                    p.copy_from_slice(&key);
+                                    *d = *deleted_tx;
+                                    *prior = order;
+                                } else {
+                                    selected_deletion_memory.reserve(key.len())?;
+                                    *selected = Some((key.clone(), *deleted_tx, order));
+                                }
+                            }
+                            edge.deleted_tx = Some(*deleted_tx);
+                            let mut encoded = Vec::new();
+                            Self::encode_into_original(&frame,&edge, &mut encoded)?;
+                            let rev_key = Self::graph_rev_key(&edge);
+                            fwd_table.insert(observed_graph_key!("graph_fwd", "insert", key.as_slice(), 5), encoded.as_slice())
+                                .map_err(Self::storage_error)?;
+                            rev_table.insert(observed_graph_key!("graph_rev", "insert", rev_key.as_slice(), 5), encoded.as_slice())
+                                .map_err(Self::storage_error)?;
+                            self.graph_writer_window(||Self::install_graph_creation_in_write(&write_txn, &edge, &encoded))?;
+                        }
+                        if let Some(charge) = &mut key_charge {
+                            crate::memory_accounting::grow_preparation_from_original(charge,key.capacity(), "writer_source", "graph_delete_keys",
+                                "Raise MEMORY_LIMIT to retain the selected edge resume key.")?;
+                            if let Some(prior) = after.take() { let bytes=prior.capacity();drop(prior);crate::memory_accounting::release_preparation_original(charge,bytes); }
+                        }
+                        after = Some(key);
+                    }
+                    if !found {
+                        return Err(Error::NotFound(format!(
+                            "edge {source} -[{edge_type}]-> {target} in graph_fwd"
+                        )));
+                    }
+                }
+
+                for entry in &ws.adj_inserts {
+                    Self::encode_into_original(&frame,entry, &mut encoded)?;
+                    let fwd_key = Self::graph_fwd_key(entry);
+                    let rev_key = Self::graph_rev_key(entry);
+                    fwd_table
+                        .insert(observed_graph_key!("graph_fwd", "insert", fwd_key.as_slice(), 5), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                    self.graph_writer_window(||Self::install_graph_creation_in_write(&write_txn, entry, &encoded))?;
+                    rev_table
+                        .insert(observed_graph_key!("graph_rev", "insert", rev_key.as_slice(), 5), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+            }
+
+            if has_vector_changes {
+                let mut vectors_table = content_size::open_vectors(&write_txn)
+                    .map_err(Self::storage_error)?;
+
+                if let Some(batch) = partition_mutations {
+                    for mutation in &batch.mutations {
+                        let PreparedVectorPartitionMutation::Delete {
+                            index,
+                            before,
+                            deleted_tx,
+                        } = mutation
+                        else {
+                            continue;
+                        };
+                        let key = Self::vector_identity_key(
+                            index,
+                            before.row.row_id,
+                            before.vector_created_tx,
+                            before.vector_lsn,
+                        );
+                        let mut entry = {
+                            let stored = vectors_table
+                                .get(key.as_slice())
+                                .map_err(Self::storage_error)?
+                                .ok_or_else(|| {
+                                    self.vector_partition_corruption(
+                                        "a prepared delete has no durable source vector",
+                                    )
+                                })?;
+                            Self::decode_vector_entry_original(&frame,stored.value())?
+                        };
+                        if entry.index != *index
+                            || entry.row_id != before.row.row_id
+                            || entry.created_tx != before.vector_created_tx
+                            || entry.lsn != before.vector_lsn
+                        {
+                            return Err(self.vector_partition_corruption(
+                                "a prepared delete source key does not match its vector payload",
+                            ));
+                        }
+                        if let Some(existing_deleted_tx) = entry.deleted_tx
+                            && existing_deleted_tx != *deleted_tx
+                        {
+                            return Err(self.vector_partition_corruption(
+                                "a prepared delete source has a conflicting deletion transaction",
+                            ));
+                        }
+                        entry.deleted_tx = Some(*deleted_tx);
+                        let quantization = vector_quantization
+                            .get(index)
+                            .copied()
+                            .unwrap_or_default();
+                        let encoded = Self::encode_vector_entry_original(&frame,&entry, quantization)?;
+                        vectors_table
+                            .insert(key.as_slice(), encoded.as_slice())
+                            .map_err(Self::storage_error)?;
+                    }
+                }
+
+                if let Some(batch) = partition_mutations {
+                    for mutation in &batch.mutations {
+                        let PreparedVectorPartitionMutation::Insert {
+                            index,
+                            after,
+                            entry,
+                        } = mutation
+                        else {
+                            continue;
+                        };
+                        if entry.index != *index
+                            || entry.row_id != after.row.row_id
+                            || entry.created_tx != after.vector_created_tx
+                            || entry.lsn != after.vector_lsn
+                            || entry.deleted_tx.is_some()
+                        {
+                            return Err(Error::Other(format!(
+                                "prepared vector insert has inconsistent identity on {}.{}",
+                                index.table, index.column
+                            )));
+                        }
+                        let quantization = vector_quantization
+                            .get(index)
+                            .copied()
+                            .unwrap_or_default();
+                        let encoded = Self::encode_vector_entry_original(&frame,entry, quantization)?;
+                        let key = Self::vector_key(entry);
+                        if let Some(existing) = vectors_table
+                            .get(key.as_slice())
+                            .map_err(Self::storage_error)?
+                            && existing.value() != encoded.as_slice()
+                        {
+                            return Err(self.vector_partition_corruption(
+                                "a prepared insert destination has conflicting vector bytes",
+                            ));
+                        }
+                        vectors_table
+                            .insert(key.as_slice(), encoded.as_slice())
+                            .map_err(Self::storage_error)?;
+                    }
+                }
+
+                if let Some(batch) = partition_mutations {
+                    for mutation in &batch.mutations {
+                        let PreparedVectorPartitionMutation::Move {
+                            index,
+                            before,
+                            after,
+                            moved_tx,
+                        } = mutation
+                        else {
+                            continue;
+                        };
+                        if after.vector_created_tx != *moved_tx
+                            || after.vector_lsn != batch.commit_lsn
+                        {
+                            return Err(Error::Other(format!(
+                                "prepared vector move has inconsistent destination identity on {}.{}",
+                                index.table, index.column
+                            )));
+                        }
+                        let old_key = Self::vector_identity_key(
+                            index,
+                            before.row.row_id,
+                            before.vector_created_tx,
+                            before.vector_lsn,
+                        );
+                        let mut old_entry = {
+                            let stored = vectors_table
+                                .get(old_key.as_slice())
+                                .map_err(Self::storage_error)?
+                                .ok_or_else(|| {
+                                    self.vector_partition_corruption(
+                                        "a prepared move has no durable source vector",
+                                    )
+                                })?;
+                            Self::decode_vector_entry_original(&frame,stored.value())?
+                        };
+                        if old_entry.index != *index
+                            || old_entry.row_id != before.row.row_id
+                            || old_entry.created_tx != before.vector_created_tx
+                            || old_entry.lsn != before.vector_lsn
+                        {
+                            return Err(self.vector_partition_corruption(
+                                "a prepared move source key does not match its vector payload",
+                            ));
+                        }
+                        if let Some(existing_deleted_tx) = old_entry.deleted_tx
+                            && existing_deleted_tx != *moved_tx
+                        {
+                            return Err(self.vector_partition_corruption(
+                                "a prepared move source has a conflicting deletion transaction",
+                            ));
+                        }
+                        old_entry.deleted_tx = Some(*moved_tx);
+                        let quantization = vector_quantization
+                            .get(index)
+                            .copied()
+                            .unwrap_or_default();
+                        let old_encoded = Self::encode_vector_entry_original(&frame,&old_entry, quantization)?;
+                        vectors_table
+                            .insert(old_key.as_slice(), old_encoded.as_slice())
+                            .map_err(Self::storage_error)?;
+
+                        let mut new_entry = old_entry;
+                        new_entry.row_id = after.row.row_id;
+                        new_entry.created_tx = *moved_tx;
+                        new_entry.deleted_tx = None;
+                        new_entry.lsn = batch.commit_lsn;
+                        let new_key = Self::vector_key(&new_entry);
+                        let new_encoded = Self::encode_vector_entry_original(&frame,&new_entry, quantization)?;
+                        if let Some(existing) = vectors_table
+                            .get(new_key.as_slice())
+                            .map_err(Self::storage_error)?
+                            && existing.value() != new_encoded.as_slice()
+                        {
+                            return Err(self.vector_partition_corruption(
+                                "a prepared move destination has conflicting vector bytes",
+                            ));
+                        }
+                        vectors_table
+                            .insert(new_key.as_slice(), new_encoded.as_slice())
+                            .map_err(Self::storage_error)?;
+                    }
+                }
+            }
+
+            if let Some(partition_mutations) = partition_mutations {
+                self.write_vector_partition_mutations_in_write(
+                    &write_txn,
+                    partition_mutations,
+                )?;
+            }
+
+            if let (Some(lsn), Some(tx)) = (ws.commit_lsn, Self::write_set_visibility_tx(ws)) {
+                let mut table = write_txn
+                    .open_table(COMMIT_INDEX_TABLE)
+                    .map_err(Self::storage_error)?;
+                table.insert(lsn.0, tx.0).map_err(Self::storage_error)?;
+                identity_mutations.push(content_identity::original_producers::commit_index_mutation(&frame,lsn, tx)?)?;
+            }
+
+            Self::stage_graph_commit_support(&write_txn,graph_commit_support)?;
+            if !change_log.is_empty() {
+                let mut table = write_txn
+                    .open_table(CHANGE_LOG_TABLE)
+                    .map_err(Self::storage_error)?;
+                let lsn = ws.commit_lsn.unwrap_or(Lsn(0));
+                let mut encoded = Vec::new();
+                let mut key = String::with_capacity(Self::change_log_entry_key_len());
+                for (index, entry) in change_log.iter().enumerate() {
+                    Self::write_change_log_entry_key(lsn, index, &mut key);
+                    if let ChangeLogEntry::EdgeDelete { source, target, edge_type, .. } = entry {
+                        let selected_index = ws.adj_deletes.iter().position(|(s, k, t, _)|
+                            s == source && t == target && k == edge_type
+                        ).ok_or_else(|| Error::StoreCorrupted {
+                            path: self.path.display().to_string(),
+                            reason: "ordinary graph deletion has no selected write-set predecessor".into(),
+                        })?;
+                        let (p, d, _) = selected_deletions[selected_index].as_ref()
+                            .ok_or_else(|| Error::StoreCorrupted {
+                                path: self.path.display().to_string(),
+                                reason: "ordinary graph deletion selected predecessor is missing".into(),
+                            })?;
+                        self.encode_change_log_with_selected_predecessor_in_write(
+                            &write_txn, entry, Some((p.as_slice(), *d)), &mut encoded,
+                        )?;
+                    } else {
+                        self.encode_change_log_into_in_write(&write_txn, entry, &mut encoded)?;
+                    }
+                    table
+                        .insert(observed_graph_key!("history", "insert", key.as_str(), 8), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                    self.graph_writer_window(||Self::write_change_log_selectors_in_write(&write_txn, key.as_str(), encoded.as_slice()))?;
+                    identity_mutations.push(Self::stored_change_log_mutation_in_write(&write_txn, &key)?)?;
+                }
+            }
+
+            if !sink_events.is_empty() {
+                let lsn = ws.commit_lsn.unwrap_or(Lsn(0));
+                let mut overflow_audits = Vec::new();
+                let mut by_sink: BTreeMap<&str, Vec<(usize, &SinkQueueEntry)>> = BTreeMap::new();
+                for (index, (sink, entry)) in sink_events.iter().enumerate() {
+                    by_sink
+                        .entry(sink.as_str())
+                        .or_default()
+                        .push((index, entry));
+                }
+                for (sink, entries) in by_sink {
+                    let table_name = Self::sink_queue_table_name(sink);
+                    let table_def: TableDefinition<u64, &[u8]> =
+                        TableDefinition::new(table_name.as_str());
+                    let mut table = write_txn
+                        .open_table(table_def)
+                        .map_err(Self::storage_error)?;
+                    let mut existing = table.len().map_err(Self::storage_error)? as usize;
+                    for (index, entry) in entries {
+                        if existing >= max_sink_queue_depth {
+                            return Err(Error::Other(format!("sink queue is full: {sink}")));
+                        }
+                        let overflow_id = if existing >= max_sink_queue_depth {
+                            table
+                                .first()
+                                .map_err(Self::storage_error)?
+                                .map(|(key, _)| key.value())
+                        } else {
+                            None
+                        };
+                        if let Some(id) = overflow_id {
+                            table.remove(id).map_err(Self::storage_error)?;
+                            existing = existing.saturating_sub(1);
+                            overflow_audits.push((index, sink.to_string()));
+                            let logical_key = format!("{}:{sink}:{id}", sink.len());
+                            identity_mutations.push(content_identity::original_producers::remove_status_mutation(&frame,
+                                b"sink-queue",
+                                logical_key.as_bytes(),
+                            )?)?;
+                        }
+                        let encoded = frame.encode(entry)?;
+                        table
+                            .insert(entry.id, encoded.as_slice())
+                            .map_err(Self::storage_error)?;
+                        let logical_key = format!("{}:{sink}:{}", sink.len(), entry.id);
+                        identity_mutations.push(content_identity::original_producers::encoded_status_mutation(&frame,
+                            b"sink-queue",
+                            logical_key.as_bytes(),
+                            entry,
+                        )?)?;
+                        existing = existing.saturating_add(1);
+                    }
+                }
+                if !overflow_audits.is_empty() {
+                    let mut audit_table = write_txn
+                        .open_table(SINK_AUDIT_TABLE)
+                        .map_err(Self::storage_error)?;
+                    for (index, sink) in overflow_audits {
+                        let key = Self::sink_audit_key(lsn, index, &sink);
+                        let audit = SinkAuditEntry {
+                            lsn,
+                            kind: SinkAuditKind::QueueOverflow {
+                                sink,
+                                dropped_count: 1,
+                            },
+                        };
+                        let encoded = frame.encode(&audit)?;
+                        audit_table
+                            .insert(key.as_str(), encoded.as_slice())
+                            .map_err(Self::storage_error)?;
+                        identity_mutations.push(content_identity::original_producers::status_mutation(&frame,
+                            b"sink-audit",
+                            key.as_bytes(),
+                            &encoded,
+                        )?)?;
+                    }
+                }
+            }
+
+            if !trigger_audits.is_empty() {
+                {
+                    let mut audit_table = write_txn
+                        .open_table(TRIGGER_AUDIT_TABLE)
+                        .map_err(Self::storage_error)?;
+                    let mut stamps = write_txn
+                        .open_table(TRIGGER_AUDIT_STAMPS_TABLE)
+                        .map_err(Self::storage_error)?;
+                    let stamped_at = Wallclock::now().0;
+                    for (index, entry) in trigger_audits {
+                        let key = Self::trigger_audit_key(*index, &entry.trigger_name);
+                        let encoded = frame.encode(entry)?;
+                        audit_table
+                            .insert(key.as_str(), encoded.as_slice())
+                            .map_err(Self::storage_error)?;
+                        stamps
+                            .insert(key.as_str(), stamped_at)
+                            .map_err(Self::storage_error)?;
+                        identity_mutations.push(content_identity::original_producers::status_mutation(&frame,
+                            b"trigger-audit",
+                            key.as_bytes(),
+                            &encoded,
+                        )?)?;
+                        identity_mutations.push(content_identity::original_producers::status_mutation(&frame,
+                            b"trigger-stamp",
+                            key.as_bytes(),
+                            &stamped_at.to_le_bytes(),
+                        )?)?;
+                    }
+                }
+                {
+                    let mut config_table = write_txn
+                        .open_table(CONFIG_TABLE)
+                        .map_err(Self::storage_error)?;
+                    let mut ring: Vec<TriggerAuditEntry> = config_table
+                        .get(TRIGGER_AUDIT_RING_CONFIG_KEY)
+                        .map_err(Self::storage_error)?
+                        .map(|value| frame.decode(value.value()))
+                        .transpose()?
+                        .unwrap_or_default();
+                    frame.array::<TriggerAuditEntry>(ring.len().checked_add(trigger_audits.len()).and_then(|n|n.checked_mul(4)).ok_or_else(||Error::Other("trigger audit ring preparation overflow".into()))?)?;
+                    ring.extend(trigger_audits.iter().map(|(_, entry)| entry.clone()));
+                    let overflow = ring
+                        .len()
+                        .saturating_sub(crate::database::trigger::TRIGGER_AUDIT_RING_CAPACITY);
+                    if overflow > 0 {
+                        ring.drain(0..overflow);
+                    }
+                    let current_next_index = config_table
+                        .get(TRIGGER_AUDIT_NEXT_INDEX_CONFIG_KEY)
+                        .map_err(Self::storage_error)?
+                        .map(|value| frame.decode::<u64>(value.value()))
+                        .transpose()?
+                        .unwrap_or(0);
+                    let next_index = trigger_audits
+                        .iter()
+                        .map(|(index, _)| index.saturating_add(1))
+                        .max()
+                        .unwrap_or(0)
+                        .max(current_next_index);
+                    let encoded_ring = frame.encode(&ring)?;
+                    config_table
+                        .insert(TRIGGER_AUDIT_RING_CONFIG_KEY, encoded_ring.as_slice())
+                        .map_err(Self::storage_error)?;
+                    identity_mutations.extend(content_identity::original_producers::config_mutations(&frame,
+                        TRIGGER_AUDIT_RING_CONFIG_KEY,
+                        Some(&encoded_ring),
+                    )?)?;
+                    let encoded_next_index = frame.encode(&next_index)?;
+                    config_table
+                        .insert(
+                            TRIGGER_AUDIT_NEXT_INDEX_CONFIG_KEY,
+                            encoded_next_index.as_slice(),
+                        )
+                        .map_err(Self::storage_error)?;
+                    identity_mutations.extend(content_identity::original_producers::config_mutations(&frame,
+                        TRIGGER_AUDIT_NEXT_INDEX_CONFIG_KEY,
+                        Some(&encoded_next_index),
+                    )?)?;
+                }
+            }
+
+            if schema_ddl.event_bus.is_some() || schema_ddl.trigger.is_some() {
+                {
+                    let mut config_table = write_txn
+                        .open_table(CONFIG_TABLE)
+                        .map_err(Self::storage_error)?;
+                    if let Some(event_bus_ddl) = schema_ddl.event_bus {
+                        for (key, encoded) in &event_bus_ddl.config_values {
+                            config_table
+                                .insert(key.as_str(), encoded.as_slice())
+                                .map_err(Self::storage_error)?;
+                            identity_mutations.extend(content_identity::original_producers::config_mutations(&frame,
+                                key,
+                                Some(encoded),
+                            )?)?;
+                        }
+                    }
+                    if let Some(trigger_ddl) = schema_ddl.trigger {
+                        for (key, encoded) in &trigger_ddl.config_values {
+                            config_table
+                                .insert(key.as_str(), encoded.as_slice())
+                                .map_err(Self::storage_error)?;
+                            identity_mutations.extend(content_identity::original_producers::config_mutations(&frame,
+                                key,
+                                Some(encoded),
+                            )?)?;
+                        }
+                    }
+                }
+                frame.array::<&DdlChange>(schema_ddl.event_bus.map_or(0,|ddl|ddl.ddl.len()).checked_add(schema_ddl.trigger.map_or(0,|ddl|ddl.ddl.len())).ok_or_else(||Error::Other("event DDL ordinal count overflow".into()))?)?;
+                let ddl_entries = schema_ddl
+                    .event_bus
+                    .into_iter()
+                    .flat_map(|commit| commit.ddl.iter())
+                    .chain(
+                        schema_ddl
+                            .trigger
+                            .into_iter()
+                            .flat_map(|commit| commit.ddl.iter()),
+                    )
+                    .collect::<Vec<_>>();
+                if !ddl_entries.is_empty() {
+                    let lsn = ws.commit_lsn.unwrap_or(Lsn(0));
+                    let mut ddl_table = write_txn
+                        .open_table(DDL_LOG_TABLE)
+                        .map_err(Self::storage_error)?;
+                    for (index, change) in ddl_entries.iter().enumerate() {
+                        let key = Self::ddl_log_key_for_index(lsn, index, ddl_entries.len());
+                        Self::append_ddl_summary_in_write(&write_txn, &key, change)?;
+                        let encoded = frame.encode(change)?;
+                        ddl_table
+                            .insert(key.as_str(), encoded.as_slice())
+                            .map_err(Self::storage_error)?;
+                        identity_mutations.push(content_identity::original_producers::encoded_history_mutation(&frame,
+                            &key, change,
+                        )?)?;
+                    }
+                }
+            }
+
+            if !ws.config_writes.is_empty() || !ws.config_deletes.is_empty() {
+                let mut config_table = write_txn
+                    .open_table(CONFIG_TABLE)
+                    .map_err(Self::storage_error)?;
+                for key in &ws.config_deletes {
+                    Self::update_policy_hold_release_index(&write_txn, key, false)?;
+                    config_table
+                        .remove(key.as_str())
+                        .map_err(Self::storage_error)?;
+                    identity_mutations.extend(content_identity::original_producers::config_mutations(&frame,key, None)?)?;
+                }
+                for (key, encoded) in &ws.config_writes {
+                    Self::update_policy_hold_release_index(&write_txn, key, true)?;
+                    let encoded = if ws.config_max_u64_keys.iter().any(|max_key| max_key == key) {
+                        let incoming = frame.decode::<u64>(encoded)?;
+                        let current = config_table
+                            .get(key.as_str())
+                            .map_err(Self::storage_error)?
+                            .map(|value| frame.decode::<u64>(value.value()))
+                            .transpose()?
+                            .unwrap_or(0);
+                        frame.encode(&current.max(incoming))?
+                    } else {
+                        encoded.clone()
+                    };
+                    config_table
+                        .insert(key.as_str(), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                    identity_mutations.extend(content_identity::original_producers::config_mutations(&frame,
+                        key,
+                        Some(&encoded),
+                    )?)?;
+                }
+            }
+
+            if let Some(erasure) = options.local_erasure.as_ref() {
+                self.apply_local_erasure(
+                    &write_txn,
+                    erasure.projection,
+                    &prepared_local_erasure_vector_generations,
+                    None,
+                    erasure.accountant.clone(),
+                    erasure.operation,
+                )?;
+            }
+            #[cfg(any(test, feature = "test-seams"))]
+            {
+                observe_append_stage(AppendStage::RowsIndexesAndLogs, &mut stage_started);
+            }
+            Self::apply_owned_content_identity_with_manifests_and_groups_in_write(
+                &write_txn,
+                &identity_mutations,
+                &pending_manifests.mutations,
+                &mut content_identity::original_writer::ProofAdmission::new(&frame.original,self.proof_scratch_owner())?, Some(&group_plan))?;
+            drop(pending_manifests);
+            #[cfg(any(test, feature = "test-seams"))]
+            {
+                observe_append_stage(AppendStage::ContentIdentity, &mut stage_started);
+            }
+            // Failure is reached after the unit and its outcome are staged.
+            #[cfg(any(test, feature = "test-seams"))]
+            if ws
+                .config_writes
+                .iter()
+                .any(|(key, _)| key.starts_with("delivery_hub_outcome.v1."))
+            {
+                crate::custody::durability::before_custody_commit(&write_txn)?;
+            }
+            #[cfg(any(test, feature = "test-seams"))]
+            {
+                stage_started = std::time::Instant::now();
+            }
+            self.preserve_graph_commit_support(&write_txn,graph_commit_support,ws.commit_lsn.zip(Self::write_set_visibility_tx(ws)))?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, Some(ws))?;
+            #[cfg(feature = "in-process-test-seams")]
+            crate::writer_commit_test_seams::reached(crate::writer_commit_test_seams::CommitBoundary::BeforeRedb);
+            { #[cfg(any(test, feature = "test-seams"))]
+            graph_observation_checkpoint(10)?;
+            let graph_commit_result = write_txn.commit();
+#[cfg(any(test, feature = "test-seams"))]
+if graph_commit_result.is_ok() { graph_publication_attempt.committed(); graph_observation_checkpoint(11)?; }
+graph_commit_result }.map_err(Self::storage_error)?;
+            #[cfg(feature = "in-process-test-seams")]
+            crate::writer_commit_test_seams::reached(crate::writer_commit_test_seams::CommitBoundary::AfterRedb);
+            #[cfg(any(test, feature = "test-seams"))]
+            {
+                observe_append_stage(AppendStage::Commit, &mut stage_started);
+            }
+            Ok(())
+        })
+    }
+
+pub(crate) fn flush_owned_received_schema_stage(
+        &self,
+original:&crate::memory_accounting::OwnedMemoryReservation,
+        ws: &WriteSet,
+        change_log: &[ChangeLogEntry],
+        stage: &ReceivedSchemaPersistenceProjection,
+        sink_events: &[PreparedSinkEvent],
+        trigger_audits: &[(u64, TriggerAuditEntry)],
+        max_sink_queue_depth: usize, schema_config:Option<&[(String,Vec<u8>)]>, config_cut:usize) -> Result<()> {
+        let frame=OriginalPersistenceFrame::new(original)?;
+        frame.plan_write_set(ws,sink_events,trigger_audits)?;
+        for meta in stage.table_meta.values(){frame.record(meta)?;}
+        for rows in stage.rows.values(){for row in rows{frame.record(row)?;}}
+        for edge in &stage.edges{frame.record(edge)?;}
+
+
+
+        if stage.schema_noop {
+            return self.flush_owned_received_schema_noop(original,ws, change_log, stage,schema_config,config_cut);
+        }
+        let partition_image = stage
+            .replace_vectors
+            .then(|| {
+                self.prepare_complete_vector_partition_image(stage, ws.commit_lsn.unwrap_or(Lsn(0)))
+            })
+            .transpose()?;
+        let vector_quantization = Self::vector_quantization_map(&stage.table_meta);
+        let sink_queue_names = sink_events
+            .iter()
+            .map(|(sink, _)| sink.clone())
+            .collect::<BTreeSet<_>>();
+        let schema = self.prepare_writer_schema_change(
+            stage.affected_tables.iter().map(String::as_str),
+            stage
+                .table_meta
+                .iter()
+                .map(|(name, meta)| (name.as_str(), meta)),
+        )?;
+        for (key, value) in original_schema_config_values(&stage.config_values, schema_config, config_cut)? {
+            frame.plan_config(key, value)?;
+        }
+        let group_plan = custody_groups::GroupPlan::prepaid(
+            original_schema_config_values(&stage.config_values, schema_config, config_cut)?.chain(&ws.config_writes))?;
+        self.with_db(|db| {
+            let write_txn = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
+            let graph_commit_support =
+                Self::capture_graph_commit_support(&write_txn, ws.commit_lsn)?;
+            let indexes_to_rebuild = {
+                let stored_meta = write_txn
+                    .open_table(META_TABLE)
+                    .map_err(Self::storage_error)?;
+                let ready = write_txn
+                    .open_table(RELATIONAL_INDEX_READY_TABLE)
+                    .map_err(Self::storage_error)?;
+                let mut rebuild = HashSet::new();
+                for (table, next) in &stage.table_meta {
+                    let previous = stored_meta
+                        .get(Self::meta_key(table).as_str())
+                        .map_err(Self::storage_error)?
+                        .map(|encoded| {
+                            Self::decode_table_meta_versioned(encoded.value()).map(|(meta, _)| meta)
+                        })
+                        .transpose()?;
+                    let unchanged_declarations = previous.as_ref().is_some_and(|previous| {
+                        if previous.maintained_counts != next.maintained_counts {
+                            return false;
+                        }
+                        let before = Self::relational_index_declarations(previous);
+                        if before != Self::relational_index_declarations(next) {
+                            return false;
+                        }
+                        let indexed_columns = before
+                            .iter()
+                            .flat_map(|index| index.columns.iter().map(|(name, _)| name.as_str()))
+                            .collect::<HashSet<_>>();
+                        previous
+                            .columns
+                            .iter()
+                            .filter(|column| indexed_columns.contains(column.name.as_str()))
+                            .eq(next
+                                .columns
+                                .iter()
+                                .filter(|column| indexed_columns.contains(column.name.as_str())))
+                    });
+                    let ready_before = ready
+                        .get(table.as_str())
+                        .map_err(Self::storage_error)?
+                        .is_some_and(|version| version.value() == RELATIONAL_INDEX_READY_VERSION);
+                    if !unchanged_declarations
+                        || !ready_before
+                        || stage.row_changed_tables.contains(table)
+                        || stage.structurally_dropped_tables.contains(table)
+                    {
+                        rebuild.insert(table.clone());
+                    }
+                }
+                rebuild
+            };
+
+            // Read before anything is replaced: every member the replaced
+            // generation stored for an affected table leaves the committed
+            // identity in this transaction, ahead of the replacement's own
+            // members, so the later mutation of one logical key wins.
+            let retired_identity =
+                self.retire_received_schema_generation_in_write_original(&frame,&write_txn, stage)?;
+
+            {
+                let mut meta_table = write_txn
+                    .open_table(META_TABLE)
+                    .map_err(Self::storage_error)?;
+                let encoded_schemas = stage
+                    .table_meta
+                    .iter()
+                    .map(|(table, meta)| {
+                        let encoded = self.schema_update_in_table(
+                            &meta_table,
+                            table,
+                            meta,
+                            stage.ddl_log.iter().map(|(_, change)| change),
+                        )?;
+                        Ok((table.clone(), encoded))
+                    })
+                    .collect::<Result<HashMap<_, _>>>()?;
+                for table in &stage.affected_tables {
+                    let key = Self::meta_key(table);
+                    meta_table
+                        .remove(key.as_str())
+                        .map_err(Self::storage_error)?;
+                }
+                for (table, meta) in &stage.table_meta {
+                    let key = Self::meta_key(table);
+                    let encoded = &encoded_schemas[table].bytes;
+                    meta_table
+                        .insert(key.as_str(), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                    vector_membership_pages::ensure_declared_routes(
+                        &write_txn,
+                        table,
+                        meta,
+                        Some(crate::memory_accounting::persistence_original_projection(frame.original)?.as_handle()),
+                    )?;
+                }
+            }
+
+            let mut relational_tables = stage.affected_tables.iter().cloned().collect::<Vec<_>>();
+            relational_tables.sort();
+            relational_tables.dedup();
+            for table in relational_tables {
+                #[cfg(any(test, feature = "test-seams"))]
+                crate::database::record_received_schema_durable_table_rewrite_for_test(&table);
+                let table_name = Self::rel_table_name(&table);
+                let table_def: TableDefinition<&[u8], &[u8]> =
+                    TableDefinition::new(table_name.as_str());
+                self.retire_relational_manifests_in_write(&write_txn, &table)?;
+                content_size::reset_rows(&write_txn, &table)?;
+                match write_txn.delete_table(table_def) {
+                    Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
+                    Err(redb::TableError::TableTypeMismatch { .. }) => {}
+                    Err(error) => return Err(Self::storage_error(error)),
+                }
+                let legacy_table_def: TableDefinition<u64, &[u8]> =
+                    TableDefinition::new(table_name.as_str());
+                match write_txn.delete_table(legacy_table_def) {
+                    Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
+                    Err(redb::TableError::TableTypeMismatch { .. }) => {}
+                    Err(error) => return Err(Self::storage_error(error)),
+                }
+            }
+            for (table, rows) in &stage.rows {
+                let table_name = Self::rel_table_name(table);
+                let table_def: TableDefinition<&[u8], &[u8]> =
+                    TableDefinition::new(table_name.as_str());
+                let mut redb_table =
+                    content_size::open_rows(&write_txn, table_def).map_err(Self::storage_error)?;
+                for row in rows {
+                    #[cfg(any(test, feature = "test-seams"))]
+                    crate::database::record_received_schema_durable_row_rewrite_for_test();
+                    let encoded = Self::encode_versioned_row_original(&frame,row, stage.table_meta.get(table))?;
+                    let key = Self::rel_row_key(row);
+                    {
+                        let predecessor = redb_table
+                            .get(key.as_slice())
+                            .map_err(Self::storage_error)?;
+                        self.replace_relational_manifest_in_write_original(&frame.original,
+                            &write_txn,
+                            table,
+                            key.as_slice(),
+                            predecessor.as_ref().map(|body| body.value()),
+                            Some(encoded.as_slice()),
+                        )?;
+                    }
+                    redb_table
+                        .insert(key.as_slice(), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+            }
+            for (table, meta) in &stage.table_meta {
+                if !indexes_to_rebuild.contains(table) {
+                    continue;
+                }
+                Self::rebuild_relational_indexes_in_write_original(&frame,
+                    &write_txn,
+                    &self.path,
+                    table,
+                    meta,
+                    stage.rows.get(table).map(Vec::as_slice),
+                    &mut content_identity::original_writer::ProofAdmission::new(&frame.original,self.proof_scratch_owner())?,
+                )?;
+            }
+            let operational_index_identity_mutations =
+                self.flush_received_schema_operational_rows_in_write_original(&frame,&write_txn, stage)?;
+
+            {
+                let mut lsn_table = write_txn
+                    .open_table(SYNC_ROW_SOURCE_LSN_TABLE)
+                    .map_err(Self::storage_error)?;
+                let mut kind_table = write_txn
+                    .open_table(SYNC_ROW_SOURCE_KIND_TABLE)
+                    .map_err(Self::storage_error)?;
+                let mut retired = Vec::new();
+                for entry in lsn_table.iter().map_err(Self::storage_error)? {
+                    let (key, _) = entry.map_err(Self::storage_error)?;
+                    if Self::decode_sync_row_source_lsn_key(key.value())
+                        .is_some_and(|(table, _)| stage.affected_tables.contains(&table))
+                    {
+                        retired.push(key.value().to_vec());
+                    }
+                }
+                for key in &retired {
+                    lsn_table
+                        .remove(key.as_slice())
+                        .map_err(Self::storage_error)?;
+                    kind_table
+                        .remove(key.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+                for (table, row_id, lsn, kind) in &stage.sync_sources {
+                    let key = Self::sync_row_source_lsn_key(table, *row_id);
+                    lsn_table
+                        .insert(key.as_slice(), lsn.0)
+                        .map_err(Self::storage_error)?;
+                    kind_table
+                        .insert(key.as_slice(), sync_source_kind_to_u8(*kind))
+                        .map_err(Self::storage_error)?;
+                }
+            }
+
+            if stage.replace_graph {
+                self.retire_graph_replacement_in_write(
+                    &write_txn,
+                    &stage.edges,
+                    Some(&stage.affected_graph_edge_types),
+                )?;
+                let mut fwd = write_txn
+                    .open_table(GRAPH_FWD_TABLE)
+                    .map_err(Self::storage_error)?;
+                let mut rev = write_txn
+                    .open_table(GRAPH_REV_TABLE)
+                    .map_err(Self::storage_error)?;
+                let mut fwd_retired = Vec::new();
+                for item in {
+                    #[cfg(any(test, feature = "test-seams"))]
+                    crate::read_work_probe::note_graph(
+                        "graph_fwd",
+                        "population_walk",
+                        &[],
+                        None,
+                        None,
+                    );
+                    fwd.iter()
+                }
+                .map_err(Self::storage_error)?
+                .inspect(|_entry| {
+                    #[cfg(any(test, feature = "test-seams"))]
+                    if let Ok((key, _)) = _entry {
+                        crate::read_work_probe::graph_storage_key(
+                            "graph_fwd",
+                            "iteration_step",
+                            key.value(),
+                        );
+                    }
+                }) {
+                    let (key, value) = item.map_err(Self::storage_error)?;
+                    #[cfg(any(test, feature = "test-seams"))]
+                    crate::read_work_probe::note_graph(
+                        "graph_payload",
+                        "payload_decode",
+                        key.value(),
+                        None,
+                        Some("received_schema_forward_selection"),
+                    );
+                    let edge = frame.decode::<AdjEntry>(value.value())?;
+                    if stage.affected_graph_edge_types.contains(&edge.edge_type) {
+                        fwd_retired.push(key.value().to_vec());
+                    }
+                }
+                let mut rev_retired = Vec::new();
+                for item in {
+                    #[cfg(any(test, feature = "test-seams"))]
+                    crate::read_work_probe::note_graph(
+                        "graph_rev",
+                        "population_walk",
+                        &[],
+                        None,
+                        None,
+                    );
+                    rev.iter()
+                }
+                .map_err(Self::storage_error)?
+                .inspect(|_entry| {
+                    #[cfg(any(test, feature = "test-seams"))]
+                    if let Ok((key, _)) = _entry {
+                        crate::read_work_probe::graph_storage_key(
+                            "graph_rev",
+                            "iteration_step",
+                            key.value(),
+                        );
+                    }
+                }) {
+                    let (key, value) = item.map_err(Self::storage_error)?;
+                    #[cfg(any(test, feature = "test-seams"))]
+                    crate::read_work_probe::note_graph(
+                        "graph_payload",
+                        "payload_decode",
+                        key.value(),
+                        None,
+                        Some("received_schema_reverse_selection"),
+                    );
+                    let edge = frame.decode::<AdjEntry>(value.value())?;
+                    if stage.affected_graph_edge_types.contains(&edge.edge_type) {
+                        rev_retired.push(key.value().to_vec());
+                    }
+                }
+                for key in fwd_retired {
+                    fwd.remove(observed_graph_key!(
+                        "graph_fwd",
+                        "remove",
+                        key.as_slice(),
+                        5
+                    ))
+                    .map_err(Self::storage_error)?;
+                }
+                for key in rev_retired {
+                    rev.remove(observed_graph_key!(
+                        "graph_rev",
+                        "remove",
+                        key.as_slice(),
+                        5
+                    ))
+                    .map_err(Self::storage_error)?;
+                }
+                for edge in &stage.edges {
+                    let encoded = frame.encode(edge)?;
+                    let fwd_key = Self::graph_fwd_key(edge);
+                    let rev_key = Self::graph_rev_key(edge);
+                    fwd.insert(
+                        observed_graph_key!("graph_fwd", "insert", fwd_key.as_slice(), 5),
+                        encoded.as_slice(),
+                    )
+                    .map_err(Self::storage_error)?;
+                    self.graph_writer_window(|| {
+                        Self::install_graph_creation_in_write(&write_txn, edge, &encoded)
+                    })?;
+                    rev.insert(
+                        observed_graph_key!("graph_rev", "insert", rev_key.as_slice(), 5),
+                        encoded.as_slice(),
+                    )
+                    .map_err(Self::storage_error)?;
+                }
+            }
+
+            if stage.replace_vectors {
+                // Authenticate the old fixed inputs while their raw bodies and
+                // source companions still belong to the committed image.
+                let previous = db.begin_read().map_err(Self::storage_error)?;
+                self.reconcile_paged_builds_for_image_in_write(
+                    &write_txn,
+                    partition_image.as_ref().expect("prepared vector image"),
+                    &previous,
+                    stage,
+                )?;
+                self.remove_vector_entries_matching_in_write(&write_txn, &|index| {
+                    stage.affected_tables.contains(&index.table)
+                })?;
+                let mut vectors =
+                    content_size::open_vectors(&write_txn).map_err(Self::storage_error)?;
+                for entry in &stage.vectors {
+                    let quantization = vector_quantization
+                        .get(&entry.index)
+                        .copied()
+                        .unwrap_or_default();
+                    let encoded = Self::encode_vector_entry_original(&frame,entry, quantization)?;
+                    let key = Self::vector_key(entry);
+                    vectors
+                        .insert(key.as_slice(), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+                self.replace_vector_partition_image_for_tables_in_write(
+                    &write_txn,
+                    partition_image.as_ref().expect("prepared vector image"),
+                    &stage.affected_tables,
+                    stage.vector_image_memory.accountant.clone(),
+                )?;
+                for (table, meta) in &stage.table_meta {
+                    vector_membership_pages::ensure_declared_routes(
+                        &write_txn,
+                        table,
+                        meta,
+                        Some(crate::memory_accounting::persistence_original_projection(frame.original)?.as_handle()),
+                    )?;
+                }
+            }
+
+            {
+                let mut ddl_table = write_txn
+                    .open_table(DDL_LOG_TABLE)
+                    .map_err(Self::storage_error)?;
+                let mut grouped = BTreeMap::<Lsn, Vec<&DdlChange>>::new();
+                for (lsn, ddl) in &stage.ddl_log {
+                    grouped.entry(*lsn).or_default().push(ddl);
+                }
+                for (lsn, ddl) in grouped {
+                    for (index, change) in ddl.iter().enumerate() {
+                        let key = Self::ddl_log_key_for_index(lsn, index, ddl.len());
+                        Self::append_ddl_summary_in_write(&write_txn, &key, change)?;
+                        let encoded = frame.encode(*change)?;
+                        ddl_table
+                            .insert(key.as_str(), encoded.as_slice())
+                            .map_err(Self::storage_error)?;
+                    }
+                }
+            }
+
+            if let (Some(lsn), Some(tx)) = (ws.commit_lsn, Self::write_set_visibility_tx(ws)) {
+                let mut index = write_txn
+                    .open_table(COMMIT_INDEX_TABLE)
+                    .map_err(Self::storage_error)?;
+                index.insert(lsn.0, tx.0).map_err(Self::storage_error)?;
+            }
+            let mut change_log_identity = OriginalMutationVector::new(&frame);
+            if !stage.structurally_dropped_tables.is_empty() {
+                // A dropped table's change-log records leave the store and
+                // the committed identity together, in this received-schema
+                // write transaction, so a later failure cannot leave a new
+                // schema image paired with old-generation history. A commit
+                // that also changed other tables keeps those records, packed
+                // back into consecutive positions within its LSN -- the
+                // layout every other history retirement leaves -- with the
+                // identity moved to the positions they now occupy.
+                let mut log = write_txn
+                    .open_table(CHANGE_LOG_TABLE)
+                    .map_err(Self::storage_error)?;
+                let mut affected_lsns = BTreeSet::new();
+                for item in {
+                    #[cfg(any(test, feature = "test-seams"))]
+                    crate::read_work_probe::note_graph(
+                        "history",
+                        "population_walk",
+                        &[],
+                        None,
+                        None,
+                    );
+                    log.iter()
+                }
+                .map_err(Self::storage_error)?
+                .inspect(|_entry| {
+                    #[cfg(any(test, feature = "test-seams"))]
+                    if let Ok((key, _)) = _entry {
+                        crate::read_work_probe::graph_storage_key(
+                            "history",
+                            "iteration_step",
+                            key.value(),
+                        );
+                    }
+                }) {
+                    let (_, value) = item.map_err(Self::storage_error)?;
+                    let entry = Self::decode_stored_change_log(value.value())?.entry;
+                    if Self::change_log_entry_references_any_table(
+                        &entry,
+                        &stage.structurally_dropped_tables,
+                    ) {
+                        affected_lsns.insert(entry.lsn());
+                    }
+                }
+                let mut key_buf = String::with_capacity(Self::change_log_entry_key_len());
+                for lsn in affected_lsns {
+                    let prefix = format!("{:020}:", lsn.0);
+                    let mut group = Vec::new();
+                    for item in log
+                        .range(prefix.as_str()..)
+                        .map_err(Self::storage_error)?
+                        .inspect(|_entry| {
+                            #[cfg(any(test, feature = "test-seams"))]
+                            if let Ok((key, _)) = _entry {
+                                crate::read_work_probe::graph_storage_key(
+                                    "history",
+                                    "iteration_step",
+                                    key.value(),
+                                );
+                            }
+                        })
+                    {
+                        let (key, value) = item.map_err(Self::storage_error)?;
+                        if !key.value().starts_with(prefix.as_str()) {
+                            break;
+                        }
+                        group.push((key.value().to_string(), value.value().to_vec()));
+                    }
+                    let mut survivors = Vec::with_capacity(group.len());
+                    for (key, bytes) in group {
+                        let entry = Self::decode_stored_change_log(&bytes)?.entry;
+                        log.remove(observed_graph_key!("history", "remove", key.as_str(), 8))
+                            .map_err(Self::storage_error)?;
+                        let carried = !Self::change_log_entry_references_any_table(
+                            &entry,
+                            &stage.structurally_dropped_tables,
+                        );
+                        Self::detach_change_log_selectors_in_write(
+                            &write_txn,
+                            key.as_str(),
+                            carried,
+                        )?;
+                        change_log_identity.push(
+                            content_identity::original_producers::remove_encoded_history_mutation(&frame,&key, &entry)?,
+                        )?;
+                        if !Self::change_log_entry_references_any_table(
+                            &entry,
+                            &stage.structurally_dropped_tables,
+                        ) {
+                            survivors.push((bytes, entry));
+                        }
+                    }
+                    for (index, (bytes, _entry)) in survivors.into_iter().enumerate() {
+                        Self::write_change_log_entry_key(lsn, index, &mut key_buf);
+                        log.insert(
+                            observed_graph_key!("history", "insert", key_buf.as_str(), 8),
+                            bytes.as_slice(),
+                        )
+                        .map_err(Self::storage_error)?;
+                        self.graph_writer_window(|| {
+                            Self::write_carried_change_log_selectors_in_write(
+                                &write_txn,
+                                key_buf.as_str(),
+                                bytes.as_slice(),
+                            )
+                        })?;
+                        change_log_identity
+                            .push(Self::stored_change_log_mutation(&key_buf, &bytes)?);
+                    }
+                }
+            }
+            Self::stage_graph_commit_support(&write_txn, graph_commit_support)?;
+            if !change_log.is_empty() {
+                let mut log = write_txn
+                    .open_table(CHANGE_LOG_TABLE)
+                    .map_err(Self::storage_error)?;
+                let lsn = ws.commit_lsn.unwrap_or(Lsn(0));
+                let mut key = String::with_capacity(Self::change_log_entry_key_len());
+                let mut encoded = Vec::new();
+                for (index, entry) in change_log.iter().enumerate() {
+                    Self::write_change_log_entry_key(lsn, index, &mut key);
+                    self.encode_change_log_into_in_write(&write_txn, entry, &mut encoded)?;
+                    log.insert(
+                        observed_graph_key!("history", "insert", key.as_str(), 8),
+                        encoded.as_slice(),
+                    )
+                    .map_err(Self::storage_error)?;
+                    self.graph_writer_window(|| {
+                        Self::write_change_log_selectors_in_write(
+                            &write_txn,
+                            key.as_str(),
+                            encoded.as_slice(),
+                        )
+                    })?;
+                }
+            }
+            let mut committed_config_values = Vec::new();
+            {
+                let mut config = write_txn
+                    .open_table(CONFIG_TABLE)
+                    .map_err(Self::storage_error)?;
+                for key in &ws.config_deletes {
+                    Self::update_policy_hold_release_index(&write_txn, key, false)?;
+                    config.remove(key.as_str()).map_err(Self::storage_error)?;
+                }
+                for (key, value) in original_schema_config_values(&stage.config_values,schema_config,config_cut)?.chain(&ws.config_writes) {
+                    Self::raise_config_identity_floors_in_write(&write_txn, key, value)?;
+                    Self::update_policy_hold_release_index(&write_txn, key, true)?;
+                    let value = if stage
+                        .config_max_u64_keys
+                        .iter()
+                        .any(|max_key| max_key == key)
+                    {
+                        let incoming = frame.decode::<u64>(value)?;
+                        let current = config
+                            .get(key.as_str())
+                            .map_err(Self::storage_error)?
+                            .map(|value| frame.decode::<u64>(value.value()))
+                            .transpose()?
+                            .unwrap_or(0);
+                        frame.encode(&current.max(incoming))?
+                    } else {
+                        value.clone()
+                    };
+                    config
+                        .insert(key.as_str(), value.as_slice())
+                        .map_err(Self::storage_error)?;
+                    committed_config_values.push((key.clone(), value));
+                }
+            }
+            // The complete received-schema core image now exists only inside
+            // this live Redb transaction. Sink queues and trigger audits for
+            // received rows belong immediately below this checkpoint and must
+            // commit with that image, never in a later transaction.
+            #[cfg(test)]
+            if take_received_schema_side_effect_persistence_fault_for_test() {
+                return Err(Error::Other(
+                    "injected received-schema side-effect persistence failure".to_string(),
+                ));
+            }
+            if !sink_events.is_empty() {
+                let lsn = ws.commit_lsn.unwrap_or(Lsn(0));
+                let mut overflow_audits = Vec::new();
+                let mut by_sink: BTreeMap<&str, Vec<(usize, &SinkQueueEntry)>> = BTreeMap::new();
+                for (index, (sink, entry)) in sink_events.iter().enumerate() {
+                    by_sink
+                        .entry(sink.as_str())
+                        .or_default()
+                        .push((index, entry));
+                }
+                for (sink, entries) in by_sink {
+                    let table_name = Self::sink_queue_table_name(sink);
+                    let table_def: TableDefinition<u64, &[u8]> =
+                        TableDefinition::new(table_name.as_str());
+                    let mut table = write_txn
+                        .open_table(table_def)
+                        .map_err(Self::storage_error)?;
+                    let mut existing = table.len().map_err(Self::storage_error)? as usize;
+                    for (index, entry) in entries {
+                        if existing >= max_sink_queue_depth {
+                            return Err(Error::Other(format!("sink queue is full: {sink}")));
+                        }
+                        let overflow_id = if existing >= max_sink_queue_depth {
+                            table
+                                .first()
+                                .map_err(Self::storage_error)?
+                                .map(|(key, _)| key.value())
+                        } else {
+                            None
+                        };
+                        if let Some(id) = overflow_id {
+                            table.remove(id).map_err(Self::storage_error)?;
+                            existing = existing.saturating_sub(1);
+                            overflow_audits.push((index, sink.to_string()));
+                        }
+                        let encoded = frame.encode(entry)?;
+                        table
+                            .insert(entry.id, encoded.as_slice())
+                            .map_err(Self::storage_error)?;
+                        existing = existing.saturating_add(1);
+                    }
+                }
+                if !overflow_audits.is_empty() {
+                    let mut audit_table = write_txn
+                        .open_table(SINK_AUDIT_TABLE)
+                        .map_err(Self::storage_error)?;
+                    for (index, sink) in overflow_audits {
+                        let key = Self::sink_audit_key(lsn, index, &sink);
+                        let audit = SinkAuditEntry {
+                            lsn,
+                            kind: SinkAuditKind::QueueOverflow {
+                                sink,
+                                dropped_count: 1,
+                            },
+                        };
+                        let encoded = frame.encode(&audit)?;
+                        audit_table
+                            .insert(key.as_str(), encoded.as_slice())
+                            .map_err(Self::storage_error)?;
+                    }
+                }
+            }
+            if !trigger_audits.is_empty() {
+                {
+                    let mut audit_table = write_txn
+                        .open_table(TRIGGER_AUDIT_TABLE)
+                        .map_err(Self::storage_error)?;
+                    let mut stamps = write_txn
+                        .open_table(TRIGGER_AUDIT_STAMPS_TABLE)
+                        .map_err(Self::storage_error)?;
+                    let stamped_at = Wallclock::now().0;
+                    for (index, entry) in trigger_audits {
+                        let key = Self::trigger_audit_key(*index, &entry.trigger_name);
+                        let encoded = frame.encode(entry)?;
+                        audit_table
+                            .insert(key.as_str(), encoded.as_slice())
+                            .map_err(Self::storage_error)?;
+                        stamps
+                            .insert(key.as_str(), stamped_at)
+                            .map_err(Self::storage_error)?;
+                    }
+                }
+                {
+                    let mut config_table = write_txn
+                        .open_table(CONFIG_TABLE)
+                        .map_err(Self::storage_error)?;
+                    let mut ring: Vec<TriggerAuditEntry> = config_table
+                        .get(TRIGGER_AUDIT_RING_CONFIG_KEY)
+                        .map_err(Self::storage_error)?
+                        .map(|value| frame.decode(value.value()))
+                        .transpose()?
+                        .unwrap_or_default();
+                    frame.array::<TriggerAuditEntry>(ring.len().checked_add(trigger_audits.len()).and_then(|n|n.checked_mul(4)).ok_or_else(||Error::Other("trigger audit ring preparation overflow".into()))?)?;
+                    ring.extend(trigger_audits.iter().map(|(_, entry)| entry.clone()));
+                    let overflow = ring
+                        .len()
+                        .saturating_sub(crate::database::trigger::TRIGGER_AUDIT_RING_CAPACITY);
+                    if overflow > 0 {
+                        ring.drain(0..overflow);
+                    }
+                    let current_next_index = config_table
+                        .get(TRIGGER_AUDIT_NEXT_INDEX_CONFIG_KEY)
+                        .map_err(Self::storage_error)?
+                        .map(|value| frame.decode::<u64>(value.value()))
+                        .transpose()?
+                        .unwrap_or(0);
+                    let next_index = trigger_audits
+                        .iter()
+                        .map(|(index, _)| index.saturating_add(1))
+                        .max()
+                        .unwrap_or(0)
+                        .max(current_next_index);
+                    let encoded_ring = frame.encode(&ring)?;
+                    config_table
+                        .insert(TRIGGER_AUDIT_RING_CONFIG_KEY, encoded_ring.as_slice())
+                        .map_err(Self::storage_error)?;
+                    committed_config_values
+                        .push((TRIGGER_AUDIT_RING_CONFIG_KEY.to_owned(), encoded_ring));
+                    let encoded_next_index = frame.encode(&next_index)?;
+                    config_table
+                        .insert(
+                            TRIGGER_AUDIT_NEXT_INDEX_CONFIG_KEY,
+                            encoded_next_index.as_slice(),
+                        )
+                        .map_err(Self::storage_error)?;
+                    committed_config_values.push((
+                        TRIGGER_AUDIT_NEXT_INDEX_CONFIG_KEY.to_owned(),
+                        encoded_next_index,
+                    ));
+                }
+            }
+            let mut identity_mutations = OriginalMutationVector::from_vec(&frame,retired_identity);
+            identity_mutations.extend(operational_index_identity_mutations)?;
+            for table in &stage.affected_tables {
+                identity_mutations.extend(content_identity::original_producers::remove_schema_mutations(&frame,table)?)?;
+            }
+            for (table, meta) in &stage.table_meta {
+                identity_mutations.extend(content_identity::original_producers::schema_mutations(&frame,table, meta)?)?;
+            }
+            // The history retirement above, removals before the packed
+            // survivors, so the physical store and the authenticated history
+            // it proves never disagree about which records this installation
+            // left behind or where they sit.
+            identity_mutations.extend(change_log_identity)?;
+            for (table, rows) in &stage.rows {
+                let mut latest = BTreeMap::<RowId, &VersionedRow>::new();
+                for row in rows {
+                    match latest.get(&row.row_id) {
+                        Some(seen) if (seen.lsn, seen.created_tx) >= (row.lsn, row.created_tx) => {}
+                        _ => {
+                            latest.insert(row.row_id, row);
+                        }
+                    }
+                }
+                for row in latest.into_values().filter(|row| row.deleted_tx.is_none()) {
+                    identity_mutations.push(content_identity::original_producers::row_mutation(&frame,
+                        table,
+                        row,
+                        stage.table_meta.get(table),
+                    )?)?;
+                }
+            }
+            for (table, row_id, _) in &ws.relational_deletes {
+                identity_mutations.push(content_identity::original_producers::remove_row_mutation(&frame,table, *row_id)?)?;
+            }
+            for (table, row) in &stage.operational_write_set.relational_inserts {
+                identity_mutations.push(content_identity::original_producers::row_mutation(&frame,
+                    table,
+                    row,
+                    stage.operational_table_meta.get(table),
+                )?)?;
+            }
+            let mut latest_edges = BTreeMap::<(String, NodeId, NodeId), &AdjEntry>::new();
+            for edge in &stage.edges {
+                let identity = (edge.edge_type.clone(), edge.source, edge.target);
+                match latest_edges.get(&identity) {
+                    Some(seen) if (seen.lsn, seen.created_tx) >= (edge.lsn, edge.created_tx) => {}
+                    _ => {
+                        latest_edges.insert(identity, edge);
+                    }
+                }
+            }
+            for edge in latest_edges
+                .into_values()
+                .filter(|edge| edge.deleted_tx.is_none())
+            {
+                identity_mutations.push(content_identity::original_producers::edge_mutation(&frame,edge)?)?;
+            }
+            let mut latest_vectors = BTreeMap::<(String, String, RowId), &VectorEntry>::new();
+            for vector in &stage.vectors {
+                let quantization = vector_quantization
+                    .get(&vector.index)
+                    .copied()
+                    .unwrap_or_default();
+                identity_mutations.push(content_identity::original_producers::vector_version_mutation(&frame,
+                    vector,
+                    quantization,
+                )?)?;
+                let identity = (
+                    vector.index.table.clone(),
+                    vector.index.column.clone(),
+                    vector.row_id,
+                );
+                match latest_vectors.get(&identity) {
+                    Some(seen)
+                        if (seen.lsn, seen.created_tx) >= (vector.lsn, vector.created_tx) => {}
+                    _ => {
+                        latest_vectors.insert(identity, vector);
+                    }
+                }
+            }
+            for vector in latest_vectors
+                .into_values()
+                .filter(|vector| vector.deleted_tx.is_none())
+            {
+                let quantization = vector_quantization
+                    .get(&vector.index)
+                    .copied()
+                    .unwrap_or_default();
+                identity_mutations.push(content_identity::original_producers::vector_mutation(&frame,vector, quantization)?)?;
+            }
+            for (table, row_id, lsn, kind) in &stage.sync_sources {
+                identity_mutations.push(content_identity::original_producers::sync_source_mutation(&frame,
+                    table,
+                    *row_id,
+                    lsn.0,
+                    sync_source_kind_to_u8(*kind),
+                )?)?;
+            }
+            let lsn = ws.commit_lsn.unwrap_or(Lsn(0));
+            let mut change_key = String::with_capacity(Self::change_log_entry_key_len());
+            for (index, _entry) in change_log.iter().enumerate() {
+                Self::write_change_log_entry_key(lsn, index, &mut change_key);
+                identity_mutations.push(Self::stored_change_log_mutation_in_write(
+                    &write_txn,
+                    &change_key,
+                )?)?;
+            }
+            let mut grouped_ddl = BTreeMap::<Lsn, Vec<&DdlChange>>::new();
+            for (ddl_lsn, change) in &stage.ddl_log {
+                grouped_ddl.entry(*ddl_lsn).or_default().push(change);
+            }
+            for (ddl_lsn, changes) in grouped_ddl {
+                for (index, change) in changes.iter().enumerate() {
+                    let key = Self::ddl_log_key_for_index(ddl_lsn, index, changes.len());
+                    identity_mutations
+                        .push(content_identity::original_producers::encoded_history_mutation(&frame,&key, *change)?);
+                }
+            }
+            // The committed history records the very commit-index entry this
+            // flush stores above, with the same transaction id.
+            if let (Some(commit_lsn), Some(tx)) = (ws.commit_lsn, Self::write_set_visibility_tx(ws))
+            {
+                identity_mutations.push(content_identity::original_producers::commit_index_mutation(&frame,commit_lsn, tx)?)?;
+            }
+            for key in &ws.config_deletes {
+                identity_mutations.extend(content_identity::original_producers::config_mutations(&frame,key, None)?)?;
+            }
+            for (key, value) in &committed_config_values {
+                identity_mutations.extend(content_identity::original_producers::config_mutations(&frame,key, Some(value))?)?;
+            }
+            if !sink_events.is_empty() {
+                let table = write_txn
+                    .open_table(SINK_AUDIT_TABLE)
+                    .map_err(Self::storage_error)?;
+                for item in table.iter().map_err(Self::storage_error)? {
+                    let (key, value) = item.map_err(Self::storage_error)?;
+                    identity_mutations.push(content_identity::original_producers::status_mutation(&frame,
+                        b"sink-audit",
+                        key.value().as_bytes(),
+                        value.value(),
+                    )?)?;
+                }
+            }
+            if !trigger_audits.is_empty() {
+                let table = write_txn
+                    .open_table(TRIGGER_AUDIT_TABLE)
+                    .map_err(Self::storage_error)?;
+                for item in table.iter().map_err(Self::storage_error)? {
+                    let (key, value) = item.map_err(Self::storage_error)?;
+                    identity_mutations.push(content_identity::original_producers::status_mutation(&frame,
+                        b"trigger-audit",
+                        key.value().as_bytes(),
+                        value.value(),
+                    )?)?;
+                }
+                let table = write_txn
+                    .open_table(TRIGGER_AUDIT_STAMPS_TABLE)
+                    .map_err(Self::storage_error)?;
+                for item in table.iter().map_err(Self::storage_error)? {
+                    let (key, stamp) = item.map_err(Self::storage_error)?;
+                    identity_mutations.push(content_identity::original_producers::status_mutation(&frame,
+                        b"trigger-stamp",
+                        key.value().as_bytes(),
+                        &stamp.value().to_le_bytes(),
+                    )?)?;
+                }
+            }
+            for sink in &sink_queue_names {
+                let table_name = Self::sink_queue_table_name(sink);
+                let table_def: TableDefinition<u64, &[u8]> =
+                    TableDefinition::new(table_name.as_str());
+                let table = write_txn
+                    .open_table(table_def)
+                    .map_err(Self::storage_error)?;
+                for item in table.iter().map_err(Self::storage_error)? {
+                    let (id, value) = item.map_err(Self::storage_error)?;
+                    let entry: SinkQueueEntry = frame.decode(value.value())?;
+                    let key = format!("{}:{sink}:{}", sink.len(), id.value());
+                    identity_mutations.push(content_identity::original_producers::encoded_status_mutation(&frame,
+                        b"sink-queue",
+                        key.as_bytes(),
+                        &entry,
+                    )?)?;
+                }
+            }
+            Self::apply_owned_content_identity_with_manifests_and_groups_in_write(
+                &write_txn,
+                &identity_mutations,
+                &[], &mut content_identity::original_writer::ProofAdmission::new(&frame.original,self.proof_scratch_owner())?, Some(&group_plan))?;
+            if take_received_schema_pre_commit_fault_for_test() {
+                return Err(Error::Other(
+                    "injected received-schema Redb pre-commit failure".to_string(),
+                ));
+            }
+            // Failure is reached after the unit and its outcome are staged.
+            #[cfg(any(test, feature = "test-seams"))]
+            if ws
+                .config_writes
+                .iter()
+                .any(|(key, _)| key.starts_with("delivery_hub_outcome.v1."))
+            {
+                crate::custody::durability::before_custody_commit(&write_txn)?;
+            }
+            for (table, rows) in &stage.rows {
+                for row in rows {
+                    Self::raise_table_read_lsn_in_write(&write_txn, table, row.lsn)?;
+                    Self::raise_noncanonical_writer_floors_in_write(
+                        &write_txn,
+                        row.created_tx.max(row.deleted_tx.unwrap_or(TxId(0))),
+                        row.lsn,
+                        row.row_id,
+                    )?;
+                }
+            }
+            for entry in &stage.vectors {
+                Self::raise_table_read_lsn_in_write(&write_txn, &entry.index.table, entry.lsn)?;
+                Self::raise_noncanonical_writer_floors_in_write(
+                    &write_txn,
+                    entry.created_tx.max(entry.deleted_tx.unwrap_or(TxId(0))),
+                    entry.lsn,
+                    entry.row_id,
+                )?;
+            }
+            self.preserve_graph_commit_support(
+                &write_txn,
+                graph_commit_support,
+                ws.commit_lsn.zip(Self::write_set_visibility_tx(ws)),
+            )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, Some(ws))?;
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)?;
+            self.complete_writer_schema_change(schema);
+            Ok(())
+        })
+    }
+
+pub(crate) fn flush_owned_received_schema_noop(
+        &self,
+original:&crate::memory_accounting::OwnedMemoryReservation,
+        ws: &WriteSet,
+        change_log: &[ChangeLogEntry],
+        stage: &ReceivedSchemaPersistenceProjection, schema_config:Option<&[(String,Vec<u8>)]>, config_cut:usize) -> Result<()> {
+        let frame=OriginalPersistenceFrame::new(original)?;
+        frame.plan_write_set(ws,&[],&[])?;
+
+
+
+        #[cfg(any(test, feature = "test-seams"))]
+        let flush_started = std::time::Instant::now();
+        #[cfg(any(test, feature = "test-seams"))]
+        {
+            crate::database::record_received_schema_persistence_work_for_test(
+                "noop-ddl-log-writes",
+                stage.ddl_log.len() as u64,
+            );
+            crate::database::record_received_schema_persistence_work_for_test(
+                "noop-config-writes",
+                stage
+                    .config_values
+                    .len()
+                    .saturating_add(ws.config_writes.len()) as u64,
+            );
+            crate::database::record_received_schema_persistence_work_for_test(
+                "noop-config-deletes",
+                ws.config_deletes.len() as u64,
+            );
+            crate::database::record_received_schema_persistence_work_for_test(
+                "noop-operational-row-writes",
+                stage
+                    .operational_write_set
+                    .relational_deletes
+                    .len()
+                    .saturating_add(stage.operational_write_set.relational_inserts.len())
+                    as u64,
+            );
+        }
+        for (key, value) in original_schema_config_values(&stage.config_values, schema_config, config_cut)? {
+            frame.plan_config(key, value)?;
+        }
+        let group_plan = custody_groups::GroupPlan::prepaid(
+            original_schema_config_values(&stage.config_values, schema_config, config_cut)?.chain(&ws.config_writes))?;
+        self.with_db(|db| {
+            #[cfg(any(test, feature = "test-seams"))]
+            let begin_started = std::time::Instant::now();
+            let write_txn = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
+            let graph_commit_support =
+                Self::capture_graph_commit_support(&write_txn, ws.commit_lsn)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            crate::database::record_received_schema_persistence_profile_for_test(
+                "noop-begin-write",
+                begin_started,
+            );
+            let operational_index_identity_mutations =
+                self.flush_received_schema_operational_rows_in_write_original(&frame,&write_txn, stage)?;
+            if !stage.ddl_log.is_empty() {
+                let mut ddl = write_txn
+                    .open_table(DDL_LOG_TABLE)
+                    .map_err(Self::storage_error)?;
+                let mut grouped = BTreeMap::<Lsn, Vec<&DdlChange>>::new();
+                for (lsn, change) in &stage.ddl_log {
+                    grouped.entry(*lsn).or_default().push(change);
+                }
+                for (lsn, changes) in grouped {
+                    for (index, change) in changes.iter().enumerate() {
+                        let key = Self::ddl_log_key_for_index(lsn, index, changes.len());
+                        Self::append_ddl_summary_in_write(&write_txn, &key, change)?;
+                        let encoded = frame.encode(*change)?;
+                        ddl.insert(key.as_str(), encoded.as_slice())
+                            .map_err(Self::storage_error)?;
+                    }
+                }
+            }
+            let mut committed_config_values = Vec::new();
+            {
+                let mut config = write_txn
+                    .open_table(CONFIG_TABLE)
+                    .map_err(Self::storage_error)?;
+                for key in &ws.config_deletes {
+                    Self::update_policy_hold_release_index(&write_txn, key, false)?;
+                    config.remove(key.as_str()).map_err(Self::storage_error)?;
+                }
+                for (key, value) in original_schema_config_values(&stage.config_values,schema_config,config_cut)?.chain(&ws.config_writes) {
+                    Self::raise_config_identity_floors_in_write(&write_txn, key, value)?;
+                    Self::update_policy_hold_release_index(&write_txn, key, true)?;
+                    let value = if ws.config_max_u64_keys.iter().any(|max_key| max_key == key) {
+                        let incoming = frame.decode::<u64>(value)?;
+                        let current = config
+                            .get(key.as_str())
+                            .map_err(Self::storage_error)?
+                            .map(|value| frame.decode::<u64>(value.value()))
+                            .transpose()?
+                            .unwrap_or(0);
+                        frame.encode(&current.max(incoming))?
+                    } else {
+                        value.clone()
+                    };
+                    config
+                        .insert(key.as_str(), value.as_slice())
+                        .map_err(Self::storage_error)?;
+                    committed_config_values.push((key.clone(), value));
+                }
+            }
+            if let (Some(lsn), Some(tx)) = (ws.commit_lsn, ws.visibility_floor) {
+                let mut index = write_txn
+                    .open_table(COMMIT_INDEX_TABLE)
+                    .map_err(Self::storage_error)?;
+                index.insert(lsn.0, tx.0).map_err(Self::storage_error)?;
+            }
+            Self::stage_graph_commit_support(&write_txn, graph_commit_support)?;
+            if !change_log.is_empty() {
+                let mut log = write_txn
+                    .open_table(CHANGE_LOG_TABLE)
+                    .map_err(Self::storage_error)?;
+                let lsn = ws.commit_lsn.unwrap_or(Lsn(0));
+                let mut key = String::with_capacity(Self::change_log_entry_key_len());
+                let mut encoded = Vec::new();
+                for (index, entry) in change_log.iter().enumerate() {
+                    Self::write_change_log_entry_key(lsn, index, &mut key);
+                    self.encode_change_log_into_in_write(&write_txn, entry, &mut encoded)?;
+                    log.insert(
+                        observed_graph_key!("history", "insert", key.as_str(), 8),
+                        encoded.as_slice(),
+                    )
+                    .map_err(Self::storage_error)?;
+                    self.graph_writer_window(|| {
+                        Self::write_change_log_selectors_in_write(
+                            &write_txn,
+                            key.as_str(),
+                            encoded.as_slice(),
+                        )
+                    })?;
+                }
+            }
+            let mut identity_mutations = OriginalMutationVector::from_vec(&frame,operational_index_identity_mutations);
+            for key in &ws.config_deletes {
+                identity_mutations.extend(content_identity::original_producers::config_mutations(&frame,key, None)?)?;
+            }
+            for (key, value) in &committed_config_values {
+                identity_mutations.extend(content_identity::original_producers::config_mutations(&frame,key, Some(value))?)?;
+            }
+            let mut grouped_ddl = BTreeMap::<Lsn, Vec<&DdlChange>>::new();
+            for (ddl_lsn, change) in &stage.ddl_log {
+                grouped_ddl.entry(*ddl_lsn).or_default().push(change);
+            }
+            for (ddl_lsn, changes) in grouped_ddl {
+                for (index, change) in changes.iter().enumerate() {
+                    let key = Self::ddl_log_key_for_index(ddl_lsn, index, changes.len());
+                    identity_mutations
+                        .push(content_identity::original_producers::encoded_history_mutation(&frame,&key, *change)?);
+                }
+            }
+            for (table, row_id, _) in &stage.operational_write_set.relational_deletes {
+                identity_mutations.push(content_identity::original_producers::remove_row_mutation(&frame,table, *row_id)?)?;
+            }
+            for (table, row) in &stage.operational_write_set.relational_inserts {
+                identity_mutations.push(content_identity::original_producers::row_mutation(&frame,
+                    table,
+                    row,
+                    stage.operational_table_meta.get(table),
+                )?)?;
+            }
+            let lsn = ws.commit_lsn.unwrap_or(Lsn(0));
+            let mut change_key = String::with_capacity(Self::change_log_entry_key_len());
+            for (index, _entry) in change_log.iter().enumerate() {
+                Self::write_change_log_entry_key(lsn, index, &mut change_key);
+                identity_mutations.push(Self::stored_change_log_mutation_in_write(
+                    &write_txn,
+                    &change_key,
+                )?)?;
+            }
+            if let (Some(commit_lsn), Some(tx)) = (ws.commit_lsn, ws.visibility_floor) {
+                identity_mutations.push(content_identity::original_producers::commit_index_mutation(&frame,commit_lsn, tx)?)?;
+            }
+            if !identity_mutations.is_empty() {
+                Self::apply_owned_content_identity_with_manifests_and_groups_in_write(
+                    &write_txn,
+                    &identity_mutations,
+                    &[], &mut content_identity::original_writer::ProofAdmission::new(&frame.original,self.proof_scratch_owner())?, Some(&group_plan))?;
+            }
+            if take_received_schema_pre_commit_fault_for_test() {
+                return Err(Error::Other(
+                    "injected received-schema Redb pre-commit failure".to_string(),
+                ));
+            }
+            #[cfg(any(test, feature = "test-seams"))]
+            let durable_commit_started = std::time::Instant::now();
+            self.preserve_graph_commit_support(
+                &write_txn,
+                graph_commit_support,
+                ws.commit_lsn.zip(ws.visibility_floor),
+            )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, Some(ws))?;
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            crate::database::record_received_schema_persistence_profile_for_test(
+                "noop-durable-commit",
+                durable_commit_started,
+            );
+            Ok(())
+        })?;
+        #[cfg(any(test, feature = "test-seams"))]
+        crate::database::record_received_schema_persistence_profile_for_test(
+            "noop-flush-total",
+            flush_started,
+        );
+        Ok(())
+    }
+
+pub(crate) fn flush_owned_local_schema_stage(
+        &self,
+original:&crate::memory_accounting::OwnedMemoryReservation,
+        ws: &WriteSet,
+        stage: &LocalSchemaPersistenceProjection, schema_config:Option<&[(String,Vec<u8>)]>, config_cut:usize) -> Result<()> {
+        let frame=OriginalPersistenceFrame::new(original)?;
+        frame.plan_write_set(ws,&[],&[])?;
+        for meta in stage.affected_table_meta.values(){frame.record(meta)?;}
+
+
+
+        let lsn = ws.commit_lsn.ok_or_else(|| {
+            Error::Other("local schema stage is missing its commit LSN".to_string())
+        })?;
+        if stage.ddl.is_empty() {
+            return Err(Error::Other(
+                "local schema stage contains no DDL".to_string(),
+            ));
+        }
+        let schema = self.prepare_writer_schema_change(
+            std::iter::empty(),
+            stage
+                .affected_table_meta
+                .iter()
+                .map(|(name, meta)| (name.as_str(), meta)),
+        )?;
+        for (key, value) in original_schema_config_values(&stage.config_values, schema_config, config_cut)? {
+            frame.plan_config(key, value)?;
+        }
+        let group_plan = custody_groups::GroupPlan::prepaid(
+            original_schema_config_values(&stage.config_values, schema_config, config_cut)?.chain(&ws.config_writes))?;
+        self.with_db(|db| {
+            let write_txn = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
+            let graph_commit_support = Self::capture_graph_commit_support(&write_txn, Some(lsn))?;
+
+            {
+                let mut meta_table = write_txn
+                    .open_table(META_TABLE)
+                    .map_err(Self::storage_error)?;
+                for (table, meta) in &stage.affected_table_meta {
+                    let key = Self::meta_key(table);
+                    let encoded_schema =
+                        self.schema_update_in_table(&meta_table, table, meta, &stage.ddl)?;
+                    let encoded = &encoded_schema.bytes;
+                    meta_table
+                        .insert(key.as_str(), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                    vector_membership_pages::ensure_declared_routes(
+                        &write_txn,
+                        table,
+                        meta,
+                        Some(crate::memory_accounting::persistence_original_projection(frame.original)?.as_handle()),
+                    )?;
+                }
+            }
+
+            // `open_table` is both the Redb table creation path and a no-op
+            // for an existing relation. Do not delete, scan, or rewrite rows:
+            // another committed local table must remain byte-for-byte intact.
+            for table in stage.affected_table_meta.keys() {
+                let table_name = Self::rel_table_name(table);
+                let table_def: TableDefinition<&[u8], &[u8]> =
+                    TableDefinition::new(table_name.as_str());
+                let _relation =
+                    content_size::open_rows(&write_txn, table_def).map_err(Self::storage_error)?;
+            }
+            for (table, meta) in &stage.affected_table_meta {
+                Self::rebuild_relational_indexes_in_write_original(&frame,
+                    &write_txn,
+                    &self.path,
+                    table,
+                    meta,
+                    None,
+                    &mut content_identity::original_writer::ProofAdmission::new(&frame.original,self.proof_scratch_owner())?,
+                )?;
+            }
+
+            {
+                let mut config_table = write_txn
+                    .open_table(CONFIG_TABLE)
+                    .map_err(Self::storage_error)?;
+                for key in &ws.config_deletes {
+                    Self::update_policy_hold_release_index(&write_txn, key, false)?;
+                    config_table
+                        .remove(key.as_str())
+                        .map_err(Self::storage_error)?;
+                }
+                for (key, encoded) in original_schema_config_values(&stage.config_values,schema_config,config_cut)?.chain(&ws.config_writes) {
+                    Self::raise_config_identity_floors_in_write(&write_txn, key, encoded)?;
+                    Self::update_policy_hold_release_index(&write_txn, key, true)?;
+                    config_table
+                        .insert(key.as_str(), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+            }
+
+            {
+                let mut ddl_table = write_txn
+                    .open_table(DDL_LOG_TABLE)
+                    .map_err(Self::storage_error)?;
+                for (index, change) in stage.ddl.iter().enumerate() {
+                    let key = Self::ddl_log_key_for_index(lsn, index, stage.ddl.len());
+                    Self::append_ddl_summary_in_write(&write_txn, &key, change)?;
+                    let encoded = frame.encode(change)?;
+                    ddl_table
+                        .insert(key.as_str(), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+            }
+
+            {
+                let mut index = write_txn
+                    .open_table(COMMIT_INDEX_TABLE)
+                    .map_err(Self::storage_error)?;
+                index
+                    .insert(lsn.0, stage.commit_index_tx.0)
+                    .map_err(Self::storage_error)?;
+            }
+
+            let mut identity_mutations = OriginalMutationVector::new(&frame);
+            for (table, meta) in &stage.affected_table_meta {
+                identity_mutations.extend(content_identity::original_producers::schema_mutations(&frame,table, meta)?)?;
+            }
+            for key in &ws.config_deletes {
+                identity_mutations.extend(content_identity::original_producers::config_mutations(&frame,key, None)?)?;
+            }
+            for (key, encoded) in original_schema_config_values(&stage.config_values,schema_config,config_cut)?.chain(&ws.config_writes) {
+                Self::raise_config_identity_floors_in_write(&write_txn, key, encoded)?;
+                identity_mutations.extend(content_identity::original_producers::config_mutations(&frame,key, Some(encoded))?)?;
+            }
+            for (index, change) in stage.ddl.iter().enumerate() {
+                let key = Self::ddl_log_key_for_index(lsn, index, stage.ddl.len());
+                identity_mutations.push(content_identity::original_producers::encoded_history_mutation(&frame,&key, change)?)?;
+            }
+            identity_mutations.push(content_identity::original_producers::commit_index_mutation(&frame,
+                lsn,
+                stage.commit_index_tx,
+            )?)?;
+            Self::apply_owned_content_identity_with_manifests_and_groups_in_write(
+                &write_txn,
+                &identity_mutations,
+                &[], &mut content_identity::original_writer::ProofAdmission::new(&frame.original,self.proof_scratch_owner())?, Some(&group_plan))?;
+
+            if take_received_schema_pre_commit_fault_for_test() {
+                return Err(Error::Other(
+                    "injected received-schema Redb pre-commit failure".to_string(),
+                ));
+            }
+            self.preserve_graph_commit_support(
+                &write_txn,
+                graph_commit_support,
+                Some((lsn, stage.commit_index_tx)),
+            )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, Some(ws))?;
+            {
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)?;
+            self.complete_writer_schema_change(schema);
+            Ok(())
+        })
+    }
+
+pub(crate) fn retire_received_schema_generation_in_write_original(
+        &self,
+frame:&OriginalPersistenceFrame<'_>,
+        write_txn: &redb::WriteTransaction,
+        stage: &ReceivedSchemaPersistenceProjection,
+    ) -> Result<Vec<content_identity::ContentIdentityMutation>> {
+
+        let mut mutations = OriginalMutationVector::new(frame);
+        let mut affected = stage.affected_tables.iter().collect::<Vec<_>>();
+        affected.sort();
+        let old_meta = {
+            let meta_table = write_txn
+                .open_table(META_TABLE)
+                .map_err(Self::storage_error)?;
+            let mut old_meta = HashMap::new();
+            for table in &affected {
+                let key = Self::meta_key(table);
+                if let Some(encoded) = meta_table.get(key.as_str()).map_err(Self::storage_error)? {
+                    old_meta.insert(
+                        (*table).clone(),
+                        Self::decode_table_meta_versioned(encoded.value())?.0,
+                    );
+                }
+            }
+            old_meta
+        };
+
+        for table in &affected {
+            // A newly declared table has no retired generation. Opening its
+            // missing relation here would create a table only to delete it
+            // before writing the replacement image.
+            if !old_meta.contains_key(*table) {
+                continue;
+            }
+            let table_name = Self::rel_table_name(table);
+            let table_def: TableDefinition<&[u8], &[u8]> =
+                TableDefinition::new(table_name.as_str());
+            let relation = match content_size::open_rows(write_txn, table_def) {
+                Ok(relation) => relation,
+                Err(redb::TableError::TableTypeMismatch { .. }) => continue,
+                Err(error) => return Err(Self::storage_error(error)),
+            };
+            let mut row_ids = BTreeSet::new();
+            for entry in relation.iter().map_err(Self::storage_error)? {
+                let (key, _) = entry.map_err(Self::storage_error)?;
+                let key = key.value();
+                let row_id = key
+                    .get(..8)
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .map(|bytes| RowId(u64::from_be_bytes(bytes)))
+                    .ok_or_else(|| Error::StoreCorrupted {
+                        path: self.path.display().to_string(),
+                        reason: format!("row key of table {table} is shorter than a row id"),
+                    })?;
+                row_ids.insert(row_id);
+            }
+            for row_id in row_ids {
+                mutations.push(content_identity::original_producers::remove_row_mutation(
+                    frame, table, row_id,
+                )?)?;
+            }
+        }
+
+        for table in &affected {
+            let Some(old) = old_meta.get(*table) else {
+                continue;
+            };
+            let replacement = stage.table_meta.get(*table);
+            let kept = replacement
+                .map(|meta| {
+                    Self::relational_index_declarations(meta)
+                        .into_iter()
+                        .map(|declaration| declaration.name)
+                        .collect::<HashSet<_>>()
+                })
+                .unwrap_or_default();
+            for declaration in Self::relational_index_declarations(old) {
+                if kept.contains(&declaration.name) {
+                    // The rebuild of the surviving declaration retires and
+                    // replaces its postings itself.
+                    continue;
+                }
+                let name = Self::relational_index_table_name(table, &declaration.name);
+                let definition: TableDefinition<DurableRelationalIndexKey, &[u8]> =
+                    TableDefinition::new(name.as_str());
+                if let Ok(existing) = write_txn.open_table(definition) {
+                    for entry in existing.iter().map_err(Self::storage_error)? {
+                        let decoded = decode_relational_index_entry(
+                            &self.path,
+                            Some(entry.map_err(Self::storage_error)?),
+                        )?
+                        .expect("an existing index iterator entry decodes");
+                        let (_, position, deleted_tx) = decoded;
+                        if deleted_tx.is_some() {
+                            continue;
+                        }
+                        let logical_key =
+                            DurableRelationalIndexKey::new(position.key, position.row_id, TxId(0))?;
+                        mutations.push(content_identity::original_producers::remove_relational_index_posting_mutation(frame,
+                            table,
+                            &declaration.name,
+                            &logical_key.0,
+                        )?)?;
+                    }
+                }
+                match write_txn.delete_table(definition) {
+                    Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
+                    Err(error) => return Err(Self::storage_error(error)),
+                }
+                let current_name =
+                    Self::current_relational_index_table_name(table, &declaration.name);
+                let current_definition: TableDefinition<DurableRelationalIndexKey, &[u8]> =
+                    TableDefinition::new(current_name.as_str());
+                write_txn
+                    .delete_table(current_definition)
+                    .map_err(Self::storage_error)?;
+            }
+            if replacement.is_some() {
+                continue;
+            }
+            // A dropped table keeps no maintained counts, no readiness and no
+            // retention expiries.
+            {
+                let mut counts = write_txn
+                    .open_table(RELATIONAL_INDEX_COUNT_TABLE)
+                    .map_err(Self::storage_error)?;
+                let mut retired = Vec::new();
+                for entry in counts.iter().map_err(Self::storage_error)? {
+                    let (key, _) = entry.map_err(Self::storage_error)?;
+                    let decoded: EncodedRelationalIndexCountKey = frame.decode(key.value())?;
+                    if decoded.table == **table {
+                        retired.push(key.value().to_vec());
+                    }
+                }
+                for key in retired {
+                    counts.remove(key.as_slice()).map_err(Self::storage_error)?;
+                    mutations.push(Self::remove_relational_index_count_mutation(&key))?;
+                }
+            }
+            if write_txn
+                .open_table(RELATIONAL_INDEX_READY_TABLE)
+                .map_err(Self::storage_error)?
+                .remove(table.as_str())
+                .map_err(Self::storage_error)?
+                .is_some()
+            {
+                mutations.push(content_identity::original_producers::remove_status_mutation(frame,
+                    RELATIONAL_INDEX_COUNT_READY_IDENTITY_NAMESPACE,
+                    table.as_bytes(),
+                )?)?;
+            }
+            let prefix = format!(
+                "{}{}:{table}:",
+                crate::composite_store::RETENTION_EXPIRY_PREFIX,
+                table.len()
+            );
+            let mut config = write_txn
+                .open_table(CONFIG_TABLE)
+                .map_err(Self::storage_error)?;
+            let expiries = config
+                .range(prefix.as_str()..)
+                .map_err(Self::storage_error)?
+                .map(|entry| {
+                    entry
+                        .map(|(key, _)| key.value().to_owned())
+                        .map_err(Self::storage_error)
+                })
+                .take_while(|entry| entry.as_ref().map_or(true, |key| key.starts_with(&prefix)))
+                .collect::<Result<Vec<_>>>()?;
+            for key in expiries {
+                config.remove(key.as_str()).map_err(Self::storage_error)?;
+                mutations.extend(content_identity::original_producers::config_mutations(frame,&key, None)?)?;
+            }
+        }
+
+        {
+            let sources = write_txn
+                .open_table(SYNC_ROW_SOURCE_LSN_TABLE)
+                .map_err(Self::storage_error)?;
+            for entry in sources.iter().map_err(Self::storage_error)? {
+                let (key, _) = entry.map_err(Self::storage_error)?;
+                if let Some((table, row_id)) = Self::decode_sync_row_source_lsn_key(key.value())
+                    && stage.affected_tables.contains(&table)
+                {
+                    mutations.push(content_identity::original_producers::remove_sync_source_mutation(frame,
+                        &table, row_id,
+                    )?)?;
+                }
+            }
+        }
+
+        if stage.replace_vectors {
+            match content_size::open_vectors(write_txn) {
+                Ok(vectors) => {
+                    for item in vectors.iter().map_err(Self::storage_error)? {
+                        let (_, value) = item.map_err(Self::storage_error)?;
+                        let entry: PersistedVectorEntry = frame.decode(value.value())?;
+                        if !stage.affected_tables.contains(&entry.index.table) {
+                            continue;
+                        }
+                        let quantization = entry.vector.quantization();
+                        mutations.push(content_identity::original_producers::remove_vector_version_mutation(frame,
+                            &entry.index,
+                            entry.row_id,
+                            entry.created_tx,
+                            entry.lsn,
+                            quantization,
+                        )?)?;
+                        mutations.push(content_identity::original_producers::remove_vector_mutation(frame,
+                            &entry.index,
+                            entry.row_id,
+                            quantization,
+                        )?)?;
+                    }
+                }
+                Err(redb::TableError::TableDoesNotExist(_)) => {}
+                Err(error) => return Err(Self::storage_error(error)),
+            }
+        }
+
+        if stage.replace_graph {
+            let forward = write_txn
+                .open_table(GRAPH_FWD_TABLE)
+                .map_err(Self::storage_error)?;
+            for item in forward
+                .iter()
+                .map_err(Self::storage_error)?
+                .inspect(|_entry| {
+                    #[cfg(any(test, feature = "test-seams"))]
+                    if let Ok((key, _)) = _entry {
+                        crate::read_work_probe::graph_storage_key(
+                            "graph_fwd",
+                            "iteration_step",
+                            key.value(),
+                        );
+                    }
+                })
+            {
+                let (_key, value) = item.map_err(Self::storage_error)?;
+                #[cfg(any(test, feature = "test-seams"))]
+                crate::read_work_probe::note_graph(
+                    "graph_payload",
+                    "payload_decode",
+                    _key.value(),
+                    None,
+                    Some("received_schema_identity_preparation"),
+                );
+                let edge = frame.decode::<AdjEntry>(value.value())?;
+                if stage.affected_graph_edge_types.contains(&edge.edge_type) {
+                    mutations.push(content_identity::original_producers::remove_edge_mutation(frame,
+                        edge.source,
+                        &edge.edge_type,
+                        edge.target,
+                    )?)?;
+                }
+            }
+        }
+        Ok(mutations.into_vec())
+    }
+
+pub(crate) fn flush_received_schema_operational_rows_in_write_original(
+        &self,
+frame:&OriginalPersistenceFrame<'_>,
+        write_txn: &redb::WriteTransaction,
+        stage: &ReceivedSchemaPersistenceProjection,
+    ) -> Result<Vec<content_identity::ContentIdentityMutation>> {
+        let ws = &stage.operational_write_set;
+        for (table, row_id, deleted_tx) in &ws.relational_deletes {
+            let old = stage
+                .operational_deleted_rows
+                .get(table)
+                .and_then(|rows| rows.get(row_id))
+                .ok_or_else(|| {
+                    Error::Other(format!(
+                        "received-schema operational update is missing row {} from {table}",
+                        row_id.0
+                    ))
+                })?;
+            let mut deleted = old.clone();
+            deleted.deleted_tx = Some(*deleted_tx);
+            let table_name = Self::rel_table_name(table);
+            let definition: TableDefinition<&[u8], &[u8]> =
+                TableDefinition::new(table_name.as_str());
+            let mut relation =
+                content_size::open_rows(write_txn, definition).map_err(Self::storage_error)?;
+            self.verify_relational_group_in_write_original(frame.original,write_txn, table, *row_id, &*relation)?;
+            let key = Self::rel_row_key(&deleted);
+            let encoded =
+                Self::encode_versioned_row_original(frame,&deleted, stage.operational_table_meta.get(table))?;
+            {
+                let predecessor = relation.get(key.as_slice()).map_err(Self::storage_error)?;
+                self.replace_relational_manifest_in_write_original(frame.original,
+                    write_txn,
+                    table,
+                    key.as_slice(),
+                    predecessor.as_ref().map(|body| body.value()),
+                    Some(encoded.as_slice()),
+                )?;
+            }
+            relation
+                .insert(key.as_slice(), encoded.as_slice())
+                .map_err(Self::storage_error)?;
+        }
+        for (table, row) in &ws.relational_inserts {
+            let table_name = Self::rel_table_name(table);
+            let definition: TableDefinition<&[u8], &[u8]> =
+                TableDefinition::new(table_name.as_str());
+            let mut relation =
+                content_size::open_rows(write_txn, definition).map_err(Self::storage_error)?;
+            let key = Self::rel_row_key(row);
+            let encoded = Self::encode_versioned_row_original(frame,row, stage.operational_table_meta.get(table))?;
+            {
+                let predecessor = relation.get(key.as_slice()).map_err(Self::storage_error)?;
+                self.replace_relational_manifest_in_write_original(frame.original,
+                    write_txn,
+                    table,
+                    key.as_slice(),
+                    predecessor.as_ref().map(|body| body.value()),
+                    Some(encoded.as_slice()),
+                )?;
+            }
+            relation
+                .insert(key.as_slice(), encoded.as_slice())
+                .map_err(Self::storage_error)?;
+        }
+        Self::flush_relational_index_changes_in_write_original(frame,
+            write_txn,
+            ws,
+            &stage.operational_table_meta,
+            Some(&stage.operational_deleted_rows),
+        )
+    }
+
+pub(crate) fn encode_versioned_row_original(
+frame:&OriginalPersistenceFrame<'_>,row: &VersionedRow, meta: Option<&TableMeta>) -> Result<Vec<u8>> {
+        let mut encoded = Vec::new();
+        Self::encode_versioned_row_into_original(frame,row, meta, &mut encoded)?;
+        Ok(encoded)
+    }
+
+pub(crate) fn encode_versioned_row_into_original(
+frame:&OriginalPersistenceFrame<'_>,
+        row: &VersionedRow,
+        meta: Option<&TableMeta>,
+        encoded: &mut Vec<u8>,
+    ) -> Result<()> {
+        Self::encode_versioned_row_with_deleted_tx_into_original(frame,row, row.deleted_tx, meta, encoded)
+    }
+
+pub(crate) fn encode_versioned_row_with_deleted_tx_into_original(
+frame:&OriginalPersistenceFrame<'_>,
+        row: &VersionedRow,
+        deleted_tx: Option<TxId>,
+        meta: Option<&TableMeta>,
+        encoded: &mut Vec<u8>,
+    ) -> Result<()> {
+        Self::encode_versioned_row_with_f32_overlay_into_original(frame,row, deleted_tx, meta, None, encoded)
+    }
+
+pub(crate) fn encode_versioned_row_with_f32_overlay_into_original(
+frame:&OriginalPersistenceFrame<'_>,
+        row: &VersionedRow,
+        deleted_tx: Option<TxId>,
+        meta: Option<&TableMeta>,
+        f32_overlay: Option<&HashMap<String, Vec<f32>>>,
+        encoded: &mut Vec<u8>,
+    ) -> Result<()> {
+        frame.record(row)?;
+        frame.map::<String,PersistedValue>(row.values.len())?;
+        if let Some(vectors)=f32_overlay{for (name,value) in vectors{frame.reserve(name.len())?;frame.array::<f32>(value.len())?;}}
+        let values = row
+            .values
+            .iter()
+            .map(|(column, value)| {
+                let persisted = match value {
+                    Value::Vector(vector) => {
+                        let quantization = Self::column_quantization(meta, column);
+                        if matches!(quantization, VectorQuantization::F32) {
+                            PersistedValue::Vector(PersistedVector::from_f32(vector, quantization))
+                        } else {
+                            PersistedValue::Plain(Value::Null)
+                        }
+                    }
+                    Value::Null
+                        if f32_overlay
+                            .and_then(|vectors| vectors.get(column))
+                            .is_some()
+                            && matches!(
+                                Self::column_quantization(meta, column),
+                                VectorQuantization::F32
+                            ) =>
+                    {
+                        PersistedValue::Vector(PersistedVector::from_f32(
+                            f32_overlay
+                                .and_then(|vectors| vectors.get(column))
+                                .expect("checked F32 row-vector overlay"),
+                            VectorQuantization::F32,
+                        ))
+                    }
+                    _ => PersistedValue::Plain(value.clone()),
+                };
+                (column.clone(), persisted)
+            })
+            .collect::<HashMap<_, _>>();
+        Self::encode_into_original(frame,
+            &PersistedVersionedRow {
+                row_id: row.row_id,
+                values,
+                created_tx: row.created_tx,
+                deleted_tx,
+                lsn: row.lsn,
+                created_at: row.created_at,
+            },
+            encoded,
+        )
+    }
+
+pub(crate) fn f32_vectors_from_row_original(
+frame:&OriginalPersistenceFrame<'_>,
+        row: &VersionedRow,
+        meta: Option<&TableMeta>,
+    ) -> Result<HashMap<String, Vec<f32>>> {
+        frame.record(row)?;frame.map::<String,Vec<f32>>(row.values.len())?;
+        Ok(row.values
+            .iter()
+            .filter_map(|(column, value)| match value {
+                Value::Vector(vector)
+                    if matches!(
+                        Self::column_quantization(meta, column),
+                        VectorQuantization::F32
+                    ) =>
+                {
+                    Some((column.clone(), vector.clone()))
+                }
+                _ => None,
+            })
+            .collect())
+    }
+
+pub(crate) fn decode_versioned_row_original(
+frame:&OriginalPersistenceFrame<'_>,bytes: &[u8], _meta: Option<&TableMeta>) -> Result<VersionedRow> {
+
+        let persisted: PersistedVersionedRow = frame.decode(bytes)?;
+        frame.reserve(
+            persisted
+                .values
+                .iter()
+                .map(|(column, value)| {
+                    column
+                        .len()
+                        .saturating_add(std::mem::size_of::<(String, Value)>().saturating_mul(4))
+                        .saturating_add(match value {
+                            PersistedValue::Vector(vector) => vector.decoded_bytes(),
+                            _ => 0,
+                        })
+                })
+                .sum(),
+        )?;
+        frame.map::<String,Value>(persisted.values.len())?;
+        let values = persisted
+            .values
+            .into_iter()
+            .map(|(column, value)| {
+                let value = match value {
+                    PersistedValue::Plain(value) => value,
+                    PersistedValue::Vector(vector) => Value::Vector(vector.to_f32()),
+                };
+                (column, value)
+            })
+            .collect::<HashMap<_, _>>();
+        Ok(VersionedRow {
+            row_id: persisted.row_id,
+            values,
+            created_tx: persisted.created_tx,
+            deleted_tx: persisted.deleted_tx,
+            lsn: persisted.lsn,
+            created_at: persisted.created_at,
+        })
+    }
+
+pub(crate) fn encode_vector_entry_original(
+frame:&OriginalPersistenceFrame<'_>,
+        entry: &VectorEntry,
+        quantization: VectorQuantization,
+    ) -> Result<Vec<u8>> {
+        frame.record(entry)?;
+        frame.encode(&PersistedVectorEntry {
+            index: entry.index.clone(),
+            row_id: entry.row_id,
+            vector: PersistedVector::from_f32(&entry.vector, quantization),
+            created_tx: entry.created_tx,
+            deleted_tx: entry.deleted_tx,
+            lsn: entry.lsn,
+        })
+    }
+
+pub(crate) fn decode_vector_entry_original(
+frame:&OriginalPersistenceFrame<'_>,bytes: &[u8]) -> Result<VectorEntry> {
+
+        let persisted: PersistedVectorEntry = frame.decode(bytes)?;
+        frame.reserve(persisted.vector.decoded_bytes())?;
+        Ok(VectorEntry {
+            index: persisted.index,
+            row_id: persisted.row_id,
+            vector: persisted.vector.to_f32(),
+            created_tx: persisted.created_tx,
+            deleted_tx: persisted.deleted_tx,
+            lsn: persisted.lsn,
+        })
+    }
+
+pub(crate) fn flush_relational_index_changes_in_write_original(
+frame:&OriginalPersistenceFrame<'_>,
+        write_txn: &redb::WriteTransaction,
+        ws: &WriteSet,
+        table_meta: &HashMap<String, TableMeta>,
+        deleted_rows: Option<&HashMap<String, HashMap<RowId, VersionedRow>>>,
+    ) -> Result<Vec<content_identity::ContentIdentityMutation>> {
+        let inserted = ws
+            .relational_inserts
+            .iter()
+            .map(|(table, row)| ((table.as_str(), row.row_id), row))
+            .collect::<HashMap<_, _>>();
+        let mut count_changes = BTreeMap::<Vec<u8>, (BTreeSet<RowId>, BTreeSet<RowId>)>::new();
+        let mut identity_mutations = OriginalMutationVector::new(frame);
+        let affected = ws
+            .relational_inserts
+            .iter()
+            .map(|(table, _)| table)
+            .chain(ws.relational_deletes.iter().map(|(table, _, _)| table))
+            .collect::<BTreeSet<_>>();
+        for table in affected {
+            let Some(meta) = table_meta.get(table) else {
+                continue;
+            };
+            let maintain_counts = {
+                let ready = write_txn
+                    .open_table(RELATIONAL_INDEX_READY_TABLE)
+                    .map_err(Self::storage_error)?;
+                ready
+                    .get(table.as_str())
+                    .map_err(Self::storage_error)?
+                    .is_some_and(|version| version.value() == RELATIONAL_INDEX_READY_VERSION)
+            };
+            for declaration in Self::relational_index_declarations(meta) {
+                let name = Self::relational_index_table_name(table, &declaration.name);
+                let definition: TableDefinition<DurableRelationalIndexKey, &[u8]> =
+                    TableDefinition::new(name.as_str());
+                let mut index = write_txn
+                    .open_table(definition)
+                    .map_err(Self::storage_error)?;
+                let current_name =
+                    Self::current_relational_index_table_name(table, &declaration.name);
+                let current_definition: TableDefinition<DurableRelationalIndexKey, &[u8]> =
+                    TableDefinition::new(current_name.as_str());
+                let mut current = write_txn
+                    .open_table(current_definition)
+                    .map_err(Self::storage_error)?;
+                for (deleted_table, row_id, deleted_tx) in &ws.relational_deletes {
+                    if deleted_table != table {
+                        continue;
+                    }
+                    // A staged delete can reach commit after another writer
+                    // has already deleted the same row. There is then no live
+                    // version to take the posting's key from, and no posting
+                    // to retire: the delete is the commit no-op it is in
+                    // memory, here too.
+                    let Some(old) = deleted_rows
+                        .and_then(|tables| tables.get(table))
+                        .and_then(|rows| rows.get(row_id))
+                    else {
+                        continue;
+                    };
+                    let old_key =
+                        contextdb_relational::index_key_for_row(&declaration.columns, &old.values);
+                    let replacement_keeps_key =
+                        inserted.get(&(table.as_str(), *row_id)).is_some_and(|new| {
+                            contextdb_relational::index_key_for_row(
+                                &declaration.columns,
+                                &new.values,
+                            ) == old_key
+                        });
+                    if replacement_keeps_key {
+                        continue;
+                    }
+                    if maintain_counts {
+                        for prefix_len in 1..=old_key.len() {
+                            // Exactly the declared members, and nothing else:
+                            // silence maintains none.
+                            if !crate::maintained_counts::maintained_count_member(
+                                meta,
+                                &declaration.columns[..prefix_len],
+                            ) {
+                                continue;
+                            }
+                            let count_key = Self::relational_index_count_key(
+                                table,
+                                &declaration.columns[..prefix_len],
+                                &old_key[..prefix_len],
+                            )?;
+                            #[cfg(any(test, feature = "test-seams"))]
+                            observe_index_prefix_count(
+                                table,
+                                meta,
+                                &declaration,
+                                prefix_len,
+                                &count_key,
+                            );
+                            let changes = count_changes.entry(count_key).or_default();
+                            changes.1.insert(*row_id);
+                        }
+                    }
+                    // An update that leaves these indexed columns unchanged
+                    // keeps the original posting. Its creating transaction
+                    // can therefore precede the current row version's.
+                    let logical_key =
+                        DurableRelationalIndexKey::new(old_key.clone(), old.row_id, TxId(0))?;
+                    let created_tx: TxId = current
+                        .get(&logical_key)
+                        .map_err(Self::storage_error)?
+                        .map(|value| Self::decode_exact(value.value()))
+                        .transpose()?
+                        .ok_or_else(|| Error::StoreCorrupted {
+                            path: current_name.clone(),
+                            reason: "current index has no posting for a deleted row".into(),
+                        })?;
+                    let key = DurableRelationalIndexKey::new(old_key, old.row_id, created_tx)?;
+                    let stamp: Option<TxId> = index
+                        .get(&key)
+                        .map_err(Self::storage_error)?
+                        .map(|value| Self::decode_exact(value.value()))
+                        .transpose()?
+                        .ok_or_else(|| Error::StoreCorrupted {
+                            path: name.clone(),
+                            reason: "current index names a missing versioned posting".into(),
+                        })?;
+                    if stamp.is_some() {
+                        return Err(Error::StoreCorrupted {
+                            path: name.clone(),
+                            reason: "current index names a deleted posting".into(),
+                        });
+                    }
+                    current.remove(&logical_key).map_err(Self::storage_error)?;
+                    let deleted = frame.encode(&Some(*deleted_tx))?;
+                    index
+                        .insert(key, deleted.as_slice())
+                        .map_err(Self::storage_error)?;
+                    let logical_key = DurableRelationalIndexKey::new(
+                        contextdb_relational::index_key_for_row(&declaration.columns, &old.values),
+                        old.row_id,
+                        TxId(0),
+                    )?;
+                    identity_mutations.push(
+                        content_identity::original_producers::remove_relational_index_posting_mutation(frame,
+                            table,
+                            &declaration.name,
+                            &logical_key.0,
+                        )?,
+                    )?;
+                }
+                for (inserted_table, row) in &ws.relational_inserts {
+                    if inserted_table != table {
+                        continue;
+                    }
+                    let key =
+                        contextdb_relational::index_key_for_row(&declaration.columns, &row.values);
+                    let replacement_keeps_key = deleted_rows
+                        .and_then(|tables| tables.get(table))
+                        .and_then(|rows| rows.get(&row.row_id))
+                        .is_some_and(|old| {
+                            contextdb_relational::index_key_for_row(
+                                &declaration.columns,
+                                &old.values,
+                            ) == key
+                        });
+                    if replacement_keeps_key {
+                        continue;
+                    }
+                    if maintain_counts {
+                        for prefix_len in 1..=key.len() {
+                            if !crate::maintained_counts::maintained_count_member(
+                                meta,
+                                &declaration.columns[..prefix_len],
+                            ) {
+                                continue;
+                            }
+                            let count_key = Self::relational_index_count_key(
+                                table,
+                                &declaration.columns[..prefix_len],
+                                &key[..prefix_len],
+                            )?;
+                            #[cfg(any(test, feature = "test-seams"))]
+                            observe_index_prefix_count(
+                                table,
+                                meta,
+                                &declaration,
+                                prefix_len,
+                                &count_key,
+                            );
+                            let changes = count_changes.entry(count_key).or_default();
+                            changes.0.insert(row.row_id);
+                        }
+                    }
+                    let key = DurableRelationalIndexKey::new(key, row.row_id, row.created_tx)?;
+                    let live = frame.encode(&Option::<TxId>::None)?;
+                    index
+                        .insert(key, live.as_slice())
+                        .map_err(Self::storage_error)?;
+                    let logical_key = DurableRelationalIndexKey::new(
+                        contextdb_relational::index_key_for_row(&declaration.columns, &row.values),
+                        row.row_id,
+                        TxId(0),
+                    )?;
+                    let created = frame.encode(&row.created_tx)?;
+                    current
+                        .insert(&logical_key, created.as_slice())
+                        .map_err(Self::storage_error)?;
+                    #[cfg(any(test, feature = "test-seams"))]
+                    observe_index_posting(table, &declaration);
+                    identity_mutations.push(content_identity::original_producers::relational_index_posting_mutation(frame,
+                        table,
+                        &declaration.name,
+                        &logical_key.0,
+                    )?)?;
+                }
+            }
+        }
+        if !count_changes.is_empty() {
+            {
+                let mut counts = write_txn
+                    .open_table(RELATIONAL_INDEX_COUNT_TABLE)
+                    .map_err(Self::storage_error)?;
+                for (key, (incremented_rows, decremented_rows)) in count_changes {
+                    let increments = u64::try_from(incremented_rows.len()).map_err(|_| {
+                        Error::Other("relational index count increment overflow".to_owned())
+                    })?;
+                    let decrements = u64::try_from(decremented_rows.len()).map_err(|_| {
+                        Error::Other("relational index count decrement overflow".to_owned())
+                    })?;
+                    let current = counts
+                        .get(key.as_slice())
+                        .map_err(Self::storage_error)?
+                        .map(|count| count.value())
+                        .unwrap_or(0);
+                    let next = current
+                        .checked_sub(decrements)
+                        .and_then(|count| count.checked_add(increments))
+                        .ok_or_else(|| Error::StoreCorrupted {
+                            path: "relational index count table".to_owned(),
+                            reason: "live index-prefix cardinality underflowed or overflowed"
+                                .to_owned(),
+                        })?;
+                    #[cfg(any(test, feature = "test-seams"))]
+                    observe_index_prefix_count_value(&key, (next > 0).then_some(next));
+                    if next == 0 {
+                        counts.remove(key.as_slice()).map_err(Self::storage_error)?;
+                        identity_mutations.push(Self::remove_relational_index_count_mutation(&key))?;
+                    } else {
+                        counts
+                            .insert(key.as_slice(), next)
+                            .map_err(Self::storage_error)?;
+                        identity_mutations.push(Self::relational_index_count_mutation(&key, next))?;
+                    }
+                }
+            }
+        }
+        Ok(identity_mutations.into_vec())
+    }
+
+pub(crate) fn retire_undeclared_relational_indexes_in_write_original(
+frame:&OriginalPersistenceFrame<'_>,
+        write_txn: &redb::WriteTransaction,
+        database_path: &Path,
+        table: &str,
+        previous_meta: &TableMeta,
+        meta: &TableMeta,
+        admission: &mut content_identity::original_writer::ProofAdmission,
+    ) -> Result<()> {
+        let still_declared = Self::relational_index_declarations(meta)
+            .into_iter()
+            .map(|declaration| declaration.name)
+            .collect::<HashSet<_>>();
+        let mut mutations = OriginalMutationVector::new(frame);
+        for declaration in Self::relational_index_declarations(previous_meta) {
+            if still_declared.contains(&declaration.name) {
+                continue;
+            }
+            let name = Self::relational_index_table_name(table, &declaration.name);
+            let definition: TableDefinition<DurableRelationalIndexKey, &[u8]> =
+                TableDefinition::new(name.as_str());
+            if let Ok(existing) = write_txn.open_table(definition) {
+                for entry in existing.iter().map_err(Self::storage_error)? {
+                    let decoded = decode_relational_index_entry(
+                        database_path,
+                        Some(entry.map_err(Self::storage_error)?),
+                    )?
+                    .expect("an existing index iterator entry decodes");
+                    let (_, position, deleted_tx) = decoded;
+                    // The declaration being retired is the one that wrote these
+                    // postings, so a posting that does not match it IS a damaged
+                    // store and is reported as one.
+                    Self::validated_index_position(&declaration, previous_meta, &position)
+                        .map_err(|reason| Error::StoreCorrupted {
+                            path: database_path.display().to_string(),
+                            reason,
+                        })?;
+                    if deleted_tx.is_some() {
+                        continue;
+                    }
+                    let logical_key =
+                        DurableRelationalIndexKey::new(position.key, position.row_id, TxId(0))?;
+                    mutations.push(content_identity::original_producers::remove_relational_index_posting_mutation(frame,
+                        table,
+                        &declaration.name,
+                        &logical_key.0,
+                    )?)?;
+                }
+            }
+            match write_txn.delete_table(definition) {
+                Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
+                Err(error) => return Err(Self::storage_error(error)),
+            }
+            let current_name = Self::current_relational_index_table_name(table, &declaration.name);
+            let current_definition: TableDefinition<DurableRelationalIndexKey, &[u8]> =
+                TableDefinition::new(current_name.as_str());
+            write_txn
+                .delete_table(current_definition)
+                .map_err(Self::storage_error)?;
+        }
+        if mutations.is_empty() {
+            return Ok(());
+        }
+        Self::apply_owned_content_identity_with_manifests_in_write(write_txn, &mutations, &[], admission)?;
+        Ok(())
+    }
+
+pub(crate) fn rebuild_relational_indexes_in_write_original(
+frame:&OriginalPersistenceFrame<'_>,
+        write_txn: &redb::WriteTransaction,
+        database_path: &Path,
+        table: &str,
+        meta: &TableMeta,
+        supplied_rows: Option<&[VersionedRow]>,
+        admission: &mut content_identity::original_writer::ProofAdmission,
+    ) -> Result<()> {
+        let mut count_mutations = OriginalMutationVector::new(frame);
+        let mut rebuilt_counts = BTreeMap::<Vec<u8>, BTreeSet<RowId>>::new();
+        {
+            let mut counts = write_txn
+                .open_table(RELATIONAL_INDEX_COUNT_TABLE)
+                .map_err(Self::storage_error)?;
+            let mut retired = Vec::new();
+            for entry in counts.iter().map_err(Self::storage_error)? {
+                let (key, _) = entry.map_err(Self::storage_error)?;
+                let key = key.value();
+                let decoded: EncodedRelationalIndexCountKey = frame.decode(key)?;
+                if decoded.table == table {
+                    retired.push(key.to_vec());
+                }
+            }
+            for key in retired {
+                counts.remove(key.as_slice()).map_err(Self::storage_error)?;
+                count_mutations.push(Self::remove_relational_index_count_mutation(&key))?;
+            }
+        }
+        for declaration in Self::relational_index_declarations(meta) {
+            let name = Self::relational_index_table_name(table, &declaration.name);
+            let definition: TableDefinition<DurableRelationalIndexKey, &[u8]> =
+                TableDefinition::new(name.as_str());
+            if let Ok(existing) = write_txn.open_table(definition) {
+                for entry in existing.iter().map_err(Self::storage_error)? {
+                    let decoded = decode_relational_index_entry(
+                        database_path,
+                        Some(entry.map_err(Self::storage_error)?),
+                    )?
+                    .expect("an existing index iterator entry decodes");
+                    let (_, position, deleted_tx) = decoded;
+                    Self::validated_index_position(&declaration, meta, &position).map_err(
+                        |reason| Error::StoreCorrupted {
+                            path: database_path.display().to_string(),
+                            reason,
+                        },
+                    )?;
+                    if deleted_tx.is_some() {
+                        continue;
+                    }
+                    let logical_key =
+                        DurableRelationalIndexKey::new(position.key, position.row_id, TxId(0))?;
+                    count_mutations.push(
+                        content_identity::original_producers::remove_relational_index_posting_mutation(frame,
+                            table,
+                            &declaration.name,
+                            &logical_key.0,
+                        )?,
+                    )?;
+                }
+            }
+            match write_txn.delete_table(definition) {
+                Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
+                Err(error) => return Err(Self::storage_error(error)),
+            }
+            let current_name = Self::current_relational_index_table_name(table, &declaration.name);
+            let current_definition: TableDefinition<DurableRelationalIndexKey, &[u8]> =
+                TableDefinition::new(current_name.as_str());
+            write_txn
+                .delete_table(current_definition)
+                .map_err(Self::storage_error)?;
+            let mut index = write_txn
+                .open_table(definition)
+                .map_err(Self::storage_error)?;
+            let mut active = HashMap::<RowId, (IndexKey, TxId, bool)>::new();
+            let mut write_row = |row: &VersionedRow| -> Result<()> {
+                let key =
+                    contextdb_relational::index_key_for_row(&declaration.columns, &row.values);
+                let (created_tx, durable_key) = match active.get(&row.row_id) {
+                    Some((prior, created_tx, _)) if prior == &key => (
+                        *created_tx,
+                        DurableRelationalIndexKey::new(key.clone(), row.row_id, *created_tx)?,
+                    ),
+                    _ => (
+                        row.created_tx,
+                        DurableRelationalIndexKey::new(key.clone(), row.row_id, row.created_tx)?,
+                    ),
+                };
+                let deleted = frame.encode(&row.deleted_tx)?;
+                index
+                    .insert(durable_key, deleted.as_slice())
+                    .map_err(Self::storage_error)?;
+                active.insert(row.row_id, (key, created_tx, row.deleted_tx.is_none()));
+                Ok(())
+            };
+            if let Some(rows) = supplied_rows {
+                // Match the durable relation's key order without copying row
+                // bodies. Callers already own these rows; this pointer-only
+                // ordering keeps version publication identical to a Redb walk.
+                let mut ordered = rows.iter().collect::<Vec<_>>();
+                ordered.sort_unstable_by_key(|row| (row.row_id, row.created_tx, row.lsn));
+                for row in ordered {
+                    write_row(row)?;
+                }
+            } else {
+                let relation_name = Self::rel_table_name(table);
+                let relation_definition: TableDefinition<&[u8], &[u8]> =
+                    TableDefinition::new(relation_name.as_str());
+                match write_txn.open_table(relation_definition) {
+                    Ok(relation) => {
+                        for entry in relation.iter().map_err(Self::storage_error)? {
+                            let (_, value) = entry.map_err(Self::storage_error)?;
+                            #[cfg(any(test, feature = "test-seams"))]
+                            RELATIONAL_INDEX_REBUILD_ROWS_DECODED
+                                .with(|count| count.set(count.get().saturating_add(1)));
+                            let _row_scope = crate::read_image_memory::active_owner()?
+                                .row_owner()?
+                                .enter();
+                            let row = Self::decode_versioned_row_original(frame,value.value(), Some(meta))?;
+                            write_row(&row)?;
+                        }
+                    }
+                    Err(redb::TableError::TableDoesNotExist(_)) => {}
+                    Err(error) => return Err(Self::storage_error(error)),
+                }
+            }
+            drop(write_row);
+            drop(index);
+            let mut current = write_txn
+                .open_table(current_definition)
+                .map_err(Self::storage_error)?;
+            for (row_id, (key, created_tx, live)) in active {
+                if !live {
+                    continue;
+                }
+                let logical_key = DurableRelationalIndexKey::new(key.clone(), row_id, TxId(0))?;
+                let created = frame.encode(&created_tx)?;
+                current
+                    .insert(&logical_key, created.as_slice())
+                    .map_err(Self::storage_error)?;
+                count_mutations.push(content_identity::original_producers::relational_index_posting_mutation(frame,
+                    table,
+                    &declaration.name,
+                    &logical_key.0,
+                )?)?;
+                for prefix_len in 1..=key.len() {
+                    // The rebuild writes exactly the declared members, so a
+                    // recompute after a declaration change lands the same set
+                    // an append would have written.
+                    if !crate::maintained_counts::maintained_count_member(
+                        meta,
+                        &declaration.columns[..prefix_len],
+                    ) {
+                        continue;
+                    }
+                    let count_key = Self::relational_index_count_key(
+                        table,
+                        &declaration.columns[..prefix_len],
+                        &key[..prefix_len],
+                    )?;
+                    #[cfg(any(test, feature = "test-seams"))]
+                    observe_index_prefix_count(table, meta, &declaration, prefix_len, &count_key);
+                    rebuilt_counts.entry(count_key).or_default().insert(row_id);
+                }
+            }
+        }
+        {
+            let mut counts = write_txn
+                .open_table(RELATIONAL_INDEX_COUNT_TABLE)
+                .map_err(Self::storage_error)?;
+            for (key, rows) in rebuilt_counts {
+                let count = u64::try_from(rows.len()).map_err(|_| {
+                    Error::Other("relational index count rebuild overflow".to_owned())
+                })?;
+                counts
+                    .insert(key.as_slice(), count)
+                    .map_err(Self::storage_error)?;
+                count_mutations.push(Self::relational_index_count_mutation(&key, count))?;
+            }
+        }
+        write_txn
+            .open_table(RELATIONAL_INDEX_READY_TABLE)
+            .map_err(Self::storage_error)?
+            .insert(table, RELATIONAL_INDEX_READY_VERSION)
+            .map_err(Self::storage_error)?;
+        count_mutations.push(content_identity::original_producers::status_mutation(frame,
+            RELATIONAL_INDEX_COUNT_READY_IDENTITY_NAMESPACE,
+            table.as_bytes(),
+            RELATIONAL_INDEX_READY_VERSION,
+        )?)?;
+        Self::apply_owned_content_identity_with_manifests_in_write(write_txn, &count_mutations, &[], admission)?;
+        Ok(())
+    }
+}

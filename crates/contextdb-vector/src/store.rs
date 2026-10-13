@@ -25,6 +25,11 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
+enum ServingPageGiveBackEvent {
+    Short,
+    Freed(usize),
+}
+
 // unpartitioned_vector_membership_pages_reload_at_constant_residency observes private directory owners.
 #[cfg(feature = "test-seams")]
 #[path = "store/resident_directory_test_seams.rs"]
@@ -17155,10 +17160,38 @@ impl VectorStore {
     }
 
     fn give_back_serving_pages_where(
+        &self, needed: usize, partial: bool, from: impl Fn(&IndexState) -> bool,
+    ) -> usize {
+        self.give_back_serving_pages_metered(needed, partial, from, |event| match event {
+            ServingPageGiveBackEvent::Short => {
+                contextdb_core::find_attribution::count("serving_page_give_back_short", 1);
+            }
+            ServingPageGiveBackEvent::Freed(freed) => {
+                contextdb_core::find_attribution::count("serving_page_bytes_given_back", freed as u64);
+            }
+        })
+    }
+
+    /// Same serving-page policy with fixed scalar meters under native pressure.
+    #[doc(hidden)]
+    pub fn give_back_serving_pages_native(&self, needed: usize) -> usize {
+        self.give_back_serving_pages_metered(needed, false, |_| true, |event| match event {
+            ServingPageGiveBackEvent::Short => {
+                contextdb_core::find_attribution::note_native_serving_page_give_back_short();
+            }
+            ServingPageGiveBackEvent::Freed(freed) => {
+                contextdb_core::find_attribution::note_native_serving_page_give_back_reached_final_pass();
+                contextdb_core::find_attribution::note_native_serving_page_bytes_given_back(freed);
+            }
+        })
+    }
+
+    fn give_back_serving_pages_metered(
         &self,
         needed: usize,
         partial: bool,
         from: impl Fn(&IndexState) -> bool,
+        meter: impl Fn(ServingPageGiveBackEvent),
     ) -> usize {
         if needed == 0 {
             return 0;
@@ -17187,7 +17220,7 @@ impl VectorStore {
             return 0;
         }
         if freed_at(1) < needed {
-            contextdb_core::find_attribution::count("serving_page_give_back_short", 1);
+            meter(ServingPageGiveBackEvent::Short);
             return 0;
         }
         // The highest level every cache can keep while the ones above it
@@ -17216,7 +17249,7 @@ impl VectorStore {
                 freed = freed.saturating_add(generation.give_back_serving_slots(low));
             }
         });
-        contextdb_core::find_attribution::count("serving_page_bytes_given_back", freed as u64);
+        meter(ServingPageGiveBackEvent::Freed(freed));
         contextdb_core::find_attribution::note_serving_pages_given_back(freed);
         freed
     }
@@ -17444,6 +17477,117 @@ impl VectorStore {
         }
 
         contextdb_core::find_attribution::count("sealed_generations_evicted", evicted as u64);
+        evicted
+    }
+
+    /// Native-pressure sibling of `make_room_for_graph_load`. It preserves
+    /// the legacy oldest-first walk and locks, but records into fixed scalar
+    /// meters so a refused native admission never enters the allocating sink.
+    #[doc(hidden)]
+    pub fn make_room_for_graph_load_native(&self, short: usize) -> usize {
+        if short == 0 {
+            return 0;
+        }
+        STATEMENT_PARTITIONS.with(|declared| {
+            let declared = declared.borrow();
+            let Some(searched) = declared.as_ref() else {
+                return 0;
+            };
+            let Some(available) = self
+                .memory_accountant
+                .read()
+                .as_ref()
+                .and_then(|accountant| accountant.available_bytes())
+            else {
+                return 0;
+            };
+            self.reclaim_idle_graphs_except_native(
+                available.saturating_add(short),
+                |state| searched.contains(&(state as *const IndexState as usize)),
+            )
+        })
+    }
+
+    fn reclaim_idle_graphs_except_native(
+        &self,
+        required_bytes: usize,
+        selected: impl Fn(&IndexState) -> bool,
+    ) -> usize {
+        let Some(accountant) = self.memory_accountant.read().clone() else {
+            return 0;
+        };
+        if accountant
+            .available_bytes()
+            .is_none_or(|available| required_bytes <= available)
+        {
+            return 0;
+        }
+        let Some(mut available) = accountant.available_bytes() else {
+            return 0;
+        };
+        let registry = self.registry.read();
+
+        contextdb_core::find_attribution::note_native_graph_reclaims_over_budget();
+        contextdb_core::find_attribution::note_native_graph_reclaim_required_bytes(required_bytes);
+        contextdb_core::find_attribution::note_native_graph_reclaim_available_bytes(available);
+        let mut evicted = 0usize;
+        let mut previous_time = None;
+        while required_bytes > available {
+            let next_time = registry
+                .values()
+                .filter_map(|column| {
+                    column
+                        .partitions
+                        .read()
+                        .values()
+                        .filter(|state| !selected(state.as_ref()))
+                        .map(|state| state.sealed_graph_last_used.load(Ordering::Relaxed))
+                        .filter(|time| previous_time.is_none_or(|previous| *time > previous))
+                        .min()
+                })
+                .min();
+            let Some(time) = next_time else {
+                break;
+            };
+            let mut previous_index: Option<&VectorIndexRef> = None;
+            while required_bytes > available {
+                let next_index = registry
+                    .keys()
+                    .filter(|index| {
+                        previous_index.is_none_or(|previous| {
+                            (&index.table, &index.column) > (&previous.table, &previous.column)
+                        })
+                    })
+                    .min_by(|left, right| {
+                        left.table
+                            .cmp(&right.table)
+                            .then(left.column.cmp(&right.column))
+                    });
+                let Some(index) = next_index else {
+                    break;
+                };
+                let column = registry
+                    .get(index)
+                    .expect("borrowed registry key remains held");
+                for state in column.partitions.read().values() {
+                    if required_bytes <= available {
+                        break;
+                    }
+                    if selected(state.as_ref())
+                        || state.sealed_graph_last_used.load(Ordering::Relaxed) != time
+                    {
+                        continue;
+                    }
+                    evicted += usize::from(state.evict_resident_sealed_generation(true));
+                    evicted += usize::from(state.evict_resident_sealed_generation(false));
+                    available = accountant.available_bytes().unwrap_or(usize::MAX);
+                }
+                previous_index = Some(index);
+            }
+            previous_time = Some(time);
+        }
+
+        contextdb_core::find_attribution::note_native_sealed_generations_evicted(evicted);
         evicted
     }
 

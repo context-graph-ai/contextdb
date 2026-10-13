@@ -101,7 +101,7 @@ fn progress_state(reason: PagedBuildReason) -> &'static str {
 /// Engine hooks shared by every batch of one registered build.
 pub(super) fn paged_build_hooks(
     _vector: &Arc<VectorStore>,
-    tx_mgr: &Arc<TransactionManager<DynStore>>,
+    tx_mgr: &DatabaseTransactionHost,
     resource_closed: &Arc<AtomicBool>,
     publication_interrupted: &Arc<AtomicBool>,
     _partition: &VectorPartitionRef,
@@ -110,7 +110,7 @@ pub(super) fn paged_build_hooks(
     record.progress()?;
     let closed = Arc::clone(resource_closed);
     let interrupted = Arc::clone(publication_interrupted);
-    let gate_manager = Arc::downgrade(tx_mgr);
+    let gate_manager = tx_mgr.downgrade();
     Ok(PagedBuildHooks {
         checkpoint: Arc::new(move || {
             if interrupted.load(Ordering::SeqCst) {
@@ -145,7 +145,7 @@ pub(super) fn paged_build_hooks(
 /// progress as the partition's reported maintenance progress.
 pub(super) fn register_paged_build(
     vector: &Arc<VectorStore>,
-    tx_mgr: &Arc<TransactionManager<DynStore>>,
+    tx_mgr: &DatabaseTransactionHost,
     persistence: &Arc<RedbPersistence>,
     accountant: &crate::memory_accounting::AccountantHandle,
     resource_closed: &Arc<AtomicBool>,
@@ -271,9 +271,9 @@ impl Database {
 /// never begin a fresh storage read.
 pub(super) fn install_paged_root_capture(
     persistence: &RedbPersistence,
-    tx_mgr: &Arc<TransactionManager<DynStore>>,
+    tx_mgr: &DatabaseTransactionHost,
 ) {
-    let manager = Arc::downgrade(tx_mgr);
+    let manager = tx_mgr.downgrade();
     let scoped_manager = manager.clone();
     persistence.set_paged_root_capture(
         Arc::new(move || {

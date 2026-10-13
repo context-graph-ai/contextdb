@@ -2265,7 +2265,7 @@ impl Database {
             sink: sink.to_string(),
             event_bus: self.event_bus.clone(),
             persistence: self.persistence.clone(),
-            tx_mgr: Arc::clone(&self.tx_mgr),
+            tx_mgr: self.tx_mgr.clone(),
         };
         let thread_shutdown = shutdown.clone();
         #[cfg(any(test, feature = "test-seams"))]
@@ -2527,7 +2527,7 @@ struct EventBusWorker {
     sink: String,
     event_bus: Arc<EventBusState>,
     persistence: Option<Arc<RedbPersistence>>,
-    tx_mgr: Arc<TransactionManager<DynStore>>,
+    tx_mgr: DatabaseTransactionHost,
 }
 
 impl EventBusWorker {
@@ -3249,5 +3249,5221 @@ mod quiescent_queue_tests {
             database.event_bus.begin_dispatcher_queue_mutation(),
             Err(Error::EventBusQueueQuiescent)
         ));
+    }
+}
+
+
+impl Database {
+    /// Append the original next-action config body only after its actual writer
+    /// has admitted the key and encoded value. The guarded splice retains that
+    /// same reservation through publication and original source retirement.
+    pub(super) fn stage_next_action_id_in_prepared_write_set(
+        &self,
+        guard: &mut contextdb_tx::manager::EngineGuard<'_>,
+        next_action_id: u64,
+    ) -> Result<()> {
+        struct ByteCount(usize);
+        impl std::io::Write for ByteCount {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0 = self.0.checked_add(bytes.len()).ok_or_else(|| {
+                    std::io::Error::other("next action config size overflow")
+                })?;
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let mut count = ByteCount(0);
+        bincode::serde::encode_into_std_write(
+            &next_action_id, &mut count, bincode::config::standard(),
+        ).map_err(|error| Error::Other(format!("bincode encode error: {error}")))?;
+        let bytes = NEXT_ACTION_ID_CONFIG_KEY.len().checked_add(count.0)
+            .ok_or_else(|| Error::Other("next action config size overflow".into()))?;
+        let mut admission = self.reserve_owned_preparation(bytes)?;
+        // Exact capacity prevents an encoder growth allocation outside the
+        // original admission. Neither key nor value exists before admission.
+        let mut encoded = Vec::with_capacity(count.0);
+        bincode::serde::encode_into_std_write(
+            &next_action_id, &mut encoded, bincode::config::standard(),
+        ).map_err(|error| Error::Other(format!("bincode encode error: {error}")))?;
+        let body = contextdb_tx::staged_source::AuxBody::ConfigWrite((
+            NEXT_ACTION_ID_CONFIG_KEY.to_owned(), encoded,
+        ));
+        let at = guard.read().config_writes.len();
+        match &self.tx_mgr {
+            DatabaseTransactionHost::Owned(handle) => handle.with_host(|host| {
+                // The original body is moved immediately with its invoice;
+                // there is no fallible operation while they are separate.
+                let invoice = admission.into_source_aux_invoice_for(&host.funder)?;
+                let batch = guard.prepare_owned_aux(body, invoice)?;
+                let prepared = guard.prepare_aux_splice(at, &[], batch)?;
+                guard.publish_tx(prepared);
+                Ok(())
+            }),
+            DatabaseTransactionHost::Legacy(_) => Err(DatabaseTransactionHost::producer_gap(
+                "stage_next_action_id_in_prepared_write_set",
+            )),
+        }
+    }
+}
+
+/// Assembly helper for the approved immutable companion seed loan. Frozen
+/// companion storage supplies its authentic stable original field outside
+/// queue/stage/state guards; the borrowing private handle retains that physical
+/// storage for the whole callback. The actual handle impl is composed only
+/// after its frozen definition is available.
+pub(crate) fn with_owned_persistence_original_seed<R>(
+    original:&crate::memory_accounting::OwnedMemoryReservation,
+    f:impl for<'o> FnOnce(&'o crate::memory_accounting::OwnedMemoryReservation)->Result<R>,
+)->Result<R> {
+    let _physical_origin=crate::memory_accounting::persistence_original_projection(original)?;
+    f(original)
+}
+
+// Dormant original-funded event storage. Legacy assembly never constructs this
+// companion; its public structs, methods, bodies and wire encoding stay intact.
+use crate::memory_accounting::{
+    copy_owned_native_string, copy_owned_native_value, new_owned_native_map, new_owned_native_ring,
+    new_owned_native_set, new_owned_native_vec, reserve_preparation_from_original,
+    validate_owned_original,
+};
+use contextdb_tx::manager::EngineTerminalIdentity;
+use contextdb_tx::{OriginalAuxInvoice, OriginalCopyGrant, SourceFunder};
+
+fn owned_event_overflow() -> Error {
+    Error::Other("event preparation allocation size overflow".into())
+}
+fn owned_event_add(a: usize, b: usize) -> Result<usize> {
+    a.checked_add(b).ok_or_else(owned_event_overflow)
+}
+fn owned_event_array<T>(count: usize) -> Result<usize> {
+    std::alloc::Layout::array::<T>(count)
+        .map(|layout| layout.size())
+        .map_err(|_| owned_event_overflow())
+}
+fn reserve_owned_event_bytes(
+    original: &OwnedMemoryReservation,
+    bytes: usize,
+) -> Result<OwnedMemoryReservation> {
+    reserve_preparation_from_original(
+        original,
+        bytes,
+        "relational",
+        "statement_overlay",
+        "Reduce prepared event bodies or raise MEMORY_LIMIT.",
+    )
+}
+
+// Every native count has an external SourceCharge, carried by the existing
+// OriginalAuxInvoice wrapper. Its separate Arc header is itself in that same
+// pinned original invoice. No current SourceFunding is used for payloads.
+pub(super) struct OwnedEventShared<T> {
+    data: Option<Arc<T>>,
+    credit: Option<Arc<OriginalAuxInvoice>>,
+}
+pub(super) struct OwnedEventSharedWeak<T> {
+    data: Option<std::sync::Weak<T>>,
+    credit: Option<Arc<OriginalAuxInvoice>>,
+}
+impl<T> OwnedEventShared<T> {
+    pub(super) fn try_new(
+        body: T,
+        original: &OwnedMemoryReservation,
+        funder: &SourceFunder,
+    ) -> Result<Self> {
+        let bytes = owned_event_add(
+            contextdb_tx::staged_source::source_arc_layout::<T>().size(),
+            contextdb_tx::staged_source::source_arc_layout::<OriginalAuxInvoice>().size(),
+        )?;
+        // A rejected stack body must die before its invoice.
+        let mut reservation = reserve_owned_event_bytes(original, bytes)?;
+        let invoice = match reservation.into_source_aux_invoice_for(funder) {
+            Ok(invoice) => invoice,
+            Err(error) => {
+                drop(body);
+                return Err(error);
+            }
+        };
+        let credit = Arc::new(invoice);
+        Ok(Self {
+            data: Some(Arc::new(body)),
+            credit: Some(credit),
+        })
+    }
+    pub(super) fn get(&self) -> &T {
+        self.data.as_deref().expect("live paid event body")
+    }
+    pub(super) fn downgrade(&self) -> OwnedEventSharedWeak<T> {
+        let credit = self.credit.as_ref().expect("live event invoice").clone();
+        let data = Arc::downgrade(self.data.as_ref().expect("live event body"));
+        OwnedEventSharedWeak {
+            data: Some(data),
+            credit: Some(credit),
+        }
+    }
+    pub(super) fn try_into_inner(mut self) -> std::result::Result<T, Self> {
+        let data = self.data.take().expect("live event body");
+        match Arc::try_unwrap(data) {
+            Ok(body) => Ok(body),
+            Err(data) => {
+                self.data = Some(data);
+                Err(self)
+            }
+        }
+    }
+}
+impl<T> std::ops::Deref for OwnedEventShared<T> {
+    type Target = T;
+    fn deref(&self) -> &T { self.get() }
+}
+impl<T> Clone for OwnedEventShared<T> {
+    fn clone(&self) -> Self {
+        let credit = self.credit.as_ref().expect("live event invoice").clone();
+        let data = self.data.as_ref().expect("live event body").clone();
+        Self {
+            data: Some(data),
+            credit: Some(credit),
+        }
+    }
+}
+impl<T> Drop for OwnedEventShared<T> {
+    fn drop(&mut self) {
+        drop(self.data.take());
+        drop(self.credit.take().and_then(Arc::into_inner));
+    }
+}
+impl<T> OwnedEventSharedWeak<T> {
+    pub(super) fn upgrade(&self) -> Option<OwnedEventShared<T>> {
+        let credit = self
+            .credit
+            .as_ref()
+            .expect("live event weak invoice")
+            .clone();
+        let data = self.data.as_ref().expect("live event weak").upgrade()?;
+        Some(OwnedEventShared {
+            data: Some(data),
+            credit: Some(credit),
+        })
+    }
+}
+impl<T> Clone for OwnedEventSharedWeak<T> {
+    fn clone(&self) -> Self {
+        let credit = self
+            .credit
+            .as_ref()
+            .expect("live event weak invoice")
+            .clone();
+        let data = self.data.as_ref().expect("live event weak").clone();
+        Self {
+            data: Some(data),
+            credit: Some(credit),
+        }
+    }
+}
+impl<T> Drop for OwnedEventSharedWeak<T> {
+    fn drop(&mut self) {
+        drop(self.data.take());
+        drop(self.credit.take().and_then(Arc::into_inner));
+    }
+}
+
+pub(super) struct OwnedEventValueCredits {
+    keys: Vec<OwnedMemoryReservation>,
+    values: Vec<OriginalCopyGrant>,
+    map: OwnedMemoryReservation,
+    key_array: OwnedMemoryReservation,
+    value_array: OwnedMemoryReservation,
+}
+fn copy_owned_event_values(
+    original: &OwnedMemoryReservation,
+    source: &HashMap<String, Value>,
+) -> Result<(HashMap<String, Value>, OwnedEventValueCredits)> {
+    let (body, credit) = new_owned_native_vec(original, source.len())?;
+    let keys = OwnedEventBody { body, credit };
+    let (body, credit) = new_owned_native_vec(original, source.len())?;
+    let values = OwnedEventBody { body, credit };
+    let (body, map) = new_owned_native_map(original, source.len())?;
+    let mut owner = OwnedEventBody {
+        body,
+        credit: OwnedEventValueCredits {
+            keys: keys.body,
+            key_array: keys.credit,
+            values: values.body,
+            value_array: values.credit,
+            map,
+        },
+    };
+    for (key, value) in source {
+        let (body, credit) = copy_owned_native_string(original, key)?;
+        let key = OwnedEventBody { body, credit };
+        let (body, credit) = copy_owned_native_value(original, value)?;
+        let value = OwnedEventBody { body, credit };
+        owner.body.insert(key.body, value.body);
+        owner.credit.keys.push(key.credit);
+        owner.credit.values.push(value.credit);
+    }
+    Ok((owner.body, owner.credit))
+}
+
+pub(super) struct OwnedEventGateCredits {
+    rows: Vec<OwnedEventValueCredits>,
+    children: Vec<OwnedEventGateCredits>,
+    row_array: OwnedMemoryReservation,
+    child_array: OwnedMemoryReservation,
+    metadata: OwnedMemoryReservation,
+}
+fn owned_gate_metadata_bytes(gate: &EventGateSnapshot) -> Result<usize> {
+    let mut bytes = gate.context_column.as_ref().map_or(0, String::len);
+    if let Some(scope) = &gate.scope_read {
+        bytes = owned_event_add(bytes, scope.column.len())?;
+        bytes = owned_event_add(bytes, owned_event_array::<String>(scope.read_labels.len())?)?;
+        for label in &scope.read_labels {
+            bytes = owned_event_add(bytes, label.len())?;
+        }
+    }
+    if let Some(acl) = &gate.acl {
+        bytes = owned_event_add(bytes, acl.column.len())?;
+        bytes = owned_event_add(bytes, acl.ref_table.len())?;
+        bytes = owned_event_add(bytes, acl.ref_column.len())?;
+        bytes = owned_event_add(bytes, std::mem::size_of::<EventGateSnapshot>())?;
+        bytes = owned_event_add(
+            bytes,
+            owned_event_array::<HashMap<String, Value>>(acl.grant_rows.rows().len())?,
+        )?;
+    }
+    Ok(bytes)
+}
+fn copy_owned_prepaid_text(text: &str) -> Result<String> {
+    let copy = text.to_owned();
+    if copy.capacity() != text.len() {
+        return Err(Error::Other("event text capacity mismatch".into()));
+    }
+    Ok(copy)
+}
+fn copy_owned_event_gate(
+    original: &OwnedMemoryReservation,
+    source: &EventGateSnapshot,
+) -> Result<(EventGateSnapshot, OwnedEventGateCredits)> {
+    let metadata = reserve_owned_event_bytes(original, owned_gate_metadata_bytes(source)?)?;
+    let row_count = source
+        .acl
+        .as_ref()
+        .map_or(0, |acl| acl.grant_rows.rows().len());
+    let (body, credit) = new_owned_native_vec(original, row_count)?;
+    let rows = OwnedEventBody { body, credit };
+    let (body, credit) = new_owned_native_vec(original, usize::from(source.acl.is_some()))?;
+    let children = OwnedEventBody { body, credit };
+    let mut owner = OwnedEventBody {
+        body: EventGateSnapshot::default(),
+        credit: OwnedEventGateCredits {
+            rows: rows.body,
+            row_array: rows.credit,
+            children: children.body,
+            child_array: children.credit,
+            metadata,
+        },
+    };
+    owner.body.context_column = source
+        .context_column
+        .as_deref()
+        .map(copy_owned_prepaid_text)
+        .transpose()?;
+    if let Some(scope) = &source.scope_read {
+        let mut labels = Vec::with_capacity(scope.read_labels.len());
+        if labels.capacity() != scope.read_labels.len() {
+            return Err(Error::Other("event labels capacity mismatch".into()));
+        }
+        for label in &scope.read_labels {
+            labels.push(copy_owned_prepaid_text(label)?);
+        }
+        owner.body.scope_read = Some(EventScopeReadGate {
+            column: copy_owned_prepaid_text(&scope.column)?,
+            read_labels: labels,
+        });
+    }
+    if let Some(acl) = &source.acl {
+        let (body, credit) = copy_owned_event_gate(original, &acl.grant_gate)?;
+        let grant_gate = OwnedEventBody { body, credit };
+        let mut grants = Vec::with_capacity(row_count);
+        if grants.capacity() != row_count {
+            return Err(Error::Other("event grants capacity mismatch".into()));
+        }
+        for row in acl.grant_rows.rows() {
+            let (body, credit) = copy_owned_event_values(original, row)?;
+            let copy = OwnedEventBody { body, credit };
+            grants.push(copy.body);
+            owner.credit.rows.push(copy.credit);
+        }
+        owner.body.acl = Some(EventAclGate {
+            column: copy_owned_prepaid_text(&acl.column)?,
+            ref_table: copy_owned_prepaid_text(&acl.ref_table)?,
+            ref_column: copy_owned_prepaid_text(&acl.ref_column)?,
+            grant_gate: Box::new(grant_gate.body),
+            grant_rows: EventGrantRows::Legacy(grants),
+        });
+        owner.credit.children.push(grant_gate.credit);
+    }
+    Ok((owner.body, owner.credit))
+}
+
+pub(super) struct OwnedSinkEventCredit {
+    row: OwnedEventValueCredits,
+    gate: OwnedEventGateCredits,
+    metadata: OwnedMemoryReservation,
+}
+pub(super) struct OwnedSinkQueueEntry {
+    pub(super) entry: SinkQueueEntry,
+    credit: OwnedSinkEventCredit,
+}
+fn copy_owned_sink_queue_entry(
+    original: &OwnedMemoryReservation,
+    source: &SinkQueueEntry,
+) -> Result<OwnedSinkQueueEntry> {
+    let bytes = owned_event_add(
+        owned_event_add(source.event.event_type.len(), source.event.table.len())?,
+        source.event.severity.len(),
+    )?;
+    let metadata = reserve_owned_event_bytes(original, bytes)?;
+    let (body, credit) = copy_owned_event_values(original, &source.event.row_values)?;
+    let row = OwnedEventBody { body, credit };
+    let (body, credit) = copy_owned_event_gate(original, &source.gate)?;
+    let gate = OwnedEventBody { body, credit };
+    let event_type = copy_owned_prepaid_text(&source.event.event_type)?;
+    let table = copy_owned_prepaid_text(&source.event.table)?;
+    let severity = copy_owned_prepaid_text(&source.event.severity)?;
+    Ok(OwnedSinkQueueEntry {
+        entry: SinkQueueEntry {
+            id: source.id,
+            row_id: source.row_id,
+            attempts: source.attempts,
+            gate: gate.body,
+            event: SinkEvent {
+                action_id: source.event.action_id,
+                event_type,
+                table,
+                row_values: row.body,
+                severity,
+                at_lsn: source.event.at_lsn,
+            },
+        },
+        credit: OwnedSinkEventCredit {
+            row: row.credit,
+            gate: gate.credit,
+            metadata,
+        },
+    })
+}
+
+pub(super) struct OwnedPreparedSinkEvents {
+    events: Vec<PreparedSinkEvent>,
+    credits: Vec<OwnedSinkEventCredit>,
+    sink_keys: Vec<OwnedMemoryReservation>,
+    event_array: OwnedMemoryReservation,
+    credit_array: OwnedMemoryReservation,
+    key_array: OwnedMemoryReservation,
+    publication: Option<OwnedAppendCustody>,
+}
+impl OwnedPreparedSinkEvents {
+    pub(super) fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+    pub(super) fn try_copy(
+        original: &OwnedMemoryReservation,
+        source: &[PreparedSinkEvent],
+    ) -> Result<Self> {
+        let (body, credit) = new_owned_native_vec(original, source.len())?;
+        let events = OwnedEventBody { body, credit };
+        let (body, credit) = new_owned_native_vec(original, source.len())?;
+        let credits = OwnedEventBody { body, credit };
+        let (body, credit) = new_owned_native_vec(original, source.len())?;
+        let sink_keys = OwnedEventBody { body, credit };
+        let mut owner = Self {
+            events: events.body,
+            event_array: events.credit,
+            credits: credits.body,
+            credit_array: credits.credit,
+            sink_keys: sink_keys.body,
+            key_array: sink_keys.credit,
+            publication: None,
+        };
+        for (sink, source) in source {
+            let (body, credit) = copy_owned_native_string(original, sink)?;
+            let key = OwnedEventBody { body, credit };
+            let copied = copy_owned_sink_queue_entry(original, source)?;
+            owner.events.push((key.body, copied.entry));
+            owner.credits.push(copied.credit);
+            owner.sink_keys.push(key.credit);
+        }
+        Ok(owner)
+    }
+    pub(super) fn empty(original: &OwnedMemoryReservation) -> Result<Self> {
+        Self::try_copy(original, &[])
+    }
+}
+// Field order is deliberate: payload arrays, row/gate invoices, array invoices,
+// then escrow cancellation and mutation lease. No Clone of this aggregate.
+pub(super) struct OwnedSinkQueue {
+    entries: VecDeque<OwnedEventShared<OwnedSinkQueueEntry>>,
+    name: OwnedEventShared<OwnedEventBody<String, OwnedMemoryReservation>>,
+    buffer: OwnedMemoryReservation,
+    key: Option<OwnedMemoryReservation>,
+    pending: usize,
+    reservations: usize,
+    present: bool,
+    retiring: usize,
+    // Exact paid source pin of the one durable/memory publication in flight.
+    mutation: Option<OwnedEventShared<OwnedSinkQueueEntry>>,
+}
+pub(super) struct OwnedQueueMap {
+    values: HashMap<String, OwnedSinkQueue>,
+    allocation: OwnedMemoryReservation,
+}
+pub(super) struct OwnedCommitEventStage {
+    pub(super) identity: EngineTerminalIdentity,
+    pub(super) events: OwnedPreparedSinkEvents,
+    pub(super) ddl: Option<OwnedStagedEventBusDdlCommit>,
+    pub(super) schema: Option<OwnedDefinitionPublication>,
+}
+pub(super) struct OwnedStagedEventBusDdlCommit {
+    pub(super) persistence: EventBusPersistenceCommit,
+    pub(super) persistence_credit: OwnedEncodedEventBusConfig,
+    pub(super) publication: OwnedDefinitionPublication,
+    pub(super) buffers: OwnedMemoryReservation,
+    pub(super) ddl_array: OwnedMemoryReservation,
+    pub(super) sidecar_array: OwnedMemoryReservation,
+}
+pub(super) struct OwnedStageMap {
+    values: HashMap<Lsn, OwnedEventShared<OwnedCommitEventStage>>,
+    allocation: OwnedMemoryReservation,
+}
+pub(crate) struct OwnedStageBorrow<'e> {
+    pub(crate) events: &'e [PreparedSinkEvent],
+    pub(crate) ddl: Option<&'e EventBusPersistenceCommit>,
+    pub(crate) schema_config: Option<&'e [(String, Vec<u8>)]>,
+}
+pub(super) struct OwnedEventBusStorage {
+    stages: Mutex<OwnedStageMap>,
+    queues: Mutex<OwnedQueueMap>,
+    queue_claim_waiters: Condvar,
+    definition_credit: Mutex<Option<OwnedMemoryReservation>>,
+    checkout_allocation: Mutex<Option<OwnedCheckoutAllocation>>,
+    metric_allocation: Mutex<Option<OwnedMetricsAllocation>>,
+    unloaded_allocation: Mutex<Option<OwnedMetricsAllocation>>,
+    common: Arc<EventBusState>,
+    funder: SourceFunder,
+    pub(super) original: OwnedMemoryReservation,
+}
+pub(crate) struct OwnedEventBusHandle {
+    storage: OwnedEventShared<OwnedEventBusStorage>,
+}
+pub(super) struct OwnedEventBusWeak {
+    storage: OwnedEventSharedWeak<OwnedEventBusStorage>,
+}
+impl Clone for OwnedEventBusHandle {
+    fn clone(&self) -> Self {
+        Self {
+            storage: self.storage.clone(),
+        }
+    }
+}
+impl Clone for OwnedEventBusWeak {
+    fn clone(&self) -> Self {
+        Self {
+            storage: self.storage.clone(),
+        }
+    }
+}
+impl OwnedEventBusWeak {
+    pub(super) fn upgrade(&self) -> Option<OwnedEventBusHandle> {
+        self.storage
+            .upgrade()
+            .map(|storage| OwnedEventBusHandle { storage })
+    }
+    pub(super) fn matches(&self, handle: &OwnedEventBusHandle) -> bool {
+        self.storage
+            .data
+            .as_ref()
+            .expect("live event weak")
+            .as_ptr()
+            == Arc::as_ptr(handle.storage.data.as_ref().expect("live event body"))
+    }
+}
+impl OwnedEventBusHandle {
+    pub(super) fn try_new(
+        common: Arc<EventBusState>,
+        original: OwnedMemoryReservation,
+        expected: &crate::memory_accounting::AccountantHandle,
+        funder: &SourceFunder,
+    ) -> Result<Self> {
+        validate_owned_original(&original, expected, funder)?;
+        // Exclusive assembly is required, rather than a shadow for Legacy.
+        if !common.queue_mutation_state.lock().checked_out.is_empty()
+            || common.queue_mutation_state.lock().active_mutations != 0
+            || !common.queues.lock().is_empty()
+            || !common.staged_for_persistence.lock().is_empty()
+            || !common.staged_ddl_for_persistence.lock().is_empty()
+            || *common.definitions.lock() != EventBusDefinitions::default()
+            || !common.callbacks.read().is_empty()
+            || !common.runtimes.lock().is_empty()
+        {
+            return Err(Error::Other(
+                "owning event assembly requires empty Legacy bodies".into(),
+            ));
+        }
+        let (stages, stage_memory) = new_owned_native_map(&original, 0)?;
+        let (queues, queue_memory) = new_owned_native_map(&original, 0)?;
+        let shared_bytes = owned_event_add(
+            contextdb_tx::staged_source::source_arc_layout::<OwnedEventBusStorage>().size(),
+            contextdb_tx::staged_source::source_arc_layout::<OriginalAuxInvoice>().size(),
+        )?;
+        let mut reservation = reserve_owned_event_bytes(&original, shared_bytes)?;
+        let invoice = reservation.into_source_aux_invoice_for(funder)?;
+        let credit = Arc::new(invoice);
+        let body = OwnedEventBusStorage {
+            stages: Mutex::new(OwnedStageMap {
+                values: stages,
+                allocation: stage_memory,
+            }),
+            queues: Mutex::new(OwnedQueueMap {
+                values: queues,
+                allocation: queue_memory,
+            }),
+            queue_claim_waiters: Condvar::new(),
+            definition_credit: Mutex::new(None),
+            checkout_allocation: Mutex::new(None),
+            metric_allocation: Mutex::new(None),
+            unloaded_allocation: Mutex::new(None),
+            common,
+            funder: funder.clone(),
+            original,
+        };
+        Ok(Self {
+            storage: OwnedEventShared {
+                data: Some(Arc::new(body)),
+                credit: Some(credit),
+            },
+        })
+    }
+    pub(super) fn data(&self) -> &OwnedEventBusStorage {
+        self.storage.get()
+    }
+    pub(super) fn downgrade(&self) -> OwnedEventBusWeak {
+        OwnedEventBusWeak {
+            storage: self.storage.downgrade(),
+        }
+    }
+    pub(super) fn owned_queue_depth(&self, sink: &str) -> u64 {
+        let loaded = self
+            .data()
+            .queues
+            .lock()
+            .values
+            .get(sink)
+            .filter(|queue| queue.present)
+            .map_or(0, |queue| queue.entries.len().saturating_sub(queue.retiring) as u64);
+        loaded.saturating_add(
+            self.data()
+                .common
+                .unloaded_queue_depths
+                .lock()
+                .get(sink)
+                .copied()
+                .unwrap_or(0),
+        )
+    }
+    pub(super) fn owned_sink_metrics(&self, sink: &str) -> SinkMetrics {
+        let queued = self.owned_queue_depth(sink);
+        let common = self.data().common.metrics.lock();
+        let state = common.get(sink);
+        SinkMetrics {
+            queued,
+            delivered: state.map_or(0, |s| s.delivered),
+            retried: state.map_or(0, |s| s.retried),
+            uncertain: state.map_or(0, |s| s.uncertain.saturating_add(s.unconfirmed)),
+            permanent_failures: state.map_or(0, |s| s.permanent_failures),
+            examined: state.map_or(0, |s| s.examined),
+        }
+    }
+    pub(super) fn with_owned_queue_entries<R>(
+        &self,
+        sink: &str,
+        f: impl for<'q> FnOnce(Option<&'q VecDeque<OwnedEventShared<OwnedSinkQueueEntry>>>) -> Result<R>,
+    ) -> Result<R> {
+        loop {
+            let maximum = {
+                let queues = self.data().queues.lock();
+                queues.values.get(sink).filter(|q| q.present).map_or(0, |q| q.entries.len().saturating_sub(q.retiring))
+            };
+            let (body, credit) = new_owned_native_ring(&self.data().original, maximum)?;
+            let mut snapshot: OwnedEventBody<VecDeque<OwnedEventShared<OwnedSinkQueueEntry>>, _> =
+                OwnedEventBody { body, credit };
+            let present;
+            {
+                let queues = self.data().queues.lock();
+                let queue = queues.values.get(sink).filter(|q| q.present);
+                if queue.is_some_and(|q| q.entries.len().saturating_sub(q.retiring) > snapshot.body.capacity()) { continue; }
+                present = queue.is_some();
+                if let Some(queue) = queue {
+                    for entry in queue.entries.iter().skip(queue.retiring) { snapshot.body.push_back(entry.clone()); }
+                }
+            }
+            return f(present.then_some(&snapshot.body));
+        }
+    }
+    pub(super) fn stage_owned_commit_events(
+        &self,
+        lsn: Lsn,
+        mut stage: OwnedCommitEventStage,
+    ) -> Result<OwnedEventStageRegistration> {
+        self.merge_owned_commit_escrow(&mut stage)?;
+        let identity = stage.identity;
+        let append = match stage
+            .events
+            .publication
+            .take()
+            .ok_or_else(|| Error::Other("owning stage has no append lease".into()))?
+        {
+            OwnedAppendCustody::Ordinary(token) => {
+                if !token.storage.matches(self) || token.state != OwnedEscrowState::Active {
+                    return Err(Error::Other(
+                        "owning stage requires its active original escrow".into(),
+                    ));
+                }
+                OwnedDiscardAppendHandle {
+                    control: OwnedEventShared::try_new(
+                        OwnedDiscardAppendControl {
+                            token: Mutex::new(Some(token)),
+                        },
+                        &self.data().original,
+                        &self.data().funder,
+                    )?,
+                }
+            }
+            OwnedAppendCustody::Discard(handle) => handle,
+        };
+        stage.events.publication = Some(OwnedAppendCustody::Discard(append.clone()));
+        let paid = OwnedEventShared::try_new(stage, &self.data().original, &self.data().funder)?;
+        let control = reserve_owned_event_bytes(&self.data().original,
+            std::mem::size_of::<OwnedEventStageRegistration>())?;
+        let mut registration = OwnedEventStageRegistration {
+            storage: self.clone(), append: Some(append), lsn, identity,
+            installed: paid.clone(), armed: false, control,
+        };
+        loop {
+            let (length, capacity, collision) = {
+                let map = self.data().stages.lock();
+                (map.values.len(), map.values.capacity(), map.values.contains_key(&lsn))
+            };
+            if collision {
+                return Err(Error::Other("owning event stage collision".into()));
+            }
+            let required = owned_event_add(length, 1)?;
+            // Both the successor and its partial/error owners are constructed
+            // before the guard, so every retry/refusal/unwind retires unlocked.
+            let mut successor = if required > capacity {
+                let (values, allocation) = new_owned_native_map(&self.data().original, required)?;
+                Some(OwnedStageMap { values, allocation })
+            } else {
+                None
+            };
+            let mut map = self.data().stages.lock();
+            if map.values.contains_key(&lsn) {
+                drop(map);
+                return Err(Error::Other("owning event stage collision".into()));
+            }
+            if map.values.len() != length || map.values.capacity() != capacity {
+                drop(map);
+                continue;
+            }
+            if let Some(next) = &mut successor {
+                for (key, value) in map.values.drain() {
+                    next.values.insert(key, value);
+                }
+                std::mem::swap(&mut *map, next);
+            }
+            map.values.insert(lsn, paid);
+            drop(map);
+            // Nothing arbitrary may retire before exact installed-source cleanup
+            // is armed. In particular the old map's original refund may unwind.
+            registration.armed = true;
+            drop(successor);
+            return Ok(registration);
+        }
+    }
+
+    pub(crate) fn with_owned_commit_events<R>(
+        &self,
+        lsn: Lsn,
+        identity: EngineTerminalIdentity,
+        f: impl for<'e> FnOnce(Option<OwnedStageBorrow<'e>>) -> Result<R>,
+    ) -> Result<R> {
+        // Pin an already-paid count, unlock the map, then lend synchronously.
+        let pin = self.data().stages.lock().values.get(&lsn)
+            .filter(|stage| stage.identity == identity).cloned();
+        f(pin.as_ref().map(|pin| {
+            let stage = pin.get();
+            OwnedStageBorrow {
+                events: &stage.events.events,
+                ddl: stage.ddl.as_ref().map(|ddl| &ddl.persistence),
+                schema_config: stage
+                    .schema
+                    .as_ref()
+                    .map(|schema| schema.config.values.as_slice()),
+            }
+        }))
+    }
+    pub(super) fn take_owned_commit_events(
+        &self,
+        lsn: Lsn,
+        identity: EngineTerminalIdentity,
+    ) -> Option<OwnedEventShared<OwnedCommitEventStage>> {
+        let mut stages = self.data().stages.lock();
+        if !stages
+            .values
+            .get(&lsn)
+            .is_some_and(|stage| stage.get().identity == identity)
+        {
+            return None;
+        }
+        let taken = stages.values.remove(&lsn);
+        drop(stages);
+        taken
+    }
+}
+pub(crate) struct OwnedEventStageRegistration {
+    storage: OwnedEventBusHandle,
+    append: Option<OwnedDiscardAppendHandle>,
+    lsn: Lsn,
+    identity: EngineTerminalIdentity,
+    installed: OwnedEventShared<OwnedCommitEventStage>,
+    armed: bool,
+    control: OwnedMemoryReservation,
+}
+impl OwnedEventStageRegistration {
+    pub(super) fn take(mut self) -> Option<OwnedEventShared<OwnedCommitEventStage>> {
+        let stage = self
+            .storage
+            .take_owned_registered_stage(&self);
+        self.armed = false;
+        stage
+    }
+}
+impl Drop for OwnedEventStageRegistration {
+    fn drop(&mut self) {
+        if self.armed {
+            let retired = self
+                .storage
+                .take_owned_registered_stage(&self);
+            drop(retired);
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum OwnedEscrowState {
+    Active,
+    Suspended,
+    Frozen,
+    Published,
+}
+pub(super) struct OwnedQueueAppendSlot {
+    sink: String,
+    key: OwnedMemoryReservation,
+    count: usize,
+    retired: Option<(String, OwnedSinkQueue)>,
+}
+pub(super) struct OwnedSinkQueuePublication {
+    entries: OwnedEventBody<Vec<Option<OwnedEventShared<OwnedSinkQueueEntry>>>, OwnedMemoryReservation>,
+    slots: Vec<OwnedQueueAppendSlot>,
+    workspace: OwnedMemoryReservation,
+    storage: OwnedEventBusWeak,
+    lease: Option<QueueMutationLease>,
+    state: OwnedEscrowState,
+}
+pub(super) struct OwnedDiscardAppendControl {
+    token: Mutex<Option<OwnedSinkQueuePublication>>,
+}
+pub(super) struct OwnedDiscardAppendHandle {
+    control: OwnedEventShared<OwnedDiscardAppendControl>,
+}
+impl Clone for OwnedDiscardAppendHandle {
+    fn clone(&self) -> Self {
+        Self {
+            control: self.control.clone(),
+        }
+    }
+}
+pub(super) enum OwnedAppendCustody {
+    Ordinary(OwnedSinkQueuePublication),
+    Discard(OwnedDiscardAppendHandle),
+}
+impl OwnedAppendCustody {
+    fn take_token(self) -> OwnedSinkQueuePublication {
+        match self {
+            Self::Ordinary(token) => token,
+            Self::Discard(handle) => handle
+                .control
+                .get()
+                .token
+                .lock()
+                .take()
+                .expect("discard owns append token"),
+        }
+    }
+}
+fn cancel_owned_slots_locked(map: &mut OwnedQueueMap, slots: &mut [OwnedQueueAppendSlot]) {
+    for slot in slots {
+        let queue = map
+            .values
+            .get_mut(&slot.sink)
+            .expect("active escrow sink exists");
+        assert!(queue.pending >= slot.count, "own pending escrow exists");
+        queue.pending -= slot.count;
+        queue.reservations -= 1;
+        if !queue.present && queue.pending == 0 && queue.reservations == 0 {
+            slot.retired = map.values.remove_entry(&slot.sink);
+        }
+    }
+}
+impl Drop for OwnedSinkQueuePublication {
+    fn drop(&mut self) {
+        if self.state == OwnedEscrowState::Active {
+            if let Some(storage) = self.storage.upgrade() {
+                let mut queues = storage.data().queues.lock();
+                cancel_owned_slots_locked(&mut queues, &mut self.slots);
+                drop(queues);
+            }
+        }
+        // Fields destroy retired bodies before their invoices; drop lease only
+        // after cancellation releases the queue lock.
+    }
+}
+pub(super) struct OwnedQueuePreparation {
+    sink: String,
+    name: Option<OwnedEventShared<OwnedEventBody<String, OwnedMemoryReservation>>>,
+    required: usize,
+    absent: bool,
+    replace_ring: bool,
+    key: Option<OwnedMemoryReservation>,
+    count: usize,
+    replacement: Option<(VecDeque<OwnedEventShared<OwnedSinkQueueEntry>>, OwnedMemoryReservation)>,
+    retired: Option<(VecDeque<OwnedEventShared<OwnedSinkQueueEntry>>, OwnedMemoryReservation)>,
+}
+impl OwnedEventBusHandle {
+    fn prepare_owned_queue_name(&self, name: &str)
+        -> Result<OwnedEventShared<OwnedEventBody<String, OwnedMemoryReservation>>>
+    {
+        let (body, credit) = copy_owned_native_string(&self.data().original, name)?;
+        OwnedEventShared::try_new(OwnedEventBody { body, credit },
+            &self.data().original, &self.data().funder)
+    }
+    fn queue_limit(&self) -> usize {
+        #[cfg(any(test, feature = "test-seams"))]
+        {
+            self.data()
+                .common
+                .queue_capacity_for_test
+                .load(Ordering::SeqCst)
+        }
+        #[cfg(not(any(test, feature = "test-seams")))]
+        {
+            MAX_SINK_QUEUE_DEPTH
+        }
+    }
+    pub(super) fn reserve_owned_queue_publication(
+        &self,
+        events: &OwnedPreparedSinkEvents,
+        lease: QueueMutationLease,
+    ) -> Result<OwnedSinkQueuePublication> {
+        // Pin actual original-funded copies before any queue guard. These are
+        // also the checkout identity; publication performs no Arc admission.
+        let (body, credit) = new_owned_native_vec(&self.data().original, events.events.len())?;
+        let mut pins = OwnedEventBody { body, credit };
+        for ((_, entry), credit) in events.events.iter().zip(&events.credits) {
+            let copied = copy_owned_sink_queue_entry(&credit.metadata, entry)?;
+            let pin = OwnedEventShared::try_new(copied, &credit.metadata, &self.data().funder)?;
+            pins.body.push(Some(pin));
+        }
+        let mut token = self.reserve_owned_queue_names(&events.events, &[], lease)?;
+        std::mem::swap(&mut token.entries, &mut pins);
+        Ok(token)
+    }
+    fn reserve_owned_queue_names(
+        &self,
+        events: &[PreparedSinkEvent],
+        names: &[String],
+        lease: QueueMutationLease,
+    ) -> Result<OwnedSinkQueuePublication> {
+        if !Arc::ptr_eq(&lease.state, &self.data().common.queue_mutation_state) {
+            return Err(Error::Other(
+                "queue lease belongs to another event bus".into(),
+            ));
+        }
+        let original = &self.data().original;
+        // Arrays are sized for the worst-case distinct keys before creating any
+        // owned lookup or successor. No unpriced additions HashMap.
+        let maximum = owned_event_add(events.len(), names.len())?;
+        let (slots, workspace) = new_owned_native_vec(original, maximum)?;
+        let (body, credit) = new_owned_native_vec(original, 0)?;
+        let mut token = OwnedSinkQueuePublication {
+            entries: OwnedEventBody { body, credit },
+            slots,
+            workspace,
+            storage: self.downgrade(),
+            lease: Some(lease),
+            state: OwnedEscrowState::Suspended,
+        };
+        for (sink, _) in events {
+            if let Some(slot) = token.slots.iter_mut().find(|slot| slot.sink == *sink) {
+                slot.count = owned_event_add(slot.count, 1)?;
+            } else {
+                let (sink, key) = copy_owned_native_string(original, sink)?;
+                token.slots.push(OwnedQueueAppendSlot {
+                    sink,
+                    key,
+                    count: 1,
+                    retired: None,
+                });
+            }
+        }
+        for sink in names {
+            if !token.slots.iter().any(|slot| slot.sink == *sink) {
+                let (sink, key) = copy_owned_native_string(original, sink)?;
+                token.slots.push(OwnedQueueAppendSlot {
+                    sink,
+                    key,
+                    count: 0,
+                    retired: None,
+                });
+            }
+        }
+        let (plans, plan_memory) = new_owned_native_vec(original, token.slots.len())?;
+        let mut plans = OwnedEventBody {
+            body: plans,
+            credit: plan_memory,
+        };
+        for slot in &token.slots {
+            let (sink, key) = copy_owned_native_string(original, &slot.sink)?;
+            let (body, credit) = copy_owned_native_string(original, &slot.sink)?;
+            let name = OwnedEventShared::try_new(
+                OwnedEventBody { body, credit }, original, &self.data().funder,
+            )?;
+            plans.body.push(OwnedQueuePreparation {
+                sink, name: Some(name), key: Some(key), count: slot.count,
+                required: 0, absent: false, replace_ring: false, replacement: None, retired: None,
+            });
+        }
+        loop {
+            // Inspect scalar requirements only. No funded constructor, copied
+            // source, formatted refusal or partial owner lives inside this guard.
+            let mut full = None;
+            let required_map;
+            let replace_map;
+            {
+                let queues = self.data().queues.lock();
+                let mut absent = 0;
+                for (index, plan) in plans.body.iter_mut().enumerate() {
+                    let queue = queues.values.get(&plan.sink);
+                    plan.absent = queue.is_none();
+                    absent += usize::from(plan.absent);
+                    let required = queue.map_or(0, |q| q.entries.len())
+                        .checked_add(queue.map_or(0, |q| q.pending))
+                        .and_then(|n| n.checked_add(plan.count));
+                    plan.required = required.unwrap_or(usize::MAX);
+                    plan.replace_ring = queue.is_none() || plan.required > queue.map_or(0, |q| q.entries.capacity());
+                    if required.is_none() || plan.required > self.queue_limit() {
+                        full = Some((index, required.is_none())); break;
+                    }
+                }
+                required_map = queues.values.len().checked_add(absent);
+                replace_map = required_map.is_some_and(|n| n > queues.values.capacity());
+            }
+            if let Some((index, overflow)) = full {
+                if overflow { return Err(owned_event_overflow()); }
+                return Err(Error::Other(format!("sink queue is full: {}", plans.body[index].sink)));
+            }
+            let required_map = required_map.ok_or_else(owned_event_overflow)?;
+            // Constructors (including their capacity-refusal and unwind paths)
+            // run unlocked; every partial successor stays in an outer owner.
+            let mut successor = if replace_map {
+                let (values, allocation) = new_owned_native_map(original, required_map)?;
+                Some(OwnedQueueMap { values, allocation })
+            } else { None };
+            for plan in &mut plans.body {
+                if plan.replace_ring { plan.replacement = Some(new_owned_native_ring(original, plan.required)?); }
+            }
+            let mut queues = self.data().queues.lock();
+            let valid = queues.values.len() + plans.body.iter()
+                .filter(|p| !queues.values.contains_key(&p.sink)).count()
+                <= successor.as_ref().map_or(queues.values.capacity(), |q| q.values.capacity())
+                && plans.body.iter().all(|p| {
+                    let queue = queues.values.get(&p.sink);
+                    queue.map_or(0, |q| q.entries.len()).checked_add(queue.map_or(0, |q| q.pending))
+                        .and_then(|n| n.checked_add(p.count))
+                        .is_some_and(|n| n <= self.queue_limit() && match &p.replacement {
+                            Some((ring, _)) => n <= ring.capacity(),
+                            None => queue.is_some_and(|q| n <= q.entries.capacity()),
+                        })
+                });
+            if !valid {
+                drop(queues);
+                for plan in &mut plans.body { drop(plan.replacement.take()); }
+                drop(successor);
+                continue;
+            }
+            // String hashing and paid-capacity moves only. Successor/plans were
+            // declared before the guard, so an unwind unlocks before retirement.
+            if let Some(successor) = &mut successor {
+                for (key, value) in queues.values.drain() { successor.values.insert(key, value); }
+                std::mem::swap(&mut *queues, successor);
+            }
+            for plan in &mut plans.body {
+                if let Some(queue) = queues.values.get_mut(&plan.sink) {
+                    if let Some(replacement) = &mut plan.replacement {
+                        if replacement.0.capacity() > queue.entries.capacity() {
+                            replacement.0.append(&mut queue.entries);
+                            std::mem::swap(&mut queue.entries, &mut replacement.0);
+                            std::mem::swap(&mut queue.buffer, &mut replacement.1);
+                        }
+                    }
+                    queue.pending += plan.count;
+                    queue.reservations += 1;
+                } else {
+                    let vacant = queues.values.entry(std::mem::take(&mut plan.sink));
+                    let (entries, buffer) = plan.replacement.take().expect("prepared new ring");
+                    vacant.or_insert(OwnedSinkQueue {
+                        entries, buffer, name: plan.name.take().expect("prepared queue name"),
+                        key: plan.key.take(), pending: plan.count, reservations: 1, present: false, retiring: 0, mutation: None,
+                    });
+                }
+            }
+            drop(queues);
+            token.state = OwnedEscrowState::Active;
+            drop(successor);
+            break;
+        }
+        drop(plans);
+        Ok(token)
+    }
+    pub(super) fn prepare_owned_sink_events(
+        &self,
+        source: &[PreparedSinkEvent],
+    ) -> Result<OwnedPreparedSinkEvents> {
+        let mut events = OwnedPreparedSinkEvents::try_copy(&self.data().original, source)?;
+        // Empty changes still participate in the original mutation freeze.
+        let lease = self.data().common.begin_queue_mutation();
+        let token = self.reserve_owned_queue_publication(&events, lease)?;
+        events.publication = Some(OwnedAppendCustody::Ordinary(token));
+        Ok(events)
+    }
+    pub(super) fn publish_owned_sink_events_to_memory(&self, mut events: OwnedPreparedSinkEvents) {
+        let mut token = events
+            .publication
+            .take()
+            .expect("prepared append custody")
+            .take_token();
+        assert!(
+            token.storage.matches(self),
+            "append retains its actual event companion"
+        );
+        assert!(
+            token.state == OwnedEscrowState::Active,
+            "append transfer installed before thaw"
+        );
+        let mut queues = self.data().queues.lock();
+        for ((sink, _), entry) in events.events.iter().zip(&mut token.entries.body) {
+            let queue = queues.values.get_mut(sink).expect("committed paid sink slot");
+            assert!(queue.pending != 0 && queue.entries.len() < queue.entries.capacity());
+            queue.entries.push_back(entry.take().expect("prepared append pin"));
+            queue.pending -= 1;
+            queue.present = true;
+        }
+        for slot in &token.slots {
+            let queue = queues.values.get_mut(&slot.sink).expect("paid append slot");
+            queue.reservations -= 1;
+            if slot.count == 0 {
+                queue.present = true;
+            }
+        }
+        token.state = OwnedEscrowState::Published;
+        drop(queues);
+        drop(token);
+        drop(events);
+        self.data().common.waiters.notify_all();
+    }
+    pub(super) fn suspend_owned_append_for_discard(
+        &self,
+        events: &mut OwnedPreparedSinkEvents,
+    ) -> Result<OwnedDiscardAppendHandle> {
+        let token = events
+            .publication
+            .take()
+            .ok_or_else(|| Error::Other("discard append has no custody".into()))?
+            .take_token();
+        if !token.storage.matches(self) || token.state != OwnedEscrowState::Active {
+            return Err(Error::Other(
+                "discard append is not active on its original companion".into(),
+            ));
+        }
+        // Admit and build the actual shared transfer control BEFORE cancelling
+        // this terminal's pending count or dropping its normal mutation lease.
+        let control = OwnedEventShared::try_new(
+            OwnedDiscardAppendControl {
+                token: Mutex::new(Some(token)),
+            },
+            &self.data().original,
+            &self.data().funder,
+        )?;
+        let handle = OwnedDiscardAppendHandle { control };
+        let mut token = handle
+            .control
+            .get()
+            .token
+            .lock()
+            .take()
+            .expect("prepared transfer token");
+        let mut queues = self.data().queues.lock();
+        cancel_owned_slots_locked(&mut queues, &mut token.slots);
+        token.state = OwnedEscrowState::Suspended;
+        drop(queues);
+        for slot in &mut token.slots {
+            drop(slot.retired.take());
+        }
+        drop(token.lease.take());
+        *handle.control.get().token.lock() = Some(token);
+        events.publication = Some(OwnedAppendCustody::Discard(handle.clone()));
+        Ok(handle)
+    }
+}
+// A pair is always retained as fields, including partial preparation/error.
+pub(super) struct OwnedEventBody<T, C> {
+    body: T,
+    credit: C,
+}
+
+// Error and unwind restore the SAME suspended escrow after queue guards leave.
+struct OwnedSuspendedAppend {
+    token: Option<OwnedSinkQueuePublication>,
+    handle: Option<OwnedDiscardAppendHandle>,
+}
+impl Drop for OwnedSuspendedAppend {
+    fn drop(&mut self) {
+        if let (Some(handle), Some(token)) = (&self.handle, self.token.take()) {
+            let previous = handle.control.get().token.lock().replace(token);
+            assert!(previous.is_none(), "suspended escrow has one owner");
+            drop(previous);
+        }
+    }
+}
+struct OwnedPurgeQueueSource {
+    name: OwnedEventShared<OwnedEventBody<String, OwnedMemoryReservation>>,
+    entries: std::ops::Range<usize>,
+    present: bool,
+}
+// This field owner drops only after the publication's queues are physically
+// destroyed, and before its original purge token reopens queue mutations.
+struct OwnedPurgeAppendTransfer {
+    handle: OwnedDiscardAppendHandle,
+}
+impl Drop for OwnedPurgeAppendTransfer {
+    fn drop(&mut self) {
+        let mut token = self.handle.control.get().token.lock();
+        if let Some(append) = token.as_mut() {
+            if append.state == OwnedEscrowState::Frozen {
+                append.state = OwnedEscrowState::Suspended;
+            }
+        }
+        // A published Active token keeps its transferred lease and identity.
+    }
+}
+pub(super) struct OwnedPurgeQueuePublication {
+    queues: OwnedQueueMap,
+    sink_names: OwnedEventBody<Vec<String>, OwnedMemoryReservation>,
+    name_keys: OwnedEventBody<Vec<OwnedMemoryReservation>, OwnedMemoryReservation>,
+    transfer: Option<OwnedPurgeAppendTransfer>,
+    transferred_lease: Option<QueueMutationLease>,
+    token: AuthoritativePurgeQueueMutationToken,
+}
+impl OwnedPurgeQueuePublication {
+    pub(super) fn with_sink_names<R>(&self, f: impl FnOnce(&[String]) -> R) -> R {
+        f(&self.sink_names.body)
+    }
+}
+impl OwnedEventBusHandle {
+    pub(super) fn prepare_owned_purge_queue_replacement(
+        &self,
+        token: AuthoritativePurgeQueueMutationToken,
+        durable_names: &BTreeSet<String>,
+        selections: &BTreeMap<String, HashSet<RowId>>,
+        own_append: Option<&OwnedPreparedSinkEvents>,
+    ) -> Result<OwnedPurgeQueuePublication> {
+        let original = &self.data().original;
+        if !Arc::ptr_eq(&token.state, &self.data().common.queue_mutation_state) {
+            return Err(Error::Other(
+                "purge token belongs to another event bus".into(),
+            ));
+        }
+        {
+            let state = token.state.lock();
+            // The ORIGINAL freeze wait, including empty received/definition
+            // mutations, has finished before copying any live body.
+            assert!(state.checkout_paused && state.mutation_blocked && state.active_mutations == 0);
+        }
+        let transfer = match own_append.and_then(|events| events.publication.as_ref()) {
+            Some(OwnedAppendCustody::Discard(handle)) => Some(handle.clone()),
+            Some(OwnedAppendCustody::Ordinary(_)) => {
+                return Err(Error::Other(
+                    "discard must suspend its own lease before freeze".into(),
+                ));
+            }
+            None => None,
+        };
+        // Take control under its own guard and immediately unlock; never hold
+        // that guard while acquiring queue/state locks.
+        let mut suspended = OwnedSuspendedAppend {
+            token: transfer.as_ref().map(|handle| {
+                handle.control.get().token.lock().take().expect("suspended discard escrow")
+            }),
+            handle: transfer.clone(),
+        };
+        if suspended.token.as_ref().is_some_and(|append| append.state != OwnedEscrowState::Suspended) {
+            return Err(Error::Other("discard escrow is not suspended".into()));
+        }
+        let (source_count, entry_count) = {
+            let queues = self.data().queues.lock();
+            assert!(queues.values.values().all(|queue| queue.pending == 0 && queue.mutation.is_none()));
+            (queues.values.len(), queues.values.values().try_fold(0usize,
+                |n, q| n.checked_add(q.entries.len())))
+        };
+        let entry_count = entry_count.ok_or_else(owned_event_overflow)?;
+        let (body, credit) = new_owned_native_vec(original, source_count)?;
+        let mut sources: OwnedEventBody<Vec<OwnedPurgeQueueSource>, _> = OwnedEventBody { body, credit };
+        let (body, credit) = new_owned_native_vec(original, entry_count)?;
+        let mut pins = OwnedEventBody { body, credit };
+        {
+            let queues = self.data().queues.lock();
+            // The original freeze makes these capacities immutable. Only paid
+            // count clones run locked; deep copies and constructors run below.
+            assert_eq!(queues.values.len(), source_count);
+            for queue in queues.values.values() {
+                let begin = pins.body.len();
+                for entry in &queue.entries { pins.body.push(entry.clone()); }
+                sources.body.push(OwnedPurgeQueueSource {
+                    name: queue.name.clone(), entries: begin..pins.body.len(), present: queue.present,
+                });
+            }
+        }
+        let extra = suspended.token.as_ref().map_or(0, |append| append.slots.len());
+        let maximum = owned_event_add(owned_event_add(source_count, durable_names.len())?, extra)?;
+        let (names, name_array) = new_owned_native_vec(original, maximum)?;
+        let (keys, key_array) = new_owned_native_vec(original, maximum)?;
+        let mut copied = OwnedEventNames { names, keys, name_array, key_array };
+        for name in durable_names.iter().map(String::as_str)
+            .chain(sources.body.iter().map(|q| q.name.body.as_str()))
+            .chain(suspended.token.iter().flat_map(|append| append.slots.iter().map(|s| s.sink.as_str())))
+        {
+            if !copied.names.iter().any(|existing| existing == name) {
+                let (name, credit) = copy_owned_native_string(original, name)?;
+                copied.names.push(name);
+                copied.keys.push(credit);
+            }
+        }
+        let (values, allocation) = new_owned_native_map(original, copied.names.len())?;
+        let mut successor = OwnedQueueMap { values, allocation };
+        for name in &copied.names {
+            let source = sources.body.iter().find(|q| q.name.body == *name);
+            let source_entries = source.map_or(&[][..], |q| &pins.body[q.entries.clone()]);
+            let keep = |entry: &&OwnedEventShared<OwnedSinkQueueEntry>| {
+                !selections.get(&entry.entry.event.table)
+                    .is_some_and(|ids| ids.contains(&entry.entry.row_id))
+            };
+            let survivors = source_entries.iter().filter(keep).count();
+            let pending = suspended.token.as_ref().map_or(Ok(0), |append| {
+                append.slots.iter().filter(|slot| slot.sink == *name)
+                    .try_fold(0, |total, slot| owned_event_add(total, slot.count))
+            })?;
+            let required = owned_event_add(survivors, pending)?;
+            if required > self.queue_limit() {
+                return Err(Error::Other(format!("sink queue is full: {name}")));
+            }
+            let (body, credit) = copy_owned_native_string(original, name)?;
+            let key = OwnedEventBody { body, credit };
+            let (entries, buffer) = new_owned_native_ring(original, required)?;
+            let mut queue = OwnedSinkQueue {
+                entries, buffer, name: self.prepare_owned_queue_name(name)?, key: None, pending,
+                reservations: suspended.token.as_ref().map_or(0, |append| {
+                    append.slots.iter().filter(|slot| slot.sink == *name).count()
+                }),
+                present: source.is_some_and(|q| q.present) || durable_names.contains(name),
+                retiring: 0,
+                mutation: None,
+            };
+            for entry in source_entries.iter().filter(keep) {
+                let copy = copy_owned_sink_queue_entry(&entry.get().credit.metadata, &entry.entry)?;
+                let pin = OwnedEventShared::try_new(copy, &entry.get().credit.metadata, &self.data().funder)?;
+                queue.entries.push_back(pin);
+            }
+            queue.key = Some(key.credit);
+            successor.values.insert(key.body, queue);
+        }
+        let queues = successor;
+        let sink_names = OwnedEventBody { body: copied.names, credit: copied.name_array };
+        let name_keys = OwnedEventBody { body: copied.keys, credit: copied.key_array };
+        // Prebuild the exact normal lease before durability, without counting
+        // it active while the original freeze is still waiting/held.
+        let transferred_lease = transfer.as_ref().map(|_| QueueMutationLease {
+            state: token.state.clone(),
+            waiters: token.waiters.clone(),
+        });
+        let transfer = transfer.map(|handle| OwnedPurgeAppendTransfer { handle });
+        if let (Some(transfer), Some(mut append)) = (transfer.as_ref(), suspended.token.take()) {
+            append.state = OwnedEscrowState::Frozen;
+            *transfer.handle.control.get().token.lock() = Some(append);
+        }
+        Ok(OwnedPurgeQueuePublication {
+            queues,
+            sink_names,
+            name_keys,
+            transfer,
+            transferred_lease,
+            token,
+        })
+    }
+    pub(super) fn publish_owned_purge_queue_replacement(
+        &self,
+        mut publication: OwnedPurgeQueuePublication,
+    ) {
+        let retired = {
+            let mut queues = self.data().queues.lock();
+            std::mem::swap(&mut *queues, &mut publication.queues);
+            // The old paid map is now owned by publication, outside the guard.
+            ()
+        };
+        let _ = retired;
+        if let Some(transfer) = &publication.transfer {
+            let mut append = transfer.handle
+                .control
+                .get()
+                .token
+                .lock()
+                .take()
+                .expect("frozen append escrow");
+            assert!(append.state == OwnedEscrowState::Frozen);
+            // Queue guard was released. Install the SAME paid lease before
+            // the ORIGINAL freeze token reopens mutations and checkouts.
+            let mut state = publication.token.state.lock();
+            assert!(state.active_mutations == 0 && state.mutation_blocked);
+            state.active_mutations += 1;
+            append.lease = publication.transferred_lease.take();
+            append.state = OwnedEscrowState::Active;
+            drop(state);
+            *transfer.handle.control.get().token.lock() = Some(append);
+        }
+        // Retire old bodies before thaw. Publication field order retains the
+        // freeze until the old map and transfer captures are physically gone.
+        drop(publication);
+        self.data().common.waiters.notify_all();
+    }
+}
+
+// The sorted insertion node plan follows the existing original JSON producer's
+// splitpoint plan. These concrete layouts require the same deployed-toolchain
+// qualification as NativeMapPlan; this dormant source is not that proof.
+#[repr(C)]
+pub(super) struct OwnedEventBTreeLeaf<K, V> {
+    parent: Option<std::ptr::NonNull<OwnedEventBTreeInternal<K, V>>>,
+    parent_index: std::mem::MaybeUninit<u16>,
+    len: u16,
+    keys: [std::mem::MaybeUninit<K>; 11],
+    values: [std::mem::MaybeUninit<V>; 11],
+}
+#[repr(C)]
+pub(super) struct OwnedEventBTreeInternal<K, V> {
+    data: OwnedEventBTreeLeaf<K, V>,
+    edges: [std::mem::MaybeUninit<std::ptr::NonNull<OwnedEventBTreeLeaf<K, V>>>; 12],
+}
+fn owned_event_btree_bytes<K, V>(members: usize) -> Result<usize> {
+    if members == 0 {
+        return Ok(0);
+    }
+    let mut right = [0u8; usize::BITS as usize];
+    let mut height = 0;
+    let mut leaves = 1;
+    let mut branches = 0;
+    for _ in 0..members {
+        let mut level = 0;
+        loop {
+            if right[level] < 11 {
+                right[level] += 1;
+                break;
+            }
+            right[level] = 5;
+            if level == 0 {
+                leaves = owned_event_add(leaves, 1)?;
+            } else {
+                branches = owned_event_add(branches, 1)?;
+            }
+            level += 1;
+            if level > height {
+                height = level;
+                if height == right.len() {
+                    return Err(owned_event_overflow());
+                }
+                right[height] = 1;
+                branches = owned_event_add(branches, 1)?;
+                break;
+            }
+        }
+    }
+    owned_event_add(
+        owned_event_array::<OwnedEventBTreeLeaf<K, V>>(leaves)?,
+        owned_event_array::<OwnedEventBTreeInternal<K, V>>(branches)?,
+    )
+}
+pub(super) struct OwnedDefinitionsProjection {
+    pub(super) definitions: EventBusDefinitions,
+    allocation: OwnedMemoryReservation,
+}
+impl OwnedDefinitionsProjection {
+    pub(super) fn try_copy_filtered(
+        original: &OwnedMemoryReservation,
+        source: &EventBusDefinitions,
+        without_table: Option<&str>,
+    ) -> Result<Self> {
+        let keep_type = |def: &&EventTypeDef| without_table != Some(def.table.as_str());
+        let keep_route = |def: &&RouteDef| {
+            source
+                .event_types
+                .get(&def.event_type)
+                .is_none_or(|event_type| without_table != Some(event_type.table.as_str()))
+        };
+        let type_count = source.event_types.values().filter(keep_type).count();
+        let route_count = source.routes.values().filter(keep_route).count();
+        let mut bytes = owned_event_add(
+            owned_event_btree_bytes::<String, EventTypeDef>(type_count)?,
+            owned_event_btree_bytes::<String, SinkDef>(source.sinks.len())?,
+        )?;
+        bytes = owned_event_add(
+            bytes,
+            owned_event_btree_bytes::<String, RouteDef>(route_count)?,
+        )?;
+        for (key, def) in source
+            .event_types
+            .iter()
+            .filter(|(_, def)| without_table != Some(def.table.as_str()))
+        {
+            bytes = owned_event_add(
+                bytes,
+                owned_event_add(owned_event_add(key.len(), def.name.len())?, def.table.len())?,
+            )?;
+        }
+        for (key, def) in &source.sinks {
+            bytes = owned_event_add(
+                bytes,
+                owned_event_add(
+                    owned_event_add(key.len(), def.name.len())?,
+                    def.url.as_ref().map_or(0, String::len),
+                )?,
+            )?;
+        }
+        for (key, def) in source.routes.iter().filter(|(_, def)| keep_route(def)) {
+            for text in [
+                key.as_str(),
+                def.name.as_str(),
+                def.event_type.as_str(),
+                def.sink.as_str(),
+            ] {
+                bytes = owned_event_add(bytes, text.len())?;
+            }
+            if let Some(filter) = &def.where_in {
+                bytes = owned_event_add(bytes, filter.column.len())?;
+                bytes = owned_event_add(bytes, owned_event_array::<String>(filter.values.len())?)?;
+                for value in &filter.values {
+                    bytes = owned_event_add(bytes, value.len())?;
+                }
+            }
+        }
+        let allocation = reserve_owned_event_bytes(original, bytes)?;
+        let mut owner = Self {
+            definitions: EventBusDefinitions::default(),
+            allocation,
+        };
+        for (key, def) in source
+            .event_types
+            .iter()
+            .filter(|(_, def)| without_table != Some(def.table.as_str()))
+        {
+            owner.definitions.event_types.insert(
+                copy_owned_prepaid_text(key)?,
+                EventTypeDef {
+                    name: copy_owned_prepaid_text(&def.name)?,
+                    trigger: def.trigger,
+                    table: copy_owned_prepaid_text(&def.table)?,
+                },
+            );
+        }
+        for (key, def) in &source.sinks {
+            owner.definitions.sinks.insert(
+                copy_owned_prepaid_text(key)?,
+                SinkDef {
+                    name: copy_owned_prepaid_text(&def.name)?,
+                    sink_type: def.sink_type,
+                    url: def
+                        .url
+                        .as_deref()
+                        .map(copy_owned_prepaid_text)
+                        .transpose()?,
+                },
+            );
+        }
+        for (key, def) in source.routes.iter().filter(|(_, def)| keep_route(def)) {
+            let where_in = if let Some(filter) = &def.where_in {
+                let mut values = Vec::with_capacity(filter.values.len());
+                if values.capacity() != filter.values.len() {
+                    return Err(Error::Other("event route capacity mismatch".into()));
+                }
+                for value in &filter.values {
+                    values.push(copy_owned_prepaid_text(value)?);
+                }
+                Some(PersistedRouteWhereIn {
+                    column: copy_owned_prepaid_text(&filter.column)?,
+                    values,
+                })
+            } else {
+                None
+            };
+            owner.definitions.routes.insert(
+                copy_owned_prepaid_text(key)?,
+                RouteDef {
+                    name: copy_owned_prepaid_text(&def.name)?,
+                    event_type: copy_owned_prepaid_text(&def.event_type)?,
+                    sink: copy_owned_prepaid_text(&def.sink)?,
+                    where_in,
+                },
+            );
+        }
+        Ok(owner)
+    }
+}
+pub(super) struct OwnedEncodedEventBusConfig {
+    pub(super) values: Vec<(String, Vec<u8>)>,
+    bodies: Vec<OwnedMemoryReservation>,
+    values_memory: OwnedMemoryReservation,
+    body_array: OwnedMemoryReservation,
+}
+pub(super) struct OwnedEventSequence<'a, T> {
+    values: std::collections::btree_map::Values<'a, String, T>,
+}
+impl<T: Serialize> Serialize for OwnedEventSequence<'_, T> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut sequence = serializer.serialize_seq(Some(self.values.len()))?;
+        for value in self.values.clone() {
+            sequence.serialize_element(value)?;
+        }
+        sequence.end()
+    }
+}
+fn encode_owned_event_value<T: Serialize>(
+    original: &OwnedMemoryReservation,
+    value: &T,
+) -> Result<OwnedEventBody<Vec<u8>, OwnedMemoryReservation>> {
+    let mut count = bincode::enc::write::SizeWriter::default();
+    bincode::serde::encode_into_writer(value, &mut count, bincode::config::standard())
+        .map_err(|error| Error::Other(format!("bincode encode error: {error}")))?;
+    let (body, credit) = new_owned_native_vec::<u8>(original, count.bytes_written)?;
+    let mut owner = OwnedEventBody { body, credit };
+    owner.body.resize(count.bytes_written, 0);
+    let written =
+        bincode::serde::encode_into_slice(value, &mut owner.body, bincode::config::standard())
+            .map_err(|error| Error::Other(format!("bincode encode error: {error}")))?;
+    if written != owner.body.len() {
+        return Err(Error::Other("event encoding size changed".into()));
+    }
+    Ok(owner)
+}
+impl OwnedEncodedEventBusConfig {
+    pub(super) fn try_new(
+        original: &OwnedMemoryReservation,
+        definitions: &EventBusDefinitions,
+    ) -> Result<Self> {
+        Self::try_new_capacity(original, definitions, 0)
+    }
+    fn try_empty(original: &OwnedMemoryReservation) -> Result<Self> {
+        let (body, credit) = new_owned_native_vec(original, 0)?;
+        let values = OwnedEventBody { body, credit };
+        let (body, credit) = new_owned_native_vec(original, 0)?;
+        Ok(Self {
+            values: values.body,
+            values_memory: values.credit,
+            bodies: body,
+            body_array: credit,
+        })
+    }
+    fn try_new_capacity(
+        original: &OwnedMemoryReservation,
+        definitions: &EventBusDefinitions,
+        extra: usize,
+    ) -> Result<Self> {
+        let (values, values_memory) = new_owned_native_vec(original, owned_event_add(3, extra)?)?;
+        let values = OwnedEventBody {
+            body: values,
+            credit: values_memory,
+        };
+        let (bodies, body_array) = new_owned_native_vec(
+            original,
+            owned_event_add(6, extra.checked_mul(3).ok_or_else(owned_event_overflow)?)?,
+        )?;
+        let mut owner = Self {
+            values: values.body,
+            values_memory: values.credit,
+            bodies,
+            body_array,
+        };
+        owner.push(
+            original,
+            EVENT_TYPES_CONFIG_KEY,
+            &OwnedEventSequence {
+                values: definitions.event_types.values(),
+            },
+        )?;
+        owner.push(
+            original,
+            SINKS_CONFIG_KEY,
+            &OwnedEventSequence {
+                values: definitions.sinks.values(),
+            },
+        )?;
+        owner.push(
+            original,
+            ROUTES_CONFIG_KEY,
+            &OwnedEventSequence {
+                values: definitions.routes.values(),
+            },
+        )?;
+        Ok(owner)
+    }
+    fn push<T: Serialize>(
+        &mut self,
+        original: &OwnedMemoryReservation,
+        key: &str,
+        value: &T,
+    ) -> Result<()> {
+        let (name, name_memory) = copy_owned_native_string(original, key)?;
+        let name = OwnedEventBody {
+            body: name,
+            credit: name_memory,
+        };
+        let encoded = encode_owned_event_value(original, value)?;
+        self.values.push((name.body, encoded.body));
+        self.bodies.push(name.credit);
+        self.bodies.push(encoded.credit);
+        Ok(())
+    }
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum OwnedDefinitionMode {
+    Additive,
+    Replace,
+}
+pub(super) struct OwnedDefinitionPublication {
+    projection: OwnedDefinitionsProjection,
+    pub(super) config: OwnedEncodedEventBusConfig,
+    names: OwnedEventBody<Vec<String>, OwnedMemoryReservation>,
+    keys: OwnedEventBody<Vec<OwnedMemoryReservation>, OwnedMemoryReservation>,
+    slots: OwnedSinkQueuePublication,
+    mode: OwnedDefinitionMode,
+    // One paid move-out cell suffices for arbitrarily many hidden slots.
+    // Publication never allocates a retirement vector or copies a map key.
+    retirement: OwnedEventBody<Option<(String, OwnedSinkQueue)>, Option<OwnedMemoryReservation>>,
+}
+impl OwnedEventBusHandle {
+    pub(super) fn prepare_owned_definition_publication(
+        &self,
+        projection: OwnedDefinitionsProjection,
+        mode: OwnedDefinitionMode,
+        lease: QueueMutationLease,
+    ) -> Result<OwnedDefinitionPublication> {
+        self.prepare_owned_definition_publication_with_extra_config(projection, mode, lease, 0)
+    }
+    fn prepare_owned_definition_publication_with_extra_config(
+        &self,
+        projection: OwnedDefinitionsProjection,
+        mode: OwnedDefinitionMode,
+        lease: QueueMutationLease,
+        extra: usize,
+    ) -> Result<OwnedDefinitionPublication> {
+        if !Arc::ptr_eq(&lease.state, &self.data().common.queue_mutation_state) {
+            return Err(Error::Other(
+                "definition lease belongs to another event bus".into(),
+            ));
+        }
+        let original = &self.data().original;
+        let config =
+            OwnedEncodedEventBusConfig::try_new_capacity(original, &projection.definitions, extra)?;
+        let (names, memory) = new_owned_native_vec(original, projection.definitions.sinks.len())?;
+        let names = OwnedEventBody {
+            body: names,
+            credit: memory,
+        };
+        let (keys, memory) = new_owned_native_vec(original, projection.definitions.sinks.len())?;
+        let keys = OwnedEventBody {
+            body: keys,
+            credit: memory,
+        };
+        let mut copied = OwnedEventNames {
+            names: names.body,
+            keys: keys.body,
+            name_array: names.credit,
+            key_array: keys.credit,
+        };
+        for sink in projection.definitions.sinks.keys() {
+            let (key, credit) = copy_owned_native_string(original, sink)?;
+            copied.names.push(key);
+            copied.keys.push(credit);
+        }
+        // Admit the move-out control before any publication; the removed key,
+        // ring and entries keep their original invoices until physical drop.
+        let retirement = OwnedEventBody {
+            body: None,
+            credit: if mode == OwnedDefinitionMode::Replace {
+                Some(reserve_owned_event_bytes(
+                    original,
+                    std::mem::size_of::<Option<(String, OwnedSinkQueue)>>(),
+                )?)
+            } else {
+                None
+            },
+        };
+        self.prepare_owned_metrics_slots(&copied.names)?;
+        let slots = self.reserve_owned_queue_names(&[], &copied.names, lease)?;
+        Ok(OwnedDefinitionPublication {
+            projection,
+            config,
+            names: OwnedEventBody {
+                body: copied.names,
+                credit: copied.name_array,
+            },
+            keys: OwnedEventBody {
+                body: copied.keys,
+                credit: copied.key_array,
+            },
+            slots,
+            mode,
+            retirement,
+        })
+    }
+    pub(super) fn publish_owned_definition_publication(
+        &self,
+        publication: OwnedDefinitionPublication,
+        events: OwnedPreparedSinkEvents,
+    ) {
+        // The event owner, even empty, retains a genuine normal lease while
+        // definition-only publication releases its own reservation.
+        self.publish_owned_definition_only(publication);
+        self.publish_owned_sink_events_to_memory(events);
+    }
+    pub(super) fn publish_owned_definition_only(
+        &self,
+        mut publication: OwnedDefinitionPublication,
+    ) {
+        let old_definitions;
+        let old_credit;
+        {
+            let mut definitions = self.data().common.definitions.lock();
+            let mut credit = self.data().definition_credit.lock();
+            old_definitions =
+                std::mem::replace(&mut *definitions, publication.projection.definitions);
+            old_credit = credit.replace(publication.projection.allocation);
+        }
+        // Physical old declarations precede their invoice, outside all guards.
+        drop(old_definitions);
+        drop(old_credit);
+        if publication.mode == OwnedDefinitionMode::Replace {
+            self.data()
+                .common
+                .callbacks
+                .write()
+                .retain(|sink, _| publication.names.body.iter().any(|name| name == sink));
+        }
+        let mut queues = self.data().queues.lock();
+        while queues.values.values().any(|queue| queue.mutation.is_some()) {
+            self.data().queue_claim_waiters.wait(&mut queues);
+        }
+        if publication.mode == OwnedDefinitionMode::Replace {
+            for (sink, queue) in &mut queues.values {
+                if !publication.names.body.iter().any(|name| name == sink) {
+                    // Per-entry owners contain no cancellation token; capacity
+                    // and key invoices remain with the actual paid ring/slot.
+                    queue.retiring = queue.entries.len();
+                    queue.present = false;
+                }
+            }
+        }
+        for name in &publication.names.body {
+            queues
+                .values
+                .get_mut(name)
+                .expect("paid definition sink slot")
+                .present = true;
+        }
+        for slot in &publication.slots.slots {
+            queues
+                .values
+                .get_mut(&slot.sink)
+                .expect("paid definition reservation")
+                .reservations -= 1;
+        }
+        publication.slots.state = OwnedEscrowState::Published;
+        drop(queues);
+        if publication.mode == OwnedDefinitionMode::Replace {
+            // Check after this publication releases its reservations, too. A
+            // competing terminal may retain P or a zero-count reservation;
+            // its cancellation owns the later last-reservation retirement.
+            // Hidden-slot removal has no observable queue contents. Recheck
+            // eligibility under the mutex on every move; drop physical bodies
+            // outside it, before their existing ring/key invoices.
+            loop {
+                // Whole paid queues retire intact when no terminal retains a
+                // reservation. Otherwise retain key/ring and drain one entry
+                // per critical section into a stack cell; no new buffer.
+                let retired_entry;
+                {
+                    let mut queues = self.data().queues.lock();
+                    publication.retirement.body = queues.values.extract_if(|_, queue| {
+                        !queue.present && queue.pending == 0 && queue.reservations == 0
+                    }).next();
+                    retired_entry = if publication.retirement.body.is_none() {
+                        queues.values.values_mut().find(|q| q.retiring != 0)
+                            .and_then(|q| {
+                                q.retiring -= 1;
+                                q.entries.pop_front()
+                            })
+                    } else { None };
+                }
+                let finished = publication.retirement.body.is_none() && retired_entry.is_none();
+                drop(publication.retirement.body.take());
+                drop(retired_entry);
+                if finished { break; }
+            }
+        }
+        // The received lease remains held through both map change and append,
+        // including when events is empty. Additive never prunes old queues.
+        // Projection fields have moved into the live definitions. Drop each
+        // remaining field in its original order before notifying waiters.
+        drop(publication.config);
+        drop(publication.names);
+        drop(publication.keys);
+        drop(publication.slots);
+        drop(publication.retirement);
+        self.data().common.waiters.notify_all();
+    }
+    pub(super) fn prepare_owned_event_bus_without_table(
+        &self,
+        table: &str,
+    ) -> Result<Option<OwnedDefinitionPublication>> {
+        let projection = {
+            let definitions = self.data().common.definitions.lock();
+            if !definitions
+                .event_types
+                .values()
+                .any(|def| def.table == table)
+            {
+                return Ok(None);
+            }
+            OwnedDefinitionsProjection::try_copy_filtered(
+                &self.data().original,
+                &definitions,
+                Some(table),
+            )?
+        };
+        let lease = self.data().common.begin_queue_mutation();
+        self.prepare_owned_definition_publication(projection, OwnedDefinitionMode::Additive, lease)
+            .map(Some)
+    }
+    pub(super) fn export_owned_event_bus_config_values(
+        &self,
+    ) -> Result<OwnedEncodedEventBusConfig> {
+        let definitions = self.data().common.definitions.lock();
+        OwnedEncodedEventBusConfig::try_new(&self.data().original, &definitions)
+    }
+}
+impl Drop for OwnedEventBusStorage {
+    fn drop(&mut self) {
+        // Exclusive Owned assembly: native bodies in common cannot survive the
+        // companion's invoices even if a coordination Arc outlives it.
+        let definitions = std::mem::take(&mut *self.common.definitions.lock());
+        let credit = self.definition_credit.get_mut().take();
+        drop(definitions);
+        drop(credit);
+        let checkouts = std::mem::take(&mut self.common.queue_mutation_state.lock().checked_out);
+        let checkout_credit = self.checkout_allocation.get_mut().take();
+        drop(checkouts);
+        drop(checkout_credit);
+        let metrics = std::mem::take(&mut *self.common.metrics.lock());
+        let metric_credit = self.metric_allocation.get_mut().take();
+        drop(metrics);
+        drop(metric_credit);
+        let unloaded = std::mem::take(&mut *self.common.unloaded_queue_depths.lock());
+        let unloaded_credit = self.unloaded_allocation.get_mut().take();
+        drop(unloaded);
+        drop(unloaded_credit);
+    }
+}
+
+fn owned_context_scope_allows(
+    access: &AccessConstraints,
+    gate: &EventGateSnapshot,
+    values: &HashMap<String, Value>,
+) -> bool {
+    if let (Some(contexts), Some(column)) = (&access.contexts, &gate.context_column) {
+        if !matches!(values.get(column), Some(Value::Uuid(context)) if contexts.contains(&ContextId::new(*context)))
+        {
+            return false;
+        }
+    }
+    if let (Some(labels), Some(scope)) = (&access.scope_labels, &gate.scope_read) {
+        if !matches!(values.get(&scope.column), Some(Value::Text(label))
+            if scope.read_labels.iter().any(|read| read == label) && labels.iter().any(|allowed| allowed.0 == *label))
+        {
+            return false;
+        }
+    }
+    true
+}
+fn owned_event_visible(access: &AccessConstraints, entry: &SinkQueueEntry) -> bool {
+    if !owned_context_scope_allows(access, &entry.gate, &entry.event.row_values) {
+        return false;
+    }
+    let Some(acl) = &entry.gate.acl else {
+        return true;
+    };
+    let Some(principal) = &access.principal else {
+        return access.contexts.is_none() && access.scope_labels.is_none();
+    };
+    let (kind, id) = match principal {
+        Principal::System => return false,
+        Principal::Agent(id) => ("Agent", id.as_str()),
+        Principal::Human(id) => ("Human", id.as_str()),
+    };
+    let Some(Value::Uuid(acl_id)) = entry.event.row_values.get(&acl.column) else {
+        return false;
+    };
+    acl.grant_rows.iter().any(|grant| {
+        owned_context_scope_allows(access, &acl.grant_gate, grant)
+            && matches!(grant.get("principal_kind"), Some(Value::Text(value)) if value == kind)
+            && matches!(grant.get("principal_id"), Some(Value::Text(value)) if value == id)
+            && grant.get(&acl.ref_column) == Some(&Value::Uuid(*acl_id))
+    })
+}
+struct OwnedCheckoutKeyCredit {
+    name: OwnedEventShared<OwnedEventBody<String, OwnedMemoryReservation>>,
+    id: u64,
+    memory: OwnedMemoryReservation,
+}
+struct OwnedCheckoutAddition {
+    key: Option<(String, u64)>,
+    credit: Option<OwnedCheckoutKeyCredit>,
+}
+pub(super) struct OwnedCheckoutAllocation {
+    keys: Vec<OwnedCheckoutKeyCredit>,
+    array: OwnedMemoryReservation,
+    buckets: OwnedMemoryReservation,
+}
+pub(super) struct OwnedCheckoutLookup {
+    name: OwnedEventShared<OwnedEventBody<String, OwnedMemoryReservation>>,
+    source: OwnedEventShared<OwnedSinkQueueEntry>,
+    key: (String, u64),
+    memory: OwnedMemoryReservation,
+    finished: Cell<bool>,
+}
+pub(super) struct OwnedSinkDispatchBatch {
+    pub(super) entries: Vec<OwnedSinkQueueEntry>,
+    pub(super) lookups: Vec<OwnedCheckoutLookup>,
+    pub(super) acked: Vec<u64>,
+    removable: Vec<u64>,
+    retired: Vec<OwnedEventShared<OwnedSinkQueueEntry>>,
+    entry_array: OwnedMemoryReservation,
+    lookup_array: OwnedMemoryReservation,
+    ack_array: OwnedMemoryReservation,
+    removal_array: OwnedMemoryReservation,
+    retired_array: OwnedMemoryReservation,
+    storage: OwnedEventBusWeak,
+    denied_rotation: bool,
+    // Paid before checkout: explicit pre-delivery failures keep the already
+    // delivered prefix registered, exactly as the original worker does.
+    cleanup_from: OwnedEventBody<usize, OwnedMemoryReservation>,
+}
+impl Drop for OwnedSinkDispatchBatch {
+    fn drop(&mut self) {
+        if let Some(storage) = self.storage.upgrade() {
+            for lookup in self.lookups.iter().skip(self.cleanup_from.body) {
+                storage.finish_owned_checked_out(lookup);
+            }
+        }
+    }
+}
+// This stack token and the queue's inline source-pin cell are paid from the
+// companion original. No new map or provider operation runs under a guard.
+struct OwnedQueueMutationClaim {
+    storage: OwnedEventBusHandle,
+    name: OwnedEventShared<OwnedEventBody<String, OwnedMemoryReservation>>,
+    source: OwnedEventShared<OwnedSinkQueueEntry>,
+    active: bool,
+    control: OwnedMemoryReservation,
+}
+impl Drop for OwnedQueueMutationClaim {
+    fn drop(&mut self) {
+        if !self.active { return; }
+        let retired = {
+            let mut queues = self.storage.data().queues.lock();
+            queues.values.get_mut(&self.name.body).and_then(|queue| {
+                let exact = queue.mutation.as_ref().is_some_and(|source| {
+                    Arc::ptr_eq(source.data.as_ref().expect("claimed source"),
+                        self.source.data.as_ref().expect("claim generation"))
+                });
+                if exact { queue.mutation.take() } else { None }
+            })
+        };
+        self.active = false;
+        // Wake before any original body/control refund can unwind.
+        self.storage.data().queue_claim_waiters.notify_all();
+        drop(retired);
+    }
+}
+// Only the caller retaining the authenticated source claim can mint this
+// borrowed token. Marking it performs one stack Cell store: no allocation,
+// provider, queue callback, source retirement or lock acquisition.
+pub(crate) struct OwnedQueueCommitToken<'a> {
+    committed: &'a Cell<bool>,
+    _source: &'a OwnedQueueMutationClaim,
+}
+impl OwnedQueueMutationClaim {
+    fn commit_token<'a>(&'a self, committed: &'a Cell<bool>) -> OwnedQueueCommitToken<'a> {
+        assert!(self.active);
+        OwnedQueueCommitToken { committed, _source: self }
+    }
+}
+impl OwnedQueueCommitToken<'_> {
+    pub(crate) fn mark_success(&self) { self.committed.set(true); }
+}
+
+// The error itself precedes its original invoices in physical drop order.
+// The existing maintenance Result borrows this admitted slot; no new public
+// Error variant or changed worker diagnostic is needed. Lower error producer
+// allocations are NOT certified by the slot's concrete control admission.
+pub(crate) struct OwnedNativeQueueFailure {
+    error: Option<Error>,
+    control: Option<OwnedMemoryReservation>,
+    diagnostic: Option<OwnedMemoryReservation>,
+}
+impl std::fmt::Display for OwnedNativeQueueFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self.error.as_ref().expect("native failure carries original error"), f)
+    }
+}
+impl OwnedNativeQueueFailure {
+    fn prepare(original: &OwnedMemoryReservation) -> Self {
+        let failure = match reserve_owned_event_bytes(original, std::mem::size_of::<Self>()) {
+            Ok(control) => Self { error: None, control: Some(control), diagnostic: None },
+            // No successor exists on an original admission refusal. Preserve
+            // that exact refusal rather than allocating a replacement error.
+            Err(error) => return Self { error: Some(error), control: None, diagnostic: None },
+        };
+        #[cfg(any(test, feature = "test-seams"))]
+        {
+            let mut failure = failure;
+            match reserve_owned_event_bytes(original, "injected currency cleanup failure".len()) {
+                Ok(credit) => failure.diagnostic = Some(credit),
+                Err(error) => failure.error = Some(error),
+            }
+            failure
+        }
+        #[cfg(not(any(test, feature = "test-seams")))]
+        { failure }
+    }
+    pub(crate) fn capture(&mut self, result: Result<()>) {
+        if let Err(error) = result {
+            assert!(self.error.is_none(), "one original native error loan");
+            self.error = Some(error);
+        }
+    }
+    // The slot/invoices remain outside the maintenance guard, through this
+    // original Result's error loan and the final transfer back into the slot.
+    fn loan_result<T>(&mut self, value: T) -> Result<T> {
+        match self.error.take() { Some(error) => Err(error), None => Ok(value) }
+    }
+    fn finish<T>(mut self, result: Result<T>) -> std::result::Result<T, Self> {
+        match result {
+            Err(error) => { self.capture(Err(error)); Err(self) }
+            Ok(value) if self.error.is_none() => Ok(value),
+            Ok(_) => Err(self),
+        }
+    }
+}
+
+// Both completion guards independently observe the same caller-owned marker.
+// Receipt is constructed last, so its unwind precedes memory publication.
+// Setting settled first prevents a second callback during callback unwind.
+struct OwnedQueuePublicationCompletion<'a, F: FnMut()> {
+    publish: F,
+    committed: &'a Cell<bool>,
+    settled: bool,
+    control: OwnedMemoryReservation,
+}
+impl<F: FnMut()> OwnedQueuePublicationCompletion<'_, F> {
+    fn finish(&mut self) {
+        if self.committed.get() && !std::mem::replace(&mut self.settled, true) { (self.publish)(); }
+    }
+}
+impl<F: FnMut()> Drop for OwnedQueuePublicationCompletion<'_, F> {
+    fn drop(&mut self) { self.finish(); }
+}
+fn prepare_owned_queue_completion<'a, F: FnMut()>(
+    original: &OwnedMemoryReservation, committed: &'a Cell<bool>, publish: F,
+) -> Result<OwnedQueuePublicationCompletion<'a, F>> {
+    let control = reserve_owned_event_bytes(original,
+        std::mem::size_of::<OwnedQueuePublicationCompletion<'a, F>>())?;
+    Ok(OwnedQueuePublicationCompletion { publish, committed, settled: false, control })
+}
+struct OwnedQueueReceiptCompletion<'a, F: FnMut()> {
+    complete: F,
+    committed: &'a Cell<bool>,
+    settled: bool,
+    control: OwnedMemoryReservation,
+}
+impl<F: FnMut()> OwnedQueueReceiptCompletion<'_, F> {
+    fn finish(&mut self) {
+        if self.committed.get() && !std::mem::replace(&mut self.settled, true) { (self.complete)(); }
+    }
+}
+impl<F: FnMut()> Drop for OwnedQueueReceiptCompletion<'_, F> {
+    fn drop(&mut self) { self.finish(); }
+}
+fn prepare_owned_queue_receipt<'a, F: FnMut()>(
+    original: &OwnedMemoryReservation, committed: &'a Cell<bool>, complete: F,
+) -> Result<OwnedQueueReceiptCompletion<'a, F>> {
+    let control = reserve_owned_event_bytes(original,
+        std::mem::size_of::<OwnedQueueReceiptCompletion<'a, F>>())?;
+    Ok(OwnedQueueReceiptCompletion { complete, committed, settled: false, control })
+}
+impl OwnedEventBusHandle {
+    fn claim_owned_checked_out(
+        &self, sink: &str, lookup: &OwnedCheckoutLookup,
+    ) -> Result<OwnedQueueMutationClaim> {
+        let control = reserve_owned_event_bytes(&self.data().original,
+            std::mem::size_of::<OwnedQueueMutationClaim>())?;
+        let mut claim = OwnedQueueMutationClaim {
+            storage: self.clone(), name: lookup.name.clone(),
+            source: lookup.source.clone(), active: false, control,
+        };
+        loop {
+            let state = self.data().common.queue_mutation_state.lock();
+            let mut queues = self.data().queues.lock();
+            let current = !lookup.finished.get() && lookup.key.0 == sink
+                && lookup.name.body == sink && state.checked_out.contains(&lookup.key)
+                && queues.values.get(sink).is_some_and(|queue| {
+                    queue.present && queue.retiring == 0
+                        && Arc::ptr_eq(queue.name.data.as_ref().expect("queue lifecycle"),
+                            lookup.name.data.as_ref().expect("checkout lifecycle"))
+                        && queue.entries.iter().any(|source| {
+                            Arc::ptr_eq(source.data.as_ref().expect("queue source"),
+                                lookup.source.data.as_ref().expect("checkout generation"))
+                        })
+                });
+            if !current {
+                drop(queues); drop(state);
+                return Err(Error::Other(format!("pending sink action disappeared: {}", lookup.key.1)));
+            }
+            if queues.values.get(sink).expect("checked queue").mutation.is_some() {
+                drop(state);
+                // Condvar atomically unlocks this queue guard; no missed wake.
+                self.data().queue_claim_waiters.wait(&mut queues);
+                drop(queues);
+                continue;
+            }
+            queues.values.get_mut(sink).expect("checked queue").mutation = Some(claim.source.clone());
+            drop(queues); drop(state);
+            claim.active = true;
+            return Ok(claim);
+        }
+    }
+    fn empty_owned_dispatch_batch(&self, maximum: usize) -> Result<OwnedSinkDispatchBatch> {
+        let original = &self.data().original;
+        let cleanup_from = OwnedEventBody {
+            body: 0,
+            credit: reserve_owned_event_bytes(original, std::mem::size_of::<usize>())?,
+        };
+        let (body, credit) = new_owned_native_vec(original, maximum)?;
+        let entries = OwnedEventBody { body, credit };
+        let (body, credit) = new_owned_native_vec(original, maximum)?;
+        let lookups = OwnedEventBody { body, credit };
+        let (body, credit) = new_owned_native_vec(original, maximum)?;
+        let acked = OwnedEventBody { body, credit };
+        let (body, credit) = new_owned_native_vec(original, maximum)?;
+        let removable = OwnedEventBody { body, credit };
+        let (body, credit) = new_owned_native_vec(original, maximum)?;
+        let retired = OwnedEventBody { body, credit };
+        Ok(OwnedSinkDispatchBatch {
+            entries: entries.body,
+            entry_array: entries.credit,
+            lookups: lookups.body,
+            lookup_array: lookups.credit,
+            acked: acked.body,
+            ack_array: acked.credit,
+            removable: removable.body,
+            removal_array: removable.credit,
+            retired: retired.body,
+            retired_array: retired.credit,
+            storage: self.downgrade(),
+            denied_rotation: false,
+            cleanup_from,
+        })
+    }
+    pub(super) fn checkout_owned_sink_batch(
+        &self,
+        sink: &str,
+        access: &AccessConstraints,
+        maximum: usize,
+    ) -> Result<OwnedSinkDispatchBatch> {
+        let maximum = maximum.min(SINK_DISPATCH_BATCH);
+        loop {
+            let mut batch = self.empty_owned_dispatch_batch(maximum)?;
+            let (body, credit) = new_owned_native_vec(&self.data().original, maximum)?;
+            let mut pins: OwnedEventBody<Vec<(OwnedEventShared<OwnedSinkQueueEntry>,
+                OwnedEventShared<OwnedEventBody<String, OwnedMemoryReservation>>)>, _> =
+                OwnedEventBody { body, credit };
+            {
+                let state = self.data().common.queue_checkout_guard();
+                let mut queues = self.data().queues.lock();
+                let Some(queue) = queues.values.get_mut(sink).filter(|q| q.present && q.retiring == 0) else {
+                    return Ok(batch);
+                };
+                let Some(front) = queue.entries.front() else { return Ok(batch); };
+                if !owned_event_visible(access, &front.entry) {
+                    if queue.mutation.is_some() {
+                        drop(queues); drop(state);
+                        let mut queues = self.data().queues.lock();
+                        while queues.values.get(sink).is_some_and(|q| q.mutation.is_some()) {
+                            self.data().queue_claim_waiters.wait(&mut queues);
+                        }
+                        drop(queues);
+                        continue;
+                    }
+                    if let Some(entry) = queue.entries.pop_front() { queue.entries.push_back(entry); }
+                    drop(queues);
+                    drop(state);
+                    self.record_owned_batch_outcome(sink, 0, 0, 1, 0, 0);
+                    self.data().common.waiters.notify_all();
+                    batch.denied_rotation = true;
+                    return Ok(batch);
+                }
+                for entry in queue.entries.iter().take(maximum)
+                    .take_while(|entry| owned_event_visible(access, &entry.entry))
+                {
+                    pins.body.push((entry.clone(), queue.name.clone()));
+                }
+            }
+            // Every deep copy and key constructor sees a retained paid pin,
+            // outside both guards. Helper-local unwind now retires unlocked.
+            for (source, name) in pins.body.drain(..) {
+                let copied = copy_owned_sink_queue_entry(&source.get().credit.metadata, &source.entry)?;
+                let (key, memory) = copy_owned_native_string(&self.data().original, sink)?;
+                batch.entries.push(copied);
+                batch.lookups.push(OwnedCheckoutLookup {
+                    key: (key, source.entry.id), memory, source, name, finished: Cell::new(true),
+                });
+            }
+            loop {
+                let (members, credits) = {
+                    let state = self.data().common.queue_checkout_guard();
+                    let credits = self.data().checkout_allocation.lock()
+                        .as_ref().map_or(0, |c| c.keys.len());
+                    (state.checked_out.len(), credits)
+                };
+                let capacity = owned_event_add(members, batch.lookups.len())?;
+                let (body, buckets) = new_owned_native_set(&self.data().original, capacity)?;
+                let (keys, array) = new_owned_native_vec(&self.data().original,
+                    owned_event_add(credits, batch.lookups.len())?)?;
+                let mut copied = OwnedEventCopiedSet { body, keys, array, buckets };
+                let (body, credit) = new_owned_native_vec(&self.data().original, batch.lookups.len())?;
+                let mut additions: OwnedEventBody<Vec<OwnedCheckoutAddition>, _> = OwnedEventBody { body, credit };
+                for lookup in &batch.lookups {
+                    let (name, credit) = copy_owned_native_string(&self.data().original, sink)?;
+                    additions.body.push(OwnedCheckoutAddition {
+                        key: Some((name, lookup.key.1)),
+                        credit: Some(OwnedCheckoutKeyCredit {
+                            name: lookup.name.clone(), id: lookup.key.1, memory: credit,
+                        }),
+                    });
+                }
+                let mut retirement = OwnedEventBody { body: None, credit: None };
+                let mut state = self.data().common.queue_checkout_guard();
+                let queues = self.data().queues.lock();
+                let unchanged = queues.values.get(sink).filter(|q| q.present && q.retiring == 0)
+                    .is_some_and(|q| q.entries.len() >= batch.lookups.len()
+                        && q.entries.iter().zip(&batch.lookups).all(|(entry, lookup)| {
+                            Arc::ptr_eq(entry.data.as_ref().expect("live queue pin"),
+                                lookup.source.data.as_ref().expect("captured queue pin"))
+                        }));
+                if !unchanged {
+                    drop(queues); drop(state);
+                    break;
+                }
+                let mut credit_guard = self.data().checkout_allocation.lock();
+                let current_credits = credit_guard.as_ref().map_or(0, |c| c.keys.len());
+                if state.checked_out.len() + batch.lookups.len() > copied.body.capacity()
+                    || current_credits + batch.lookups.len() > copied.keys.capacity()
+                {
+                    drop(credit_guard); drop(queues); drop(state);
+                    continue;
+                }
+                // Move existing keys with their actual old invoices. No copied
+                // set or key is destroyed under state/queue guards, even on unwind.
+                for key in state.checked_out.drain() { copied.body.insert(key); }
+                for addition in &mut additions.body {
+                    if !copied.body.contains(addition.key.as_ref().expect("prepared checkout key")) {
+                        copied.body.insert(addition.key.take().expect("prepared checkout key"));
+                        copied.keys.push(addition.credit.take().expect("prepared key invoice"));
+                    }
+                }
+                retirement.body = Some(std::mem::replace(&mut state.checked_out, copied.body));
+                retirement.credit = credit_guard.take();
+                if let Some(old) = &mut retirement.credit { copied.keys.append(&mut old.keys); }
+                *credit_guard = Some(OwnedCheckoutAllocation {
+                    keys: std::mem::take(&mut copied.keys),
+                    array: copied.array, buckets: copied.buckets,
+                });
+                for lookup in &batch.lookups { lookup.finished.set(false); }
+                drop(credit_guard); drop(queues); drop(state);
+                drop(retirement);
+                return Ok(batch);
+            }
+            // A purge/replacement changed the snapshot before registration.
+            // All partial owners retire unlocked; capture a new actual batch.
+        }
+    }
+    pub(super) fn finish_owned_checked_out(&self, lookup: &OwnedCheckoutLookup) {
+        if lookup.finished.replace(true) {
+            return;
+        }
+        let mut retired = OwnedEventBody { body: None, credit: None };
+        {
+            let mut state = self.data().common.queue_mutation_state.lock();
+            retired.body = state.checked_out.take(&lookup.key);
+            if retired.body.is_some() {
+                let mut allocation = self.data().checkout_allocation.lock();
+                if let Some(allocation) = &mut *allocation {
+                    if let Some(index) = allocation.keys.iter().position(|credit| {
+                        credit.id == lookup.key.1 && credit.name.body == lookup.key.0
+                    }) {
+                        retired.credit = Some(allocation.keys.swap_remove(index));
+                    }
+                }
+            }
+        }
+        // Field order also covers unwinding: key bytes before their invoice.
+        drop(retired);
+        self.data().common.queue_mutation_waiters.notify_all();
+    }
+    fn record_owned_batch_outcome(
+        &self,
+        sink: &str,
+        delivered: u64,
+        failures: u64,
+        examined: u64,
+        retried: u64,
+        uncertain: u64,
+    ) {
+        let mut metrics = self.data().common.metrics.lock();
+        let state = metrics
+            .get_mut(sink)
+            .expect("owning sink metrics prepared before worker");
+        state.delivered += delivered;
+        state.permanent_failures += failures;
+        state.examined += examined;
+        state.retried += retried;
+        state.uncertain += uncertain;
+    }
+    pub(super) fn transition_owned_sink_attempt<P: OwnedSinkQueuePersistence>(
+        &self,
+        persistence: &P,
+        tx_mgr: &DatabaseTransactionHost,
+        sink: &str,
+        lookup: &mut OwnedCheckoutLookup,
+        start: bool,
+        uncertain: bool,
+    ) -> std::result::Result<u32, OwnedNativeQueueFailure> {
+        let mut failure = OwnedNativeQueueFailure::prepare(&self.data().original);
+        if failure.error.is_some() { return Err(failure); }
+        let result = tx_mgr.with_maintenance_publication(|publication| {
+            let _lease = self.data().common.begin_dispatcher_queue_mutation()?;
+            let entry_id = lookup.key.1;
+            let _claim = self.claim_owned_checked_out(sink, lookup)?;
+            // The lookup pins the ACTUAL checked-out entry, including its
+            // original invoice. No new root/key lookup chooses a funding seed.
+            let initially_current = {
+                let state = self.data().common.queue_mutation_state.lock();
+                let queues = self.data().queues.lock();
+                !lookup.finished.get() && state.checked_out.contains(&lookup.key)
+                    && queues.values.get(sink).is_some_and(|q| q.entries.iter().skip(q.retiring).any(|entry| {
+                        Arc::ptr_eq(entry.data.as_ref().expect("live queue entry"),
+                            lookup.source.data.as_ref().expect("checked-out source"))
+                    }))
+            };
+            if !initially_current {
+                return Err(Error::Other(format!("pending sink action disappeared: {entry_id}")));
+            }
+            let source = &lookup.source;
+            let mut updated = copy_owned_sink_queue_entry(&source.get().credit.metadata, &source.entry)?;
+            let attempts = updated.entry.attempts & ATTEMPT_COUNT_MASK;
+            updated.entry.attempts = if start {
+                if updated.entry.attempts & UNCONFIRMED_ATTEMPT != 0 {
+                    return Err(Error::Other(format!(
+                        "sink action has an unresolved attempt: {entry_id}"
+                    )));
+                }
+                attempts.saturating_add(1).min(ATTEMPT_COUNT_MASK) | UNCONFIRMED_ATTEMPT
+            } else { attempts };
+            let was_unconfirmed = source.entry.attempts & UNCONFIRMED_ATTEMPT != 0;
+            let delta = if start { 1 } else if was_unconfirmed { -1 } else { 0 };
+            let encoded = encode_owned_event_value(&source.get().credit.metadata, &updated.entry)?;
+            let successor = OwnedEventShared::try_new(updated, &source.get().credit.metadata, &self.data().funder)?;
+            let prepared = persistence.prepare_update(
+                &self.data().original, sink, entry_id, &encoded.body, uncertain, delta,
+            )?;
+            let current = {
+                let state = self.data().common.queue_mutation_state.lock();
+                let queues = self.data().queues.lock();
+                !lookup.finished.get() && state.checked_out.contains(&lookup.key)
+                    && queues.values.get(sink).is_some_and(|q| q.entries.iter().skip(q.retiring).any(|entry| {
+                        Arc::ptr_eq(entry.data.as_ref().expect("live queue entry"),
+                            source.data.as_ref().expect("checked-out source"))
+                    }))
+            };
+            if !current {
+                return Err(Error::Other(format!("pending sink action disappeared: {entry_id}")));
+            }
+            // The real claim keeps this pointer generation installed through
+            // commit and completion. Pre-admit the unwind publication control.
+            let source = &_claim.source;
+            let mut successor = Some(successor);
+            let committed = Cell::new(false);
+            let mut completion = prepare_owned_queue_completion(&self.data().original, &committed, || {
+                let next = successor.take().expect("one attempt successor");
+                let retired;
+                {
+                    let mut queues = self.data().queues.lock();
+                    let entry = queues.values.get_mut(sink)
+                        .and_then(|q| q.entries.iter_mut().find(|entry| {
+                            Arc::ptr_eq(entry.data.as_ref().expect("live queue entry"),
+                                source.data.as_ref().expect("claimed source"))
+                        })).expect("claimed attempt source remains installed");
+                    retired = std::mem::replace(entry, next.clone());
+                }
+                let old_lookup = std::mem::replace(&mut lookup.source, next);
+                {
+                    let mut metrics = self.data().common.metrics.lock();
+                    let state = metrics.get_mut(sink).expect("paid owning sink metrics");
+                    if start { state.unconfirmed += 1; }
+                    else if was_unconfirmed { state.unconfirmed = state.unconfirmed.saturating_sub(1); }
+                }
+                // Durable and in-memory bodies already agree before any old
+                // original/control refund can panic.
+                drop(old_lookup);
+                drop(retired);
+            })?;
+            let durable = persistence.is_durable();
+            if durable { publication.reserve()?; }
+            let mut receipt = prepare_owned_queue_receipt(&self.data().original, &committed, || {
+                if durable { publication.complete(); }
+            })?;
+            let token = _claim.commit_token(&committed);
+            persistence.commit_update_at_boundary(prepared, &token, &mut failure);
+            // A checkpoint diagnostic can report Err after mark. Settle both
+            // original publications before lending that diagnostic to Result.
+            receipt.finish();
+            completion.finish();
+            failure.loan_result(attempts.max(1))
+        });
+        failure.finish(result)
+    }
+    pub(super) fn ack_owned_front_entries<P: OwnedSinkQueuePersistence>(
+        &self,
+        persistence: &P,
+        tx_mgr: &DatabaseTransactionHost,
+        sink: &str,
+        batch: &mut OwnedSinkDispatchBatch,
+    ) -> std::result::Result<(), OwnedNativeQueueFailure> {
+        if batch.acked.is_empty() {
+            return Ok(());
+        }
+        let mut failure = OwnedNativeQueueFailure::prepare(&self.data().original);
+        if failure.error.is_some() { return Err(failure); }
+        let result = tx_mgr.with_maintenance_publication(|publication| {
+            let _lease = self.data().common.begin_dispatcher_queue_mutation()?;
+            batch.removable.clear();
+            // Qualify the actual first source before preparing any durable ack.
+            // An absent prefix retains the original no-op behavior; an equal
+            // ID with a different source generation is an ordinary error.
+            let first = batch.acked[0];
+            let first_lookup = batch.lookups.iter().find(|lookup| lookup.key.1 == first)
+                .ok_or_else(|| Error::Other(format!("pending sink action disappeared: {first}")))?;
+            let (front_id_matches, front_matches) = {
+                let queues = self.data().queues.lock();
+                queues.values.get(sink).filter(|q| q.retiring == 0)
+                    .and_then(|q| q.entries.front()).map_or((false, false), |entry| {
+                        (entry.entry.id == first, entry.entry.id == first && Arc::ptr_eq(
+                            entry.data.as_ref().expect("ack front source"),
+                            first_lookup.source.data.as_ref().expect("ack checkout generation")))
+                    })
+            };
+            if !front_id_matches { return Ok(()); }
+            if !front_matches {
+                return Err(Error::Other(format!("pending sink action disappeared: {first}")));
+            }
+            let _claim = self.claim_owned_checked_out(sink, first_lookup)?;
+            let unconfirmed;
+            let mut stale = None;
+            {
+                let queues = self.data().queues.lock();
+                if let Some(queue) = queues.values.get(sink).filter(|q| q.retiring == 0) {
+                    for (id, entry) in batch.acked.iter().zip(&queue.entries) {
+                        let exact = batch.lookups.iter().find(|lookup| lookup.key.1 == *id)
+                            .is_some_and(|lookup| !lookup.finished.get()
+                                && Arc::ptr_eq(entry.data.as_ref().expect("ack source"),
+                                    lookup.source.data.as_ref().expect("ack generation")));
+                        if *id != entry.entry.id { break; }
+                        if !exact { stale = Some(*id); break; }
+                        batch.removable.push(*id);
+                    }
+                    unconfirmed = queue.entries.iter().take(batch.removable.len())
+                        .filter(|entry| entry.entry.attempts & UNCONFIRMED_ATTEMPT != 0).count() as u64;
+                } else { unconfirmed = 0; }
+            }
+            if let Some(id) = stale {
+                return Err(Error::Other(format!("pending sink action disappeared: {id}")));
+            }
+            if batch.removable.is_empty() { return Ok(()); }
+            let prepared = persistence.prepare_removals(
+                &self.data().original, sink, &batch.removable, unconfirmed,
+            )?;
+            let removable = &batch.removable;
+            let retired = &mut batch.retired;
+            let committed = Cell::new(false);
+            let mut completion = prepare_owned_queue_completion(&self.data().original, &committed, || {
+                {
+                    let mut queues = self.data().queues.lock();
+                    let queue = queues.values.get_mut(sink).expect("claimed ack queue");
+                    for id in removable {
+                        assert!(queue.entries.front().is_some_and(|entry| entry.entry.id == *id),
+                            "claimed ack prefix remains installed");
+                        retired.push(queue.entries.pop_front().expect("ack prefix"));
+                    }
+                }
+                let mut metrics = self.data().common.metrics.lock();
+                let state = metrics.get_mut(sink).expect("paid owning sink metrics");
+                state.unconfirmed = state.unconfirmed.saturating_sub(unconfirmed);
+            })?;
+            let durable = persistence.is_durable();
+            if durable { publication.reserve()?; }
+            let mut receipt = prepare_owned_queue_receipt(&self.data().original, &committed, || {
+                if durable { publication.complete(); }
+            })?;
+            let token = _claim.commit_token(&committed);
+            persistence.commit_removals_at_boundary(prepared, &token, &mut failure);
+            receipt.finish();
+            completion.finish();
+            failure.loan_result(())
+        });
+        for lookup in &batch.lookups {
+            if batch.acked.contains(&lookup.key.1) {
+                self.finish_owned_checked_out(lookup);
+            }
+        }
+        batch.retired.clear();
+        self.data().common.waiters.notify_all();
+        failure.finish(result)
+    }
+}
+// Native persistence is a separate owned-path slice. This interface has no
+// blanket Legacy implementation or fallback; the worker cannot encode naked
+// keys or call the inherited allocating persistence helpers.
+pub(crate) trait OwnedSinkQueuePersistence {
+    type Update<'o>;
+    type Removals<'o>;
+    fn is_durable(&self) -> bool;
+    fn prepare_update<'o>(
+        &self,
+        original: &'o OwnedMemoryReservation,
+        sink: &'o str,
+        entry_id: u64,
+        encoded: &[u8],
+        uncertain: bool,
+        unconfirmed_delta: i8,
+    ) -> Result<Self::Update<'o>>;
+    fn commit_update(&self, prepared: Self::Update<'_>) -> Result<()>;
+    fn commit_update_at_boundary(
+        &self, prepared: Self::Update<'_>, completion: &OwnedQueueCommitToken<'_>,
+        failure: &mut OwnedNativeQueueFailure,
+    ) {
+        assert!(!self.is_durable(), "durable native adapter requires its owning commit boundary");
+        let result = self.commit_update(prepared);
+        if result.is_ok() { completion.mark_success(); }
+        failure.capture(result);
+    }
+    fn prepare_removals<'o>(
+        &self,
+        original: &'o OwnedMemoryReservation,
+        sink: &'o str,
+        ids: &'o [u64],
+        unconfirmed: u64,
+    ) -> Result<Self::Removals<'o>>;
+    fn commit_removals(&self, prepared: Self::Removals<'_>) -> Result<()>;
+    fn commit_removals_at_boundary(
+        &self, prepared: Self::Removals<'_>, completion: &OwnedQueueCommitToken<'_>,
+        failure: &mut OwnedNativeQueueFailure,
+    ) {
+        assert!(!self.is_durable(), "durable native adapter requires its owning commit boundary");
+        let result = self.commit_removals(prepared);
+        if result.is_ok() { completion.mark_success(); }
+        failure.capture(result);
+    }
+}
+
+pub(super) struct OwnedMetricsAllocation {
+    keys: Vec<OwnedMemoryReservation>,
+    array: OwnedMemoryReservation,
+    buckets: OwnedMemoryReservation,
+}
+impl OwnedEventBusHandle {
+    fn prepare_owned_metrics_slots(&self, names: &[String]) -> Result<()> {
+        let original = &self.data().original;
+        loop {
+            // Count only. Overflow diagnostics are constructed after unlock.
+            let counts = {
+                let current = self.data().common.metrics.lock();
+                let missing = names.iter().filter(|name| !current.contains_key(*name)).count();
+                let bytes = current.keys().try_fold(0usize, |n, key| n.checked_add(key.len()));
+                (current.len(), missing, bytes)
+            };
+            if counts.1 == 0 { return Ok(()); }
+            let bytes = counts.2.ok_or_else(owned_event_overflow)?;
+            let (body, credit) = new_owned_native_vec::<u8>(original, bytes)?;
+            let mut text = OwnedEventBody { body, credit };
+            let (body, credit) = new_owned_native_vec::<(std::ops::Range<usize>, SinkMetricsState)>(original, counts.0)?;
+            let mut captured = OwnedEventBody { body, credit };
+            {
+                let current = self.data().common.metrics.lock();
+                let size = current.keys().try_fold(0usize, |n, key| n.checked_add(key.len()));
+                if current.len() > captured.body.capacity()
+                    || size.is_none_or(|n| n > text.body.capacity()) {
+                    continue;
+                }
+                // Only prepaid byte copies and scalar state captures run here.
+                for (key, state) in current.iter() {
+                    let start = text.body.len();
+                    text.body.extend_from_slice(key.as_bytes());
+                    captured.body.push((start..text.body.len(), state.clone()));
+                }
+            }
+            // A changed missing-name count can need more space than the initial
+            // observation. Recompute from the captured, immutable key bytes.
+            let source_key = |range: &std::ops::Range<usize>| {
+                std::str::from_utf8(&text.body[range.clone()]).expect("captured UTF-8 metric key")
+            };
+            let missing = names.iter().filter(|name| !captured.body.iter().any(|(range, _)| source_key(range) == name.as_str())).count();
+            let maximum = owned_event_add(captured.body.len(), missing)?;
+            let (body, credit) = new_owned_native_map(original, maximum)?;
+            let successor = OwnedEventBody { body, credit };
+            let (body, credit) = new_owned_native_vec(original, maximum)?;
+            let keys = OwnedEventBody { body, credit };
+            let mut copied = OwnedEventCopiedMap {
+                body: successor.body, keys: keys.body,
+                array: keys.credit, buckets: successor.credit,
+            };
+            for (range, state) in &captured.body {
+                let (key, memory) = copy_owned_native_string(original, source_key(range))?;
+                copied.body.insert(key, state.clone());
+                copied.keys.push(memory);
+            }
+            for name in names {
+                if !copied.body.contains_key(name) {
+                    let (key, memory) = copy_owned_native_string(original, name)?;
+                    copied.body.insert(key, SinkMetricsState::default());
+                    copied.keys.push(memory);
+                }
+            }
+            let mut retired = OwnedEventBody { body: None, credit: None };
+            let mut current = self.data().common.metrics.lock();
+            if current.len() != captured.body.len()
+                || captured.body.iter().any(|(range, _)| !current.contains_key(source_key(range))) {
+                drop(current);
+                continue;
+            }
+            // Preserve counter increments made while the successor was built.
+            for (key, state) in current.iter() {
+                *copied.body.get_mut(key).expect("captured metric key") = state.clone();
+            }
+            retired.body = Some(std::mem::replace(&mut *current, copied.body));
+            retired.credit = self.data().metric_allocation.lock().replace(OwnedMetricsAllocation {
+                keys: copied.keys, array: copied.array, buckets: copied.buckets,
+            });
+            drop(current);
+            drop(retired);
+            return Ok(());
+        }
+    }
+
+    pub(super) fn copy_owned_sink_registration(
+        &self,
+        sink: &str,
+    ) -> Result<Option<OwnedSinkRegistration>> {
+        let callbacks = self.data().common.callbacks.read();
+        let Some(registration) = callbacks.get(sink) else {
+            return Ok(None);
+        };
+        let access = &registration.access;
+        let mut bytes = owned_event_btree_bytes::<ContextId, ()>(
+            access.contexts.as_ref().map_or(0, BTreeSet::len),
+        )?;
+        bytes = owned_event_add(
+            bytes,
+            owned_event_btree_bytes::<ScopeLabel, ()>(
+                access.scope_labels.as_ref().map_or(0, BTreeSet::len),
+            )?,
+        )?;
+        if let Some(labels) = &access.scope_labels {
+            for label in labels {
+                bytes = owned_event_add(bytes, label.0.len())?;
+            }
+        }
+        if let Some(Principal::Agent(id) | Principal::Human(id)) = &access.principal {
+            bytes = owned_event_add(bytes, id.len())?;
+        }
+        let allocation = reserve_owned_event_bytes(&self.data().original, bytes)?;
+        let mut owner = OwnedSinkRegistration {
+            registration: SinkRegistration {
+                access: AccessConstraints::default(),
+                callback: registration.callback.clone(),
+            },
+            allocation,
+        };
+        if let Some(contexts) = &access.contexts {
+            let mut copied = BTreeSet::new();
+            for context in contexts {
+                copied.insert(context.clone());
+            }
+            owner.registration.access.contexts = Some(copied);
+        }
+        if let Some(labels) = &access.scope_labels {
+            let mut copied = BTreeSet::new();
+            for label in labels {
+                copied.insert(ScopeLabel::new(copy_owned_prepaid_text(&label.0)?));
+            }
+            owner.registration.access.scope_labels = Some(copied);
+        }
+        owner.registration.access.principal = match &access.principal {
+            None => None,
+            Some(Principal::System) => Some(Principal::System),
+            Some(Principal::Agent(id)) => Some(Principal::Agent(copy_owned_prepaid_text(id)?)),
+            Some(Principal::Human(id)) => Some(Principal::Human(copy_owned_prepaid_text(id)?)),
+        };
+        Ok(Some(owner))
+    }
+}
+pub(super) struct OwnedSinkRegistration {
+    registration: SinkRegistration,
+    allocation: OwnedMemoryReservation,
+}
+pub(super) struct OwnedEventBusWorker<P> {
+    sink: OwnedEventBody<String, OwnedMemoryReservation>,
+    events: OwnedEventBusHandle,
+    persistence: P,
+    tx_mgr: DatabaseTransactionHost,
+    control: OwnedMemoryReservation,
+}
+impl<P: OwnedSinkQueuePersistence> OwnedEventBusWorker<P> {
+    pub(super) fn try_new(
+        events: OwnedEventBusHandle,
+        sink: &str,
+        persistence: P,
+        tx_mgr: DatabaseTransactionHost,
+        expected: &crate::memory_accounting::AccountantHandle,
+    ) -> Result<Self> {
+        match &tx_mgr {
+            DatabaseTransactionHost::Owned(handle) => handle.with_host(|host| {
+                validate_owned_original(&events.data().original, expected, &host.funder)
+            })?,
+            DatabaseTransactionHost::Legacy(_) => {
+                return Err(Error::Other(
+                    "owning worker requires its actual native host".into(),
+                ));
+            }
+        }
+        let (name, memory) = copy_owned_native_string(&events.data().original, sink)?;
+        let sink = OwnedEventBody {
+            body: name,
+            credit: memory,
+        };
+        let control =
+            reserve_owned_event_bytes(&events.data().original, std::mem::size_of::<Self>())?;
+        Ok(Self {
+            sink,
+            events,
+            persistence,
+            tx_mgr,
+            control,
+        })
+    }
+    fn wait(&self, shutdown: &AtomicBool, duration: Duration) {
+        if shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+        let mut guard = self.events.data().common.wait_lock.lock();
+        self.events
+            .data()
+            .common
+            .waiters
+            .wait_for(&mut guard, duration);
+    }
+    fn in_flight(&self, increment: bool) {
+        let mut metrics = self.events.data().common.metrics.lock();
+        let state = metrics
+            .get_mut(&self.sink.body)
+            .expect("paid owning metrics");
+        if increment {
+            state.in_flight += 1;
+        } else {
+            state.in_flight = state.in_flight.saturating_sub(1);
+        }
+    }
+    pub(super) fn dispatch_loop(self, shutdown: Arc<AtomicBool>) {
+        'dispatch: while !shutdown.load(Ordering::SeqCst) {
+            let registration = match self.events.copy_owned_sink_registration(&self.sink.body) {
+                Ok(Some(registration)) => registration,
+                Ok(None) => {
+                    self.wait(&shutdown, Duration::from_millis(100));
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "cannot admit owning sink registration");
+                    self.wait(&shutdown, Duration::from_millis(50));
+                    continue;
+                }
+            };
+            let mut batch = match self.events.checkout_owned_sink_batch(
+                &self.sink.body,
+                &registration.registration.access,
+                SINK_DISPATCH_BATCH,
+            ) {
+                Ok(batch) => batch,
+                Err(error) => {
+                    tracing::warn!(%error, "cannot admit owning sink checkout");
+                    self.wait(&shutdown, Duration::from_millis(50));
+                    continue;
+                }
+            };
+            if batch.entries.is_empty() {
+                self.wait(
+                    &shutdown,
+                    Duration::from_millis(if batch.denied_rotation { 10 } else { 250 }),
+                );
+                continue;
+            }
+            let mut delivered = 0u64;
+            let mut failed = 0u64;
+            let mut examined = 0u64;
+            for position in 0..batch.entries.len() {
+                if shutdown.load(Ordering::SeqCst) {
+                    // Original shutdown releases the undelivered suffix before
+                    // the post-batch prefix ack. Finished lookups make the
+                    // subsequent batch drop a no-op for that suffix.
+                    for lookup in batch.lookups.iter().skip(position) {
+                        self.events.finish_owned_checked_out(lookup);
+                    }
+                    break;
+                }
+                let entry = &batch.entries[position].entry;
+                if entry.attempts & UNCONFIRMED_ATTEMPT != 0 {
+                    if let Err(error) = self.events.transition_owned_sink_attempt(
+                        &self.persistence,
+                        &self.tx_mgr,
+                        &self.sink.body,
+                        &mut batch.lookups[position],
+                        false,
+                        true,
+                    ) {
+                        batch.cleanup_from.body = position;
+                        tracing::warn!(%error, "cannot durably reconcile an unconfirmed sink attempt");
+                        drop(batch);
+                        self.wait(&shutdown, Duration::from_millis(50));
+                        continue 'dispatch;
+                    }
+                    self.events
+                        .record_owned_batch_outcome(&self.sink.body, 0, 0, 0, 0, 1);
+                }
+                let attempts = match self.events.transition_owned_sink_attempt(
+                    &self.persistence,
+                    &self.tx_mgr,
+                    &self.sink.body,
+                    &mut batch.lookups[position],
+                    true,
+                    false,
+                ) {
+                    Ok(attempts) => attempts,
+                    Err(error) => {
+                        batch.cleanup_from.body = position;
+                        tracing::warn!(%error, "cannot durably record sink attempt before delivery");
+                        drop(batch);
+                        self.wait(&shutdown, Duration::from_millis(50));
+                        continue 'dispatch;
+                    }
+                };
+                examined = examined.saturating_add(1);
+                self.in_flight(true);
+                // Mutate only the already-paid batch copy. Callback borrows it;
+                // there is no second naked event clone and no commit/queue lock.
+                let entry = &mut batch.entries[position].entry;
+                if entry.event.action_id == 0 {
+                    entry.event.action_id = entry.id;
+                }
+                let result = {
+                    let _callback = EventBusCallbackGuard::enter(&self.events.data().common);
+                    catch_unwind(AssertUnwindSafe(|| {
+                        (registration.registration.callback)(&entry.event)
+                    }))
+                };
+                self.in_flight(false);
+                let outcome = match result {
+                    Ok(outcome) => OwnedEventBody {
+                        body: outcome,
+                        credit: None,
+                    },
+                    Err(payload) => {
+                        let message = if let Some(message) = payload.downcast_ref::<&str>() {
+                            *message
+                        } else if let Some(message) = payload.downcast_ref::<String>() {
+                            message.as_str()
+                        } else {
+                            "non-string panic payload"
+                        };
+                        let (body, credit) = match copy_owned_native_string(
+                            &self.events.data().original,
+                            message,
+                        ) {
+                            Ok(copy) => copy,
+                            Err(error) => {
+                                batch.cleanup_from.body = position;
+                                tracing::warn!(%error, "sink panic remains durably unconfirmed for recovery");
+                                drop(batch);
+                                self.wait(&shutdown, Duration::from_millis(50));
+                                continue 'dispatch;
+                            }
+                        };
+                        OwnedEventBody {
+                            body: Err(SinkError::OutcomeUncertain(body)),
+                            credit: Some(credit),
+                        }
+                    }
+                };
+                let uncertain = matches!(&outcome.body, Err(SinkError::OutcomeUncertain(_)));
+                match outcome.body {
+                    Ok(()) => {
+                        delivered = delivered.saturating_add(1);
+                        batch.acked.push(entry.id);
+                    }
+                    Err(SinkError::Permanent(_)) => {
+                        failed = failed.saturating_add(1);
+                        batch.acked.push(entry.id);
+                    }
+                    Err(SinkError::Transient(_) | SinkError::OutcomeUncertain(_)) => {
+                        let _ = self.events.ack_owned_front_entries(
+                            &self.persistence,
+                            &self.tx_mgr,
+                            &self.sink.body,
+                            &mut batch,
+                        );
+                        match self.events.transition_owned_sink_attempt(
+                            &self.persistence,
+                            &self.tx_mgr,
+                            &self.sink.body,
+                            &mut batch.lookups[position],
+                            false,
+                            uncertain,
+                        ) {
+                            Ok(_) if uncertain => self.events.record_owned_batch_outcome(
+                                &self.sink.body,
+                                0,
+                                0,
+                                0,
+                                0,
+                                1,
+                            ),
+                            Ok(_) => (),
+                            Err(error) => {
+                                tracing::warn!(%error, "sink attempt remains durably unconfirmed for recovery")
+                            }
+                        }
+                        self.events.record_owned_batch_outcome(
+                            &self.sink.body,
+                            delivered,
+                            failed,
+                            examined,
+                            1,
+                            0,
+                        );
+                        drop(batch);
+                        self.wait(&shutdown, retry_backoff(attempts));
+                        continue 'dispatch;
+                    }
+                }
+            }
+            let _ = self.events.ack_owned_front_entries(
+                &self.persistence,
+                &self.tx_mgr,
+                &self.sink.body,
+                &mut batch,
+            );
+            self.events.record_owned_batch_outcome(
+                &self.sink.body,
+                delivered,
+                failed,
+                examined,
+                0,
+                0,
+            );
+        }
+        let cleanup = {
+            let mut deferred = self.events.data().common.deferred_resource_cleanup.lock();
+            if deferred
+                .as_ref()
+                .is_some_and(|cleanup| cleanup.sink == self.sink.body)
+            {
+                deferred.take()
+            } else {
+                None
+            }
+        };
+        if let Some(cleanup) = cleanup {
+            cleanup.close();
+        }
+    }
+}
+
+impl OwnedEventBusHandle {
+    pub(super) fn merge_owned_commit_escrow(
+        &self,
+        stage: &mut OwnedCommitEventStage,
+    ) -> Result<()> {
+        let additional = owned_event_add(
+            stage
+                .ddl
+                .as_ref()
+                .map_or(0, |ddl| ddl.publication.slots.slots.len()),
+            stage
+                .schema
+                .as_ref()
+                .map_or(0, |schema| schema.slots.slots.len()),
+        )?;
+        if additional == 0 {
+            return Ok(());
+        }
+        let Some(OwnedAppendCustody::Ordinary(events)) = &mut stage.events.publication else {
+            return Err(Error::Other(
+                "combined stage must join ordinary escrow before discard".into(),
+            ));
+        };
+        let maximum = owned_event_add(events.slots.len(), additional)?;
+        let (body, credit) = new_owned_native_vec(&self.data().original, maximum)?;
+        let mut successor = OwnedEventBody { body, credit };
+        successor.body.append(&mut events.slots);
+        for publication in stage
+            .ddl
+            .as_mut()
+            .map(|ddl| &mut ddl.publication)
+            .into_iter()
+            .chain(stage.schema.as_mut())
+        {
+            assert!(publication.slots.state == OwnedEscrowState::Active);
+            successor.body.append(&mut publication.slots.slots);
+            publication.slots.state = OwnedEscrowState::Published;
+            // The normal event lease remains active. No queue/control guard
+            // crosses the release of another same-terminal lease.
+            drop(publication.slots.lease.take());
+        }
+        let old_body = std::mem::replace(&mut events.slots, successor.body);
+        let old_credit = std::mem::replace(&mut events.workspace, successor.credit);
+        drop(old_body);
+        drop(old_credit);
+        Ok(())
+    }
+}
+
+// The encoded source object must pin ONE durable root/read transaction for the
+// entire call. These native-only dependency traits deliberately have no Legacy
+// blanket adapter, decode-then-charge implementation, or per-pass root opener.
+pub(super) trait OwnedEncodedEventSource {
+    fn visit(
+        &self,
+        sink: &str,
+        visit: impl for<'e> FnMut(u64, &'e [u8]) -> Result<()>,
+    ) -> Result<()>;
+    fn unloaded_extent(&self, sink: &str) -> Result<Option<(u64, u64)>>;
+    fn counters(&self, sink: &str) -> Result<(u64, u64)>;
+    fn next_action_id(&self) -> Result<u64>;
+}
+pub(super) trait OwnedEventEntryDecoder {
+    fn decode(
+        &self,
+        original: &OwnedMemoryReservation,
+        encoded: &[u8],
+    ) -> Result<OwnedSinkQueueEntry>;
+}
+pub(super) struct OwnedEventStartupImage {
+    queues: OwnedQueueMap,
+    definitions: OwnedDefinitionsProjection,
+    metrics: HashMap<String, SinkMetricsState>,
+    metrics_credit: OwnedMetricsAllocation,
+    unloaded: HashMap<String, u64>,
+    unloaded_credit: OwnedMetricsAllocation,
+    next_action_id: u64,
+}
+impl OwnedEventBusHandle {
+    pub(super) fn prepare_owned_event_bus_image<
+        S: OwnedEncodedEventSource,
+        D: OwnedEventEntryDecoder,
+    >(
+        &self,
+        source: &S,
+        decoder: &D,
+        definitions: OwnedDefinitionsProjection,
+        writable: bool,
+    ) -> Result<OwnedEventStartupImage> {
+        let original = &self.data().original;
+        let count = definitions.definitions.sinks.len();
+        let (queues, allocation) = new_owned_native_map(original, count)?;
+        let queues = OwnedQueueMap {
+            values: queues,
+            allocation,
+        };
+        let (body, credit) = new_owned_native_map(original, count)?;
+        let metrics = OwnedEventBody { body, credit };
+        let (body, credit) = new_owned_native_vec(original, count)?;
+        let metric_keys = OwnedEventBody { body, credit };
+        let (body, credit) = new_owned_native_map(original, if writable { 0 } else { count })?;
+        let unloaded = OwnedEventBody { body, credit };
+        let (body, credit) = new_owned_native_vec(original, if writable { 0 } else { count })?;
+        let unloaded_keys = OwnedEventBody { body, credit };
+        let next_action_id = source.next_action_id()?.max(1);
+        let mut image = OwnedEventStartupImage {
+            queues,
+            definitions,
+            metrics: metrics.body,
+            metrics_credit: OwnedMetricsAllocation {
+                keys: metric_keys.body,
+                array: metric_keys.credit,
+                buckets: metrics.credit,
+            },
+            unloaded: unloaded.body,
+            unloaded_credit: OwnedMetricsAllocation {
+                keys: unloaded_keys.body,
+                array: unloaded_keys.credit,
+                buckets: unloaded.credit,
+            },
+            next_action_id,
+        };
+        for name in image.definitions.definitions.sinks.keys() {
+            let (uncertain, unconfirmed) = source.counters(name)?;
+            let extent = source.unloaded_extent(name)?;
+            if writable && extent.is_some() {
+                return Err(Error::Other(
+                    "writable owning queue cannot retain an unloaded extent".into(),
+                ));
+            }
+            let mut entries_count = 0usize;
+            if extent.is_none() {
+                source.visit(name, |_, _| {
+                    entries_count = owned_event_add(entries_count, 1)?;
+                    Ok(())
+                })?;
+            }
+            let (body, credit) = copy_owned_native_string(original, name)?;
+            let key = OwnedEventBody { body, credit };
+            let (entries, buffer) = new_owned_native_ring(original, entries_count)?;
+            let mut queue = OwnedSinkQueue {
+                entries,
+                buffer,
+                name: self.prepare_owned_queue_name(name)?,
+                key: None,
+                pending: 0,
+                reservations: 0,
+                present: true,
+                retiring: 0,
+                mutation: None,
+            };
+            if extent.is_none() {
+                source.visit(name, |id, bytes| {
+                    if queue.entries.len() == entries_count {
+                        return Err(Error::Other("pinned event source count changed".into()));
+                    }
+                    let mut entry = decoder.decode(original, bytes)?;
+                    if entry.entry.id != id {
+                        return Err(Error::Other(
+                            "sink queue key/content identity mismatch".into(),
+                        ));
+                    }
+                    entry.entry.event.action_id = entry.entry.id;
+                    image.next_action_id = image.next_action_id.max(id.saturating_add(1));
+                    let pin = OwnedEventShared::try_new(entry, original, &self.data().funder)?;
+                    queue.entries.push_back(pin);
+                    Ok(())
+                })?;
+                if queue.entries.len() != entries_count {
+                    return Err(Error::Other("pinned event source count changed".into()));
+                }
+            } else {
+                let (key, credit) = copy_owned_native_string(original, name)?;
+                let key = OwnedEventBody { body: key, credit };
+                let (depth, newest_id) = extent.expect("read image extent");
+                image.next_action_id = image.next_action_id.max(newest_id.saturating_add(1));
+                image.unloaded.insert(key.body, depth);
+                image.unloaded_credit.keys.push(key.credit);
+            }
+            queue.key = Some(key.credit);
+            image.queues.values.insert(key.body, queue);
+            let (key, credit) = copy_owned_native_string(original, name)?;
+            image.metrics.insert(
+                key,
+                SinkMetricsState {
+                    uncertain,
+                    unconfirmed,
+                    ..SinkMetricsState::default()
+                },
+            );
+            image.metrics_credit.keys.push(credit);
+        }
+        Ok(image)
+    }
+    pub(super) fn install_owned_event_bus_image(
+        &self,
+        mut image: OwnedEventStartupImage,
+    ) -> Result<()> {
+        // Startup only: no worker, checkout, stage or pending publication may
+        // coexist with this wholesale initial-image installation.
+        let state = self.data().common.queue_mutation_state.lock();
+        if state.active_mutations != 0
+            || !state.checked_out.is_empty()
+            || !self.data().common.runtimes.lock().is_empty()
+            || !self.data().stages.lock().values.is_empty()
+        {
+            return Err(Error::Other(
+                "owning event load requires inactive assembly".into(),
+            ));
+        }
+        let mut queues = self.data().queues.lock();
+        if queues
+            .values
+            .values()
+            .any(|queue| queue.pending != 0 || queue.reservations != 0 || queue.mutation.is_some())
+        {
+            return Err(Error::Other(
+                "owning event load cannot replace escrow".into(),
+            ));
+        }
+        std::mem::swap(&mut *queues, &mut image.queues);
+        drop(queues);
+        drop(state);
+        let old_defs = std::mem::replace(
+            &mut *self.data().common.definitions.lock(),
+            image.definitions.definitions,
+        );
+        let old_defs_credit = self
+            .data()
+            .definition_credit
+            .lock()
+            .replace(image.definitions.allocation);
+        let old_metrics = std::mem::replace(&mut *self.data().common.metrics.lock(), image.metrics);
+        let old_metrics_credit = self
+            .data()
+            .metric_allocation
+            .lock()
+            .replace(image.metrics_credit);
+        let old_unloaded = std::mem::replace(
+            &mut *self.data().common.unloaded_queue_depths.lock(),
+            image.unloaded,
+        );
+        let old_unloaded_credit = self
+            .data()
+            .unloaded_allocation
+            .lock()
+            .replace(image.unloaded_credit);
+        self.data()
+            .common
+            .next_queue_id
+            .store(image.next_action_id, Ordering::SeqCst);
+        drop(old_defs);
+        drop(old_defs_credit);
+        drop(old_metrics);
+        drop(old_metrics_credit);
+        drop(old_unloaded);
+        drop(old_unloaded_credit);
+        drop(image.queues);
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct OwnedEventTypeView<'a> {
+    key: &'a str,
+    name: &'a str,
+    trigger: EventTrigger,
+    table: &'a str,
+}
+#[derive(Clone, Copy)]
+pub(super) struct OwnedSinkView<'a> {
+    key: &'a str,
+    name: &'a str,
+    sink_type: PersistedSinkType,
+    url: Option<&'a str>,
+}
+#[derive(Clone, Copy)]
+pub(super) struct OwnedRouteView<'a> {
+    key: &'a str,
+    name: &'a str,
+    event_type: &'a str,
+    sink: &'a str,
+    where_in: Option<(&'a str, &'a [String])>,
+}
+impl OwnedEventBusHandle {
+    pub(super) fn prepare_owned_definition_projection_with_ddl(
+        &self,
+        ddl: &[DdlChange],
+        table_exists: impl Fn(&str) -> bool,
+    ) -> Result<OwnedDefinitionsProjection> {
+        let original = &self.data().original;
+        // The inherited definitions are mutable, not an Arc-backed source.
+        // Capture only counts, scalar tags, offsets, and prepaid bytes while
+        // guarded. String/value-array/tree construction consumes that immutable
+        // capture after unlock; no borrowed definition escapes the guard.
+        type Span = std::ops::Range<usize>;
+        type TypeCapture = (Span, Span, EventTrigger, Span);
+        type SinkCapture = (Span, Span, PersistedSinkType, Option<Span>);
+        type RouteCapture = (Span, Span, Span, Span, Option<(Span, Span)>);
+        let snapshot = loop {
+            let measure = |source: &EventBusDefinitions| {
+                let mut bytes = Some(0usize);
+                let mut values = Some(0usize);
+                let mut add = |text: &str| { bytes = bytes.and_then(|n| n.checked_add(text.len())); };
+                for (key, def) in &source.event_types {
+                    for text in [key, &def.name, &def.table] { add(text); }
+                }
+                for (key, def) in &source.sinks {
+                    for text in [key.as_str(), def.name.as_str(), def.url.as_deref().unwrap_or("")] { add(text); }
+                }
+                for (key, def) in &source.routes {
+                    for text in [key, &def.name, &def.event_type, &def.sink] { add(text); }
+                    if let Some(filter) = &def.where_in {
+                        add(&filter.column);
+                        values = values.and_then(|n| n.checked_add(filter.values.len()));
+                        for value in &filter.values { add(value); }
+                    }
+                }
+                (source.event_types.len(), source.sinks.len(), source.routes.len(), bytes, values)
+            };
+            let counts = {
+                let current = self.data().common.definitions.lock();
+                measure(&current)
+            };
+            let bytes = counts.3.ok_or_else(owned_event_overflow)?;
+            let value_count = counts.4.ok_or_else(owned_event_overflow)?;
+            let (body, credit) = new_owned_native_vec::<u8>(original, bytes)?;
+            let mut text = OwnedEventBody { body, credit };
+            let (body, credit) = new_owned_native_vec::<TypeCapture>(original, counts.0)?;
+            let mut type_source = OwnedEventBody { body, credit };
+            let (body, credit) = new_owned_native_vec::<SinkCapture>(original, counts.1)?;
+            let mut sink_source = OwnedEventBody { body, credit };
+            let (body, credit) = new_owned_native_vec::<RouteCapture>(original, counts.2)?;
+            let mut route_source = OwnedEventBody { body, credit };
+            let (body, credit) = new_owned_native_vec::<Span>(original, value_count)?;
+            let mut value_source = OwnedEventBody { body, credit };
+            {
+                let current = self.data().common.definitions.lock();
+                let now = measure(&current);
+                if now.0 > type_source.body.capacity()
+                    || now.1 > sink_source.body.capacity()
+                    || now.2 > route_source.body.capacity()
+                    || now.3.is_none_or(|n| n > text.body.capacity())
+                    || now.4.is_none_or(|n| n > value_source.body.capacity()) {
+                    continue;
+                }
+                let mut capture = |value: &str| {
+                    let start = text.body.len();
+                    text.body.extend_from_slice(value.as_bytes());
+                    start..text.body.len()
+                };
+                for (key, def) in &current.event_types {
+                    type_source.body.push((capture(key), capture(&def.name), def.trigger, capture(&def.table)));
+                }
+                for (key, def) in &current.sinks {
+                    sink_source.body.push((capture(key), capture(&def.name), def.sink_type, def.url.as_deref().map(&mut capture)));
+                }
+                for (key, def) in &current.routes {
+                    let key = capture(key);
+                    let name = capture(&def.name);
+                    let event_type = capture(&def.event_type);
+                    let sink = capture(&def.sink);
+                    let filter = def.where_in.as_ref().map(|filter| {
+                        let column = capture(&filter.column);
+                        let start = value_source.body.len();
+                        for value in &filter.values { value_source.body.push(capture(value)); }
+                        (column, start..value_source.body.len())
+                    });
+                    route_source.body.push((key, name, event_type, sink, filter));
+                }
+            }
+            let source_text = |span: &Span| {
+                std::str::from_utf8(&text.body[span.clone()]).expect("captured UTF-8 definition")
+            };
+            let mut bytes = owned_event_add(text.body.len(), owned_event_array::<String>(value_source.body.len())?)?;
+            bytes = owned_event_add(bytes, owned_event_btree_bytes::<String, EventTypeDef>(type_source.body.len())?)?;
+            bytes = owned_event_add(bytes, owned_event_btree_bytes::<String, SinkDef>(sink_source.body.len())?)?;
+            bytes = owned_event_add(bytes, owned_event_btree_bytes::<String, RouteDef>(route_source.body.len())?)?;
+            let allocation = reserve_owned_event_bytes(original, bytes)?;
+            let mut snapshot = OwnedDefinitionsProjection { definitions: EventBusDefinitions::default(), allocation };
+            for (key, name, trigger, table) in &type_source.body {
+                snapshot.definitions.event_types.insert(copy_owned_prepaid_text(source_text(key))?, EventTypeDef {
+                    name: copy_owned_prepaid_text(source_text(name))?, trigger: *trigger,
+                    table: copy_owned_prepaid_text(source_text(table))?,
+                });
+            }
+            for (key, name, sink_type, url) in &sink_source.body {
+                snapshot.definitions.sinks.insert(copy_owned_prepaid_text(source_text(key))?, SinkDef {
+                    name: copy_owned_prepaid_text(source_text(name))?, sink_type: *sink_type,
+                    url: url.as_ref().map(|span| copy_owned_prepaid_text(source_text(span))).transpose()?,
+                });
+            }
+            for (key, name, event_type, sink, filter) in &route_source.body {
+                let where_in = if let Some((column, span)) = filter {
+                    let mut values = Vec::with_capacity(span.len());
+                    if values.capacity() != span.len() {
+                        return Err(Error::Other("event route capacity mismatch".into()));
+                    }
+                    for value in &value_source.body[span.clone()] {
+                        values.push(copy_owned_prepaid_text(source_text(value))?);
+                    }
+                    Some(PersistedRouteWhereIn { column: copy_owned_prepaid_text(source_text(column))?, values })
+                } else { None };
+                snapshot.definitions.routes.insert(copy_owned_prepaid_text(source_text(key))?, RouteDef {
+                    name: copy_owned_prepaid_text(source_text(name))?,
+                    event_type: copy_owned_prepaid_text(source_text(event_type))?,
+                    sink: copy_owned_prepaid_text(source_text(sink))?, where_in,
+                });
+            }
+            break snapshot;
+        };
+        let current = &snapshot.definitions;
+        let (body, credit) = new_owned_native_vec(
+            original,
+            owned_event_add(current.event_types.len(), ddl.len())?,
+        )?;
+        let mut types = OwnedEventBody { body, credit };
+        let (body, credit) =
+            new_owned_native_vec(original, owned_event_add(current.sinks.len(), ddl.len())?)?;
+        let mut sinks = OwnedEventBody { body, credit };
+        let (body, credit) =
+            new_owned_native_vec(original, owned_event_add(current.routes.len(), ddl.len())?)?;
+        let mut routes = OwnedEventBody { body, credit };
+        for (key, def) in &current.event_types {
+            types.body.push(OwnedEventTypeView {
+                key,
+                name: &def.name,
+                trigger: def.trigger,
+                table: &def.table,
+            });
+        }
+        for (key, def) in &current.sinks {
+            sinks.body.push(OwnedSinkView {
+                key,
+                name: &def.name,
+                sink_type: def.sink_type,
+                url: def.url.as_deref(),
+            });
+        }
+        for (key, def) in &current.routes {
+            routes.body.push(OwnedRouteView {
+                key,
+                name: &def.name,
+                event_type: &def.event_type,
+                sink: &def.sink,
+                where_in: def
+                    .where_in
+                    .as_ref()
+                    .map(|filter| (filter.column.as_str(), filter.values.as_slice())),
+            });
+        }
+        for change in ddl {
+            match change {
+                DdlChange::CreateEventType {
+                    name,
+                    trigger,
+                    table,
+                } => {
+                    if !table_exists(table) {
+                        return Err(Error::TableNotFound(table.clone()));
+                    }
+                    let trigger = if trigger.eq_ignore_ascii_case("INSERT") {
+                        EventTrigger::Insert
+                    } else if trigger.eq_ignore_ascii_case("UPDATE") {
+                        EventTrigger::Update
+                    } else if trigger.eq_ignore_ascii_case("DELETE") {
+                        EventTrigger::Delete
+                    } else {
+                        return Err(Error::Other(format!(
+                            "invalid event type trigger: {trigger}"
+                        )));
+                    };
+                    if let Some(existing) = types.body.iter().find(|def| def.key == name) {
+                        if existing.name != name
+                            || existing.trigger != trigger
+                            || existing.table != table
+                        {
+                            return Err(Error::Other(format!(
+                                "event type already exists with a different definition: {name}"
+                            )));
+                        }
+                    } else {
+                        types.body.push(OwnedEventTypeView {
+                            key: name,
+                            name,
+                            trigger,
+                            table,
+                        });
+                    }
+                }
+                DdlChange::CreateSink {
+                    name,
+                    sink_type,
+                    url,
+                } => {
+                    let sink_type = if sink_type.eq_ignore_ascii_case("WEBHOOK") {
+                        PersistedSinkType::Webhook
+                    } else if sink_type.eq_ignore_ascii_case("CALLBACK") {
+                        PersistedSinkType::Callback
+                    } else {
+                        return Err(Error::Other(format!("invalid sink type: {sink_type}")));
+                    };
+                    if let Some(existing) = sinks.body.iter().find(|def| def.key == name) {
+                        if existing.name != name
+                            || existing.sink_type != sink_type
+                            || existing.url != url.as_deref()
+                        {
+                            return Err(Error::Other(format!(
+                                "sink already exists with a different definition: {name}"
+                            )));
+                        }
+                    } else {
+                        sinks.body.push(OwnedSinkView {
+                            key: name,
+                            name,
+                            sink_type,
+                            url: url.as_deref(),
+                        });
+                    }
+                }
+                DdlChange::CreateRoute {
+                    name,
+                    event_type,
+                    sink,
+                    table,
+                    where_in,
+                } => {
+                    let route_table = types
+                        .body
+                        .iter()
+                        .find(|def| def.key == event_type)
+                        .map(|def| def.table)
+                        .ok_or_else(|| {
+                            Error::Other(format!("event type not found: {event_type}"))
+                        })?;
+                    if !sinks.body.iter().any(|def| def.key == sink) {
+                        return Err(Error::Other(format!("sink not found: {sink}")));
+                    }
+                    let filter = where_in
+                        .as_ref()
+                        .map(|(column, values)| (column.as_str(), values.as_slice()));
+                    if let Some(existing) = routes.body.iter().find(|def| def.key == name) {
+                        if existing.name != name
+                            || existing.event_type != event_type
+                            || existing.sink != sink
+                            || existing.where_in != filter
+                        {
+                            return Err(Error::Other(format!(
+                                "route already exists with a different definition: {name}"
+                            )));
+                        }
+                    } else {
+                        routes.body.push(OwnedRouteView {
+                            key: name,
+                            name,
+                            event_type,
+                            sink,
+                            where_in: filter,
+                        });
+                    }
+                    if !table.is_empty() && table != route_table {
+                        return Err(Error::Other(format!(
+                            "route table mismatch for {name}: ddl={table}, event_type={route_table}"
+                        )));
+                    }
+                }
+                DdlChange::DropRoute { name, .. } => routes.body.retain(|def| def.key != name),
+                DdlChange::DropTable { name } => {
+                    routes.body.retain(|route| {
+                        !types
+                            .body
+                            .iter()
+                            .any(|def| def.table == name && def.name == route.event_type)
+                    });
+                    types.body.retain(|def| def.table != name);
+                }
+                _ => (),
+            }
+        }
+        // A borrowed overlay establishes exact final counts and nested sizes;
+        // it never allocates String/DDL/definition bodies while validating.
+        types.body.sort_unstable_by_key(|def| def.key);
+        sinks.body.sort_unstable_by_key(|def| def.key);
+        routes.body.sort_unstable_by_key(|def| def.key);
+        let mut bytes = owned_event_add(
+            owned_event_btree_bytes::<String, EventTypeDef>(types.body.len())?,
+            owned_event_btree_bytes::<String, SinkDef>(sinks.body.len())?,
+        )?;
+        bytes = owned_event_add(
+            bytes,
+            owned_event_btree_bytes::<String, RouteDef>(routes.body.len())?,
+        )?;
+        for def in &types.body {
+            for text in [def.key, def.name, def.table] {
+                bytes = owned_event_add(bytes, text.len())?;
+            }
+        }
+        for def in &sinks.body {
+            for text in [def.key, def.name, def.url.unwrap_or("")] {
+                bytes = owned_event_add(bytes, text.len())?;
+            }
+        }
+        for def in &routes.body {
+            for text in [def.key, def.name, def.event_type, def.sink] {
+                bytes = owned_event_add(bytes, text.len())?;
+            }
+            if let Some((column, values)) = def.where_in {
+                bytes = owned_event_add(bytes, column.len())?;
+                bytes = owned_event_add(bytes, owned_event_array::<String>(values.len())?)?;
+                for value in values {
+                    bytes = owned_event_add(bytes, value.len())?;
+                }
+            }
+        }
+        let allocation = reserve_owned_event_bytes(original, bytes)?;
+        let mut owner = OwnedDefinitionsProjection {
+            definitions: EventBusDefinitions::default(),
+            allocation,
+        };
+        for def in &types.body {
+            owner.definitions.event_types.insert(
+                copy_owned_prepaid_text(def.key)?,
+                EventTypeDef {
+                    name: copy_owned_prepaid_text(def.name)?,
+                    trigger: def.trigger,
+                    table: copy_owned_prepaid_text(def.table)?,
+                },
+            );
+        }
+        for def in &sinks.body {
+            owner.definitions.sinks.insert(
+                copy_owned_prepaid_text(def.key)?,
+                SinkDef {
+                    name: copy_owned_prepaid_text(def.name)?,
+                    sink_type: def.sink_type,
+                    url: def.url.map(copy_owned_prepaid_text).transpose()?,
+                },
+            );
+        }
+        for def in &routes.body {
+            let where_in = if let Some((column, source)) = def.where_in {
+                let mut values = Vec::with_capacity(source.len());
+                if values.capacity() != source.len() {
+                    return Err(Error::Other("event route capacity mismatch".into()));
+                }
+                for value in source {
+                    values.push(copy_owned_prepaid_text(value)?);
+                }
+                Some(PersistedRouteWhereIn {
+                    column: copy_owned_prepaid_text(column)?,
+                    values,
+                })
+            } else {
+                None
+            };
+            owner.definitions.routes.insert(
+                copy_owned_prepaid_text(def.key)?,
+                RouteDef {
+                    name: copy_owned_prepaid_text(def.name)?,
+                    event_type: copy_owned_prepaid_text(def.event_type)?,
+                    sink: copy_owned_prepaid_text(def.sink)?,
+                    where_in,
+                },
+            );
+        }
+        Ok(owner)
+    }
+}
+
+pub(super) struct OwnedEventDdlInput {
+    ddl: Vec<DdlChange>,
+    bodies: OwnedMemoryReservation,
+    array: OwnedMemoryReservation,
+}
+impl OwnedEventDdlInput {
+    pub(super) fn try_copy(original: &OwnedMemoryReservation, ddl: &[DdlChange]) -> Result<Self> {
+        let mut bytes = 0;
+        for change in ddl {
+            match change {
+                DdlChange::CreateEventType {
+                    name,
+                    trigger,
+                    table,
+                } => {
+                    for text in [name, trigger, table] {
+                        bytes = owned_event_add(bytes, text.len())?;
+                    }
+                }
+                DdlChange::CreateSink {
+                    name,
+                    sink_type,
+                    url,
+                } => {
+                    bytes = owned_event_add(bytes, owned_event_add(name.len(), sink_type.len())?)?;
+                    bytes = owned_event_add(bytes, url.as_ref().map_or(0, String::len))?;
+                }
+                DdlChange::CreateRoute {
+                    name,
+                    event_type,
+                    sink,
+                    table,
+                    where_in,
+                } => {
+                    for text in [name, event_type, sink, table] {
+                        bytes = owned_event_add(bytes, text.len())?;
+                    }
+                    if let Some((column, values)) = where_in {
+                        bytes = owned_event_add(bytes, column.len())?;
+                        bytes = owned_event_add(bytes, owned_event_array::<String>(values.len())?)?;
+                        for text in values {
+                            bytes = owned_event_add(bytes, text.len())?;
+                        }
+                    }
+                }
+                DdlChange::DropRoute { name, table } => {
+                    bytes = owned_event_add(bytes, owned_event_add(name.len(), table.len())?)?;
+                }
+                DdlChange::DropTable { name } => bytes = owned_event_add(bytes, name.len())?,
+                _ => return Err(Error::Other(
+                    "owning event DDL requires the original producer for non-event declarations"
+                        .into(),
+                )),
+            }
+        }
+        let bodies = reserve_owned_event_bytes(original, bytes)?;
+        let (ddl_body, array) = new_owned_native_vec(original, ddl.len())?;
+        let mut owner = Self {
+            ddl: ddl_body,
+            bodies,
+            array,
+        };
+        for change in ddl {
+            let copied = match change {
+                DdlChange::CreateEventType {
+                    name,
+                    trigger,
+                    table,
+                } => DdlChange::CreateEventType {
+                    name: copy_owned_prepaid_text(name)?,
+                    trigger: copy_owned_prepaid_text(trigger)?,
+                    table: copy_owned_prepaid_text(table)?,
+                },
+                DdlChange::CreateSink {
+                    name,
+                    sink_type,
+                    url,
+                } => DdlChange::CreateSink {
+                    name: copy_owned_prepaid_text(name)?,
+                    sink_type: copy_owned_prepaid_text(sink_type)?,
+                    url: url.as_deref().map(copy_owned_prepaid_text).transpose()?,
+                },
+                DdlChange::CreateRoute {
+                    name,
+                    event_type,
+                    sink,
+                    table,
+                    where_in,
+                } => {
+                    let where_in = if let Some((column, source)) = where_in {
+                        let mut values = Vec::with_capacity(source.len());
+                        if values.capacity() != source.len() {
+                            return Err(Error::Other("event DDL values capacity mismatch".into()));
+                        }
+                        for value in source {
+                            values.push(copy_owned_prepaid_text(value)?);
+                        }
+                        Some((copy_owned_prepaid_text(column)?, values))
+                    } else {
+                        None
+                    };
+                    DdlChange::CreateRoute {
+                        name: copy_owned_prepaid_text(name)?,
+                        event_type: copy_owned_prepaid_text(event_type)?,
+                        sink: copy_owned_prepaid_text(sink)?,
+                        table: copy_owned_prepaid_text(table)?,
+                        where_in,
+                    }
+                }
+                DdlChange::DropRoute { name, table } => DdlChange::DropRoute {
+                    name: copy_owned_prepaid_text(name)?,
+                    table: copy_owned_prepaid_text(table)?,
+                },
+                DdlChange::DropTable { name } => DdlChange::DropTable {
+                    name: copy_owned_prepaid_text(name)?,
+                },
+                _ => unreachable!("category was validated before admission"),
+            };
+            owner.ddl.push(copied);
+        }
+        Ok(owner)
+    }
+}
+fn owned_ddl_sidecar_key(
+    original: &OwnedMemoryReservation,
+    lsn: Lsn,
+    ordinal: u32,
+) -> Result<OwnedEventBody<String, OwnedMemoryReservation>> {
+    use std::fmt::Write;
+    let digits = if ordinal == 0 {
+        1
+    } else {
+        ordinal.ilog10() as usize + 1
+    };
+    let size = owned_event_add("sync_ddl_generation.v1.".len() + 20 + 1, digits.max(6))?;
+    let (body, credit) = new_owned_native_vec::<u8>(original, size)?;
+    let mut owner = OwnedEventBody {
+        body: String::from_utf8(body).expect("empty utf8 buffer"),
+        credit,
+    };
+    write!(
+        &mut owner.body,
+        "sync_ddl_generation.v1.{:020}.{ordinal:06}",
+        lsn.0
+    )
+    .map_err(|_| owned_event_overflow())?;
+    if owner.body.len() != size || owner.body.capacity() != size {
+        return Err(Error::Other("event sidecar key capacity mismatch".into()));
+    }
+    Ok(owner)
+}
+impl Database {
+    pub(super) fn stage_owned_event_bus_ddl_for_commit(
+        &self,
+        events: &OwnedEventBusHandle,
+        lsn: Lsn,
+        ddl: &[DdlChange],
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<(u32, Option<OwnedStagedEventBusDdlCommit>)> {
+        if ddl.is_empty() {
+            return Ok((0, None));
+        }
+        let projection = events.prepare_owned_definition_projection_with_ddl(ddl, |table| {
+            self.table_meta(table).is_some()
+        })?;
+        if projection.definitions == *events.data().common.definitions.lock() {
+            return Ok((0, None));
+        }
+        let count = u32::try_from(ddl.len())
+            .map_err(|_| Error::SyncError("event-bus DDL ordinal overflow".into()))?;
+        match &self.tx_mgr {
+            DatabaseTransactionHost::Owned(handle) => handle.with_host(|host| {
+                validate_owned_original(
+                    &events.data().original,
+                    &self.finalization.accountant,
+                    &host.funder,
+                )
+            })?,
+            DatabaseTransactionHost::Legacy(_) => {
+                return Err(Error::Other(
+                    "owning event DDL requires its native database host".into(),
+                ));
+            }
+        }
+        let original = &events.data().original;
+        let ddl = OwnedEventDdlInput::try_copy(original, ddl)?;
+        let mut publication = events.prepare_owned_definition_publication_with_extra_config(
+            projection,
+            OwnedDefinitionMode::Additive,
+            events.data().common.begin_queue_mutation(),
+            ddl.ddl.len(),
+        )?;
+        let (body, credit) = new_owned_native_vec(original, ddl.ddl.len())?;
+        let mut sidecars = OwnedEventBody { body, credit };
+        for (ordinal, change) in ddl.ddl.iter().enumerate() {
+            let table = Self::ddl_affected_table(change);
+            let generation = table
+                .map(|table| self.durable_lineage_table_generation(table, read_memory.clone()))
+                .transpose()?;
+            let table = match table {
+                Some(table) => {
+                    let (body, credit) = copy_owned_native_string(original, table)?;
+                    publication.config.bodies.push(credit);
+                    Some(body)
+                }
+                None => None,
+            };
+            let sidecar = super::DurableDdlGenerationSidecar {
+                table,
+                table_generation: generation,
+            };
+            let key = owned_ddl_sidecar_key(original, lsn, ordinal as u32)?;
+            let encoded = encode_owned_event_value(original, &sidecar)?;
+            publication.config.values.push((key.body, encoded.body));
+            publication.config.bodies.push(key.credit);
+            publication.config.bodies.push(encoded.credit);
+            sidecars.body.push(sidecar);
+        }
+        let config_values = std::mem::take(&mut publication.config.values);
+        let persistence = EventBusPersistenceCommit {
+            config_values,
+            ddl: ddl.ddl,
+            generation_sidecars: sidecars.body,
+        };
+        let empty_config = OwnedEncodedEventBusConfig::try_empty(original)?;
+        let persistence_credit = std::mem::replace(&mut publication.config, empty_config);
+        Ok((
+            count,
+            Some(OwnedStagedEventBusDdlCommit {
+                persistence,
+                persistence_credit,
+                publication,
+                buffers: ddl.bodies,
+                ddl_array: ddl.array,
+                sidecar_array: sidecars.credit,
+            }),
+        ))
+    }
+    pub(super) fn commit_owned_event_bus_ddl_changes<P: OwnedEventDdlPersistence>(
+        &self,
+        events: &OwnedEventBusHandle,
+        ddl: &[DdlChange],
+        persistence: &P,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<()> {
+        if !matches!(&self.tx_mgr, DatabaseTransactionHost::Owned(_)) {
+            return Err(Error::Other(
+                "owning event DDL requires its native database host".into(),
+            ));
+        }
+        let initial = events.prepare_owned_definition_projection_with_ddl(ddl, |table| {
+            self.table_meta(table).is_some()
+        })?;
+        if initial.definitions == *events.data().common.definitions.lock() {
+            return Ok(());
+        }
+        drop(initial);
+        // Same original LSN allocator and commit boundary as direct Legacy DDL.
+        self.allocate_ddl_lsn(|lsn| {
+            let (_, stage) =
+                self.stage_owned_event_bus_ddl_for_commit(events, lsn, ddl, read_memory.clone())?;
+            let Some(stage) = stage else {
+                return Ok(());
+            };
+            let log = persistence.prepare_log(&events.data().original, lsn, &stage.persistence)?;
+            let empty_events = events.prepare_owned_sink_events(&[])?;
+            persistence.flush(lsn, &stage.persistence)?;
+            let OwnedStagedEventBusDdlCommit {
+                persistence: bodies,
+                persistence_credit,
+                publication,
+                buffers,
+                ddl_array,
+                sidecar_array,
+            } = stage;
+            let bodies = OwnedEventDdlLogBodies {
+                persistence: bodies,
+                persistence_credit,
+                buffers,
+                ddl_array,
+                sidecar_array,
+            };
+            events.publish_owned_definition_publication(publication, empty_events);
+            // The native log adapter moves already-paid DDL/sidecars at the
+            // original definitions-then-log position, with no new admission.
+            persistence.publish_log(log, lsn, bodies);
+            Ok(())
+        })
+    }
+}
+pub(super) struct OwnedEventDdlLogBodies {
+    pub(super) persistence: EventBusPersistenceCommit,
+    pub(super) persistence_credit: OwnedEncodedEventBusConfig,
+    pub(super) buffers: OwnedMemoryReservation,
+    pub(super) ddl_array: OwnedMemoryReservation,
+    pub(super) sidecar_array: OwnedMemoryReservation,
+}
+pub(super) trait OwnedEventDdlPersistence {
+    type Log;
+    fn prepare_log(
+        &self,
+        original: &OwnedMemoryReservation,
+        lsn: Lsn,
+        commit: &EventBusPersistenceCommit,
+    ) -> Result<Self::Log>;
+    fn flush(&self, lsn: Lsn, commit: &EventBusPersistenceCommit) -> Result<()>;
+    fn publish_log(&self, log: Self::Log, lsn: Lsn, bodies: OwnedEventDdlLogBodies);
+}
+
+// A restricted producer supplies the already-pinned committed predecessor and
+// the original insertion/update/delete traversal, including ACL grant rows.
+// No implementation here calls an allocating Legacy candidate/gate builder.
+pub(super) trait OwnedEventCandidateSource {
+    fn visit(
+        &self,
+        visit: impl for<'r> FnMut(
+            OwnedRowEventCandidateRef<'r>,
+            &'r OwnedPreparedEventGate,
+        ) -> Result<()>,
+    ) -> Result<()>;
+}
+impl OwnedPreparedSinkEvents {
+    pub(super) fn with_capacity(
+        original: &OwnedMemoryReservation,
+        capacity: usize,
+    ) -> Result<Self> {
+        let (body, credit) = new_owned_native_vec(original, capacity)?;
+        let events = OwnedEventBody { body, credit };
+        let (body, credit) = new_owned_native_vec(original, capacity)?;
+        let credits = OwnedEventBody { body, credit };
+        let (body, credit) = new_owned_native_vec(original, capacity)?;
+        let sink_keys = OwnedEventBody { body, credit };
+        Ok(Self {
+            events: events.body,
+            event_array: events.credit,
+            credits: credits.body,
+            credit_array: credits.credit,
+            sink_keys: sink_keys.body,
+            key_array: sink_keys.credit,
+            publication: None,
+        })
+    }
+}
+impl OwnedEventBusHandle {
+    pub(super) fn prepare_owned_candidate_events<S: OwnedEventCandidateSource>(
+        &self,
+        source: &S,
+        definitions: &EventBusDefinitions,
+        lsn: Lsn,
+        received_next: Option<u64>,
+    ) -> Result<(OwnedPreparedSinkEvents, u64)> {
+        let original = &self.data().original;
+        let mut count = 0;
+        source.visit(|candidate, _| {
+            for event_type in definitions.event_types.values().filter(|event_type| {
+                event_type.table == candidate.table && event_type.trigger == candidate.kind.legacy()
+            }) {
+                for route in definitions.routes.values().filter(|route| {
+                    route.event_type == event_type.name && route_matches(route, candidate.values)
+                }) {
+                    let _ = route;
+                    count = owned_event_add(count, 1)?;
+                }
+            }
+            Ok(())
+        })?;
+        let mut out = OwnedPreparedSinkEvents::with_capacity(original, count)?;
+        let mut next = received_next.unwrap_or_else(|| self.data().common.next_action_id());
+        source.visit(|candidate, gate| {
+            for event_type in definitions.event_types.values().filter(|event_type| {
+                event_type.table == candidate.table && event_type.trigger == candidate.kind.legacy()
+            }) {
+                for route in definitions.routes.values().filter(|route| {
+                    route.event_type == event_type.name && route_matches(route, candidate.values)
+                }) {
+                    if out.events.len() == count {
+                        return Err(Error::Other("pinned event candidate source changed".into()));
+                    }
+                    let severity = candidate
+                        .values
+                        .get("severity")
+                        .and_then(Value::as_text)
+                        .unwrap_or("");
+                    let metadata = reserve_owned_event_bytes(
+                        original,
+                        owned_event_add(
+                            owned_event_add(event_type.name.len(), candidate.table.len())?,
+                            severity.len(),
+                        )?,
+                    )?;
+                    let (body, credit) = copy_owned_native_string(original, &route.sink)?;
+                    let sink = OwnedEventBody { body, credit };
+                    let (body, credit) = copy_owned_event_values(original, candidate.values)?;
+                    let values = OwnedEventBody { body, credit };
+                    let (body, credit) = copy_owned_event_gate(original, &gate.body)?;
+                    let gate = OwnedEventBody { body, credit };
+                    let name = copy_owned_prepaid_text(&event_type.name)?;
+                    let table = copy_owned_prepaid_text(candidate.table)?;
+                    let severity = copy_owned_prepaid_text(severity)?;
+                    let action_id = if received_next.is_some() {
+                        let id = next;
+                        next = next.saturating_add(1);
+                        id
+                    } else {
+                        self.data().common.allocate_queue_id()
+                    };
+                    out.events.push((
+                        sink.body,
+                        SinkQueueEntry {
+                            id: action_id,
+                            row_id: candidate.row_id,
+                            attempts: 0,
+                            gate: gate.body,
+                            event: SinkEvent {
+                                action_id,
+                                event_type: name,
+                                table,
+                                row_values: values.body,
+                                severity,
+                                at_lsn: lsn,
+                            },
+                        },
+                    ));
+                    out.credits.push(OwnedSinkEventCredit {
+                        row: values.credit,
+                        gate: gate.credit,
+                        metadata,
+                    });
+                    out.sink_keys.push(sink.credit);
+                }
+            }
+            Ok(())
+        })?;
+        if out.events.len() != count {
+            return Err(Error::Other("pinned event candidate source changed".into()));
+        }
+        let lease = self.data().common.begin_queue_mutation();
+        out.publication = Some(OwnedAppendCustody::Ordinary(
+            self.reserve_owned_queue_publication(&out, lease)?,
+        ));
+        Ok((out, next))
+    }
+}
+pub(super) struct OwnedDeleteReleaseBytes {
+    bytes: DeleteReleaseBytes,
+    relational_array: OwnedMemoryReservation,
+    vector_array: OwnedMemoryReservation,
+}
+impl OwnedDeleteReleaseBytes {
+    pub(super) fn try_copy(
+        original: &OwnedMemoryReservation,
+        relational: &[usize],
+        vectors: &[usize],
+    ) -> Result<Self> {
+        let (body, credit) =
+            crate::memory_accounting::copy_owned_native_slice(original, relational)?;
+        let relational = OwnedEventBody { body, credit };
+        let (body, credit) = crate::memory_accounting::copy_owned_native_slice(original, vectors)?;
+        Ok(Self {
+            bytes: DeleteReleaseBytes {
+                relational: relational.body,
+                vectors: body,
+            },
+            relational_array: relational.credit,
+            vector_array: credit,
+        })
+    }
+}
+impl Database {
+    pub(super) fn settle_owned_delete_release_bytes(&self, bytes: OwnedDeleteReleaseBytes) {
+        self.release_delete_allocations_from_bytes(&bytes.bytes);
+        // Consuming custody makes successful settlement exactly once. Abort
+        // simply destroys these arrays; it never calls this settlement door.
+        drop(bytes);
+    }
+    pub(super) fn apply_owned_event_bus_ddl_from_user<P: OwnedEventDdlPersistence>(
+        &self,
+        events: &OwnedEventBusHandle,
+        ddl: &[DdlChange],
+        persistence: &P,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<()> {
+        self.require_admin_event_bus_ddl()?;
+        self.commit_owned_event_bus_ddl_changes(events, ddl, persistence, read_memory)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum OwnedRowEventKind {
+    Insert,
+    Update,
+    Delete,
+}
+impl OwnedRowEventKind {
+    fn legacy(self) -> EventTrigger {
+        match self {
+            Self::Insert => EventTrigger::Insert,
+            Self::Update => EventTrigger::Update,
+            Self::Delete => EventTrigger::Delete,
+        }
+    }
+}
+pub(super) struct OwnedRowEventCandidateRef<'a> {
+    pub(super) kind: OwnedRowEventKind,
+    pub(super) table: &'a str,
+    pub(super) row_id: RowId,
+    pub(super) values: &'a HashMap<String, Value>,
+}
+pub(super) struct OwnedPreparedEventGate {
+    body: EventGateSnapshot,
+    credit: OwnedEventGateCredits,
+}
+impl OwnedPreparedEventGate {
+    fn try_from_meta(original: &OwnedMemoryReservation, meta: Option<&TableMeta>) -> Result<Self> {
+        let context = meta
+            .and_then(|meta| meta.columns.iter().find(|column| column.context_id))
+            .map(|column| column.name.as_str());
+        let scope = meta.and_then(|meta| {
+            meta.columns
+                .iter()
+                .find_map(|column| match &column.scope_label {
+                    Some(ScopeLabelKind::Split { read_labels, .. }) => {
+                        Some((column.name.as_str(), read_labels.as_slice()))
+                    }
+                    _ => None,
+                })
+        });
+        let mut bytes = context.map_or(0, str::len);
+        if let Some((column, labels)) = scope {
+            bytes = owned_event_add(bytes, column.len())?;
+            bytes = owned_event_add(bytes, owned_event_array::<String>(labels.len())?)?;
+            for label in labels {
+                bytes = owned_event_add(bytes, label.len())?;
+            }
+        }
+        let metadata = reserve_owned_event_bytes(original, bytes)?;
+        let (body, credit) = new_owned_native_vec(original, 0)?;
+        let rows = OwnedEventBody { body, credit };
+        let (body, credit) = new_owned_native_vec(original, 0)?;
+        let children = OwnedEventBody { body, credit };
+        let mut owner = Self {
+            body: EventGateSnapshot::default(),
+            credit: OwnedEventGateCredits {
+                rows: rows.body,
+                row_array: rows.credit,
+                children: children.body,
+                child_array: children.credit,
+                metadata,
+            },
+        };
+        owner.body.context_column = context.map(copy_owned_prepaid_text).transpose()?;
+        if let Some((column, source)) = scope {
+            let mut labels = Vec::with_capacity(source.len());
+            if labels.capacity() != source.len() {
+                return Err(Error::Other("event scope labels capacity mismatch".into()));
+            }
+            for label in source {
+                labels.push(copy_owned_prepaid_text(label)?);
+            }
+            owner.body.scope_read = Some(EventScopeReadGate {
+                column: copy_owned_prepaid_text(column)?,
+                read_labels: labels,
+            });
+        }
+        Ok(owner)
+    }
+    pub(super) fn try_from_projection(
+        original: &OwnedMemoryReservation,
+        meta: Option<&TableMeta>,
+        values: &HashMap<String, Value>,
+        projected_tables: &HashMap<String, TableMeta>,
+        projected_rows: &HashMap<String, Vec<VersionedRow>>,
+    ) -> Result<Self> {
+        let base = Self::try_from_meta(original, meta)?;
+        let Some(column) =
+            meta.and_then(|meta| meta.columns.iter().find(|column| column.acl_ref.is_some()))
+        else {
+            return Ok(base);
+        };
+        let acl = column.acl_ref.as_ref().expect("selected acl ref");
+        let acl_id = match values.get(&column.name) {
+            Some(Value::Uuid(id)) => Some(*id),
+            _ => None,
+        };
+        let matches = |row: &&VersionedRow| {
+            row.deleted_tx.is_none()
+                && acl_id
+                    .is_some_and(|id| row.values.get(&acl.ref_column) == Some(&Value::Uuid(id)))
+        };
+        let count = projected_rows
+            .get(&acl.ref_table)
+            .map_or(0, |rows| rows.iter().filter(matches).count());
+        let metadata_bytes = owned_event_add(
+            owned_event_add(
+                owned_event_add(column.name.len(), acl.ref_table.len())?,
+                acl.ref_column.len(),
+            )?,
+            owned_event_add(
+                std::mem::size_of::<EventGateSnapshot>(),
+                owned_event_array::<HashMap<String, Value>>(count)?,
+            )?,
+        )?;
+        let metadata = reserve_owned_event_bytes(original, metadata_bytes)?;
+        let (body, credit) = new_owned_native_vec(original, count)?;
+        let rows = OwnedEventBody { body, credit };
+        let (body, credit) = new_owned_native_vec(original, 2)?;
+        let children = OwnedEventBody { body, credit };
+        let mut owner = Self {
+            body: base.body,
+            credit: OwnedEventGateCredits {
+                rows: rows.body,
+                row_array: rows.credit,
+                children: children.body,
+                child_array: children.credit,
+                metadata,
+            },
+        };
+        owner.credit.children.push(base.credit);
+        let grant_gate = Self::try_from_meta(original, projected_tables.get(&acl.ref_table))?;
+        let mut grants = Vec::with_capacity(count);
+        if grants.capacity() != count {
+            return Err(Error::Other(
+                "event projected grant capacity mismatch".into(),
+            ));
+        }
+        if let Some(source) = projected_rows.get(&acl.ref_table) {
+            for row in source.iter().filter(matches) {
+                let (body, credit) = copy_owned_event_values(original, &row.values)?;
+                let copy = OwnedEventBody { body, credit };
+                grants.push(copy.body);
+                owner.credit.rows.push(copy.credit);
+            }
+        }
+        owner.body.acl = Some(EventAclGate {
+            column: copy_owned_prepaid_text(&column.name)?,
+            ref_table: copy_owned_prepaid_text(&acl.ref_table)?,
+            ref_column: copy_owned_prepaid_text(&acl.ref_column)?,
+            grant_gate: Box::new(grant_gate.body),
+            grant_rows: EventGrantRows::Legacy(grants),
+        });
+        owner.credit.children.push(grant_gate.credit);
+        Ok(owner)
+    }
+}
+struct OwnedReceivedEventCandidates<'a> {
+    deleted: HashMap<(&'a str, RowId), &'a VersionedRow>,
+    deleted_memory: OwnedMemoryReservation,
+    ws: &'a contextdb_tx::WriteSet,
+    tables: &'a HashMap<String, TableMeta>,
+    rows: &'a HashMap<String, Vec<VersionedRow>>,
+    original: &'a OwnedMemoryReservation,
+}
+impl OwnedEventCandidateSource for OwnedReceivedEventCandidates<'_> {
+    fn visit(
+        &self,
+        mut visit: impl for<'r> FnMut(
+            OwnedRowEventCandidateRef<'r>,
+            &'r OwnedPreparedEventGate,
+        ) -> Result<()>,
+    ) -> Result<()> {
+        let (body, credit) = new_owned_native_set(self.original, self.deleted.len())?;
+        let mut consumed = OwnedEventBody { body, credit };
+        for (table, row) in &self.ws.relational_inserts {
+            let same_row = (table.as_str(), row.row_id);
+            let same_identity = self.deleted.iter().find_map(|((old_table, old_id), old)| {
+                (*old_table == table.as_str()
+                    && old.values.contains_key("id")
+                    && old.values.get("id") == row.values.get("id"))
+                .then_some((*old_table, *old_id))
+            });
+            let key = self
+                .deleted
+                .contains_key(&same_row)
+                .then_some(same_row)
+                .or(same_identity);
+            let kind = if let Some(key) = key {
+                consumed.body.insert(key);
+                OwnedRowEventKind::Update
+            } else {
+                OwnedRowEventKind::Insert
+            };
+            let gate = OwnedPreparedEventGate::try_from_projection(
+                self.original,
+                self.tables.get(table),
+                &row.values,
+                self.tables,
+                self.rows,
+            )?;
+            visit(
+                OwnedRowEventCandidateRef {
+                    kind,
+                    table,
+                    row_id: row.row_id,
+                    values: &row.values,
+                },
+                &gate,
+            )?;
+        }
+        for ((table, row_id), row) in &self.deleted {
+            if !consumed.body.contains(&(*table, *row_id)) {
+                let gate = OwnedPreparedEventGate::try_from_projection(
+                    self.original,
+                    self.tables.get(*table),
+                    &row.values,
+                    self.tables,
+                    self.rows,
+                )?;
+                visit(
+                    OwnedRowEventCandidateRef {
+                        kind: OwnedRowEventKind::Delete,
+                        table,
+                        row_id: *row_id,
+                        values: &row.values,
+                    },
+                    &gate,
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+impl Database {
+    pub(super) fn prepare_received_owned_sink_events_from_projection(
+        &self,
+        events: &OwnedEventBusHandle,
+        host: &EngineDatabaseTransactions,
+        ws: &contextdb_tx::WriteSet,
+        definitions: &EventBusDefinitions,
+        projected_rows: &HashMap<String, Vec<VersionedRow>>,
+        projected_tables: &HashMap<String, TableMeta>,
+    ) -> Result<(OwnedPreparedSinkEvents, u64)> {
+        self.validate_owned_event_host(events, host)?;
+        let next = events.data().common.next_action_id();
+        let Some(lsn) = ws.commit_lsn else {
+            return Ok((events.prepare_owned_sink_events(&[])?, next));
+        };
+        if definitions.event_types.is_empty() || definitions.routes.is_empty() {
+            return Ok((events.prepare_owned_sink_events(&[])?, next));
+        }
+        let (deleted, deleted_memory) =
+            new_owned_native_map(&events.data().original, ws.relational_deletes.len())?;
+        let mut source = OwnedReceivedEventCandidates {
+            deleted,
+            deleted_memory,
+            ws,
+            tables: projected_tables,
+            rows: projected_rows,
+            original: &events.data().original,
+        };
+        for (table, row_id, _) in &ws.relational_deletes {
+            if let Some(row) = projected_rows
+                .get(table)
+                .and_then(|rows| rows.iter().rev().find(|row| row.row_id == *row_id))
+            {
+                source.deleted.insert((table.as_str(), *row_id), row);
+            }
+        }
+        events.prepare_owned_candidate_events(&source, definitions, lsn, Some(next))
+    }
+}
+
+impl OwnedEventBusHandle {
+    pub(super) fn suspend_owned_registered_append_for_discard(
+        &self,
+        registration: &OwnedEventStageRegistration,
+    ) -> Result<OwnedDiscardAppendHandle> {
+        let handle = registration.append.as_ref().ok_or_else(|| {
+            Error::Other("registered stage has no append transfer control".into())
+        })?;
+        let mut token = handle
+            .control
+            .get()
+            .token
+            .lock()
+            .take()
+            .ok_or_else(|| Error::Other("registered append was already consumed".into()))?;
+        if !token.storage.matches(self) || token.state != OwnedEscrowState::Active {
+            *handle.control.get().token.lock() = Some(token);
+            return Err(Error::Other(
+                "registered discard requires its active original escrow".into(),
+            ));
+        }
+        let mut queues = self.data().queues.lock();
+        cancel_owned_slots_locked(&mut queues, &mut token.slots);
+        token.state = OwnedEscrowState::Suspended;
+        drop(queues);
+        for slot in &mut token.slots {
+            drop(slot.retired.take());
+        }
+        drop(token.lease.take());
+        *handle.control.get().token.lock() = Some(token);
+        // The actual paid control was installed before stage registration and
+        // durability. The exact terminal registration is the source of this
+        // capability, never a lookup in a replacement same-LSN slot.
+        Ok(handle.clone())
+    }
+}
+impl Database {
+    pub(super) fn publish_owned_staged_event_bus_ddl_commit<P: OwnedEventDdlPersistence>(
+        &self,
+        events: &OwnedEventBusHandle,
+        lsn: Lsn,
+        stage: OwnedStagedEventBusDdlCommit,
+        log: P::Log,
+        persistence: &P,
+    ) {
+        let OwnedStagedEventBusDdlCommit {
+            persistence: bodies,
+            persistence_credit,
+            publication,
+            buffers,
+            ddl_array,
+            sidecar_array,
+        } = stage;
+        let bodies = OwnedEventDdlLogBodies {
+            persistence: bodies,
+            persistence_credit,
+            buffers,
+            ddl_array,
+            sidecar_array,
+        };
+        events.publish_owned_definition_only(publication);
+        persistence.publish_log(log, lsn, bodies);
+    }
+}
+
+struct OwnedEventNames {
+    names: Vec<String>,
+    keys: Vec<OwnedMemoryReservation>,
+    name_array: OwnedMemoryReservation,
+    key_array: OwnedMemoryReservation,
+}
+struct OwnedEventCopiedMap<K, V> {
+    body: HashMap<K, V>,
+    keys: Vec<OwnedMemoryReservation>,
+    array: OwnedMemoryReservation,
+    buckets: OwnedMemoryReservation,
+}
+struct OwnedEventCopiedSet<K> {
+    body: HashSet<K>,
+    keys: Vec<OwnedCheckoutKeyCredit>,
+    array: OwnedMemoryReservation,
+    buckets: OwnedMemoryReservation,
+}
+impl OwnedEventBusHandle {
+    pub(crate) fn with_owned_registered_stage_identity<R>(
+        &self, registration: &OwnedEventStageRegistration,
+        f: impl FnOnce(Lsn, EngineTerminalIdentity) -> Result<R>,
+    ) -> Result<R> {
+        let pin = self.pin_owned_registered_stage(registration).ok_or_else(|| {
+            Error::Other("native event apply registered stage identity mismatch".into())
+        })?;
+        // The supplied registration, never the looked-up stage, provides the
+        // identity. The exact pin check only authenticates its installation.
+        let result = f(registration.lsn, registration.identity);
+        drop(pin);
+        result
+    }
+    fn take_owned_registered_stage(
+        &self,
+        registration: &OwnedEventStageRegistration,
+    ) -> Option<OwnedEventShared<OwnedCommitEventStage>> {
+        let pin = self.pin_owned_registered_stage(registration)?;
+        let mut stages = self.data().stages.lock();
+        let matches = stages.values.get(&registration.lsn).is_some_and(|stage| {
+            stage.identity == registration.identity
+                && Arc::ptr_eq(stage.data.as_ref().expect("installed stage"),
+                    pin.data.as_ref().expect("registered stage"))
+        });
+        let retired = if matches { stages.values.remove(&registration.lsn) } else { None };
+        drop(stages);
+        drop(pin);
+        retired
+    }
+    pub(super) fn pin_owned_registered_stage(
+        &self,
+        registration: &OwnedEventStageRegistration,
+    ) -> Option<OwnedEventShared<OwnedCommitEventStage>> {
+        if !registration.armed || !Arc::ptr_eq(
+            self.storage.data.as_ref().expect("live event companion"),
+            registration
+                .storage
+                .storage
+                .data
+                .as_ref()
+                .expect("live registered event companion"),
+        ) {
+            return None;
+        }
+        let stages = self.data().stages.lock();
+        stages
+            .values
+            .get(&registration.lsn)
+            .filter(|stage| stage.get().identity == registration.identity
+                && Arc::ptr_eq(stage.data.as_ref().expect("installed stage"),
+                    registration.installed.data.as_ref().expect("registered stage")))
+            .cloned()
+    }
+}
+impl OwnedDefinitionsProjection {
+    pub(super) fn with_definitions<R>(
+        &self,
+        f: impl for<'d> FnOnce(&'d EventBusDefinitions) -> R,
+    ) -> R {
+        f(&self.definitions)
+    }
+    pub(super) fn sanitize(&mut self, live_tables: &HashMap<String, TableMeta>) {
+        self.definitions
+            .event_types
+            .retain(|_, def| live_tables.contains_key(&def.table));
+        self.definitions.routes.retain(|_, route| {
+            self.definitions.event_types.contains_key(&route.event_type)
+                && self.definitions.sinks.contains_key(&route.sink)
+        });
+    }
+}
+
+struct OwnedOriginalEventPreimage {
+    values: HashMap<String, Value>,
+    credit: OriginalCopyGrant,
+}
+struct OwnedOrdinaryEventCandidates<'a> {
+    deleted: HashMap<(&'a str, RowId), OwnedOriginalEventPreimage>,
+    deleted_memory: OwnedMemoryReservation,
+    database: &'a Database,
+    ws: &'a contextdb_tx::WriteSet,
+    original: &'a OwnedMemoryReservation,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+}
+impl OwnedEventCandidateSource for OwnedOrdinaryEventCandidates<'_> {
+    fn visit(
+        &self,
+        mut visit: impl for<'r> FnMut(
+            OwnedRowEventCandidateRef<'r>,
+            &'r OwnedPreparedEventGate,
+        ) -> Result<()>,
+    ) -> Result<()> {
+        let (body, credit) = new_owned_native_set(self.original, self.deleted.len())?;
+        let mut consumed = OwnedEventBody { body, credit };
+        for (table, row) in &self.ws.relational_inserts {
+            let same_row = (table.as_str(), row.row_id);
+            let same_identity = self.deleted.iter().find_map(|((old_table, old_id), old)| {
+                (*old_table == table.as_str()
+                    && old.values.contains_key("id")
+                    && old.values.get("id") == row.values.get("id"))
+                .then_some((*old_table, *old_id))
+            });
+            let key = self
+                .deleted
+                .contains_key(&same_row)
+                .then_some(same_row)
+                .or(same_identity);
+            let kind = if let Some(key) = key {
+                consumed.body.insert(key);
+                OwnedRowEventKind::Update
+            } else {
+                OwnedRowEventKind::Insert
+            };
+            let gate = self.database.prepare_owned_event_gate(
+                self.original,
+                table,
+                &row.values,
+                self.ws,
+                self.read_memory.clone(),
+            )?;
+            visit(
+                OwnedRowEventCandidateRef {
+                    kind,
+                    table,
+                    row_id: row.row_id,
+                    values: &row.values,
+                },
+                &gate,
+            )?;
+        }
+        for ((table, row_id), row) in &self.deleted {
+            if !consumed.body.contains(&(*table, *row_id)) {
+                let gate = self.database.prepare_owned_event_gate(
+                    self.original,
+                    table,
+                    &row.values,
+                    self.ws,
+                    self.read_memory.clone(),
+                )?;
+                visit(
+                    OwnedRowEventCandidateRef {
+                        kind: OwnedRowEventKind::Delete,
+                        table,
+                        row_id: *row_id,
+                        values: &row.values,
+                    },
+                    &gate,
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+impl Database {
+    fn with_owned_event_preimage<R>(
+        &self,
+        original: &OwnedMemoryReservation,
+        table: &str,
+        row_id: RowId,
+        snapshot: SnapshotId,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        f: impl for<'r> FnOnce(Option<&'r VersionedRow>) -> Result<R>,
+    ) -> Result<R> {
+        if let Some(root) = self.writer_read_root()? {
+            let source = crate::persistence::writer_adapters::WriterRelationalSource::new_for_read(
+                root,
+                read_memory,
+            )?;
+            let row = contextdb_relational::source::visible_row(&source, table, row_id, snapshot)?;
+            return f(row.as_ref().map(|row| row.value()));
+        }
+        // This unchanged indexed observation helper creates one temporary
+        // table String. Admit its exact source length BEFORE the helper; its
+        // temporary dies inside the call, before this invoice is released.
+        let lookup_memory = reserve_owned_event_bytes(original, table.len())?;
+        let tables = self.relational_store.tables.read();
+        let row = tables.get(table).and_then(|rows| {
+            self.relational_store
+                .visible_version_position(table, rows, row_id, snapshot)
+                .and_then(|position| rows.get(position))
+        });
+        drop(lookup_memory);
+        f(row)
+    }
+    fn visit_owned_event_grants(
+        &self,
+        acl: &AclRef,
+        acl_id: uuid::Uuid,
+        snapshot: SnapshotId,
+        ws: &contextdb_tx::WriteSet,
+        deleted: &HashSet<RowId>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        mut visit: impl FnMut(&VersionedRow) -> Result<()>,
+    ) -> Result<()> {
+        let matches = |row: &VersionedRow| {
+            row.visible_at(snapshot)
+                && !deleted.contains(&row.row_id)
+                && row.values.get(&acl.ref_column) == Some(&Value::Uuid(acl_id))
+        };
+        let visited = self.visit_writer_rows::<Error>(
+            &acl.ref_table,
+            |row| {
+                if matches(row) {
+                    visit(row)?;
+                }
+                Ok(())
+            },
+            read_memory,
+        )?;
+        if !visited {
+            let tables = self.relational_store.tables.read();
+            for row in tables.get(&acl.ref_table).into_iter().flatten() {
+                if matches(row) {
+                    visit(row)?;
+                }
+            }
+        }
+        for (table, row) in &ws.relational_inserts {
+            if table == &acl.ref_table
+                && row.deleted_tx.is_none()
+                && row.values.get(&acl.ref_column) == Some(&Value::Uuid(acl_id))
+            {
+                visit(row)?;
+            }
+        }
+        Ok(())
+    }
+    pub(super) fn prepare_owned_event_gate(
+        &self,
+        original: &OwnedMemoryReservation,
+        table: &str,
+        values: &HashMap<String, Value>,
+        ws: &contextdb_tx::WriteSet,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<OwnedPreparedEventGate> {
+        self.with_owned_event_meta_pair(table, |meta, grant_meta| {
+            let Some(meta) = meta else {
+                return OwnedPreparedEventGate::try_from_meta(original, None);
+            };
+            let base = OwnedPreparedEventGate::try_from_meta(original, Some(meta))?;
+            let Some(column) = meta.columns.iter().find(|column| column.acl_ref.is_some()) else {
+                return Ok(base);
+            };
+            let acl = column.acl_ref.as_ref().expect("selected acl ref");
+            let acl_id = match values.get(&column.name) {
+                Some(Value::Uuid(id)) => Some(*id),
+                _ => None,
+            };
+            let (body, credit) = new_owned_native_set(original, ws.relational_deletes.len())?;
+            let mut deleted = OwnedEventBody { body, credit };
+            for (table, id, _) in &ws.relational_deletes {
+                if table == &acl.ref_table {
+                    deleted.body.insert(*id);
+                }
+            }
+            let snapshot = self.snapshot();
+            let mut count = 0;
+            if let Some(id) = acl_id {
+                self.visit_owned_event_grants(
+                    acl,
+                    id,
+                    snapshot,
+                    ws,
+                    &deleted.body,
+                    read_memory.clone(),
+                    |_| {
+                        count = owned_event_add(count, 1)?;
+                        Ok(())
+                    },
+                )?;
+            }
+            let bytes = owned_event_add(
+                owned_event_add(
+                    owned_event_add(column.name.len(), acl.ref_table.len())?,
+                    acl.ref_column.len(),
+                )?,
+                owned_event_add(
+                    std::mem::size_of::<EventGateSnapshot>(),
+                    owned_event_array::<HashMap<String, Value>>(count)?,
+                )?,
+            )?;
+            let metadata = reserve_owned_event_bytes(original, bytes)?;
+            let (body, credit) = new_owned_native_vec(original, count)?;
+            let rows = OwnedEventBody { body, credit };
+            let (body, credit) = new_owned_native_vec(original, 2)?;
+            let children = OwnedEventBody { body, credit };
+            let mut owner = OwnedPreparedEventGate {
+                body: base.body,
+                credit: OwnedEventGateCredits {
+                    rows: rows.body,
+                    row_array: rows.credit,
+                    children: children.body,
+                    child_array: children.credit,
+                    metadata,
+                },
+            };
+            owner.credit.children.push(base.credit);
+            let grant_gate = OwnedPreparedEventGate::try_from_meta(original, grant_meta)?;
+            let mut grants = Vec::with_capacity(count);
+            if grants.capacity() != count {
+                return Err(Error::Other("event grant capacity mismatch".into()));
+            }
+            if let Some(id) = acl_id {
+                self.visit_owned_event_grants(
+                    acl,
+                    id,
+                    snapshot,
+                    ws,
+                    &deleted.body,
+                    read_memory.clone(),
+                    |row| {
+                        if grants.len() == count {
+                            return Err(Error::Other("pinned event grant source changed".into()));
+                        }
+                        let (body, credit) = copy_owned_event_values(original, &row.values)?;
+                        let copy = OwnedEventBody { body, credit };
+                        grants.push(copy.body);
+                        owner.credit.rows.push(copy.credit);
+                        Ok(())
+                    },
+                )?;
+            }
+            if grants.len() != count {
+                return Err(Error::Other("pinned event grant source changed".into()));
+            }
+            owner.body.acl = Some(EventAclGate {
+                column: copy_owned_prepaid_text(&column.name)?,
+                ref_table: copy_owned_prepaid_text(&acl.ref_table)?,
+                ref_column: copy_owned_prepaid_text(&acl.ref_column)?,
+                grant_gate: Box::new(grant_gate.body),
+                grant_rows: EventGrantRows::Legacy(grants),
+            });
+            owner.credit.children.push(grant_gate.credit);
+            Ok(owner)
+        })
+    }
+    pub(super) fn prepare_owned_sink_events_in_prepared_write_set(
+        &self,
+        events: &OwnedEventBusHandle,
+        host: &EngineDatabaseTransactions,
+        guard: &contextdb_tx::manager::EngineGuard<'_>,
+        event_bus_ddl: &[DdlChange],
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<OwnedPreparedSinkEvents> {
+        self.validate_owned_event_host(events, host)?;
+        guard.with_legacy(|ws| {
+            let Some(lsn) = ws.commit_lsn else {
+                return events.prepare_owned_sink_events(&[]);
+            };
+            if ws.relational_inserts.is_empty() && ws.relational_deletes.is_empty() {
+                return events.prepare_owned_sink_events(&[]);
+            }
+            let definitions = events
+                .prepare_owned_definition_projection_with_ddl(event_bus_ddl, |table| {
+                    self.table_meta(table).is_some()
+                })?;
+            if definitions.definitions.event_types.is_empty()
+                || definitions.definitions.routes.is_empty()
+            {
+                return events.prepare_owned_sink_events(&[]);
+            }
+            // Capture the SAME committed-predecessor cut as the original,
+            // independently of the transaction's retained base read.
+            let published = self.tx_mgr.capture_published_read();
+            let _current_source = self.enter_writer_read(
+                super::writer_read::durable_root(published.handle)?,
+                read_memory.clone(),
+            );
+            let (deleted, deleted_memory) =
+                new_owned_native_map(&events.data().original, ws.relational_deletes.len())?;
+            let mut source = OwnedOrdinaryEventCandidates {
+                deleted,
+                deleted_memory,
+                database: self,
+                ws,
+                original: &events.data().original,
+                read_memory: read_memory.clone(),
+            };
+            let snapshot = self.snapshot();
+            for (table, id, _) in &ws.relational_deletes {
+                let preimage = self.with_owned_event_preimage(
+                    &events.data().original,
+                    table,
+                    *id,
+                    snapshot,
+                    read_memory.clone(),
+                    |row| {
+                        row.map(|row| {
+                            let (values, credit) =
+                                crate::memory_accounting::copy_owned_event_row_values(
+                                    &events.data().original,
+                                    row,
+                                )?;
+                            Ok(OwnedOriginalEventPreimage { values, credit })
+                        })
+                        .transpose()
+                    },
+                )?;
+                if let Some(preimage) = preimage {
+                    source.deleted.insert((table.as_str(), *id), preimage);
+                }
+            }
+            events
+                .prepare_owned_candidate_events(&source, &definitions.definitions, lsn, None)
+                .map(|(events, _)| events)
+        })
+    }
+}
+
+impl Database {
+    fn with_owned_event_meta_pair<R>(
+        &self,
+        table: &str,
+        f: impl for<'m> FnOnce(Option<&'m TableMeta>, Option<&'m TableMeta>) -> Result<R>,
+    ) -> Result<R> {
+        if let Some(root) = self.scoped_writer_root() {
+            let meta = root.borrow_captured_table_meta(table);
+            let grant_meta = meta
+                .and_then(|meta| {
+                    meta.columns
+                        .iter()
+                        .find_map(|column| column.acl_ref.as_ref())
+                })
+                .and_then(|acl| root.borrow_captured_table_meta(&acl.ref_table));
+            f(meta, grant_meta)
+        } else {
+            // One catalog guard supplies BOTH borrowed metas. Never recursively
+            // acquire a read guard behind a waiting catalog writer.
+            let catalog = self.relational_store.table_meta.read();
+            let meta = catalog.get(table);
+            let grant_meta = meta
+                .and_then(|meta| {
+                    meta.columns
+                        .iter()
+                        .find_map(|column| column.acl_ref.as_ref())
+                })
+                .and_then(|acl| catalog.get(&acl.ref_table));
+            f(meta, grant_meta)
+        }
+    }
+}
+
+impl Database {
+    fn validate_owned_event_host(
+        &self,
+        events: &OwnedEventBusHandle,
+        host: &EngineDatabaseTransactions,
+    ) -> Result<()> {
+        match &self.tx_mgr {
+            DatabaseTransactionHost::Owned(handle) => handle.with_host(|actual| {
+                if !std::ptr::eq(actual, host) {
+                    return Err(Error::Other(
+                        "owning events require the selected original transaction host".into(),
+                    ));
+                }
+                validate_owned_original(
+                    &events.data().original,
+                    &self.finalization.accountant,
+                    &actual.funder,
+                )
+            }),
+            DatabaseTransactionHost::Legacy(_) => Err(Error::Other(
+                "owning events require the selected native transaction host".into(),
+            )),
+        }
+    }
+}
+
+impl OwnedEventBusHandle {
+    /// The companion owns this immutable seed outside every mutable queue,
+    /// stage and state guard. The shared storage cannot retire while self is
+    /// lent, including callback failure and unwinding.
+    pub(crate) fn with_owned_persistence_original<R>(
+        &self,
+        f: impl for<'o> FnOnce(&'o OwnedMemoryReservation) -> Result<R>,
+    ) -> Result<R> {
+        with_owned_persistence_original_seed(&self.storage.get().original, f)
+    }
+}
+
+impl Database {
+    pub(super) fn validate_owned_cron_store(
+        &self,
+        events: &OwnedEventBusHandle,
+        host: &EngineDatabaseTransactions,
+        store: &crate::persistent_store::OwnedPersistentCompositeStore,
+    ) -> Result<()> {
+        self.validate_owned_event_host(events, host)?;
+        if !Arc::ptr_eq(&events.data().common, &self.event_bus) {
+            return Err(Error::Other("native cron requires this database's event companion".into()));
+        }
+        host.transactions.with_transactions(|lower| {
+            let installed: &dyn contextdb_tx::WriteSetApplicator = lower.store().as_ref();
+            if installed as *const dyn contextdb_tx::WriteSetApplicator as *const ()
+                != store as *const _ as *const ()
+            {
+                return Err(Error::Other("native cron requires its host's installed store".into()));
+            }
+            Ok(())
+        })
+    }
+
+    pub(super) fn prepare_owned_delete_release_bytes_in_prepared_write_set(
+        &self,
+        events: &OwnedEventBusHandle,
+        host: &EngineDatabaseTransactions,
+        guard: &contextdb_tx::manager::EngineGuard<'_>,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<OwnedDeleteReleaseBytes> {
+        self.validate_owned_event_host(events, host)?;
+        events.with_owned_persistence_original(|original| {
+            guard.with_legacy(|ws| {
+                let mut relational_count = 0;
+                let mut vector_count = 0;
+                self.visit_owned_delete_release_bytes(
+                    original, ws, vector_copy_owner, read_memory.clone(),
+                    |vector, _| {
+                        let count = if vector { &mut vector_count } else { &mut relational_count };
+                        *count = owned_event_add(*count, 1)?;
+                        Ok(())
+                    },
+                )?;
+                // Both arrays receive their original preparation invoices BEFORE allocation.
+                let (body, credit) = new_owned_native_vec(original, relational_count)?;
+                let relational = OwnedEventBody { body, credit };
+                let (body, credit) = new_owned_native_vec(original, vector_count)?;
+                let mut release = OwnedDeleteReleaseBytes {
+                    bytes: DeleteReleaseBytes { relational: relational.body, vectors: body },
+                    relational_array: relational.credit,
+                    vector_array: credit,
+                };
+                self.visit_owned_delete_release_bytes(
+                    original, ws, vector_copy_owner, read_memory,
+                    |vector, bytes| {
+                        let (array, count) = if vector {
+                            (&mut release.bytes.vectors, vector_count)
+                        } else {
+                            (&mut release.bytes.relational, relational_count)
+                        };
+                        if array.len() == count {
+                            return Err(Error::Other("native delete release source changed".into()));
+                        }
+                        array.push(bytes);
+                        Ok(())
+                    },
+                )?;
+                if release.bytes.relational.len() != relational_count
+                    || release.bytes.vectors.len() != vector_count
+                {
+                    return Err(Error::Other("native delete release source changed".into()));
+                }
+                Ok(release)
+            })
+        })
+    }
+
+    fn visit_owned_delete_release_bytes(
+        &self,
+        original: &OwnedMemoryReservation,
+        ws: &contextdb_tx::WriteSet,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        mut visit: impl FnMut(bool, usize) -> Result<()>,
+    ) -> Result<()> {
+        let snapshot = SnapshotId::from_raw_wire(u64::MAX);
+        for (table, row_id, _) in &ws.relational_deletes {
+            self.with_owned_event_meta_pair(table, |meta, _| {
+                // The same resident indexed selection as row_by_id, borrowing
+                // the row instead of making an unadmitted payload copy.
+                let lookup_memory = reserve_owned_event_bytes(original, table.len())?;
+                let tables = self.relational_store.tables.read();
+                let row = tables.get(table).and_then(|rows| {
+                    self.relational_store.visible_version_position(table, rows, *row_id, snapshot)
+                        .and_then(|position| rows.get(position))
+                });
+                drop(lookup_memory);
+                if let Some(row) = row {
+                    visit(false, retained_row_bytes_with_optional_meta(table, row, meta))?;
+                }
+                Ok(())
+            })?;
+        }
+        // State-owned vector bodies retain their charge until physical removal.
+        // Adjacency likewise remains charged; this commit settles neither.
+        for (index, row_id, _) in &ws.vector_deletes {
+            if self.vector_store.raw_entry_charge_owned_by_state(index, *row_id) {
+                continue;
+            }
+            if let Some(vector) = self.find_vector_by_index_and_row(
+                index, *row_id, vector_copy_owner, read_memory.clone(),
+            )? {
+                visit(true, self.vector_insert_accounted_bytes(
+                    index, vector.vector.len(), vector_copy_owner,
+                )?)?;
+            }
+        }
+        Ok(())
     }
 }

@@ -6264,3 +6264,13 @@ mod tests {
         assert!(pending.edges.is_empty());
     }
 }
+
+/// Private native envelope companion; byte/text producers own or borrow only
+/// storage funded by the exact supplied operation. No legacy image adapter.
+pub(crate) fn decode_native_sync_envelope(
+    memory: &crate::read_image_memory::NativeDeliveryImage,
+    data: &[u8],
+    expected: Option<u8>,
+) -> std::result::Result<crate::sync_native_delivery::NativeEnvelope, crate::sync_native_delivery::DecodeError> {
+    crate::sync_native_delivery::decode_envelope(memory, data, expected)
+}

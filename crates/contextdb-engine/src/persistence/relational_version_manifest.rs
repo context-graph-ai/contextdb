@@ -148,13 +148,13 @@ impl RedbPersistence {
         Ok(())
     }
 
-    fn relational_manifest_damage(&self, reason: impl std::fmt::Display) -> Error {
+    pub(super) fn relational_manifest_damage(&self, reason: impl std::fmt::Display) -> Error {
         Error::StoreCorrupted {
             path: self.path.display().to_string(),
             reason: format!("relational version manifest: {reason}"),
         }
     }
-    fn relational_manifest_error(&self, error: Error) -> Error {
+    pub(super) fn relational_manifest_error(&self, error: Error) -> Error {
         match error {
             Error::MemoryBudgetExceeded { .. } | Error::StoreCorrupted { .. }
             | Error::ReadCancelled | Error::ReadFailure(_) => error,

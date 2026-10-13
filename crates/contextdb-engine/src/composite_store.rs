@@ -1682,3 +1682,186 @@ fn abort_before_vector_publication_for_test() {
         std::process::abort();
     }
 }
+
+/// Lend the single finalized event/DDL slot to a synchronous persistence
+/// consumer. The result cannot retain the stage borrow; all guards have ended
+/// when this bridge returns to its memory-publication caller.
+pub(crate) fn with_owned_commit_events_for_apply<R>(
+    events: &crate::database::event_bus::OwnedEventBusHandle,
+    lsn: Option<Lsn>,
+    identity: contextdb_tx::manager::EngineTerminalIdentity,
+    f: impl for<'e> FnOnce(Option<crate::database::event_bus::OwnedStageBorrow<'e>>) -> Result<R>,
+) -> Result<R> {
+    match lsn {
+        Some(lsn) => events.with_owned_commit_events(lsn, identity, f),
+        None => f(None),
+    }
+}
+
+
+pub(crate) struct OwnedPreparedMemoryApply {
+    pub(crate) log_entries:Vec<ChangeLogEntry>,
+    pub(crate) partition_mutations:Option<PreparedVectorPartitionMutationBatch>,
+    clear_sources:Vec<SyncSourceLsnClear>,
+    set_sources:Vec<SyncSourceLsnSet>,
+    _preparation:crate::memory_accounting::OwnedMemoryReservation,
+}
+impl OwnedPreparedMemoryApply {
+    pub(crate) fn prepare(original:&crate::memory_accounting::OwnedMemoryReservation,ws:&WriteSet,log_entries:Vec<ChangeLogEntry>,partition_mutations:PreparedVectorPartitionMutationBatch,mut preparation:crate::memory_accounting::OwnedMemoryReservation)->Result<Self>{
+        let frame=crate::persistence::OriginalPersistenceFrame::new(original)?;
+        frame.array::<SyncSourceLsnClear>(ws.relational_deletes.len())?;
+        frame.array::<SyncSourceLsnSet>(ws.relational_inserts.len())?;
+        for (table,_,_) in &ws.relational_deletes{frame.reserve(table.len())?;}
+        for (table,_) in &ws.relational_inserts{frame.reserve(table.len()*2)?;}
+        let (clear_sources,set_sources)=sync_source_lsn_updates(ws);
+        let mut source_memory=frame.into_reservation();crate::memory_accounting::merge_preparation_original(&mut preparation,&mut source_memory)?;
+        Ok(Self {log_entries,partition_mutations:Some(partition_mutations),clear_sources,set_sources,_preparation:preparation})
+    }
+}
+impl CompositeStore {
+    pub(crate) fn prepare_owned_change_log_entries_with_snapshots(&self,original:&crate::memory_accounting::OwnedMemoryReservation,ws:&WriteSet,table_meta:Option<&HashMap<String,TableMeta>>,deleted_rows:Option<&HashMap<String,HashMap<RowId,VersionedRow>>>)->Result<(Vec<ChangeLogEntry>,crate::memory_accounting::OwnedMemoryReservation)>{
+        let frame=crate::persistence::OriginalPersistenceFrame::new(original)?;
+        let count=ws.relational_inserts.len().checked_add(ws.relational_deletes.len()).and_then(|n|n.checked_add(ws.adj_inserts.len())).and_then(|n|n.checked_add(ws.adj_deletes.len())).and_then(|n|n.checked_add(ws.vector_inserts.len())).and_then(|n|n.checked_add(ws.vector_deletes.len())).ok_or_else(||Error::Other("change log preparation count overflow".into()))?;
+        frame.array::<ChangeLogEntry>(count.checked_mul(4).ok_or_else(||Error::Other("change log preparation layout overflow".into()))?)?;
+        for (table,_) in &ws.relational_inserts{frame.reserve(table.len())?;}
+        for (table,id,_) in &ws.relational_deletes {
+            frame.reserve(table.len()+2)?;
+            if let Some(row)=deleted_rows.and_then(|tables|tables.get(table)).and_then(|rows|rows.get(id)){frame.record(row)?;}
+            else if let Some(row)=self.relational.tables.read().get(table).and_then(|rows|rows.iter().find(|r|r.row_id==*id)){frame.record(row)?;}
+            if let Some(meta)=table_meta.and_then(|tables|tables.get(table)){frame.record(meta)?;}
+        }
+        for edge in &ws.adj_inserts{frame.reserve(edge.edge_type.len())?;}
+        for (_,kind,_,_) in &ws.adj_deletes{frame.reserve(kind.len())?;}
+        for vector in &ws.vector_inserts{frame.reserve(vector.index.table.len()+vector.index.column.len())?;}
+        for (index,_,_) in &ws.vector_deletes{frame.reserve(index.table.len()+index.column.len())?;}
+        let entries=self.build_change_log_entries_with_snapshots(ws,table_meta,deleted_rows);
+        Ok((entries,frame.into_reservation()))
+    }
+pub(crate) fn apply_owned_exact_with_log_entries(
+        &self,
+        ws: &WriteSet,
+        mut prepared: OwnedPreparedMemoryApply,
+    ) -> Result<()> {
+        crate::database::discard::publish_original_discard_for_apply(ws);
+        let partition_mutations=prepared.partition_mutations.take().expect("prepared native partition publication");
+        self.relational.apply_prepared_rows(
+            &ws.relational_deletes,
+            &ws.relational_inserts,
+            partition_mutations.memberships,
+        );
+        self.relational
+            .publish_retention_expiries(partition_mutations.retention_expiries);
+        self.apply_phase_pause.maybe_pause();
+        self.graph.apply_deletes_ref(&ws.adj_deletes);
+        self.graph.apply_inserts_ref(&ws.adj_inserts);
+        if let Some(publication) = partition_mutations.vector_publication {
+            #[cfg(any(test, feature = "test-seams"))]
+            abort_before_vector_publication_for_test();
+            self.vector.publish_prepared_partitioned_batch(
+                publication,
+                partition_mutations.commit_lsn,
+                Some(&*self.accountant),
+            );
+        }
+        let clear_source_lsns=std::mem::take(&mut prepared.clear_sources);let set_source_lsns=std::mem::take(&mut prepared.set_sources);
+        if !clear_source_lsns.is_empty() {
+            self.relational.clear_sync_source_lsns(clear_source_lsns);
+        }
+        if !set_source_lsns.is_empty() {
+            self.relational.set_sync_source_lsns(
+                set_source_lsns
+                    .iter()
+                    .map(|(table, row_id, lsn, _)| (table.clone(), *row_id, *lsn)),
+            );
+            self.relational
+                .set_sync_source_kinds(set_source_lsns.into_iter().map(
+                    |(table, row_id, _, kind)| {
+                        (
+                            table,
+                            row_id,
+                            match kind {
+                                1 => SyncSourceKind::AcceptedLocal,
+                                2 => SyncSourceKind::AcceptedLocalPending,
+                                _ => SyncSourceKind::Pulled,
+                            },
+                        )
+                    },
+                ));
+        }
+        // File-backed history is already installed atomically in durable
+        // selectors. Keep no second decoded log or lookup directory.
+        if self.relational.uses_disk_backed_committed_bodies() {
+            return Ok(());
+        }
+        // What the log and its two side indexes now hold, plus the one
+        // commit-index entry the transaction manager inserts for this commit
+        // the moment this apply returns. Both exist once the commit is
+        // durable, so the charge cannot refuse here -- the typed refusal
+        // fires on the next admission, which is what a declared limit is for.
+        self.accountant
+            .charge_retained(change_log_retained_bytes(&prepared.log_entries).saturating_add(
+                if self.relational.uses_disk_backed_committed_bodies() {
+                    0
+                } else {
+                    COMMIT_INDEX_ENTRY_BYTES
+                },
+            ));
+        record_change_log_entries(
+            &mut self.change_log_table_index.write(),
+            &mut self.change_log_lsn_refcounts.write(),
+            &prepared.log_entries,
+        );
+        self.change_log.write().extend(std::mem::take(&mut prepared.log_entries));
+        Ok(())
+    }
+}
+
+// A memory-only host has no durable queue transaction. The event companion
+// performs the actual guarded queue publication after these infallible commits.
+impl crate::database::event_bus::OwnedSinkQueuePersistence for CompositeStore {
+    type Update<'o> = ();
+    type Removals<'o> = ();
+    fn is_durable(&self) -> bool { false }
+    fn prepare_update<'o>(
+        &self,
+        original: &'o crate::memory_accounting::OwnedMemoryReservation,
+        _sink: &'o str,
+        _entry_id: u64,
+        _encoded: &[u8],
+        _uncertain: bool,
+        _unconfirmed_delta: i8,
+    ) -> Result<Self::Update<'o>> {
+        crate::memory_accounting::persistence_original_projection(original)?;
+        Ok(())
+    }
+    fn commit_update(&self, _: Self::Update<'_>) -> Result<()> { Ok(()) }
+    fn prepare_removals<'o>(
+        &self,
+        original: &'o crate::memory_accounting::OwnedMemoryReservation,
+        _sink: &'o str,
+        _ids: &'o [u64],
+        _unconfirmed: u64,
+    ) -> Result<Self::Removals<'o>> {
+        crate::memory_accounting::persistence_original_projection(original)?;
+        Ok(())
+    }
+    fn commit_removals(&self, _: Self::Removals<'_>) -> Result<()> { Ok(()) }
+}
+
+impl crate::database::event_bus::OwnedSinkQueuePersistence for std::sync::Arc<CompositeStore> {
+    type Update<'o> = <CompositeStore as crate::database::event_bus::OwnedSinkQueuePersistence>::Update<'o>;
+    type Removals<'o> = <CompositeStore as crate::database::event_bus::OwnedSinkQueuePersistence>::Removals<'o>;
+    fn is_durable(&self) -> bool { <CompositeStore as crate::database::event_bus::OwnedSinkQueuePersistence>::is_durable(self.as_ref()) }
+    fn prepare_update<'o>(&self, original: &'o crate::memory_accounting::OwnedMemoryReservation, sink: &'o str, entry_id: u64, encoded: &[u8], uncertain: bool, delta: i8) -> Result<Self::Update<'o>> {
+        <CompositeStore as crate::database::event_bus::OwnedSinkQueuePersistence>::prepare_update(self.as_ref(), original, sink, entry_id, encoded, uncertain, delta)
+    }
+    fn commit_update(&self, prepared: Self::Update<'_>) -> Result<()> {
+        <CompositeStore as crate::database::event_bus::OwnedSinkQueuePersistence>::commit_update(self.as_ref(), prepared)
+    }
+    fn prepare_removals<'o>(&self, original: &'o crate::memory_accounting::OwnedMemoryReservation, sink: &'o str, ids: &'o [u64], unconfirmed: u64) -> Result<Self::Removals<'o>> {
+        <CompositeStore as crate::database::event_bus::OwnedSinkQueuePersistence>::prepare_removals(self.as_ref(), original, sink, ids, unconfirmed)
+    }
+    fn commit_removals(&self, prepared: Self::Removals<'_>) -> Result<()> {
+        <CompositeStore as crate::database::event_bus::OwnedSinkQueuePersistence>::commit_removals(self.as_ref(), prepared)
+    }
+}

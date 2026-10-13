@@ -504,7 +504,7 @@ impl Database {
     }
 }
 
-fn note_commit_directory_sample(manager: &TransactionManager<DynStore>, durable_entries: usize) {
+fn note_commit_directory_sample(manager: &DatabaseTransactionHost, durable_entries: usize) {
     // retained_entry_bytes counts the actual decoded pair slots; source cache
     // pages and caller-owned cursor output are not resident directory entries.
     let resident_entries = manager.retained_commit_directory_bytes_for_test()
@@ -517,7 +517,7 @@ fn note_commit_directory_sample(manager: &TransactionManager<DynStore>, durable_
 
 struct ObservedReadCommitCursor {
     cursor: Box<dyn contextdb_tx::ReadCommitCursor>,
-    manager: Arc<TransactionManager<DynStore>>,
+    manager: DatabaseTransactionHost,
     image: Option<std::sync::Weak<crate::read_image_memory::ImageMemory>>,
 }
 
@@ -622,7 +622,7 @@ impl SavedVectorRootForTest {
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         action: impl FnOnce(&Database, &crate::read_session::ReadSession) -> Result<T>,
     ) -> Result<T> {
-        if self.manager != Arc::as_ptr(&database.tx_mgr) as usize {
+        if self.manager != database.tx_mgr.identity() {
             return Err(Error::Other(
                 "saved vector proof root belongs to another database".into(),
             ));
@@ -758,7 +758,7 @@ impl Database {
             ));
         };
         Ok(SavedVectorRootForTest {
-            manager: Arc::as_ptr(&self.tx_mgr) as usize,
+            manager: self.tx_mgr.identity(),
             writer,
             retained,
             session: self.read_session(limits)?,

@@ -1,5 +1,7 @@
 use crate::ScratchBackend;
 use crate::transaction_tracker::TransactionId;
+#[cfg(feature = "contextdb-internal")]
+use crate::transactions::DurablePublication;
 use crate::transactions::{AllocatorStateKey, AllocatorStateTree, AllocatorStateTreeMut};
 use crate::tree_store::btree_base::{BtreeHeader, Checksum};
 use crate::tree_store::page_store::base::{MAX_PAGE_INDEX, PageHint};
@@ -213,6 +215,25 @@ impl InMemoryState {
     }
 }
 
+// Armed throughout header publication until that same header is installed.
+// Drop must remain infallible and independent of every storage mutex.
+#[cfg(feature = "contextdb-internal")]
+struct PublicationRecoveryGuard<'a> {
+    needs_recovery: &'a AtomicBool,
+    publication_needs_recovery: &'a AtomicBool,
+    armed: bool,
+}
+
+#[cfg(feature = "contextdb-internal")]
+impl Drop for PublicationRecoveryGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.needs_recovery.store(true, Ordering::Release);
+            self.publication_needs_recovery.store(true, Ordering::Release);
+        }
+    }
+}
+
 pub(crate) struct TransactionalMemory {
     // Pages allocated since the last commit
     // TODO: maybe this should be moved to WriteTransaction?
@@ -221,6 +242,8 @@ pub(crate) struct TransactionalMemory {
     // True if the allocator state was corrupted when the file was opened
     // TODO: maybe we can remove this flag now that CheckedBackend exists?
     needs_recovery: AtomicBool,
+    #[cfg(feature = "contextdb-internal")]
+    publication_needs_recovery: AtomicBool,
     storage: PagedCachedFile,
     state: Mutex<InMemoryState>,
     // The number of PageMut which are outstanding
@@ -242,6 +265,16 @@ pub(crate) struct TransactionalMemory {
 }
 
 impl TransactionalMemory {
+    // Only the publishing sibling sets this flag: ordinary commit is unchanged.
+    // Check before taking state locks, including poisoned locks after unwind.
+    #[cfg(feature = "contextdb-internal")]
+    pub(crate) fn check_publication_recovery(&self) -> Result {
+        if self.publication_needs_recovery.load(Ordering::Acquire) {
+            return Err(StorageError::PreviousIo);
+        }
+        Ok(())
+    }
+
     pub(crate) fn allocator_resident_bytes(&self) -> usize {
         self.state.lock().unwrap().allocators.resident_bytes()
     }
@@ -416,6 +449,8 @@ impl TransactionalMemory {
             allocated_since_commit: Mutex::new(Default::default()),
             unpersisted: Mutex::new(Default::default()),
             needs_recovery: AtomicBool::new(needs_recovery),
+            #[cfg(feature = "contextdb-internal")]
+            publication_needs_recovery: AtomicBool::new(false),
             storage,
             state: Mutex::new(state),
             #[cfg(debug_assertions)]
@@ -857,6 +892,32 @@ impl TransactionalMemory {
         result
     }
 
+    #[cfg(feature = "contextdb-internal")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn commit_publishing(
+        &self,
+        data_root: Option<BtreeHeader>,
+        system_root: Option<BtreeHeader>,
+        transaction_id: TransactionId,
+        two_phase: bool,
+        shrink_policy: ShrinkPolicy,
+        marker: &DurablePublication,
+    ) -> Result {
+        marker.validate(self, transaction_id)?;
+        let result = self.commit_inner_publishing(
+            data_root,
+            system_root,
+            transaction_id,
+            two_phase,
+            shrink_policy,
+            marker,
+        );
+        if result.is_err() {
+            self.needs_recovery.store(true, Ordering::Release);
+        }
+        result
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn commit_inner(
         &self,
@@ -930,6 +991,96 @@ impl TransactionalMemory {
         );
         state.header = header;
         self.read_from_secondary.store(false, Ordering::Release);
+        // Hold lock until read_from_secondary is set to false, so that the new primary state is read.
+        // TODO: maybe we can remove the whole read_from_secondary flag?
+        drop(state);
+
+        Ok(())
+    }
+
+    #[cfg(feature = "contextdb-internal")]
+    #[allow(clippy::too_many_arguments)]
+    fn commit_inner_publishing(
+        &self,
+        data_root: Option<BtreeHeader>,
+        system_root: Option<BtreeHeader>,
+        transaction_id: TransactionId,
+        two_phase: bool,
+        shrink_policy: ShrinkPolicy,
+        marker: &DurablePublication,
+    ) -> Result {
+        // All mutable pages must be dropped, this ensures that when a transaction completes
+        // no more writes can happen to the pages it allocated. Thus it is safe to make them visible
+        // to future read transactions
+        #[cfg(debug_assertions)]
+        debug_assert!(self.open_dirty_pages.lock().unwrap().is_empty());
+        assert!(!self.needs_recovery.load(Ordering::Acquire));
+
+        let mut state = self.state.lock().unwrap();
+        // Trim surplus file space, before finalizing the commit
+        let shrunk = if !matches!(shrink_policy, ShrinkPolicy::Never) {
+            Self::try_shrink(&mut state, matches!(shrink_policy, ShrinkPolicy::Maximum))?
+        } else {
+            false
+        };
+        // Copy the header so that we can release the state lock, while we flush the file
+        let mut header = state.header.clone();
+        drop(state);
+        self.check_io_errors()?;
+
+        let old_transaction_id = header.secondary_slot().transaction_id;
+        let secondary = header.secondary_slot_mut();
+        secondary.transaction_id = transaction_id;
+        secondary.user_root = data_root;
+        secondary.system_root = system_root;
+
+        let mut recovery_guard = PublicationRecoveryGuard {
+            needs_recovery: &self.needs_recovery,
+            publication_needs_recovery: &self.publication_needs_recovery,
+            armed: true,
+        };
+        marker.header_begun();
+        self.write_header(&header)?;
+
+        // Use 2-phase commit, if checksums are disabled
+        if two_phase {
+            self.storage.flush()?;
+        }
+
+        // Make our new commit the primary, and record whether it was a 2-phase commit.
+        // These two bits need to be written atomically
+        header.swap_primary_slot();
+        header.two_phase_commit = two_phase;
+
+        // Write the new header to disk
+        self.write_header(&header)?;
+        self.storage.flush()?;
+        marker.durable();
+
+        if shrunk {
+            let result = self.storage.resize(header.layout().len());
+            if result.is_err() {
+                // TODO: it would be nice to have a more cohesive approach to setting this.
+                // we do it in commit() & rollback() on failure, but there are probably other places that need it
+                self.needs_recovery.store(true, Ordering::Release);
+                return result;
+            }
+        }
+        let mut allocated_since_commit = self.allocated_since_commit.lock().unwrap();
+        allocated_since_commit.clear();
+        allocated_since_commit.shrink_to_fit();
+        let mut unpersisted = self.unpersisted.lock().unwrap();
+        unpersisted.clear();
+        unpersisted.shrink_to_fit();
+
+        let mut state = self.state.lock().unwrap();
+        assert_eq!(
+            state.header.secondary_slot().transaction_id,
+            old_transaction_id
+        );
+        state.header = header;
+        self.read_from_secondary.store(false, Ordering::Release);
+        recovery_guard.armed = false;
         // Hold lock until read_from_secondary is set to false, so that the new primary state is read.
         // TODO: maybe we can remove the whole read_from_secondary flag?
         drop(state);
@@ -1700,5 +1851,45 @@ mod test {
                 }
             }
         }
+    }
+}
+
+#[cfg(feature = "contextdb-internal")]
+impl TransactionalMemory {
+    pub(crate) fn get_native_page_memory(
+        &self, page: PageNumber,
+    ) -> std::result::Result<super::cached_file::PageMemory, crate::NativeColdReadError> {
+        use crate::{NativeColdFault, NativeColdReadError};
+        let corrupt = || {
+            let mut fault = NativeColdFault::new("native page address exceeds allocation layout");
+            fault.page = page.to_le_bytes();
+            NativeColdReadError::Corrupt(fault)
+        };
+        if page.page_order > MAX_MAX_PAGE_ORDER { return Err(corrupt()); }
+        let pages = 1u64 << page.page_order;
+        let end_page = u64::from(page.page_index).checked_add(1)
+            .and_then(|n| n.checked_mul(pages)).ok_or_else(corrupt)?;
+        {
+            let state = self.state.lock().unwrap();
+            let layout = state.header.layout();
+            if page.region >= layout.num_regions()
+                || end_page > u64::from(layout.region_layout(page.region).num_pages()) {
+                return Err(corrupt());
+            }
+        }
+        #[cfg(debug_assertions)]
+        if self.open_dirty_pages.lock().unwrap().contains(&page) {
+            return Err(corrupt());
+        }
+        let len = pages.checked_mul(u64::from(self.page_size)).ok_or_else(corrupt)?;
+        let offset = u64::from(page.page_index).checked_mul(len)
+            .and_then(|n| n.checked_add(self.region_header_with_padding_size))
+            .and_then(|n| u64::from(page.region).checked_mul(self.region_size).and_then(|r| r.checked_add(n)))
+            .and_then(|n| n.checked_add(u64::from(self.page_size))).ok_or_else(corrupt)?;
+        offset.checked_add(len).ok_or_else(corrupt)?;
+        let len = usize::try_from(len).map_err(|_| corrupt())?;
+        // Like existing get_page_window, this lends immutable PageMemory.
+        // No PageImpl/debug HashMap node or generic get_page is constructed.
+        self.storage.read_native_clean_miss(offset, len)
     }
 }

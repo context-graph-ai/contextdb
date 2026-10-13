@@ -2482,6 +2482,10 @@ impl IrohServer {
         }
     }
 
+    pub(crate) fn lineage_identity(&self) -> Arc<FabricIdentity> {
+        self.identity.clone()
+    }
+
     pub(crate) fn lineage_signer(&self) -> LineageSigner {
         let identity = self.identity.clone();
         Arc::new(move |bytes| Ok(identity.sign_lineage(bytes)))
@@ -5024,6 +5028,391 @@ async fn write_reply(
     .await
     .map_err(|_| TransportError::Timeout)??;
     Ok(())
+}
+
+// Private receive primitives. The approved responder/handler boundary is
+// not wired here: see the candidate's interface-gaps.md. These factories
+// never turn the existing large-control or eager paths into a native claim.
+#[allow(dead_code)]
+struct ReadBoundFrameHeader {
+    subject: [u8; u16::MAX as usize],
+    subject_len: usize,
+    body_len: u32,
+}
+#[allow(dead_code)]
+impl ReadBoundFrameHeader {
+    fn subject(&self) -> &str {
+        // UTF-8 is checked before constructing this header.
+        std::str::from_utf8(&self.subject[..self.subject_len]).expect("validated wire subject")
+    }
+}
+
+/// The fixed header belongs to this exact admitted concrete frame. The full
+/// u16 subject range is preserved; subject and body controls allocate nothing
+/// while selecting a route. The endpoint owns external connection buffers.
+#[allow(dead_code)]
+fn read_bound_header_admitted<'a>(
+    recv: &'a mut RecvStream,
+    installation: contextdb_core::read_memory::ReadMemoryOwner,
+    pre_admission: &'a PreAdmissionGuardrails,
+) -> super::WireResult<super::AdmittedWireFuture<'a, ReadBoundFrameHeader>> {
+    super::admit_wire_future(installation, async move {
+        let mut header = ReadBoundFrameHeader {
+            subject: [0; u16::MAX as usize],
+            subject_len: 0,
+            body_len: 0,
+        };
+        let mut subject_len = [0; 2];
+        read_exact_with_progress(recv, &mut subject_len, pre_admission.request_read_idle).await?;
+        header.subject_len = u16::from_be_bytes(subject_len) as usize;
+        read_exact_with_progress(
+            recv,
+            &mut header.subject[..header.subject_len],
+            pre_admission.request_read_idle,
+        )
+        .await?;
+        std::str::from_utf8(&header.subject[..header.subject_len])
+            .map_err(|error| TransportError::IncompleteReply(error.to_string()))?;
+        let mut body_len = [0; 4];
+        read_exact_with_progress(recv, &mut body_len, pre_admission.request_read_idle).await?;
+        header.body_len = u32::from_be_bytes(body_len);
+        if header.body_len as usize > MAX_FRAME_BYTES {
+            return Err(TransportError::IncompleteReply(format!(
+                "frame of {} bytes exceeds the {MAX_FRAME_BYTES}-byte ceiling",
+                header.body_len
+            ))
+            .into());
+        }
+        Ok(header)
+    })
+}
+
+#[allow(dead_code)]
+struct ReadBoundIrohBody {
+    // Unregister before the source's final cursor alias drops. The callback
+    // owns only the existing admitted cursor and never a source back-reference.
+    _cancel_listener: Option<contextdb_core::read_contract::NativeCancellationListener>,
+    state: contextdb_core::read_memory::ReadShared<Mutex<ReadBoundReceiveCursor>>,
+}
+#[allow(dead_code)]
+struct ReadBoundReceiveCursor {
+    recv: Option<RecvStream>,
+    position: u64,
+    length: u64,
+    owner: contextdb_core::read_memory::ReadMemoryOwner,
+    idle: Duration,
+    cancellation: Option<contextdb_core::read_contract::NativeReadCancellation>,
+}
+impl super::WireBodySource for ReadBoundIrohBody {
+    fn read_at<'a>(&'a self, position: u64, dst: &'a mut [u8]) -> super::WireFuture<'a, usize> {
+        // This preserved erased facade is a legacy boundary. The private
+        // admitted body driver below polls directly, with no read future Box.
+        let idle = self
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .idle;
+        Box::pin(async move {
+            tokio::time::timeout(
+                idle,
+                std::future::poll_fn(move |cx| self.poll_read_at(position, dst, cx)),
+            )
+            .await
+            .map_err(|_| {
+                super::WireError::Transport(TransportError::IncompleteReply(
+                    "request frame made no byte progress before its idle deadline".into(),
+                ))
+            })?
+        })
+    }
+    fn poll_read_at(
+        &self,
+        position: u64,
+        dst: &mut [u8],
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<super::WireResult<usize>> {
+        use std::task::Poll;
+        let mut cursor = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if cursor.cancellation.as_ref().is_some_and(|cancel| cancel.is_cancelled()) {
+            return Poll::Ready(Err(contextdb_core::Error::ReadCancelled.into()));
+        }
+        if position != cursor.position {
+            return Poll::Ready(Err(TransportError::RetryUnsafe(
+                "native incoming body is one-use and monotonic".into(),
+            )
+            .into()));
+        }
+        let limit = (cursor.length - cursor.position).min(dst.len() as u64) as usize;
+        if limit == 0 {
+            return Poll::Ready(Ok(0));
+        }
+        let Some(recv) = cursor.recv.as_mut() else {
+            return Poll::Ready(Err(TransportError::IncompleteReply(
+                "native incoming stream has already finished".into(),
+            )
+            .into()));
+        };
+        let mut buffer = tokio::io::ReadBuf::new(&mut dst[..limit]);
+        match AsyncRead::poll_read(std::pin::Pin::new(recv), cx, &mut buffer) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(error)) => Poll::Ready(Err(TransportError::IncompleteReply(
+                error.to_string(),
+            )
+            .into())),
+            Poll::Ready(Ok(())) => {
+                let count = buffer.filled().len();
+                if count == 0 {
+                    return Poll::Ready(Err(TransportError::IncompleteReply(
+                        "body source did not honor its declared length".into(),
+                    )
+                    .into()));
+                }
+                cursor.position += count as u64;
+                Poll::Ready(Ok(count))
+            }
+        }
+    }
+    fn read_idle(&self) -> Option<Duration> {
+        Some(
+            self.state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .idle,
+        )
+    }
+    fn reopen(&self) -> super::WireResult<super::BoundedWireBody> {
+        Err(TransportError::RetryUnsafe("native incoming body cannot be reopened".into()).into())
+    }
+    fn prepare_materialization(&self) -> super::WireResult<()> {
+        Ok(())
+    }
+}
+
+/// The dispatcher supplies its one acquired child. Body and handler share
+/// that same real block/legacy Arc; this helper never acquires a child.
+#[allow(dead_code)]
+fn receive_read_bound_body(
+    q: &crate::vector_read_memory::RequestReadOwner,
+    recv: RecvStream,
+    length: u32,
+    pre_admission: &PreAdmissionGuardrails,
+) -> super::WireResult<(
+    super::BoundedWireBody,
+    contextdb_core::read_memory::ReadShared<Mutex<ReadBoundReceiveCursor>>,
+)> {
+    use crate::vector_read_memory::RequestReadRoute;
+    use contextdb_core::read_memory::ReadMemoryOwner;
+    let owner = match q.share().into_route() {
+        RequestReadRoute::Legacy(reader) => ReadMemoryOwner::from_legacy(reader),
+        RequestReadRoute::Native(receipt) => receipt.into_owner(),
+    };
+    receive_read_body_owned(owner, None, recv, length, pre_admission)
+}
+
+/// Share the existing cursor/source allocation kernels without changing the
+/// original read-bound entry's parameters. Each cell is admitted on its funder
+/// before allocation; backend stream heaps have separate standing custody.
+fn receive_read_body_owned(
+    owner: contextdb_core::read_memory::ReadMemoryOwner,
+    cancellation: Option<contextdb_core::read_contract::NativeReadCancellation>,
+    recv: RecvStream,
+    length: u32,
+    pre_admission: &PreAdmissionGuardrails,
+) -> super::WireResult<(
+    super::BoundedWireBody,
+    contextdb_core::read_memory::ReadShared<Mutex<ReadBoundReceiveCursor>>,
+)> {
+    use contextdb_core::read_memory::OwnedReadBox;
+    type CursorCell = contextdb_core::read_memory::ReadShared<Mutex<ReadBoundReceiveCursor>>;
+    let state_credit = super::native_wire::wire_credit(
+        owner.clone(), CursorCell::layout().size(), "incoming_stream_control",
+    )?;
+    let token = cancellation.clone();
+    let state = CursorCell::try_from_prepaid(
+        Mutex::new(ReadBoundReceiveCursor {
+            recv: Some(recv),
+            position: 0,
+            length: u64::from(length),
+            owner: owner.clone(),
+            idle: pre_admission.request_read_idle,
+            cancellation,
+        }),
+        state_credit,
+    )?;
+    let cancel_listener = match token {
+        Some(token) => {
+            let cancelled_state = state.clone();
+            Some(token.try_tell_on_cancel(move || {
+                // Move the stream out under the cursor lock, then destroy it
+                // outside that lock. RecvStream::drop stops receiving, but
+                // removes the blocked-reader waker without waking it. Prompt
+                // local wake and backend allocation custody remain gates.
+                let recv = cancelled_state.lock()
+                    .unwrap_or_else(|error| error.into_inner()).recv.take();
+                drop(recv);
+            })?)
+        }
+        None => None,
+    };
+    let credit = super::native_wire::wire_credit(
+        owner.clone(),
+        std::alloc::Layout::new::<ReadBoundIrohBody>().size(),
+        "incoming_stream_source",
+    )?;
+    let source: Box<dyn super::WireBodySource> = Box::new(ReadBoundIrohBody {
+        _cancel_listener: cancel_listener,
+        state: state.clone(),
+    });
+    let body = super::BoundedWireBody::from_captured_owned(
+        OwnedReadBox::new(source, credit),
+        u64::from(length),
+        owner,
+    );
+    Ok((body, state))
+}
+
+/// The original operation supplies both its exact child and token. The
+/// source checks that token on each read poll. Wake-on-cancel, stream stop,
+/// timers and task/registry controls require their separately admitted owners.
+#[allow(dead_code)]
+fn receive_native_read_body(
+    operation: &crate::owner_read::NativeReadRequest,
+    recv: RecvStream,
+    length: u32,
+    pre_admission: &PreAdmissionGuardrails,
+) -> super::WireResult<(
+    super::BoundedWireBody,
+    contextdb_core::read_memory::ReadShared<Mutex<ReadBoundReceiveCursor>>,
+)> {
+    if operation.cancellation().is_cancelled() {
+        return Err(contextdb_core::Error::ReadCancelled.into());
+    }
+    receive_read_body_owned(
+        operation.owner(),
+        Some(operation.cancellation().clone()),
+        recv,
+        length,
+        pre_admission,
+    )
+}
+
+#[allow(dead_code)]
+struct NativeReadBody {
+    body: super::BoundedWireBody,
+    state: contextdb_core::read_memory::ReadShared<Mutex<ReadBoundReceiveCursor>>,
+    operation: crate::owner_read::NativeReadRequest,
+}
+#[allow(dead_code)]
+enum BegunReadBody {
+    Legacy {
+        owner: crate::vector_read_memory::RequestReadOwner,
+        recv: RecvStream,
+    },
+    Native {
+        received: NativeReadBody,
+        cancellation: contextdb_core::read_contract::NativeReadCancellation,
+    },
+}
+
+/// Inactive accepted-header entry. Selection uses the existing borrowed
+/// header; begin mints cancellation before body controls and returns it before
+/// the caller dispatches the handler.
+/// The production serve_sync_connection accept loop remains Legacy.
+#[allow(dead_code)]
+fn begin_receive_read_body<H>(
+    registration: &super::native_wire::NativeReadStreamRegistration<H>,
+    recv: RecvStream,
+    length: u32,
+    pre_admission: &PreAdmissionGuardrails,
+) -> super::WireResult<BegunReadBody>
+where
+    H: Fn(super::ReadBoundIncomingRequest, crate::owner_read::NativeReadRequest)
+            -> super::WireResult<super::DispatchedWireFuture<'static, ()>>
+        + Send + Sync + 'static,
+{
+    match registration.begin_request()? {
+        super::native_wire::NativeReadStreamBegin::Legacy(owner) => {
+            Ok(BegunReadBody::Legacy { owner, recv })
+        }
+        super::native_wire::NativeReadStreamBegin::Native { operation, cancellation } => {
+            let (body, state) = receive_native_read_body(&operation, recv, length, pre_admission)?;
+            Ok(BegunReadBody::Native {
+                received: NativeReadBody { body, state, operation },
+                cancellation,
+            })
+        }
+    }
+}
+
+/// The accept-loop owner must retain the returned state in its prepaid
+/// responder and the real cancellation in its admitted active-route lease.
+/// Registration receives this operation by value, never a new child or token.
+#[allow(dead_code)]
+fn dispatch_native_read_body<H>(
+    registration: &super::native_wire::NativeReadStreamRegistration<H>,
+    received: NativeReadBody,
+    make_responder: impl FnOnce(
+        &crate::owner_read::NativeReadRequest,
+        contextdb_core::read_memory::ReadShared<Mutex<ReadBoundReceiveCursor>>,
+    ) -> super::WireResult<super::native_wire::NativeStreamResponder>,
+    node_id: Option<String>,
+) -> super::WireResult<super::DispatchedWireFuture<'static, ()>>
+where
+    H: Fn(super::ReadBoundIncomingRequest, crate::owner_read::NativeReadRequest)
+            -> super::WireResult<super::DispatchedWireFuture<'static, ()>>
+        + Send + Sync + 'static,
+{
+    let responder = make_responder(&received.operation, received.state)?;
+    registration.dispatch(
+        super::ReadBoundIncomingRequest {
+            body: received.body,
+            responder: super::ReadBoundResponder::Native(responder),
+            node_id,
+        },
+        received.operation,
+    )
+}
+
+/// Returning the actual receive stream moves it out exactly once, only after
+/// its declared body is consumed. The same owner admits the concrete receipt
+/// driver; its external credit outlives the frame's physical allocation.
+#[allow(dead_code)]
+fn finish_read_bound_reply(
+    mut send: SendStream,
+    state: contextdb_core::read_memory::ReadShared<Mutex<ReadBoundReceiveCursor>>,
+    status: u8,
+    payload: super::AdmittedWireVec,
+) -> super::WireResult<super::AdmittedWireFuture<'static, ()>> {
+    let owner = state
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .owner
+        .clone();
+    if !owner.same_owner(&payload.reader) {
+        return Err(
+            TransportError::Other("native reply payload belongs to another reader".into()).into(),
+        );
+    }
+    super::admit_wire_future(owner, async move {
+        let mut recv = {
+            let mut cursor = state.lock().unwrap_or_else(|error| error.into_inner());
+            if cursor.position != cursor.length {
+                return Err(TransportError::IncompleteReply(
+                    "native request body was not fully consumed before replying".into(),
+                )
+                .into());
+            }
+            cursor
+                .recv
+                .take()
+                .ok_or_else(|| TransportError::Other("reply already sent on this stream".into()))?
+        };
+        // Existing byte framing, ACK validation, receipt timeout and trailing
+        // byte refusal are authoritative. This is a concrete, unboxed future.
+        write_reply(&mut send, &mut recv, status, &payload.bytes)
+            .await
+            .map_err(super::WireError::Transport)
+    })
 }
 
 #[cfg(test)]

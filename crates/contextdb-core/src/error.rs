@@ -137,6 +137,11 @@ pub enum VectorPolicyDeclarationIssue {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// Native cancellation identities are never reused. This is a local,
+    /// typed construction refusal rather than a channel or wire condition.
+    #[doc(hidden)]
+    #[error("native cancellation identity space exhausted")]
+    NativeCancellationIdentityExhausted,
     #[error("bounded read session is not implemented")]
     ReadSessionNotImplemented,
     #[error("owner reads did not drain before shutdown deadline")]

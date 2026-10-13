@@ -7268,10 +7268,11 @@ fn exec_insert(
             match existing {
                 None => {
                     let intent_insert_values = upsert_values.clone();
-                    match db.insert_row_prepaid(
+                    match db.insert_row_prepaid_owned(
                         txid,
                         &p.table,
                         upsert_values,
+                        row_admission.take().expect("row payload admission"),
                         vector_copy_owner,
                         read_memory.clone(),
                     ) {
@@ -7344,12 +7345,13 @@ fn exec_insert(
                             .and_then(|sm| upsert_values.get(&sm.column))
                             .and_then(Value::as_text)
                             .map(std::borrow::ToOwned::to_owned);
-                        let row_id = match db.insert_row_replacing(
+                        let row_id = match db.insert_row_replacing_owned(
                             txid,
                             &p.table,
                             upsert_values,
                             existing_row.row_id,
                             true,
+                            row_admission.take().expect("row payload admission"),
                             vector_copy_owner,
                             read_memory.clone(),
                         ) {
@@ -7359,12 +7361,6 @@ fn exec_insert(
                                 return Err(err);
                             }
                         };
-                        db.record_owned_row_admission(
-                            txid,
-                            &p.table,
-                            row_id,
-                            row_admission.take().expect("row payload admission"),
-                        );
                         if let (Some(uuid), Some(state)) = (row_uuid, new_state.as_deref())
                             && let Err(err) = db.propagate_state_change_if_needed(
                                 txid,
@@ -7383,15 +7379,17 @@ fn exec_insert(
                 }
             }
         } else {
-            match db.insert_row_with_unique_noop(
+            match db.insert_row_with_unique_noop_owned(
                 txid,
                 &p.table,
                 values,
+                &mut row_admission,
                 vector_copy_owner,
                 read_memory.clone(),
             ) {
                 Ok(InsertRowResult::Inserted(row_id)) => row_id,
                 Ok(InsertRowResult::NoOp) => {
+                    checkpoint.settle();
                     continue;
                 }
                 Err(err) => {
@@ -7430,6 +7428,7 @@ fn exec_insert(
             }
         }
 
+        checkpoint.settle();
         rows_affected += 1;
     }
 
@@ -8069,7 +8068,7 @@ fn exec_update(
                         .committed_row_at(&p.table, row.row_id, snapshot, read_memory.clone())?
                         .is_some();
                 let (new_row_id, before_counts, after_counts) = match db
-                    .replace_row_after_update_validation_counted(
+                    .replace_row_after_update_validation_counted_owned(
                         txid,
                         &p.table,
                         row.row_id,
@@ -8079,13 +8078,13 @@ fn exec_update(
                             committed_row_exists,
                             created_at: db.trigger_callback_wallclock(),
                         },
+                        row_admission,
                     ) {
                     Ok(outcome) => outcome,
                     Err(err) => {
                         return Err(err);
                     }
                 };
-                db.record_owned_row_admission(txid, &p.table, new_row_id, row_admission);
                 if let Some(predicates) = conditional_predicates.clone() {
                     db.record_conditional_update_guard(
                         txid,
@@ -8107,12 +8106,13 @@ fn exec_update(
                 }
             };
             let before_counts = db.write_set_counts(txid)?;
-            let new_row_id = match db.replace_row_after_update_validation(
+            let new_row_id = match db.replace_row_after_update_validation_owned(
                 txid,
                 &p.table,
                 row.row_id,
                 values,
                 snapshot,
+                row_admission,
                 read_memory.clone(),
             ) {
                 Ok(row_id) => row_id,
@@ -8121,7 +8121,6 @@ fn exec_update(
                     return Err(err);
                 }
             };
-            db.record_owned_row_admission(txid, &p.table, new_row_id, row_admission);
             if let Err(err) = db.propagate_state_change_if_needed(
                 txid,
                 &p.table,
@@ -8145,6 +8144,7 @@ fn exec_update(
                     false,
                 )?;
             }
+            checkpoint.settle();
             affected = affected.saturating_add(1);
         }
         return Ok(OwnedQueryResult::empty_with_affected(affected));
@@ -8264,12 +8264,13 @@ fn exec_update(
             && assigned_vector_columns.is_empty()
             && vector_indexes.is_empty();
         let new_row_id = if vector_free_trigger_update {
-            match db.replace_row_after_update_validation(
+            match db.replace_row_after_update_validation_owned(
                 txid,
                 &p.table,
                 row.row_id,
                 values,
                 snapshot,
+                row_admission,
                 read_memory.clone(),
             ) {
                 Ok(row_id) => row_id,
@@ -8291,12 +8292,13 @@ fn exec_update(
                     return Err(err);
                 }
             }
-            let new_row_id = match db.replace_row_after_update_validation(
+            let new_row_id = match db.replace_row_after_update_validation_owned(
                 txid,
                 &p.table,
                 row.row_id,
                 values,
                 snapshot,
+                row_admission,
                 read_memory.clone(),
             ) {
                 Ok(row_id) => row_id,
@@ -8323,7 +8325,6 @@ fn exec_update(
             }
             new_row_id
         };
-        db.record_owned_row_admission(txid, &p.table, new_row_id, row_admission);
         for (column, vector) in assigned_vector_values {
             let index = contextdb_core::VectorIndexRef::new(&p.table, column);
             if let Err(err) = db.insert_vector_strict(
@@ -8361,6 +8362,7 @@ fn exec_update(
                 false,
             )?;
         }
+        checkpoint.settle();
     }
 
     Ok(OwnedQueryResult::empty_with_affected(matched.len() as u64))
@@ -22012,3 +22014,15 @@ mod composite_resume_range_tests {
 #[path = "executor/writecost_missing_index_tests.rs"]
 mod writecost_missing_index_tests;
 
+
+/// Private storage-operation companion only. No SQL planning/default target
+/// methods switch to Native, and no unsupported method delegates to Legacy.
+#[cfg(feature = "sync-orchestration")]
+pub(crate) fn native_point_row(
+    database: &Database,
+    key: &(contextdb_core::TableName, RowId),
+    snapshot: SnapshotId,
+    entry: &bounded::NativeReadExecutionEntry,
+) -> std::result::Result<Option<crate::transport::AdmittedWireVec>, BoundedExecutionError> {
+    bounded::execute_native_point_read(database, key, snapshot, entry)
+}
