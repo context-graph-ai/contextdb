@@ -315,7 +315,7 @@ fn arm(dir: &Path, n: usize) -> Arm {
     let start = edge.__custody_writer_work_for_test();
     let mut checkpoints = Vec::with_capacity(4);
     checkpoints.push(checkpoint(&edge, 0, start));
-    let mut commits = 0;
+    let mut commits: usize = 0;
     for unit in n..n + K {
         commit_unit(&edge, unit);
         commits += 1;
