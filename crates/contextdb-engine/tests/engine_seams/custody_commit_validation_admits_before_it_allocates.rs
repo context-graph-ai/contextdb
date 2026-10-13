@@ -47,8 +47,9 @@ async fn custody_commit_validation_admits_before_it_allocates() {
     commit_unit(&edge, 0);
     let (roots_before, rows_before) = (roots(&edge), rows(&edge));
 
-    // A zero budget refuses at the first admission: nothing was decoded.
-    Database::__limit_custody_validation_for_test(Some(0));
+    // A one-byte budget (zero means unlimited) refuses at the first
+    // admission: nothing was decoded.
+    Database::__limit_custody_validation_for_test(Some(1));
     let decoded_before = edge.__custody_writer_work_for_test().1;
     let refused = try_unit(&edge, 1);
     assert!(
