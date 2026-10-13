@@ -72,6 +72,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache: false
+          rustflags: ""
       - uses: Swatinem/rust-cache@v2
         with:
           key: rc2-${{ matrix.shard }}
