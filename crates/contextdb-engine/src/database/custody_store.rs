@@ -467,28 +467,6 @@ impl Database {
         drop(memory);
         (answer, examined, accountant.usage().used)
     }
-    /// Measurement only: the custody CONFIG writes and deletes staged in `tx`.
-    #[cfg(feature = "test-seams")]
-    #[doc(hidden)]
-    pub fn __staged_custody_writes_for_test(
-        &self,
-        tx: contextdb_core::TxId,
-    ) -> Result<(Vec<(String, Vec<u8>)>, Vec<String>)> {
-        self.tx_mgr.with_write_set(tx, |ws| {
-            (
-                ws.config_writes
-                    .iter()
-                    .filter(|(key, _)| owned_key(key))
-                    .cloned()
-                    .collect(),
-                ws.config_deletes
-                    .iter()
-                    .filter(|key| owned_key(key))
-                    .cloned()
-                    .collect(),
-            )
-        })
-    }
     /// Measurement only: run commit-time custody validation of `writes` and
     /// `deletes` against the latest root under a standalone memory of `limit`
     /// bytes, without committing. Answers the outcome and the bytes still

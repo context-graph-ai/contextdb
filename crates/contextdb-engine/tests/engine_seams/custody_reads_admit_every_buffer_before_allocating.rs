@@ -24,10 +24,22 @@ const SLACK: isize = 16 * 1024;
 static BASE: AtomicUsize = AtomicUsize::new(0);
 static EXCESS: AtomicIsize = AtomicIsize::new(isize::MIN);
 static PROBES: AtomicUsize = AtomicUsize::new(0);
+/// Measure from the first admission point instead of from `BASE`.
+static FROM_FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static FIRST: AtomicIsize = AtomicIsize::new(0);
 
 fn probe(held: usize) {
-    let live = live_allocations_for_test() as isize - BASE.load(Ordering::SeqCst) as isize;
-    EXCESS.fetch_max(live - held as isize, Ordering::SeqCst);
+    let live = live_allocations_for_test() as isize;
+    let unadmitted = live - held as isize;
+    if FROM_FIRST.load(Ordering::SeqCst) && PROBES.load(Ordering::SeqCst) == 0 {
+        FIRST.store(unadmitted, Ordering::SeqCst);
+    }
+    let start = if FROM_FIRST.load(Ordering::SeqCst) {
+        FIRST.load(Ordering::SeqCst)
+    } else {
+        BASE.load(Ordering::SeqCst) as isize
+    };
+    EXCESS.fetch_max(unadmitted - start, Ordering::SeqCst);
     PROBES.fetch_add(1, Ordering::SeqCst);
 }
 /// Observe one operation: `(its answer, the largest unadmitted excess seen at
@@ -164,13 +176,11 @@ async fn pending_growth() {
     println!("S3_ADMIT pending refusals_during_visit={refusals_during_visit} excess={largest}");
 }
 
-/// Commit validation admits its companion planning before allocating it.
-async fn companion_planning() {
+/// Stage one wide unit: a root, `MEMBERS` member rows and its registration.
+fn stage_wide_unit(edge: &Database, unit: usize) -> contextdb_core::TxId {
     const MEMBERS: usize = 400;
-    let dir = tempfile::tempdir().unwrap();
-    let (edge, _hub) = edge_with_units(dir.path(), 1).await;
     let tx = edge.begin().unwrap();
-    let root = root_id(1);
+    let root = root_id(unit);
     edge.insert_row(
         tx,
         "records",
@@ -182,7 +192,7 @@ async fn companion_planning() {
     .unwrap();
     let mut members = Vec::new();
     for member in 0..MEMBERS {
-        let id = member_id(1_000 + member);
+        let id = member_id(unit * 1_000 + member);
         edge.insert_row(
             tx,
             "parts",
@@ -204,13 +214,26 @@ async fn companion_planning() {
         },
     )
     .unwrap();
-    let (writes, deletes) = edge.__staged_custody_writes_for_test(tx).unwrap();
-    // Find the limit that admits the whole validation, warming the pages.
+    tx
+}
+
+/// Commit validation admits its companion planning before allocating it:
+/// commits of wide units under a sweep of validation limits, measured from
+/// validation's first admission point.
+async fn companion_planning() {
+    let dir = tempfile::tempdir().unwrap();
+    let (edge, _hub) = edge_with_units(dir.path(), 1).await;
+    let mut unit = 1usize;
+    // Find the limit that admits a whole validation (also warming pages).
     let mut enough = 64 * 1024;
     loop {
-        let (validated, held) = edge.__validate_custody_writes_for_test(&writes, &deletes, enough);
-        assert_eq!(held, 0);
-        match validated {
+        let tx = stage_wide_unit(&edge, unit);
+        unit += 1;
+        Database::__limit_custody_validation_for_test(Some(enough));
+        let committed = edge.commit(tx);
+        Database::__limit_custody_validation_for_test(None);
+        assert_eq!(Database::__last_custody_validation_for_test().0, Some(0));
+        match committed {
             Ok(()) => break,
             Err(error) => {
                 assert!(budget(&error), "{error:?}");
@@ -219,17 +242,22 @@ async fn companion_planning() {
             }
         }
     }
+    FROM_FIRST.store(true, Ordering::SeqCst);
     let mut refusals = 0;
     let mut largest = isize::MIN;
     for step in 1..=96usize {
         let limit = enough * step / 97;
-        let ((validated, held), excess, _) =
-            observed(|| edge.__validate_custody_writes_for_test(&writes, &deletes, limit));
+        let tx = stage_wide_unit(&edge, unit);
+        unit += 1;
+        Database::__limit_custody_validation_for_test(Some(limit));
+        let (committed, excess, _) = observed(|| edge.commit(tx));
+        Database::__limit_custody_validation_for_test(None);
         assert_eq!(
-            held, 0,
+            Database::__last_custody_validation_for_test().0,
+            Some(0),
             "limit {limit}: validation holds nothing afterwards"
         );
-        if let Err(error) = validated {
+        if let Err(error) = committed {
             assert!(budget(&error), "{error:?}");
             refusals += 1;
             largest = largest.max(excess);
@@ -239,8 +267,8 @@ async fn companion_planning() {
             );
         }
     }
-    assert!(refusals > 0);
-    edge.rollback(tx).unwrap();
+    FROM_FIRST.store(false, Ordering::SeqCst);
+    assert!(refusals > 0, "some limit refuses during validation");
     println!("S3_ADMIT planning enough={enough} refusals={refusals} excess={largest}");
 }
 

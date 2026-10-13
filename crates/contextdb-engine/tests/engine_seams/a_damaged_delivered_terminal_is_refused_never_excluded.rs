@@ -3,8 +3,8 @@
 //! terminal altered after commit, or one whose diagnostic or object admission
 //! is gone, never silently excludes its root: the pending read and the next
 //! push refuse as corruption, after a reopen, after the custody index is
-//! rebuilt, and when a destination change brings that terminal's destination
-//! back.
+//! rebuilt; a destination change recomputes every root against the new
+//! destination.
 use crate::custody_fixture::*;
 use contextdb_core::Error;
 use contextdb_engine::Database;
@@ -116,33 +116,33 @@ async fn a_damaged_delivered_terminal_is_refused_never_excluded() {
         reopened_and_rebuilt(edge, client, &broker, dir.path(), case).await;
     }
 
-    // A terminal damaged while its destination is not current is found when a
-    // destination change brings that destination back.
+    // A destination change recomputes every root against the new destination:
+    // the damaged terminal names a former destination, so its root is simply
+    // pending there, and delivery to the new destination clears it. (A store
+    // cannot rebind to a former hub, so that terminal never counts again.)
     let dir = tempfile::tempdir().unwrap();
     let (edge, client) = bound_edge(&broker, dir.path(), None).await;
     for unit in 0..4 {
         commit_unit(&edge, unit);
     }
     client.push().await.unwrap();
+    flip_terminal_signature(&edge);
+    assert_refused(&edge, &client, "damaged at the current destination").await;
     let second = start_hub(&broker, Arc::new(Database::open_memory())).await;
     client.change_destination(&second.node).unwrap();
     client
         .bind_application_table_policy(expectation())
         .await
         .unwrap();
-    flip_terminal_signature(&edge);
     let (moved, _) = edge.__custody_pending_for_test().unwrap();
     assert_eq!(
         moved.len(),
         4,
-        "at the second destination every root is pending, the damaged one included"
+        "at the new destination every root is pending, the damaged one included"
     );
-    client.change_destination(&first.node).unwrap();
-    client
-        .bind_application_table_policy(expectation())
-        .await
-        .unwrap();
-    assert_refused(&edge, &client, "destination returned").await;
+    client.push().await.unwrap();
+    let (delivered, _) = edge.__custody_pending_for_test().unwrap();
+    assert!(delivered.is_empty(), "{delivered:?}");
     drop(client);
     second.stop().await;
     first.stop().await;
