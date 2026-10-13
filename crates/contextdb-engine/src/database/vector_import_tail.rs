@@ -24,16 +24,27 @@ impl Database {
 }
 
 impl MaintenanceContext {
-    /// The uncovered suffix is writer maintenance: its decoded bodies were
-    /// already admitted against this writer's workspace, so decoding them is
-    /// funded by the same writer budget. Without an active owner, persistence
-    /// would open a private reader at the shipped default reader memory and
-    /// refuse any suffix whose vectors exceed it, however much the consumer
-    /// declared for its own reads or writes.
-    fn writer_suffix_decode(&self) -> Result<crate::read_image_memory::ImageMemoryScope> {
+    /// Import-tail work is writer maintenance, so every stored value it
+    /// decodes -- partition metadata, catalogs, counts, the uncovered suffix
+    /// and the publication that follows -- is funded by this writer's
+    /// declared memory limit. Without an active owner, persistence opens a
+    /// private reader at the shipped default reader memory and refuses any
+    /// suffix whose vectors exceed it, whatever the consumer declared.
+    fn writer_maintenance_decode(&self) -> Result<crate::read_image_memory::ImageMemoryScope> {
         crate::read_image_memory::ImageMemory::enter_writer_operation(
             crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
         )
+    }
+
+    /// The suffix's decoded bodies are already admitted against this
+    /// writer's workspace. Their decoder charge gets its own writer owner so
+    /// it is returned as soon as the load returns, not when the partition's
+    /// publication finishes.
+    fn writer_suffix_decode(&self) -> Result<crate::read_image_memory::ImageMemoryScope> {
+        Ok(crate::read_image_memory::ImageMemory::operation_writer(
+            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
+        )?
+        .enter())
     }
 
     fn persist_import_vector_tails(
@@ -49,6 +60,7 @@ impl MaintenanceContext {
         let routes = vector_partition_routes(&self.vector, &mut copy_owner)?;
         let mut complete = true;
         for partition in routes {
+            let _decode = self.writer_maintenance_decode()?;
             let Some(info) = self.vector.try_partition_info(
                 &partition.index,
                 &partition.partition_key,
@@ -333,6 +345,7 @@ impl MaintenanceContext {
         progress: &PagedVectorProgress,
         copy_owner: &mut contextdb_vector::VectorCopyAdmission,
     ) -> Result<bool> {
+        let _decode = self.writer_maintenance_decode()?;
         use crate::persistence::vector_paged::import_tail::NativeImportCandidate;
         let Some(through_lsn) =
             persistence.native_candidate_first_uncovered_lsn(partition, progress.frontier_lsn)?
