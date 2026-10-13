@@ -426,7 +426,7 @@ fn verdict(result: crate::custody::native_selection::Selected<()>) -> Result<boo
         Err(Failure::Invalid(_)) => Ok(false),
         Err(Failure::Refused(refusal)) => Err(Error::Other(refusal.to_string())),
         Err(Failure::Unqualified(error)) => Err(error),
-        Err(Failure::ColdUnqualified(error)) => Err(Error::Other(error.to_string())),
+        Err(Failure::ColdUnqualified(error)) => Err(Error::Other(format!("{error:?}"))),
         Err(Failure::OwnerMismatch) => Err(Error::Other(
             "custody pending verification owner mismatch".into(),
         )),
