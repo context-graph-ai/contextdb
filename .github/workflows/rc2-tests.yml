@@ -68,6 +68,11 @@ jobs:
           sudo rm -rf /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/go /opt/az /opt/ghc \
             /usr/local/lib/android /usr/share/dotnet /usr/local/share/boost
           df -h /
+          # The CLI's staged classification proof needs `rg` (and `jq`, preinstalled).
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ripgrep
+          rg --version
+          jq --version
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
