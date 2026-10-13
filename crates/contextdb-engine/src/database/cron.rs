@@ -2175,8 +2175,7 @@ mod tests {
     /// plain `cargo test` the cron worker handle used to segfault this way.
     /// This check reads the sources so the mismatch fails here, by name,
     /// instead of crashing whichever test first drops the handle.
-    #[test]
-    fn every_hand_built_database_writes_each_field_under_its_declared_gate() {
+    fn assert_every_hand_built_database_writes_each_field_under_its_declared_gate() {
         fn gate_before(lines: &[&str], index: usize) -> Option<String> {
             index
                 .checked_sub(1)
@@ -2292,6 +2291,9 @@ mod tests {
 
     #[test]
     fn paused_manual_cron_guard_drop_does_not_restart_tickler() -> Result<()> {
+        // This test's background handle is one of the hand-built initializers;
+        // a skipped field there is undefined behaviour, so check them first.
+        assert_every_hand_built_database_writes_each_field_under_its_declared_gate();
         let db = Database::open_memory();
         let first_pause = db.pause_cron_tickler_for_test();
         let second_pause = db.pause_cron_tickler_for_test();
