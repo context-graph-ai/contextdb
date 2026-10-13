@@ -184,6 +184,17 @@ pub(crate) mod work {
     pub(crate) fn thread_decoded() -> u64 {
         THREAD_DECODED.with(std::cell::Cell::get)
     }
+    thread_local! {
+        static THREAD_VALIDATION_DECODED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+    /// A decode performed by commit-time delta validation on this thread.
+    pub(crate) fn validation_decoded(n: u64) {
+        decoded(n);
+        THREAD_VALIDATION_DECODED.with(|count| count.set(count.get() + n));
+    }
+    pub(crate) fn thread_validation_decoded() -> u64 {
+        THREAD_VALIDATION_DECODED.with(std::cell::Cell::get)
+    }
     pub(crate) fn read() -> (u64, u64) {
         (
             HYDRATED.load(Ordering::Relaxed),
@@ -199,6 +210,8 @@ pub(crate) mod work {
     pub(crate) fn decoded(_: u64) {}
     #[inline(always)]
     pub(crate) fn pending_examined(_: u64) {}
+    #[inline(always)]
+    pub(crate) fn validation_decoded(_: u64) {}
 }
 
 /// Where a durable store reads: the database's own captured roots, or one root
@@ -1452,7 +1465,7 @@ mod durable {
                     .and_then(|n| n.checked_add(2 * ALLOCATION_BYTES))
                     .ok_or_else(invalid)?,
             )?;
-            work::decoded(1);
+            work::validation_decoded(1);
             let record = decode(bytes)?;
             if record.key()? != *key {
                 return Err(invalid());
@@ -1483,7 +1496,7 @@ mod durable {
                                 .and_then(|n| n.checked_add(2 * ALLOCATION_BYTES))
                                 .ok_or_else(invalid)?,
                         )?;
-                        work::decoded(1);
+                        work::validation_decoded(1);
                         let record = decode(bytes)?;
                         if record.key()? != key {
                             return Err(invalid());

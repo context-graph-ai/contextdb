@@ -317,6 +317,13 @@ impl Database {
     pub fn __custody_thread_decodes_for_test() -> u64 {
         crate::custody::store::work::thread_decoded()
     }
+    /// Measurement only: decodes commit-time delta validation performed on
+    /// the calling thread.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __custody_thread_validation_decodes_for_test() -> u64 {
+        crate::custody::store::work::thread_validation_decoded()
+    }
     /// Measurement only: drop the custody group index completion marker.
     /// Takes effect for roots captured after the next open.
     #[cfg(feature = "test-seams")]
