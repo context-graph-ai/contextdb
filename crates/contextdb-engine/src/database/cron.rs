@@ -982,7 +982,7 @@ impl Database {
                     #[cfg(all(test, feature = "test-seams"))]
                     super::r1_database_field_for_test(6);
                 }
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 {
                     std::ptr::addr_of_mut!((*construction.source).forced_change_log_gap_through)
                         .write(self.forced_change_log_gap_through.clone());
@@ -1419,21 +1419,21 @@ impl Database {
                     #[cfg(all(test, feature = "test-seams"))]
                     super::r1_database_field_for_test(56);
                 }
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 {
                     std::ptr::addr_of_mut!((*construction.source).route_observer).write(None);
                     construction.initialized[57] = true;
                     #[cfg(all(test, feature = "test-seams"))]
                     super::r1_database_field_for_test(57);
                 }
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 {
                     std::ptr::addr_of_mut!((*construction.source).kernel_observer).write(None);
                     construction.initialized[58] = true;
                     #[cfg(all(test, feature = "test-seams"))]
                     super::r1_database_field_for_test(58);
                 }
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 {
                     std::ptr::addr_of_mut!(
                         (*construction.source).snapshot_free_retirement_pass_count
@@ -1826,7 +1826,7 @@ impl Database {
                     #[cfg(all(test, feature = "test-seams"))]
                     super::r1_database_field_for_test(110);
                 }
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 {
                     std::ptr::addr_of_mut!((*construction.source).close_follower_observer)
                         .write(Mutex::new(None));
@@ -1980,7 +1980,7 @@ impl Database {
                     #[cfg(all(test, feature = "test-seams"))]
                     super::r1_database_field_for_test(129);
                 }
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 {
                     std::ptr::addr_of_mut!((*construction.source).commit_stage_wall_nanos)
                         .write(std::array::from_fn(|_| AtomicU64::new(0)));
