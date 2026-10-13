@@ -45,6 +45,9 @@ pub(crate) enum PageMemory {
 pub(crate) struct CachedPage {
     bytes: Arc<[u8]>,
     counted: Arc<AtomicUsize>,
+    // Read only through memoized_byte_node_checksum (contextdb-internal and tests); kept in
+    // every build so the page layout and its admitted memory charge do not vary by feature.
+    #[allow(dead_code)]
     byte_node_checksum: Mutex<Option<u128>>,
 }
 
@@ -73,6 +76,9 @@ impl Drop for CachedPage {
 pub(crate) struct ChargedPage {
     bytes: Arc<[u8]>,
     _charge: crate::read_admission::ReadPageCharge,
+    // Read only through memoized_byte_node_checksum (contextdb-internal and tests); kept in
+    // every build so the page layout and its admitted memory charge do not vary by feature.
+    #[allow(dead_code)]
     byte_node_checksum: Mutex<Option<u128>>,
 }
 
@@ -109,7 +115,7 @@ thread_local! {
 }
 
 impl PageMemory {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "contextdb-internal"))]
     pub(crate) fn admitted_bytes_for_test(len: usize) -> usize {
         admitted_page_bytes(len)
     }
@@ -122,6 +128,7 @@ impl PageMemory {
     /// Cache only the computation for variable-width byte nodes. The caller
     /// must validate their layout first and compare its expected checksum on
     /// every visit. This slot grants no authentication or root authority.
+    #[cfg(any(test, feature = "contextdb-internal"))]
     pub(crate) fn memoized_byte_node_checksum(
         &self,
         compute: impl FnOnce() -> Result<u128>,
@@ -160,11 +167,7 @@ impl PageMemory {
         #[cfg(test)]
         BYTE_CHECKSUM_COUNTS.with(|counts| {
             let mut value = counts.get();
-            value[if matches!(self, Self::Cached(_)) {
-                0
-            } else {
-                1
-            }] += 1;
+            value[usize::from(!matches!(self, Self::Cached(_)))] += 1;
             counts.set(value);
         });
         let checksum = compute()?;
@@ -441,7 +444,8 @@ impl PagedCachedFile {
         page_size: u64,
         max_cache_size: usize,
     ) -> Result<Self, DatabaseError> {
-        let read_cache = Self::new_read_index(max_cache_size, page_size as usize, 0);
+        let read_cache =
+            Self::new_read_index(max_cache_size, usize::try_from(page_size).unwrap(), 0);
 
         Ok(Self {
             file: CheckedBackend::new(file),
@@ -481,7 +485,7 @@ impl PagedCachedFile {
         let entries = Self::read_index_entries(bytes, page_size, held_entries);
         let arena = EntryArena::new(entries);
         let heads = entries
-            .div_ceil(Self::lock_stripes() as usize)
+            .div_ceil(usize::try_from(Self::lock_stripes()).unwrap())
             .next_power_of_two();
         (0..Self::lock_stripes())
             .map(|_| RwLock::new(LRUCache::new(arena.clone(), heads)))
@@ -661,7 +665,7 @@ impl PagedCachedFile {
                 // A race could replace an existing buffer; dropping it gives
                 // back its count once no reader holds it.
                 debug_assert!(
-                    buffer.len() >= self.page_size as usize
+                    buffer.len() >= usize::try_from(self.page_size).unwrap()
                         || (*offset == 0 && buffer.len() == DB_HEADER_SIZE)
                 );
                 drop(lock.try_insert(
@@ -803,7 +807,8 @@ impl PagedCachedFile {
             let write_bytes = self.write_buffer_bytes.load(Ordering::Acquire);
             if previous + page_bytes + write_bytes <= self.max_cache_size.load(Ordering::Acquire) {
                 debug_assert!(
-                    len >= self.page_size as usize || (offset == 0 && len == DB_HEADER_SIZE)
+                    len >= usize::try_from(self.page_size).unwrap()
+                        || (offset == 0 && len == DB_HEADER_SIZE)
                 );
                 let page = CachedPage::admitted(buffer.clone(), &self.read_cache_bytes);
                 let mut write_lock = self.read_cache[cache_slot].write().unwrap();
@@ -850,7 +855,10 @@ impl PagedCachedFile {
             .fetch_add(page_bytes, Ordering::AcqRel);
         let write_bytes = self.write_buffer_bytes.load(Ordering::Acquire);
         if previous + page_bytes + write_bytes <= self.max_cache_size.load(Ordering::Acquire) {
-            debug_assert!(len >= self.page_size as usize || (offset == 0 && len == DB_HEADER_SIZE));
+            debug_assert!(
+                len >= usize::try_from(self.page_size).unwrap()
+                    || (offset == 0 && len == DB_HEADER_SIZE)
+            );
             let page = CachedPage::admitted(buffer.clone(), &self.read_cache_bytes);
             let mut write_lock = self.read_cache[cache_slot].write().unwrap();
             // A race could replace an existing buffer; dropping it gives back
@@ -1043,6 +1051,78 @@ impl PagedCachedFile {
             offset,
             data,
         })
+    }
+}
+
+#[cfg(test)]
+impl PagedCachedFile {
+    pub(crate) fn write_map_for_test(&self) -> (usize, usize) {
+        let write = self.write_buffer.lock().unwrap();
+        (write.cache.len(), write.cache.map_capacity_for_test())
+    }
+}
+
+#[cfg(feature = "contextdb-internal")]
+impl PagedCachedFile {
+    /// A paid native page copies an original clean warm-cache hit; it never
+    /// borrows or adopts a legacy cell and never probes the write buffer.
+    pub(super) fn read_native_clean_miss(
+        &self,
+        offset: u64,
+        len: usize,
+    ) -> std::result::Result<PageMemory, crate::NativeColdReadError> {
+        use crate::native_storage_admission::{
+            NativeColdFault, NativeColdReadError, NativePagePayload, NativeStorageBuffer,
+            NativeStorageShared,
+        };
+        if !crate::native_storage_admission::native_storage_active() {
+            return Err(NativeColdReadError::AdmissionRefused);
+        }
+        if self.file.io_failed.load(Ordering::Acquire) {
+            return Err(NativeColdReadError::Corrupt(NativeColdFault::new(
+                "native read requires an available backend",
+            )));
+        }
+        // Admit both owners on the original scope before taking a cache lock.
+        let bytes = NativeStorageBuffer::zeroed(len)?;
+        let mut page = NativeStorageShared::new(NativePagePayload {
+            bytes,
+            checksum: Mutex::new(None),
+        })?;
+        let stripe = (offset % Self::lock_stripes()) as usize;
+        {
+            let cache = self.read_cache[stripe].read().unwrap();
+            if let Some(cell) = cache.get(offset) {
+                if cell.bytes.len() != len {
+                    let mut fault = NativeColdFault::new(
+                        "native cache page length does not match the requested extent",
+                    );
+                    fault.expected = len as u128;
+                    fault.actual = cell.bytes.len() as u128;
+                    return Err(NativeColdReadError::Corrupt(fault));
+                }
+                page.get_mut()
+                    .expect("unpublished native page is unique")
+                    .bytes
+                    .as_mut_slice()
+                    .copy_from_slice(&cell.bytes);
+                return Ok(PageMemory::Native(page));
+            }
+        }
+        // Every page allocation and its receipt is admitted before backend I/O.
+        let result = self.file.file.read(
+            offset,
+            page.get_mut()
+                .expect("unpublished native page is unique")
+                .bytes
+                .as_mut_slice(),
+        );
+        if let Err(error) = result {
+            self.file.io_failed.store(true, Ordering::Release);
+            return Err(NativeColdReadError::Io(error));
+        }
+        crate::read_admission::record_backend_read(len);
+        Ok(PageMemory::Native(page))
     }
 }
 
@@ -1412,8 +1492,8 @@ mod test {
             file.max_cache_size.load(Ordering::Acquire),
             UNIFORM_CACHE_CAP
         );
-        assert!(UNIFORM_CACHE_SLOTS * 4208 <= UNIFORM_CACHE_CAP);
-        assert!((UNIFORM_CACHE_SLOTS + 1) * 4208 > UNIFORM_CACHE_CAP);
+        const { assert!(UNIFORM_CACHE_SLOTS * 4208 <= UNIFORM_CACHE_CAP) };
+        const { assert!((UNIFORM_CACHE_SLOTS + 1) * 4208 > UNIFORM_CACHE_CAP) };
     }
 
     #[test]
@@ -1580,7 +1660,7 @@ mod test {
                     let stripe = if skewed {
                         0
                     } else {
-                        ordinal as usize % stripes.len()
+                        usize::try_from(ordinal).unwrap() % stripes.len()
                     };
                     assert!(matches!(
                         stripes[stripe]
@@ -1648,12 +1728,12 @@ mod test {
         assert_eq!(cap / super::cached_page_bytes(4096), 996);
         let pages = 3 * 996;
         let backend = SparseZeroFixture(std::sync::atomic::AtomicU64::new(
-            (pages * 131 * 4096) as u64,
+            u64::try_from(pages * 131 * 4096).unwrap(),
         ));
         let file = PagedCachedFile::new(Box::new(backend), 4096, cap).unwrap();
         let index_bytes = file.index_bytes();
         for ordinal in 0..pages {
-            let offset = (ordinal * 131 * 4096) as u64;
+            let offset = u64::try_from(ordinal * 131 * 4096).unwrap();
             assert_eq!(offset % PagedCachedFile::lock_stripes(), 0);
             let page = file.read(offset, 4096, PageHint::Clean).unwrap();
             assert!(matches!(page, super::PageMemory::Cached(_)));
@@ -1935,77 +2015,5 @@ mod test {
                 }
             }
         }
-    }
-}
-
-#[cfg(test)]
-impl PagedCachedFile {
-    pub(crate) fn write_map_for_test(&self) -> (usize, usize) {
-        let write = self.write_buffer.lock().unwrap();
-        (write.cache.len(), write.cache.map_capacity_for_test())
-    }
-}
-
-#[cfg(feature = "contextdb-internal")]
-impl PagedCachedFile {
-    /// A paid native page copies an original clean warm-cache hit; it never
-    /// borrows or adopts a legacy cell and never probes the write buffer.
-    pub(super) fn read_native_clean_miss(
-        &self,
-        offset: u64,
-        len: usize,
-    ) -> std::result::Result<PageMemory, crate::NativeColdReadError> {
-        use crate::native_storage_admission::{
-            NativeColdFault, NativeColdReadError, NativePagePayload, NativeStorageBuffer,
-            NativeStorageShared,
-        };
-        if !crate::native_storage_admission::native_storage_active() {
-            return Err(NativeColdReadError::AdmissionRefused);
-        }
-        if self.file.io_failed.load(Ordering::Acquire) {
-            return Err(NativeColdReadError::Corrupt(NativeColdFault::new(
-                "native read requires an available backend",
-            )));
-        }
-        // Admit both owners on the original scope before taking a cache lock.
-        let bytes = NativeStorageBuffer::zeroed(len)?;
-        let mut page = NativeStorageShared::new(NativePagePayload {
-            bytes,
-            checksum: Mutex::new(None),
-        })?;
-        let stripe = (offset % Self::lock_stripes()) as usize;
-        {
-            let cache = self.read_cache[stripe].read().unwrap();
-            if let Some(cell) = cache.get(offset) {
-                if cell.bytes.len() != len {
-                    let mut fault = NativeColdFault::new(
-                        "native cache page length does not match the requested extent",
-                    );
-                    fault.expected = len as u128;
-                    fault.actual = cell.bytes.len() as u128;
-                    return Err(NativeColdReadError::Corrupt(fault));
-                }
-                page.get_mut()
-                    .expect("unpublished native page is unique")
-                    .bytes
-                    .as_mut_slice()
-                    .copy_from_slice(&cell.bytes);
-                return Ok(PageMemory::Native(page));
-            }
-        }
-        // Every page allocation and its receipt is admitted before backend I/O.
-        let result = self.file.file.read(
-            offset,
-            page.get_mut()
-                .expect("unpublished native page is unique")
-                .bytes
-                .as_mut_slice(),
-        );
-        if let Err(error) = result {
-            self.file.io_failed.store(true, Ordering::Release);
-            return Err(NativeColdReadError::Io(error));
-        }
-        crate::read_admission::record_backend_read(len);
-        Ok(PageMemory::Native(page))
     }
 }

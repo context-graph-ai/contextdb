@@ -10385,7 +10385,7 @@
  use crate::{CacheStats, DatabaseError, Result, StorageBackend, StorageError};
  use std::ops::{Index, IndexMut};
  use std::slice::SliceIndex;
-@@ -15,6 +16,190 @@
+@@ -15,6 +16,193 @@
      std::iter::repeat_n(0u8, len).collect()
  }
  
@@ -10418,6 +10418,9 @@
 +pub(crate) struct CachedPage {
 +    bytes: Arc<[u8]>,
 +    counted: Arc<AtomicUsize>,
++    // Read only through memoized_byte_node_checksum (contextdb-internal and tests); kept in
++    // every build so the page layout and its admitted memory charge do not vary by feature.
++    #[allow(dead_code)]
 +    byte_node_checksum: Mutex<Option<u128>>,
 +}
 +
@@ -10446,6 +10449,9 @@
 +pub(crate) struct ChargedPage {
 +    bytes: Arc<[u8]>,
 +    _charge: crate::read_admission::ReadPageCharge,
++    // Read only through memoized_byte_node_checksum (contextdb-internal and tests); kept in
++    // every build so the page layout and its admitted memory charge do not vary by feature.
++    #[allow(dead_code)]
 +    byte_node_checksum: Mutex<Option<u128>>,
 +}
 +
@@ -10482,7 +10488,7 @@
 +}
 +
 +impl PageMemory {
-+    #[cfg(test)]
++    #[cfg(all(test, feature = "contextdb-internal"))]
 +    pub(crate) fn admitted_bytes_for_test(len: usize) -> usize {
 +        admitted_page_bytes(len)
 +    }
@@ -10495,6 +10501,7 @@
 +    /// Cache only the computation for variable-width byte nodes. The caller
 +    /// must validate their layout first and compare its expected checksum on
 +    /// every visit. This slot grants no authentication or root authority.
++    #[cfg(any(test, feature = "contextdb-internal"))]
 +    pub(crate) fn memoized_byte_node_checksum(
 +        &self,
 +        compute: impl FnOnce() -> Result<u128>,
@@ -10533,11 +10540,7 @@
 +        #[cfg(test)]
 +        BYTE_CHECKSUM_COUNTS.with(|counts| {
 +            let mut value = counts.get();
-+            value[if matches!(self, Self::Cached(_)) {
-+                0
-+            } else {
-+                1
-+            }] += 1;
++            value[usize::from(!matches!(self, Self::Cached(_)))] += 1;
 +            counts.set(value);
 +        });
 +        let checksum = compute()?;
@@ -10576,7 +10579,7 @@
  pub(super) struct WritablePage {
      buffer: Arc<Mutex<LRUWriteCache>>,
      offset: u64,
-@@ -56,7 +241,7 @@
+@@ -56,7 +244,7 @@
  
  #[derive(Default)]
  struct LRUWriteCache {
@@ -10585,7 +10588,7 @@
  }
  
  impl LRUWriteCache {
-@@ -165,6 +350,8 @@
+@@ -165,6 +353,8 @@
          let result = self.file.read(offset, out);
          if result.is_err() {
              self.io_failed.store(true, Ordering::Release);
@@ -10594,7 +10597,7 @@
          }
          result.map_err(StorageError::from)
      }
-@@ -172,7 +359,13 @@
+@@ -172,7 +362,13 @@
      fn set_len(&self, len: u64) -> Result<()> {
          self.check_failure()?;
          let result = self.file.set_len(len);
@@ -10609,7 +10612,7 @@
              self.io_failed.store(true, Ordering::Release);
          }
          result.map_err(StorageError::from)
-@@ -218,9 +411,13 @@
+@@ -218,9 +414,13 @@
      // soft limit and momentary over-/under-counting by one page is harmless.
      // A third "total" counter would add contention on every insert/remove for
      // negligible accuracy gain.
@@ -10625,7 +10628,7 @@
      // Rotates the starting stripe for read-cache eviction
      next_eviction_stripe: AtomicUsize,
      #[cfg(feature = "cache_metrics")]
-@@ -233,7 +430,7 @@
+@@ -233,7 +433,7 @@
      writes_hits: AtomicU64,
      #[cfg(feature = "cache_metrics")]
      evictions: AtomicU64,
@@ -10634,14 +10637,15 @@
      // TODO: maybe move this cache to WriteTransaction?
      write_buffer: Arc<Mutex<LRUWriteCache>>,
  }
-@@ -244,16 +441,14 @@
+@@ -244,16 +444,15 @@
          page_size: u64,
          max_cache_size: usize,
      ) -> Result<Self, DatabaseError> {
 -        let read_cache = (0..Self::lock_stripes())
 -            .map(|_| RwLock::new(LRUCache::new()))
 -            .collect();
-+        let read_cache = Self::new_read_index(max_cache_size, page_size as usize, 0);
++        let read_cache =
++            Self::new_read_index(max_cache_size, usize::try_from(page_size).unwrap(), 0);
  
          Ok(Self {
              file: CheckedBackend::new(file),
@@ -10654,7 +10658,7 @@
              next_eviction_stripe: AtomicUsize::new(0),
              #[cfg(feature = "cache_metrics")]
              reads_total: Default::default(),
-@@ -268,6 +463,57 @@
+@@ -268,6 +467,57 @@
              read_cache,
              write_buffer: Arc::new(Mutex::new(LRUWriteCache::new())),
          })
@@ -10676,7 +10680,7 @@
 +        let entries = Self::read_index_entries(bytes, page_size, held_entries);
 +        let arena = EntryArena::new(entries);
 +        let heads = entries
-+            .div_ceil(Self::lock_stripes() as usize)
++            .div_ceil(usize::try_from(Self::lock_stripes()).unwrap())
 +            .next_power_of_two();
 +        (0..Self::lock_stripes())
 +            .map(|_| RwLock::new(LRUCache::new(arena.clone(), heads)))
@@ -10712,7 +10716,7 @@
      }
  
      #[allow(clippy::unused_self)]
-@@ -301,6 +547,42 @@
+@@ -301,6 +551,42 @@
                  used_bytes: read_bytes + write_bytes,
              }
          }
@@ -10755,7 +10759,7 @@
      }
  
      pub(crate) fn close(&self) -> Result {
-@@ -339,13 +621,17 @@
+@@ -339,13 +625,17 @@
              let stripe = (start + i) % num_stripes;
              let mut lock = self.read_cache[stripe].write().unwrap();
              while freed < bytes_needed {
@@ -10776,7 +10780,7 @@
                  } else {
                      break;
                  }
-@@ -364,21 +650,27 @@
+@@ -364,21 +654,27 @@
          // drained, so the total check only considers the read cache size.
          for (offset, buffer) in write_buffer.cache.iter_mut() {
              let buffer = buffer.take().unwrap();
@@ -10799,7 +10803,7 @@
 +                // A race could replace an existing buffer; dropping it gives
 +                // back its count once no reader holds it.
 +                debug_assert!(
-+                    buffer.len() >= self.page_size as usize
++                    buffer.len() >= usize::try_from(self.page_size).unwrap()
 +                        || (*offset == 0 && buffer.len() == DB_HEADER_SIZE)
 +                );
 +                drop(lock.try_insert(
@@ -10813,7 +10817,7 @@
                  break;
              }
          }
-@@ -390,10 +682,28 @@
+@@ -390,10 +686,28 @@
  
      // Caller should invalidate all cached pages that are no longer valid
      pub(super) fn resize(&self, len: u64) -> Result {
@@ -10844,7 +10848,7 @@
      }
  
      pub(super) fn flush(&self) -> Result {
-@@ -419,15 +729,22 @@
+@@ -419,15 +733,22 @@
      // Like `read_direct`, but writes directly into an `Arc<[u8]>` instead of a
      // `Vec<u8>` that is then copied into an `Arc`. The buffer is zero-filled
      // because `StorageBackend::read` takes `&mut [u8]`.
@@ -10870,7 +10874,7 @@
          debug_assert_eq!(0, offset % self.page_size);
          #[cfg(feature = "cache_metrics")]
          self.reads_total.fetch_add(1, Ordering::AcqRel);
-@@ -438,7 +755,7 @@
+@@ -438,7 +759,7 @@
                  #[cfg(feature = "cache_metrics")]
                  self.reads_hits.fetch_add(1, Ordering::Release);
                  debug_assert_eq!(cached.len(), len);
@@ -10879,7 +10883,7 @@
              }
          }
  
-@@ -449,45 +766,161 @@
+@@ -449,45 +770,165 @@
                  #[cfg(feature = "cache_metrics")]
                  self.reads_hits.fetch_add(1, Ordering::Release);
                  debug_assert_eq!(cached.len(), len);
@@ -10929,7 +10933,8 @@
 +            let write_bytes = self.write_buffer_bytes.load(Ordering::Acquire);
 +            if previous + page_bytes + write_bytes <= self.max_cache_size.load(Ordering::Acquire) {
 +                debug_assert!(
-+                    len >= self.page_size as usize || (offset == 0 && len == DB_HEADER_SIZE)
++                    len >= usize::try_from(self.page_size).unwrap()
++                        || (offset == 0 && len == DB_HEADER_SIZE)
 +                );
 +                let page = CachedPage::admitted(buffer.clone(), &self.read_cache_bytes);
 +                let mut write_lock = self.read_cache[cache_slot].write().unwrap();
@@ -11004,7 +11009,10 @@
 +            .fetch_add(page_bytes, Ordering::AcqRel);
 +        let write_bytes = self.write_buffer_bytes.load(Ordering::Acquire);
 +        if previous + page_bytes + write_bytes <= self.max_cache_size.load(Ordering::Acquire) {
-+            debug_assert!(len >= self.page_size as usize || (offset == 0 && len == DB_HEADER_SIZE));
++            debug_assert!(
++                len >= usize::try_from(self.page_size).unwrap()
++                    || (offset == 0 && len == DB_HEADER_SIZE)
++            );
 +            let page = CachedPage::admitted(buffer.clone(), &self.read_cache_bytes);
 +            let mut write_lock = self.read_cache[cache_slot].write().unwrap();
 +            // A race could replace an existing buffer; dropping it gives back
@@ -11078,7 +11086,7 @@
      }
  
      // Discard pending writes to the given range
-@@ -507,18 +940,13 @@
+@@ -507,18 +948,13 @@
          let mut lock = self.read_cache[cache_slot].write().unwrap();
          if let Some(removed) = lock.remove(offset) {
              assert_eq!(len, removed.len());
@@ -11098,7 +11106,7 @@
          }
      }
  
-@@ -539,9 +967,9 @@
+@@ -539,9 +975,9 @@
                      "cache inconsistency {len} != {} for offset {offset}",
                      removed.len()
                  );
@@ -11111,7 +11119,7 @@
              } else {
                  None
              }
-@@ -554,7 +982,7 @@
+@@ -554,7 +990,7 @@
          } else {
              let previous = self.write_buffer_bytes.fetch_add(len, Ordering::AcqRel);
              let mut write_bytes = previous + len;
@@ -11120,7 +11128,7 @@
  
              // Rule 1: write buffer NEVER exceeds 50%.  Flush excess to disk.
              if write_bytes > half {
-@@ -586,8 +1014,11 @@
+@@ -586,8 +1022,11 @@
              // exceeds the budget then read must be > 50%, so evict from the
              // read cache (fairness: we only take from read when read > 50%).
              let read_bytes = self.read_cache_bytes.load(Ordering::Acquire);
@@ -11134,7 +11142,7 @@
              }
              let result = if let Some(data) = existing {
                  #[cfg(feature = "cache_metrics")]
-@@ -598,7 +1029,9 @@
+@@ -598,7 +1037,9 @@
                  self.writes_hits.fetch_add(1, Ordering::AcqRel);
                  zero_filled_arc(len)
              } else {
@@ -11145,7 +11153,83 @@
              };
              lock.insert(offset, result);
              lock.take_value(offset).unwrap()
-@@ -618,9 +1051,103 @@
+@@ -614,13 +1055,179 @@
+ }
+ 
+ #[cfg(test)]
++impl PagedCachedFile {
++    pub(crate) fn write_map_for_test(&self) -> (usize, usize) {
++        let write = self.write_buffer.lock().unwrap();
++        (write.cache.len(), write.cache.map_capacity_for_test())
++    }
++}
++
++#[cfg(feature = "contextdb-internal")]
++impl PagedCachedFile {
++    /// A paid native page copies an original clean warm-cache hit; it never
++    /// borrows or adopts a legacy cell and never probes the write buffer.
++    pub(super) fn read_native_clean_miss(
++        &self,
++        offset: u64,
++        len: usize,
++    ) -> std::result::Result<PageMemory, crate::NativeColdReadError> {
++        use crate::native_storage_admission::{
++            NativeColdFault, NativeColdReadError, NativePagePayload, NativeStorageBuffer,
++            NativeStorageShared,
++        };
++        if !crate::native_storage_admission::native_storage_active() {
++            return Err(NativeColdReadError::AdmissionRefused);
++        }
++        if self.file.io_failed.load(Ordering::Acquire) {
++            return Err(NativeColdReadError::Corrupt(NativeColdFault::new(
++                "native read requires an available backend",
++            )));
++        }
++        // Admit both owners on the original scope before taking a cache lock.
++        let bytes = NativeStorageBuffer::zeroed(len)?;
++        let mut page = NativeStorageShared::new(NativePagePayload {
++            bytes,
++            checksum: Mutex::new(None),
++        })?;
++        let stripe = (offset % Self::lock_stripes()) as usize;
++        {
++            let cache = self.read_cache[stripe].read().unwrap();
++            if let Some(cell) = cache.get(offset) {
++                if cell.bytes.len() != len {
++                    let mut fault = NativeColdFault::new(
++                        "native cache page length does not match the requested extent",
++                    );
++                    fault.expected = len as u128;
++                    fault.actual = cell.bytes.len() as u128;
++                    return Err(NativeColdReadError::Corrupt(fault));
++                }
++                page.get_mut()
++                    .expect("unpublished native page is unique")
++                    .bytes
++                    .as_mut_slice()
++                    .copy_from_slice(&cell.bytes);
++                return Ok(PageMemory::Native(page));
++            }
++        }
++        // Every page allocation and its receipt is admitted before backend I/O.
++        let result = self.file.file.read(
++            offset,
++            page.get_mut()
++                .expect("unpublished native page is unique")
++                .bytes
++                .as_mut_slice(),
++        );
++        if let Err(error) = result {
++            self.file.io_failed.store(true, Ordering::Release);
++            return Err(NativeColdReadError::Io(error));
++        }
++        crate::read_admission::record_backend_read(len);
++        Ok(PageMemory::Native(page))
++    }
++}
++
++#[cfg(test)]
+ mod test {
      use crate::StorageBackend;
      use crate::backends::InMemoryBackend;
      use crate::tree_store::PageHint;
@@ -11251,7 +11335,7 @@
  
      #[test]
      fn cache_leak() {
-@@ -653,4 +1180,832 @@
+@@ -653,4 +1260,760 @@
          cached_file.invalidate_cache(0, 128);
          assert_eq!(cached_file.read_cache_bytes.load(Ordering::Acquire), 0);
      }
@@ -11488,8 +11572,8 @@
 +            file.max_cache_size.load(Ordering::Acquire),
 +            UNIFORM_CACHE_CAP
 +        );
-+        assert!(UNIFORM_CACHE_SLOTS * 4208 <= UNIFORM_CACHE_CAP);
-+        assert!((UNIFORM_CACHE_SLOTS + 1) * 4208 > UNIFORM_CACHE_CAP);
++        const { assert!(UNIFORM_CACHE_SLOTS * 4208 <= UNIFORM_CACHE_CAP) };
++        const { assert!((UNIFORM_CACHE_SLOTS + 1) * 4208 > UNIFORM_CACHE_CAP) };
 +    }
 +
 +    #[test]
@@ -11656,7 +11740,7 @@
 +                    let stripe = if skewed {
 +                        0
 +                    } else {
-+                        ordinal as usize % stripes.len()
++                        usize::try_from(ordinal).unwrap() % stripes.len()
 +                    };
 +                    assert!(matches!(
 +                        stripes[stripe]
@@ -11724,12 +11808,12 @@
 +        assert_eq!(cap / super::cached_page_bytes(4096), 996);
 +        let pages = 3 * 996;
 +        let backend = SparseZeroFixture(std::sync::atomic::AtomicU64::new(
-+            (pages * 131 * 4096) as u64,
++            u64::try_from(pages * 131 * 4096).unwrap(),
 +        ));
 +        let file = PagedCachedFile::new(Box::new(backend), 4096, cap).unwrap();
 +        let index_bytes = file.index_bytes();
 +        for ordinal in 0..pages {
-+            let offset = (ordinal * 131 * 4096) as u64;
++            let offset = u64::try_from(ordinal * 131 * 4096).unwrap();
 +            assert_eq!(offset % PagedCachedFile::lock_stripes(), 0);
 +            let page = file.read(offset, 4096, PageHint::Clean).unwrap();
 +            assert!(matches!(page, super::PageMemory::Cached(_)));
@@ -12013,78 +12097,6 @@
 +        }
 +    }
 +}
-+
-+#[cfg(test)]
-+impl PagedCachedFile {
-+    pub(crate) fn write_map_for_test(&self) -> (usize, usize) {
-+        let write = self.write_buffer.lock().unwrap();
-+        (write.cache.len(), write.cache.map_capacity_for_test())
-+    }
-+}
-+
-+#[cfg(feature = "contextdb-internal")]
-+impl PagedCachedFile {
-+    /// A paid native page copies an original clean warm-cache hit; it never
-+    /// borrows or adopts a legacy cell and never probes the write buffer.
-+    pub(super) fn read_native_clean_miss(
-+        &self,
-+        offset: u64,
-+        len: usize,
-+    ) -> std::result::Result<PageMemory, crate::NativeColdReadError> {
-+        use crate::native_storage_admission::{
-+            NativeColdFault, NativeColdReadError, NativePagePayload, NativeStorageBuffer,
-+            NativeStorageShared,
-+        };
-+        if !crate::native_storage_admission::native_storage_active() {
-+            return Err(NativeColdReadError::AdmissionRefused);
-+        }
-+        if self.file.io_failed.load(Ordering::Acquire) {
-+            return Err(NativeColdReadError::Corrupt(NativeColdFault::new(
-+                "native read requires an available backend",
-+            )));
-+        }
-+        // Admit both owners on the original scope before taking a cache lock.
-+        let bytes = NativeStorageBuffer::zeroed(len)?;
-+        let mut page = NativeStorageShared::new(NativePagePayload {
-+            bytes,
-+            checksum: Mutex::new(None),
-+        })?;
-+        let stripe = (offset % Self::lock_stripes()) as usize;
-+        {
-+            let cache = self.read_cache[stripe].read().unwrap();
-+            if let Some(cell) = cache.get(offset) {
-+                if cell.bytes.len() != len {
-+                    let mut fault = NativeColdFault::new(
-+                        "native cache page length does not match the requested extent",
-+                    );
-+                    fault.expected = len as u128;
-+                    fault.actual = cell.bytes.len() as u128;
-+                    return Err(NativeColdReadError::Corrupt(fault));
-+                }
-+                page.get_mut()
-+                    .expect("unpublished native page is unique")
-+                    .bytes
-+                    .as_mut_slice()
-+                    .copy_from_slice(&cell.bytes);
-+                return Ok(PageMemory::Native(page));
-+            }
-+        }
-+        // Every page allocation and its receipt is admitted before backend I/O.
-+        let result = self.file.file.read(
-+            offset,
-+            page.get_mut()
-+                .expect("unpublished native page is unique")
-+                .bytes
-+                .as_mut_slice(),
-+        );
-+        if let Err(error) = result {
-+            self.file.io_failed.store(true, Ordering::Release);
-+            return Err(NativeColdReadError::Io(error));
-+        }
-+        crate::read_admission::record_backend_read(len);
-+        Ok(PageMemory::Native(page))
-+    }
-+}
 --- a/src/tree_store/page_store/file_backend/fallback.rs
 +++ b/src/tree_store/page_store/file_backend/fallback.rs
 @@ -1,13 +1,15 @@
@@ -12314,7 +12326,7 @@
  
 --- a/src/tree_store/page_store/lru_cache.rs
 +++ b/src/tree_store/page_store/lru_cache.rs
-@@ -1,19 +1,354 @@
+@@ -1,19 +1,357 @@
  use crate::tree_store::page_store::fast_hash::FastHashMapU64;
 -use std::collections::VecDeque;
 -use std::sync::atomic::{AtomicBool, Ordering};
@@ -12361,7 +12373,7 @@
 +            })
 +            .collect::<Vec<_>>()
 +            .into_boxed_slice();
-+        let slots = (0..capacity as u32)
++        let slots = (0..u32::try_from(capacity).unwrap())
 +            .rev()
 +            .collect::<Vec<_>>()
 +            .into_boxed_slice();
@@ -12430,6 +12442,7 @@
 +        }
 +    }
 +
++    #[cfg(feature = "contextdb-internal")]
 +    pub(crate) fn arena_capacity(&self) -> usize {
 +        self.arena.entries.len()
 +    }
@@ -12440,10 +12453,13 @@
 +    pub(crate) fn index_bytes(&self) -> usize {
 +        self.heads.len() * size_of::<u32>()
 +    }
++    #[cfg(any(test, feature = "contextdb-internal"))]
 +    pub(crate) fn len(&self) -> usize {
 +        self.len
 +    }
 +
++    // Truncating the 64-bit hash is intended: the head count is a power of two.
++    #[allow(clippy::cast_possible_truncation)]
 +    fn bucket(&self, key: u64) -> usize {
 +        let mut hasher = FastHasher64::default();
 +        hasher.write_u64(key);
@@ -12515,10 +12531,8 @@
 +    }
 +    #[cfg(test)]
 +    pub(crate) fn insert(&mut self, key: u64, value: T) -> Option<T> {
-+        match self.try_insert(key, value) {
-+            Ok(old) => old,
-+            Err(_) => panic!("fixed read index capacity exceeded"),
-+        }
++        self.try_insert(key, value)
++            .unwrap_or_else(|_| panic!("fixed read index capacity exceeded"))
 +    }
 +
 +    pub(crate) fn remove(&mut self, key: u64) -> Option<T> {
@@ -12619,6 +12633,7 @@
 +        }
 +        None
 +    }
++    #[cfg(feature = "contextdb-internal")]
 +    pub(crate) fn transfer_to(&mut self, destination: &mut Self) {
 +        while self.first != NONE {
 +            let entry = &self.arena.entries[self.first as usize];
@@ -12677,7 +12692,7 @@
          }
      }
  
-@@ -21,83 +356,488 @@
+@@ -21,83 +359,497 @@
          self.cache.len()
      }
  
@@ -12820,6 +12835,19 @@
 +    }
 +}
 +
++#[cfg(all(test, feature = "contextdb-internal"))]
++impl<T> LRUCache<T> {
++    pub(crate) fn arena_capacity_for_test(&self) -> usize {
++        self.arena_capacity()
++    }
++}
++#[cfg(test)]
++impl<T> WriteCache<T> {
++    pub(crate) fn map_capacity_for_test(&self) -> usize {
++        self.cache.capacity()
++    }
++}
++
 +#[cfg(test)]
 +pub(crate) mod arena_index_tests {
 +    use std::alloc::{GlobalAlloc, Layout, System};
@@ -12890,9 +12918,12 @@
 +            WATCH.with(|watch| assert!(!watch.replace(true)));
 +            Self
 +        }
++        // Methods on the live watch: only an active watch may reset or cut.
++        #[allow(clippy::unused_self)]
 +        pub(crate) fn reset(&self) {
 +            COUNTS.with(|counts| counts.set([0; 5]));
 +        }
++        #[allow(clippy::unused_self)]
 +        pub(crate) fn cut(&self) -> [usize; 5] {
 +            COUNTS.with(Cell::get)
 +        }
@@ -12921,7 +12952,11 @@
 +            for round in 0..3_u64 {
 +                for ordinal in 0..996_u64 {
 +                    let key = round * 996 + ordinal;
-+                    let stripe = if skewed { 0 } else { ordinal as usize % 131 };
++                    let stripe = if skewed {
++                        0
++                    } else {
++                        usize::try_from(ordinal).unwrap() % 131
++                    };
 +                    assert_eq!(stripes[stripe].try_insert(key, key), Ok(None));
 +                }
 +                assert_eq!(stripes.iter().map(|s| s.len()).sum::<usize>(), 996);
@@ -13006,6 +13041,8 @@
 +    }
 +
 +    // Independent published pre-arena implementation, SHA f062c990.
++    // Kept verbatim; the comparison tests exercise only part of its surface.
++    #[allow(dead_code)]
 +    mod old_reference {
 +        use crate::tree_store::page_store::fast_hash::FastHasher64;
 +        type FastHashMapU64<T> =
@@ -13225,19 +13262,6 @@
 +                *self = Self::new();
 +            }
 +        }
-+    }
-+}
-+
-+#[cfg(test)]
-+impl<T> LRUCache<T> {
-+    pub(crate) fn arena_capacity_for_test(&self) -> usize {
-+        self.arena_capacity()
-+    }
-+}
-+#[cfg(test)]
-+impl<T> WriteCache<T> {
-+    pub(crate) fn map_capacity_for_test(&self) -> usize {
-+        self.cache.capacity()
 +    }
 +}
 --- a/src/tree_store/page_store/mod.rs
@@ -14335,7 +14359,7 @@
 +    }
 +    #[test]
 +    fn committed_write_buffer_releases_all_map_capacity_even_at_zero_cache_cap() {
-+        use crate::{ReadableDatabase, ReadableTable};
++        use crate::ReadableDatabase;
 +        for cap in [0, 4096, 4 * 1024 * 1024] {
 +            let tmpfile = crate::create_tempfile();
 +            let db = Database::builder()
@@ -14351,7 +14375,7 @@
 +                {
 +                    let mut table = transaction.open_table(definition).unwrap();
 +                    for key in 0..16_u64 {
-+                        let bytes = [round as u8; 512];
++                        let bytes = [u8::try_from(round).unwrap(); 512];
 +                        table.insert(&key, bytes.as_slice()).unwrap();
 +                    }
 +                }
@@ -14364,7 +14388,7 @@
 +                    for key in 0..16_u64 {
 +                        assert_eq!(
 +                            table.get(&key).unwrap().unwrap().value(),
-+                            &[round as u8; 512]
++                            &[u8::try_from(round).unwrap(); 512]
 +                        );
 +                    }
 +                }

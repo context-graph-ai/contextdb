@@ -1810,7 +1810,7 @@ mod test {
     }
     #[test]
     fn committed_write_buffer_releases_all_map_capacity_even_at_zero_cache_cap() {
-        use crate::{ReadableDatabase, ReadableTable};
+        use crate::ReadableDatabase;
         for cap in [0, 4096, 4 * 1024 * 1024] {
             let tmpfile = crate::create_tempfile();
             let db = Database::builder()
@@ -1826,7 +1826,7 @@ mod test {
                 {
                     let mut table = transaction.open_table(definition).unwrap();
                     for key in 0..16_u64 {
-                        let bytes = [round as u8; 512];
+                        let bytes = [u8::try_from(round).unwrap(); 512];
                         table.insert(&key, bytes.as_slice()).unwrap();
                     }
                 }
@@ -1839,7 +1839,7 @@ mod test {
                     for key in 0..16_u64 {
                         assert_eq!(
                             table.get(&key).unwrap().unwrap().value(),
-                            &[round as u8; 512]
+                            &[u8::try_from(round).unwrap(); 512]
                         );
                     }
                 }

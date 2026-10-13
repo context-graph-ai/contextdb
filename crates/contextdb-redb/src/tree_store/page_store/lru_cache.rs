@@ -40,7 +40,7 @@ impl<T> EntryArena<T> {
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        let slots = (0..capacity as u32)
+        let slots = (0..u32::try_from(capacity).unwrap())
             .rev()
             .collect::<Vec<_>>()
             .into_boxed_slice();
@@ -106,6 +106,7 @@ impl<T> LRUCache<T> {
         }
     }
 
+    #[cfg(feature = "contextdb-internal")]
     pub(crate) fn arena_capacity(&self) -> usize {
         self.arena.entries.len()
     }
@@ -116,10 +117,13 @@ impl<T> LRUCache<T> {
     pub(crate) fn index_bytes(&self) -> usize {
         self.heads.len() * size_of::<u32>()
     }
+    #[cfg(any(test, feature = "contextdb-internal"))]
     pub(crate) fn len(&self) -> usize {
         self.len
     }
 
+    // Truncating the 64-bit hash is intended: the head count is a power of two.
+    #[allow(clippy::cast_possible_truncation)]
     fn bucket(&self, key: u64) -> usize {
         let mut hasher = FastHasher64::default();
         hasher.write_u64(key);
@@ -191,10 +195,8 @@ impl<T> LRUCache<T> {
     }
     #[cfg(test)]
     pub(crate) fn insert(&mut self, key: u64, value: T) -> Option<T> {
-        match self.try_insert(key, value) {
-            Ok(old) => old,
-            Err(_) => panic!("fixed read index capacity exceeded"),
-        }
+        self.try_insert(key, value)
+            .unwrap_or_else(|_| panic!("fixed read index capacity exceeded"))
     }
 
     pub(crate) fn remove(&mut self, key: u64) -> Option<T> {
@@ -295,6 +297,7 @@ impl<T> LRUCache<T> {
         }
         None
     }
+    #[cfg(feature = "contextdb-internal")]
     pub(crate) fn transfer_to(&mut self, destination: &mut Self) {
         while self.first != NONE {
             let entry = &self.arena.entries[self.first as usize];
@@ -481,6 +484,19 @@ impl<T> WriteCache<T> {
     }
 }
 
+#[cfg(all(test, feature = "contextdb-internal"))]
+impl<T> LRUCache<T> {
+    pub(crate) fn arena_capacity_for_test(&self) -> usize {
+        self.arena_capacity()
+    }
+}
+#[cfg(test)]
+impl<T> WriteCache<T> {
+    pub(crate) fn map_capacity_for_test(&self) -> usize {
+        self.cache.capacity()
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod arena_index_tests {
     use std::alloc::{GlobalAlloc, Layout, System};
@@ -551,9 +567,12 @@ pub(crate) mod arena_index_tests {
             WATCH.with(|watch| assert!(!watch.replace(true)));
             Self
         }
+        // Methods on the live watch: only an active watch may reset or cut.
+        #[allow(clippy::unused_self)]
         pub(crate) fn reset(&self) {
             COUNTS.with(|counts| counts.set([0; 5]));
         }
+        #[allow(clippy::unused_self)]
         pub(crate) fn cut(&self) -> [usize; 5] {
             COUNTS.with(Cell::get)
         }
@@ -582,7 +601,11 @@ pub(crate) mod arena_index_tests {
             for round in 0..3_u64 {
                 for ordinal in 0..996_u64 {
                     let key = round * 996 + ordinal;
-                    let stripe = if skewed { 0 } else { ordinal as usize % 131 };
+                    let stripe = if skewed {
+                        0
+                    } else {
+                        usize::try_from(ordinal).unwrap() % 131
+                    };
                     assert_eq!(stripes[stripe].try_insert(key, key), Ok(None));
                 }
                 assert_eq!(stripes.iter().map(|s| s.len()).sum::<usize>(), 996);
@@ -667,6 +690,8 @@ pub(crate) mod arena_index_tests {
     }
 
     // Independent published pre-arena implementation, SHA f062c990.
+    // Kept verbatim; the comparison tests exercise only part of its surface.
+    #[allow(dead_code)]
     mod old_reference {
         use crate::tree_store::page_store::fast_hash::FastHasher64;
         type FastHashMapU64<T> =
@@ -826,18 +851,5 @@ pub(crate) mod arena_index_tests {
                 *self = Self::new();
             }
         }
-    }
-}
-
-#[cfg(test)]
-impl<T> LRUCache<T> {
-    pub(crate) fn arena_capacity_for_test(&self) -> usize {
-        self.arena_capacity()
-    }
-}
-#[cfg(test)]
-impl<T> WriteCache<T> {
-    pub(crate) fn map_capacity_for_test(&self) -> usize {
-        self.cache.capacity()
     }
 }
