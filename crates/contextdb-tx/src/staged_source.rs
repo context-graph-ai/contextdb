@@ -15,6 +15,14 @@ pub struct SourceLease {
     pub epoch: usize,
 }
 
+/// The row change passed alongside a sidecar copy (unchanged tuple shape).
+type SidecarChange<'a> = (
+    &'a str,
+    contextdb_core::RowId,
+    Option<(contextdb_core::Lsn, u8)>,
+    Option<usize>,
+);
+
 /// The engine implements this on its existing accountant. No separately
 /// allocated trait adapter or reader budget is introduced at this boundary.
 #[doc(hidden)]
@@ -73,12 +81,7 @@ pub trait SourceFunding: Send + Sync {
     fn copy_sidecars(
         self: Arc<Self>,
         _maps: SidecarsBorrow<'_>,
-        _change: Option<(
-            &str,
-            contextdb_core::RowId,
-            Option<(contextdb_core::Lsn, u8)>,
-            Option<usize>,
-        )>,
+        _change: Option<SidecarChange<'_>>,
     ) -> Result<AdmittedSidecars> {
         Err(Error::Other(
             "provider has no sidecar native copy capability".into(),
@@ -227,12 +230,7 @@ impl SourceFunder {
     pub fn copy_sidecars(
         &self,
         maps: SidecarsBorrow<'_>,
-        change: Option<(
-            &str,
-            contextdb_core::RowId,
-            Option<(contextdb_core::Lsn, u8)>,
-            Option<usize>,
-        )>,
+        change: Option<SidecarChange<'_>>,
     ) -> Result<AdmittedSidecars> {
         let guard = self.clone();
         let result = guard.receiver().clone().copy_sidecars(maps, change)?;
@@ -673,6 +671,8 @@ pub(crate) fn visit_link_debits<'a, K, V>(
     }
 }
 /// Borrow entries without copying keys, values, or allocating traversal storage.
+// activated by bounded-storage S3/S4; remove allow at activation
+#[allow(dead_code)]
 pub(crate) fn for_each_entry<'a, K, V>(root: &'a Link<K, V>, visit: &mut impl FnMut(&'a K, &'a V)) {
     if let Some(node) = root {
         for_each_entry(&node.left, visit);
@@ -943,6 +943,8 @@ impl<T> SourceBuffer<T> {
     pub(crate) fn pop(&mut self) -> Option<T> {
         self.values.pop()
     }
+    // activated by bounded-storage S3/S4; remove allow at activation
+    #[allow(dead_code)]
     pub(crate) fn clear(&mut self) {
         self.values.clear();
     }
@@ -2380,10 +2382,8 @@ fn mutable_balance_nonfallible<K, V>(
         let needs_rotation = node.get().left.as_ref().is_some_and(|left| {
             mutable_height(&left.get().right) > mutable_height(&left.get().left)
         });
-        if needs_rotation {
-            if let Some(left) = node.get_mut().left.take() {
-                node.get_mut().left = Some(rotate_left_nonfallible(left));
-            }
+        if needs_rotation && let Some(left) = node.get_mut().left.take() {
+            node.get_mut().left = Some(rotate_left_nonfallible(left));
         }
         return rotate_right_nonfallible(node);
     }
@@ -2391,10 +2391,8 @@ fn mutable_balance_nonfallible<K, V>(
         let needs_rotation = node.get().right.as_ref().is_some_and(|right| {
             mutable_height(&right.get().left) > mutable_height(&right.get().right)
         });
-        if needs_rotation {
-            if let Some(right) = node.get_mut().right.take() {
-                node.get_mut().right = Some(rotate_right_nonfallible(right));
-            }
+        if needs_rotation && let Some(right) = node.get_mut().right.take() {
+            node.get_mut().right = Some(rotate_right_nonfallible(right));
         }
         return rotate_left_nonfallible(node);
     }
@@ -3143,6 +3141,8 @@ impl AdmittedEagerSourceRow {
                 .bytes(),
         )
     }
+    // activated by bounded-storage S3/S4; remove allow at activation
+    #[allow(dead_code)]
     pub(crate) fn reserve_original_copy(
         &self,
         bytes: usize,
@@ -3233,12 +3233,18 @@ impl AdmittedEagerSourceVector {
     pub(crate) fn entry(&self) -> &contextdb_core::VectorEntry {
         &self.entry
     }
+    // activated by bounded-storage S3/S4; remove allow at activation
+    #[allow(dead_code)]
     pub(crate) fn reserve_private_original_copy(&self, bytes: usize) -> Result<OriginalCopyGrant> {
         self.copy_private_original_grant(bytes)
     }
+    // activated by bounded-storage S3/S4; remove allow at activation
+    #[allow(dead_code)]
     pub(crate) fn copy_private_original_grant(&self, bytes: usize) -> Result<OriginalCopyGrant> {
         self.original_copy.reserve_private_original_copy(bytes)
     }
+    // activated by bounded-storage S3/S4; remove allow at activation
+    #[allow(dead_code)]
     pub(crate) fn retained_bytes(&self) -> usize {
         self.invoice
             .retained_bytes()
@@ -3633,6 +3639,9 @@ impl AuxBodies {
             Self::ConfigMaxU64Keys(v) => v.len(),
         }
     }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 impl AuxBorrow<'_> {
     pub fn len(&self) -> usize {
@@ -3648,6 +3657,9 @@ impl AuxBorrow<'_> {
             Self::ConfigDeletes(v) => v.len(),
             Self::ConfigMaxU64Keys(v) => v.len(),
         }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 /// Fields destroy bodies before element invoices and native buffer credit.

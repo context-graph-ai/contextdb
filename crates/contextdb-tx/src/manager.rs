@@ -2405,6 +2405,9 @@ impl EngineTerminalInventory<'_> {
     pub fn len(&self) -> usize {
         self.active.len()
     }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 /// Source map stays first, retaining all remaining peers until its destruction
@@ -2519,6 +2522,7 @@ impl<S: WriteSetApplicator> EngineCommitScope<'_, '_, S> {
     /// payload custody. The qualified consume/install functions only move
     /// validated original links, release guards, and cannot panic or allocate.
     /// A/R are owned and cannot retain either HRTB peer/guard borrow.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_engine_peer_detached<V, U, P: 'static, A, R>(
         &self,
         tx: TxId,
@@ -2735,6 +2739,7 @@ impl<S: WriteSetApplicator> EngineTransactions<S> {
         let pair = self.take_terminal_locked(tx, validate_peer, consume_peer);
         EngineTerminalFailure::new(error, pair)
     }
+    #[allow(clippy::too_many_arguments)]
     pub fn commit_owned_active_prepare_and_applied_with_peer<V, P: 'static>(
         &self,
         tx: TxId,
@@ -2946,6 +2951,7 @@ impl<S: WriteSetApplicator> EngineTransactions<S> {
 }
 
 impl<S: WriteSetApplicator> EngineTransactions<S> {
+    #[allow(clippy::too_many_arguments)]
     pub fn commit_owned_active_prepare_and_applied_with_peer_scoped<V, P: 'static>(
         &self,
         tx: TxId,
@@ -5593,6 +5599,8 @@ enum SourceUndo {
         state: TxState,
         eager: crate::ordered_staged::NativeOrderedCheckpoint,
     },
+    // held only as retirement custody: dropped with the retired journal node, never read
+    #[allow(dead_code)]
     RetiredAdopt {
         state: TxState,
         displaced_eager: crate::ordered_staged::OrderedStagedRows,
@@ -6210,8 +6218,8 @@ impl EngineGuard<'_> {
             });
         assert!(capacity >= p.frame.id.depth, "prepared frame capacity");
     }
-    pub fn begin_checkpoint(&mut self, mut p: PreparedTxCheckpoint) -> TxCheckpointId {
-        self.validate_prepared_checkpoint(&mut p);
+    pub fn begin_checkpoint(&mut self, p: PreparedTxCheckpoint) -> TxCheckpointId {
+        self.validate_prepared_checkpoint(&p);
         self.install_prepared_checkpoint(p)
     }
     fn install_prepared_checkpoint(&mut self, mut p: PreparedTxCheckpoint) -> TxCheckpointId {
@@ -7114,10 +7122,12 @@ pub struct PreparedTxMutation {
     undo: Option<PreparedSourceUndo>,
 }
 enum TxMutationKind {
-    ConditionalSlice(PreparedConditionalSlice),
+    ConditionalSlice(Box<PreparedConditionalSlice>),
     RowWithSidecars(
-        PreparedSourceMutation,
-        crate::staged_source::AdmittedSidecars,
+        Box<(
+            PreparedSourceMutation,
+            crate::staged_source::AdmittedSidecars,
+        )>,
     ),
     Aux(PreparedAux),
     Sidecars(crate::staged_source::AdmittedSidecars),
@@ -7522,11 +7532,12 @@ impl EngineGuard<'_> {
     pub fn publish_tx(&mut self, mut p: PreparedTxMutation) {
         self.validate_binding(&p.binding);
         if let TxMutationKind::ConditionalSlice(slice) = p.kind {
-            self.publish_conditional_slice(slice, p.undo.take());
+            self.publish_conditional_slice(*slice, p.undo.take());
             self.host.revision = p.binding.next_revision;
             return;
         }
-        if let TxMutationKind::RowWithSidecars(row, maps) = p.kind {
+        if let TxMutationKind::RowWithSidecars(row_and_maps) = p.kind {
+            let (row, maps) = *row_and_maps;
             self.publish(row);
             let old = self.swap_sidecars(maps);
             self.record_undo(SourceUndo::Sidecars(old));
@@ -7536,7 +7547,7 @@ impl EngineGuard<'_> {
         self.host.revision = p.binding.next_revision;
         match p.kind {
             TxMutationKind::ConditionalSlice(_) => unreachable!(),
-            TxMutationKind::RowWithSidecars(_, _) => unreachable!(),
+            TxMutationKind::RowWithSidecars(_) => unreachable!(),
             TxMutationKind::Flags(flags) => {
                 let old = EngineFlags::from_ws(&self.host.state.ws);
                 self.record_undo(SourceUndo::Flags(old));
@@ -7858,6 +7869,7 @@ impl EngineCapturedWriteSet {
     }
 }
 impl EngineGuard<'_> {
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare_row_with_sidecars(
         &self,
         table: &str,
@@ -7879,7 +7891,7 @@ impl EngineGuard<'_> {
         body.undo = self.prepare_undo(6)?;
         Ok(PreparedTxMutation {
             binding: self.binding()?,
-            kind: TxMutationKind::RowWithSidecars(row, maps),
+            kind: TxMutationKind::RowWithSidecars(Box::new((row, maps))),
             undo: None,
         })
     }
@@ -8263,7 +8275,7 @@ impl<S: WriteSetApplicator> EngineTransactions<S> {
 
 // Private observation rows: a real checkpoint is installed before its isolated
 // generation mismatch is constructed. No normal checkpoint algorithm changes.
-#[cfg(any(test, feature = "test-seams"))]
+#[cfg(feature = "test-seams")]
 fn checkpoint_id_with_wrong_generation(id: &TxCheckpointId) -> TxCheckpointId {
     TxCheckpointId {
         tx: id.tx,
@@ -8273,7 +8285,7 @@ fn checkpoint_id_with_wrong_generation(id: &TxCheckpointId) -> TxCheckpointId {
     }
 }
 
-#[cfg(any(test, feature = "test-seams"))]
+#[cfg(feature = "test-seams")]
 fn checkpoint_generation_refusal_rows(guard: &mut EngineGuard<'_>) -> Result<()> {
     let prepared = guard.prepare_checkpoint()?;
     let original_identity = prepared.identity();
@@ -8315,7 +8327,7 @@ fn checkpoint_generation_refusal_rows(guard: &mut EngineGuard<'_>) -> Result<()>
 
 // Inputs to this private row are observations of actual engine accountants and
 // the actual compiled native caller provider. This constructs no grant/funder.
-#[cfg(any(test, feature = "test-seams"))]
+#[cfg(feature = "test-seams")]
 struct NativeRemovalOwners<'a> {
     caller: &'a SourceFunder,
     original_used: &'a dyn Fn() -> usize,
@@ -8326,7 +8338,7 @@ struct NativeRemovalOwners<'a> {
     set_caller_limit: &'a dyn Fn(Option<usize>),
 }
 
-#[cfg(any(test, feature = "test-seams"))]
+#[cfg(feature = "test-seams")]
 fn distinct_native_removal_owner_rows(
     guard: &mut EngineGuard<'_>,
     owners: NativeRemovalOwners<'_>,
@@ -8497,6 +8509,7 @@ fn distinct_native_removal_owner_rows(
 #[cfg(feature = "test-seams")]
 impl EngineGuard<'_> {
     #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
     pub fn __test_distinct_native_checkpoint_rows(
         &mut self,
         caller: &SourceFunder,
@@ -9235,7 +9248,7 @@ impl EngineGuard<'_> {
             .ok_or_else(source_identity_error)?;
         Ok(PreparedTxMutation {
             binding: self.binding()?,
-            kind: TxMutationKind::ConditionalSlice(slice),
+            kind: TxMutationKind::ConditionalSlice(Box::new(slice)),
             undo: self.prepare_undo(records)?,
         })
     }
@@ -9341,7 +9354,7 @@ fn validate_exact_positions(positions: &[usize], length: usize) {
     assert!(positions.iter().all(|position| *position < length));
     assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
 }
-fn validate_empty_slice<T>(values: &Vec<T>, funding: &AuxFunding, p: &PreparedSplice<T>) {
+fn validate_empty_slice<T>(values: &[T], funding: &AuxFunding, p: &PreparedSplice<T>) {
     assert_eq!(values.len(), funding.invoices.len());
     validate_exact_positions(p.selection.as_slice(), values.len());
     assert!(p.at <= values.len() - p.selection.len());
@@ -9351,6 +9364,8 @@ fn validate_empty_slice<T>(values: &Vec<T>, funding: &AuxFunding, p: &PreparedSp
 }
 
 impl EngineGuard<'_> {
+    // activated by bounded-storage S3/S4; remove allow at activation
+    #[allow(dead_code)]
     pub(crate) fn prepare_append_vector_slot(
         &self,
         entry: VectorEntry,
@@ -9359,6 +9374,8 @@ impl EngineGuard<'_> {
     ) -> Result<PreparedSourceMutation> {
         self.prepare_vector_slot_inner(self.eager_preparation(), entry, scalar, invoice)
     }
+    // activated by bounded-storage S3/S4; remove allow at activation
+    #[allow(dead_code)]
     fn prepare_vector_slot_inner(
         &self,
         eager_enabled: bool,

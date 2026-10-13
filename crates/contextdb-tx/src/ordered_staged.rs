@@ -1507,25 +1507,20 @@ impl OrderedStagedRows {
         if let Some(image) = self.native_image() {
             let index = image.get().index(table, index)?;
             // Match the existing BTreeMap range contract before seeking.
-            match (&lower, &upper) {
-                (
-                    Bound::Included(start) | Bound::Excluded(start),
-                    Bound::Included(end) | Bound::Excluded(end),
-                ) => {
-                    assert!(
-                        start <= end,
-                        "range start is greater than range end in BTreeMap"
-                    );
-                    assert!(
-                        start != end
-                            || !matches!(
-                                (&lower, &upper),
-                                (Bound::Excluded(_), Bound::Excluded(_))
-                            ),
-                        "range start and end are equal and excluded in BTreeMap"
-                    );
-                }
-                _ => {}
+            if let (
+                Bound::Included(start) | Bound::Excluded(start),
+                Bound::Included(end) | Bound::Excluded(end),
+            ) = (&lower, &upper)
+            {
+                assert!(
+                    start <= end,
+                    "range start is greater than range end in BTreeMap"
+                );
+                assert!(
+                    start != end
+                        || !matches!((&lower, &upper), (Bound::Excluded(_), Bound::Excluded(_))),
+                    "range start and end are equal and excluded in BTreeMap"
+                );
             }
             return Some(OrderedStagedCursor {
                 range: OrderedStagedRange::Native(NativeOrderedRange::new(
@@ -1861,11 +1856,15 @@ struct NativeEagerVectorBody {
 
 #[derive(Clone)]
 enum NativeEagerVectorPayload {
+    // activated by bounded-storage S3/S4; remove allow at activation
+    #[allow(dead_code)]
     Scalar(crate::statement_rows::NativeEagerRow),
     Owned(crate::staged_source::FundedArc<crate::staged_source::AdmittedEagerSourceVector>),
 }
 
 impl NativeEagerVector {
+    // activated by bounded-storage S3/S4; remove allow at activation
+    #[allow(dead_code)]
     pub(crate) fn prepare_scalar(
         row: crate::statement_rows::NativeEagerRow,
         column: &str,
@@ -1945,6 +1944,8 @@ impl NativeEagerVector {
 
     /// A move preserves the payload and its distinct original invoice. Only
     /// the new capability header needs admission; the native name is shared.
+    // activated by bounded-storage S3/S4; remove allow at activation
+    #[allow(dead_code)]
     pub(crate) fn prepare_move(
         &self,
         to: RowId,
@@ -2607,8 +2608,8 @@ impl<'a> NativeOrderedRange<'a> {
             }
             std::cmp::Ordering::Equal
         };
-        let first = crate::staged_source::seek_by(root, false, &compare).map(|entry| entry.0);
-        let final_key = crate::staged_source::seek_by(root, true, &compare).map(|entry| entry.0);
+        let first = crate::staged_source::seek_by(root, false, compare).map(|entry| entry.0);
+        let final_key = crate::staged_source::seek_by(root, true, compare).map(|entry| entry.0);
         Self {
             root,
             lower: first,
@@ -2972,6 +2973,8 @@ impl OrderedStagedRows {
             original_copy: None,
         })
     }
+    // activated by bounded-storage S3/S4; remove allow at activation
+    #[allow(dead_code)]
     pub(crate) fn prepare_native_moved_vector(
         &self,
         index: &contextdb_core::VectorIndexRef,
@@ -3099,6 +3102,8 @@ impl OrderedStagedRows {
             self.vectors = directory;
         }
     }
+    // activated by bounded-storage S3/S4; remove allow at activation
+    #[allow(dead_code)]
     pub(crate) fn publish_native_change(&mut self, prepared: PreparedNativeChange) -> Result<()> {
         let validated = self.validate_native_change(prepared)?;
         self.publish_validated_native_change(validated);
@@ -3124,13 +3129,15 @@ impl OrderedStagedRows {
         self.vectors = prior.0;
     }
 }
+/// Per-table staged row positions supplied to a native posting rebind.
+type NativePositionsByTable<'a> = HashMap<&'a str, HashMap<RowId, (usize, TxId)>>;
 impl NativeOrderedRoot {
     /// Rebind only the native posting directory and its current identity rows.
     /// Captured statement bodies, row sequence and comparator domains remain
     /// the exact earlier immutable objects, as in the public Legacy path.
     fn prepare_positions(
         &self,
-        positions: Option<&HashMap<&str, HashMap<RowId, (usize, TxId)>>>,
+        positions: Option<&NativePositionsByTable<'_>>,
         reassign: Option<(TxId, TxId)>,
         funder: &crate::staged_source::SourceFunder,
     ) -> Result<crate::statement_rows::NativeImage<Self>> {
@@ -3570,6 +3577,8 @@ impl NativeEagerVector {
             _charge: Arc::new(TerminalVectorControl(self.clone())),
         })
     }
+    // activated by bounded-storage S3/S4; remove allow at activation
+    #[allow(dead_code)]
     fn reserve_private_original_copy(
         &self,
         bytes: usize,
@@ -3934,6 +3943,8 @@ impl NativeOrderedRoot {
     }
 }
 impl OrderedStagedRows {
+    // activated by bounded-storage S3/S4; remove allow at activation
+    #[allow(dead_code)]
     pub(crate) fn eager_statement(
         &self,
         table: &str,
@@ -3942,6 +3953,8 @@ impl OrderedStagedRows {
             self.native_root()?.table(table)?.statement.get(),
         ))
     }
+    // activated by bounded-storage S3/S4; remove allow at activation
+    #[allow(dead_code)]
     pub(crate) fn eager_vector(
         &self,
         index: &contextdb_core::VectorIndexRef,
@@ -3970,9 +3983,13 @@ impl OrderedStagedRows {
 }
 
 /// Engine semantic capture retains only private native custody.
+// activated by bounded-storage S3/S4; remove allow at activation
+#[allow(dead_code)]
 pub(crate) struct NativeOrderedCapture {
     image: crate::statement_rows::NativeImage<NativeOrderedRoot>,
 }
+// activated by bounded-storage S3/S4; remove allow at activation
+#[allow(dead_code)]
 impl NativeOrderedCapture {
     pub(crate) fn eager_statement(
         &self,
@@ -4000,6 +4017,8 @@ impl NativeOrderedCapture {
     }
 }
 impl NativeOrderedCheckpoint {
+    // activated by bounded-storage S3/S4; remove allow at activation
+    #[allow(dead_code)]
     pub(crate) fn visit_retained_debits<'a>(
         &'a self,
         visit: &mut dyn FnMut(crate::staged_source::RetainedDebit<'a>),
@@ -4020,11 +4039,15 @@ impl NativeOrderedCheckpoint {
     }
 }
 impl OrderedStagedRows {
+    // activated by bounded-storage S3/S4; remove allow at activation
+    #[allow(dead_code)]
     pub(crate) fn capture_native(&self) -> Option<NativeOrderedCapture> {
         self.native_image().map(|image| NativeOrderedCapture {
             image: image.clone(),
         })
     }
+    // activated by bounded-storage S3/S4; remove allow at activation
+    #[allow(dead_code)]
     pub(crate) fn visit_native_debits<'a>(
         &'a self,
         visit: &mut dyn FnMut(crate::staged_source::RetainedDebit<'a>),
@@ -4043,6 +4066,8 @@ impl OrderedStagedRows {
             }
         }
     }
+    // activated by bounded-storage S3/S4; remove allow at activation
+    #[allow(dead_code)]
     pub(crate) fn native_retained_union(
         &self,
         captures: &[NativeOrderedCapture],
@@ -4092,6 +4117,8 @@ impl OrderedStagedRows {
         self.native_image()
             .map(crate::statement_rows::NativeImage::semantic_holders)
     }
+    // activated by bounded-storage S3/S4; remove allow at activation
+    #[allow(dead_code)]
     pub(crate) fn native_statement_semantic_holders(&self, name: &str) -> Option<usize> {
         Some(
             self.native_root()?
@@ -5513,6 +5540,7 @@ impl OrderedStagedRows {
 }
 
 impl OrderedStagedRows {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare_native_admitted_original_row(
         &self,
         table: &str,

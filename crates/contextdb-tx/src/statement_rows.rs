@@ -1444,6 +1444,8 @@ impl NativeStatementRoot {
                 .map(|_| index.schema.clone())
         })
     }
+    // activated by bounded-storage S3/S4; remove allow at activation
+    #[allow(dead_code)]
     fn structural_bytes(&self) -> usize {
         let mut bytes = crate::staged_source::retained_link_bytes(&self.by_id)
             .saturating_add(crate::staged_source::retained_link_bytes(&self.by_sequence))
@@ -2112,9 +2114,13 @@ impl TerminalStatementAlias {
 }
 
 /// A private borrowed view never creates or retains a public std shell.
+// activated by bounded-storage S3/S4; remove allow at activation
+#[allow(dead_code)]
 pub(crate) struct NativeStatementBorrow<'a> {
     root: &'a NativeStatementRoot,
 }
+// activated by bounded-storage S3/S4; remove allow at activation
+#[allow(dead_code)]
 impl<'a> NativeStatementBorrow<'a> {
     pub(crate) fn new(root: &'a NativeStatementRoot) -> Self {
         Self { root }
@@ -2160,6 +2166,8 @@ impl<T> NativeImage<T> {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 }
+// activated by bounded-storage S3/S4; remove allow at activation
+#[allow(dead_code)]
 impl NativeStatementBorrow<'_> {
     pub(crate) fn rows(&self) -> impl Iterator<Item = &VersionedRow> {
         let mut after = None;
