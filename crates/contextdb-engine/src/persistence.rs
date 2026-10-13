@@ -55672,8 +55672,10 @@ graph_commit_result }.map_err(Self::storage_error)?;
                                 bytes.as_slice(),
                             )
                         })?;
-                        change_log_identity
-                            .push_at("received_change_log", Self::stored_change_log_mutation(&key_buf, &bytes)?)?;
+                        change_log_identity.push_at(
+                            "received_change_log",
+                            Self::stored_change_log_mutation(&key_buf, &bytes)?,
+                        )?;
                     }
                 }
             }
