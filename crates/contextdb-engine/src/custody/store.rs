@@ -133,12 +133,42 @@ fn copy_records<'a>(
                 &mut rmp_serde::Serializer::new(&mut bytes).with_struct_map(),
             )
             .map_err(|_| invalid())?;
+            work::decoded(1);
             memory.decode_msgpack::<Record>(&bytes)
         })();
         memory.release(credit);
         records.push(decoded?);
     }
     Ok(AdmittedRecords { records, memory })
+}
+
+/// Test-seam measurement of custody-journal work (process-wide).
+/// `HYDRATED` counts delivery-journal records loaded into a resident store;
+/// `DECODED` counts every custody record decode the store layer performs.
+#[cfg(feature = "test-seams")]
+pub(crate) mod work {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub(crate) static HYDRATED: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static DECODED: AtomicU64 = AtomicU64::new(0);
+    pub(crate) fn hydrated(n: u64) {
+        HYDRATED.fetch_add(n, Ordering::Relaxed);
+    }
+    pub(crate) fn decoded(n: u64) {
+        DECODED.fetch_add(n, Ordering::Relaxed);
+    }
+    pub(crate) fn read() -> (u64, u64) {
+        (
+            HYDRATED.load(Ordering::Relaxed),
+            DECODED.load(Ordering::Relaxed),
+        )
+    }
+}
+#[cfg(not(feature = "test-seams"))]
+pub(crate) mod work {
+    #[inline(always)]
+    pub(crate) fn hydrated(_: u64) {}
+    #[inline(always)]
+    pub(crate) fn decoded(_: u64) {}
 }
 
 #[derive(Default)]
@@ -243,9 +273,41 @@ fn groups(r: &Record) -> Result<Vec<String>> {
 }
 
 impl Store {
+    /// Resident delivery-journal records and an estimate of their owned bytes
+    /// (keys, decoded records, encoded bodies and group membership).
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn resident_delivery_for_test(&self) -> (u64, u64) {
+        let mut records = 0u64;
+        let mut bytes = 0usize;
+        for (key, record) in &self.records {
+            if key.starts_with("delivery_") {
+                records += 1;
+                bytes += key.capacity()
+                    + std::mem::size_of::<Record>()
+                    + encode(record).map_or(0, |e| e.len());
+            }
+        }
+        for (group, keys) in &self.groups {
+            let members = keys.iter().filter(|k| k.starts_with("delivery_"));
+            let mut any = false;
+            for key in members {
+                any = true;
+                bytes += key.capacity() + std::mem::size_of::<String>();
+            }
+            if any {
+                bytes += group.capacity() + std::mem::size_of::<String>();
+            }
+        }
+        bytes += (self.local_roots.len() + self.pending.len()) * std::mem::size_of::<uuid::Uuid>();
+        (records, bytes as u64)
+    }
     pub fn from_entries(entries: BTreeMap<String, Vec<u8>>) -> Result<Self> {
         let mut store = Self::default();
         for (key, bytes) in entries {
+            work::decoded(1);
+            if key.starts_with("delivery_") {
+                work::hydrated(1);
+            }
             let record = decode(&bytes)?;
             if record.key()? != key {
                 return Err(invalid());
@@ -577,6 +639,7 @@ impl Store {
             {
                 continue;
             }
+            work::decoded(1);
             let record = decode(bytes)?;
             if record.key()? != *key {
                 return Err(invalid());

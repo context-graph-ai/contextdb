@@ -122,6 +122,30 @@ impl Database {
             ))
         })
     }
+    /// Measurement only: `(hydrated delivery-journal records, decoded custody
+    /// records, resident delivery-journal records, resident delivery-journal
+    /// bytes)`. The first two are process-wide counters; the resident pair
+    /// observes this handle's cache without loading it.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __custody_writer_work_for_test(&self) -> (u64, u64, u64, u64) {
+        let (hydrated, decoded) = crate::custody::store::work::read();
+        let (records, bytes) = self
+            .custody_cache
+            .lock()
+            .as_ref()
+            .map_or((0, 0), Store::resident_delivery_for_test);
+        (hydrated, decoded, records, bytes)
+    }
+    /// Measurement only: committed custody CONFIG keys under `prefix`
+    /// (for example `delivery_root.v1.`), counted without decoding values.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __custody_durable_key_count_for_test(&self, prefix: &str) -> Result<u64> {
+        self.persistence
+            .as_ref()
+            .map_or(Ok(0), |p| p.count_config_keys_with_prefix_for_test(prefix))
+    }
     pub(crate) fn custody_records(
         &self,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
