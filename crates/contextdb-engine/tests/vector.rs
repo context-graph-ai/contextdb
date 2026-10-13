@@ -26,6 +26,9 @@ mod a_graph_search_stays_inside_its_serving_cache;
 #[path = "vector/a_replaced_vector_cannot_end_a_tied_frontier.rs"]
 mod a_replaced_vector_cannot_end_a_tied_frontier;
 #[cfg(unix)]
+#[path = "vector/a_replaced_vector_tied_frontier_walk_diagnostic.rs"]
+mod a_replaced_vector_tied_frontier_walk_diagnostic;
+#[cfg(unix)]
 #[path = "vector/a_saved_graph_load_checks_its_bytes_once.rs"]
 mod a_saved_graph_load_checks_its_bytes_once;
 #[cfg(unix)]
@@ -70,8 +73,12 @@ mod graph_build_distance_evaluations_stay_under_the_ratchet;
 mod graph_route_profile_quality;
 #[path = "vector/indexed_route_does_less_work_than_exact.rs"]
 mod indexed_route_does_less_work_than_exact;
+#[path = "vector/single_context_search_radius_work_diagnostic.rs"]
+mod single_context_search_radius_work_diagnostic;
 #[path = "fixtures/maintained_search/mod.rs"]
 mod maintained_search;
+#[path = "vector/multi_partition_union_recall_beam_diagnostic.rs"]
+mod multi_partition_union_recall_beam_diagnostic;
 #[path = "vector/multi_partition_union_recovers_nearest_rows.rs"]
 mod multi_partition_union_recovers_nearest_rows;
 #[path = "vector/named_vector_planner_tests.rs"]

@@ -9529,6 +9529,12 @@ impl VectorIndexLayout {
     /// The topology members use the partition's live count; AUTO routing uses
     /// `effective_auto_index_at` against the separately aggregated allowed
     /// count at the caller.
+    /// How far past its beam's edge distance a graph walk keeps expanding,
+    /// as a fraction of that distance, before the edge ends it.
+    pub fn resolve_search_radius(&self) -> f32 {
+        HNSW_DEFAULT_SEARCH_RADIUS
+    }
+
     pub fn resolve_policy(&self, live_vectors: usize, k: usize) -> ResolvedVectorPolicy {
         let (profile_m, profile_ef_construction, profile_ef_search) =
             compatibility_hnsw_profile(live_vectors, self.quantization);
@@ -9597,6 +9603,10 @@ impl VectorIndexLayout {
     }
 }
 
+/// The search radius every index resolves to: a walk keeps expanding heads
+/// up to 2% past its beam's edge distance. The previous default was 0, which
+/// ended the walk at the edge.
+const HNSW_DEFAULT_SEARCH_RADIUS: f32 = 0.02;
 const HNSW_MEDIUM_PROFILE_START: usize = 5_001;
 const HNSW_LARGE_PROFILE_START: usize = 50_001;
 

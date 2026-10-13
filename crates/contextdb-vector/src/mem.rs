@@ -4193,6 +4193,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                         snapshot_sources,
                         &mut union_partitions,
                         statement_policy.hnsw_ef_search,
+                        layout.resolve_search_radius(),
                         allowed_search_limits,
                         &mut query_self_scores,
                         &mut before_source_entry,
@@ -4610,6 +4611,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         sources: &[BoundedSnapshotVectorSource],
         partitions: &mut [UnionPartition<'_>],
         ef_search: usize,
+        search_radius: f32,
         allowed_search_limits: HnswAllowedSearchLimits,
         query_self_scores: &mut BoundedHnswQuerySelfScores<'_>,
         before_source_entry: &mut impl FnMut() -> std::result::Result<(), E>,
@@ -4694,7 +4696,8 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         let funder = owner.funder();
         let mut run_layer = |slice: &[crate::hnsw::HnswUnionLayer<'_>],
                              remaining: usize,
-                             spent: usize| {
+                             spent: usize,
+                             settled: &[crate::hnsw::union::HnswUnionCandidate]| {
             crate::hnsw::union::search_union_allowed_bounded_with_navigation(
                 slice,
                 query,
@@ -4795,6 +4798,8 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 Some(&crate::hnsw::union::NavigationSession::new(Some(
                     funder.clone(),
                 ))),
+                search_radius,
+                settled,
             )
         };
         // Layers are grouped by partition: a partition's base, change and
@@ -4811,13 +4816,13 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 _ => partition_runs.push((position, position + 1)),
             }
         }
-        let searched = crate::hnsw::union::merge_layer_searches(
+        let searched = crate::hnsw::union::merge_layer_searches_with_settled(
             partition_runs.len(),
             budget,
             k,
-            |run, remaining, spent| {
+            |run, remaining, spent, settled| {
                 let (start, end) = partition_runs[run];
-                run_layer(&layers[start..end], remaining, spent).map(|mut result| {
+                run_layer(&layers[start..end], remaining, spent, settled).map(|mut result| {
                     partitions[layers[start].partition].rescore_credit.set(
                         remaining.saturating_sub(
                             result

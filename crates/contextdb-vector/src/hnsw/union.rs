@@ -1245,15 +1245,46 @@ impl Walk {
         Ok(())
     }
 
+    #[cfg(test)]
     fn frontier_is_farther_than_kept(&self, candidate: Reached, required_results: usize) -> bool {
-        // A frontier row's ID says nothing about the IDs of its undiscovered
-        // neighbours. Equal-distance rows must be expanded until the tie is
-        // exhausted, unless enough already-kept rows are strictly nearer
-        // than that whole tied plateau.
+        self.frontier_ends_walk(candidate, required_results, 0.0, |_| 0)
+    }
+
+    /// Whether `candidate` ends the walk. A head farther than the beam's edge
+    /// distance by more than `search_radius` (a fraction of that distance; 0
+    /// ends the walk at the edge) ends it. A frontier row's ID
+    /// says nothing about the IDs of its undiscovered neighbours, so a head
+    /// tied with other kept rows at the edge ends it only when enough rows
+    /// are strictly nearer than that whole tied plateau: kept here, or
+    /// already returned by the partitions searched before this one
+    /// (`settled_nearer`), since the page is merged across them. A head that
+    /// is itself the edge's only row is inside any positive radius.
+    fn frontier_ends_walk(
+        &self,
+        candidate: Reached,
+        required_results: usize,
+        search_radius: f32,
+        settled_nearer: impl FnOnce(f32) -> usize,
+    ) -> bool {
         self.kept.peek().is_some_and(|worst| {
-            match self.compare_stop_distance(candidate.distance, worst.0.reached.distance) {
-                CmpOrdering::Greater => true,
-                CmpOrdering::Equal => self.kept.len() - self.worst_ties >= required_results,
+            let edge = worst.0.reached.distance;
+            match self.compare_stop_distance(candidate.distance, edge) {
+                CmpOrdering::Greater => {
+                    search_radius <= 0.0
+                        || candidate.distance > edge + edge.abs() * search_radius
+                }
+                CmpOrdering::Equal => {
+                    let only_edge_row = self.worst_ties == 1
+                        && worst.0.row_id == candidate.row_id
+                        && worst.0.reached.layer == candidate.layer;
+                    if search_radius > 0.0 && only_edge_row {
+                        return false;
+                    }
+                    let nearer = self.kept.len() - self.worst_ties;
+                    nearer >= required_results
+                        || nearer.saturating_add(settled_nearer(candidate.distance))
+                            >= required_results
+                }
                 CmpOrdering::Less => false,
             }
         })
@@ -1327,17 +1358,39 @@ pub(crate) fn graph_work_cannot_beat_exact(
 /// one partition's layers always were) in turn against its declared evaluation
 /// cap and merge their kept rows by distance. A layer search that stops on a limit
 /// (the cap included) makes the union Incomplete; a refused layer refuses it.
+#[cfg(test)]
 pub(crate) fn merge_layer_searches<E>(
     layers: usize,
     cap: usize,
     k: usize,
     mut search_layer: impl FnMut(usize, usize, usize) -> std::result::Result<HnswUnionSearchResult, E>,
 ) -> std::result::Result<HnswUnionSearchResult, E> {
+    merge_layer_searches_with_settled(layers, cap, k, |position, remaining, spent, _| {
+        search_layer(position, remaining, spent)
+    })
+}
+
+/// As [`merge_layer_searches`], handing each partition's search the rows the
+/// partitions before it returned, so a stop proof can count them.
+pub(crate) fn merge_layer_searches_with_settled<E>(
+    layers: usize,
+    cap: usize,
+    k: usize,
+    mut search_layer: impl FnMut(
+        usize,
+        usize,
+        usize,
+        &[HnswUnionCandidate],
+    ) -> std::result::Result<HnswUnionSearchResult, E>,
+) -> std::result::Result<HnswUnionSearchResult, E> {
     let mut merged: Option<HnswUnionSearchResult> = None;
     let mut spent = 0usize;
     for position in 0..layers {
         let remaining = cap;
-        let one = search_layer(position, remaining, spent)?;
+        let settled = merged
+            .as_ref()
+            .map_or(&[][..], |merged| merged.candidates.as_slice());
+        let one = search_layer(position, remaining, spent, settled)?;
         spent = spent
             .saturating_add(one.admission_evaluations)
             .saturating_add(one.expansion_evaluations);
@@ -1538,6 +1591,8 @@ where
         acquire,
         release,
         None,
+        0.0,
+        &[],
     )
 }
 
@@ -1559,6 +1614,8 @@ pub(crate) fn search_union_allowed_bounded_with_navigation<E, S, D, A, R, F, V>(
     mut acquire: A,
     mut release: R,
     navigation_session: Option<&NavigationSession>,
+    search_radius: f32,
+    settled: &[HnswUnionCandidate],
 ) -> std::result::Result<HnswUnionSearchResult, E>
 where
     E: From<Error>,
@@ -1569,6 +1626,8 @@ where
     F: FnMut(usize, RowId) -> bool,
     V: FnMut(usize, RowId, &mut S, &mut D) -> std::result::Result<Option<f32>, E>,
 {
+    #[cfg(feature = "test-seams")]
+    let search_radius = search_radius_override().unwrap_or(search_radius);
     let fallback = NavigationSession::new(None);
     let navigation = navigation_session.unwrap_or(&fallback);
     let mut total_allowed = 0usize;
@@ -1865,6 +1924,8 @@ where
         encoded: encoded_query.as_deref(),
     };
 
+    #[cfg(feature = "test-seams")]
+    trace_begin(open[0].partition);
     let searched = (|| -> std::result::Result<HnswUnionSearchResult, E> {
         let mut admission_evaluations = 0usize;
         let mut expansion_evaluations = 0usize;
@@ -1925,6 +1986,8 @@ where
                 required_results,
                 graph_scores_are_current,
                 can_certify_resolved_scores,
+                search_radius,
+                settled,
                 allow_bridges,
                 &mut is_allowed,
                 &mut resolve_score,
@@ -2341,6 +2404,8 @@ where
             frontier_exhausted,
         })
     })();
+    #[cfg(feature = "test-seams")]
+    trace_end();
 
     // Each charge goes back only once what it covers has been dropped.
     let frontier_charged = walk.frontier_charged;
@@ -2695,6 +2760,8 @@ where
                 };
                 walk.push_frontier(reached, acquire)?;
                 if let Some(row_id) = layer.row(origin, before_source_entry)? {
+                    #[cfg(feature = "test-seams")]
+                    trace_evaluation(row_id, distance);
                     walk.keep(Kept {
                         reached,
                         partition,
@@ -2732,6 +2799,8 @@ fn expand<E, S, D, A, R, F, V>(
     required_results: usize,
     graph_scores_are_current: bool,
     can_certify_resolved_scores: bool,
+    search_radius: f32,
+    settled: &[HnswUnionCandidate],
     allow_bridges: bool,
     is_allowed: &mut F,
     resolve_score: &mut V,
@@ -2753,7 +2822,23 @@ where
     // is borrowed below.
     let mut hops = std::mem::take(&mut walk.hops);
     let mut bridges = std::mem::take(&mut walk.bridges);
+    // Earlier partitions' rows, nearest first by walk distance, and their
+    // visible stored distances once a stop proof has read them.
+    let mut settled_order: Vec<usize> = (0..settled.len()).collect();
+    settled_order.sort_by(|left, right| {
+        settled[*left]
+            .distance
+            .total_cmp(&settled[*right].distance)
+            .then(settled[*left].partition.cmp(&settled[*right].partition))
+            .then(settled[*left].row_id.cmp(&settled[*right].row_id))
+    });
+    let mut settled_scores: Vec<Option<Option<f32>>> = settled
+        .iter()
+        .map(|candidate| candidate.resolved_score.map(Some))
+        .collect();
     let expanded = (|| -> std::result::Result<Expanded, E> {
+        #[cfg(feature = "test-seams")]
+        let mut expansions = 0usize;
         while let Some(Nearest(candidate)) = walk.frontier.pop() {
             // Every admitted row is already kept, each once. Admissions are
             // not rows: a row whose superseded version still sits in a graph
@@ -2768,11 +2853,48 @@ where
             // Frontier row IDs do not bound the IDs behind them. An equal
             // score can stop only when the requested page is already filled
             // by strictly nearer rows.
+            // Whether the stop leaned on rows earlier partitions returned. The
+            // merged page orders those by their visible stored scores, so they
+            // count only once those scores confirm them strictly nearer.
+            let mut leaned_on_settled = false;
             if walk.kept.len() >= walk.kept_capacity
-                && walk.frontier_is_farther_than_kept(candidate, required_results)
+                && walk.frontier_ends_walk(candidate, required_results, search_radius, |distance| {
+                    leaned_on_settled = true;
+                    settled
+                        .iter()
+                        .filter(|row| row.distance.total_cmp(&distance) == CmpOrdering::Less)
+                        .count()
+                })
             {
-                let certified = if graph_scores_are_current {
+                let certified = if graph_scores_are_current && !leaned_on_settled {
                     true
+                } else if graph_scores_are_current {
+                    let mut nearer = walk.kept.len() - walk.worst_ties;
+                    for position in settled_order.iter().copied() {
+                        if nearer >= required_results {
+                            break;
+                        }
+                        let row = settled[position];
+                        let score = match settled_scores[position] {
+                            Some(score) => score,
+                            None => {
+                                let score = resolve_score(
+                                    row.partition,
+                                    row.row_id,
+                                    before_source_entry,
+                                    before_distance,
+                                )?;
+                                settled_scores[position] = Some(score);
+                                score
+                            }
+                        };
+                        if score.is_some_and(|score| {
+                            (1.0 - score).total_cmp(&candidate.distance) == CmpOrdering::Less
+                        }) {
+                            nearer += 1;
+                        }
+                    }
+                    nearer >= required_results
                 } else if can_certify_resolved_scores {
                     if walk.failed_resolved_stop_distance.is_some_and(|failed| {
                         failed.total_cmp(&candidate.distance) == CmpOrdering::Equal
@@ -2834,6 +2956,32 @@ where
                                 }
                             }
                         }
+                        // Rows earlier partitions returned compete for the
+                        // same merged page, scored the same way.
+                        for position in settled_order.iter().copied() {
+                            if nearer >= required_results {
+                                break;
+                            }
+                            let row = settled[position];
+                            let score = match settled_scores[position] {
+                                Some(score) => score,
+                                None => {
+                                    let score = resolve_score(
+                                        row.partition,
+                                        row.row_id,
+                                        before_source_entry,
+                                        before_distance,
+                                    )?;
+                                    settled_scores[position] = Some(score);
+                                    score
+                                }
+                            };
+                            if score.is_some_and(|score| {
+                                (1.0 - score).total_cmp(&candidate.distance) == CmpOrdering::Less
+                            }) {
+                                nearer += 1;
+                            }
+                        }
                         if nearer < required_results {
                             walk.failed_resolved_stop_distance = Some(candidate.distance);
                         }
@@ -2843,11 +2991,30 @@ where
                     false
                 };
                 if certified {
+                    #[cfg(feature = "test-seams")]
+                    trace_stop(
+                        open,
+                        walk,
+                        &mut hops,
+                        query,
+                        candidate,
+                        expansions,
+                        is_allowed,
+                        before_source_entry,
+                        before_distance,
+                        acquire,
+                        release,
+                    )?;
                     return Ok(Expanded {
                         converged: true,
                         stop: None,
                     });
                 }
+            }
+            #[cfg(feature = "test-seams")]
+            {
+                expansions += 1;
+                trace_expansion(expansions, candidate.row_id);
             }
             let layer = &mut open[candidate.layer as usize];
             let neighbours = layer
@@ -2997,6 +3164,8 @@ where
     };
     walk.push_frontier(reached, acquire)?;
     if admitted && let Some(row_id) = row_id {
+        #[cfg(feature = "test-seams")]
+        trace_evaluation(row_id, distance);
         walk.keep(Kept {
             reached,
             partition: layer.partition,
@@ -3068,6 +3237,296 @@ pub(crate) fn record_union_search(receipt: UnionSearchReceipt) {
             receipts.push(receipt);
         }
     });
+}
+
+/// One row a traced partition walk evaluated: the expansion that reached it
+/// (0 while the layers were opened) and the row whose expansion reached it.
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UnionWalkEvaluation {
+    pub row_id: u64,
+    pub distance: f32,
+    pub expansion: usize,
+    pub parent: Option<u64>,
+}
+
+/// The stop check that ended a traced walk.
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UnionWalkStop {
+    pub head_row: u64,
+    pub head_distance: f32,
+    pub worst_kept_distance: f32,
+    pub worst_ties: usize,
+    pub kept: usize,
+    pub head_is_farther: bool,
+    pub evaluations: usize,
+    pub frontier_len: usize,
+}
+
+/// What one partition walk did, for a diagnostic: every evaluation in order,
+/// how many heads it expanded, the stop it took, the frontier it left and an
+/// observer-only continuation past that stop that changes nothing it returned.
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct UnionWalkTrace {
+    pub partition: usize,
+    pub expansions: usize,
+    pub stop: Option<UnionWalkStop>,
+    pub evaluated: Vec<UnionWalkEvaluation>,
+    pub frontier_at_stop: Vec<(u64, f32)>,
+    pub continuation: Vec<UnionWalkEvaluation>,
+}
+
+#[cfg(feature = "test-seams")]
+struct WalkTraceState {
+    continuation_expansions: usize,
+    finished: Vec<UnionWalkTrace>,
+    current: Option<UnionWalkTrace>,
+    expansion: usize,
+    parent: Option<u64>,
+}
+
+#[cfg(feature = "test-seams")]
+thread_local! {
+    static UNION_WALK_TRACES: RefCell<Option<WalkTraceState>> = const { RefCell::new(None) };
+}
+
+/// Trace every union partition walk `search` runs on this thread, continuing
+/// each past its stop by at most `continuation_expansions` observer-only
+/// expansions.
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub fn with_union_walk_traces<R>(
+    continuation_expansions: usize,
+    search: impl FnOnce() -> R,
+) -> (R, Vec<UnionWalkTrace>) {
+    let prior = UNION_WALK_TRACES.with(|slot| {
+        slot.replace(Some(WalkTraceState {
+            continuation_expansions,
+            finished: Vec::new(),
+            current: None,
+            expansion: 0,
+            parent: None,
+        }))
+    });
+    let result = search();
+    let traces = UNION_WALK_TRACES
+        .with(|slot| slot.replace(prior))
+        .map(|state| state.finished)
+        .unwrap_or_default();
+    (result, traces)
+}
+
+#[cfg(feature = "test-seams")]
+thread_local! {
+    static UNION_SEARCH_RADIUS: std::cell::Cell<Option<f32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run `search` with every union walk on this thread using `radius` in place
+/// of the index's resolved search radius, for measuring it.
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub fn with_union_search_radius<R>(radius: f32, search: impl FnOnce() -> R) -> R {
+    let prior = UNION_SEARCH_RADIUS.with(|slot| slot.replace(Some(radius)));
+    let result = search();
+    UNION_SEARCH_RADIUS.with(|slot| slot.set(prior));
+    result
+}
+
+#[cfg(feature = "test-seams")]
+fn search_radius_override() -> Option<f32> {
+    UNION_SEARCH_RADIUS.with(|slot| slot.get())
+}
+
+#[cfg(feature = "test-seams")]
+fn trace_with<T>(change: impl FnOnce(&mut WalkTraceState) -> T) -> Option<T> {
+    UNION_WALK_TRACES.with(|slot| slot.borrow_mut().as_mut().map(change))
+}
+
+#[cfg(feature = "test-seams")]
+fn trace_begin(partition: usize) {
+    trace_with(|state| {
+        state.expansion = 0;
+        state.parent = None;
+        state.current = Some(UnionWalkTrace {
+            partition,
+            ..UnionWalkTrace::default()
+        });
+    });
+}
+
+#[cfg(feature = "test-seams")]
+fn trace_end() {
+    trace_with(|state| {
+        if let Some(trace) = state.current.take() {
+            state.finished.push(trace);
+        }
+    });
+}
+
+#[cfg(feature = "test-seams")]
+fn trace_expansion(expansion: usize, parent: RowId) {
+    trace_with(|state| {
+        state.expansion = expansion;
+        state.parent = Some(parent.0);
+        if let Some(trace) = state.current.as_mut() {
+            trace.expansions = expansion;
+        }
+    });
+}
+
+#[cfg(feature = "test-seams")]
+fn trace_evaluation(row_id: RowId, distance: f32) {
+    trace_with(|state| {
+        let (expansion, parent) = (state.expansion, state.parent);
+        if let Some(trace) = state.current.as_mut() {
+            trace.evaluated.push(UnionWalkEvaluation {
+                row_id: row_id.0,
+                distance,
+                expansion,
+                parent,
+            });
+        }
+    });
+}
+
+#[cfg(feature = "test-seams")]
+fn trace_continuation_expansions() -> usize {
+    trace_with(|state| {
+        if state.current.is_some() {
+            state.continuation_expansions
+        } else {
+            0
+        }
+    })
+    .unwrap_or(0)
+}
+
+/// Record the stop a traced walk took, and continue it past that stop on a
+/// copy of its frontier and reached set: nothing it returns, keeps or charges
+/// to the walk changes.
+#[cfg(feature = "test-seams")]
+#[allow(clippy::too_many_arguments)]
+fn trace_stop<E, S, D, A, R, F>(
+    open: &mut [OpenLayer<'_>],
+    walk: &Walk,
+    hops: &mut HopScratch,
+    query: &UnionQuery<'_>,
+    head: Reached,
+    expansions: usize,
+    is_allowed: &mut F,
+    before_source_entry: &mut S,
+    before_distance: &mut D,
+    acquire: &mut A,
+    release: &mut R,
+) -> std::result::Result<(), E>
+where
+    E: From<Error>,
+    S: FnMut() -> std::result::Result<(), E>,
+    D: FnMut() -> std::result::Result<(), E>,
+    A: FnMut(HnswSearchScratchEvent) -> std::result::Result<(), E>,
+    R: FnMut(HnswSearchScratchEvent),
+    F: FnMut(usize, RowId) -> bool,
+{
+    let continuation_expansions = trace_continuation_expansions();
+    if trace_with(|state| state.current.is_some()) != Some(true) {
+        return Ok(());
+    }
+    let worst = walk
+        .kept
+        .peek()
+        .map_or(f32::INFINITY, |entry| entry.0.reached.distance);
+    let mut frontier_at_stop: Vec<(u64, f32)> = walk
+        .frontier
+        .iter()
+        .map(|entry| (entry.0.row_id.0, entry.0.distance))
+        .collect();
+    frontier_at_stop.sort_by(|left, right| left.1.total_cmp(&right.1).then(left.0.cmp(&right.0)));
+    let stop = UnionWalkStop {
+        head_row: head.row_id.0,
+        head_distance: head.distance,
+        worst_kept_distance: worst,
+        worst_ties: walk.worst_ties,
+        kept: walk.kept.len(),
+        head_is_farther: head.distance.total_cmp(&worst) == CmpOrdering::Greater,
+        evaluations: walk.evaluations,
+        frontier_len: walk.frontier.len(),
+    };
+    // The head the stop declined is expanded first, as a stop-less walk would.
+    let mut frontier: BinaryHeap<Nearest> =
+        walk.frontier.iter().map(|entry| Nearest(entry.0)).collect();
+    frontier.push(Nearest(head));
+    let mut marked: std::collections::HashSet<usize> = walk
+        .reached
+        .iter()
+        .filter(|(_, visit)| visit.marked)
+        .map(|(bit, _)| *bit)
+        .collect();
+    let mut continuation = Vec::new();
+    for extra in 0..continuation_expansions {
+        let Some(Nearest(candidate)) = frontier.pop() else {
+            break;
+        };
+        let layer = &mut open[candidate.layer as usize];
+        let listed: Vec<(PointId, usize)> =
+            match layer.neighbours(candidate.point, 0, &mut *hops, acquire, before_source_entry)? {
+                Some(neighbours) => (0..neighbours.len()).map(|hop| neighbours.get(hop)).collect(),
+                None => continue,
+            };
+        for (point, origin) in listed {
+            let Some(bit) = layer.bit(point) else {
+                continue;
+            };
+            if !marked.insert(bit) {
+                continue;
+            }
+            let Some(row_id) = layer.row(origin, before_source_entry)? else {
+                continue;
+            };
+            if !is_allowed(layer.partition, row_id) {
+                continue;
+            }
+            let distance = match walk.reached.get(&bit).and_then(|visit| visit.score) {
+                Some(distance) => distance,
+                None => match layer.distance(
+                    point,
+                    query,
+                    before_source_entry,
+                    before_distance,
+                    acquire,
+                    release,
+                )? {
+                    Some(distance) => distance,
+                    None => continue,
+                },
+            };
+            frontier.push(Nearest(Reached {
+                distance,
+                row_id,
+                layer: candidate.layer,
+                point,
+                origin,
+            }));
+            continuation.push(UnionWalkEvaluation {
+                row_id: row_id.0,
+                distance,
+                expansion: expansions + 1 + extra,
+                parent: Some(candidate.row_id.0),
+            });
+        }
+    }
+    trace_with(|state| {
+        if let Some(trace) = state.current.as_mut() {
+            trace.stop = Some(stop);
+            trace.frontier_at_stop = frontier_at_stop;
+            trace.continuation = continuation;
+        }
+    });
+    Ok(())
 }
 
 #[cfg(test)]

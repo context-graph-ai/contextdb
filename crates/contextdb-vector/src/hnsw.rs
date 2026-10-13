@@ -33,7 +33,10 @@ pub(crate) use union::{
 };
 #[cfg(feature = "test-seams")]
 #[doc(hidden)]
-pub use union::{UnionSearchReceipt, with_union_search_receipts};
+pub use union::{
+    UnionSearchReceipt, UnionWalkEvaluation, UnionWalkStop, UnionWalkTrace, with_union_search_receipts,
+    with_union_search_radius, with_union_walk_traces,
+};
 
 pub struct HnswIndex {
     hnsw: HnswInner,
