@@ -42089,10 +42089,14 @@ graph_commit_result }.map_err(Self::storage_error)?;
         Ok(())
     }
 
+    /// Rebuild the custody read mirror and its derived group index from the
+    /// committed CONFIG journal. The index is rebuilt complete, so a repaired
+    /// store keeps durable custody reads instead of losing them.
     pub(super) fn rebuild_read_custody_config_in_write(
         write_txn: &redb::WriteTransaction,
+        admission: &mut content_identity::ProofAdmission,
     ) -> Result<()> {
-        custody_groups::invalidate(write_txn)?;
+        custody_groups::reset_complete(write_txn)?;
         match write_txn.delete_table(READ_CUSTODY_CONFIG_TABLE) {
             Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
             Err(error) => return Err(Self::storage_error(error)),
@@ -42123,7 +42127,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                     write_txn,
                     key.value(),
                     Some(value.value()),
-                    custody_groups::Funding::Unavailable,
+                    custody_groups::Funding::Legacy(&mut *admission),
                 )?;
             }
         }

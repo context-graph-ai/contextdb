@@ -42368,16 +42368,15 @@ impl Database {
             match &self.persistence {
                 // The working image reads the receiver's committed journal
                 // durably; nothing of the journal is copied into it.
-                Some(persistence) if persistence.custody_groups_complete()? => {
+                Some(_) => {
                     // Pinned to the receiver's committed root at preparation:
                     // every custody read of the unit sees that one root.
                     *working.custody_cache.lock() =
                         Some(crate::custody::store::Store::durable_pinned(
-                            persistence.clone(),
                             self.latest_custody_root()?,
                         )?);
                 }
-                _ => {
+                None => {
                     *working.custody_metadata.lock() = self
                         .custody_records(read_memory.clone())?
                         .iter()

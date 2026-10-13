@@ -24,6 +24,27 @@ pub(super) fn invalidate(write: &redb::WriteTransaction) -> Result<()> {
     Ok(())
 }
 
+/// Start a complete, empty index in this transaction. The caller then
+/// maintains every committed custody entry into it with funded scratch, so the
+/// marker is true again when the transaction commits.
+pub(super) fn reset_complete(write: &redb::WriteTransaction) -> Result<()> {
+    for result in [write.delete_table(GROUP_TABLE), write.delete_table(REVERSE_TABLE)] {
+        match result {
+            Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
+            Err(error) => return Err(RedbPersistence::storage_error(error)),
+        }
+    }
+    write
+        .open_table(REVERSE_TABLE)
+        .map_err(RedbPersistence::storage_error)?;
+    write
+        .open_table(GROUP_TABLE)
+        .map_err(RedbPersistence::storage_error)?
+        .insert(COMPLETE, COMPLETE_VALUE)
+        .map_err(RedbPersistence::storage_error)?;
+    Ok(())
+}
+
 pub(super) fn initialize_empty(write: &redb::WriteTransaction) -> Result<()> {
     // Only an actual empty database can acquire the completion marker. This is
     // deliberately stronger than finding an empty custody mirror.

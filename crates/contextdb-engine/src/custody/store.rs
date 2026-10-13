@@ -184,7 +184,6 @@ pub(crate) mod work {
 /// pinned for its whole life (a received unit's detached working image).
 #[derive(Clone)]
 pub(crate) struct DurableSource {
-    persistence: Arc<crate::persistence::RedbPersistence>,
     pinned: Option<Arc<crate::persistence::writer_source::WriterSnapshot>>,
 }
 
@@ -349,27 +348,20 @@ impl Store {
         Ok(store)
     }
     /// A durable view: `tenant_entries` are the tenant policy and binding
-    /// records only; every delivery record is read from `persistence`.
-    pub fn durable(
-        persistence: Arc<crate::persistence::RedbPersistence>,
-        tenant_entries: BTreeMap<String, Vec<u8>>,
-    ) -> Result<Self> {
+    /// records only; every delivery record is read at a captured writer root.
+    pub fn durable(tenant_entries: BTreeMap<String, Vec<u8>>) -> Result<Self> {
         if tenant_entries.keys().any(|key| !key.starts_with("tenant_")) {
             return Err(invalid());
         }
         let mut store = Self::from_entries(tenant_entries)?;
-        store.durable = Some(DurableSource {
-            persistence,
-            pinned: None,
-        });
+        store.durable = Some(DurableSource { pinned: None });
         Ok(store)
     }
     /// A durable view that reads only `root`, whoever asks.
     pub fn durable_pinned(
-        persistence: Arc<crate::persistence::RedbPersistence>,
         root: Arc<crate::persistence::writer_source::WriterSnapshot>,
     ) -> Result<Self> {
-        let mut store = Self::durable(persistence, BTreeMap::new())?;
+        let mut store = Self::durable(BTreeMap::new())?;
         if let Some(source) = store.durable.as_mut() {
             source.pinned = Some(root);
         }
@@ -388,39 +380,20 @@ impl Store {
     ) {
         self.read_root = root;
     }
-    /// Run one durable read; if the group index lost its completion marker
-    /// since this view was chosen, become the resident journal and answer `None`
-    /// so the caller takes the resident path.
+    /// Run one durable read at this call's captured root. A root whose group
+    /// index is incomplete refuses with the typed incomplete-index error; the
+    /// journal is never loaded whole in its place.
     fn durable_read<T>(
         &mut self,
         read: impl FnOnce(&crate::persistence::custody_source::CustodyReader) -> Result<T>,
     ) -> Result<Option<T>> {
-        let Some(DurableSource { persistence, .. }) = self.durable.clone() else {
+        if self.durable.is_none() {
             return Ok(None);
-        };
+        }
         let root = self.read_root.clone().ok_or_else(invalid)?;
-        if let Some(answer) = root.with_custody_read(read)? {
-            return Ok(Some(answer));
-        }
-        let mut entries = BTreeMap::new();
-        for prefix in [
-            "tenant_table_policy.v1.",
-            "tenant_policy_binding.v1.",
-            "delivery_",
-        ] {
-            entries.extend(persistence.load_config_values_raw_with_prefix(prefix)?);
-        }
-        let mut resident = Self::from_entries(entries)?;
-        resident.publications = self.publications.clone();
-        resident.selected_records = self.selected_records;
-        resident.read_visits = self.read_visits;
-        resident.validation_visits = self.validation_visits;
-        #[cfg(feature = "sync-orchestration")]
-        {
-            resident.hidden_pulls = std::mem::take(&mut self.hidden_pulls);
-        }
-        *self = resident;
-        Ok(None)
+        root.with_custody_read(read)?
+            .map(Some)
+            .ok_or_else(crate::persistence::custody_source::incomplete_custody_index)
     }
     fn mirrors(&self, key: &str) -> bool {
         self.durable.is_none() || !key.starts_with("delivery_")

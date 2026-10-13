@@ -123,27 +123,18 @@ impl Database {
         if cache.is_none() {
             let mut entries = BTreeMap::new();
             if let Some(persistence) = &self.persistence
-                && persistence.custody_groups_complete()?
+                && !persistence.custody_groups_complete()?
             {
+                // Never load the whole journal in place of a missing index.
+                return Err(crate::persistence::custody_source::incomplete_custody_index());
+            } else if let Some(persistence) = &self.persistence {
                 // The delivery journal stays durable and is read through the
                 // derived group index. Only the bounded tenant policy and
                 // binding records are mirrored.
                 for prefix in ["tenant_table_policy.v1.", "tenant_policy_binding.v1."] {
                     entries.extend(persistence.load_config_values_raw_with_prefix(prefix)?);
                 }
-                *cache = Some(Store::durable(
-                    persistence.clone(),
-                    std::mem::take(&mut entries),
-                )?);
-            } else if let Some(persistence) = &self.persistence {
-                // Never dump unrelated config; each owned journal is a Redb prefix range.
-                for prefix in [
-                    "tenant_table_policy.v1.",
-                    "tenant_policy_binding.v1.",
-                    "delivery_",
-                ] {
-                    entries.extend(persistence.load_config_values_raw_with_prefix(prefix)?);
-                }
+                *cache = Some(Store::durable(std::mem::take(&mut entries))?);
             } else {
                 if let Some(image) = &self.committed_image_startup {
                     entries.extend(image.config_source.load_image_custody_config()?);
@@ -224,6 +215,34 @@ impl Database {
         let records = self.custody_records_in(&[selector.to_owned()], read_memory)?;
         records.iter().map(Record::key).collect()
     }
+    /// Measurement only: drop the custody group index completion marker.
+    /// Takes effect for roots captured after the next open.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __invalidate_custody_groups_for_test(&self) -> Result<()> {
+        self.persistence
+            .as_ref()
+            .expect("file-backed fixture")
+            .invalidate_custody_groups_for_test()
+    }
+    /// Measurement only: the repair rebuild of the custody group index.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __rebuild_custody_index_for_test(&self) -> Result<()> {
+        self.persistence
+            .as_ref()
+            .expect("file-backed fixture")
+            .rebuild_custody_index_for_test()
+    }
+    /// Measurement only: whether the committed custody group index is complete.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __custody_groups_complete_for_test(&self) -> Result<bool> {
+        self.persistence
+            .as_ref()
+            .expect("file-backed fixture")
+            .custody_groups_complete()
+    }
     /// Measurement only: committed custody CONFIG keys under `prefix`
     /// (for example `delivery_root.v1.`), counted without decoding values.
     #[cfg(feature = "test-seams")]
@@ -266,7 +285,7 @@ impl Database {
             }
         }
         let mut resident = Store::from_entries(all)?;
-        let mut durable = Store::durable(persistence.clone(), tenant)?;
+        let mut durable = Store::durable(tenant)?;
         durable.set_read_root(Some(self.latest_custody_root()?));
         let read_memory = self.declared_reader_memory()?;
         let memory = || {
@@ -581,10 +600,35 @@ impl Database {
         if ws.relational_deletes.is_empty() {
             return Ok(());
         }
+        // A manifest names rows only of a delivery root table and the member
+        // tables that root declares. Deletes elsewhere own no custody record,
+        // so they read no custody state at all.
+        let delivery_tables = {
+            let metas = self.relational_store.table_meta.read();
+            metas
+                .iter()
+                .filter_map(|(name, meta)| {
+                    meta.delivery_manifest_tables
+                        .as_ref()
+                        .map(|members| (name, members))
+                })
+                .flat_map(|(name, members)| std::iter::once(name.clone()).chain(members.iter().cloned()))
+                .collect::<HashSet<String>>()
+        };
+        if !ws
+            .relational_deletes
+            .iter()
+            .any(|(table, _, _)| delivery_tables.contains(table))
+        {
+            return Ok(());
+        }
         let mut selectors = BTreeSet::new();
         for (table, rows) in
             self.deleted_row_snapshots_by_table(ws, snapshot, read_memory.clone())?
         {
+            if !delivery_tables.contains(&table) {
+                continue;
+            }
             let Some(meta) = self.table_meta(&table) else {
                 continue;
             };

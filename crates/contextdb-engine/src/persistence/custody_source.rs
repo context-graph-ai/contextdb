@@ -3,6 +3,31 @@
 use super::*;
 
 impl RedbPersistence {
+    /// Measurement only: drop the custody group index completion marker in
+    /// its own committed transaction, as an unfunded maintenance write does.
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn invalidate_custody_groups_for_test(&self) -> Result<()> {
+        self.with_db(|db| {
+            let write = Self::begin_history_write(db)?;
+            custody_groups::invalidate(&write)?;
+            write.commit().map_err(Self::storage_error)
+        })
+    }
+    /// Measurement only: the repair rebuild of the custody read mirror and its
+    /// group index, in its own committed transaction.
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn rebuild_custody_index_for_test(&self) -> Result<()> {
+        self.with_db(|db| {
+            let write = Self::begin_history_write(db)?;
+            Self::rebuild_read_custody_config_in_write(&write, &mut self.proof_admission())?;
+            Self::apply_content_identity_mutations_in_write(
+                &write,
+                &[],
+                &mut self.proof_admission(),
+            )?;
+            write.commit().map_err(Self::storage_error)
+        })
+    }
     /// Measurement only: how many committed CONFIG keys start with `prefix`.
     /// Visits keys; never decodes or copies a value.
     #[cfg(feature = "test-seams")]
@@ -173,6 +198,18 @@ impl RedbPersistence {
                 .map_err(Self::storage_error)?
                 .is_some_and(|v| v.value() == custody_groups::COMPLETE_VALUE))
         })
+    }
+}
+
+/// The typed refusal for a store whose custody group index is incomplete.
+/// Its delivery journal is never loaded whole instead; under the greenfield
+/// rule such a store is moved aside and recreated.
+pub(crate) fn incomplete_custody_index() -> Error {
+    Error::StoreCorrupted {
+        path: "read_custody_groups".into(),
+        reason: "the custody group index is incomplete, so the delivery journal cannot be read \
+                 within the writer budget; move the store aside and recreate it"
+            .into(),
     }
 }
 
