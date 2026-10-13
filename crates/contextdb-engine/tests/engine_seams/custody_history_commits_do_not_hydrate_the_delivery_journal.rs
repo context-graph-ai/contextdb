@@ -208,6 +208,14 @@ fn prepare(dir: &Path, n: usize) {
         hub.__seed_tenant_table_policies_for_test(TenantId::from(TENANT), expectation())
             .unwrap();
         let (shutdown, task) = start_server(&broker, &hub, &dir.join("hub.key")).await;
+        // The second edge, which the hub arm measures, binds while the hub is
+        // still empty, so both arms hold an identical bound second edge.
+        let (second, second_client) = bound_edge(&broker, dir, "second-edge").await;
+        drop(second_client);
+        Arc::into_inner(second)
+            .expect("the second edge has one owner")
+            .close()
+            .unwrap();
         let (edge, client) = bound_edge(&broker, dir, "edge").await;
         // Delivered in exchanges of 16 units: one exchange carrying hundreds
         // of pending units exceeds the default reader limit.
@@ -403,8 +411,9 @@ fn hub_arm(dir: &Path) -> HubArm {
         let broker = InProcessBroker::new();
         let hub = Arc::new(open(&dir.join("hub.db"), Some(CEILING)));
         let (shutdown, task) = start_server(&broker, &hub, &dir.join("hub.key")).await;
-        // The second edge is created fresh in each arm: its own work is equal.
-        let (edge, client) = bound_edge(&broker, dir, "second-edge").await;
+        // The second edge was bound in the fixture: its work is equal in both arms.
+        let edge = Arc::new(open(&dir.join("second-edge.db"), Some(CEILING)));
+        let client = edge_client(&edge, &broker, &dir.join("second-edge.key"));
         for unit in 0..K {
             commit_unit(&edge, 1_000_000 + unit);
         }
