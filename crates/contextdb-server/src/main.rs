@@ -9,7 +9,7 @@ use contextdb_server::protocol::PROTOCOL_VERSION;
 use contextdb_server::transport::ServerResourcePolicy;
 use contextdb_server::transport::iroh::{EndpointSpec, IrohServer};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
 /// The `--version` disclosure, computed from the real `PROTOCOL_VERSION`
 /// constant rather than a hand-maintained literal — a hardcoded string here
@@ -303,13 +303,17 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         SyncServer::new_with_read_budget_provider(db, endpoint, tenant, read_host)
     })?;
 
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let signal_shutdown = shutdown.clone();
+    // The stop handle funds the native delivery installation; the status,
+    // pull, push and binding subjects keep their Legacy handlers beside it.
+    let stop = server
+        .native_stop(Arc::new(AtomicBool::new(false)))
+        .map_err(|error| error.to_string())?;
+    let signal_stop = stop.clone();
     tokio::spawn(async move {
         wait_for_shutdown_signal().await;
-        signal_shutdown.store(true, Ordering::SeqCst);
+        signal_stop.request_stop();
     });
-    server.run_until(shutdown).await;
+    server.run_until_stopped(stop).await;
     server.db().close()?;
     Ok(())
 }

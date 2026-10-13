@@ -636,6 +636,8 @@ struct SyncRouteLifecycle {
 #[derive(Default)]
 struct SyncRouteState {
     lifecycle: Mutex<SyncRouteLifecycle>,
+    /// Native routes served beside the Legacy route map, for one serve call.
+    native: Mutex<Option<super::ReadBoundStreamInstallation>>,
     idle: Notify,
     reply_owners_cancelled: AtomicBool,
     reply_owner_cancelled: Notify,
@@ -646,6 +648,32 @@ struct SyncRouteState {
 }
 
 impl SyncRouteState {
+    fn install_native(&self, installation: super::ReadBoundStreamInstallation) {
+        *self.native.lock().unwrap_or_else(|err| err.into_inner()) = Some(installation);
+    }
+
+    fn clear_native(&self) {
+        let installation = self
+            .native
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .take();
+        drop(installation);
+    }
+
+    /// The installed native root, when it routes `subject`.
+    fn native_route(
+        &self,
+        subject: &str,
+    ) -> Option<contextdb_core::read_memory::ReadShared<super::native_wire::NativeWireRoutes>> {
+        let native = self.native.lock().unwrap_or_else(|err| err.into_inner());
+        native
+            .as_ref()
+            .and_then(|installation| installation.native_routes())
+            .filter(|routes| routes.find(subject).is_some())
+            .cloned()
+    }
+
     fn begin_serving(&self, routes: Arc<HashMap<String, super::RequestHandler>>) {
         let mut lifecycle = self.lifecycle.lock().unwrap_or_else(|err| err.into_inner());
         self.reply_owners_cancelled.store(false, Ordering::SeqCst);
@@ -3440,6 +3468,32 @@ impl LazyBoundServerTransport {
 }
 
 impl ServerTransport for LazyBoundServerTransport {
+    fn serve_native_installation<'a>(
+        &'a self,
+        legacy: Vec<HandlerRegistration>,
+        bound: super::ReadBoundStreamInstallation,
+        stop: super::NativeStop,
+    ) -> super::WireResult<super::DispatchedWireFuture<'a, ()>> {
+        if bound.native_routes().is_none() {
+            return self.serve_read_bound_installation(legacy, bound, stop.flag());
+        }
+        Ok(super::DispatchedWireFuture::legacy(Box::pin(async move {
+            let server = self.bind_server().await?;
+            tracing::info!(
+                ticket = %server.ticket(),
+                node_id = %server.node_id(),
+                "sync endpoint bound; enroll edges with this ticket"
+            );
+            let transport = server.transport();
+            let result = match transport.serve_native_installation(legacy, bound, stop) {
+                Ok(serving) => serving.await,
+                Err(error) => Err(error),
+            };
+            server.close().await;
+            result
+        })))
+    }
+
     fn serve<'a>(
         &'a self,
         handlers: Vec<HandlerRegistration>,
@@ -3478,6 +3532,30 @@ struct IrohServerTransport {
 }
 
 impl ServerTransport for IrohServerTransport {
+    /// Native routes are served beside the Legacy route map on the same
+    /// accept loop and drain; stop is observed through its shared flag.
+    fn serve_native_installation<'a>(
+        &'a self,
+        legacy: Vec<HandlerRegistration>,
+        bound: super::ReadBoundStreamInstallation,
+        stop: super::NativeStop,
+    ) -> super::WireResult<super::DispatchedWireFuture<'a, ()>> {
+        let Some(routes) = bound.native_routes() else {
+            return self.serve_read_bound_installation(legacy, bound, stop.flag());
+        };
+        if !stop.is_funded_by(&routes.installation_owner()) {
+            return Err(TransportError::NoResponder.into());
+        }
+        self.sync_routes.install_native(bound);
+        let shutdown = stop.flag();
+        Ok(super::DispatchedWireFuture::legacy(Box::pin(async move {
+            let result = self.serve(legacy, shutdown).await;
+            self.sync_routes.clear_native();
+            drop(stop);
+            result.map_err(super::WireError::Transport)
+        })))
+    }
+
     fn serve<'a>(
         &'a self,
         handlers: Vec<HandlerRegistration>,
@@ -4111,13 +4189,15 @@ async fn serve_sync_connection(
         large_request_stage.record_authenticated_status_probe_after_reset_for_test(&subject);
         #[cfg(feature = "test-seams")]
         large_request_stage.record_authenticated_pull_request_after_reset_for_test(&subject);
-        let Some(handler) = routes.get(&subject).cloned() else {
+        let native_route = sync_routes.native_route(&subject);
+        let handler = routes.get(&subject).cloned();
+        if native_route.is_none() && handler.is_none() {
             let _ = write_reply(&mut send, &mut recv, REPLY_NO_HANDLER, subject.as_bytes()).await;
             if let Some(path) = completed_stage {
                 remove_stage_after_reply(&large_request_stage, path).await;
             }
             continue;
-        };
+        }
         #[cfg(feature = "test-seams")]
         if completed_stage.is_some() {
             large_request_stage.record_completed_handler_dispatch_for_test();
@@ -4354,13 +4434,28 @@ async fn serve_sync_connection(
                 }) as TransportFuture<'static, ()>
             }
         });
-        if let Err(err) = handler(IncomingRequest {
-            bytes: payload,
-            responder,
-            node_id: Some(remote_node_id.clone()),
-        })
-        .await
-        {
+        let dispatched = match (native_route, handler) {
+            // A natively routed subject never reaches the Legacy route map.
+            (Some(native), _) => {
+                serve_native_subject(
+                    &native,
+                    &subject,
+                    payload,
+                    responder,
+                    remote_node_id.clone(),
+                )
+                .await
+            }
+            (None, Some(handler)) => handler(IncomingRequest {
+                bytes: payload,
+                responder,
+                node_id: Some(remote_node_id.clone()),
+            })
+            .await
+            .map_err(super::WireError::Transport),
+            (None, None) => unreachable!("an unrouted subject answered REPLY_NO_HANDLER above"),
+        };
+        if let Err(err) = dispatched {
             let detail = err.to_string();
             let mut slot = send_slot.lock().await;
             if let Some((mut send, mut recv)) = slot.take() {
@@ -4376,6 +4471,91 @@ async fn serve_sync_connection(
         }
         drop(request_lease);
     }
+}
+
+/// One request on a natively routed subject. The installed provider is
+/// consulted exactly once. A Native selection copies the already admitted
+/// frame payload into a body charged to the original operation; its reply
+/// buffer moves, with its invoice, into the connection's ordinary responder,
+/// so framing, oversize staging, receipt and drain behave as for Legacy.
+/// A Legacy selection runs the route's explicit-owner Legacy arm.
+async fn serve_native_subject(
+    routes: &contextdb_core::read_memory::ReadShared<super::native_wire::NativeWireRoutes>,
+    subject: &str,
+    payload: Vec<u8>,
+    responder: Responder,
+    node_id: String,
+) -> super::WireResult<()> {
+    use super::native_wire::{
+        NativeReadStreamBegin, NativeStreamResponder, admit_wire_future_with,
+    };
+    let future = {
+        let route = routes.find(subject).ok_or(TransportError::NoResponder)?;
+        match route.begin_request()? {
+            NativeReadStreamBegin::Native { operation, .. } => {
+                let owner = operation.owner();
+                let body = super::BoundedWireBody::from_native_reply(
+                    super::AdmittedWireVec::copy_for_native(&payload, &operation)?,
+                );
+                drop(payload);
+                let finish_owner = owner.clone();
+                let reply = NativeStreamResponder::try_new_with(owner, || {
+                    Ok(move |body: super::BoundedWireBody| {
+                        admit_wire_future_with(finish_owner, || {
+                            Ok(async move {
+                                let (bytes, credit) = body
+                                    .into_native_contiguous()
+                                    .map_err(|_| TransportError::NoResponder)?
+                                    .into_prepaid();
+                                // The reply Vec frees inside the write before
+                                // its invoice settles here.
+                                let written = responder(bytes).await;
+                                drop(credit);
+                                written.map_err(super::WireError::Transport)
+                            })
+                        })
+                    })
+                })?;
+                route.dispatch_native(
+                    super::ReadBoundIncomingRequest {
+                        body,
+                        responder: super::ReadBoundResponder::Native(reply),
+                        node_id: Some(node_id),
+                    },
+                    operation,
+                )?
+            }
+            NativeReadStreamBegin::Legacy(acquired) => {
+                let crate::vector_read_memory::RequestReadRoute::Legacy(reader) =
+                    acquired.share().into_route()
+                else {
+                    return Err(TransportError::NoResponder.into());
+                };
+                let owner = contextdb_core::read_memory::ReadMemoryOwner::from_legacy(reader);
+                let body = super::BoundedWireBody::from_legacy_reply(payload, owner)?;
+                let finish: super::StreamResponder = Box::new(move |body| {
+                    Box::pin(async move {
+                        let (bytes, credit) = body
+                            .into_native_contiguous()
+                            .map_err(|_| TransportError::NoResponder)?
+                            .into_prepaid();
+                        let written = responder(bytes).await;
+                        drop(credit);
+                        written.map_err(super::WireError::Transport)
+                    })
+                });
+                route.dispatch_legacy(
+                    super::ReadBoundIncomingRequest {
+                        body,
+                        responder: super::ReadBoundResponder::Legacy(finish),
+                        node_id: Some(node_id),
+                    },
+                    acquired,
+                )?
+            }
+        }
+    };
+    future.await
 }
 
 fn decode_large_response_control_frame(bytes: &[u8]) -> TransportResult<LargeResponseControl> {
