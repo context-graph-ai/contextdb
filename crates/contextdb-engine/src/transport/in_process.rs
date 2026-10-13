@@ -35,6 +35,10 @@ struct Inner {
     // Original broker baseline, never relabelled as request-paid storage.
     #[cfg(target_os = "linux")]
     native: Mutex<Option<contextdb_core::read_memory::ReadShared<native_serving::Mailbox>>>,
+    /// Legacy subjects served beside the live native root. Broker baseline,
+    /// removed from `routes` when that root retires.
+    #[cfg(target_os = "linux")]
+    legacy_beside_native: Mutex<Vec<String>>,
 }
 
 struct InProcessClient {
@@ -65,7 +69,8 @@ impl ClientTransport for InProcessClient {
                     .map(native_serving::Mailbox::acquire_client)
                     .transpose()?
             };
-            if let Some(mailbox) = mailbox {
+            // A subject outside the native root keeps its Legacy route.
+            if let Some(mailbox) = mailbox.filter(|mailbox| mailbox.serves(subject)) {
                 return native_serving::request(
                     mailbox,
                     subject,
@@ -170,18 +175,49 @@ impl ServerTransport for InProcessServer {
         if bound.native_routes().is_none() {
             return self.serve_read_bound_installation(legacy, bound, stop.flag());
         }
-        // Mixing unowned eager handlers into a Native root needs the real
-        // explicit-owner route companions, not an unpaid callback adapter.
-        if !legacy.is_empty() {
-            return Err(TransportError::NoResponder.into());
-        }
         #[cfg(target_os = "linux")]
         {
-            native_serving::serve(&self.inner, bound, stop)
+            // Legacy companions keep their ordinary, unpaid route-map entries
+            // beside the native root, exactly as `serve` installs them. No
+            // unpaid callback enters the native installation itself.
+            if self
+                .inner
+                .native
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .is_some()
+            {
+                return Err(TransportError::NoResponder.into());
+            }
+            let subjects = legacy
+                .iter()
+                .map(|handler| handler.subject.clone())
+                .collect::<Vec<_>>();
+            {
+                let mut routes = self
+                    .inner
+                    .routes
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner());
+                for handler in legacy {
+                    routes.insert(handler.subject, handler.handler);
+                }
+            }
+            *self
+                .inner
+                .legacy_beside_native
+                .lock()
+                .unwrap_or_else(|err| err.into_inner()) = subjects;
+            let serving = native_serving::serve(&self.inner, bound, stop).inspect_err(|_| {
+                self.inner.retire_legacy_beside_native();
+            })?;
+            // Readiness is announced only once the native root is live too.
+            self.inner.routes_changed.notify_waiters();
+            Ok(serving)
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = (bound, stop);
+            let _ = (legacy, bound, stop);
             Err(TransportError::NoResponder.into())
         }
     }
@@ -225,6 +261,22 @@ impl ServerTransport for InProcessServer {
     }
 }
 
+#[cfg(target_os = "linux")]
+impl Inner {
+    fn retire_legacy_beside_native(&self) {
+        let subjects = std::mem::take(
+            &mut *self
+                .legacy_beside_native
+                .lock()
+                .unwrap_or_else(|err| err.into_inner()),
+        );
+        let mut routes = self.routes.lock().unwrap_or_else(|err| err.into_inner());
+        for subject in subjects {
+            routes.remove(&subject);
+        }
+    }
+}
+
 impl InProcessBroker {
     pub fn new() -> Self {
         Self {
@@ -237,6 +289,8 @@ impl InProcessBroker {
                 server_node_id: Mutex::new(None),
                 #[cfg(target_os = "linux")]
                 native: Mutex::new(None),
+                #[cfg(target_os = "linux")]
+                legacy_beside_native: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -513,6 +567,7 @@ pub(crate) fn begin_native_in_process(
     installation: &super::ReadBoundStreamInstallation,
     subject: &str,
     request: &[u8],
+    node_id: Option<&str>,
 ) -> super::WireResult<(
     contextdb_core::read_contract::NativeReadCancellation,
     super::DispatchedWireFuture<'static, ()>,
@@ -569,7 +624,8 @@ pub(crate) fn begin_native_in_process(
         super::ReadBoundIncomingRequest {
             body,
             responder: super::ReadBoundResponder::Native(responder),
-            node_id: None,
+            // Test-driver identity: the broker's paid identity copy is in `request`.
+            node_id: node_id.map(str::to_owned),
         },
         operation,
     )?;
@@ -734,6 +790,9 @@ mod native_serving {
     impl ClientHandle {
         fn mailbox(&self) -> &Mailbox {
             self.mailbox.as_ref().expect("live client handle")
+        }
+        pub(super) fn serves(&self, subject: &str) -> bool {
+            self.mailbox().routes.find(subject).is_some()
         }
     }
     impl Drop for ClientHandle {
@@ -1308,6 +1367,8 @@ mod native_serving {
                 .is_some_and(|current| std::ptr::eq(&**current, &*self.mailbox))
             {
                 drop(native.take());
+                drop(native);
+                self.inner.retire_legacy_beside_native();
             }
         }
     }

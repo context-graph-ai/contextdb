@@ -1168,6 +1168,149 @@ pub(crate) fn install_native_point_route(
     )?;
     builder.finish()
 }
+/// Authenticated delivery-outcome route. The native arm moves the admitted
+/// request body into the paid custody selection and moves the paid reply into
+/// the responder; neither direction copies the bytes or issues a second invoice.
+/// Tenant and hub stay on the installation invoice; each request makes its own
+/// paid copies of them and of the authenticated edge before the frame exists.
+/// The Database, identity and clock are standing roots, retained, never re-labelled.
+#[allow(clippy::too_many_arguments)] // Standing roots and policy stay explicit.
+pub(crate) fn install_native_delivery_route<L>(
+    installation: NativeReadChildReceipt,
+    provider: std::sync::Arc<dyn crate::vector_read_memory::ReadRequestBudgetProvider>,
+    subject: &str,
+    tenant: &str,
+    hub: &str,
+    database: std::sync::Arc<crate::database::Database>,
+    identity: std::sync::Arc<crate::identity::FabricIdentity>,
+    clock: std::sync::Arc<dyn contextdb_core::read_contract::DeadlineClock>,
+    limits: contextdb_core::read_contract::ReadLimits,
+    timeouts: contextdb_core::read_contract::OwnerServiceTimeouts,
+    on_native: impl Fn() + Send + Sync + 'static,
+    legacy: L,
+) -> WireResult<ReadBoundStreamInstallation>
+where
+    L: Fn(
+            super::ReadBoundIncomingRequest,
+            crate::vector_read_memory::RequestReadOwner,
+        ) -> WireResult<DispatchedWireFuture<'static, ()>>
+        + Send
+        + Sync
+        + 'static,
+{
+    use crate::custody::native_selection::NativeBuffer;
+    let mut builder = NativeRouteBuilder::try_new(installation, 1, &clock, timeouts)?;
+    builder.try_push(
+        subject,
+        provider,
+        |owner| {
+            let tenant = NativeWireString::try_from_parts(owner.clone(), &[tenant])?;
+            let hub = NativeWireString::try_from_parts(owner, &[hub])?;
+            Ok(
+                move |request: super::ReadBoundIncomingRequest,
+                      operation: crate::owner_read::NativeReadRequest| {
+                    on_native();
+                    let database = database.clone();
+                    let identity = identity.clone();
+                    let clock = clock.clone();
+                    let owner = operation.owner();
+                    let edge = request
+                        .node_id
+                        .as_deref()
+                        .ok_or(super::TransportError::NoResponder)?;
+                    let tenant = NativeBuffer::copy_from(&owner, tenant.as_str().as_bytes())
+                        .map_err(native_delivery_error)?;
+                    let hub = NativeBuffer::copy_from(&owner, hub.as_str().as_bytes())
+                        .map_err(native_delivery_error)?;
+                    let edge = NativeBuffer::copy_from(&owner, edge.as_bytes())
+                        .map_err(native_delivery_error)?;
+                    admit_native_operation_future_with(operation, |operation| {
+                        let entry = crate::executor::bounded::NativeReadExecutionEntry::try_new(
+                            operation, limits, clock,
+                        )?;
+                        let operation = operation.share();
+                        Ok(async move {
+                            let super::ReadBoundIncomingRequest {
+                                body, responder, ..
+                            } = request;
+                            let (bytes, credit) = body
+                                .into_native_contiguous()
+                                .map_err(|_| super::TransportError::NoResponder)?
+                                .into_prepaid();
+                            let input = NativeBuffer::from_prepaid(bytes, credit, &owner)
+                                .map_err(native_delivery_error)?;
+                            let context = entry.open_context();
+                            let reply = crate::sync_native_delivery::paid_delivery_response(
+                                &database, &identity, input, tenant, hub, edge, &operation,
+                                &context,
+                            )
+                            .map_err(native_delivery_error)?;
+                            let (bytes, credit) = reply.into_prepaid();
+                            let reply = super::AdmittedWireVec::from_prepaid(bytes, credit, owner)?;
+                            responder
+                                .try_finish(super::BoundedWireBody::from_native_reply(reply))?
+                                .await?;
+                            // entry's only persistent logical strong then drops.
+                            Ok(())
+                        })
+                    })
+                },
+            )
+        },
+        |_| Ok(legacy),
+    )?;
+    builder.finish()
+}
+/// Typed terminal for one refused or failed native delivery. A memory refusal
+/// keeps its budget figures; cancellation and backend faults stay unqualified.
+pub(crate) fn native_delivery_error(
+    failure: crate::custody::native_selection::Failure,
+) -> super::WireError {
+    use crate::custody::native_selection::Failure;
+    use contextdb_core::read_memory::NativeRefusal;
+    match failure {
+        Failure::Refused(NativeRefusal::MemoryBudgetExceeded {
+            subsystem,
+            operation,
+            requested_bytes,
+            available_bytes,
+            budget_limit_bytes,
+            hint,
+        }) => contextdb_core::Error::MemoryBudgetExceeded {
+            subsystem: subsystem.to_owned(),
+            operation: operation.to_owned(),
+            requested_bytes,
+            available_bytes,
+            budget_limit_bytes,
+            hint: hint.to_owned(),
+        }
+        .into(),
+        Failure::Refused(NativeRefusal::ProcessMemoryBudgetExceeded {
+            operation,
+            requested_bytes,
+            available_bytes,
+            budget_limit_bytes,
+            hint,
+        }) => contextdb_core::Error::MemoryBudgetExceeded {
+            subsystem: "process_native_ceiling".to_owned(),
+            operation: operation.to_owned(),
+            requested_bytes,
+            available_bytes,
+            budget_limit_bytes,
+            hint: hint.to_owned(),
+        }
+        .into(),
+        Failure::Refused(refusal) => contextdb_core::Error::Other(refusal.to_string()).into(),
+        Failure::Unqualified(error) => error.into(),
+        Failure::ColdUnqualified(error) => {
+            contextdb_core::Error::Other(format!("{error:?}")).into()
+        }
+        Failure::Invalid(_) => {
+            super::TransportError::Other("invalid authenticated outcome request".into()).into()
+        }
+        Failure::OwnerMismatch => super::TransportError::NoResponder.into(),
+    }
+}
 fn native_point_error(error: crate::executor::BoundedExecutionError) -> super::WireError {
     match error {
         crate::executor::BoundedExecutionError::Engine(error) => error.into(),

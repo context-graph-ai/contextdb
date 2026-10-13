@@ -12,6 +12,14 @@ use crate::{
 use contextdb_core::{Incarnation, Lsn, TenantId, read_memory::ReadShared};
 use std::sync::{Arc, Mutex, atomic::Ordering};
 
+// Delivery-order records visited on this thread by the counting pass and by
+// the collecting pass of `custody_outcomes_native_with_after`.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static NATIVE_ORDERS_EXAMINED: std::cell::Cell<(u64, u64)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
 pub(crate) enum Selector<'a> {
     Prefix(&'a str),
     Group(&'a str),
@@ -418,6 +426,8 @@ impl Database {
                     .visit_next(Ok)?;
                 let Some(raw) = raw else { break };
                 let selected = NativeCustodyWindow::admit(raw, &operation.owner())?;
+                #[cfg(test)]
+                NATIVE_ORDERS_EXAMINED.with(|seen| seen.set((seen.get().0 + 1, seen.get().1)));
                 let view = selected.view()?;
                 match view.record()? {
                     RecordView::Order {
@@ -449,6 +459,8 @@ impl Database {
                 .visit_next(Ok)?;
             let Some(raw) = raw else { break };
             let order = NativeCustodyWindow::admit(raw, &operation.owner())?;
+            #[cfg(test)]
+            NATIVE_ORDERS_EXAMINED.with(|seen| seen.set((seen.get().0, seen.get().1 + 1)));
             let (submission, position) = {
                 let view = order.view()?;
                 match view.record()? {

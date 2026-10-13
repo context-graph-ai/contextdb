@@ -690,16 +690,27 @@ impl SyncClient {
         };
         let bytes = encode_named(MessageType::FetchDeliveryOutcomesRequest, &request)
             .map_err(|e| Error::SyncError(e.to_string()))?;
-        let response = self
+        // The admitted path reaches a native delivery installation when the
+        // transport has one; every other transport keeps its Legacy request.
+        let body = crate::transport::BoundedWireBody::from_legacy_reply(
+            bytes,
+            contextdb_core::read_memory::ReadMemoryOwner::from_legacy(read_memory.clone()),
+        )
+        .map_err(|e| Error::SyncError(e.to_string()))?;
+        let reply = self
             .transport
-            .request(
+            .request_stream_admitted(
                 &crate::subjects::delivery_outcomes_subject(self.tenant_id.as_str()),
-                bytes,
+                body,
                 SYNC_TIMEOUT,
             )
+            .map_err(|e| Error::SyncError(e.to_string()))?
             .await
             .map_err(|e| Error::SyncError(e.to_string()))?;
-        let envelope = decode_sync_envelope(&decoded_memory, &response, None)?;
+        let response = reply.contiguous_bytes().ok_or_else(|| {
+            Error::SyncError("delivery reply is not one contiguous admitted body".into())
+        })?;
+        let envelope = decode_sync_envelope(&decoded_memory, response, None)?;
         if envelope.message_type != MessageType::FetchDeliveryOutcomesResponse {
             return Err(crate::custody::canonical::invalid());
         }

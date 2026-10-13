@@ -136,6 +136,35 @@ impl NativeBuffer {
         let text = String::from_utf8(bytes).map_err(|_| Failure::Invalid(Invalid::Codec))?;
         Ok((text, invoice))
     }
+    /// Hand the exact physical bytes and their original invoice to another
+    /// prepaid holder. Nothing is copied, reserved or released.
+    pub(crate) fn into_prepaid(self) -> (Vec<u8>, ReadCredit) {
+        let Self { bytes, invoice } = self;
+        (bytes, invoice)
+    }
+    /// Adopt bytes whose exact allocation `owner` already paid for. A foreign
+    /// or inexact invoice refuses; the refused bytes free before their invoice.
+    pub(crate) fn from_prepaid(
+        bytes: Vec<u8>,
+        invoice: ReadCredit,
+        owner: &ReadMemoryOwner,
+    ) -> Selected<Self> {
+        if !invoice.is_funded_by(owner)
+            || bytes.len() != bytes.capacity()
+            || invoice.bytes() != bytes.capacity()
+        {
+            drop(bytes);
+            drop(invoice);
+            return Err(Failure::OwnerMismatch);
+        }
+        Ok(Self { bytes, invoice })
+    }
+    /// Exact paid copy of borrowed bytes on the original request owner.
+    pub(crate) fn copy_from(owner: &ReadMemoryOwner, source: &[u8]) -> Selected<Self> {
+        let mut copy = Self::allocate(owner, source.len())?;
+        copy.bytes.copy_from_slice(source);
+        Ok(copy)
+    }
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.bytes
     }

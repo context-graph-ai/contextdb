@@ -287,6 +287,10 @@ pub struct SyncServer {
     peer_schema_capabilities: PeerSchemaCapabilities,
     #[cfg(feature = "test-seams")]
     completed_apply_before_reply_pause: Arc<ApplyPhasePause>,
+    /// Native delivery installation prepared by `native_stop`, taken by the
+    /// one `run_until_stopped` driven by that stop handle.
+    native_delivery: std::sync::Mutex<Option<crate::transport::ReadBoundStreamInstallation>>,
+    delivery_route_counts: Arc<DeliveryRouteCounts>,
 }
 
 impl SyncServer {
@@ -380,6 +384,8 @@ impl SyncServer {
             peer_schema_capabilities: PeerSchemaCapabilities::default(),
             #[cfg(feature = "test-seams")]
             completed_apply_before_reply_pause: Arc::new(ApplyPhasePause::new()),
+            native_delivery: std::sync::Mutex::new(None),
+            delivery_route_counts: Arc::new(DeliveryRouteCounts::default()),
         })
     }
 
@@ -541,20 +547,40 @@ impl SyncServer {
         apply_tasks.wait_idle().await;
     }
 
-    /// Stop-handle sibling. Real Native registration awaits the five subject
-    /// companions; until then this uses the transport's genuine Legacy branch.
+    /// Stop-handle sibling. When `stop` came from [`Self::native_stop`], the
+    /// delivery subject is served by its native installation and the status,
+    /// pull, push and binding subjects stay on their Legacy handlers beside it.
+    /// Any other stop handle serves every subject on the transport's Legacy branch.
     #[doc(hidden)]
     pub async fn run_until_stopped(&self, stop: crate::transport::NativeStop) {
         let apply_tasks = Arc::new(ApplyTracker::new());
         let in_flight_push_applies: InFlightPushApplies =
             Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let apply_permits = Arc::new(Semaphore::new(MAX_CONCURRENT_PUSH_APPLIES));
-        let handlers = self.handlers(apply_tasks.clone(), in_flight_push_applies, apply_permits);
-        match self.transport.serve_native_installation(
-            handlers,
-            crate::transport::ReadBoundStreamInstallation::empty(),
-            stop,
-        ) {
+        let mut handlers =
+            self.handlers(apply_tasks.clone(), in_flight_push_applies, apply_permits);
+        let prepared = self
+            .native_delivery
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+            .filter(|installation| {
+                installation
+                    .native_routes()
+                    .is_some_and(|routes| stop.is_funded_by(&routes.installation_owner()))
+            });
+        let installation = match prepared {
+            Some(installation) => {
+                let delivery = crate::subjects::delivery_outcomes_subject(self.tenant_id.as_str());
+                handlers.retain(|handler| handler.subject != delivery);
+                installation
+            }
+            None => crate::transport::ReadBoundStreamInstallation::empty(),
+        };
+        match self
+            .transport
+            .serve_native_installation(handlers, installation, stop)
+        {
             Ok(serving) => {
                 if let Err(err) = serving.await {
                     tracing::error!(error = %err, "sync server transport loop failed");
@@ -775,71 +801,25 @@ impl SyncServer {
             let read_budget_provider = self.read_budget_provider.clone();
             let tenant = self.tenant_id.clone();
             let hub = self.local_node_id.clone();
+            let legacy_fetches = self.delivery_route_counts.clone();
             Arc::new(move |req: IncomingRequest| {
                 let db = db.clone();
                 let read_budget_provider = read_budget_provider.clone();
                 let tenant = tenant.clone();
                 let hub = hub.clone();
+                legacy_fetches.legacy.fetch_add(1, Ordering::SeqCst);
                 Box::pin(async move {
                     let read_memory = read_budget_provider
                         .request_budget()
                         .map_err(to_transport_error)?;
-                    let decoded_memory = crate::read_image_memory::ImageMemory::charging_reader_for(
-                        db.bounded_read_accountant(),
-                        read_memory.clone(),
-                        "reader",
-                        "decode_sync_request",
-                        "Reduce the request or raise the declared reader memory limit.",
-                    );
-                    use crate::protocol::*;
-                    let envelope =
-                        crate::sync_client::decode_sync_envelope(&decoded_memory, &req.bytes, None)
-                            .map_err(to_transport_error)?;
-                    let request: FetchDeliveryOutcomesRequest = decoded_memory
-                        .decode_msgpack(&envelope.payload)
-                        .map_err(to_transport_error)?;
-                    if envelope.message_type != MessageType::FetchDeliveryOutcomesRequest
-                        || request.format != 1
-                        || request.tenant_id != tenant.as_str()
-                    {
-                        return Err(TransportError::Other(
-                            "invalid authenticated outcome request".into(),
-                        ));
-                    }
-                    let hub = hub.ok_or_else(|| {
-                        TransportError::Other("authenticated hub required".into())
-                    })?;
-                    let edge = req.node_id.ok_or_else(|| {
-                        TransportError::Other("authenticated edge required".into())
-                    })?;
-                    let outcomes = crate::custody::delivery::fetch(
+                    let bytes = legacy_delivery_reply(
                         &db,
                         &tenant,
-                        &hub,
-                        &edge,
-                        request.edge_incarnation,
-                        request.since.as_deref(),
-                        read_memory.clone(),
-                    )
-                    .map_err(|e| TransportError::Other(e.to_string()))?;
-                    let response = FetchDeliveryOutcomesResponse {
-                        format: 1,
-                        request_nonce: request.request_nonce,
-                        hub_node_id: hub,
-                        hub_incarnation: db
-                            .existing_sync_incarnation(&tenant, read_memory.clone())
-                            .map_err(|e| TransportError::Other(e.to_string()))?
-                            .ok_or_else(|| {
-                                TransportError::Other("hub authority is not initialized".into())
-                            })?,
-                        tenant_id: tenant.as_str().into(),
-                        edge_node_id: edge,
-                        edge_incarnation: request.edge_incarnation,
-                        result: Some(DeliveryOutcomePage { outcomes }),
-                        error: None,
-                    };
-                    let bytes = encode_named(MessageType::FetchDeliveryOutcomesResponse, &response)
-                        .map_err(|e| TransportError::Other(e.to_string()))?;
+                        hub,
+                        read_memory,
+                        &req.bytes,
+                        req.node_id,
+                    )?;
                     (req.responder)(bytes).await
                 }) as crate::transport::TransportFuture<'static, ()>
             }) as RequestHandler
@@ -3167,6 +3147,9 @@ fn merge_changeset_groups(groups: Vec<ChangeSet>) -> ChangeSet {
     }
     merged
 }
+#[cfg(all(test, feature = "test-seams"))]
+mod native_delivery_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3245,83 +3228,200 @@ mod tests {
     }
 }
 
-// Explicit-owner delivery companion. The native installation's Legacy branch
-// supplies begin_request's exact capability; this sibling never reacquires it.
-// Original run/serve handlers remain untouched, including their existing errors.
-impl SyncServer {
-    pub(crate) fn outcomes_handler_with_read_owner(
-        &self,
-        req: IncomingRequest,
-        selected: crate::vector_read_memory::RequestReadOwner,
-    ) -> crate::transport::WireResult<crate::transport::DispatchedWireFuture<'static, ()>> {
+/// The Legacy delivery answer: decode, fetch through the custody cache, encode.
+/// Shared by the ordinary route and by the native installation's Legacy arm,
+/// so a host-provided Legacy reader keeps exactly today's reply bytes.
+fn legacy_delivery_reply(
+    db: &Database,
+    tenant: &TenantId,
+    hub: Option<String>,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    bytes: &[u8],
+    node_id: Option<String>,
+) -> Result<Vec<u8>, TransportError> {
+    let decoded_memory = crate::read_image_memory::ImageMemory::charging_reader_for(
+        db.bounded_read_accountant(),
+        read_memory.clone(),
+        "reader",
+        "decode_sync_request",
+        "Reduce the request or raise the declared reader memory limit.",
+    );
+    use crate::protocol::*;
+    let envelope = crate::sync_client::decode_sync_envelope(&decoded_memory, bytes, None)
+        .map_err(to_transport_error)?;
+    let request: FetchDeliveryOutcomesRequest = decoded_memory
+        .decode_msgpack(&envelope.payload)
+        .map_err(to_transport_error)?;
+    if envelope.message_type != MessageType::FetchDeliveryOutcomesRequest
+        || request.format != 1
+        || request.tenant_id != tenant.as_str()
+    {
+        return Err(TransportError::Other(
+            "invalid authenticated outcome request".into(),
+        ));
+    }
+    let hub = hub.ok_or_else(|| TransportError::Other("authenticated hub required".into()))?;
+    let edge =
+        node_id.ok_or_else(|| TransportError::Other("authenticated edge required".into()))?;
+    let outcomes = crate::custody::delivery::fetch(
+        db,
+        tenant,
+        &hub,
+        &edge,
+        request.edge_incarnation,
+        request.since.as_deref(),
+        read_memory.clone(),
+    )
+    .map_err(|e| TransportError::Other(e.to_string()))?;
+    let response = FetchDeliveryOutcomesResponse {
+        format: 1,
+        request_nonce: request.request_nonce,
+        hub_node_id: hub,
+        hub_incarnation: db
+            .existing_sync_incarnation(tenant, read_memory.clone())
+            .map_err(|e| TransportError::Other(e.to_string()))?
+            .ok_or_else(|| TransportError::Other("hub authority is not initialized".into()))?,
+        tenant_id: tenant.as_str().into(),
+        edge_node_id: edge,
+        edge_incarnation: request.edge_incarnation,
+        result: Some(DeliveryOutcomePage { outcomes }),
+        error: None,
+    };
+    encode_named(MessageType::FetchDeliveryOutcomesResponse, &response)
+        .map_err(|e| TransportError::Other(e.to_string()))
+}
+
+/// Explicit-owner Legacy arm of the native delivery route. The installation's
+/// begin_request supplies the exact capability; this arm never reacquires it,
+/// and its reply is admitted on that same reader before the responder sees it.
+fn legacy_delivery_arm(
+    db: Arc<Database>,
+    tenant: TenantId,
+    hub: Option<String>,
+    counts: Arc<DeliveryRouteCounts>,
+) -> impl Fn(
+    crate::transport::ReadBoundIncomingRequest,
+    crate::vector_read_memory::RequestReadOwner,
+) -> crate::transport::WireResult<crate::transport::DispatchedWireFuture<'static, ()>>
++ Send
++ Sync
++ 'static {
+    move |request, selected| {
         let read_memory = match selected.into_route() {
             crate::vector_read_memory::RequestReadRoute::Legacy(reader) => reader,
             crate::vector_read_memory::RequestReadRoute::Native(_) => {
                 return Err(TransportError::NoResponder.into());
             }
         };
+        counts.legacy.fetch_add(1, Ordering::SeqCst);
         let owner = contextdb_core::read_memory::ReadMemoryOwner::from_legacy(read_memory.clone());
-        let db = self.db.clone();
-        let tenant = self.tenant_id.clone();
-        let hub = self.local_node_id.clone();
-        crate::transport::admit_wire_future(owner, async move {
-            let decoded_memory = crate::read_image_memory::ImageMemory::charging_reader_for(
-                db.bounded_read_accountant(),
-                read_memory.clone(),
-                "reader",
-                "decode_sync_request",
-                "Reduce the request or raise the declared reader memory limit.",
-            );
-            use crate::protocol::*;
-            let envelope =
-                crate::sync_client::decode_sync_envelope(&decoded_memory, &req.bytes, None)
-                    .map_err(to_transport_error)?;
-            let request: FetchDeliveryOutcomesRequest = decoded_memory
-                .decode_msgpack(&envelope.payload)
-                .map_err(to_transport_error)?;
-            if envelope.message_type != MessageType::FetchDeliveryOutcomesRequest
-                || request.format != 1
-                || request.tenant_id != tenant.as_str()
-            {
-                return Err(
-                    TransportError::Other("invalid authenticated outcome request".into()).into(),
-                );
-            }
-            let hub =
-                hub.ok_or_else(|| TransportError::Other("authenticated hub required".into()))?;
-            let edge = req
-                .node_id
-                .ok_or_else(|| TransportError::Other("authenticated edge required".into()))?;
-            let outcomes = crate::custody::delivery::fetch(
-                &db,
-                &tenant,
-                &hub,
-                &edge,
-                request.edge_incarnation,
-                request.since.as_deref(),
-                read_memory.clone(),
-            )
-            .map_err(|e| TransportError::Other(e.to_string()))?;
-            let response = FetchDeliveryOutcomesResponse {
-                format: 1,
-                request_nonce: request.request_nonce,
-                hub_node_id: hub,
-                hub_incarnation: db
-                    .existing_sync_incarnation(&tenant, read_memory.clone())
-                    .map_err(|e| TransportError::Other(e.to_string()))?
-                    .ok_or_else(|| {
-                        TransportError::Other("hub authority is not initialized".into())
-                    })?,
-                tenant_id: tenant.as_str().into(),
-                edge_node_id: edge,
-                edge_incarnation: request.edge_incarnation,
-                result: Some(DeliveryOutcomePage { outcomes }),
-                error: None,
-            };
-            let bytes = encode_named(MessageType::FetchDeliveryOutcomesResponse, &response)
-                .map_err(|e| TransportError::Other(e.to_string()))?;
-            (req.responder)(bytes).await.map_err(Into::into)
+        let db = db.clone();
+        let tenant = tenant.clone();
+        let hub = hub.clone();
+        crate::transport::admit_wire_future(owner.clone(), async move {
+            let crate::transport::ReadBoundIncomingRequest {
+                body,
+                responder,
+                node_id,
+            } = request;
+            let bytes = body
+                .native_contiguous_bytes()
+                .ok_or(TransportError::NoResponder)?;
+            let reply = legacy_delivery_reply(&db, &tenant, hub, read_memory, bytes, node_id)?;
+            drop(body);
+            responder
+                .try_finish(crate::transport::BoundedWireBody::from_legacy_reply(
+                    reply, owner,
+                )?)?
+                .await
         })
         .map(crate::transport::DispatchedWireFuture::native)
+    }
+}
+
+/// Standing count of which delivery arm actually served each request.
+#[derive(Debug, Default)]
+struct DeliveryRouteCounts {
+    native: AtomicUsize,
+    legacy: AtomicUsize,
+}
+
+impl SyncServer {
+    /// Prepare this hub's native delivery installation and the stop handle that
+    /// must drive it. The installation, its route and the stop control are paid
+    /// by one native child of the declared reader. A hub without a fabric
+    /// identity gets a stop handle and keeps every subject on Legacy.
+    #[doc(hidden)]
+    pub fn native_stop(
+        &self,
+        flag: Arc<AtomicBool>,
+    ) -> crate::transport::WireResult<crate::transport::NativeStop> {
+        let receipt = match self
+            .db
+            .declared_read_request_provider()
+            .request_budget_owner()?
+            .into_route()
+        {
+            crate::vector_read_memory::RequestReadRoute::Native(receipt) => receipt,
+            crate::vector_read_memory::RequestReadRoute::Legacy(_) => {
+                return Err(TransportError::NoResponder.into());
+            }
+        };
+        // Native custody selection reads the durable committed root. A memory
+        // store has none, so its delivery stays on the Legacy handler.
+        let (Some(hub), Some(identity), false) = (
+            &self.local_node_id,
+            &self.lineage_identity,
+            self.db.is_memory_backed(),
+        ) else {
+            return crate::transport::NativeStop::try_new(flag, &receipt.into_owner());
+        };
+        let config = self.db.owner_read_config();
+        let on_native = {
+            let counts = self.delivery_route_counts.clone();
+            move || {
+                counts.native.fetch_add(1, Ordering::SeqCst);
+            }
+        };
+        let installation = crate::transport::install_native_delivery_route(
+            receipt,
+            self.read_budget_provider.clone(),
+            &crate::subjects::delivery_outcomes_subject(self.tenant_id.as_str()),
+            self.tenant_id.as_str(),
+            hub,
+            self.db.clone(),
+            identity.clone(),
+            crate::read_session::read_clock(),
+            config.limits.limits,
+            config.timeouts,
+            on_native,
+            legacy_delivery_arm(
+                self.db.clone(),
+                self.tenant_id.clone(),
+                self.local_node_id.clone(),
+                self.delivery_route_counts.clone(),
+            ),
+        )?;
+        let owner = installation
+            .native_routes()
+            .ok_or(TransportError::NoResponder)?
+            .installation_owner();
+        let stop = crate::transport::NativeStop::try_new(flag, &owner)?;
+        *self
+            .native_delivery
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(installation);
+        Ok(stop)
+    }
+
+    /// Requests served by the native delivery arm and by either Legacy delivery
+    /// path since construction, in that order.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn delivery_route_counts_for_test(&self) -> (usize, usize) {
+        (
+            self.delivery_route_counts.native.load(Ordering::SeqCst),
+            self.delivery_route_counts.legacy.load(Ordering::SeqCst),
+        )
     }
 }

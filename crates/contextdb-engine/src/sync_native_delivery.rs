@@ -12,6 +12,8 @@ mod paid_request;
 pub(crate) use borrowed_packet::{
     NativeBorrowedOutcomeBatch, NativePacketNamespace, encode_custody_outcomes,
 };
+#[cfg(test)]
+pub(crate) use paid_request::AFTER_SELECTION;
 pub(crate) use paid_request::paid_delivery_response;
 mod wire_views;
 pub(crate) use packet::encode_packet;

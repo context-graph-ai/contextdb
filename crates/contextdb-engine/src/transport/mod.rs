@@ -12,12 +12,16 @@ pub(crate) mod iroh_blobs_adapter;
 pub(crate) use iroh_blobs_adapter as adapter;
 #[cfg(feature = "iroh")]
 mod large_request_staging;
+#[cfg(test)]
+mod native_buffer_transfer_tests;
 mod native_wire;
 #[doc(hidden)]
 pub use native_wire::ReadBoundStreamInstallation;
 #[doc(hidden)]
 pub use native_wire::{AdmittedWireFuture, DispatchedWireFuture};
-pub(crate) use native_wire::{NativeStreamResponder, NativeWireString, admit_wire_future};
+pub(crate) use native_wire::{
+    NativeStreamResponder, NativeWireString, admit_wire_future, install_native_delivery_route,
+};
 
 // Transport-neutral surface for embedding consumers (e.g. a downstream fabric
 // runtime): a peer-endpoint alias plus scheme-free spec builders, so an
@@ -328,6 +332,10 @@ impl BoundedWireReply {
     pub fn body_mut(&mut self) -> &mut BoundedWireBody {
         &mut self.body
     }
+    /// The whole reply when it is one unconsumed admitted buffer.
+    pub(crate) fn contiguous_bytes(&self) -> Option<&[u8]> {
+        self.body.native_contiguous_bytes()
+    }
 }
 
 #[doc(hidden)]
@@ -530,6 +538,41 @@ impl AdmittedWireVec {
             return Err(contextdb_core::Error::ReadCancelled.into());
         }
         Self::copy_from(bytes, operation.owner())
+    }
+
+    /// Adopt bytes whose exact allocation `reader` already paid for, keeping
+    /// the same invoice. A foreign or inexact invoice refuses without reserving;
+    /// the refused bytes free before their invoice.
+    pub(crate) fn from_prepaid(
+        bytes: Vec<u8>,
+        credit: contextdb_core::read_memory::ReadCredit,
+        reader: ReadMemoryOwner,
+    ) -> WireResult<Self> {
+        if !credit.is_funded_by(&reader)
+            || bytes.len() != bytes.capacity()
+            || credit.bytes() != bytes.capacity()
+        {
+            drop(bytes);
+            drop(credit);
+            return Err(TransportError::NoResponder.into());
+        }
+        Ok(Self {
+            bytes,
+            _credit: credit,
+            reader,
+        })
+    }
+
+    /// Hand the exact physical bytes and their invoice to another prepaid
+    /// holder. Nothing is copied, reserved or released.
+    pub(crate) fn into_prepaid(self) -> (Vec<u8>, contextdb_core::read_memory::ReadCredit) {
+        let Self { bytes, _credit, .. } = self;
+        (bytes, _credit)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn as_ptr_for_test(&self) -> *const u8 {
+        self.bytes.as_ptr()
     }
 
     fn from_legacy(bytes: Vec<u8>, reader: ReadMemoryOwner) -> WireResult<Self> {
@@ -1152,7 +1195,25 @@ impl std::io::Write for NativeRowSize {
 }
 
 impl BoundedWireBody {
-    fn from_native_reply(bytes: AdmittedWireVec) -> Self {
+    /// Move an unconsumed contiguous admitted body out with its invoice.
+    /// A captured stream or a partly read body is handed back unchanged.
+    pub(crate) fn into_native_contiguous(self) -> Result<AdmittedWireVec, Self> {
+        match self {
+            Self {
+                storage: WireBodyStorage::Legacy(bytes),
+                position: 0,
+                ..
+            } => Ok(bytes),
+            other => Err(other),
+        }
+    }
+    /// A Legacy reply's complete Vec, admitted on the selected reader.
+    pub(crate) fn from_legacy_reply(bytes: Vec<u8>, reader: ReadMemoryOwner) -> WireResult<Self> {
+        Ok(Self::from_native_reply(AdmittedWireVec::from_legacy(
+            bytes, reader,
+        )?))
+    }
+    pub(crate) fn from_native_reply(bytes: AdmittedWireVec) -> Self {
         Self {
             length: bytes.bytes.len() as u64,
             position: 0,
@@ -1162,7 +1223,7 @@ impl BoundedWireBody {
     }
     // Only an in-process admitted contiguous body can supply this borrow.
     // Captured stream sources require the unactivated native decode companion.
-    fn native_contiguous_bytes(&self) -> Option<&[u8]> {
+    pub(crate) fn native_contiguous_bytes(&self) -> Option<&[u8]> {
         match &self.storage {
             WireBodyStorage::Legacy(bytes) if self.position == 0 => Some(&bytes.bytes),
             _ => None,

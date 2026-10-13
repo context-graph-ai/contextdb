@@ -11,6 +11,13 @@ use crate::owner_read::NativeReadRequest;
 use crate::protocol::MessageType;
 use contextdb_core::{Incarnation, Lsn, TenantId};
 
+// One-shot test action run on this thread right after custody selection.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static AFTER_SELECTION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 struct PaidMemory<'a> {
     operation: &'a NativeReadRequest,
     context: &'a NativeReadOpenContext,
@@ -132,6 +139,12 @@ pub(crate) fn paid_delivery_response(
         operation,
         context,
     )?;
+    #[cfg(test)]
+    AFTER_SELECTION.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
     batch.checkpoint()?;
     let (tenant, hub, edge) = namespace.text()?;
     let output = encode_response(
