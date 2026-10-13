@@ -20,6 +20,10 @@ pub(crate) struct ImageMemory {
     held: AtomicUsize,
     control_bytes: usize,
     failure: parking_lot::Mutex<Option<Error>>,
+    /// Present on an owner whose every top-level decode call is charged to
+    /// its own writer owner: the slot holds the latest call's owner until the
+    /// next call begins or this owner drops.
+    per_call: Option<parking_lot::Mutex<Option<Arc<ImageMemory>>>>,
     // Last custody field pins the original writer epoch through image refund.
     _writer_custody: Option<crate::memory_accounting::StoreAccountantHandle>,
 }
@@ -38,6 +42,7 @@ impl ImageMemory {
             held: AtomicUsize::new(0),
             control_bytes: 0,
             failure: parking_lot::Mutex::new(None),
+            per_call: None,
             _writer_custody: None,
         })
     }
@@ -73,6 +78,7 @@ impl ImageMemory {
             held: AtomicUsize::new(0),
             control_bytes: 0,
             failure: parking_lot::Mutex::new(None),
+            per_call: None,
             _writer_custody: writer_custody,
         })
     }
@@ -91,6 +97,7 @@ impl ImageMemory {
             held: AtomicUsize::new(0),
             control_bytes: 0,
             failure: parking_lot::Mutex::new(None),
+            per_call: None,
             _writer_custody: None,
         })
     }
@@ -114,6 +121,7 @@ impl ImageMemory {
             held: AtomicUsize::new(0),
             control_bytes: 0,
             failure: parking_lot::Mutex::new(None),
+            per_call: None,
             _writer_custody: None,
         })
     }
@@ -146,6 +154,7 @@ impl ImageMemory {
             held: AtomicUsize::new(control),
             control_bytes: control,
             failure: parking_lot::Mutex::new(None),
+            per_call: None,
             _writer_custody: None,
         }))
     }
@@ -170,8 +179,44 @@ impl ImageMemory {
             held: AtomicUsize::new(0),
             control_bytes: control | crate::memory_accounting::OPEN_RESIDUE_TAG,
             failure: parking_lot::Mutex::new(None),
+            per_call: None,
             _writer_custody: writer_custody,
         }))
+    }
+
+    /// A writer owner for a loop that decodes one stored value per call and
+    /// whose retained results are already paid for by the caller's own
+    /// workspace. Each top-level decode call under it gets a fresh writer
+    /// owner, and the previous call's owner -- the stored body it decoded and
+    /// dropped, its codec growth and its copy -- is returned when the next
+    /// call begins. Its charges are therefore live for exactly one value at a
+    /// time instead of accumulating across values that are already freed.
+    pub(crate) fn operation_writer_per_call(
+        accountant: crate::memory_accounting::AccountantHandle,
+    ) -> Result<Arc<Self>> {
+        let mut owner = Self::operation_writer(accountant)?;
+        Arc::get_mut(&mut owner)
+            .expect("new writer owner is exclusive")
+            .per_call = Some(parking_lot::Mutex::new(None));
+        Ok(owner)
+    }
+
+    /// `subsystem/operation` this owner's admissions and refusals carry.
+    pub(crate) fn labels(&self) -> (&'static str, &'static str) {
+        (self.subsystem, self.operation)
+    }
+
+    /// Bytes held by this owner, including its current per-call owner.
+    pub(crate) fn held_with_call(&self) -> usize {
+        self.held().saturating_add(
+            self.per_call
+                .as_ref()
+                .map_or(0, |slot| slot.lock().as_ref().map_or(0, |call| call.held())),
+        )
+    }
+
+    pub(crate) fn is_per_call(&self) -> bool {
+        self.per_call.is_some()
     }
 
     /// A standalone call uses the engine's default open ceiling and keeps
@@ -188,6 +233,15 @@ impl ImageMemory {
     /// Reuse an operation's owner; otherwise admit a fresh call-local owner.
     pub(crate) fn enter_decode_call() -> Result<ImageMemoryScope> {
         if let Ok(owner) = active_owner() {
+            if let Some(slot) = &owner.per_call {
+                let mut slot = slot.lock();
+                // The previous call returned before this one began; its
+                // stored body and codec growth are already dropped.
+                drop(slot.take());
+                let call = Self::operation_writer(owner.accountant.clone())?;
+                *slot = Some(call.clone());
+                return Ok(call.enter());
+            }
             return Ok(owner.enter());
         }
         Self::enter_writer_operation(Self::default_decode_accountant())
@@ -437,6 +491,7 @@ impl ImageMemory {
             held: AtomicUsize::new(control),
             control_bytes: control,
             failure: parking_lot::Mutex::new(None),
+            per_call: None,
             _writer_custody: self._writer_custody.clone(),
         }))
     }
