@@ -990,9 +990,65 @@ mod verified {
     }
 }
 
+/// The operation's memory as the funder of native signature inputs: each
+/// native buffer is admitted to it before the buffer exists, and a refusal
+/// keeps the operation's own typed error for the caller.
+#[derive(Debug)]
+struct VerificationFunds {
+    memory: Arc<crate::read_image_memory::ImageMemory>,
+    refusal: parking_lot::Mutex<Option<contextdb_core::Error>>,
+}
+impl contextdb_core::read_memory::ReadMemoryBudget for VerificationFunds {
+    fn try_reserve(
+        &self,
+        bytes: usize,
+        _subsystem: &'static str,
+        _operation: &'static str,
+        _hint: &'static str,
+    ) -> Result<()> {
+        self.memory.reserve(bytes)
+    }
+    fn try_reserve_native(
+        &self,
+        bytes: usize,
+        subsystem: &'static str,
+        operation: &'static str,
+        hint: &'static str,
+    ) -> std::result::Result<(), contextdb_core::read_memory::NativeRefusal> {
+        use contextdb_core::read_memory::NativeRefusal;
+        self.memory.reserve(bytes).map_err(|error| {
+            let refusal = match &error {
+                contextdb_core::Error::MemoryBudgetExceeded {
+                    requested_bytes,
+                    available_bytes,
+                    budget_limit_bytes,
+                    ..
+                } => NativeRefusal::MemoryBudgetExceeded {
+                    subsystem,
+                    operation,
+                    requested_bytes: *requested_bytes,
+                    available_bytes: *available_bytes,
+                    budget_limit_bytes: *budget_limit_bytes,
+                    hint,
+                },
+                _ => NativeRefusal::Other("custody verification admission refused"),
+            };
+            *self.refusal.lock() = Some(error);
+            refusal
+        })
+    }
+    fn native_reserve_supported(&self) -> bool {
+        true
+    }
+    fn release(&self, bytes: usize) {
+        self.memory.release(bytes);
+    }
+}
+
 /// Verify a stored record's signature unless these exact stored bytes were
 /// verified before. The native verifier renders each signature input into a
-/// buffer `memory` admits first, so no verification allocation goes unfunded.
+/// buffer `memory` admits first; the funder itself is admitted too, so no
+/// verification allocation goes unfunded.
 fn verify_stored(
     memory: &Arc<crate::read_image_memory::ImageMemory>,
     key: &str,
@@ -1004,13 +1060,27 @@ fn verify_stored(
         return Ok(());
     }
     let view = super::native_record_codec::decode_record(bytes).map_err(|_| invalid())?;
-    let owner = contextdb_core::read_memory::ReadMemoryOwner::from_legacy(memory.clone());
-    match view.verify_native(&owner) {
+    // The funder's shared allocation, admitted before it exists.
+    let funder_bytes = std::mem::size_of::<VerificationFunds>()
+        + 2 * std::mem::size_of::<usize>()
+        + crate::sync_types::held::ALLOCATION_BYTES;
+    memory.reserve(funder_bytes)?;
+    let funds = Arc::new(VerificationFunds {
+        memory: memory.clone(),
+        refusal: parking_lot::Mutex::new(None),
+    });
+    let owner = contextdb_core::read_memory::ReadMemoryOwner::from_legacy(funds.clone());
+    let verified = view.verify_native(&owner);
+    drop(owner);
+    let refusal = funds.refusal.lock().take();
+    drop(funds);
+    memory.release(funder_bytes);
+    match verified {
         Ok(()) => {}
         Err(Failure::Invalid(_)) => return Err(invalid()),
         Err(Failure::Unqualified(error)) => return Err(error),
         Err(other) => {
-            return Err(memory.take_failure().unwrap_or_else(|| {
+            return Err(refusal.unwrap_or_else(|| {
                 contextdb_core::Error::Other(match other {
                     Failure::Refused(refusal) => refusal.to_string(),
                     _ => "custody signature verification failed".into(),
