@@ -3,8 +3,8 @@
 //! terminal altered after commit, or one whose diagnostic or object admission
 //! is gone, never silently excludes its root: the pending read and the next
 //! push refuse as corruption, after a reopen, after the custody index is
-//! rebuilt; a destination change recomputes every root against the new
-//! destination.
+//! rebuilt; after a destination change the root is pending at the new
+//! destination and offering it still refuses as corruption.
 use crate::custody_fixture::*;
 use contextdb_core::Error;
 use contextdb_engine::Database;
@@ -117,9 +117,11 @@ async fn a_damaged_delivered_terminal_is_refused_never_excluded() {
     }
 
     // A destination change recomputes every root against the new destination:
-    // the damaged terminal names a former destination, so its root is simply
-    // pending there, and delivery to the new destination clears it. (A store
-    // cannot rebind to a former hub, so that terminal never counts again.)
+    // the damaged terminal names a former destination, so its root is pending
+    // there and is not excluded; offering it still reads its submission's
+    // evidence, which refuses as corruption rather than sending the unit on.
+    // (A store cannot rebind to a former hub, so that terminal never counts
+    // again.)
     let dir = tempfile::tempdir().unwrap();
     let (edge, client) = bound_edge(&broker, dir.path(), None).await;
     for unit in 0..4 {
@@ -140,9 +142,11 @@ async fn a_damaged_delivered_terminal_is_refused_never_excluded() {
         4,
         "at the new destination every root is pending, the damaged one included"
     );
-    client.push().await.unwrap();
-    let (delivered, _) = edge.__custody_pending_for_test().unwrap();
-    assert!(delivered.is_empty(), "{delivered:?}");
+    let pushed = client.push().await;
+    assert!(
+        pushed.as_ref().is_err_and(corruption),
+        "the damaged unit is refused, not sent on: {pushed:?}"
+    );
     drop(client);
     second.stop().await;
     first.stop().await;
