@@ -35,6 +35,20 @@ pub(crate) struct CustodyReader {
 }
 
 impl CustodyReader {
+    /// Open the custody tables of one already pinned storage view.
+    fn open(read: &redb::ReadTransaction) -> Result<Self> {
+        let config = match read.open_table(CONFIG_TABLE) {
+            Ok(table) => Some(table),
+            Err(redb::TableError::TableDoesNotExist(_)) => None,
+            Err(err) => return Err(RedbPersistence::storage_error(err)),
+        };
+        let groups = match read.open_table(custody_groups::GROUP_TABLE) {
+            Ok(table) => Some(table),
+            Err(redb::TableError::TableDoesNotExist(_)) => None,
+            Err(err) => return Err(RedbPersistence::storage_error(err)),
+        };
+        Ok(Self { config, groups })
+    }
     /// Visit exactly `key`'s stored value, if committed.
     pub(crate) fn get<T>(
         &self,
@@ -160,36 +174,22 @@ impl RedbPersistence {
                 .is_some_and(|v| v.value() == custody_groups::COMPLETE_VALUE))
         })
     }
-    /// Run `read` against one committed custody view. A view whose group index
-    /// is incomplete answers `None`: its membership answers could be partial.
+}
+
+impl super::writer_source::WriterSnapshot {
+    /// Run `read` against this captured root's custody tables. Every read of
+    /// one operation sees exactly the root it captured, however many commits,
+    /// retirements or cleanups happen meanwhile. A root whose group index was
+    /// incomplete answers `None`: its membership answers could be partial.
     pub(crate) fn with_custody_read<T>(
         &self,
         read: impl FnOnce(&CustodyReader) -> Result<T>,
     ) -> Result<Option<T>> {
-        self.with_db(|db| {
-            let read_txn = db.begin_read().map_err(Self::storage_error)?;
-            let config = match read_txn.open_table(CONFIG_TABLE) {
-                Ok(table) => Some(table),
-                Err(redb::TableError::TableDoesNotExist(_)) => None,
-                Err(err) => return Err(Self::storage_error(err)),
-            };
-            let groups = match read_txn.open_table(custody_groups::GROUP_TABLE) {
-                Ok(table) => table,
-                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-                Err(err) => return Err(Self::storage_error(err)),
-            };
-            if groups
-                .get(custody_groups::COMPLETE)
-                .map_err(Self::storage_error)?
-                .is_none_or(|v| v.value() != custody_groups::COMPLETE_VALUE)
-            {
-                return Ok(None);
-            }
-            read(&CustodyReader {
-                config,
-                groups: Some(groups),
-            })
-            .map(Some)
-        })
+        if !self.custody_groups_complete() {
+            return Ok(None);
+        }
+        let txn = self.owner_read()?;
+        let reader = CustodyReader::open(&txn)?;
+        read(&reader).map(Some)
     }
 }

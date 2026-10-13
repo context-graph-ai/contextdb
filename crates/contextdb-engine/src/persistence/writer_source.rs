@@ -62,6 +62,10 @@ struct WriterTableMeta {
 }
 
 impl WriterSnapshot {
+    /// Whether this captured root carried a complete custody group index.
+    pub(crate) fn custody_groups_complete(&self) -> bool {
+        self.custody_groups_complete
+    }
     /// Whether an authoritative erasure invalidated part of this captured view.
     pub(crate) fn erased(&self) -> bool {
         let erasure = self.erasure.read();

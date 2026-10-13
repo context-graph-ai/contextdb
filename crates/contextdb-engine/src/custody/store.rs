@@ -180,6 +180,14 @@ pub(crate) mod work {
     pub(crate) fn decoded(_: u64) {}
 }
 
+/// Where a durable store reads: the database's own captured roots, or one root
+/// pinned for its whole life (a received unit's detached working image).
+#[derive(Clone)]
+pub(crate) struct DurableSource {
+    persistence: Arc<crate::persistence::RedbPersistence>,
+    pinned: Option<Arc<crate::persistence::writer_source::WriterSnapshot>>,
+}
+
 #[derive(Default)]
 pub(crate) struct Store {
     pub records: BTreeMap<String, Record>,
@@ -192,7 +200,9 @@ pub(crate) struct Store {
     /// A file-backed store whose derived group index is complete reads the
     /// delivery journal durably. The maps above then mirror only the bounded
     /// tenant policy and binding records; no delivery record stays resident.
-    durable: Option<Arc<crate::persistence::RedbPersistence>>,
+    durable: Option<DurableSource>,
+    /// The captured writer root every durable read of the current call uses.
+    read_root: Option<Arc<crate::persistence::writer_source::WriterSnapshot>>,
     pub selected_records: u64,
     pub read_visits: u64,
     pub validation_visits: u64,
@@ -348,11 +358,35 @@ impl Store {
             return Err(invalid());
         }
         let mut store = Self::from_entries(tenant_entries)?;
-        store.durable = Some(persistence);
+        store.durable = Some(DurableSource {
+            persistence,
+            pinned: None,
+        });
+        Ok(store)
+    }
+    /// A durable view that reads only `root`, whoever asks.
+    pub fn durable_pinned(
+        persistence: Arc<crate::persistence::RedbPersistence>,
+        root: Arc<crate::persistence::writer_source::WriterSnapshot>,
+    ) -> Result<Self> {
+        let mut store = Self::durable(persistence, BTreeMap::new())?;
+        if let Some(source) = store.durable.as_mut() {
+            source.pinned = Some(root);
+        }
         Ok(store)
     }
     pub fn is_durable(&self) -> bool {
         self.durable.is_some()
+    }
+    pub fn pinned_root(&self) -> Option<&Arc<crate::persistence::writer_source::WriterSnapshot>> {
+        self.durable.as_ref().and_then(|source| source.pinned.as_ref())
+    }
+    /// Set (or clear) the captured root for the reads of one call.
+    pub fn set_read_root(
+        &mut self,
+        root: Option<Arc<crate::persistence::writer_source::WriterSnapshot>>,
+    ) {
+        self.read_root = root;
     }
     /// Run one durable read; if the group index lost its completion marker
     /// since this view was chosen, become the resident journal and answer `None`
@@ -361,10 +395,11 @@ impl Store {
         &mut self,
         read: impl FnOnce(&crate::persistence::custody_source::CustodyReader) -> Result<T>,
     ) -> Result<Option<T>> {
-        let Some(persistence) = self.durable.clone() else {
+        let Some(DurableSource { persistence, .. }) = self.durable.clone() else {
             return Ok(None);
         };
-        if let Some(answer) = persistence.with_custody_read(read)? {
+        let root = self.read_root.clone().ok_or_else(invalid)?;
+        if let Some(answer) = root.with_custody_read(read)? {
             return Ok(Some(answer));
         }
         let mut entries = BTreeMap::new();

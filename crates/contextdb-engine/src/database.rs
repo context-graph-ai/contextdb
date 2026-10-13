@@ -9,6 +9,8 @@
 pub(crate) mod custody_pull;
 mod custody_remainder;
 mod custody_store;
+#[cfg(feature = "test-seams")]
+pub use custody_store::HeldCustodyRootForTest;
 mod maintenance_frontier;
 #[cfg(feature = "sync-orchestration")]
 pub(crate) mod native_custody_selection;
@@ -42367,10 +42369,13 @@ impl Database {
                 // The working image reads the receiver's committed journal
                 // durably; nothing of the journal is copied into it.
                 Some(persistence) if persistence.custody_groups_complete()? => {
-                    *working.custody_cache.lock() = Some(crate::custody::store::Store::durable(
-                        persistence.clone(),
-                        BTreeMap::new(),
-                    )?);
+                    // Pinned to the receiver's committed root at preparation:
+                    // every custody read of the unit sees that one root.
+                    *working.custody_cache.lock() =
+                        Some(crate::custody::store::Store::durable_pinned(
+                            persistence.clone(),
+                            self.latest_custody_root()?,
+                        )?);
                 }
                 _ => {
                     *working.custody_metadata.lock() = self

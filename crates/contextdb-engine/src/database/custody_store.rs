@@ -2,6 +2,20 @@
 use super::*;
 use crate::custody::{records::*, store::Store};
 
+/// A captured writer root held by a test.
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub struct HeldCustodyRootForTest(Arc<crate::persistence::writer_source::WriterSnapshot>);
+
+/// Which captured writer root a custody call reads.
+#[derive(Clone, Copy)]
+enum CustodyRoot {
+    /// The calling operation's captured root (or the latest when it has none).
+    Operation,
+    /// The latest published root: commit preparation and retirement.
+    Latest,
+}
+
 pub(crate) struct CustodyDelta {
     _publication: crate::custody::store::Publication,
     records: BTreeMap<String, Option<Record>>,
@@ -82,6 +96,29 @@ impl Database {
         &self,
         f: impl FnOnce(&mut Store) -> Result<T>,
     ) -> Result<T> {
+        self.with_custody_store_at(CustodyRoot::Operation, f)
+    }
+    /// The latest published writer root. Commit preparation validates and
+    /// retires against it, so it sees every commit published before this one.
+    pub(crate) fn latest_custody_root(
+        &self,
+    ) -> Result<Arc<crate::persistence::writer_source::WriterSnapshot>> {
+        super::writer_read::durable_root(self.tx_mgr.capture_published_read().handle)?
+            .ok_or_else(|| Error::Other("writer publication has no durable root".into()))
+    }
+    fn with_custody_store_at<T>(
+        &self,
+        at: CustodyRoot,
+        f: impl FnOnce(&mut Store) -> Result<T>,
+    ) -> Result<T> {
+        // Capture the root before the cache lock: publication takes the
+        // published-read lock and then the cache, never the reverse.
+        let root = self.persistence.as_ref().map(|_| match at {
+            CustodyRoot::Operation => self.writer_read_root().and_then(|root| {
+                root.ok_or_else(|| Error::Other("writer publication has no durable root".into()))
+            }),
+            CustodyRoot::Latest => self.latest_custody_root(),
+        });
         let mut cache = self.custody_cache.lock();
         if cache.is_none() {
             let mut entries = BTreeMap::new();
@@ -95,7 +132,6 @@ impl Database {
                     entries.extend(persistence.load_config_values_raw_with_prefix(prefix)?);
                 }
                 *cache = Some(Store::durable(persistence.clone(), entries)?);
-                return f(cache.as_mut().expect("loaded custody metadata"));
             } else if let Some(persistence) = &self.persistence {
                 // Never dump unrelated config; each owned journal is a Redb prefix range.
                 for prefix in [
@@ -116,9 +152,24 @@ impl Database {
                         .map(|(k, v)| (k.clone(), v.clone())),
                 );
             }
-            *cache = Some(Store::from_entries(entries)?);
+            if cache.is_none() {
+                *cache = Some(Store::from_entries(entries)?);
+            }
         }
-        f(cache.as_mut().expect("loaded custody metadata"))
+        let store = cache.as_mut().expect("loaded custody metadata");
+        if !store.is_durable() {
+            return f(store);
+        }
+        let read_root = match store.pinned_root() {
+            Some(pinned) => pinned.clone(),
+            None => root.ok_or_else(crate::custody::canonical::invalid)??,
+        };
+        store.set_read_root(Some(read_root));
+        let answer = f(store);
+        if let Some(store) = cache.as_mut() {
+            store.set_read_root(None);
+        }
+        answer
     }
 
     /// Measurement only; no mutation or production API.
@@ -147,6 +198,28 @@ impl Database {
             .as_ref()
             .map_or((0, 0), Store::resident_delivery_for_test);
         (hydrated, decoded, records, bytes)
+    }
+    /// Measurement only: capture the latest published writer root, held until
+    /// the returned value drops.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __hold_custody_root_for_test(&self) -> Result<HeldCustodyRootForTest> {
+        Ok(HeldCustodyRootForTest(self.latest_custody_root()?))
+    }
+    /// Measurement only: the keys one ordinary custody selection answers,
+    /// inside an operation whose captured root is `held` (or the operation's
+    /// own root when `None`).
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __custody_keys_for_test(
+        &self,
+        held: Option<&HeldCustodyRootForTest>,
+        selector: &str,
+    ) -> Result<Vec<String>> {
+        let read_memory = self.declared_reader_memory()?;
+        let _scope = held.map(|held| self.enter_writer_read(Some(held.0.clone()), read_memory.clone()));
+        let records = self.custody_records_in(&[selector.to_owned()], read_memory)?;
+        records.iter().map(Record::key).collect()
     }
     /// Measurement only: committed custody CONFIG keys under `prefix`
     /// (for example `delivery_root.v1.`), counted without decoding values.
@@ -191,6 +264,7 @@ impl Database {
         }
         let mut resident = Store::from_entries(all)?;
         let mut durable = Store::durable(persistence.clone(), tenant)?;
+        durable.set_read_root(Some(self.latest_custody_root()?));
         let read_memory = self.declared_reader_memory()?;
         let memory = || {
             crate::read_image_memory::ImageMemory::charging_reader(
@@ -267,11 +341,19 @@ impl Database {
         selectors: &[String],
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<crate::custody::store::AdmittedRecords> {
+        self.custody_records_in_at(CustodyRoot::Operation, selectors, read_memory)
+    }
+    fn custody_records_in_at(
+        &self,
+        at: CustodyRoot,
+        selectors: &[String],
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<crate::custody::store::AdmittedRecords> {
         let memory = crate::read_image_memory::ImageMemory::charging_reader(
             self.accountant.clone(),
             read_memory.clone(),
         );
-        self.with_custody_store(|store| {
+        self.with_custody_store_at(at, |store| {
             let records = store.select(selectors, memory.clone())?;
             self.verify_selected_custody_records(store, &records)?;
             Ok(records)
@@ -521,7 +603,8 @@ impl Database {
         if selectors.is_empty() {
             return Ok(());
         }
-        let selected = self.custody_records_in(
+        let selected = self.custody_records_in_at(
+            CustodyRoot::Latest,
             &selectors.into_iter().collect::<Vec<_>>(),
             read_memory.clone(),
         )?;
@@ -534,7 +617,14 @@ impl Database {
                 submission: m.id,
             };
             let key = root.key()?;
-            let owned = self.custody_submission(m.id, read_memory.clone())?;
+            let owned = self.custody_records_in_at(
+                CustodyRoot::Latest,
+                &[format!(
+                    "@{}",
+                    crate::custody::store::submission_group(m.id)
+                )],
+                read_memory.clone(),
+            )?;
             if !owned.iter().any(|r| {
                 matches!(r, Record::Root { life, submission }
                 if *life == m.root_life && *submission == m.id)
@@ -575,7 +665,7 @@ impl Database {
             "validate_custody_commit",
             "Reduce the custody records one commit touches or raise MEMORY_LIMIT.",
         );
-        let (records, publication) = self.with_custody_store(|store| {
+        let (records, publication) = self.with_custody_store_at(CustodyRoot::Latest, |store| {
             let records = store.validate_delta(&ws.config_writes, &ws.config_deletes, memory)?;
             Ok((
                 records,
