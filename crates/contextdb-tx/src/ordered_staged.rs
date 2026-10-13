@@ -2075,8 +2075,8 @@ impl NativeOrderedRoot {
         Self {
             tables: None,
             vectors: None,
-                exact: NativeExactSlots::default(),
-            }
+            exact: NativeExactSlots::default(),
+        }
     }
     fn table(&self, table: &str) -> Option<&NativeOrderedTable> {
         crate::staged_source::get_by(&self.tables, |name| table.cmp(name.as_str()))
@@ -2226,8 +2226,12 @@ impl NativeOrderedRoot {
                 Self {
                     tables: self.tables.clone(),
                     vectors: self.vectors.clone(),
-                exact: self.exact.prepare_filter(|slot| slot.table.as_str() != table || slot.body.row().row_id != row, |_| true, funder)?,
-            },
+                    exact: self.exact.prepare_filter(
+                        |slot| slot.table.as_str() != table || slot.body.row().row_id != row,
+                        |_| true,
+                        funder,
+                    )?,
+                },
                 funder,
             );
         };
@@ -2265,7 +2269,11 @@ impl NativeOrderedRoot {
             Self {
                 tables,
                 vectors: self.vectors.clone(),
-                exact: self.exact.prepare_filter(|slot| slot.table.as_str() != table || slot.body.row().row_id != row, |_| true, funder)?,
+                exact: self.exact.prepare_filter(
+                    |slot| slot.table.as_str() != table || slot.body.row().row_id != row,
+                    |_| true,
+                    funder,
+                )?,
             },
             funder,
         )
@@ -2377,8 +2385,16 @@ impl NativeOrderedRoot {
                 Self {
                     tables: self.tables.clone(),
                     vectors: self.vectors.clone(),
-                exact: self.exact.prepare_filter(|_| true, |slot| slot.index.table.as_str() != index.table || slot.index.column.as_str() != index.column || slot.body.row_id() != row, funder)?,
-            },
+                    exact: self.exact.prepare_filter(
+                        |_| true,
+                        |slot| {
+                            slot.index.table.as_str() != index.table
+                                || slot.index.column.as_str() != index.column
+                                || slot.body.row_id() != row
+                        },
+                        funder,
+                    )?,
+                },
                 funder,
             );
         };
@@ -2401,7 +2417,15 @@ impl NativeOrderedRoot {
             Self {
                 tables: self.tables.clone(),
                 vectors,
-                exact: self.exact.prepare_filter(|_| true, |slot| slot.index.table.as_str() != index.table || slot.index.column.as_str() != index.column || slot.body.row_id() != row, funder)?,
+                exact: self.exact.prepare_filter(
+                    |_| true,
+                    |slot| {
+                        slot.index.table.as_str() != index.table
+                            || slot.index.column.as_str() != index.column
+                            || slot.body.row_id() != row
+                    },
+                    funder,
+                )?,
             },
             funder,
         )
@@ -3770,7 +3794,15 @@ impl NativeOrderedRoot {
             Self {
                 tables,
                 vectors: self.vectors.clone(),
-                exact: self.exact.prepare_filter(|slot| !selected.iter().any(|(table, id)| table == slot.table.as_str() && *id == slot.body.row().row_id), |_| true, funder)?,
+                exact: self.exact.prepare_filter(
+                    |slot| {
+                        !selected.iter().any(|(table, id)| {
+                            table == slot.table.as_str() && *id == slot.body.row().row_id
+                        })
+                    },
+                    |_| true,
+                    funder,
+                )?,
             },
             funder,
         )
@@ -4234,7 +4266,10 @@ impl NativeExactRowChange {
     fn row_at(self, ordinal: usize, cell: &crate::staged_source::RowCellHandle) -> Option<RowId> {
         match self {
             Self::RemoveRange { start, end } if (start..end).contains(&ordinal) => None,
-            Self::Replace { ordinal: selected, row } if ordinal == selected => Some(row),
+            Self::Replace {
+                ordinal: selected,
+                row,
+            } if ordinal == selected => Some(row),
             _ => Some(cell.identity.row),
         }
     }
@@ -4243,43 +4278,64 @@ impl NativeExactRowChange {
     }
 }
 struct NativeExactTableGrants<'a> {
-    entries: Vec<(&'a crate::staged_source::SourceName, crate::staged_source::OriginalCopyGrant)>,
+    entries: Vec<(
+        &'a crate::staged_source::SourceName,
+        crate::staged_source::OriginalCopyGrant,
+    )>,
     _collection: Option<crate::staged_source::OriginalCopyGrant>,
 }
 pub(crate) fn exact_native_error() -> contextdb_core::Error {
     contextdb_core::Error::Other("native exact source selector mismatch".into())
 }
 impl NativeOrderedRoot {
-    fn exact_row(&self, cell: &crate::staged_source::RowCellHandle)
-        -> Result<crate::statement_rows::NativeEagerRow>
-    {
-        if let Some(slot) = crate::staged_source::get_by(&self.exact.rows,
-            |key| cell.allocation_key().cmp(key))
+    fn exact_row(
+        &self,
+        cell: &crate::staged_source::RowCellHandle,
+    ) -> Result<crate::statement_rows::NativeEagerRow> {
+        if let Some(slot) =
+            crate::staged_source::get_by(&self.exact.rows, |key| cell.allocation_key().cmp(key))
         {
-            if slot.selector != cell.allocation_key() || slot.table != cell.identity.table
+            if slot.selector != cell.allocation_key()
+                || slot.table != cell.identity.table
                 || slot.body.sequence() != cell.identity.sequence
-                || slot.body.row().row_id != cell.identity.row { return Err(exact_native_error()); }
+                || slot.body.row().row_id != cell.identity.row
+            {
+                return Err(exact_native_error());
+            }
             return Ok(slot.body.clone());
         }
         // A matching canonical header cannot prove custody of this exact slot.
         // Only the retained native producer may supply its original body.
         Err(exact_native_error())
     }
-    fn exact_vector(&self, cell: &crate::staged_source::VectorCellHandle)
-        -> Result<NativeEagerVector>
-    {
-        let slot = crate::staged_source::get_by(&self.exact.vectors,
-            |key| cell.allocation_key().cmp(key)).ok_or_else(exact_native_error)?;
-        if slot.selector != cell.allocation_key() || slot.index != cell.identity.index
-            || slot.body.row_id() != cell.identity.row { return Err(exact_native_error()); }
+    fn exact_vector(
+        &self,
+        cell: &crate::staged_source::VectorCellHandle,
+    ) -> Result<NativeEagerVector> {
+        let slot =
+            crate::staged_source::get_by(&self.exact.vectors, |key| cell.allocation_key().cmp(key))
+                .ok_or_else(exact_native_error)?;
+        if slot.selector != cell.allocation_key()
+            || slot.index != cell.identity.index
+            || slot.body.row_id() != cell.identity.row
+        {
+            return Err(exact_native_error());
+        }
         Ok(slot.body.clone())
     }
     fn prepare_exact_slots(
-        &self, exact: NativeExactSlots, funder: &crate::staged_source::SourceFunder,
+        &self,
+        exact: NativeExactSlots,
+        funder: &crate::staged_source::SourceFunder,
     ) -> Result<crate::statement_rows::NativeImage<Self>> {
-        crate::statement_rows::NativeImage::prepare(Self {
-            tables: self.tables.clone(), vectors: self.vectors.clone(), exact,
-        }, funder)
+        crate::statement_rows::NativeImage::prepare(
+            Self {
+                tables: self.tables.clone(),
+                vectors: self.vectors.clone(),
+                exact,
+            },
+            funder,
+        )
     }
 }
 impl PreparedNativeChange {
@@ -4287,111 +4343,180 @@ impl PreparedNativeChange {
         let NativeSuccessor::Replace(directory) = &self.successor else {
             unreachable!("native slot producer has a replacement image");
         };
-        let NativeDirectoryImage::Active(image) = &directory.native_body()
-            .expect("prepared native directory").image else {
+        let NativeDirectoryImage::Active(image) = &directory
+            .native_body()
+            .expect("prepared native directory")
+            .image
+        else {
             unreachable!("prepared native slot image is active");
         };
         image
     }
-    fn install_prepared_image(&mut self,
+    fn install_prepared_image(
+        &mut self,
         image: crate::statement_rows::NativeImage<NativeOrderedRoot>,
         funder: &crate::staged_source::SourceFunder,
     ) -> Result<()> {
         // Free the intermediate directory before final admission. All native
         // body owners remain retained in the complete successor image.
         self.successor = NativeSuccessor::Unchanged;
-        self.successor = NativeSuccessor::Replace(
-            StagedVectorDirectory::prepare_native(image, funder)?);
+        self.successor =
+            NativeSuccessor::Replace(StagedVectorDirectory::prepare_native(image, funder)?);
         Ok(())
     }
-    pub(crate) fn prepare_retain_row(mut self,
+    pub(crate) fn prepare_retain_row(
+        mut self,
         cell: crate::staged_source::RowCellHandle,
         funder: &crate::staged_source::SourceFunder,
     ) -> Result<Self> {
         use crate::staged_source::{Entry, FundedArc, insert};
         let root = self.active_image().get();
-        let body = root.table(cell.identity.table.as_str())
+        let body = root
+            .table(cell.identity.table.as_str())
             .and_then(|table| table.statement.get().row(cell.identity.row))
-            .filter(|body| body.sequence() == cell.identity.sequence
-                && cell.identity.matches_row(body.row()))
-            .ok_or_else(exact_native_error)?.clone();
-        let rows = insert(&root.exact.rows, FundedArc::try_new(Entry {
-            key: cell.allocation_key(), value: NativeExactRow { selector: cell.allocation_key(), table: cell.identity.table.clone(), created_tx: cell.identity.created_tx, body },
-        }, funder.clone())?, funder)?;
-        let image = root.prepare_exact_slots(NativeExactSlots {
-            rows, vectors: root.exact.vectors.clone(),
-        }, funder)?;
+            .filter(|body| {
+                body.sequence() == cell.identity.sequence && cell.identity.matches_row(body.row())
+            })
+            .ok_or_else(exact_native_error)?
+            .clone();
+        let rows = insert(
+            &root.exact.rows,
+            FundedArc::try_new(
+                Entry {
+                    key: cell.allocation_key(),
+                    value: NativeExactRow {
+                        selector: cell.allocation_key(),
+                        table: cell.identity.table.clone(),
+                        created_tx: cell.identity.created_tx,
+                        body,
+                    },
+                },
+                funder.clone(),
+            )?,
+            funder,
+        )?;
+        let image = root.prepare_exact_slots(
+            NativeExactSlots {
+                rows,
+                vectors: root.exact.vectors.clone(),
+            },
+            funder,
+        )?;
         self.install_prepared_image(image, funder)?;
         Ok(self)
     }
-    pub(crate) fn prepare_retain_vector(mut self,
+    pub(crate) fn prepare_retain_vector(
+        mut self,
         cell: crate::staged_source::VectorCellHandle,
         funder: &crate::staged_source::SourceFunder,
     ) -> Result<Self> {
         let root = self.active_image().get();
-        let exact = root.exact.prepare_filter(|_| true, |slot| {
-            slot.index != cell.identity.index || slot.body.row_id() != cell.identity.row
-        }, funder)?;
+        let exact = root.exact.prepare_filter(
+            |_| true,
+            |slot| slot.index != cell.identity.index || slot.body.row_id() != cell.identity.row,
+            funder,
+        )?;
         let image = root.prepare_exact_slots(exact, funder)?;
         self.install_prepared_image(image, funder)?;
         self.prepare_retain_vector_slot(cell, funder)
     }
-    pub(crate) fn prepare_retain_vector_slot(mut self,
+    pub(crate) fn prepare_retain_vector_slot(
+        mut self,
         cell: crate::staged_source::VectorCellHandle,
         funder: &crate::staged_source::SourceFunder,
     ) -> Result<Self> {
         use crate::staged_source::{Entry, FundedArc, insert};
         let root = self.active_image().get();
         let body = crate::staged_source::get_by(&root.vectors, |name| {
-            (cell.identity.index.table.as_str(), cell.identity.index.column.as_str())
+            (
+                cell.identity.index.table.as_str(),
+                cell.identity.index.column.as_str(),
+            )
                 .cmp(&(name.table.as_str(), name.column.as_str()))
         })
-            .and_then(|index| crate::staged_source::get_by(&index.rows,
-                |key| cell.identity.row.cmp(key)))
-            .ok_or_else(exact_native_error)?.clone();
-        let vectors = insert(&root.exact.vectors, FundedArc::try_new(Entry {
-            key: cell.allocation_key(), value: NativeExactVector { selector: cell.allocation_key(), index: cell.identity.index.clone(), body },
-        }, funder.clone())?, funder)?;
-        let image = root.prepare_exact_slots(NativeExactSlots {
-            rows: root.exact.rows.clone(), vectors,
-        }, funder)?;
+        .and_then(|index| {
+            crate::staged_source::get_by(&index.rows, |key| cell.identity.row.cmp(key))
+        })
+        .ok_or_else(exact_native_error)?
+        .clone();
+        let vectors = insert(
+            &root.exact.vectors,
+            FundedArc::try_new(
+                Entry {
+                    key: cell.allocation_key(),
+                    value: NativeExactVector {
+                        selector: cell.allocation_key(),
+                        index: cell.identity.index.clone(),
+                        body,
+                    },
+                },
+                funder.clone(),
+            )?,
+            funder,
+        )?;
+        let image = root.prepare_exact_slots(
+            NativeExactSlots {
+                rows: root.exact.rows.clone(),
+                vectors,
+            },
+            funder,
+        )?;
         self.install_prepared_image(image, funder)?;
         Ok(self)
     }
 }
 impl OrderedStagedRows {
-    pub(crate) fn prepare_native_exact_admission<'a>(&'a self,
+    pub(crate) fn prepare_native_exact_admission<'a>(
+        &'a self,
         rows: &'a [crate::staged_source::RowCellHandle],
         vectors: &'a [crate::staged_source::VectorCellHandle],
         row_change: NativeExactRowChange,
     ) -> Result<NativeExactAdmission<'a>> {
         self.native_preparation_state()?;
         match row_change {
-            NativeExactRowChange::RemoveRange { start, end } if start > end || end > rows.len() =>
-                return Err(exact_native_error()),
-            NativeExactRowChange::Replace { ordinal, .. } if ordinal >= rows.len() =>
-                return Err(exact_native_error()),
-            _ => {},
+            NativeExactRowChange::RemoveRange { start, end } if start > end || end > rows.len() => {
+                return Err(exact_native_error());
+            }
+            NativeExactRowChange::Replace { ordinal, .. } if ordinal >= rows.len() => {
+                return Err(exact_native_error());
+            }
+            _ => {}
         }
         let root = self.native_root();
         // Validate every owner, not just the eventual canonical winner.
         if let Some(root) = root {
-            for cell in rows { root.exact_row(cell)?; }
-            for cell in vectors { root.exact_vector(cell)?; }
+            for cell in rows {
+                root.exact_row(cell)?;
+            }
+            for cell in vectors {
+                root.exact_vector(cell)?;
+            }
         } else if !rows.is_empty() || !vectors.is_empty() {
             return Err(exact_native_error());
         }
         let mut admission = NativeExactAdmission {
-            source: self, rows, vectors, row_change, table_count: 0, collection: None,
+            source: self,
+            rows,
+            vectors,
+            row_change,
+            table_count: 0,
+            collection: None,
         };
         if let Some(root) = root {
             let mut after = None;
-            while let Some((name, table)) = crate::staged_source::seek_by(&root.tables, false, |name| {
-                if after.is_some_and(|after| name.as_str() <= after) { std::cmp::Ordering::Less }
-                else { std::cmp::Ordering::Equal }
-            }) {
+            while let Some((name, table)) =
+                crate::staged_source::seek_by(&root.tables, false, |name| {
+                    if after.is_some_and(|after| name.as_str() <= after) {
+                        std::cmp::Ordering::Less
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                })
+            {
                 if admission.needs_original_table(root, name, table)? {
-                    admission.table_count = admission.table_count.checked_add(1)
+                    admission.table_count = admission
+                        .table_count
+                        .checked_add(1)
                         .ok_or_else(exact_native_error)?;
                 }
                 after = Some(name.as_str());
@@ -4399,12 +4524,15 @@ impl OrderedStagedRows {
             // The only O-paid allocation is the actual table-grant Vec. Exact
             // archives, winner trees and directory controls are all C-funded.
             if admission.table_count != 0 {
-                let bytes = std::alloc::Layout::array::<(&crate::staged_source::SourceName,
-                    crate::staged_source::OriginalCopyGrant)>(admission.table_count)
-                    .map_err(|_| exact_native_error())?.size();
+                let bytes = std::alloc::Layout::array::<(
+                    &crate::staged_source::SourceName,
+                    crate::staged_source::OriginalCopyGrant,
+                )>(admission.table_count)
+                .map_err(|_| exact_native_error())?
+                .size();
                 let cell = rows.first().ok_or_else(exact_native_error)?;
-                admission.collection = Some(root.exact_row(cell)?
-                    .reserve_private_original_copy(bytes)?);
+                admission.collection =
+                    Some(root.exact_row(cell)?.reserve_private_original_copy(bytes)?);
             }
         }
         Ok(admission)
@@ -4413,7 +4541,9 @@ impl OrderedStagedRows {
 impl NativeExactAdmission<'_> {
     /// Gather changed shared statements' O admissions before invoking any C
     /// preparation. The actual table-grant buffer has its own O grant.
-    pub(crate) fn prepare<T>(mut self, funder: &crate::staged_source::SourceFunder,
+    pub(crate) fn prepare<T>(
+        mut self,
+        funder: &crate::staged_source::SourceFunder,
         caller: impl FnOnce() -> Result<(T, Option<NativeExactReplacement>)>,
         selection: for<'b> fn(&'b T) -> (&'b [usize], &'b [usize]),
     ) -> Result<(T, PreparedNativeChange)> {
@@ -4425,85 +4555,150 @@ impl NativeExactAdmission<'_> {
         let (rows, vectors) = selection(&value);
         let mut image = self.prepare_successor(root, replacement, rows, vectors, funder)?;
         for (name, grant) in originals.entries {
-            let next = image.get().table(name.as_str()).expect("retained table control");
+            let next = image
+                .get()
+                .table(name.as_str())
+                .expect("retained table control");
             let prior = root.table(name.as_str()).ok_or_else(exact_native_error)?;
             if prior.statement.ptr_eq(&next.statement) {
                 return Err(exact_native_error());
             }
             let statement = next.statement.clone().with_original_copy(Some(grant));
-            let table = FundedArc::try_new(NativeOrderedTable {
-                statement, rows: next.rows.clone(), indexes: next.indexes.clone(),
-                ordered_present: next.ordered_present,
-            }, funder.clone())?;
-            let tables = insert(&image.get().tables, FundedArc::try_new(Entry {
-                key: name.clone(), value: table,
-            }, funder.clone())?, funder)?;
-            image = crate::statement_rows::NativeImage::prepare(NativeOrderedRoot {
-                tables, vectors: image.get().vectors.clone(), exact: image.get().exact.clone(),
-            }, funder)?;
+            let table = FundedArc::try_new(
+                NativeOrderedTable {
+                    statement,
+                    rows: next.rows.clone(),
+                    indexes: next.indexes.clone(),
+                    ordered_present: next.ordered_present,
+                },
+                funder.clone(),
+            )?;
+            let tables = insert(
+                &image.get().tables,
+                FundedArc::try_new(
+                    Entry {
+                        key: name.clone(),
+                        value: table,
+                    },
+                    funder.clone(),
+                )?,
+                funder,
+            )?;
+            image = crate::statement_rows::NativeImage::prepare(
+                NativeOrderedRoot {
+                    tables,
+                    vectors: image.get().vectors.clone(),
+                    exact: image.get().exact.clone(),
+                },
+                funder,
+            )?;
         }
-        Ok((value, PreparedNativeChange {
-            expected: self.source.native_image()
-                .map(crate::statement_rows::NativeImage::validation_handle),
-            successor: NativeSuccessor::Replace(
-                StagedVectorDirectory::prepare_native(image, funder)?),
-            original_copy: None,
-        }))
+        Ok((
+            value,
+            PreparedNativeChange {
+                expected: self
+                    .source
+                    .native_image()
+                    .map(crate::statement_rows::NativeImage::validation_handle),
+                successor: NativeSuccessor::Replace(StagedVectorDirectory::prepare_native(
+                    image, funder,
+                )?),
+                original_copy: None,
+            },
+        ))
     }
-    fn prepare_original_tables<'a>(&mut self, root: &'a NativeOrderedRoot)
-        -> Result<NativeExactTableGrants<'a>>
-    {
+    fn prepare_original_tables<'a>(
+        &mut self,
+        root: &'a NativeOrderedRoot,
+    ) -> Result<NativeExactTableGrants<'a>> {
         let count = self.table_count;
-        if count != 0 && self.collection.is_none() { return Err(exact_native_error()); }
+        if count != 0 && self.collection.is_none() {
+            return Err(exact_native_error());
+        }
         let mut originals = NativeExactTableGrants {
-            entries: Vec::with_capacity(count), _collection: self.collection.take(),
+            entries: Vec::with_capacity(count),
+            _collection: self.collection.take(),
         };
-        if originals.entries.capacity() != count { return Err(exact_native_error()); }
-        if count == 0 { return Ok(originals); }
+        if originals.entries.capacity() != count {
+            return Err(exact_native_error());
+        }
+        if count == 0 {
+            return Ok(originals);
+        }
         let mut after = None;
         while let Some((name, table)) = crate::staged_source::seek_by(&root.tables, false, |name| {
-            if after.is_some_and(|after| name.as_str() <= after) { std::cmp::Ordering::Less }
-            else { std::cmp::Ordering::Equal }
+            if after.is_some_and(|after| name.as_str() <= after) {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
         }) {
             if self.needs_original_table(root, name, table)? {
-                let body = table.statement.get().first_row().ok_or_else(exact_native_error)?;
-                let grant = body.reserve_private_original_copy(table.statement.get().legacy_control_bytes())?;
+                let body = table
+                    .statement
+                    .get()
+                    .first_row()
+                    .ok_or_else(exact_native_error)?;
+                let grant = body
+                    .reserve_private_original_copy(table.statement.get().legacy_control_bytes())?;
                 originals.entries.push((name, grant));
             }
             after = Some(name.as_str());
         }
-        if originals.entries.len() != count { return Err(exact_native_error()); }
+        if originals.entries.len() != count {
+            return Err(exact_native_error());
+        }
         Ok(originals)
     }
-    fn needs_original_table(&self, root: &NativeOrderedRoot,
-        name: &crate::staged_source::SourceName, table: &NativeOrderedTable,
+    fn needs_original_table(
+        &self,
+        root: &NativeOrderedRoot,
+        name: &crate::staged_source::SourceName,
+        table: &NativeOrderedTable,
     ) -> Result<bool> {
-        let shared = self.source.native_image()
+        let shared = self
+            .source
+            .native_image()
             .is_some_and(crate::statement_rows::NativeImage::is_shared)
             || table.statement.is_shared();
-        if !shared || table.statement.get().first_row().is_none() { return Ok(false); }
+        if !shared || table.statement.get().first_row().is_none() {
+            return Ok(false);
+        }
         match self.row_change {
             NativeExactRowChange::Unchanged => Ok(false),
             NativeExactRowChange::RemoveRange { start, end } => {
                 for cell in &self.rows[start..end] {
-                    if cell.identity.table != *name { continue; }
-                    let current = table.statement.get().row(cell.identity.row)
+                    if cell.identity.table != *name {
+                        continue;
+                    }
+                    let current = table
+                        .statement
+                        .get()
+                        .row(cell.identity.row)
                         .ok_or_else(exact_native_error)?;
                     // Removing an earlier duplicate only shifts ordered
                     // positions; it cannot change this statement's body.
-                    if !current.ptr_eq(&root.exact_row(cell)?) { continue; }
+                    if !current.ptr_eq(&root.exact_row(cell)?) {
+                        continue;
+                    }
                     let winner = self.rows.iter().enumerate().rev().find(|(ordinal, have)| {
                         have.identity.table == *name
                             && self.row_change.row_at(*ordinal, have) == Some(cell.identity.row)
                     });
-                    let Some((_, winner)) = winner else { return Ok(true); };
-                    if !current.ptr_eq(&root.exact_row(winner)?) { return Ok(true); }
+                    let Some((_, winner)) = winner else {
+                        return Ok(true);
+                    };
+                    if !current.ptr_eq(&root.exact_row(winner)?) {
+                        return Ok(true);
+                    }
                 }
                 Ok(false)
             }
             NativeExactRowChange::Replace { ordinal, row } => {
                 let cell = &self.rows[ordinal];
-                if cell.identity.table != *name { return Ok(false); }
+                if cell.identity.table != *name {
+                    return Ok(false);
+                }
                 // Only the old and supplied identities can change. Borrowed
                 // scans allocate nothing before the genuine O reservations.
                 for id in [cell.identity.row, row] {
@@ -4513,11 +4708,14 @@ impl NativeExactAdmission<'_> {
                     });
                     let current = table.statement.get().row(id);
                     match (current, winner) {
-                        (None, None) => {},
+                        (None, None) => {}
                         (Some(_), None) | (None, Some(_)) => return Ok(true),
                         (Some(current), Some((ordinal, winner))) => {
                             if self.row_change.replaces(ordinal)
-                                || !current.ptr_eq(&root.exact_row(winner)?) { return Ok(true); }
+                                || !current.ptr_eq(&root.exact_row(winner)?)
+                            {
+                                return Ok(true);
+                            }
                         }
                     }
                 }
@@ -4525,99 +4723,202 @@ impl NativeExactAdmission<'_> {
             }
         }
     }
-    fn prepare_successor(&self, root: &NativeOrderedRoot,
-        replacement: Option<NativeExactReplacement>, remove_rows: &[usize], remove_vectors: &[usize],
+    fn prepare_successor(
+        &self,
+        root: &NativeOrderedRoot,
+        replacement: Option<NativeExactReplacement>,
+        remove_rows: &[usize],
+        remove_vectors: &[usize],
         funder: &crate::staged_source::SourceFunder,
     ) -> Result<crate::statement_rows::NativeImage<NativeOrderedRoot>> {
-        use crate::staged_source::{Entry, FundedArc, insert, get_by, seek_by};
-        for (selected, len) in [(remove_rows, self.rows.len()), (remove_vectors, self.vectors.len())] {
+        use crate::staged_source::{Entry, FundedArc, get_by, insert, seek_by};
+        for (selected, len) in [
+            (remove_rows, self.rows.len()),
+            (remove_vectors, self.vectors.len()),
+        ] {
             if selected.iter().any(|slot| *slot >= len)
-                || selected.windows(2).any(|pair| pair[0] >= pair[1]) { return Err(exact_native_error()); }
+                || selected.windows(2).any(|pair| pair[0] >= pair[1])
+            {
+                return Err(exact_native_error());
+            }
         }
         let selection_matches = match self.row_change {
             NativeExactRowChange::Unchanged => remove_rows.is_empty() && replacement.is_none(),
-            NativeExactRowChange::RemoveRange { start, end } =>
-                replacement.is_none() && remove_rows.iter().copied().eq(start..end),
-            NativeExactRowChange::Replace { ordinal, row } => remove_rows.is_empty()
-                && replacement.as_ref().is_some_and(|p|
-                    p.old.ptr_eq(&self.rows[ordinal]) && p.cell.identity.row == row),
+            NativeExactRowChange::RemoveRange { start, end } => {
+                replacement.is_none() && remove_rows.iter().copied().eq(start..end)
+            }
+            NativeExactRowChange::Replace { ordinal, row } => {
+                remove_rows.is_empty()
+                    && replacement.as_ref().is_some_and(|p| {
+                        p.old.ptr_eq(&self.rows[ordinal]) && p.cell.identity.row == row
+                    })
+            }
         };
-        if !selection_matches { return Err(exact_native_error()); }
+        if !selection_matches {
+            return Err(exact_native_error());
+        }
         if let Some(p) = &replacement {
-            let ordinal = self.rows.iter().position(|cell| cell.ptr_eq(&p.old)).ok_or_else(exact_native_error)?;
+            let ordinal = self
+                .rows
+                .iter()
+                .position(|cell| cell.ptr_eq(&p.old))
+                .ok_or_else(exact_native_error)?;
             p.body.validate_exact_funder(funder)?;
             if !p.cell.is_funded_by(funder)
                 || p.old.identity.tx != p.cell.identity.tx
                 || p.old.identity.generation != p.cell.identity.generation
-                || !crate::manager::same_published_source(&p.old.identity.base, &p.cell.identity.base)
+                || !crate::manager::same_published_source(
+                    &p.old.identity.base,
+                    &p.cell.identity.base,
+                )
                 || remove_rows.binary_search(&ordinal).is_ok()
                 || p.old.identity.table != p.cell.identity.table
                 || p.old.identity.sequence != p.cell.identity.sequence
                 || p.cell.identity.sequence != p.body.sequence()
                 || !p.cell.identity.matches_row(p.body.row())
-                || !p.cell.identity.schema.ptr_eq(p.body.schema()) { return Err(exact_native_error()); }
+                || !p.cell.identity.schema.ptr_eq(p.body.schema())
+            {
+                return Err(exact_native_error());
+            }
         }
         let mut exact = NativeExactSlots::default();
         let mut row_winners = None;
         let mut vector_winners = None;
         let mut row_position = 0usize;
         for (ordinal, old) in self.rows.iter().enumerate() {
-            if remove_rows.binary_search(&ordinal).is_ok() { continue; }
+            if remove_rows.binary_search(&ordinal).is_ok() {
+                continue;
+            }
             let (cell, body) = match replacement.as_ref().filter(|p| p.old.ptr_eq(old)) {
                 Some(p) => (p.cell.clone(), p.body.clone()),
                 None => (old.clone(), root.exact_row(old)?),
             };
             let key = (cell.identity.table.clone(), cell.identity.row);
-            let value = NativeExactRow { selector: cell.allocation_key(), table: cell.identity.table.clone(), created_tx: cell.identity.created_tx, body };
-            exact.rows = insert(&exact.rows, FundedArc::try_new(Entry {
-                key: value.selector, value: value.clone(),
-            }, funder.clone())?, funder)?;
-            row_winners = insert(&row_winners, FundedArc::try_new(Entry {
-                key, value: (row_position, value),
-            }, funder.clone())?, funder)?;
+            let value = NativeExactRow {
+                selector: cell.allocation_key(),
+                table: cell.identity.table.clone(),
+                created_tx: cell.identity.created_tx,
+                body,
+            };
+            exact.rows = insert(
+                &exact.rows,
+                FundedArc::try_new(
+                    Entry {
+                        key: value.selector,
+                        value: value.clone(),
+                    },
+                    funder.clone(),
+                )?,
+                funder,
+            )?;
+            row_winners = insert(
+                &row_winners,
+                FundedArc::try_new(
+                    Entry {
+                        key,
+                        value: (row_position, value),
+                    },
+                    funder.clone(),
+                )?,
+                funder,
+            )?;
             row_position += 1;
         }
         for (ordinal, cell) in self.vectors.iter().enumerate() {
-            if remove_vectors.binary_search(&ordinal).is_ok() { continue; }
+            if remove_vectors.binary_search(&ordinal).is_ok() {
+                continue;
+            }
             let body = root.exact_vector(cell)?;
-            let value = NativeExactVector { selector: cell.allocation_key(), index: cell.identity.index.clone(), body };
-            exact.vectors = insert(&exact.vectors, FundedArc::try_new(Entry {
-                key: cell.allocation_key(), value: value.clone(),
-            }, funder.clone())?, funder)?;
-            let name = NativeVectorName { table: cell.identity.index.table.clone(),
-                column: cell.identity.index.column.clone() };
-            vector_winners = insert(&vector_winners, FundedArc::try_new(Entry {
-                key: (name, cell.identity.row), value,
-            }, funder.clone())?, funder)?;
+            let value = NativeExactVector {
+                selector: cell.allocation_key(),
+                index: cell.identity.index.clone(),
+                body,
+            };
+            exact.vectors = insert(
+                &exact.vectors,
+                FundedArc::try_new(
+                    Entry {
+                        key: cell.allocation_key(),
+                        value: value.clone(),
+                    },
+                    funder.clone(),
+                )?,
+                funder,
+            )?;
+            let name = NativeVectorName {
+                table: cell.identity.index.table.clone(),
+                column: cell.identity.index.column.clone(),
+            };
+            vector_winners = insert(
+                &vector_winners,
+                FundedArc::try_new(
+                    Entry {
+                        key: (name, cell.identity.row),
+                        value,
+                    },
+                    funder.clone(),
+                )?,
+                funder,
+            )?;
         }
         let mut image = root.prepare_exact_slots(exact, funder)?;
         let mut after = None;
         while let Some((name, table)) = seek_by(&root.tables, false, |name| {
-            if after.is_some_and(|after| name.as_str() <= after) { std::cmp::Ordering::Less }
-            else { std::cmp::Ordering::Equal }
+            if after.is_some_and(|after| name.as_str() <= after) {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
         }) {
             let mut after_row = None;
             while let Some((id, old)) = seek_by(&table.rows, false, |id| {
-                if after_row.is_some_and(|after| *id <= after) { std::cmp::Ordering::Less }
-                else { std::cmp::Ordering::Equal }
+                if after_row.is_some_and(|after| *id <= after) {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Equal
+                }
             }) {
-                let winner = get_by(&row_winners, |key: &(crate::staged_source::SourceName, RowId)|
-                    (name, id).cmp(&(&key.0, &key.1)));
+                let winner = get_by(
+                    &row_winners,
+                    |key: &(crate::staged_source::SourceName, RowId)| {
+                        (name, id).cmp(&(&key.0, &key.1))
+                    },
+                );
                 let next_image = match winner {
                     Some((position, slot)) => {
                         let old_body = table.statement.get().row(*id).expect("native current row");
                         if old_body.ptr_eq(&slot.body) {
-                            if old.position.position == *position && old.position.created_tx == slot.created_tx {
-                                after_row = Some(*id); continue;
+                            if old.position.position == *position
+                                && old.position.created_tx == slot.created_tx
+                            {
+                                after_row = Some(*id);
+                                continue;
                             }
-                            image.get().prepare_exact_position(name.as_str(), StagedPosition {
-                                row_id: *id, created_tx: slot.created_tx, position: *position,
-                            }, funder)?
-                        } else { image.get().prepare_exact_row(name.as_str(), StagedPosition {
-                            row_id: *id, created_tx: slot.created_tx, position: *position,
-                        }, slot.body.clone(), funder)? }
+                            image.get().prepare_exact_position(
+                                name.as_str(),
+                                StagedPosition {
+                                    row_id: *id,
+                                    created_tx: slot.created_tx,
+                                    position: *position,
+                                },
+                                funder,
+                            )?
+                        } else {
+                            image.get().prepare_exact_row(
+                                name.as_str(),
+                                StagedPosition {
+                                    row_id: *id,
+                                    created_tx: slot.created_tx,
+                                    position: *position,
+                                },
+                                slot.body.clone(),
+                                funder,
+                            )?
+                        }
                     }
-                    None => image.get().prepare_remove(name.as_str(), *id, funder, None)?,
+                    None => image
+                        .get()
+                        .prepare_remove(name.as_str(), *id, funder, None)?,
                 };
                 image = next_image;
                 after_row = Some(*id);
@@ -4628,48 +4929,96 @@ impl NativeExactAdmission<'_> {
         // directory. Preserve the selected original sequence when installing it.
         let mut after_winner = None;
         while let Some((key, (position, slot))) = seek_by(&row_winners, false, |key| {
-            if after_winner.is_some_and(|after| key <= after) { std::cmp::Ordering::Less }
-            else { std::cmp::Ordering::Equal }
+            if after_winner.is_some_and(|after| key <= after) {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
         }) {
-            if root.table(key.0.as_str()).and_then(|table|
-                crate::staged_source::get_by(&table.rows, |id| key.1.cmp(id))).is_none() {
-                image = image.get().prepare_exact_row(key.0.as_str(), StagedPosition {
-                    row_id: key.1, created_tx: slot.created_tx, position: *position,
-                }, slot.body.clone(), funder)?;
+            if root
+                .table(key.0.as_str())
+                .and_then(|table| crate::staged_source::get_by(&table.rows, |id| key.1.cmp(id)))
+                .is_none()
+            {
+                image = image.get().prepare_exact_row(
+                    key.0.as_str(),
+                    StagedPosition {
+                        row_id: key.1,
+                        created_tx: slot.created_tx,
+                        position: *position,
+                    },
+                    slot.body.clone(),
+                    funder,
+                )?;
             }
             after_winner = Some(key);
         }
         let mut after = None;
         while let Some((name, index)) = seek_by(&root.vectors, false, |name| {
-            if after.is_some_and(|after| name <= after) { std::cmp::Ordering::Less }
-            else { std::cmp::Ordering::Equal }
+            if after.is_some_and(|after| name <= after) {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
         }) {
             let mut rows = index.rows.clone();
             let mut after_row = None;
             while let Some((id, old)) = seek_by(&index.rows, false, |id| {
-                if after_row.is_some_and(|after| *id <= after) { std::cmp::Ordering::Less }
-                else { std::cmp::Ordering::Equal }
+                if after_row.is_some_and(|after| *id <= after) {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Equal
+                }
             }) {
-                let winner = get_by(&vector_winners, |key: &(NativeVectorName, RowId)|
-                    (name, id).cmp(&(&key.0, &key.1)));
+                let winner = get_by(&vector_winners, |key: &(NativeVectorName, RowId)| {
+                    (name, id).cmp(&(&key.0, &key.1))
+                });
                 rows = match winner {
-                    Some(slot) if old.0.ptr_eq(&slot.body.0) => { after_row = Some(*id); continue; }
-                    Some(slot) => insert(&rows, FundedArc::try_new(Entry {
-                        key: *id, value: slot.body.clone(),
-                    }, funder.clone())?, funder)?,
+                    Some(slot) if old.0.ptr_eq(&slot.body.0) => {
+                        after_row = Some(*id);
+                        continue;
+                    }
+                    Some(slot) => insert(
+                        &rows,
+                        FundedArc::try_new(
+                            Entry {
+                                key: *id,
+                                value: slot.body.clone(),
+                            },
+                            funder.clone(),
+                        )?,
+                        funder,
+                    )?,
                     None => crate::staged_source::remove_by(&rows, &|key| id.cmp(key), funder)?,
                 };
                 after_row = Some(*id);
             }
-            let value = FundedArc::try_new(NativeVectorIndex {
-                rows, control: index.control.clone(),
-            }, funder.clone())?;
-            let vectors = insert(&image.get().vectors, FundedArc::try_new(Entry {
-                key: name.clone(), value,
-            }, funder.clone())?, funder)?;
-            image = crate::statement_rows::NativeImage::prepare(NativeOrderedRoot {
-                tables: image.get().tables.clone(), vectors, exact: image.get().exact.clone(),
-            }, funder)?;
+            let value = FundedArc::try_new(
+                NativeVectorIndex {
+                    rows,
+                    control: index.control.clone(),
+                },
+                funder.clone(),
+            )?;
+            let vectors = insert(
+                &image.get().vectors,
+                FundedArc::try_new(
+                    Entry {
+                        key: name.clone(),
+                        value,
+                    },
+                    funder.clone(),
+                )?,
+                funder,
+            )?;
+            image = crate::statement_rows::NativeImage::prepare(
+                NativeOrderedRoot {
+                    tables: image.get().tables.clone(),
+                    vectors,
+                    exact: image.get().exact.clone(),
+                },
+                funder,
+            )?;
             after = Some(name);
         }
         Ok(image)
@@ -4677,7 +5026,8 @@ impl NativeExactAdmission<'_> {
 }
 
 impl NativeExactSlots {
-    fn visit_retained_debits<'a>(&'a self,
+    fn visit_retained_debits<'a>(
+        &'a self,
         visit: &mut dyn FnMut(crate::staged_source::RetainedDebit<'a>),
     ) {
         use crate::staged_source::{seek_by, visit_link_debits};
@@ -4685,8 +5035,11 @@ impl NativeExactSlots {
         visit_link_debits(&self.vectors, visit);
         let mut after = None;
         while let Some((key, slot)) = seek_by(&self.rows, false, |key| {
-            if after.is_some_and(|after| *key <= after) { std::cmp::Ordering::Less }
-            else { std::cmp::Ordering::Equal }
+            if after.is_some_and(|after| *key <= after) {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
         }) {
             slot.table.visit_retained_debits(visit);
             slot.body.visit_retained_debits(visit);
@@ -4694,8 +5047,11 @@ impl NativeExactSlots {
         }
         let mut after = None;
         while let Some((key, slot)) = seek_by(&self.vectors, false, |key| {
-            if after.is_some_and(|after| *key <= after) { std::cmp::Ordering::Less }
-            else { std::cmp::Ordering::Equal }
+            if after.is_some_and(|after| *key <= after) {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
         }) {
             slot.index.table.visit_retained_debits(visit);
             slot.index.column.visit_retained_debits(visit);
@@ -4706,84 +5062,142 @@ impl NativeExactSlots {
 }
 
 impl NativeExactSlots {
-    fn prepare_filter(&self,
+    fn prepare_filter(
+        &self,
         keep_row: impl Fn(&NativeExactRow) -> bool,
         keep_vector: impl Fn(&NativeExactVector) -> bool,
         funder: &crate::staged_source::SourceFunder,
     ) -> Result<Self> {
-        use crate::staged_source::{seek_by, remove_by};
+        use crate::staged_source::{remove_by, seek_by};
         let mut rows = self.rows.clone();
         let mut after = None;
         while let Some((key, slot)) = seek_by(&self.rows, false, |key| {
-            if after.is_some_and(|after| *key <= after) { std::cmp::Ordering::Less }
-            else { std::cmp::Ordering::Equal }
+            if after.is_some_and(|after| *key <= after) {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
         }) {
-            if !keep_row(slot) { rows = remove_by(&rows, &|have| key.cmp(have), funder)?; }
+            if !keep_row(slot) {
+                rows = remove_by(&rows, &|have| key.cmp(have), funder)?;
+            }
             after = Some(*key);
         }
         let mut vectors = self.vectors.clone();
         let mut after = None;
         while let Some((key, slot)) = seek_by(&self.vectors, false, |key| {
-            if after.is_some_and(|after| *key <= after) { std::cmp::Ordering::Less }
-            else { std::cmp::Ordering::Equal }
+            if after.is_some_and(|after| *key <= after) {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
         }) {
-            if !keep_vector(slot) { vectors = remove_by(&vectors, &|have| key.cmp(have), funder)?; }
+            if !keep_vector(slot) {
+                vectors = remove_by(&vectors, &|have| key.cmp(have), funder)?;
+            }
             after = Some(*key);
         }
         Ok(Self { rows, vectors })
     }
 }
 impl PreparedNativeChange {
-    pub(crate) fn prepare_prune_canonical_slots(mut self,
+    pub(crate) fn prepare_prune_canonical_slots(
+        mut self,
         funder: &crate::staged_source::SourceFunder,
     ) -> Result<Self> {
-        if matches!(&self.successor, NativeSuccessor::Unchanged) { return Ok(self); }
+        if matches!(&self.successor, NativeSuccessor::Unchanged) {
+            return Ok(self);
+        }
         let root = self.active_image().get();
-        let exact = root.exact.prepare_filter(|slot| {
-            root.table(slot.table.as_str()).and_then(|table|
-                table.statement.get().row(slot.body.row().row_id))
-                .is_some_and(|current| current.ptr_eq(&slot.body))
-        }, |_| true, funder)?;
+        let exact = root.exact.prepare_filter(
+            |slot| {
+                root.table(slot.table.as_str())
+                    .and_then(|table| table.statement.get().row(slot.body.row().row_id))
+                    .is_some_and(|current| current.ptr_eq(&slot.body))
+            },
+            |_| true,
+            funder,
+        )?;
         let image = root.prepare_exact_slots(exact, funder)?;
         self.install_prepared_image(image, funder)?;
         Ok(self)
     }
-    pub(crate) fn prepare_rekey_row(mut self,
-        old: &crate::staged_source::RowCellHandle, new: &crate::staged_source::RowCellHandle,
+    pub(crate) fn prepare_rekey_row(
+        mut self,
+        old: &crate::staged_source::RowCellHandle,
+        new: &crate::staged_source::RowCellHandle,
         funder: &crate::staged_source::SourceFunder,
     ) -> Result<Self> {
         use crate::staged_source::{Entry, FundedArc, insert, remove_by};
         let root = self.active_image().get();
         let body = root.exact_row(old)?;
-        let rows = remove_by(&root.exact.rows, &|key| old.allocation_key().cmp(key), funder)?;
-        let rows = insert(&rows, FundedArc::try_new(Entry {
-            key: new.allocation_key(), value: NativeExactRow {
-                selector: new.allocation_key(), table: new.identity.table.clone(),
-                created_tx: new.identity.created_tx, body,
+        let rows = remove_by(
+            &root.exact.rows,
+            &|key| old.allocation_key().cmp(key),
+            funder,
+        )?;
+        let rows = insert(
+            &rows,
+            FundedArc::try_new(
+                Entry {
+                    key: new.allocation_key(),
+                    value: NativeExactRow {
+                        selector: new.allocation_key(),
+                        table: new.identity.table.clone(),
+                        created_tx: new.identity.created_tx,
+                        body,
+                    },
+                },
+                funder.clone(),
+            )?,
+            funder,
+        )?;
+        let image = root.prepare_exact_slots(
+            NativeExactSlots {
+                rows,
+                vectors: root.exact.vectors.clone(),
             },
-        }, funder.clone())?, funder)?;
-        let image = root.prepare_exact_slots(NativeExactSlots {
-            rows, vectors: root.exact.vectors.clone(),
-        }, funder)?;
+            funder,
+        )?;
         self.install_prepared_image(image, funder)?;
         Ok(self)
     }
-    pub(crate) fn prepare_rekey_vector(mut self,
-        old: &crate::staged_source::VectorCellHandle, new: &crate::staged_source::VectorCellHandle,
+    pub(crate) fn prepare_rekey_vector(
+        mut self,
+        old: &crate::staged_source::VectorCellHandle,
+        new: &crate::staged_source::VectorCellHandle,
         funder: &crate::staged_source::SourceFunder,
     ) -> Result<Self> {
         use crate::staged_source::{Entry, FundedArc, insert, remove_by};
         let root = self.active_image().get();
         let body = root.exact_vector(old)?;
-        let vectors = remove_by(&root.exact.vectors, &|key| old.allocation_key().cmp(key), funder)?;
-        let vectors = insert(&vectors, FundedArc::try_new(Entry {
-            key: new.allocation_key(), value: NativeExactVector {
-                selector: new.allocation_key(), index: new.identity.index.clone(), body,
+        let vectors = remove_by(
+            &root.exact.vectors,
+            &|key| old.allocation_key().cmp(key),
+            funder,
+        )?;
+        let vectors = insert(
+            &vectors,
+            FundedArc::try_new(
+                Entry {
+                    key: new.allocation_key(),
+                    value: NativeExactVector {
+                        selector: new.allocation_key(),
+                        index: new.identity.index.clone(),
+                        body,
+                    },
+                },
+                funder.clone(),
+            )?,
+            funder,
+        )?;
+        let image = root.prepare_exact_slots(
+            NativeExactSlots {
+                rows: root.exact.rows.clone(),
+                vectors,
             },
-        }, funder.clone())?, funder)?;
-        let image = root.prepare_exact_slots(NativeExactSlots {
-            rows: root.exact.rows.clone(), vectors,
-        }, funder)?;
+            funder,
+        )?;
         self.install_prepared_image(image, funder)?;
         Ok(self)
     }
@@ -4801,7 +5215,9 @@ impl NativeOrderedRoot {
             .ok_or_else(exact_native_error)?;
         let header = FundedArc::<NativeOrderedRow>::prepare(funder.clone())?;
         let mut keys = SourceBuffer::with_capacity(old.keys.len(), funder)?;
-        for (name, key) in old.keys.as_slice() { keys.push((name.clone(), key.clone())); }
+        for (name, key) in old.keys.as_slice() {
+            keys.push((name.clone(), key.clone()));
+        }
         let statement = prior.statement.clone();
         let row = FundedArc::from_prepared(
             NativeOrderedRow {
@@ -4894,13 +5310,15 @@ impl NativeOrderedRoot {
 
 impl OrderedStagedRows {
     pub(crate) fn copy_exact_original_row_for(
-        &self, cell: &crate::staged_source::RowCellHandle,
+        &self,
+        cell: &crate::staged_source::RowCellHandle,
         funder: &crate::staged_source::SourceFunder,
     ) -> Result<crate::staged_source::AdmittedSourceRow> {
         self.native_preparation_state()?;
         let root = self.native_root().ok_or_else(exact_native_error)?;
-        let slot = crate::staged_source::get_by(&root.exact.rows,
-            |key| cell.allocation_key().cmp(key)).ok_or_else(exact_native_error)?;
+        let slot =
+            crate::staged_source::get_by(&root.exact.rows, |key| cell.allocation_key().cmp(key))
+                .ok_or_else(exact_native_error)?;
         if !cell.is_funded_by(funder)
             || slot.selector != cell.allocation_key()
             || slot.table != cell.identity.table
@@ -4917,28 +5335,38 @@ impl OrderedStagedRows {
 
 impl NativeEagerVector {
     fn copy_exact_original_vector_for(
-        &self, entry: &contextdb_core::VectorEntry,
+        &self,
+        entry: &contextdb_core::VectorEntry,
         funder: &crate::staged_source::SourceFunder,
     ) -> Result<crate::staged_source::AdmittedEagerSourceVector> {
         if !self.0.is_funded_by(funder)
-            || self.row_id() != entry.row_id || self.0.column.as_str() != entry.index.column
+            || self.row_id() != entry.row_id
+            || self.0.column.as_str() != entry.index.column
             || self.vector() != entry.vector.as_slice()
-        { return Err(exact_native_error()); }
+        {
+            return Err(exact_native_error());
+        }
         let mut copied = match &self.0.payload {
-            NativeEagerVectorPayload::Scalar(row) => {
-                row.copy_original_vector_input_for(
-                    crate::staged_source::BorrowedOriginalVectorCopyInput::new(
-                        &entry.index.table, &entry.index.column, self.vector(),
-                        row.row().row_id, row.row().created_tx, row.row().deleted_tx, row.row().lsn,
-                    ), funder,
-                )?
-            }
+            NativeEagerVectorPayload::Scalar(row) => row.copy_original_vector_input_for(
+                crate::staged_source::BorrowedOriginalVectorCopyInput::new(
+                    &entry.index.table,
+                    &entry.index.column,
+                    self.vector(),
+                    row.row().row_id,
+                    row.row().created_tx,
+                    row.row().deleted_tx,
+                    row.row().lsn,
+                ),
+                funder,
+            )?,
             NativeEagerVectorPayload::Owned(payload) => {
                 payload.validate_original_pairing(funder)?;
                 if !payload.is_funded_by(funder) || payload.entry.index != entry.index {
                     return Err(exact_native_error());
                 }
-                payload.original_copy.copy_original_eager_vector_for(&payload.entry, funder)?
+                payload
+                    .original_copy
+                    .copy_original_eager_vector_for(&payload.entry, funder)?
             }
         };
         // Scalar aliases and moved capabilities keep their receiver's original
@@ -4953,77 +5381,113 @@ impl NativeEagerVector {
 
 impl OrderedStagedRows {
     pub(crate) fn copy_exact_original_vector_for(
-        &self, cell: &crate::staged_source::VectorCellHandle,
+        &self,
+        cell: &crate::staged_source::VectorCellHandle,
         entry: &contextdb_core::VectorEntry,
         funder: &crate::staged_source::SourceFunder,
     ) -> Result<crate::staged_source::AdmittedEagerSourceVector> {
         self.native_preparation_state()?;
         let root = self.native_root().ok_or_else(exact_native_error)?;
-        let slot = crate::staged_source::get_by(&root.exact.vectors,
-            |key| cell.allocation_key().cmp(key)).ok_or_else(exact_native_error)?;
+        let slot =
+            crate::staged_source::get_by(&root.exact.vectors, |key| cell.allocation_key().cmp(key))
+                .ok_or_else(exact_native_error)?;
         if !cell.is_funded_by(funder)
-            || slot.selector != cell.allocation_key() || slot.index != cell.identity.index
+            || slot.selector != cell.allocation_key()
+            || slot.index != cell.identity.index
             || !cell.identity.matches_entry(entry)
-        { return Err(exact_native_error()); }
+        {
+            return Err(exact_native_error());
+        }
         let custody = cell.custody.lock();
-        let Some(crate::staged_source::VectorCustody::Sealed { entry: original, .. })
-            = custody.as_ref() else { return Err(exact_native_error()); };
-        if !cell.identity.matches_entry(original) || original.index != entry.index
+        let Some(crate::staged_source::VectorCustody::Sealed {
+            entry: original, ..
+        }) = custody.as_ref()
+        else {
+            return Err(exact_native_error());
+        };
+        if !cell.identity.matches_entry(original)
+            || original.index != entry.index
             || original.vector != entry.vector
-        { return Err(exact_native_error()); }
+        {
+            return Err(exact_native_error());
+        }
         slot.body.copy_exact_original_vector_for(entry, funder)
     }
 
     pub(crate) fn copy_exact_original_vector_input_for_row(
-        &self, cell: &crate::staged_source::RowCellHandle,
-        column: &str, values: &[f32],
+        &self,
+        cell: &crate::staged_source::RowCellHandle,
+        column: &str,
+        values: &[f32],
         funder: &crate::staged_source::SourceFunder,
     ) -> Result<crate::staged_source::AdmittedEagerSourceVector> {
         self.native_preparation_state()?;
         let root = self.native_root().ok_or_else(exact_native_error)?;
-        let slot = crate::staged_source::get_by(&root.exact.rows,
-            |key| cell.allocation_key().cmp(key)).ok_or_else(exact_native_error)?;
-        if !cell.is_funded_by(funder) || slot.selector != cell.allocation_key()
-            || slot.table != cell.identity.table || slot.created_tx != cell.identity.created_tx
+        let slot =
+            crate::staged_source::get_by(&root.exact.rows, |key| cell.allocation_key().cmp(key))
+                .ok_or_else(exact_native_error)?;
+        if !cell.is_funded_by(funder)
+            || slot.selector != cell.allocation_key()
+            || slot.table != cell.identity.table
+            || slot.created_tx != cell.identity.created_tx
             || slot.body.sequence() != cell.identity.sequence
             || !cell.identity.matches_row(slot.body.row())
             || !slot.body.schema().ptr_eq(&cell.identity.schema)
-        { return Err(exact_native_error()); }
+        {
+            return Err(exact_native_error());
+        }
         slot.body.copy_original_vector_input_for(
             crate::staged_source::BorrowedOriginalVectorCopyInput::new(
-                cell.identity.table.as_str(), column, values, cell.identity.row,
-                cell.identity.created_tx, cell.identity.deleted_tx, cell.identity.lsn,
-            ), funder,
+                cell.identity.table.as_str(),
+                column,
+                values,
+                cell.identity.row,
+                cell.identity.created_tx,
+                cell.identity.deleted_tx,
+                cell.identity.lsn,
+            ),
+            funder,
         )
     }
 }
 
 impl OrderedStagedRows {
     pub(crate) fn prepare_native_admitted_original_vector(
-        &self, entry: &contextdb_core::VectorEntry,
+        &self,
+        entry: &contextdb_core::VectorEntry,
         original: crate::staged_source::AdmittedEagerSourceVector,
         funder: &crate::staged_source::SourceFunder,
     ) -> Result<PreparedNativeChange> {
-        if original.entry.index != entry.index || original.entry.row_id != entry.row_id
-            || original.entry.vector != entry.vector || original.entry.created_tx != entry.created_tx
-            || original.entry.deleted_tx != entry.deleted_tx || original.entry.lsn != entry.lsn
-        { return Err(exact_native_error()); }
+        if original.entry.index != entry.index
+            || original.entry.row_id != entry.row_id
+            || original.entry.vector != entry.vector
+            || original.entry.created_tx != entry.created_tx
+            || original.entry.deleted_tx != entry.deleted_tx
+            || original.entry.lsn != entry.lsn
+        {
+            return Err(exact_native_error());
+        }
         let vector = NativeEagerVector::prepare_owned(original, funder)?;
         self.prepare_native_vector(&entry.index, vector, funder)
     }
 }
 
-
 impl OrderedStagedRows {
     pub(crate) fn copy_changed_exact_original_rows_for(
-        &self, cell: &crate::staged_source::RowCellHandle,
-        expected: &contextdb_core::VersionedRow, replacement: &contextdb_core::VersionedRow,
+        &self,
+        cell: &crate::staged_source::RowCellHandle,
+        expected: &contextdb_core::VersionedRow,
+        replacement: &contextdb_core::VersionedRow,
         funder: &crate::staged_source::SourceFunder,
-    ) -> Result<(crate::staged_source::AdmittedSourceRow, crate::staged_source::AdmittedEagerSourceRow)> {
+    ) -> Result<(
+        crate::staged_source::AdmittedSourceRow,
+        crate::staged_source::AdmittedEagerSourceRow,
+    )> {
         self.native_preparation_state()?;
         let root = self.native_root().ok_or_else(exact_native_error)?;
-        let slot = crate::staged_source::get_by(&root.exact.rows,
-            |key| cell.allocation_key().cmp(key)).ok_or_else(exact_native_error)?;
+        let slot =
+            crate::staged_source::get_by(&root.exact.rows, |key| cell.allocation_key().cmp(key))
+                .ok_or_else(exact_native_error)?;
         if !cell.is_funded_by(funder)
             || slot.selector != cell.allocation_key()
             || slot.table != cell.identity.table
@@ -5033,18 +5497,23 @@ impl OrderedStagedRows {
             || !cell.identity.matches_row(slot.body.row())
             || !crate::staged_source::changed_original_rows_identical(slot.body.row(), expected)
             || !slot.body.schema().ptr_eq(&cell.identity.schema)
-        { return Err(exact_native_error()); }
+        {
+            return Err(exact_native_error());
+        }
         // Keep the two genuine original admissions independent. A refusal of
         // the eager copy destroys the canonical body before refunding its O.
-        let canonical = slot.body.copy_changed_original_row_for(expected, replacement, funder)?;
-        let eager = slot.body.copy_changed_original_eager_row_for(expected, replacement, funder)?;
+        let canonical = slot
+            .body
+            .copy_changed_original_row_for(expected, replacement, funder)?;
+        let eager = slot
+            .body
+            .copy_changed_original_eager_row_for(expected, replacement, funder)?;
         Ok((canonical, eager))
     }
 }
 
-
 impl OrderedStagedRows {
-pub(crate) fn prepare_native_admitted_original_row(
+    pub(crate) fn prepare_native_admitted_original_row(
         &self,
         table: &str,
         position: StagedPosition,
@@ -5063,7 +5532,9 @@ pub(crate) fn prepare_native_admitted_original_row(
         let empty = NativeOrderedRoot::empty();
         let root = self.native_root().unwrap_or(&empty);
         original.validate_exact_funder(funder)?;
-        if !crate::staged_source::changed_original_rows_identical(&original.row, row) { return Err(exact_native_error()); }
+        if !crate::staged_source::changed_original_rows_identical(&original.row, row) {
+            return Err(exact_native_error());
+        }
         let copied = original;
         let eager = crate::statement_rows::NativeEagerRow::prepare(
             copied,

@@ -277,23 +277,34 @@ impl<T> ScopedVectorCopy<T> {
     /// the complete decoded value drops before the admission is released.
     #[doc(hidden)]
     pub fn from_admitted(value: T, admission: Option<VectorCopyAdmission>) -> Self {
-        Self { value, _admission: admission }
+        Self {
+            value,
+            _admission: admission,
+        }
     }
 
     /// Transform while source and output coexist under the same admitted
     /// window; on every exit the source buffer drops before its token.
     #[doc(hidden)]
-    pub fn try_map<U>(self, materialize: impl FnOnce(&T) -> Result<U>) -> Result<ScopedVectorCopy<U>> {
+    pub fn try_map<U>(
+        self,
+        materialize: impl FnOnce(&T) -> Result<U>,
+    ) -> Result<ScopedVectorCopy<U>> {
         let value = materialize(&self.value)?;
         drop(self.value);
-        Ok(ScopedVectorCopy { value, _admission: self._admission })
+        Ok(ScopedVectorCopy {
+            value,
+            _admission: self._admission,
+        })
     }
 
     /// Only for provider paths whose allocation is already funded elsewhere.
     #[doc(hidden)]
     pub fn into_already_funded(self) -> Result<T> {
         if self._admission.is_some() {
-            return Err(contextdb_core::Error::Other("admitted value cannot detach its charge".into()));
+            return Err(contextdb_core::Error::Other(
+                "admitted value cannot detach its charge".into(),
+            ));
         }
         Ok(self.value)
     }
@@ -578,9 +589,15 @@ mod tests {
         assert_eq!(routing_budget.0.load(Ordering::SeqCst), initial);
         let prepaid_live = Arc::new(AtomicUsize::new(0));
         let charge = VectorWorkspaceReservation::try_new(
-            routing_budget.clone(), prepaid_live.clone(), bytes, "routing", "control",
-        ).unwrap();
-        let mut prepaid = VectorCopyAdmission::from_prepaid(routing_budget.clone(), charge).unwrap();
+            routing_budget.clone(),
+            prepaid_live.clone(),
+            bytes,
+            "routing",
+            "control",
+        )
+        .unwrap();
+        let mut prepaid =
+            VectorCopyAdmission::from_prepaid(routing_budget.clone(), charge).unwrap();
         assert!(!prepaid.historical_durable_reads());
         assert_eq!(routing_budget.0.load(Ordering::SeqCst), initial + bytes);
         prepaid.with_historical_durable_reads(|marked| {

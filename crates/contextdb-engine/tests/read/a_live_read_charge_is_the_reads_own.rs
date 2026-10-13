@@ -54,7 +54,10 @@ fn a_live_read_reports_its_own_charge_unmoved_by_writes_and_identical_across_reo
             insert(&db, id);
         }
         let (baseline, held, after) = one_cursor_charge(&db);
-        assert!(held > baseline, "hydrated rows charge the read that holds them");
+        assert!(
+            held > baseline,
+            "hydrated rows charge the read that holds them"
+        );
         assert_eq!(after, baseline, "closing the cursor returns its charge");
 
         // Writer state grows the shared accountant; the read's charge does not move.
@@ -75,6 +78,10 @@ fn a_live_read_reports_its_own_charge_unmoved_by_writes_and_identical_across_reo
     db.execute("DELETE FROM charged_rows WHERE id = 4", &HashMap::new())
         .expect("restore the three-row table");
     let (baseline, held, after) = one_cursor_charge(&db);
-    assert_eq!(held - baseline, first, "the same read reports the same charge after reopen");
+    assert_eq!(
+        held - baseline,
+        first,
+        "the same read reports the same charge after reopen"
+    );
     assert_eq!(after, baseline);
 }

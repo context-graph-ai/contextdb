@@ -2298,7 +2298,6 @@ mod sync_effect_tests {
     }
 }
 
-
 // Scoped consumers keep exceptional temporary custody through callbacks and audits.
 impl Database {
     pub(super) fn dispatch_triggers_for_tx_owned(

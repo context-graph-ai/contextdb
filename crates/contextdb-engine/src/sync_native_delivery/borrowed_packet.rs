@@ -50,10 +50,17 @@ impl NativePacketNamespace {
             cursor: None,
         })
     }
-    pub(super) fn with_cursor(mut self, cursor: Option<NativeBuffer>, operation: &NativeReadRequest,
-        context: &NativeReadOpenContext) -> Selected<Self> {
+    pub(super) fn with_cursor(
+        mut self,
+        cursor: Option<NativeBuffer>,
+        operation: &NativeReadRequest,
+        context: &NativeReadOpenContext,
+    ) -> Selected<Self> {
         same_request(operation, context)?;
-        if cursor.as_ref().is_some_and(|token| !token.is_funded_by(&operation.owner())) {
+        if cursor
+            .as_ref()
+            .is_some_and(|token| !token.is_funded_by(&operation.owner()))
+        {
             return Err(Failure::OwnerMismatch);
         }
         self.cursor = cursor;
@@ -66,7 +73,10 @@ impl NativePacketNamespace {
         self.tenant_invoice.is_funded_by(owner)
             && self.hub.is_funded_by(owner)
             && self.edge.is_funded_by(owner)
-            && self.cursor.as_ref().is_none_or(|token| token.is_funded_by(owner))
+            && self
+                .cursor
+                .as_ref()
+                .is_none_or(|token| token.is_funded_by(owner))
     }
 }
 pub(crate) type NativeBorrowedOutcome = super::NativeOutcome<NativeBuffer>;
@@ -483,17 +493,37 @@ pub(crate) fn encode_custody_outcomes(
     // All incarnation, root/cursor and other cold calls finish without views.
     let selection = match &namespace.cursor {
         None => db.custody_outcomes_native(
-            &namespace.tenant, namespace.hub.text()?, namespace.edge.text()?,
-            edge_incarnation, after, operation, context,
+            &namespace.tenant,
+            namespace.hub.text()?,
+            namespace.edge.text()?,
+            edge_incarnation,
+            after,
+            operation,
+            context,
         )?,
         Some(token) => {
-            if after.is_some() { return Err(Invalid::Canonical.into()); }
+            if after.is_some() {
+                return Err(Invalid::Canonical.into());
+            }
             db.custody_outcomes_native_with_after(
-                &namespace.tenant, namespace.hub.text()?, namespace.edge.text()?,
-                edge_incarnation, operation, context,
-                |incarnation| super::paid_request::cursor_after(token, &namespace.tenant,
-                    namespace.hub.text()?, incarnation, namespace.edge.text()?,
-                    edge_incarnation, operation, context),
+                &namespace.tenant,
+                namespace.hub.text()?,
+                namespace.edge.text()?,
+                edge_incarnation,
+                operation,
+                context,
+                |incarnation| {
+                    super::paid_request::cursor_after(
+                        token,
+                        &namespace.tenant,
+                        namespace.hub.text()?,
+                        incarnation,
+                        namespace.edge.text()?,
+                        edge_incarnation,
+                        operation,
+                        context,
+                    )
+                },
             )?
         }
     };

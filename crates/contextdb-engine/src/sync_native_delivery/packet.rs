@@ -279,7 +279,7 @@ pub(crate) fn encode_packet(
     };
     // Count then fallibly admit the complete original named-codec packet. The
     // fixed certificate signature is copied as a sequence into this exact buffer.
-    let packet_length = super::named_size(&packet)?;
+    let packet_length = super::named_size(memory, &packet)?;
     wire_context.finish_json_pass()?;
     let mut lookup_source = memory.allocate(packet_length)?;
     wire_context.reset_json_pass();

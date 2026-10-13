@@ -10,6 +10,8 @@
 //! the session and its cursor usable, and a report belonging to one request
 //! is never mistaken for another's.
 
+#[cfg(unix)]
+use super::owner_cursor_test_support;
 use contextdb_core::read_contract::{
     DatabaseIdentity, DeadlineClock, LocalUserIdentity, OwnerReadCancellation, OwnerReadLimits,
     OwnerReadStatus, OwnerServiceTimeouts, OwnerServingState, ReadClientTimeouts, ReadLimits,
@@ -26,8 +28,6 @@ use contextdb_engine::owner_read::{
     OwnerClient, OwnerReadScaffoldError, OwnerReadService, OwnerServicePublicationObserver,
     OwnerServiceSpec, ValidatedOwnerListener,
 };
-#[cfg(unix)]
-use super::owner_cursor_test_support;
 #[cfg(unix)]
 use owner_cursor_test_support::decode_owner_cursor_page as decode_cursor_page;
 
@@ -911,8 +911,7 @@ fn cancellation_received_before_owner_cursor_page_publication_withdraws_and_repl
     assert_eq!(after_cancellation.active_cancellations, 0);
     assert!(after_cancellation.cursor_retained_bytes > 0);
     assert_eq!(
-        i128::from(after_cancellation.reader_used_bytes)
-            - i128::from(after_open.reader_used_bytes),
+        i128::from(after_cancellation.reader_used_bytes) - i128::from(after_open.reader_used_bytes),
         i128::from(after_cancellation.cursor_retained_bytes)
             - i128::from(after_open.cursor_retained_bytes),
         "the pending page moves the reader and owner cursor accounts by the same bytes"

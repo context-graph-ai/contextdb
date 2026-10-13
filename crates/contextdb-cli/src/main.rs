@@ -413,13 +413,18 @@ fn main() {
             canonical_help_signatures().contains(&operation.spelling()),
             "every operational spelling is part of the one discovery surface"
         );
-        let read_parent = contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
-            args.read_configuration().limits.memory,
-        );
+        let read_parent =
+            contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+                args.read_configuration().limits.memory,
+            );
         let exit_code = contextdb_cli::ops::run_operational(
             operation.spelling(),
             operation.arguments(),
-            || read_parent.child().map(|operation| (operation, read_parent.clone())),
+            || {
+                read_parent
+                    .child()
+                    .map(|operation| (operation, read_parent.clone()))
+            },
         )
         .expect("the command tree only resolves spellings the operations answer to");
         drop(read_parent);
@@ -799,10 +804,9 @@ fn main() {
     // Graceful shutdown: stop background notifications, wait for any in-flight
     // auto-sync work to finish, then do one final flush before closing the DB.
     if let Some((rt, client)) = rt_and_client {
-        if let Err(err) = read_memory
-            .child()
-            .and_then(|root| db.execute_with_read_memory("ROLLBACK", &std::collections::HashMap::new(), root))
-        {
+        if let Err(err) = read_memory.child().and_then(|root| {
+            db.execute_with_read_memory("ROLLBACK", &std::collections::HashMap::new(), root)
+        }) {
             output.report_error(
                 ErrorClass::of(&err),
                 &format!("Final transaction rollback failed: {err}"),

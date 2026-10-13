@@ -4,7 +4,9 @@ use super::*;
 // Target one accountant so parallel maintenance fixtures cannot consume the cut.
 static BEFORE_INSTALL: OnceLock<Mutex<Option<(usize, Arc<ApplyPhasePause>)>>> = OnceLock::new();
 
-fn arm_before_install(accountant: &crate::memory_accounting::AccountantHandle) -> ApplyPhasePauseGuard {
+fn arm_before_install(
+    accountant: &crate::memory_accounting::AccountantHandle,
+) -> ApplyPhasePauseGuard {
     let pause = Arc::new(ApplyPhasePause::new());
     let guard = ApplyPhasePauseGuard::arm_for_test(Arc::clone(&pause));
     *BEFORE_INSTALL.get_or_init(|| Mutex::new(None)).lock() =

@@ -152,7 +152,9 @@ impl ManualDeadlineClock {
                     due
                 }
             };
-            let Some(wake) = wake else { return; };
+            let Some(wake) = wake else {
+                return;
+            };
             // Only authentic paid retention, never a stack pointer, survives
             // unlock. A callback/payload/refund panic cannot strand a node.
             wake.wake_read();
@@ -185,16 +187,26 @@ impl DeadlineClock for ManualDeadlineClock {
     fn try_native_source(
         &self,
         _standing: &contextdb_core::read_memory::ReadMemoryOwner,
-    ) -> contextdb_core::Result<Option<contextdb_core::read_memory::OwnedReadBox<dyn contextdb_core::read_contract::NativeDeadlineSource>>> {
+    ) -> contextdb_core::Result<
+        Option<
+            contextdb_core::read_memory::OwnedReadBox<
+                dyn contextdb_core::read_contract::NativeDeadlineSource,
+            >,
+        >,
+    > {
         #[cfg(target_os = "linux")]
         {
-            let source = native_source_with(
-                _standing.clone(), || Ok(ManualNativeSource { state: Arc::clone(&self.state) }),
-            )?;
+            let source = native_source_with(_standing.clone(), || {
+                Ok(ManualNativeSource {
+                    state: Arc::clone(&self.state),
+                })
+            })?;
             Ok(Some(source))
         }
         #[cfg(not(target_os = "linux"))]
-        { Ok(None) }
+        {
+            Ok(None)
+        }
     }
 
     fn now_ms(&self) -> u64 {
@@ -217,7 +229,11 @@ struct NativeParkList {
     head: *const NativeParkNode,
 }
 impl Default for NativeParkList {
-    fn default() -> Self { Self { head: std::ptr::null() } }
+    fn default() -> Self {
+        Self {
+            head: std::ptr::null(),
+        }
+    }
 }
 // SAFETY: the head and all node links are accessed only under the owning
 // ManualDeadlineState mutex; the pinned caller guard removes every node before
@@ -239,7 +255,9 @@ impl NativeParkList {
         // SAFETY: all nodes in this list have a live pinned registration guard;
         // links are UnsafeCell, never an illicit write through a shared reference.
         unsafe {
-            if !(*(*node).links.get()).linked { return; }
+            if !(*(*node).links.get()).linked {
+                return;
+            }
             let mut link = &mut self.head as *mut *const NativeParkNode;
             while !(*link).is_null() {
                 let current = *link;
@@ -286,15 +304,21 @@ impl contextdb_core::read_contract::NativeDeadlineSource for ManualNativeSource 
             deadline_ms,
             wake: park.wake_lease(),
             links: std::cell::UnsafeCell::new(NativeParkLinks {
-                next: std::ptr::null(), linked: false,
+                next: std::ptr::null(),
+                linked: false,
             }),
             _pin: std::marker::PhantomPinned,
         });
-        let registration = NativeParkRegistration { state: &self.state, node: node.as_ref() };
+        let registration = NativeParkRegistration {
+            state: &self.state,
+            node: node.as_ref(),
+        };
         {
             let mut state = ManualDeadlineClock::locked(&self.state);
             // Recheck the SAME clock under its mutex to close advance-before-link.
-            if state.now_ms >= deadline_ms { return Ok(()); }
+            if state.now_ms >= deadline_ms {
+                return Ok(());
+            }
             let pointer = node.as_ref().get_ref() as *const NativeParkNode;
             // SAFETY: pin precedes publication, the guard already exists, and
             // this mutex serializes every link access until guard destruction.
@@ -487,15 +511,21 @@ impl DeadlineClock for MonotonicDeadlineClock {
     fn try_native_source(
         &self,
         _standing: &contextdb_core::read_memory::ReadMemoryOwner,
-    ) -> contextdb_core::Result<Option<contextdb_core::read_memory::OwnedReadBox<dyn contextdb_core::read_contract::NativeDeadlineSource>>> {
+    ) -> contextdb_core::Result<
+        Option<
+            contextdb_core::read_memory::OwnedReadBox<
+                dyn contextdb_core::read_contract::NativeDeadlineSource,
+            >,
+        >,
+    > {
         #[cfg(target_os = "linux")]
         {
-            native_source_with(
-                _standing.clone(), || Ok(MonotonicNativeSource),
-            ).map(Some)
+            native_source_with(_standing.clone(), || Ok(MonotonicNativeSource)).map(Some)
         }
         #[cfg(not(target_os = "linux"))]
-        { Ok(None) }
+        {
+            Ok(None)
+        }
     }
 
     fn now_ms(&self) -> u64 {
@@ -740,27 +770,50 @@ deadline_operation!(drain_shutdown_with_deadline, ShutdownDrain);
 fn native_source_with<S: contextdb_core::read_contract::NativeDeadlineSource + 'static>(
     owner: contextdb_core::read_memory::ReadMemoryOwner,
     make: impl FnOnce() -> contextdb_core::Result<S>,
-) -> contextdb_core::Result<contextdb_core::read_memory::OwnedReadBox<dyn contextdb_core::read_contract::NativeDeadlineSource>> {
+) -> contextdb_core::Result<
+    contextdb_core::read_memory::OwnedReadBox<
+        dyn contextdb_core::read_contract::NativeDeadlineSource,
+    >,
+> {
     use contextdb_core::read_memory::{OwnedReadBox, ReadCredit};
     let layout = std::alloc::Layout::new::<S>();
-    let credit = ReadCredit::try_new_owned(owner, layout.size(), "reader", "native deadline source",
-        "admit the concrete clock source before its producer")?;
-    let block = if layout.size() == 0 { std::ptr::NonNull::<S>::dangling() } else {
+    let credit = ReadCredit::try_new_owned(
+        owner,
+        layout.size(),
+        "reader",
+        "native deadline source",
+        "admit the concrete clock source before its producer",
+    )?;
+    let block = if layout.size() == 0 {
+        std::ptr::NonNull::<S>::dangling()
+    } else {
         std::ptr::NonNull::new(unsafe { std::alloc::alloc(layout) }.cast::<S>())
             .ok_or(contextdb_core::Error::ReadSessionNotImplemented)?
     };
-    struct Guard<S> { block: std::ptr::NonNull<S>, layout: std::alloc::Layout,
-        credit: contextdb_core::read_memory::ReadCredit }
+    struct Guard<S> {
+        block: std::ptr::NonNull<S>,
+        layout: std::alloc::Layout,
+        credit: contextdb_core::read_memory::ReadCredit,
+    }
     impl<S> Drop for Guard<S> {
         fn drop(&mut self) {
-            if self.layout.size() != 0 { unsafe { std::alloc::dealloc(self.block.as_ptr().cast(), self.layout) }; }
+            if self.layout.size() != 0 {
+                unsafe { std::alloc::dealloc(self.block.as_ptr().cast(), self.layout) };
+            }
         }
     }
-    let guard = Guard { block, layout, credit };
+    let guard = Guard {
+        block,
+        layout,
+        credit,
+    };
     let source = make()?;
-    unsafe { block.as_ptr().write(source); }
+    unsafe {
+        block.as_ptr().write(source);
+    }
     let guard = std::mem::ManuallyDrop::new(guard);
-    let payload: Box<dyn contextdb_core::read_contract::NativeDeadlineSource> = unsafe { Box::from_raw(block.as_ptr()) };
+    let payload: Box<dyn contextdb_core::read_contract::NativeDeadlineSource> =
+        unsafe { Box::from_raw(block.as_ptr()) };
     let credit = unsafe { std::ptr::read(&guard.credit) };
     Ok(OwnedReadBox::new(payload, credit))
 }

@@ -305,7 +305,12 @@ fn eager_indexed_projection_loads_only_selected_vector_bodies() {
         "projecting selected bodies does not hydrate a complete partition"
     );
     assert_eq!(selected_work.counters().decoded_vectors, matching as u64);
-    assert!(vectors.rows.iter().all(|row| row == &vec![expected_vector()]));
+    assert!(
+        vectors
+            .rows
+            .iter()
+            .all(|row| row == &vec![expected_vector()])
+    );
     database.close().expect("close the projection fixture");
 }
 

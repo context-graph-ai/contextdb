@@ -168,7 +168,9 @@ impl DeclaredReadMemory {
     }
 
     /// Admit the actual native cell against this original declared parent.
-    pub(crate) fn native_child(self: &Arc<Self>) -> std::result::Result<NativeReadChildReceipt, NativeRefusal> {
+    pub(crate) fn native_child(
+        self: &Arc<Self>,
+    ) -> std::result::Result<NativeReadChildReceipt, NativeRefusal> {
         let control_bytes =
             ReadMemoryOwner::native_layout::<NativeDeclaredChild, NativeChildInvoice>().size();
         self.try_reserve_native(
@@ -187,7 +189,8 @@ impl DeclaredReadMemory {
             parent: self.clone(),
             retained: std::sync::atomic::AtomicU64::new(0),
         };
-        ReadMemoryOwner::try_native_reserving(payload, invoice).map(|owner| NativeReadChildReceipt { owner })
+        ReadMemoryOwner::try_native_reserving(payload, invoice)
+            .map(|owner| NativeReadChildReceipt { owner })
     }
 
     /// Existing public provider result remains unqualified at its Error terminal.
@@ -263,7 +266,9 @@ struct NativeDeclaredChild {
     retained: std::sync::atomic::AtomicU64,
 }
 impl ReadMemoryBudget for NativeDeclaredChild {
-    fn native_reserve_supported(&self) -> bool { true }
+    fn native_reserve_supported(&self) -> bool {
+        true
+    }
     fn try_reserve_native(
         &self,
         bytes: usize,
@@ -271,7 +276,8 @@ impl ReadMemoryBudget for NativeDeclaredChild {
         operation: &'static str,
         hint: &'static str,
     ) -> std::result::Result<(), NativeRefusal> {
-        self.parent.try_reserve_native(bytes, subsystem, operation, hint)?;
+        self.parent
+            .try_reserve_native(bytes, subsystem, operation, hint)?;
         let held = self
             .retained
             .fetch_add(bytes as u64, std::sync::atomic::Ordering::SeqCst)
@@ -340,14 +346,22 @@ pub fn take_reader_budget_ledger_for_test() -> Vec<crate::memory_accounting::Bud
 
 impl ReadMemoryBudget for DeclaredReadMemory {
     fn try_reserve_native(
-        &self, bytes: usize, subsystem: &'static str,
-        operation: &'static str, hint: &'static str,
+        &self,
+        bytes: usize,
+        subsystem: &'static str,
+        operation: &'static str,
+        hint: &'static str,
     ) -> std::result::Result<(), NativeRefusal> {
-        self.try_count(bytes).map_err(|held| NativeRefusal::MemoryBudgetExceeded {
-            subsystem, operation, requested_bytes: bytes,
-            available_bytes: usize::try_from(self.limit.saturating_sub(held)).unwrap_or(usize::MAX),
-            budget_limit_bytes: usize::try_from(self.limit).unwrap_or(usize::MAX), hint,
-        })
+        self.try_count(bytes)
+            .map_err(|held| NativeRefusal::MemoryBudgetExceeded {
+                subsystem,
+                operation,
+                requested_bytes: bytes,
+                available_bytes: usize::try_from(self.limit.saturating_sub(held))
+                    .unwrap_or(usize::MAX),
+                budget_limit_bytes: usize::try_from(self.limit).unwrap_or(usize::MAX),
+                hint,
+            })
     }
     fn try_reserve(
         &self,
@@ -423,7 +437,8 @@ impl ReadRequestBudgetProvider for Arc<DeclaredReadMemory> {
         self.child()
     }
     fn request_budget_owner(&self) -> Result<RequestReadOwner> {
-        self.native_child_unqualified().map(RequestReadOwner::native)
+        self.native_child_unqualified()
+            .map(RequestReadOwner::native)
     }
 }
 

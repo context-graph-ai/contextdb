@@ -3252,7 +3252,6 @@ mod quiescent_queue_tests {
     }
 }
 
-
 impl Database {
     /// Append the original next-action config body only after its actual writer
     /// has admitted the key and encoded value. The guarded splice retains that
@@ -3265,28 +3264,40 @@ impl Database {
         struct ByteCount(usize);
         impl std::io::Write for ByteCount {
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0 = self.0.checked_add(bytes.len()).ok_or_else(|| {
-                    std::io::Error::other("next action config size overflow")
-                })?;
+                self.0 = self
+                    .0
+                    .checked_add(bytes.len())
+                    .ok_or_else(|| std::io::Error::other("next action config size overflow"))?;
                 Ok(bytes.len())
             }
-            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
         }
         let mut count = ByteCount(0);
         bincode::serde::encode_into_std_write(
-            &next_action_id, &mut count, bincode::config::standard(),
-        ).map_err(|error| Error::Other(format!("bincode encode error: {error}")))?;
-        let bytes = NEXT_ACTION_ID_CONFIG_KEY.len().checked_add(count.0)
+            &next_action_id,
+            &mut count,
+            bincode::config::standard(),
+        )
+        .map_err(|error| Error::Other(format!("bincode encode error: {error}")))?;
+        let bytes = NEXT_ACTION_ID_CONFIG_KEY
+            .len()
+            .checked_add(count.0)
             .ok_or_else(|| Error::Other("next action config size overflow".into()))?;
         let mut admission = self.reserve_owned_preparation(bytes)?;
         // Exact capacity prevents an encoder growth allocation outside the
         // original admission. Neither key nor value exists before admission.
         let mut encoded = Vec::with_capacity(count.0);
         bincode::serde::encode_into_std_write(
-            &next_action_id, &mut encoded, bincode::config::standard(),
-        ).map_err(|error| Error::Other(format!("bincode encode error: {error}")))?;
+            &next_action_id,
+            &mut encoded,
+            bincode::config::standard(),
+        )
+        .map_err(|error| Error::Other(format!("bincode encode error: {error}")))?;
         let body = contextdb_tx::staged_source::AuxBody::ConfigWrite((
-            NEXT_ACTION_ID_CONFIG_KEY.to_owned(), encoded,
+            NEXT_ACTION_ID_CONFIG_KEY.to_owned(),
+            encoded,
         ));
         let at = guard.read().config_writes.len();
         match &self.tx_mgr {
@@ -3312,10 +3323,10 @@ impl Database {
 /// storage for the whole callback. The actual handle impl is composed only
 /// after its frozen definition is available.
 pub(crate) fn with_owned_persistence_original_seed<R>(
-    original:&crate::memory_accounting::OwnedMemoryReservation,
-    f:impl for<'o> FnOnce(&'o crate::memory_accounting::OwnedMemoryReservation)->Result<R>,
-)->Result<R> {
-    let _physical_origin=crate::memory_accounting::persistence_original_projection(original)?;
+    original: &crate::memory_accounting::OwnedMemoryReservation,
+    f: impl for<'o> FnOnce(&'o crate::memory_accounting::OwnedMemoryReservation) -> Result<R>,
+) -> Result<R> {
+    let _physical_origin = crate::memory_accounting::persistence_original_projection(original)?;
     f(original)
 }
 
@@ -3413,7 +3424,9 @@ impl<T> OwnedEventShared<T> {
 }
 impl<T> std::ops::Deref for OwnedEventShared<T> {
     type Target = T;
-    fn deref(&self) -> &T { self.get() }
+    fn deref(&self) -> &T {
+        self.get()
+    }
 }
 impl<T> Clone for OwnedEventShared<T> {
     fn clone(&self) -> Self {
@@ -3859,7 +3872,9 @@ impl OwnedEventBusHandle {
             .values
             .get(sink)
             .filter(|queue| queue.present)
-            .map_or(0, |queue| queue.entries.len().saturating_sub(queue.retiring) as u64);
+            .map_or(0, |queue| {
+                queue.entries.len().saturating_sub(queue.retiring) as u64
+            });
         loaded.saturating_add(
             self.data()
                 .common
@@ -3891,7 +3906,11 @@ impl OwnedEventBusHandle {
         loop {
             let maximum = {
                 let queues = self.data().queues.lock();
-                queues.values.get(sink).filter(|q| q.present).map_or(0, |q| q.entries.len().saturating_sub(q.retiring))
+                queues
+                    .values
+                    .get(sink)
+                    .filter(|q| q.present)
+                    .map_or(0, |q| q.entries.len().saturating_sub(q.retiring))
             };
             let (body, credit) = new_owned_native_ring(&self.data().original, maximum)?;
             let mut snapshot: OwnedEventBody<VecDeque<OwnedEventShared<OwnedSinkQueueEntry>>, _> =
@@ -3900,10 +3919,16 @@ impl OwnedEventBusHandle {
             {
                 let queues = self.data().queues.lock();
                 let queue = queues.values.get(sink).filter(|q| q.present);
-                if queue.is_some_and(|q| q.entries.len().saturating_sub(q.retiring) > snapshot.body.capacity()) { continue; }
+                if queue.is_some_and(|q| {
+                    q.entries.len().saturating_sub(q.retiring) > snapshot.body.capacity()
+                }) {
+                    continue;
+                }
                 present = queue.is_some();
                 if let Some(queue) = queue {
-                    for entry in queue.entries.iter().skip(queue.retiring) { snapshot.body.push_back(entry.clone()); }
+                    for entry in queue.entries.iter().skip(queue.retiring) {
+                        snapshot.body.push_back(entry.clone());
+                    }
                 }
             }
             return f(present.then_some(&snapshot.body));
@@ -3942,16 +3967,27 @@ impl OwnedEventBusHandle {
         };
         stage.events.publication = Some(OwnedAppendCustody::Discard(append.clone()));
         let paid = OwnedEventShared::try_new(stage, &self.data().original, &self.data().funder)?;
-        let control = reserve_owned_event_bytes(&self.data().original,
-            std::mem::size_of::<OwnedEventStageRegistration>())?;
+        let control = reserve_owned_event_bytes(
+            &self.data().original,
+            std::mem::size_of::<OwnedEventStageRegistration>(),
+        )?;
         let mut registration = OwnedEventStageRegistration {
-            storage: self.clone(), append: Some(append), lsn, identity,
-            installed: paid.clone(), armed: false, control,
+            storage: self.clone(),
+            append: Some(append),
+            lsn,
+            identity,
+            installed: paid.clone(),
+            armed: false,
+            control,
         };
         loop {
             let (length, capacity, collision) = {
                 let map = self.data().stages.lock();
-                (map.values.len(), map.values.capacity(), map.values.contains_key(&lsn))
+                (
+                    map.values.len(),
+                    map.values.capacity(),
+                    map.values.contains_key(&lsn),
+                )
             };
             if collision {
                 return Err(Error::Other("owning event stage collision".into()));
@@ -3997,8 +4033,14 @@ impl OwnedEventBusHandle {
         f: impl for<'e> FnOnce(Option<OwnedStageBorrow<'e>>) -> Result<R>,
     ) -> Result<R> {
         // Pin an already-paid count, unlock the map, then lend synchronously.
-        let pin = self.data().stages.lock().values.get(&lsn)
-            .filter(|stage| stage.identity == identity).cloned();
+        let pin = self
+            .data()
+            .stages
+            .lock()
+            .values
+            .get(&lsn)
+            .filter(|stage| stage.identity == identity)
+            .cloned();
         f(pin.as_ref().map(|pin| {
             let stage = pin.get();
             OwnedStageBorrow {
@@ -4040,9 +4082,7 @@ pub(crate) struct OwnedEventStageRegistration {
 }
 impl OwnedEventStageRegistration {
     pub(super) fn take(mut self) -> Option<OwnedEventShared<OwnedCommitEventStage>> {
-        let stage = self
-            .storage
-            .take_owned_registered_stage(&self);
+        let stage = self.storage.take_owned_registered_stage(&self);
         self.armed = false;
         stage
     }
@@ -4050,9 +4090,7 @@ impl OwnedEventStageRegistration {
 impl Drop for OwnedEventStageRegistration {
     fn drop(&mut self) {
         if self.armed {
-            let retired = self
-                .storage
-                .take_owned_registered_stage(&self);
+            let retired = self.storage.take_owned_registered_stage(&self);
             drop(retired);
         }
     }
@@ -4072,7 +4110,8 @@ pub(super) struct OwnedQueueAppendSlot {
     retired: Option<(String, OwnedSinkQueue)>,
 }
 pub(super) struct OwnedSinkQueuePublication {
-    entries: OwnedEventBody<Vec<Option<OwnedEventShared<OwnedSinkQueueEntry>>>, OwnedMemoryReservation>,
+    entries:
+        OwnedEventBody<Vec<Option<OwnedEventShared<OwnedSinkQueueEntry>>>, OwnedMemoryReservation>,
     slots: Vec<OwnedQueueAppendSlot>,
     workspace: OwnedMemoryReservation,
     storage: OwnedEventBusWeak,
@@ -4145,16 +4184,26 @@ pub(super) struct OwnedQueuePreparation {
     replace_ring: bool,
     key: Option<OwnedMemoryReservation>,
     count: usize,
-    replacement: Option<(VecDeque<OwnedEventShared<OwnedSinkQueueEntry>>, OwnedMemoryReservation)>,
-    retired: Option<(VecDeque<OwnedEventShared<OwnedSinkQueueEntry>>, OwnedMemoryReservation)>,
+    replacement: Option<(
+        VecDeque<OwnedEventShared<OwnedSinkQueueEntry>>,
+        OwnedMemoryReservation,
+    )>,
+    retired: Option<(
+        VecDeque<OwnedEventShared<OwnedSinkQueueEntry>>,
+        OwnedMemoryReservation,
+    )>,
 }
 impl OwnedEventBusHandle {
-    fn prepare_owned_queue_name(&self, name: &str)
-        -> Result<OwnedEventShared<OwnedEventBody<String, OwnedMemoryReservation>>>
-    {
+    fn prepare_owned_queue_name(
+        &self,
+        name: &str,
+    ) -> Result<OwnedEventShared<OwnedEventBody<String, OwnedMemoryReservation>>> {
         let (body, credit) = copy_owned_native_string(&self.data().original, name)?;
-        OwnedEventShared::try_new(OwnedEventBody { body, credit },
-            &self.data().original, &self.data().funder)
+        OwnedEventShared::try_new(
+            OwnedEventBody { body, credit },
+            &self.data().original,
+            &self.data().funder,
+        )
     }
     fn queue_limit(&self) -> usize {
         #[cfg(any(test, feature = "test-seams"))]
@@ -4245,11 +4294,20 @@ impl OwnedEventBusHandle {
             let (sink, key) = copy_owned_native_string(original, &slot.sink)?;
             let (body, credit) = copy_owned_native_string(original, &slot.sink)?;
             let name = OwnedEventShared::try_new(
-                OwnedEventBody { body, credit }, original, &self.data().funder,
+                OwnedEventBody { body, credit },
+                original,
+                &self.data().funder,
             )?;
             plans.body.push(OwnedQueuePreparation {
-                sink, name: Some(name), key: Some(key), count: slot.count,
-                required: 0, absent: false, replace_ring: false, replacement: None, retired: None,
+                sink,
+                name: Some(name),
+                key: Some(key),
+                count: slot.count,
+                required: 0,
+                absent: false,
+                replace_ring: false,
+                replacement: None,
+                retired: None,
             });
         }
         loop {
@@ -4265,21 +4323,29 @@ impl OwnedEventBusHandle {
                     let queue = queues.values.get(&plan.sink);
                     plan.absent = queue.is_none();
                     absent += usize::from(plan.absent);
-                    let required = queue.map_or(0, |q| q.entries.len())
+                    let required = queue
+                        .map_or(0, |q| q.entries.len())
                         .checked_add(queue.map_or(0, |q| q.pending))
                         .and_then(|n| n.checked_add(plan.count));
                     plan.required = required.unwrap_or(usize::MAX);
-                    plan.replace_ring = queue.is_none() || plan.required > queue.map_or(0, |q| q.entries.capacity());
+                    plan.replace_ring = queue.is_none()
+                        || plan.required > queue.map_or(0, |q| q.entries.capacity());
                     if required.is_none() || plan.required > self.queue_limit() {
-                        full = Some((index, required.is_none())); break;
+                        full = Some((index, required.is_none()));
+                        break;
                     }
                 }
                 required_map = queues.values.len().checked_add(absent);
                 replace_map = required_map.is_some_and(|n| n > queues.values.capacity());
             }
             if let Some((index, overflow)) = full {
-                if overflow { return Err(owned_event_overflow()); }
-                return Err(Error::Other(format!("sink queue is full: {}", plans.body[index].sink)));
+                if overflow {
+                    return Err(owned_event_overflow());
+                }
+                return Err(Error::Other(format!(
+                    "sink queue is full: {}",
+                    plans.body[index].sink
+                )));
             }
             let required_map = required_map.ok_or_else(owned_event_overflow)?;
             // Constructors (including their capacity-refusal and unwind paths)
@@ -4287,33 +4353,52 @@ impl OwnedEventBusHandle {
             let mut successor = if replace_map {
                 let (values, allocation) = new_owned_native_map(original, required_map)?;
                 Some(OwnedQueueMap { values, allocation })
-            } else { None };
+            } else {
+                None
+            };
             for plan in &mut plans.body {
-                if plan.replace_ring { plan.replacement = Some(new_owned_native_ring(original, plan.required)?); }
+                if plan.replace_ring {
+                    plan.replacement = Some(new_owned_native_ring(original, plan.required)?);
+                }
             }
             let mut queues = self.data().queues.lock();
-            let valid = queues.values.len() + plans.body.iter()
-                .filter(|p| !queues.values.contains_key(&p.sink)).count()
-                <= successor.as_ref().map_or(queues.values.capacity(), |q| q.values.capacity())
+            let valid = queues.values.len()
+                + plans
+                    .body
+                    .iter()
+                    .filter(|p| !queues.values.contains_key(&p.sink))
+                    .count()
+                <= successor
+                    .as_ref()
+                    .map_or(queues.values.capacity(), |q| q.values.capacity())
                 && plans.body.iter().all(|p| {
                     let queue = queues.values.get(&p.sink);
-                    queue.map_or(0, |q| q.entries.len()).checked_add(queue.map_or(0, |q| q.pending))
+                    queue
+                        .map_or(0, |q| q.entries.len())
+                        .checked_add(queue.map_or(0, |q| q.pending))
                         .and_then(|n| n.checked_add(p.count))
-                        .is_some_and(|n| n <= self.queue_limit() && match &p.replacement {
-                            Some((ring, _)) => n <= ring.capacity(),
-                            None => queue.is_some_and(|q| n <= q.entries.capacity()),
+                        .is_some_and(|n| {
+                            n <= self.queue_limit()
+                                && match &p.replacement {
+                                    Some((ring, _)) => n <= ring.capacity(),
+                                    None => queue.is_some_and(|q| n <= q.entries.capacity()),
+                                }
                         })
                 });
             if !valid {
                 drop(queues);
-                for plan in &mut plans.body { drop(plan.replacement.take()); }
+                for plan in &mut plans.body {
+                    drop(plan.replacement.take());
+                }
                 drop(successor);
                 continue;
             }
             // String hashing and paid-capacity moves only. Successor/plans were
             // declared before the guard, so an unwind unlocks before retirement.
             if let Some(successor) = &mut successor {
-                for (key, value) in queues.values.drain() { successor.values.insert(key, value); }
+                for (key, value) in queues.values.drain() {
+                    successor.values.insert(key, value);
+                }
                 std::mem::swap(&mut *queues, successor);
             }
             for plan in &mut plans.body {
@@ -4331,8 +4416,15 @@ impl OwnedEventBusHandle {
                     let vacant = queues.values.entry(std::mem::take(&mut plan.sink));
                     let (entries, buffer) = plan.replacement.take().expect("prepared new ring");
                     vacant.or_insert(OwnedSinkQueue {
-                        entries, buffer, name: plan.name.take().expect("prepared queue name"),
-                        key: plan.key.take(), pending: plan.count, reservations: 1, present: false, retiring: 0, mutation: None,
+                        entries,
+                        buffer,
+                        name: plan.name.take().expect("prepared queue name"),
+                        key: plan.key.take(),
+                        pending: plan.count,
+                        reservations: 1,
+                        present: false,
+                        retiring: 0,
+                        mutation: None,
                     });
                 }
             }
@@ -4371,9 +4463,14 @@ impl OwnedEventBusHandle {
         );
         let mut queues = self.data().queues.lock();
         for ((sink, _), entry) in events.events.iter().zip(&mut token.entries.body) {
-            let queue = queues.values.get_mut(sink).expect("committed paid sink slot");
+            let queue = queues
+                .values
+                .get_mut(sink)
+                .expect("committed paid sink slot");
             assert!(queue.pending != 0 && queue.entries.len() < queue.entries.capacity());
-            queue.entries.push_back(entry.take().expect("prepared append pin"));
+            queue
+                .entries
+                .push_back(entry.take().expect("prepared append pin"));
             queue.pending -= 1;
             queue.present = true;
         }
@@ -4521,22 +4618,43 @@ impl OwnedEventBusHandle {
         // that guard while acquiring queue/state locks.
         let mut suspended = OwnedSuspendedAppend {
             token: transfer.as_ref().map(|handle| {
-                handle.control.get().token.lock().take().expect("suspended discard escrow")
+                handle
+                    .control
+                    .get()
+                    .token
+                    .lock()
+                    .take()
+                    .expect("suspended discard escrow")
             }),
             handle: transfer.clone(),
         };
-        if suspended.token.as_ref().is_some_and(|append| append.state != OwnedEscrowState::Suspended) {
+        if suspended
+            .token
+            .as_ref()
+            .is_some_and(|append| append.state != OwnedEscrowState::Suspended)
+        {
             return Err(Error::Other("discard escrow is not suspended".into()));
         }
         let (source_count, entry_count) = {
             let queues = self.data().queues.lock();
-            assert!(queues.values.values().all(|queue| queue.pending == 0 && queue.mutation.is_none()));
-            (queues.values.len(), queues.values.values().try_fold(0usize,
-                |n, q| n.checked_add(q.entries.len())))
+            assert!(
+                queues
+                    .values
+                    .values()
+                    .all(|queue| queue.pending == 0 && queue.mutation.is_none())
+            );
+            (
+                queues.values.len(),
+                queues
+                    .values
+                    .values()
+                    .try_fold(0usize, |n, q| n.checked_add(q.entries.len())),
+            )
         };
         let entry_count = entry_count.ok_or_else(owned_event_overflow)?;
         let (body, credit) = new_owned_native_vec(original, source_count)?;
-        let mut sources: OwnedEventBody<Vec<OwnedPurgeQueueSource>, _> = OwnedEventBody { body, credit };
+        let mut sources: OwnedEventBody<Vec<OwnedPurgeQueueSource>, _> =
+            OwnedEventBody { body, credit };
         let (body, credit) = new_owned_native_vec(original, entry_count)?;
         let mut pins = OwnedEventBody { body, credit };
         {
@@ -4546,20 +4664,39 @@ impl OwnedEventBusHandle {
             assert_eq!(queues.values.len(), source_count);
             for queue in queues.values.values() {
                 let begin = pins.body.len();
-                for entry in &queue.entries { pins.body.push(entry.clone()); }
+                for entry in &queue.entries {
+                    pins.body.push(entry.clone());
+                }
                 sources.body.push(OwnedPurgeQueueSource {
-                    name: queue.name.clone(), entries: begin..pins.body.len(), present: queue.present,
+                    name: queue.name.clone(),
+                    entries: begin..pins.body.len(),
+                    present: queue.present,
                 });
             }
         }
-        let extra = suspended.token.as_ref().map_or(0, |append| append.slots.len());
+        let extra = suspended
+            .token
+            .as_ref()
+            .map_or(0, |append| append.slots.len());
         let maximum = owned_event_add(owned_event_add(source_count, durable_names.len())?, extra)?;
         let (names, name_array) = new_owned_native_vec(original, maximum)?;
         let (keys, key_array) = new_owned_native_vec(original, maximum)?;
-        let mut copied = OwnedEventNames { names, keys, name_array, key_array };
-        for name in durable_names.iter().map(String::as_str)
+        let mut copied = OwnedEventNames {
+            names,
+            keys,
+            name_array,
+            key_array,
+        };
+        for name in durable_names
+            .iter()
+            .map(String::as_str)
             .chain(sources.body.iter().map(|q| q.name.body.as_str()))
-            .chain(suspended.token.iter().flat_map(|append| append.slots.iter().map(|s| s.sink.as_str())))
+            .chain(
+                suspended
+                    .token
+                    .iter()
+                    .flat_map(|append| append.slots.iter().map(|s| s.sink.as_str())),
+            )
         {
             if !copied.names.iter().any(|existing| existing == name) {
                 let (name, credit) = copy_owned_native_string(original, name)?;
@@ -4573,12 +4710,16 @@ impl OwnedEventBusHandle {
             let source = sources.body.iter().find(|q| q.name.body == *name);
             let source_entries = source.map_or(&[][..], |q| &pins.body[q.entries.clone()]);
             let keep = |entry: &&OwnedEventShared<OwnedSinkQueueEntry>| {
-                !selections.get(&entry.entry.event.table)
+                !selections
+                    .get(&entry.entry.event.table)
                     .is_some_and(|ids| ids.contains(&entry.entry.row_id))
             };
             let survivors = source_entries.iter().filter(keep).count();
             let pending = suspended.token.as_ref().map_or(Ok(0), |append| {
-                append.slots.iter().filter(|slot| slot.sink == *name)
+                append
+                    .slots
+                    .iter()
+                    .filter(|slot| slot.sink == *name)
                     .try_fold(0, |total, slot| owned_event_add(total, slot.count))
             })?;
             let required = owned_event_add(survivors, pending)?;
@@ -4589,9 +4730,17 @@ impl OwnedEventBusHandle {
             let key = OwnedEventBody { body, credit };
             let (entries, buffer) = new_owned_native_ring(original, required)?;
             let mut queue = OwnedSinkQueue {
-                entries, buffer, name: self.prepare_owned_queue_name(name)?, key: None, pending,
+                entries,
+                buffer,
+                name: self.prepare_owned_queue_name(name)?,
+                key: None,
+                pending,
                 reservations: suspended.token.as_ref().map_or(0, |append| {
-                    append.slots.iter().filter(|slot| slot.sink == *name).count()
+                    append
+                        .slots
+                        .iter()
+                        .filter(|slot| slot.sink == *name)
+                        .count()
                 }),
                 present: source.is_some_and(|q| q.present) || durable_names.contains(name),
                 retiring: 0,
@@ -4599,15 +4748,25 @@ impl OwnedEventBusHandle {
             };
             for entry in source_entries.iter().filter(keep) {
                 let copy = copy_owned_sink_queue_entry(&entry.get().credit.metadata, &entry.entry)?;
-                let pin = OwnedEventShared::try_new(copy, &entry.get().credit.metadata, &self.data().funder)?;
+                let pin = OwnedEventShared::try_new(
+                    copy,
+                    &entry.get().credit.metadata,
+                    &self.data().funder,
+                )?;
                 queue.entries.push_back(pin);
             }
             queue.key = Some(key.credit);
             successor.values.insert(key.body, queue);
         }
         let queues = successor;
-        let sink_names = OwnedEventBody { body: copied.names, credit: copied.name_array };
-        let name_keys = OwnedEventBody { body: copied.keys, credit: copied.key_array };
+        let sink_names = OwnedEventBody {
+            body: copied.names,
+            credit: copied.name_array,
+        };
+        let name_keys = OwnedEventBody {
+            body: copied.keys,
+            credit: copied.key_array,
+        };
         // Prebuild the exact normal lease before durability, without counting
         // it active while the original freeze is still waiting/held.
         let transferred_lease = transfer.as_ref().map(|_| QueueMutationLease {
@@ -4640,7 +4799,8 @@ impl OwnedEventBusHandle {
         };
         let _ = retired;
         if let Some(transfer) = &publication.transfer {
-            let mut append = transfer.handle
+            let mut append = transfer
+                .handle
                 .control
                 .get()
                 .token
@@ -5132,21 +5292,31 @@ impl OwnedEventBusHandle {
                 let retired_entry;
                 {
                     let mut queues = self.data().queues.lock();
-                    publication.retirement.body = queues.values.extract_if(|_, queue| {
-                        !queue.present && queue.pending == 0 && queue.reservations == 0
-                    }).next();
+                    publication.retirement.body = queues
+                        .values
+                        .extract_if(|_, queue| {
+                            !queue.present && queue.pending == 0 && queue.reservations == 0
+                        })
+                        .next();
                     retired_entry = if publication.retirement.body.is_none() {
-                        queues.values.values_mut().find(|q| q.retiring != 0)
+                        queues
+                            .values
+                            .values_mut()
+                            .find(|q| q.retiring != 0)
                             .and_then(|q| {
                                 q.retiring -= 1;
                                 q.entries.pop_front()
                             })
-                    } else { None };
+                    } else {
+                        None
+                    };
                 }
                 let finished = publication.retirement.body.is_none() && retired_entry.is_none();
                 drop(publication.retirement.body.take());
                 drop(retired_entry);
-                if finished { break; }
+                if finished {
+                    break;
+                }
             }
         }
         // The received lease remains held through both map change and append,
@@ -5316,13 +5486,17 @@ struct OwnedQueueMutationClaim {
 }
 impl Drop for OwnedQueueMutationClaim {
     fn drop(&mut self) {
-        if !self.active { return; }
+        if !self.active {
+            return;
+        }
         let retired = {
             let mut queues = self.storage.data().queues.lock();
             queues.values.get_mut(&self.name.body).and_then(|queue| {
                 let exact = queue.mutation.as_ref().is_some_and(|source| {
-                    Arc::ptr_eq(source.data.as_ref().expect("claimed source"),
-                        self.source.data.as_ref().expect("claim generation"))
+                    Arc::ptr_eq(
+                        source.data.as_ref().expect("claimed source"),
+                        self.source.data.as_ref().expect("claim generation"),
+                    )
                 });
                 if exact { queue.mutation.take() } else { None }
             })
@@ -5343,11 +5517,16 @@ pub(crate) struct OwnedQueueCommitToken<'a> {
 impl OwnedQueueMutationClaim {
     fn commit_token<'a>(&'a self, committed: &'a Cell<bool>) -> OwnedQueueCommitToken<'a> {
         assert!(self.active);
-        OwnedQueueCommitToken { committed, _source: self }
+        OwnedQueueCommitToken {
+            committed,
+            _source: self,
+        }
     }
 }
 impl OwnedQueueCommitToken<'_> {
-    pub(crate) fn mark_success(&self) { self.committed.set(true); }
+    pub(crate) fn mark_success(&self) {
+        self.committed.set(true);
+    }
 }
 
 // The error itself precedes its original invoices in physical drop order.
@@ -5361,16 +5540,31 @@ pub(crate) struct OwnedNativeQueueFailure {
 }
 impl std::fmt::Display for OwnedNativeQueueFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(self.error.as_ref().expect("native failure carries original error"), f)
+        std::fmt::Display::fmt(
+            self.error
+                .as_ref()
+                .expect("native failure carries original error"),
+            f,
+        )
     }
 }
 impl OwnedNativeQueueFailure {
     fn prepare(original: &OwnedMemoryReservation) -> Self {
         let failure = match reserve_owned_event_bytes(original, std::mem::size_of::<Self>()) {
-            Ok(control) => Self { error: None, control: Some(control), diagnostic: None },
+            Ok(control) => Self {
+                error: None,
+                control: Some(control),
+                diagnostic: None,
+            },
             // No successor exists on an original admission refusal. Preserve
             // that exact refusal rather than allocating a replacement error.
-            Err(error) => return Self { error: Some(error), control: None, diagnostic: None },
+            Err(error) => {
+                return Self {
+                    error: Some(error),
+                    control: None,
+                    diagnostic: None,
+                };
+            }
         };
         #[cfg(any(test, feature = "test-seams"))]
         {
@@ -5382,7 +5576,9 @@ impl OwnedNativeQueueFailure {
             failure
         }
         #[cfg(not(any(test, feature = "test-seams")))]
-        { failure }
+        {
+            failure
+        }
     }
     pub(crate) fn capture(&mut self, result: Result<()>) {
         if let Err(error) = result {
@@ -5393,11 +5589,17 @@ impl OwnedNativeQueueFailure {
     // The slot/invoices remain outside the maintenance guard, through this
     // original Result's error loan and the final transfer back into the slot.
     fn loan_result<T>(&mut self, value: T) -> Result<T> {
-        match self.error.take() { Some(error) => Err(error), None => Ok(value) }
+        match self.error.take() {
+            Some(error) => Err(error),
+            None => Ok(value),
+        }
     }
     fn finish<T>(mut self, result: Result<T>) -> std::result::Result<T, Self> {
         match result {
-            Err(error) => { self.capture(Err(error)); Err(self) }
+            Err(error) => {
+                self.capture(Err(error));
+                Err(self)
+            }
             Ok(value) if self.error.is_none() => Ok(value),
             Ok(_) => Err(self),
         }
@@ -5415,18 +5617,31 @@ struct OwnedQueuePublicationCompletion<'a, F: FnMut()> {
 }
 impl<F: FnMut()> OwnedQueuePublicationCompletion<'_, F> {
     fn finish(&mut self) {
-        if self.committed.get() && !std::mem::replace(&mut self.settled, true) { (self.publish)(); }
+        if self.committed.get() && !std::mem::replace(&mut self.settled, true) {
+            (self.publish)();
+        }
     }
 }
 impl<F: FnMut()> Drop for OwnedQueuePublicationCompletion<'_, F> {
-    fn drop(&mut self) { self.finish(); }
+    fn drop(&mut self) {
+        self.finish();
+    }
 }
 fn prepare_owned_queue_completion<'a, F: FnMut()>(
-    original: &OwnedMemoryReservation, committed: &'a Cell<bool>, publish: F,
+    original: &OwnedMemoryReservation,
+    committed: &'a Cell<bool>,
+    publish: F,
 ) -> Result<OwnedQueuePublicationCompletion<'a, F>> {
-    let control = reserve_owned_event_bytes(original,
-        std::mem::size_of::<OwnedQueuePublicationCompletion<'a, F>>())?;
-    Ok(OwnedQueuePublicationCompletion { publish, committed, settled: false, control })
+    let control = reserve_owned_event_bytes(
+        original,
+        std::mem::size_of::<OwnedQueuePublicationCompletion<'a, F>>(),
+    )?;
+    Ok(OwnedQueuePublicationCompletion {
+        publish,
+        committed,
+        settled: false,
+        control,
+    })
 }
 struct OwnedQueueReceiptCompletion<'a, F: FnMut()> {
     complete: F,
@@ -5436,56 +5651,95 @@ struct OwnedQueueReceiptCompletion<'a, F: FnMut()> {
 }
 impl<F: FnMut()> OwnedQueueReceiptCompletion<'_, F> {
     fn finish(&mut self) {
-        if self.committed.get() && !std::mem::replace(&mut self.settled, true) { (self.complete)(); }
+        if self.committed.get() && !std::mem::replace(&mut self.settled, true) {
+            (self.complete)();
+        }
     }
 }
 impl<F: FnMut()> Drop for OwnedQueueReceiptCompletion<'_, F> {
-    fn drop(&mut self) { self.finish(); }
+    fn drop(&mut self) {
+        self.finish();
+    }
 }
 fn prepare_owned_queue_receipt<'a, F: FnMut()>(
-    original: &OwnedMemoryReservation, committed: &'a Cell<bool>, complete: F,
+    original: &OwnedMemoryReservation,
+    committed: &'a Cell<bool>,
+    complete: F,
 ) -> Result<OwnedQueueReceiptCompletion<'a, F>> {
-    let control = reserve_owned_event_bytes(original,
-        std::mem::size_of::<OwnedQueueReceiptCompletion<'a, F>>())?;
-    Ok(OwnedQueueReceiptCompletion { complete, committed, settled: false, control })
+    let control = reserve_owned_event_bytes(
+        original,
+        std::mem::size_of::<OwnedQueueReceiptCompletion<'a, F>>(),
+    )?;
+    Ok(OwnedQueueReceiptCompletion {
+        complete,
+        committed,
+        settled: false,
+        control,
+    })
 }
 impl OwnedEventBusHandle {
     fn claim_owned_checked_out(
-        &self, sink: &str, lookup: &OwnedCheckoutLookup,
+        &self,
+        sink: &str,
+        lookup: &OwnedCheckoutLookup,
     ) -> Result<OwnedQueueMutationClaim> {
-        let control = reserve_owned_event_bytes(&self.data().original,
-            std::mem::size_of::<OwnedQueueMutationClaim>())?;
+        let control = reserve_owned_event_bytes(
+            &self.data().original,
+            std::mem::size_of::<OwnedQueueMutationClaim>(),
+        )?;
         let mut claim = OwnedQueueMutationClaim {
-            storage: self.clone(), name: lookup.name.clone(),
-            source: lookup.source.clone(), active: false, control,
+            storage: self.clone(),
+            name: lookup.name.clone(),
+            source: lookup.source.clone(),
+            active: false,
+            control,
         };
         loop {
             let state = self.data().common.queue_mutation_state.lock();
             let mut queues = self.data().queues.lock();
-            let current = !lookup.finished.get() && lookup.key.0 == sink
-                && lookup.name.body == sink && state.checked_out.contains(&lookup.key)
+            let current = !lookup.finished.get()
+                && lookup.key.0 == sink
+                && lookup.name.body == sink
+                && state.checked_out.contains(&lookup.key)
                 && queues.values.get(sink).is_some_and(|queue| {
-                    queue.present && queue.retiring == 0
-                        && Arc::ptr_eq(queue.name.data.as_ref().expect("queue lifecycle"),
-                            lookup.name.data.as_ref().expect("checkout lifecycle"))
+                    queue.present
+                        && queue.retiring == 0
+                        && Arc::ptr_eq(
+                            queue.name.data.as_ref().expect("queue lifecycle"),
+                            lookup.name.data.as_ref().expect("checkout lifecycle"),
+                        )
                         && queue.entries.iter().any(|source| {
-                            Arc::ptr_eq(source.data.as_ref().expect("queue source"),
-                                lookup.source.data.as_ref().expect("checkout generation"))
+                            Arc::ptr_eq(
+                                source.data.as_ref().expect("queue source"),
+                                lookup.source.data.as_ref().expect("checkout generation"),
+                            )
                         })
                 });
             if !current {
-                drop(queues); drop(state);
-                return Err(Error::Other(format!("pending sink action disappeared: {}", lookup.key.1)));
+                drop(queues);
+                drop(state);
+                return Err(Error::Other(format!(
+                    "pending sink action disappeared: {}",
+                    lookup.key.1
+                )));
             }
-            if queues.values.get(sink).expect("checked queue").mutation.is_some() {
+            if queues
+                .values
+                .get(sink)
+                .expect("checked queue")
+                .mutation
+                .is_some()
+            {
                 drop(state);
                 // Condvar atomically unlocks this queue guard; no missed wake.
                 self.data().queue_claim_waiters.wait(&mut queues);
                 drop(queues);
                 continue;
             }
-            queues.values.get_mut(sink).expect("checked queue").mutation = Some(claim.source.clone());
-            drop(queues); drop(state);
+            queues.values.get_mut(sink).expect("checked queue").mutation =
+                Some(claim.source.clone());
+            drop(queues);
+            drop(state);
             claim.active = true;
             return Ok(claim);
         }
@@ -5532,27 +5786,44 @@ impl OwnedEventBusHandle {
         loop {
             let mut batch = self.empty_owned_dispatch_batch(maximum)?;
             let (body, credit) = new_owned_native_vec(&self.data().original, maximum)?;
-            let mut pins: OwnedEventBody<Vec<(OwnedEventShared<OwnedSinkQueueEntry>,
-                OwnedEventShared<OwnedEventBody<String, OwnedMemoryReservation>>)>, _> =
-                OwnedEventBody { body, credit };
+            let mut pins: OwnedEventBody<
+                Vec<(
+                    OwnedEventShared<OwnedSinkQueueEntry>,
+                    OwnedEventShared<OwnedEventBody<String, OwnedMemoryReservation>>,
+                )>,
+                _,
+            > = OwnedEventBody { body, credit };
             {
                 let state = self.data().common.queue_checkout_guard();
                 let mut queues = self.data().queues.lock();
-                let Some(queue) = queues.values.get_mut(sink).filter(|q| q.present && q.retiring == 0) else {
+                let Some(queue) = queues
+                    .values
+                    .get_mut(sink)
+                    .filter(|q| q.present && q.retiring == 0)
+                else {
                     return Ok(batch);
                 };
-                let Some(front) = queue.entries.front() else { return Ok(batch); };
+                let Some(front) = queue.entries.front() else {
+                    return Ok(batch);
+                };
                 if !owned_event_visible(access, &front.entry) {
                     if queue.mutation.is_some() {
-                        drop(queues); drop(state);
+                        drop(queues);
+                        drop(state);
                         let mut queues = self.data().queues.lock();
-                        while queues.values.get(sink).is_some_and(|q| q.mutation.is_some()) {
+                        while queues
+                            .values
+                            .get(sink)
+                            .is_some_and(|q| q.mutation.is_some())
+                        {
                             self.data().queue_claim_waiters.wait(&mut queues);
                         }
                         drop(queues);
                         continue;
                     }
-                    if let Some(entry) = queue.entries.pop_front() { queue.entries.push_back(entry); }
+                    if let Some(entry) = queue.entries.pop_front() {
+                        queue.entries.push_back(entry);
+                    }
                     drop(queues);
                     drop(state);
                     self.record_owned_batch_outcome(sink, 0, 0, 1, 0, 0);
@@ -5560,7 +5831,10 @@ impl OwnedEventBusHandle {
                     batch.denied_rotation = true;
                     return Ok(batch);
                 }
-                for entry in queue.entries.iter().take(maximum)
+                for entry in queue
+                    .entries
+                    .iter()
+                    .take(maximum)
                     .take_while(|entry| owned_event_visible(access, &entry.entry))
                 {
                     pins.body.push((entry.clone(), queue.name.clone()));
@@ -5569,47 +5843,78 @@ impl OwnedEventBusHandle {
             // Every deep copy and key constructor sees a retained paid pin,
             // outside both guards. Helper-local unwind now retires unlocked.
             for (source, name) in pins.body.drain(..) {
-                let copied = copy_owned_sink_queue_entry(&source.get().credit.metadata, &source.entry)?;
+                let copied =
+                    copy_owned_sink_queue_entry(&source.get().credit.metadata, &source.entry)?;
                 let (key, memory) = copy_owned_native_string(&self.data().original, sink)?;
                 batch.entries.push(copied);
                 batch.lookups.push(OwnedCheckoutLookup {
-                    key: (key, source.entry.id), memory, source, name, finished: Cell::new(true),
+                    key: (key, source.entry.id),
+                    memory,
+                    source,
+                    name,
+                    finished: Cell::new(true),
                 });
             }
             loop {
                 let (members, credits) = {
                     let state = self.data().common.queue_checkout_guard();
-                    let credits = self.data().checkout_allocation.lock()
-                        .as_ref().map_or(0, |c| c.keys.len());
+                    let credits = self
+                        .data()
+                        .checkout_allocation
+                        .lock()
+                        .as_ref()
+                        .map_or(0, |c| c.keys.len());
                     (state.checked_out.len(), credits)
                 };
                 let capacity = owned_event_add(members, batch.lookups.len())?;
                 let (body, buckets) = new_owned_native_set(&self.data().original, capacity)?;
-                let (keys, array) = new_owned_native_vec(&self.data().original,
-                    owned_event_add(credits, batch.lookups.len())?)?;
-                let mut copied = OwnedEventCopiedSet { body, keys, array, buckets };
-                let (body, credit) = new_owned_native_vec(&self.data().original, batch.lookups.len())?;
-                let mut additions: OwnedEventBody<Vec<OwnedCheckoutAddition>, _> = OwnedEventBody { body, credit };
+                let (keys, array) = new_owned_native_vec(
+                    &self.data().original,
+                    owned_event_add(credits, batch.lookups.len())?,
+                )?;
+                let mut copied = OwnedEventCopiedSet {
+                    body,
+                    keys,
+                    array,
+                    buckets,
+                };
+                let (body, credit) =
+                    new_owned_native_vec(&self.data().original, batch.lookups.len())?;
+                let mut additions: OwnedEventBody<Vec<OwnedCheckoutAddition>, _> =
+                    OwnedEventBody { body, credit };
                 for lookup in &batch.lookups {
                     let (name, credit) = copy_owned_native_string(&self.data().original, sink)?;
                     additions.body.push(OwnedCheckoutAddition {
                         key: Some((name, lookup.key.1)),
                         credit: Some(OwnedCheckoutKeyCredit {
-                            name: lookup.name.clone(), id: lookup.key.1, memory: credit,
+                            name: lookup.name.clone(),
+                            id: lookup.key.1,
+                            memory: credit,
                         }),
                     });
                 }
-                let mut retirement = OwnedEventBody { body: None, credit: None };
+                let mut retirement = OwnedEventBody {
+                    body: None,
+                    credit: None,
+                };
                 let mut state = self.data().common.queue_checkout_guard();
                 let queues = self.data().queues.lock();
-                let unchanged = queues.values.get(sink).filter(|q| q.present && q.retiring == 0)
-                    .is_some_and(|q| q.entries.len() >= batch.lookups.len()
-                        && q.entries.iter().zip(&batch.lookups).all(|(entry, lookup)| {
-                            Arc::ptr_eq(entry.data.as_ref().expect("live queue pin"),
-                                lookup.source.data.as_ref().expect("captured queue pin"))
-                        }));
+                let unchanged = queues
+                    .values
+                    .get(sink)
+                    .filter(|q| q.present && q.retiring == 0)
+                    .is_some_and(|q| {
+                        q.entries.len() >= batch.lookups.len()
+                            && q.entries.iter().zip(&batch.lookups).all(|(entry, lookup)| {
+                                Arc::ptr_eq(
+                                    entry.data.as_ref().expect("live queue pin"),
+                                    lookup.source.data.as_ref().expect("captured queue pin"),
+                                )
+                            })
+                    });
                 if !unchanged {
-                    drop(queues); drop(state);
+                    drop(queues);
+                    drop(state);
                     break;
                 }
                 let mut credit_guard = self.data().checkout_allocation.lock();
@@ -5617,27 +5922,45 @@ impl OwnedEventBusHandle {
                 if state.checked_out.len() + batch.lookups.len() > copied.body.capacity()
                     || current_credits + batch.lookups.len() > copied.keys.capacity()
                 {
-                    drop(credit_guard); drop(queues); drop(state);
+                    drop(credit_guard);
+                    drop(queues);
+                    drop(state);
                     continue;
                 }
                 // Move existing keys with their actual old invoices. No copied
                 // set or key is destroyed under state/queue guards, even on unwind.
-                for key in state.checked_out.drain() { copied.body.insert(key); }
+                for key in state.checked_out.drain() {
+                    copied.body.insert(key);
+                }
                 for addition in &mut additions.body {
-                    if !copied.body.contains(addition.key.as_ref().expect("prepared checkout key")) {
-                        copied.body.insert(addition.key.take().expect("prepared checkout key"));
-                        copied.keys.push(addition.credit.take().expect("prepared key invoice"));
+                    if !copied
+                        .body
+                        .contains(addition.key.as_ref().expect("prepared checkout key"))
+                    {
+                        copied
+                            .body
+                            .insert(addition.key.take().expect("prepared checkout key"));
+                        copied
+                            .keys
+                            .push(addition.credit.take().expect("prepared key invoice"));
                     }
                 }
                 retirement.body = Some(std::mem::replace(&mut state.checked_out, copied.body));
                 retirement.credit = credit_guard.take();
-                if let Some(old) = &mut retirement.credit { copied.keys.append(&mut old.keys); }
+                if let Some(old) = &mut retirement.credit {
+                    copied.keys.append(&mut old.keys);
+                }
                 *credit_guard = Some(OwnedCheckoutAllocation {
                     keys: std::mem::take(&mut copied.keys),
-                    array: copied.array, buckets: copied.buckets,
+                    array: copied.array,
+                    buckets: copied.buckets,
                 });
-                for lookup in &batch.lookups { lookup.finished.set(false); }
-                drop(credit_guard); drop(queues); drop(state);
+                for lookup in &batch.lookups {
+                    lookup.finished.set(false);
+                }
+                drop(credit_guard);
+                drop(queues);
+                drop(state);
                 drop(retirement);
                 return Ok(batch);
             }
@@ -5649,7 +5972,10 @@ impl OwnedEventBusHandle {
         if lookup.finished.replace(true) {
             return;
         }
-        let mut retired = OwnedEventBody { body: None, credit: None };
+        let mut retired = OwnedEventBody {
+            body: None,
+            credit: None,
+        };
         {
             let mut state = self.data().common.queue_mutation_state.lock();
             retired.body = state.checked_out.take(&lookup.key);
@@ -5697,7 +6023,9 @@ impl OwnedEventBusHandle {
         uncertain: bool,
     ) -> std::result::Result<u32, OwnedNativeQueueFailure> {
         let mut failure = OwnedNativeQueueFailure::prepare(&self.data().original);
-        if failure.error.is_some() { return Err(failure); }
+        if failure.error.is_some() {
+            return Err(failure);
+        }
         let result = tx_mgr.with_maintenance_publication(|publication| {
             let _lease = self.data().common.begin_dispatcher_queue_mutation()?;
             let entry_id = lookup.key.1;
@@ -5707,17 +6035,25 @@ impl OwnedEventBusHandle {
             let initially_current = {
                 let state = self.data().common.queue_mutation_state.lock();
                 let queues = self.data().queues.lock();
-                !lookup.finished.get() && state.checked_out.contains(&lookup.key)
-                    && queues.values.get(sink).is_some_and(|q| q.entries.iter().skip(q.retiring).any(|entry| {
-                        Arc::ptr_eq(entry.data.as_ref().expect("live queue entry"),
-                            lookup.source.data.as_ref().expect("checked-out source"))
-                    }))
+                !lookup.finished.get()
+                    && state.checked_out.contains(&lookup.key)
+                    && queues.values.get(sink).is_some_and(|q| {
+                        q.entries.iter().skip(q.retiring).any(|entry| {
+                            Arc::ptr_eq(
+                                entry.data.as_ref().expect("live queue entry"),
+                                lookup.source.data.as_ref().expect("checked-out source"),
+                            )
+                        })
+                    })
             };
             if !initially_current {
-                return Err(Error::Other(format!("pending sink action disappeared: {entry_id}")));
+                return Err(Error::Other(format!(
+                    "pending sink action disappeared: {entry_id}"
+                )));
             }
             let source = &lookup.source;
-            let mut updated = copy_owned_sink_queue_entry(&source.get().credit.metadata, &source.entry)?;
+            let mut updated =
+                copy_owned_sink_queue_entry(&source.get().credit.metadata, &source.entry)?;
             let attempts = updated.entry.attempts & ATTEMPT_COUNT_MASK;
             updated.entry.attempts = if start {
                 if updated.entry.attempts & UNCONFIRMED_ATTEMPT != 0 {
@@ -5726,60 +6062,100 @@ impl OwnedEventBusHandle {
                     )));
                 }
                 attempts.saturating_add(1).min(ATTEMPT_COUNT_MASK) | UNCONFIRMED_ATTEMPT
-            } else { attempts };
+            } else {
+                attempts
+            };
             let was_unconfirmed = source.entry.attempts & UNCONFIRMED_ATTEMPT != 0;
-            let delta = if start { 1 } else if was_unconfirmed { -1 } else { 0 };
+            let delta = if start {
+                1
+            } else if was_unconfirmed {
+                -1
+            } else {
+                0
+            };
             let encoded = encode_owned_event_value(&source.get().credit.metadata, &updated.entry)?;
-            let successor = OwnedEventShared::try_new(updated, &source.get().credit.metadata, &self.data().funder)?;
+            let successor = OwnedEventShared::try_new(
+                updated,
+                &source.get().credit.metadata,
+                &self.data().funder,
+            )?;
             let prepared = persistence.prepare_update(
-                &self.data().original, sink, entry_id, &encoded.body, uncertain, delta,
+                &self.data().original,
+                sink,
+                entry_id,
+                &encoded.body,
+                uncertain,
+                delta,
             )?;
             let current = {
                 let state = self.data().common.queue_mutation_state.lock();
                 let queues = self.data().queues.lock();
-                !lookup.finished.get() && state.checked_out.contains(&lookup.key)
-                    && queues.values.get(sink).is_some_and(|q| q.entries.iter().skip(q.retiring).any(|entry| {
-                        Arc::ptr_eq(entry.data.as_ref().expect("live queue entry"),
-                            source.data.as_ref().expect("checked-out source"))
-                    }))
+                !lookup.finished.get()
+                    && state.checked_out.contains(&lookup.key)
+                    && queues.values.get(sink).is_some_and(|q| {
+                        q.entries.iter().skip(q.retiring).any(|entry| {
+                            Arc::ptr_eq(
+                                entry.data.as_ref().expect("live queue entry"),
+                                source.data.as_ref().expect("checked-out source"),
+                            )
+                        })
+                    })
             };
             if !current {
-                return Err(Error::Other(format!("pending sink action disappeared: {entry_id}")));
+                return Err(Error::Other(format!(
+                    "pending sink action disappeared: {entry_id}"
+                )));
             }
             // The real claim keeps this pointer generation installed through
             // commit and completion. Pre-admit the unwind publication control.
             let source = &_claim.source;
             let mut successor = Some(successor);
             let committed = Cell::new(false);
-            let mut completion = prepare_owned_queue_completion(&self.data().original, &committed, || {
-                let next = successor.take().expect("one attempt successor");
-                let retired;
-                {
-                    let mut queues = self.data().queues.lock();
-                    let entry = queues.values.get_mut(sink)
-                        .and_then(|q| q.entries.iter_mut().find(|entry| {
-                            Arc::ptr_eq(entry.data.as_ref().expect("live queue entry"),
-                                source.data.as_ref().expect("claimed source"))
-                        })).expect("claimed attempt source remains installed");
-                    retired = std::mem::replace(entry, next.clone());
-                }
-                let old_lookup = std::mem::replace(&mut lookup.source, next);
-                {
-                    let mut metrics = self.data().common.metrics.lock();
-                    let state = metrics.get_mut(sink).expect("paid owning sink metrics");
-                    if start { state.unconfirmed += 1; }
-                    else if was_unconfirmed { state.unconfirmed = state.unconfirmed.saturating_sub(1); }
-                }
-                // Durable and in-memory bodies already agree before any old
-                // original/control refund can panic.
-                drop(old_lookup);
-                drop(retired);
-            })?;
+            let mut completion =
+                prepare_owned_queue_completion(&self.data().original, &committed, || {
+                    let next = successor.take().expect("one attempt successor");
+                    let retired;
+                    {
+                        let mut queues = self.data().queues.lock();
+                        let entry = queues
+                            .values
+                            .get_mut(sink)
+                            .and_then(|q| {
+                                q.entries.iter_mut().find(|entry| {
+                                    Arc::ptr_eq(
+                                        entry.data.as_ref().expect("live queue entry"),
+                                        source.data.as_ref().expect("claimed source"),
+                                    )
+                                })
+                            })
+                            .expect("claimed attempt source remains installed");
+                        retired = std::mem::replace(entry, next.clone());
+                    }
+                    let old_lookup = std::mem::replace(&mut lookup.source, next);
+                    {
+                        let mut metrics = self.data().common.metrics.lock();
+                        let state = metrics.get_mut(sink).expect("paid owning sink metrics");
+                        if start {
+                            state.unconfirmed += 1;
+                        } else if was_unconfirmed {
+                            state.unconfirmed = state.unconfirmed.saturating_sub(1);
+                        }
+                    }
+                    // Durable and in-memory bodies already agree before any old
+                    // original/control refund can panic.
+                    drop(old_lookup);
+                    drop(retired);
+                })?;
             let durable = persistence.is_durable();
-            if durable { publication.reserve()?; }
-            let mut receipt = prepare_owned_queue_receipt(&self.data().original, &committed, || {
-                if durable { publication.complete(); }
-            })?;
+            if durable {
+                publication.reserve()?;
+            }
+            let mut receipt =
+                prepare_owned_queue_receipt(&self.data().original, &committed, || {
+                    if durable {
+                        publication.complete();
+                    }
+                })?;
             let token = _claim.commit_token(&committed);
             persistence.commit_update_at_boundary(prepared, &token, &mut failure);
             // A checkpoint diagnostic can report Err after mark. Settle both
@@ -5801,7 +6177,9 @@ impl OwnedEventBusHandle {
             return Ok(());
         }
         let mut failure = OwnedNativeQueueFailure::prepare(&self.data().original);
-        if failure.error.is_some() { return Err(failure); }
+        if failure.error.is_some() {
+            return Err(failure);
+        }
         let result = tx_mgr.with_maintenance_publication(|publication| {
             let _lease = self.data().common.begin_dispatcher_queue_mutation()?;
             batch.removable.clear();
@@ -5809,20 +6187,40 @@ impl OwnedEventBusHandle {
             // An absent prefix retains the original no-op behavior; an equal
             // ID with a different source generation is an ordinary error.
             let first = batch.acked[0];
-            let first_lookup = batch.lookups.iter().find(|lookup| lookup.key.1 == first)
+            let first_lookup = batch
+                .lookups
+                .iter()
+                .find(|lookup| lookup.key.1 == first)
                 .ok_or_else(|| Error::Other(format!("pending sink action disappeared: {first}")))?;
             let (front_id_matches, front_matches) = {
                 let queues = self.data().queues.lock();
-                queues.values.get(sink).filter(|q| q.retiring == 0)
-                    .and_then(|q| q.entries.front()).map_or((false, false), |entry| {
-                        (entry.entry.id == first, entry.entry.id == first && Arc::ptr_eq(
-                            entry.data.as_ref().expect("ack front source"),
-                            first_lookup.source.data.as_ref().expect("ack checkout generation")))
+                queues
+                    .values
+                    .get(sink)
+                    .filter(|q| q.retiring == 0)
+                    .and_then(|q| q.entries.front())
+                    .map_or((false, false), |entry| {
+                        (
+                            entry.entry.id == first,
+                            entry.entry.id == first
+                                && Arc::ptr_eq(
+                                    entry.data.as_ref().expect("ack front source"),
+                                    first_lookup
+                                        .source
+                                        .data
+                                        .as_ref()
+                                        .expect("ack checkout generation"),
+                                ),
+                        )
                     })
             };
-            if !front_id_matches { return Ok(()); }
+            if !front_id_matches {
+                return Ok(());
+            }
             if !front_matches {
-                return Err(Error::Other(format!("pending sink action disappeared: {first}")));
+                return Err(Error::Other(format!(
+                    "pending sink action disappeared: {first}"
+                )));
             }
             let _claim = self.claim_owned_checked_out(sink, first_lookup)?;
             let unconfirmed;
@@ -5831,47 +6229,83 @@ impl OwnedEventBusHandle {
                 let queues = self.data().queues.lock();
                 if let Some(queue) = queues.values.get(sink).filter(|q| q.retiring == 0) {
                     for (id, entry) in batch.acked.iter().zip(&queue.entries) {
-                        let exact = batch.lookups.iter().find(|lookup| lookup.key.1 == *id)
-                            .is_some_and(|lookup| !lookup.finished.get()
-                                && Arc::ptr_eq(entry.data.as_ref().expect("ack source"),
-                                    lookup.source.data.as_ref().expect("ack generation")));
-                        if *id != entry.entry.id { break; }
-                        if !exact { stale = Some(*id); break; }
+                        let exact = batch
+                            .lookups
+                            .iter()
+                            .find(|lookup| lookup.key.1 == *id)
+                            .is_some_and(|lookup| {
+                                !lookup.finished.get()
+                                    && Arc::ptr_eq(
+                                        entry.data.as_ref().expect("ack source"),
+                                        lookup.source.data.as_ref().expect("ack generation"),
+                                    )
+                            });
+                        if *id != entry.entry.id {
+                            break;
+                        }
+                        if !exact {
+                            stale = Some(*id);
+                            break;
+                        }
                         batch.removable.push(*id);
                     }
-                    unconfirmed = queue.entries.iter().take(batch.removable.len())
-                        .filter(|entry| entry.entry.attempts & UNCONFIRMED_ATTEMPT != 0).count() as u64;
-                } else { unconfirmed = 0; }
+                    unconfirmed = queue
+                        .entries
+                        .iter()
+                        .take(batch.removable.len())
+                        .filter(|entry| entry.entry.attempts & UNCONFIRMED_ATTEMPT != 0)
+                        .count() as u64;
+                } else {
+                    unconfirmed = 0;
+                }
             }
             if let Some(id) = stale {
-                return Err(Error::Other(format!("pending sink action disappeared: {id}")));
+                return Err(Error::Other(format!(
+                    "pending sink action disappeared: {id}"
+                )));
             }
-            if batch.removable.is_empty() { return Ok(()); }
+            if batch.removable.is_empty() {
+                return Ok(());
+            }
             let prepared = persistence.prepare_removals(
-                &self.data().original, sink, &batch.removable, unconfirmed,
+                &self.data().original,
+                sink,
+                &batch.removable,
+                unconfirmed,
             )?;
             let removable = &batch.removable;
             let retired = &mut batch.retired;
             let committed = Cell::new(false);
-            let mut completion = prepare_owned_queue_completion(&self.data().original, &committed, || {
-                {
-                    let mut queues = self.data().queues.lock();
-                    let queue = queues.values.get_mut(sink).expect("claimed ack queue");
-                    for id in removable {
-                        assert!(queue.entries.front().is_some_and(|entry| entry.entry.id == *id),
-                            "claimed ack prefix remains installed");
-                        retired.push(queue.entries.pop_front().expect("ack prefix"));
+            let mut completion =
+                prepare_owned_queue_completion(&self.data().original, &committed, || {
+                    {
+                        let mut queues = self.data().queues.lock();
+                        let queue = queues.values.get_mut(sink).expect("claimed ack queue");
+                        for id in removable {
+                            assert!(
+                                queue
+                                    .entries
+                                    .front()
+                                    .is_some_and(|entry| entry.entry.id == *id),
+                                "claimed ack prefix remains installed"
+                            );
+                            retired.push(queue.entries.pop_front().expect("ack prefix"));
+                        }
                     }
-                }
-                let mut metrics = self.data().common.metrics.lock();
-                let state = metrics.get_mut(sink).expect("paid owning sink metrics");
-                state.unconfirmed = state.unconfirmed.saturating_sub(unconfirmed);
-            })?;
+                    let mut metrics = self.data().common.metrics.lock();
+                    let state = metrics.get_mut(sink).expect("paid owning sink metrics");
+                    state.unconfirmed = state.unconfirmed.saturating_sub(unconfirmed);
+                })?;
             let durable = persistence.is_durable();
-            if durable { publication.reserve()?; }
-            let mut receipt = prepare_owned_queue_receipt(&self.data().original, &committed, || {
-                if durable { publication.complete(); }
-            })?;
+            if durable {
+                publication.reserve()?;
+            }
+            let mut receipt =
+                prepare_owned_queue_receipt(&self.data().original, &committed, || {
+                    if durable {
+                        publication.complete();
+                    }
+                })?;
             let token = _claim.commit_token(&committed);
             persistence.commit_removals_at_boundary(prepared, &token, &mut failure);
             receipt.finish();
@@ -5906,12 +6340,19 @@ pub(crate) trait OwnedSinkQueuePersistence {
     ) -> Result<Self::Update<'o>>;
     fn commit_update(&self, prepared: Self::Update<'_>) -> Result<()>;
     fn commit_update_at_boundary(
-        &self, prepared: Self::Update<'_>, completion: &OwnedQueueCommitToken<'_>,
+        &self,
+        prepared: Self::Update<'_>,
+        completion: &OwnedQueueCommitToken<'_>,
         failure: &mut OwnedNativeQueueFailure,
     ) {
-        assert!(!self.is_durable(), "durable native adapter requires its owning commit boundary");
+        assert!(
+            !self.is_durable(),
+            "durable native adapter requires its owning commit boundary"
+        );
         let result = self.commit_update(prepared);
-        if result.is_ok() { completion.mark_success(); }
+        if result.is_ok() {
+            completion.mark_success();
+        }
         failure.capture(result);
     }
     fn prepare_removals<'o>(
@@ -5923,12 +6364,19 @@ pub(crate) trait OwnedSinkQueuePersistence {
     ) -> Result<Self::Removals<'o>>;
     fn commit_removals(&self, prepared: Self::Removals<'_>) -> Result<()>;
     fn commit_removals_at_boundary(
-        &self, prepared: Self::Removals<'_>, completion: &OwnedQueueCommitToken<'_>,
+        &self,
+        prepared: Self::Removals<'_>,
+        completion: &OwnedQueueCommitToken<'_>,
         failure: &mut OwnedNativeQueueFailure,
     ) {
-        assert!(!self.is_durable(), "durable native adapter requires its owning commit boundary");
+        assert!(
+            !self.is_durable(),
+            "durable native adapter requires its owning commit boundary"
+        );
         let result = self.commit_removals(prepared);
-        if result.is_ok() { completion.mark_success(); }
+        if result.is_ok() {
+            completion.mark_success();
+        }
         failure.capture(result);
     }
 }
@@ -5945,21 +6393,33 @@ impl OwnedEventBusHandle {
             // Count only. Overflow diagnostics are constructed after unlock.
             let counts = {
                 let current = self.data().common.metrics.lock();
-                let missing = names.iter().filter(|name| !current.contains_key(*name)).count();
-                let bytes = current.keys().try_fold(0usize, |n, key| n.checked_add(key.len()));
+                let missing = names
+                    .iter()
+                    .filter(|name| !current.contains_key(*name))
+                    .count();
+                let bytes = current
+                    .keys()
+                    .try_fold(0usize, |n, key| n.checked_add(key.len()));
                 (current.len(), missing, bytes)
             };
-            if counts.1 == 0 { return Ok(()); }
+            if counts.1 == 0 {
+                return Ok(());
+            }
             let bytes = counts.2.ok_or_else(owned_event_overflow)?;
             let (body, credit) = new_owned_native_vec::<u8>(original, bytes)?;
             let mut text = OwnedEventBody { body, credit };
-            let (body, credit) = new_owned_native_vec::<(std::ops::Range<usize>, SinkMetricsState)>(original, counts.0)?;
+            let (body, credit) = new_owned_native_vec::<(std::ops::Range<usize>, SinkMetricsState)>(
+                original, counts.0,
+            )?;
             let mut captured = OwnedEventBody { body, credit };
             {
                 let current = self.data().common.metrics.lock();
-                let size = current.keys().try_fold(0usize, |n, key| n.checked_add(key.len()));
+                let size = current
+                    .keys()
+                    .try_fold(0usize, |n, key| n.checked_add(key.len()));
                 if current.len() > captured.body.capacity()
-                    || size.is_none_or(|n| n > text.body.capacity()) {
+                    || size.is_none_or(|n| n > text.body.capacity())
+                {
                     continue;
                 }
                 // Only prepaid byte copies and scalar state captures run here.
@@ -5974,15 +6434,25 @@ impl OwnedEventBusHandle {
             let source_key = |range: &std::ops::Range<usize>| {
                 std::str::from_utf8(&text.body[range.clone()]).expect("captured UTF-8 metric key")
             };
-            let missing = names.iter().filter(|name| !captured.body.iter().any(|(range, _)| source_key(range) == name.as_str())).count();
+            let missing = names
+                .iter()
+                .filter(|name| {
+                    !captured
+                        .body
+                        .iter()
+                        .any(|(range, _)| source_key(range) == name.as_str())
+                })
+                .count();
             let maximum = owned_event_add(captured.body.len(), missing)?;
             let (body, credit) = new_owned_native_map(original, maximum)?;
             let successor = OwnedEventBody { body, credit };
             let (body, credit) = new_owned_native_vec(original, maximum)?;
             let keys = OwnedEventBody { body, credit };
             let mut copied = OwnedEventCopiedMap {
-                body: successor.body, keys: keys.body,
-                array: keys.credit, buckets: successor.credit,
+                body: successor.body,
+                keys: keys.body,
+                array: keys.credit,
+                buckets: successor.credit,
             };
             for (range, state) in &captured.body {
                 let (key, memory) = copy_owned_native_string(original, source_key(range))?;
@@ -5996,10 +6466,17 @@ impl OwnedEventBusHandle {
                     copied.keys.push(memory);
                 }
             }
-            let mut retired = OwnedEventBody { body: None, credit: None };
+            let mut retired = OwnedEventBody {
+                body: None,
+                credit: None,
+            };
             let mut current = self.data().common.metrics.lock();
             if current.len() != captured.body.len()
-                || captured.body.iter().any(|(range, _)| !current.contains_key(source_key(range))) {
+                || captured
+                    .body
+                    .iter()
+                    .any(|(range, _)| !current.contains_key(source_key(range)))
+            {
                 drop(current);
                 continue;
             }
@@ -6008,9 +6485,15 @@ impl OwnedEventBusHandle {
                 *copied.body.get_mut(key).expect("captured metric key") = state.clone();
             }
             retired.body = Some(std::mem::replace(&mut *current, copied.body));
-            retired.credit = self.data().metric_allocation.lock().replace(OwnedMetricsAllocation {
-                keys: copied.keys, array: copied.array, buckets: copied.buckets,
-            });
+            retired.credit = self
+                .data()
+                .metric_allocation
+                .lock()
+                .replace(OwnedMetricsAllocation {
+                    keys: copied.keys,
+                    array: copied.array,
+                    buckets: copied.buckets,
+                });
             drop(current);
             drop(retired);
             return Ok(());
@@ -6656,22 +7139,42 @@ impl OwnedEventBusHandle {
             let measure = |source: &EventBusDefinitions| {
                 let mut bytes = Some(0usize);
                 let mut values = Some(0usize);
-                let mut add = |text: &str| { bytes = bytes.and_then(|n| n.checked_add(text.len())); };
+                let mut add = |text: &str| {
+                    bytes = bytes.and_then(|n| n.checked_add(text.len()));
+                };
                 for (key, def) in &source.event_types {
-                    for text in [key, &def.name, &def.table] { add(text); }
+                    for text in [key, &def.name, &def.table] {
+                        add(text);
+                    }
                 }
                 for (key, def) in &source.sinks {
-                    for text in [key.as_str(), def.name.as_str(), def.url.as_deref().unwrap_or("")] { add(text); }
+                    for text in [
+                        key.as_str(),
+                        def.name.as_str(),
+                        def.url.as_deref().unwrap_or(""),
+                    ] {
+                        add(text);
+                    }
                 }
                 for (key, def) in &source.routes {
-                    for text in [key, &def.name, &def.event_type, &def.sink] { add(text); }
+                    for text in [key, &def.name, &def.event_type, &def.sink] {
+                        add(text);
+                    }
                     if let Some(filter) = &def.where_in {
                         add(&filter.column);
                         values = values.and_then(|n| n.checked_add(filter.values.len()));
-                        for value in &filter.values { add(value); }
+                        for value in &filter.values {
+                            add(value);
+                        }
                     }
                 }
-                (source.event_types.len(), source.sinks.len(), source.routes.len(), bytes, values)
+                (
+                    source.event_types.len(),
+                    source.sinks.len(),
+                    source.routes.len(),
+                    bytes,
+                    values,
+                )
             };
             let counts = {
                 let current = self.data().common.definitions.lock();
@@ -6696,7 +7199,8 @@ impl OwnedEventBusHandle {
                     || now.1 > sink_source.body.capacity()
                     || now.2 > route_source.body.capacity()
                     || now.3.is_none_or(|n| n > text.body.capacity())
-                    || now.4.is_none_or(|n| n > value_source.body.capacity()) {
+                    || now.4.is_none_or(|n| n > value_source.body.capacity())
+                {
                     continue;
                 }
                 let mut capture = |value: &str| {
@@ -6705,10 +7209,20 @@ impl OwnedEventBusHandle {
                     start..text.body.len()
                 };
                 for (key, def) in &current.event_types {
-                    type_source.body.push((capture(key), capture(&def.name), def.trigger, capture(&def.table)));
+                    type_source.body.push((
+                        capture(key),
+                        capture(&def.name),
+                        def.trigger,
+                        capture(&def.table),
+                    ));
                 }
                 for (key, def) in &current.sinks {
-                    sink_source.body.push((capture(key), capture(&def.name), def.sink_type, def.url.as_deref().map(&mut capture)));
+                    sink_source.body.push((
+                        capture(key),
+                        capture(&def.name),
+                        def.sink_type,
+                        def.url.as_deref().map(&mut capture),
+                    ));
                 }
                 for (key, def) in &current.routes {
                     let key = capture(key);
@@ -6718,32 +7232,62 @@ impl OwnedEventBusHandle {
                     let filter = def.where_in.as_ref().map(|filter| {
                         let column = capture(&filter.column);
                         let start = value_source.body.len();
-                        for value in &filter.values { value_source.body.push(capture(value)); }
+                        for value in &filter.values {
+                            value_source.body.push(capture(value));
+                        }
                         (column, start..value_source.body.len())
                     });
-                    route_source.body.push((key, name, event_type, sink, filter));
+                    route_source
+                        .body
+                        .push((key, name, event_type, sink, filter));
                 }
             }
             let source_text = |span: &Span| {
                 std::str::from_utf8(&text.body[span.clone()]).expect("captured UTF-8 definition")
             };
-            let mut bytes = owned_event_add(text.body.len(), owned_event_array::<String>(value_source.body.len())?)?;
-            bytes = owned_event_add(bytes, owned_event_btree_bytes::<String, EventTypeDef>(type_source.body.len())?)?;
-            bytes = owned_event_add(bytes, owned_event_btree_bytes::<String, SinkDef>(sink_source.body.len())?)?;
-            bytes = owned_event_add(bytes, owned_event_btree_bytes::<String, RouteDef>(route_source.body.len())?)?;
+            let mut bytes = owned_event_add(
+                text.body.len(),
+                owned_event_array::<String>(value_source.body.len())?,
+            )?;
+            bytes = owned_event_add(
+                bytes,
+                owned_event_btree_bytes::<String, EventTypeDef>(type_source.body.len())?,
+            )?;
+            bytes = owned_event_add(
+                bytes,
+                owned_event_btree_bytes::<String, SinkDef>(sink_source.body.len())?,
+            )?;
+            bytes = owned_event_add(
+                bytes,
+                owned_event_btree_bytes::<String, RouteDef>(route_source.body.len())?,
+            )?;
             let allocation = reserve_owned_event_bytes(original, bytes)?;
-            let mut snapshot = OwnedDefinitionsProjection { definitions: EventBusDefinitions::default(), allocation };
+            let mut snapshot = OwnedDefinitionsProjection {
+                definitions: EventBusDefinitions::default(),
+                allocation,
+            };
             for (key, name, trigger, table) in &type_source.body {
-                snapshot.definitions.event_types.insert(copy_owned_prepaid_text(source_text(key))?, EventTypeDef {
-                    name: copy_owned_prepaid_text(source_text(name))?, trigger: *trigger,
-                    table: copy_owned_prepaid_text(source_text(table))?,
-                });
+                snapshot.definitions.event_types.insert(
+                    copy_owned_prepaid_text(source_text(key))?,
+                    EventTypeDef {
+                        name: copy_owned_prepaid_text(source_text(name))?,
+                        trigger: *trigger,
+                        table: copy_owned_prepaid_text(source_text(table))?,
+                    },
+                );
             }
             for (key, name, sink_type, url) in &sink_source.body {
-                snapshot.definitions.sinks.insert(copy_owned_prepaid_text(source_text(key))?, SinkDef {
-                    name: copy_owned_prepaid_text(source_text(name))?, sink_type: *sink_type,
-                    url: url.as_ref().map(|span| copy_owned_prepaid_text(source_text(span))).transpose()?,
-                });
+                snapshot.definitions.sinks.insert(
+                    copy_owned_prepaid_text(source_text(key))?,
+                    SinkDef {
+                        name: copy_owned_prepaid_text(source_text(name))?,
+                        sink_type: *sink_type,
+                        url: url
+                            .as_ref()
+                            .map(|span| copy_owned_prepaid_text(source_text(span)))
+                            .transpose()?,
+                    },
+                );
             }
             for (key, name, event_type, sink, filter) in &route_source.body {
                 let where_in = if let Some((column, span)) = filter {
@@ -6754,13 +7298,22 @@ impl OwnedEventBusHandle {
                     for value in &value_source.body[span.clone()] {
                         values.push(copy_owned_prepaid_text(source_text(value))?);
                     }
-                    Some(PersistedRouteWhereIn { column: copy_owned_prepaid_text(source_text(column))?, values })
-                } else { None };
-                snapshot.definitions.routes.insert(copy_owned_prepaid_text(source_text(key))?, RouteDef {
-                    name: copy_owned_prepaid_text(source_text(name))?,
-                    event_type: copy_owned_prepaid_text(source_text(event_type))?,
-                    sink: copy_owned_prepaid_text(source_text(sink))?, where_in,
-                });
+                    Some(PersistedRouteWhereIn {
+                        column: copy_owned_prepaid_text(source_text(column))?,
+                        values,
+                    })
+                } else {
+                    None
+                };
+                snapshot.definitions.routes.insert(
+                    copy_owned_prepaid_text(source_text(key))?,
+                    RouteDef {
+                        name: copy_owned_prepaid_text(source_text(name))?,
+                        event_type: copy_owned_prepaid_text(source_text(event_type))?,
+                        sink: copy_owned_prepaid_text(source_text(sink))?,
+                        where_in,
+                    },
+                );
             }
             break snapshot;
         };
@@ -7868,12 +8421,15 @@ struct OwnedEventCopiedSet<K> {
 }
 impl OwnedEventBusHandle {
     pub(crate) fn with_owned_registered_stage_identity<R>(
-        &self, registration: &OwnedEventStageRegistration,
+        &self,
+        registration: &OwnedEventStageRegistration,
         f: impl FnOnce(Lsn, EngineTerminalIdentity) -> Result<R>,
     ) -> Result<R> {
-        let pin = self.pin_owned_registered_stage(registration).ok_or_else(|| {
-            Error::Other("native event apply registered stage identity mismatch".into())
-        })?;
+        let pin = self
+            .pin_owned_registered_stage(registration)
+            .ok_or_else(|| {
+                Error::Other("native event apply registered stage identity mismatch".into())
+            })?;
         // The supplied registration, never the looked-up stage, provides the
         // identity. The exact pin check only authenticates its installation.
         let result = f(registration.lsn, registration.identity);
@@ -7888,10 +8444,16 @@ impl OwnedEventBusHandle {
         let mut stages = self.data().stages.lock();
         let matches = stages.values.get(&registration.lsn).is_some_and(|stage| {
             stage.identity == registration.identity
-                && Arc::ptr_eq(stage.data.as_ref().expect("installed stage"),
-                    pin.data.as_ref().expect("registered stage"))
+                && Arc::ptr_eq(
+                    stage.data.as_ref().expect("installed stage"),
+                    pin.data.as_ref().expect("registered stage"),
+                )
         });
-        let retired = if matches { stages.values.remove(&registration.lsn) } else { None };
+        let retired = if matches {
+            stages.values.remove(&registration.lsn)
+        } else {
+            None
+        };
         drop(stages);
         drop(pin);
         retired
@@ -7900,24 +8462,34 @@ impl OwnedEventBusHandle {
         &self,
         registration: &OwnedEventStageRegistration,
     ) -> Option<OwnedEventShared<OwnedCommitEventStage>> {
-        if !registration.armed || !Arc::ptr_eq(
-            self.storage.data.as_ref().expect("live event companion"),
-            registration
-                .storage
-                .storage
-                .data
-                .as_ref()
-                .expect("live registered event companion"),
-        ) {
+        if !registration.armed
+            || !Arc::ptr_eq(
+                self.storage.data.as_ref().expect("live event companion"),
+                registration
+                    .storage
+                    .storage
+                    .data
+                    .as_ref()
+                    .expect("live registered event companion"),
+            )
+        {
             return None;
         }
         let stages = self.data().stages.lock();
         stages
             .values
             .get(&registration.lsn)
-            .filter(|stage| stage.get().identity == registration.identity
-                && Arc::ptr_eq(stage.data.as_ref().expect("installed stage"),
-                    registration.installed.data.as_ref().expect("registered stage")))
+            .filter(|stage| {
+                stage.get().identity == registration.identity
+                    && Arc::ptr_eq(
+                        stage.data.as_ref().expect("installed stage"),
+                        registration
+                            .installed
+                            .data
+                            .as_ref()
+                            .expect("registered stage"),
+                    )
+            })
             .cloned()
     }
 }
@@ -8356,14 +8928,18 @@ impl Database {
     ) -> Result<()> {
         self.validate_owned_event_host(events, host)?;
         if !Arc::ptr_eq(&events.data().common, &self.event_bus) {
-            return Err(Error::Other("native cron requires this database's event companion".into()));
+            return Err(Error::Other(
+                "native cron requires this database's event companion".into(),
+            ));
         }
         host.transactions.with_transactions(|lower| {
             let installed: &dyn contextdb_tx::WriteSetApplicator = lower.store().as_ref();
             if installed as *const dyn contextdb_tx::WriteSetApplicator as *const ()
                 != store as *const _ as *const ()
             {
-                return Err(Error::Other("native cron requires its host's installed store".into()));
+                return Err(Error::Other(
+                    "native cron requires its host's installed store".into(),
+                ));
             }
             Ok(())
         })
@@ -8383,9 +8959,16 @@ impl Database {
                 let mut relational_count = 0;
                 let mut vector_count = 0;
                 self.visit_owned_delete_release_bytes(
-                    original, ws, vector_copy_owner, read_memory.clone(),
+                    original,
+                    ws,
+                    vector_copy_owner,
+                    read_memory.clone(),
                     |vector, _| {
-                        let count = if vector { &mut vector_count } else { &mut relational_count };
+                        let count = if vector {
+                            &mut vector_count
+                        } else {
+                            &mut relational_count
+                        };
                         *count = owned_event_add(*count, 1)?;
                         Ok(())
                     },
@@ -8395,12 +8978,18 @@ impl Database {
                 let relational = OwnedEventBody { body, credit };
                 let (body, credit) = new_owned_native_vec(original, vector_count)?;
                 let mut release = OwnedDeleteReleaseBytes {
-                    bytes: DeleteReleaseBytes { relational: relational.body, vectors: body },
+                    bytes: DeleteReleaseBytes {
+                        relational: relational.body,
+                        vectors: body,
+                    },
                     relational_array: relational.credit,
                     vector_array: credit,
                 };
                 self.visit_owned_delete_release_bytes(
-                    original, ws, vector_copy_owner, read_memory,
+                    original,
+                    ws,
+                    vector_copy_owner,
+                    read_memory,
                     |vector, bytes| {
                         let (array, count) = if vector {
                             (&mut release.bytes.vectors, vector_count)
@@ -8408,7 +8997,9 @@ impl Database {
                             (&mut release.bytes.relational, relational_count)
                         };
                         if array.len() == count {
-                            return Err(Error::Other("native delete release source changed".into()));
+                            return Err(Error::Other(
+                                "native delete release source changed".into(),
+                            ));
                         }
                         array.push(bytes);
                         Ok(())
@@ -8440,12 +9031,16 @@ impl Database {
                 let lookup_memory = reserve_owned_event_bytes(original, table.len())?;
                 let tables = self.relational_store.tables.read();
                 let row = tables.get(table).and_then(|rows| {
-                    self.relational_store.visible_version_position(table, rows, *row_id, snapshot)
+                    self.relational_store
+                        .visible_version_position(table, rows, *row_id, snapshot)
                         .and_then(|position| rows.get(position))
                 });
                 drop(lookup_memory);
                 if let Some(row) = row {
-                    visit(false, retained_row_bytes_with_optional_meta(table, row, meta))?;
+                    visit(
+                        false,
+                        retained_row_bytes_with_optional_meta(table, row, meta),
+                    )?;
                 }
                 Ok(())
             })?;
@@ -8453,15 +9048,26 @@ impl Database {
         // State-owned vector bodies retain their charge until physical removal.
         // Adjacency likewise remains charged; this commit settles neither.
         for (index, row_id, _) in &ws.vector_deletes {
-            if self.vector_store.raw_entry_charge_owned_by_state(index, *row_id) {
+            if self
+                .vector_store
+                .raw_entry_charge_owned_by_state(index, *row_id)
+            {
                 continue;
             }
             if let Some(vector) = self.find_vector_by_index_and_row(
-                index, *row_id, vector_copy_owner, read_memory.clone(),
+                index,
+                *row_id,
+                vector_copy_owner,
+                read_memory.clone(),
             )? {
-                visit(true, self.vector_insert_accounted_bytes(
-                    index, vector.vector.len(), vector_copy_owner,
-                )?)?;
+                visit(
+                    true,
+                    self.vector_insert_accounted_bytes(
+                        index,
+                        vector.vector.len(),
+                        vector_copy_owner,
+                    )?,
+                )?;
             }
         }
         Ok(())

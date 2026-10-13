@@ -12,7 +12,11 @@ use std::{cell::RefCell, marker::PhantomData, rc::Rc, sync::Arc};
 pub enum VectorJournalReplayWork {
     /// Original immutable producer input, copied only while a proof observer is installed.
     #[cfg(any(test, feature = "test-seams"))]
-    SavedTopologyExport { is_base: bool, generation_id: u64, bytes: Arc<[u8]> },
+    SavedTopologyExport {
+        is_base: bool,
+        generation_id: u64,
+        bytes: Arc<[u8]>,
+    },
     /// Bytes returned by the storage backend while selecting or loading the
     /// replay suffix. Counts cache misses at the backend, independently of
     /// decoded journal records and unique immutable vector identities.
@@ -87,14 +91,23 @@ pub(crate) fn emit(
 
 #[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn observe_saved_topology_export(
-    partition: &VectorPartitionRef, covered_lsn: Lsn, is_base: bool,
-    generation_id: u64, bytes: &[u8],
+    partition: &VectorPartitionRef,
+    covered_lsn: Lsn,
+    is_base: bool,
+    generation_id: u64,
+    bytes: &[u8],
 ) {
     if OBSERVER.with(|slot| slot.borrow().is_some()) {
-        emit(&partition.index, &partition.partition_key, covered_lsn,
+        emit(
+            &partition.index,
+            &partition.partition_key,
+            covered_lsn,
             VectorJournalReplayWork::SavedTopologyExport {
-                is_base, generation_id, bytes: Arc::from(bytes),
-            });
+                is_base,
+                generation_id,
+                bytes: Arc::from(bytes),
+            },
+        );
     }
 }
 
@@ -104,7 +117,9 @@ pub fn observe_additional_journal_replay(observer: Observer) -> VectorJournalObs
     let prior = OBSERVER.with(|slot| slot.borrow().clone());
     observe_journal_replay(Arc::new(move |event| {
         observer(event);
-        if let Some(prior) = &prior { prior(event); }
+        if let Some(prior) = &prior {
+            prior(event);
+        }
     }))
 }
 
@@ -159,7 +174,10 @@ pub fn observe_graph_workspace_for_test(
     observer: GraphWorkspaceObserver,
 ) -> VectorGraphWorkspaceObservationForTest {
     let previous = GRAPH_WORKSPACE_OBSERVER.with(|slot| slot.replace(Some(observer)));
-    VectorGraphWorkspaceObservationForTest { previous, _thread: PhantomData }
+    VectorGraphWorkspaceObservationForTest {
+        previous,
+        _thread: PhantomData,
+    }
 }
 
 #[cfg(any(test, feature = "test-seams"))]
@@ -179,7 +197,9 @@ impl Drop for VectorGraphWorkspaceObservationForTest {
 pub(crate) fn observe_graph_buffer_for_test(kind: VectorGraphBufferKindForTest, bytes: &Vec<u8>) {
     if bytes.capacity() != 0 {
         emit_graph_workspace_for_test(VectorGraphWorkspaceEventForTest::GraphBuffers {
-            kind, pointer: bytes.as_ptr() as usize, capacity: bytes.capacity(),
+            kind,
+            pointer: bytes.as_ptr() as usize,
+            capacity: bytes.capacity(),
         });
     }
 }
@@ -187,23 +207,40 @@ pub(crate) fn observe_graph_buffer_for_test(kind: VectorGraphBufferKindForTest, 
 #[cfg(any(test, feature = "test-seams"))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn observe_export_identity_for_test(
-    original_generation_id: u64, artifact_generation_id: u64, storage_id: u64,
-    is_base: bool, source_digest: [u8; 32], generation_key: &[u8], root_key: &[u8],
+    original_generation_id: u64,
+    artifact_generation_id: u64,
+    storage_id: u64,
+    is_base: bool,
+    source_digest: [u8; 32],
+    generation_key: &[u8],
+    root_key: &[u8],
 ) {
     // Key addresses are borrowed only during the synchronous callback. The
     // fixed inline event adds no allocation or production observation.
     emit_graph_workspace_for_test(VectorGraphWorkspaceEventForTest::ExportIdentity {
-        original_generation_id, artifact_generation_id, storage_id, is_base, source_digest,
-        generation_key_pointer: generation_key.as_ptr() as usize, generation_key_len: generation_key.len(),
-        root_key_pointer: root_key.as_ptr() as usize, root_key_len: root_key.len(),
+        original_generation_id,
+        artifact_generation_id,
+        storage_id,
+        is_base,
+        source_digest,
+        generation_key_pointer: generation_key.as_ptr() as usize,
+        generation_key_len: generation_key.len(),
+        root_key_pointer: root_key.as_ptr() as usize,
+        root_key_len: root_key.len(),
     });
 }
 
 #[cfg(any(test, feature = "test-seams"))]
-pub(crate) fn observe_workspace_resize_for_test(previous: usize, next: usize, operation: &'static str) {
+pub(crate) fn observe_workspace_resize_for_test(
+    previous: usize,
+    next: usize,
+    operation: &'static str,
+) {
     if next < previous {
         emit_graph_workspace_for_test(VectorGraphWorkspaceEventForTest::WorkspaceResize {
-            previous, next, operation,
+            previous,
+            next,
+            operation,
         });
     }
 }

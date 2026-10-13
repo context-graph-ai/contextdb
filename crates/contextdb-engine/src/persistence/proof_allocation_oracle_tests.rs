@@ -64,23 +64,38 @@ impl NativeFreeWatch {
 static NATIVE_FREE: [NativeFreeWatch; 32] = [const { NativeFreeWatch::new() }; 32];
 
 // Extend the mapped oracle's fixed storage; no allocating observation ledger.
-pub(crate) fn source_requests_for_test<T>(counter: usize, operation: impl FnOnce() -> T)
-    -> (T, [(usize, usize, usize); 32], usize) {
+pub(crate) fn source_requests_for_test<T>(
+    counter: usize,
+    operation: impl FnOnce() -> T,
+) -> (T, [(usize, usize, usize); 32], usize) {
     struct Guard;
-    impl Drop for Guard { fn drop(&mut self) { SOURCE_REQUEST_COUNTER.with(|c| c.set(0)); } }
-    SOURCE_REQUEST_CREDIT.with(|credits| credits.set([0;32]));
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            SOURCE_REQUEST_COUNTER.with(|c| c.set(0));
+        }
+    }
+    SOURCE_REQUEST_CREDIT.with(|credits| credits.set([0; 32]));
     SOURCE_REQUEST_COUNTER.with(|c| c.set(counter));
-    let guard=Guard;
+    let guard = Guard;
     let (value, _, count) = native_requests_for_test(operation);
     drop(guard);
     (value, NATIVE_REQUESTS.with(std::cell::Cell::get), count)
 }
-pub(crate) fn source_request_credit_for_test() -> [usize;32] { SOURCE_REQUEST_CREDIT.with(std::cell::Cell::get) }
+pub(crate) fn source_request_credit_for_test() -> [usize; 32] {
+    SOURCE_REQUEST_CREDIT.with(std::cell::Cell::get)
+}
 pub(crate) fn watch_source_free_for_test(requests: &[(usize, usize, usize)], counter: usize) {
-    for watch in &NATIVE_FREE { watch.pointer.store(0, AtomicOrdering::SeqCst); }
+    for watch in &NATIVE_FREE {
+        watch.pointer.store(0, AtomicOrdering::SeqCst);
+    }
     for (request, watch) in requests.iter().zip(&NATIVE_FREE) {
         assert_ne!(request.0, 0);
-        let header = unsafe { (request.0 as *const u8).sub(std::mem::size_of::<Header>()).cast::<Header>().read() };
+        let header = unsafe {
+            (request.0 as *const u8)
+                .sub(std::mem::size_of::<Header>())
+                .cast::<Header>()
+                .read()
+        };
         assert_ne!(header.window, 0);
         watch.window.store(header.window, AtomicOrdering::SeqCst);
         watch.before.store(0, AtomicOrdering::SeqCst);
@@ -92,8 +107,14 @@ pub(crate) fn watch_source_free_for_test(requests: &[(usize, usize, usize)], cou
 }
 pub(crate) fn source_free_for_test(count: usize) -> [(usize, usize, usize); 32] {
     assert!(count <= NATIVE_FREE.len());
-    std::array::from_fn(|index| { let w=&NATIVE_FREE[index];
-        (w.before.load(AtomicOrdering::SeqCst), w.after.load(AtomicOrdering::SeqCst), w.count.load(AtomicOrdering::SeqCst)) })
+    std::array::from_fn(|index| {
+        let w = &NATIVE_FREE[index];
+        (
+            w.before.load(AtomicOrdering::SeqCst),
+            w.after.load(AtomicOrdering::SeqCst),
+            w.count.load(AtomicOrdering::SeqCst),
+        )
+    })
 }
 
 pub(crate) fn native_requests_for_test<T>(
@@ -186,14 +207,19 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
             return std::ptr::null_mut();
         }
         let (allocation, offset) = allocation_layout(layout);
-        let source_counter=SOURCE_REQUEST_COUNTER.try_with(std::cell::Cell::get).unwrap_or(0);
-        if source_counter!=0 {
-            let index=NATIVE_REQUEST_COUNT.with(std::cell::Cell::get);
-            if index<32 { SOURCE_REQUEST_CREDIT.with(|credits| {
-                let mut entries=credits.get();
-                entries[index]=unsafe { &*(source_counter as *const AtomicUsize) }.load(AtomicOrdering::SeqCst);
-                credits.set(entries);
-            }); }
+        let source_counter = SOURCE_REQUEST_COUNTER
+            .try_with(std::cell::Cell::get)
+            .unwrap_or(0);
+        if source_counter != 0 {
+            let index = NATIVE_REQUEST_COUNT.with(std::cell::Cell::get);
+            if index < 32 {
+                SOURCE_REQUEST_CREDIT.with(|credits| {
+                    let mut entries = credits.get();
+                    entries[index] = unsafe { &*(source_counter as *const AtomicUsize) }
+                        .load(AtomicOrdering::SeqCst);
+                    credits.set(entries);
+                });
+            }
         }
         let base = unsafe { System.alloc(allocation) };
         if base.is_null() {
@@ -228,7 +254,10 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
         }
         if window != 0 {
             LAST_REQUEST_POINTER.with(|last| last.set(pointer as usize));
-            LAST_REQUEST.with(|last| { let (_, _, count) = last.get(); last.set((layout.size(), layout.align(), count + 1)); });
+            LAST_REQUEST.with(|last| {
+                let (_, _, count) = last.get();
+                last.set((layout.size(), layout.align(), count + 1));
+            });
             let mut measurement = MEASUREMENT.lock().unwrap();
             if measurement.active_window == window {
                 measurement.live += allocation.size();
@@ -258,14 +287,20 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
         let watching_payload = payload_watch.0 == pointer as usize && payload_watch.0 != 0;
         let watch = WATCH_NODE_FREE.with(std::cell::Cell::get);
         let watching_node = watch.0 == pointer as usize && watch.0 != 0;
-        let process_before_free = if watching_node { crate::memory_accounting::process_aggregate_bytes_for_test() } else { 0 };
-        let used_before_free = if watching_node { unsafe { &*(watch.1 as *const AtomicUsize) }.load(AtomicOrdering::SeqCst) } else { 0 };
-        let native_watch = NATIVE_FREE
-            .iter()
-            .find(|watch| {
-                watch.pointer.load(AtomicOrdering::SeqCst) == pointer as usize
-                    && watch.window.load(AtomicOrdering::SeqCst) == header.window
-            });
+        let process_before_free = if watching_node {
+            crate::memory_accounting::process_aggregate_bytes_for_test()
+        } else {
+            0
+        };
+        let used_before_free = if watching_node {
+            unsafe { &*(watch.1 as *const AtomicUsize) }.load(AtomicOrdering::SeqCst)
+        } else {
+            0
+        };
+        let native_watch = NATIVE_FREE.iter().find(|watch| {
+            watch.pointer.load(AtomicOrdering::SeqCst) == pointer as usize
+                && watch.window.load(AtomicOrdering::SeqCst) == header.window
+        });
         if let Some(watch) = native_watch {
             let counter = watch.counter.load(AtomicOrdering::SeqCst);
             let before = if counter == 0 {
@@ -275,7 +310,11 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
             };
             watch.before.store(before, AtomicOrdering::SeqCst);
         }
-        crate::vector_read_memory::native_ownership_proof::before_free(pointer, layout, header.window);
+        crate::vector_read_memory::native_ownership_proof::before_free(
+            pointer,
+            layout,
+            header.window,
+        );
         unsafe {
             System.dealloc(pointer.sub(offset), allocation);
         }
@@ -301,18 +340,32 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
                 // The node pointer is never dereferenced after physical free.
                 let accountant = unsafe { &*(observer as *const MemoryAccountant) };
                 let registration = accountant.writer_registration_observation_for_test();
-                PAYLOAD_FREE_CENSUS.with(|slot| slot.set((registration.2, registration.3,
-                    accountant.writer_fixed_ownership().2, accountant.usage().used)));
+                PAYLOAD_FREE_CENSUS.with(|slot| {
+                    slot.set((
+                        registration.2,
+                        registration.3,
+                        accountant.writer_fixed_ownership().2,
+                        accountant.usage().used,
+                    ))
+                });
             }
         }
         if watching_node {
-            WATCH_NODE_PROCESS_FREE.with(|slot| slot.set((process_before_free, crate::memory_accounting::process_aggregate_bytes_for_test())));
+            WATCH_NODE_PROCESS_FREE.with(|slot| {
+                slot.set((
+                    process_before_free,
+                    crate::memory_accounting::process_aggregate_bytes_for_test(),
+                ))
+            });
             let payload_done = WATCH_PAYLOAD_FREE.with(std::cell::Cell::get);
             if payload_done.0 != 0 {
-                WATCH_PAYLOAD_FREE.with(|slot| slot.set((payload_done.0, payload_done.1, payload_done.1)));
+                WATCH_PAYLOAD_FREE
+                    .with(|slot| slot.set((payload_done.0, payload_done.1, payload_done.1)));
             }
-            let used_after_free = unsafe { &*(watch.1 as *const AtomicUsize) }.load(AtomicOrdering::SeqCst);
-            WATCH_NODE_FREE.with(|slot| slot.set((watch.0, watch.1, used_before_free, used_after_free, true)));
+            let used_after_free =
+                unsafe { &*(watch.1 as *const AtomicUsize) }.load(AtomicOrdering::SeqCst);
+            WATCH_NODE_FREE
+                .with(|slot| slot.set((watch.0, watch.1, used_before_free, used_after_free, true)));
         }
     }
 }
@@ -1154,94 +1207,168 @@ pub(crate) fn assert_saved_export_identities(expected: usize) {
 fn writer_adapter_arc_request_matches_pinned_layout() {
     crate::memory_accounting::native_allocation_lifetime_rows_for_test();
     let accountant = Arc::new(MemoryAccountant::no_limit());
-    let native_process_before = crate::memory_accounting::resident_insertion_runtime_snapshot().map_or(0, |runtime| runtime.1);
+    let native_process_before = crate::memory_accounting::resident_insertion_runtime_snapshot()
+        .map_or(0, |runtime| runtime.1);
     let constructor_process_baseline = crate::memory_accounting::process_aggregate_bytes_for_test();
     LAST_REQUEST.with(|last| last.set((0, 0, 0)));
-    let (root, _, _) = measured(|| crate::memory_accounting::WriterBudget::from_accountant(accountant.clone()).unwrap());
+    let (root, _, _) = measured(|| {
+        crate::memory_accounting::WriterBudget::from_accountant(accountant.clone()).unwrap()
+    });
     let root_request = LAST_REQUEST.with(std::cell::Cell::get);
     let root_pointer = LAST_REQUEST_POINTER.with(std::cell::Cell::get);
-    assert!(root_request.2 >= 2, "the constructor observes registration and startup Arc requests");
+    assert!(
+        root_request.2 >= 2,
+        "the constructor observes registration and startup Arc requests"
+    );
     let constructor_process_after = crate::memory_accounting::process_aggregate_bytes_for_test();
-    let expected = crate::memory_accounting::AccountantHandle::from_host(accountant.clone()).writer_vector_adapter_layout_for_test();
-    let (node, node_bytes, epoch, users, used_counter) = accountant.writer_registration_observation_for_test();
+    let expected = crate::memory_accounting::AccountantHandle::from_host(accountant.clone())
+        .writer_vector_adapter_layout_for_test();
+    let (node, node_bytes, epoch, users, used_counter) =
+        accountant.writer_registration_observation_for_test();
     assert_ne!(epoch, 0);
-    assert_eq!(users, 2, "construction root and its one adapter are counted");
-    assert_eq!((root_request.0, root_request.1), (expected.size(), expected.align()),
-        "the actual final startup request is its typed adapter backing");
-    assert_eq!(constructor_process_after,
+    assert_eq!(
+        users, 2,
+        "construction root and its one adapter are counted"
+    );
+    assert_eq!(
+        (root_request.0, root_request.1),
+        (expected.size(), expected.align()),
+        "the actual final startup request is its typed adapter backing"
+    );
+    assert_eq!(
+        constructor_process_after,
         constructor_process_baseline + node_bytes + root_request.0,
-        "startup registration and the actual root adapter invoice join the aggregate");
-    assert_eq!(accountant.writer_fixed_ownership().2, 0,
-        "the startup adapter is independently process-funded");
+        "startup registration and the actual root adapter invoice join the aggregate"
+    );
+    assert_eq!(
+        accountant.writer_fixed_ownership().2,
+        0,
+        "the startup adapter is independently process-funded"
+    );
     // Nested mapped rows may install their own retained native runtime; capture
     // their completed process baseline separately from this root's liabilities.
     let process_before_extra_adapter = crate::memory_accounting::process_aggregate_bytes_for_test();
     let process_final_baseline = process_before_extra_adapter - node_bytes - root_request.0;
-    let native_process_after = crate::memory_accounting::resident_insertion_runtime_snapshot().map_or(0, |runtime| runtime.1);
-    assert_eq!(process_final_baseline,
+    let native_process_after = crate::memory_accounting::resident_insertion_runtime_snapshot()
+        .map_or(0, |runtime| runtime.1);
+    assert_eq!(
+        process_final_baseline,
         constructor_process_baseline + native_process_after - native_process_before,
-        "the nested mapped rows retain only their separately invoiced process runtime");
+        "the nested mapped rows retain only their separately invoiced process runtime"
+    );
     WATCH_NODE_FREE.with(|slot| slot.set((node, used_counter, 0, 0, false)));
     LAST_REQUEST.with(|last| last.set((0, 0, 0)));
-    let (adapter, _, _) = measured(|| crate::memory_accounting::AccountantHandle::from_host(accountant.clone()).vector_budget().unwrap());
+    let (adapter, _, _) = measured(|| {
+        crate::memory_accounting::AccountantHandle::from_host(accountant.clone())
+            .vector_budget()
+            .unwrap()
+    });
     let (size, align, count) = LAST_REQUEST.with(std::cell::Cell::get);
-    assert!(count >= 1, "existing oracle observed actual allocator requests");
+    assert!(
+        count >= 1,
+        "existing oracle observed actual allocator requests"
+    );
     // Test-seam admission formats its ledger name before construction. The
     // factory's final allocating operation is Arc::new(adapter); record its
     // unfiltered actual request, not a request selected by expected Layout.
     assert_eq!((size, align), (expected.size(), expected.align()));
     assert_eq!(accountant.writer_fixed_ownership().2, expected.size());
-    assert_eq!(crate::memory_accounting::process_aggregate_bytes_for_test(),
-        process_before_extra_adapter + size);
+    assert_eq!(
+        crate::memory_accounting::process_aggregate_bytes_for_test(),
+        process_before_extra_adapter + size
+    );
     watch_registry_free_for_test(root_pointer, used_counter);
     drop(root);
     let root_free = registry_free_observation_for_test(true);
-    assert_eq!(root_free, (node_bytes + size, node_bytes + size, true),
-        "the original writer remains funded through the actual process-funded startup Arc free");
+    assert_eq!(
+        root_free,
+        (node_bytes + size, node_bytes + size, true),
+        "the original writer remains funded through the actual process-funded startup Arc free"
+    );
     // This fixed ordinary std Arc uses its recorded immediate-before-free
     // correction refund; native accountant/limit/counter rows require free first.
     let process_after_root = process_before_extra_adapter + size - root_request.0;
-    assert_eq!(registry_process_free_observation_for_test(), (process_after_root, process_after_root));
+    assert_eq!(
+        registry_process_free_observation_for_test(),
+        (process_after_root, process_after_root)
+    );
     WATCH_NODE_FREE.with(|slot| slot.set((node, used_counter, 0, 0, false)));
-    println!("ROOT_ADAPTER_CUSTODY_WITNESS actual_request={root_request:?} actual_pointer={root_pointer} actual_free={root_free:?} process_startup_delta={} nested_native_invoice={} original_writer_extra_single_layout=true", node_bytes + root_request.0, native_process_after - native_process_before);
-    assert_eq!(crate::memory_accounting::process_aggregate_bytes_for_test(),
-        process_before_extra_adapter + size - root_request.0);
-    assert_ne!(accountant.writer_fixed_ownership().0, 0, "escaped adapter keeps epoch live");
+    println!(
+        "ROOT_ADAPTER_CUSTODY_WITNESS actual_request={root_request:?} actual_pointer={root_pointer} actual_free={root_free:?} process_startup_delta={} nested_native_invoice={} original_writer_extra_single_layout=true",
+        node_bytes + root_request.0,
+        native_process_after - native_process_before
+    );
+    assert_eq!(
+        crate::memory_accounting::process_aggregate_bytes_for_test(),
+        process_before_extra_adapter + size - root_request.0
+    );
+    assert_ne!(
+        accountant.writer_fixed_ownership().0,
+        0,
+        "escaped adapter keeps epoch live"
+    );
     drop(adapter);
     assert_eq!(accountant.writer_fixed_ownership(), (0, 0, 0));
     assert_eq!(accountant.usage().used, 0);
-    assert_eq!(crate::memory_accounting::process_aggregate_bytes_for_test(), process_final_baseline);
+    assert_eq!(
+        crate::memory_accounting::process_aggregate_bytes_for_test(),
+        process_final_baseline
+    );
     let (_, _, before_free, after_free, freed) = WATCH_NODE_FREE.with(std::cell::Cell::get);
     WATCH_NODE_FREE.with(|slot| slot.set((0, 0, 0, 0, false)));
-    assert!(freed, "existing oracle saw the actual registration Box deallocation");
+    assert!(
+        freed,
+        "existing oracle saw the actual registration Box deallocation"
+    );
     assert_eq!(before_free, node_bytes + expected.size());
-    assert_eq!(after_free, node_bytes + expected.size(), "node and adapter remain charged until node physical free returns");
-    let reopened = crate::memory_accounting::WriterBudget::from_accountant(accountant.clone()).unwrap();
-    assert_ne!(accountant.writer_registration_observation_for_test().2, epoch);
+    assert_eq!(
+        after_free,
+        node_bytes + expected.size(),
+        "node and adapter remain charged until node physical free returns"
+    );
+    let reopened =
+        crate::memory_accounting::WriterBudget::from_accountant(accountant.clone()).unwrap();
+    assert_ne!(
+        accountant.writer_registration_observation_for_test().2,
+        epoch
+    );
     drop(reopened);
     assert_eq!(accountant.usage().used, 0);
     // Registration/control custody rows share this allocator witness. The
     // unchanged canonical tests cannot observe the zero-byte escape lifetime.
-    let reader_adapter = crate::memory_accounting::AccountantHandle::from_host(accountant.clone()).vector_budget().unwrap();
+    let reader_adapter = crate::memory_accounting::AccountantHandle::from_host(accountant.clone())
+        .vector_budget()
+        .unwrap();
     assert_eq!(accountant.writer_registration_observation_for_test().2, 0);
     drop(reader_adapter);
     accountant.try_allocate(37).unwrap();
-    let first = crate::memory_accounting::WriterBudget::from_accountant(accountant.clone()).unwrap();
-    let second = crate::memory_accounting::WriterBudget::from_accountant(accountant.clone()).unwrap();
+    let first =
+        crate::memory_accounting::WriterBudget::from_accountant(accountant.clone()).unwrap();
+    let second =
+        crate::memory_accounting::WriterBudget::from_accountant(accountant.clone()).unwrap();
     assert_eq!(accountant.writer_fixed_ownership().0, node_bytes);
-    let mut escape = crate::memory_accounting::OwnedMemoryReservation::new(accountant.clone().into());
+    let mut escape =
+        crate::memory_accounting::OwnedMemoryReservation::new(accountant.clone().into());
     drop(first);
     drop(second);
     assert_ne!(accountant.writer_registration_observation_for_test().2, 0);
     assert_eq!(accountant.usage().used, 37 + node_bytes);
-    escape.try_grow_for(19, "writer", "retained_reservation", "test").unwrap();
+    escape
+        .try_grow_for(19, "writer", "retained_reservation", "test")
+        .unwrap();
     drop(escape);
     assert_eq!(accountant.writer_registration_observation_for_test().2, 0);
     assert_eq!(accountant.usage().used, 37);
     accountant.release(37);
     assert_eq!(accountant.underflow_count_for_test(), 0);
-    println!("WRITER_REGISTRATION_FREE_WITNESS node_bytes={node_bytes} used_before_free={before_free} used_after_free={after_free} registration_refund_after_deallocation=true fresh_epoch=true");
-    println!("WRITER_ADAPTER_LAYOUT_WITNESS request_size={size} request_align={align} request_count={count} helper_size={} helper_align={} final_used=0", expected.size(), expected.align());
+    println!(
+        "WRITER_REGISTRATION_FREE_WITNESS node_bytes={node_bytes} used_before_free={before_free} used_after_free={after_free} registration_refund_after_deallocation=true fresh_epoch=true"
+    );
+    println!(
+        "WRITER_ADAPTER_LAYOUT_WITNESS request_size={size} request_align={align} request_count={count} helper_size={} helper_align={} final_used=0",
+        expected.size(),
+        expected.align()
+    );
 }
 
 // Addenda 5-7 mapped rows are reached through the authorized layout seam.
@@ -1251,14 +1378,25 @@ pub(crate) fn r1_mapped_control_rows() {
     r1_node_custody_rows();
     crate::database::r1_database_cleanup_rows_for_test();
     crate::persistence::writer_source::r1_schema_control_rows_for_test();
-    use crate::memory_accounting::{OwnedMemoryReservation, StoreAccountantHandle,
-        TransferredRowReservation, WriterBudget, writer_adapter_type_layout};
+    use crate::memory_accounting::{
+        OwnedMemoryReservation, StoreAccountantHandle, TransferredRowReservation, WriterBudget,
+        writer_adapter_type_layout,
+    };
     fn send_sync<T: Send + Sync>() {}
     send_sync::<StoreAccountantHandle>();
     send_sync::<Arc<MemoryAccountant>>();
-    assert_eq!(std::mem::size_of::<StoreAccountantHandle>(), std::mem::size_of::<Arc<MemoryAccountant>>());
-    assert_eq!(std::mem::align_of::<StoreAccountantHandle>(), std::mem::align_of::<Arc<MemoryAccountant>>());
-    assert_eq!(std::mem::size_of::<Option<StoreAccountantHandle>>(), std::mem::size_of::<Option<Arc<MemoryAccountant>>>());
+    assert_eq!(
+        std::mem::size_of::<StoreAccountantHandle>(),
+        std::mem::size_of::<Arc<MemoryAccountant>>()
+    );
+    assert_eq!(
+        std::mem::align_of::<StoreAccountantHandle>(),
+        std::mem::align_of::<Arc<MemoryAccountant>>()
+    );
+    assert_eq!(
+        std::mem::size_of::<Option<StoreAccountantHandle>>(),
+        std::mem::size_of::<Option<Arc<MemoryAccountant>>>()
+    );
     let owner = Arc::new(MemoryAccountant::no_limit());
     owner.try_allocate(17).unwrap();
     let untagged = StoreAccountantHandle::new(owner.clone().into());
@@ -1266,11 +1404,18 @@ pub(crate) fn r1_mapped_control_rows() {
     let epoch = owner.writer_registration_observation_for_test().2;
     let users = owner.writer_registration_observation_for_test().3;
     let plain_clone = untagged.clone();
-    assert_eq!(owner.writer_registration_observation_for_test().3, users, "reader handle clone cannot acquire a later writer epoch");
+    assert_eq!(
+        owner.writer_registration_observation_for_test().3,
+        users,
+        "reader handle clone cannot acquire a later writer epoch"
+    );
     drop(plain_clone);
     let tagged = StoreAccountantHandle::new(owner.clone().into());
     let tagged_clone = tagged.clone();
-    assert_eq!(owner.writer_registration_observation_for_test().3, users + 2);
+    assert_eq!(
+        owner.writer_registration_observation_for_test().3,
+        users + 2
+    );
     assert_eq!(tagged.as_handle().as_ptr(), Arc::as_ptr(&owner));
     drop(root);
     assert_eq!(owner.writer_registration_observation_for_test().3, 2);
@@ -1286,20 +1431,31 @@ pub(crate) fn r1_mapped_control_rows() {
     assert_eq!(owner.usage().used, 17);
     owner.release(17);
     assert_eq!(owner.usage().used, 0);
-    println!("CDB127_R1_ROW tagged_handle pointer_niche=true reader_clone_stays_reader=true original_funder=true fresh_epoch=true host_baseline=17");
+    println!(
+        "CDB127_R1_ROW tagged_handle pointer_niche=true reader_clone_stays_reader=true original_funder=true fresh_epoch=true host_baseline=17"
+    );
 
     let owner = Arc::new(MemoryAccountant::no_limit());
     let root = WriterBudget::from_accountant(owner.clone()).unwrap();
     let baseline = owner.usage().used;
     let baseline_controls = owner.writer_fixed_ownership().2;
-    let reservation = OwnedMemoryReservation::try_new_for(owner.clone().into(), 31,
-        "proof", "r1_mapped_reservation", "proof").unwrap();
+    let reservation = OwnedMemoryReservation::try_new_for(
+        owner.clone().into(),
+        31,
+        "proof",
+        "r1_mapped_reservation",
+        "proof",
+    )
+    .unwrap();
     LAST_REQUEST.with(|slot| slot.set((0, 0, 0)));
     let (allocation, _, _) = measured(|| reservation.into_admitted_arc().unwrap());
     let request = LAST_REQUEST.with(std::cell::Cell::get);
     let expected = writer_adapter_type_layout::<OwnedMemoryReservation>();
     assert_eq!(request, (expected.size(), expected.align(), 1));
-    assert_eq!(owner.writer_fixed_ownership().2, baseline_controls + expected.size());
+    assert_eq!(
+        owner.writer_fixed_ownership().2,
+        baseline_controls + expected.size()
+    );
     assert_eq!(owner.usage().used, baseline + 31 + expected.size());
     let cloned = allocation.clone();
     drop(allocation);
@@ -1307,7 +1463,10 @@ pub(crate) fn r1_mapped_control_rows() {
     drop(cloned);
     assert_eq!(owner.usage().used, baseline);
     assert_eq!(owner.writer_fixed_ownership().2, baseline_controls);
-    println!("CDB127_R1_ROW reservation_arc actual_size={} actual_align={} one_request=true payload=31 clone_single_debit=true final_baseline=true", request.0, request.1);
+    println!(
+        "CDB127_R1_ROW reservation_arc actual_size={} actual_align={} one_request=true payload=31 clone_single_debit=true final_baseline=true",
+        request.0, request.1
+    );
 
     let reservation = OwnedMemoryReservation::new(owner.clone().into());
     LAST_REQUEST.with(|slot| slot.set((0, 0, 0)));
@@ -1317,17 +1476,29 @@ pub(crate) fn r1_mapped_control_rows() {
     assert_eq!(request, (expected.size(), expected.align(), 1));
     assert_eq!(owner.usage().used, baseline + expected.size());
     drop(root);
-    assert_ne!(owner.writer_registration_observation_for_test().2, 0, "zero payload control retains its epoch");
+    assert_ne!(
+        owner.writer_registration_observation_for_test().2,
+        0,
+        "zero payload control retains its epoch"
+    );
     drop(allocation);
     assert_eq!(owner.usage().used, 0);
-    println!("CDB127_R1_ROW reservation_mutex_arc actual_size={} actual_align={} zero_payload_keeps_epoch=true final_zero=true", request.0, request.1);
+    println!(
+        "CDB127_R1_ROW reservation_mutex_arc actual_size={} actual_align={} zero_payload_keeps_epoch=true final_zero=true",
+        request.0, request.1
+    );
 
     let root = WriterBudget::from_accountant(owner.clone()).unwrap();
     let baseline = owner.usage().used;
     owner.try_allocate(23).unwrap();
-    let control = TransferredRowReservation::prepare_control(&crate::memory_accounting::AccountantHandle::from_host(owner.clone())).unwrap();
+    let control = TransferredRowReservation::prepare_control(
+        &crate::memory_accounting::AccountantHandle::from_host(owner.clone()),
+    )
+    .unwrap();
     LAST_REQUEST.with(|slot| slot.set((0, 0, 0)));
-    let (allocation, _, _) = measured(|| TransferredRowReservation::from_admitted_with_control(owner.clone().into(), 23, control));
+    let (allocation, _, _) = measured(|| {
+        TransferredRowReservation::from_admitted_with_control(owner.clone().into(), 23, control)
+    });
     let request = LAST_REQUEST.with(std::cell::Cell::get);
     let expected = writer_adapter_type_layout::<TransferredRowReservation>();
     assert_eq!(request, (expected.size(), expected.align(), 1));
@@ -1339,100 +1510,175 @@ pub(crate) fn r1_mapped_control_rows() {
     assert_eq!(owner.usage().used, baseline);
     drop(root);
     assert_eq!(owner.usage().used, 0);
-    println!("CDB127_R1_ROW transferred_reservation actual_size={} actual_align={} original_credit=23 clone_single_debit=true final_zero=true", request.0, request.1);
+    println!(
+        "CDB127_R1_ROW transferred_reservation actual_size={} actual_align={} original_credit=23 clone_single_debit=true final_zero=true",
+        request.0, request.1
+    );
     let reader = Arc::new(MemoryAccountant::no_limit());
-    let reader_control = OwnedMemoryReservation::new(reader.clone().into()).into_admitted_arc().unwrap();
+    let reader_control = OwnedMemoryReservation::new(reader.clone().into())
+        .into_admitted_arc()
+        .unwrap();
     assert_eq!(reader.writer_registration_observation_for_test().2, 0);
     let reader_bytes = reader.usage().used;
     let later_writer = WriterBudget::from_accountant(reader.clone()).unwrap();
     let later_controls = reader.writer_fixed_ownership().2;
     let later_used = reader.usage().used;
     drop(reader_control);
-    assert_eq!(reader.writer_fixed_ownership().2, later_controls, "an original reader control never subtracts a later writer epoch's receipt");
+    assert_eq!(
+        reader.writer_fixed_ownership().2,
+        later_controls,
+        "an original reader control never subtracts a later writer epoch's receipt"
+    );
     assert_eq!(reader.usage().used, later_used - reader_bytes);
     drop(later_writer);
     assert_eq!(reader.usage().used, 0);
     assert_eq!(reader.underflow_count_for_test(), 0);
-    println!("CDB127_R1_ROW control_admission_epoch original_reader_stays_reader=true later_writer_receipt_unchanged=true original_funder_final_zero=true");
-
+    println!(
+        "CDB127_R1_ROW control_admission_epoch original_reader_stays_reader=true later_writer_receipt_unchanged=true original_funder_final_zero=true"
+    );
 }
 
 // Mapped custody/debit rows reuse this allocator and the original node layout.
 fn r1_node_custody_rows() {
-    use crate::memory_accounting::{StoreAccountantHandle, WriterBudget, writer_adapter_type_layout};
-    println!("CDB127_R1_LAYOUT AdmittedBytes size={} align={} accountant={} bytes={}",
-        std::mem::size_of::<AdmittedBytes>(), std::mem::align_of::<AdmittedBytes>(),
-        std::mem::offset_of!(AdmittedBytes, accountant), std::mem::offset_of!(AdmittedBytes, bytes));
-    println!("CDB127_R1_LAYOUT OptionAdmittedBytes size={} align={}",
-        std::mem::size_of::<Option<AdmittedBytes>>(), std::mem::align_of::<Option<AdmittedBytes>>());
-    println!("CDB127_R1_LAYOUT FloorCharge size={} align={} floor={} bytes={}",
-        std::mem::size_of::<FloorCharge>(), std::mem::align_of::<FloorCharge>(),
-        std::mem::offset_of!(FloorCharge, floor), std::mem::offset_of!(FloorCharge, bytes));
-    println!("CDB127_R1_LAYOUT OptionFloorCharge size={} align={}",
-        std::mem::size_of::<Option<FloorCharge>>(), std::mem::align_of::<Option<FloorCharge>>());
-    println!("CDB127_R1_LAYOUT VerifiedReadNode size={} align={} node={} bytes={} charge={} floor={} allowance={}",
-        std::mem::size_of::<VerifiedReadNode>(), std::mem::align_of::<VerifiedReadNode>(),
-        std::mem::offset_of!(VerifiedReadNode, node), std::mem::offset_of!(VerifiedReadNode, bytes),
-        std::mem::offset_of!(VerifiedReadNode, _charge), std::mem::offset_of!(VerifiedReadNode, _floor),
-        VERIFIED_READ_NODE_HANDLE_BYTES);
+    use crate::memory_accounting::{
+        StoreAccountantHandle, WriterBudget, writer_adapter_type_layout,
+    };
+    println!(
+        "CDB127_R1_LAYOUT AdmittedBytes size={} align={} accountant={} bytes={}",
+        std::mem::size_of::<AdmittedBytes>(),
+        std::mem::align_of::<AdmittedBytes>(),
+        std::mem::offset_of!(AdmittedBytes, accountant),
+        std::mem::offset_of!(AdmittedBytes, bytes)
+    );
+    println!(
+        "CDB127_R1_LAYOUT OptionAdmittedBytes size={} align={}",
+        std::mem::size_of::<Option<AdmittedBytes>>(),
+        std::mem::align_of::<Option<AdmittedBytes>>()
+    );
+    println!(
+        "CDB127_R1_LAYOUT FloorCharge size={} align={} floor={} bytes={}",
+        std::mem::size_of::<FloorCharge>(),
+        std::mem::align_of::<FloorCharge>(),
+        std::mem::offset_of!(FloorCharge, floor),
+        std::mem::offset_of!(FloorCharge, bytes)
+    );
+    println!(
+        "CDB127_R1_LAYOUT OptionFloorCharge size={} align={}",
+        std::mem::size_of::<Option<FloorCharge>>(),
+        std::mem::align_of::<Option<FloorCharge>>()
+    );
+    println!(
+        "CDB127_R1_LAYOUT VerifiedReadNode size={} align={} node={} bytes={} charge={} floor={} allowance={}",
+        std::mem::size_of::<VerifiedReadNode>(),
+        std::mem::align_of::<VerifiedReadNode>(),
+        std::mem::offset_of!(VerifiedReadNode, node),
+        std::mem::offset_of!(VerifiedReadNode, bytes),
+        std::mem::offset_of!(VerifiedReadNode, _charge),
+        std::mem::offset_of!(VerifiedReadNode, _floor),
+        VERIFIED_READ_NODE_HANDLE_BYTES
+    );
     let owner = Arc::new(MemoryAccountant::no_limit());
     let root = WriterBudget::from_accountant(owner.clone()).unwrap();
     let registration = owner.writer_registration_observation_for_test();
     let baseline = owner.usage().used;
     let floor = Arc::new(AtomicUsize::new(64));
-    let payload = Arc::new(Node { level: 0, entries: vec![PageEntry { key: vec![9], value_hash: [0; 32] }], subtree_hash: [0; 32] });
+    let payload = Arc::new(Node {
+        level: 0,
+        entries: vec![PageEntry {
+            key: vec![9],
+            value_hash: [0; 32],
+        }],
+        subtree_hash: [0; 32],
+    });
     let payload_allocation = (Arc::as_ptr(&payload) as usize) - 2 * std::mem::size_of::<usize>();
     WATCH_PAYLOAD_FREE.with(|slot| slot.set((payload_allocation, false, false)));
     WATCH_NODE_FREE.with(|slot| slot.set((registration.0, registration.4, 0, 0, false)));
-    let source = StoreAccountantHandle::retain_if_writer(&crate::memory_accounting::AccountantHandle::from_host(owner.clone())).unwrap();
+    let source = StoreAccountantHandle::retain_if_writer(
+        &crate::memory_accounting::AccountantHandle::from_host(owner.clone()),
+    )
+    .unwrap();
     LAST_REQUEST.with(|slot| slot.set((0, 0, 0)));
-    let (unaccounted, _, _) = measured(|| Arc::new(VerifiedReadNode {
-        node: payload.clone(), bytes: 64,
-        _charge: AdmittedBytes::with_source(Some(source), None), _floor: None,
-    }));
+    let (unaccounted, _, _) = measured(|| {
+        Arc::new(VerifiedReadNode {
+            node: payload.clone(),
+            bytes: 64,
+            _charge: AdmittedBytes::with_source(Some(source), None),
+            _floor: None,
+        })
+    });
     let request = LAST_REQUEST.with(std::cell::Cell::get);
     let expected = writer_adapter_type_layout::<VerifiedReadNode>();
     assert_eq!(request, (expected.size(), expected.align(), 1));
     assert_eq!(owner.usage().used, baseline, "zero debit is custody only");
     let retained = Arc::new(VerifiedReadNode {
-        node: payload.clone(), bytes: 64,
-        _charge: AdmittedBytes::with_source(unaccounted._charge.as_ref().and_then(AdmittedBytes::source_custody), None),
-        _floor: Some(FloorCharge { floor: floor.clone(), bytes: 64 }),
+        node: payload.clone(),
+        bytes: 64,
+        _charge: AdmittedBytes::with_source(
+            unaccounted
+                ._charge
+                .as_ref()
+                .and_then(AdmittedBytes::source_custody),
+            None,
+        ),
+        _floor: Some(FloorCharge {
+            floor: floor.clone(),
+            bytes: 64,
+        }),
     });
     drop(unaccounted);
     drop(payload);
     drop(root);
-    assert_ne!(owner.writer_registration_observation_for_test().2, 0, "floor borrower retains source after source/cache owners leave");
+    assert_ne!(
+        owner.writer_registration_observation_for_test().2,
+        0,
+        "floor borrower retains source after source/cache owners leave"
+    );
     assert_eq!(floor.load(AtomicOrdering::SeqCst), 64);
     drop(retained);
     assert_eq!(floor.load(AtomicOrdering::SeqCst), 0);
     assert_eq!(owner.usage().used, 0);
     let payload_watch = WATCH_PAYLOAD_FREE.with(std::cell::Cell::get);
-    assert!(payload_watch.1 && payload_watch.2, "actual payload Arc free precedes final source-use registration free");
+    assert!(
+        payload_watch.1 && payload_watch.2,
+        "actual payload Arc free precedes final source-use registration free"
+    );
     assert!(WATCH_NODE_FREE.with(std::cell::Cell::get).4);
     WATCH_NODE_FREE.with(|slot| slot.set((0, 0, 0, 0, false)));
     WATCH_PAYLOAD_FREE.with(|slot| slot.set((0, false, false)));
-    println!("CDB127_R1_ROW node_custody actual_size={} actual_align={} one_request=true zero_debit=true floor_borrower=true payload_free_before_source_use=true final_original_funder_zero=true", request.0, request.1);
+    println!(
+        "CDB127_R1_ROW node_custody actual_size={} actual_align={} one_request=true zero_debit=true floor_borrower=true payload_free_before_source_use=true final_original_funder_zero=true",
+        request.0, request.1
+    );
 
     let root = WriterBudget::from_accountant(owner.clone()).unwrap();
     let baseline = owner.usage().used;
     let mut admission = ProofAdmission::new(Some(owner.clone().into()));
     admission.admit(64).unwrap();
-    let source = StoreAccountantHandle::retain_if_writer(&crate::memory_accounting::AccountantHandle::from_host(owner.clone()));
+    let source = StoreAccountantHandle::retain_if_writer(
+        &crate::memory_accounting::AccountantHandle::from_host(owner.clone()),
+    );
     let charge = AdmittedBytes::with_source(source, Some(admission.detach(64))).unwrap();
-    assert_eq!(owner.usage().used, baseline + 64, "coalescing cannot refund the positive debit early");
+    assert_eq!(
+        owner.usage().used,
+        baseline + 64,
+        "coalescing cannot refund the positive debit early"
+    );
     assert_eq!(charge.bytes, 64);
     drop(root);
     assert_ne!(owner.writer_registration_observation_for_test().2, 0);
     drop(charge);
     assert_eq!(owner.usage().used, 0);
     assert_eq!(owner.underflow_count_for_test(), 0);
-    println!("CDB127_R1_ROW node_positive_debit source_payer_identity=true original_debit=64 early_refund=false final_zero=true underflow=0");
+    println!(
+        "CDB127_R1_ROW node_positive_debit source_payer_identity=true original_debit=64 early_refund=false final_zero=true underflow=0"
+    );
 }
 
 pub(crate) fn last_request_for_test(reset: bool) -> (usize, usize, usize) {
     let request = LAST_REQUEST.with(std::cell::Cell::get);
-    if reset { LAST_REQUEST.with(|slot| slot.set((0, 0, 0))); }
+    if reset {
+        LAST_REQUEST.with(|slot| slot.set((0, 0, 0)));
+    }
     request
 }
 
@@ -1447,7 +1693,9 @@ pub(crate) fn watch_registry_free_for_test(pointer: usize, counter: usize) {
 }
 pub(crate) fn registry_free_observation_for_test(clear: bool) -> (usize, usize, bool) {
     let observed = WATCH_NODE_FREE.with(std::cell::Cell::get);
-    if clear { WATCH_NODE_FREE.with(|slot| slot.set((0, 0, 0, 0, false))); }
+    if clear {
+        WATCH_NODE_FREE.with(|slot| slot.set((0, 0, 0, 0, false)));
+    }
     (observed.2, observed.3, observed.4)
 }
 
@@ -1460,7 +1708,11 @@ pub(crate) fn watch_candidate_payload_for_test(pointer: usize, accountant: &Arc<
     let registration = accountant.writer_registration_observation_for_test();
     WATCH_NODE_FREE.with(|slot| slot.set((registration.0, registration.4, 0, 0, false)));
 }
-pub(crate) fn candidate_payload_free_observation_for_test() -> ((usize, usize, usize, usize), (bool, bool), (usize, usize, bool)) {
+pub(crate) fn candidate_payload_free_observation_for_test() -> (
+    (usize, usize, usize, usize),
+    (bool, bool),
+    (usize, usize, bool),
+) {
     let census = PAYLOAD_FREE_CENSUS.with(std::cell::Cell::get);
     let payload = WATCH_PAYLOAD_FREE.with(std::cell::Cell::get);
     let node = WATCH_NODE_FREE.with(std::cell::Cell::get);
@@ -1800,7 +2052,10 @@ pub(crate) fn disarm_source_free_watch() {
 
 pub(crate) fn arm_inverse_window() {
     NATIVE_REQUEST_COUNT.with(|count| count.set(0));
-    NATIVE_REQUEST_ACTIVE.with(|active| { assert!(!active.get()); active.set(true); });
+    NATIVE_REQUEST_ACTIVE.with(|active| {
+        assert!(!active.get());
+        active.set(true);
+    });
 }
 pub(crate) fn disarm_inverse_window() -> usize {
     NATIVE_REQUEST_ACTIVE.with(|active| active.set(false));

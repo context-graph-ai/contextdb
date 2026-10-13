@@ -127,7 +127,12 @@ pub(crate) struct TransactionTracker {
 
 impl TransactionTracker {
     pub(crate) fn new(next_transaction_id: TransactionId) -> Self {
-        Self::new_with_external_snapshots(next_transaction_id, None, (usize::MAX, usize::MAX), false)
+        Self::new_with_external_snapshots(
+            next_transaction_id,
+            None,
+            (usize::MAX, usize::MAX),
+            false,
+        )
     }
 
     pub(crate) fn new_with_external_snapshots(

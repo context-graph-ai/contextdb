@@ -266,7 +266,10 @@ fn reopen_and_selected_queries_keep_raw_vector_residency_partition_local() {
     );
 
     search(&db, alpha, 0, "EXACT");
-    assert!(!raw_resident(&db, alpha), "EXACT streams the selected bodies");
+    assert!(
+        !raw_resident(&db, alpha),
+        "EXACT streams the selected bodies"
+    );
     assert!(!raw_resident(&db, bravo));
     assert_eq!(
         db.vector_store_for_test()

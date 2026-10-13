@@ -246,8 +246,9 @@ fn nested_refusals_recover_only_the_current_scope_and_restore_after_unwind() {
             redb::TableError::Storage(redb::StorageError::AdmissionRefused(_))
         ));
         let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _: Result<()> =
-                with_source_page_admission(Arc::new(MemoryAccountant::with_budget(7)).into(), || {
+            let _: Result<()> = with_source_page_admission(
+                Arc::new(MemoryAccountant::with_budget(7)).into(),
+                || {
                     let inner = read.open_table(GENERATIONS).err().unwrap();
                     assert!(matches!(
                         &inner,
@@ -262,7 +263,8 @@ fn nested_refusals_recover_only_the_current_scope_and_restore_after_unwind() {
                         }
                     ));
                     panic!("exercise scope restoration");
-                });
+                },
+            );
         }));
         assert!(unwind.is_err());
         let independent = crate::persistence::RedbPersistence::storage_error(
@@ -559,15 +561,18 @@ fn foreground_projection_query_preserves_page_refusal_before_the_admission_scope
     ));
     let mut observed = None;
     let mut available_at_refusal = None;
-    let outer =
-        persistence.visit_relational_table_with_admission("admission_driver", &crate::memory_accounting::AccountantHandle::from_host(pages.clone()), |_| {
+    let outer = persistence.visit_relational_table_with_admission(
+        "admission_driver",
+        &crate::memory_accounting::AccountantHandle::from_host(pages.clone()),
+        |_| {
             // Same public API and statement shape as selected_events_through
             // in cg foreground event-search projection. Assert its result
             // before r17's outer side-channel repair can substitute it.
             observed = Some(db.execute(QUERY, &params).unwrap_err());
             available_at_refusal = Some(PAGE_BUDGET - pages.usage().used);
             Ok(())
-        });
+        },
+    );
     let error = observed.expect("the admitted driver calls the foreground query");
     assert!(
         matches!(&error, Error::MemoryBudgetExceeded {

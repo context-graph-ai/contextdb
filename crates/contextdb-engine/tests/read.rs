@@ -10,11 +10,10 @@ pub(crate) fn child_test_filter(module_path: &str, fn_name: &str) -> String {
 #[cfg(unix)]
 #[path = "read/a_budget_refusal_is_never_reported_as_a_corrupt_store.rs"]
 mod a_budget_refusal_is_never_reported_as_a_corrupt_store;
-#[cfg(unix)]
-#[path = "read/json_decode_admission_contract.rs"]
-mod json_decode_admission_contract;
 #[path = "read/a_damaged_edge_tombstone_keeps_its_typed_diagnosis.rs"]
 mod a_damaged_edge_tombstone_keeps_its_typed_diagnosis;
+#[path = "read/a_live_read_charge_is_the_reads_own.rs"]
+mod a_live_read_charge_is_the_reads_own;
 #[path = "read/a_local_drop_leaves_the_remaining_history_readable.rs"]
 mod a_local_drop_leaves_the_remaining_history_readable;
 #[cfg(unix)]
@@ -67,6 +66,9 @@ mod existing_only_open_contract_tests;
 mod graceful_owner_drop_completes_accepted_read;
 #[path = "read/history_answer_is_complete_and_in_author_order.rs"]
 mod history_answer_is_complete_and_in_author_order;
+#[cfg(unix)]
+#[path = "read/json_decode_admission_contract.rs"]
+mod json_decode_admission_contract;
 #[cfg(unix)]
 #[path = "read/ledger_job_state_through_a_read_session_matches_the_writable_answer.rs"]
 mod ledger_job_state_through_a_read_session_matches_the_writable_answer;
@@ -136,8 +138,6 @@ mod saved_row_key_integrity;
 #[cfg(unix)]
 #[path = "read/session_charged_bytes.rs"]
 mod session_charged_bytes;
-#[path = "read/a_live_read_charge_is_the_reads_own.rs"]
-mod a_live_read_charge_is_the_reads_own;
 #[cfg(unix)]
 #[path = "read/vector_compaction_publication_contract.rs"]
 mod vector_compaction_publication_contract;

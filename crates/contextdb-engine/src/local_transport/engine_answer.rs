@@ -1183,11 +1183,18 @@ pub(crate) fn encode_read_error_into_slice(
 ) -> Result<usize, super::LocalTransportError> {
     use super::{LocalTransportError, PayloadViolation};
     use contextdb_core::Error as E;
-    struct Sink<'a> { bytes: &'a mut [u8], offset: usize }
+    struct Sink<'a> {
+        bytes: &'a mut [u8],
+        offset: usize,
+    }
     impl Sink<'_> {
         fn field<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), LocalTransportError> {
-            let written = bincode::serde::encode_into_slice(value, &mut self.bytes[self.offset..], bincode::config::standard())
-                .map_err(|_| LocalTransportError::Payload(PayloadViolation::Malformed))?;
+            let written = bincode::serde::encode_into_slice(
+                value,
+                &mut self.bytes[self.offset..],
+                bincode::config::standard(),
+            )
+            .map_err(|_| LocalTransportError::Payload(PayloadViolation::Malformed))?;
             self.offset += written;
             Ok(())
         }
@@ -1206,42 +1213,79 @@ pub(crate) fn encode_read_error_into_slice(
             if count.0 > self.bytes.len() - self.offset {
                 return Err(LocalTransportError::Payload(PayloadViolation::Malformed));
             }
-            struct Text<'a> { bytes: &'a mut [u8], offset: usize }
+            struct Text<'a> {
+                bytes: &'a mut [u8],
+                offset: usize,
+            }
             impl fmt::Write for Text<'_> {
                 fn write_str(&mut self, text: &str) -> fmt::Result {
                     let end = self.offset.checked_add(text.len()).ok_or(fmt::Error)?;
                     let destination = self.bytes.get_mut(self.offset..end).ok_or(fmt::Error)?;
-                    destination.copy_from_slice(text.as_bytes()); self.offset = end; Ok(())
+                    destination.copy_from_slice(text.as_bytes());
+                    self.offset = end;
+                    Ok(())
                 }
             }
-            let mut text = Text { bytes: &mut self.bytes[self.offset..self.offset + count.0], offset: 0 };
+            let mut text = Text {
+                bytes: &mut self.bytes[self.offset..self.offset + count.0],
+                offset: 0,
+            };
             fmt::write(&mut text, format_args!("{value}"))
                 .map_err(|_| LocalTransportError::Payload(PayloadViolation::Malformed))?;
-            if text.offset != count.0 { return Err(LocalTransportError::Payload(PayloadViolation::Malformed)); }
-            self.offset += count.0; Ok(())
+            if text.offset != count.0 {
+                return Err(LocalTransportError::Payload(PayloadViolation::Malformed));
+            }
+            self.offset += count.0;
+            Ok(())
         }
     }
     struct Class<'a>(&'a contextdb_core::Error);
     impl fmt::Display for Class<'_> {
         fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            struct Prefix<'a, 'b> { out: &'a mut fmt::Formatter<'b>, stopped: bool }
+            struct Prefix<'a, 'b> {
+                out: &'a mut fmt::Formatter<'b>,
+                stopped: bool,
+            }
             impl fmt::Write for Prefix<'_, '_> {
                 fn write_str(&mut self, text: &str) -> fmt::Result {
                     for ch in text.chars() {
-                        if self.stopped { break; }
-                        if ch.is_alphanumeric() || ch == '_' { self.out.write_str(ch.encode_utf8(&mut [0; 4]))?; }
-                        else { self.stopped = true; }
+                        if self.stopped {
+                            break;
+                        }
+                        if ch.is_alphanumeric() || ch == '_' {
+                            self.out.write_str(ch.encode_utf8(&mut [0; 4]))?;
+                        } else {
+                            self.stopped = true;
+                        }
                     }
                     Ok(())
                 }
             }
-            fmt::write(&mut Prefix { out: formatter, stopped: false }, format_args!("{:?}", self.0))
+            fmt::write(
+                &mut Prefix {
+                    out: formatter,
+                    stopped: false,
+                },
+                format_args!("{:?}", self.0),
+            )
         }
     }
     let length = output.len().min(BLOB_SOURCE_REFUSAL_MAX_BYTES);
-    let mut sink = Sink { bytes: &mut output[..length], offset: 0 };
-    macro_rules! body { ($tag:expr, $body:expr) => {{ sink.field(&$tag)?; sink.field(&$body)?; }}; }
-    macro_rules! index { ($tag:expr, $index:expr) => { body!($tag, (&$index.table, &$index.column)) }; }
+    let mut sink = Sink {
+        bytes: &mut output[..length],
+        offset: 0,
+    };
+    macro_rules! body {
+        ($tag:expr, $body:expr) => {{
+            sink.field(&$tag)?;
+            sink.field(&$body)?;
+        }};
+    }
+    macro_rules! index {
+        ($tag:expr, $index:expr) => {
+            body!($tag, (&$index.table, &$index.column))
+        };
+    }
     match error {
         E::ReadSessionNotImplemented => body!(TAG_READ_SESSION_NOT_IMPLEMENTED, ()),
         E::OwnerReadDrainTimeout => body!(TAG_OWNER_READ_DRAIN_TIMEOUT, ()),
@@ -1252,9 +1296,16 @@ pub(crate) fn encode_read_error_into_slice(
         E::SchemaInvalid { reason } => body!(TAG_SCHEMA_INVALID, reason),
         E::TableNotFound(table) => body!(TAG_TABLE_NOT_FOUND, table),
         E::ColumnNotFound { table, column } => body!(TAG_COLUMN_NOT_FOUND, (table, column)),
-        E::ColumnTypeMismatch { table, column, expected, actual } => {
-            sink.field(&TAG_COLUMN_TYPE_MISMATCH)?; sink.field(&(table, column))?;
-            sink.display(expected)?; sink.display(actual)?;
+        E::ColumnTypeMismatch {
+            table,
+            column,
+            expected,
+            actual,
+        } => {
+            sink.field(&TAG_COLUMN_TYPE_MISMATCH)?;
+            sink.field(&(table, column))?;
+            sink.display(expected)?;
+            sink.display(actual)?;
         }
         E::IndexNotFound { table, index } => body!(TAG_INDEX_NOT_FOUND, (table, index)),
         E::NotFound(message) => body!(TAG_NOT_FOUND, message),
@@ -1269,31 +1320,111 @@ pub(crate) fn encode_read_error_into_slice(
         E::BfsDepthExceeded(maximum) => body!(TAG_BFS_DEPTH_EXCEEDED, maximum),
         E::BfsVisitedExceeded(limit) => body!(TAG_BFS_VISITED_EXCEEDED, *limit as u64),
         E::UnknownVectorIndex { index: i } => index!(TAG_UNKNOWN_VECTOR_INDEX, i),
-        E::VectorIndexDimensionMismatch { index: i, expected, actual } => body!(TAG_VECTOR_INDEX_DIMENSION_MISMATCH, (&i.table, &i.column, *expected as u64, *actual as u64)),
-        E::PersistedRowVectorRowMissing { index: i, key } => body!(TAG_PERSISTED_ROW_VECTOR_ROW_MISSING, (&i.table, &i.column, key)),
-        E::PersistedRowVectorCellNull { index: i, key } => body!(TAG_PERSISTED_ROW_VECTOR_CELL_NULL, (&i.table, &i.column, key)),
+        E::VectorIndexDimensionMismatch {
+            index: i,
+            expected,
+            actual,
+        } => body!(
+            TAG_VECTOR_INDEX_DIMENSION_MISMATCH,
+            (&i.table, &i.column, *expected as u64, *actual as u64)
+        ),
+        E::PersistedRowVectorRowMissing { index: i, key } => body!(
+            TAG_PERSISTED_ROW_VECTOR_ROW_MISSING,
+            (&i.table, &i.column, key)
+        ),
+        E::PersistedRowVectorCellNull { index: i, key } => body!(
+            TAG_PERSISTED_ROW_VECTOR_CELL_NULL,
+            (&i.table, &i.column, key)
+        ),
         E::UseRankRequiresVectorOrder => body!(TAG_USE_RANK_REQUIRES_VECTOR_ORDER, ()),
         E::UseRankRequiresLimit => body!(TAG_USE_RANK_REQUIRES_LIMIT, ()),
         E::UseVectorRequiresVectorOrder => body!(TAG_USE_VECTOR_REQUIRES_VECTOR_ORDER, ()),
         E::InvalidVectorPartitionDeclaration { index: i, issue } => {
-            if let Some(issue) = vector_declaration_issue_code(*issue) { body!(TAG_INVALID_VECTOR_PARTITION_DECLARATION, (&i.table, &i.column, issue)); }
-            else { sink.field(&TAG_UNKNOWN)?; sink.display(Class(error))?; sink.display(error)?; }
+            if let Some(issue) = vector_declaration_issue_code(*issue) {
+                body!(
+                    TAG_INVALID_VECTOR_PARTITION_DECLARATION,
+                    (&i.table, &i.column, issue)
+                );
+            } else {
+                sink.field(&TAG_UNKNOWN)?;
+                sink.display(Class(error))?;
+                sink.display(error)?;
+            }
         }
-        E::VectorPartitionLimitExceeded { index: i, max_partitions } => body!(TAG_VECTOR_PARTITION_LIMIT_EXCEEDED, (&i.table, &i.column, max_partitions)),
-        E::VectorExactSearchBudgetExceeded { index: i, required_bytes, available_bytes } => body!(TAG_VECTOR_EXACT_SEARCH_BUDGET_EXCEEDED, (&i.table, &i.column, required_bytes, available_bytes)),
-        E::VectorIndexedRouteUnavailable { index: i } => index!(TAG_VECTOR_INDEXED_ROUTE_UNAVAILABLE, i),
-        E::VectorFilteredRouteUnavailable { index: i, predicate_columns } => body!(TAG_VECTOR_FILTERED_ROUTE_UNAVAILABLE, (&i.table, &i.column, predicate_columns)),
+        E::VectorPartitionLimitExceeded {
+            index: i,
+            max_partitions,
+        } => body!(
+            TAG_VECTOR_PARTITION_LIMIT_EXCEEDED,
+            (&i.table, &i.column, max_partitions)
+        ),
+        E::VectorExactSearchBudgetExceeded {
+            index: i,
+            required_bytes,
+            available_bytes,
+        } => body!(
+            TAG_VECTOR_EXACT_SEARCH_BUDGET_EXCEEDED,
+            (&i.table, &i.column, required_bytes, available_bytes)
+        ),
+        E::VectorIndexedRouteUnavailable { index: i } => {
+            index!(TAG_VECTOR_INDEXED_ROUTE_UNAVAILABLE, i)
+        }
+        E::VectorFilteredRouteUnavailable {
+            index: i,
+            predicate_columns,
+        } => body!(
+            TAG_VECTOR_FILTERED_ROUTE_UNAVAILABLE,
+            (&i.table, &i.column, predicate_columns)
+        ),
         E::VectorWholeIndexInspectionDenied => body!(TAG_VECTOR_WHOLE_INDEX_INSPECTION_DENIED, ()),
-        E::RankPolicyNotFound { index, sort_key } => body!(TAG_RANK_POLICY_NOT_FOUND, (index, sort_key)),
-        E::RankPolicyColumnUnknown { index, column } => body!(TAG_RANK_POLICY_COLUMN_UNKNOWN, (index, column)),
-        E::RankPolicyColumnAmbiguous { index, column } => body!(TAG_RANK_POLICY_COLUMN_AMBIGUOUS, (index, column)),
-        E::RankPolicyColumnType { index, column, expected, actual } => body!(TAG_RANK_POLICY_COLUMN_TYPE, (index, column, expected, actual)),
-        E::RankPolicyJoinTableUnknown { index, table } => body!(TAG_RANK_POLICY_JOIN_TABLE_UNKNOWN, (index, table)),
-        E::RankPolicyJoinColumnUnknown { index, table, column } => body!(TAG_RANK_POLICY_JOIN_COLUMN_UNKNOWN, (index, table, column)),
-        E::RankPolicyJoinColumnUnindexed { index, joined_table, column } => body!(TAG_RANK_POLICY_JOIN_COLUMN_UNINDEXED, (index, joined_table, column)),
-        E::RankPolicyFormulaParse { index, position, reason } => body!(TAG_RANK_POLICY_FORMULA_PARSE, (index, *position as u64, reason)),
+        E::RankPolicyNotFound { index, sort_key } => {
+            body!(TAG_RANK_POLICY_NOT_FOUND, (index, sort_key))
+        }
+        E::RankPolicyColumnUnknown { index, column } => {
+            body!(TAG_RANK_POLICY_COLUMN_UNKNOWN, (index, column))
+        }
+        E::RankPolicyColumnAmbiguous { index, column } => {
+            body!(TAG_RANK_POLICY_COLUMN_AMBIGUOUS, (index, column))
+        }
+        E::RankPolicyColumnType {
+            index,
+            column,
+            expected,
+            actual,
+        } => body!(
+            TAG_RANK_POLICY_COLUMN_TYPE,
+            (index, column, expected, actual)
+        ),
+        E::RankPolicyJoinTableUnknown { index, table } => {
+            body!(TAG_RANK_POLICY_JOIN_TABLE_UNKNOWN, (index, table))
+        }
+        E::RankPolicyJoinColumnUnknown {
+            index,
+            table,
+            column,
+        } => body!(TAG_RANK_POLICY_JOIN_COLUMN_UNKNOWN, (index, table, column)),
+        E::RankPolicyJoinColumnUnindexed {
+            index,
+            joined_table,
+            column,
+        } => body!(
+            TAG_RANK_POLICY_JOIN_COLUMN_UNINDEXED,
+            (index, joined_table, column)
+        ),
+        E::RankPolicyFormulaParse {
+            index,
+            position,
+            reason,
+        } => body!(
+            TAG_RANK_POLICY_FORMULA_PARSE,
+            (index, *position as u64, reason)
+        ),
         E::PrincipalRequired { table } => body!(TAG_PRINCIPAL_REQUIRED, table),
-        E::AclDenied { table, row_id, principal } => {
+        E::AclDenied {
+            table,
+            row_id,
+            principal,
+        } => {
             let (kind, id) = match principal {
                 contextdb_core::types::Principal::System => (PRINCIPAL_KIND_SYSTEM, ""),
                 contextdb_core::types::Principal::Agent(id) => (PRINCIPAL_KIND_AGENT, id.as_str()),
@@ -1302,25 +1433,68 @@ pub(crate) fn encode_read_error_into_slice(
             body!(TAG_ACL_DENIED, (table, row_id.0, kind, id));
         }
         E::ContextScopeViolation { requested, allowed } => {
-            sink.field(&TAG_CONTEXT_SCOPE_VIOLATION)?; sink.display(requested.0)?;
+            sink.field(&TAG_CONTEXT_SCOPE_VIOLATION)?;
+            sink.display(requested.0)?;
             sink.field(&(allowed.len() as u64))?;
-            for item in allowed { sink.display(item.0)?; }
+            for item in allowed {
+                sink.display(item.0)?;
+            }
         }
         E::ScopeLabelViolation { requested, allowed } => {
-            sink.field(&TAG_SCOPE_LABEL_VIOLATION)?; sink.field(&requested.0)?;
+            sink.field(&TAG_SCOPE_LABEL_VIOLATION)?;
+            sink.field(&requested.0)?;
             sink.field(&(allowed.len() as u64))?;
-            for item in allowed { sink.field(&item.0)?; }
+            for item in allowed {
+                sink.field(&item.0)?;
+            }
         }
         E::StoreCorrupted { path, reason } => body!(TAG_STORE_CORRUPTED, (path, reason)),
         E::StoreIdentityUnprovable { path } => body!(TAG_STORE_IDENTITY_UNPROVABLE, path),
-        E::LegacyVectorStoreDetected { found_format_marker, expected_release } => body!(TAG_LEGACY_VECTOR_STORE_DETECTED, (found_format_marker, expected_release)),
+        E::LegacyVectorStoreDetected {
+            found_format_marker,
+            expected_release,
+        } => body!(
+            TAG_LEGACY_VECTOR_STORE_DETECTED,
+            (found_format_marker, expected_release)
+        ),
         E::DatabaseLocked { holder_pid, path } => {
-            sink.field(&TAG_DATABASE_LOCKED)?; sink.field(holder_pid)?; sink.display(path.display())?;
+            sink.field(&TAG_DATABASE_LOCKED)?;
+            sink.field(holder_pid)?;
+            sink.display(path.display())?;
         }
-        E::MemoryBudgetExceeded { subsystem, operation, requested_bytes, available_bytes, budget_limit_bytes, hint } => body!(TAG_MEMORY_BUDGET_EXCEEDED, (subsystem, operation, *requested_bytes as u64, *available_bytes as u64, *budget_limit_bytes as u64, hint)),
-        E::DiskBudgetExceeded { operation, current_bytes, budget_limit_bytes, hint } => body!(TAG_DISK_BUDGET_EXCEEDED, (operation, current_bytes, budget_limit_bytes, hint)),
+        E::MemoryBudgetExceeded {
+            subsystem,
+            operation,
+            requested_bytes,
+            available_bytes,
+            budget_limit_bytes,
+            hint,
+        } => body!(
+            TAG_MEMORY_BUDGET_EXCEEDED,
+            (
+                subsystem,
+                operation,
+                *requested_bytes as u64,
+                *available_bytes as u64,
+                *budget_limit_bytes as u64,
+                hint
+            )
+        ),
+        E::DiskBudgetExceeded {
+            operation,
+            current_bytes,
+            budget_limit_bytes,
+            hint,
+        } => body!(
+            TAG_DISK_BUDGET_EXCEEDED,
+            (operation, current_bytes, budget_limit_bytes, hint)
+        ),
         E::Other(message) => body!(TAG_OTHER, message),
-        _ => { sink.field(&TAG_UNKNOWN)?; sink.display(Class(error))?; sink.display(error)?; }
+        _ => {
+            sink.field(&TAG_UNKNOWN)?;
+            sink.display(Class(error))?;
+            sink.display(error)?;
+        }
     }
     Ok(sink.offset)
 }

@@ -776,13 +776,17 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
     ) -> Result<Option<crate::persistence::vector_membership_source::VectorReadScope>>;
 
     fn preflight_historical_graph(
-        &self, snapshot: SnapshotId,
+        &self,
+        snapshot: SnapshotId,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         before: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
     ) -> std::result::Result<(), BoundedExecutionError>;
 
     fn preflight_historical_index(
-        &self, table: &str, index: &str, snapshot: SnapshotId,
+        &self,
+        table: &str,
+        index: &str,
+        snapshot: SnapshotId,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         before: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
     ) -> std::result::Result<(), BoundedExecutionError>;
@@ -1934,7 +1938,8 @@ impl ReadExecutionTarget for Database {
     }
 
     fn preflight_historical_graph(
-        &self, snapshot: SnapshotId,
+        &self,
+        snapshot: SnapshotId,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         before: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
     ) -> std::result::Result<(), BoundedExecutionError> {
@@ -1942,7 +1947,10 @@ impl ReadExecutionTarget for Database {
     }
 
     fn preflight_historical_index(
-        &self, table: &str, index: &str, snapshot: SnapshotId,
+        &self,
+        table: &str,
+        index: &str,
+        snapshot: SnapshotId,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         before: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
     ) -> std::result::Result<(), BoundedExecutionError> {
@@ -2014,8 +2022,7 @@ impl ReadExecutionTarget for Database {
         before_storage_step: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
-        release_retained: &mut dyn FnMut(
-            usize) -> std::result::Result<(), BoundedExecutionError>,
+        release_retained: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         before_clone: &mut dyn FnMut(
             crate::read_image_memory::RowReadAdmission<'_>,
         ) -> std::result::Result<(), BoundedExecutionError>,
@@ -6879,9 +6886,10 @@ impl WindowRankValues {
 
     fn get(self, binding: WindowBindingId) -> Result<Value> {
         if binding == self.binding.0
-            && let Some(rank) = self.values.get(self.binding.1) {
-                return Ok(Value::Int64(*rank));
-            }
+            && let Some(rank) = self.values.get(self.binding.1)
+        {
+            return Ok(Value::Int64(*rank));
+        }
         Err(Error::PlanError(
             "window rank binding is outside its scope".to_string(),
         ))
@@ -11907,9 +11915,10 @@ fn execute_index_scan(
         && let Some(meta) = db.table_meta(table)
         && let Ok(pick) = coerce_pick_shape_to_column_type(db, table, pick)
         && pick.pushed_columns.len() == pick.columns.len()
-        && meta.indexes.iter().any(|decl| {
-            decl.name == pick.name && index_is_unique(decl, &meta)
-        })
+        && meta
+            .indexes
+            .iter()
+            .any(|decl| decl.name == pick.name && index_is_unique(decl, &meta))
     {
         let values = std::iter::once(&pick.shape)
             .chain(&pick.suffix_shapes)
@@ -11921,14 +11930,31 @@ fn execute_index_scan(
             })
             .collect::<Option<Vec<_>>>();
         if let Some(values) = values.filter(|values| values.len() == pick.columns.len()) {
-            let columns = pick.columns.iter().map(|(column, _)| column.clone()).collect::<Vec<_>>();
-            let mut rows = db.unique_row_lookup_in_tx(
-                txid, table, &columns, &values, snapshot, read_memory.clone(),
-            )?.into_iter().collect::<Vec<_>>();
+            let columns = pick
+                .columns
+                .iter()
+                .map(|(column, _)| column.clone())
+                .collect::<Vec<_>>();
+            let mut rows = db
+                .unique_row_lookup_in_tx(
+                    txid,
+                    table,
+                    &columns,
+                    &values,
+                    snapshot,
+                    read_memory.clone(),
+                )?
+                .into_iter()
+                .collect::<Vec<_>>();
             let examined = rows.len() as u64;
             db.supplement_selected_vector_columns(
-                table, snapshot, tx, materialized_columns, &mut rows,
-                vector_copy_owner, read_memory.clone(),
+                table,
+                snapshot,
+                tx,
+                materialized_columns,
+                &mut rows,
+                vector_copy_owner,
+                read_memory.clone(),
             )?;
             let rows = db.filter_rows_for_read_in_tx(tx, table, rows, snapshot, read_memory)?;
             return Ok((rows, examined));
@@ -20729,23 +20755,30 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         copies: &mut contextdb_vector::VectorCopyAdmission,
         checkpoint: Option<bounded::ReadOpenContext>,
     ) -> Result<Option<crate::persistence::vector_membership_source::VectorReadScope>> {
-        self.store.vector_read_preflight(snapshot, read_memory, copies, checkpoint)
+        self.store
+            .vector_read_preflight(snapshot, read_memory, copies, checkpoint)
     }
 
     fn preflight_historical_graph(
-        &self, snapshot: SnapshotId,
+        &self,
+        snapshot: SnapshotId,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         before: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
     ) -> std::result::Result<(), BoundedExecutionError> {
-        self.store.preflight_historical_graph(snapshot, read_memory, before)
+        self.store
+            .preflight_historical_graph(snapshot, read_memory, before)
     }
 
     fn preflight_historical_index(
-        &self, table: &str, index: &str, snapshot: SnapshotId,
+        &self,
+        table: &str,
+        index: &str,
+        snapshot: SnapshotId,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         before: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
     ) -> std::result::Result<(), BoundedExecutionError> {
-        self.store.preflight_historical_index(table, index, snapshot, read_memory, before)
+        self.store
+            .preflight_historical_index(table, index, snapshot, read_memory, before)
     }
 
     fn bounded_row_by_identity(
@@ -20811,8 +20844,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         before_storage_step: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
-        release_retained: &mut dyn FnMut(
-            usize) -> std::result::Result<(), BoundedExecutionError>,
+        release_retained: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         before_clone: &mut dyn FnMut(
             crate::read_image_memory::RowReadAdmission<'_>,
         ) -> std::result::Result<(), BoundedExecutionError>,
@@ -22013,7 +22045,6 @@ mod composite_resume_range_tests {
 #[cfg(all(test, feature = "test-seams"))]
 #[path = "executor/writecost_missing_index_tests.rs"]
 mod writecost_missing_index_tests;
-
 
 /// Private storage-operation companion only. No SQL planning/default target
 /// methods switch to Native, and no unsupported method delegates to Legacy.

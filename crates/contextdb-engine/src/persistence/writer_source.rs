@@ -68,7 +68,10 @@ impl WriterSnapshot {
         !erasure.tables.is_empty() || !erasure.graph_keys.is_empty()
     }
     pub(super) fn internal_source_owner(&self) -> SourceWindowOwner {
-        SourceWindowOwner::Write(self.accountant.clone(), crate::memory_accounting::WriterUse::retain_if_writer(&self.accountant))
+        SourceWindowOwner::Write(
+            self.accountant.clone(),
+            crate::memory_accounting::WriterUse::retain_if_writer(&self.accountant),
+        )
     }
 
     pub(crate) fn row_body_bytes(
@@ -194,7 +197,8 @@ impl RedbPersistence {
                     meta.metadata_bytes()
                         .saturating_add(64)
                         .saturating_add(name.len().saturating_add(128)),
-                ).with_enclosing_arc_control::<WriterTableMeta>(true)?;
+                )
+                .with_enclosing_arc_control::<WriterTableMeta>(true)?;
                 tables.insert(
                     name.to_owned(),
                     Arc::new(WriterTableMeta {
@@ -250,7 +254,8 @@ impl RedbPersistence {
             "writer_source",
             "captured_schema",
             HINT,
-        )?.with_enclosing_arc_control::<WriterSchema>(false)?;
+        )?
+        .with_enclosing_arc_control::<WriterSchema>(false)?;
         let mut tables = HashMap::new();
         for (name, owned) in &base.tables {
             if unchanged(name) {
@@ -264,7 +269,8 @@ impl RedbPersistence {
                 "writer_source",
                 "captured_schema",
                 HINT,
-            )?.with_enclosing_arc_control::<WriterTableMeta>(false)?;
+            )?
+            .with_enclosing_arc_control::<WriterTableMeta>(false)?;
             tables.insert(
                 name.to_owned(),
                 Arc::new(WriterTableMeta {
@@ -440,8 +446,11 @@ impl RedbPersistence {
             let identity = read.storage_snapshot_identity();
             // The scalar fact is captured from this exact immutable root during
             // publication, never inferred from a newer writer or resident image.
-            let custody_groups_complete = match read.open_table(super::custody_groups::GROUP_TABLE) {
-                Ok(table) => table.get(super::custody_groups::COMPLETE).map_err(Self::storage_error)?
+            let custody_groups_complete = match read.open_table(super::custody_groups::GROUP_TABLE)
+            {
+                Ok(table) => table
+                    .get(super::custody_groups::COMPLETE)
+                    .map_err(Self::storage_error)?
                     .is_some_and(|v| v.value() == super::custody_groups::COMPLETE_VALUE),
                 Err(redb::TableError::TableDoesNotExist(_)) => false,
                 Err(error) => return Err(Self::storage_error(error)),
@@ -517,7 +526,10 @@ pub(crate) enum WriterCursorFamily {
 #[derive(Clone)]
 pub(crate) enum SourceWindowOwner {
     Read(Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>),
-    Write(crate::memory_accounting::AccountantHandle, Option<crate::memory_accounting::WriterUse>),
+    Write(
+        crate::memory_accounting::AccountantHandle,
+        Option<crate::memory_accounting::WriterUse>,
+    ),
 }
 
 pub(crate) enum SourceWindowCredit {
@@ -880,14 +892,15 @@ impl WriterSnapshot {
     }
 
     pub(super) fn owner_read(&self) -> Result<Arc<redb::ReadTransaction>> {
-        let read = self.read
-            .read()
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| Error::StoreHandleRecycleFailed {
-                path: "writer source".into(),
-                reason: "the retained source has no open storage view".into(),
-            })?;
+        let read =
+            self.read
+                .read()
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| Error::StoreHandleRecycleFailed {
+                    path: "writer source".into(),
+                    reason: "the retained source has no open storage view".into(),
+                })?;
         if read.storage_snapshot_identity() != self.identity {
             return Err(Error::StoreCorrupted {
                 path: "writer source".into(),
@@ -1320,7 +1333,9 @@ impl WriterReadCursor {
             .check_scope(self.logical_table.as_deref(), &self.table)?;
         let (lower, upper) = self.bounds();
         #[cfg(any(test, feature = "test-seams"))]
-        if self.table.starts_with("graph_") || matches!(self.table.as_ref(), "change_log" | "writer_change_log") {
+        if self.table.starts_with("graph_")
+            || matches!(self.table.as_ref(), "change_log" | "writer_change_log")
+        {
             crate::read_work_probe::note_graph(&self.table, "range", &[], None, None);
         }
         let finish = |key: &[u8], value: &[u8]| -> Result<(SourceResume, T)> {
@@ -1343,7 +1358,9 @@ impl WriterReadCursor {
                 let storage_error = |error: redb::StorageError| {
                     if self.table.starts_with("rel_") {
                         return RedbPersistence::relational_storage_error(
-                            self.logical_table.as_deref().unwrap_or("relational row"), error);
+                            self.logical_table.as_deref().unwrap_or("relational row"),
+                            error,
+                        );
                     }
                     let corrupted = graph && matches!(&error, redb::StorageError::Corrupted(_));
                     match RedbPersistence::storage_error(error) {
@@ -1401,7 +1418,9 @@ impl WriterReadCursor {
                         crate::read_work_probe::note_row_version_point_read();
                     }
                     #[cfg(any(test, feature = "test-seams"))]
-                    if self.table.starts_with("graph_") || matches!(self.table.as_ref(), "change_log" | "writer_change_log") {
+                    if self.table.starts_with("graph_")
+                        || matches!(self.table.as_ref(), "change_log" | "writer_change_log")
+                    {
                         crate::read_work_probe::graph_storage_key(&self.table, "get", *low);
                     }
                     return table
@@ -1427,11 +1446,22 @@ impl WriterReadCursor {
                     range.next()
                 };
                 next.transpose()
-                    .map_err(|error| RedbPersistence::storage_source_error(self.logical_table.as_deref().unwrap_or(&self.table), error))?
+                    .map_err(|error| {
+                        RedbPersistence::storage_source_error(
+                            self.logical_table.as_deref().unwrap_or(&self.table),
+                            error,
+                        )
+                    })?
                     .map(|(key, value)| {
                         #[cfg(any(test, feature = "test-seams"))]
-                        if self.table.starts_with("graph_") || matches!(self.table.as_ref(), "change_log" | "writer_change_log") {
-                            crate::read_work_probe::graph_storage_key(&self.table, "iteration_step", key.value());
+                        if self.table.starts_with("graph_")
+                            || matches!(self.table.as_ref(), "change_log" | "writer_change_log")
+                        {
+                            crate::read_work_probe::graph_storage_key(
+                                &self.table,
+                                "iteration_step",
+                                key.value(),
+                            );
                         }
                         finish(key.value(), value.value())
                     })
@@ -1504,11 +1534,22 @@ impl WriterReadCursor {
                     range.next()
                 };
                 next.transpose()
-                    .map_err(|error| RedbPersistence::storage_source_error(self.logical_table.as_deref().unwrap_or(&self.table), error))?
+                    .map_err(|error| {
+                        RedbPersistence::storage_source_error(
+                            self.logical_table.as_deref().unwrap_or(&self.table),
+                            error,
+                        )
+                    })?
                     .map(|(key, value)| {
                         #[cfg(any(test, feature = "test-seams"))]
-                        if self.table.starts_with("graph_") || matches!(self.table.as_ref(), "change_log" | "writer_change_log") {
-                            crate::read_work_probe::graph_storage_key(&self.table, "iteration_step", key.value().as_bytes());
+                        if self.table.starts_with("graph_")
+                            || matches!(self.table.as_ref(), "change_log" | "writer_change_log")
+                        {
+                            crate::read_work_probe::graph_storage_key(
+                                &self.table,
+                                "iteration_step",
+                                key.value().as_bytes(),
+                            );
                         }
                         finish(key.value().as_bytes(), value.value())
                     })
@@ -1550,8 +1591,9 @@ impl WriterReadCursor {
                     crate::read_work_probe::note_decoded_row();
                     crate::read_work_probe::note_stored_row_bytes(value.len());
                 }
-                let row = RedbPersistence::decode_versioned_row(value, None)
-                    .map_err(|error| RedbPersistence::relational_decode_error("relational row", error))?;
+                let row = RedbPersistence::decode_versioned_row(value, None).map_err(|error| {
+                    RedbPersistence::relational_decode_error("relational row", error)
+                })?;
                 if RedbPersistence::rel_row_key(&row) != key {
                     return Err(Error::StoreCorrupted {
                         path: "relational row".into(),
@@ -1783,7 +1825,13 @@ impl WriterReadCursor {
                     );
                 }
                 #[cfg(any(test, feature = "test-seams"))]
-                crate::read_work_probe::note_graph("graph_payload", "payload_decode", key, None, None);
+                crate::read_work_probe::note_graph(
+                    "graph_payload",
+                    "payload_decode",
+                    key,
+                    None,
+                    None,
+                );
                 let edge: AdjEntry = decode_window_exact(value).map_err(|error| match error {
                     Error::Other(reason) => Error::StoreCorrupted {
                         path: "graph adjacency".into(),
@@ -1878,7 +1926,19 @@ impl WriterCommitCursor {
         crate::read_work_probe::note_graph("commit_index", "range", &[], None, None);
         let mut range = table
             .range((lower, upper))
-            .map_err(RedbPersistence::storage_error)?.inspect(|_entry| { #[cfg(any(test, feature = "test-seams"))] if let Ok((key, _)) = _entry { crate::read_work_probe::note_graph("commit_index", "iteration_step", &key.value().to_be_bytes(), Some(contextdb_core::Lsn(key.value())), Some("writer_commit_cursor")); } });
+            .map_err(RedbPersistence::storage_error)?
+            .inspect(|_entry| {
+                #[cfg(any(test, feature = "test-seams"))]
+                if let Ok((key, _)) = _entry {
+                    crate::read_work_probe::note_graph(
+                        "commit_index",
+                        "iteration_step",
+                        &key.value().to_be_bytes(),
+                        Some(contextdb_core::Lsn(key.value())),
+                        Some("writer_commit_cursor"),
+                    );
+                }
+            });
         let next = if self.reverse {
             range.next_back()
         } else {
@@ -2031,7 +2091,8 @@ impl WriterSnapshot {
         // Borrow value payloads while sizing and encoding; no tuple clone is
         // made before its owner admits the complete endpoint capacities.
         let lower = admitted_relational_index_endpoint(tuple, RowId(0), TxId(0), &memory)?;
-        let upper = admitted_relational_index_endpoint(tuple, RowId(u64::MAX), TxId(u64::MAX), &memory)?;
+        let upper =
+            admitted_relational_index_endpoint(tuple, RowId(u64::MAX), TxId(u64::MAX), &memory)?;
         self.index_cursor(
             owner,
             table,
@@ -2048,19 +2109,37 @@ impl WriterSnapshot {
     /// Build an admitted physical endpoint using the persistence codec. Query
     /// adapters need not duplicate its encoding or its row/version suffixes.
     pub(crate) fn index_position_key(
-        self: &Arc<Self>, owner: SourceWindowOwner, tuple: &IndexKey,
-        row_id: RowId, created_tx: TxId,
+        self: &Arc<Self>,
+        owner: SourceWindowOwner,
+        tuple: &IndexKey,
+        row_id: RowId,
+        created_tx: TxId,
     ) -> Result<WriterWindow<Vec<u8>>> {
         self.index_position_key_with_checkpoint(owner, tuple, row_id, created_tx, &mut || Ok(()))
     }
 
     pub(crate) fn row_index_position_key_with_checkpoint(
-        self: &Arc<Self>, owner: SourceWindowOwner, declaration: &IndexDecl,
-        row: &VersionedRow, created_tx: TxId, checkpoint: &mut dyn FnMut() -> Result<()>,
+        self: &Arc<Self>,
+        owner: SourceWindowOwner,
+        declaration: &IndexDecl,
+        row: &VersionedRow,
+        created_tx: TxId,
+        checkpoint: &mut dyn FnMut() -> Result<()>,
     ) -> Result<WriterWindow<Vec<u8>>> {
         let memory = owner.image(self, "index_seek_keys");
-        let key = admitted_relational_row_index_endpoint_with_checkpoint(declaration, row, created_tx, &memory, checkpoint)?;
-        Ok(WriterWindow { value: key, position: Box::default(), _root: Arc::clone(self), _memory: memory })
+        let key = admitted_relational_row_index_endpoint_with_checkpoint(
+            declaration,
+            row,
+            created_tx,
+            &memory,
+            checkpoint,
+        )?;
+        Ok(WriterWindow {
+            value: key,
+            position: Box::default(),
+            _root: Arc::clone(self),
+            _memory: memory,
+        })
     }
 
     pub(crate) fn index_position_key_with_checkpoint(
@@ -2072,7 +2151,9 @@ impl WriterSnapshot {
         checkpoint: &mut dyn FnMut() -> Result<()>,
     ) -> Result<WriterWindow<Vec<u8>>> {
         let memory = owner.image(self, "index_seek_keys");
-        let key = admitted_relational_index_endpoint_with_checkpoint(tuple, row_id, created_tx, &memory, checkpoint)?;
+        let key = admitted_relational_index_endpoint_with_checkpoint(
+            tuple, row_id, created_tx, &memory, checkpoint,
+        )?;
         Ok(WriterWindow {
             value: key,
             position: Box::default(),
@@ -2230,7 +2311,9 @@ mod tests {
                             let captured = capture();
                             {
                                 let observed_identity = captured.storage_identity();
-                                assert!(observed_identity.transaction_id >= old_identity.transaction_id);
+                                assert!(
+                                    observed_identity.transaction_id >= old_identity.transaction_id
+                                );
                                 assert_eq!(observed_identity.user_root, old_identity.user_root);
                             }
                             assert!(
@@ -2354,7 +2437,11 @@ mod tests {
             }
         }
         let fixture_open_accountant_2311 = Arc::new(MemoryAccountant::no_limit());
-        let _fixture_decode_scope_2311 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_2311).into()).unwrap();
+        let _fixture_decode_scope_2311 =
+            crate::read_image_memory::ImageMemory::enter_writer_operation(
+                std::sync::Arc::clone(&fixture_open_accountant_2311).into(),
+            )
+            .unwrap();
         let store = RedbPersistence::open(&path).unwrap();
         store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_2311).into());
         let bounds = store.writer_open_bounds(["items"]).unwrap();
@@ -2539,7 +2626,6 @@ mod tests {
     }
 }
 
-
 impl WriterSnapshot {
     /// Reconcile an independently rooted retained-version range before any
     /// selected value or successful absence escapes its immutable capture.
@@ -2564,116 +2650,202 @@ impl WriterSnapshot {
                 .ok_or_else(|| Error::Other("historical row controls overflow".into()))?,
             "historical_row_controls",
         )?;
-        graph_read::with_pages(read_memory.clone(), || image.scope(|| {
-            before()?;
-            let read = self.owner_read()?;
-            let bounds = RedbPersistence::read_authenticated_bounds_in_read(&read)?;
-            let gate = content_identity::history_open_control::acquire(&read, bounds.commit_count)?;
-            before()?;
-            gate.check_directory(&read)?;
-            let verifier = content_identity::ContentIdentityReadVerifier::open(
-                &read, Path::new(table), None,
-            )?;
-            let meta = self.borrow_captured_table_meta(table)
-                .ok_or_else(|| Error::TableNotFound(table.into()))?;
-            let prefix_credit = owner.reserve(table.len().checked_add(72)
-                .ok_or_else(|| Error::Other("historical row bound overflow".into()))?, "historical_row_bound")?;
-            let mut prefix = manifest::manifest_prefix(table)?;
-            if let Some(row) = row_id { prefix.extend_from_slice(&row.0.to_be_bytes()); }
-            let physical_name = owner.endpoint(&[b"rel_", table.as_bytes()], "historical_row_table")?;
-            let name = std::str::from_utf8(&physical_name.key).expect("UTF-8 table name");
-            let relation = read.open_table(TableDefinition::<&[u8], &[u8]>::new(name))
-                .map_err(|error| match error {
-                    redb::TableError::TableDoesNotExist(_) => verifier.corrupt("required relational table is absent"),
-                    other => RedbPersistence::relational_table_error(table, other),
-                })?;
-            let (low, high) = row_id.map(RedbPersistence::rel_row_key_range)
-                .unwrap_or(([0; 8], [255; 8]));
-            let mut physical = relation.range::<&[u8]>((
-                if row_id.is_some() { Bound::Included(low.as_slice()) } else { Bound::Unbounded },
-                if row_id.is_some() { Bound::Excluded(high.as_slice()) } else { Bound::Unbounded },
-            )).map_err(|error| RedbPersistence::relational_storage_error(table, error))?;
-            let proof_owner = ReadHistoryProofOwner::new(read_memory.clone())?;
-            let proof = content_identity::ProofMemory::growable(0, proof_owner.clone());
-            let touch = std::cell::RefCell::new(&mut *before);
-            let typed_body_error = |error| match error {
-                Error::ReadCancelled | Error::ReadFailure(_)
-                | Error::MemoryBudgetExceeded { .. } | Error::StoreCorrupted { .. } => error,
-                other => verifier.corrupt(other),
-            };
-            let mut previous = None::<[u8; 24]>;
-            let mut group = None::<RowId>;
-            let mut selected = None::<WriterWindow<VersionedRow>>;
-            let complete = verifier.visit_history_from::<Error>(
-                content_identity::HistoryKind::RelationalVersion,
-                Bound::Included(prefix.clone()), false, &proof,
-                &mut || (touch.borrow_mut())(),
-                &mut |coordinate, marker| {
-                    let witness = manifest::parse_manifest(coordinate).map_err(&typed_body_error)?;
-                    if !coordinate.starts_with(&prefix) { return Ok(false); }
-                    if marker != manifest::manifest_marker_hash()
-                        || previous.is_some_and(|prior| prior >= witness.identity) {
-                        return Err(verifier.corrupt("duplicate, reordered or invalid version member"));
-                    }
-                    let id = RowId(u64::from_be_bytes(witness.identity[..8].try_into().expect("row identity")));
-                    if group.is_some_and(|prior| prior != id)
-                        && let Some(row) = selected.take().filter(|row| row.value.visible_at(snapshot)) {
+        graph_read::with_pages(read_memory.clone(), || {
+            image.scope(|| {
+                before()?;
+                let read = self.owner_read()?;
+                let bounds = RedbPersistence::read_authenticated_bounds_in_read(&read)?;
+                let gate =
+                    content_identity::history_open_control::acquire(&read, bounds.commit_count)?;
+                before()?;
+                gate.check_directory(&read)?;
+                let verifier = content_identity::ContentIdentityReadVerifier::open(
+                    &read,
+                    Path::new(table),
+                    None,
+                )?;
+                let meta = self
+                    .borrow_captured_table_meta(table)
+                    .ok_or_else(|| Error::TableNotFound(table.into()))?;
+                let prefix_credit = owner.reserve(
+                    table
+                        .len()
+                        .checked_add(72)
+                        .ok_or_else(|| Error::Other("historical row bound overflow".into()))?,
+                    "historical_row_bound",
+                )?;
+                let mut prefix = manifest::manifest_prefix(table)?;
+                if let Some(row) = row_id {
+                    prefix.extend_from_slice(&row.0.to_be_bytes());
+                }
+                let physical_name =
+                    owner.endpoint(&[b"rel_", table.as_bytes()], "historical_row_table")?;
+                let name = std::str::from_utf8(&physical_name.key).expect("UTF-8 table name");
+                let relation = read
+                    .open_table(TableDefinition::<&[u8], &[u8]>::new(name))
+                    .map_err(|error| match error {
+                        redb::TableError::TableDoesNotExist(_) => {
+                            verifier.corrupt("required relational table is absent")
+                        }
+                        other => RedbPersistence::relational_table_error(table, other),
+                    })?;
+                let (low, high) = row_id
+                    .map(RedbPersistence::rel_row_key_range)
+                    .unwrap_or(([0; 8], [255; 8]));
+                let mut physical = relation
+                    .range::<&[u8]>((
+                        if row_id.is_some() {
+                            Bound::Included(low.as_slice())
+                        } else {
+                            Bound::Unbounded
+                        },
+                        if row_id.is_some() {
+                            Bound::Excluded(high.as_slice())
+                        } else {
+                            Bound::Unbounded
+                        },
+                    ))
+                    .map_err(|error| RedbPersistence::relational_storage_error(table, error))?;
+                let proof_owner = ReadHistoryProofOwner::new(read_memory.clone())?;
+                let proof = content_identity::ProofMemory::growable(0, proof_owner.clone());
+                let touch = std::cell::RefCell::new(&mut *before);
+                let typed_body_error = |error| match error {
+                    Error::ReadCancelled
+                    | Error::ReadFailure(_)
+                    | Error::MemoryBudgetExceeded { .. }
+                    | Error::StoreCorrupted { .. } => error,
+                    other => verifier.corrupt(other),
+                };
+                let mut previous = None::<[u8; 24]>;
+                let mut group = None::<RowId>;
+                let mut selected = None::<WriterWindow<VersionedRow>>;
+                let complete = verifier.visit_history_from::<Error>(
+                    content_identity::HistoryKind::RelationalVersion,
+                    Bound::Included(prefix.clone()),
+                    false,
+                    &proof,
+                    &mut || (touch.borrow_mut())(),
+                    &mut |coordinate, marker| {
+                        let witness =
+                            manifest::parse_manifest(coordinate).map_err(&typed_body_error)?;
+                        if !coordinate.starts_with(&prefix) {
+                            return Ok(false);
+                        }
+                        if marker != manifest::manifest_marker_hash()
+                            || previous.is_some_and(|prior| prior >= witness.identity)
+                        {
+                            return Err(
+                                verifier.corrupt("duplicate, reordered or invalid version member")
+                            );
+                        }
+                        let id = RowId(u64::from_be_bytes(
+                            witness.identity[..8].try_into().expect("row identity"),
+                        ));
+                        if group.is_some_and(|prior| prior != id)
+                            && let Some(row) =
+                                selected.take().filter(|row| row.value.visible_at(snapshot))
+                        {
+                            (touch.borrow_mut())()?;
+                            visit(row)?;
+                        }
+                        group = Some(id);
+                        previous = Some(witness.identity);
                         (touch.borrow_mut())()?;
-                        visit(row)?;
-                    }
-                    group = Some(id);
-                    previous = Some(witness.identity);
-                    (touch.borrow_mut())()?;
-                    let Some((key, body)) = physical.next().transpose().map_err(|error| RedbPersistence::relational_storage_error(table, error))? else {
-                        return Err(verifier.corrupt("rooted relational version is physically missing"));
-                    };
-                    if key.value() != witness.identity {
-                        return Err(verifier.corrupt("physical relational gap or extra member"));
-                    }
-                    let mut admission = content_identity::ProofAdmission::for_reader(read_memory.clone());
-                    let actual = manifest::manifest_for_body_with_checkpoint(table, key.value(), body.value(),
-                        &mut admission, &mut || (touch.borrow_mut())());
-                    if let Some(error) = admission.take_reader_refusal() { return Err(error); }
-                    if actual.map_err(&typed_body_error)?.as_slice() != coordinate {
-                        return Err(verifier.corrupt("persisted row body or closure does not authenticate"));
-                    }
-                    let created = TxId(u64::from_be_bytes(witness.identity[8..16].try_into().expect("creation identity")));
-                    let lsn = Lsn(u64::from_be_bytes(witness.identity[16..].try_into().expect("log identity")));
-                    validate_read_version_bounds(&read, table, lsn, created, witness.deleted_tx,
-                        TxId(self.snapshot.0), self.lsn)
+                        let Some((key, body)) = physical.next().transpose().map_err(|error| {
+                            RedbPersistence::relational_storage_error(table, error)
+                        })?
+                        else {
+                            return Err(
+                                verifier.corrupt("rooted relational version is physically missing")
+                            );
+                        };
+                        if key.value() != witness.identity {
+                            return Err(verifier.corrupt("physical relational gap or extra member"));
+                        }
+                        let mut admission =
+                            content_identity::ProofAdmission::for_reader(read_memory.clone());
+                        let actual = manifest::manifest_for_body_with_checkpoint(
+                            table,
+                            key.value(),
+                            body.value(),
+                            &mut admission,
+                            &mut || (touch.borrow_mut())(),
+                        );
+                        if let Some(error) = admission.take_reader_refusal() {
+                            return Err(error);
+                        }
+                        if actual.map_err(&typed_body_error)?.as_slice() != coordinate {
+                            return Err(verifier
+                                .corrupt("persisted row body or closure does not authenticate"));
+                        }
+                        let created = TxId(u64::from_be_bytes(
+                            witness.identity[8..16]
+                                .try_into()
+                                .expect("creation identity"),
+                        ));
+                        let lsn = Lsn(u64::from_be_bytes(
+                            witness.identity[16..].try_into().expect("log identity"),
+                        ));
+                        validate_read_version_bounds(
+                            &read,
+                            table,
+                            lsn,
+                            created,
+                            witness.deleted_tx,
+                            TxId(self.snapshot.0),
+                            self.lsn,
+                        )
                         .map_err(|error| match error {
                             LoadReadImageError::Memory(error) => typed_body_error(error),
                             other => verifier.corrupt(other),
                         })?;
-                    if created.0 <= snapshot.0 {
-                        let memory = owner.image(self, "historical_selected_row");
-                        let row = memory.scope(|| RedbPersistence::decode_relational_source_row(table, meta, body.value()))
-                            .map_err(&typed_body_error)?;
-                        memory.reserve(witness.identity.len())?;
-                        selected = Some(WriterWindow {
-                            value: row, position: Box::from(witness.identity.as_slice()),
-                            _root: self.clone(), _memory: memory,
-                        });
-                    }
-                    Ok(true)
-                },
-            )?;
-            if let Some(error) = proof_owner.refusal.lock().take() { return Err(error); }
-            if !complete { return Err(verifier.corrupt("historical version proof did not complete")); }
-            (touch.borrow_mut())()?;
-            if physical.next().transpose().map_err(|error| RedbPersistence::relational_storage_error(table, error))?.is_some() {
-                return Err(verifier.corrupt("unwitnessed physical relational suffix"));
-            }
-            if let Some(row) = selected.filter(|row| row.value.visible_at(snapshot)) {
+                        if created.0 <= snapshot.0 {
+                            let memory = owner.image(self, "historical_selected_row");
+                            let row = memory
+                                .scope(|| {
+                                    RedbPersistence::decode_relational_source_row(
+                                        table,
+                                        meta,
+                                        body.value(),
+                                    )
+                                })
+                                .map_err(&typed_body_error)?;
+                            memory.reserve(witness.identity.len())?;
+                            selected = Some(WriterWindow {
+                                value: row,
+                                position: Box::from(witness.identity.as_slice()),
+                                _root: self.clone(),
+                                _memory: memory,
+                            });
+                        }
+                        Ok(true)
+                    },
+                )?;
+                if let Some(error) = proof_owner.refusal.lock().take() {
+                    return Err(error);
+                }
+                if !complete {
+                    return Err(verifier.corrupt("historical version proof did not complete"));
+                }
                 (touch.borrow_mut())()?;
-                visit(row)?;
-            }
-            drop(prefix_credit);
-            Ok(())
-        }))
+                if physical
+                    .next()
+                    .transpose()
+                    .map_err(|error| RedbPersistence::relational_storage_error(table, error))?
+                    .is_some()
+                {
+                    return Err(verifier.corrupt("unwitnessed physical relational suffix"));
+                }
+                if let Some(row) = selected.filter(|row| row.value.visible_at(snapshot)) {
+                    (touch.borrow_mut())()?;
+                    visit(row)?;
+                }
+                drop(prefix_credit);
+                Ok(())
+            })
+        })
     }
 }
-
 
 impl WriterReadCursor {
     /// The manifest chooses the next physical identity independently of the
@@ -2686,10 +2858,15 @@ impl WriterReadCursor {
     ) -> Result<Option<H>> {
         use super::content_identity::version_manifest as manifest;
         let SourceWindowOwner::Read(memory) = &self.owner else {
-            return Err(Error::Other("historical row cursor requires its reader child".into()));
+            return Err(Error::Other(
+                "historical row cursor requires its reader child".into(),
+            ));
         };
         let memory = memory.clone();
-        let table = self.logical_table.as_deref().ok_or_else(|| Error::Other("historical row cursor has no table".into()))?;
+        let table = self
+            .logical_table
+            .as_deref()
+            .ok_or_else(|| Error::Other("historical row cursor has no table".into()))?;
         let controls = self.owner.reserve(
             std::mem::size_of::<content_identity::ContentIdentityReadVerifier>()
                 .checked_add(2 * table.len() + 144)
@@ -2697,79 +2874,120 @@ impl WriterReadCursor {
             "historical_cursor_controls",
         )?;
         let image = self.owner.image(&self.root, "historical_cursor_proof");
-        let expected = graph_read::with_pages(memory.clone(), || image.scope(|| {
-            before()?;
-            let read = self.root.owner_read()?;
-            let bounds = RedbPersistence::read_authenticated_bounds_in_read(&read)?;
-            let gate = content_identity::history_open_control::acquire(&read, bounds.commit_count)?;
-            before()?;
-            gate.check_directory(&read)?;
-            let verifier = content_identity::ContentIdentityReadVerifier::open(&read,
-                Path::new(table), None)?;
-            let prefix = manifest::manifest_prefix(table)?;
-            let (lower, upper) = self.bounds();
-            let edge = if self.reverse { upper } else { lower };
-            let mut start = Vec::with_capacity(prefix.len() + 65);
-            start.extend_from_slice(&prefix);
-            let inclusive = match edge {
-                Bound::Included(key) => {
-                    start.extend_from_slice(key);
-                    if self.reverse { start.extend_from_slice(&[255; 41]); }
-                    true
-                }
-                Bound::Excluded(key) => {
-                    start.extend_from_slice(key);
-                    if !self.reverse { start.extend_from_slice(&[255; 41]); }
-                    false
-                }
-                Bound::Unbounded => {
-                    if self.reverse { start.extend_from_slice(&[255; 65]); }
-                    true
-                }
-            };
-            let owner = ReadHistoryProofOwner::new(memory.clone())?;
-            let proof = content_identity::ProofMemory::growable(0, owner.clone());
-            let mut expected = None;
-            let complete = verifier.visit_history_from::<Error>(content_identity::HistoryKind::RelationalVersion,
-                if inclusive { Bound::Included(start) } else { Bound::Excluded(start) }, self.reverse,
-                &proof, before, &mut |coordinate, marker| {
-                    let witness = manifest::parse_manifest(coordinate)?;
-                    if marker != manifest::manifest_marker_hash() {
-                        return Err(verifier.corrupt("historical cursor has an invalid manifest marker"));
+        let expected = graph_read::with_pages(memory.clone(), || {
+            image.scope(|| {
+                before()?;
+                let read = self.root.owner_read()?;
+                let bounds = RedbPersistence::read_authenticated_bounds_in_read(&read)?;
+                let gate =
+                    content_identity::history_open_control::acquire(&read, bounds.commit_count)?;
+                before()?;
+                gate.check_directory(&read)?;
+                let verifier = content_identity::ContentIdentityReadVerifier::open(
+                    &read,
+                    Path::new(table),
+                    None,
+                )?;
+                let prefix = manifest::manifest_prefix(table)?;
+                let (lower, upper) = self.bounds();
+                let edge = if self.reverse { upper } else { lower };
+                let mut start = Vec::with_capacity(prefix.len() + 65);
+                start.extend_from_slice(&prefix);
+                let inclusive = match edge {
+                    Bound::Included(key) => {
+                        start.extend_from_slice(key);
+                        if self.reverse {
+                            start.extend_from_slice(&[255; 41]);
+                        }
+                        true
                     }
-                    if coordinate.starts_with(&prefix) {
-                        let inside_lower = match lower {
-                            Bound::Included(key) => witness.identity.as_slice() >= key,
-                            Bound::Excluded(key) => witness.identity.as_slice() > key,
-                            Bound::Unbounded => true,
-                        };
-                        let inside_upper = match upper {
-                            Bound::Included(key) => witness.identity.as_slice() <= key,
-                            Bound::Excluded(key) => witness.identity.as_slice() < key,
-                            Bound::Unbounded => true,
-                        };
-                        if inside_lower && inside_upper { expected = Some(witness.identity); }
+                    Bound::Excluded(key) => {
+                        start.extend_from_slice(key);
+                        if !self.reverse {
+                            start.extend_from_slice(&[255; 41]);
+                        }
+                        false
                     }
-                    Ok(false)
-                })?;
-            if let Some(error) = owner.refusal.lock().take() { return Err(error); }
-            if !complete { return Err(verifier.corrupt("historical cursor proof did not complete")); }
-            Ok(expected)
-        }))?;
+                    Bound::Unbounded => {
+                        if self.reverse {
+                            start.extend_from_slice(&[255; 65]);
+                        }
+                        true
+                    }
+                };
+                let owner = ReadHistoryProofOwner::new(memory.clone())?;
+                let proof = content_identity::ProofMemory::growable(0, owner.clone());
+                let mut expected = None;
+                let complete = verifier.visit_history_from::<Error>(
+                    content_identity::HistoryKind::RelationalVersion,
+                    if inclusive {
+                        Bound::Included(start)
+                    } else {
+                        Bound::Excluded(start)
+                    },
+                    self.reverse,
+                    &proof,
+                    before,
+                    &mut |coordinate, marker| {
+                        let witness = manifest::parse_manifest(coordinate)?;
+                        if marker != manifest::manifest_marker_hash() {
+                            return Err(verifier
+                                .corrupt("historical cursor has an invalid manifest marker"));
+                        }
+                        if coordinate.starts_with(&prefix) {
+                            let inside_lower = match lower {
+                                Bound::Included(key) => witness.identity.as_slice() >= key,
+                                Bound::Excluded(key) => witness.identity.as_slice() > key,
+                                Bound::Unbounded => true,
+                            };
+                            let inside_upper = match upper {
+                                Bound::Included(key) => witness.identity.as_slice() <= key,
+                                Bound::Excluded(key) => witness.identity.as_slice() < key,
+                                Bound::Unbounded => true,
+                            };
+                            if inside_lower && inside_upper {
+                                expected = Some(witness.identity);
+                            }
+                        }
+                        Ok(false)
+                    },
+                )?;
+                if let Some(error) = owner.refusal.lock().take() {
+                    return Err(error);
+                }
+                if !complete {
+                    return Err(verifier.corrupt("historical cursor proof did not complete"));
+                }
+                Ok(expected)
+            })
+        })?;
         if let Some(identity) = expected {
-            let id = RowId(u64::from_be_bytes(identity[..8].try_into().expect("row identity")));
+            let id = RowId(u64::from_be_bytes(
+                identity[..8].try_into().expect("row identity"),
+            ));
             if self.historical_proved_group != Some(id) {
-                self.root.visit_historical_rows(table, Some(id), snapshot, memory,
-                    before, &mut |_| Ok(()))?;
+                self.root.visit_historical_rows(
+                    table,
+                    Some(id),
+                    snapshot,
+                    memory,
+                    before,
+                    &mut |_| Ok(()),
+                )?;
                 self.historical_proved_group = Some(id);
             }
         }
         before()?;
         let row = self.next_row_before(before)?;
-        let actual = row.as_ref().map(|row| RedbPersistence::rel_row_key(&row.value));
+        let actual = row
+            .as_ref()
+            .map(|row| RedbPersistence::rel_row_key(&row.value));
         if actual.as_deref() != expected.as_ref().map(|key| key.as_slice()) {
-            return Err(Error::StoreCorrupted { path: "historical relational cursor".into(),
-                reason: "physical version gap or extra member differs from independent manifest".into() });
+            return Err(Error::StoreCorrupted {
+                path: "historical relational cursor".into(),
+                reason: "physical version gap or extra member differs from independent manifest"
+                    .into(),
+            });
         }
         drop(controls);
         row.map(handoff).transpose()
@@ -2779,7 +2997,9 @@ impl WriterReadCursor {
 #[cfg(test)]
 pub(crate) fn r1_schema_control_rows_for_test() {
     use crate::memory_accounting::{WriterBudget, writer_adapter_type_layout};
-    use crate::persistence::content_identity::proof_allocation_oracle_tests::{last_request_for_test, measured, };
+    use crate::persistence::content_identity::proof_allocation_oracle_tests::{
+        last_request_for_test, measured,
+    };
     let owner = Arc::new(MemoryAccountant::no_limit());
     let root = WriterBudget::from_accountant(owner.clone()).unwrap();
     let baseline = owner.usage().used;
@@ -2792,39 +3012,73 @@ pub(crate) fn r1_schema_control_rows_for_test() {
     let (table, _, _) = measured(|| {
         Arc::new(WriterTableMeta {
             meta,
-            _memory: memory ,
+            _memory: memory,
         })
     });
     let request = last_request_for_test(true);
     let table_layout = writer_adapter_type_layout::<WriterTableMeta>();
     assert_eq!(request, (table_layout.size(), table_layout.align(), 1));
-    assert_eq!(owner.writer_fixed_ownership().2, controls + table_layout.size());
+    assert_eq!(
+        owner.writer_fixed_ownership().2,
+        controls + table_layout.size()
+    );
     let mut tables = HashMap::new();
     tables.insert("r1".to_owned(), table.clone());
     let memory = OwnedMemoryReservation::from_admitted(owner.clone().into(), 0)
-        .with_enclosing_arc_control::<WriterSchema>(false).unwrap();
+        .with_enclosing_arc_control::<WriterSchema>(false)
+        .unwrap();
     last_request_for_test(true);
-    let (schema, _, _) = measured(|| Arc::new(WriterSchema { tables, _memory: memory }));
+    let (schema, _, _) = measured(|| {
+        Arc::new(WriterSchema {
+            tables,
+            _memory: memory,
+        })
+    });
     let request = last_request_for_test(true);
     let schema_layout = writer_adapter_type_layout::<WriterSchema>();
     assert_eq!(request, (schema_layout.size(), schema_layout.align(), 1));
-    assert_eq!(owner.usage().used, baseline + table_layout.size() + schema_layout.size());
+    assert_eq!(
+        owner.usage().used,
+        baseline + table_layout.size() + schema_layout.size()
+    );
     let cloned = schema.clone();
     drop(schema);
-    assert_eq!(owner.usage().used, baseline + table_layout.size() + schema_layout.size());
+    assert_eq!(
+        owner.usage().used,
+        baseline + table_layout.size() + schema_layout.size()
+    );
     drop(cloned);
     assert_eq!(owner.usage().used, baseline + table_layout.size());
     drop(root);
-    assert_ne!(owner.writer_registration_observation_for_test().2, 0, "escaping table metadata holds the real source use");
+    assert_ne!(
+        owner.writer_registration_observation_for_test().2,
+        0,
+        "escaping table metadata holds the real source use"
+    );
     drop(table);
     assert_eq!(owner.usage().used, 0);
-    println!("CDB127_R1_ROW schema_controls table_size={} table_align={} schema_size={} schema_align={} one_request_each=true clone_single_debit=true last_child_holds_epoch=true original_funder_final_zero=true", table_layout.size(), table_layout.align(), schema_layout.size(), schema_layout.align());
-    println!("CDB127_R1_LAYOUT WriterSnapshot size={} align={} read={} control={} schema={} registry={}",
-        std::mem::size_of::<WriterSnapshot>(), std::mem::align_of::<WriterSnapshot>(),
-        std::mem::offset_of!(WriterSnapshot, read), std::mem::offset_of!(WriterSnapshot, _control),
-        std::mem::offset_of!(WriterSnapshot, schema), std::mem::offset_of!(WriterSnapshot, registry));
-    println!("CDB127_R1_LAYOUT WriterErasure size={} align={} memory={}",
-        std::mem::size_of::<WriterErasure>(), std::mem::align_of::<WriterErasure>(), std::mem::offset_of!(WriterErasure, _memory));
+    println!(
+        "CDB127_R1_ROW schema_controls table_size={} table_align={} schema_size={} schema_align={} one_request_each=true clone_single_debit=true last_child_holds_epoch=true original_funder_final_zero=true",
+        table_layout.size(),
+        table_layout.align(),
+        schema_layout.size(),
+        schema_layout.align()
+    );
+    println!(
+        "CDB127_R1_LAYOUT WriterSnapshot size={} align={} read={} control={} schema={} registry={}",
+        std::mem::size_of::<WriterSnapshot>(),
+        std::mem::align_of::<WriterSnapshot>(),
+        std::mem::offset_of!(WriterSnapshot, read),
+        std::mem::offset_of!(WriterSnapshot, _control),
+        std::mem::offset_of!(WriterSnapshot, schema),
+        std::mem::offset_of!(WriterSnapshot, registry)
+    );
+    println!(
+        "CDB127_R1_LAYOUT WriterErasure size={} align={} memory={}",
+        std::mem::size_of::<WriterErasure>(),
+        std::mem::align_of::<WriterErasure>(),
+        std::mem::offset_of!(WriterErasure, _memory)
+    );
 }
 
 #[cfg(test)]
@@ -2850,7 +3104,9 @@ pub(crate) enum NativeConfigFailure {
 }
 #[cfg(feature = "sync-orchestration")]
 impl From<super::native_storage_admission::NativeStorageFailure> for NativeConfigFailure {
-    fn from(error: super::native_storage_admission::NativeStorageFailure) -> Self { Self::Storage(error) }
+    fn from(error: super::native_storage_admission::NativeStorageFailure) -> Self {
+        Self::Storage(error)
+    }
 }
 
 /// Fixed physical byte allocation followed by its original child's invoice.
@@ -2865,30 +3121,54 @@ impl NativeConfigBytes {
         owner: &contextdb_core::read_memory::ReadMemoryOwner,
         parts: &[&[u8]],
     ) -> std::result::Result<Self, NativeConfigFailure> {
-        use contextdb_core::read_memory::{NativeRefusal, ReadCredit};
         use super::native_storage_admission::NativeStorageFailure;
-        let refuse = |message| NativeConfigFailure::Storage(NativeStorageFailure::Refused(NativeRefusal::Other(message)));
-        let length = parts.iter().try_fold(0usize, |n, p| n.checked_add(p.len()))
+        use contextdb_core::read_memory::{NativeRefusal, ReadCredit};
+        let refuse = |message| {
+            NativeConfigFailure::Storage(NativeStorageFailure::Refused(NativeRefusal::Other(
+                message,
+            )))
+        };
+        let length = parts
+            .iter()
+            .try_fold(0usize, |n, p| n.checked_add(p.len()))
             .ok_or_else(|| refuse("native config byte length overflow"))?;
         let layout = std::alloc::Layout::array::<u8>(length)
             .map_err(|_| refuse("native config byte layout overflow"))?;
         let invoice = ReadCredit::try_new_owned_native(
-            owner.clone(), layout.size(), "writer_source", "config_bytes", HINT,
-        ).map_err(|r| NativeConfigFailure::Storage(NativeStorageFailure::Refused(r)))?;
-        let bytes = if length == 0 { Vec::new() } else {
+            owner.clone(),
+            layout.size(),
+            "writer_source",
+            "config_bytes",
+            HINT,
+        )
+        .map_err(|r| NativeConfigFailure::Storage(NativeStorageFailure::Refused(r)))?;
+        let bytes = if length == 0 {
+            Vec::new()
+        } else {
             let pointer = std::ptr::NonNull::new(unsafe { std::alloc::alloc(layout) })
                 .ok_or_else(|| refuse("native config byte allocation failed"))?;
             let mut offset = 0;
             for part in parts {
                 // Exact prepaid u8 layout; all bytes initialized, no growth.
-                unsafe { std::ptr::copy_nonoverlapping(part.as_ptr(), pointer.as_ptr().add(offset), part.len()); }
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        part.as_ptr(),
+                        pointer.as_ptr().add(offset),
+                        part.len(),
+                    );
+                }
                 offset += part.len();
             }
             unsafe { Vec::from_raw_parts(pointer.as_ptr(), length, length) }
         };
-        Ok(Self { bytes, _invoice: invoice })
+        Ok(Self {
+            bytes,
+            _invoice: invoice,
+        })
     }
-    pub(crate) fn as_slice(&self) -> &[u8] { &self.bytes }
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 
 /// Full original stored bytes and independent decoded text remain admitted
@@ -2897,20 +3177,31 @@ impl NativeConfigBytes {
 pub(crate) struct NativeConfigWindow {
     stored: NativeConfigBytes,
     text: NativeConfigBytes,
-    metadata: contextdb_core::read_memory::ReadShared<super::native_storage_admission::ColdSnapshotMetadata>,
+    metadata: contextdb_core::read_memory::ReadShared<
+        super::native_storage_admission::ColdSnapshotMetadata,
+    >,
 }
 #[cfg(feature = "sync-orchestration")]
 impl NativeConfigWindow {
-    pub(crate) fn stored_bytes(&self) -> &[u8] { self.stored.as_slice() }
+    pub(crate) fn stored_bytes(&self) -> &[u8] {
+        self.stored.as_slice()
+    }
     pub(crate) fn text(&self) -> &str {
         // Borrowed bincode String decoder validated UTF-8 before the copy.
         std::str::from_utf8(self.text.as_slice()).expect("decoded config UTF-8")
     }
-    pub(crate) fn incarnation(&self) -> std::result::Result<contextdb_core::Incarnation, NativeConfigFailure> {
-        contextdb_core::Incarnation::from_hex(self.text()).ok_or(NativeConfigFailure::InvalidIncarnation)
+    pub(crate) fn incarnation(
+        &self,
+    ) -> std::result::Result<contextdb_core::Incarnation, NativeConfigFailure> {
+        contextdb_core::Incarnation::from_hex(self.text())
+            .ok_or(NativeConfigFailure::InvalidIncarnation)
     }
     pub(crate) fn committed_view(&self) -> (redb::StorageSnapshotIdentity, SnapshotId, Lsn) {
-        (self.metadata.identity, self.metadata.snapshot, self.metadata.lsn)
+        (
+            self.metadata.identity,
+            self.metadata.snapshot,
+            self.metadata.lsn,
+        )
     }
 }
 
@@ -2920,7 +3211,9 @@ impl NativeConfigWindow {
 struct NativeConfigCursor<'root> {
     source: cold_provider::ColdCommittedProvider<'root>,
     key: NativeConfigBytes,
-    metadata: contextdb_core::read_memory::ReadShared<super::native_storage_admission::ColdSnapshotMetadata>,
+    metadata: contextdb_core::read_memory::ReadShared<
+        super::native_storage_admission::ColdSnapshotMetadata,
+    >,
     storage: super::native_storage_admission::StorageAdmissionScope,
     owner: contextdb_core::read_memory::ReadMemoryOwner,
     context: crate::executor::bounded::NativeReadOpenContext,
@@ -2928,29 +3221,47 @@ struct NativeConfigCursor<'root> {
 }
 #[cfg(feature = "sync-orchestration")]
 impl NativeConfigCursor<'_> {
-    fn next_text(&mut self) -> std::result::Result<Option<NativeConfigWindow>, NativeConfigFailure> {
+    fn next_text(
+        &mut self,
+    ) -> std::result::Result<Option<NativeConfigWindow>, NativeConfigFailure> {
         use super::native_storage_admission::NativeStorageFailure;
-        if self.finished { return Ok(None); }
-        self.context.checkpoint().map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?;
+        if self.finished {
+            return Ok(None);
+        }
+        self.context
+            .checkpoint()
+            .map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?;
         let key = std::str::from_utf8(self.key.as_slice()).expect("prefix and tenant are UTF-8");
         let owner = &self.owner;
         let metadata = &self.metadata;
         let context = &self.context;
-        let value = self.source.lend_native_read(
-            &self.storage, metadata, key, &mut || context.checkpoint(),
-            |bytes| -> std::result::Result<NativeConfigWindow, NativeConfigFailure> {
-                // This uses the exact standard bincode serde String codec,
-                // borrowing text without any nested allocation. Like the
-                // original decode_config_value<String>, trailing bytes remain
-                // accepted; stored bytes are retained unchanged, never normalized.
-                let (text, _) = bincode::serde::borrow_decode_from_slice::<&str, _>(
-                    bytes, bincode::config::standard(),
-                ).map_err(|_| NativeConfigFailure::InvalidStoredText)?;
-                let stored = NativeConfigBytes::join(owner, &[bytes])?;
-                let text = NativeConfigBytes::join(owner, &[text.as_bytes()])?;
-                Ok(NativeConfigWindow { stored, text, metadata: metadata.clone() })
-            },
-        ).map_err(NativeConfigFailure::Storage)?
+        let value = self
+            .source
+            .lend_native_read(
+                &self.storage,
+                metadata,
+                key,
+                &mut || context.checkpoint(),
+                |bytes| -> std::result::Result<NativeConfigWindow, NativeConfigFailure> {
+                    // This uses the exact standard bincode serde String codec,
+                    // borrowing text without any nested allocation. Like the
+                    // original decode_config_value<String>, trailing bytes remain
+                    // accepted; stored bytes are retained unchanged, never normalized.
+                    let (text, _) = bincode::serde::borrow_decode_from_slice::<&str, _>(
+                        bytes,
+                        bincode::config::standard(),
+                    )
+                    .map_err(|_| NativeConfigFailure::InvalidStoredText)?;
+                    let stored = NativeConfigBytes::join(owner, &[bytes])?;
+                    let text = NativeConfigBytes::join(owner, &[text.as_bytes()])?;
+                    Ok(NativeConfigWindow {
+                        stored,
+                        text,
+                        metadata: metadata.clone(),
+                    })
+                },
+            )
+            .map_err(NativeConfigFailure::Storage)?
             .map_err(NativeConfigFailure::ColdUnqualified)??;
         self.finished = true;
         Ok(value)
@@ -2965,27 +3276,49 @@ impl WriterSnapshot {
         prefix: &str,
         tenant: &contextdb_core::TenantId,
     ) -> std::result::Result<Option<NativeConfigWindow>, NativeConfigFailure> {
-        use contextdb_core::read_memory::{ReadCredit, ReadShared};
         use super::native_storage_admission::{NativeStorageFailure, StorageAdmissionScope};
+        use contextdb_core::read_memory::{ReadCredit, ReadShared};
         let owner = operation.owner();
-        context.checkpoint().map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?;
-        let context_owner = context.owner().map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?;
-        if !owner.same_owner(&context_owner) { return Err(NativeConfigFailure::OwnerMismatch); }
+        context
+            .checkpoint()
+            .map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?;
+        let context_owner = context
+            .owner()
+            .map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?;
+        if !owner.same_owner(&context_owner) {
+            return Err(NativeConfigFailure::OwnerMismatch);
+        }
         let control = ReadCredit::try_new_owned_native(
-            owner.clone(), ReadShared::<std::sync::Mutex<NativeConfigCursor<'_>>>::layout().size(),
-            "writer_source", "config_cursor", HINT,
-        ).map_err(|r| NativeConfigFailure::Storage(NativeStorageFailure::Refused(r)))?;
+            owner.clone(),
+            ReadShared::<std::sync::Mutex<NativeConfigCursor<'_>>>::layout().size(),
+            "writer_source",
+            "config_cursor",
+            HINT,
+        )
+        .map_err(|r| NativeConfigFailure::Storage(NativeStorageFailure::Refused(r)))?;
         let source = cold_provider::ColdCommittedProvider::capture(self)
             .map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?;
         let metadata = source.native_read_metadata(&owner)?;
         // Same <prefix>:<tenant> bytes as TenantId::config_key, without an
         // unadmitted format!/String. This singleton owns its complete endpoint.
-        let key = NativeConfigBytes::join(&owner, &[prefix.as_bytes(), b":", tenant.as_str().as_bytes()])?;
+        let key = NativeConfigBytes::join(
+            &owner,
+            &[prefix.as_bytes(), b":", tenant.as_str().as_bytes()],
+        )?;
         let storage = StorageAdmissionScope::reader_native_owner(owner.clone())?;
-        let cursor = ReadShared::try_from_prepaid_native(std::sync::Mutex::new(NativeConfigCursor {
-            source, key, metadata, storage, owner, context: context.clone(),
-            finished: false,
-        }), control).map_err(|r| NativeConfigFailure::Storage(NativeStorageFailure::Refused(r)))?;
+        let cursor = ReadShared::try_from_prepaid_native(
+            std::sync::Mutex::new(NativeConfigCursor {
+                source,
+                key,
+                metadata,
+                storage,
+                owner,
+                context: context.clone(),
+                finished: false,
+            }),
+            control,
+        )
+        .map_err(|r| NativeConfigFailure::Storage(NativeStorageFailure::Refused(r)))?;
         let result = cursor.lock().unwrap_or_else(|p| p.into_inner()).next_text();
         result
     }
@@ -2998,7 +3331,9 @@ impl WriterSnapshot {
 pub(crate) struct NativeRawConfigWindow {
     key: redb::AccessGuard<'static, &'static [u8]>,
     value: redb::AccessGuard<'static, &'static [u8]>,
-    metadata: contextdb_core::read_memory::ReadShared<super::native_storage_admission::ColdSnapshotMetadata>,
+    metadata: contextdb_core::read_memory::ReadShared<
+        super::native_storage_admission::ColdSnapshotMetadata,
+    >,
     context: crate::executor::bounded::NativeReadOpenContext,
     root: Arc<WriterSnapshot>,
 }
@@ -3010,24 +3345,43 @@ pub(crate) struct NativeRawConfigView<'window> {
 }
 #[cfg(feature = "sync-orchestration")]
 impl NativeRawConfigView<'_> {
-    pub(crate) fn key(&self) -> &str { self.key }
-    pub(crate) fn stored_bytes(&self) -> &[u8] { self.value }
+    pub(crate) fn key(&self) -> &str {
+        self.key
+    }
+    pub(crate) fn stored_bytes(&self) -> &[u8] {
+        self.value
+    }
 }
 #[cfg(feature = "sync-orchestration")]
 impl NativeRawConfigWindow {
     pub(crate) fn view(&self) -> std::result::Result<NativeRawConfigView<'_>, NativeConfigFailure> {
         use super::native_storage_admission::NativeStorageFailure;
-        self.context.checkpoint().map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?;
+        self.context
+            .checkpoint()
+            .map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?;
         // A producer callback already holds this fence; recursive reads avoid
         // deadlocking behind a queued erasure writer. The returned view holds it.
         let fence = self.root.erasure.read_recursive();
-        fence.check_scope(None, CONFIG_TABLE.name()).map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?;
-        fence.check_key(CONFIG_TABLE.name(), self.key.value()).map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?;
-        let key = std::str::from_utf8(self.key.value()).map_err(|_| NativeConfigFailure::InvalidStoredText)?;
-        Ok(NativeRawConfigView { key, value: self.value.value(), _fence: fence })
+        fence
+            .check_scope(None, CONFIG_TABLE.name())
+            .map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?;
+        fence
+            .check_key(CONFIG_TABLE.name(), self.key.value())
+            .map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?;
+        let key = std::str::from_utf8(self.key.value())
+            .map_err(|_| NativeConfigFailure::InvalidStoredText)?;
+        Ok(NativeRawConfigView {
+            key,
+            value: self.value.value(),
+            _fence: fence,
+        })
     }
     pub(crate) fn committed_view(&self) -> (redb::StorageSnapshotIdentity, SnapshotId, Lsn) {
-        (self.metadata.identity, self.metadata.snapshot, self.metadata.lsn)
+        (
+            self.metadata.identity,
+            self.metadata.snapshot,
+            self.metadata.lsn,
+        )
     }
 }
 
@@ -3040,7 +3394,9 @@ pub(crate) struct NativeRawConfigCursor {
     prefix: NativeConfigBytes,
     upper: Option<NativeConfigBytes>,
     after: Option<NativeConfigBytes>,
-    metadata: contextdb_core::read_memory::ReadShared<super::native_storage_admission::ColdSnapshotMetadata>,
+    metadata: contextdb_core::read_memory::ReadShared<
+        super::native_storage_admission::ColdSnapshotMetadata,
+    >,
     storage: super::native_storage_admission::StorageAdmissionScope,
     owner: contextdb_core::read_memory::ReadMemoryOwner,
     context: crate::executor::bounded::NativeReadOpenContext,
@@ -3049,66 +3405,122 @@ pub(crate) struct NativeRawConfigCursor {
 #[cfg(feature = "sync-orchestration")]
 impl NativeRawConfigCursor {
     fn visit_next_group<T>(
-        &mut self, visit: impl FnOnce(NativeRawConfigWindow) -> std::result::Result<T, NativeConfigFailure>,
+        &mut self,
+        visit: impl FnOnce(NativeRawConfigWindow) -> std::result::Result<T, NativeConfigFailure>,
     ) -> std::result::Result<Option<T>, NativeConfigFailure> {
         use super::native_storage_admission::NativeStorageFailure;
         let lower = self.after.as_ref().unwrap_or(&self.prefix).as_slice();
         let context = &self.context;
-        let next = self.source.lend_next_native_group(
-            &self.storage, &self.metadata, lower, self.after.is_some(),
-            self.upper.as_ref().map(NativeConfigBytes::as_slice),
-            &mut || context.checkpoint(),
-            |index, empty| -> std::result::Result<_, NativeConfigFailure> {
-                if !empty.value().is_empty() || !index.value().starts_with(self.prefix.as_slice()) {
-                    return Err(NativeConfigFailure::InvalidCanonicalIndex);
-                }
-                let key = &index.value()[self.prefix.as_slice().len()..];
-                std::str::from_utf8(key).map_err(|_| NativeConfigFailure::InvalidCanonicalIndex)?;
-                if key.is_empty() { return Err(NativeConfigFailure::InvalidCanonicalIndex); }
-                let resume = NativeConfigBytes::join(&self.owner, &[index.value()])?;
-                let record = self.source.lend_next_native_config(
-                    &self.storage, &self.metadata, key, false, None,
-                    &mut || context.checkpoint(),
-                    |actual, value| -> std::result::Result<_, NativeConfigFailure> {
-                        if actual.value() != key { return Err(NativeConfigFailure::InvalidCanonicalIndex); }
-                        visit(NativeRawConfigWindow { key: actual, value,
-                            metadata: self.metadata.clone(), context: context.clone(), root: self.source.root().clone() })
-                    },
-                ).map_err(NativeConfigFailure::Storage)?.map_err(NativeConfigFailure::ColdUnqualified)??
-                    .ok_or(NativeConfigFailure::InvalidCanonicalIndex)?;
-                context.checkpoint().map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?;
-                Ok((resume, record))
-            },
-        ).map_err(NativeConfigFailure::Storage)?.map_err(NativeConfigFailure::ColdUnqualified)??;
+        let next = self
+            .source
+            .lend_next_native_group(
+                &self.storage,
+                &self.metadata,
+                lower,
+                self.after.is_some(),
+                self.upper.as_ref().map(NativeConfigBytes::as_slice),
+                &mut || context.checkpoint(),
+                |index, empty| -> std::result::Result<_, NativeConfigFailure> {
+                    if !empty.value().is_empty()
+                        || !index.value().starts_with(self.prefix.as_slice())
+                    {
+                        return Err(NativeConfigFailure::InvalidCanonicalIndex);
+                    }
+                    let key = &index.value()[self.prefix.as_slice().len()..];
+                    std::str::from_utf8(key)
+                        .map_err(|_| NativeConfigFailure::InvalidCanonicalIndex)?;
+                    if key.is_empty() {
+                        return Err(NativeConfigFailure::InvalidCanonicalIndex);
+                    }
+                    let resume = NativeConfigBytes::join(&self.owner, &[index.value()])?;
+                    let record = self
+                        .source
+                        .lend_next_native_config(
+                            &self.storage,
+                            &self.metadata,
+                            key,
+                            false,
+                            None,
+                            &mut || context.checkpoint(),
+                            |actual, value| -> std::result::Result<_, NativeConfigFailure> {
+                                if actual.value() != key {
+                                    return Err(NativeConfigFailure::InvalidCanonicalIndex);
+                                }
+                                visit(NativeRawConfigWindow {
+                                    key: actual,
+                                    value,
+                                    metadata: self.metadata.clone(),
+                                    context: context.clone(),
+                                    root: self.source.root().clone(),
+                                })
+                            },
+                        )
+                        .map_err(NativeConfigFailure::Storage)?
+                        .map_err(NativeConfigFailure::ColdUnqualified)??
+                        .ok_or(NativeConfigFailure::InvalidCanonicalIndex)?;
+                    context.checkpoint().map_err(|e| {
+                        NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e))
+                    })?;
+                    Ok((resume, record))
+                },
+            )
+            .map_err(NativeConfigFailure::Storage)?
+            .map_err(NativeConfigFailure::ColdUnqualified)??;
         match next {
-            Some((resume, result)) => { self.after = Some(resume); Ok(Some(result)) }
-            None => { self.finished = true; Ok(None) }
+            Some((resume, result)) => {
+                self.after = Some(resume);
+                Ok(Some(result))
+            }
+            None => {
+                self.finished = true;
+                Ok(None)
+            }
         }
     }
 
     /// Exact persisted-byte comparison loan on this cursor's original owner,
     /// metadata and captured transaction. It never changes prefix resume state.
     pub(crate) fn visit_exact<T>(
-        &self, key: &str,
+        &self,
+        key: &str,
         visit: impl FnOnce(NativeRawConfigWindow) -> std::result::Result<T, NativeConfigFailure>,
     ) -> std::result::Result<Option<T>, NativeConfigFailure> {
         use super::native_storage_admission::NativeStorageFailure;
         let context = &self.context;
         let root = self.source.root();
-        context.checkpoint().map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?;
+        context
+            .checkpoint()
+            .map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?;
         // Own the full input key on the original owner before descent.
         let key = NativeConfigBytes::join(&self.owner, &[key.as_bytes()])?;
-        let next = self.source.lend_next_native_config(
-            &self.storage, &self.metadata, key.as_slice(), false, None,
-            &mut || context.checkpoint(),
-            |actual, value| -> std::result::Result<Option<T>, NativeConfigFailure> {
-                if actual.value() != key.as_slice() { return Ok(None); }
-                let result = visit(NativeRawConfigWindow { key: actual, value,
-                    metadata: self.metadata.clone(), context: context.clone(), root: root.clone() })?;
-                context.checkpoint().map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?;
-                Ok(Some(result))
-            },
-        ).map_err(NativeConfigFailure::Storage)?.map_err(NativeConfigFailure::ColdUnqualified)??;
+        let next = self
+            .source
+            .lend_next_native_config(
+                &self.storage,
+                &self.metadata,
+                key.as_slice(),
+                false,
+                None,
+                &mut || context.checkpoint(),
+                |actual, value| -> std::result::Result<Option<T>, NativeConfigFailure> {
+                    if actual.value() != key.as_slice() {
+                        return Ok(None);
+                    }
+                    let result = visit(NativeRawConfigWindow {
+                        key: actual,
+                        value,
+                        metadata: self.metadata.clone(),
+                        context: context.clone(),
+                        root: root.clone(),
+                    })?;
+                    context.checkpoint().map_err(|e| {
+                        NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e))
+                    })?;
+                    Ok(Some(result))
+                },
+            )
+            .map_err(NativeConfigFailure::Storage)?
+            .map_err(NativeConfigFailure::ColdUnqualified)??;
         Ok(next.flatten())
     }
 
@@ -3119,9 +3531,15 @@ impl NativeRawConfigCursor {
         visit: impl FnOnce(NativeRawConfigWindow) -> std::result::Result<T, NativeConfigFailure>,
     ) -> std::result::Result<Option<T>, NativeConfigFailure> {
         use super::native_storage_admission::NativeStorageFailure;
-        self.context.checkpoint().map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?;
-        if self.finished { return Ok(None); }
-        if self.group { return self.visit_next_group(visit); }
+        self.context
+            .checkpoint()
+            .map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?;
+        if self.finished {
+            return Ok(None);
+        }
+        if self.group {
+            return self.visit_next_group(visit);
+        }
         let lower = self.after.as_ref().unwrap_or(&self.prefix).as_slice();
         let owner = &self.owner;
         let context = &self.context;
@@ -3129,22 +3547,42 @@ impl NativeRawConfigCursor {
         let metadata = &self.metadata;
         // A re-seek from the same captured root is O(height), not a scan of
         // previously returned keys. Full raw prefix endpoints never change.
-        let next = self.source.lend_next_native_config(
-            &self.storage, metadata, lower, self.after.is_some(),
-            self.upper.as_ref().map(NativeConfigBytes::as_slice),
-            &mut || context.checkpoint(),
-            |key, value| -> std::result::Result<_, NativeConfigFailure> {
-                let resume = NativeConfigBytes::join(owner, &[key.value()])?;
-                let window = NativeRawConfigWindow { key, value,
-                    metadata: metadata.clone(), context: context.clone(), root: root.clone() };
-                let result = visit(window)?;
-                context.checkpoint().map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?;
-                Ok((resume, result))
-            },
-        ).map_err(NativeConfigFailure::Storage)?.map_err(NativeConfigFailure::ColdUnqualified)??;
+        let next = self
+            .source
+            .lend_next_native_config(
+                &self.storage,
+                metadata,
+                lower,
+                self.after.is_some(),
+                self.upper.as_ref().map(NativeConfigBytes::as_slice),
+                &mut || context.checkpoint(),
+                |key, value| -> std::result::Result<_, NativeConfigFailure> {
+                    let resume = NativeConfigBytes::join(owner, &[key.value()])?;
+                    let window = NativeRawConfigWindow {
+                        key,
+                        value,
+                        metadata: metadata.clone(),
+                        context: context.clone(),
+                        root: root.clone(),
+                    };
+                    let result = visit(window)?;
+                    context.checkpoint().map_err(|e| {
+                        NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e))
+                    })?;
+                    Ok((resume, result))
+                },
+            )
+            .map_err(NativeConfigFailure::Storage)?
+            .map_err(NativeConfigFailure::ColdUnqualified)??;
         match next {
-            Some((resume, value)) => { self.after = Some(resume); Ok(Some(value)) }
-            None => { self.finished = true; Ok(None) }
+            Some((resume, value)) => {
+                self.after = Some(resume);
+                Ok(Some(value))
+            }
+            None => {
+                self.finished = true;
+                Ok(None)
+            }
         }
     }
 }
@@ -3155,69 +3593,129 @@ impl WriterSnapshot {
         operation: &crate::owner_read::NativeReadRequest,
         context: &crate::executor::bounded::NativeReadOpenContext,
         prefix: &str,
-    ) -> std::result::Result<contextdb_core::read_memory::ReadShared<std::sync::Mutex<NativeRawConfigCursor>>, NativeConfigFailure> {
+    ) -> std::result::Result<
+        contextdb_core::read_memory::ReadShared<std::sync::Mutex<NativeRawConfigCursor>>,
+        NativeConfigFailure,
+    > {
         self.native_raw_config_prefix_after(operation, context, prefix, None)
     }
     pub(crate) fn native_raw_config_prefix_after(
-        self: &Arc<Self>, operation: &crate::owner_read::NativeReadRequest,
+        self: &Arc<Self>,
+        operation: &crate::owner_read::NativeReadRequest,
         context: &crate::executor::bounded::NativeReadOpenContext,
-        prefix: &str, after: Option<&str>,
-    ) -> std::result::Result<contextdb_core::read_memory::ReadShared<std::sync::Mutex<NativeRawConfigCursor>>, NativeConfigFailure> {
-        if after.is_some_and(|key| !key.starts_with(prefix)) { return Err(NativeConfigFailure::InvalidCanonicalIndex); }
+        prefix: &str,
+        after: Option<&str>,
+    ) -> std::result::Result<
+        contextdb_core::read_memory::ReadShared<std::sync::Mutex<NativeRawConfigCursor>>,
+        NativeConfigFailure,
+    > {
+        if after.is_some_and(|key| !key.starts_with(prefix)) {
+            return Err(NativeConfigFailure::InvalidCanonicalIndex);
+        }
         self.native_raw_cursor(operation, context, &[prefix.as_bytes()], after, false)
     }
     pub(crate) fn native_raw_custody_group(
-        self: &Arc<Self>, operation: &crate::owner_read::NativeReadRequest,
-        context: &crate::executor::bounded::NativeReadOpenContext, group: &str,
-    ) -> std::result::Result<contextdb_core::read_memory::ReadShared<std::sync::Mutex<NativeRawConfigCursor>>, NativeConfigFailure> {
+        self: &Arc<Self>,
+        operation: &crate::owner_read::NativeReadRequest,
+        context: &crate::executor::bounded::NativeReadOpenContext,
+        group: &str,
+    ) -> std::result::Result<
+        contextdb_core::read_memory::ReadShared<std::sync::Mutex<NativeRawConfigCursor>>,
+        NativeConfigFailure,
+    > {
         // Refuse from the captured scalar before any cursor/control/key/storage
         // allocation or CONFIG examination. No lazy index and no fallback.
         self.require_native_custody_groups()?;
-        let len = u64::try_from(group.len()).map_err(|_| NativeConfigFailure::InvalidCanonicalIndex)?.to_be_bytes();
+        let len = u64::try_from(group.len())
+            .map_err(|_| NativeConfigFailure::InvalidCanonicalIndex)?
+            .to_be_bytes();
         self.native_raw_cursor(operation, context, &[&len, group.as_bytes()], None, true)
     }
-    pub(crate) fn require_native_custody_groups(&self) -> std::result::Result<(), NativeConfigFailure> {
+    pub(crate) fn require_native_custody_groups(
+        &self,
+    ) -> std::result::Result<(), NativeConfigFailure> {
         if !self.custody_groups_complete {
-            return Err(NativeConfigFailure::Storage(super::native_storage_admission::NativeStorageFailure::Refused(
-                contextdb_core::read_memory::NativeRefusal::NativeUnsupported {
-                    subsystem: "custody", operation: "durable_group_index",
-                })));
+            return Err(NativeConfigFailure::Storage(
+                super::native_storage_admission::NativeStorageFailure::Refused(
+                    contextdb_core::read_memory::NativeRefusal::NativeUnsupported {
+                        subsystem: "custody",
+                        operation: "durable_group_index",
+                    },
+                ),
+            ));
         }
         Ok(())
     }
     fn native_raw_cursor(
-        self: &Arc<Self>, operation: &crate::owner_read::NativeReadRequest,
+        self: &Arc<Self>,
+        operation: &crate::owner_read::NativeReadRequest,
         context: &crate::executor::bounded::NativeReadOpenContext,
-        prefix: &[&[u8]], after: Option<&str>, group: bool,
-    ) -> std::result::Result<contextdb_core::read_memory::ReadShared<std::sync::Mutex<NativeRawConfigCursor>>, NativeConfigFailure> {
-        use contextdb_core::read_memory::{ReadCredit, ReadShared};
+        prefix: &[&[u8]],
+        after: Option<&str>,
+        group: bool,
+    ) -> std::result::Result<
+        contextdb_core::read_memory::ReadShared<std::sync::Mutex<NativeRawConfigCursor>>,
+        NativeConfigFailure,
+    > {
         use super::native_storage_admission::{NativeStorageFailure, StorageAdmissionScope};
+        use contextdb_core::read_memory::{ReadCredit, ReadShared};
         let owner = operation.owner();
-        context.checkpoint().map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?;
-        let context_owner = context.owner().map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?;
-        if !owner.same_owner(&context_owner) { return Err(NativeConfigFailure::OwnerMismatch); }
+        context
+            .checkpoint()
+            .map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?;
+        let context_owner = context
+            .owner()
+            .map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?;
+        if !owner.same_owner(&context_owner) {
+            return Err(NativeConfigFailure::OwnerMismatch);
+        }
         let control = ReadCredit::try_new_owned_native(
-            owner.clone(), ReadShared::<std::sync::Mutex<NativeRawConfigCursor>>::layout().size(),
-            "writer_source", "raw_config_cursor", HINT,
-        ).map_err(|r| NativeConfigFailure::Storage(NativeStorageFailure::Refused(r)))?;
+            owner.clone(),
+            ReadShared::<std::sync::Mutex<NativeRawConfigCursor>>::layout().size(),
+            "writer_source",
+            "raw_config_cursor",
+            HINT,
+        )
+        .map_err(|r| NativeConfigFailure::Storage(NativeStorageFailure::Refused(r)))?;
         let captured = cold_provider::ColdCommittedProvider::capture(self)
             .map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?;
         let metadata = captured.native_read_metadata(&owner)?;
         let source = captured.into_native_config_range(self.clone())?;
         let prefix = NativeConfigBytes::join(&owner, prefix)?;
-        let after = after.map(|key| NativeConfigBytes::join(&owner, &[key.as_bytes()])).transpose()?;
+        let after = after
+            .map(|key| NativeConfigBytes::join(&owner, &[key.as_bytes()]))
+            .transpose()?;
         // Exclusive successor is bytewise, including a last UTF-8 byte of 0xbf.
         // Never reinterpret CONFIG_TABLE text as a fixed relational identity.
         let mut end = prefix.as_slice().len();
-        while end > 0 && prefix.as_slice()[end - 1] == u8::MAX { end -= 1; }
-        let upper = if end == 0 { None } else {
+        while end > 0 && prefix.as_slice()[end - 1] == u8::MAX {
+            end -= 1;
+        }
+        let upper = if end == 0 {
+            None
+        } else {
             let last = [prefix.as_slice()[end - 1] + 1];
-            Some(NativeConfigBytes::join(&owner, &[&prefix.as_slice()[..end - 1], &last])?)
+            Some(NativeConfigBytes::join(
+                &owner,
+                &[&prefix.as_slice()[..end - 1], &last],
+            )?)
         };
         let storage = StorageAdmissionScope::reader_native_owner(owner.clone())?;
-        ReadShared::try_from_prepaid_native(std::sync::Mutex::new(NativeRawConfigCursor {
-            source, group, prefix, upper, after, metadata, storage, owner,
-            context: context.clone(), finished: false,
-        }), control).map_err(|r| NativeConfigFailure::Storage(NativeStorageFailure::Refused(r)))
+        ReadShared::try_from_prepaid_native(
+            std::sync::Mutex::new(NativeRawConfigCursor {
+                source,
+                group,
+                prefix,
+                upper,
+                after,
+                metadata,
+                storage,
+                owner,
+                context: context.clone(),
+                finished: false,
+            }),
+            control,
+        )
+        .map_err(|r| NativeConfigFailure::Storage(NativeStorageFailure::Refused(r)))
     }
 }

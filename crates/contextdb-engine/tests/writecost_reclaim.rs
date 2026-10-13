@@ -45,9 +45,18 @@ pub fn fixture(policy: MaintenancePolicy) -> Fixture {
     let path = dir.path().join("writecost.db");
     let db = Database::open(&path).unwrap();
     db.set_maintenance_policy(policy);
-    db.execute("CREATE TABLE churn (id INTEGER PRIMARY KEY, payload TEXT)", &p()).unwrap();
-    db.execute("CREATE TABLE bulk (id INTEGER PRIMARY KEY, payload TEXT)", &p()).unwrap();
-    db.execute("INSERT INTO churn (id, payload) VALUES (0, 'seed')", &p()).unwrap();
+    db.execute(
+        "CREATE TABLE churn (id INTEGER PRIMARY KEY, payload TEXT)",
+        &p(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE bulk (id INTEGER PRIMARY KEY, payload TEXT)",
+        &p(),
+    )
+    .unwrap();
+    db.execute("INSERT INTO churn (id, payload) VALUES (0, 'seed')", &p())
+        .unwrap();
     seed_bulk(&db, 0, BULK_ROWS);
     Fixture { dir, path, db }
 }
@@ -55,7 +64,10 @@ pub fn fixture(policy: MaintenancePolicy) -> Fixture {
 pub fn churn(db: &Database, commits: usize) {
     for generation in 0..commits {
         db.execute(
-            &format!("UPDATE churn SET payload = 'g{generation}{}' WHERE id = 0", "y".repeat(8192)),
+            &format!(
+                "UPDATE churn SET payload = 'g{generation}{}' WHERE id = 0",
+                "y".repeat(8192)
+            ),
             &p(),
         )
         .unwrap();
@@ -64,8 +76,13 @@ pub fn churn(db: &Database, commits: usize) {
 
 pub fn hold(db: &Database) -> (ReadSession, ReadCursor) {
     let session = db.read_session(ReadLimits::default()).unwrap();
-    let cursor = session.open_cursor("SELECT id FROM bulk ORDER BY id", &p()).unwrap();
-    assert!(cursor.first_page().has_more, "the cursor must keep a live snapshot");
+    let cursor = session
+        .open_cursor("SELECT id FROM bulk ORDER BY id", &p())
+        .unwrap();
+    assert!(
+        cursor.first_page().has_more,
+        "the cursor must keep a live snapshot"
+    );
     (session, cursor)
 }
 
@@ -86,7 +103,9 @@ fn rows_in(mut cursor: ReadCursor) -> usize {
 }
 
 fn count_rows(db: &Database, table: &str) -> i64 {
-    let result = db.execute(&format!("SELECT COUNT(*) FROM {table}"), &p()).unwrap();
+    let result = db
+        .execute(&format!("SELECT COUNT(*) FROM {table}"), &p())
+        .unwrap();
     match &result.rows[0][0] {
         Value::Int64(n) => *n,
         other => panic!("unexpected count value {other:?}"),
@@ -101,7 +120,10 @@ fn cycles_until_drained(db: &Database, max_pages: usize, limit: usize) -> usize 
         }
         db.run_maintenance_cycle().unwrap();
     }
-    panic!("{limit} cycles did not drain the backlog: {:?}", backlog(db));
+    panic!(
+        "{limit} cycles did not drain the backlog: {:?}",
+        backlog(db)
+    );
 }
 
 /// Row 1. A final small write whose snapshot-held history is the only backlog drains through
@@ -112,16 +134,26 @@ fn an_idle_tail_drains_through_maintenance_cycles_alone() {
     let (session, cursor) = hold(&f.db);
     churn(&f.db, 96);
     let held = backlog(&f.db);
-    assert!(held.1 > 3_000, "the held snapshot must park a large backlog: {held:?}");
+    assert!(
+        held.1 > 3_000,
+        "the held snapshot must park a large backlog: {held:?}"
+    );
     drop(cursor);
     drop(session);
     churn(&f.db, 1); // the final write; nothing after it
     let before = backlog(&f.db);
-    assert!(before.1 > 3_000, "release does not by itself reclaim: {before:?}");
+    assert!(
+        before.1 > 3_000,
+        "release does not by itself reclaim: {before:?}"
+    );
     // At most four cycles; the fix needs one.
     let used = cycles_until_drained(&f.db, 128, 4);
     assert!(used >= 1, "{before:?}");
-    assert!(backlog(&f.db).0 <= 3, "only the cycle's own bookkeeping tail may remain: {:?}", backlog(&f.db));
+    assert!(
+        backlog(&f.db).0 <= 3,
+        "only the cycle's own bookkeeping tail may remain: {:?}",
+        backlog(&f.db)
+    );
     assert_eq!(count_rows(&f.db, "bulk"), BULK_ROWS);
     assert_eq!(count_rows(&f.db, "churn"), 1);
 }
@@ -145,7 +177,11 @@ fn a_held_reader_keeps_its_snapshot_and_release_lets_retried_cycles_drain() {
     );
     // Reuse freed pages hard, then read the whole held snapshot.
     churn(&f.db, 24);
-    assert_eq!(rows_in(cursor), BULK_ROWS as usize, "the held snapshot must stay intact");
+    assert_eq!(
+        rows_in(cursor),
+        BULK_ROWS as usize,
+        "the held snapshot must stay intact"
+    );
     drop(session);
     // No deadline is claimed: every cycle must make progress, and the backlog must eventually
     // drain. (While a storage-compaction sweep owns reclamation the stage stands down and the
@@ -154,10 +190,17 @@ fn a_held_reader_keeps_its_snapshot_and_release_lets_retried_cycles_drain() {
     let mut cycles = 0;
     while backlog(&f.db).1 > 128 {
         cycles += 1;
-        assert!(cycles <= 80, "the backlog must eventually drain: {:?} after {cycles} cycles", backlog(&f.db));
+        assert!(
+            cycles <= 80,
+            "the backlog must eventually drain: {:?} after {cycles} cycles",
+            backlog(&f.db)
+        );
         f.db.run_maintenance_cycle().unwrap();
         let now = backlog(&f.db).1;
-        assert!(now < previous, "cycle {cycles} must make progress: {previous} -> {now}");
+        assert!(
+            now < previous,
+            "cycle {cycles} must make progress: {previous} -> {now}"
+        );
         previous = now;
     }
     assert!(cycles >= 1);
@@ -178,8 +221,14 @@ fn releasing_older_snapshots_never_frees_what_a_newer_one_reads() {
     drop(older_session);
     f.db.run_maintenance_cycle().unwrap();
     let after_older = backlog(&f.db);
-    assert!(after_older.1 < both.1, "releasing the older snapshot must free its share: {both:?} -> {after_older:?}");
-    assert!(after_older.1 > 0, "the newer snapshot's share stays parked: {after_older:?}");
+    assert!(
+        after_older.1 < both.1,
+        "releasing the older snapshot must free its share: {both:?} -> {after_older:?}"
+    );
+    assert!(
+        after_older.1 > 0,
+        "the newer snapshot's share stays parked: {after_older:?}"
+    );
     for _ in 0..3 {
         f.db.run_maintenance_cycle().unwrap();
     }
@@ -207,13 +256,20 @@ fn a_declaration_free_store_keeps_pace_on_its_own_commits_and_spawns_no_thread()
     redb::commit_work::reset_commit_pages_for_test();
     churn(&f.db, 1);
     let small = redb::commit_work::take_commit_pages_for_test();
-    assert!(small.reclaimed_pages <= 64.max(small.freed_pages), "{small:?}");
+    assert!(
+        small.reclaimed_pages <= 64.max(small.freed_pages),
+        "{small:?}"
+    );
 
     // One large commit: delete every bulk row (hundreds of extents) with older work pending.
     redb::commit_work::reset_commit_pages_for_test();
-    f.db.execute("DELETE FROM bulk WHERE id >= 0", &p()).unwrap();
+    f.db.execute("DELETE FROM bulk WHERE id >= 0", &p())
+        .unwrap();
     let large = redb::commit_work::take_commit_pages_for_test();
-    assert!(large.freed_pages > 64, "the delete must free more than the ordinary budget: {large:?}");
+    assert!(
+        large.freed_pages > 64,
+        "the delete must free more than the ordinary budget: {large:?}"
+    );
     assert!(
         large.reclaimed_pages >= large.freed_pages,
         "a large commit must reclaim at least what it frees: {large:?}"
@@ -227,12 +283,22 @@ fn a_declaration_free_store_keeps_pace_on_its_own_commits_and_spawns_no_thread()
     let mut previous = backlog(&f.db).1;
     for round in 0..3 {
         seed_bulk(&f.db, 1_000 * (round + 1), 200);
-        f.db.execute(&format!("DELETE FROM bulk WHERE id >= {}", 1_000 * (round + 1)), &p()).unwrap();
+        f.db.execute(
+            &format!("DELETE FROM bulk WHERE id >= {}", 1_000 * (round + 1)),
+            &p(),
+        )
+        .unwrap();
         let now = backlog(&f.db).1;
-        assert!(now <= previous + 64, "round {round}: backlog grew {previous} -> {now}");
+        assert!(
+            now <= previous + 64,
+            "round {round}: backlog grew {previous} -> {now}"
+        );
         previous = now;
     }
-    assert!(!f.db.maintenance_status().running, "no thread is ever spawned for an undeclared store");
+    assert!(
+        !f.db.maintenance_status().running,
+        "no thread is ever spawned for an undeclared store"
+    );
     assert!(!f.db.__maintenance_thread_running());
 
     // Close drains what is left; a reopen sees an empty (or one-entry) tail.

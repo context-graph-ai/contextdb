@@ -166,7 +166,9 @@ impl AtomicCounters {
             graph_iteration_steps: self.graph_iteration_steps.load(Ordering::Relaxed),
             graph_population_walks: self.graph_population_walks.load(Ordering::Relaxed),
             graph_payload_decodes: self.graph_payload_decodes.load(Ordering::Relaxed),
-            graph_private_history_decodes: self.graph_private_history_decodes.load(Ordering::Relaxed),
+            graph_private_history_decodes: self
+                .graph_private_history_decodes
+                .load(Ordering::Relaxed),
             graph_root_reads: self.graph_root_reads.load(Ordering::Relaxed),
             graph_addressed_gets: self.graph_addressed_gets.load(Ordering::Relaxed),
             graph_maximum_seeks: self.graph_maximum_seeks.load(Ordering::Relaxed),
@@ -174,17 +176,29 @@ impl AtomicCounters {
             graph_support_probes: self.graph_support_probes.load(Ordering::Relaxed),
             graph_forward_mutations: self.graph_forward_mutations.load(Ordering::Relaxed),
             graph_reverse_mutations: self.graph_reverse_mutations.load(Ordering::Relaxed),
-            graph_creation_contribution_mutations: self.graph_creation_contribution_mutations.load(Ordering::Relaxed),
+            graph_creation_contribution_mutations: self
+                .graph_creation_contribution_mutations
+                .load(Ordering::Relaxed),
             graph_lifecycle_mutations: self.graph_lifecycle_mutations.load(Ordering::Relaxed),
-            graph_deletion_contribution_mutations: self.graph_deletion_contribution_mutations.load(Ordering::Relaxed),
+            graph_deletion_contribution_mutations: self
+                .graph_deletion_contribution_mutations
+                .load(Ordering::Relaxed),
             graph_location_mutations: self.graph_location_mutations.load(Ordering::Relaxed),
             graph_history_mutations: self.graph_history_mutations.load(Ordering::Relaxed),
-            graph_survivor_history_touches: self.graph_survivor_history_touches.load(Ordering::Relaxed),
-            graph_survivor_location_touches: self.graph_survivor_location_touches.load(Ordering::Relaxed),
-            graph_survivor_deletion_contribution_touches: self.graph_survivor_deletion_contribution_touches.load(Ordering::Relaxed),
+            graph_survivor_history_touches: self
+                .graph_survivor_history_touches
+                .load(Ordering::Relaxed),
+            graph_survivor_location_touches: self
+                .graph_survivor_location_touches
+                .load(Ordering::Relaxed),
+            graph_survivor_deletion_contribution_touches: self
+                .graph_survivor_deletion_contribution_touches
+                .load(Ordering::Relaxed),
             graph_publication_commits: self.graph_publication_commits.load(Ordering::Relaxed),
             graph_snapshots_constructed: self.graph_snapshots_constructed.load(Ordering::Relaxed),
-            graph_descriptors_at_last_capture: self.graph_descriptors_at_last_capture.load(Ordering::Relaxed),
+            graph_descriptors_at_last_capture: self
+                .graph_descriptors_at_last_capture
+                .load(Ordering::Relaxed),
             worker_admitted_pages: self.worker_admitted_pages.load(Ordering::Relaxed),
             worker_admitted_page_bytes: self.worker_admitted_page_bytes.load(Ordering::Relaxed),
         }
@@ -243,14 +257,24 @@ struct CommitDirectoryFundingReceipt {
 impl CommitDirectoryFundingReceipt {
     fn sample(&self) -> CommitDirectoryFunding {
         let image = self.image.as_ref().and_then(std::sync::Weak::upgrade);
-        let accountant = self.image_accountant.as_ref().and_then(std::sync::Weak::upgrade);
+        let accountant = self
+            .image_accountant
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade);
         CommitDirectoryFunding {
             open_child: self.open_child.sample(),
             request_child: self.request_child.as_ref().map(|child| child.sample()),
             image_alive: self.image.as_ref().map(|_| image.is_some()),
-            image_held_bytes: self.image.as_ref().map(|_| image.as_ref().map_or(0, |image| image.held())),
+            image_held_bytes: self
+                .image
+                .as_ref()
+                .map(|_| image.as_ref().map_or(0, |image| image.held())),
             image_accountant_alive: self.image_accountant.as_ref().map(|_| accountant.is_some()),
-            image_accountant_used_bytes: self.image_accountant.as_ref().map(|_| accountant.as_ref().map_or(0, |accountant| accountant.usage().used)),
+            image_accountant_used_bytes: self.image_accountant.as_ref().map(|_| {
+                accountant
+                    .as_ref()
+                    .map_or(0, |accountant| accountant.usage().used)
+            }),
         }
     }
 }
@@ -493,13 +517,21 @@ thread_local! {
     static GRAPH_ROOT: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 /// Capability identity is process-local and remains stable while the owner lives.
-pub(crate) fn funding_owner_name<T: ?Sized + contextdb_core::read_memory::ReadMemoryBudget>(owner: &std::sync::Arc<T>) -> String {
+pub(crate) fn funding_owner_name<T: ?Sized + contextdb_core::read_memory::ReadMemoryBudget>(
+    owner: &std::sync::Arc<T>,
+) -> String {
     if let Some(funder) = owner.funding_owner_for_test() {
         return funding_owner_name(funder);
     }
-    format!("{}@{:p}", std::any::type_name::<T>(), std::sync::Arc::as_ptr(owner) as *const ())
+    format!(
+        "{}@{:p}",
+        std::any::type_name::<T>(),
+        std::sync::Arc::as_ptr(owner) as *const ()
+    )
 }
-pub(crate) fn funding_owner_id<T: ?Sized + contextdb_core::read_memory::ReadMemoryBudget>(owner: &std::sync::Arc<T>) -> usize {
+pub(crate) fn funding_owner_id<T: ?Sized + contextdb_core::read_memory::ReadMemoryBudget>(
+    owner: &std::sync::Arc<T>,
+) -> usize {
     if let Some(funder) = owner.funding_owner_for_test() {
         return funding_owner_id(funder);
     }
@@ -510,7 +542,11 @@ pub(crate) fn observed_funding_identity() -> Option<usize> {
 }
 pub(crate) struct FundingScope(Option<(String, usize, usize)>);
 impl Drop for FundingScope {
-    fn drop(&mut self) { FUNDING.with(|f| { f.replace(self.0.take()); }); }
+    fn drop(&mut self) {
+        FUNDING.with(|f| {
+            f.replace(self.0.take());
+        });
+    }
 }
 pub(crate) fn observe_funding(owner: String, identity: usize, controls: usize) -> FundingScope {
     FundingScope(FUNDING.with(|f| f.replace(Some((owner, identity, controls)))))
@@ -600,26 +636,47 @@ impl ReadWorkObservationScope {
     /// None means the actual open funder was never observed. Samples retain
     /// only Weak handles; a known dropped owner is reported as dead with zero.
     pub fn commit_directory_funding(&self) -> Option<CommitDirectoryFunding> {
-        self.commit_directory_funding.lock().unwrap_or_else(|error| error.into_inner())
-            .as_ref().map(CommitDirectoryFundingReceipt::sample)
+        self.commit_directory_funding
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .map(CommitDirectoryFundingReceipt::sample)
     }
     /// None means no successful source registration was observed on this seam.
     /// Snapshot values never resample or retain the ImageMemory owner.
-    pub fn commit_directory_source_registration_funding(&self) -> Option<CommitDirectorySourceRegistrationFunding> {
-        self.commit_directory_funding.lock().unwrap_or_else(|error| error.into_inner())
-            .as_ref().and_then(|receipt| receipt.source_registration)
+    pub fn commit_directory_source_registration_funding(
+        &self,
+    ) -> Option<CommitDirectorySourceRegistrationFunding> {
+        self.commit_directory_funding
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .and_then(|receipt| receipt.source_registration)
     }
     pub fn owner_worker_paths(&self) -> Vec<GraphWorkerInstallation> {
-        self.graph.worker_paths.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.graph
+            .worker_paths
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
     /// None means no executing worker path was observed; pages/bytes live on
     /// the same shared probe and are recorded only after successful admission.
     pub fn owner_page_admission(&self) -> Option<(u64, u64)> {
-        self.owner_graph_counters().map(|c| (c.worker_admitted_pages, c.worker_admitted_page_bytes))
+        self.owner_graph_counters()
+            .map(|c| (c.worker_admitted_pages, c.worker_admitted_page_bytes))
     }
     /// Per-capability successful funding totals; None remains UNOBSERVED.
-    pub fn owner_page_admission_by_owner(&self) -> Option<std::collections::BTreeMap<String, (u64, u64)>> {
-        self.owner_graph_counters().map(|_| self.graph.page_admissions.lock().unwrap_or_else(|e| e.into_inner()).clone())
+    pub fn owner_page_admission_by_owner(
+        &self,
+    ) -> Option<std::collections::BTreeMap<String, (u64, u64)>> {
+        self.owner_graph_counters().map(|_| {
+            self.graph
+                .page_admissions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        })
     }
     pub fn owner_graph_counters(&self) -> Option<GraphReadWorkCounters> {
         (!self.owner_worker_paths().is_empty()).then(|| self.graph_counters())
@@ -653,10 +710,17 @@ pub(crate) fn enter_owner_graph_scope(
         .cloned();
     if let Some(a) = &mut active {
         a.worker_request_id = Some(format!("{:?}:{}", connection, ordinal));
-        a.graph.worker_paths.lock().unwrap_or_else(|e| e.into_inner()).push(GraphWorkerInstallation {
-            path: path.into(),
-            worker_request_id: a.worker_request_id.clone().expect("worker identity assigned above"),
-        });
+        a.graph
+            .worker_paths
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(GraphWorkerInstallation {
+                path: path.into(),
+                worker_request_id: a
+                    .worker_request_id
+                    .clone()
+                    .expect("worker identity assigned above"),
+            });
     }
     GraphWorkerScope {
         previous: ACTIVE.with(|a| a.replace(active)),
@@ -683,7 +747,13 @@ pub(crate) fn note_graph(
         let family = match family {
             "change_log" | "writer_change_log" => "history",
             "graph_contribution" if key.len() < 18 => "graph_contribution",
-            "graph_contribution" => if key.get(17) == Some(&1) { "graph_deletion" } else { "graph_creation" },
+            "graph_contribution" => {
+                if key.get(17) == Some(&1) {
+                    "graph_deletion"
+                } else {
+                    "graph_creation"
+                }
+            }
             "graph_contributions_v1" => {
                 if key.get(17) == Some(&1) {
                     "graph_deletion"
@@ -760,8 +830,17 @@ pub(crate) fn note_graph(
                 phase: a.phase,
                 operation_id: a.operation_id.clone(),
                 worker_request_id: a.worker_request_id.clone(),
-                observation_status: if GRAPH_ROOT.with(|r| r.borrow().is_some()) { "OBSERVED" } else { "UNOBSERVED" }.into(),
-                acquired_root: if operation == "root" { role.map(Into::into) } else { None },
+                observation_status: if GRAPH_ROOT.with(|r| r.borrow().is_some()) {
+                    "OBSERVED"
+                } else {
+                    "UNOBSERVED"
+                }
+                .into(),
+                acquired_root: if operation == "root" {
+                    role.map(Into::into)
+                } else {
+                    None
+                },
                 captured_root: GRAPH_ROOT.with(|r| r.borrow().clone()),
                 family: family.into(),
                 operation: operation.into(),
@@ -783,7 +862,10 @@ impl GraphPublicationAttempt {
         let previous_root = GRAPH_ROOT.with(|r| r.borrow().clone());
         bind_graph_write_root(write);
         note_graph("publication", "begin", &[], None, None);
-        Self { committed: false, previous_root }
+        Self {
+            committed: false,
+            previous_root,
+        }
     }
     pub(crate) fn committed(&mut self) {
         self.committed = true;
@@ -795,7 +877,9 @@ impl Drop for GraphPublicationAttempt {
         if !self.committed {
             note_graph("publication", "aborted", &[], None, None);
         }
-        GRAPH_ROOT.with(|r| { r.replace(self.previous_root.take()); });
+        GRAPH_ROOT.with(|r| {
+            r.replace(self.previous_root.take());
+        });
     }
 }
 
@@ -816,15 +900,48 @@ pub(crate) fn graph_storage_key<K: AsRef<[u8]>>(family: &str, operation: &str, k
 
 /// Initial roots of this executing transaction, captured before any open handles.
 pub(crate) fn bind_graph_write_root(write: &redb::WriteTransaction) {
-    let mut roots = ["graph_fwd", "graph_rev", "graph_contributions_v1", "graph_occurrence_locations_v1", "graph_predecessor_lifecycle_v1"]
-        .map(|name| (name, write.table_root_fingerprint(redb::TableDefinition::<&[u8], &[u8]>::new(name)))).into_iter().collect::<Vec<_>>();
-    roots.push(("change_log", write.table_root_fingerprint(redb::TableDefinition::<&str, &[u8]>::new("change_log"))));
-    roots.push(("writer_change_log", write.table_root_fingerprint(redb::TableDefinition::<&[u8], &[u8]>::new("writer_change_log"))));
-    for (name, root) in &roots { note_graph_root("root_binding", name.as_bytes(), root); }
+    let mut roots = [
+        "graph_fwd",
+        "graph_rev",
+        "graph_contributions_v1",
+        "graph_occurrence_locations_v1",
+        "graph_predecessor_lifecycle_v1",
+    ]
+    .map(|name| {
+        (
+            name,
+            write.table_root_fingerprint(redb::TableDefinition::<&[u8], &[u8]>::new(name)),
+        )
+    })
+    .into_iter()
+    .collect::<Vec<_>>();
+    roots.push((
+        "change_log",
+        write.table_root_fingerprint(redb::TableDefinition::<&str, &[u8]>::new("change_log")),
+    ));
+    roots.push((
+        "writer_change_log",
+        write.table_root_fingerprint(redb::TableDefinition::<&[u8], &[u8]>::new(
+            "writer_change_log",
+        )),
+    ));
+    for (name, root) in &roots {
+        note_graph_root("root_binding", name.as_bytes(), root);
+    }
     if roots.iter().any(|(_, root)| root.is_err()) {
-        GRAPH_ROOT.with(|r| { r.replace(None); });
-        note_graph("root_binding", "UNOBSERVED", &[], None, Some("transaction roots unavailable"));
-    } else { bind_graph_root(&roots); }
+        GRAPH_ROOT.with(|r| {
+            r.replace(None);
+        });
+        note_graph(
+            "root_binding",
+            "UNOBSERVED",
+            &[],
+            None,
+            Some("transaction roots unavailable"),
+        );
+    } else {
+        bind_graph_root(&roots);
+    }
 }
 pub(crate) fn note_graph_root(family: &str, key: &[u8], root: impl std::fmt::Debug) {
     let acquired = format!("{root:?}");
@@ -832,16 +949,27 @@ pub(crate) fn note_graph_root(family: &str, key: &[u8], root: impl std::fmt::Deb
 }
 
 /// Marks the completed adapter construction, before any edge cursor load.
-pub(crate) fn note_graph_snapshot_capture(root: impl std::fmt::Debug, owner: String, identity: usize, controls: usize) {
+pub(crate) fn note_graph_snapshot_capture(
+    root: impl std::fmt::Debug,
+    owner: String,
+    identity: usize,
+    controls: usize,
+) {
     let _funding = observe_funding(owner, identity, controls);
     let mut sample = None;
     ACTIVE.with(|active| {
         if let Some(active) = active.borrow().as_ref() {
             let c = &active.counters;
-            let constructed = c.graph_snapshots_constructed.fetch_add(1, Ordering::Relaxed) + 1;
+            let constructed = c
+                .graph_snapshots_constructed
+                .fetch_add(1, Ordering::Relaxed)
+                + 1;
             let descriptors = c.graph_root_reads.load(Ordering::Relaxed);
-            c.graph_descriptors_at_last_capture.store(descriptors, Ordering::Relaxed);
-            sample = Some(format!("constructed={constructed};descriptor_reads_so_far={descriptors}"));
+            c.graph_descriptors_at_last_capture
+                .store(descriptors, Ordering::Relaxed);
+            sample = Some(format!(
+                "constructed={constructed};descriptor_reads_so_far={descriptors}"
+            ));
         }
     });
     // A snapshot event describes this construction only. Restore the caller's
@@ -849,12 +977,20 @@ pub(crate) fn note_graph_snapshot_capture(root: impl std::fmt::Debug, owner: Str
     struct EventRoot(Option<String>);
     impl Drop for EventRoot {
         fn drop(&mut self) {
-            GRAPH_ROOT.with(|r| { r.replace(self.0.take()); });
+            GRAPH_ROOT.with(|r| {
+                r.replace(self.0.take());
+            });
         }
     }
     let _root = EventRoot(GRAPH_ROOT.with(|r| r.replace(Some(format!("{root:?}")))));
     if let Some(sample) = sample {
-        note_graph("graph_snapshot", "SNAPSHOT_CAPTURE", &[], None, Some(&sample));
+        note_graph(
+            "graph_snapshot",
+            "SNAPSHOT_CAPTURE",
+            &[],
+            None,
+            Some(&sample),
+        );
     }
 }
 pub(crate) fn note_graph_root_bound(root: impl std::fmt::Debug) {
@@ -864,13 +1000,27 @@ pub(crate) fn note_graph_root_bound(root: impl std::fmt::Debug) {
 /// Called by actual storage-page admission callbacks after funding succeeds.
 pub(crate) fn note_worker_page_admitted(bytes: usize, owner: String) {
     ACTIVE.with(|active| {
-        if let Some(active) = active.borrow().as_ref().filter(|a| a.worker_request_id.is_some()) {
-            let mut admissions = active.graph.page_admissions.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(active) = active
+            .borrow()
+            .as_ref()
+            .filter(|a| a.worker_request_id.is_some())
+        {
+            let mut admissions = active
+                .graph
+                .page_admissions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let total = admissions.entry(owner).or_default();
             total.0 += 1;
             total.1 += bytes as u64;
-            active.counters.worker_admitted_pages.fetch_add(1, Ordering::Relaxed);
-            active.counters.worker_admitted_page_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+            active
+                .counters
+                .worker_admitted_pages
+                .fetch_add(1, Ordering::Relaxed);
+            active
+                .counters
+                .worker_admitted_page_bytes
+                .fetch_add(bytes as u64, Ordering::Relaxed);
         }
     });
 }
@@ -880,10 +1030,15 @@ pub(crate) fn note_owner_graph_path(path: &str) {
         if let Some(active) = active.borrow().as_ref()
             && let Some(worker_request_id) = &active.worker_request_id
         {
-            active.graph.worker_paths.lock().unwrap_or_else(|e| e.into_inner()).push(GraphWorkerInstallation {
-                path: path.into(),
-                worker_request_id: worker_request_id.clone(),
-            });
+            active
+                .graph
+                .worker_paths
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(GraphWorkerInstallation {
+                    path: path.into(),
+                    worker_request_id: worker_request_id.clone(),
+                });
         }
     });
 }
@@ -892,47 +1047,81 @@ pub(crate) fn note_owner_graph_path(path: &str) {
 pub(crate) fn note_commit_directory_residency(resident: u64, durable: u64) {
     ACTIVE.with(|active| {
         if let Some(active) = active.borrow().as_ref() {
-            *active.commit_directory_residency
+            *active
+                .commit_directory_residency
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = Some(CommitDirectoryResidency {
-                    resident_entries: resident,
-                    durable_entries: durable,
-                });
+                resident_entries: resident,
+                durable_entries: durable,
+            });
         }
     });
 }
 
 /// Bind the exact child selected for native open, never an inferred byte sum.
-pub(crate) fn note_commit_directory_open_funding(memory: &Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>) {
+pub(crate) fn note_commit_directory_open_funding(
+    memory: &Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) {
     let child = crate::vector_read_memory::declared_child_observer(memory);
     ACTIVE.with(|active| {
         if let Some(active) = active.borrow().as_ref() {
-            let mut receipt = active.commit_directory_funding.lock().unwrap_or_else(|error| error.into_inner());
+            let mut receipt = active
+                .commit_directory_funding
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             match child {
                 Some(open_child) => {
-                    if receipt.as_ref().is_some_and(|previous| previous.open_child.sample().owner_identity == open_child.sample().owner_identity) {
+                    if receipt.as_ref().is_some_and(|previous| {
+                        previous.open_child.sample().owner_identity
+                            == open_child.sample().owner_identity
+                    }) {
                         return;
                     }
-                    *receipt = Some(CommitDirectoryFundingReceipt { open_child, request_child: None, image: None, image_accountant: None, source_registration: None });
+                    *receipt = Some(CommitDirectoryFundingReceipt {
+                        open_child,
+                        request_child: None,
+                        image: None,
+                        image_accountant: None,
+                        source_registration: None,
+                    });
                 }
                 None => *receipt = None,
             }
         }
     });
 }
-pub(crate) fn note_commit_directory_image_memory(image: &Arc<crate::read_image_memory::ImageMemory>) {
+pub(crate) fn note_commit_directory_image_memory(
+    image: &Arc<crate::read_image_memory::ImageMemory>,
+) {
     ACTIVE.with(|active| {
         if let Some(active) = active.borrow().as_ref()
-            && let Some(receipt) = active.commit_directory_funding.lock().unwrap_or_else(|error| error.into_inner()).as_mut() {
+            && let Some(receipt) = active
+                .commit_directory_funding
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_mut()
+        {
             receipt.image = Some(Arc::downgrade(image));
-            receipt.image_accountant = Some(Arc::downgrade(&image.accountant.standard_arc().expect("reader image preserves standard Arc observation")));
+            receipt.image_accountant = Some(Arc::downgrade(
+                &image
+                    .accountant
+                    .standard_arc()
+                    .expect("reader image preserves standard Arc observation"),
+            ));
         }
     });
 }
-pub(crate) fn note_commit_directory_request_funding(memory: &Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>) {
+pub(crate) fn note_commit_directory_request_funding(
+    memory: &Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) {
     ACTIVE.with(|active| {
         if let Some(active) = active.borrow().as_ref()
-            && let Some(receipt) = active.commit_directory_funding.lock().unwrap_or_else(|error| error.into_inner()).as_mut() {
+            && let Some(receipt) = active
+                .commit_directory_funding
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_mut()
+        {
             receipt.request_child = crate::vector_read_memory::declared_child_observer(memory);
         }
     });
@@ -953,7 +1142,12 @@ pub(crate) fn note_commit_directory_source_registration_funding(
     };
     ACTIVE.with(|active| {
         if let Some(active) = active.borrow().as_ref()
-            && let Some(receipt) = active.commit_directory_funding.lock().unwrap_or_else(|error| error.into_inner()).as_mut() {
+            && let Some(receipt) = active
+                .commit_directory_funding
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_mut()
+        {
             receipt.source_registration = Some(window);
         }
     });

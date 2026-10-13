@@ -418,7 +418,9 @@ fn reader_at_boundary(boundary: CommitBoundary) {
             .iter()
             .flatten()
             .any(|(family, root)| {
-                *family == PhysicalFamily::Graph && (root.transaction_id >= original_physical.transaction_id && root.user_root == original_physical.user_root)
+                *family == PhysicalFamily::Graph
+                    && (root.transaction_id >= original_physical.transaction_id
+                        && root.user_root == original_physical.user_root)
             }),
         "the evicted sealed graph reload must use the captured native root: {indexed_transaction_work:?}"
     );
@@ -464,17 +466,16 @@ fn reader_at_boundary(boundary: CommitBoundary) {
             .iter()
             .flatten()
             .any(|(family, root)| {
-                *family == PhysicalFamily::Vector && (root.transaction_id >= original_physical.transaction_id && root.user_root == original_physical.user_root)
+                *family == PhysicalFamily::Vector
+                    && (root.transaction_id >= original_physical.transaction_id
+                        && root.user_root == original_physical.user_root)
             }),
         "raw vector reads use the captured native root: {raw_reload_work:?}"
     );
-    assert!(
-        raw_reload_work
-            .physical_sources
-            .iter()
-            .flatten()
-            .all(|(_, root)| (root.transaction_id >= original_physical.transaction_id && root.user_root == original_physical.user_root))
-    );
+    assert!(raw_reload_work.physical_sources.iter().flatten().all(
+        |(_, root)| (root.transaction_id >= original_physical.transaction_id
+            && root.user_root == original_physical.user_root)
+    ));
     eprintln!(
         "durable vector reload: owners={:?} activity={raw_activity:?} sources={raw_reload_work:?}",
         database.writer_memory_ownership_receipt_for_test().vector
@@ -570,7 +571,10 @@ fn reader_at_boundary(boundary: CommitBoundary) {
             .physical_sources
             .iter()
             .flatten()
-            .all(|(_, root)| (root.transaction_id >= successor_physical.transaction_id && root.user_root == successor_physical.user_root))
+            .all(
+                |(_, root)| (root.transaction_id >= successor_physical.transaction_id
+                    && root.user_root == successor_physical.user_root)
+            )
     );
     assert!(
         cancelled_cursor.cursor.continuation_bytes().unwrap().total > 0,
@@ -772,7 +776,9 @@ fn reader_at_boundary(boundary: CommitBoundary) {
             work.physical_sources
                 .iter()
                 .flatten()
-                .all(|(_, identity)| (identity.transaction_id >= successor_physical.transaction_id && identity.user_root == successor_physical.user_root)),
+                .all(|(_, identity)| (identity.transaction_id
+                    >= successor_physical.transaction_id
+                    && identity.user_root == successor_physical.user_root)),
             "{label} pins the current root and filters old MVCC intervals"
         );
     }
@@ -785,7 +791,10 @@ fn reader_at_boundary(boundary: CommitBoundary) {
             .physical_sources
             .iter()
             .flatten()
-            .all(|(_, identity)| (identity.transaction_id >= successor_physical.transaction_id && identity.user_root == successor_physical.user_root)),
+            .all(
+                |(_, identity)| (identity.transaction_id >= successor_physical.transaction_id
+                    && identity.user_root == successor_physical.user_root)
+            ),
         "every actual successor page access uses the successor root"
     );
     database.close().unwrap();

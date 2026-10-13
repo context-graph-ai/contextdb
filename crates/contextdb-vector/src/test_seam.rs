@@ -377,7 +377,9 @@ pub struct SavedTopologyBoundaryForTest {
 }
 #[doc(hidden)]
 pub fn saved_topology_boundary_for_test(
-    bytes: &[u8], dimension: usize, quantization: VectorQuantization,
+    bytes: &[u8],
+    dimension: usize,
+    quantization: VectorQuantization,
     checkpoint: &mut dyn FnMut() -> contextdb_core::Result<()>,
 ) -> contextdb_core::Result<SavedTopologyBoundaryForTest> {
     use crate::hnsw::saved_topology::{SavedPointCursor, SavedTopology};
@@ -394,19 +396,29 @@ pub fn saved_topology_boundary_for_test(
         // immutable point. This measures emitted bytes rather than a bound.
         let mut bytes = Vec::new();
         let result = match point.decode()? {
-            crate::hnsw::paged_builder::PagedVectorPoint::F32(point) =>
-                crate::hnsw::paged_builder::encode_paged_point_into(&point, &mut bytes),
-            crate::hnsw::paged_builder::PagedVectorPoint::Quantized(point) =>
-                crate::hnsw::paged_builder::encode_paged_point_into(&point, &mut bytes),
+            crate::hnsw::paged_builder::PagedVectorPoint::F32(point) => {
+                crate::hnsw::paged_builder::encode_paged_point_into(&point, &mut bytes)
+            }
+            crate::hnsw::paged_builder::PagedVectorPoint::Quantized(point) => {
+                crate::hnsw::paged_builder::encode_paged_point_into(&point, &mut bytes)
+            }
         };
-        result.map_err(|error| contextdb_core::Error::Other(format!("saved point boundary encoding failed: {error}")))?;
+        result.map_err(|error| {
+            contextdb_core::Error::Other(format!("saved point boundary encoding failed: {error}"))
+        })?;
         encoded = encoded.max(bytes.len());
     }
     Ok(SavedTopologyBoundaryForTest {
-        source_bytes: bytes.len(), retained_control_bytes: std::mem::size_of_val(&topology),
-        points: topology.state.points, dimension, quantization,
-        m: topology.m, ef_construction: topology.ef_construction, ef_search: topology.ef_search,
-        max_point_bytes: topology.max_point_bytes, max_native_encoded_point_bytes: encoded,
+        source_bytes: bytes.len(),
+        retained_control_bytes: std::mem::size_of_val(&topology),
+        points: topology.state.points,
+        dimension,
+        quantization,
+        m: topology.m,
+        ef_construction: topology.ef_construction,
+        ef_search: topology.ef_search,
+        max_point_bytes: topology.max_point_bytes,
+        max_native_encoded_point_bytes: encoded,
         max_workspace_bytes: workspace,
         max_exact_key_bytes: exact,
     })

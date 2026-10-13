@@ -229,7 +229,8 @@ impl Drop for PublicationRecoveryGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
             self.needs_recovery.store(true, Ordering::Release);
-            self.publication_needs_recovery.store(true, Ordering::Release);
+            self.publication_needs_recovery
+                .store(true, Ordering::Release);
         }
     }
 }
@@ -1857,7 +1858,8 @@ mod test {
 #[cfg(feature = "contextdb-internal")]
 impl TransactionalMemory {
     pub(crate) fn get_native_page_memory(
-        &self, page: PageNumber,
+        &self,
+        page: PageNumber,
     ) -> std::result::Result<super::cached_file::PageMemory, crate::NativeColdReadError> {
         use crate::{NativeColdFault, NativeColdReadError};
         let corrupt = || {
@@ -1865,15 +1867,20 @@ impl TransactionalMemory {
             fault.page = page.to_le_bytes();
             NativeColdReadError::Corrupt(fault)
         };
-        if page.page_order > MAX_MAX_PAGE_ORDER { return Err(corrupt()); }
+        if page.page_order > MAX_MAX_PAGE_ORDER {
+            return Err(corrupt());
+        }
         let pages = 1u64 << page.page_order;
-        let end_page = u64::from(page.page_index).checked_add(1)
-            .and_then(|n| n.checked_mul(pages)).ok_or_else(corrupt)?;
+        let end_page = u64::from(page.page_index)
+            .checked_add(1)
+            .and_then(|n| n.checked_mul(pages))
+            .ok_or_else(corrupt)?;
         {
             let state = self.state.lock().unwrap();
             let layout = state.header.layout();
             if page.region >= layout.num_regions()
-                || end_page > u64::from(layout.region_layout(page.region).num_pages()) {
+                || end_page > u64::from(layout.region_layout(page.region).num_pages())
+            {
                 return Err(corrupt());
             }
         }
@@ -1881,11 +1888,19 @@ impl TransactionalMemory {
         if self.open_dirty_pages.lock().unwrap().contains(&page) {
             return Err(corrupt());
         }
-        let len = pages.checked_mul(u64::from(self.page_size)).ok_or_else(corrupt)?;
-        let offset = u64::from(page.page_index).checked_mul(len)
+        let len = pages
+            .checked_mul(u64::from(self.page_size))
+            .ok_or_else(corrupt)?;
+        let offset = u64::from(page.page_index)
+            .checked_mul(len)
             .and_then(|n| n.checked_add(self.region_header_with_padding_size))
-            .and_then(|n| u64::from(page.region).checked_mul(self.region_size).and_then(|r| r.checked_add(n)))
-            .and_then(|n| n.checked_add(u64::from(self.page_size))).ok_or_else(corrupt)?;
+            .and_then(|n| {
+                u64::from(page.region)
+                    .checked_mul(self.region_size)
+                    .and_then(|r| r.checked_add(n))
+            })
+            .and_then(|n| n.checked_add(u64::from(self.page_size)))
+            .ok_or_else(corrupt)?;
         offset.checked_add(len).ok_or_else(corrupt)?;
         let len = usize::try_from(len).map_err(|_| corrupt())?;
         // Like existing get_page_window, this lends immutable PageMemory.

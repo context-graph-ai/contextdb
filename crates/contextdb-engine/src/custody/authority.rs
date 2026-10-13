@@ -186,16 +186,26 @@ pub(crate) fn history_root(states: &[StateRecord]) -> Digest {
 /// encoder scratch; the ordinary history's token order and domains are exact.
 pub(crate) fn history_root_owned(db: &crate::Database, states: &[&StateRecord]) -> Result<Digest> {
     use super::preparation::{OwnedPreparationValue, preparation_array_bytes};
-    let sorted = OwnedPreparationValue::try_produce(db,
-        preparation_array_bytes::<(usize, &StateRecord)>(states.len())?, || {
+    let sorted = OwnedPreparationValue::try_produce(
+        db,
+        preparation_array_bytes::<(usize, &StateRecord)>(states.len())?,
+        || {
             let mut sorted = Vec::with_capacity(states.len());
-            if sorted.capacity() != states.len() { return Err(invalid()); }
-            sorted.extend(states.iter().enumerate().map(|(position, state)| (position, *state)));
+            if sorted.capacity() != states.len() {
+                return Err(invalid());
+            }
+            sorted.extend(
+                states
+                    .iter()
+                    .enumerate()
+                    .map(|(position, state)| (position, *state)),
+            );
             // Preserve the original stable order for equal tokens without an
             // unadmitted stable-sort scratch allocation.
             sorted.sort_unstable_by_key(|(position, state)| (state.state.token, *position));
             Ok(sorted)
-        })?;
+        },
+    )?;
     let capacity = (8usize + "delivery-history-index.v1".len() + 8)
         .checked_add(states.len().checked_mul(64).ok_or_else(invalid)?)
         .ok_or_else(invalid)?;
@@ -204,20 +214,25 @@ pub(crate) fn history_root_owned(db: &crate::Database, states: &[&StateRecord]) 
         e.u64(states.len() as u64);
         sorted.with_value(|states| -> Result<()> {
             for (_, state) in states {
-                let state_capacity = 80usize + 1 + usize::from(state.parent.is_some()) * 32 + 8 + 32;
-                let state_bytes = super::canonical::prepare_encoder_owned(db, state_capacity, |e| {
-                    state.state.encode(e);
-                    e.option(state.parent.as_ref(), |e, token| e.raw(token));
-                    e.u64(state.sequence);
-                    e.raw(&state.retirement_root);
-                    Ok(())
-                })?;
-                let record = super::canonical::prepare_encoder_owned(db,
-                    8 + "delivery-state-record.v1".len() + state_capacity, |e| {
+                let state_capacity =
+                    80usize + 1 + usize::from(state.parent.is_some()) * 32 + 8 + 32;
+                let state_bytes =
+                    super::canonical::prepare_encoder_owned(db, state_capacity, |e| {
+                        state.state.encode(e);
+                        e.option(state.parent.as_ref(), |e, token| e.raw(token));
+                        e.u64(state.sequence);
+                        e.raw(&state.retirement_root);
+                        Ok(())
+                    })?;
+                let record = super::canonical::prepare_encoder_owned(
+                    db,
+                    8 + "delivery-state-record.v1".len() + state_capacity,
+                    |e| {
                         e.string("delivery-state-record.v1");
                         state_bytes.with_value(|bytes| e.raw(bytes));
                         Ok(())
-                    })?;
+                    },
+                )?;
                 e.raw(&state.state.token);
                 record.with_value(|bytes| e.raw(blake3::hash(bytes).as_bytes()));
             }
@@ -466,7 +481,9 @@ pub(crate) fn validate_retirement_closure_owned(
             preparation_array_bytes::<BirthRef>(capacity)?,
             || {
                 let mut pending = Vec::with_capacity(capacity);
-                if pending.capacity() != capacity { return Err(invalid()); }
+                if pending.capacity() != capacity {
+                    return Err(invalid());
+                }
                 pending.extend(origin.retired.iter().cloned());
                 Ok(pending)
             },
@@ -477,7 +494,9 @@ pub(crate) fn validate_retirement_closure_owned(
             || {
                 let capacity = retired.len();
                 let value = Vec::with_capacity(capacity);
-                if value.capacity() != capacity { return Err(invalid()); }
+                if value.capacity() != capacity {
+                    return Err(invalid());
+                }
                 Ok(value)
             },
         )?;

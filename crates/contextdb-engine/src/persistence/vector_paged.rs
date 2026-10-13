@@ -307,7 +307,11 @@ impl PageSetHasher {
     pub(crate) fn new() -> Self {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"contextdb.paged.page-set.v1");
-        Self { hasher, pages: 0, bytes: 0 }
+        Self {
+            hasher,
+            pages: 0,
+            bytes: 0,
+        }
     }
     pub(crate) fn page(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         self.hasher.update(&(key.len() as u64).to_be_bytes());
@@ -338,8 +342,9 @@ impl PageSetHasher {
 /// until the page table's own root moves. Fixed size: the oldest proof is
 /// dropped first.
 const VERIFIED_PAGE_SETS: usize = 256;
-static VERIFIED_PAGE_SET_PROOFS: parking_lot::Mutex<std::collections::VecDeque<(u64, [u8; 32], [u8; 32])>> =
-    parking_lot::Mutex::new(std::collections::VecDeque::new());
+static VERIFIED_PAGE_SET_PROOFS: parking_lot::Mutex<
+    std::collections::VecDeque<(u64, [u8; 32], [u8; 32])>,
+> = parking_lot::Mutex::new(std::collections::VecDeque::new());
 
 fn page_set_proven(storage_id: u64, root: &PageSetRoot, table: [u8; 32]) -> bool {
     VERIFIED_PAGE_SET_PROOFS
@@ -558,7 +563,11 @@ fn first_page_in_write(
     let mut range = pages
         .range(start.as_slice()..end.as_slice())
         .map_err(RedbPersistence::storage_error)?;
-    let entry = if last { range.next_back() } else { range.next() };
+    let entry = if last {
+        range.next_back()
+    } else {
+        range.next()
+    };
     let (key, value) = entry
         .ok_or_else(|| Error::Other("paged saved graph has no such page".into()))?
         .map_err(RedbPersistence::storage_error)?;
@@ -607,10 +616,10 @@ pub(super) fn damage_route_pages_in_write_for_test(
             (key, sealed)
         }
         Fault::CrossRouteFirstPointPage => {
-            let other = storage_prefix(
-                other_storage_id
-                    .ok_or_else(|| Error::Other("cross-route damage names no other route".into()))?,
-            );
+            let other =
+                storage_prefix(other_storage_id.ok_or_else(|| {
+                    Error::Other("cross-route damage names no other route".into())
+                })?);
             let (key, _) = first_page_in_write(&pages, &storage, Some(KIND_POINT), false)?;
             let (other_key, other_value) =
                 first_page_in_write(&pages, &other, Some(KIND_POINT), false)?;
@@ -2595,8 +2604,7 @@ impl PagedVectorReader for NativePagedReader {
                 // before any record was admitted to this reader.
                 *verified = true;
             }
-            if !*verified
-                && page_set_proven(self.storage_id, &self.page_set, self.pages_table_root)
+            if !*verified && page_set_proven(self.storage_id, &self.page_set, self.pages_table_root)
             {
                 *verified = true;
             }
@@ -3240,9 +3248,11 @@ impl RedbPersistence {
                         .map_err(Self::storage_error)?
                         .remove(key.as_slice())
                         .map_err(Self::storage_error)?;
-                    retired.lock().push((partition, memory.map(
-                        crate::memory_accounting::ContainedMemoryReservation::from_owned,
-                    )));
+                    retired.lock().push((
+                        partition,
+                        memory
+                            .map(crate::memory_accounting::ContainedMemoryReservation::from_owned),
+                    ));
                 }
                 cursor = Some((key, cursor_memory));
             }
@@ -3275,9 +3285,11 @@ impl RedbPersistence {
                     .map_err(Self::storage_error)?
                     .is_none()
                 {
-                    retired.lock().push((partition, memory.map(
-                        crate::memory_accounting::ContainedMemoryReservation::from_owned,
-                    )));
+                    retired.lock().push((
+                        partition,
+                        memory
+                            .map(crate::memory_accounting::ContainedMemoryReservation::from_owned),
+                    ));
                 }
             }
         }
@@ -4214,9 +4226,14 @@ impl RedbPersistence {
 
     /// A restart learns the retired initial-build route from existing durable
     /// facts. No volatile quarantine or new marker directory is required.
-    pub(crate) fn retired_vector_rebuild_pending(&self, partition: &VectorPartitionRef) -> Result<bool> {
+    pub(crate) fn retired_vector_rebuild_pending(
+        &self,
+        partition: &VectorPartitionRef,
+    ) -> Result<bool> {
         self.prepare_proof_owner()?;
-        if !self.has_vector_repair_fence()? { return Ok(false); }
+        if !self.has_vector_repair_fence()? {
+            return Ok(false);
+        }
         let key_bound = Self::vector_partition_physical_key_bound(
             &partition.index,
             &partition.partition_key,
@@ -4262,7 +4279,10 @@ impl RedbPersistence {
     /// Physical generation identities remain ordered even if their payload is
     /// unusable. The caller has already retired the catalog under the fence.
     /// Last-key seeks inspect only two B-tree paths, not every retained body.
-    pub(crate) fn highest_retired_vector_generation_key(&self, partition: &VectorPartitionRef) -> Result<u64> {
+    pub(crate) fn highest_retired_vector_generation_key(
+        &self,
+        partition: &VectorPartitionRef,
+    ) -> Result<u64> {
         self.prepare_proof_owner()?;
         let key_bound = Self::vector_partition_physical_key_bound(
             &partition.index,

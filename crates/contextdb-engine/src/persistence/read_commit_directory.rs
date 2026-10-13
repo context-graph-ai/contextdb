@@ -55,38 +55,44 @@ impl RetainedCommitDirectory {
             // Authenticated count authorizes only this constructor's actual
             // empty/floor probe; ordinary floor uses the first-use gate.
             if directory.source.history_open_control.control().commit_count != 0 {
-                return Err(directory.source.history_damage("empty open capability has nonempty controls"));
+                return Err(directory
+                    .source
+                    .history_damage("empty open capability has nonempty controls"));
             }
-            let observed =
-        graph_read::with_pages(context.read_memory.clone(), || {
-            directory.source.with_read(|read| {
-                directory.source
-                    .history_open_control
-                    .check_snapshot(read.storage_snapshot_identity())?;
-                let table = read
-                    .open_table(COMMIT_INDEX_TABLE)
-                    .map_err(RedbPersistence::storage_error)?;
-                let mut range = table.range::<u64>(..).map_err(RedbPersistence::storage_error)?;
-                let pair = range
-                    .next_back()
-                    .transpose()
-                    .map_err(RedbPersistence::storage_error)?;
-                if let Some((_key, _)) = &pair {
-                    #[cfg(any(test, feature = "test-seams"))]
-                    crate::read_work_probe::note_graph(
-                        "commit_index",
-                        "iteration_step",
-                        &_key.value().to_be_bytes(),
-                        Some(contextdb_core::Lsn(_key.value())),
-                        None,
-                    );
-                }
-                context.checkpoint()?;
-                Ok(pair.map(|(key, value)| (Lsn(key.value()), TxId(value.value()))))
-            })
-        })?;
+            let observed = graph_read::with_pages(context.read_memory.clone(), || {
+                directory.source.with_read(|read| {
+                    directory
+                        .source
+                        .history_open_control
+                        .check_snapshot(read.storage_snapshot_identity())?;
+                    let table = read
+                        .open_table(COMMIT_INDEX_TABLE)
+                        .map_err(RedbPersistence::storage_error)?;
+                    let mut range = table
+                        .range::<u64>(..)
+                        .map_err(RedbPersistence::storage_error)?;
+                    let pair = range
+                        .next_back()
+                        .transpose()
+                        .map_err(RedbPersistence::storage_error)?;
+                    if let Some((_key, _)) = &pair {
+                        #[cfg(any(test, feature = "test-seams"))]
+                        crate::read_work_probe::note_graph(
+                            "commit_index",
+                            "iteration_step",
+                            &_key.value().to_be_bytes(),
+                            Some(contextdb_core::Lsn(_key.value())),
+                            None,
+                        );
+                    }
+                    context.checkpoint()?;
+                    Ok(pair.map(|(key, value)| (Lsn(key.value()), TxId(value.value()))))
+                })
+            })?;
             if observed.is_some() {
-                return Err(directory.source.history_damage("empty commit directory has a committed member"));
+                return Err(directory
+                    .source
+                    .history_damage("empty commit directory has a committed member"));
             }
         }
         #[cfg(any(test, feature = "test-seams"))]
@@ -109,7 +115,6 @@ struct OpenEndpointProof<'a, 'operation> {
 }
 
 impl RetainedCommitDirectory {
-    
     fn get_value(
         &self,
         lsn: Lsn,
@@ -281,10 +286,14 @@ impl RetainedCommitCursor {
                 context.read_memory.clone(),
                 std::mem::size_of::<blake3::Hasher>()
                     + 2 * std::mem::size_of::<Option<(Lsn, TxId)>>(),
-                "reader", "complete_commit_controls", "Raise the declared reader memory limit.",
+                "reader",
+                "complete_commit_controls",
+                "Raise the declared reader memory limit.",
             )?;
             self.source.history_open_control.check_complete_commits(
-                self.seen_count, self.seen_first, self.seen_last,
+                self.seen_count,
+                self.seen_first,
+                self.seen_last,
             )?;
         }
         context.checkpoint()?;
@@ -318,9 +327,13 @@ impl ReadCommitCursor for RetainedCommitCursor {
         if !in_range {
             return self.finish(context);
         }
-        self.seen_count = self.seen_count.checked_add(1)
+        self.seen_count = self
+            .seen_count
+            .checked_add(1)
             .ok_or_else(|| self.source.history_damage("complete commit count overflow"))?;
-        if self.seen_first.is_none() { self.seen_first = Some((lsn, tx)); }
+        if self.seen_first.is_none() {
+            self.seen_first = Some((lsn, tx));
+        }
         self.seen_last = Some((lsn, tx));
         self.after = Some(lsn);
         context.checkpoint()?;

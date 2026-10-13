@@ -5133,7 +5133,11 @@ impl super::WireBodySource for ReadBoundIrohBody {
     ) -> std::task::Poll<super::WireResult<usize>> {
         use std::task::Poll;
         let mut cursor = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        if cursor.cancellation.as_ref().is_some_and(|cancel| cancel.is_cancelled()) {
+        if cursor
+            .cancellation
+            .as_ref()
+            .is_some_and(|cancel| cancel.is_cancelled())
+        {
             return Poll::Ready(Err(contextdb_core::Error::ReadCancelled.into()));
         }
         if position != cursor.position {
@@ -5225,7 +5229,9 @@ fn receive_read_body_owned(
     use contextdb_core::read_memory::OwnedReadBox;
     type CursorCell = contextdb_core::read_memory::ReadShared<Mutex<ReadBoundReceiveCursor>>;
     let state_credit = super::native_wire::wire_credit(
-        owner.clone(), CursorCell::layout().size(), "incoming_stream_control",
+        owner.clone(),
+        CursorCell::layout().size(),
+        "incoming_stream_control",
     )?;
     let token = cancellation.clone();
     let state = CursorCell::try_from_prepaid(
@@ -5247,8 +5253,11 @@ fn receive_read_body_owned(
                 // outside that lock. RecvStream::drop stops receiving, but
                 // removes the blocked-reader waker without waking it. Prompt
                 // local wake and backend allocation custody remain gates.
-                let recv = cancelled_state.lock()
-                    .unwrap_or_else(|error| error.into_inner()).recv.take();
+                let recv = cancelled_state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .recv
+                    .take();
                 drop(recv);
             })?)
         }
@@ -5326,18 +5335,29 @@ fn begin_receive_read_body<H>(
     pre_admission: &PreAdmissionGuardrails,
 ) -> super::WireResult<BegunReadBody>
 where
-    H: Fn(super::ReadBoundIncomingRequest, crate::owner_read::NativeReadRequest)
-            -> super::WireResult<super::DispatchedWireFuture<'static, ()>>
-        + Send + Sync + 'static,
+    H: Fn(
+            super::ReadBoundIncomingRequest,
+            crate::owner_read::NativeReadRequest,
+        ) -> super::WireResult<super::DispatchedWireFuture<'static, ()>>
+        + Send
+        + Sync
+        + 'static,
 {
     match registration.begin_request()? {
         super::native_wire::NativeReadStreamBegin::Legacy(owner) => {
             Ok(BegunReadBody::Legacy { owner, recv })
         }
-        super::native_wire::NativeReadStreamBegin::Native { operation, cancellation } => {
+        super::native_wire::NativeReadStreamBegin::Native {
+            operation,
+            cancellation,
+        } => {
             let (body, state) = receive_native_read_body(&operation, recv, length, pre_admission)?;
             Ok(BegunReadBody::Native {
-                received: NativeReadBody { body, state, operation },
+                received: NativeReadBody {
+                    body,
+                    state,
+                    operation,
+                },
                 cancellation,
             })
         }
@@ -5358,9 +5378,13 @@ fn dispatch_native_read_body<H>(
     node_id: Option<String>,
 ) -> super::WireResult<super::DispatchedWireFuture<'static, ()>>
 where
-    H: Fn(super::ReadBoundIncomingRequest, crate::owner_read::NativeReadRequest)
-            -> super::WireResult<super::DispatchedWireFuture<'static, ()>>
-        + Send + Sync + 'static,
+    H: Fn(
+            super::ReadBoundIncomingRequest,
+            crate::owner_read::NativeReadRequest,
+        ) -> super::WireResult<super::DispatchedWireFuture<'static, ()>>
+        + Send
+        + Sync
+        + 'static,
 {
     let responder = make_responder(&received.operation, received.state)?;
     registration.dispatch(

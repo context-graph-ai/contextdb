@@ -17,9 +17,7 @@ use crate::transport::{
     HandlerRegistration, IncomingRequest, LineageSigner, RequestHandler, Responder,
     ServerTransport, TransportError,
 };
-use contextdb_core::{
-    AtomicLsn, Error, Incarnation, Lsn, TableMeta, TenantId,
-};
+use contextdb_core::{AtomicLsn, Error, Incarnation, Lsn, TableMeta, TenantId};
 use contextdb_engine::sync_types::{
     ChangeSet, DdlChange, DurableSchemaSyncHoldback, NaturalKey, SchemaSyncCapability,
     SchemaSyncHoldback, SyncAdoption, SyncDirection,
@@ -347,7 +345,10 @@ impl SyncServer {
         db.enable_sync_relay_mode();
         let read_memory = read_budget_provider.request_budget()?;
         let applied_push_watermark = db
-            .persisted_sync_applied_push_watermark_with_read_memory(&tenant_id, read_memory.clone())?
+            .persisted_sync_applied_push_watermark_with_read_memory(
+                &tenant_id,
+                read_memory.clone(),
+            )?
             .unwrap_or(Lsn(0));
         let schema_sync_holdbacks = db
             .persisted_inbound_schema_sync_holdbacks(&tenant_id, read_memory.clone())?
@@ -409,7 +410,15 @@ impl SyncServer {
         tenant_id: TenantId,
         read_budget_provider: Arc<dyn crate::vector_read_memory::ReadRequestBudgetProvider>,
     ) -> Result<Self, Error> {
-        Self::build(db, transport, None, None, tenant_id, None, read_budget_provider)
+        Self::build(
+            db,
+            transport,
+            None,
+            None,
+            tenant_id,
+            None,
+            read_budget_provider,
+        )
     }
 
     /// Test-only construction with a fabric key matching the hub identity
@@ -542,7 +551,9 @@ impl SyncServer {
         let apply_permits = Arc::new(Semaphore::new(MAX_CONCURRENT_PUSH_APPLIES));
         let handlers = self.handlers(apply_tasks.clone(), in_flight_push_applies, apply_permits);
         match self.transport.serve_native_installation(
-            handlers, crate::transport::ReadBoundStreamInstallation::empty(), stop,
+            handlers,
+            crate::transport::ReadBoundStreamInstallation::empty(),
+            stop,
         ) {
             Ok(serving) => {
                 if let Err(err) = serving.await {
@@ -934,7 +945,8 @@ impl SyncServer {
                     let request = decoded_memory
                         .decode_msgpack(&req.bytes)
                         .map_err(to_transport_error)?;
-                    let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
+                    let mut vector_copy_owner =
+                        crate::vector_read_memory::admission(read_memory.clone());
                     let record = crate::custody::fixtures::issue_fixture_outcome(
                         &db,
                         tenant_id,
@@ -995,7 +1007,8 @@ impl SyncServer {
                     let request = decoded_memory
                         .decode_msgpack(&req.bytes)
                         .map_err(to_transport_error)?;
-                    let mut retained_vector_copy = crate::vector_read_memory::admission(read_memory.clone());
+                    let mut retained_vector_copy =
+                        crate::vector_read_memory::admission(read_memory.clone());
                     let vector_copy_owner = &mut retained_vector_copy;
                     let record = crate::custody::preparation::commit_terminal_batch(
                         &db,
@@ -1244,8 +1257,14 @@ fn refused_outcomes_for_request(
         .map(|(_, digest)| *digest)
         .collect::<Vec<_>>();
     for batch in requested.chunks(128) {
-        let (page, lease) =
-            db.refused_schema_unit_outcomes_for_digests(tenant, peer, incarnation, hub, batch, read_memory.clone())?;
+        let (page, lease) = db.refused_schema_unit_outcomes_for_digests(
+            tenant,
+            peer,
+            incarnation,
+            hub,
+            batch,
+            read_memory.clone(),
+        )?;
         outcomes.extend(page.into_iter().filter(|outcome| {
             digests.contains(&(
                 (
@@ -2278,7 +2297,8 @@ async fn handle_pull(
     // the response carries no source. Missing source identity is not idempotent
     // with the stored cursor binding.
     let source = db.sync_incarnation_with_read_memory(&tenant_id, read_memory.clone())?;
-    let local_incarnation = db.sync_incarnation_with_read_memory(&tenant_id, read_memory.clone())?;
+    let local_incarnation =
+        db.sync_incarnation_with_read_memory(&tenant_id, read_memory.clone())?;
     let served_row_count = ordinary.rows.len()
         + dependency_units
             .iter()
@@ -2628,8 +2648,6 @@ fn schema_capabilities_in_meta(meta: &TableMeta) -> BTreeSet<SchemaSyncCapabilit
     }
     capabilities
 }
-
-
 
 /// Exclude the rows of retained tables whose retention window has already
 /// passed from a changeset about to leave the hub. This is a SERVE-time content
@@ -3247,63 +3265,63 @@ impl SyncServer {
         let tenant = self.tenant_id.clone();
         let hub = self.local_node_id.clone();
         crate::transport::admit_wire_future(owner, async move {
-                    let decoded_memory = crate::read_image_memory::ImageMemory::charging_reader_for(
-                        db.bounded_read_accountant(),
-                        read_memory.clone(),
-                        "reader",
-                        "decode_sync_request",
-                        "Reduce the request or raise the declared reader memory limit.",
-                    );
-                    use crate::protocol::*;
-                    let envelope =
-                        crate::sync_client::decode_sync_envelope(&decoded_memory, &req.bytes, None)
-                            .map_err(to_transport_error)?;
-                    let request: FetchDeliveryOutcomesRequest = decoded_memory
-                        .decode_msgpack(&envelope.payload)
-                        .map_err(to_transport_error)?;
-                    if envelope.message_type != MessageType::FetchDeliveryOutcomesRequest
-                        || request.format != 1
-                        || request.tenant_id != tenant.as_str()
-                    {
-                        return Err(TransportError::Other(
-                            "invalid authenticated outcome request".into(),
-                        ).into());
-                    }
-                    let hub = hub.ok_or_else(|| {
-                        TransportError::Other("authenticated hub required".into())
-                    })?;
-                    let edge = req.node_id.ok_or_else(|| {
-                        TransportError::Other("authenticated edge required".into())
-                    })?;
-                    let outcomes = crate::custody::delivery::fetch(
-                        &db,
-                        &tenant,
-                        &hub,
-                        &edge,
-                        request.edge_incarnation,
-                        request.since.as_deref(),
-                        read_memory.clone(),
-                    )
-                    .map_err(|e| TransportError::Other(e.to_string()))?;
-                    let response = FetchDeliveryOutcomesResponse {
-                        format: 1,
-                        request_nonce: request.request_nonce,
-                        hub_node_id: hub,
-                        hub_incarnation: db
-                            .existing_sync_incarnation(&tenant, read_memory.clone())
-                            .map_err(|e| TransportError::Other(e.to_string()))?
-                            .ok_or_else(|| {
-                                TransportError::Other("hub authority is not initialized".into())
-                            })?,
-                        tenant_id: tenant.as_str().into(),
-                        edge_node_id: edge,
-                        edge_incarnation: request.edge_incarnation,
-                        result: Some(DeliveryOutcomePage { outcomes }),
-                        error: None,
-                    };
-                    let bytes = encode_named(MessageType::FetchDeliveryOutcomesResponse, &response)
-                        .map_err(|e| TransportError::Other(e.to_string()))?;
-                    (req.responder)(bytes).await.map_err(Into::into)
-        }).map(crate::transport::DispatchedWireFuture::native)
+            let decoded_memory = crate::read_image_memory::ImageMemory::charging_reader_for(
+                db.bounded_read_accountant(),
+                read_memory.clone(),
+                "reader",
+                "decode_sync_request",
+                "Reduce the request or raise the declared reader memory limit.",
+            );
+            use crate::protocol::*;
+            let envelope =
+                crate::sync_client::decode_sync_envelope(&decoded_memory, &req.bytes, None)
+                    .map_err(to_transport_error)?;
+            let request: FetchDeliveryOutcomesRequest = decoded_memory
+                .decode_msgpack(&envelope.payload)
+                .map_err(to_transport_error)?;
+            if envelope.message_type != MessageType::FetchDeliveryOutcomesRequest
+                || request.format != 1
+                || request.tenant_id != tenant.as_str()
+            {
+                return Err(
+                    TransportError::Other("invalid authenticated outcome request".into()).into(),
+                );
+            }
+            let hub =
+                hub.ok_or_else(|| TransportError::Other("authenticated hub required".into()))?;
+            let edge = req
+                .node_id
+                .ok_or_else(|| TransportError::Other("authenticated edge required".into()))?;
+            let outcomes = crate::custody::delivery::fetch(
+                &db,
+                &tenant,
+                &hub,
+                &edge,
+                request.edge_incarnation,
+                request.since.as_deref(),
+                read_memory.clone(),
+            )
+            .map_err(|e| TransportError::Other(e.to_string()))?;
+            let response = FetchDeliveryOutcomesResponse {
+                format: 1,
+                request_nonce: request.request_nonce,
+                hub_node_id: hub,
+                hub_incarnation: db
+                    .existing_sync_incarnation(&tenant, read_memory.clone())
+                    .map_err(|e| TransportError::Other(e.to_string()))?
+                    .ok_or_else(|| {
+                        TransportError::Other("hub authority is not initialized".into())
+                    })?,
+                tenant_id: tenant.as_str().into(),
+                edge_node_id: edge,
+                edge_incarnation: request.edge_incarnation,
+                result: Some(DeliveryOutcomePage { outcomes }),
+                error: None,
+            };
+            let bytes = encode_named(MessageType::FetchDeliveryOutcomesResponse, &response)
+                .map_err(|e| TransportError::Other(e.to_string()))?;
+            (req.responder)(bytes).await.map_err(Into::into)
+        })
+        .map(crate::transport::DispatchedWireFuture::native)
     }
 }

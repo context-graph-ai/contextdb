@@ -115,7 +115,7 @@ impl BoundedExecutionProbe for ProbeAdapter {
         );
         if let Some(touch) = TestSourceTouch::from_bounded(touch) {
             self.0.before_source_touch(touch, completed_items);
-    }
+        }
     }
 
     fn before_hnsw_candidate_distance(
@@ -209,8 +209,7 @@ impl TestSourceTouch {
             BoundedSourceTouch::HnswCandidate => Self::HnswCandidate,
             BoundedSourceTouch::RankCandidate => Self::RankCandidate,
             BoundedSourceTouch::AccessRow => Self::AccessRow,
-        }
-    )
+        })
     }
 }
 

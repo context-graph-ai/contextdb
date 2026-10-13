@@ -324,11 +324,12 @@ impl RedbPersistence {
                 .checked_add(u64::from(next.as_ref().is_some_and(|state| state.unmarked)))
                 .ok_or_else(|| damage("unmarked count overflow"))?;
             if let Some(old) = &old
-                && old.eligible {
-                    selectors
-                        .remove(old.selector.as_slice())
-                        .map_err(Self::storage_error)?;
-                }
+                && old.eligible
+            {
+                selectors
+                    .remove(old.selector.as_slice())
+                    .map_err(Self::storage_error)?;
+            }
             if let Some(next) = next {
                 if next.eligible {
                     selectors

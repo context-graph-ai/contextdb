@@ -28,10 +28,10 @@ use crate::read_contract::{
 };
 use crate::{Database, OwnerReadConfig};
 use contextdb_core::read_contract::{
-    CursorExpiryKind, DeadlineClock, LocalUserIdentity, MetadataPage,
-    MetadataPageVocabulary, OwnerLimitExceededDetail, OwnerReadCancellation, OwnerReadLimits,
-    OwnerReadStatus, OwnerServingReason, OwnerServingState, ReadFailure, ReadFailureDetail,
-    ReadFailureKind, ReadFailureLimit, ReadLimits,
+    CursorExpiryKind, DeadlineClock, LocalUserIdentity, MetadataPage, MetadataPageVocabulary,
+    OwnerLimitExceededDetail, OwnerReadCancellation, OwnerReadLimits, OwnerReadStatus,
+    OwnerServingReason, OwnerServingState, ReadFailure, ReadFailureDetail, ReadFailureKind,
+    ReadFailureLimit, ReadLimits,
 };
 use contextdb_core::read_memory::ReadCredit;
 use contextdb_parser::{StatementEffect, parse, statement_effect};
@@ -216,9 +216,8 @@ impl BoundedExecutionProbe for OwnerBoundedProbeAdapter {
     fn before_source_touch(&self, touch: BoundedSourceTouch, completed_items: u64) {
         self.observe_start();
         if let Some(touch) = TestSourceTouch::from_bounded(touch) {
-            self.observer
-            .before_source_touch(touch, completed_items);
-    }
+            self.observer.before_source_touch(touch, completed_items);
+        }
     }
 
     fn before_hnsw_candidate_distance(
@@ -1611,7 +1610,9 @@ impl OwnerReadService {
             .spawn(move || {
                 #[cfg(any(test, feature = "test-seams"))]
                 let _graph_observation = crate::read_work_probe::enter_owner_graph_scope(
-                    &worker_service.spec.database, connection_id, request_ordinal,
+                    &worker_service.spec.database,
+                    connection_id,
+                    request_ordinal,
                     match &request.envelope.request {
                         LocalRequest::Query { .. } | LocalRequest::CursorOpen { .. } => "query",
                         _ => "request",
@@ -1729,10 +1730,12 @@ impl OwnerReadService {
                     RequestOutcome::Answered(responses) => {
                         if caller_cancelled_fetch {
                             drop(responses.cursor_authorization);
-                            let cancelled = self.cancelled_cursor_responses(
-                                connection_id,
-                                cursor_fetch_id.expect("cursor fetch request"),
-                            ).unwrap_or_else(|error| vec![refusal_response(error)]);
+                            let cancelled = self
+                                .cancelled_cursor_responses(
+                                    connection_id,
+                                    cursor_fetch_id.expect("cursor fetch request"),
+                                )
+                                .unwrap_or_else(|error| vec![refusal_response(error)]);
                             drop(
                                 active_cursor_fetch
                                     .lock()
@@ -1922,10 +1925,12 @@ impl OwnerReadService {
                             )?;
                             if named == request_ordinal {
                                 drop(completed.cursor_authorization.take());
-                                let cancelled = self.cancelled_cursor_responses(
-                                    connection_id,
-                                    publication.cursor_id,
-                                ).unwrap_or_else(|error| vec![refusal_response(error)]);
+                                let cancelled = self
+                                    .cancelled_cursor_responses(
+                                        connection_id,
+                                        publication.cursor_id,
+                                    )
+                                    .unwrap_or_else(|error| vec![refusal_response(error)]);
                                 drop(
                                     active_cursor_fetch
                                         .lock()
@@ -2111,7 +2116,7 @@ impl OwnerReadService {
             )
             .unwrap_or(u64::MAX),
             accountant_used_bytes: u64::try_from(usage.used).unwrap_or(u64::MAX),
-        #[cfg(any(test, feature = "test-seams"))]
+            #[cfg(any(test, feature = "test-seams"))]
             reader_used_bytes: self
                 .spec
                 .database
@@ -3003,7 +3008,8 @@ impl OwnerReadService {
                 .cursor
                 .as_ref()
                 .expect("live cursor handle")
-                .retained_read_bytes_with_observations(fetched_observation, None).saturating_add(fetched.as_ref().map_or(0, |page| page.page.credit_bytes())),
+                .retained_read_bytes_with_observations(fetched_observation, None)
+                .saturating_add(fetched.as_ref().map_or(0, |page| page.page.credit_bytes())),
         )
         .unwrap_or(u64::MAX);
         self.adjust_cursor_retained(entry.retained_memory_bytes, retained_memory_bytes);
@@ -3146,7 +3152,9 @@ impl OwnerReadService {
                     return Err(OwnerReadScaffoldError::Database(error));
                 }
             };
-            remaining_page.rows.discard_prefix(publication.published_rows);
+            remaining_page
+                .rows
+                .discard_prefix(publication.published_rows);
             let resized = encode_observed_cursor_page(&remaining_page, &pending.observation)
                 .ok()
                 .map(|encoded| encoded.len())
@@ -3192,7 +3200,11 @@ impl OwnerReadService {
             return Ok(());
         }
 
-        let pending_bytes = match u64::try_from(pending.memory.bytes().saturating_add(pending.page.credit_bytes()),
+        let pending_bytes = match u64::try_from(
+            pending
+                .memory
+                .bytes()
+                .saturating_add(pending.page.credit_bytes()),
         ) {
             Ok(bytes) => bytes,
             Err(_) => {

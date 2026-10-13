@@ -67,7 +67,11 @@ impl RedbPersistence {
                     .open_table(graph_history_record::GRAPH_OCCURRENCE_LOCATIONS)
                     .map_err(Self::storage_error)?;
                 let location = locations
-                    .get(observed_graph_key!("graph_location", "get", graph_history_record::location_key(w.id).as_slice()))
+                    .get(observed_graph_key!(
+                        "graph_location",
+                        "get",
+                        graph_history_record::location_key(w.id).as_slice()
+                    ))
                     .map_err(Self::storage_error)?
                     .ok_or_else(|| Error::StoreCorrupted {
                         path: "graph_history".into(),
@@ -103,7 +107,10 @@ impl RedbPersistence {
         write
             .open_table(WRITER_CHANGE_LOG_TABLE)
             .map_err(Self::storage_error)?
-            .insert(observed_graph_key!("history", "insert", position.as_slice(), 8), encoded)
+            .insert(
+                observed_graph_key!("history", "insert", position.as_slice(), 8),
+                encoded,
+            )
             .map_err(Self::storage_error)?;
         if let Some(key) = Self::log_table_selector(&entry, &position) {
             write
@@ -149,17 +156,22 @@ impl RedbPersistence {
             let mut log = write
                 .open_table(WRITER_CHANGE_LOG_TABLE)
                 .map_err(Self::storage_error)?;
-            log.remove(observed_graph_key!("history", "remove", position.as_slice(), 8))
-                .map_err(Self::storage_error)?
-                .map(|value| {
-                    if carry {
-                        Self::validate_graph_occurrence_in_write(write, &position, value.value())?;
-                    } else {
-                        Self::remove_graph_occurrence_in_write(write, &position, value.value())?;
-                    }
-                    Self::decode_stored_change_log(value.value()).map(|record| record.entry)
-                })
-                .transpose()?
+            log.remove(observed_graph_key!(
+                "history",
+                "remove",
+                position.as_slice(),
+                8
+            ))
+            .map_err(Self::storage_error)?
+            .map(|value| {
+                if carry {
+                    Self::validate_graph_occurrence_in_write(write, &position, value.value())?;
+                } else {
+                    Self::remove_graph_occurrence_in_write(write, &position, value.value())?;
+                }
+                Self::decode_stored_change_log(value.value()).map(|record| record.entry)
+            })
+            .transpose()?
         };
         let Some(entry) = entry else {
             return Ok(());

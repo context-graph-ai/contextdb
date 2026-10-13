@@ -40,7 +40,10 @@ struct Row {
 fn padded_document(bytes: usize) -> String {
     let prefix = r#"{"p":""#;
     let suffix = r#""}"#;
-    format!("{prefix}{}{suffix}", "x".repeat(bytes - prefix.len() - suffix.len()))
+    format!(
+        "{prefix}{}{suffix}",
+        "x".repeat(bytes - prefix.len() - suffix.len())
+    )
 }
 
 fn scalar_1_mib() -> String {
@@ -152,7 +155,10 @@ fn raw_funding(row: &Row) {
     // control floor plus an operation control allowance, never lend these
     // already-owned bytes to observed AST/scratch allocations.
     let already_funded = document.capacity() + 4 * std::mem::size_of::<Value>() + 128 + 4096;
-    let budget = Arc::new(FundingBudget { json: json.clone(), already_funded });
+    let budget = Arc::new(FundingBudget {
+        json: json.clone(),
+        already_funded,
+    });
     let guard = contextdb_core::types::JsonReadAdmissionGuard::enter(budget);
     let (decoded, peak, unfunded, allocations) =
         super::cursor_survives_writer_handover::append_heap_oracle::measure_funding(
@@ -160,18 +166,44 @@ fn raw_funding(row: &Row) {
             || contextdb_core::types::deserialize_json_in_read_scope(&document),
         );
     drop(guard);
-    assert_eq!(unfunded, 0, "{}: each native allocation, including realloc overlap, must already be funded", row.name);
-    let decoded = decoded.unwrap_or_else(|error| panic!("{}: decode must fit with input/control funded: {error}", row.name));
+    assert_eq!(
+        unfunded, 0,
+        "{}: each native allocation, including realloc overlap, must already be funded",
+        row.name
+    );
+    let decoded = decoded.unwrap_or_else(|error| {
+        panic!(
+            "{}: decode must fit with input/control funded: {error}",
+            row.name
+        )
+    });
     assert_eq!(decoded, expected, "{}: exact decoded payload", row.name);
-    assert!(allocations > 0 && peak > 0, "{}: native allocation oracle participated", row.name);
+    assert!(
+        allocations > 0 && peak > 0,
+        "{}: native allocation oracle participated",
+        row.name
+    );
     let retained = contextdb_core::types::json_retained_heap_bytes(&decoded);
-    assert_eq!(json.load(Ordering::SeqCst), retained, "{}: final charge is transferred retained AST only", row.name);
+    assert_eq!(
+        json.load(Ordering::SeqCst),
+        retained,
+        "{}: final charge is transferred retained AST only",
+        row.name
+    );
     drop(decoded);
     // Raw entrypoint transfers its lease to the caller. Drop native payload
     // first, then return the caller's owned retained credit explicitly.
     assert_eq!(json.fetch_sub(retained, Ordering::SeqCst), retained);
-    assert_eq!(json.load(Ordering::SeqCst), 0, "{}: raw owner released", row.name);
-    eprintln!("CDB140 ROW {} PASS class=allocation-order peak={peak} unfunded={unfunded} allocations={allocations}", row.name);
+    assert_eq!(
+        json.load(Ordering::SeqCst),
+        0,
+        "{}: raw owner released",
+        row.name
+    );
+    eprintln!(
+        "CDB140 ROW {} PASS class=allocation-order peak={peak} unfunded={unfunded} allocations={allocations}",
+        row.name
+    );
 }
 
 fn writer_reopen(row: &Row) {
@@ -179,10 +211,14 @@ fn writer_reopen(row: &Row) {
     let path = root.path().join("large-document.db");
     let document = (row.document)();
     seed(&path, &document, false);
-    Database::open(&path).expect("default writer reopens committed 16 MiB JSON document").close().expect("close default reopened writer");
+    Database::open(&path)
+        .expect("default writer reopens committed 16 MiB JSON document")
+        .close()
+        .expect("close default reopened writer");
     let mut reopen_options = contextdb_engine::DatabaseOpenOptions::default();
     reopen_options.owner_reads.limits.limits.memory = 64 * 1_048_576;
-    let database = Database::open_with_options(&path, reopen_options).expect("reopen committed 16 MiB JSON document with explicit verification owner budget");
+    let database = Database::open_with_options(&path, reopen_options)
+        .expect("reopen committed 16 MiB JSON document with explicit verification owner budget");
     // Qualifies writer commit and reopen only. A full document read would
     // exceed the independently shipped 4 MiB result ceiling.
     // COUNT(id) still decodes the row. Give only this verification read an
@@ -192,14 +228,29 @@ fn writer_reopen(row: &Row) {
         memory: 64 * 1_048_576,
         ..ReadLimits::default()
     };
-    let verification = database.read_session(verification_limits).expect("open explicit-budget verification read");
-    let answer = verification.execute("SELECT COUNT(id) FROM json_decode_rows", &HashMap::new()).expect("count persisted row after reopening 16 MiB document");
-    assert_eq!(answer.rows.len(), 1, "16 MiB writer/reopen returns one count row");
-    assert_eq!(answer.rows[0].first(), Some(&Value::Int64(1)), "16 MiB writer/reopen preserves the committed row");
+    let verification = database
+        .read_session(verification_limits)
+        .expect("open explicit-budget verification read");
+    let answer = verification
+        .execute("SELECT COUNT(id) FROM json_decode_rows", &HashMap::new())
+        .expect("count persisted row after reopening 16 MiB document");
+    assert_eq!(
+        answer.rows.len(),
+        1,
+        "16 MiB writer/reopen returns one count row"
+    );
+    assert_eq!(
+        answer.rows[0].first(),
+        Some(&Value::Int64(1)),
+        "16 MiB writer/reopen preserves the committed row"
+    );
     drop(answer);
     drop(verification);
     database.close().expect("close reopened writer");
-    eprintln!("CDB140 ROW {} PASS class=compatibility route=writer-commit-reopen", row.name);
+    eprintln!(
+        "CDB140 ROW {} PASS class=compatibility route=writer-commit-reopen",
+        row.name
+    );
 }
 
 fn seed(path: &Path, document: &str, sequential: bool) {
@@ -215,7 +266,10 @@ fn seed(path: &Path, document: &str, sequential: bool) {
         database
             .execute(
                 "INSERT INTO json_decode_rows VALUES ($id, $doc)",
-                &HashMap::from([("id".into(), Value::Int64(id)), ("doc".into(), value.clone())]),
+                &HashMap::from([
+                    ("id".into(), Value::Int64(id)),
+                    ("doc".into(), value.clone()),
+                ]),
             )
             .expect("persist JSON fixture");
     }
@@ -341,25 +395,88 @@ fn resolved_serde_json_features() -> Vec<String> {
 #[test]
 fn json_decode_rows_are_admitted_before_allocation_and_release_to_their_baseline() {
     let rows = [
-        Row { name: "raw_array_allocation_funded", drive: Drive::RawFunding, expected: Expected::Answers, document: fitting_array_peak },
-        Row { name: "scalar_3_mib_input_control_funded", drive: Drive::RawFunding, expected: Expected::Answers, document: scalar_3_mib },
-        Row { name: "document_16_mib_writer_reopen", drive: Drive::WriterReopen, expected: Expected::Answers, document: document_16_mib },
-        Row { name: "scalar_1_mib", drive: Drive::One, expected: Expected::Answers, document: scalar_1_mib },
-        Row { name: "document_64_kib", drive: Drive::One, expected: Expected::Answers, document: document_64_kib },
-        Row { name: "two_fields_64_kib", drive: Drive::One, expected: Expected::Answers, document: two_fields_64_kib },
-        Row { name: "sequential_row_release", drive: Drive::Sequential, expected: Expected::Answers, document: document_64_kib },
-        Row { name: "fitting_array_peak", drive: Drive::One, expected: Expected::Answers, document: fitting_array_peak },
-        Row { name: "growing_escaped_newlines", drive: Drive::One, expected: Expected::Answers, document: growing_escaped_newlines },
-        Row { name: "retained_fits_peak_exceeds", drive: Drive::One, expected: Expected::MemoryRefusal, document: retained_fits_peak_exceeds },
-        Row { name: "serde_json_feature_set", drive: Drive::Metadata, expected: Expected::Answers, document: metadata_row },
+        Row {
+            name: "raw_array_allocation_funded",
+            drive: Drive::RawFunding,
+            expected: Expected::Answers,
+            document: fitting_array_peak,
+        },
+        Row {
+            name: "scalar_3_mib_input_control_funded",
+            drive: Drive::RawFunding,
+            expected: Expected::Answers,
+            document: scalar_3_mib,
+        },
+        Row {
+            name: "document_16_mib_writer_reopen",
+            drive: Drive::WriterReopen,
+            expected: Expected::Answers,
+            document: document_16_mib,
+        },
+        Row {
+            name: "scalar_1_mib",
+            drive: Drive::One,
+            expected: Expected::Answers,
+            document: scalar_1_mib,
+        },
+        Row {
+            name: "document_64_kib",
+            drive: Drive::One,
+            expected: Expected::Answers,
+            document: document_64_kib,
+        },
+        Row {
+            name: "two_fields_64_kib",
+            drive: Drive::One,
+            expected: Expected::Answers,
+            document: two_fields_64_kib,
+        },
+        Row {
+            name: "sequential_row_release",
+            drive: Drive::Sequential,
+            expected: Expected::Answers,
+            document: document_64_kib,
+        },
+        Row {
+            name: "fitting_array_peak",
+            drive: Drive::One,
+            expected: Expected::Answers,
+            document: fitting_array_peak,
+        },
+        Row {
+            name: "growing_escaped_newlines",
+            drive: Drive::One,
+            expected: Expected::Answers,
+            document: growing_escaped_newlines,
+        },
+        Row {
+            name: "retained_fits_peak_exceeds",
+            drive: Drive::One,
+            expected: Expected::MemoryRefusal,
+            document: retained_fits_peak_exceeds,
+        },
+        Row {
+            name: "serde_json_feature_set",
+            drive: Drive::Metadata,
+            expected: Expected::Answers,
+            document: metadata_row,
+        },
     ];
 
     let selected = std::env::var("CDB140_ROW").ok();
-    assert!(selected.as_ref().is_none_or(|name| rows.iter().any(|row| row.name == name)), "CDB140_ROW must name an existing row");
+    assert!(
+        selected
+            .as_ref()
+            .is_none_or(|name| rows.iter().any(|row| row.name == name)),
+        "CDB140_ROW must name an existing row"
+    );
     for row in rows {
         // One selected row yields an independent receipt without adding test
         // functions or allowing an earlier failure to mask later rows.
-        if selected.as_ref().is_some_and(|selected| selected != row.name) {
+        if selected
+            .as_ref()
+            .is_some_and(|selected| selected != row.name)
+        {
             continue;
         }
         if matches!(row.drive, Drive::RawFunding) {
@@ -377,13 +494,20 @@ fn json_decode_rows_are_admitted_before_allocation_and_release_to_their_baseline
                 "{}: a changed resolved serde_json feature set needs a scratch audit before decode admission can be trusted",
                 row.name
             );
-            eprintln!("CDB140 ROW {} PASS class=dependency-compatibility", row.name);
+            eprintln!(
+                "CDB140 ROW {} PASS class=dependency-compatibility",
+                row.name
+            );
             continue;
         }
 
         let root = tempfile::tempdir().expect("task-scoped store directory");
         let path = root.path().join(format!("{}.db", row.name));
-        seed(&path, &(row.document)(), matches!(row.drive, Drive::Sequential));
+        seed(
+            &path,
+            &(row.document)(),
+            matches!(row.drive, Drive::Sequential),
+        );
         let reader = session(&path);
         let baseline = receipt(&reader);
         let ids: &[i64] = match row.drive {
@@ -402,7 +526,12 @@ fn json_decode_rows_are_admitted_before_allocation_and_release_to_their_baseline
                     let answer = outcome.unwrap_or_else(|error| {
                         panic!("{}: shipped memory must answer, got {error:?}", row.name)
                     });
-                    assert_eq!(answer.rows.len(), 1, "{}: selected row answers once", row.name);
+                    assert_eq!(
+                        answer.rows.len(),
+                        1,
+                        "{}: selected row answers once",
+                        row.name
+                    );
                     drop(answer);
                     let released = receipt(&reader);
                     assert_eq!(
@@ -436,6 +565,14 @@ fn json_decode_rows_are_admitted_before_allocation_and_release_to_their_baseline
                 }
             }
         }
-        eprintln!("CDB140 ROW {} PASS class={}", row.name, if matches!(row.expected, Expected::MemoryRefusal) { "refusal-regression" } else { "compatibility" });
+        eprintln!(
+            "CDB140 ROW {} PASS class={}",
+            row.name,
+            if matches!(row.expected, Expected::MemoryRefusal) {
+                "refusal-regression"
+            } else {
+                "compatibility"
+            }
+        );
     }
 }

@@ -567,7 +567,9 @@ impl ApplyPhasePause {
         let deadline = std::time::Instant::now() + ABANDONED_PAUSE;
         while state.armed && !state.released {
             if self.waiters.wait_until(&mut state, deadline).timed_out() {
-                eprintln!("an armed test pause was never released; continuing after {ABANDONED_PAUSE:?}");
+                eprintln!(
+                    "an armed test pause was never released; continuing after {ABANDONED_PAUSE:?}"
+                );
                 break;
             }
         }
@@ -819,7 +821,10 @@ impl CompositeStore {
                     issue: VectorPartitionDeclarationIssue::RequiresVectorColumn,
                 }
             })?;
-        if !self.vector.with_index_layout(index, |layout| layout == &expected)? {
+        if !self
+            .vector
+            .with_index_layout(index, |layout| layout == &expected)?
+        {
             return Err(Error::Other(format!(
                 "registered vector layout does not match the durable declaration for {}.{}",
                 index.table, index.column
@@ -1003,7 +1008,7 @@ impl CompositeStore {
         commit_lsn.and_then(|lsn| self.received_arriving_table_meta.lock().remove(&lsn))
     }
 
-#[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
+    #[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
     fn prepare_vector_partition_mutations_with_reclamation(
         &self,
         ws: &WriteSet,
@@ -1077,14 +1082,7 @@ impl CompositeStore {
                     read_memory.clone(),
                 )?
                 .ok_or_else(|| Error::NotFound(format!("vector row {row_id}")))?;
-            let before = Self::prepared_binding(
-                index,
-                meta,
-                declaration,
-                row,
-                vector.0,
-                vector.1,
-            )?;
+            let before = Self::prepared_binding(index, meta, declaration, row, vector.0, vector.1)?;
             keyed_deletes.push(PartitionedVectorDelete::new(
                 index.clone(),
                 before.partition_key.clone(),
@@ -1206,21 +1204,26 @@ impl CompositeStore {
             )?;
             let after =
                 Self::prepared_binding(index, meta, declaration, new_row, *moved_tx, commit_lsn)?;
-            keyed_moves.push(PartitionedVectorMove::new(
-                index.clone(),
-                before.partition_key.clone(),
-                after.partition_key.clone(),
-                *old_row_id,
-                *new_row_id,
-                *moved_tx,
-                before.vector_created_tx,
-                before.vector_lsn,
-            ).with_target_membership(contextdb_vector::store::VectorMembershipProvenance::new(
-                after.row.created_tx,
-                after.row.lsn,
-                *moved_tx,
-                after.row.deleted_tx,
-            )));
+            keyed_moves.push(
+                PartitionedVectorMove::new(
+                    index.clone(),
+                    before.partition_key.clone(),
+                    after.partition_key.clone(),
+                    *old_row_id,
+                    *new_row_id,
+                    *moved_tx,
+                    before.vector_created_tx,
+                    before.vector_lsn,
+                )
+                .with_target_membership(
+                    contextdb_vector::store::VectorMembershipProvenance::new(
+                        after.row.created_tx,
+                        after.row.lsn,
+                        *moved_tx,
+                        after.row.deleted_tx,
+                    ),
+                ),
+            );
             mutations.push(PreparedVectorPartitionMutation::Move {
                 index: index.clone(),
                 before,
@@ -1311,12 +1314,14 @@ impl CompositeStore {
                         before.vector_lsn,
                     )
                     .replacing_row_version()
-                    .with_target_membership(contextdb_vector::store::VectorMembershipProvenance::new(
-                        after.row.created_tx,
-                        after.row.lsn,
-                        new_row.created_tx,
-                        after.row.deleted_tx,
-                    )),
+                    .with_target_membership(
+                        contextdb_vector::store::VectorMembershipProvenance::new(
+                            after.row.created_tx,
+                            after.row.lsn,
+                            new_row.created_tx,
+                            after.row.deleted_tx,
+                        ),
+                    ),
                 );
                 mutations.push(PreparedVectorPartitionMutation::Move {
                     index,
@@ -1381,7 +1386,11 @@ impl CompositeStore {
         })
     }
 
-    pub(crate) fn apply_exact(&self, ws: &WriteSet, read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>) -> Result<()> {
+    pub(crate) fn apply_exact(
+        &self,
+        ws: &WriteSet,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<()> {
         let registered_snapshots = self.take_vector_partition_snapshot_stage(ws.commit_lsn);
         // A received unit that declares a table in the same delivery that
         // carries that table's rows/vectors has not published its schema
@@ -1698,52 +1707,116 @@ pub(crate) fn with_owned_commit_events_for_apply<R>(
     }
 }
 
-
 pub(crate) struct OwnedPreparedMemoryApply {
-    pub(crate) log_entries:Vec<ChangeLogEntry>,
-    pub(crate) partition_mutations:Option<PreparedVectorPartitionMutationBatch>,
-    clear_sources:Vec<SyncSourceLsnClear>,
-    set_sources:Vec<SyncSourceLsnSet>,
-    _preparation:crate::memory_accounting::OwnedMemoryReservation,
+    pub(crate) log_entries: Vec<ChangeLogEntry>,
+    pub(crate) partition_mutations: Option<PreparedVectorPartitionMutationBatch>,
+    clear_sources: Vec<SyncSourceLsnClear>,
+    set_sources: Vec<SyncSourceLsnSet>,
+    _preparation: crate::memory_accounting::OwnedMemoryReservation,
 }
 impl OwnedPreparedMemoryApply {
-    pub(crate) fn prepare(original:&crate::memory_accounting::OwnedMemoryReservation,ws:&WriteSet,log_entries:Vec<ChangeLogEntry>,partition_mutations:PreparedVectorPartitionMutationBatch,mut preparation:crate::memory_accounting::OwnedMemoryReservation)->Result<Self>{
-        let frame=crate::persistence::OriginalPersistenceFrame::new(original)?;
+    pub(crate) fn prepare(
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        ws: &WriteSet,
+        log_entries: Vec<ChangeLogEntry>,
+        partition_mutations: PreparedVectorPartitionMutationBatch,
+        mut preparation: crate::memory_accounting::OwnedMemoryReservation,
+    ) -> Result<Self> {
+        let frame = crate::persistence::OriginalPersistenceFrame::new(original)?;
         frame.array::<SyncSourceLsnClear>(ws.relational_deletes.len())?;
         frame.array::<SyncSourceLsnSet>(ws.relational_inserts.len())?;
-        for (table,_,_) in &ws.relational_deletes{frame.reserve(table.len())?;}
-        for (table,_) in &ws.relational_inserts{frame.reserve(table.len()*2)?;}
-        let (clear_sources,set_sources)=sync_source_lsn_updates(ws);
-        let mut source_memory=frame.into_reservation();crate::memory_accounting::merge_preparation_original(&mut preparation,&mut source_memory)?;
-        Ok(Self {log_entries,partition_mutations:Some(partition_mutations),clear_sources,set_sources,_preparation:preparation})
+        for (table, _, _) in &ws.relational_deletes {
+            frame.reserve(table.len())?;
+        }
+        for (table, _) in &ws.relational_inserts {
+            frame.reserve(table.len() * 2)?;
+        }
+        let (clear_sources, set_sources) = sync_source_lsn_updates(ws);
+        let mut source_memory = frame.into_reservation();
+        crate::memory_accounting::merge_preparation_original(&mut preparation, &mut source_memory)?;
+        Ok(Self {
+            log_entries,
+            partition_mutations: Some(partition_mutations),
+            clear_sources,
+            set_sources,
+            _preparation: preparation,
+        })
     }
 }
 impl CompositeStore {
-    pub(crate) fn prepare_owned_change_log_entries_with_snapshots(&self,original:&crate::memory_accounting::OwnedMemoryReservation,ws:&WriteSet,table_meta:Option<&HashMap<String,TableMeta>>,deleted_rows:Option<&HashMap<String,HashMap<RowId,VersionedRow>>>)->Result<(Vec<ChangeLogEntry>,crate::memory_accounting::OwnedMemoryReservation)>{
-        let frame=crate::persistence::OriginalPersistenceFrame::new(original)?;
-        let count=ws.relational_inserts.len().checked_add(ws.relational_deletes.len()).and_then(|n|n.checked_add(ws.adj_inserts.len())).and_then(|n|n.checked_add(ws.adj_deletes.len())).and_then(|n|n.checked_add(ws.vector_inserts.len())).and_then(|n|n.checked_add(ws.vector_deletes.len())).ok_or_else(||Error::Other("change log preparation count overflow".into()))?;
-        frame.array::<ChangeLogEntry>(count.checked_mul(4).ok_or_else(||Error::Other("change log preparation layout overflow".into()))?)?;
-        for (table,_) in &ws.relational_inserts{frame.reserve(table.len())?;}
-        for (table,id,_) in &ws.relational_deletes {
-            frame.reserve(table.len()+2)?;
-            if let Some(row)=deleted_rows.and_then(|tables|tables.get(table)).and_then(|rows|rows.get(id)){frame.record(row)?;}
-            else if let Some(row)=self.relational.tables.read().get(table).and_then(|rows|rows.iter().find(|r|r.row_id==*id)){frame.record(row)?;}
-            if let Some(meta)=table_meta.and_then(|tables|tables.get(table)){frame.record(meta)?;}
+    pub(crate) fn prepare_owned_change_log_entries_with_snapshots(
+        &self,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        ws: &WriteSet,
+        table_meta: Option<&HashMap<String, TableMeta>>,
+        deleted_rows: Option<&HashMap<String, HashMap<RowId, VersionedRow>>>,
+    ) -> Result<(
+        Vec<ChangeLogEntry>,
+        crate::memory_accounting::OwnedMemoryReservation,
+    )> {
+        let frame = crate::persistence::OriginalPersistenceFrame::new(original)?;
+        let count = ws
+            .relational_inserts
+            .len()
+            .checked_add(ws.relational_deletes.len())
+            .and_then(|n| n.checked_add(ws.adj_inserts.len()))
+            .and_then(|n| n.checked_add(ws.adj_deletes.len()))
+            .and_then(|n| n.checked_add(ws.vector_inserts.len()))
+            .and_then(|n| n.checked_add(ws.vector_deletes.len()))
+            .ok_or_else(|| Error::Other("change log preparation count overflow".into()))?;
+        frame.array::<ChangeLogEntry>(
+            count
+                .checked_mul(4)
+                .ok_or_else(|| Error::Other("change log preparation layout overflow".into()))?,
+        )?;
+        for (table, _) in &ws.relational_inserts {
+            frame.reserve(table.len())?;
         }
-        for edge in &ws.adj_inserts{frame.reserve(edge.edge_type.len())?;}
-        for (_,kind,_,_) in &ws.adj_deletes{frame.reserve(kind.len())?;}
-        for vector in &ws.vector_inserts{frame.reserve(vector.index.table.len()+vector.index.column.len())?;}
-        for (index,_,_) in &ws.vector_deletes{frame.reserve(index.table.len()+index.column.len())?;}
-        let entries=self.build_change_log_entries_with_snapshots(ws,table_meta,deleted_rows);
-        Ok((entries,frame.into_reservation()))
+        for (table, id, _) in &ws.relational_deletes {
+            frame.reserve(table.len() + 2)?;
+            if let Some(row) = deleted_rows
+                .and_then(|tables| tables.get(table))
+                .and_then(|rows| rows.get(id))
+            {
+                frame.record(row)?;
+            } else if let Some(row) = self
+                .relational
+                .tables
+                .read()
+                .get(table)
+                .and_then(|rows| rows.iter().find(|r| r.row_id == *id))
+            {
+                frame.record(row)?;
+            }
+            if let Some(meta) = table_meta.and_then(|tables| tables.get(table)) {
+                frame.record(meta)?;
+            }
+        }
+        for edge in &ws.adj_inserts {
+            frame.reserve(edge.edge_type.len())?;
+        }
+        for (_, kind, _, _) in &ws.adj_deletes {
+            frame.reserve(kind.len())?;
+        }
+        for vector in &ws.vector_inserts {
+            frame.reserve(vector.index.table.len() + vector.index.column.len())?;
+        }
+        for (index, _, _) in &ws.vector_deletes {
+            frame.reserve(index.table.len() + index.column.len())?;
+        }
+        let entries = self.build_change_log_entries_with_snapshots(ws, table_meta, deleted_rows);
+        Ok((entries, frame.into_reservation()))
     }
-pub(crate) fn apply_owned_exact_with_log_entries(
+    pub(crate) fn apply_owned_exact_with_log_entries(
         &self,
         ws: &WriteSet,
         mut prepared: OwnedPreparedMemoryApply,
     ) -> Result<()> {
         crate::database::discard::publish_original_discard_for_apply(ws);
-        let partition_mutations=prepared.partition_mutations.take().expect("prepared native partition publication");
+        let partition_mutations = prepared
+            .partition_mutations
+            .take()
+            .expect("prepared native partition publication");
         self.relational.apply_prepared_rows(
             &ws.relational_deletes,
             &ws.relational_inserts,
@@ -1763,7 +1836,8 @@ pub(crate) fn apply_owned_exact_with_log_entries(
                 Some(&*self.accountant),
             );
         }
-        let clear_source_lsns=std::mem::take(&mut prepared.clear_sources);let set_source_lsns=std::mem::take(&mut prepared.set_sources);
+        let clear_source_lsns = std::mem::take(&mut prepared.clear_sources);
+        let set_source_lsns = std::mem::take(&mut prepared.set_sources);
         if !clear_source_lsns.is_empty() {
             self.relational.clear_sync_source_lsns(clear_source_lsns);
         }
@@ -1798,20 +1872,23 @@ pub(crate) fn apply_owned_exact_with_log_entries(
         // the moment this apply returns. Both exist once the commit is
         // durable, so the charge cannot refuse here -- the typed refusal
         // fires on the next admission, which is what a declared limit is for.
-        self.accountant
-            .charge_retained(change_log_retained_bytes(&prepared.log_entries).saturating_add(
+        self.accountant.charge_retained(
+            change_log_retained_bytes(&prepared.log_entries).saturating_add(
                 if self.relational.uses_disk_backed_committed_bodies() {
                     0
                 } else {
                     COMMIT_INDEX_ENTRY_BYTES
                 },
-            ));
+            ),
+        );
         record_change_log_entries(
             &mut self.change_log_table_index.write(),
             &mut self.change_log_lsn_refcounts.write(),
             &prepared.log_entries,
         );
-        self.change_log.write().extend(std::mem::take(&mut prepared.log_entries));
+        self.change_log
+            .write()
+            .extend(std::mem::take(&mut prepared.log_entries));
         Ok(())
     }
 }
@@ -1821,7 +1898,9 @@ pub(crate) fn apply_owned_exact_with_log_entries(
 impl crate::database::event_bus::OwnedSinkQueuePersistence for CompositeStore {
     type Update<'o> = ();
     type Removals<'o> = ();
-    fn is_durable(&self) -> bool { false }
+    fn is_durable(&self) -> bool {
+        false
+    }
     fn prepare_update<'o>(
         &self,
         original: &'o crate::memory_accounting::OwnedMemoryReservation,
@@ -1834,7 +1913,9 @@ impl crate::database::event_bus::OwnedSinkQueuePersistence for CompositeStore {
         crate::memory_accounting::persistence_original_projection(original)?;
         Ok(())
     }
-    fn commit_update(&self, _: Self::Update<'_>) -> Result<()> { Ok(()) }
+    fn commit_update(&self, _: Self::Update<'_>) -> Result<()> {
+        Ok(())
+    }
     fn prepare_removals<'o>(
         &self,
         original: &'o crate::memory_accounting::OwnedMemoryReservation,
@@ -1845,23 +1926,65 @@ impl crate::database::event_bus::OwnedSinkQueuePersistence for CompositeStore {
         crate::memory_accounting::persistence_original_projection(original)?;
         Ok(())
     }
-    fn commit_removals(&self, _: Self::Removals<'_>) -> Result<()> { Ok(()) }
+    fn commit_removals(&self, _: Self::Removals<'_>) -> Result<()> {
+        Ok(())
+    }
 }
 
 impl crate::database::event_bus::OwnedSinkQueuePersistence for std::sync::Arc<CompositeStore> {
-    type Update<'o> = <CompositeStore as crate::database::event_bus::OwnedSinkQueuePersistence>::Update<'o>;
-    type Removals<'o> = <CompositeStore as crate::database::event_bus::OwnedSinkQueuePersistence>::Removals<'o>;
-    fn is_durable(&self) -> bool { <CompositeStore as crate::database::event_bus::OwnedSinkQueuePersistence>::is_durable(self.as_ref()) }
-    fn prepare_update<'o>(&self, original: &'o crate::memory_accounting::OwnedMemoryReservation, sink: &'o str, entry_id: u64, encoded: &[u8], uncertain: bool, delta: i8) -> Result<Self::Update<'o>> {
-        <CompositeStore as crate::database::event_bus::OwnedSinkQueuePersistence>::prepare_update(self.as_ref(), original, sink, entry_id, encoded, uncertain, delta)
+    type Update<'o> =
+        <CompositeStore as crate::database::event_bus::OwnedSinkQueuePersistence>::Update<'o>;
+    type Removals<'o> =
+        <CompositeStore as crate::database::event_bus::OwnedSinkQueuePersistence>::Removals<'o>;
+    fn is_durable(&self) -> bool {
+        <CompositeStore as crate::database::event_bus::OwnedSinkQueuePersistence>::is_durable(
+            self.as_ref(),
+        )
+    }
+    fn prepare_update<'o>(
+        &self,
+        original: &'o crate::memory_accounting::OwnedMemoryReservation,
+        sink: &'o str,
+        entry_id: u64,
+        encoded: &[u8],
+        uncertain: bool,
+        delta: i8,
+    ) -> Result<Self::Update<'o>> {
+        <CompositeStore as crate::database::event_bus::OwnedSinkQueuePersistence>::prepare_update(
+            self.as_ref(),
+            original,
+            sink,
+            entry_id,
+            encoded,
+            uncertain,
+            delta,
+        )
     }
     fn commit_update(&self, prepared: Self::Update<'_>) -> Result<()> {
-        <CompositeStore as crate::database::event_bus::OwnedSinkQueuePersistence>::commit_update(self.as_ref(), prepared)
+        <CompositeStore as crate::database::event_bus::OwnedSinkQueuePersistence>::commit_update(
+            self.as_ref(),
+            prepared,
+        )
     }
-    fn prepare_removals<'o>(&self, original: &'o crate::memory_accounting::OwnedMemoryReservation, sink: &'o str, ids: &'o [u64], unconfirmed: u64) -> Result<Self::Removals<'o>> {
-        <CompositeStore as crate::database::event_bus::OwnedSinkQueuePersistence>::prepare_removals(self.as_ref(), original, sink, ids, unconfirmed)
+    fn prepare_removals<'o>(
+        &self,
+        original: &'o crate::memory_accounting::OwnedMemoryReservation,
+        sink: &'o str,
+        ids: &'o [u64],
+        unconfirmed: u64,
+    ) -> Result<Self::Removals<'o>> {
+        <CompositeStore as crate::database::event_bus::OwnedSinkQueuePersistence>::prepare_removals(
+            self.as_ref(),
+            original,
+            sink,
+            ids,
+            unconfirmed,
+        )
     }
     fn commit_removals(&self, prepared: Self::Removals<'_>) -> Result<()> {
-        <CompositeStore as crate::database::event_bus::OwnedSinkQueuePersistence>::commit_removals(self.as_ref(), prepared)
+        <CompositeStore as crate::database::event_bus::OwnedSinkQueuePersistence>::commit_removals(
+            self.as_ref(),
+            prepared,
+        )
     }
 }

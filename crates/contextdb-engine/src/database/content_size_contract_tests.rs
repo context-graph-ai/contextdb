@@ -410,9 +410,14 @@ fn assert_received_disjoint_file_export_restore() {
     ];
     {
         let fixture_open_accountant_412 = Arc::new(MemoryAccountant::no_limit());
-        let _fixture_decode_scope_412 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_412).into()).unwrap();
+        let _fixture_decode_scope_412 =
+            crate::read_image_memory::ImageMemory::enter_writer_operation(
+                std::sync::Arc::clone(&fixture_open_accountant_412).into(),
+            )
+            .unwrap();
         let persistence = RedbPersistence::open(&path).expect("open the physical producer");
-        persistence.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_412).into());
+        persistence
+            .attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_412).into());
         persistence
             .append_table_rows_batch(
                 "placements",

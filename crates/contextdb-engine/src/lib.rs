@@ -85,6 +85,11 @@ mod memory_accounting;
 pub mod memory_accounting;
 mod metadata_page;
 #[cfg(not(feature = "test-seams"))]
+mod owned_cursor_page;
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub mod owned_cursor_page;
+#[cfg(not(feature = "test-seams"))]
 mod owner_read;
 #[cfg(feature = "test-seams")]
 #[doc(hidden)]
@@ -102,15 +107,9 @@ pub(crate) mod read_contract;
 pub mod read_contract;
 mod read_image;
 mod read_image_memory;
-pub mod vector_read_memory;
 #[cfg(any(test, feature = "test-seams"))]
 mod read_probe;
 mod read_progress;
-#[cfg(not(feature = "test-seams"))]
-mod owned_cursor_page;
-#[cfg(feature = "test-seams")]
-#[doc(hidden)]
-pub mod owned_cursor_page;
 #[cfg(not(feature = "test-seams"))]
 mod read_session;
 #[cfg(feature = "test-seams")]
@@ -121,6 +120,7 @@ mod read_work_probe;
 pub mod schema_enforcer;
 pub mod sync;
 pub mod sync_types;
+pub mod vector_read_memory;
 pub mod work_ledger;
 
 #[cfg(feature = "sync-orchestration")]
@@ -140,9 +140,9 @@ pub mod subjects;
 #[cfg(feature = "sync-orchestration")]
 pub mod sync_client;
 #[cfg(feature = "sync-orchestration")]
-pub mod sync_server;
-#[cfg(feature = "sync-orchestration")]
 mod sync_native_delivery;
+#[cfg(feature = "sync-orchestration")]
+pub mod sync_server;
 #[cfg(feature = "sync-orchestration")]
 mod sync_system_tables;
 #[cfg(feature = "sync-orchestration")]
@@ -161,6 +161,8 @@ pub use contextdb_core::read_contract::{
 /// reads it back from the structures; it is not a ledger figure.
 #[cfg(any(test, feature = "test-seams"))]
 pub use contextdb_relational::store::RetainedStructureBytes;
+#[doc(hidden)]
+pub use contextdb_vector::VectorPartitionRef;
 #[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub use contextdb_vector::{
@@ -174,16 +176,11 @@ pub use custody_types::{
 };
 #[doc(hidden)]
 pub use database::CommitStageStats;
-#[cfg(feature = "test-seams")]
-#[doc(hidden)]
-pub use database::{reclaim_steps_last_cycle_for_test, set_reclaim_steps_per_cycle_for_test};
 pub use database::MemoryHeldReceivedSchemaUnit;
 pub use database::PolicyHeldReceivedTable;
 pub use database::TriggerProgressTelemetrySnapshot;
 #[doc(hidden)]
 pub use database::WriterVectorSession;
-#[doc(hidden)]
-pub use contextdb_vector::VectorPartitionRef;
 pub use database::{
     ApplyPhasePauseGuard, CronAuditEntry, CronAuditKind, CronPauseGuard, CronScheduleStatus,
     EventBusStatus, EventTypeStatus, RouteStatus, SinkError, SinkEvent, SinkMetrics, SinkStatus,
@@ -212,6 +209,9 @@ pub use database::{
     VectorMemoryOwnershipReceiptForTest, VectorPartitionGenerationRetentionForTest,
     VectorPartitionJournalFileForTest,
 };
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub use database::{reclaim_steps_last_cycle_for_test, set_reclaim_steps_per_cycle_for_test};
 pub use direct_file_reader::{
     DirectChangeFrontiers, DirectChangeState, DirectColumnReference, DirectConfigurationState,
     DirectEventTypeStatus, DirectEventsStatus, DirectImageMetadataKind, DirectImageState,
@@ -225,10 +225,10 @@ pub use direct_file_reader::{
 #[cfg(feature = "sync-orchestration")]
 pub use identity::FabricIdentity;
 #[cfg(any(test, feature = "test-seams"))]
+pub use persistence::PagedRouteFaultForTest;
+#[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub use persistence::VectorGenerationCatalogRecordFaultForTest;
-#[cfg(any(test, feature = "test-seams"))]
-pub use persistence::PagedRouteFaultForTest;
 pub use plugin::DatabasePlugin;
 pub use read_progress::{ReadPhase, ReadProgress, ReadProgressObserver};
 pub use read_session::{

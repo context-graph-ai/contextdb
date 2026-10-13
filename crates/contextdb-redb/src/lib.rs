@@ -67,8 +67,9 @@
 pub use db::scratch_backend_allocation_size;
 pub use db::{
     Builder, CacheStats, Database, MultimapTableDefinition, MultimapTableHandle, ReadOnlyDatabase,
-    ReadableDatabase, ReclaimBoundary, ReclaimStep, RepairSession, ScratchBackend, StorageBackend, TableDefinition, TableHandle,
-    UntypedMultimapTableHandle, UntypedTableHandle, scratch_backend_in_directory,
+    ReadableDatabase, ReclaimBoundary, ReclaimStep, RepairSession, ScratchBackend, StorageBackend,
+    TableDefinition, TableHandle, UntypedMultimapTableHandle, UntypedTableHandle,
+    scratch_backend_in_directory,
 };
 pub use error::{
     CommitError, CompactionError, DatabaseError, Error, SavepointError, SetDurabilityError,
@@ -135,7 +136,10 @@ fn create_tempfile() -> tempfile::NamedTempFile {
 mod native_storage_admission;
 #[cfg(feature = "contextdb-internal")]
 #[doc(hidden)]
-pub use native_storage_admission::{NativeColdFault, NativeColdReadError, NativeStorageAdmission, NativeStorageCredit, NativeStorageRefused, with_native_storage_admission};
+pub use native_storage_admission::{
+    NativeColdFault, NativeColdReadError, NativeStorageAdmission, NativeStorageCredit,
+    NativeStorageRefused, with_native_storage_admission,
+};
 
 mod read_admission;
 #[doc(hidden)]

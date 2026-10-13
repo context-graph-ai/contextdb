@@ -291,16 +291,18 @@ impl ValidatedHistoryOpenControl {
         first: Option<(Lsn, TxId)>,
         last: Option<(Lsn, TxId)>,
     ) -> Result<()> {
-        let pair = |pair: Option<(Lsn, TxId)>| pair.map(|(lsn, tx)| {
-            let hash = commit_index_value_hash(tx);
-            // This new reconciliation hashes the actual value-hash inputs;
-            // the existing membership observation convention is unchanged.
-            #[cfg(feature = "test-seams")]
-            crate::read_work_probe::note_hashed_bytes(
-                b"contextdb-logical-record-value-v1".len() + 2 * 8 + 1 + 8,
-            );
-            (lsn, hash)
-        });
+        let pair = |pair: Option<(Lsn, TxId)>| {
+            pair.map(|(lsn, tx)| {
+                let hash = commit_index_value_hash(tx);
+                // This new reconciliation hashes the actual value-hash inputs;
+                // the existing membership observation convention is unchanged.
+                #[cfg(feature = "test-seams")]
+                crate::read_work_probe::note_hashed_bytes(
+                    b"contextdb-logical-record-value-v1".len() + 2 * 8 + 1 + 8,
+                );
+                (lsn, hash)
+            })
+        };
         if count != self.publication.control.commit_count
             || pair(first) != self.publication.control.first
             || pair(last) != self.publication.control.last

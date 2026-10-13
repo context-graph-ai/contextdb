@@ -76,8 +76,7 @@ fn reader(path: &Path, runtime: &Path) -> std::thread::JoinHandle<()> {
     let path = path.to_path_buf();
     let runtime = runtime.to_path_buf();
     std::thread::spawn(move || {
-        let session =
-            open_paused_reader(&path, &runtime);
+        let session = open_paused_reader(&path, &runtime);
         assert_eq!(session.route(), ReadRoute::File);
     })
 }
@@ -98,8 +97,7 @@ fn reader_with_completion_signal(
     let runtime = runtime.to_path_buf();
     let (finished_tx, finished_rx) = std::sync::mpsc::channel();
     let handle = std::thread::spawn(move || {
-        let session =
-            open_paused_reader(&path, &runtime);
+        let session = open_paused_reader(&path, &runtime);
         assert_eq!(session.route(), ReadRoute::File);
         let _ = finished_tx.send(());
     });

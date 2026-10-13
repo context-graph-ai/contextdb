@@ -55,9 +55,11 @@ pub(crate) type CommitPreparation<'a> =
 
 // Native payload fields precede their original reservations in every owner.
 // None of these owners exports a payload or a replaceable funding provider.
-pub(crate) type OwnedCommitPreparation<'a> = dyn for<'g, 'h>
-    FnMut(&Database, &'g mut contextdb_tx::manager::EngineGuard<'h>)
-        -> Result<OwnedPreparationRecords> + 'a;
+pub(crate) type OwnedCommitPreparation<'a> = dyn for<'g, 'h> FnMut(
+        &Database,
+        &'g mut contextdb_tx::manager::EngineGuard<'h>,
+    ) -> Result<OwnedPreparationRecords>
+    + 'a;
 
 pub(crate) enum DeliveryPreparation<'borrow, 'body> {
     Legacy(&'borrow mut CommitPreparation<'body>),
@@ -87,9 +89,15 @@ pub(crate) fn preparation_array_bytes<T>(count: usize) -> Result<usize> {
 }
 
 impl OwnedPreparationRecords {
-    pub(crate) fn try_new(db: &Database, record_capacity: usize, debit_capacity: usize) -> Result<Self> {
+    pub(crate) fn try_new(
+        db: &Database,
+        record_capacity: usize,
+        debit_capacity: usize,
+    ) -> Result<Self> {
         let bytes = preparation_array_bytes::<Record>(record_capacity)?
-            .checked_add(preparation_array_bytes::<crate::memory_accounting::OwnedMemoryReservation>(debit_capacity)?)
+            .checked_add(preparation_array_bytes::<
+                crate::memory_accounting::OwnedMemoryReservation,
+            >(debit_capacity)?)
             .ok_or_else(invalid)?;
         let buffers = db.reserve_owned_preparation(bytes)?;
         let records = Vec::with_capacity(record_capacity);
@@ -100,7 +108,11 @@ impl OwnedPreparationRecords {
             drop(records);
             return Err(invalid());
         }
-        Ok(Self { records, debits, buffers })
+        Ok(Self {
+            records,
+            debits,
+            buffers,
+        })
     }
 
     pub(crate) fn with_records<R>(&self, f: impl for<'r> FnOnce(&'r [Record]) -> R) -> R {
@@ -108,16 +120,28 @@ impl OwnedPreparationRecords {
     }
 
     pub(crate) fn copy_record(&mut self, db: &Database, record: &Record) -> Result<()> {
-        assert!(self.records.len() < self.records.capacity(), "preadmitted record slot");
-        assert!(self.debits.len() < self.debits.capacity(), "preadmitted original debit slot");
+        assert!(
+            self.records.len() < self.records.capacity(),
+            "preadmitted record slot"
+        );
+        assert!(
+            self.debits.len() < self.debits.capacity(),
+            "preadmitted original debit slot"
+        );
         let copied = copy_record_owned(db, record)?;
         self.push(copied);
         Ok(())
     }
 
     fn push(&mut self, value: OwnedPreparationValue<Record>) {
-        assert!(self.records.len() < self.records.capacity(), "preadmitted record slot");
-        assert!(self.debits.len() < self.debits.capacity(), "preadmitted original debit slot");
+        assert!(
+            self.records.len() < self.records.capacity(),
+            "preadmitted record slot"
+        );
+        assert!(
+            self.debits.len() < self.debits.capacity(),
+            "preadmitted original debit slot"
+        );
         let OwnedPreparationValue { value, debit } = value;
         // An unwind after this move still retains the invoice until value dies.
         self.debits.push(debit);
@@ -153,7 +177,11 @@ impl OwnedPreparationRecords {
 }
 
 impl<T> OwnedPreparationValue<T> {
-    pub(crate) fn try_produce(db: &Database, native_bytes: usize, produce: impl FnOnce() -> Result<T>) -> Result<Self> {
+    pub(crate) fn try_produce(
+        db: &Database,
+        native_bytes: usize,
+        produce: impl FnOnce() -> Result<T>,
+    ) -> Result<Self> {
         let debit = db.reserve_owned_preparation(native_bytes)?;
         let value = produce()?;
         Ok(Self { value, debit })
@@ -163,9 +191,15 @@ impl<T> OwnedPreparationValue<T> {
         f(&self.value)
     }
 
-    fn transfer_into(self, target: &mut OwnedPreparationRecords,
-        append: impl FnOnce(T, &mut OwnedPreparationRecords)) {
-        assert!(target.debits.len() < target.debits.capacity(), "preadmitted original debit slot");
+    fn transfer_into(
+        self,
+        target: &mut OwnedPreparationRecords,
+        append: impl FnOnce(T, &mut OwnedPreparationRecords),
+    ) {
+        assert!(
+            target.debits.len() < target.debits.capacity(),
+            "preadmitted original debit slot"
+        );
         let Self { value, debit } = self;
         target.debits.push(debit);
         append(value, target);
@@ -174,7 +208,9 @@ impl<T> OwnedPreparationValue<T> {
 
 impl OwnedPreparationOutputs {
     pub(crate) fn try_new(db: &Database, batch_capacity: usize) -> Result<Self> {
-        let debit = db.reserve_owned_preparation(preparation_array_bytes::<OwnedPreparationRecords>(batch_capacity)?)?;
+        let debit = db.reserve_owned_preparation(preparation_array_bytes::<
+            OwnedPreparationRecords,
+        >(batch_capacity)?)?;
         let batches = Vec::with_capacity(batch_capacity);
         if batches.capacity() != batch_capacity {
             drop(batches);
@@ -184,27 +220,40 @@ impl OwnedPreparationOutputs {
     }
 
     pub(crate) fn retain(&mut self, batch: OwnedPreparationRecords) {
-        assert!(self.batches.len() < self.batches.capacity(), "preadmitted output slot");
+        assert!(
+            self.batches.len() < self.batches.capacity(),
+            "preadmitted output slot"
+        );
         self.batches.push(batch);
     }
 }
 
 impl SourceRegistration {
-    pub(crate) fn manifest_input_owned<'a>(&'a self, db: &Database)
-        -> Result<OwnedPreparationValue<DeliveryManifest<'a>>> {
+    pub(crate) fn manifest_input_owned<'a>(
+        &'a self,
+        db: &Database,
+    ) -> Result<OwnedPreparationValue<DeliveryManifest<'a>>> {
         let mut bytes = preparation_array_bytes::<(&str, NaturalKey)>(self.members.len())?
-            .checked_add(count_key_native(&self.root.key)?).ok_or_else(invalid)?;
+            .checked_add(count_key_native(&self.root.key)?)
+            .ok_or_else(invalid)?;
         for reference in &self.members {
-            bytes = bytes.checked_add(count_key_native(&reference.key)?).ok_or_else(invalid)?;
+            bytes = bytes
+                .checked_add(count_key_native(&reference.key)?)
+                .ok_or_else(invalid)?;
         }
         OwnedPreparationValue::try_produce(db, bytes, || {
             let mut members = Vec::with_capacity(self.members.len());
-            if members.capacity() != self.members.len() { return Err(invalid()); }
+            if members.capacity() != self.members.len() {
+                return Err(invalid());
+            }
             for reference in &self.members {
                 members.push((reference.table.as_str(), copy_key_native(&reference.key)?));
             }
-            Ok(DeliveryManifest { root_table: &self.root.table,
-                root_key: copy_key_native(&self.root.key)?, members })
+            Ok(DeliveryManifest {
+                root_table: &self.root.table,
+                root_key: copy_key_native(&self.root.key)?,
+                members,
+            })
         })
     }
 }
@@ -214,7 +263,9 @@ pub(crate) fn copy_row_owned(
     row: &contextdb_core::VersionedRow,
 ) -> Result<OwnedPreparationValue<contextdb_core::VersionedRow>> {
     let bytes = crate::memory_accounting::preparation_row_copy_bytes(row)?;
-    OwnedPreparationValue::try_produce(db, bytes, || crate::memory_accounting::preparation_copy_row(row))
+    OwnedPreparationValue::try_produce(db, bytes, || {
+        crate::memory_accounting::preparation_copy_row(row)
+    })
 }
 
 fn row_matches_reference(
@@ -231,13 +282,22 @@ fn row_matches_reference(
         std::slice::from_ref(&column.name)
     } else if let Some(column) = meta.columns.iter().find(|column| column.name == "id") {
         std::slice::from_ref(&column.name)
-    } else { return false; };
+    } else {
+        return false;
+    };
     columns.len() == 1 + key.rest.len()
         && columns[0] == key.column
-        && columns.iter().skip(1).zip(&key.rest).all(|(column, (name, _))| column == name)
+        && columns
+            .iter()
+            .skip(1)
+            .zip(&key.rest)
+            .all(|(column, (name, _))| column == name)
         && key.matches_values(values)
 }
-fn stored_vector_scratch_bytes(dimension: usize, quantization: contextdb_core::VectorQuantization) -> Result<usize> {
+fn stored_vector_scratch_bytes(
+    dimension: usize,
+    quantization: contextdb_core::VectorQuantization,
+) -> Result<usize> {
     use contextdb_core::VectorQuantization;
     let packed = match quantization {
         VectorQuantization::F32 => return Ok(0),
@@ -248,9 +308,19 @@ fn stored_vector_scratch_bytes(dimension: usize, quantization: contextdb_core::V
     // exact payload into Arc<[u8]>. SQ4 also constructs dimension quantized bytes.
     let arc = std::alloc::Layout::new::<[usize; 2]>()
         .extend(std::alloc::Layout::array::<u8>(packed).map_err(|_| invalid())?)
-        .map_err(|_| invalid())?.0.pad_to_align().size();
-    packed.checked_add(arc)
-        .and_then(|bytes| bytes.checked_add(if quantization == VectorQuantization::SQ4 { dimension } else { 0 }))
+        .map_err(|_| invalid())?
+        .0
+        .pad_to_align()
+        .size();
+    packed
+        .checked_add(arc)
+        .and_then(|bytes| {
+            bytes.checked_add(if quantization == VectorQuantization::SQ4 {
+                dimension
+            } else {
+                0
+            })
+        })
         .ok_or_else(invalid)
 }
 
@@ -261,14 +331,22 @@ pub(crate) fn final_row_owned(
     require_write: bool,
     read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<OwnedPreparationValue<contextdb_core::VersionedRow>> {
-    let staged = db.with_owned_delivery_meta(&reference.table, |meta|
-        final_row_from_meta_owned(db, guard, reference, meta))?;
-    if let Some(staged) = staged { return Ok(staged); }
+    let staged = db.with_owned_delivery_meta(&reference.table, |meta| {
+        final_row_from_meta_owned(db, guard, reference, meta)
+    })?;
+    if let Some(staged) = staged {
+        return Ok(staged);
+    }
     if require_write {
-        return Err(Error::ManifestMemberOutsideTransaction { table: reference.table.clone() });
+        return Err(Error::ManifestMemberOutsideTransaction {
+            table: reference.table.clone(),
+        });
     }
     // End the catalog borrow before the indexed read re-enters table metadata.
-    let memory = crate::read_image_memory::ImageMemory::operation_reader(db.bounded_read_accountant(), read_memory.clone())?;
+    let memory = crate::read_image_memory::ImageMemory::operation_reader(
+        db.bounded_read_accountant(),
+        read_memory.clone(),
+    )?;
     let _scope = memory.enter();
     let selected = actual_row(db, reference, read_memory)?;
     copy_row_owned(db, &selected)
@@ -279,37 +357,80 @@ fn final_row_from_meta_owned(
     reference: &RowRef,
     meta: &contextdb_core::TableMeta,
 ) -> Result<Option<OwnedPreparationValue<contextdb_core::VersionedRow>>> {
-    use crate::memory_accounting::{preparation_row_map_bytes, preparation_value_copy_bytes, preparation_copy_value, preparation_check_row_capacity};
+    use crate::memory_accounting::{
+        preparation_check_row_capacity, preparation_copy_value, preparation_row_map_bytes,
+        preparation_value_copy_bytes,
+    };
     let view = guard.read();
-    let mut rows = view.relational_inserts.iter().filter(|(table, row)|
-        *table == reference.table && row_matches_reference(meta, &row.values, &reference.key));
-    let Some((_, row)) = rows.next() else { return Ok(None); };
-    if rows.next().is_some() { return Err(invalid()); }
+    let mut rows = view.relational_inserts.iter().filter(|(table, row)| {
+        *table == reference.table && row_matches_reference(meta, &row.values, &reference.key)
+    });
+    let Some((_, row)) = rows.next() else {
+        return Ok(None);
+    };
+    if rows.next().is_some() {
+        return Err(invalid());
+    }
     let vector = |column: &contextdb_core::ColumnDef| -> Option<&[f32]> {
-        if !matches!(column.column_type, contextdb_core::ColumnType::Vector(_)) { return None; }
-        view.vector_inserts.iter().rev().find(|entry|
-            entry.index.table == reference.table && entry.index.column == column.name && entry.row_id == row.row_id)
-            .map(|entry| entry.vector.as_slice()).or_else(|| match row.values.get(&column.name) {
-                Some(contextdb_core::Value::Vector(vector)) => Some(vector.as_slice()), _ => None,
+        if !matches!(column.column_type, contextdb_core::ColumnType::Vector(_)) {
+            return None;
+        }
+        view.vector_inserts
+            .iter()
+            .rev()
+            .find(|entry| {
+                entry.index.table == reference.table
+                    && entry.index.column == column.name
+                    && entry.row_id == row.row_id
+            })
+            .map(|entry| entry.vector.as_slice())
+            .or_else(|| match row.values.get(&column.name) {
+                Some(contextdb_core::Value::Vector(vector)) => Some(vector.as_slice()),
+                _ => None,
             })
     };
-    let extra = meta.columns.iter().filter(|column| !row.values.contains_key(&column.name) && vector(column).is_some()).count();
+    let extra = meta
+        .columns
+        .iter()
+        .filter(|column| !row.values.contains_key(&column.name) && vector(column).is_some())
+        .count();
     let members = row.values.len().checked_add(extra).ok_or_else(invalid)?;
     let mut bytes = preparation_row_map_bytes(members)?;
     let mut scratch = 0usize;
     for (name, value) in &row.values {
         let column = meta.columns.iter().find(|column| column.name == *name);
-        let payload = if let Some((column, selected)) = column.and_then(|column| vector(column).map(|selected| (column, selected))) {
-            scratch = scratch.max(stored_vector_scratch_bytes(selected.len(), column.quantization)?);
+        let payload = if let Some((column, selected)) =
+            column.and_then(|column| vector(column).map(|selected| (column, selected)))
+        {
+            scratch = scratch.max(stored_vector_scratch_bytes(
+                selected.len(),
+                column.quantization,
+            )?);
             preparation_array_bytes::<f32>(selected.len())?
-        } else { preparation_value_copy_bytes(value)? };
-        bytes = bytes.checked_add(name.len()).and_then(|bytes| bytes.checked_add(payload)).ok_or_else(invalid)?;
+        } else {
+            preparation_value_copy_bytes(value)?
+        };
+        bytes = bytes
+            .checked_add(name.len())
+            .and_then(|bytes| bytes.checked_add(payload))
+            .ok_or_else(invalid)?;
     }
-    for column in meta.columns.iter().filter(|column| !row.values.contains_key(&column.name)) {
+    for column in meta
+        .columns
+        .iter()
+        .filter(|column| !row.values.contains_key(&column.name))
+    {
         if let Some(selected) = vector(column) {
-            scratch = scratch.max(stored_vector_scratch_bytes(selected.len(), column.quantization)?);
-            bytes = bytes.checked_add(column.name.len())
-                .and_then(|bytes| bytes.checked_add(selected.len().checked_mul(std::mem::size_of::<f32>())?)).ok_or_else(invalid)?;
+            scratch = scratch.max(stored_vector_scratch_bytes(
+                selected.len(),
+                column.quantization,
+            )?);
+            bytes = bytes
+                .checked_add(column.name.len())
+                .and_then(|bytes| {
+                    bytes.checked_add(selected.len().checked_mul(std::mem::size_of::<f32>())?)
+                })
+                .ok_or_else(invalid)?;
         }
     }
     let _scratch = db.reserve_owned_preparation(scratch)?;
@@ -317,22 +438,45 @@ fn final_row_from_meta_owned(
         let mut values = std::collections::HashMap::with_capacity(members);
         for (name, value) in &row.values {
             let column = meta.columns.iter().find(|column| column.name == *name);
-            let value = if let Some((column, selected)) = column.and_then(|column| vector(column).map(|selected| (column, selected))) {
-                contextdb_core::Value::Vector(contextdb_vector::stored_vector_value(selected, column.quantization))
-            } else { preparation_copy_value(value)? };
+            let value = if let Some((column, selected)) =
+                column.and_then(|column| vector(column).map(|selected| (column, selected)))
+            {
+                contextdb_core::Value::Vector(contextdb_vector::stored_vector_value(
+                    selected,
+                    column.quantization,
+                ))
+            } else {
+                preparation_copy_value(value)?
+            };
             values.insert(name.as_str().to_owned(), value);
         }
-        for column in meta.columns.iter().filter(|column| !row.values.contains_key(&column.name)) {
+        for column in meta
+            .columns
+            .iter()
+            .filter(|column| !row.values.contains_key(&column.name))
+        {
             if let Some(selected) = vector(column) {
-                values.insert(column.name.clone(), contextdb_core::Value::Vector(
-                    contextdb_vector::stored_vector_value(selected, column.quantization)));
+                values.insert(
+                    column.name.clone(),
+                    contextdb_core::Value::Vector(contextdb_vector::stored_vector_value(
+                        selected,
+                        column.quantization,
+                    )),
+                );
             }
         }
-        let copied = contextdb_core::VersionedRow { row_id: row.row_id, values,
-            created_tx: row.created_tx, deleted_tx: row.deleted_tx, lsn: row.lsn, created_at: row.created_at };
+        let copied = contextdb_core::VersionedRow {
+            row_id: row.row_id,
+            values,
+            created_tx: row.created_tx,
+            deleted_tx: row.deleted_tx,
+            lsn: row.lsn,
+            created_at: row.created_at,
+        };
         preparation_check_row_capacity(&copied)?;
         Ok(copied)
-    }).map(Some)
+    })
+    .map(Some)
 }
 
 pub(crate) fn final_row(
@@ -513,22 +657,36 @@ pub(crate) fn next_state_owned(
 ) -> Result<OwnedPreparationValue<StateRecord>> {
     let selected = db.custody_authority(read_memory)?;
     let control = selected.iter().find_map(|record| match record {
-        Record::Control(control) => Some(control), _ => None,
+        Record::Control(control) => Some(control),
+        _ => None,
     });
-    let previous = control.map(|control| selected.iter().find_map(|record| match record {
-        Record::State(state) if state.state.token == control.head => Some(state), _ => None,
-    }).ok_or_else(invalid)).transpose()?;
+    let previous = control
+        .map(|control| {
+            selected
+                .iter()
+                .find_map(|record| match record {
+                    Record::State(state) if state.state.token == control.head => Some(state),
+                    _ => None,
+                })
+                .ok_or_else(invalid)
+        })
+        .transpose()?;
     if previous.is_some_and(|state| state.state.incarnation != incarnation) {
         return Err(invalid());
     }
     OwnedPreparationValue::try_produce(db, 0, || {
-        if let Some(previous) = previous { return Ok(previous.clone()); }
+        if let Some(previous) = previous {
+            return Ok(previous.clone());
+        }
         Ok(StateRecord {
             state: StateRef {
-                logical_store_id: Uuid::new_v4(), incarnation,
-                birth_id: Uuid::new_v4(), token: random_digest(),
+                logical_store_id: Uuid::new_v4(),
+                incarnation,
+                birth_id: Uuid::new_v4(),
+                token: random_digest(),
             },
-            parent: None, sequence: 0,
+            parent: None,
+            sequence: 0,
             retirement_root: history_root_owned(db, &[])?,
         })
     })
@@ -548,40 +706,74 @@ pub(crate) fn state_records_owned(
         matches!(record, Record::State(state) if BirthRef::from(&state.state) == birth)).count();
     let includes_state = state.with_value(|state| existing.iter().any(|record|
         matches!(record, Record::State(other) if BirthRef::from(&other.state) == birth && other.state == state.state)));
-    let count = selected_count.checked_add(usize::from(!includes_state)).ok_or_else(invalid)?;
-    let states = OwnedPreparationValue::try_produce(db, preparation_array_bytes::<&StateRecord>(count)?, || {
-        let mut states = Vec::with_capacity(count);
-        if states.capacity() != count { return Err(invalid()); }
-        for record in existing.iter() {
-            if let Record::State(state) = record
-                && BirthRef::from(&state.state) == birth { states.push(state); }
-        }
-        // The input owner lives through the hash; no borrowed state escapes it.
-        if !includes_state { states.push(&state.value); }
-        Ok(states)
-    })?;
+    let count = selected_count
+        .checked_add(usize::from(!includes_state))
+        .ok_or_else(invalid)?;
+    let states = OwnedPreparationValue::try_produce(
+        db,
+        preparation_array_bytes::<&StateRecord>(count)?,
+        || {
+            let mut states = Vec::with_capacity(count);
+            if states.capacity() != count {
+                return Err(invalid());
+            }
+            for record in existing.iter() {
+                if let Record::State(state) = record
+                    && BirthRef::from(&state.state) == birth
+                {
+                    states.push(state);
+                }
+            }
+            // The input owner lives through the hash; no borrowed state escapes it.
+            if !includes_state {
+                states.push(&state.value);
+            }
+            Ok(states)
+        },
+    )?;
     let active_history_root = states.with_value(|states| history_root_owned(db, states))?;
     drop(states);
-    let needs_birth = !existing.iter().any(|record|
-        matches!(record, Record::Birth(existing) if existing.identity == birth));
+    let needs_birth = !existing
+        .iter()
+        .any(|record| matches!(record, Record::Birth(existing) if existing.identity == birth));
     let capacity = 2 + usize::from(needs_birth);
     let mut records = OwnedPreparationRecords::try_new(db, capacity, capacity)?;
-    let native = hub.len().checked_add(tenant.as_str().len()).ok_or_else(invalid)?;
-    let control = OwnedPreparationValue::try_produce(db, native, || Ok(Record::Control(Control {
-        format: 1, identity: birth.clone(), hub_node: Some(hub.into()),
-        tenant: Some(tenant.clone()), head: state.value.state.token,
-        namespace_revision: existing.iter().find_map(|record| match record {
-            Record::Control(control) => Some(control.namespace_revision), _ => None,
-        }).unwrap_or(0),
-        active_history_root, retired_history_root: state.value.retirement_root,
-    })))?;
+    let native = hub
+        .len()
+        .checked_add(tenant.as_str().len())
+        .ok_or_else(invalid)?;
+    let control = OwnedPreparationValue::try_produce(db, native, || {
+        Ok(Record::Control(Control {
+            format: 1,
+            identity: birth.clone(),
+            hub_node: Some(hub.into()),
+            tenant: Some(tenant.clone()),
+            head: state.value.state.token,
+            namespace_revision: existing
+                .iter()
+                .find_map(|record| match record {
+                    Record::Control(control) => Some(control.namespace_revision),
+                    _ => None,
+                })
+                .unwrap_or(0),
+            active_history_root,
+            retired_history_root: state.value.retirement_root,
+        }))
+    })?;
     records.push(control);
-    state.transfer_into(&mut records, |state, records| records.records.push(Record::State(state)));
+    state.transfer_into(&mut records, |state, records| {
+        records.records.push(Record::State(state))
+    });
     if needs_birth {
-        records.push(OwnedPreparationValue::try_produce(db, 0, || Ok(Record::Birth(Birth {
-            identity: birth, predecessor: None, selected_image: None,
-            triggers: Vec::new(), retired: Vec::new(),
-        })))?);
+        records.push(OwnedPreparationValue::try_produce(db, 0, || {
+            Ok(Record::Birth(Birth {
+                identity: birth,
+                predecessor: None,
+                selected_image: None,
+                triggers: Vec::new(),
+                retired: Vec::new(),
+            }))
+        })?);
     }
     Ok(records)
 }
@@ -853,8 +1045,15 @@ pub(crate) fn prepare_manifest(
             "manifest prerequisites must come from one actual committed writing transaction".into(),
         ));
     }
-    let lineages =
-        db.prepare_delivery_row_lineages(ws, &changes, tenant, edge, incarnation, signer.as_ref(), read_memory.clone())?;
+    let lineages = db.prepare_delivery_row_lineages(
+        ws,
+        &changes,
+        tenant,
+        edge,
+        incarnation,
+        signer.as_ref(),
+        read_memory.clone(),
+    )?;
     let mut evidence = Vec::new();
     let mut lives = Vec::new();
     let mut content = Vec::new();
@@ -1117,7 +1316,8 @@ fn prepare_terminal_at(
     }
     let b = binding(db, &edge, read_memory.clone())?;
     if b.namespace.hub_node != hub
-        || b.namespace.hub_incarnation != db.sync_incarnation_with_read_memory(&tenant, read_memory.clone())?
+        || b.namespace.hub_incarnation
+            != db.sync_incarnation_with_read_memory(&tenant, read_memory.clone())?
     {
         return Err(invalid());
     }
@@ -2242,7 +2442,9 @@ pub(crate) fn sign_preparation_owned(
     // Every inventoried signer invokes FabricIdentity::sign_lineage once.
     OwnedPreparationValue::try_produce(db, 64, || {
         let signature = signer(bytes)?;
-        if signature.len() != 64 || signature.capacity() != 64 { return Err(invalid()); }
+        if signature.len() != 64 || signature.capacity() != 64 {
+            return Err(invalid());
+        }
         Ok(signature)
     })
 }
@@ -2270,7 +2472,9 @@ pub(crate) fn emit_config_encoding<T: serde::Serialize>(
     output: &mut Vec<u8>,
 ) -> Result<()> {
     let planned = count_config_encoding(value)?;
-    if !output.is_empty() || output.capacity() != planned { return Err(invalid()); }
+    if !output.is_empty() || output.capacity() != planned {
+        return Err(invalid());
+    }
     struct Bounded<'a>(&'a mut Vec<u8>);
     impl std::io::Write for Bounded<'_> {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -2286,7 +2490,9 @@ pub(crate) fn emit_config_encoding<T: serde::Serialize>(
     }
     bincode::serde::encode_into_std_write(value, &mut Bounded(output), bincode::config::standard())
         .map_err(|_| invalid())?;
-    if output.len() != planned || output.capacity() != planned { return Err(invalid()); }
+    if output.len() != planned || output.capacity() != planned {
+        return Err(invalid());
+    }
     Ok(())
 }
 fn actual_policy_owned(
@@ -2356,9 +2562,13 @@ fn binding_owned(
             _ => None,
         })
         .ok_or_else(invalid)?;
-    OwnedPreparationBody::try_produce(db, binding_native_bytes_owned(binding)?, signature_count(&binding.signature)?, 0, || {
-        Ok(binding.clone())
-    })
+    OwnedPreparationBody::try_produce(
+        db,
+        binding_native_bytes_owned(binding)?,
+        signature_count(&binding.signature)?,
+        0,
+        || Ok(binding.clone()),
+    )
 }
 
 impl<T: serde::Serialize> serde::Serialize for OwnedPreparationValue<T> {
@@ -2668,7 +2878,9 @@ fn schema_constraints_owned(
         preparation_array_bytes::<OwnedPreparationValue<String>>(count)?,
         || {
             let mut result = Vec::with_capacity(count);
-            if result.capacity() != count { return Err(invalid()); }
+            if result.capacity() != count {
+                return Err(invalid());
+            }
             let mut add =
                 |render: &dyn Fn(&mut dyn std::fmt::Write) -> std::fmt::Result| -> Result<()> {
                     if result.len() == result.capacity() {
@@ -2711,7 +2923,9 @@ fn schema_constraints_owned(
                     preparation_array_bytes::<OwnedPreparationValue<String>>(sm.transitions.len())?,
                     || {
                         let mut clauses = Vec::with_capacity(sm.transitions.len());
-                        if clauses.capacity() != sm.transitions.len() { return Err(invalid()); }
+                        if clauses.capacity() != sm.transitions.len() {
+                            return Err(invalid());
+                        }
                         for (from, to) in &sm.transitions {
                             clauses.push(text_owned(db, |out| {
                                 write!(out, "{from} -> [{}]", Joined(to))
@@ -2887,7 +3101,9 @@ fn schema_dependency_owned(
             preparation_array_bytes::<(&str, OwnedPreparationValue<String>)>(meta.columns.len())?,
             || {
                 let mut columns = Vec::with_capacity(meta.columns.len());
-                if columns.capacity() != meta.columns.len() { return Err(invalid()); }
+                if columns.capacity() != meta.columns.len() {
+                    return Err(invalid());
+                }
                 for column in &meta.columns {
                     columns.push((
                         column.name.as_str(),
@@ -2946,8 +3162,9 @@ fn schema_dependency_owned(
         )?;
         let bytes = finite_bytes_owned(db, |e| schema.value.bytes_finite(e))?;
         let schema = OwnedPreparationBody::from_unsigned(db, schema)?;
-        let schema = schema.sign(db, signer.as_ref(), &bytes.value,
-            |schema, signature| schema.signature = signature)?;
+        let schema = schema.sign(db, signer.as_ref(), &bytes.value, |schema, signature| {
+            schema.signature = signature
+        })?;
         Ok(schema)
     })
 }
@@ -3092,7 +3309,9 @@ pub(crate) fn prepare_manifest_owned(
         )>(input.members.len())?,
         || {
             let mut members = Vec::with_capacity(input.members.len());
-            if members.capacity() != input.members.len() { return Err(invalid()); }
+            if members.capacity() != input.members.len() {
+                return Err(invalid());
+            }
             for (position, (table, key)) in input.members.iter().enumerate() {
                 members.push((
                     reference_owned(db, table, key)?,
@@ -3145,7 +3364,9 @@ pub(crate) fn prepare_manifest_owned(
     let references =
         OwnedPreparationValue::try_produce(db, preparation_array_bytes::<&RowRef>(count)?, || {
             let mut references = Vec::with_capacity(count);
-            if references.capacity() != count { return Err(invalid()); }
+            if references.capacity() != count {
+                return Err(invalid());
+            }
             references.push(&root.value);
             references.extend(members.value.iter().map(|m| &m.0.value));
             Ok(references)
@@ -3157,7 +3378,9 @@ pub(crate) fn prepare_manifest_owned(
             || {
                 let capacity = count;
                 let value = Vec::with_capacity(capacity);
-                if value.capacity() != capacity { return Err(invalid()); }
+                if value.capacity() != capacity {
+                    return Err(invalid());
+                }
                 Ok(value)
             },
         )?;
@@ -3168,7 +3391,9 @@ pub(crate) fn prepare_manifest_owned(
             || {
                 let capacity = count;
                 let value = Vec::with_capacity(capacity);
-                if value.capacity() != capacity { return Err(invalid()); }
+                if value.capacity() != capacity {
+                    return Err(invalid());
+                }
                 Ok(value)
             },
         )?;
@@ -3179,7 +3404,9 @@ pub(crate) fn prepare_manifest_owned(
             || {
                 let capacity = count;
                 let value = Vec::with_capacity(capacity);
-                if value.capacity() != capacity { return Err(invalid()); }
+                if value.capacity() != capacity {
+                    return Err(invalid());
+                }
                 Ok(value)
             },
         )?;
@@ -3284,7 +3511,9 @@ pub(crate) fn prepare_manifest_owned(
             || {
                 let capacity = count;
                 let value = Vec::with_capacity(capacity);
-                if value.capacity() != capacity { return Err(invalid()); }
+                if value.capacity() != capacity {
+                    return Err(invalid());
+                }
                 Ok(value)
             },
         )?;
@@ -3295,7 +3524,9 @@ pub(crate) fn prepare_manifest_owned(
             || {
                 let capacity = count;
                 let value = Vec::with_capacity(capacity);
-                if value.capacity() != capacity { return Err(invalid()); }
+                if value.capacity() != capacity {
+                    return Err(invalid());
+                }
                 Ok(value)
             },
         )?;
@@ -3304,14 +3535,20 @@ pub(crate) fn prepare_manifest_owned(
             let bytes = count_reference_native(reference)?
                 .checked_add(lineage_native_bytes_owned(lineage)?)
                 .ok_or_else(invalid)?;
-            OwnedPreparationBody::try_produce(db, bytes, signature_count(&lineage.attestation)?, 0, || {
-                Ok(RowEvidence {
-                    reference: copy_reference_finite(reference)?,
-                    creator: lineage.clone(),
-                    authored_source: (row.value.lsn, 0),
-                    row_digest: finite_row_digest(&row.value.values, None)?,
-                })
-            })
+            OwnedPreparationBody::try_produce(
+                db,
+                bytes,
+                signature_count(&lineage.attestation)?,
+                0,
+                || {
+                    Ok(RowEvidence {
+                        reference: copy_reference_finite(reference)?,
+                        creator: lineage.clone(),
+                        authored_source: (row.value.lsn, 0),
+                        row_digest: finite_row_digest(&row.value.values, None)?,
+                    })
+                },
+            )
         })?;
         lives.value.push(OwnedPreparationValue::try_produce(
             db,
@@ -3368,7 +3605,9 @@ pub(crate) fn prepare_manifest_owned(
         preparation_array_bytes::<(&str, u64)>(count)?,
         || {
             let mut tables = Vec::with_capacity(count);
-            if tables.capacity() != count { return Err(invalid()); }
+            if tables.capacity() != count {
+                return Err(invalid());
+            }
             for row in &evidence.value {
                 tables.push((
                     row.value.reference.table.as_str(),
@@ -3388,7 +3627,9 @@ pub(crate) fn prepare_manifest_owned(
             || {
                 let capacity = tables.value.len();
                 let value = Vec::with_capacity(capacity);
-                if value.capacity() != capacity { return Err(invalid()); }
+                if value.capacity() != capacity {
+                    return Err(invalid());
+                }
                 Ok(value)
             },
         )?;
@@ -3457,11 +3698,22 @@ pub(crate) fn prepare_manifest_owned(
         )
         .ok_or_else(invalid)?;
     let copied_signatures = evidence.value.iter().try_fold(0usize, |n, row| {
-        n.checked_add(signature_count(&row.value.creator.attestation)?).ok_or_else(invalid)
+        n.checked_add(signature_count(&row.value.creator.attestation)?)
+            .ok_or_else(invalid)
     })?;
-    let copied_signatures = schemas.value.iter().try_fold(copied_signatures, |n, schema| {
-        n.checked_add(signature_count(&schema.value.signature)?).ok_or_else(invalid)
-    })?.checked_add(binding.as_ref().map_or(Ok(0), |b| signature_count(&b.value.signature))?).ok_or_else(invalid)?;
+    let copied_signatures = schemas
+        .value
+        .iter()
+        .try_fold(copied_signatures, |n, schema| {
+            n.checked_add(signature_count(&schema.value.signature)?)
+                .ok_or_else(invalid)
+        })?
+        .checked_add(
+            binding
+                .as_ref()
+                .map_or(Ok(0), |b| signature_count(&b.value.signature))?,
+        )
+        .ok_or_else(invalid)?;
     let mut manifest = OwnedPreparationBody::try_produce(db, bytes, copied_signatures, 1, || {
         Ok(ManifestRecord {
             tenant: tenant.clone(),
@@ -3493,15 +3745,22 @@ pub(crate) fn prepare_manifest_owned(
     manifest.value.seal.projection_digest = manifest.value.projection_digest_owned(db)?;
     manifest.value.seal.authority_digest = manifest.value.authority_digest_owned(db)?;
     let signed = finite_bytes_owned(db, |e| manifest.value.signed_bytes_finite(e))?;
-    let manifest = manifest.sign(db, signer.as_ref(), &signed.value,
-        |manifest, signature| manifest.signature = signature)?;
+    let manifest = manifest.sign(db, signer.as_ref(), &signed.value, |manifest, signature| {
+        manifest.signature = signature
+    })?;
     manifest.value.verify_owned(db, read_memory)?;
     let m = &manifest.value;
     let capacity = count
         .checked_mul(2)
         .and_then(|n| n.checked_add(2))
         .ok_or_else(invalid)?;
-    let mut records = OwnedPreparationRecords::try_new(db, capacity, capacity.checked_add(manifest_signature_count(m)?).ok_or_else(invalid)?)?;
+    let mut records = OwnedPreparationRecords::try_new(
+        db,
+        capacity,
+        capacity
+            .checked_add(manifest_signature_count(m)?)
+            .ok_or_else(invalid)?,
+    )?;
     records.push(OwnedPreparationValue::try_produce(
         db,
         m.root_life.original_table.len(),
@@ -3517,7 +3776,8 @@ pub(crate) fn prepare_manifest_owned(
         count_manifest_native_finite(m)?
             .checked_add(std::mem::size_of::<ManifestRecord>())
             .ok_or_else(invalid)?,
-        manifest_signature_count(m)?, 0,
+        manifest_signature_count(m)?,
+        0,
         || Ok(Record::Manifest(Box::new(copy_manifest_finite(m)?))),
     )?);
     for member in &m.member_lives {
@@ -3747,11 +4007,13 @@ fn prepare_terminal_at_owned(
         db,
         preparation_array_bytes::<OwnedPreparationValue<(LocalLifeAnchor, Digest)>>(m.rows.len())?,
         || {
-                let capacity = m.rows.len();
-                let value = Vec::with_capacity(capacity);
-                if value.capacity() != capacity { return Err(invalid()); }
-                Ok(value)
-            },
+            let capacity = m.rows.len();
+            let value = Vec::with_capacity(capacity);
+            if value.capacity() != capacity {
+                return Err(invalid());
+            }
+            Ok(value)
+        },
     )?;
     for (source, source_life) in m
         .rows
@@ -3826,7 +4088,9 @@ fn prepare_terminal_at_owned(
         )>(m.rows.len())?,
         || {
             let mut subjects = Vec::with_capacity(m.rows.len());
-            if subjects.capacity() != m.rows.len() { return Err(invalid()); }
+            if subjects.capacity() != m.rows.len() {
+                return Err(invalid());
+            }
             for (position, row) in m.rows.iter().enumerate() {
                 subjects.push((
                     reference_owned(db, &row.reference.table, &row.reference.key)?,
@@ -3910,8 +4174,9 @@ fn prepare_terminal_at_owned(
     )?;
     let bytes = finite_bytes_owned(db, |e| terminal.value.bytes_finite(e))?;
     let terminal = OwnedPreparationBody::from_unsigned(db, terminal)?;
-    let terminal = terminal.sign(db, signer.as_ref(), &bytes.value,
-        |terminal, signature| terminal.signature = signature)?;
+    let terminal = terminal.sign(db, signer.as_ref(), &bytes.value, |terminal, signature| {
+        terminal.signature = signature
+    })?;
     terminal.value.verify_owned(db)?;
     let t = &terminal.value;
     let mut records = state_records_owned(
@@ -3933,12 +4198,21 @@ fn prepare_terminal_at_owned(
         .checked_add(additional)
         .ok_or_else(invalid)?;
     let materialized_signatures = if t.kind != 2 {
-        m.rows.iter().try_fold(0usize, |n, row| n.checked_add(signature_count(&row.creator.attestation)?).ok_or_else(invalid))?
-    } else { 0 };
-    let debit_capacity = records.debits.len().checked_add(additional)
+        m.rows.iter().try_fold(0usize, |n, row| {
+            n.checked_add(signature_count(&row.creator.attestation)?)
+                .ok_or_else(invalid)
+        })?
+    } else {
+        0
+    };
+    let debit_capacity = records
+        .debits
+        .len()
+        .checked_add(additional)
         .and_then(|n| n.checked_add(manifest_signature_count(m).ok()?))
         .and_then(|n| n.checked_add(signature_count(&t.signature).ok()?))
-        .and_then(|n| n.checked_add(materialized_signatures)).ok_or_else(invalid)?;
+        .and_then(|n| n.checked_add(materialized_signatures))
+        .ok_or_else(invalid)?;
     records.grow(db, capacity, debit_capacity)?;
     for (source, entry) in m.rows.iter().zip(&incumbent_lives.value) {
         let (incumbent, digest) = &entry.value;
@@ -3949,17 +4223,23 @@ fn prepare_terminal_at_owned(
                 .and_then(|n| n.checked_add(count_reference_native(&source.reference).ok()?))
                 .and_then(|n| n.checked_add(incumbent_lives.value[0].value.0.original_table.len()))
                 .ok_or_else(invalid)?;
-            records.push_body(OwnedPreparationBody::try_produce(db, native, signature_count(&source.creator.attestation)?, 0, || {
-                Ok(Record::MaterializedOwner(MaterializedOwner {
-                    namespace: t.namespace.clone(),
-                    submission: t.submission,
-                    source: copy_row_evidence_finite(source)?,
-                    incumbent: incumbent.clone(),
-                    incumbent_reference: copy_reference_finite(&source.reference)?,
-                    incumbent_row_digest: *digest,
-                    root_incumbent: incumbent_lives.value[0].value.0.clone(),
-                }))
-            })?);
+            records.push_body(OwnedPreparationBody::try_produce(
+                db,
+                native,
+                signature_count(&source.creator.attestation)?,
+                0,
+                || {
+                    Ok(Record::MaterializedOwner(MaterializedOwner {
+                        namespace: t.namespace.clone(),
+                        submission: t.submission,
+                        source: copy_row_evidence_finite(source)?,
+                        incumbent: incumbent.clone(),
+                        incumbent_reference: copy_reference_finite(&source.reference)?,
+                        incumbent_row_digest: *digest,
+                        root_incumbent: incumbent_lives.value[0].value.0.clone(),
+                    }))
+                },
+            )?);
         }
         records.push(OwnedPreparationValue::try_produce(
             db,
@@ -3978,7 +4258,8 @@ fn prepare_terminal_at_owned(
     records.push_body(OwnedPreparationBody::try_produce(
         db,
         terminal_native_bytes_owned(t)?,
-        signature_count(&t.signature)?, 0,
+        signature_count(&t.signature)?,
+        0,
         || {
             Ok(Record::Terminal {
                 edge: false,
@@ -4002,7 +4283,8 @@ fn prepare_terminal_at_owned(
         count_manifest_native_finite(m)?
             .checked_add(std::mem::size_of::<ManifestRecord>())
             .ok_or_else(invalid)?,
-        manifest_signature_count(m)?, 0,
+        manifest_signature_count(m)?,
+        0,
         || Ok(Record::Manifest(Box::new(copy_manifest_finite(m)?))),
     )?);
     records.push(OwnedPreparationValue::try_produce(
@@ -4115,13 +4397,16 @@ pub(crate) fn prepare_admitted_binding_owned(
         key.value.len().checked_add(size).ok_or_else(invalid)?,
         || {
             let mut bytes = Vec::with_capacity(size);
-            if bytes.capacity() != size { return Err(invalid()); }
+            if bytes.capacity() != size {
+                return Err(invalid());
+            }
             emit_config_encoding(&incarnation.value, &mut bytes)?;
             let copied_key = key.value.clone();
-            if copied_key.capacity() != copied_key.len() { return Err(invalid()); }
+            if copied_key.capacity() != copied_key.len() {
+                return Err(invalid());
+            }
             Ok(contextdb_tx::staged_source::AuxBody::ConfigWrite((
-                copied_key,
-                bytes,
+                copied_key, bytes,
             )))
         },
     )?;
@@ -4135,7 +4420,9 @@ pub(crate) fn prepare_admitted_binding_owned(
         preparation_array_bytes::<OwnedPreparationValue<String>>(old_count)?,
         || {
             let mut selectors = Vec::with_capacity(old_count);
-            if selectors.capacity() != old_count { return Err(invalid()); }
+            if selectors.capacity() != old_count {
+                return Err(invalid());
+            }
             for prior in existing.iter().filter_map(|r| match r {
                 Record::Binding(prior) if prior.namespace == b.namespace => Some(prior),
                 _ => None,
@@ -4198,20 +4485,26 @@ pub(crate) fn prepare_admitted_binding_owned(
         }
     }
     let capacity = records.records.len().checked_add(4).ok_or_else(invalid)?;
-    let debit_capacity = records.debits.len().checked_add(4)
+    let debit_capacity = records
+        .debits
+        .len()
+        .checked_add(4)
         .and_then(|n| n.checked_add(signature_count(&b.signature).ok()?))
-        .and_then(|n| n.checked_add(signature_count(&certificate.signature).ok()?)).ok_or_else(invalid)?;
+        .and_then(|n| n.checked_add(signature_count(&certificate.signature).ok()?))
+        .ok_or_else(invalid)?;
     records.grow(db, capacity, debit_capacity)?;
     records.push_body(OwnedPreparationBody::try_produce(
         db,
         binding_native_bytes_owned(b)?,
-        signature_count(&b.signature)?, 0,
+        signature_count(&b.signature)?,
+        0,
         || Ok(Record::Binding(b.clone())),
     )?);
     records.push_body(OwnedPreparationBody::try_produce(
         db,
         certificate_native_bytes_owned(certificate)?,
-        signature_count(&certificate.signature)?, 0,
+        signature_count(&certificate.signature)?,
+        0,
         || Ok(Record::Certificate(certificate.clone())),
     )?);
     records.push(OwnedPreparationValue::try_produce(
@@ -4269,10 +4562,18 @@ pub(crate) fn prepare_terminal_batch_owned(
             .ok_or_else(invalid)
     })?;
     let debit_capacity = requests.iter().try_fold(capacity, |n, request| {
-        n.checked_add(request.manifest.rows.len().checked_mul(2).ok_or_else(invalid)?)
-            .and_then(|n| n.checked_add(request.manifest.schemas.len()))
-            .and_then(|n| n.checked_add(usize::from(request.manifest.binding.is_some())))
-            .and_then(|n| n.checked_add(2)).ok_or_else(invalid)
+        n.checked_add(
+            request
+                .manifest
+                .rows
+                .len()
+                .checked_mul(2)
+                .ok_or_else(invalid)?,
+        )
+        .and_then(|n| n.checked_add(request.manifest.schemas.len()))
+        .and_then(|n| n.checked_add(usize::from(request.manifest.binding.is_some())))
+        .and_then(|n| n.checked_add(2))
+        .ok_or_else(invalid)
     })?;
     let mut result = OwnedPreparationRecords::try_new(db, capacity, debit_capacity)?;
     let mut keyed: OwnedPreparationValue<Vec<(OwnedPreparationValue<String>, Record)>> =
@@ -4282,7 +4583,9 @@ pub(crate) fn prepare_terminal_batch_owned(
             || {
                 let capacity = capacity;
                 let value = Vec::with_capacity(capacity);
-                if value.capacity() != capacity { return Err(invalid()); }
+                if value.capacity() != capacity {
+                    return Err(invalid());
+                }
                 Ok(value)
             },
         )?;
@@ -4301,20 +4604,30 @@ pub(crate) fn prepare_terminal_batch_owned(
         )?;
         // Move all exact original invoices before any body moves. Displaced
         // duplicate bodies die while their original credit stays in result.
-        assert!(batch.debits.len() <= result.debits.capacity() - result.debits.len(),
-            "preadmitted batch original invoices");
+        assert!(
+            batch.debits.len() <= result.debits.capacity() - result.debits.len(),
+            "preadmitted batch original invoices"
+        );
         result.debits.extend(batch.debits.drain(..));
         for record in batch.records.drain(..) {
             let key = record_key_owned(db, &record)?;
-            match keyed.value.binary_search_by(|prior| prior.0.value.cmp(&key.value)) {
+            match keyed
+                .value
+                .binary_search_by(|prior| prior.0.value.cmp(&key.value))
+            {
                 Ok(index) => {
                     let old = prepare_named_encoding_owned(db, &keyed.value[index].1)?;
                     let next = prepare_named_encoding_owned(db, &record)?;
-                    if old.value != next.value { return Err(invalid()); }
+                    if old.value != next.value {
+                        return Err(invalid());
+                    }
                     keyed.value[index] = (key, record);
                 }
                 Err(index) => {
-                    assert!(keyed.value.len() < keyed.value.capacity(), "preadmitted batch key slot");
+                    assert!(
+                        keyed.value.len() < keyed.value.capacity(),
+                        "preadmitted batch key slot"
+                    );
                     keyed.value.insert(index, (key, record));
                 }
             }
@@ -4344,14 +4657,19 @@ impl OwnedPreparationRecords {
                 key.value.len().checked_add(capacity).ok_or_else(invalid)?,
                 || {
                     let mut encoded = Vec::with_capacity(capacity);
-                    if encoded.capacity() != capacity { return Err(invalid()); }
+                    if encoded.capacity() != capacity {
+                        return Err(invalid());
+                    }
                     emit_named_encoding(record, &mut encoded)?;
-                    if encoded.len() != capacity || encoded.capacity() != capacity { return Err(invalid()); }
+                    if encoded.len() != capacity || encoded.capacity() != capacity {
+                        return Err(invalid());
+                    }
                     let copied_key = key.value.clone();
-                    if copied_key.capacity() != copied_key.len() { return Err(invalid()); }
+                    if copied_key.capacity() != copied_key.len() {
+                        return Err(invalid());
+                    }
                     Ok(contextdb_tx::staged_source::AuxBody::ConfigWrite((
-                        copied_key,
-                        encoded,
+                        copied_key, encoded,
                     )))
                 },
             )?;
@@ -4429,21 +4747,25 @@ pub(crate) fn prepare_issued_binding_owned(
         db,
         preparation_array_bytes::<OwnedPreparationValue<BoundPolicy>>(count)?,
         || {
-                let capacity = count;
-                let value = Vec::with_capacity(capacity);
-                if value.capacity() != capacity { return Err(invalid()); }
-                Ok(value)
-            },
+            let capacity = count;
+            let value = Vec::with_capacity(capacity);
+            if value.capacity() != capacity {
+                return Err(invalid());
+            }
+            Ok(value)
+        },
     )?;
     let mut declarations = OwnedPreparationValue::try_produce(
         db,
         preparation_array_bytes::<OwnedPreparationValue<PolicyRecord>>(count)?,
         || {
-                let capacity = count;
-                let value = Vec::with_capacity(capacity);
-                if value.capacity() != capacity { return Err(invalid()); }
-                Ok(value)
-            },
+            let capacity = count;
+            let value = Vec::with_capacity(capacity);
+            if value.capacity() != capacity {
+                return Err(invalid());
+            }
+            Ok(value)
+        },
     )?;
     for (table, expected) in &request.expectation.tables {
         let declaration = declared
@@ -4577,13 +4899,15 @@ pub(crate) fn prepare_issued_binding_owned(
     })?;
     let signed = finite_bytes_owned(db, |e| binding.value.bytes_finite(e))?;
     let binding = OwnedPreparationBody::from_unsigned(db, binding)?;
-    let binding = binding.sign(db, signer.as_ref(), &signed.value,
-        |binding, signature| binding.signature = signature)?;
+    let binding = binding.sign(db, signer.as_ref(), &signed.value, |binding, signature| {
+        binding.signature = signature
+    })?;
     binding.value.verify_owned(db)?;
     *result = Some(OwnedPreparationBody::try_produce(
         db,
         binding_native_bytes_owned(&binding.value)?,
-        signature_count(&binding.value.signature)?, 0,
+        signature_count(&binding.value.signature)?,
+        0,
         || Ok(binding.value.clone()),
     )?);
     let mut out = state_records_owned(
@@ -4599,7 +4923,12 @@ pub(crate) fn prepare_issued_binding_owned(
         .checked_add(1)
         .and_then(|n| n.checked_add(count))
         .ok_or_else(invalid)?;
-    let debit_capacity = out.debits.len().checked_add(2).and_then(|n| n.checked_add(count)).ok_or_else(invalid)?;
+    let debit_capacity = out
+        .debits
+        .len()
+        .checked_add(2)
+        .and_then(|n| n.checked_add(count))
+        .ok_or_else(invalid)?;
     out.grow(db, capacity, debit_capacity)?;
     binding.transfer_into(&mut out, |binding, out| {
         out.records.push(Record::Binding(binding))
@@ -4670,7 +4999,9 @@ pub(crate) fn reference_from_row_owned(
     }
     OwnedPreparationValue::try_produce(db, bytes, || {
         let mut rest = Vec::with_capacity(columns.len() - 1);
-        if rest.capacity() != columns.len() - 1 { return Err(invalid()); }
+        if rest.capacity() != columns.len() - 1 {
+            return Err(invalid());
+        }
         for column in &columns[1..] {
             rest.push((
                 column.clone(),
@@ -4751,7 +5082,9 @@ pub(crate) fn prepare_terminal_batch_input_owned(
         || {
             let mut unique: Vec<(&RowChange, OwnedPreparationValue<Vec<u8>>, Digest)> =
                 Vec::with_capacity(row_count);
-            if unique.capacity() != row_count { return Err(invalid()); }
+            if unique.capacity() != row_count {
+                return Err(invalid());
+            }
             for request in requests {
                 request.manifest.verify_owned(db, read_memory.clone())?;
                 for row in &request.rows {
@@ -4804,12 +5137,15 @@ pub(crate) fn prepare_terminal_batch_input_owned(
     }
     let signature_count = requests.iter().try_fold(0usize, |n, request| {
         request.manifest.rows.iter().try_fold(n, |n, row| {
-            n.checked_add(signature_count(&row.creator.attestation)?).ok_or_else(invalid)
+            n.checked_add(signature_count(&row.creator.attestation)?)
+                .ok_or_else(invalid)
         })
     })?;
     let lineages = OwnedPreparationBody::try_produce(db, bytes, signature_count, 0, || {
         let mut lineages = Vec::with_capacity(lineage_count);
-        if lineages.capacity() != lineage_count { return Err(invalid()); }
+        if lineages.capacity() != lineage_count {
+            return Err(invalid());
+        }
         for request in requests {
             for row in &request.manifest.rows {
                 lineages.push((
@@ -4853,8 +5189,12 @@ impl OwnedPreparationRecords {
             self.records.len() < self.records.capacity(),
             "preadmitted record slot"
         );
-        let needed = self.debits.len().checked_add(1)
-            .and_then(|n| n.checked_add(record_signature_count(record).ok()?)).ok_or_else(invalid)?;
+        let needed = self
+            .debits
+            .len()
+            .checked_add(1)
+            .and_then(|n| n.checked_add(record_signature_count(record).ok()?))
+            .ok_or_else(invalid)?;
         if needed > self.debits.capacity() {
             self.grow(db, self.records.capacity(), needed)?;
         }
@@ -4880,16 +5220,22 @@ pub(crate) fn copy_terminal_input_owned(
             .checked_add(row_change_native_bytes_owned(row)?)
             .ok_or_else(invalid)?;
     }
-    OwnedPreparationBody::try_produce(db, bytes, manifest_signature_count(&input.manifest)?, 0, || {
-        Ok(TerminalInput {
-            tenant_id: input.tenant_id.clone(),
-            edge_incarnation: input.edge_incarnation,
-            manifest: copy_manifest_finite(&input.manifest)?,
-            rows: copy_finite_vec(&input.rows, copy_row_change_finite)?,
-            kind: input.kind,
-            cause: input.cause.clone(),
-        })
-    })
+    OwnedPreparationBody::try_produce(
+        db,
+        bytes,
+        manifest_signature_count(&input.manifest)?,
+        0,
+        || {
+            Ok(TerminalInput {
+                tenant_id: input.tenant_id.clone(),
+                edge_incarnation: input.edge_incarnation,
+                manifest: copy_manifest_finite(&input.manifest)?,
+                rows: copy_finite_vec(&input.rows, copy_row_change_finite)?,
+                kind: input.kind,
+                cause: input.cause.clone(),
+            })
+        },
+    )
 }
 pub(crate) fn terminal_callback_owned<'a>(
     tenant: &'a TenantId,

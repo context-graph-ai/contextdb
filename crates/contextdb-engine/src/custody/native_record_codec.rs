@@ -150,9 +150,16 @@ fn shared_walk(
     walk: impl FnOnce(&mut NativeEncoder<'_>) -> Decoded<()>,
 ) -> Decoded<()> {
     let mut raw = |b: &[u8]| shared.raw(b);
-    let mut encoder = NativeEncoder { sink: &mut raw, failed: false };
+    let mut encoder = NativeEncoder {
+        sink: &mut raw,
+        failed: false,
+    };
     walk(&mut encoder)?;
-    if encoder.failed { Err(Invalid::Canonical) } else { Ok(()) }
+    if encoder.failed {
+        Err(Invalid::Canonical)
+    } else {
+        Ok(())
+    }
 }
 pub(crate) fn finite_len(
     walk: impl FnOnce(&mut NativeEncoder<'_>) -> Decoded<()>,
@@ -171,7 +178,9 @@ pub(crate) fn finite_bytes(
     let n = finite_len(|e| walk(e))?;
     let mut b = NativeBuffer::allocate(owner, n)?;
     super::canonical::finite_emit_with_error(
-        b.bytes_mut(), |e| shared_walk(e, |e| walk(e)), || Invalid::Canonical,
+        b.bytes_mut(),
+        |e| shared_walk(e, |e| walk(e)),
+        || Invalid::Canonical,
     )?;
     Ok(b)
 }
@@ -732,7 +741,7 @@ pub(crate) fn retirement_closure_with_checkpoint<'a>(
             checkpoint()?;
             let mut changed = false;
             for i in 0..retired.len() {
-        checkpoint()?;
+                checkpoint()?;
                 if !seen.as_slice()[i] {
                     continue;
                 }
@@ -763,21 +772,37 @@ pub(crate) fn retirement_closure_with_checkpoint<'a>(
 }
 
 pub(crate) fn certificate_fields_finite(
-    e: &mut NativeEncoder<'_>, format: u32, tenant: &str, hub_node: &str,
-    state: &StateRecord<'_>, birth: &Birth<'_>, retirement_digest: &Digest,
+    e: &mut NativeEncoder<'_>,
+    format: u32,
+    tenant: &str,
+    hub_node: &str,
+    state: &StateRecord<'_>,
+    birth: &Birth<'_>,
+    retirement_digest: &Digest,
 ) -> Decoded<()> {
     e.string("delivery-committed-state.v1");
-    e.u32(format); e.string(tenant); e.node(hub_node)?;
+    e.u32(format);
+    e.string(tenant);
+    e.node(hub_node)?;
     e.raw(state.state.logical_store_id.as_bytes());
     e.raw(&state.state.incarnation.0.to_be_bytes());
     e.raw(state.state.birth_id.as_bytes());
-    state.bytes_finite(e); e.raw(&birth.digest_finite()?); e.raw(retirement_digest);
+    state.bytes_finite(e);
+    e.raw(&birth.digest_finite()?);
+    e.raw(retirement_digest);
     Ok(())
 }
 impl Certificate<'_> {
     pub(crate) fn bytes_finite(&self, e: &mut NativeEncoder<'_>) -> Decoded<()> {
-        certificate_fields_finite(e, self.format, self.tenant, self.hub_node,
-            &self.state, &self.birth, &self.retirement_digest)
+        certificate_fields_finite(
+            e,
+            self.format,
+            self.tenant,
+            self.hub_node,
+            &self.state,
+            &self.birth,
+            &self.retirement_digest,
+        )
     }
     pub(crate) fn id_finite(&self) -> Decoded<Digest> {
         finite_hash(|e| {
@@ -1590,17 +1615,18 @@ impl RecordView<'_> {
             let expected = group.as_bytes();
             let mut position = 0usize;
             let mut equal = true;
-            let mut emit = |bytes: &[u8]| {
-                match position.checked_add(bytes.len()) {
-                    Some(end) => {
-                        equal &= expected.get(position..end) == Some(bytes);
-                        position = end;
-                    }
-                    None => equal = false,
+            let mut emit = |bytes: &[u8]| match position.checked_add(bytes.len()) {
+                Some(end) => {
+                    equal &= expected.get(position..end) == Some(bytes);
+                    position = end;
                 }
+                None => equal = false,
             };
             let valid = {
-                let mut e = NativeEncoder { sink: &mut emit, failed: false };
+                let mut e = NativeEncoder {
+                    sink: &mut emit,
+                    failed: false,
+                };
                 walk(&mut e)?;
                 !e.failed
             };
@@ -1955,53 +1981,92 @@ pub(crate) fn visit_groups(
                 e.raw(&[HEX[(byte >> 4) as usize], HEX[(byte & 15) as usize]]);
             }
         };
-        let mut hex = NativeEncoder { sink: &mut emit, failed: false };
+        let mut hex = NativeEncoder {
+            sink: &mut emit,
+            failed: false,
+        };
         r.encode_finite(&mut hex);
-        if hex.failed { return Err(Invalid::Canonical); }
+        if hex.failed {
+            return Err(Invalid::Canonical);
+        }
         Ok(())
     }
     fn digest(e: &mut NativeEncoder<'_>, tag: &[u8], bytes: &Digest) {
         const HEX: &[u8; 16] = b"0123456789abcdef";
         e.raw(tag);
-        for byte in bytes { e.raw(&[HEX[(byte >> 4) as usize], HEX[(byte & 15) as usize]]); }
+        for byte in bytes {
+            e.raw(&[HEX[(byte >> 4) as usize], HEX[(byte & 15) as usize]]);
+        }
     }
     match record {
         RecordView::Manifest(m) => {
             visit(&|e| reference(e, b"root:", &m.seal.root))?;
-            for row in m.rows.iter()? { let row = row?; visit(&|e| reference(e, b"row:", &row.reference))?; }
+            for row in m.rows.iter()? {
+                let row = row?;
+                visit(&|e| reference(e, b"row:", &row.reference))?;
+            }
         }
         RecordView::Terminal { record: t, .. } => {
             visit(&|e| reference(e, b"root:", &t.root))?;
             let object = terminal_object(t)?;
-            visit(&|e| { digest(e, b"object:", &object); Ok(()) })?;
+            visit(&|e| {
+                digest(e, b"object:", &object);
+                Ok(())
+            })?;
         }
-        RecordView::MaterializedOwner(o) => visit(&|e| reference(e, b"root:", &o.source.reference))?,
+        RecordView::MaterializedOwner(o) => {
+            visit(&|e| reference(e, b"root:", &o.source.reference))?
+        }
         RecordView::Binding(b) => {
-            visit(&|e| { e.raw(b"authority"); Ok(()) })?;
+            visit(&|e| {
+                e.raw(b"authority");
+                Ok(())
+            })?;
             let object = object_digest(0, |e| b.bytes_finite(e), b.signature)?;
-            visit(&|e| { digest(e, b"object:", &object); Ok(()) })?;
+            visit(&|e| {
+                digest(e, b"object:", &object);
+                Ok(())
+            })?;
         }
         RecordView::ObjectAdmission(a) => {
-            visit(&|e| { digest(e, b"object:", &a.object_digest); Ok(()) })?;
-            visit(&|e| { digest(e, b"certificate:", &a.certificate); Ok(()) })?;
+            visit(&|e| {
+                digest(e, b"object:", &a.object_digest);
+                Ok(())
+            })?;
+            visit(&|e| {
+                digest(e, b"certificate:", &a.certificate);
+                Ok(())
+            })?;
         }
-        RecordView::Policy(_) => visit(&|e| { e.raw(b"policies"); Ok(()) })?,
-        RecordView::Control(_) | RecordView::State(_) | RecordView::Birth(_)
-        | RecordView::Certificate(_) | RecordView::Destination(_) => visit(&|e| { e.raw(b"authority"); Ok(()) })?,
+        RecordView::Policy(_) => visit(&|e| {
+            e.raw(b"policies");
+            Ok(())
+        })?,
+        RecordView::Control(_)
+        | RecordView::State(_)
+        | RecordView::Birth(_)
+        | RecordView::Certificate(_)
+        | RecordView::Destination(_) => visit(&|e| {
+            e.raw(b"authority");
+            Ok(())
+        })?,
         _ => {}
     }
     if let Some(id) = record.submission() {
         let mut text = [0; 36];
         let text = id.hyphenated().encode_lower(&mut text);
-        visit(&|e| { e.raw(b"submission:"); e.raw(text.as_bytes()); Ok(()) })?;
+        visit(&|e| {
+            e.raw(b"submission:");
+            e.raw(text.as_bytes());
+            Ok(())
+        })?;
     }
     Ok(())
 }
 /// Write a counted canonical walk into caller-prepaid storage, with no growth.
 pub(crate) fn finite_into(
-    bytes: &mut [u8], walk: impl FnOnce(&mut NativeEncoder<'_>) -> Decoded<()>,
+    bytes: &mut [u8],
+    walk: impl FnOnce(&mut NativeEncoder<'_>) -> Decoded<()>,
 ) -> Decoded<()> {
-    super::canonical::finite_emit_with_error(
-        bytes, |e| shared_walk(e, walk), || Invalid::Canonical,
-    )
+    super::canonical::finite_emit_with_error(bytes, |e| shared_walk(e, walk), || Invalid::Canonical)
 }

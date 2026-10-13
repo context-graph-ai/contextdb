@@ -2,7 +2,9 @@
 //! pages and durable lookup directories; this module never retains an all-node
 //! graph or row/exact-vector map.
 use super::{DistQuantizedCosine, HNSW_BUILD_SEED, exact_key_for_stored_vector, hnsw_f32_distance};
-use crate::memory_budget::{MemoryBudget, VectorWorkspaceReservation, VectorCopyAdmission, ScopedVectorCopy};
+use crate::memory_budget::{
+    MemoryBudget, ScopedVectorCopy, VectorCopyAdmission, VectorWorkspaceReservation,
+};
 use crate::quantized::StoredVector;
 use crate::store::{ResolvedVectorPolicy, VectorPartitionRef};
 use contextdb_core::{
@@ -204,16 +206,41 @@ fn workspace_overflow() -> Error {
 /// covers point, identity and directory copies, without changing traversal.
 #[doc(hidden)]
 pub enum PagedVectorReadRequest<'q> {
-    Point { id: PointId },
-    Identity { data_id: usize },
-    PointForRow { row: RowId, snapshot: SnapshotId },
-    ExactRows { key: &'q [u8], snapshot: SnapshotId, after: Option<RowId>, limit: usize },
-    VisibleCount { snapshot: SnapshotId },
-    RowWindow { snapshot: SnapshotId, after: Option<RowId>, limit: usize },
+    Point {
+        id: PointId,
+    },
+    Identity {
+        data_id: usize,
+    },
+    PointForRow {
+        row: RowId,
+        snapshot: SnapshotId,
+    },
+    ExactRows {
+        key: &'q [u8],
+        snapshot: SnapshotId,
+        after: Option<RowId>,
+        limit: usize,
+    },
+    VisibleCount {
+        snapshot: SnapshotId,
+    },
+    RowWindow {
+        snapshot: SnapshotId,
+        after: Option<RowId>,
+        limit: usize,
+    },
     RowBounds,
-    PointAtOrAfter { row: RowId },
-    GraphPointForRow { row: RowId },
-    ExactGraphRowAfter { key: &'q [u8], after: Option<RowId> },
+    PointAtOrAfter {
+        row: RowId,
+    },
+    GraphPointForRow {
+        row: RowId,
+    },
+    ExactGraphRowAfter {
+        key: &'q [u8],
+        after: Option<RowId>,
+    },
 }
 #[doc(hidden)]
 pub enum PagedVectorReadValue {
@@ -244,16 +271,59 @@ pub trait PagedVectorReader: Send {
         _admit: &mut dyn FnMut(usize) -> Result<Option<VectorCopyAdmission>>,
     ) -> Result<PagedVectorReadValue> {
         Ok(match request {
-            PagedVectorReadRequest::Point { id } => PagedVectorReadValue::Point(ScopedVectorCopy::from_admitted(self.load_point(id)?, None)),
-            PagedVectorReadRequest::Identity { data_id } => PagedVectorReadValue::Identity(ScopedVectorCopy::from_admitted(self.identity(data_id)?, None)),
-            PagedVectorReadRequest::PointForRow { row, snapshot } => PagedVectorReadValue::PointForRow(ScopedVectorCopy::from_admitted(self.point_for_row(row, snapshot)?, None)),
-            PagedVectorReadRequest::ExactRows { key, snapshot, after, limit } => PagedVectorReadValue::ExactRows(ScopedVectorCopy::from_admitted(self.exact_rows(key, snapshot, after, limit)?, None)),
-            PagedVectorReadRequest::VisibleCount { snapshot } => PagedVectorReadValue::VisibleCount(ScopedVectorCopy::from_admitted(self.visible_count(snapshot)?, None)),
-            PagedVectorReadRequest::RowWindow { snapshot, after, limit } => PagedVectorReadValue::RowWindow(ScopedVectorCopy::from_admitted(self.row_window(snapshot, after, limit)?, None)),
-            PagedVectorReadRequest::RowBounds => PagedVectorReadValue::RowBounds(ScopedVectorCopy::from_admitted(self.row_bounds()?, None)),
-            PagedVectorReadRequest::PointAtOrAfter { row } => PagedVectorReadValue::PointAtOrAfter(ScopedVectorCopy::from_admitted(self.point_at_or_after(row)?, None)),
-            PagedVectorReadRequest::GraphPointForRow { row } => PagedVectorReadValue::GraphPointForRow(ScopedVectorCopy::from_admitted(self.graph_point_for_row(row)?, None)),
-            PagedVectorReadRequest::ExactGraphRowAfter { key, after } => PagedVectorReadValue::ExactGraphRowAfter(ScopedVectorCopy::from_admitted(self.exact_graph_row_after(key, after)?, None)),
+            PagedVectorReadRequest::Point { id } => PagedVectorReadValue::Point(
+                ScopedVectorCopy::from_admitted(self.load_point(id)?, None),
+            ),
+            PagedVectorReadRequest::Identity { data_id } => PagedVectorReadValue::Identity(
+                ScopedVectorCopy::from_admitted(self.identity(data_id)?, None),
+            ),
+            PagedVectorReadRequest::PointForRow { row, snapshot } => {
+                PagedVectorReadValue::PointForRow(ScopedVectorCopy::from_admitted(
+                    self.point_for_row(row, snapshot)?,
+                    None,
+                ))
+            }
+            PagedVectorReadRequest::ExactRows {
+                key,
+                snapshot,
+                after,
+                limit,
+            } => PagedVectorReadValue::ExactRows(ScopedVectorCopy::from_admitted(
+                self.exact_rows(key, snapshot, after, limit)?,
+                None,
+            )),
+            PagedVectorReadRequest::VisibleCount { snapshot } => {
+                PagedVectorReadValue::VisibleCount(ScopedVectorCopy::from_admitted(
+                    self.visible_count(snapshot)?,
+                    None,
+                ))
+            }
+            PagedVectorReadRequest::RowWindow {
+                snapshot,
+                after,
+                limit,
+            } => PagedVectorReadValue::RowWindow(ScopedVectorCopy::from_admitted(
+                self.row_window(snapshot, after, limit)?,
+                None,
+            )),
+            PagedVectorReadRequest::RowBounds => PagedVectorReadValue::RowBounds(
+                ScopedVectorCopy::from_admitted(self.row_bounds()?, None),
+            ),
+            PagedVectorReadRequest::PointAtOrAfter { row } => PagedVectorReadValue::PointAtOrAfter(
+                ScopedVectorCopy::from_admitted(self.point_at_or_after(row)?, None),
+            ),
+            PagedVectorReadRequest::GraphPointForRow { row } => {
+                PagedVectorReadValue::GraphPointForRow(ScopedVectorCopy::from_admitted(
+                    self.graph_point_for_row(row)?,
+                    None,
+                ))
+            }
+            PagedVectorReadRequest::ExactGraphRowAfter { key, after } => {
+                PagedVectorReadValue::ExactGraphRowAfter(ScopedVectorCopy::from_admitted(
+                    self.exact_graph_row_after(key, after)?,
+                    None,
+                ))
+            }
         })
     }
 
@@ -307,17 +377,36 @@ pub(crate) struct AdmittedPagedReader<'a> {
     reclaim: Option<&'a dyn Fn() -> bool>,
 }
 impl<'a> AdmittedPagedReader<'a> {
-    pub(crate) fn with_reclamation(reader: &'a mut dyn PagedVectorReader, owner: Option<Arc<dyn MemoryBudget>>, reclaim: &'a dyn Fn() -> bool) -> Self { Self { reader, owner, reclaim: Some(reclaim) } }
+    pub(crate) fn with_reclamation(
+        reader: &'a mut dyn PagedVectorReader,
+        owner: Option<Arc<dyn MemoryBudget>>,
+        reclaim: &'a dyn Fn() -> bool,
+    ) -> Self {
+        Self {
+            reader,
+            owner,
+            reclaim: Some(reclaim),
+        }
+    }
     fn read(&mut self, request: PagedVectorReadRequest<'_>) -> Result<PagedVectorReadValue> {
         let owner = self.owner.as_ref();
         let reclaim = self.reclaim;
         self.reader.read_with_copy_admission(request, &mut |bytes| {
-            let Some(owner) = owner else { return Ok(None); };
+            let Some(owner) = owner else {
+                return Ok(None);
+            };
             let mut token = VectorCopyAdmission::new(Arc::clone(owner));
             loop {
-                match token.reserve_for(bytes, "vector_index", "read_paged_vector_window", "Reduce the selected reader working set or raise its declared memory limit.") {
+                match token.reserve_for(
+                    bytes,
+                    "vector_index",
+                    "read_paged_vector_window",
+                    "Reduce the selected reader working set or raise its declared memory limit.",
+                ) {
                     Ok(()) => break,
-                    Err(error) if super::union::navigation_memory_refusal(&error) && reclaim.is_some_and(|reclaim| reclaim()) => {},
+                    Err(error)
+                        if super::union::navigation_memory_refusal(&error)
+                            && reclaim.is_some_and(|reclaim| reclaim()) => {}
                     Err(error) => return Err(error),
                 }
             }
@@ -327,37 +416,56 @@ impl<'a> AdmittedPagedReader<'a> {
     pub(crate) fn load_point(&mut self, id: PointId) -> Result<ScopedVectorCopy<PagedVectorPoint>> {
         match self.read(PagedVectorReadRequest::Point { id })? {
             PagedVectorReadValue::Point(value) => Ok(value),
-            _ => Err(Error::Other("paged admission returned the wrong request kind".into())),
+            _ => Err(Error::Other(
+                "paged admission returned the wrong request kind".into(),
+            )),
         }
     }
-    pub(crate) fn identity(&mut self, data_id: usize) -> Result<ScopedVectorCopy<PagedVectorIdentity>> {
+    pub(crate) fn identity(
+        &mut self,
+        data_id: usize,
+    ) -> Result<ScopedVectorCopy<PagedVectorIdentity>> {
         match self.read(PagedVectorReadRequest::Identity { data_id })? {
             PagedVectorReadValue::Identity(value) => Ok(value),
-            _ => Err(Error::Other("paged admission returned the wrong request kind".into())),
+            _ => Err(Error::Other(
+                "paged admission returned the wrong request kind".into(),
+            )),
         }
     }
     pub(crate) fn row_bounds(&mut self) -> Result<Option<(RowId, RowId, usize)>> {
         match self.read(PagedVectorReadRequest::RowBounds)? {
             PagedVectorReadValue::RowBounds(value) => Ok(*value),
-            _ => Err(Error::Other("paged admission returned the wrong request kind".into())),
+            _ => Err(Error::Other(
+                "paged admission returned the wrong request kind".into(),
+            )),
         }
     }
     pub(crate) fn point_at_or_after(&mut self, row: RowId) -> Result<Option<(RowId, PointId)>> {
         match self.read(PagedVectorReadRequest::PointAtOrAfter { row })? {
             PagedVectorReadValue::PointAtOrAfter(value) => Ok(*value),
-            _ => Err(Error::Other("paged admission returned the wrong request kind".into())),
+            _ => Err(Error::Other(
+                "paged admission returned the wrong request kind".into(),
+            )),
         }
     }
     pub(crate) fn graph_point_for_row(&mut self, row: RowId) -> Result<Option<PointId>> {
         match self.read(PagedVectorReadRequest::GraphPointForRow { row })? {
             PagedVectorReadValue::GraphPointForRow(value) => Ok(*value),
-            _ => Err(Error::Other("paged admission returned the wrong request kind".into())),
+            _ => Err(Error::Other(
+                "paged admission returned the wrong request kind".into(),
+            )),
         }
     }
-    pub(crate) fn exact_graph_row_after(&mut self, key: &[u8], after: Option<RowId>) -> Result<Option<RowId>> {
+    pub(crate) fn exact_graph_row_after(
+        &mut self,
+        key: &[u8],
+        after: Option<RowId>,
+    ) -> Result<Option<RowId>> {
         match self.read(PagedVectorReadRequest::ExactGraphRowAfter { key, after })? {
             PagedVectorReadValue::ExactGraphRowAfter(value) => Ok(*value),
-            _ => Err(Error::Other("paged admission returned the wrong request kind".into())),
+            _ => Err(Error::Other(
+                "paged admission returned the wrong request kind".into(),
+            )),
         }
     }
 }
@@ -690,7 +798,8 @@ struct RetainedPagedReader {
 }
 impl PagedVectorReader for RetainedPagedReader {
     fn read_with_copy_admission(
-        &mut self, request: PagedVectorReadRequest<'_>,
+        &mut self,
+        request: PagedVectorReadRequest<'_>,
         admit: &mut dyn FnMut(usize) -> Result<Option<VectorCopyAdmission>>,
     ) -> Result<PagedVectorReadValue> {
         self.reader.read_with_copy_admission(request, admit)
@@ -872,8 +981,14 @@ impl PagedVectorTail {
     /// that meets clones or successor roots counts each charge once.
     pub(crate) fn retained_control_receipts(&self) -> [(usize, usize); 2] {
         [
-            (Arc::as_ptr(&self.root_charge) as usize, self.root_charge.bytes),
-            (Arc::as_ptr(&self.partition) as usize, self.partition.charge.bytes),
+            (
+                Arc::as_ptr(&self.root_charge) as usize,
+                self.root_charge.bytes,
+            ),
+            (
+                Arc::as_ptr(&self.partition) as usize,
+                self.partition.charge.bytes,
+            ),
         ]
     }
 

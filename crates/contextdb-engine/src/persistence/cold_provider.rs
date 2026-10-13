@@ -193,8 +193,6 @@ impl<'root> ColdCommittedProvider<'root> {
             finished: false,
         })
     }
-
-
 }
 
 /// Actual heap bytes are freed before their actual original is refunded.
@@ -385,11 +383,14 @@ impl ColdCommittedProvider<'_> {
         &self,
     ) -> Result<super::super::native_storage_admission::ColdMetadataOwner> {
         use super::super::native_storage_admission::{ColdMetadataOwner, ColdSnapshotMetadata};
-        ColdMetadataOwner::new_unqualified(&self.root.accountant, ColdSnapshotMetadata {
-            identity: self.read.storage_snapshot_identity(),
-            snapshot: self.root.snapshot,
-            lsn: self.root.lsn,
-        })
+        ColdMetadataOwner::new_unqualified(
+            &self.root.accountant,
+            ColdSnapshotMetadata {
+                identity: self.read.storage_snapshot_identity(),
+                snapshot: self.root.snapshot,
+                lsn: self.root.lsn,
+            },
+        )
     }
 
     /// ONE exact [u8;24] lookup, lending only the body in this captured view.
@@ -411,11 +412,14 @@ impl ColdCommittedProvider<'_> {
     > {
         use super::super::native_storage_admission::{NativeStorageFailure, StorageAdmissionScope};
         before().map_err(NativeStorageFailure::Unqualified)?;
-        let scope = StorageAdmissionScope::writer_unqualified(original, &self.root.accountant, funder)
-            .map_err(NativeStorageFailure::Unqualified)?;
-        scope.run_native(|| scope.with_rel_name(logical, |physical| {
-            self.lend_exact_body_in_scope(logical, physical, key, visit)
-        }))
+        let scope =
+            StorageAdmissionScope::writer_unqualified(original, &self.root.accountant, funder)
+                .map_err(NativeStorageFailure::Unqualified)?;
+        scope.run_native(|| {
+            scope.with_rel_name(logical, |physical| {
+                self.lend_exact_body_in_scope(logical, physical, key, visit)
+            })
+        })
     }
 
     /// Same storage primitive and captured transaction, with one actual native
@@ -433,16 +437,23 @@ impl ColdCommittedProvider<'_> {
     > {
         use super::super::native_storage_admission::{NativeStorageFailure, StorageAdmissionScope};
         before().map_err(NativeStorageFailure::Unqualified)?;
-        let child = declared.native_child().map_err(NativeStorageFailure::Refused)?;
+        let child = declared
+            .native_child()
+            .map_err(NativeStorageFailure::Refused)?;
         let scope = StorageAdmissionScope::reader_unqualified(child)
             .map_err(NativeStorageFailure::Unqualified)?;
-        scope.run_native(|| scope.with_rel_name(logical, |physical| {
-            self.lend_exact_body_in_scope(logical, physical, key, visit)
-        }))
+        scope.run_native(|| {
+            scope.with_rel_name(logical, |physical| {
+                self.lend_exact_body_in_scope(logical, physical, key, visit)
+            })
+        })
     }
 
     fn lend_exact_body_in_scope<T>(
-        &self, logical: &str, physical: &str, key: &[u8; 24],
+        &self,
+        logical: &str,
+        physical: &str,
+        key: &[u8; 24],
         visit: impl FnOnce(&[u8]) -> Result<T>,
     ) -> Result<std::result::Result<Option<T>, redb::NativeColdReadError>> {
         let key = *key; // exact relational identity remains inline on this stack
@@ -467,19 +478,30 @@ impl ColdCommittedProvider<'_> {
         &self,
         owner: &contextdb_core::read_memory::ReadMemoryOwner,
     ) -> std::result::Result<
-        contextdb_core::read_memory::ReadShared<super::super::native_storage_admission::ColdSnapshotMetadata>,
+        contextdb_core::read_memory::ReadShared<
+            super::super::native_storage_admission::ColdSnapshotMetadata,
+        >,
         super::super::native_storage_admission::NativeStorageFailure,
     > {
-        use contextdb_core::read_memory::{ReadCredit, ReadShared};
         use super::super::native_storage_admission::{ColdSnapshotMetadata, NativeStorageFailure};
+        use contextdb_core::read_memory::{ReadCredit, ReadShared};
         let invoice = ReadCredit::try_new_owned_native(
-            owner.clone(), ReadShared::<ColdSnapshotMetadata>::layout().size(),
-            "writer_source", "config_metadata", HINT,
-        ).map_err(NativeStorageFailure::Refused)?;
-        ReadShared::try_from_prepaid_native(ColdSnapshotMetadata {
-            identity: self.read.storage_snapshot_identity(),
-            snapshot: self.root.snapshot, lsn: self.root.lsn,
-        }, invoice).map_err(NativeStorageFailure::Refused)
+            owner.clone(),
+            ReadShared::<ColdSnapshotMetadata>::layout().size(),
+            "writer_source",
+            "config_metadata",
+            HINT,
+        )
+        .map_err(NativeStorageFailure::Refused)?;
+        ReadShared::try_from_prepaid_native(
+            ColdSnapshotMetadata {
+                identity: self.read.storage_snapshot_identity(),
+                snapshot: self.root.snapshot,
+                lsn: self.root.lsn,
+            },
+            invoice,
+        )
+        .map_err(NativeStorageFailure::Refused)
     }
 
     /// Exact config lookup in the same cold transaction as the original cursor.
@@ -499,7 +521,9 @@ impl ColdCommittedProvider<'_> {
         scope.run_native(|| {
             before()?;
             if metadata.identity != self.read.storage_snapshot_identity()
-                || metadata.snapshot != self.root.snapshot || metadata.lsn != self.root.lsn {
+                || metadata.snapshot != self.root.snapshot
+                || metadata.lsn != self.root.lsn
+            {
                 return Err(Error::StoreCorrupted {
                     path: "writer source".into(),
                     reason: "config metadata differs from its retained committed view".into(),
@@ -533,15 +557,23 @@ pub(crate) struct NativeConfigRangeSource {
 #[cfg(feature = "sync-orchestration")]
 impl ColdCommittedProvider<'_> {
     pub(crate) fn into_native_config_range(
-        self, root: Arc<WriterSnapshot>,
+        self,
+        root: Arc<WriterSnapshot>,
     ) -> std::result::Result<NativeConfigRangeSource, super::NativeConfigFailure> {
-        if !std::ptr::eq(self.root, root.as_ref()) { return Err(super::NativeConfigFailure::OwnerMismatch); }
-        Ok(NativeConfigRangeSource { root, read: self.read })
+        if !std::ptr::eq(self.root, root.as_ref()) {
+            return Err(super::NativeConfigFailure::OwnerMismatch);
+        }
+        Ok(NativeConfigRangeSource {
+            root,
+            read: self.read,
+        })
     }
 }
 #[cfg(feature = "sync-orchestration")]
 impl NativeConfigRangeSource {
-    pub(crate) fn root(&self) -> &Arc<WriterSnapshot> { &self.root }
+    pub(crate) fn root(&self) -> &Arc<WriterSnapshot> {
+        &self.root
+    }
 
     /// Actual CONFIG_TABLE range producer. The callback receives only actual
     /// immutable page guards; refusal extraction precedes callback/cold errors.
@@ -549,9 +581,14 @@ impl NativeConfigRangeSource {
         &self,
         scope: &super::super::native_storage_admission::StorageAdmissionScope,
         metadata: &super::super::native_storage_admission::ColdSnapshotMetadata,
-        lower: &[u8], exclusive: bool, upper: Option<&[u8]>,
+        lower: &[u8],
+        exclusive: bool,
+        upper: Option<&[u8]>,
         before: &mut dyn FnMut() -> Result<()>,
-        visit: impl FnOnce(redb::AccessGuard<'static, &'static [u8]>, redb::AccessGuard<'static, &'static [u8]>) -> std::result::Result<T, E>,
+        visit: impl FnOnce(
+            redb::AccessGuard<'static, &'static [u8]>,
+            redb::AccessGuard<'static, &'static [u8]>,
+        ) -> std::result::Result<T, E>,
     ) -> std::result::Result<
         std::result::Result<std::result::Result<Option<T>, E>, redb::NativeColdReadError>,
         super::super::native_storage_admission::NativeStorageFailure,
@@ -559,31 +596,47 @@ impl NativeConfigRangeSource {
         scope.run_native(|| {
             before()?;
             if metadata.identity != self.read.storage_snapshot_identity()
-                || metadata.snapshot != self.root.snapshot || metadata.lsn != self.root.lsn {
-                return Err(Error::StoreCorrupted { path: "writer source".into(),
-                    reason: "raw config metadata differs from retained committed view".into() });
+                || metadata.snapshot != self.root.snapshot
+                || metadata.lsn != self.root.lsn
+            {
+                return Err(Error::StoreCorrupted {
+                    path: "writer source".into(),
+                    reason: "raw config metadata differs from retained committed view".into(),
+                });
             }
             let erasure = self.root.erasure.read_recursive();
             erasure.check_scope(None, CONFIG_TABLE.name())?;
             let mut checkpoint_fault = None;
-            let next = self.read.next_native_text_range(CONFIG_TABLE.name(), lower, exclusive, upper,
+            let next = self.read.next_native_text_range(
+                CONFIG_TABLE.name(),
+                lower,
+                exclusive,
+                upper,
                 &mut || match before() {
                     Ok(()) => Ok(()),
                     Err(error) => {
                         checkpoint_fault = Some(error);
                         // Inline lower interruption is only a stop signal. The
                         // actual engine checkpoint error remains Unqualified.
-                        Err(redb::NativeColdReadError::Io(std::io::ErrorKind::Interrupted.into()))
+                        Err(redb::NativeColdReadError::Io(
+                            std::io::ErrorKind::Interrupted.into(),
+                        ))
                     }
-                });
-            if let Some(error) = checkpoint_fault { return Err(error); }
+                },
+            );
+            if let Some(error) = checkpoint_fault {
+                return Err(error);
+            }
             match next {
                 Ok(Some((key, value))) => {
                     before()?;
                     erasure.check_key(CONFIG_TABLE.name(), key.value())?;
                     Ok(Ok(visit(key, value).map(Some)))
                 }
-                Ok(None) => { before()?; Ok(Ok(Ok(None))) }
+                Ok(None) => {
+                    before()?;
+                    Ok(Ok(Ok(None)))
+                }
                 Err(fault) => Ok(Err(fault)),
             }
             // Erasure fence spans callback and raw page construction.
@@ -593,9 +646,14 @@ impl NativeConfigRangeSource {
         &self,
         scope: &super::super::native_storage_admission::StorageAdmissionScope,
         metadata: &super::super::native_storage_admission::ColdSnapshotMetadata,
-        lower: &[u8], exclusive: bool, upper: Option<&[u8]>,
+        lower: &[u8],
+        exclusive: bool,
+        upper: Option<&[u8]>,
         before: &mut dyn FnMut() -> Result<()>,
-        visit: impl FnOnce(redb::AccessGuard<'static, &'static [u8]>, redb::AccessGuard<'static, &'static [u8]>) -> std::result::Result<T, E>,
+        visit: impl FnOnce(
+            redb::AccessGuard<'static, &'static [u8]>,
+            redb::AccessGuard<'static, &'static [u8]>,
+        ) -> std::result::Result<T, E>,
     ) -> std::result::Result<
         std::result::Result<std::result::Result<Option<T>, E>, redb::NativeColdReadError>,
         super::super::native_storage_admission::NativeStorageFailure,
@@ -603,31 +661,47 @@ impl NativeConfigRangeSource {
         scope.run_native(|| {
             before()?;
             if metadata.identity != self.read.storage_snapshot_identity()
-                || metadata.snapshot != self.root.snapshot || metadata.lsn != self.root.lsn {
-                return Err(Error::StoreCorrupted { path: "writer source".into(),
-                    reason: "raw config metadata differs from retained committed view".into() });
+                || metadata.snapshot != self.root.snapshot
+                || metadata.lsn != self.root.lsn
+            {
+                return Err(Error::StoreCorrupted {
+                    path: "writer source".into(),
+                    reason: "raw config metadata differs from retained committed view".into(),
+                });
             }
             let erasure = self.root.erasure.read_recursive();
             erasure.check_scope(None, CONFIG_TABLE.name())?;
             let mut checkpoint_fault = None;
-            let next = self.read.next_native_byte_range(super::super::custody_groups::GROUP_TABLE.name(), lower, exclusive, upper,
+            let next = self.read.next_native_byte_range(
+                super::super::custody_groups::GROUP_TABLE.name(),
+                lower,
+                exclusive,
+                upper,
                 &mut || match before() {
                     Ok(()) => Ok(()),
                     Err(error) => {
                         checkpoint_fault = Some(error);
                         // Inline lower interruption is only a stop signal. The
                         // actual engine checkpoint error remains Unqualified.
-                        Err(redb::NativeColdReadError::Io(std::io::ErrorKind::Interrupted.into()))
+                        Err(redb::NativeColdReadError::Io(
+                            std::io::ErrorKind::Interrupted.into(),
+                        ))
                     }
-                });
-            if let Some(error) = checkpoint_fault { return Err(error); }
+                },
+            );
+            if let Some(error) = checkpoint_fault {
+                return Err(error);
+            }
             match next {
                 Ok(Some((key, value))) => {
                     before()?;
                     erasure.check_key(CONFIG_TABLE.name(), key.value())?;
                     Ok(Ok(visit(key, value).map(Some)))
                 }
-                Ok(None) => { before()?; Ok(Ok(Ok(None))) }
+                Ok(None) => {
+                    before()?;
+                    Ok(Ok(Ok(None)))
+                }
                 Err(fault) => Ok(Err(fault)),
             }
             // Erasure fence spans callback and raw page construction.

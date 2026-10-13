@@ -634,7 +634,13 @@ impl RawVectorMembershipSource for LazyRawVectorMembershipSource {
         snapshot: SnapshotId,
         before_read: &mut dyn FnMut() -> bool,
         owner: &mut super::VectorCopyAdmission,
-        admit: &mut dyn FnMut(&mut super::VectorCopyAdmission, usize, &str, &str, &str) -> Result<()>,
+        admit: &mut dyn FnMut(
+            &mut super::VectorCopyAdmission,
+            usize,
+            &str,
+            &str,
+            &str,
+        ) -> Result<()>,
     ) -> Result<Option<RawVectorDirectoryEntry>> {
         self.resolve(before_read)?
             .visible_by_row_with_copy_admission(row, snapshot, before_read, owner, admit)

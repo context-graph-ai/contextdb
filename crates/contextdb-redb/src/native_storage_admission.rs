@@ -33,17 +33,27 @@ impl NativeStorageCredit {
         retain: unsafe fn(NonNull<()>),
         finish: unsafe fn(NonNull<()>),
     ) -> Self {
-        Self { receipt, retain, finish }
+        Self {
+            receipt,
+            retain,
+            finish,
+        }
     }
 }
 impl Clone for NativeStorageCredit {
     fn clone(&self) -> Self {
         unsafe { (self.retain)(self.receipt) };
-        Self { receipt: self.receipt, retain: self.retain, finish: self.finish }
+        Self {
+            receipt: self.receipt,
+            retain: self.retain,
+            finish: self.finish,
+        }
     }
 }
 impl Drop for NativeStorageCredit {
-    fn drop(&mut self) { unsafe { (self.finish)(self.receipt) } }
+    fn drop(&mut self) {
+        unsafe { (self.finish)(self.receipt) }
+    }
 }
 
 #[doc(hidden)]
@@ -62,11 +72,19 @@ impl NativeStorageAdmission {
         finish: unsafe fn(NonNull<()>),
         admit: unsafe fn(NonNull<()>, Layout) -> Result<NativeStorageCredit, NativeStorageRefused>,
     ) -> Self {
-        Self { owner: unsafe { NativeStorageCredit::from_owned_receipt(receipt, retain, finish) }, admit }
+        Self {
+            owner: unsafe { NativeStorageCredit::from_owned_receipt(receipt, retain, finish) },
+            admit,
+        }
     }
 }
 impl Clone for NativeStorageAdmission {
-    fn clone(&self) -> Self { Self { owner: self.owner.clone(), admit: self.admit } }
+    fn clone(&self) -> Self {
+        Self {
+            owner: self.owner.clone(),
+            admit: self.admit,
+        }
+    }
 }
 thread_local! {
     static NATIVE: RefCell<Option<NativeStorageAdmission>> = const { RefCell::new(None) };
@@ -87,11 +105,18 @@ pub fn with_native_storage_admission<R>(
     operation: impl FnOnce() -> R,
 ) -> R {
     let previous = NATIVE.with(|slot| slot.replace(Some(admission)));
-    let _restore = Restore { previous, _thread: PhantomData };
+    let _restore = Restore {
+        previous,
+        _thread: PhantomData,
+    };
     operation()
 }
-pub(crate) fn admit_native_storage(layout: Layout) -> Result<NativeStorageCredit, NativeStorageRefused> {
-    let owner = NATIVE.with(|slot| slot.borrow().clone()).ok_or(NativeStorageRefused)?;
+pub(crate) fn admit_native_storage(
+    layout: Layout,
+) -> Result<NativeStorageCredit, NativeStorageRefused> {
+    let owner = NATIVE
+        .with(|slot| slot.borrow().clone())
+        .ok_or(NativeStorageRefused)?;
     unsafe { (owner.admit)(owner.owner.receipt, layout) }
 }
 pub(crate) fn native_storage_active() -> bool {
@@ -109,7 +134,13 @@ pub struct NativeColdFault {
 }
 impl NativeColdFault {
     pub(crate) fn new(reason: &'static str) -> Self {
-        Self { reason, page: [0; 8], offset: 0, expected: 0, actual: 0 }
+        Self {
+            reason,
+            page: [0; 8],
+            offset: 0,
+            expected: 0,
+            actual: 0,
+        }
     }
 }
 #[doc(hidden)]
@@ -122,7 +153,9 @@ pub enum NativeColdReadError {
     Io(std::io::Error),
 }
 impl From<NativeStorageRefused> for NativeColdReadError {
-    fn from(_: NativeStorageRefused) -> Self { Self::AdmissionRefused }
+    fn from(_: NativeStorageRefused) -> Self {
+        Self::AdmissionRefused
+    }
 }
 
 /// Exact fresh backing; its invoice is outside Vec's physical destruction.
@@ -132,19 +165,26 @@ pub(crate) struct NativeStorageBuffer<T> {
 }
 impl<T> NativeStorageBuffer<T> {
     pub(crate) fn new() -> Self {
-        Self { data: ManuallyDrop::new(Vec::new()), invoice: Mutex::new(None) }
+        Self {
+            data: ManuallyDrop::new(Vec::new()),
+            invoice: Mutex::new(None),
+        }
     }
     pub(crate) fn with_capacity(capacity: usize) -> Result<Self, NativeColdReadError> {
         let layout = Layout::array::<T>(capacity).map_err(|_| {
             NativeColdReadError::Corrupt(NativeColdFault::new("native buffer layout overflow"))
         })?;
-        if layout.size() == 0 { return Ok(Self::new()); }
+        if layout.size() == 0 {
+            return Ok(Self::new());
+        }
         let invoice = admit_native_storage(layout)?;
         let pointer = unsafe { alloc(layout) }.cast::<T>();
         let Some(pointer) = NonNull::new(pointer) else {
             // Inline ErrorKind keeps the lower allocator failure unqualified,
             // with no diagnostic allocation or fabricated budget refusal.
-            return Err(NativeColdReadError::Io(std::io::ErrorKind::OutOfMemory.into()));
+            return Err(NativeColdReadError::Io(
+                std::io::ErrorKind::OutOfMemory.into(),
+            ));
         };
         Ok(Self {
             data: ManuallyDrop::new(unsafe { Vec::from_raw_parts(pointer.as_ptr(), 0, capacity) }),
@@ -153,13 +193,25 @@ impl<T> NativeStorageBuffer<T> {
     }
     pub(crate) fn push(&mut self, item: T) -> Result<(), NativeColdReadError> {
         if self.data.len() == self.data.capacity() {
-            let capacity = self.data.capacity().checked_mul(2).filter(|n| *n != 0)
+            let capacity = self
+                .data
+                .capacity()
+                .checked_mul(2)
+                .filter(|n| *n != 0)
                 .or_else(|| self.data.is_empty().then_some(1))
-                .ok_or_else(|| NativeColdReadError::Corrupt(NativeColdFault::new("native buffer capacity overflow")))?;
+                .ok_or_else(|| {
+                    NativeColdReadError::Corrupt(NativeColdFault::new(
+                        "native buffer capacity overflow",
+                    ))
+                })?;
             let mut next = Self::with_capacity(capacity)?;
             // No item callback or allocator is invoked while moving initialized items.
             unsafe {
-                std::ptr::copy_nonoverlapping(self.data.as_ptr(), next.data.as_mut_ptr(), self.data.len());
+                std::ptr::copy_nonoverlapping(
+                    self.data.as_ptr(),
+                    next.data.as_mut_ptr(),
+                    self.data.len(),
+                );
                 next.data.set_len(self.data.len());
                 self.data.set_len(0);
             }
@@ -169,22 +221,35 @@ impl<T> NativeStorageBuffer<T> {
         self.data.push(item);
         Ok(())
     }
-    pub(crate) fn pop(&mut self) -> Option<T> { self.data.pop() }
-    pub(crate) fn as_slice(&self) -> &[T] { &self.data }
+    pub(crate) fn pop(&mut self) -> Option<T> {
+        self.data.pop()
+    }
+    pub(crate) fn as_slice(&self) -> &[T] {
+        &self.data
+    }
 }
 impl NativeStorageBuffer<u8> {
     pub(crate) fn zeroed(len: usize) -> Result<Self, NativeColdReadError> {
         let mut buffer = Self::with_capacity(len)?;
         if len != 0 {
-            unsafe { std::ptr::write_bytes(buffer.data.as_mut_ptr(), 0, len); buffer.data.set_len(len); }
+            unsafe {
+                std::ptr::write_bytes(buffer.data.as_mut_ptr(), 0, len);
+                buffer.data.set_len(len);
+            }
         }
         Ok(buffer)
     }
-    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] { &mut self.data }
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.data
+    }
 }
 impl<T> Drop for NativeStorageBuffer<T> {
     fn drop(&mut self) {
-        let invoice = self.invoice.get_mut().unwrap_or_else(|e| e.into_inner()).take();
+        let invoice = self
+            .invoice
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         // Vec's own drop glue releases its allocation even if an element panics.
         // The external local is unwound only after that glue has finished.
         unsafe { ManuallyDrop::drop(&mut self.data) };
@@ -197,11 +262,15 @@ pub(crate) struct NativeStorageSharedBlock<T> {
     payload: ManuallyDrop<T>,
     ownership: Mutex<Option<NativeStorageCredit>>,
 }
-pub(crate) struct NativeStorageShared<T> { block: NonNull<NativeStorageSharedBlock<T>> }
+pub(crate) struct NativeStorageShared<T> {
+    block: NonNull<NativeStorageSharedBlock<T>>,
+}
 unsafe impl<T: Send + Sync> Send for NativeStorageShared<T> {}
 unsafe impl<T: Send + Sync> Sync for NativeStorageShared<T> {}
 impl<T> NativeStorageShared<T> {
-    pub(crate) fn layout() -> Layout { Layout::new::<NativeStorageSharedBlock<T>>() }
+    pub(crate) fn layout() -> Layout {
+        Layout::new::<NativeStorageSharedBlock<T>>()
+    }
     pub(crate) fn new(payload: T) -> Result<Self, NativeColdReadError> {
         let layout = Self::layout();
         let invoice = admit_native_storage(layout)?;
@@ -211,42 +280,80 @@ impl<T> NativeStorageShared<T> {
             // BEFORE returning this control invoice, including panic unwind.
             drop(payload);
             drop(invoice);
-            return Err(NativeColdReadError::Io(std::io::ErrorKind::OutOfMemory.into()));
+            return Err(NativeColdReadError::Io(
+                std::io::ErrorKind::OutOfMemory.into(),
+            ));
         };
-        unsafe { block.as_ptr().write(NativeStorageSharedBlock {
-            owners: AtomicUsize::new(1), payload: ManuallyDrop::new(payload),
-            ownership: Mutex::new(Some(invoice)),
-        }); }
+        unsafe {
+            block.as_ptr().write(NativeStorageSharedBlock {
+                owners: AtomicUsize::new(1),
+                payload: ManuallyDrop::new(payload),
+                ownership: Mutex::new(Some(invoice)),
+            });
+        }
         Ok(Self { block })
     }
-    pub(crate) fn get(&self) -> &T { unsafe { &self.block.as_ref().payload } }
+    pub(crate) fn get(&self) -> &T {
+        unsafe { &self.block.as_ref().payload }
+    }
     pub(crate) fn get_mut(&mut self) -> Option<&mut T> {
-        if unsafe { self.block.as_ref() }.owners.load(Ordering::Acquire) != 1 { return None; }
+        if unsafe { self.block.as_ref() }
+            .owners
+            .load(Ordering::Acquire)
+            != 1
+        {
+            return None;
+        }
         Some(unsafe { &mut self.block.as_mut().payload })
     }
 }
 impl<T> Clone for NativeStorageShared<T> {
     fn clone(&self) -> Self {
-        unsafe { self.block.as_ref() }.owners.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
-            |n| n.checked_add(1).filter(|n| *n <= isize::MAX as usize)).expect("native strong count overflow");
+        unsafe { self.block.as_ref() }
+            .owners
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                n.checked_add(1).filter(|n| *n <= isize::MAX as usize)
+            })
+            .expect("native strong count overflow");
         Self { block: self.block }
     }
 }
-struct SharedFree<T> { block: NonNull<NativeStorageSharedBlock<T>>, invoice: Option<NativeStorageCredit> }
+struct SharedFree<T> {
+    block: NonNull<NativeStorageSharedBlock<T>>,
+    invoice: Option<NativeStorageCredit>,
+}
 impl<T> Drop for SharedFree<T> {
     fn drop(&mut self) {
-        unsafe { dealloc(self.block.as_ptr().cast(), NativeStorageShared::<T>::layout()) };
+        unsafe {
+            dealloc(
+                self.block.as_ptr().cast(),
+                NativeStorageShared::<T>::layout(),
+            )
+        };
         drop(self.invoice.take());
     }
 }
 impl<T> Drop for NativeStorageShared<T> {
     fn drop(&mut self) {
-        if unsafe { self.block.as_ref() }.owners.fetch_sub(1, Ordering::Release) != 1 { return; }
+        if unsafe { self.block.as_ref() }
+            .owners
+            .fetch_sub(1, Ordering::Release)
+            != 1
+        {
+            return;
+        }
         fence(Ordering::Acquire);
         let block = unsafe { self.block.as_mut() };
-        let invoice = block.ownership.get_mut().unwrap_or_else(|e| e.into_inner()).take()
+        let invoice = block
+            .ownership
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
             .expect("native header keeps its genuine original invoice");
-        let _free = SharedFree { block: self.block, invoice: Some(invoice) };
+        let _free = SharedFree {
+            block: self.block,
+            invoice: Some(invoice),
+        };
         unsafe { ManuallyDrop::drop(&mut block.payload) };
     }
 }

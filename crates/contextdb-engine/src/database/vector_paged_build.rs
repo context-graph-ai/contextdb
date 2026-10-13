@@ -580,7 +580,12 @@ impl MaintenanceContext {
         // the declared writer budget: a tight budget advances one finite batch
         // per cycle, a roomy one finishes small partitions in a single cycle.
         // Free headroom is not used: it swings with resident caches.
-        let budget = self.finalization.accountant.usage().limit.unwrap_or(usize::MAX);
+        let budget = self
+            .finalization
+            .accountant
+            .usage()
+            .limit
+            .unwrap_or(usize::MAX);
         let batches = (budget / batch_bytes.saturating_mul(16).max(1))
             .clamp(PAGED_MIN_BATCHES_PER_CYCLE, PAGED_MAX_BATCHES_PER_CYCLE * 4);
         for _ in 0..batches {
@@ -729,7 +734,12 @@ impl MaintenanceContext {
             let export_bytes = paged_batch_plan(&declaration)?.workspace_bytes()?;
             needed = needed.max(plan.resident_export_phase_bytes(export_bytes));
         }
-        Ok(self.finalization.accountant.usage().available.is_none_or(|available| available >= needed))
+        Ok(self
+            .finalization
+            .accountant
+            .usage()
+            .available
+            .is_none_or(|available| available >= needed))
     }
 
     /// Price the same suffix and prior-base owners as resident publication.
@@ -830,7 +840,8 @@ impl MaintenanceContext {
 
     pub(super) fn workspace_plan_fits(&self, plan: VectorGenerationWorkspacePlan) -> bool {
         let needed = plan.complete_peak_bytes();
-        self.finalization.accountant
+        self.finalization
+            .accountant
             .usage()
             .available
             .is_none_or(|available| available >= needed)
@@ -1136,7 +1147,9 @@ impl MaintenanceContext {
             .saturating_mul(8)
             .saturating_add(64 * 1024);
         let mut candidate_workspace = self.vector.reserve_workspace(
-            Arc::clone(&self.finalization.vector_accountant), metadata_bytes, "prepare_vector_generation",
+            Arc::clone(&self.finalization.vector_accountant),
+            metadata_bytes,
+            "prepare_vector_generation",
             "Free writer memory before preparing paged publication metadata.",
         )?;
         // The build is complete: its last page write has committed, so this
@@ -1335,7 +1348,9 @@ impl MaintenanceContext {
         }
         impl Drop for CursorExit<'_> {
             fn drop(&mut self) {
-                if !self.keep { (*self.persistence).abandon_vector_repair_audit_cursor(); }
+                if !self.keep {
+                    (*self.persistence).abandon_vector_repair_audit_cursor();
+                }
             }
         }
         let mut cursor_exit = CursorExit {
@@ -1356,7 +1371,9 @@ impl MaintenanceContext {
         )?;
         let audit_scratch = if has_fence { 256 * 1024 } else { 0 };
         let mut workspace = self.vector.reserve_workspace(
-            Arc::clone(&self.finalization.vector_accountant), audit_scratch, "reclaim_paged_vector_generation",
+            Arc::clone(&self.finalization.vector_accountant),
+            audit_scratch,
+            "reclaim_paged_vector_generation",
             "Free writer memory before reclaiming retired vector pages.",
         )?;
         let attempt = (|| -> Result<_> {
@@ -1364,7 +1381,9 @@ impl MaintenanceContext {
             self.tx_mgr.with_maintenance_publication(|publication| {
                 self.build_checkpoint()?;
                 vector_source_page_admission::with_preparation_source_page_admission(
-                    crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
+                    crate::memory_accounting::AccountantHandle::clone(
+                        &self.finalization.accountant,
+                    ),
                     || {
                         publication.reserve()?;
                         let status =

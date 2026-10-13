@@ -15,13 +15,13 @@ use contextdb_core::read_contract::{
 use contextdb_core::{ContextId, Lsn, Principal, ScopeLabel, TxId, Value};
 #[cfg(any(test, feature = "test-seams"))]
 use contextdb_core::{RowId, VectorIndexRef};
-#[cfg(any(test, feature = "test-seams"))]
-use uuid::Uuid;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(any(test, feature = "test-seams"))]
+use uuid::Uuid;
 
 /// Inputs controlled by route assembly rather than by a file opener.
 #[derive(Clone)]
@@ -1040,7 +1040,12 @@ fn handoff_to_backend_neutral_reader(
 
     // No target observation is possible until this fallible call returns its
     // private receipt. The current narrow stub returns the typed missing seam.
-    let constructed = construct_backend_neutral_target(pending_image, retained_source, config, declared_read_memory)?;
+    let constructed = construct_backend_neutral_target(
+        pending_image,
+        retained_source,
+        config,
+        declared_read_memory,
+    )?;
     observation.checkpoint(HydrationPhase::BackendTargetConstructed {
         breadcrumb_path: breadcrumb_path.clone(),
     });
@@ -1287,7 +1292,13 @@ impl DirectFileReader {
         config: DirectReaderConfig,
         cancellation: &OwnerReadCancellation,
     ) -> Result<Self, DirectFileReaderError> {
-        Self::open_inner_with_cancellation(path, config, HydrationObservation::disabled(), None, cancellation)
+        Self::open_inner_with_cancellation(
+            path,
+            config,
+            HydrationObservation::disabled(),
+            None,
+            cancellation,
+        )
     }
 
     pub(crate) fn from_owner_snapshot_with_cancellation(
@@ -1297,7 +1308,11 @@ impl DirectFileReader {
         cancellation: &OwnerReadCancellation,
     ) -> Result<Self, DirectFileReaderError> {
         Self::open_inner_with_cancellation(
-            path, config, HydrationObservation::disabled(), Some(registration), cancellation,
+            path,
+            config,
+            HydrationObservation::disabled(),
+            Some(registration),
+            cancellation,
         )
     }
 
@@ -1307,7 +1322,13 @@ impl DirectFileReader {
         config: DirectReaderConfig,
         observation: HydrationObservation,
     ) -> Result<Self, DirectFileReaderError> {
-        Self::open_inner_with_cancellation(path, config, observation, None, &OwnerReadCancellation::new())
+        Self::open_inner_with_cancellation(
+            path,
+            config,
+            observation,
+            None,
+            &OwnerReadCancellation::new(),
+        )
     }
 
     fn open_inner_with_cancellation(
@@ -1319,13 +1340,17 @@ impl DirectFileReader {
     ) -> Result<Self, DirectFileReaderError> {
         // Resolve this image's declared parent once. Preparation and captured
         // directory reads retain one child; statements use this same parent.
-        let declared_read_memory = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(config.limits.memory);
+        let declared_read_memory =
+            crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(config.limits.memory);
         let open_context = crate::executor::bounded::ReadOpenContext::new(
-            declared_read_memory.child().map_err(crate::read_image::history_answer_error)?,
+            declared_read_memory
+                .child()
+                .map_err(crate::read_image::history_answer_error)?,
             config.limits,
             config.clock.clone(),
             cancellation.clone(),
-        ).map_err(crate::read_image::history_answer_error)?;
+        )
+        .map_err(crate::read_image::history_answer_error)?;
         let load = crate::persistence::load_read_image_at_registration_with_context(
             path,
             config.memory_limit,
@@ -1848,7 +1873,9 @@ pub mod test_seams {
         let mut image = (*reader.image).clone();
         image.sync = reader.target.committed_sync_state(
             &|| Ok(()),
-            &crate::read_image_memory::ImageMemory::charging(reader.image_memory.accountant.clone()),
+            &crate::read_image_memory::ImageMemory::charging(
+                reader.image_memory.accountant.clone(),
+            ),
         )?;
         Ok(image)
     }

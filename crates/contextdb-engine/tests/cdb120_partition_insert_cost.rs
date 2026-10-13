@@ -19,7 +19,9 @@ use uuid::Uuid;
 static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
 fn serial() -> MutexGuard<'static, ()> {
-    ONE_AT_A_TIME.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn none() -> HashMap<String, Value> {
@@ -47,11 +49,19 @@ fn create(db: &Database, cap: u32, history: &str) {
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
 }
 
-fn sql_insert(db: &Database, tx: Option<contextdb_core::TxId>, row: u64, scope: &str) -> contextdb_core::Result<()> {
+fn sql_insert(
+    db: &Database,
+    tx: Option<contextdb_core::TxId>,
+    row: u64,
+    scope: &str,
+) -> contextdb_core::Result<()> {
     let params = HashMap::from([
         ("id".to_owned(), Value::Uuid(id(row))),
         ("scope".to_owned(), Value::Text(scope.to_owned())),
-        ("v".to_owned(), Value::Vector(vec![1.0, (row % 97) as f32 / 97.0])),
+        (
+            "v".to_owned(),
+            Value::Vector(vec![1.0, (row % 97) as f32 / 97.0]),
+        ),
     ]);
     let sql = "INSERT INTO items (id, scope, embedding) VALUES ($id, $scope, $v)";
     match tx {
@@ -105,11 +115,17 @@ fn assert_exact(db: &Database, step: &str) {
         .partition_limit_audit_for_test(&index())
         .expect("the partitioned column is registered");
     assert_eq!(audit.occupied, audit.recounted_occupied, "{step}: occupied");
-    let (mut maintained, mut recounted) = (audit.empty_counted.clone(), audit.recounted_empty_counted.clone());
+    let (mut maintained, mut recounted) = (
+        audit.empty_counted.clone(),
+        audit.recounted_empty_counted.clone(),
+    );
     maintained.sort();
     recounted.sort();
     assert_eq!(maintained, recounted, "{step}: counted-empty set");
-    assert_eq!(audit.directory_bytes, audit.recounted_directory_bytes, "{step}: directory bytes");
+    assert_eq!(
+        audit.directory_bytes, audit.recounted_directory_bytes,
+        "{step}: directory bytes"
+    );
 }
 
 fn is_cap_refusal(error: &Error, cap: u32) -> bool {
@@ -125,13 +141,18 @@ impl Flavor {
     fn open(&self) -> Database {
         match self {
             Flavor::Resident => Database::open_memory(),
-            Flavor::Durable(dir) => Database::open(dir.path().join("cdb120.redb")).expect("open durable fixture"),
+            Flavor::Durable(dir) => {
+                Database::open(dir.path().join("cdb120.redb")).expect("open durable fixture")
+            }
         }
     }
     fn all() -> Vec<(&'static str, Flavor)> {
         vec![
             ("resident", Flavor::Resident),
-            ("durable", Flavor::Durable(TempDir::new().expect("temp dir"))),
+            (
+                "durable",
+                Flavor::Durable(TempDir::new().expect("temp dir")),
+            ),
         ]
     }
 }
@@ -177,12 +198,23 @@ fn r1_one_row_insert_costs_one_route_at_64_and_at_4096_partitions() {
                 after_existing.cap_edge_route_visits - after_new.cap_edge_route_visits,
                 after_existing.hold_lookups - after_new.hold_lookups,
             );
-            assert_eq!(new_key, (1, 0, 0), "{label} K={partitions}: new-key insert work");
-            assert_eq!(existing, (1, 0, 0), "{label} K={partitions}: existing-key insert work");
+            assert_eq!(
+                new_key,
+                (1, 0, 0),
+                "{label} K={partitions}: new-key insert work"
+            );
+            assert_eq!(
+                existing,
+                (1, 0, 0),
+                "{label} K={partitions}: existing-key insert work"
+            );
             assert_exact(&db, "after the two inserts");
             per_size.push((new_key, existing));
         }
-        assert_eq!(per_size[0], per_size[1], "{label}: per-insert work is identical at 64 and 4096 partitions");
+        assert_eq!(
+            per_size[0], per_size[1],
+            "{label}: per-insert work is identical at 64 and 4096 partitions"
+        );
     }
 }
 
@@ -197,14 +229,24 @@ fn r1b_cap_four_refuses_the_fifth_key_and_admits_the_fourth() {
         let db = flavor.open();
         create(&db, 4, "HISTORY CURRENT ONLY");
         for n in 0..3 {
-            sql_insert(&db, None, n, &format!("k{n}")).unwrap_or_else(|e| panic!("{label}: key {n} below the cap: {e}"));
+            sql_insert(&db, None, n, &format!("k{n}"))
+                .unwrap_or_else(|e| panic!("{label}: key {n} below the cap: {e}"));
         }
-        sql_insert(&db, None, 3, "k3").unwrap_or_else(|e| panic!("{label}: the fourth key is the cap, not above it: {e}"));
+        sql_insert(&db, None, 3, "k3")
+            .unwrap_or_else(|e| panic!("{label}: the fourth key is the cap, not above it: {e}"));
         let refusal = sql_insert(&db, None, 4, "k4").expect_err("the fifth key exceeds the cap");
-        assert!(is_cap_refusal(&refusal, 4), "{label}: typed refusal, got {refusal:?}");
+        assert!(
+            is_cap_refusal(&refusal, 4),
+            "{label}: typed refusal, got {refusal:?}"
+        );
         assert_exact(&db, "after refusal");
-        sql_insert(&db, None, 5, "k0").unwrap_or_else(|e| panic!("{label}: an existing key stays writable at the cap: {e}"));
-        let rows = db.execute("SELECT id FROM items", &none()).unwrap().rows.len();
+        sql_insert(&db, None, 5, "k0")
+            .unwrap_or_else(|e| panic!("{label}: an existing key stays writable at the cap: {e}"));
+        let rows = db
+            .execute("SELECT id FROM items", &none())
+            .unwrap()
+            .rows
+            .len();
         assert_eq!(rows, 5, "{label}: the refused write left no row behind");
     }
 }
@@ -233,15 +275,23 @@ fn make_historical_routes(db: &Database) {
         for (row, _) in &keys {
             sql_delete(db, None, *row);
         }
-        db.run_maintenance_cycle().expect("retire the emptied routes to historical-only");
+        db.run_maintenance_cycle()
+            .expect("retire the emptied routes to historical-only");
         assert_exact(db, "after a historical wave");
     }
-    let audit = db.vector_store_for_test().partition_limit_audit_for_test(&index()).unwrap();
-    assert_eq!(audit.occupied, 0, "historical-only routes do not count against the cap");
+    let audit = db
+        .vector_store_for_test()
+        .partition_limit_audit_for_test(&index())
+        .unwrap();
+    assert_eq!(
+        audit.occupied, 0,
+        "historical-only routes do not count against the cap"
+    );
 }
 
 #[test]
-fn r3_edge_refuses_exactly_as_the_base_does_visits_no_historical_route_and_admits_after_retirement() {
+fn r3_edge_refuses_exactly_as_the_base_does_visits_no_historical_route_and_admits_after_retirement()
+{
     let _one = serial();
     for (label, flavor) in Flavor::all() {
         let db = flavor.open();
@@ -249,19 +299,38 @@ fn r3_edge_refuses_exactly_as_the_base_does_visits_no_historical_route_and_admit
         make_historical_routes(&db);
         // Seven routes whose last vector is gone but whose old image a pin
         // still sees, and one live route: the cap is full.
-        seed(&db, (0..EMPTIES).map(|n| (100 + n, format!("a{n}"))).chain([(300, "l".to_owned())]));
+        seed(
+            &db,
+            (0..EMPTIES)
+                .map(|n| (100 + n, format!("a{n}")))
+                .chain([(300, "l".to_owned())]),
+        );
         let held = db.pin_snapshot(db.snapshot());
         for n in 0..EMPTIES {
             sql_delete(&db, None, 100 + n);
         }
-        let audit = db.vector_store_for_test().partition_limit_audit_for_test(&index()).unwrap();
-        assert_eq!(audit.occupied, EDGE_CAP as usize, "{label}: the cap is full");
-        assert_eq!(audit.empty_counted.len() as u64, EMPTIES, "{label}: seven counted-empty routes");
+        let audit = db
+            .vector_store_for_test()
+            .partition_limit_audit_for_test(&index())
+            .unwrap();
+        assert_eq!(
+            audit.occupied, EDGE_CAP as usize,
+            "{label}: the cap is full"
+        );
+        assert_eq!(
+            audit.empty_counted.len() as u64,
+            EMPTIES,
+            "{label}: seven counted-empty routes"
+        );
         assert_exact(&db, "cap is full of counted routes");
 
         let before = counters(&db);
-        let refusal = sql_insert(&db, None, 400, "brand-new").expect_err("every counted route is held");
-        assert!(is_cap_refusal(&refusal, EDGE_CAP), "{label}: typed refusal, got {refusal:?}");
+        let refusal =
+            sql_insert(&db, None, 400, "brand-new").expect_err("every counted route is held");
+        assert!(
+            is_cap_refusal(&refusal, EDGE_CAP),
+            "{label}: typed refusal, got {refusal:?}"
+        );
         let visits = counters(&db).cap_edge_route_visits - before.cap_edge_route_visits;
         assert!(
             visits <= EMPTIES,
@@ -269,13 +338,17 @@ fn r3_edge_refuses_exactly_as_the_base_does_visits_no_historical_route_and_admit
         );
         assert_exact(&db, "after the refusal");
         assert_eq!(
-            db.execute("SELECT id FROM items", &none()).unwrap().rows.len(),
+            db.execute("SELECT id FROM items", &none())
+                .unwrap()
+                .rows
+                .len(),
             1,
             "{label}: the refused write left no row"
         );
 
         drop(held);
-        db.run_maintenance_cycle().expect("retire the unheld emptied routes");
+        db.run_maintenance_cycle()
+            .expect("retire the unheld emptied routes");
         sql_insert(&db, None, 400, "brand-new")
             .unwrap_or_else(|e| panic!("{label}: after retirement the cap has room: {e}"));
         assert_exact(&db, "after retirement and admission");
@@ -311,7 +384,10 @@ impl PinAt {
         PinAt::SeesTheLiveVector,
     ];
     fn route_is_held(self) -> bool {
-        matches!(self, PinAt::InsideFirstBurst | PinAt::InsideSecondBurst | PinAt::SeesTheLiveVector)
+        matches!(
+            self,
+            PinAt::InsideFirstBurst | PinAt::InsideSecondBurst | PinAt::SeesTheLiveVector
+        )
     }
 }
 
@@ -328,7 +404,9 @@ fn delete_rows(db: &Database, first: u64, n: u64) {
 fn history_route<'a>(db: &'a Database, n: u64, at: PinAt) -> SnapshotPin<'a> {
     create(db, 4, "HISTORY ALL");
     let mut pins: Vec<(PinAt, SnapshotPin<'a>)> = Vec::new();
-    let mut pin = |db: &'a Database, which: PinAt| pins.push((which, db.pin_snapshot(db.snapshot()).expect("pin snapshot")));
+    let mut pin = |db: &'a Database, which: PinAt| {
+        pins.push((which, db.pin_snapshot(db.snapshot()).expect("pin snapshot")))
+    };
     pin(db, PinAt::BeforeEverything);
     seed(db, (0..3).map(|k| (900 + k, format!("live{k}"))));
     seed(db, (0..n).map(|k| (10_000 + k, "x".to_owned())));
@@ -341,18 +419,26 @@ fn history_route<'a>(db: &'a Database, n: u64, at: PinAt) -> SnapshotPin<'a> {
     pin(db, PinAt::AfterLastCloseBeforeLiveVector);
     seed(db, [(30_000, "x".to_owned())]);
     pin(db, PinAt::SeesTheLiveVector);
-    let chosen = pins.iter().position(|(which, _)| *which == at).expect("the chosen pin was taken");
+    let chosen = pins
+        .iter()
+        .position(|(which, _)| *which == at)
+        .expect("the chosen pin was taken");
     pins.swap_remove(chosen).1
 }
 
 #[test]
-fn r3_extension_the_last_vector_move_reads_no_history_while_a_route_grows_from_16_to_4096_memberships() {
+fn r3_extension_the_last_vector_move_reads_no_history_while_a_route_grows_from_16_to_4096_memberships()
+ {
     let _one = serial();
     for (label, _) in Flavor::all() {
         for at in PinAt::ALL {
             let mut observed = Vec::new();
             // Durable commits cost ~12 ms a row, so the durable column grows 16x, the resident 256x.
-            let sizes = if label == "resident" { [16_u64, 4096] } else { [16_u64, 256] };
+            let sizes = if label == "resident" {
+                [16_u64, 4096]
+            } else {
+                [16_u64, 256]
+            };
             for n in sizes {
                 let flavor = if label == "resident" {
                     Flavor::Resident
@@ -370,8 +456,12 @@ fn r3_extension_the_last_vector_move_reads_no_history_while_a_route_grows_from_1
                 match (&outcome, at.route_is_held()) {
                     (Err(e), true) => assert!(is_cap_refusal(e, 4), "{label} {at:?} n={n}: {e:?}"),
                     (Ok(()), false) => {}
-                    (Ok(()), true) => panic!("{label} {at:?} n={n}: a pin that sees x must keep it counted"),
-                    (Err(e), false) => panic!("{label} {at:?} n={n}: no pin sees x but the move was refused: {e}"),
+                    (Ok(()), true) => {
+                        panic!("{label} {at:?} n={n}: a pin that sees x must keep it counted")
+                    }
+                    (Err(e), false) => {
+                        panic!("{label} {at:?} n={n}: no pin sees x but the move was refused: {e}")
+                    }
                 }
                 assert_exact(&db, "after the move");
                 let streamed = after.hold_streamed_records - before.hold_streamed_records;
@@ -379,7 +469,11 @@ fn r3_extension_the_last_vector_move_reads_no_history_while_a_route_grows_from_1
                     streamed, 0,
                     "{label} {at:?} n={n}: the hold check streamed {streamed} membership records instead of using the interval index"
                 );
-                observed.push((after.hold_lookups - before.hold_lookups, outcome.is_ok(), decoded));
+                observed.push((
+                    after.hold_lookups - before.hold_lookups,
+                    outcome.is_ok(),
+                    decoded,
+                ));
             }
             assert_eq!(
                 observed[0], observed[1],
@@ -404,13 +498,20 @@ fn r4_the_same_insert_fits_the_same_headroom_as_unrelated_partitions_grow_16x() 
         let accountant = Arc::new(MemoryAccountant::no_limit());
         let db = Database::open_memory_with_accountant(accountant.clone());
         create(&db, 8192, "HISTORY CURRENT ONLY");
-        seed(&db, (0..partitions).flat_map(|n| [(n * 2, format!("p{n}")), (n * 2 + 1, format!("p{n}"))]));
+        seed(
+            &db,
+            (0..partitions).flat_map(|n| [(n * 2, format!("p{n}")), (n * 2 + 1, format!("p{n}"))]),
+        );
         let settled = accountant.usage().used;
         accountant.set_budget(Some(settled + HEADROOM)).unwrap();
-        sql_insert(&db, None, 900_000, "fresh-key")
-            .unwrap_or_else(|e| panic!("{partitions} partitions: a new-key insert inside {HEADROOM} bytes of headroom: {e}"));
-        sql_insert(&db, None, 900_001, "p3")
-            .unwrap_or_else(|e| panic!("{partitions} partitions: an existing-key insert inside the headroom: {e}"));
+        sql_insert(&db, None, 900_000, "fresh-key").unwrap_or_else(|e| {
+            panic!(
+                "{partitions} partitions: a new-key insert inside {HEADROOM} bytes of headroom: {e}"
+            )
+        });
+        sql_insert(&db, None, 900_001, "p3").unwrap_or_else(|e| {
+            panic!("{partitions} partitions: an existing-key insert inside the headroom: {e}")
+        });
         assert_eq!(accountant.underflow_count_for_test(), 0);
         assert_exact(&db, "after the budgeted inserts");
     }
@@ -439,15 +540,21 @@ fn r2_cap_figures_stay_exact_through_insert_move_delete_reclaim_refusal_reopen()
         sql_delete(&db, None, 0);
         assert_exact(&db, "delete under a pin");
         let held_move = sql_move(&db, 1, "k5").unwrap_err();
-        assert!(is_cap_refusal(&held_move, 4), "{label}: a pinned source keeps its slot: {held_move:?}");
+        assert!(
+            is_cap_refusal(&held_move, 4),
+            "{label}: a pinned source keeps its slot: {held_move:?}"
+        );
         assert_exact(&db, "refused move");
         drop(pin);
-        sql_move(&db, 1, "k5").unwrap_or_else(|e| panic!("{label}: the unpinned last-vector move reuses its slot: {e}"));
+        sql_move(&db, 1, "k5").unwrap_or_else(|e| {
+            panic!("{label}: the unpinned last-vector move reuses its slot: {e}")
+        });
         assert_exact(&db, "move");
 
         db.run_maintenance_cycle().unwrap();
         assert_exact(&db, "maintenance reclaim");
-        sql_insert(&db, None, 10, "k6").unwrap_or_else(|e| panic!("{label}: the reclaimed slot admits a new key: {e}"));
+        sql_insert(&db, None, 10, "k6")
+            .unwrap_or_else(|e| panic!("{label}: the reclaimed slot admits a new key: {e}"));
         assert_exact(&db, "insert into a reclaimed slot");
 
         if let Flavor::Durable(_) = &flavor {
@@ -456,7 +563,10 @@ fn r2_cap_figures_stay_exact_through_insert_move_delete_reclaim_refusal_reopen()
             assert_exact(&reopened, "reopen");
             reopened.set_maintenance_policy(MaintenancePolicy::CallerDriven);
             let refusal = sql_insert(&reopened, None, 11, "k7").unwrap_err();
-            assert!(is_cap_refusal(&refusal, 4), "reopened store enforces the same cap: {refusal:?}");
+            assert!(
+                is_cap_refusal(&refusal, 4),
+                "reopened store enforces the same cap: {refusal:?}"
+            );
             assert_exact(&reopened, "refusal after reopen");
         }
     }
@@ -495,10 +605,19 @@ fn r2_a_process_death_after_durable_commits_reopens_with_exact_cap_figures() {
         .env(CRASH_PATH_ENV, &path)
         .status()
         .expect("spawn the crash child");
-    assert!(!status.success(), "the child must die by abort, got {status:?}");
+    assert!(
+        !status.success(),
+        "the child must die by abort, got {status:?}"
+    );
     let db = Database::open(&path).expect("reopen after the process death");
     assert_exact(&db, "after the crash");
-    assert_eq!(db.execute("SELECT id FROM items", &none()).unwrap().rows.len(), 4);
+    assert_eq!(
+        db.execute("SELECT id FROM items", &none())
+            .unwrap()
+            .rows
+            .len(),
+        4
+    );
     // The emptied route does not survive the restart, so one slot is free again.
     sql_insert(&db, None, 29, "k8").expect("a free slot admits a new key");
     let refusal = sql_insert(&db, None, 30, "k9").unwrap_err();

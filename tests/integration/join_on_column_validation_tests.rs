@@ -183,17 +183,21 @@ fn join_on_valid_column_with_rows_still_works() {
                 ("source", Value::Uuid(source_id)),
                 ("sequence", Value::Int64(sequence)),
             ]),
-        ).unwrap();
+        )
+        .unwrap();
     }
     let expected = vec![vec![Value::Int64(1), Value::Int64(100), Value::Int64(9)]];
     for sql in [
         "SELECT t.a, s.x, join_limits.committed_sequence FROM t INNER JOIN s ON t.id = s.id INNER JOIN join_limits ON s.id = join_limits.source_id WHERE join_limits.committed_sequence >= 8 AND join_limits.committed_sequence < 10",
         "SELECT events.a, cursors.x, limits.committed_sequence FROM t AS events INNER JOIN s AS cursors ON events.id = cursors.id INNER JOIN join_limits AS limits ON cursors.id = limits.source_id WHERE limits.committed_sequence >= 8 AND limits.committed_sequence < 10",
     ] {
-        let joined = db.execute(sql, &empty())
+        let joined = db
+            .execute(sql, &empty())
             .expect("three-table join resolves qualified columns from every input");
-        assert_eq!(joined.rows, expected,
-            "third-table WHERE excludes both low and high sequences without losing the second input's qualifier");
+        assert_eq!(
+            joined.rows, expected,
+            "third-table WHERE excludes both low and high sequences without losing the second input's qualifier"
+        );
     }
 }
 

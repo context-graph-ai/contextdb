@@ -24,7 +24,10 @@ use bao_tree::io::outboard::PreOrderOutboard;
 use bao_tree::io::sync::{CreateOutboard, ReadAt, WriteAt};
 use bao_tree::io::{BaoContentItem, EncodeError, Leaf};
 use bao_tree::{BaoTree, ChunkNum, ChunkRanges};
-use contextdb_core::{Error, Result, read_memory::{ReadCredit, ReadMemoryBudget}};
+use contextdb_core::{
+    Error, Result,
+    read_memory::{ReadCredit, ReadMemoryBudget},
+};
 use iroh::endpoint::VarInt;
 use iroh_blobs::api::Store;
 use iroh_blobs::api::blobs::BlobStatus;
@@ -140,17 +143,26 @@ const SOURCE_CONTROL_BYTES: usize = crate::local_transport::BLOB_SOURCE_REFUSAL_
 fn malformed_source_control() -> Error {
     use contextdb_core::read_contract::{ReadFailure, ReadFailureDetail, ReadFailureKind};
     Error::ReadFailure(
-        ReadFailure::new(ReadFailureKind::LocalProtocolMismatch, ReadFailureDetail::None)
-            .expect("bare protocol refusal is valid"),
+        ReadFailure::new(
+            ReadFailureKind::LocalProtocolMismatch,
+            ReadFailureDetail::None,
+        )
+        .expect("bare protocol refusal is valid"),
     )
 }
 
-async fn send_source_error<W: SendStream>(send: &mut W, error: &Error) -> std::result::Result<(), ()> {
+async fn send_source_error<W: SendStream>(
+    send: &mut W,
+    error: &Error,
+) -> std::result::Result<(), ()> {
     let mut payload = [0u8; SOURCE_CONTROL_BYTES];
     let length = crate::local_transport::encode_read_error_into_slice(error, &mut payload)
-        .or_else(|_| crate::local_transport::encode_read_error_into_slice(
-            &malformed_source_control(), &mut payload,
-        ))
+        .or_else(|_| {
+            crate::local_transport::encode_read_error_into_slice(
+                &malformed_source_control(),
+                &mut payload,
+            )
+        })
         .map_err(|_| ())?;
     let mut header = [1u8, 0, 0, 0, 0];
     header[1..].copy_from_slice(&(length as u32).to_be_bytes());
@@ -200,7 +212,8 @@ impl<R: RecvStream> ControlledRecv<R> {
         let mut header = [0u8; 5];
         if let Err(error) = self.inner.recv_exact(&mut header).await {
             if error.kind() == std::io::ErrorKind::UnexpectedEof {
-                *self.failure.lock().expect("control failure lock") = Some(malformed_source_control());
+                *self.failure.lock().expect("control failure lock") =
+                    Some(malformed_source_control());
             }
             return Err(error);
         }
@@ -215,25 +228,34 @@ impl<R: RecvStream> ControlledRecv<R> {
             // The fixed ceiling bounds the terminal error representation; its
             // frame credit releases when conversion to the core error finishes.
             let credit = ReadCredit::try_new(
-                self.read_memory.clone(), length,
-                "blob", "source_refusal", "Raise the requesting reader's memory limit.",
+                self.read_memory.clone(),
+                length,
+                "blob",
+                "source_refusal",
+                "Raise the requesting reader's memory limit.",
             );
             match credit {
                 Err(error) => error,
                 Ok(_credit) => {
                     let mut payload = [0u8; SOURCE_CONTROL_BYTES];
                     if let Err(error) = self.inner.recv_exact(&mut payload[..length]).await {
-                        *self.failure.lock().expect("control failure lock") = Some(malformed_source_control());
+                        *self.failure.lock().expect("control failure lock") =
+                            Some(malformed_source_control());
                         return Err(error);
                     }
                     crate::local_transport::decode_read_error_under_memory_ceiling(
-                        &payload[..length], SOURCE_CONTROL_BYTES as u64,
-                    ).unwrap_or_else(|_| malformed_source_control())
+                        &payload[..length],
+                        SOURCE_CONTROL_BYTES as u64,
+                    )
+                    .unwrap_or_else(|_| malformed_source_control())
                 }
             }
         };
         *self.failure.lock().expect("control failure lock") = Some(error);
-        Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "blob source refusal"))
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "blob source refusal",
+        ))
     }
 }
 
@@ -2638,22 +2660,23 @@ pub(crate) async fn fetch_into_sink(
     holder_node_id: Option<&mut String>,
     export_offset: u64,
 ) -> std::result::Result<FetchOutcome, FetchFailure> {
-    let outcome = match fetch_into_local_store(store, identity_path, ticket, hash, read_memory).await {
-        Ok(outcome) => outcome,
-        Err(failure) => {
-            if matches!(failure, FetchFailure::Aborted) {
-                // The local store already committed whatever it verified
-                // before the abort (bao writes verified chunks
-                // incrementally). Export that verified partial prefix into
-                // the caller's sink so a retry can resume from it, then
-                // still report the abort. Refusals (Unentitled/Policy/
-                // NotFound) never reach here — they leave the sink empty,
-                // since no fetch ever ran.
-                let _ = export_local_into_sink(store, hash, sink, export_offset, false).await;
+    let outcome =
+        match fetch_into_local_store(store, identity_path, ticket, hash, read_memory).await {
+            Ok(outcome) => outcome,
+            Err(failure) => {
+                if matches!(failure, FetchFailure::Aborted) {
+                    // The local store already committed whatever it verified
+                    // before the abort (bao writes verified chunks
+                    // incrementally). Export that verified partial prefix into
+                    // the caller's sink so a retry can resume from it, then
+                    // still report the abort. Refusals (Unentitled/Policy/
+                    // NotFound) never reach here — they leave the sink empty,
+                    // since no fetch ever ran.
+                    let _ = export_local_into_sink(store, hash, sink, export_offset, false).await;
+                }
+                return Err(failure);
             }
-            return Err(failure);
-        }
-    };
+        };
     if let Some(slot) = holder_node_id {
         *slot = outcome.holder_node_id;
     }
@@ -2698,8 +2721,11 @@ async fn run_verified_fetch(
     let _control_owner = ReadCredit::try_new(
         read_memory.clone(),
         std::mem::size_of::<Mutex<Option<Error>>>() + 2 * std::mem::size_of::<usize>(),
-        "blob", "source_control_owner", "Raise the requesting reader's memory limit.",
-    ).map_err(FetchFailure::SourceError)?;
+        "blob",
+        "source_control_owner",
+        "Raise the requesting reader's memory limit.",
+    )
+    .map_err(FetchFailure::SourceError)?;
     let control_failure = Arc::new(Mutex::new(None));
     let streams = ControlledGetStreams {
         connection: peer.connection.clone(),
@@ -2722,7 +2748,8 @@ async fn run_verified_fetch(
                 return Ok(stats.payload_bytes_read.max(last_payload));
             }
             GetProgressItem::Error(err) => {
-                if let Some(failure) = control_failure.lock().expect("control failure lock").take() {
+                if let Some(failure) = control_failure.lock().expect("control failure lock").take()
+                {
                     return Err(FetchFailure::SourceError(failure));
                 }
                 return Err(classify_get_error(err, hash));

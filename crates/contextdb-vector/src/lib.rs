@@ -34,8 +34,6 @@ pub use store::{
     VectorPartitionInfo, VectorPartitionRef, VectorRouteQuarantineReason, VectorStore,
     VectorTeardownReceipt, VectorVersionIdentity,
 };
-#[doc(hidden)]
-pub use store::{VectorMemoryOwnershipSnapshot, WriterVectorTail};
 #[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub use store::{VectorCapWorkCountersForTest, VectorPartitionLimitAuditForTest};
@@ -49,6 +47,8 @@ pub use store::{
 #[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub use store::{VectorMaintenanceProgressPauseHandle, VectorPassiveActivityCounters};
+#[doc(hidden)]
+pub use store::{VectorMemoryOwnershipSnapshot, WriterVectorTail};
 
 #[cfg(feature = "test-seams")]
 #[doc(hidden)]

@@ -467,8 +467,14 @@ fn assert_final_writer_refund(writer: crate::memory_accounting::AccountantHandle
     // counter. Their private seam reports the live identities and typed
     // layouts; it is not an allocator measurement.
     let (native_origin, controls) = writer.native_backing_for_test();
-    assert!(native_origin, "this diagnostic retains an engine-created writer");
-    let backing = controls.iter().map(|(_, layout)| layout.size()).sum::<usize>();
+    assert!(
+        native_origin,
+        "this diagnostic retains an engine-created writer"
+    );
+    let backing = controls
+        .iter()
+        .map(|(_, layout)| layout.size())
+        .sum::<usize>();
     assert_eq!(
         writer.usage().used,
         backing,

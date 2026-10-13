@@ -82,7 +82,11 @@ pub(crate) mod vector_membership_source;
 pub(crate) mod vector_paged;
 mod vector_saved;
 pub(crate) use schema_binding::VectorSchemaBinding;
+mod custody_groups;
 pub(crate) mod history_root_witness;
+#[allow(dead_code)]
+// Staged native storage admission is inactive until its integration prerequisites land.
+pub(crate) mod native_storage_admission;
 #[cfg(test)]
 mod vector_streamed_frame_tests;
 pub(crate) mod writer_adapters;
@@ -91,14 +95,11 @@ mod writer_commit_directory;
 mod writer_ddl_occurrences;
 mod writer_ddl_summary;
 mod writer_export;
-mod custody_groups;
 mod writer_file;
 mod writer_history;
 mod writer_recovery;
 mod writer_row_heads;
 pub(crate) mod writer_source;
-#[allow(dead_code)] // Staged native storage admission is inactive until its integration prerequisites land.
-pub(crate) mod native_storage_admission;
 use writer_file::{LockedWriterFile, OpenedWriterDatabase};
 #[allow(unused_imports)] // Recovery types are consumed by writer integration.
 pub(crate) use writer_recovery::{WriterOpenBounds, WriterRecoveryBounds};
@@ -616,7 +617,10 @@ impl DurableRelationalIndexKey {
         let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
         let position = RedbPersistence::decode::<EncodedRelationalIndexPosition>(&self.0)?;
         crate::read_image_memory::reserve(
-            position.key.len().saturating_mul(std::mem::size_of::<DirectedValue>()),
+            position
+                .key
+                .len()
+                .saturating_mul(std::mem::size_of::<DirectedValue>()),
         )?;
         Ok(position.into())
     }
@@ -634,13 +638,11 @@ impl DurableRelationalIndexKey {
     fn decode_canonical(&self) -> Result<RelationalIndexPosition> {
         let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
         let position = RedbPersistence::decode_exact::<EncodedRelationalIndexPosition>(&self.0)
-            .map_err(|error| {
-                match error {
-                    Error::Other(reason) => Error::Other(format!(
-                        "durable index position is not an exactly decodable key: {reason}"
-                    )),
-                    other => other,
-                }
+            .map_err(|error| match error {
+                Error::Other(reason) => Error::Other(format!(
+                    "durable index position is not an exactly decodable key: {reason}"
+                )),
+                other => other,
             })?;
         // Count without allocating, then fund an exact buffer before re-encoding.
         let mut size = bincode::enc::write::SizeWriter::default();
@@ -656,7 +658,10 @@ impl DurableRelationalIndexKey {
             ));
         }
         crate::read_image_memory::reserve(
-            position.key.len().saturating_mul(std::mem::size_of::<DirectedValue>()),
+            position
+                .key
+                .len()
+                .saturating_mul(std::mem::size_of::<DirectedValue>()),
         )?;
         Ok(position.into())
     }
@@ -2027,11 +2032,12 @@ impl ReadPersistenceImage {
         if self.history_on_request.is_some() {
             let checkpoint = || self.open_context.checkpoint();
             let read_memory = self.open_context.read_memory();
-            let history = retained_source.load_history(
-                &Arc::new(crate::memory_accounting::MemoryAccountant::no_limit()).into(),
-                &checkpoint,
-                read_memory.clone(),
-            )
+            let history = retained_source
+                .load_history(
+                    &Arc::new(crate::memory_accounting::MemoryAccountant::no_limit()).into(),
+                    &checkpoint,
+                    read_memory.clone(),
+                )
                 .map_err(crate::database::ImageHistoryError::into_engine_error)?;
             self.change_log = history.change_log;
             self.ddl_log = history.ddl_log;
@@ -5232,17 +5238,27 @@ struct SourceMemoryReservation {
 impl SourceMemoryReservation {
     fn new(memory: Arc<crate::read_image_memory::ImageMemory>, bytes: usize) -> Result<Self> {
         memory.reserve(bytes)?;
-        Ok(Self { memory, bytes: std::sync::atomic::AtomicUsize::new(bytes) })
+        Ok(Self {
+            memory,
+            bytes: std::sync::atomic::AtomicUsize::new(bytes),
+        })
     }
     fn detach_control(&self, bytes: usize) -> Result<crate::memory_accounting::ControlCredit> {
-        self.bytes.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| held.checked_sub(bytes))
-            .map_err(|_| Error::Other("source control exceeds its existing fixed reservation".into()))?;
+        self.bytes
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
+                held.checked_sub(bytes)
+            })
+            .map_err(|_| {
+                Error::Other("source control exceeds its existing fixed reservation".into())
+            })?;
         match self.memory.detach_direct_source_credit(bytes) {
             Ok(credit) => Ok(credit),
-            Err(error) => { self.bytes.fetch_add(bytes, Ordering::SeqCst); Err(error) }
+            Err(error) => {
+                self.bytes.fetch_add(bytes, Ordering::SeqCst);
+                Err(error)
+            }
         }
     }
-
 }
 
 impl Drop for SourceMemoryReservation {
@@ -6343,10 +6359,9 @@ impl CheckpointReadSource {
             "export_decode_owner",
             "Raise the declared reader memory limit.",
         )?;
-        let bridge = self
-            .accountant
-            .clone()
-            .unwrap_or_else(|| Arc::new(crate::memory_accounting::MemoryAccountant::no_limit()).into());
+        let bridge = self.accountant.clone().unwrap_or_else(|| {
+            Arc::new(crate::memory_accounting::MemoryAccountant::no_limit()).into()
+        });
         let decoded = crate::read_image_memory::ImageMemory::charging_reader(bridge, read_memory);
         let (filled, mut admission) =
             decoded.scope(|| self.load_export_row_values(name, meta, rows))?;
@@ -6363,8 +6378,8 @@ impl CheckpointReadSource {
     ) -> Result<(usize, ExportBodyAdmission)> {
         // Explicit export readers supply their own child. Standalone writer
         // exports retain the captured source's writer funder.
-        let memory = crate::read_image_memory::active_owner()
-            .unwrap_or_else(|_| self.decode_memory.clone());
+        let memory =
+            crate::read_image_memory::active_owner().unwrap_or_else(|_| self.decode_memory.clone());
         let admission = ExportBodyAdmission::empty(memory.row_owner()?);
         if rows.is_empty() {
             return Ok((0, admission));
@@ -6565,10 +6580,9 @@ impl CheckpointReadSource {
             "export_decode_owner",
             "Raise the declared reader memory limit.",
         )?;
-        let bridge = self
-            .accountant
-            .clone()
-            .unwrap_or_else(|| Arc::new(crate::memory_accounting::MemoryAccountant::no_limit()).into());
+        let bridge = self.accountant.clone().unwrap_or_else(|| {
+            Arc::new(crate::memory_accounting::MemoryAccountant::no_limit()).into()
+        });
         let decoded = crate::read_image_memory::ImageMemory::charging_reader(bridge, read_memory);
         decoded.scope(|| self.overlay_export_row_f32_projections(name, meta, rows))?;
         Ok((decoded, controls))
@@ -6582,8 +6596,8 @@ impl CheckpointReadSource {
     ) -> Result<ExportBodyAdmission> {
         // Explicit export readers supply their own child. Standalone writer
         // exports retain the captured source's writer funder.
-        let memory = crate::read_image_memory::active_owner()
-            .unwrap_or_else(|_| self.decode_memory.clone());
+        let memory =
+            crate::read_image_memory::active_owner().unwrap_or_else(|_| self.decode_memory.clone());
         let admission = ExportBodyAdmission::empty(memory.row_owner()?);
         if let Err(error) = self
             .overlay_export_row_f32_projections_with_admission(name, meta, rows, &admission, false)
@@ -6749,7 +6763,10 @@ impl CheckpointReadSource {
 impl RetainedReadSource {
     #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn cache_index_charge_for_test(&self) -> (usize, usize) {
-        (self.database.cache_index_bytes(), self._source_memory.bytes.load(Ordering::SeqCst))
+        (
+            self.database.cache_index_bytes(),
+            self._source_memory.bytes.load(Ordering::SeqCst),
+        )
     }
 
     pub(crate) fn durable_membership_summary(
@@ -7009,11 +7026,7 @@ impl RetainedReadSource {
         }
     }
 
-    fn verify_history_root_in_read(
-        &self,
-        read: &redb::ReadTransaction,
-        name: &str,
-    ) -> Result<()> {
+    fn verify_history_root_in_read(&self, read: &redb::ReadTransaction, name: &str) -> Result<()> {
         RedbPersistence::verify_history_root(read, name).map_err(|error| match error {
             Error::StoreCorrupted { reason, .. } => self.content_identity_corruption(reason),
             other => other,
@@ -7557,10 +7570,7 @@ impl RetainedReadSource {
             .map_err(E::from)?;
         let ready = self
             .with_read(|read| {
-                self.verify_history_root_in_read(
-                    read,
-                    &RedbPersistence::rel_table_name(table),
-                )?;
+                self.verify_history_root_in_read(read, &RedbPersistence::rel_table_name(table))?;
                 self.verify_history_root_in_read(
                     read,
                     &RedbPersistence::relational_index_table_name(table, index),
@@ -9067,12 +9077,10 @@ impl RetainedReadSource {
             None => {
                 let read = self.begin_read().map_err(E::from)?;
                 let name = RedbPersistence::relational_index_table_name(table, &declaration.name);
-                self.verify_history_root_in_read(&read, &name).map_err(E::from)?;
-                self.verify_history_root_in_read(
-                    &read,
-                    &RedbPersistence::rel_table_name(table),
-                )
-                .map_err(E::from)?;
+                self.verify_history_root_in_read(&read, &name)
+                    .map_err(E::from)?;
+                self.verify_history_root_in_read(&read, &RedbPersistence::rel_table_name(table))
+                    .map_err(E::from)?;
                 let definition: TableDefinition<DurableRelationalIndexKey, &[u8]> =
                     TableDefinition::new(name.as_str());
                 #[cfg(any(test, feature = "test-seams"))]
@@ -9374,23 +9382,25 @@ impl RetainedReadSource {
                 // disagreeing with the producer's witness changes no answer.
                 // The row table stays strict above; the mismatch is disclosed
                 // and every read that consumes physical postings still refuses.
-                IndexRootCheck::Canonical => match RedbPersistence::verify_history_root_canonical(read, &name) {
-                    Ok(matches) => {
-                        history_root_witness::note_index_root_damage(
-                            &self.database_path,
-                            table,
-                            index,
-                            !matches,
-                        );
-                        Ok(())
-                    }
-                    Err(error) => Err(match error {
-                        Error::StoreCorrupted { reason, .. } => {
-                            self.content_identity_corruption(reason)
+                IndexRootCheck::Canonical => {
+                    match RedbPersistence::verify_history_root_canonical(read, &name) {
+                        Ok(matches) => {
+                            history_root_witness::note_index_root_damage(
+                                &self.database_path,
+                                table,
+                                index,
+                                !matches,
+                            );
+                            Ok(())
                         }
-                        other => other,
-                    }),
-                },
+                        Err(error) => Err(match error {
+                            Error::StoreCorrupted { reason, .. } => {
+                                self.content_identity_corruption(reason)
+                            }
+                            other => other,
+                        }),
+                    }
+                }
             }
         })
     }
@@ -9416,7 +9426,7 @@ impl RetainedReadSource {
             IndexRootCheck::Canonical,
             read_memory.clone(),
         )
-            .map_err(E::from)?;
+        .map_err(E::from)?;
         let _attribution = contextdb_core::find_attribution::stage("window_probe");
         let Some(memory) = self.verified_ordered_runs.begin_build(read_memory.clone()) else {
             return Ok(None);
@@ -9563,9 +9573,7 @@ impl RetainedReadSource {
         cursor: &mut contextdb_relational::mem::BoundedPhysicalCursor,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), E>,
         observed: &mut dyn FnMut(&VersionedRow) -> std::result::Result<(), E>,
-        before_clone: &mut dyn FnMut(
-            usize,
-        ) -> std::result::Result<(), E>,
+        before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), E>,
     ) -> std::result::Result<Option<VersionedRow>, E>
     where
         E: From<Error>,
@@ -9581,7 +9589,14 @@ impl RetainedReadSource {
                     cursor,
                     before_touch,
                     observed,
-                    &mut |admission: crate::read_image_memory::RowReadAdmission<'_>| before_clone(match admission { crate::read_image_memory::RowReadAdmission::Copy(bytes) => bytes, crate::read_image_memory::RowReadAdmission::Move(memory) => memory.retained_payload_bytes() }),
+                    &mut |admission: crate::read_image_memory::RowReadAdmission<'_>| {
+                        before_clone(match admission {
+                            crate::read_image_memory::RowReadAdmission::Copy(bytes) => bytes,
+                            crate::read_image_memory::RowReadAdmission::Move(memory) => {
+                                memory.retained_payload_bytes()
+                            }
+                        })
+                    },
                     read_memory,
                 )
             },
@@ -9908,7 +9923,7 @@ impl RetainedReadSource {
             IndexRootCheck::Physical,
             read_memory.clone(),
         )
-            .map_err(E::from)?;
+        .map_err(E::from)?;
         self.historical_index_preflight(
             table,
             meta,
@@ -10231,7 +10246,8 @@ impl RetainedReadSource {
             let decode_owner = crate::read_image_memory::ImageMemory::operation_reader(
                 self._source_memory.memory.accountant.clone(),
                 read_memory.clone(),
-            ).map_err(E::from)?;
+            )
+            .map_err(E::from)?;
             let _decode_scope = decode_owner.enter();
             let Some(probe) = cursor.source_probe().cloned() else {
                 return Ok(None);
@@ -10361,21 +10377,18 @@ fn decode_relational_index_entry(
         reason,
     };
     let key = key.value();
-    let position = key
-        .decode_canonical()
-        .map_err(|error| match error {
-            Error::Other(reason) => corrupt(reason),
+    let position = key.decode_canonical().map_err(|error| match error {
+        Error::Other(reason) => corrupt(reason),
+        other => other,
+    })?;
+    let deleted_tx = RedbPersistence::decode_exact::<Option<TxId>>(value.value()).map_err(
+        |error| match error {
+            Error::Other(reason) => corrupt(format!(
+                "durable index visibility record is damaged: {reason}"
+            )),
             other => other,
-        })?;
-    let deleted_tx =
-        RedbPersistence::decode_exact::<Option<TxId>>(value.value()).map_err(|error| {
-            match error {
-                Error::Other(reason) => corrupt(format!(
-                    "durable index visibility record is damaged: {reason}"
-                )),
-                other => other,
-            }
-        })?;
+        },
+    )?;
     Ok(Some((key.0, position, deleted_tx)))
 }
 
@@ -10429,7 +10442,8 @@ impl ReadImageSource {
         // Charge the actual opened handle and release it with the source.
         let index_bytes = database.cache_index_bytes();
         let total_source_bytes = source_memory
-            .bytes.load(Ordering::SeqCst)
+            .bytes
+            .load(Ordering::SeqCst)
             .checked_add(index_bytes)
             .ok_or_else(|| {
                 LoadReadImageError::Memory(Error::Other(
@@ -10440,7 +10454,9 @@ impl ReadImageSource {
             .memory
             .reserve(index_bytes)
             .map_err(LoadReadImageError::Memory)?;
-        source_memory.bytes.store(total_source_bytes, Ordering::SeqCst);
+        source_memory
+            .bytes
+            .store(total_source_bytes, Ordering::SeqCst);
         #[cfg(any(test, feature = "test-seams"))]
         crate::read_probe::note_persistence_read_only_open();
         #[cfg(any(test, feature = "test-seams"))]
@@ -10613,9 +10629,15 @@ impl ReadImageSource {
         history_open_control
             .check_snapshot(snapshot)
             .map_err(read_image_error)?;
-        let own_control = self.source_memory.as_mut().ok_or_else(|| {
-            invalid_read_image_state("reader source memory reservation disappeared")
-        })?.detach_control(crate::memory_accounting::writer_adapter_type_layout::<RetainedReadSource>().size())
+        let own_control = self
+            .source_memory
+            .as_mut()
+            .ok_or_else(|| {
+                invalid_read_image_state("reader source memory reservation disappeared")
+            })?
+            .detach_control(
+                crate::memory_accounting::writer_adapter_type_layout::<RetainedReadSource>().size(),
+            )
             .map_err(read_image_error)?;
         let source = Arc::new(RetainedReadSource {
             database_path: self.database_path.clone(),
@@ -10903,7 +10925,8 @@ fn read_database_open_error(error: redb::DatabaseError) -> LoadReadImageError {
 fn decode_read_table_meta(
     read_txn: &redb::ReadTransaction,
 ) -> std::result::Result<HashMap<String, TableMeta>, LoadReadImageError> {
-    let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call().map_err(read_image_error)?;
+    let _decode_scope =
+        crate::read_image_memory::ImageMemory::enter_decode_call().map_err(read_image_error)?;
     let meta_table = match read_txn.open_table(META_TABLE) {
         Ok(table) => table,
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(HashMap::new()),
@@ -10966,7 +10989,8 @@ fn decode_read_relational_table_with_bounds(
     meta: &TableMeta,
     authenticated: Option<&writer_recovery::AuthenticatedReadBounds<'_>>,
 ) -> std::result::Result<Vec<VersionedRow>, LoadReadImageError> {
-        let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call().map_err(read_image_error)?;
+    let _decode_scope =
+        crate::read_image_memory::ImageMemory::enter_decode_call().map_err(read_image_error)?;
     let table_name = RedbPersistence::rel_table_name(name);
     let definition: TableDefinition<&[u8], &[u8]> = TableDefinition::new(table_name.as_str());
     let table = match read_txn.open_table(definition) {
@@ -11081,7 +11105,8 @@ fn decode_read_vectors_with_bounds(
     read_txn: &redb::ReadTransaction,
     authenticated: Option<&writer_recovery::AuthenticatedReadBounds<'_>>,
 ) -> std::result::Result<Vec<VectorEntry>, LoadReadImageError> {
-        let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call().map_err(read_image_error)?;
+    let _decode_scope =
+        crate::read_image_memory::ImageMemory::enter_decode_call().map_err(read_image_error)?;
     let table = match read_txn.open_table(VECTORS_TABLE) {
         Ok(table) => table,
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
@@ -11570,7 +11595,7 @@ fn decode_retained_raw_vector_entry(
     expected_dimension: usize,
     corruption: impl Fn(String) -> Error,
 ) -> Result<VectorEntry> {
-        let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
+    let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
     validate_raw_vector_entry_encoded_width(
         bytes,
         &membership.index,
@@ -11680,12 +11705,17 @@ fn stream_raw_partition_memberships<T>(
         // rather than accumulating in the enclosing operation's image owner.
         let window = crate::read_image_memory::active_owner()?.row_owner()?;
         window.scope(|| -> Result<()> {
-            let membership: VectorPartitionMembershipRecord = RedbPersistence::decode_exact(payload)
-                .map_err(|error| {
-                    if preserves_typed_read_refusal(&error) { error }
-                    else { corruption(format!("raw membership payload decode failed: {error}")) }
+            let membership: VectorPartitionMembershipRecord =
+                RedbPersistence::decode_exact(payload).map_err(|error| {
+                    if preserves_typed_read_refusal(&error) {
+                        error
+                    } else {
+                        corruption(format!("raw membership payload decode failed: {error}"))
+                    }
                 })?;
-            if RedbPersistence::vector_partition_membership_key(&membership).as_slice() != key.value() {
+            if RedbPersistence::vector_partition_membership_key(&membership).as_slice()
+                != key.value()
+            {
                 return Err(corruption(
                     "raw-vector membership key disagrees with its checksummed payload".into(),
                 ));
@@ -11858,7 +11888,8 @@ fn decode_read_vector_generation_catalog(
     ),
     LoadReadImageError,
 > {
-    let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call().map_err(read_image_error)?;
+    let _decode_scope =
+        crate::read_image_memory::ImageMemory::enter_decode_call().map_err(read_image_error)?;
     vector_membership_pages::validate_in_read(read_txn).map_err(read_image_error)?;
     // Schema metadata is store-wide: damage there refuses the whole read here,
     // before any route could take it for that route's own graph damage.
@@ -12610,7 +12641,8 @@ fn ensure_required_quantized_vectors_are_present(
 fn decode_read_sync_source_lsns(
     read_txn: &redb::ReadTransaction,
 ) -> std::result::Result<HashMap<(String, RowId), Lsn>, LoadReadImageError> {
-    let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call().map_err(read_image_error)?;
+    let _decode_scope =
+        crate::read_image_memory::ImageMemory::enter_decode_call().map_err(read_image_error)?;
     let table = match read_txn.open_table(SYNC_ROW_SOURCE_LSN_TABLE) {
         Ok(table) => table,
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(HashMap::new()),
@@ -12632,7 +12664,8 @@ fn decode_read_sync_source_lsns(
 fn decode_read_sync_source_kinds(
     read_txn: &redb::ReadTransaction,
 ) -> std::result::Result<HashMap<(String, RowId), u8>, LoadReadImageError> {
-    let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call().map_err(read_image_error)?;
+    let _decode_scope =
+        crate::read_image_memory::ImageMemory::enter_decode_call().map_err(read_image_error)?;
     let table = match read_txn.open_table(SYNC_ROW_SOURCE_KIND_TABLE) {
         Ok(table) => table,
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(HashMap::new()),
@@ -12687,7 +12720,8 @@ fn note_open_history(class: OpenHistoryClass, bytes: usize) {
 fn decode_read_change_log(
     read_txn: &redb::ReadTransaction,
 ) -> std::result::Result<Vec<ChangeLogEntry>, LoadReadImageError> {
-    let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call().map_err(read_image_error)?;
+    let _decode_scope =
+        crate::read_image_memory::ImageMemory::enter_decode_call().map_err(read_image_error)?;
     let table = match read_txn.open_table(CHANGE_LOG_TABLE) {
         Ok(table) => table,
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
@@ -12715,7 +12749,8 @@ fn decode_read_change_log(
 fn decode_read_ddl_log(
     read_txn: &redb::ReadTransaction,
 ) -> std::result::Result<Vec<(Lsn, DdlChange)>, LoadReadImageError> {
-    let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call().map_err(read_image_error)?;
+    let _decode_scope =
+        crate::read_image_memory::ImageMemory::enter_decode_call().map_err(read_image_error)?;
     let table = match read_txn.open_table(DDL_LOG_TABLE) {
         Ok(table) => table,
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
@@ -12977,7 +13012,8 @@ fn decode_read_raw_string_table(
     definition: TableDefinition<&str, &[u8]>,
     history: Option<OpenHistoryClass>,
 ) -> std::result::Result<Vec<(String, Vec<u8>)>, LoadReadImageError> {
-    let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call().map_err(read_image_error)?;
+    let _decode_scope =
+        crate::read_image_memory::ImageMemory::enter_decode_call().map_err(read_image_error)?;
     let table = match read_txn.open_table(definition) {
         Ok(table) => table,
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
@@ -13038,7 +13074,8 @@ pub(crate) fn read_image_open_config_key(key: &str) -> bool {
 fn decode_read_open_config(
     read_txn: &redb::ReadTransaction,
 ) -> std::result::Result<Vec<(String, Vec<u8>)>, LoadReadImageError> {
-    let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call().map_err(read_image_error)?;
+    let _decode_scope =
+        crate::read_image_memory::ImageMemory::enter_decode_call().map_err(read_image_error)?;
     let table = read_txn
         .open_table(READ_OPEN_CONFIG_TABLE)
         .map_err(read_table_error)?;
@@ -13097,7 +13134,8 @@ fn decode_read_open_config(
 fn decode_read_trigger_audit_stamps(
     read_txn: &redb::ReadTransaction,
 ) -> std::result::Result<Vec<(String, u64)>, LoadReadImageError> {
-    let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call().map_err(read_image_error)?;
+    let _decode_scope =
+        crate::read_image_memory::ImageMemory::enter_decode_call().map_err(read_image_error)?;
     let table = match read_txn.open_table(TRIGGER_AUDIT_STAMPS_TABLE) {
         Ok(table) => table,
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
@@ -13137,7 +13175,8 @@ fn read_sink_queue_names(
 fn decode_read_sink_queue_extents(
     read_txn: &redb::ReadTransaction,
 ) -> std::result::Result<BTreeMap<String, SinkQueueExtent>, LoadReadImageError> {
-    let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call().map_err(read_image_error)?;
+    let _decode_scope =
+        crate::read_image_memory::ImageMemory::enter_decode_call().map_err(read_image_error)?;
     let mut extents = BTreeMap::new();
     for name in read_sink_queue_names(read_txn)? {
         let table_name = RedbPersistence::sink_queue_table_name(&name);
@@ -13159,7 +13198,8 @@ fn decode_read_sink_queue_extents(
 fn decode_read_sink_queues(
     read_txn: &redb::ReadTransaction,
 ) -> std::result::Result<BTreeMap<String, Vec<(u64, Vec<u8>)>>, LoadReadImageError> {
-    let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call().map_err(read_image_error)?;
+    let _decode_scope =
+        crate::read_image_memory::ImageMemory::enter_decode_call().map_err(read_image_error)?;
     let mut queues = BTreeMap::new();
     for name in read_sink_queue_names(read_txn)? {
         let table_name = RedbPersistence::sink_queue_table_name(&name);
@@ -13432,7 +13472,8 @@ fn decode_complete_read_image(
     memory: Arc<crate::read_image_memory::ImageMemory>,
     open_context: crate::executor::bounded::ReadOpenContext,
 ) -> std::result::Result<ReadPersistenceImage, LoadReadImageError> {
-    let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call().map_err(read_image_error)?;
+    let _decode_scope =
+        crate::read_image_memory::ImageMemory::enter_decode_call().map_err(read_image_error)?;
     // What each step of the open holds, for the attribution sink only.
     let open_started = std::time::Instant::now();
     let note_open = |step: &str| {
@@ -18535,7 +18576,9 @@ pub mod read_persistence_test_scaffold {
             }
         }
         let Some((physical_key, created_tx)) = found else {
-            return Err(format!("index {index} has no live posting for row {row_id}"));
+            return Err(format!(
+                "index {index} has no live posting for row {row_id}"
+            ));
         };
         let write = database.begin_write().map_err(|error| error.to_string())?;
         {
@@ -18545,7 +18588,9 @@ pub mod read_persistence_test_scaffold {
             let key = super::DurableRelationalIndexKey(physical_key);
             match damage {
                 IndexPostingDamage::Remove => {
-                    index_table.remove(&key).map_err(|error| error.to_string())?;
+                    index_table
+                        .remove(&key)
+                        .map_err(|error| error.to_string())?;
                 }
                 IndexPostingDamage::Hide => {
                     let retired = super::RedbPersistence::encode(&Some(super::TxId(
@@ -19348,16 +19393,25 @@ struct PersistenceBytes {
     bytes: usize,
 }
 impl PersistenceBytes {
-    fn try_new_for(accountant: crate::memory_accounting::AccountantHandle,
-        bytes: usize, component: &str, operation: &str, hint: &str) -> Result<Self> {
+    fn try_new_for(
+        accountant: crate::memory_accounting::AccountantHandle,
+        bytes: usize,
+        component: &str,
+        operation: &str,
+        hint: &str,
+    ) -> Result<Self> {
         accountant.try_allocate_for(bytes, component, operation, hint)?;
         Ok(Self { accountant, bytes })
     }
     #[cfg(any(test, feature = "test-seams"))]
-    fn bytes(&self) -> usize { self.bytes }
+    fn bytes(&self) -> usize {
+        self.bytes
+    }
 }
 impl Drop for PersistenceBytes {
-    fn drop(&mut self) { self.accountant.release(self.bytes); }
+    fn drop(&mut self) {
+        self.accountant.release(self.bytes);
+    }
 }
 
 /// Only this private Arc owns persistence-wide writer custody. It has no
@@ -19379,8 +19433,13 @@ impl PersistenceProofOwner {
         };
         let bytes = crate::memory_accounting::writer_adapter_layout(&owner).size();
         owner.control = Some(crate::memory_accounting::ControlCredit::admit_from_handle(
-            owner.accountant.as_ref().expect("prepared owner has its funder"),
-            bytes, "vector_maintenance", "persistence_proof_control",
+            owner
+                .accountant
+                .as_ref()
+                .expect("prepared owner has its funder"),
+            bytes,
+            "vector_maintenance",
+            "persistence_proof_control",
             "Raise MEMORY_LIMIT for this fixed writer control.",
         )?);
         Ok(Arc::new(owner))
@@ -19388,8 +19447,11 @@ impl PersistenceProofOwner {
 }
 impl Drop for PersistenceProofOwner {
     fn drop(&mut self) {
-        struct Cleanup<'a> { owner: &'a mut PersistenceProofOwner, next: u8,
-            refund: Option<crate::memory_accounting::PendingControlRefund> }
+        struct Cleanup<'a> {
+            owner: &'a mut PersistenceProofOwner,
+            next: u8,
+            refund: Option<crate::memory_accounting::PendingControlRefund>,
+        }
         impl Cleanup<'_> {
             fn finish(&mut self) {
                 while self.next < 3 {
@@ -19400,9 +19462,11 @@ impl Drop for PersistenceProofOwner {
                             drop(self.owner.accountant.take());
                             #[cfg(test)]
                             RETURNED_LOADER_OWNER_DROP_PANIC_FOR_TEST.with(|flag| {
-                                if flag.replace(false) { panic!("CDB127 original-owner cleanup unwind"); }
+                                if flag.replace(false) {
+                                    panic!("CDB127 original-owner cleanup unwind");
+                                }
                             });
-                        },
+                        }
                         1 => drop(self.owner.writer_use.take()),
                         2 => drop(self.refund.take()),
                         _ => unreachable!(),
@@ -19410,9 +19474,20 @@ impl Drop for PersistenceProofOwner {
                 }
             }
         }
-        impl Drop for Cleanup<'_> { fn drop(&mut self) { self.finish(); } }
-        let refund = self.control.take().map(crate::memory_accounting::ControlCredit::prepare);
-        let mut cleanup = Cleanup { owner: self, next: 0, refund };
+        impl Drop for Cleanup<'_> {
+            fn drop(&mut self) {
+                self.finish();
+            }
+        }
+        let refund = self
+            .control
+            .take()
+            .map(crate::memory_accounting::ControlCredit::prepare);
+        let mut cleanup = Cleanup {
+            owner: self,
+            next: 0,
+            refund,
+        };
         cleanup.finish();
     }
 }
@@ -19435,11 +19510,16 @@ impl ProofAccountantSlot {
         // snapshot. Into-raw moves that exact Arc/use into the slot. A rejected
         // OnceLock set drops only this attempted slot after the gate is gone.
         let handle = crate::memory_accounting::StoreAccountantHandle::new(accountant);
-        Self(std::sync::atomic::AtomicPtr::new(handle.into_owned_raw().cast()))
+        Self(std::sync::atomic::AtomicPtr::new(
+            handle.into_owned_raw().cast(),
+        ))
     }
 
     fn raw_handle_pointer(pointer: *mut ()) -> *mut crate::memory_accounting::MemoryAccountant {
-        debug_assert!(matches!(pointer.addr() & Self::MASK, Self::RAW_READER | Self::RAW_WRITER));
+        debug_assert!(matches!(
+            pointer.addr() & Self::MASK,
+            Self::RAW_READER | Self::RAW_WRITER
+        ));
         // Bits 0/1 already match StoreAccountantHandle's immutable role tag.
         pointer.cast()
     }
@@ -19454,14 +19534,21 @@ impl ProofAccountantSlot {
         match pointer.addr() & Self::MASK {
             Self::READY_WRITER => {
                 // Ready is terminal. Borrowing self keeps this owner live.
-                unsafe { (&*Self::ready_pointer(pointer)).accountant.as_ref()
-                    .expect("ready owner has its funder").as_handle() }
+                unsafe {
+                    (&*Self::ready_pointer(pointer))
+                        .accountant
+                        .as_ref()
+                        .expect("ready owner has its funder")
+                        .as_handle()
+                }
             }
             Self::RAW_READER | Self::RAW_WRITER => {
                 // A writer winner owns this same accountant before publishing
                 // and consuming raw custody. A reader never transitions.
                 let original = std::mem::ManuallyDrop::new(unsafe {
-                    crate::memory_accounting::StoreAccountantHandle::from_owned_raw(Self::raw_handle_pointer(pointer))
+                    crate::memory_accounting::StoreAccountantHandle::from_owned_raw(
+                        Self::raw_handle_pointer(pointer),
+                    )
                 });
                 original.as_handle()
             }
@@ -19476,18 +19563,28 @@ impl ProofAccountantSlot {
         let pointer = self.0.load(Ordering::Acquire);
         match pointer.addr() & Self::MASK {
             Self::READY_WRITER => {
-                let handle = unsafe { (&*Self::ready_pointer(pointer)).accountant.as_ref()
-                    .expect("ready owner has its funder") };
+                let handle = unsafe {
+                    (&*Self::ready_pointer(pointer))
+                        .accountant
+                        .as_ref()
+                        .expect("ready owner has its funder")
+                };
                 handle.same_accountant(accountant).then(|| handle.clone())
             }
             Self::RAW_READER | Self::RAW_WRITER => {
-                let decoded = pointer.map_addr(|address| address & !0b111)
+                let decoded = pointer
+                    .map_addr(|address| address & !0b111)
                     .cast::<crate::memory_accounting::MemoryAccountant>();
-                if !std::ptr::eq(decoded, accountant.as_ptr()) { return None; }
+                if !std::ptr::eq(decoded, accountant.as_ptr()) {
+                    return None;
+                }
                 // Even a delayed observation after publication is pinned by
                 // the winner's same-accountant, same-original-epoch chain.
-                Some(unsafe { crate::memory_accounting::StoreAccountantHandle::borrow_owned_raw(
-                    Self::raw_handle_pointer(pointer)) })
+                Some(unsafe {
+                    crate::memory_accounting::StoreAccountantHandle::borrow_owned_raw(
+                        Self::raw_handle_pointer(pointer),
+                    )
+                })
             }
             _ => unreachable!("invalid proof-accountant slot state"),
         }
@@ -19503,26 +19600,41 @@ impl ProofAccountantSlot {
         #[cfg(test)]
         RETURNED_LOADER_AFTER_RAW_OBSERVATION_FOR_TEST.with(|hook| {
             let callback = hook.borrow_mut().take();
-            if let Some(callback) = callback { callback(); }
+            if let Some(callback) = callback {
+                callback();
+            }
         });
         // Clone precisely the observed role; never rediscover a current
         // writer association. The domain gate ends before control admission.
-        let attempt = unsafe { crate::memory_accounting::StoreAccountantHandle::borrow_owned_raw(
-            Self::raw_handle_pointer(old)) };
+        let attempt = unsafe {
+            crate::memory_accounting::StoreAccountantHandle::borrow_owned_raw(
+                Self::raw_handle_pointer(old),
+            )
+        };
         let owner = PersistenceProofOwner::prepare(attempt)?;
         let raw = Arc::into_raw(owner).cast_mut().cast::<()>();
         let tagged = raw.map_addr(|address| address | Self::READY_WRITER);
-        match self.0.compare_exchange(old, tagged, Ordering::AcqRel, Ordering::Acquire) {
+        match self
+            .0
+            .compare_exchange(old, tagged, Ordering::AcqRel, Ordering::Acquire)
+        {
             Ok(_) => {
                 // The published winner already owns the same original Arc
                 // and counted epoch. Consume exactly the former raw ownership.
-                unsafe { drop(crate::memory_accounting::StoreAccountantHandle::from_owned_raw(
-                    Self::raw_handle_pointer(old))); }
+                unsafe {
+                    drop(
+                        crate::memory_accounting::StoreAccountantHandle::from_owned_raw(
+                            Self::raw_handle_pointer(old),
+                        ),
+                    );
+                }
             }
             Err(_) => {
                 // Lose only the admitted attempt. The old raw ownership was
                 // consumed by its winner and is never consumed by a loser.
-                unsafe { drop(Arc::from_raw(raw.cast::<PersistenceProofOwner>())); }
+                unsafe {
+                    drop(Arc::from_raw(raw.cast::<PersistenceProofOwner>()));
+                }
             }
         }
         Ok(())
@@ -19532,10 +19644,15 @@ impl Drop for ProofAccountantSlot {
     fn drop(&mut self) {
         let pointer = *self.0.get_mut();
         match pointer.addr() & Self::MASK {
-            Self::READY_WRITER => unsafe { drop(Arc::from_raw(Self::ready_pointer(pointer))); },
+            Self::READY_WRITER => unsafe {
+                drop(Arc::from_raw(Self::ready_pointer(pointer)));
+            },
             Self::RAW_READER | Self::RAW_WRITER => unsafe {
-                drop(crate::memory_accounting::StoreAccountantHandle::from_owned_raw(
-                    Self::raw_handle_pointer(pointer)));
+                drop(
+                    crate::memory_accounting::StoreAccountantHandle::from_owned_raw(
+                        Self::raw_handle_pointer(pointer),
+                    ),
+                );
             },
             _ => unreachable!("invalid proof-accountant slot state"),
         }
@@ -19589,7 +19706,6 @@ pub struct RedbPersistence {
     /// through this, so a write that cannot fit the configured budget receives
     /// the existing typed refusal instead of allocating anyway.
     proof_accountant: std::sync::OnceLock<ProofAccountantSlot>,
-
 }
 pub(crate) struct RawSyncApplyStateDigest {
     pub(crate) digest: String,
@@ -22182,102 +22298,125 @@ impl RedbPersistence {
         // the unlinked old-store inode be released.
         drop(old_db);
         Ok({
-        let mut storage = std::mem::MaybeUninit::<Self>::uninit();
-        let mut construction = PersistenceConstruction {
-            source: storage.as_mut_ptr(), initialized: [false; 19],
-        };
-        // SAFETY: each field is written once and marked only after its
-        // initializer succeeds. The stack guard owns exactly marked fields.
-        unsafe {
+            let mut storage = std::mem::MaybeUninit::<Self>::uninit();
+            let mut construction = PersistenceConstruction {
+                source: storage.as_mut_ptr(),
+                initialized: [false; 19],
+            };
+            // SAFETY: each field is written once and marked only after its
+            // initializer succeeds. The stack guard owns exactly marked fields.
+            unsafe {
+                {
+                    std::ptr::addr_of_mut!((*construction.source).path).write(path.to_path_buf());
+                    construction.initialized[0] = true;
+                }
 
-            {
-                std::ptr::addr_of_mut!((*construction.source).path).write(path.to_path_buf());
-                construction.initialized[0] = true;
-            }
+                {
+                    std::ptr::addr_of_mut!((*construction.source).runtime_dir).write(None);
+                    construction.initialized[1] = true;
+                }
 
-            {
-                std::ptr::addr_of_mut!((*construction.source).runtime_dir).write(None);
-                construction.initialized[1] = true;
-            }
+                {
+                    std::ptr::addr_of_mut!((*construction.source).lock_file)
+                        .write(Arc::new(std::sync::RwLock::new(Some(lock_file))));
+                    construction.initialized[4] = true;
+                }
 
-            {
-                std::ptr::addr_of_mut!((*construction.source).lock_file).write(Arc::new(std::sync::RwLock::new(Some(lock_file))));
-                construction.initialized[4] = true;
-            }
+                {
+                    std::ptr::addr_of_mut!((*construction.source).db)
+                        .write(Arc::new(std::sync::RwLock::new(Some(replacement_db))));
+                    construction.initialized[2] = true;
+                }
 
-            {
-                std::ptr::addr_of_mut!((*construction.source).db).write(Arc::new(std::sync::RwLock::new(Some(replacement_db))));
-                construction.initialized[2] = true;
-            }
+                {
+                    std::ptr::addr_of_mut!((*construction.source).writer_file)
+                        .write(std::sync::RwLock::new(Some(replacement_owner)));
+                    construction.initialized[3] = true;
+                }
 
-            {
-                std::ptr::addr_of_mut!((*construction.source).writer_file).write(std::sync::RwLock::new(Some(replacement_owner)));
-                construction.initialized[3] = true;
-            }
+                {
+                    std::ptr::addr_of_mut!((*construction.source).storage_compaction)
+                        .write(Mutex::new(Default::default()));
+                    construction.initialized[5] = true;
+                }
 
-            {
-                std::ptr::addr_of_mut!((*construction.source).storage_compaction).write(Mutex::new(Default::default()));
-                construction.initialized[5] = true;
-            }
+                #[cfg(any(test, feature = "test-seams"))]
+                {
+                    std::ptr::addr_of_mut!((*construction.source).handoff_prepare_io_fault)
+                        .write(AtomicBool::new(false));
+                    construction.initialized[6] = true;
+                }
 
-            #[cfg(any(test, feature = "test-seams"))]
-            {
-                std::ptr::addr_of_mut!((*construction.source).handoff_prepare_io_fault).write(AtomicBool::new(false));
-                construction.initialized[6] = true;
-            }
+                {
+                    std::ptr::addr_of_mut!((*construction.source).proof_accountant)
+                        .write(std::sync::OnceLock::new());
+                    construction.initialized[15] = true;
+                }
 
-            {
-                std::ptr::addr_of_mut!((*construction.source).proof_accountant).write(std::sync::OnceLock::new());
-                construction.initialized[15] = true;
-            }
+                {
+                    std::ptr::addr_of_mut!((*construction.source).writer_snapshots)
+                        .write(Arc::new(parking_lot::Mutex::new(Vec::new())));
+                    construction.initialized[7] = true;
+                }
 
-            {
-                std::ptr::addr_of_mut!((*construction.source).writer_snapshots).write(Arc::new(parking_lot::Mutex::new(Vec::new())));
-                construction.initialized[7] = true;
-            }
+                {
+                    std::ptr::addr_of_mut!((*construction.source).writer_schema)
+                        .write(parking_lot::Mutex::new(None));
+                    construction.initialized[8] = true;
+                }
 
-            {
-                std::ptr::addr_of_mut!((*construction.source).writer_schema).write(parking_lot::Mutex::new(None));
-                construction.initialized[8] = true;
-            }
+                {
+                    std::ptr::addr_of_mut!((*construction.source).cache_charge_bytes)
+                        .write(std::sync::OnceLock::new());
+                    construction.initialized[9] = true;
+                    std::ptr::addr_of_mut!((*construction.source).cache_stripe_residue)
+                        .write(std::sync::OnceLock::new());
+                    construction.initialized[18] = true;
+                }
 
-            {
-                std::ptr::addr_of_mut!((*construction.source).cache_charge_bytes).write(std::sync::OnceLock::new());
-                construction.initialized[9] = true;
-                std::ptr::addr_of_mut!((*construction.source).cache_stripe_residue).write(std::sync::OnceLock::new());
-                construction.initialized[18] = true;
-            }
+                {
+                    std::ptr::addr_of_mut!((*construction.source).used_legacy_table_meta_layout)
+                        .write(AtomicBool::new(false));
+                    construction.initialized[10] = true;
+                }
 
-            {
-                std::ptr::addr_of_mut!((*construction.source).used_legacy_table_meta_layout).write(AtomicBool::new(false));
-                construction.initialized[10] = true;
-            }
+                {
+                    std::ptr::addr_of_mut!((*construction.source).paged_publications)
+                        .write(Default::default());
+                    construction.initialized[11] = true;
+                }
 
-            {
-                std::ptr::addr_of_mut!((*construction.source).paged_publications).write(Default::default());
-                construction.initialized[11] = true;
-            }
+                {
+                    std::ptr::addr_of_mut!((*construction.source).paged_root_capture)
+                        .write(std::sync::OnceLock::new());
+                    construction.initialized[12] = true;
+                }
 
-            {
-                std::ptr::addr_of_mut!((*construction.source).paged_root_capture).write(std::sync::OnceLock::new());
-                construction.initialized[12] = true;
-            }
+                {
+                    std::ptr::addr_of_mut!((*construction.source).scoped_vector_root_capture)
+                        .write(std::sync::OnceLock::new());
+                    construction.initialized[13] = true;
+                }
 
-            {
-                std::ptr::addr_of_mut!((*construction.source).scoped_vector_root_capture).write(std::sync::OnceLock::new());
-                construction.initialized[13] = true;
+                {
+                    std::ptr::addr_of_mut!((*construction.source).vector_repair_audit)
+                        .write(parking_lot::Mutex::new(None));
+                    construction.initialized[14] = true;
+                }
+                {
+                    std::ptr::addr_of_mut!((*construction.source).saved_export_recovery_cutoff)
+                        .write(std::sync::OnceLock::new());
+                    construction.initialized[16] = true;
+                }
+                {
+                    std::ptr::addr_of_mut!((*construction.source).saved_export_abandonment_error)
+                        .write(Arc::new(parking_lot::Mutex::new(None)));
+                    construction.initialized[17] = true;
+                }
             }
-
-            {
-                std::ptr::addr_of_mut!((*construction.source).vector_repair_audit).write(parking_lot::Mutex::new(None));
-                construction.initialized[14] = true;
-            }
-{ std::ptr::addr_of_mut!((*construction.source).saved_export_recovery_cutoff).write(std::sync::OnceLock::new()); construction.initialized[16] = true; }
-{ std::ptr::addr_of_mut!((*construction.source).saved_export_abandonment_error).write(Arc::new(parking_lot::Mutex::new(None))); construction.initialized[17] = true; }
-        }
-        construction.initialized.fill(false);
-        unsafe { storage.assume_init() }
-    })
+            construction.initialized.fill(false);
+            unsafe { storage.assume_init() }
+        })
     }
 
     fn create_with_lock(
@@ -22331,102 +22470,137 @@ impl RedbPersistence {
                         let _ = proof_accountant.set(ProofAccountantSlot::attached(accountant));
                     }
                     Ok({
-        let mut storage = std::mem::MaybeUninit::<Self>::uninit();
-        let mut construction = PersistenceConstruction {
-            source: storage.as_mut_ptr(), initialized: [false; 19],
-        };
-        // SAFETY: each field is written once and marked only after its
-        // initializer succeeds. The stack guard owns exactly marked fields.
-        unsafe {
+                        let mut storage = std::mem::MaybeUninit::<Self>::uninit();
+                        let mut construction = PersistenceConstruction {
+                            source: storage.as_mut_ptr(),
+                            initialized: [false; 19],
+                        };
+                        // SAFETY: each field is written once and marked only after its
+                        // initializer succeeds. The stack guard owns exactly marked fields.
+                        unsafe {
+                            {
+                                std::ptr::addr_of_mut!((*construction.source).path)
+                                    .write(path.to_path_buf());
+                                construction.initialized[0] = true;
+                            }
 
-            {
-                std::ptr::addr_of_mut!((*construction.source).path).write(path.to_path_buf());
-                construction.initialized[0] = true;
-            }
+                            {
+                                std::ptr::addr_of_mut!((*construction.source).runtime_dir)
+                                    .write(runtime_dir.map(Path::to_path_buf));
+                                construction.initialized[1] = true;
+                            }
 
-            {
-                std::ptr::addr_of_mut!((*construction.source).runtime_dir).write(runtime_dir.map(Path::to_path_buf));
-                construction.initialized[1] = true;
-            }
+                            {
+                                std::ptr::addr_of_mut!((*construction.source).lock_file)
+                                    .write(Arc::new(std::sync::RwLock::new(Some(lock_file))));
+                                construction.initialized[4] = true;
+                            }
 
-            {
-                std::ptr::addr_of_mut!((*construction.source).lock_file).write(Arc::new(std::sync::RwLock::new(Some(lock_file))));
-                construction.initialized[4] = true;
-            }
+                            {
+                                std::ptr::addr_of_mut!((*construction.source).db)
+                                    .write(Arc::new(std::sync::RwLock::new(Some(db))));
+                                construction.initialized[2] = true;
+                            }
 
-            {
-                std::ptr::addr_of_mut!((*construction.source).db).write(Arc::new(std::sync::RwLock::new(Some(db))));
-                construction.initialized[2] = true;
-            }
+                            {
+                                std::ptr::addr_of_mut!((*construction.source).writer_file)
+                                    .write(std::sync::RwLock::new(Some(owner)));
+                                construction.initialized[3] = true;
+                            }
 
-            {
-                std::ptr::addr_of_mut!((*construction.source).writer_file).write(std::sync::RwLock::new(Some(owner)));
-                construction.initialized[3] = true;
-            }
+                            {
+                                std::ptr::addr_of_mut!((*construction.source).storage_compaction)
+                                    .write(Mutex::new(Default::default()));
+                                construction.initialized[5] = true;
+                            }
 
-            {
-                std::ptr::addr_of_mut!((*construction.source).storage_compaction).write(Mutex::new(Default::default()));
-                construction.initialized[5] = true;
-            }
+                            #[cfg(any(test, feature = "test-seams"))]
+                            {
+                                std::ptr::addr_of_mut!(
+                                    (*construction.source).handoff_prepare_io_fault
+                                )
+                                .write(AtomicBool::new(false));
+                                construction.initialized[6] = true;
+                            }
 
-            #[cfg(any(test, feature = "test-seams"))]
-            {
-                std::ptr::addr_of_mut!((*construction.source).handoff_prepare_io_fault).write(AtomicBool::new(false));
-                construction.initialized[6] = true;
-            }
+                            {
+                                std::ptr::addr_of_mut!((*construction.source).proof_accountant)
+                                    .write(proof_accountant);
+                                construction.initialized[15] = true;
+                            }
 
-            {
-                std::ptr::addr_of_mut!((*construction.source).proof_accountant).write(proof_accountant);
-                construction.initialized[15] = true;
-            }
+                            {
+                                std::ptr::addr_of_mut!((*construction.source).writer_snapshots)
+                                    .write(Arc::new(parking_lot::Mutex::new(Vec::new())));
+                                construction.initialized[7] = true;
+                            }
 
-            {
-                std::ptr::addr_of_mut!((*construction.source).writer_snapshots).write(Arc::new(parking_lot::Mutex::new(Vec::new())));
-                construction.initialized[7] = true;
-            }
+                            {
+                                std::ptr::addr_of_mut!((*construction.source).writer_schema)
+                                    .write(parking_lot::Mutex::new(None));
+                                construction.initialized[8] = true;
+                            }
 
-            {
-                std::ptr::addr_of_mut!((*construction.source).writer_schema).write(parking_lot::Mutex::new(None));
-                construction.initialized[8] = true;
-            }
+                            {
+                                std::ptr::addr_of_mut!((*construction.source).cache_charge_bytes)
+                                    .write(std::sync::OnceLock::new());
+                                construction.initialized[9] = true;
+                                std::ptr::addr_of_mut!((*construction.source).cache_stripe_residue)
+                                    .write(std::sync::OnceLock::new());
+                                construction.initialized[18] = true;
+                            }
 
-            {
-                std::ptr::addr_of_mut!((*construction.source).cache_charge_bytes).write(std::sync::OnceLock::new());
-                construction.initialized[9] = true;
-                std::ptr::addr_of_mut!((*construction.source).cache_stripe_residue).write(std::sync::OnceLock::new());
-                construction.initialized[18] = true;
-            }
+                            {
+                                std::ptr::addr_of_mut!(
+                                    (*construction.source).used_legacy_table_meta_layout
+                                )
+                                .write(AtomicBool::new(false));
+                                construction.initialized[10] = true;
+                            }
 
-            {
-                std::ptr::addr_of_mut!((*construction.source).used_legacy_table_meta_layout).write(AtomicBool::new(false));
-                construction.initialized[10] = true;
-            }
+                            {
+                                std::ptr::addr_of_mut!((*construction.source).paged_publications)
+                                    .write(Default::default());
+                                construction.initialized[11] = true;
+                            }
 
-            {
-                std::ptr::addr_of_mut!((*construction.source).paged_publications).write(Default::default());
-                construction.initialized[11] = true;
-            }
+                            {
+                                std::ptr::addr_of_mut!((*construction.source).paged_root_capture)
+                                    .write(std::sync::OnceLock::new());
+                                construction.initialized[12] = true;
+                            }
 
-            {
-                std::ptr::addr_of_mut!((*construction.source).paged_root_capture).write(std::sync::OnceLock::new());
-                construction.initialized[12] = true;
-            }
+                            {
+                                std::ptr::addr_of_mut!(
+                                    (*construction.source).scoped_vector_root_capture
+                                )
+                                .write(std::sync::OnceLock::new());
+                                construction.initialized[13] = true;
+                            }
 
-            {
-                std::ptr::addr_of_mut!((*construction.source).scoped_vector_root_capture).write(std::sync::OnceLock::new());
-                construction.initialized[13] = true;
-            }
-
-            {
-                std::ptr::addr_of_mut!((*construction.source).vector_repair_audit).write(parking_lot::Mutex::new(None));
-                construction.initialized[14] = true;
-            }
-{ std::ptr::addr_of_mut!((*construction.source).saved_export_recovery_cutoff).write(std::sync::OnceLock::new()); construction.initialized[16] = true; }
-{ std::ptr::addr_of_mut!((*construction.source).saved_export_abandonment_error).write(Arc::new(parking_lot::Mutex::new(None))); construction.initialized[17] = true; }
-        }
-        construction.initialized.fill(false);
-        unsafe { storage.assume_init() }
-    })
+                            {
+                                std::ptr::addr_of_mut!((*construction.source).vector_repair_audit)
+                                    .write(parking_lot::Mutex::new(None));
+                                construction.initialized[14] = true;
+                            }
+                            {
+                                std::ptr::addr_of_mut!(
+                                    (*construction.source).saved_export_recovery_cutoff
+                                )
+                                .write(std::sync::OnceLock::new());
+                                construction.initialized[16] = true;
+                            }
+                            {
+                                std::ptr::addr_of_mut!(
+                                    (*construction.source).saved_export_abandonment_error
+                                )
+                                .write(Arc::new(parking_lot::Mutex::new(None)));
+                                construction.initialized[17] = true;
+                            }
+                        }
+                        construction.initialized.fill(false);
+                        unsafe { storage.assume_init() }
+                    })
                 }
                 Err(err) => {
                     drop(db);
@@ -22477,7 +22651,9 @@ impl RedbPersistence {
     }
 
     fn cache_stripe_residue_bytes(&self) -> usize {
-        self.cache_stripe_residue.get().map_or(0, |(bytes, _)| *bytes)
+        self.cache_stripe_residue
+            .get()
+            .map_or(0, |(bytes, _)| *bytes)
     }
 
     /// What the close hands back for this store's page cache.
@@ -22604,102 +22780,135 @@ impl RedbPersistence {
         match publish {
             Ok(()) => {
                 let persistence = {
-        let mut storage = std::mem::MaybeUninit::<Self>::uninit();
-        let mut construction = PersistenceConstruction {
-            source: storage.as_mut_ptr(), initialized: [false; 19],
-        };
-        // SAFETY: each field is written once and marked only after its
-        // initializer succeeds. The stack guard owns exactly marked fields.
-        unsafe {
+                    let mut storage = std::mem::MaybeUninit::<Self>::uninit();
+                    let mut construction = PersistenceConstruction {
+                        source: storage.as_mut_ptr(),
+                        initialized: [false; 19],
+                    };
+                    // SAFETY: each field is written once and marked only after its
+                    // initializer succeeds. The stack guard owns exactly marked fields.
+                    unsafe {
+                        {
+                            std::ptr::addr_of_mut!((*construction.source).path)
+                                .write(path.to_path_buf());
+                            construction.initialized[0] = true;
+                        }
 
-            {
-                std::ptr::addr_of_mut!((*construction.source).path).write(path.to_path_buf());
-                construction.initialized[0] = true;
-            }
+                        {
+                            std::ptr::addr_of_mut!((*construction.source).runtime_dir)
+                                .write(runtime_dir.map(Path::to_path_buf));
+                            construction.initialized[1] = true;
+                        }
 
-            {
-                std::ptr::addr_of_mut!((*construction.source).runtime_dir).write(runtime_dir.map(Path::to_path_buf));
-                construction.initialized[1] = true;
-            }
+                        {
+                            std::ptr::addr_of_mut!((*construction.source).lock_file)
+                                .write(Arc::new(std::sync::RwLock::new(Some(lock_file))));
+                            construction.initialized[4] = true;
+                        }
 
-            {
-                std::ptr::addr_of_mut!((*construction.source).lock_file).write(Arc::new(std::sync::RwLock::new(Some(lock_file))));
-                construction.initialized[4] = true;
-            }
+                        {
+                            std::ptr::addr_of_mut!((*construction.source).db)
+                                .write(Arc::new(std::sync::RwLock::new(Some(db.database))));
+                            construction.initialized[2] = true;
+                        }
 
-            {
-                std::ptr::addr_of_mut!((*construction.source).db).write(Arc::new(std::sync::RwLock::new(Some(db.database))));
-                construction.initialized[2] = true;
-            }
+                        {
+                            std::ptr::addr_of_mut!((*construction.source).writer_file)
+                                .write(std::sync::RwLock::new(Some(db.owner)));
+                            construction.initialized[3] = true;
+                        }
 
-            {
-                std::ptr::addr_of_mut!((*construction.source).writer_file).write(std::sync::RwLock::new(Some(db.owner)));
-                construction.initialized[3] = true;
-            }
+                        {
+                            std::ptr::addr_of_mut!((*construction.source).storage_compaction)
+                                .write(Mutex::new(Default::default()));
+                            construction.initialized[5] = true;
+                        }
 
-            {
-                std::ptr::addr_of_mut!((*construction.source).storage_compaction).write(Mutex::new(Default::default()));
-                construction.initialized[5] = true;
-            }
+                        #[cfg(any(test, feature = "test-seams"))]
+                        {
+                            std::ptr::addr_of_mut!((*construction.source).handoff_prepare_io_fault)
+                                .write(AtomicBool::new(false));
+                            construction.initialized[6] = true;
+                        }
 
-            #[cfg(any(test, feature = "test-seams"))]
-            {
-                std::ptr::addr_of_mut!((*construction.source).handoff_prepare_io_fault).write(AtomicBool::new(false));
-                construction.initialized[6] = true;
-            }
+                        {
+                            std::ptr::addr_of_mut!((*construction.source).proof_accountant)
+                                .write(std::sync::OnceLock::new());
+                            construction.initialized[15] = true;
+                        }
 
-            {
-                std::ptr::addr_of_mut!((*construction.source).proof_accountant).write(std::sync::OnceLock::new());
-                construction.initialized[15] = true;
-            }
+                        {
+                            std::ptr::addr_of_mut!((*construction.source).writer_snapshots)
+                                .write(Arc::new(parking_lot::Mutex::new(Vec::new())));
+                            construction.initialized[7] = true;
+                        }
 
-            {
-                std::ptr::addr_of_mut!((*construction.source).writer_snapshots).write(Arc::new(parking_lot::Mutex::new(Vec::new())));
-                construction.initialized[7] = true;
-            }
+                        {
+                            std::ptr::addr_of_mut!((*construction.source).writer_schema)
+                                .write(parking_lot::Mutex::new(None));
+                            construction.initialized[8] = true;
+                        }
 
-            {
-                std::ptr::addr_of_mut!((*construction.source).writer_schema).write(parking_lot::Mutex::new(None));
-                construction.initialized[8] = true;
-            }
+                        {
+                            std::ptr::addr_of_mut!((*construction.source).cache_charge_bytes)
+                                .write(std::sync::OnceLock::new());
+                            construction.initialized[9] = true;
+                            std::ptr::addr_of_mut!((*construction.source).cache_stripe_residue)
+                                .write(std::sync::OnceLock::new());
+                            construction.initialized[18] = true;
+                        }
 
-            {
-                std::ptr::addr_of_mut!((*construction.source).cache_charge_bytes).write(std::sync::OnceLock::new());
-                construction.initialized[9] = true;
-                std::ptr::addr_of_mut!((*construction.source).cache_stripe_residue).write(std::sync::OnceLock::new());
-                construction.initialized[18] = true;
-            }
+                        {
+                            std::ptr::addr_of_mut!(
+                                (*construction.source).used_legacy_table_meta_layout
+                            )
+                            .write(AtomicBool::new(false));
+                            construction.initialized[10] = true;
+                        }
 
-            {
-                std::ptr::addr_of_mut!((*construction.source).used_legacy_table_meta_layout).write(AtomicBool::new(false));
-                construction.initialized[10] = true;
-            }
+                        {
+                            std::ptr::addr_of_mut!((*construction.source).paged_publications)
+                                .write(Default::default());
+                            construction.initialized[11] = true;
+                        }
 
-            {
-                std::ptr::addr_of_mut!((*construction.source).paged_publications).write(Default::default());
-                construction.initialized[11] = true;
-            }
+                        {
+                            std::ptr::addr_of_mut!((*construction.source).paged_root_capture)
+                                .write(std::sync::OnceLock::new());
+                            construction.initialized[12] = true;
+                        }
 
-            {
-                std::ptr::addr_of_mut!((*construction.source).paged_root_capture).write(std::sync::OnceLock::new());
-                construction.initialized[12] = true;
-            }
+                        {
+                            std::ptr::addr_of_mut!(
+                                (*construction.source).scoped_vector_root_capture
+                            )
+                            .write(std::sync::OnceLock::new());
+                            construction.initialized[13] = true;
+                        }
 
-            {
-                std::ptr::addr_of_mut!((*construction.source).scoped_vector_root_capture).write(std::sync::OnceLock::new());
-                construction.initialized[13] = true;
-            }
-
-            {
-                std::ptr::addr_of_mut!((*construction.source).vector_repair_audit).write(parking_lot::Mutex::new(None));
-                construction.initialized[14] = true;
-            }
-{ std::ptr::addr_of_mut!((*construction.source).saved_export_recovery_cutoff).write(std::sync::OnceLock::new()); construction.initialized[16] = true; }
-{ std::ptr::addr_of_mut!((*construction.source).saved_export_abandonment_error).write(Arc::new(parking_lot::Mutex::new(None))); construction.initialized[17] = true; }
-        }
-        construction.initialized.fill(false);
-        unsafe { storage.assume_init() }
-    };
+                        {
+                            std::ptr::addr_of_mut!((*construction.source).vector_repair_audit)
+                                .write(parking_lot::Mutex::new(None));
+                            construction.initialized[14] = true;
+                        }
+                        {
+                            std::ptr::addr_of_mut!(
+                                (*construction.source).saved_export_recovery_cutoff
+                            )
+                            .write(std::sync::OnceLock::new());
+                            construction.initialized[16] = true;
+                        }
+                        {
+                            std::ptr::addr_of_mut!(
+                                (*construction.source).saved_export_abandonment_error
+                            )
+                            .write(Arc::new(parking_lot::Mutex::new(None)));
+                            construction.initialized[17] = true;
+                        }
+                    }
+                    construction.initialized.fill(false);
+                    unsafe { storage.assume_init() }
+                };
                 persistence.recover_authoritative_purge_publication()?;
                 persistence.truncate_uncommitted_commit_index_tail()?;
                 Ok(persistence)
@@ -30220,8 +30429,11 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 .map_err(Self::storage_error)?
                 .map(|value| value.value().to_vec())
                 .ok_or_else(|| Error::Other("selected vector base fixture is absent".into()))?;
-            decode_vector_partition_record_payload(VectorPartitionRecordKind::BaseGeneration, &bytes)
-                .map_err(|reason| Error::Other(format!("invalid base fixture: {reason}")))?
+            decode_vector_partition_record_payload(
+                VectorPartitionRecordKind::BaseGeneration,
+                &bytes,
+            )
+            .map_err(|reason| Error::Other(format!("invalid base fixture: {reason}")))?
         };
         let paged = match vector_paged::paged_storage_of_graph_for_test(
             base.graph_format_version,
@@ -30291,8 +30503,11 @@ graph_commit_result }.map_err(Self::storage_error)?;
             .map(|value| value.value().to_vec())
             .ok_or_else(|| Error::Other("vector generation catalog fixture is absent".into()))?;
         let catalog: VectorPartitionGenerationCatalogRecord =
-            decode_vector_partition_record_payload(VectorPartitionRecordKind::GenerationCatalog, &bytes)
-                .map_err(|reason| Error::Other(format!("invalid catalog fixture: {reason}")))?;
+            decode_vector_partition_record_payload(
+                VectorPartitionRecordKind::GenerationCatalog,
+                &bytes,
+            )
+            .map_err(|reason| Error::Other(format!("invalid catalog fixture: {reason}")))?;
         let base_key = Self::vector_partition_base_generation_key_from_parts(
             &partition.index,
             &partition.partition_key,
@@ -30306,9 +30521,11 @@ graph_commit_result }.map_err(Self::storage_error)?;
             .map_err(Self::storage_error)?
             .map(|value| value.value().to_vec())
             .ok_or_else(|| Error::Other("selected vector base fixture is absent".into()))?;
-        let base: VectorPartitionBaseGenerationRecord =
-            decode_vector_partition_record_payload(VectorPartitionRecordKind::BaseGeneration, &bytes)
-                .map_err(|reason| Error::Other(format!("invalid base fixture: {reason}")))?;
+        let base: VectorPartitionBaseGenerationRecord = decode_vector_partition_record_payload(
+            VectorPartitionRecordKind::BaseGeneration,
+            &bytes,
+        )
+        .map_err(|reason| Error::Other(format!("invalid base fixture: {reason}")))?;
         vector_paged::paged_storage_of_graph_for_test(base.graph_format_version, &base.graph.bytes)?
             .ok_or_else(|| Error::Other("selected vector base is not paged".into()))
     }
@@ -30563,15 +30780,32 @@ graph_commit_result }.map_err(Self::storage_error)?;
         // These legacy write transactions do not pass a decode workspace.
         // Own their fixed route-inspection scratch locally, never attach it
         // to a caller token that survives this helper's copies.
-        let _inspection = self.proof_accountant().map(|accountant| {
-            crate::memory_accounting::OwnedMemoryReservation::try_new_for(
-                accountant, (64usize * 1024).saturating_add(
-                    Self::vector_partition_physical_key_bound(&catalog.index, &catalog.partition_key, 32)
-                        .saturating_mul(8)), "vector", "reclaim_vector_generation_metadata",
-                "Free writer memory before reclaiming vector generation metadata.",
-            )
-        }).transpose()?;
-        self.reclaim_vector_generations_in_write_with_checkpoint(write, catalog, retained_chains, false, || Ok(()))
+        let _inspection = self
+            .proof_accountant()
+            .map(|accountant| {
+                crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+                    accountant,
+                    (64usize * 1024).saturating_add(
+                        Self::vector_partition_physical_key_bound(
+                            &catalog.index,
+                            &catalog.partition_key,
+                            32,
+                        )
+                        .saturating_mul(8),
+                    ),
+                    "vector",
+                    "reclaim_vector_generation_metadata",
+                    "Free writer memory before reclaiming vector generation metadata.",
+                )
+            })
+            .transpose()?;
+        self.reclaim_vector_generations_in_write_with_checkpoint(
+            write,
+            catalog,
+            retained_chains,
+            false,
+            || Ok(()),
+        )
     }
 
     fn reclaim_vector_generations_in_write_with_checkpoint(
@@ -31530,31 +31764,62 @@ graph_commit_result }.map_err(Self::storage_error)?;
     /// Constant-size witness for an optional writer tail: the exact committed
     /// catalog and final journal record, authenticated at one root. The last
     /// journal key is a B-tree seek, never a prefix walk.
-    pub(crate) fn writer_vector_tail_frontier(&self, partition: &VectorPartitionRef) -> Result<Option<[u8; 32]>> {
+    pub(crate) fn writer_vector_tail_frontier(
+        &self,
+        partition: &VectorPartitionRef,
+    ) -> Result<Option<[u8; 32]>> {
         let prefix = Self::vector_partition_prefix(&partition.index, &partition.partition_key);
         self.with_db(|db| {
             let read = db.begin_read().map_err(Self::storage_error)?;
-            let catalogs = match read.open_byte_table_bounded(VECTOR_PARTITION_GENERATION_CATALOG_TABLE) {
-                Ok(table) => table,
-                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-                Err(error) => return Err(Self::storage_error(error)),
+            let catalogs =
+                match read.open_byte_table_bounded(VECTOR_PARTITION_GENERATION_CATALOG_TABLE) {
+                    Ok(table) => table,
+                    Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+                    Err(error) => return Err(Self::storage_error(error)),
+                };
+            let Some(value) = catalogs
+                .get_bounded(prefix.as_slice())
+                .map_err(Self::storage_error)?
+            else {
+                return Ok(None);
             };
-            let Some(value) = catalogs.get_bounded(prefix.as_slice()).map_err(Self::storage_error)? else { return Ok(None); };
-            let catalog: VectorPartitionGenerationCatalogRecord = self.decode_expected_vector_partition_metadata(
-                VectorPartitionRecordKind::GenerationCatalog, value.value(), &partition.index, &partition.partition_key,
-            )?;
-            if catalog.index != partition.index || catalog.partition_key != partition.partition_key { return Ok(None); }
+            let catalog: VectorPartitionGenerationCatalogRecord = self
+                .decode_expected_vector_partition_metadata(
+                    VectorPartitionRecordKind::GenerationCatalog,
+                    value.value(),
+                    &partition.index,
+                    &partition.partition_key,
+                )?;
+            if catalog.index != partition.index || catalog.partition_key != partition.partition_key
+            {
+                return Ok(None);
+            }
             let mut digest = blake3::Hasher::new();
             digest.update(value.value());
             match read.open_byte_table_bounded(VECTOR_PARTITION_JOURNAL_TABLE) {
                 Ok(table) => {
-                    let upper = writer_source::prefix_end(&prefix).ok_or_else(|| self.vector_partition_corruption("journal prefix has no upper bound"))?;
-                    if let Some(entry) = table.range(prefix.as_slice()..upper.as_slice()).map_err(Self::storage_error)?.next_back() {
+                    let upper = writer_source::prefix_end(&prefix).ok_or_else(|| {
+                        self.vector_partition_corruption("journal prefix has no upper bound")
+                    })?;
+                    if let Some(entry) = table
+                        .range(prefix.as_slice()..upper.as_slice())
+                        .map_err(Self::storage_error)?
+                        .next_back()
+                    {
                         let (key, value) = entry.map_err(Self::storage_error)?;
-                        let record: VectorPartitionJournalRecord = self.decode_vector_partition_record(VectorPartitionRecordKind::Journal, value.value())?;
-                        if record.index != partition.index || record.partition_key != partition.partition_key
+                        let record: VectorPartitionJournalRecord = self
+                            .decode_vector_partition_record(
+                                VectorPartitionRecordKind::Journal,
+                                value.value(),
+                            )?;
+                        if record.index != partition.index
+                            || record.partition_key != partition.partition_key
                             || Self::vector_partition_journal_key(&record).as_slice() != key.value()
-                        { return Err(self.vector_partition_corruption("tail frontier journal identity mismatch")); }
+                        {
+                            return Err(self.vector_partition_corruption(
+                                "tail frontier journal identity mismatch",
+                            ));
+                        }
                         digest.update(key.value());
                         digest.update(value.value());
                     }
@@ -32644,14 +32909,22 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 Self::resize_vector_cleanup_workspace(workspace, fixed_owned, OPERATION)?;
             }
 
-            if expected_catalog.change.unwrap_or(expected_catalog.base).generation_id
-                & vector_paged::MUTABLE_STORAGE != 0
+            if expected_catalog
+                .change
+                .unwrap_or(expected_catalog.base)
+                .generation_id
+                & vector_paged::MUTABLE_STORAGE
+                != 0
             {
                 Self::resize_vector_cleanup_workspace(
-                    workspace, fixed_owned.saturating_add(64 * 1024), OPERATION,
+                    workspace,
+                    fixed_owned.saturating_add(64 * 1024),
+                    OPERATION,
                 )?;
                 if let Some(complete) = self.truncate_native_tail_journal_in_write(
-                    &write_txn, expected_catalog, &mut checkpoint,
+                    &write_txn,
+                    expected_catalog,
+                    &mut checkpoint,
                 )? {
                     Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
                     checkpoint()?;
@@ -33617,7 +33890,10 @@ graph_commit_result }.map_err(Self::storage_error)?;
     pub(crate) fn load_trigger_audit_history_with_read_memory(
         &self,
         read_memory: Option<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>>,
-    ) -> Result<(Vec<TriggerAuditEntry>, Option<contextdb_core::read_memory::ReadCredit>)> {
+    ) -> Result<(
+        Vec<TriggerAuditEntry>,
+        Option<contextdb_core::read_memory::ReadCredit>,
+    )> {
         let _decode_scope = self.reader_decode_scope()?;
         self.with_db(|db| {
             let read_txn = db.begin_read().map_err(Self::storage_error)?;
@@ -36142,7 +36418,9 @@ graph_commit_result }.map_err(Self::storage_error)?;
                         "Raise MEMORY_LIMIT to prepare retention vector journal keys.",
                     )?;
                 }
-                let _row_scope = crate::read_image_memory::active_owner()?.row_owner()?.enter();
+                let _row_scope = crate::read_image_memory::active_owner()?
+                    .row_owner()?
+                    .enter();
                 let record: VectorPartitionJournalRecord = self.decode_vector_partition_record(
                     VectorPartitionRecordKind::Journal,
                     value.value(),
@@ -37449,7 +37727,10 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 database_path: self.path().to_path_buf(),
                 read,
                 content_identity,
-                _writer_use: self.proof_accountant().as_ref().and_then(crate::memory_accounting::WriterUse::retain_if_writer),
+                _writer_use: self
+                    .proof_accountant()
+                    .as_ref()
+                    .and_then(crate::memory_accounting::WriterUse::retain_if_writer),
                 accountant: self.proof_accountant(),
                 decode_memory,
             })
@@ -40822,11 +41103,11 @@ graph_commit_result }.map_err(Self::storage_error)?;
             .map_err(|reason| self.vector_partition_corruption(reason))?;
         prevalidate_vector_partition_metadata_routes(expected_kind, payload)
             .map_err(|reason| self.vector_partition_corruption(reason))?;
-        Self::decode_exact(payload).map_err(|error| {
-            match error {
-                Error::MemoryBudgetExceeded { .. } | Error::ReadFailure(_) | Error::ReadCancelled => error,
-                error => self.vector_partition_corruption(format!("payload decode failed: {error}")),
+        Self::decode_exact(payload).map_err(|error| match error {
+            Error::MemoryBudgetExceeded { .. } | Error::ReadFailure(_) | Error::ReadCancelled => {
+                error
             }
+            error => self.vector_partition_corruption(format!("payload decode failed: {error}")),
         })
     }
 
@@ -40841,11 +41122,11 @@ graph_commit_result }.map_err(Self::storage_error)?;
         let payload =
             vector_partition_expected_metadata_payload(kind, encoded, index, partition_key)
                 .map_err(|reason| self.vector_partition_corruption(reason))?;
-        Self::decode_exact(payload).map_err(|error| {
-            match error {
-                Error::MemoryBudgetExceeded { .. } | Error::ReadFailure(_) | Error::ReadCancelled => error,
-                error => self.vector_partition_corruption(format!("payload decode failed: {error}")),
+        Self::decode_exact(payload).map_err(|error| match error {
+            Error::MemoryBudgetExceeded { .. } | Error::ReadFailure(_) | Error::ReadCancelled => {
+                error
             }
+            error => self.vector_partition_corruption(format!("payload decode failed: {error}")),
         })
     }
 
@@ -41269,7 +41550,12 @@ graph_commit_result }.map_err(Self::storage_error)?;
         for entry in config.iter().map_err(Self::storage_error)? {
             let (key, value) = entry.map_err(Self::storage_error)?;
             if crate::custody::records::owned_key(key.value()) {
-                Self::write_read_custody_config_entry(write_txn, key.value(), Some(value.value()), custody_groups::Funding::Unavailable)?;
+                Self::write_read_custody_config_entry(
+                    write_txn,
+                    key.value(),
+                    Some(value.value()),
+                    custody_groups::Funding::Unavailable,
+                )?;
             }
         }
         Ok(())
@@ -41429,9 +41715,14 @@ graph_commit_result }.map_err(Self::storage_error)?;
     }
 
     fn require_decode_accountant(&self) -> Result<crate::memory_accounting::AccountantHandle> {
-        Ok(self.proof_accountant.get_or_init(|| ProofAccountantSlot::attached(
-            crate::read_image_memory::ImageMemory::default_decode_accountant(),
-        )).accountant())
+        Ok(self
+            .proof_accountant
+            .get_or_init(|| {
+                ProofAccountantSlot::attached(
+                    crate::read_image_memory::ImageMemory::default_decode_accountant(),
+                )
+            })
+            .accountant())
     }
 
     /// A standalone persistence read has the default declared reader limit.
@@ -41445,8 +41736,10 @@ graph_commit_result }.map_err(Self::storage_error)?;
             crate::OwnerReadConfig::default().limits.limits.memory,
         );
         Ok(crate::read_image_memory::ImageMemory::operation_reader(
-            self.require_decode_accountant()?, declared.child()?,
-        )?.enter())
+            self.require_decode_accountant()?,
+            declared.child()?,
+        )?
+        .enter())
     }
 
     fn writer_decode_scope(&self) -> Result<crate::read_image_memory::ImageMemoryScope> {
@@ -41527,7 +41820,10 @@ graph_commit_result }.map_err(Self::storage_error)?;
             Err(_) => {
                 let legacy: LegacyTableMetaV1 = Self::decode(bytes)?;
                 crate::read_image_memory::reserve(
-                    legacy.columns.len().saturating_mul(std::mem::size_of::<contextdb_core::ColumnDef>()),
+                    legacy
+                        .columns
+                        .len()
+                        .saturating_mul(std::mem::size_of::<contextdb_core::ColumnDef>()),
                 )?;
                 Ok((legacy.into(), true))
             }
@@ -41759,7 +42055,10 @@ graph_commit_result }.map_err(Self::storage_error)?;
     /// Declared relational indexes whose physical table root differs from
     /// the root its producer witnessed. Constant work per index: one root
     /// comparison, no posting is read.
-    pub(crate) fn index_root_damage(&self, indexes: &[(String, String)]) -> Result<Vec<(String, String)>> {
+    pub(crate) fn index_root_damage(
+        &self,
+        indexes: &[(String, String)],
+    ) -> Result<Vec<(String, String)>> {
         self.with_db(|db| {
             let read = db.begin_read().map_err(Self::storage_error)?;
             let mut damaged = Vec::new();
@@ -41811,67 +42110,109 @@ struct PersistenceConstruction {
 impl PersistenceConstruction {
     fn finish(&mut self) {
         for step in (0..15).chain([16, 17, 18, 15]) {
-            if !std::mem::replace(&mut self.initialized[step], false) { continue; }
+            if !std::mem::replace(&mut self.initialized[step], false) {
+                continue;
+            }
             // Advancing before drop prevents repeating an unwinding field.
-            unsafe { match step {
-                0 => { 
-                    { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).path)); }
-                },
-                1 => { 
-                    { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).runtime_dir)); }
-                },
-                2 => { 
-                    { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).db)); }
-                },
-                3 => { 
-                    { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).writer_file)); }
-                },
-                4 => { 
-                    { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).lock_file)); }
-                },
-                5 => { 
-                    { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).storage_compaction)); }
-                },
-                6 => { #[cfg(any(test, feature = "test-seams"))]
-                    { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).handoff_prepare_io_fault)); }
-                },
-                7 => { 
-                    { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).writer_snapshots)); }
-                },
-                8 => { 
-                    { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).writer_schema)); }
-                },
-                9 => { 
-                    { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).cache_charge_bytes)); }
-                },
-                18 => { 
-                    { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).cache_stripe_residue)); }
-                },
-                10 => { 
-                    { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).used_legacy_table_meta_layout)); }
-                },
-                11 => { 
-                    { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).paged_publications)); }
-                },
-                12 => { 
-                    { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).paged_root_capture)); }
-                },
-                13 => { 
-                    { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).scoped_vector_root_capture)); }
-                },
-                14 => { 
-                    { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).vector_repair_audit)); }
-                },
-                15 => { 
-                    { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).proof_accountant)); }
-                },
-                16 => { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).saved_export_recovery_cutoff)); },
-                17 => { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).saved_export_abandonment_error)); },
-                _ => unreachable!(),
-            }}
+            unsafe {
+                match step {
+                    0 => {
+                        std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).path));
+                    }
+                    1 => {
+                        std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).runtime_dir));
+                    }
+                    2 => {
+                        std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).db));
+                    }
+                    3 => {
+                        std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).writer_file));
+                    }
+                    4 => {
+                        std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.source).lock_file));
+                    }
+                    5 => {
+                        std::ptr::drop_in_place(std::ptr::addr_of_mut!(
+                            (*self.source).storage_compaction
+                        ));
+                    }
+                    6 => {
+                        #[cfg(any(test, feature = "test-seams"))]
+                        {
+                            std::ptr::drop_in_place(std::ptr::addr_of_mut!(
+                                (*self.source).handoff_prepare_io_fault
+                            ));
+                        }
+                    }
+                    7 => {
+                        std::ptr::drop_in_place(std::ptr::addr_of_mut!(
+                            (*self.source).writer_snapshots
+                        ));
+                    }
+                    8 => {
+                        std::ptr::drop_in_place(std::ptr::addr_of_mut!(
+                            (*self.source).writer_schema
+                        ));
+                    }
+                    9 => {
+                        std::ptr::drop_in_place(std::ptr::addr_of_mut!(
+                            (*self.source).cache_charge_bytes
+                        ));
+                    }
+                    18 => {
+                        std::ptr::drop_in_place(std::ptr::addr_of_mut!(
+                            (*self.source).cache_stripe_residue
+                        ));
+                    }
+                    10 => {
+                        std::ptr::drop_in_place(std::ptr::addr_of_mut!(
+                            (*self.source).used_legacy_table_meta_layout
+                        ));
+                    }
+                    11 => {
+                        std::ptr::drop_in_place(std::ptr::addr_of_mut!(
+                            (*self.source).paged_publications
+                        ));
+                    }
+                    12 => {
+                        std::ptr::drop_in_place(std::ptr::addr_of_mut!(
+                            (*self.source).paged_root_capture
+                        ));
+                    }
+                    13 => {
+                        std::ptr::drop_in_place(std::ptr::addr_of_mut!(
+                            (*self.source).scoped_vector_root_capture
+                        ));
+                    }
+                    14 => {
+                        std::ptr::drop_in_place(std::ptr::addr_of_mut!(
+                            (*self.source).vector_repair_audit
+                        ));
+                    }
+                    15 => {
+                        std::ptr::drop_in_place(std::ptr::addr_of_mut!(
+                            (*self.source).proof_accountant
+                        ));
+                    }
+                    16 => {
+                        std::ptr::drop_in_place(std::ptr::addr_of_mut!(
+                            (*self.source).saved_export_recovery_cutoff
+                        ));
+                    }
+                    17 => {
+                        std::ptr::drop_in_place(std::ptr::addr_of_mut!(
+                            (*self.source).saved_export_abandonment_error
+                        ));
+                    }
+                    _ => unreachable!(),
+                }
+            }
             #[cfg(test)]
             RETURNED_LOADER_PARTIAL_PANIC_FOR_TEST.with(|flag| {
-                if flag.get() == Some(step) { flag.set(None); panic!("CDB127 partial persistence cleanup unwind"); }
+                if flag.get() == Some(step) {
+                    flag.set(None);
+                    panic!("CDB127 partial persistence cleanup unwind");
+                }
             });
         }
     }
@@ -41881,7 +42222,11 @@ impl Drop for PersistenceConstruction {
         // If one initialized child unwinds, this stack guard resumes at the
         // next field. finish disarms each field before its destructor runs.
         struct Resume<'a>(&'a mut PersistenceConstruction);
-        impl Drop for Resume<'_> { fn drop(&mut self) { self.0.finish(); } }
+        impl Drop for Resume<'_> {
+            fn drop(&mut self) {
+                self.0.finish();
+            }
+        }
         let resume = Resume(self);
         resume.0.finish();
     }
@@ -42502,87 +42847,209 @@ mod empty_declared_index_readiness_tests {
         assert_eq!(open.hashed_bytes, expected_hashed_bytes, "{case}: {open:?}");
     }
 
-
-
     // These consumers use the graph sidecar only; legacy default oracles stay exact.
     // The closed observation receipt supplies complete returned-key coverage.
     // Population events denote whole-table walks; fixed seeks/probes stay separate.
     fn assert_graph_no_population_walk(scope: &ReadWorkObservationScope) {
         let work = scope.graph_counters();
         let events = scope.graph_events();
-        assert_eq!(work.graph_population_walks, 0, "open and addressed proof windows never walk a complete graph/history population");
-        assert_eq!(events.iter().filter(|event| event.operation == "population_walk").count(), 0, "actual complete-walk events must agree with the graph sidecar");
+        assert_eq!(
+            work.graph_population_walks, 0,
+            "open and addressed proof windows never walk a complete graph/history population"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.operation == "population_walk")
+                .count(),
+            0,
+            "actual complete-walk events must agree with the graph sidecar"
+        );
     }
 
-    fn graph_retained_zero_touch_keys(before: &GraphPublicationState) -> Vec<(&'static str, Vec<u8>)> {
+    fn graph_retained_zero_touch_keys(
+        before: &GraphPublicationState,
+    ) -> Vec<(&'static str, Vec<u8>)> {
         // Decode and derive fixture identities before entering Mutation.
         let mut retained = Vec::new();
         for (key, bytes) in &before.1[0] {
             retained.push(("history", key.as_bytes().to_vec()));
             let position = RedbPersistence::numeric_change_key(key).unwrap();
             retained.push(("history", position.to_vec()));
-            let entry = RedbPersistence::decode_stored_change_log(bytes).unwrap().entry;
+            let entry = RedbPersistence::decode_stored_change_log(bytes)
+                .unwrap()
+                .entry;
             if let Some(selector) = RedbPersistence::log_table_selector(&entry, &position) {
                 retained.push(("change_log_by_table", selector));
             }
         }
         for (key, _) in &before.0[2] {
-            if key.get(17) == Some(&1) { retained.push(("graph_deletion", key.clone())); }
+            if key.get(17) == Some(&1) {
+                retained.push(("graph_deletion", key.clone()));
+            }
         }
-        for (key, _) in &before.0[3] { retained.push(("graph_location", key.clone())); }
+        for (key, _) in &before.0[3] {
+            retained.push(("graph_location", key.clone()));
+        }
         retained
     }
 
-    fn assert_graph_retained_zero_touch(scope: &ReadWorkObservationScope, retained: &[(&str, Vec<u8>)]) {
+    fn assert_graph_retained_zero_touch(
+        scope: &ReadWorkObservationScope,
+        retained: &[(&str, Vec<u8>)],
+    ) {
         assert!(retained.iter().any(|(family, _)| *family == "history"));
-        assert!(retained.iter().any(|(family, _)| *family == "graph_location"));
-        assert!(retained.iter().any(|(family, _)| *family == "graph_deletion"));
+        assert!(
+            retained
+                .iter()
+                .any(|(family, _)| *family == "graph_location")
+        );
+        assert!(
+            retained
+                .iter()
+                .any(|(family, _)| *family == "graph_deletion")
+        );
         let events = scope.graph_events();
-        assert!(events.iter().filter(|event| matches!(event.operation.as_str(), "get" | "insert" | "remove" | "iteration_step")).all(|event| !retained.iter().any(|(family, key)| event.family == *family && event.key == *key)), "pure predecessor retirement must never read, write or visit an exact retained history/T/deletion-C key");
+        assert!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event.operation.as_str(),
+                    "get" | "insert" | "remove" | "iteration_step"
+                ))
+                .all(|event| !retained
+                    .iter()
+                    .any(|(family, key)| event.family == *family && event.key == *key)),
+            "pure predecessor retirement must never read, write or visit an exact retained history/T/deletion-C key"
+        );
     }
 
     fn assert_graph_context(scope: &ReadWorkObservationScope, phase: ReadWorkPhase) {
         let events = scope.graph_events();
-        assert!(!events.is_empty(), "an absent observation cannot prove zero work");
+        assert!(
+            !events.is_empty(),
+            "an absent observation cannot prove zero work"
+        );
         assert!(events.iter().all(|event| event.phase == phase));
-        assert!(events.iter().all(|event| event.operation_id.as_deref() == Some("graph-observer-row")));
-        assert!(events.iter().any(|event| event.observation_status == "OBSERVED" && event.captured_root.is_some()));
-        assert!(events.iter().filter(|event| (event.family.starts_with("graph_") || matches!(event.family.as_str(), "commit_index" | "history")) && matches!(event.operation.as_str(), "get" | "remove" | "insert" | "maximum_seek")).all(|event| event.observation_status == "OBSERVED" && event.captured_root.is_some()));
+        assert!(
+            events
+                .iter()
+                .all(|event| event.operation_id.as_deref() == Some("graph-observer-row"))
+        );
+        assert!(
+            events.iter().any(
+                |event| event.observation_status == "OBSERVED" && event.captured_root.is_some()
+            )
+        );
+        assert!(
+            events
+                .iter()
+                .filter(|event| (event.family.starts_with("graph_")
+                    || matches!(event.family.as_str(), "commit_index" | "history"))
+                    && matches!(
+                        event.operation.as_str(),
+                        "get" | "remove" | "insert" | "maximum_seek"
+                    ))
+                .all(
+                    |event| event.observation_status == "OBSERVED" && event.captured_root.is_some()
+                )
+        );
     }
 
-    fn assert_graph_open_work(scope: &ReadWorkObservationScope, expected_root: &str) -> crate::read_work_probe::GraphReadWorkCounters {
+    fn assert_graph_open_work(
+        scope: &ReadWorkObservationScope,
+        expected_root: &str,
+    ) -> crate::read_work_probe::GraphReadWorkCounters {
         assert_graph_context(scope, ReadWorkPhase::Open);
         assert_graph_no_population_walk(scope);
         let work = scope.graph_counters();
         assert_eq!(work.graph_payload_decodes, 0);
         assert_eq!(work.graph_private_history_decodes, 0);
         let events = scope.graph_events();
-        let roots = events.iter().filter(|event| event.operation == "root" && matches!(event.family.as_str(), "graph_fwd" | "graph_rev" | "graph_contribution" | "graph_location" | "graph_lifecycle")).collect::<Vec<_>>();
-        assert!(roots.iter().all(|event| event.captured_root.as_deref() == Some(expected_root)), "the descriptors belong to the actual captured source transaction");
-        assert_eq!(roots.len(), 5, "each logical validation acquires five graph-family descriptors");
+        let roots = events
+            .iter()
+            .filter(|event| {
+                event.operation == "root"
+                    && matches!(
+                        event.family.as_str(),
+                        "graph_fwd"
+                            | "graph_rev"
+                            | "graph_contribution"
+                            | "graph_location"
+                            | "graph_lifecycle"
+                    )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            roots
+                .iter()
+                .all(|event| event.captured_root.as_deref() == Some(expected_root)),
+            "the descriptors belong to the actual captured source transaction"
+        );
+        assert_eq!(
+            roots.len(),
+            5,
+            "each logical validation acquires five graph-family descriptors"
+        );
         assert_eq!(work.graph_root_reads, roots.len() as u64);
-        for family in ["graph_fwd", "graph_rev", "graph_contribution", "graph_location", "graph_lifecycle"] {
-            let descriptors = roots.iter().filter(|event| event.family == family).collect::<Vec<_>>();
+        for family in [
+            "graph_fwd",
+            "graph_rev",
+            "graph_contribution",
+            "graph_location",
+            "graph_lifecycle",
+        ] {
+            let descriptors = roots
+                .iter()
+                .filter(|event| event.family == family)
+                .collect::<Vec<_>>();
             assert_eq!(descriptors.len(), 1);
-            assert!(descriptors[0].acquired_root.as_ref().is_some_and(|root| !root.is_empty()));
+            assert!(
+                descriptors[0]
+                    .acquired_root
+                    .as_ref()
+                    .is_some_and(|root| !root.is_empty())
+            );
             assert_eq!(descriptors[0].captured_root, roots[0].captured_root);
         }
         work
     }
 
-    fn assert_graph_addressed_work(scope: &ReadWorkObservationScope, bound: u64) -> crate::read_work_probe::GraphReadWorkCounters {
+    fn assert_graph_addressed_work(
+        scope: &ReadWorkObservationScope,
+        bound: u64,
+    ) -> crate::read_work_probe::GraphReadWorkCounters {
         assert_graph_context(scope, ReadWorkPhase::Query);
         assert_graph_no_population_walk(scope);
         let work = scope.graph_counters();
         assert!(work.graph_addressed_gets > 0);
-        assert!(work.graph_addressed_gets <= bound, "additional addressed proof work: {work:?}");
+        assert!(
+            work.graph_addressed_gets <= bound,
+            "additional addressed proof work: {work:?}"
+        );
         assert_eq!(work.graph_maximum_seeks, 1);
         assert!(work.graph_commit_gets > 0);
         let events = scope.graph_events();
-        assert_eq!(events.iter().filter(|event| event.operation == "maximum_seek").count() as u64, work.graph_maximum_seeks);
-        assert_eq!(events.iter().filter(|event| event.family == "commit_index" && event.operation == "get").count() as u64, work.graph_commit_gets);
-        assert!(events.iter().any(|event| event.family == "commit_index" && event.role.as_deref() == Some("requested_own") && event.queried_lsn.is_some()));
-        assert!(events.iter().any(|event| event.family == "commit_index" && event.role.as_deref() == Some("maximum_source") && event.queried_lsn.is_some()));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.operation == "maximum_seek")
+                .count() as u64,
+            work.graph_maximum_seeks
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.family == "commit_index" && event.operation == "get")
+                .count() as u64,
+            work.graph_commit_gets
+        );
+        assert!(events.iter().any(|event| event.family == "commit_index"
+            && event.role.as_deref() == Some("requested_own")
+            && event.queried_lsn.is_some()));
+        assert!(events.iter().any(|event| event.family == "commit_index"
+            && event.role.as_deref() == Some("maximum_source")
+            && event.queried_lsn.is_some()));
         // Full-key iterator coverage is unfinished. No zero-population assertion.
         // The pinned final receipt closes that historical gap; the shared assertion above now applies.
         work
@@ -42590,10 +43057,19 @@ mod empty_declared_index_readiness_tests {
 
     // The supplied history bytes are fetched before Query; full-history answers
     // remain in the original helper after these isolated proof windows finish.
-    fn graph_addressed_observer_row(root: &graph_read::GraphReadRoot, predecessor: &AdjEntry, present: bool, physical: Lsn, ordinal: usize, expected: &ChangeLogEntry) -> Vec<crate::read_work_probe::GraphReadWorkCounters> {
+    fn graph_addressed_observer_row(
+        root: &graph_read::GraphReadRoot,
+        predecessor: &AdjEntry,
+        present: bool,
+        physical: Lsn,
+        ordinal: usize,
+        expected: &ChangeLogEntry,
+    ) -> Vec<crate::read_work_probe::GraphReadWorkCounters> {
         use std::ops::Bound;
         use writer_source::SourceWindowOwner;
-        let memory = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(16 * 1024 * 1024));
+        let memory = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(
+            16 * 1024 * 1024,
+        ));
         let mut result = Vec::new();
         let expected_root = match root {
             graph_read::GraphReadRoot::Writer(root) => format!("{:?}", root.storage_identity()),
@@ -42601,16 +43077,31 @@ mod empty_declared_index_readiness_tests {
         };
         if present {
             for reverse in [false, true] {
-                let key = if reverse { RedbPersistence::graph_rev_key(predecessor) } else { RedbPersistence::graph_fwd_key(predecessor) };
+                let key = if reverse {
+                    RedbPersistence::graph_rev_key(predecessor)
+                } else {
+                    RedbPersistence::graph_fwd_key(predecessor)
+                };
                 let scope = ReadWorkObservationScope::enter(ReadWorkPhase::Query);
                 scope.set_operation_id("graph-observer-row");
                 // This direct observation starts after capture. Bind the actual
                 // pinned source before the cursor records its first range event.
                 match root {
-                    graph_read::GraphReadRoot::Writer(source) => crate::read_work_probe::bind_graph_root(source.storage_identity()),
-                    graph_read::GraphReadRoot::Image(source) => crate::read_work_probe::bind_graph_root(source.storage_identity()),
+                    graph_read::GraphReadRoot::Writer(source) => {
+                        crate::read_work_probe::bind_graph_root(source.storage_identity())
+                    }
+                    graph_read::GraphReadRoot::Image(source) => {
+                        crate::read_work_probe::bind_graph_root(source.storage_identity())
+                    }
                 }
-                let mut cursor = root.cursor(reverse, Bound::Included(&key), Bound::Included(&key), memory.clone()).unwrap();
+                let mut cursor = root
+                    .cursor(
+                        reverse,
+                        Bound::Included(&key),
+                        Bound::Included(&key),
+                        memory.clone(),
+                    )
+                    .unwrap();
                 assert_eq!(cursor.next_edge().unwrap().unwrap().edge(), predecessor);
                 assert!(cursor.next_edge().unwrap().is_none());
                 result.push(assert_graph_addressed_work(&scope, 7));
@@ -42629,25 +43120,49 @@ mod empty_declared_index_readiness_tests {
                 let value = table.get(key.as_str()).unwrap().unwrap();
                 value.value().to_vec()
             }
-            graph_read::GraphReadRoot::Image(source) => source.with_read(|read| {
-                let table = read.open_table(CHANGE_LOG_TABLE).unwrap();
-                let value = table.get(key.as_str()).unwrap().unwrap();
-                Ok(value.value().to_vec())
-            }).unwrap(),
+            graph_read::GraphReadRoot::Image(source) => source
+                .with_read(|read| {
+                    let table = read.open_table(CHANGE_LOG_TABLE).unwrap();
+                    let value = table.get(key.as_str()).unwrap().unwrap();
+                    Ok(value.value().to_vec())
+                })
+                .unwrap(),
         };
         let scope = ReadWorkObservationScope::enter(ReadWorkPhase::Query);
         scope.set_operation_id("graph-observer-row");
         match root {
-            graph_read::GraphReadRoot::Writer(root) => root.verify_stored_graph_history_at_root(&key, &bytes, &SourceWindowOwner::Read(memory.clone())).unwrap(),
-            graph_read::GraphReadRoot::Image(source) => source.verify_stored_graph_history(&key, &bytes, memory).unwrap(),
+            graph_read::GraphReadRoot::Writer(root) => root
+                .verify_stored_graph_history_at_root(
+                    &key,
+                    &bytes,
+                    &SourceWindowOwner::Read(memory.clone()),
+                )
+                .unwrap(),
+            graph_read::GraphReadRoot::Image(source) => source
+                .verify_stored_graph_history(&key, &bytes, memory)
+                .unwrap(),
         }
         let work = assert_graph_addressed_work(&scope, if present { 12 } else { 10 });
-        assert!(scope.graph_events().iter().filter(|event| event.observation_status == "OBSERVED").all(|event| event.captured_root.as_deref() == Some(expected_root.as_str())));
+        assert!(
+            scope
+                .graph_events()
+                .iter()
+                .filter(|event| event.observation_status == "OBSERVED")
+                .all(|event| event.captured_root.as_deref() == Some(expected_root.as_str()))
+        );
         assert_eq!(work.graph_supplied_primary_reads, 1);
         assert!(work.graph_private_history_decodes > 0);
         let events = scope.graph_events();
-        assert!(events.iter().filter(|event| event.family == "commit_index").all(|event| event.queried_lsn != Some(physical.0)), "physical storage coordinates never invent public commits");
-        assert!(events.iter().any(|event| event.family == "commit_index" && event.queried_lsn == Some(expected.lsn().0) && event.role.as_deref() == Some("requested_own")));
+        assert!(
+            events
+                .iter()
+                .filter(|event| event.family == "commit_index")
+                .all(|event| event.queried_lsn != Some(physical.0)),
+            "physical storage coordinates never invent public commits"
+        );
+        assert!(events.iter().any(|event| event.family == "commit_index"
+            && event.queried_lsn == Some(expected.lsn().0)
+            && event.role.as_deref() == Some("requested_own")));
         result.push(work);
         result
     }
@@ -42659,22 +43174,39 @@ mod empty_declared_index_readiness_tests {
             retained.push(("history", key.as_bytes().to_vec()));
             let position = RedbPersistence::numeric_change_key(key).unwrap();
             retained.push(("history", position.to_vec()));
-            let entry = RedbPersistence::decode_stored_change_log(bytes).unwrap().entry;
+            let entry = RedbPersistence::decode_stored_change_log(bytes)
+                .unwrap()
+                .entry;
             if let Some(selector) = RedbPersistence::log_table_selector(&entry, &position) {
                 retained.push(("change_log_by_table", selector));
             }
         }
         for (key, _) in &before.0[2] {
-            retained.push((if key.get(17) == Some(&1) { "graph_deletion" } else { "graph_creation" }, key.clone()));
+            retained.push((
+                if key.get(17) == Some(&1) {
+                    "graph_deletion"
+                } else {
+                    "graph_creation"
+                },
+                key.clone(),
+            ));
         }
-        for (key, _) in &before.0[3] { retained.push(("graph_location", key.clone())); }
+        for (key, _) in &before.0[3] {
+            retained.push(("graph_location", key.clone()));
+        }
         let scope = ReadWorkObservationScope::enter(ReadWorkPhase::Mutation);
         scope.set_operation_id("graph-observer-row");
-        for (family, key) in retained { scope.retain_graph_key(family, &key); }
+        for (family, key) in retained {
+            scope.retain_graph_key(family, &key);
+        }
         scope
     }
 
-    fn assert_graph_retirement_work(scope: &ReadWorkObservationScope, predecessor: &AdjEntry, repack: bool) -> [u64; 4] {
+    fn assert_graph_retirement_work(
+        scope: &ReadWorkObservationScope,
+        predecessor: &AdjEntry,
+        repack: bool,
+    ) -> [u64; 4] {
         assert_graph_context(scope, ReadWorkPhase::Mutation);
         let work = scope.graph_counters();
         let events = scope.graph_events();
@@ -42682,26 +43214,88 @@ mod empty_declared_index_readiness_tests {
         let reverse = RedbPersistence::graph_rev_key(predecessor);
         let creation = graph_history_record::creation_contribution_key(&p).unwrap();
         let lifecycle = graph_history_record::lifecycle_key(&p).unwrap();
-        for (family, operation, key) in [("graph_fwd", "remove", &p), ("graph_rev", "remove", &reverse), ("graph_creation", "remove", &creation)] {
-            assert_eq!(events.iter().filter(|event| event.family == family && event.operation == operation && event.key == *key).count(), 1, "exact selected-key attempted operation");
-            assert_eq!(events.iter().filter(|event| event.family == family && event.operation == operation).count(), 1, "no additional same-family removals or receipt rewrites");
+        for (family, operation, key) in [
+            ("graph_fwd", "remove", &p),
+            ("graph_rev", "remove", &reverse),
+            ("graph_creation", "remove", &creation),
+        ] {
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event.family == family
+                        && event.operation == operation
+                        && event.key == *key)
+                    .count(),
+                1,
+                "exact selected-key attempted operation"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event.family == family && event.operation == operation)
+                    .count(),
+                1,
+                "no additional same-family removals or receipt rewrites"
+            );
         }
-        let rewrites = events.iter().filter(|event| event.family == "graph_lifecycle" && event.operation == "insert").collect::<Vec<_>>();
+        let rewrites = events
+            .iter()
+            .filter(|event| event.family == "graph_lifecycle" && event.operation == "insert")
+            .collect::<Vec<_>>();
         assert!(rewrites.iter().all(|event| event.key == lifecycle));
-        if repack { assert!(!rewrites.is_empty(), "repack reinstalls witnesses before final retirement"); } else { assert_eq!(rewrites.len(), 1, "retirement alone rewrites one lifecycle receipt"); }
+        if repack {
+            assert!(
+                !rewrites.is_empty(),
+                "repack reinstalls witnesses before final retirement"
+            );
+        } else {
+            assert_eq!(
+                rewrites.len(),
+                1,
+                "retirement alone rewrites one lifecycle receipt"
+            );
+        }
         assert_eq!(work.graph_publication_commits, 1);
-        assert_eq!(events.iter().filter(|event| event.family == "publication" && event.operation == "committed").count(), 1);
-        assert_eq!(events.iter().filter(|event| event.family == "publication" && event.operation == "aborted").count(), 0);
-        assert!(events.iter().any(|event| event.family == "publication" && event.operation == "begin" && event.captured_root.is_some()));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.family == "publication" && event.operation == "committed")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.family == "publication" && event.operation == "aborted")
+                .count(),
+            0
+        );
+        assert!(events.iter().any(|event| event.family == "publication"
+            && event.operation == "begin"
+            && event.captured_root.is_some()));
         // Retained keys are registered, but zero-touch counters are NOT asserted
         // until the source receipt pins complete per-key iterator coverage.
         // Historical gap above is closed by the pinned final source receipt.
         if !repack {
-            assert_eq!(work.graph_survivor_history_touches, 0, "pure retirement never touches retained history keys");
-            assert_eq!(work.graph_survivor_location_touches, 0, "pure retirement never touches retained T keys");
-            assert_eq!(work.graph_survivor_deletion_contribution_touches, 0, "pure retirement never touches retained deletion C keys");
+            assert_eq!(
+                work.graph_survivor_history_touches, 0,
+                "pure retirement never touches retained history keys"
+            );
+            assert_eq!(
+                work.graph_survivor_location_touches, 0,
+                "pure retirement never touches retained T keys"
+            );
+            assert_eq!(
+                work.graph_survivor_deletion_contribution_touches, 0,
+                "pure retirement never touches retained deletion C keys"
+            );
         }
-        [work.graph_forward_mutations, work.graph_reverse_mutations, work.graph_creation_contribution_mutations, work.graph_lifecycle_mutations]
+        [
+            work.graph_forward_mutations,
+            work.graph_reverse_mutations,
+            work.graph_creation_contribution_mutations,
+            work.graph_lifecycle_mutations,
+        ]
     }
 
     // Samples the existing worker kernel before its first graph source cursor
@@ -42716,44 +43310,97 @@ mod empty_declared_index_readiness_tests {
         capture_events: std::sync::Mutex<Vec<crate::read_work_probe::GraphWorkEvent>>,
         capture_workers: std::sync::Mutex<Vec<crate::read_work_probe::GraphWorkerInstallation>>,
         capture_pages: std::sync::Mutex<Option<(u64, u64)>>,
-        capture_page_owners: std::sync::Mutex<Option<std::collections::BTreeMap<String, (u64, u64)>>>,
+        capture_page_owners:
+            std::sync::Mutex<Option<std::collections::BTreeMap<String, (u64, u64)>>>,
         first_source: std::sync::Mutex<Option<crate::read_session::ReadKernelSourceEvent>>,
     }
 
     #[cfg(any(test, feature = "test-seams"))]
     impl crate::read_session::ReadKernelTestObserver for OwnerGraphSnapshotBoundaryObserver {
-        fn registered_snapshot_for_test(&self, route: ReadRoute, operation: crate::read_session::ReadSessionOperation, snapshot: SnapshotId) {
+        fn registered_snapshot_for_test(
+            &self,
+            route: ReadRoute,
+            operation: crate::read_session::ReadSessionOperation,
+            snapshot: SnapshotId,
+        ) {
             if self.scope.lock().unwrap().is_some() {
                 assert_eq!(route, ReadRoute::Owner);
-                assert_eq!(operation, crate::read_session::ReadSessionOperation::Execute);
+                assert_eq!(
+                    operation,
+                    crate::read_session::ReadSessionOperation::Execute
+                );
                 self.snapshots.lock().unwrap().push(snapshot);
             }
         }
-        fn before_source_touch(&self, event: crate::read_session::ReadKernelSourceEvent, _: contextdb_core::read_contract::OwnerReadCancellation) {
-            if event.source != crate::read_session::ReadKernelSource::GraphEdge { return; }
+        fn before_source_touch(
+            &self,
+            event: crate::read_session::ReadKernelSourceEvent,
+            _: contextdb_core::read_contract::OwnerReadCancellation,
+        ) {
+            if event.source != crate::read_session::ReadKernelSource::GraphEdge {
+                return;
+            }
             let installed = self.scope.lock().unwrap();
-            let Some(scope) = installed.as_ref() else { return; };
+            let Some(scope) = installed.as_ref() else {
+                return;
+            };
             let mut first = self.first_edge.lock().unwrap();
             if first.is_none() {
                 assert_eq!(event.route, ReadRoute::Owner);
-                assert_eq!(event.operation, crate::read_session::ReadSessionOperation::Execute);
+                assert_eq!(
+                    event.operation,
+                    crate::read_session::ReadSessionOperation::Execute
+                );
                 assert_eq!(scope.phase(), ReadWorkPhase::Query);
-                assert_eq!(self.snapshots.lock().unwrap().len(), 1, "the statement has registered its real snapshot before graph capture reaches its first source touch");
+                assert_eq!(
+                    self.snapshots.lock().unwrap().len(),
+                    1,
+                    "the statement has registered its real snapshot before graph capture reaches its first source touch"
+                );
                 *self.first_source.lock().unwrap() = Some(event);
-                let page_owners = scope.owner_page_admission_by_owner().expect("the executing query must expose its actual per-capability admission map");
-                let capture = scope.graph_events().into_iter().find(|event| event.family == "graph_snapshot" && event.operation == "SNAPSHOT_CAPTURE").expect("the first edge callback follows the real graph capture");
-                let capture_owner = capture.funding_owner.as_deref().expect("the actual capture names its funding capability");
+                let page_owners = scope.owner_page_admission_by_owner().expect(
+                    "the executing query must expose its actual per-capability admission map",
+                );
+                let capture = scope
+                    .graph_events()
+                    .into_iter()
+                    .find(|event| {
+                        event.family == "graph_snapshot" && event.operation == "SNAPSHOT_CAPTURE"
+                    })
+                    .expect("the first edge callback follows the real graph capture");
+                let capture_owner = capture
+                    .funding_owner
+                    .as_deref()
+                    .expect("the actual capture names its funding capability");
                 let named_pages = page_owners.get(capture_owner).expect("the cold first graph capture must admit pages on its named capability before opening the edge cursor");
-                assert!(named_pages.0 > 0, "the first GraphEdge callback must already observe a page admitted on its named query owner");
-                assert!(named_pages.1 > 0, "nonzero bytes on the named query owner prove its actual page callback ran before the edge cursor");
+                assert!(
+                    named_pages.0 > 0,
+                    "the first GraphEdge callback must already observe a page admitted on its named query owner"
+                );
+                assert!(
+                    named_pages.1 > 0,
+                    "nonzero bytes on the named query owner prove its actual page callback ran before the edge cursor"
+                );
                 *self.capture_page_owners.lock().unwrap() = Some(page_owners);
-                *first = Some(scope.owner_graph_counters().expect("the executing graph worker must install the owner binding"));
+                *first = Some(
+                    scope
+                        .owner_graph_counters()
+                        .expect("the executing graph worker must install the owner binding"),
+                );
                 *self.capture_events.lock().unwrap() = scope.graph_events();
                 *self.capture_workers.lock().unwrap() = scope.owner_worker_paths();
-                *self.capture_pages.lock().unwrap() = Some(scope.owner_page_admission().expect("the installed graph worker must expose its actual page admissions"));
+                *self.capture_pages.lock().unwrap() =
+                    Some(scope.owner_page_admission().expect(
+                        "the installed graph worker must expose its actual page admissions",
+                    ));
             }
         }
-        fn cancellation_observed(&self, _: crate::read_session::ReadKernelCancellationEvent, _: contextdb_core::read_contract::OwnerReadCancellation) {}
+        fn cancellation_observed(
+            &self,
+            _: crate::read_session::ReadKernelCancellationEvent,
+            _: contextdb_core::read_contract::OwnerReadCancellation,
+        ) {
+        }
     }
 
     #[cfg(any(test, feature = "test-seams"))]
@@ -42763,68 +43410,127 @@ mod empty_declared_index_readiness_tests {
         // This block owns every handle used to author the fixture. No source,
         // graph reader, transaction, or writing Database survives its end.
         let (owner_reads, declared_reader_limit) = {
-            let database = Database::open_with_options(&path, crate::DatabaseOpenOptions {
-                maintenance_policy: crate::database::MaintenancePolicy::CallerDriven,
-                test_kernel_observer: Some(observer.clone()),
-                ..Default::default()
-            }).unwrap();
-            database.execute("CREATE TABLE nodes (id UUID PRIMARY KEY) SYNC OFF", &HashMap::new()).unwrap();
+            let database = Database::open_with_options(
+                &path,
+                crate::DatabaseOpenOptions {
+                    maintenance_policy: crate::database::MaintenancePolicy::CallerDriven,
+                    test_kernel_observer: Some(observer.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            database
+                .execute(
+                    "CREATE TABLE nodes (id UUID PRIMARY KEY) SYNC OFF",
+                    &HashMap::new(),
+                )
+                .unwrap();
             database.execute("CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT) SYNC OFF", &HashMap::new()).unwrap();
             for id in [1, 2] {
-                database.execute("INSERT INTO nodes VALUES ($id)", &HashMap::from([("id".into(), Value::Uuid(uuid::Uuid::from_u128(id)))])).unwrap();
+                database
+                    .execute(
+                        "INSERT INTO nodes VALUES ($id)",
+                        &HashMap::from([("id".into(), Value::Uuid(uuid::Uuid::from_u128(id)))]),
+                    )
+                    .unwrap();
             }
             let tx = database.begin_or_panic();
-            database.insert_edge(tx, uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2), "LINKS".into(), HashMap::new()).unwrap();
+            database
+                .insert_edge(
+                    tx,
+                    uuid::Uuid::from_u128(1),
+                    uuid::Uuid::from_u128(2),
+                    "LINKS".into(),
+                    HashMap::new(),
+                )
+                .unwrap();
             database.commit(tx).unwrap();
             // Preserve the exact reader declaration used to write this fixture.
             let owner_reads = database.owner_read_config().clone();
             let declared_reader_limit = owner_reads.limits.limits.memory;
             let written_edges = database.execute("SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) WHERE a.id = $source COLUMNS (b.id AS t))", &HashMap::from([("source".into(), Value::Uuid(uuid::Uuid::from_u128(1)))])).unwrap();
-            assert_eq!(written_edges.rows, vec![vec![Value::Uuid(uuid::Uuid::from_u128(2))]], "the store has the authored edge before every writing handle is dropped");
+            assert_eq!(
+                written_edges.rows,
+                vec![vec![Value::Uuid(uuid::Uuid::from_u128(2))]],
+                "the store has the authored edge before every writing handle is dropped"
+            );
             database.close().unwrap();
             drop(database);
             (owner_reads, declared_reader_limit)
         };
-        assert!(path.is_file(), "reopen the already-written task store, never an empty replacement");
-        let database = Database::open_with_options(&path, crate::DatabaseOpenOptions {
-            owner_reads,
-            maintenance_policy: crate::database::MaintenancePolicy::CallerDriven,
-            test_kernel_observer: Some(observer.clone()),
-            ..Default::default()
-        }).unwrap();
-        assert_eq!(database.owner_read_config().limits.limits.memory, declared_reader_limit, "reopen preserves the fixture's existing declared reader limit");
+        assert!(
+            path.is_file(),
+            "reopen the already-written task store, never an empty replacement"
+        );
+        let database = Database::open_with_options(
+            &path,
+            crate::DatabaseOpenOptions {
+                owner_reads,
+                maintenance_policy: crate::database::MaintenancePolicy::CallerDriven,
+                test_kernel_observer: Some(observer.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            database.owner_read_config().limits.limits.memory,
+            declared_reader_limit,
+            "reopen preserves the fixture's existing declared reader limit"
+        );
         // Tuple fields are read hits, read misses, evictions, resident bytes.
         let reopened_cache_bytes = database.__writer_cache_stats_for_test().unwrap().3;
         // The live writer read transaction pins one native root page and its control.
-        assert!(reopened_cache_bytes <= 4096 + 112, "the reopened writer retains at most one native root page plus its control before public owner open: {reopened_cache_bytes}");
+        assert!(
+            reopened_cache_bytes <= 4096 + 112,
+            "the reopened writer retains at most one native root page plus its control before public owner open: {reopened_cache_bytes}"
+        );
         let owner_reads = database.owner_read_config().clone();
         database.close().unwrap();
         drop(database);
         // Double the committed node population, then release every writing handle.
-        let growing = Database::open_with_options(&path, crate::DatabaseOpenOptions {
-            owner_reads: owner_reads.clone(),
-            maintenance_policy: crate::database::MaintenancePolicy::CallerDriven,
-            test_kernel_observer: Some(observer.clone()),
-            ..Default::default()
-        }).unwrap();
+        let growing = Database::open_with_options(
+            &path,
+            crate::DatabaseOpenOptions {
+                owner_reads: owner_reads.clone(),
+                maintenance_policy: crate::database::MaintenancePolicy::CallerDriven,
+                test_kernel_observer: Some(observer.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         for id in [3, 4] {
-            growing.execute("INSERT INTO nodes VALUES ($id)", &HashMap::from([("id".into(), Value::Uuid(uuid::Uuid::from_u128(id)))])).unwrap();
+            growing
+                .execute(
+                    "INSERT INTO nodes VALUES ($id)",
+                    &HashMap::from([("id".into(), Value::Uuid(uuid::Uuid::from_u128(id)))]),
+                )
+                .unwrap();
         }
         growing.close().unwrap();
         drop(growing);
-        let database = Database::open_with_options(&path, crate::DatabaseOpenOptions {
-            owner_reads,
-            maintenance_policy: crate::database::MaintenancePolicy::CallerDriven,
-            test_kernel_observer: Some(observer.clone()),
-            ..Default::default()
-        }).unwrap();
-        assert_eq!(database.__writer_cache_stats_for_test().unwrap().3, reopened_cache_bytes, "the pinned writer root cache is identical after reopening two-node and four-node stores");
+        let database = Database::open_with_options(
+            &path,
+            crate::DatabaseOpenOptions {
+                owner_reads,
+                maintenance_policy: crate::database::MaintenancePolicy::CallerDriven,
+                test_kernel_observer: Some(observer.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            database.__writer_cache_stats_for_test().unwrap().3,
+            reopened_cache_bytes,
+            "the pinned writer root cache is identical after reopening two-node and four-node stores"
+        );
         let scope = Arc::new(ReadWorkObservationScope::enter(ReadWorkPhase::Open));
         let binding = scope.bind_owner(&database, "owner-open-graph-capture-row");
         *observer.scope.lock().unwrap() = Some(scope.clone());
         let session = ReadSession::open_owner_only(&path, ReadSessionOptions::default()).unwrap();
         assert_eq!(session.route(), ReadRoute::Owner);
-        let opened = scope.owner_graph_counters().expect("public owner open must reach an installed executing worker");
+        let opened = scope
+            .owner_graph_counters()
+            .expect("public owner open must reach an installed executing worker");
         assert_eq!(opened.graph_payload_decodes, 0);
         assert_eq!(opened.graph_private_history_decodes, 0);
         assert_eq!(opened.graph_range_reads, 0);
@@ -42832,111 +43538,310 @@ mod empty_declared_index_readiness_tests {
         assert!(opened.graph_root_reads <= 5);
         assert_eq!(opened.graph_population_walks, 0);
         assert_eq!(opened.graph_snapshots_constructed, 0);
-        assert_eq!(scope.owner_page_admission().expect("handshake and status workers must be observed"), (0, 0), "handshake and status paths admit no storage pages");
-        assert!(scope.owner_page_admission_by_owner().expect("installed open workers expose an actual empty admission map").is_empty());
+        assert_eq!(
+            scope
+                .owner_page_admission()
+                .expect("handshake and status workers must be observed"),
+            (0, 0),
+            "handshake and status paths admit no storage pages"
+        );
+        assert!(
+            scope
+                .owner_page_admission_by_owner()
+                .expect("installed open workers expose an actual empty admission map")
+                .is_empty()
+        );
         let open_workers = scope.owner_worker_paths();
-        let handshake = open_workers.iter().find(|worker| worker.path == "handshake").expect("owner-only open must observe the authenticated handshake separately");
-        let status = open_workers.iter().find(|worker| worker.path == "status").expect("owner-only open must observe its status request separately");
+        let handshake = open_workers
+            .iter()
+            .find(|worker| worker.path == "handshake")
+            .expect("owner-only open must observe the authenticated handshake separately");
+        let status = open_workers
+            .iter()
+            .find(|worker| worker.path == "status")
+            .expect("owner-only open must observe its status request separately");
         assert!(!handshake.worker_request_id.is_empty());
         assert!(!status.worker_request_id.is_empty());
         assert_ne!(handshake.worker_request_id, status.worker_request_id);
-        assert!(!open_workers.iter().any(|worker| worker.path == "query"), "the first graph query has not run at public open completion");
-        let (connection, handshake_ordinal) = handshake.worker_request_id.rsplit_once(':').expect("the actual handshake identity includes its connection and ordinal");
+        assert!(
+            !open_workers.iter().any(|worker| worker.path == "query"),
+            "the first graph query has not run at public open completion"
+        );
+        let (connection, handshake_ordinal) = handshake
+            .worker_request_id
+            .rsplit_once(':')
+            .expect("the actual handshake identity includes its connection and ordinal");
         assert_eq!(handshake_ordinal, "0");
-        assert_eq!(status.worker_request_id.rsplit_once(':').expect("the actual status identity includes its connection and ordinal").0, connection);
+        assert_eq!(
+            status
+                .worker_request_id
+                .rsplit_once(':')
+                .expect("the actual status identity includes its connection and ordinal")
+                .0,
+            connection
+        );
         // Handshake/status have completed without adding cache warmth;
         // the first graph query retains the accepted fresh-writer pinned root.
         let cache_before_query = database.__writer_cache_stats_for_test().unwrap();
-        assert_eq!(cache_before_query.3, reopened_cache_bytes, "public owner open adds no cache warmth: resident bytes equal the accepted fresh-writer baseline, with the pinned root preserved");
+        assert_eq!(
+            cache_before_query.3, reopened_cache_bytes,
+            "public owner open adds no cache warmth: resident bytes equal the accepted fresh-writer baseline, with the pinned root preserved"
+        );
         *observer.scope.lock().unwrap() = None;
         drop(binding);
         drop(scope);
         let scope = Arc::new(ReadWorkObservationScope::enter(ReadWorkPhase::Query));
         let binding = scope.bind_owner(&database, "owner-open-graph-capture-row");
         *observer.scope.lock().unwrap() = Some(scope.clone());
-        assert!(scope.owner_graph_counters().is_none(), "a caller query scope alone is UNOBSERVED until its worker installs");
+        assert!(
+            scope.owner_graph_counters().is_none(),
+            "a caller query scope alone is UNOBSERVED until its worker installs"
+        );
         // The first real query samples inside the executing kernel before its
         // edge cursor opens, then continues to the actual target as its control.
         let actual_edges = session.execute("SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) WHERE a.id = $source COLUMNS (b.id AS t))", &HashMap::from([("source".into(), Value::Uuid(uuid::Uuid::from_u128(1)))])).unwrap();
-        let captured = observer.first_edge.lock().unwrap().expect("the first real graph query must reach the source callback after graph capture");
-        assert_eq!(captured.graph_payload_decodes, 0, "open plus first graph capture has not decoded any edge");
+        let captured = observer.first_edge.lock().unwrap().expect(
+            "the first real graph query must reach the source callback after graph capture",
+        );
+        assert_eq!(
+            captured.graph_payload_decodes, 0,
+            "open plus first graph capture has not decoded any edge"
+        );
         assert_eq!(captured.graph_private_history_decodes, 0);
-        assert_eq!(captured.graph_range_reads, 0, "the graph source cursor has not loaded an edge window");
+        assert_eq!(
+            captured.graph_range_reads, 0,
+            "the graph source cursor has not loaded an edge window"
+        );
         assert_eq!(captured.graph_iteration_steps, 0);
         assert_eq!(captured.graph_population_walks, 0);
         assert!(captured.graph_root_reads <= 5);
-        assert_eq!(captured.graph_snapshots_constructed, 1, "the first real query captured one graph storage root");
-        assert_eq!(captured.graph_descriptors_at_last_capture, captured.graph_root_reads);
+        assert_eq!(
+            captured.graph_snapshots_constructed, 1,
+            "the first real query captured one graph storage root"
+        );
+        assert_eq!(
+            captured.graph_descriptors_at_last_capture,
+            captured.graph_root_reads
+        );
         let capture_events = observer.capture_events.lock().unwrap();
-        let captures = capture_events.iter().filter(|event| event.family == "graph_snapshot" && event.operation == "SNAPSHOT_CAPTURE").collect::<Vec<_>>();
-        assert_eq!(captures.len(), 1, "a counter alone cannot certify storage-root capture");
+        let captures = capture_events
+            .iter()
+            .filter(|event| {
+                event.family == "graph_snapshot" && event.operation == "SNAPSHOT_CAPTURE"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            captures.len(),
+            1,
+            "a counter alone cannot certify storage-root capture"
+        );
         let capture = captures[0];
-        let capture_root = capture.captured_root.as_deref().expect("storage identity must be published at graph snapshot construction");
+        let capture_root = capture
+            .captured_root
+            .as_deref()
+            .expect("storage identity must be published at graph snapshot construction");
         assert!(!capture_root.is_empty());
         assert_eq!(capture.observation_status, "OBSERVED");
         assert_eq!(capture.phase, ReadWorkPhase::Query);
-        assert_eq!(capture.operation_id.as_deref(), Some("owner-open-graph-capture-row"));
+        assert_eq!(
+            capture.operation_id.as_deref(),
+            Some("owner-open-graph-capture-row")
+        );
         let capture_workers = observer.capture_workers.lock().unwrap();
-        let query = capture_workers.iter().find(|worker| worker.path == "query").expect("the executing first graph query must have a separate installation receipt");
+        let query = capture_workers
+            .iter()
+            .find(|worker| worker.path == "query")
+            .expect("the executing first graph query must have a separate installation receipt");
         assert!(!query.worker_request_id.is_empty());
-        assert_eq!(capture.worker_request_id.as_deref(), Some(query.worker_request_id.as_str()));
+        assert_eq!(
+            capture.worker_request_id.as_deref(),
+            Some(query.worker_request_id.as_str())
+        );
         assert_ne!(query.worker_request_id, handshake.worker_request_id);
         assert_ne!(query.worker_request_id, status.worker_request_id);
-        assert_eq!(query.worker_request_id.rsplit_once(':').expect("the actual query identity includes its connection and ordinal").0, connection);
-        assert!(!capture_workers.iter().any(|worker| matches!(worker.path.as_str(), "handshake" | "status")), "open workers belong to the separate completed open scope");
-        assert!(!capture_events.iter().any(|event| matches!(event.operation.as_str(), "payload_decode" | "private_history_decode" | "range" | "iteration_step" | "population_walk")), "edge loading cannot precede the first source cursor opening");
-        let source = observer.first_source.lock().unwrap().expect("sample the actual first GraphEdge callback");
-        assert_eq!(source.completed_items, 0, "the first callback precedes the first edge cursor");
-        let source_owner = source.funding_owner.expect("the executing query must name its actual funding capability");
+        assert_eq!(
+            query
+                .worker_request_id
+                .rsplit_once(':')
+                .expect("the actual query identity includes its connection and ordinal")
+                .0,
+            connection
+        );
+        assert!(
+            !capture_workers
+                .iter()
+                .any(|worker| matches!(worker.path.as_str(), "handshake" | "status")),
+            "open workers belong to the separate completed open scope"
+        );
+        assert!(
+            !capture_events.iter().any(|event| matches!(
+                event.operation.as_str(),
+                "payload_decode"
+                    | "private_history_decode"
+                    | "range"
+                    | "iteration_step"
+                    | "population_walk"
+            )),
+            "edge loading cannot precede the first source cursor opening"
+        );
+        let source = observer
+            .first_source
+            .lock()
+            .unwrap()
+            .expect("sample the actual first GraphEdge callback");
+        assert_eq!(
+            source.completed_items, 0,
+            "the first callback precedes the first edge cursor"
+        );
+        let source_owner = source
+            .funding_owner
+            .expect("the executing query must name its actual funding capability");
         assert_ne!(source_owner, 0);
-        let capture_owner = capture.funding_owner.as_deref().expect("adapter construction must name its actual funding capability");
-        let (_, capture_address) = capture_owner.rsplit_once('@').expect("the source observer names a capability type and Arc address");
-        let capture_identity = usize::from_str_radix(capture_address.strip_prefix("0x").expect("Arc addresses are hexadecimal"), 16).unwrap();
-        assert_eq!(capture_identity, source_owner, "adapter and query source use the same actual capability, independent of the caller operation label");
-        let control_bytes = capture.control_reservation_bytes.expect("snapshot capture records the exact retained adapter-control credit");
+        let capture_owner = capture
+            .funding_owner
+            .as_deref()
+            .expect("adapter construction must name its actual funding capability");
+        let (_, capture_address) = capture_owner
+            .rsplit_once('@')
+            .expect("the source observer names a capability type and Arc address");
+        let capture_identity = usize::from_str_radix(
+            capture_address
+                .strip_prefix("0x")
+                .expect("Arc addresses are hexadecimal"),
+            16,
+        )
+        .unwrap();
+        assert_eq!(
+            capture_identity, source_owner,
+            "adapter and query source use the same actual capability, independent of the caller operation label"
+        );
+        let control_bytes = capture
+            .control_reservation_bytes
+            .expect("snapshot capture records the exact retained adapter-control credit");
         assert!(control_bytes > 0);
         assert!(control_bytes as u64 <= declared_reader_limit);
-        let request_bytes = source.control_reservation_bytes.expect("the source callback records current query request-reservation bytes");
+        let request_bytes = source
+            .control_reservation_bytes
+            .expect("the source callback records current query request-reservation bytes");
         assert!(request_bytes > 0);
         assert!(request_bytes as u64 <= declared_reader_limit);
         // Adapter-control bytes and request bytes are different actual credits.
         // Successful page totals are cumulative admissions, not live credits.
-        let capture_pages = observer.capture_pages.lock().unwrap().expect("the first graph callback must sample the executing worker's page accessor");
-        assert_eq!(capture_pages, (captured.worker_admitted_pages, captured.worker_admitted_page_bytes));
+        let capture_pages =
+            observer.capture_pages.lock().unwrap().expect(
+                "the first graph callback must sample the executing worker's page accessor",
+            );
+        assert_eq!(
+            capture_pages,
+            (
+                captured.worker_admitted_pages,
+                captured.worker_admitted_page_bytes
+            )
+        );
         assert!(capture_pages.1 <= declared_reader_limit);
         let capture_page_owners = observer.capture_page_owners.lock().unwrap();
-        let capture_page_owners = capture_page_owners.as_ref().expect("sample the real per-capability page map at the boundary");
-        assert_eq!(capture_page_owners.values().fold((0, 0), |sum, pages| (sum.0 + pages.0, sum.1 + pages.1)), capture_pages);
-        assert!(capture_page_owners.keys().all(|owner| owner == capture_owner), "every pre-edge page admission is funded by the captured query capability");
+        let capture_page_owners = capture_page_owners
+            .as_ref()
+            .expect("sample the real per-capability page map at the boundary");
+        assert_eq!(
+            capture_page_owners
+                .values()
+                .fold((0, 0), |sum, pages| (sum.0 + pages.0, sum.1 + pages.1)),
+            capture_pages
+        );
+        assert!(
+            capture_page_owners
+                .keys()
+                .all(|owner| owner == capture_owner),
+            "every pre-edge page admission is funded by the captured query capability"
+        );
         assert_eq!(capture_pages.0 == 0, capture_pages.1 == 0);
         // The observer has already required nonzero admission on this exact
         // named owner inside the first callback, before any edge cursor opens.
         let cache_after_query = database.__writer_cache_stats_for_test().unwrap();
         assert!(cache_after_query.0 >= cache_before_query.0);
         assert!(cache_after_query.1 >= cache_before_query.1);
-        assert_eq!(actual_edges.rows, vec![vec![Value::Uuid(uuid::Uuid::from_u128(2))]]);
-        let loaded = scope.owner_graph_counters().expect("the actual edge read remains observed on its worker");
+        assert_eq!(
+            actual_edges.rows,
+            vec![vec![Value::Uuid(uuid::Uuid::from_u128(2))]]
+        );
+        let loaded = scope
+            .owner_graph_counters()
+            .expect("the actual edge read remains observed on its worker");
         assert!(loaded.graph_payload_decodes > captured.graph_payload_decodes);
         let events = scope.graph_events();
-        assert!(!events.is_empty(), "the actual edge control must emit graph events");
-        assert!(events.iter().all(|event| event.phase == ReadWorkPhase::Query));
-        assert!(events.iter().all(|event| event.operation_id.as_deref() == Some("owner-open-graph-capture-row")));
-        assert!(events.iter().all(|event| event.worker_request_id.as_ref().is_some_and(|id| !id.is_empty())));
-        assert!(events.iter().any(|event| event.captured_root.is_some() && event.observation_status == "OBSERVED"));
-        let loaded_root = events.iter().find(|event| event.family == "graph_snapshot" && event.operation == "ROOT_BOUND").expect("the actual edge control must bind its source root");
-        assert_eq!(loaded_root.captured_root.as_deref().expect("edge loading must observe its actual root"), capture_root);
-        assert_eq!(loaded_root.worker_request_id.as_deref(), Some(query.worker_request_id.as_str()));
-        let loaded_pages = scope.owner_page_admission().expect("actual edge loading must preserve the executing page observer");
-        assert_eq!(loaded_pages, (loaded.worker_admitted_pages, loaded.worker_admitted_page_bytes));
+        assert!(
+            !events.is_empty(),
+            "the actual edge control must emit graph events"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| event.phase == ReadWorkPhase::Query)
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| event.operation_id.as_deref() == Some("owner-open-graph-capture-row"))
+        );
+        assert!(events.iter().all(|event| {
+            event
+                .worker_request_id
+                .as_ref()
+                .is_some_and(|id| !id.is_empty())
+        }));
+        assert!(
+            events.iter().any(
+                |event| event.captured_root.is_some() && event.observation_status == "OBSERVED"
+            )
+        );
+        let loaded_root = events
+            .iter()
+            .find(|event| event.family == "graph_snapshot" && event.operation == "ROOT_BOUND")
+            .expect("the actual edge control must bind its source root");
+        assert_eq!(
+            loaded_root
+                .captured_root
+                .as_deref()
+                .expect("edge loading must observe its actual root"),
+            capture_root
+        );
+        assert_eq!(
+            loaded_root.worker_request_id.as_deref(),
+            Some(query.worker_request_id.as_str())
+        );
+        let loaded_pages = scope
+            .owner_page_admission()
+            .expect("actual edge loading must preserve the executing page observer");
+        assert_eq!(
+            loaded_pages,
+            (
+                loaded.worker_admitted_pages,
+                loaded.worker_admitted_page_bytes
+            )
+        );
         assert!(loaded_pages.0 >= capture_pages.0);
         assert!(loaded_pages.1 >= capture_pages.1);
         assert!(loaded_pages.1 <= declared_reader_limit);
         assert_eq!(loaded_pages.0 == 0, loaded_pages.1 == 0);
-        let loaded_page_owners = scope.owner_page_admission_by_owner().expect("the edge control remains observed per actual capability");
-        assert_eq!(loaded_page_owners.values().fold((0, 0), |sum, pages| (sum.0 + pages.0, sum.1 + pages.1)), loaded_pages);
-        assert!(loaded_page_owners.keys().all(|owner| owner == capture_owner));
+        let loaded_page_owners = scope
+            .owner_page_admission_by_owner()
+            .expect("the edge control remains observed per actual capability");
+        assert_eq!(
+            loaded_page_owners
+                .values()
+                .fold((0, 0), |sum, pages| (sum.0 + pages.0, sum.1 + pages.1)),
+            loaded_pages
+        );
+        assert!(
+            loaded_page_owners
+                .keys()
+                .all(|owner| owner == capture_owner)
+        );
         for (owner, pages) in capture_page_owners {
-            let loaded = loaded_page_owners.get(owner).expect("successful admission totals retain the same capability identity");
+            let loaded = loaded_page_owners
+                .get(owner)
+                .expect("successful admission totals retain the same capability identity");
             assert!(loaded.0 >= pages.0 && loaded.1 >= pages.1);
         }
         drop(capture_workers);
@@ -42950,27 +43855,62 @@ mod empty_declared_index_readiness_tests {
 
     fn assert_public_owner_graph_observer_row(directory: &Path) {
         let path = directory.join("graph-observed-owner.db");
-        let database = Database::open_with_options(&path, crate::DatabaseOpenOptions { maintenance_policy: crate::database::MaintenancePolicy::CallerDriven, ..Default::default() }).unwrap();
-        database.execute("CREATE TABLE nodes (id UUID PRIMARY KEY) SYNC OFF", &HashMap::new()).unwrap();
+        let database = Database::open_with_options(
+            &path,
+            crate::DatabaseOpenOptions {
+                maintenance_policy: crate::database::MaintenancePolicy::CallerDriven,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        database
+            .execute(
+                "CREATE TABLE nodes (id UUID PRIMARY KEY) SYNC OFF",
+                &HashMap::new(),
+            )
+            .unwrap();
         database.execute("CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT) SYNC OFF", &HashMap::new()).unwrap();
         for id in [1, 2] {
-            database.execute("INSERT INTO nodes VALUES ($id)", &HashMap::from([("id".into(), Value::Uuid(uuid::Uuid::from_u128(id)))])).unwrap();
+            database
+                .execute(
+                    "INSERT INTO nodes VALUES ($id)",
+                    &HashMap::from([("id".into(), Value::Uuid(uuid::Uuid::from_u128(id)))]),
+                )
+                .unwrap();
         }
         let tx = database.begin_or_panic();
-        database.insert_edge(tx, uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2), "LINKS".into(), HashMap::new()).unwrap();
+        database
+            .insert_edge(
+                tx,
+                uuid::Uuid::from_u128(1),
+                uuid::Uuid::from_u128(2),
+                "LINKS".into(),
+                HashMap::new(),
+            )
+            .unwrap();
         database.commit(tx).unwrap();
         let session = ReadSession::open_owner_only(&path, ReadSessionOptions::default()).unwrap();
         assert_eq!(session.route(), ReadRoute::Owner);
         let scope = ReadWorkObservationScope::enter(ReadWorkPhase::Query);
         let binding = scope.bind_owner(&database, "graph-observer-row");
         let result = session.execute("SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) WHERE a.id = $source COLUMNS (b.id AS t))", &HashMap::from([("source".into(), Value::Uuid(uuid::Uuid::from_u128(1)))])).unwrap();
-        assert_eq!(result.rows, vec![vec![Value::Uuid(uuid::Uuid::from_u128(2))]]);
-        let observed = scope.owner_graph_counters().expect("executing owner worker must install the scope");
+        assert_eq!(
+            result.rows,
+            vec![vec![Value::Uuid(uuid::Uuid::from_u128(2))]]
+        );
+        let observed = scope
+            .owner_graph_counters()
+            .expect("executing owner worker must install the scope");
         assert!(observed.graph_addressed_gets > 0);
         assert!(observed.graph_payload_decodes > 0);
         assert_graph_context(&scope, ReadWorkPhase::Query);
         assert_graph_no_population_walk(&scope);
-        assert!(scope.graph_events().iter().all(|event| event.worker_request_id.as_ref().is_some_and(|id| !id.is_empty())));
+        assert!(scope.graph_events().iter().all(|event| {
+            event
+                .worker_request_id
+                .as_ref()
+                .is_some_and(|id| !id.is_empty())
+        }));
         drop(binding);
         drop(scope);
         drop(session);
@@ -43012,7 +43952,10 @@ mod empty_declared_index_readiness_tests {
         };
         let row = VersionedRow {
             row_id: RowId(1),
-            values: HashMap::from([("body".into(), Value::Text("selected physical retention payload".into()))]),
+            values: HashMap::from([(
+                "body".into(),
+                Value::Text("selected physical retention payload".into()),
+            )]),
             created_tx: TxId(100),
             deleted_tx: None,
             lsn: Lsn(20),
@@ -43025,25 +43968,48 @@ mod empty_declared_index_readiness_tests {
         let (meta, expected) = graph_retention_row();
         let row = match root {
             graph_read::GraphReadRoot::Writer(root) => {
-                let memory = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(16 * 1024 * 1024));
+                let memory = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(
+                    16 * 1024 * 1024,
+                ));
                 let key: [u8; 24] = RedbPersistence::rel_row_key(&expected).try_into().unwrap();
-                let mut cursor = root.exact_row(writer_source::SourceWindowOwner::Read(memory), "removed_rows", &key).unwrap();
-                let row = cursor.next_row().unwrap().map(|window| window.value.clone());
+                let mut cursor = root
+                    .exact_row(
+                        writer_source::SourceWindowOwner::Read(memory),
+                        "removed_rows",
+                        &key,
+                    )
+                    .unwrap();
+                let row = cursor
+                    .next_row()
+                    .unwrap()
+                    .map(|window| window.value.clone());
                 assert!(cursor.next_row().unwrap().is_none());
                 row
             }
-            graph_read::GraphReadRoot::Image(source) => source.relational_row_by_id_lsn("removed_rows", &meta, expected.row_id, expected.lsn).unwrap(),
+            graph_read::GraphReadRoot::Image(source) => source
+                .relational_row_by_id_lsn("removed_rows", &meta, expected.row_id, expected.lsn)
+                .unwrap(),
         };
-        assert_eq!(row, present.then_some(expected), "row payload presence follows this captured root, including pinned old roots");
+        assert_eq!(
+            row,
+            present.then_some(expected),
+            "row payload presence follows this captured root, including pinned old roots"
+        );
     }
 
     // Coordinates are fixture inputs, not reconstructed from an engine
     // population. Each physical group holds one survivor with its own public J.
     type GraphHistoryCoordinate = (Lsn, usize, ChangeLogEntry);
-    fn graph_distinct_history_fixture(path: &Path, versions: usize, references: usize) -> (RedbPersistence, AdjEntry, Vec<GraphHistoryCoordinate>) {
+    fn graph_distinct_history_fixture(
+        path: &Path,
+        versions: usize,
+        references: usize,
+    ) -> (RedbPersistence, AdjEntry, Vec<GraphHistoryCoordinate>) {
         let (store, predecessor, entries) = graph_history_fixture(path, versions, 1, false);
         let mut coordinates = vec![(Lsn(30), 0, entries[0].clone())];
-        let commits = (1..references).map(|offset| (Lsn(20 + offset as u64), TxId(100))).collect::<BTreeMap<_, _>>();
+        let commits = (1..references)
+            .map(|offset| (Lsn(20 + offset as u64), TxId(100)))
+            .collect::<BTreeMap<_, _>>();
         store.flush_commit_index_entries(&commits).unwrap();
         for offset in 1..references {
             let public_lsn = Lsn(20 + offset as u64);
@@ -43054,76 +44020,121 @@ mod empty_declared_index_readiness_tests {
                 edge_type: predecessor.edge_type.clone(),
                 lsn: public_lsn,
             };
-            store.append_change_log(physical_lsn, std::slice::from_ref(&entry)).unwrap();
+            store
+                .append_change_log(physical_lsn, std::slice::from_ref(&entry))
+                .unwrap();
             coordinates.push((physical_lsn, 0, entry));
         }
         (store, predecessor, coordinates)
     }
 
-    fn assert_graph_coordinate_witnesses(store: &RedbPersistence, predecessor: &AdjEntry, coordinates: &[GraphHistoryCoordinate], private_bytes: &[Vec<u8>], retired: bool) {
+    fn assert_graph_coordinate_witnesses(
+        store: &RedbPersistence,
+        predecessor: &AdjEntry,
+        coordinates: &[GraphHistoryCoordinate],
+        private_bytes: &[Vec<u8>],
+        retired: bool,
+    ) {
         use graph_history_record::*;
         assert_eq!(coordinates.len(), private_bytes.len());
-        store.with_db(|db| {
-            let read = db.begin_read().map_err(RedbPersistence::storage_error)?;
-            let history = read.open_table(CHANGE_LOG_TABLE).unwrap();
-            let contributions = read.open_table(GRAPH_CONTRIBUTIONS).unwrap();
-            let locations = read.open_table(GRAPH_OCCURRENCE_LOCATIONS).unwrap();
-            let receipts = read.open_table(GRAPH_PREDECESSOR_LIFECYCLE).unwrap();
-            let commits = read.open_table(COMMIT_INDEX_TABLE).unwrap();
-            let p = RedbPersistence::graph_fwd_key(predecessor);
-            let rk = lifecycle_key(&p)?;
-            let receipt = receipts.get(rk.as_slice()).unwrap().unwrap();
-            let mut expected_r = vec![1];
-            expected_r.extend_from_slice(&100u64.to_be_bytes());
-            expected_r.extend_from_slice(&(coordinates.len() as u64).to_be_bytes());
-            expected_r.push(u8::from(retired));
-            assert_eq!(receipt.value(), expected_r.as_slice());
-            for ((physical, ordinal, entry), expected) in coordinates.iter().zip(private_bytes) {
-                let mut key = String::new();
-                RedbPersistence::write_change_log_entry_key(*physical, *ordinal, &mut key);
-                let value = history.get(key.as_str()).unwrap().unwrap();
-                assert_eq!(value.value(), expected.as_slice(), "retained distinct-address private bytes remain exact");
-                let record = RedbPersistence::decode_stored_change_log(value.value())?;
-                assert_eq!(record.tag, 2);
-                assert_eq!(&record.entry, entry);
-                let witness = record.witness.unwrap();
-                assert_eq!(witness.predecessor, p);
-                assert_eq!(witness.deletion_tx, TxId(100));
-                let location_key = location_key(witness.id);
-                let location = locations.get(location_key.as_slice()).unwrap().unwrap();
-                let mut expected_t = vec![1];
-                expected_t.extend_from_slice(&physical.0.to_be_bytes());
-                expected_t.extend_from_slice(&(*ordinal as u64).to_be_bytes());
-                assert_eq!(location.value(), expected_t.as_slice());
-                let c_key = deletion_contribution_key(*physical, &witness);
-                let contribution = contributions.get(c_key.as_slice()).unwrap().unwrap();
-                let mut expected_c = vec![1];
-                expected_c.extend_from_slice(&contribution_digest(false, &witness.id.to_be_bytes(), expected)?);
-                assert_eq!(contribution.value(), expected_c.as_slice());
-                assert_eq!(commits.get(entry.lsn().0).unwrap().unwrap().value(), 100);
-                assert!(commits.get(physical.0).unwrap().is_none(), "a distinct physical history coordinate does not invent a commit");
-            }
-            let fwd = read.open_table(GRAPH_FWD_TABLE).unwrap();
-            let rev = read.open_table(GRAPH_REV_TABLE).unwrap();
-            let reverse = RedbPersistence::graph_rev_key(predecessor);
-            assert_eq!(fwd.get(p.as_slice()).unwrap().is_none(), retired);
-            assert_eq!(rev.get(reverse.as_slice()).unwrap().is_none(), retired);
-            let creation = creation_contribution_key(&p)?;
-            assert_eq!(contributions.get(creation.as_slice()).unwrap().is_none(), retired);
-            Ok(())
-        }).unwrap();
+        store
+            .with_db(|db| {
+                let read = db.begin_read().map_err(RedbPersistence::storage_error)?;
+                let history = read.open_table(CHANGE_LOG_TABLE).unwrap();
+                let contributions = read.open_table(GRAPH_CONTRIBUTIONS).unwrap();
+                let locations = read.open_table(GRAPH_OCCURRENCE_LOCATIONS).unwrap();
+                let receipts = read.open_table(GRAPH_PREDECESSOR_LIFECYCLE).unwrap();
+                let commits = read.open_table(COMMIT_INDEX_TABLE).unwrap();
+                let p = RedbPersistence::graph_fwd_key(predecessor);
+                let rk = lifecycle_key(&p)?;
+                let receipt = receipts.get(rk.as_slice()).unwrap().unwrap();
+                let mut expected_r = vec![1];
+                expected_r.extend_from_slice(&100u64.to_be_bytes());
+                expected_r.extend_from_slice(&(coordinates.len() as u64).to_be_bytes());
+                expected_r.push(u8::from(retired));
+                assert_eq!(receipt.value(), expected_r.as_slice());
+                for ((physical, ordinal, entry), expected) in coordinates.iter().zip(private_bytes)
+                {
+                    let mut key = String::new();
+                    RedbPersistence::write_change_log_entry_key(*physical, *ordinal, &mut key);
+                    let value = history.get(key.as_str()).unwrap().unwrap();
+                    assert_eq!(
+                        value.value(),
+                        expected.as_slice(),
+                        "retained distinct-address private bytes remain exact"
+                    );
+                    let record = RedbPersistence::decode_stored_change_log(value.value())?;
+                    assert_eq!(record.tag, 2);
+                    assert_eq!(&record.entry, entry);
+                    let witness = record.witness.unwrap();
+                    assert_eq!(witness.predecessor, p);
+                    assert_eq!(witness.deletion_tx, TxId(100));
+                    let location_key = location_key(witness.id);
+                    let location = locations.get(location_key.as_slice()).unwrap().unwrap();
+                    let mut expected_t = vec![1];
+                    expected_t.extend_from_slice(&physical.0.to_be_bytes());
+                    expected_t.extend_from_slice(&(*ordinal as u64).to_be_bytes());
+                    assert_eq!(location.value(), expected_t.as_slice());
+                    let c_key = deletion_contribution_key(*physical, &witness);
+                    let contribution = contributions.get(c_key.as_slice()).unwrap().unwrap();
+                    let mut expected_c = vec![1];
+                    expected_c.extend_from_slice(&contribution_digest(
+                        false,
+                        &witness.id.to_be_bytes(),
+                        expected,
+                    )?);
+                    assert_eq!(contribution.value(), expected_c.as_slice());
+                    assert_eq!(commits.get(entry.lsn().0).unwrap().unwrap().value(), 100);
+                    assert!(
+                        commits.get(physical.0).unwrap().is_none(),
+                        "a distinct physical history coordinate does not invent a commit"
+                    );
+                }
+                let fwd = read.open_table(GRAPH_FWD_TABLE).unwrap();
+                let rev = read.open_table(GRAPH_REV_TABLE).unwrap();
+                let reverse = RedbPersistence::graph_rev_key(predecessor);
+                assert_eq!(fwd.get(p.as_slice()).unwrap().is_none(), retired);
+                assert_eq!(rev.get(reverse.as_slice()).unwrap().is_none(), retired);
+                let creation = creation_contribution_key(&p)?;
+                assert_eq!(
+                    contributions.get(creation.as_slice()).unwrap().is_none(),
+                    retired
+                );
+                Ok(())
+            })
+            .unwrap();
     }
 
-    fn assert_graph_coordinate_source_answers(root: graph_read::GraphReadRoot, predecessor: &AdjEntry, expected_edge: bool, coordinates: &[GraphHistoryCoordinate]) {
+    fn assert_graph_coordinate_source_answers(
+        root: graph_read::GraphReadRoot,
+        predecessor: &AdjEntry,
+        expected_edge: bool,
+        coordinates: &[GraphHistoryCoordinate],
+    ) {
         use std::ops::Bound;
         use writer_source::SourceWindowOwner;
-        let memory = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(16 * 1024 * 1024));
+        let memory = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(
+            16 * 1024 * 1024,
+        ));
         for reverse in [false, true] {
-            let key = if reverse { RedbPersistence::graph_rev_key(predecessor) } else { RedbPersistence::graph_fwd_key(predecessor) };
-            let mut cursor = root.cursor(reverse, Bound::Included(&key), Bound::Included(&key), memory.clone()).unwrap();
+            let key = if reverse {
+                RedbPersistence::graph_rev_key(predecessor)
+            } else {
+                RedbPersistence::graph_fwd_key(predecessor)
+            };
+            let mut cursor = root
+                .cursor(
+                    reverse,
+                    Bound::Included(&key),
+                    Bound::Included(&key),
+                    memory.clone(),
+                )
+                .unwrap();
             let window = cursor.next_edge().unwrap();
             assert_eq!(window.is_some(), expected_edge);
-            if let Some(window) = window { assert_eq!(window.edge(), predecessor); }
+            if let Some(window) = window {
+                assert_eq!(window.edge(), predecessor);
+            }
             assert!(cursor.next_edge().unwrap().is_none());
         }
         let mut changes = Vec::new();
@@ -43133,29 +44144,67 @@ mod empty_declared_index_readiness_tests {
                     let mut position = [0u8; 16];
                     position[..8].copy_from_slice(&physical.0.to_be_bytes());
                     position[8..].copy_from_slice(&(*ordinal as u64).to_be_bytes());
-                    let mut cursor = root.cursor(SourceWindowOwner::Read(memory.clone()), writer_history::WRITER_CHANGE_LOG_TABLE.name(), writer_source::WriterCursorFamily::Bytes, Bound::Included(&position), Bound::Included(&position), false).unwrap();
+                    let mut cursor = root
+                        .cursor(
+                            SourceWindowOwner::Read(memory.clone()),
+                            writer_history::WRITER_CHANGE_LOG_TABLE.name(),
+                            writer_source::WriterCursorFamily::Bytes,
+                            Bound::Included(&position),
+                            Bound::Included(&position),
+                            false,
+                        )
+                        .unwrap();
                     assert_eq!(cursor.next_change().unwrap().unwrap().value, *expected);
                     assert!(cursor.next_change().unwrap().is_none());
                 }
-                let mut cursor = root.change_log_cursor(SourceWindowOwner::Read(memory), coordinates.first().unwrap().0, coordinates.last().unwrap().0).unwrap();
-                while let Some(window) = cursor.next_change().unwrap() { changes.push(window.value.clone()); }
+                let mut cursor = root
+                    .change_log_cursor(
+                        SourceWindowOwner::Read(memory),
+                        coordinates.first().unwrap().0,
+                        coordinates.last().unwrap().0,
+                    )
+                    .unwrap();
+                while let Some(window) = cursor.next_change().unwrap() {
+                    changes.push(window.value.clone());
+                }
             }
             graph_read::GraphReadRoot::Image(source) => {
                 for (physical, ordinal, expected) in coordinates {
                     let mut key = String::new();
                     RedbPersistence::write_change_log_entry_key(*physical, *ordinal, &mut key);
-                    source.with_read(|read| {
-                        let history = read.open_table(CHANGE_LOG_TABLE).unwrap();
-                        let value = history.get(key.as_str()).unwrap().unwrap();
-                        source.verify_stored_graph_history_in_read(read, key.as_str(), value.value(), memory.clone())?;
-                        assert_eq!(RedbPersistence::decode_stored_change_log(value.value())?.entry, *expected);
-                        Ok(())
-                    }).unwrap();
+                    source
+                        .with_read(|read| {
+                            let history = read.open_table(CHANGE_LOG_TABLE).unwrap();
+                            let value = history.get(key.as_str()).unwrap().unwrap();
+                            source.verify_stored_graph_history_in_read(
+                                read,
+                                key.as_str(),
+                                value.value(),
+                                memory.clone(),
+                            )?;
+                            assert_eq!(
+                                RedbPersistence::decode_stored_change_log(value.value())?.entry,
+                                *expected
+                            );
+                            Ok(())
+                        })
+                        .unwrap();
                 }
-                source.visit_changes_since(Lsn(19), memory, &|| Ok(()), &mut |entry| { changes.push(entry); Ok(()) }).unwrap();
+                source
+                    .visit_changes_since(Lsn(19), memory, &|| Ok(()), &mut |entry| {
+                        changes.push(entry);
+                        Ok(())
+                    })
+                    .unwrap();
             }
         }
-        assert_eq!(changes, coordinates.iter().map(|(_, _, entry)| entry.clone()).collect::<Vec<_>>());
+        assert_eq!(
+            changes,
+            coordinates
+                .iter()
+                .map(|(_, _, entry)| entry.clone())
+                .collect::<Vec<_>>()
+        );
     }
 
     fn assert_graph_distinct_maintenance_rows(directory: &Path) {
@@ -43165,40 +44214,99 @@ mod empty_declared_index_readiness_tests {
         // population. Repeated A=30/J=20 rows remain in the original helper.
         for references in [1, 4, 8] {
             for versions in [4, 8, 16] {
-                let path = directory.join(format!("graph-distinct-retirement-{references}-{versions}.db"));
-                let (store, predecessor, coordinates) = graph_distinct_history_fixture(&path, versions, references);
+                let path = directory.join(format!(
+                    "graph-distinct-retirement-{references}-{versions}.db"
+                ));
+                let (store, predecessor, coordinates) =
+                    graph_distinct_history_fixture(&path, versions, references);
                 let before = graph_publication_state(&store);
-                let private_bytes = before.1[0].iter().map(|(_, value)| value.clone()).collect::<Vec<_>>();
-                assert_graph_coordinate_witnesses(&store, &predecessor, &coordinates, &private_bytes, false);
+                let private_bytes = before.1[0]
+                    .iter()
+                    .map(|(_, value)| value.clone())
+                    .collect::<Vec<_>>();
+                assert_graph_coordinate_witnesses(
+                    &store,
+                    &predecessor,
+                    &coordinates,
+                    &private_bytes,
+                    false,
+                );
                 drop(store);
-                let (image, _receipt, old_source) = load_read_image_with_memory(&path, Some(16 * 1024 * 1024)).unwrap().into_parts();
+                let (image, _receipt, old_source) =
+                    load_read_image_with_memory(&path, Some(16 * 1024 * 1024))
+                        .unwrap()
+                        .into_parts();
                 drop(image);
-                let fixture_open_accountant_41665 = Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-                let _fixture_decode_scope_41665 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_41665).into()).unwrap();
+                let fixture_open_accountant_41665 =
+                    Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+                let _fixture_decode_scope_41665 =
+                    crate::read_image_memory::ImageMemory::enter_writer_operation(
+                        std::sync::Arc::clone(&fixture_open_accountant_41665).into(),
+                    )
+                    .unwrap();
                 let store = RedbPersistence::open(&path).unwrap();
-                store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_41665).into());
+                store.attach_memory_accountant(
+                    std::sync::Arc::clone(&fixture_open_accountant_41665).into(),
+                );
                 let physical_end = coordinates.last().unwrap().0;
-                let old_writer = store.initialize_writer_snapshot(SnapshotId(100), physical_end).unwrap();
+                let old_writer = store
+                    .initialize_writer_snapshot(SnapshotId(100), physical_end)
+                    .unwrap();
                 let deferred = HashSet::new();
                 let retained_zero_keys = graph_retained_zero_touch_keys(&before);
                 let scope = graph_retirement_observer(&before);
-                let stats = store.prune_retention_scoped(&HashMap::new(), &[], &[], &[], Some((&[], std::slice::from_ref(&predecessor), &deferred)), &[], &Vec::new(), &[("graph_fixture_progress".into(), vec![1])]).unwrap();
+                let stats = store
+                    .prune_retention_scoped(
+                        &HashMap::new(),
+                        &[],
+                        &[],
+                        &[],
+                        Some((&[], std::slice::from_ref(&predecessor), &deferred)),
+                        &[],
+                        &Vec::new(),
+                        &[("graph_fixture_progress".into(), vec![1])],
+                    )
+                    .unwrap();
                 let counts = assert_graph_retirement_work(&scope, &predecessor, false);
                 assert_graph_retained_zero_touch(&scope, &retained_zero_keys);
-                if let Some(control) = mutation_control { assert_eq!(counts, control, "one predecessor retirement work stays fixed across independent fanout and population scales"); } else { mutation_control = Some(counts); }
+                if let Some(control) = mutation_control {
+                    assert_eq!(
+                        counts, control,
+                        "one predecessor retirement work stays fixed across independent fanout and population scales"
+                    );
+                } else {
+                    mutation_control = Some(counts);
+                }
                 drop(scope);
                 assert_eq!(stats.row_keys_removed, 0);
                 assert_eq!(stats.change_log_keys_removed, 0);
                 assert_eq!(stats.edge_keys_removed, 2);
-                assert_graph_coordinate_witnesses(&store, &predecessor, &coordinates, &private_bytes, true);
+                assert_graph_coordinate_witnesses(
+                    &store,
+                    &predecessor,
+                    &coordinates,
+                    &private_bytes,
+                    true,
+                );
                 let after = graph_publication_state(&store);
-                assert_eq!(after.1[0], before.1[0], "every retained private history key and byte survives");
+                assert_eq!(
+                    after.1[0], before.1[0],
+                    "every retained private history key and byte survives"
+                );
                 assert_eq!(after.0[3], before.0[3], "every retained T byte survives");
                 let p = RedbPersistence::graph_fwd_key(&predecessor);
                 let reverse = RedbPersistence::graph_rev_key(&predecessor);
                 let creation = graph_history_record::creation_contribution_key(&p).unwrap();
                 for (family, key) in [(0, &p), (1, &reverse), (2, &creation)] {
-                    assert_eq!(after.0[family], before.0[family].iter().filter(|(candidate, _)| candidate != key).cloned().collect::<Vec<_>>(), "only the selected predecessor projection/creation C disappears");
+                    assert_eq!(
+                        after.0[family],
+                        before.0[family]
+                            .iter()
+                            .filter(|(candidate, _)| candidate != key)
+                            .cloned()
+                            .collect::<Vec<_>>(),
+                        "only the selected predecessor projection/creation C disappears"
+                    );
                 }
                 assert_eq!(before.0[4].len(), 1);
                 let rk = graph_history_record::lifecycle_key(&p).unwrap();
@@ -43206,33 +44314,142 @@ mod empty_declared_index_readiness_tests {
                 assert_eq!(expected_r[0].0, rk);
                 assert_eq!(expected_r[0].1[17], 0);
                 expected_r[0].1[17] = 1;
-                assert_eq!(after.0[4], expected_r, "one selected receipt changes Present to Retired without count or identity changes");
+                assert_eq!(
+                    after.0[4], expected_r,
+                    "one selected receipt changes Present to Retired without count or identity changes"
+                );
                 assert!(after.1[3].contains(&("graph_fixture_progress".to_owned(), vec![1])));
-                assert!(!before.1[3].iter().any(|(key, _)| key == "graph_fixture_progress"));
-                assert_ne!(after.1[4], before.1[4], "final binding joins the selected progress and graph publication");
-                assert_ne!(after.1[1], before.1[1], "recovery bounds join the same publication");
-                let query_work = graph_addressed_observer_row(&graph_read::GraphReadRoot::Writer(old_writer.clone()), &predecessor, true, coordinates[0].0, coordinates[0].1, &coordinates[0].2);
-                if let Some(control) = query_controls.get(&(true, true)) { assert_eq!(&query_work, control, "addressed work stays fixed across unrelated graph population and distinct public/physical fanout"); } else { query_controls.insert((true, true), query_work); }
-                assert_graph_coordinate_source_answers(graph_read::GraphReadRoot::Writer(old_writer), &predecessor, true, &coordinates);
-                let query_work = graph_addressed_observer_row(&graph_read::GraphReadRoot::Image(old_source.clone()), &predecessor, true, coordinates[0].0, coordinates[0].1, &coordinates[0].2);
-                if let Some(control) = query_controls.get(&(false, true)) { assert_eq!(&query_work, control, "addressed work stays fixed across unrelated graph population and distinct public/physical fanout"); } else { query_controls.insert((false, true), query_work); }
-                assert_graph_coordinate_source_answers(graph_read::GraphReadRoot::Image(old_source), &predecessor, true, &coordinates);
-                let new_writer = store.prepare_writer_snapshot(store.reserve_writer_snapshot().unwrap(), SnapshotId(100), physical_end).unwrap();
-                let query_work = graph_addressed_observer_row(&graph_read::GraphReadRoot::Writer(new_writer.clone()), &predecessor, false, coordinates[0].0, coordinates[0].1, &coordinates[0].2);
-                if let Some(control) = query_controls.get(&(true, false)) { assert_eq!(&query_work, control, "addressed work stays fixed across unrelated graph population and distinct public/physical fanout"); } else { query_controls.insert((true, false), query_work); }
-                assert_graph_coordinate_source_answers(graph_read::GraphReadRoot::Writer(new_writer), &predecessor, false, &coordinates);
+                assert!(
+                    !before.1[3]
+                        .iter()
+                        .any(|(key, _)| key == "graph_fixture_progress")
+                );
+                assert_ne!(
+                    after.1[4], before.1[4],
+                    "final binding joins the selected progress and graph publication"
+                );
+                assert_ne!(
+                    after.1[1], before.1[1],
+                    "recovery bounds join the same publication"
+                );
+                let query_work = graph_addressed_observer_row(
+                    &graph_read::GraphReadRoot::Writer(old_writer.clone()),
+                    &predecessor,
+                    true,
+                    coordinates[0].0,
+                    coordinates[0].1,
+                    &coordinates[0].2,
+                );
+                if let Some(control) = query_controls.get(&(true, true)) {
+                    assert_eq!(
+                        &query_work, control,
+                        "addressed work stays fixed across unrelated graph population and distinct public/physical fanout"
+                    );
+                } else {
+                    query_controls.insert((true, true), query_work);
+                }
+                assert_graph_coordinate_source_answers(
+                    graph_read::GraphReadRoot::Writer(old_writer),
+                    &predecessor,
+                    true,
+                    &coordinates,
+                );
+                let query_work = graph_addressed_observer_row(
+                    &graph_read::GraphReadRoot::Image(old_source.clone()),
+                    &predecessor,
+                    true,
+                    coordinates[0].0,
+                    coordinates[0].1,
+                    &coordinates[0].2,
+                );
+                if let Some(control) = query_controls.get(&(false, true)) {
+                    assert_eq!(
+                        &query_work, control,
+                        "addressed work stays fixed across unrelated graph population and distinct public/physical fanout"
+                    );
+                } else {
+                    query_controls.insert((false, true), query_work);
+                }
+                assert_graph_coordinate_source_answers(
+                    graph_read::GraphReadRoot::Image(old_source),
+                    &predecessor,
+                    true,
+                    &coordinates,
+                );
+                let new_writer = store
+                    .prepare_writer_snapshot(
+                        store.reserve_writer_snapshot().unwrap(),
+                        SnapshotId(100),
+                        physical_end,
+                    )
+                    .unwrap();
+                let query_work = graph_addressed_observer_row(
+                    &graph_read::GraphReadRoot::Writer(new_writer.clone()),
+                    &predecessor,
+                    false,
+                    coordinates[0].0,
+                    coordinates[0].1,
+                    &coordinates[0].2,
+                );
+                if let Some(control) = query_controls.get(&(true, false)) {
+                    assert_eq!(
+                        &query_work, control,
+                        "addressed work stays fixed across unrelated graph population and distinct public/physical fanout"
+                    );
+                } else {
+                    query_controls.insert((true, false), query_work);
+                }
+                assert_graph_coordinate_source_answers(
+                    graph_read::GraphReadRoot::Writer(new_writer),
+                    &predecessor,
+                    false,
+                    &coordinates,
+                );
                 drop(store);
                 drop(_fixture_decode_scope_41665);
-                let (image, _receipt, new_source) = load_read_image_with_memory(&path, Some(16 * 1024 * 1024)).unwrap().into_parts();
+                let (image, _receipt, new_source) =
+                    load_read_image_with_memory(&path, Some(16 * 1024 * 1024))
+                        .unwrap()
+                        .into_parts();
                 drop(image);
-                let query_work = graph_addressed_observer_row(&graph_read::GraphReadRoot::Image(new_source.clone()), &predecessor, false, coordinates[0].0, coordinates[0].1, &coordinates[0].2);
-                if let Some(control) = query_controls.get(&(false, false)) { assert_eq!(&query_work, control, "addressed work stays fixed across unrelated graph population and distinct public/physical fanout"); } else { query_controls.insert((false, false), query_work); }
-                assert_graph_coordinate_source_answers(graph_read::GraphReadRoot::Image(new_source), &predecessor, false, &coordinates);
-                let fixture_open_accountant_41717 = std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-                let _fixture_decode_scope_41717 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_41717).into()).unwrap();
+                let query_work = graph_addressed_observer_row(
+                    &graph_read::GraphReadRoot::Image(new_source.clone()),
+                    &predecessor,
+                    false,
+                    coordinates[0].0,
+                    coordinates[0].1,
+                    &coordinates[0].2,
+                );
+                if let Some(control) = query_controls.get(&(false, false)) {
+                    assert_eq!(
+                        &query_work, control,
+                        "addressed work stays fixed across unrelated graph population and distinct public/physical fanout"
+                    );
+                } else {
+                    query_controls.insert((false, false), query_work);
+                }
+                assert_graph_coordinate_source_answers(
+                    graph_read::GraphReadRoot::Image(new_source),
+                    &predecessor,
+                    false,
+                    &coordinates,
+                );
+                let fixture_open_accountant_41717 =
+                    std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+                let _fixture_decode_scope_41717 =
+                    crate::read_image_memory::ImageMemory::enter_writer_operation(
+                        std::sync::Arc::clone(&fixture_open_accountant_41717).into(),
+                    )
+                    .unwrap();
                 let reopened = RedbPersistence::open(&path).unwrap();
-                reopened.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_41717).into());
-                assert_eq!(graph_publication_state(&reopened), after, "restart exposes the complete new publication");
+                reopened.attach_memory_accountant(
+                    std::sync::Arc::clone(&fixture_open_accountant_41717).into(),
+                );
+                assert_eq!(
+                    graph_publication_state(&reopened),
+                    after,
+                    "restart exposes the complete new publication"
+                );
             }
         }
     }
@@ -43248,7 +44465,8 @@ mod empty_declared_index_readiness_tests {
     ) -> (RedbPersistence, AdjEntry, Vec<ChangeLogEntry>) {
         let memory = Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
         let store =
-            RedbPersistence::create_with_accountant(path, Some(memory.into()), REDB_CACHE_BYTES).unwrap();
+            RedbPersistence::create_with_accountant(path, Some(memory.into()), REDB_CACHE_BYTES)
+                .unwrap();
         let predecessor = AdjEntry {
             source: NodeId::from_u128(1),
             target: NodeId::from_u128(2),
@@ -43289,7 +44507,15 @@ mod empty_declared_index_readiness_tests {
                 .append_table_rows_batch("removed_rows", Some(&meta), std::slice::from_ref(&row))
                 .unwrap();
             assert_eq!(
-                store.load_relational_row_version("removed_rows", &meta, row.row_id, row.created_tx, row.lsn).unwrap(),
+                store
+                    .load_relational_row_version(
+                        "removed_rows",
+                        &meta,
+                        row.row_id,
+                        row.created_tx,
+                        row.lsn
+                    )
+                    .unwrap(),
                 Some(row),
                 "the repack fixture contains an actual physical row version"
             );
@@ -43558,7 +44784,11 @@ mod empty_declared_index_readiness_tests {
 
     // The callbacks use the installed execution target and its real declared
     // operation child. Residency is a paired observation, never graph work.
-    fn assert_installed_commit_directory_rows(file: &ReadSession, expected: &[(Lsn, TxId)], path: &Path) -> ReadWorkObservationScope {
+    fn assert_installed_commit_directory_rows(
+        file: &ReadSession,
+        expected: &[(Lsn, TxId)],
+        path: &Path,
+    ) -> ReadWorkObservationScope {
         use contextdb_core::read_contract::{OwnerReadCancellation, ReadLimits};
         use std::ops::Bound::{Excluded, Included, Unbounded};
         file.__with_resident_history_for_test(|database| {
@@ -43684,21 +44914,45 @@ mod empty_declared_index_readiness_tests {
     }
 
     fn assert_commit_directory_final_drop(scope: &ReadWorkObservationScope) {
-        let dead = scope.commit_directory_funding().expect("previously bound funding remains observed after destruction");
+        let dead = scope
+            .commit_directory_funding()
+            .expect("previously bound funding remains observed after destruction");
         assert!(!dead.open_child.alive && !dead.open_child.parent_alive);
-        assert_eq!((dead.open_child.charged_bytes, dead.open_child.parent_charged_bytes), (0, 0));
+        assert_eq!(
+            (
+                dead.open_child.charged_bytes,
+                dead.open_child.parent_charged_bytes
+            ),
+            (0, 0)
+        );
         if let Some(request) = dead.request_child {
             assert!(!request.alive && !request.parent_alive);
-            assert_eq!((request.charged_bytes, request.parent_charged_bytes), (0, 0));
+            assert_eq!(
+                (request.charged_bytes, request.parent_charged_bytes),
+                (0, 0)
+            );
         }
-        assert_eq!((dead.image_alive, dead.image_held_bytes), (Some(false), Some(0)));
-        assert_eq!((dead.image_accountant_alive, dead.image_accountant_used_bytes), (Some(false), Some(0)));
+        assert_eq!(
+            (dead.image_alive, dead.image_held_bytes),
+            (Some(false), Some(0))
+        );
+        assert_eq!(
+            (
+                dead.image_accountant_alive,
+                dead.image_accountant_used_bytes
+            ),
+            (Some(false), Some(0))
+        );
     }
 
     struct DirectoryProofClock;
     impl contextdb_core::read_contract::DeadlineClock for DirectoryProofClock {
-        fn now_ms(&self) -> u64 { 0 }
-        fn wait_until(&self, _: u64) -> contextdb_core::read_contract::DeadlineWait<'_> { Box::pin(std::future::pending()) }
+        fn now_ms(&self) -> u64 {
+            0
+        }
+        fn wait_until(&self, _: u64) -> contextdb_core::read_contract::DeadlineWait<'_> {
+            Box::pin(std::future::pending())
+        }
     }
 
     // The injected clock reads the existing real suffix-advance receipt. It
@@ -43712,112 +44966,306 @@ mod empty_declared_index_readiness_tests {
     }
     impl contextdb_core::read_contract::DeadlineClock for SuffixProgressClock {
         fn now_ms(&self) -> u64 {
-            if self.stop == 4 && self.entry_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+            if self.stop == 4
+                && self
+                    .entry_reads
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    > 0
+            {
                 return self.deadline.saturating_add(1);
             }
-            let progressed = self.scope.graph_events().iter().any(|event|
-                event.family == "commit_index" && event.operation == "iteration_step");
-            if progressed && self.stop == 1 { self.cancellation.cancel(); }
-            if progressed && self.stop == 2 { self.deadline.saturating_add(1) } else { 0 }
+            let progressed =
+                self.scope.graph_events().iter().any(|event| {
+                    event.family == "commit_index" && event.operation == "iteration_step"
+                });
+            if progressed && self.stop == 1 {
+                self.cancellation.cancel();
+            }
+            if progressed && self.stop == 2 {
+                self.deadline.saturating_add(1)
+            } else {
+                0
+            }
         }
-        fn wait_until(&self, _: u64) -> contextdb_core::read_contract::DeadlineWait<'_> { Box::pin(std::future::pending()) }
+        fn wait_until(&self, _: u64) -> contextdb_core::read_contract::DeadlineWait<'_> {
+            Box::pin(std::future::pending())
+        }
     }
 
-    fn commit_suffix_fixture(path: &Path, frontier: Option<(Lsn, TxId)>, suffix: &[(u64,u64)]) {
-        let store = RedbPersistence::create_with_accountant(path,
-            Some(Arc::new(crate::memory_accounting::MemoryAccountant::no_limit()).into()), REDB_CACHE_BYTES).unwrap();
-        if let Some(pair) = frontier { store.flush_commit_index_entries(&BTreeMap::from([pair])).unwrap(); }
+    fn commit_suffix_fixture(path: &Path, frontier: Option<(Lsn, TxId)>, suffix: &[(u64, u64)]) {
+        let store = RedbPersistence::create_with_accountant(
+            path,
+            Some(Arc::new(crate::memory_accounting::MemoryAccountant::no_limit()).into()),
+            REDB_CACHE_BYTES,
+        )
+        .unwrap();
+        if let Some(pair) = frontier {
+            store
+                .flush_commit_index_entries(&BTreeMap::from([pair]))
+                .unwrap();
+        }
         // These pairs are deliberately uncommitted: do not publish their
         // content-identity frontier. Open must diagnose them before mismatch.
-        store.with_db(|database| {
-            let write = database.begin_write().map_err(RedbPersistence::storage_error)?;
-            {
-                let mut table = write.open_table(COMMIT_INDEX_TABLE).unwrap();
-                for &(lsn, tx) in suffix { table.insert(lsn, tx).unwrap(); }
-            }
-            write.commit().map_err(RedbPersistence::storage_error)?;
-            Ok(())
-        }).unwrap();
+        store
+            .with_db(|database| {
+                let write = database
+                    .begin_write()
+                    .map_err(RedbPersistence::storage_error)?;
+                {
+                    let mut table = write.open_table(COMMIT_INDEX_TABLE).unwrap();
+                    for &(lsn, tx) in suffix {
+                        table.insert(lsn, tx).unwrap();
+                    }
+                }
+                write.commit().map_err(RedbPersistence::storage_error)?;
+                Ok(())
+            })
+            .unwrap();
     }
 
     fn assert_commit_suffix_open_rows(directory: &Path) {
-        use contextdb_core::read_contract::{OwnerLimitExceededDetail, OwnerReadCancellation, ReadFailure, ReadFailureLimit,
-            ReadLimits, };
+        use contextdb_core::read_contract::{
+            OwnerLimitExceededDetail, OwnerReadCancellation, ReadFailure, ReadFailureLimit,
+            ReadLimits,
+        };
         let frontier = Some((Lsn(20), TxId(100)));
         let cases = [
             ("healthy-nonempty-committed", frontier, vec![], None, 0),
-            ("monotone-three", frontier, vec![(21,101),(22,102),(23,103)], Some((ReadImageRequiresWriterCause::WritableSanitizerWouldChange, "writable recovery must truncate 3 uncommitted commit-index entries past Some((Lsn(20), TxId(100)))")), 3),
-            ("interior-decrease", frontier, vec![(21,101),(22,103),(23,102)], Some((ReadImageRequiresWriterCause::NonMonotonicCommitIndex, "commit-index transaction order needs writable repair")), 3),
-            ("first-entry-decrease", frontier, vec![(21,99),(22,101)], Some((ReadImageRequiresWriterCause::NonMonotonicCommitIndex, "commit-index transaction order needs writable repair")), 1),
-            ("empty-frontier-monotone", None, vec![(1,1),(2,2)], Some((ReadImageRequiresWriterCause::WritableSanitizerWouldChange, "writable recovery must truncate 2 uncommitted commit-index entries past None")), 2),
+            (
+                "monotone-three",
+                frontier,
+                vec![(21, 101), (22, 102), (23, 103)],
+                Some((
+                    ReadImageRequiresWriterCause::WritableSanitizerWouldChange,
+                    "writable recovery must truncate 3 uncommitted commit-index entries past Some((Lsn(20), TxId(100)))",
+                )),
+                3,
+            ),
+            (
+                "interior-decrease",
+                frontier,
+                vec![(21, 101), (22, 103), (23, 102)],
+                Some((
+                    ReadImageRequiresWriterCause::NonMonotonicCommitIndex,
+                    "commit-index transaction order needs writable repair",
+                )),
+                3,
+            ),
+            (
+                "first-entry-decrease",
+                frontier,
+                vec![(21, 99), (22, 101)],
+                Some((
+                    ReadImageRequiresWriterCause::NonMonotonicCommitIndex,
+                    "commit-index transaction order needs writable repair",
+                )),
+                1,
+            ),
+            (
+                "empty-frontier-monotone",
+                None,
+                vec![(1, 1), (2, 2)],
+                Some((
+                    ReadImageRequiresWriterCause::WritableSanitizerWouldChange,
+                    "writable recovery must truncate 2 uncommitted commit-index entries past None",
+                )),
+                2,
+            ),
             ("empty-frontier-empty", None, vec![], None, 0),
-            ("maximum-frontier", Some((Lsn(u64::MAX), TxId(100))), vec![], None, 0),
+            (
+                "maximum-frontier",
+                Some((Lsn(u64::MAX), TxId(100))),
+                vec![],
+                None,
+                0,
+            ),
         ];
         for (name, frontier, suffix, repair, diagnosed) in cases {
             let path = directory.join(format!("commit-suffix-{name}.db"));
             commit_suffix_fixture(&path, frontier, &suffix);
             let durable_before = std::fs::read(&path).unwrap();
-            let parent = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(16 * 1024 * 1024);
+            let parent =
+                crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(16 * 1024 * 1024);
             let baseline = parent.retained_bytes_for_test();
             let scope = Arc::new(ReadWorkObservationScope::enter(ReadWorkPhase::Open));
-            let open = crate::executor::bounded::ReadOpenContext::new(parent.child().unwrap(), ReadLimits::default(), Arc::new(DirectoryProofClock), OwnerReadCancellation::new()).unwrap();
-            let (result, work) = read_persistence_test_scaffold::observe_open_history_work_for_test(||
-                load_read_image_at_registration_with_context(&path, None, None, None, open));
-            assert_eq!(work.commit_index_scanned, diagnosed, "{name}: only anomalous suffix entries are diagnosed");
-            assert_eq!(read_persistence_test_scaffold::OpenHistoryWork { commit_index_scanned: 0, ..work }, read_persistence_test_scaffold::OpenHistoryWork::default());
-            let advanced = scope.graph_events().into_iter().filter(|event| event.family == "commit_index" && event.operation == "iteration_step").collect::<Vec<_>>();
+            let open = crate::executor::bounded::ReadOpenContext::new(
+                parent.child().unwrap(),
+                ReadLimits::default(),
+                Arc::new(DirectoryProofClock),
+                OwnerReadCancellation::new(),
+            )
+            .unwrap();
+            let (result, work) =
+                read_persistence_test_scaffold::observe_open_history_work_for_test(|| {
+                    load_read_image_at_registration_with_context(&path, None, None, None, open)
+                });
+            assert_eq!(
+                work.commit_index_scanned, diagnosed,
+                "{name}: only anomalous suffix entries are diagnosed"
+            );
+            assert_eq!(
+                read_persistence_test_scaffold::OpenHistoryWork {
+                    commit_index_scanned: 0,
+                    ..work
+                },
+                read_persistence_test_scaffold::OpenHistoryWork::default()
+            );
+            let advanced = scope
+                .graph_events()
+                .into_iter()
+                .filter(|event| {
+                    event.family == "commit_index" && event.operation == "iteration_step"
+                })
+                .collect::<Vec<_>>();
             assert_eq!(advanced.len() as u64, diagnosed);
-            assert_eq!(advanced.iter().map(|event| event.key.clone()).collect::<Vec<_>>(), suffix.iter().take(diagnosed as usize).map(|(lsn, _)| lsn.to_be_bytes().to_vec()).collect::<Vec<_>>());
+            assert_eq!(
+                advanced
+                    .iter()
+                    .map(|event| event.key.clone())
+                    .collect::<Vec<_>>(),
+                suffix
+                    .iter()
+                    .take(diagnosed as usize)
+                    .map(|(lsn, _)| lsn.to_be_bytes().to_vec())
+                    .collect::<Vec<_>>()
+            );
             match repair {
                 Some((cause, reason)) => match result {
-                    Err(LoadReadImageError::RequiresWriter { cause: actual, reason: actual_reason }) => { assert_eq!(actual, cause); assert_eq!(actual_reason, reason); }
+                    Err(LoadReadImageError::RequiresWriter {
+                        cause: actual,
+                        reason: actual_reason,
+                    }) => {
+                        assert_eq!(actual, cause);
+                        assert_eq!(actual_reason, reason);
+                    }
                     _ => panic!("{name}: exact repair type must precede root/count disagreement"),
                 },
                 None => {
                     let loaded = result.unwrap();
-                    assert_eq!(work, read_persistence_test_scaffold::OpenHistoryWork::default());
+                    assert_eq!(
+                        work,
+                        read_persistence_test_scaffold::OpenHistoryWork::default()
+                    );
                     let (image, _receipt, source) = loaded.into_parts();
                     assert!(image.commit_index.is_empty());
-                    drop(image); drop(source);
+                    drop(image);
+                    drop(source);
                 }
             }
             drop(scope);
-            assert_eq!(parent.retained_bytes_for_test(), baseline, "{name}: actual open child releases after physical image/source release");
+            assert_eq!(
+                parent.retained_bytes_for_test(),
+                baseline,
+                "{name}: actual open child releases after physical image/source release"
+            );
             assert_eq!(std::fs::read(&path).unwrap(), durable_before);
         }
         for stop in [1, 2, 3, 4] {
             let path = directory.join(format!("commit-suffix-stop-{stop}.db"));
-            commit_suffix_fixture(&path, frontier, &[(21,101),(22,103),(23,102)]);
+            commit_suffix_fixture(&path, frontier, &[(21, 101), (22, 103), (23, 102)]);
             let before = std::fs::read(&path).unwrap();
-            let parent = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(16 * 1024 * 1024);
+            let parent =
+                crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(16 * 1024 * 1024);
             let baseline = parent.retained_bytes_for_test();
             let scope = Arc::new(ReadWorkObservationScope::enter(ReadWorkPhase::Open));
             let cancellation = OwnerReadCancellation::new();
-            if stop == 3 { cancellation.cancel(); }
+            if stop == 3 {
+                cancellation.cancel();
+            }
             let limits = ReadLimits::default();
-            let clock = Arc::new(SuffixProgressClock { scope: scope.clone(), cancellation: cancellation.clone(), stop, deadline: limits.active_ms, entry_reads: std::sync::atomic::AtomicU64::new(0) });
-            let source_events = read_persistence_test_scaffold::observe_read_image_source_events_for_test(&path);
+            let clock = Arc::new(SuffixProgressClock {
+                scope: scope.clone(),
+                cancellation: cancellation.clone(),
+                stop,
+                deadline: limits.active_ms,
+                entry_reads: std::sync::atomic::AtomicU64::new(0),
+            });
+            let source_events =
+                read_persistence_test_scaffold::observe_read_image_source_events_for_test(&path);
             source_events.reset();
-            let open = crate::executor::bounded::ReadOpenContext::new(parent.child().unwrap(), limits, clock, cancellation);
-            let (result, work) = read_persistence_test_scaffold::observe_open_history_work_for_test(||
-                match open { Ok(open) => load_read_image_at_registration_with_context(&path, None, None, None, open), Err(error) => Err(LoadReadImageError::Memory(error)) });
+            let open = crate::executor::bounded::ReadOpenContext::new(
+                parent.child().unwrap(),
+                limits,
+                clock,
+                cancellation,
+            );
+            let (result, work) =
+                read_persistence_test_scaffold::observe_open_history_work_for_test(|| match open {
+                    Ok(open) => {
+                        load_read_image_at_registration_with_context(&path, None, None, None, open)
+                    }
+                    Err(error) => Err(LoadReadImageError::Memory(error)),
+                });
             match result {
-                Err(LoadReadImageError::Memory(Error::ReadCancelled)) if stop == 1 || stop == 3 => {},
-                Err(LoadReadImageError::Memory(Error::ReadFailure(failure))) if stop == 2 || stop == 4 => {
-                    assert_eq!(failure, ReadFailure::owner_limit_exceeded(OwnerLimitExceededDetail { limit: ReadFailureLimit::ActiveMs, value: limits.active_ms, required: None, statement: None }));
-                },
+                Err(LoadReadImageError::Memory(Error::ReadCancelled)) if stop == 1 || stop == 3 => {
+                }
+                Err(LoadReadImageError::Memory(Error::ReadFailure(failure)))
+                    if stop == 2 || stop == 4 =>
+                {
+                    assert_eq!(
+                        failure,
+                        ReadFailure::owner_limit_exceeded(OwnerLimitExceededDetail {
+                            limit: ReadFailureLimit::ActiveMs,
+                            value: limits.active_ms,
+                            required: None,
+                            statement: None
+                        })
+                    );
+                }
                 _ => panic!("real open interruption must retain the existing typed refusal"),
             }
-            let diagnosed = if stop == 1 { 2 } else if stop == 2 { 1 } else { 0 };
-            assert_eq!(work.commit_index_scanned, diagnosed, "clock observes real progress; cancellation is read by the following checkpoint");
-            assert_eq!(read_persistence_test_scaffold::OpenHistoryWork { commit_index_scanned: 0, ..work }, read_persistence_test_scaffold::OpenHistoryWork::default());
-            let advanced = scope.graph_events().into_iter().filter(|event| event.family == "commit_index" && event.operation == "iteration_step").collect::<Vec<_>>();
-            assert_eq!(advanced.iter().map(|event| event.key.clone()).collect::<Vec<_>>(), [21u64,22].iter().take(diagnosed as usize).map(|lsn| lsn.to_be_bytes().to_vec()).collect::<Vec<_>>());
+            let diagnosed = if stop == 1 {
+                2
+            } else if stop == 2 {
+                1
+            } else {
+                0
+            };
+            assert_eq!(
+                work.commit_index_scanned, diagnosed,
+                "clock observes real progress; cancellation is read by the following checkpoint"
+            );
+            assert_eq!(
+                read_persistence_test_scaffold::OpenHistoryWork {
+                    commit_index_scanned: 0,
+                    ..work
+                },
+                read_persistence_test_scaffold::OpenHistoryWork::default()
+            );
+            let advanced = scope
+                .graph_events()
+                .into_iter()
+                .filter(|event| {
+                    event.family == "commit_index" && event.operation == "iteration_step"
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                advanced
+                    .iter()
+                    .map(|event| event.key.clone())
+                    .collect::<Vec<_>>(),
+                [21u64, 22]
+                    .iter()
+                    .take(diagnosed as usize)
+                    .map(|lsn| lsn.to_be_bytes().to_vec())
+                    .collect::<Vec<_>>()
+            );
             if stop == 1 || stop == 2 {
                 let events = source_events.events();
                 let dropped = events.iter().position(|event| matches!(event, read_persistence_test_scaffold::ReadImageSourceEvent::SourceHandlesDropped)).unwrap();
-                let released = events.iter().position(|event| matches!(event, read_persistence_test_scaffold::ReadImageSourceEvent::Released { .. })).unwrap();
-                assert!(dropped < released, "physical source handles drop before release is certified");
+                let released = events
+                    .iter()
+                    .position(|event| {
+                        matches!(
+                            event,
+                            read_persistence_test_scaffold::ReadImageSourceEvent::Released { .. }
+                        )
+                    })
+                    .unwrap();
+                assert!(
+                    dropped < released,
+                    "physical source handles drop before release is certified"
+                );
             }
             drop(scope);
             assert_eq!(parent.retained_bytes_for_test(), baseline);
@@ -43825,18 +45273,33 @@ mod empty_declared_index_readiness_tests {
         }
     }
 
-    fn directory_pinned_view(file: &ReadSession) -> ((usize, Lsn), Option<TxId>, Option<(Lsn,TxId)>, Option<(u64,u64)>) {
+    fn directory_pinned_view(
+        file: &ReadSession,
+    ) -> (
+        (usize, Lsn),
+        Option<TxId>,
+        Option<(Lsn, TxId)>,
+        Option<(u64, u64)>,
+    ) {
         file.__with_resident_history_for_test(|database| {
-            let open = crate::executor::bounded::ReadOpenContext::new(database.declared_reader_memory()?,
-                contextdb_core::read_contract::ReadLimits::default(), Arc::new(DirectoryProofClock), contextdb_core::read_contract::OwnerReadCancellation::new())?;
+            let open = crate::executor::bounded::ReadOpenContext::new(
+                database.declared_reader_memory()?,
+                contextdb_core::read_contract::ReadLimits::default(),
+                Arc::new(DirectoryProofClock),
+                contextdb_core::read_contract::OwnerReadCancellation::new(),
+            )?;
             let checkpoint = || open.checkpoint();
             let context = contextdb_tx::ReadCommitContext::new(open.read_memory(), &checkpoint);
             let scope = ReadWorkObservationScope::enter(ReadWorkPhase::Query);
             let census = database.__commit_directory_census_with_context_for_test(&context)?;
             let get = database.__commit_directory_get_with_context_for_test(Lsn(40), &context)?;
-            let floor = database.__commit_directory_floor_with_context_for_test(std::ops::Bound::Included(Lsn(40)), &context)?;
+            let floor = database.__commit_directory_floor_with_context_for_test(
+                std::ops::Bound::Included(Lsn(40)),
+                &context,
+            )?;
             Ok((census, get, floor, scope.commit_directory_residency()))
-        }).unwrap()
+        })
+        .unwrap()
     }
 
     fn assert_directory_pinned_publication_row(directory: &Path) {
@@ -43845,37 +45308,89 @@ mod empty_declared_index_readiness_tests {
         drop(store);
         let old = ReadSession::open(&path).unwrap();
         let before = directory_pinned_view(&old);
-        assert_eq!(before, ((6,Lsn(1)), None, Some((Lsn(20),TxId(100))), Some((0,6))));
+        assert_eq!(
+            before,
+            ((6, Lsn(1)), None, Some((Lsn(20), TxId(100))), Some((0, 6)))
+        );
         let identity = old.file_snapshot_for_test().unwrap();
-        let fixture_open_accountant_42332 = Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-        let _fixture_decode_scope_42332 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_42332).into()).unwrap();
+        let fixture_open_accountant_42332 =
+            Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+        let _fixture_decode_scope_42332 =
+            crate::read_image_memory::ImageMemory::enter_writer_operation(
+                std::sync::Arc::clone(&fixture_open_accountant_42332).into(),
+            )
+            .unwrap();
         let store = RedbPersistence::open(&path).unwrap();
-        store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_42332).into());
-        store.flush_commit_index_entries(&BTreeMap::from([(Lsn(40),TxId(101))])).unwrap();
+        store
+            .attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_42332).into());
+        store
+            .flush_commit_index_entries(&BTreeMap::from([(Lsn(40), TxId(101))]))
+            .unwrap();
         drop(_fixture_decode_scope_42332);
-        assert_eq!(directory_pinned_view(&old), before, "installed old directory retains the captured membership and floor after real publication");
+        assert_eq!(
+            directory_pinned_view(&old),
+            before,
+            "installed old directory retains the captured membership and floor after real publication"
+        );
         assert_eq!(old.file_snapshot_for_test().unwrap(), identity);
         drop(store);
         let fresh = ReadSession::open(&path).unwrap();
-        assert_eq!(directory_pinned_view(&fresh), ((7,Lsn(1)), Some(TxId(101)), Some((Lsn(40),TxId(101))), Some((0,7))));
+        assert_eq!(
+            directory_pinned_view(&fresh),
+            (
+                (7, Lsn(1)),
+                Some(TxId(101)),
+                Some((Lsn(40), TxId(101))),
+                Some((0, 7))
+            )
+        );
     }
 
     fn assert_commit_directory_writable_controls(directory: &Path) {
-        for versions in [4,8,16] {
+        for versions in [4, 8, 16] {
             let path = directory.join(format!("commit-directory-writable-{versions}.db"));
             let (store, _, _) = graph_history_fixture(&path, versions, 4, false);
             let expected = store.load_commit_index().unwrap();
             drop(store);
             let database = Database::open(&path).unwrap();
             assert!(!database.__has_captured_commit_directory_for_test());
-            let open = crate::executor::bounded::ReadOpenContext::new(database.declared_reader_memory().unwrap(),
-                contextdb_core::read_contract::ReadLimits::default(), Arc::new(DirectoryProofClock), contextdb_core::read_contract::OwnerReadCancellation::new()).unwrap();
+            let open = crate::executor::bounded::ReadOpenContext::new(
+                database.declared_reader_memory().unwrap(),
+                contextdb_core::read_contract::ReadLimits::default(),
+                Arc::new(DirectoryProofClock),
+                contextdb_core::read_contract::OwnerReadCancellation::new(),
+            )
+            .unwrap();
             let checkpoint = || open.checkpoint();
             let context = contextdb_tx::ReadCommitContext::new(open.read_memory(), &checkpoint);
-            assert_eq!(database.__commit_directory_census_with_context_for_test(&context).unwrap(), (expected.len(),Lsn(1)));
-            assert_eq!(database.__commit_directory_floor_with_context_for_test(std::ops::Bound::Included(Lsn(19)), &context).unwrap(), Some((Lsn(versions as u64+1),TxId(versions as u64+1))));
-            assert_eq!(database.__commit_directory_floor_with_context_for_test(std::ops::Bound::Included(Lsn(20)), &context).unwrap(), Some((Lsn(20),TxId(100))));
-            assert_eq!(database.snapshot_at(Lsn(19)), SnapshotId(versions as u64+1));
+            assert_eq!(
+                database
+                    .__commit_directory_census_with_context_for_test(&context)
+                    .unwrap(),
+                (expected.len(), Lsn(1))
+            );
+            assert_eq!(
+                database
+                    .__commit_directory_floor_with_context_for_test(
+                        std::ops::Bound::Included(Lsn(19)),
+                        &context
+                    )
+                    .unwrap(),
+                Some((Lsn(versions as u64 + 1), TxId(versions as u64 + 1)))
+            );
+            assert_eq!(
+                database
+                    .__commit_directory_floor_with_context_for_test(
+                        std::ops::Bound::Included(Lsn(20)),
+                        &context
+                    )
+                    .unwrap(),
+                Some((Lsn(20), TxId(100)))
+            );
+            assert_eq!(
+                database.snapshot_at(Lsn(19)),
+                SnapshotId(versions as u64 + 1)
+            );
             assert_eq!(database.snapshot_at(Lsn(20)), SnapshotId(100));
         }
     }
@@ -43906,32 +45421,57 @@ mod empty_declared_index_readiness_tests {
             let (store, predecessor, entries) = graph_history_fixture(&path, versions, 4, false);
             // Durable fixture inspection precedes every operation scope.
             // These are support memberships, not resident directory entries.
-            let expected_commit_count = match versions { 4 => 6, 8 => 10, 16 => 18, _ => unreachable!() };
+            let expected_commit_count = match versions {
+                4 => 6,
+                8 => 10,
+                16 => 18,
+                _ => unreachable!(),
+            };
             let expected_commits = (1..=versions as u64 + 1)
                 .map(|lsn| (Lsn(lsn), TxId(lsn)))
                 .chain(std::iter::once((Lsn(20), TxId(100))))
                 .collect::<Vec<_>>();
             let physical_commits = store.load_commit_index().unwrap();
-            assert_eq!(physical_commits.len(), expected_commit_count, "durable support grows at 4/8/16 versions");
-            assert_eq!(physical_commits.into_iter().collect::<Vec<_>>(), expected_commits, "every authored support commit is retained");
+            assert_eq!(
+                physical_commits.len(),
+                expected_commit_count,
+                "durable support grows at 4/8/16 versions"
+            );
+            assert_eq!(
+                physical_commits.into_iter().collect::<Vec<_>>(),
+                expected_commits,
+                "every authored support commit is retained"
+            );
             drop(store);
             // Match the public File opener's declared parent and operation
             // child. The image ceiling remains the existing fixture ceiling.
             let limits = ReadSessionOptions::default().limits;
-            let declared_read_memory = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(limits.memory);
+            let declared_read_memory =
+                crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(limits.memory);
             let raw_parent_baseline = declared_read_memory.retained_bytes_for_test();
             let raw_parent_identity = Arc::as_ptr(&declared_read_memory) as usize;
             let observation = ReadWorkObservationScope::enter(ReadWorkPhase::Open);
             assert_eq!(observation.commit_directory_funding(), None);
             let open_context = crate::executor::bounded::ReadOpenContext::new(
-                declared_read_memory.child().unwrap(), limits,
-                crate::read_session::read_clock(), OwnerReadCancellation::new(),
-            ).unwrap();
+                declared_read_memory.child().unwrap(),
+                limits,
+                crate::read_session::read_clock(),
+                OwnerReadCancellation::new(),
+            )
+            .unwrap();
             observation.set_operation_id("graph-observer-row");
-            let raw_open_identity = crate::read_work_probe::funding_owner_id(&open_context.read_memory());
+            let raw_open_identity =
+                crate::read_work_probe::funding_owner_id(&open_context.read_memory());
             let (loaded, history_work) =
                 read_persistence_test_scaffold::observe_open_history_work_for_test(|| {
-                    load_read_image_at_registration_with_context(&path, Some(16 * 1024 * 1024), None, None, open_context).unwrap()
+                    load_read_image_at_registration_with_context(
+                        &path,
+                        Some(16 * 1024 * 1024),
+                        None,
+                        None,
+                        open_context,
+                    )
+                    .unwrap()
                 });
             let (image, _receipt, source) = loaded.into_parts();
             assert!(image.change_log.is_empty());
@@ -43950,57 +45490,183 @@ mod empty_declared_index_readiness_tests {
             let raw_image_held = image.memory.held();
             let raw_accountant_used = image.memory.accountant.usage().used;
             let constructor_context = image.open_context.clone();
-            let funding_loaded = observation.commit_directory_funding().expect("scope entered before native open observes actual child");
+            let funding_loaded = observation
+                .commit_directory_funding()
+                .expect("scope entered before native open observes actual child");
             assert_eq!(funding_loaded.open_child.owner_identity, raw_open_identity);
-            assert_eq!(funding_loaded.open_child.parent_identity, raw_parent_identity);
-            assert_eq!(funding_loaded.open_child.parent_charged_bytes, declared_read_memory.retained_bytes_for_test());
+            assert_eq!(
+                funding_loaded.open_child.parent_identity,
+                raw_parent_identity
+            );
+            assert_eq!(
+                funding_loaded.open_child.parent_charged_bytes,
+                declared_read_memory.retained_bytes_for_test()
+            );
             // Keep the actual pre-directory child sample as the baseline.
             // Zero is lawful: source cache/verifier/index use ImageMemory;
             // the installed directory must add charge to this same child.
-            assert_eq!(funding_loaded.request_child, None, "no request child was observed during raw open");
-            assert_eq!(observation.commit_directory_source_registration_funding(), None, "raw open has not reserved the graph source wrapper");
+            assert_eq!(
+                funding_loaded.request_child, None,
+                "no request child was observed during raw open"
+            );
+            assert_eq!(
+                observation.commit_directory_source_registration_funding(),
+                None,
+                "raw open has not reserved the graph source wrapper"
+            );
             let constructor_before = observation.graph_counters();
             let constructor_accountant = image.memory.accountant.clone();
-            let (constructed, constructor_history_work) = read_persistence_test_scaffold::observe_open_history_work_for_test(||
-                Database::open_committed_image(
-                    image.into_runtime_parts(source.clone()), Arc::new(crate::plugin::CorePlugin),
-                    constructor_accountant, declared_read_memory.clone(),
-                ).unwrap());
-            assert_eq!(constructor_history_work, read_persistence_test_scaffold::OpenHistoryWork::default());
+            let (constructed, constructor_history_work) =
+                read_persistence_test_scaffold::observe_open_history_work_for_test(|| {
+                    Database::open_committed_image(
+                        image.into_runtime_parts(source.clone()),
+                        Arc::new(crate::plugin::CorePlugin),
+                        constructor_accountant,
+                        declared_read_memory.clone(),
+                    )
+                    .unwrap()
+                });
+            assert_eq!(
+                constructor_history_work,
+                read_persistence_test_scaffold::OpenHistoryWork::default()
+            );
             let constructor_after = observation.graph_counters();
-            let constructor_gets = constructor_after.graph_commit_gets - constructor_before.graph_commit_gets;
+            let constructor_gets =
+                constructor_after.graph_commit_gets - constructor_before.graph_commit_gets;
             assert!(constructed.__has_captured_commit_directory_for_test());
             if let Some(control) = directory_constructor_control {
-                assert_eq!(constructor_gets, control, "real directory construction adds the same fixed endpoint count at N/2N/4N");
-            } else { directory_constructor_control = Some(constructor_gets); }
-            let constructor_keys = observation.graph_events().into_iter().filter(|event| event.family == "commit_index" && event.operation == "get").map(|event| event.key).collect::<Vec<_>>();
-            assert_eq!(constructor_keys, [expected_commits.first().unwrap().0, expected_commits.last().unwrap().0].into_iter().map(|lsn| lsn.0.to_be_bytes().to_vec()).collect::<Vec<_>>(), "both real constructor endpoint accesses remain visible");
-            assert_eq!(constructor_gets, [expected_commits.first(), expected_commits.last()].into_iter().flatten().count() as u64, "real nonempty directory construction verifies exactly its two endpoints at every 4/8/16 fixture");
-            assert_eq!(observation.commit_directory_residency(), Some((0, expected_commit_count as u64)), "actual installed constructor pairs zero resident entries with growing durable support");
+                assert_eq!(
+                    constructor_gets, control,
+                    "real directory construction adds the same fixed endpoint count at N/2N/4N"
+                );
+            } else {
+                directory_constructor_control = Some(constructor_gets);
+            }
+            let constructor_keys = observation
+                .graph_events()
+                .into_iter()
+                .filter(|event| event.family == "commit_index" && event.operation == "get")
+                .map(|event| event.key)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                constructor_keys,
+                [
+                    expected_commits.first().unwrap().0,
+                    expected_commits.last().unwrap().0
+                ]
+                .into_iter()
+                .map(|lsn| lsn.0.to_be_bytes().to_vec())
+                .collect::<Vec<_>>(),
+                "both real constructor endpoint accesses remain visible"
+            );
+            assert_eq!(
+                constructor_gets,
+                [expected_commits.first(), expected_commits.last()]
+                    .into_iter()
+                    .flatten()
+                    .count() as u64,
+                "real nonempty directory construction verifies exactly its two endpoints at every 4/8/16 fixture"
+            );
+            assert_eq!(
+                observation.commit_directory_residency(),
+                Some((0, expected_commit_count as u64)),
+                "actual installed constructor pairs zero resident entries with growing durable support"
+            );
             let constructor_checkpoint = || constructor_context.checkpoint();
-            let constructor_request = contextdb_tx::ReadCommitContext::new(constructor_context.read_memory(), &constructor_checkpoint);
-            constructed.__commit_directory_census_with_context_for_test(&constructor_request).unwrap();
+            let constructor_request = contextdb_tx::ReadCommitContext::new(
+                constructor_context.read_memory(),
+                &constructor_checkpoint,
+            );
+            constructed
+                .__commit_directory_census_with_context_for_test(&constructor_request)
+                .unwrap();
             let funding_constructed = observation.commit_directory_funding().unwrap();
             let source_registration = observation.commit_directory_source_registration_funding().expect("real captured Database construction observes its successful graph source wrapper reservation");
-            assert_eq!(source_registration.image_owner_identity, raw_image_owner_identity);
-            assert_eq!(source_registration.image_accountant_identity, raw_image_accountant_identity);
-            assert_eq!(source_registration.image_held_before_reservation, raw_image_held);
-            assert_eq!(source_registration.image_accountant_used_before_reservation, raw_accountant_used);
+            assert_eq!(
+                source_registration.image_owner_identity,
+                raw_image_owner_identity
+            );
+            assert_eq!(
+                source_registration.image_accountant_identity,
+                raw_image_accountant_identity
+            );
+            assert_eq!(
+                source_registration.image_held_before_reservation,
+                raw_image_held
+            );
+            assert_eq!(
+                source_registration.image_accountant_used_before_reservation,
+                raw_accountant_used
+            );
             let wrapper_held_delta = source_registration.image_held_after_reservation.checked_sub(source_registration.image_held_before_reservation).expect("successful source wrapper reservation increases its actual image owner counter");
-            let wrapper_accountant_delta = source_registration.image_accountant_used_after_reservation.checked_sub(source_registration.image_accountant_used_before_reservation).expect("successful source wrapper reservation increases its actual accountant counter");
-            assert_eq!(wrapper_held_delta, 8, "the image-held graph source wrapper remains exactly eight bytes");
-            assert_eq!(wrapper_accountant_delta, wrapper_held_delta, "the same native reservation funds image ownership and its accountant");
-            assert_eq!(funding_constructed.image_held_bytes.and_then(|held| held.checked_sub(raw_image_held)), Some(wrapper_held_delta), "the old image observation window contains exactly the observed wrapper reservation");
-            let constructor_accountant_delta = funding_constructed.image_accountant_used_bytes.and_then(|used| used.checked_sub(raw_accountant_used)).expect("construction retains its wrapper and fixed controls on the actual accountant");
-            assert_eq!(constructor_accountant_delta, wrapper_accountant_delta + fixed_constructor_controls_bytes, "the accountant holds the wrapper plus fixed stage registries, finalization and store wrappers");
+            let wrapper_accountant_delta = source_registration
+                .image_accountant_used_after_reservation
+                .checked_sub(source_registration.image_accountant_used_before_reservation)
+                .expect(
+                    "successful source wrapper reservation increases its actual accountant counter",
+                );
+            assert_eq!(
+                wrapper_held_delta, 8,
+                "the image-held graph source wrapper remains exactly eight bytes"
+            );
+            assert_eq!(
+                wrapper_accountant_delta, wrapper_held_delta,
+                "the same native reservation funds image ownership and its accountant"
+            );
+            assert_eq!(
+                funding_constructed
+                    .image_held_bytes
+                    .and_then(|held| held.checked_sub(raw_image_held)),
+                Some(wrapper_held_delta),
+                "the old image observation window contains exactly the observed wrapper reservation"
+            );
+            let constructor_accountant_delta = funding_constructed
+                .image_accountant_used_bytes
+                .and_then(|used| used.checked_sub(raw_accountant_used))
+                .expect(
+                    "construction retains its wrapper and fixed controls on the actual accountant",
+                );
+            assert_eq!(
+                constructor_accountant_delta,
+                wrapper_accountant_delta + fixed_constructor_controls_bytes,
+                "the accountant holds the wrapper plus fixed stage registries, finalization and store wrappers"
+            );
             if let Some(control) = constructor_accountant_control {
-                assert_eq!(constructor_accountant_delta, control, "constructor accountant bytes are identical across 4/8/16 store sizes");
-            } else { constructor_accountant_control = Some(constructor_accountant_delta); }
-            assert_eq!(funding_constructed.open_child.owner_identity, raw_open_identity);
-            assert!(funding_constructed.open_child.charged_bytes > funding_loaded.open_child.charged_bytes, "installed directory controls use the declared open child");
-            assert_eq!(funding_constructed.open_child.parent_charged_bytes - funding_loaded.open_child.parent_charged_bytes, funding_constructed.open_child.charged_bytes - funding_loaded.open_child.charged_bytes);
-            assert_eq!(funding_constructed.image_held_bytes, Some(source_registration.image_held_after_reservation), "directory controls do not charge ImageMemory instead");
-            assert_eq!(funding_constructed.image_accountant_used_bytes, Some(source_registration.image_accountant_used_after_reservation + fixed_constructor_controls_bytes), "the actual image accountant also holds the separately admitted fixed constructor controls");
+                assert_eq!(
+                    constructor_accountant_delta, control,
+                    "constructor accountant bytes are identical across 4/8/16 store sizes"
+                );
+            } else {
+                constructor_accountant_control = Some(constructor_accountant_delta);
+            }
+            assert_eq!(
+                funding_constructed.open_child.owner_identity,
+                raw_open_identity
+            );
+            assert!(
+                funding_constructed.open_child.charged_bytes
+                    > funding_loaded.open_child.charged_bytes,
+                "installed directory controls use the declared open child"
+            );
+            assert_eq!(
+                funding_constructed.open_child.parent_charged_bytes
+                    - funding_loaded.open_child.parent_charged_bytes,
+                funding_constructed.open_child.charged_bytes
+                    - funding_loaded.open_child.charged_bytes
+            );
+            assert_eq!(
+                funding_constructed.image_held_bytes,
+                Some(source_registration.image_held_after_reservation),
+                "directory controls do not charge ImageMemory instead"
+            );
+            assert_eq!(
+                funding_constructed.image_accountant_used_bytes,
+                Some(
+                    source_registration.image_accountant_used_after_reservation
+                        + fixed_constructor_controls_bytes
+                ),
+                "the actual image accountant also holds the separately admitted fixed constructor controls"
+            );
             drop(constructor_request);
             drop(constructor_context);
             drop(constructed);
@@ -44014,17 +45680,39 @@ mod empty_declared_index_readiness_tests {
             } else {
                 control_open = Some(observed);
             }
-            let graph_open = assert_graph_open_work(&observation, &format!("{:?}", source.storage_identity()));
-            if let Some(control) = graph_open_control { assert_eq!(graph_open, control, "captured image open graph work stays fixed across 4/8/16 versions"); } else { graph_open_control = Some(graph_open); }
-            let query_work = graph_addressed_observer_row(&graph_read::GraphReadRoot::Image(source.clone()), &predecessor, true, Lsn(30), 0, &entries[0]);
-            if let Some(control) = query_controls.get(&false) { assert_eq!(&query_work, control); } else { query_controls.insert(false, query_work); }
+            let graph_open =
+                assert_graph_open_work(&observation, &format!("{:?}", source.storage_identity()));
+            if let Some(control) = graph_open_control {
+                assert_eq!(
+                    graph_open, control,
+                    "captured image open graph work stays fixed across 4/8/16 versions"
+                );
+            } else {
+                graph_open_control = Some(graph_open);
+            }
+            let query_work = graph_addressed_observer_row(
+                &graph_read::GraphReadRoot::Image(source.clone()),
+                &predecessor,
+                true,
+                Lsn(30),
+                0,
+                &entries[0],
+            );
+            if let Some(control) = query_controls.get(&false) {
+                assert_eq!(&query_work, control);
+            } else {
+                query_controls.insert(false, query_work);
+            }
             assert_graph_source_answers(
                 graph_read::GraphReadRoot::Image(source),
                 &predecessor,
                 true,
                 &entries,
             );
-            assert_eq!(declared_read_memory.retained_bytes_for_test(), raw_parent_baseline);
+            assert_eq!(
+                declared_read_memory.retained_bytes_for_test(),
+                raw_parent_baseline
+            );
             drop(declared_read_memory);
             assert_commit_directory_final_drop(&observation);
             drop(observation);
@@ -44037,42 +45725,99 @@ mod empty_declared_index_readiness_tests {
                     ReadSession::open(&path).unwrap()
                 });
             assert_eq!(file.route(), ReadRoute::File);
-            assert_eq!(public_history_work, read_persistence_test_scaffold::OpenHistoryWork::default());
+            assert_eq!(
+                public_history_work,
+                read_persistence_test_scaffold::OpenHistoryWork::default()
+            );
             assert_graph_context(&public_open, ReadWorkPhase::Open);
-            assert_eq!(public_open.graph_counters(), graph_open, "public File open has the same fixed graph work as the captured source control");
-            let public_constructor_gets = public_open.graph_events().iter().filter(|event| event.family == "commit_index" && event.operation == "get").count() as u64;
-            assert_eq!(public_constructor_gets, constructor_gets, "RAW and public File complete the same real endpoint verification, fixed across every 4/8/16 fixture");
-            let public_constructor_keys = public_open.graph_events().into_iter().filter(|event| event.family == "commit_index" && event.operation == "get").map(|event| event.key).collect::<Vec<_>>();
-            assert_eq!(public_constructor_keys, constructor_keys, "public File verifies the same first/last durable keys as the real RAW constructor at every 4/8/16 fixture");
-            assert_eq!(public_open.commit_directory_residency(), Some((0, expected_commit_count as u64)));
+            assert_eq!(
+                public_open.graph_counters(),
+                graph_open,
+                "public File open has the same fixed graph work as the captured source control"
+            );
+            let public_constructor_gets = public_open
+                .graph_events()
+                .iter()
+                .filter(|event| event.family == "commit_index" && event.operation == "get")
+                .count() as u64;
+            assert_eq!(
+                public_constructor_gets, constructor_gets,
+                "RAW and public File complete the same real endpoint verification, fixed across every 4/8/16 fixture"
+            );
+            let public_constructor_keys = public_open
+                .graph_events()
+                .into_iter()
+                .filter(|event| event.family == "commit_index" && event.operation == "get")
+                .map(|event| event.key)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                public_constructor_keys, constructor_keys,
+                "public File verifies the same first/last durable keys as the real RAW constructor at every 4/8/16 fixture"
+            );
+            assert_eq!(
+                public_open.commit_directory_residency(),
+                Some((0, expected_commit_count as u64))
+            );
             drop(public_open);
-            let funding_scope = assert_installed_commit_directory_rows(&file, &expected_commits, &path);
+            let funding_scope =
+                assert_installed_commit_directory_rows(&file, &expected_commits, &path);
             let registration = file.file_storage_registration_for_test().unwrap();
             assert!(registration.descriptor_open);
             assert!(!registration.load_lock_held);
-            assert_eq!(file.file_retained_charge_bytes_for_test(), Some(0), "the captured public reader never borrows the writer retention door");
+            assert_eq!(
+                file.file_retained_charge_bytes_for_test(),
+                Some(0),
+                "the captured public reader never borrows the writer retention door"
+            );
             let snapshot = file.file_snapshot_for_test().unwrap();
             let (_, _, _, file_memory) = file.file_memory_for_test().unwrap();
-            let answer = file.metadata(crate::MetadataRequest::ImageState {
-                kind: crate::DirectImageMetadataKind::ChangeLog,
-            }, None).unwrap();
+            let answer = file
+                .metadata(
+                    crate::MetadataRequest::ImageState {
+                        kind: crate::DirectImageMetadataKind::ChangeLog,
+                    },
+                    None,
+                )
+                .unwrap();
             let crate::direct_file_reader::DirectMetadataBody::ImageState {
                 state: crate::direct_file_reader::DirectImageState::ChangeLog(changes),
-            } = &answer.body else { panic!("the requested public history metadata returns its change state"); };
-            assert_eq!(changes.commit_index.len(), expected_commit_count, "public output preserves durable membership census");
-            assert_eq!(changes.commit_index, expected_commits, "the admitted public collector returns every authored support pair in order");
-            assert_eq!(file.file_snapshot_for_test().unwrap(), snapshot, "requesting history preserves the public session's committed identity");
+            } = &answer.body
+            else {
+                panic!("the requested public history metadata returns its change state");
+            };
+            assert_eq!(
+                changes.commit_index.len(),
+                expected_commit_count,
+                "public output preserves durable membership census"
+            );
+            assert_eq!(
+                changes.commit_index, expected_commits,
+                "the admitted public collector returns every authored support pair in order"
+            );
+            assert_eq!(
+                file.file_snapshot_for_test().unwrap(),
+                snapshot,
+                "requesting history preserves the public session's committed identity"
+            );
             drop(answer);
             drop(file);
-            assert!(file_memory.upgrade().is_none(), "the final public File handle releases its actual image-memory owner");
+            assert!(
+                file_memory.upgrade().is_none(),
+                "the final public File handle releases its actual image-memory owner"
+            );
             assert_commit_directory_final_drop(&funding_scope);
             drop(funding_scope);
-            let fixture_open_accountant_42536 = Arc::new(
-                crate::memory_accounting::MemoryAccountant::no_limit(),
-            );
-            let _fixture_decode_scope_42536 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_42536).into()).unwrap();
+            let fixture_open_accountant_42536 =
+                Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+            let _fixture_decode_scope_42536 =
+                crate::read_image_memory::ImageMemory::enter_writer_operation(
+                    std::sync::Arc::clone(&fixture_open_accountant_42536).into(),
+                )
+                .unwrap();
             let store = RedbPersistence::open(&path).unwrap();
-            store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_42536).into());
+            store.attach_memory_accountant(
+                std::sync::Arc::clone(&fixture_open_accountant_42536).into(),
+            );
             let root = store
                 .initialize_writer_snapshot(SnapshotId(100), Lsn(30))
                 .unwrap();
@@ -44080,12 +45825,33 @@ mod empty_declared_index_readiness_tests {
             writer_observation.set_operation_id("graph-observer-row");
             let captured_read = root.owner_read().unwrap();
             RedbPersistence::read_authenticated_bounds_in_read(&captured_read).unwrap();
-            let writer_open = assert_graph_open_work(&writer_observation, &format!("{:?}", root.storage_identity()));
-            if let Some(control) = writer_open_control { assert_eq!(writer_open, control, "captured writer root validation stays fixed across 4/8/16 versions"); } else { writer_open_control = Some(writer_open); }
+            let writer_open = assert_graph_open_work(
+                &writer_observation,
+                &format!("{:?}", root.storage_identity()),
+            );
+            if let Some(control) = writer_open_control {
+                assert_eq!(
+                    writer_open, control,
+                    "captured writer root validation stays fixed across 4/8/16 versions"
+                );
+            } else {
+                writer_open_control = Some(writer_open);
+            }
             drop(captured_read);
             drop(writer_observation);
-            let query_work = graph_addressed_observer_row(&graph_read::GraphReadRoot::Writer(root.clone()), &predecessor, true, Lsn(30), 0, &entries[0]);
-            if let Some(control) = query_controls.get(&true) { assert_eq!(&query_work, control); } else { query_controls.insert(true, query_work); }
+            let query_work = graph_addressed_observer_row(
+                &graph_read::GraphReadRoot::Writer(root.clone()),
+                &predecessor,
+                true,
+                Lsn(30),
+                0,
+                &entries[0],
+            );
+            if let Some(control) = query_controls.get(&true) {
+                assert_eq!(&query_work, control);
+            } else {
+                query_controls.insert(true, query_work);
+            }
             assert_graph_source_answers(
                 graph_read::GraphReadRoot::Writer(root),
                 &predecessor,
@@ -44121,12 +45887,17 @@ mod empty_declared_index_readiness_tests {
                         .unwrap()
                         .into_parts();
                 drop(image);
-                let fixture_open_accountant_42588 = Arc::new(
-                    crate::memory_accounting::MemoryAccountant::no_limit(),
-                );
-                let _fixture_decode_scope_42588 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_42588).into()).unwrap();
+                let fixture_open_accountant_42588 =
+                    Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+                let _fixture_decode_scope_42588 =
+                    crate::read_image_memory::ImageMemory::enter_writer_operation(
+                        std::sync::Arc::clone(&fixture_open_accountant_42588).into(),
+                    )
+                    .unwrap();
                 let store = RedbPersistence::open(&path).unwrap();
-                store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_42588).into());
+                store.attach_memory_accountant(
+                    std::sync::Arc::clone(&fixture_open_accountant_42588).into(),
+                );
                 let old_writer = store
                     .initialize_writer_snapshot(SnapshotId(100), Lsn(30))
                     .unwrap();
@@ -44137,7 +45908,12 @@ mod empty_declared_index_readiness_tests {
                 };
                 let (row_meta, physical_row) = graph_retention_row();
                 let row_keys = if repack {
-                    vec![("removed_rows".to_owned(), physical_row.row_id, physical_row.created_tx, physical_row.lsn)]
+                    vec![(
+                        "removed_rows".to_owned(),
+                        physical_row.row_id,
+                        physical_row.created_tx,
+                        physical_row.lsn,
+                    )]
                 } else {
                     Vec::new()
                 };
@@ -44174,7 +45950,11 @@ mod empty_declared_index_readiness_tests {
                     );
                 }
                 let deferred = HashSet::new();
-                let retained_zero_keys = if repack { Vec::new() } else { graph_retained_zero_touch_keys(&before) };
+                let retained_zero_keys = if repack {
+                    Vec::new()
+                } else {
+                    graph_retained_zero_touch_keys(&before)
+                };
                 let mutation_scope = graph_retirement_observer(&before);
                 let stats = store
                     .prune_retention_scoped(
@@ -44188,27 +45968,61 @@ mod empty_declared_index_readiness_tests {
                         &[("graph_fixture_progress".into(), vec![1])],
                     )
                     .unwrap();
-                let mutation_counts = assert_graph_retirement_work(&mutation_scope, &predecessor, repack);
-                if !repack { assert_graph_retained_zero_touch(&mutation_scope, &retained_zero_keys); }
+                let mutation_counts =
+                    assert_graph_retirement_work(&mutation_scope, &predecessor, repack);
                 if !repack {
-                    if let Some(control) = mutation_control { assert_eq!(mutation_counts, control, "one retirement has constant selected-family work across 1/4/8 retained references"); } else { mutation_control = Some(mutation_counts); }
+                    assert_graph_retained_zero_touch(&mutation_scope, &retained_zero_keys);
+                }
+                if !repack {
+                    if let Some(control) = mutation_control {
+                        assert_eq!(
+                            mutation_counts, control,
+                            "one retirement has constant selected-family work across 1/4/8 retained references"
+                        );
+                    } else {
+                        mutation_control = Some(mutation_counts);
+                    }
                 }
                 drop(mutation_scope);
                 assert_eq!(stats.row_keys_removed, u64::from(repack));
                 if repack {
-                    assert!(store.load_relational_row_version("removed_rows", &row_meta, physical_row.row_id, physical_row.created_tx, physical_row.lsn).unwrap().is_none());
+                    assert!(
+                        store
+                            .load_relational_row_version(
+                                "removed_rows",
+                                &row_meta,
+                                physical_row.row_id,
+                                physical_row.created_tx,
+                                physical_row.lsn
+                            )
+                            .unwrap()
+                            .is_none()
+                    );
                 }
                 assert_eq!(stats.change_log_keys_removed, u64::from(repack));
                 assert_eq!(stats.edge_keys_removed, 2);
                 assert_retained_graph_witnesses(&store, &predecessor, &private_bytes, 0, true);
                 let after = graph_publication_state(&store);
                 assert!(after.1[3].contains(&("graph_fixture_progress".to_owned(), vec![1])));
-                assert!(!before.1[3].iter().any(|(key, _)| key == "graph_fixture_progress"));
+                assert!(
+                    !before.1[3]
+                        .iter()
+                        .any(|(key, _)| key == "graph_fixture_progress")
+                );
                 if repack {
                     assert_eq!(before.0[5].len(), 1);
-                    assert!(after.0[5].is_empty(), "the selected physical row payload joins the same publication");
-                    assert_graph_retention_row_source(&graph_read::GraphReadRoot::Writer(old_writer.clone()), true);
-                    assert_graph_retention_row_source(&graph_read::GraphReadRoot::Image(old_source.clone()), true);
+                    assert!(
+                        after.0[5].is_empty(),
+                        "the selected physical row payload joins the same publication"
+                    );
+                    assert_graph_retention_row_source(
+                        &graph_read::GraphReadRoot::Writer(old_writer.clone()),
+                        true,
+                    );
+                    assert_graph_retention_row_source(
+                        &graph_read::GraphReadRoot::Image(old_source.clone()),
+                        true,
+                    );
                 }
                 assert_eq!(
                     before.0[3],
@@ -44301,7 +46115,10 @@ mod empty_declared_index_readiness_tests {
                     )
                     .unwrap();
                 if repack {
-                    assert_graph_retention_row_source(&graph_read::GraphReadRoot::Writer(new_writer.clone()), false);
+                    assert_graph_retention_row_source(
+                        &graph_read::GraphReadRoot::Writer(new_writer.clone()),
+                        false,
+                    );
                 }
                 assert_graph_source_answers(
                     graph_read::GraphReadRoot::Writer(new_writer),
@@ -44317,7 +46134,10 @@ mod empty_declared_index_readiness_tests {
                         .into_parts();
                 drop(image);
                 if repack {
-                    assert_graph_retention_row_source(&graph_read::GraphReadRoot::Image(new_source.clone()), false);
+                    assert_graph_retention_row_source(
+                        &graph_read::GraphReadRoot::Image(new_source.clone()),
+                        false,
+                    );
                 }
                 assert_graph_source_answers(
                     graph_read::GraphReadRoot::Image(new_source),
@@ -44325,12 +46145,30 @@ mod empty_declared_index_readiness_tests {
                     false,
                     &entries[first_ordinal..],
                 );
-                let fixture_open_accountant_42789 = std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-                let _fixture_decode_scope_42789 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_42789).into()).unwrap();
+                let fixture_open_accountant_42789 =
+                    std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+                let _fixture_decode_scope_42789 =
+                    crate::read_image_memory::ImageMemory::enter_writer_operation(
+                        std::sync::Arc::clone(&fixture_open_accountant_42789).into(),
+                    )
+                    .unwrap();
                 let reopened = RedbPersistence::open(&path).unwrap();
-                reopened.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_42789).into());
+                reopened.attach_memory_accountant(
+                    std::sync::Arc::clone(&fixture_open_accountant_42789).into(),
+                );
                 if repack {
-                    assert!(reopened.load_relational_row_version("removed_rows", &row_meta, physical_row.row_id, physical_row.created_tx, physical_row.lsn).unwrap().is_none());
+                    assert!(
+                        reopened
+                            .load_relational_row_version(
+                                "removed_rows",
+                                &row_meta,
+                                physical_row.row_id,
+                                physical_row.created_tx,
+                                physical_row.lsn
+                            )
+                            .unwrap()
+                            .is_none()
+                    );
                 }
                 assert_eq!(
                     graph_publication_state(&reopened),
@@ -44354,95 +46192,124 @@ mod empty_declared_index_readiness_tests {
     );
 
     fn graph_durability_state(store: &RedbPersistence) -> GraphDurabilityState {
-        let supplement = store.with_db(|db| {
-            let read = db.begin_read().map_err(RedbPersistence::storage_error)?;
-            let mut byte_tables = Vec::new();
-            for definition in [writer_history::WRITER_CHANGE_LOG_TABLE, writer_history::CHANGE_LOG_BY_TABLE] {
-                let table = read.open_table(definition).map_err(RedbPersistence::storage_error)?;
-                let mut rows = Vec::new();
+        let supplement = store
+            .with_db(|db| {
+                let read = db.begin_read().map_err(RedbPersistence::storage_error)?;
+                let mut byte_tables = Vec::new();
+                for definition in [
+                    writer_history::WRITER_CHANGE_LOG_TABLE,
+                    writer_history::CHANGE_LOG_BY_TABLE,
+                ] {
+                    let table = read
+                        .open_table(definition)
+                        .map_err(RedbPersistence::storage_error)?;
+                    let mut rows = Vec::new();
+                    for next in table.iter().map_err(RedbPersistence::storage_error)? {
+                        let (key, value) = next.map_err(RedbPersistence::storage_error)?;
+                        rows.push((key.value().to_vec(), value.value().to_vec()));
+                    }
+                    byte_tables.push(rows);
+                }
+                let mut bounds = Vec::new();
+                for name in ["retention_clock_bounds", "committed_read_lsn_bounds"] {
+                    let definition: TableDefinition<&str, u64> = TableDefinition::new(name);
+                    let table = read
+                        .open_table(definition)
+                        .map_err(RedbPersistence::storage_error)?;
+                    let mut rows = Vec::new();
+                    for next in table.iter().map_err(RedbPersistence::storage_error)? {
+                        let (key, value) = next.map_err(RedbPersistence::storage_error)?;
+                        rows.push((key.value().to_owned(), value.value()));
+                    }
+                    bounds.push(rows);
+                }
+                let table = read
+                    .open_table(writer_history::CHANGE_LOG_LSN_COUNT)
+                    .map_err(RedbPersistence::storage_error)?;
+                let mut counts = Vec::new();
                 for next in table.iter().map_err(RedbPersistence::storage_error)? {
                     let (key, value) = next.map_err(RedbPersistence::storage_error)?;
-                    rows.push((key.value().to_vec(), value.value().to_vec()));
+                    counts.push((key.value(), value.value()));
                 }
-                byte_tables.push(rows);
-            }
-            let mut bounds = Vec::new();
-            for name in ["retention_clock_bounds", "committed_read_lsn_bounds"] {
-                let definition: TableDefinition<&str, u64> = TableDefinition::new(name);
-                let table = read.open_table(definition).map_err(RedbPersistence::storage_error)?;
-                let mut rows = Vec::new();
-                for next in table.iter().map_err(RedbPersistence::storage_error)? {
-                    let (key, value) = next.map_err(RedbPersistence::storage_error)?;
-                    rows.push((key.value().to_owned(), value.value()));
+                // Capture the actual related durable families, including table
+                // absence. The fixture has no vector members; these bytes certify
+                // their unchanged state, not populated-vector removal coverage.
+                let mut publication_tables = Vec::new();
+                for definition in [
+                    VECTORS_TABLE,
+                    VECTOR_PARTITION_MEMBERSHIP_TABLE,
+                    VECTOR_OPEN_DIRECTORY_TABLE,
+                    VECTOR_PARTITION_JOURNAL_TABLE,
+                    VECTOR_PARTITION_TOMBSTONE_TABLE,
+                    VECTOR_PARTITION_BASE_GENERATION_TABLE,
+                    VECTOR_PARTITION_CHANGE_GENERATION_TABLE,
+                    VECTOR_PARTITION_GRAPH_PAGE_TABLE,
+                    VECTOR_PARTITION_GENERATION_CATALOG_TABLE,
+                    vector_membership_pages::SOURCE,
+                    vector_membership_pages::REVERSE,
+                    vector_membership_pages::SUMMARY,
+                    TableDefinition::new("writer_row_heads"),
+                    CONTENT_IDENTITY_NODES_TABLE,
+                ] {
+                    let rows = match read.open_table(definition) {
+                        Ok(table) => {
+                            let mut rows = Vec::new();
+                            for next in table.iter().map_err(RedbPersistence::storage_error)? {
+                                let (key, value) = next.map_err(RedbPersistence::storage_error)?;
+                                rows.push((key.value().to_vec(), value.value().to_vec()));
+                            }
+                            Some(rows)
+                        }
+                        Err(redb::TableError::TableDoesNotExist(_)) => None,
+                        Err(error) => return Err(RedbPersistence::storage_error(error)),
+                    };
+                    publication_tables.push((definition.name().to_owned(), rows));
                 }
-                bounds.push(rows);
-            }
-            let table = read.open_table(writer_history::CHANGE_LOG_LSN_COUNT).map_err(RedbPersistence::storage_error)?;
-            let mut counts = Vec::new();
-            for next in table.iter().map_err(RedbPersistence::storage_error)? {
-                let (key, value) = next.map_err(RedbPersistence::storage_error)?;
-                counts.push((key.value(), value.value()));
-            }
-            // Capture the actual related durable families, including table
-            // absence. The fixture has no vector members; these bytes certify
-            // their unchanged state, not populated-vector removal coverage.
-            let mut publication_tables = Vec::new();
-            for definition in [
-                VECTORS_TABLE,
-                VECTOR_PARTITION_MEMBERSHIP_TABLE,
-                VECTOR_OPEN_DIRECTORY_TABLE,
-                VECTOR_PARTITION_JOURNAL_TABLE,
-                VECTOR_PARTITION_TOMBSTONE_TABLE,
-                VECTOR_PARTITION_BASE_GENERATION_TABLE,
-                VECTOR_PARTITION_CHANGE_GENERATION_TABLE,
-                VECTOR_PARTITION_GRAPH_PAGE_TABLE,
-                VECTOR_PARTITION_GENERATION_CATALOG_TABLE,
-                vector_membership_pages::SOURCE,
-                vector_membership_pages::REVERSE,
-                vector_membership_pages::SUMMARY,
-                TableDefinition::new("writer_row_heads"),
-                CONTENT_IDENTITY_NODES_TABLE,
-            ] {
-                let rows = match read.open_table(definition) {
+                let identity_roots = match read.open_table(CONTENT_IDENTITY_ROOTS_TABLE) {
                     Ok(table) => {
                         let mut rows = Vec::new();
                         for next in table.iter().map_err(RedbPersistence::storage_error)? {
                             let (key, value) = next.map_err(RedbPersistence::storage_error)?;
-                            rows.push((key.value().to_vec(), value.value().to_vec()));
+                            rows.push((vec![key.value()], value.value().to_vec()));
                         }
                         Some(rows)
                     }
                     Err(redb::TableError::TableDoesNotExist(_)) => None,
                     Err(error) => return Err(RedbPersistence::storage_error(error)),
                 };
-                publication_tables.push((definition.name().to_owned(), rows));
-            }
-            let identity_roots = match read.open_table(CONTENT_IDENTITY_ROOTS_TABLE) {
-                Ok(table) => {
-                    let mut rows = Vec::new();
-                    for next in table.iter().map_err(RedbPersistence::storage_error)? {
-                        let (key, value) = next.map_err(RedbPersistence::storage_error)?;
-                        rows.push((vec![key.value()], value.value().to_vec()));
-                    }
-                    Some(rows)
-                }
-                Err(redb::TableError::TableDoesNotExist(_)) => None,
-                Err(error) => return Err(RedbPersistence::storage_error(error)),
-            };
-            publication_tables.push((CONTENT_IDENTITY_ROOTS_TABLE.name().to_owned(), identity_roots));
-            Ok((byte_tables, bounds, counts, publication_tables))
-        }).unwrap();
-        (graph_publication_state(store), supplement.0, supplement.1, supplement.2, store.load_commit_index().unwrap(), supplement.3)
+                publication_tables.push((
+                    CONTENT_IDENTITY_ROOTS_TABLE.name().to_owned(),
+                    identity_roots,
+                ));
+                Ok((byte_tables, bounds, counts, publication_tables))
+            })
+            .unwrap();
+        (
+            graph_publication_state(store),
+            supplement.0,
+            supplement.1,
+            supplement.2,
+            store.load_commit_index().unwrap(),
+            supplement.3,
+        )
     }
 
     // Same mixed row/history/predecessor transaction as the existing semantic
     // row. This helper only removes its fixture's nominated physical version.
-    fn graph_durability_publication(store: &RedbPersistence, predecessor: &AdjEntry) -> Result<PruneScopedStats> {
+    fn graph_durability_publication(
+        store: &RedbPersistence,
+        predecessor: &AdjEntry,
+    ) -> Result<PruneScopedStats> {
         let (meta, row) = graph_retention_row();
         let deferred = HashSet::new();
         store.prune_retention_scoped(
             &HashMap::from([("removed_rows".to_owned(), meta)]),
-            &[("removed_rows".to_owned(), row.row_id, row.created_tx, row.lsn)],
+            &[(
+                "removed_rows".to_owned(),
+                row.row_id,
+                row.created_tx,
+                row.lsn,
+            )],
             &[("removed_rows".to_owned(), RowId(1), Lsn(30))],
             &[],
             Some((&[], std::slice::from_ref(predecessor), &deferred)),
@@ -44454,21 +46321,51 @@ mod empty_declared_index_readiness_tests {
 
     // Publication attempts are linked to actual transaction fingerprints.
     // A missing executing root is a failed observation, never a zero oracle.
-    fn assert_graph_durability_observation(scope: &ReadWorkObservationScope, committed: bool, boundary: Option<u8>) {
-        assert_eq!(scope.graph_counters().graph_publication_commits, u64::from(committed));
+    fn assert_graph_durability_observation(
+        scope: &ReadWorkObservationScope,
+        committed: bool,
+        boundary: Option<u8>,
+    ) {
+        assert_eq!(
+            scope.graph_counters().graph_publication_commits,
+            u64::from(committed)
+        );
         let events = scope.graph_events();
-        let begins = events.iter().filter(|event| event.family == "publication" && event.operation == "begin").collect::<Vec<_>>();
+        let begins = events
+            .iter()
+            .filter(|event| event.family == "publication" && event.operation == "begin")
+            .collect::<Vec<_>>();
         assert_eq!(begins.len(), 1);
-        let captured = begins[0].captured_root.as_ref().expect("the executing write has an observed root");
+        let captured = begins[0]
+            .captured_root
+            .as_ref()
+            .expect("the executing write has an observed root");
         assert_eq!(begins[0].observation_status, "OBSERVED");
-        let outcomes = events.iter().filter(|event| event.family == "publication" && matches!(event.operation.as_str(), "committed" | "aborted")).collect::<Vec<_>>();
+        let outcomes = events
+            .iter()
+            .filter(|event| {
+                event.family == "publication"
+                    && matches!(event.operation.as_str(), "committed" | "aborted")
+            })
+            .collect::<Vec<_>>();
         assert_eq!(outcomes.len(), 1);
-        assert_eq!(outcomes[0].operation, if committed { "committed" } else { "aborted" });
+        assert_eq!(
+            outcomes[0].operation,
+            if committed { "committed" } else { "aborted" }
+        );
         assert_eq!(outcomes[0].captured_root.as_ref(), Some(captured));
         assert_eq!(outcomes[0].observation_status, "OBSERVED");
-        assert!(events.iter().any(|event| event.family == "root_binding" && event.operation == "root" && event.acquired_root.is_some()));
+        assert!(events.iter().any(|event| event.family == "root_binding"
+            && event.operation == "root"
+            && event.acquired_root.is_some()));
         if let Some(boundary) = boundary {
-            assert!(events.iter().any(|event| event.family == "publication" && event.operation == "checkpoint" && event.key == vec![boundary] && event.role.as_deref() == Some("currency_reclaim_checkpoint_for_test")), "the selected returned-error checkpoint was actually reached");
+            assert!(
+                events.iter().any(|event| event.family == "publication"
+                    && event.operation == "checkpoint"
+                    && event.key == vec![boundary]
+                    && event.role.as_deref() == Some("currency_reclaim_checkpoint_for_test")),
+                "the selected returned-error checkpoint was actually reached"
+            );
         }
         // A successful control must visit every distinct new stage. A fault
         // row must visit its own stage exactly once under the executing root.
@@ -44478,28 +46375,68 @@ mod empty_declared_index_readiness_tests {
             Some(_) => Vec::new(),
         };
         for stage in stages {
-            let checkpoints = events.iter().filter(|event| event.family == "publication" && event.operation == "checkpoint" && event.key == vec![stage] && event.role.as_deref() == Some("currency_reclaim_checkpoint_for_test")).collect::<Vec<_>>();
-            assert_eq!(checkpoints.len(), 1, "publication stage {stage} must execute exactly once");
-            assert_eq!(checkpoints[0].observation_status, "OBSERVED", "publication stage {stage} must carry an executing root");
-            assert_eq!(checkpoints[0].captured_root.as_ref(), Some(captured), "publication stage {stage} belongs to this same transaction");
+            let checkpoints = events
+                .iter()
+                .filter(|event| {
+                    event.family == "publication"
+                        && event.operation == "checkpoint"
+                        && event.key == vec![stage]
+                        && event.role.as_deref() == Some("currency_reclaim_checkpoint_for_test")
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                checkpoints.len(),
+                1,
+                "publication stage {stage} must execute exactly once"
+            );
+            assert_eq!(
+                checkpoints[0].observation_status, "OBSERVED",
+                "publication stage {stage} must carry an executing root"
+            );
+            assert_eq!(
+                checkpoints[0].captured_root.as_ref(),
+                Some(captured),
+                "publication stage {stage} belongs to this same transaction"
+            );
         }
     }
 
     // The mapped test is its own isolated-process entry point; no additional
     // test name, global fault cell or production injection hook is introduced.
     fn graph_durability_interruption_child() -> bool {
-        let Some(path) = std::env::var_os("CONTEXTDB_GRAPH_DURABILITY_PATH") else { return false; };
-        let boundary: u8 = std::env::var("CONTEXTDB_GRAPH_DURABILITY_BOUNDARY").expect("child boundary").parse().expect("numeric child boundary");
+        let Some(path) = std::env::var_os("CONTEXTDB_GRAPH_DURABILITY_PATH") else {
+            return false;
+        };
+        let boundary: u8 = std::env::var("CONTEXTDB_GRAPH_DURABILITY_BOUNDARY")
+            .expect("child boundary")
+            .parse()
+            .expect("numeric child boundary");
         if boundary >= 12 {
             assert!((12..=26).contains(&boundary));
         } else {
-        assert!((4..=11).contains(&boundary));
+            assert!((4..=11).contains(&boundary));
         }
-        let fixture_open_accountant_42956 = Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-        let _fixture_decode_scope_42956 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_42956).into()).unwrap();
-        let store = RedbPersistence::open(Path::new(&path)).expect("open the parent's fresh temporary fixture");
-        store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_42956).into());
-        let candidates = store.load_graph_table(GRAPH_FWD_TABLE).unwrap().into_iter().filter(|edge| edge.source == NodeId::from_u128(1) && edge.target == NodeId::from_u128(2) && edge.edge_type == "retained_link").collect::<Vec<_>>();
+        let fixture_open_accountant_42956 =
+            Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+        let _fixture_decode_scope_42956 =
+            crate::read_image_memory::ImageMemory::enter_writer_operation(
+                std::sync::Arc::clone(&fixture_open_accountant_42956).into(),
+            )
+            .unwrap();
+        let store = RedbPersistence::open(Path::new(&path))
+            .expect("open the parent's fresh temporary fixture");
+        store
+            .attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_42956).into());
+        let candidates = store
+            .load_graph_table(GRAPH_FWD_TABLE)
+            .unwrap()
+            .into_iter()
+            .filter(|edge| {
+                edge.source == NodeId::from_u128(1)
+                    && edge.target == NodeId::from_u128(2)
+                    && edge.edge_type == "retained_link"
+            })
+            .collect::<Vec<_>>();
         assert_eq!(candidates.len(), 1);
         arm_retention_reclaim_crash_for_test(boundary);
         let result = graph_durability_publication(&store, &candidates[0]);
@@ -44510,20 +46447,34 @@ mod empty_declared_index_readiness_tests {
         let fixture_path = directory.join("graph-durability-fixture.db");
         let (fixture, predecessor, entries) = graph_history_fixture(&fixture_path, 4, 4, true);
         let before = graph_durability_state(&fixture);
-        let private_bytes = before.0.1[0].iter().skip(1).map(|(_, bytes)| bytes.clone()).collect::<Vec<_>>();
+        let private_bytes = before.0.1[0]
+            .iter()
+            .skip(1)
+            .map(|(_, bytes)| bytes.clone())
+            .collect::<Vec<_>>();
         assert_retained_graph_witnesses(&fixture, &predecessor, &private_bytes, 1, false);
         assert_eq!(before.0.0[5].len(), 1);
-        assert!(!before.0.1[3].iter().any(|(key, _)| key == "graph_fixture_progress"));
+        assert!(
+            !before.0.1[3]
+                .iter()
+                .any(|(key, _)| key == "graph_fixture_progress")
+        );
         drop(fixture);
 
         // Copy only the closed, test-owned database. A separate successful
         // transaction supplies the whole new state, including root bindings.
         let control_path = directory.join("graph-durability-control.db");
         std::fs::copy(&fixture_path, &control_path).unwrap();
-        let fixture_open_accountant_42979 = Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-        let _fixture_decode_scope_42979 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_42979).into()).unwrap();
+        let fixture_open_accountant_42979 =
+            Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+        let _fixture_decode_scope_42979 =
+            crate::read_image_memory::ImageMemory::enter_writer_operation(
+                std::sync::Arc::clone(&fixture_open_accountant_42979).into(),
+            )
+            .unwrap();
         let control = RedbPersistence::open(&control_path).unwrap();
-        control.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_42979).into());
+        control
+            .attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_42979).into());
         assert_eq!(graph_durability_state(&control), before);
         let observation = ReadWorkObservationScope::enter(ReadWorkPhase::Mutation);
         let stats = graph_durability_publication(&control, &predecessor).unwrap();
@@ -44547,35 +46498,93 @@ mod empty_declared_index_readiness_tests {
             std::fs::copy(&fixture_path, &path).unwrap();
             let executable = std::env::current_exe().unwrap();
             let module = module_path!().split_once("::").expect("crate and module").1;
-            let exact_name = format!("{module}::empty_declared_index_publishes_marker_and_postings_for_a_lazy_ordered_read");
+            let exact_name = format!(
+                "{module}::empty_declared_index_publishes_marker_and_postings_for_a_lazy_ordered_read"
+            );
             let output = std::process::Command::new(executable)
                 .args(["--exact", &exact_name, "--nocapture", "--test-threads=1"])
                 .env("CONTEXTDB_GRAPH_DURABILITY_PATH", &path)
                 .env("CONTEXTDB_GRAPH_DURABILITY_BOUNDARY", boundary.to_string())
                 .current_dir(directory)
-                .output().expect("dispatch the exact mapped test in a separate process");
+                .output()
+                .expect("dispatch the exact mapped test in a separate process");
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
             let marker = format!("RETENTION_RECLAIM_CRASH={boundary}");
-            assert_eq!(stderr.lines().filter(|line| *line == marker).count(), 1, "the selected boundary marker is required: {stderr}");
-            assert_eq!(stderr.lines().filter(|line| line.starts_with("RETENTION_RECLAIM_CRASH=")).count(), 1);
-            assert!(!output.status.success(), "the intended interruption cannot return success");
-            #[cfg(unix)] {
+            assert_eq!(
+                stderr.lines().filter(|line| *line == marker).count(),
+                1,
+                "the selected boundary marker is required: {stderr}"
+            );
+            assert_eq!(
+                stderr
+                    .lines()
+                    .filter(|line| line.starts_with("RETENTION_RECLAIM_CRASH="))
+                    .count(),
+                1
+            );
+            assert!(
+                !output.status.success(),
+                "the intended interruption cannot return success"
+            );
+            #[cfg(unix)]
+            {
                 use std::os::unix::process::ExitStatusExt;
-                assert_eq!(output.status.signal(), Some(libc::SIGABRT), "a test failure is not the intended interruption: {stdout}\n{stderr}");
+                assert_eq!(
+                    output.status.signal(),
+                    Some(libc::SIGABRT),
+                    "a test failure is not the intended interruption: {stdout}\n{stderr}"
+                );
             }
-            assert!(!stdout.contains("FAILED"), "libtest failure is not a boundary interruption: {stdout}");
-            assert!(!stderr.contains("panicked at"), "a panic is not a boundary interruption: {stderr}");
+            assert!(
+                !stdout.contains("FAILED"),
+                "libtest failure is not a boundary interruption: {stdout}"
+            );
+            assert!(
+                !stderr.contains("panicked at"),
+                "a panic is not a boundary interruption: {stderr}"
+            );
             let expected = if boundary == 11 { &after } else { &before };
-            let fixture_open_accountant_43023 = Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-            let _fixture_decode_scope_43023 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43023).into()).unwrap();
+            let fixture_open_accountant_43023 =
+                Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+            let _fixture_decode_scope_43023 =
+                crate::read_image_memory::ImageMemory::enter_writer_operation(
+                    std::sync::Arc::clone(&fixture_open_accountant_43023).into(),
+                )
+                .unwrap();
             let reopened = RedbPersistence::open(&path).unwrap();
-            reopened.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43023).into());
-            assert_eq!(&graph_durability_state(&reopened), expected, "boundary {boundary} must expose the complete old or complete new publication after reopen");
-            assert_retained_graph_witnesses(&reopened, &predecessor, &private_bytes, usize::from(boundary != 11), boundary == 11);
-            let root = reopened.initialize_writer_snapshot(SnapshotId(100), Lsn(30)).unwrap();
-            assert_graph_retention_row_source(&graph_read::GraphReadRoot::Writer(root.clone()), boundary != 11);
-            assert_graph_source_answers(graph_read::GraphReadRoot::Writer(root), &predecessor, boundary != 11, if boundary == 11 { &entries[1..] } else { &entries });
+            reopened.attach_memory_accountant(
+                std::sync::Arc::clone(&fixture_open_accountant_43023).into(),
+            );
+            assert_eq!(
+                &graph_durability_state(&reopened),
+                expected,
+                "boundary {boundary} must expose the complete old or complete new publication after reopen"
+            );
+            assert_retained_graph_witnesses(
+                &reopened,
+                &predecessor,
+                &private_bytes,
+                usize::from(boundary != 11),
+                boundary == 11,
+            );
+            let root = reopened
+                .initialize_writer_snapshot(SnapshotId(100), Lsn(30))
+                .unwrap();
+            assert_graph_retention_row_source(
+                &graph_read::GraphReadRoot::Writer(root.clone()),
+                boundary != 11,
+            );
+            assert_graph_source_answers(
+                graph_read::GraphReadRoot::Writer(root),
+                &predecessor,
+                boundary != 11,
+                if boundary == 11 {
+                    &entries[1..]
+                } else {
+                    &entries
+                },
+            );
             drop(reopened);
             drop(_fixture_decode_scope_43023);
 
@@ -44583,45 +46592,85 @@ mod empty_declared_index_readiness_tests {
             // mixed transaction. It covers only the named instrumented sites.
             let error_path = directory.join(format!("graph-durability-error-{boundary}.db"));
             std::fs::copy(&fixture_path, &error_path).unwrap();
-            let fixture_open_accountant_43036 = Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-            let _fixture_decode_scope_43036 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43036).into()).unwrap();
+            let fixture_open_accountant_43036 =
+                Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+            let _fixture_decode_scope_43036 =
+                crate::read_image_memory::ImageMemory::enter_writer_operation(
+                    std::sync::Arc::clone(&fixture_open_accountant_43036).into(),
+                )
+                .unwrap();
             let store = RedbPersistence::open(&error_path).unwrap();
-            store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43036).into());
+            store.attach_memory_accountant(
+                std::sync::Arc::clone(&fixture_open_accountant_43036).into(),
+            );
             assert_eq!(graph_durability_state(&store), before);
             let observation = ReadWorkObservationScope::enter(ReadWorkPhase::Mutation);
             arm_currency_reclaim_fault_for_test(boundary, false);
             let error = graph_durability_publication(&store, &predecessor).unwrap_err();
-            assert!(matches!(error, Error::Other(ref message) if message == "injected currency cleanup failure"));
+            assert!(
+                matches!(error, Error::Other(ref message) if message == "injected currency cleanup failure")
+            );
             assert_graph_durability_observation(&observation, boundary == 11, Some(boundary));
             drop(observation);
-            assert_eq!(&graph_durability_state(&store), expected, "returned error {boundary} preserves the complete publication outcome");
+            assert_eq!(
+                &graph_durability_state(&store),
+                expected,
+                "returned error {boundary} preserves the complete publication outcome"
+            );
             drop(store);
             drop(_fixture_decode_scope_43036);
-            let fixture_open_accountant_43047 = std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-            let _fixture_decode_scope_43047 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43047).into()).unwrap();
+            let fixture_open_accountant_43047 =
+                std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+            let _fixture_decode_scope_43047 =
+                crate::read_image_memory::ImageMemory::enter_writer_operation(
+                    std::sync::Arc::clone(&fixture_open_accountant_43047).into(),
+                )
+                .unwrap();
             let reopened = RedbPersistence::open(&error_path).unwrap();
-            reopened.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43047).into());
-            assert_eq!(&graph_durability_state(&reopened), expected, "returned error {boundary} has the same exact state after reopen");
+            reopened.attach_memory_accountant(
+                std::sync::Arc::clone(&fixture_open_accountant_43047).into(),
+            );
+            assert_eq!(
+                &graph_durability_state(&reopened),
+                expected,
+                "returned error {boundary} has the same exact state after reopen"
+            );
         }
     }
 
     // Physical relocation uses the real callback, separate from retention.
     // Read only the persisted cursor; postcommit reporting failure occurs
     // before compact_incremental updates its in-memory progress receipt.
-    type GraphCompactionState = (GraphDurabilityState, Option<Vec<u8>>, redb::StorageSnapshotIdentity);
+    type GraphCompactionState = (
+        GraphDurabilityState,
+        Option<Vec<u8>>,
+        redb::StorageSnapshotIdentity,
+    );
 
     fn graph_compaction_state(store: &RedbPersistence) -> GraphCompactionState {
-        let cursor = store.with_db(|db| {
-            let read = db.begin_read().map_err(RedbPersistence::storage_error)?;
-            let definition: TableDefinition<&str, &[u8]> = TableDefinition::new("writer_storage_compaction");
-            match read.open_table(definition) {
-                Ok(table) => Ok(table.get("cursor").map_err(RedbPersistence::storage_error)?.map(|value| value.value().to_vec())),
-                Err(redb::TableError::TableDoesNotExist(_)) => Ok(None),
-                Err(error) => Err(RedbPersistence::storage_error(error)),
-            }
-        }).unwrap();
-        let root = store.initialize_writer_snapshot(SnapshotId(100), Lsn(30)).unwrap();
-        (graph_durability_state(store), cursor, root.storage_identity())
+        let cursor = store
+            .with_db(|db| {
+                let read = db.begin_read().map_err(RedbPersistence::storage_error)?;
+                let definition: TableDefinition<&str, &[u8]> =
+                    TableDefinition::new("writer_storage_compaction");
+                match read.open_table(definition) {
+                    Ok(table) => Ok(table
+                        .get("cursor")
+                        .map_err(RedbPersistence::storage_error)?
+                        .map(|value| value.value().to_vec())),
+                    Err(redb::TableError::TableDoesNotExist(_)) => Ok(None),
+                    Err(error) => Err(RedbPersistence::storage_error(error)),
+                }
+            })
+            .unwrap();
+        let root = store
+            .initialize_writer_snapshot(SnapshotId(100), Lsn(30))
+            .unwrap();
+        (
+            graph_durability_state(store),
+            cursor,
+            root.storage_identity(),
+        )
     }
 
     fn graph_compaction_fixture(path: &Path) -> (AdjEntry, Vec<ChangeLogEntry>) {
@@ -44629,68 +46678,167 @@ mod empty_declared_index_readiness_tests {
         // The existing overlap fixture's real page population crosses the
         // 80-page relocation batch. It is temporary fixture data, not padding
         // counted as live relational/vector acceptance content.
-        let payload: TableDefinition<u64, &[u8]> = TableDefinition::new("compaction_durability_payload");
-        store.with_db(|db| {
-            let write = db.begin_write().map_err(RedbPersistence::storage_error)?;
-            {
-                let mut table = write.open_table(payload).map_err(RedbPersistence::storage_error)?;
-                for id in 0..1024 { table.insert(id, &[91u8; 8192][..]).map_err(RedbPersistence::storage_error)?; }
-            }
-            write.commit().map_err(RedbPersistence::storage_error)?;
-            let write = db.begin_write().map_err(RedbPersistence::storage_error)?;
-            {
-                let mut table = write.open_table(payload).map_err(RedbPersistence::storage_error)?;
-                for id in 0..896 { table.remove(id).map_err(RedbPersistence::storage_error)?; }
-            }
-            write.commit().map_err(RedbPersistence::storage_error)
-        }).unwrap();
+        let payload: TableDefinition<u64, &[u8]> =
+            TableDefinition::new("compaction_durability_payload");
+        store
+            .with_db(|db| {
+                let write = db.begin_write().map_err(RedbPersistence::storage_error)?;
+                {
+                    let mut table = write
+                        .open_table(payload)
+                        .map_err(RedbPersistence::storage_error)?;
+                    for id in 0..1024 {
+                        table
+                            .insert(id, &[91u8; 8192][..])
+                            .map_err(RedbPersistence::storage_error)?;
+                    }
+                }
+                write.commit().map_err(RedbPersistence::storage_error)?;
+                let write = db.begin_write().map_err(RedbPersistence::storage_error)?;
+                {
+                    let mut table = write
+                        .open_table(payload)
+                        .map_err(RedbPersistence::storage_error)?;
+                    for id in 0..896 {
+                        table.remove(id).map_err(RedbPersistence::storage_error)?;
+                    }
+                }
+                write.commit().map_err(RedbPersistence::storage_error)
+            })
+            .unwrap();
         drop(store);
         (predecessor, entries)
     }
 
-    fn graph_compaction_publication(store: &RedbPersistence) -> Result<(redb::CompactionProgress, Option<u64>)> {
-        store.compact_incremental(Arc::new(crate::memory_accounting::MemoryAccountant::no_limit()).into(), 0.5)
+    fn graph_compaction_publication(
+        store: &RedbPersistence,
+    ) -> Result<(redb::CompactionProgress, Option<u64>)> {
+        store.compact_incremental(
+            Arc::new(crate::memory_accounting::MemoryAccountant::no_limit()).into(),
+            0.5,
+        )
     }
 
     fn assert_graph_compaction_observation(scope: &ReadWorkObservationScope, boundary: Option<u8>) {
         let committed = boundary.is_none_or(|stage| stage == 11);
-        assert_eq!(scope.graph_counters().graph_publication_commits, u64::from(committed));
+        assert_eq!(
+            scope.graph_counters().graph_publication_commits,
+            u64::from(committed)
+        );
         let events = scope.graph_events();
-        let begins = events.iter().filter(|event| event.family == "publication" && event.operation == "begin").collect::<Vec<_>>();
+        let begins = events
+            .iter()
+            .filter(|event| event.family == "publication" && event.operation == "begin")
+            .collect::<Vec<_>>();
         assert_eq!(begins.len(), 1);
-        let root = begins[0].captured_root.as_ref().expect("actual executing compaction root");
-        let outcomes = events.iter().filter(|event| event.family == "publication" && matches!(event.operation.as_str(), "committed" | "aborted")).collect::<Vec<_>>();
+        let root = begins[0]
+            .captured_root
+            .as_ref()
+            .expect("actual executing compaction root");
+        let outcomes = events
+            .iter()
+            .filter(|event| {
+                event.family == "publication"
+                    && matches!(event.operation.as_str(), "committed" | "aborted")
+            })
+            .collect::<Vec<_>>();
         assert_eq!(outcomes.len(), 1);
-        assert_eq!(outcomes[0].operation, if committed { "committed" } else { "aborted" });
+        assert_eq!(
+            outcomes[0].operation,
+            if committed { "committed" } else { "aborted" }
+        );
         assert_eq!(outcomes[0].captured_root.as_ref(), Some(root));
-        assert_eq!(events.iter().filter(|event| event.family == "publication" && event.operation == "compaction_hook").count(), 1);
-        let stages = boundary.map_or_else(|| [27, 28, 29, 30, 9].into_iter().chain(19..=26).chain([31, 10, 11]).collect::<Vec<_>>(), |stage| vec![stage]);
-        let complete_order = [27, 28, 29, 30, 9, 19, 20, 21, 22, 23, 24, 25, 26, 31, 10, 11];
-        let expected_order = boundary.map_or_else(|| complete_order.to_vec(), |stage| {
-            complete_order[..=complete_order.iter().position(|selected| *selected == stage).unwrap()].to_vec()
-        });
-        assert_eq!(events.iter().filter(|event| event.family == "publication" && event.operation == "checkpoint"
-                && event.role.as_deref() == Some("currency_reclaim_checkpoint_for_test"))
-            .map(|event| event.key.clone()).collect::<Vec<_>>(),
-            expected_order.into_iter().map(|stage| vec![stage]).collect::<Vec<_>>(),
-            "the actual compaction callback reaches precisely the source-bound stage prefix");
+        assert_eq!(
+            events
+                .iter()
+                .filter(
+                    |event| event.family == "publication" && event.operation == "compaction_hook"
+                )
+                .count(),
+            1
+        );
+        let stages = boundary.map_or_else(
+            || {
+                [27, 28, 29, 30, 9]
+                    .into_iter()
+                    .chain(19..=26)
+                    .chain([31, 10, 11])
+                    .collect::<Vec<_>>()
+            },
+            |stage| vec![stage],
+        );
+        let complete_order = [
+            27, 28, 29, 30, 9, 19, 20, 21, 22, 23, 24, 25, 26, 31, 10, 11,
+        ];
+        let expected_order = boundary.map_or_else(
+            || complete_order.to_vec(),
+            |stage| {
+                complete_order[..=complete_order
+                    .iter()
+                    .position(|selected| *selected == stage)
+                    .unwrap()]
+                    .to_vec()
+            },
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.family == "publication"
+                    && event.operation == "checkpoint"
+                    && event.role.as_deref() == Some("currency_reclaim_checkpoint_for_test"))
+                .map(|event| event.key.clone())
+                .collect::<Vec<_>>(),
+            expected_order
+                .into_iter()
+                .map(|stage| vec![stage])
+                .collect::<Vec<_>>(),
+            "the actual compaction callback reaches precisely the source-bound stage prefix"
+        );
         for stage in stages {
-            let selected = events.iter().filter(|event| event.family == "publication" && event.operation == "checkpoint" && event.key == vec![stage] && event.role.as_deref() == Some("currency_reclaim_checkpoint_for_test")).collect::<Vec<_>>();
-            assert_eq!(selected.len(), 1, "specific compaction stage {stage} executed exactly once");
+            let selected = events
+                .iter()
+                .filter(|event| {
+                    event.family == "publication"
+                        && event.operation == "checkpoint"
+                        && event.key == vec![stage]
+                        && event.role.as_deref() == Some("currency_reclaim_checkpoint_for_test")
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                selected.len(),
+                1,
+                "specific compaction stage {stage} executed exactly once"
+            );
             assert_eq!(selected[0].observation_status, "OBSERVED");
             assert_eq!(selected[0].captured_root.as_ref(), Some(root));
         }
     }
 
     fn graph_compaction_interruption_child() -> bool {
-        let Some(path) = std::env::var_os("CONTEXTDB_GRAPH_COMPACTION_PATH") else { return false; };
-        let boundary: u8 = std::env::var("CONTEXTDB_GRAPH_COMPACTION_BOUNDARY").expect("child compaction stage").parse().expect("numeric child stage");
+        let Some(path) = std::env::var_os("CONTEXTDB_GRAPH_COMPACTION_PATH") else {
+            return false;
+        };
+        let boundary: u8 = std::env::var("CONTEXTDB_GRAPH_COMPACTION_BOUNDARY")
+            .expect("child compaction stage")
+            .parse()
+            .expect("numeric child stage");
         // Selectors 27 through 31 are bound to the immutable revision 8a compaction stages.
-        if (27..=31).contains(&boundary) { assert!((27..=31).contains(&boundary)); } else { assert!([10, 11].contains(&boundary) || (19..=26).contains(&boundary)); }
-        let fixture_open_accountant_43134 = Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-        let _fixture_decode_scope_43134 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43134).into()).unwrap();
-        let store = RedbPersistence::open(Path::new(&path)).expect("open closed temporary compaction fixture beside registered old readers");
-        store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43134).into());
+        if (27..=31).contains(&boundary) {
+            assert!((27..=31).contains(&boundary));
+        } else {
+            assert!([10, 11].contains(&boundary) || (19..=26).contains(&boundary));
+        }
+        let fixture_open_accountant_43134 =
+            Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+        let _fixture_decode_scope_43134 =
+            crate::read_image_memory::ImageMemory::enter_writer_operation(
+                std::sync::Arc::clone(&fixture_open_accountant_43134).into(),
+            )
+            .unwrap();
+        let store = RedbPersistence::open(Path::new(&path))
+            .expect("open closed temporary compaction fixture beside registered old readers");
+        store
+            .attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43134).into());
         arm_retention_reclaim_crash_for_test(boundary);
         let result = graph_compaction_publication(&store);
         panic!("selected compaction interruption {boundary} was not reached: {result:?}");
@@ -44706,34 +46854,77 @@ mod empty_declared_index_readiness_tests {
         // is real custody of the old storage root, held through publication.
         let control_session = ReadSession::open(&control_path).unwrap();
         assert_eq!(control_session.route(), ReadRoute::File);
-        let control_registration = control_session.file_storage_registration_for_test().unwrap();
+        let control_registration = control_session
+            .file_storage_registration_for_test()
+            .unwrap();
         assert!(control_registration.descriptor_open);
         assert!(!control_registration.load_lock_held);
-        let (image, _receipt, control_source) = load_read_image_with_memory(&control_path, Some(16 * 1024 * 1024)).unwrap().into_parts();
+        let (image, _receipt, control_source) =
+            load_read_image_with_memory(&control_path, Some(16 * 1024 * 1024))
+                .unwrap()
+                .into_parts();
         drop(image);
-        let fixture_open_accountant_43155 = Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-        let _fixture_decode_scope_43155 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43155).into()).unwrap();
+        let fixture_open_accountant_43155 =
+            Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+        let _fixture_decode_scope_43155 =
+            crate::read_image_memory::ImageMemory::enter_writer_operation(
+                std::sync::Arc::clone(&fixture_open_accountant_43155).into(),
+            )
+            .unwrap();
         let control = RedbPersistence::open(&control_path).unwrap();
-        control.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43155).into());
-        let page_size = control.with_db(|db| {
-            let snapshot = db.storage_statistics_snapshot().map_err(RedbPersistence::storage_error)?;
-            Ok(snapshot.stats().map_err(RedbPersistence::storage_error)?.page_size())
-        }).unwrap();
+        control
+            .attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43155).into());
+        let page_size = control
+            .with_db(|db| {
+                let snapshot = db
+                    .storage_statistics_snapshot()
+                    .map_err(RedbPersistence::storage_error)?;
+                Ok(snapshot
+                    .stats()
+                    .map_err(RedbPersistence::storage_error)?
+                    .page_size())
+            })
+            .unwrap();
         let initial_fixture_file_pages = initial_fixture_file_bytes.div_ceil(page_size as u64);
         // Freeze the finite progress window before any compaction step.
         let maximum_progress_steps = initial_fixture_file_pages.div_ceil(80) + 1;
         let before = graph_compaction_state(&control);
-        let control_writer = control.initialize_writer_snapshot(SnapshotId(100), Lsn(30)).unwrap();
+        let control_writer = control
+            .initialize_writer_snapshot(SnapshotId(100), Lsn(30))
+            .unwrap();
         let writer_pin = control_writer.storage_identity();
         let source_pin = control_source.storage_identity();
         drop(_fixture_decode_scope_43155);
         let session_image = control_session.file_snapshot_for_test().unwrap();
-        let row_answer = control_session.execute("SELECT body FROM removed_rows", &HashMap::new()).unwrap().rows;
-        assert_eq!(row_answer, vec![vec![Value::Text("selected physical retention payload".into())]]);
-        let history_answer = control_session.metadata(crate::MetadataRequest::ImageState { kind: crate::DirectImageMetadataKind::ChangeLog }, None).unwrap().body;
+        let row_answer = control_session
+            .execute("SELECT body FROM removed_rows", &HashMap::new())
+            .unwrap()
+            .rows;
+        assert_eq!(
+            row_answer,
+            vec![vec![Value::Text(
+                "selected physical retention payload".into()
+            )]]
+        );
+        let history_answer = control_session
+            .metadata(
+                crate::MetadataRequest::ImageState {
+                    kind: crate::DirectImageMetadataKind::ChangeLog,
+                },
+                None,
+            )
+            .unwrap()
+            .body;
         let directory_before = directory_pinned_view(&control_session);
-        assert_eq!(directory_before, ((6,Lsn(1)), None, Some((Lsn(20),TxId(100))), Some((0,6))));
-        let _fixture_decode_scope_43155 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43155).into()).unwrap();
+        assert_eq!(
+            directory_before,
+            ((6, Lsn(1)), None, Some((Lsn(20), TxId(100))), Some((0, 6)))
+        );
+        let _fixture_decode_scope_43155 =
+            crate::read_image_memory::ImageMemory::enter_writer_operation(
+                std::sync::Arc::clone(&fixture_open_accountant_43155).into(),
+            )
+            .unwrap();
         let mut relocation_observed = false;
         let mut cumulative_pages_relocated = 0;
         let mut first_successful_step = None;
@@ -44752,21 +46943,57 @@ mod empty_declared_index_readiness_tests {
                 break;
             }
         }
-        let first_successful_step = first_successful_step.expect("the control executes its first successful compaction step");
-        assert!(relocation_observed, "the control must execute physical page relocation within {maximum_progress_steps} steps");
-        assert!(cumulative_pages_relocated > 0, "the control executes actual physical page relocation within the frozen progress window");
+        let first_successful_step = first_successful_step
+            .expect("the control executes its first successful compaction step");
+        assert!(
+            relocation_observed,
+            "the control must execute physical page relocation within {maximum_progress_steps} steps"
+        );
+        assert!(
+            cumulative_pages_relocated > 0,
+            "the control executes actual physical page relocation within the frozen progress window"
+        );
         drop(_fixture_decode_scope_43155);
-        assert_eq!(directory_pinned_view(&control_session), directory_before, "actual installed directory survives physical relocation at its original root");
-        let _fixture_decode_scope_43155 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43155).into()).unwrap();
+        assert_eq!(
+            directory_pinned_view(&control_session),
+            directory_before,
+            "actual installed directory survives physical relocation at its original root"
+        );
+        let _fixture_decode_scope_43155 =
+            crate::read_image_memory::ImageMemory::enter_writer_operation(
+                std::sync::Arc::clone(&fixture_open_accountant_43155).into(),
+            )
+            .unwrap();
         let after = graph_compaction_state(&control);
         assert_ne!(after.1, before.1, "successor cursor is published durably");
-        assert_ne!(after.2, before.2, "compaction publishes a new physical root");
-        assert_eq!(after.0.0.0, before.0.0.0, "forward/reverse/C/T/R and row bytes survive relocation");
-        assert_eq!(after.0.0.1[0], before.0.0.1[0], "private history bytes survive relocation");
-        assert_eq!(after.0.1, before.0.1, "numeric history and selectors survive relocation");
-        assert_eq!(after.0.2, before.0.2, "clock/read bounds survive relocation");
-        assert_eq!(after.0.3, before.0.3, "occurrence counts survive relocation");
-        assert_eq!(after.0.4, before.0.4, "commit directory members survive relocation");
+        assert_ne!(
+            after.2, before.2,
+            "compaction publishes a new physical root"
+        );
+        assert_eq!(
+            after.0.0.0, before.0.0.0,
+            "forward/reverse/C/T/R and row bytes survive relocation"
+        );
+        assert_eq!(
+            after.0.0.1[0], before.0.0.1[0],
+            "private history bytes survive relocation"
+        );
+        assert_eq!(
+            after.0.1, before.0.1,
+            "numeric history and selectors survive relocation"
+        );
+        assert_eq!(
+            after.0.2, before.0.2,
+            "clock/read bounds survive relocation"
+        );
+        assert_eq!(
+            after.0.3, before.0.3,
+            "occurrence counts survive relocation"
+        );
+        assert_eq!(
+            after.0.4, before.0.4,
+            "commit directory members survive relocation"
+        );
         {
             let observed_identity = control_writer.storage_identity();
             assert!(observed_identity.transaction_id >= writer_pin.transaction_id);
@@ -44779,18 +47006,60 @@ mod empty_declared_index_readiness_tests {
         }
         drop(_fixture_decode_scope_43155);
         {
-            let mut observed_registration = control_session.file_storage_registration_for_test().unwrap();
-            assert!(observed_registration.storage_transaction_id >= control_registration.storage_transaction_id);
-            observed_registration.storage_transaction_id = control_registration.storage_transaction_id;
+            let mut observed_registration = control_session
+                .file_storage_registration_for_test()
+                .unwrap();
+            assert!(
+                observed_registration.storage_transaction_id
+                    >= control_registration.storage_transaction_id
+            );
+            observed_registration.storage_transaction_id =
+                control_registration.storage_transaction_id;
             assert_eq!(observed_registration, control_registration);
         }
-        assert_eq!(control_session.file_snapshot_for_test().unwrap(), session_image);
-        assert_eq!(control_session.execute("SELECT body FROM removed_rows", &HashMap::new()).unwrap().rows, row_answer);
-        assert_eq!(control_session.metadata(crate::MetadataRequest::ImageState { kind: crate::DirectImageMetadataKind::ChangeLog }, None).unwrap().body, history_answer);
-        assert_graph_retention_row_source(&graph_read::GraphReadRoot::Writer(control_writer.clone()), true);
-        assert_graph_source_answers(graph_read::GraphReadRoot::Writer(control_writer.clone()), &predecessor, true, &entries);
-        assert_graph_retention_row_source(&graph_read::GraphReadRoot::Image(control_source.clone()), true);
-        assert_graph_source_answers(graph_read::GraphReadRoot::Image(control_source.clone()), &predecessor, true, &entries);
+        assert_eq!(
+            control_session.file_snapshot_for_test().unwrap(),
+            session_image
+        );
+        assert_eq!(
+            control_session
+                .execute("SELECT body FROM removed_rows", &HashMap::new())
+                .unwrap()
+                .rows,
+            row_answer
+        );
+        assert_eq!(
+            control_session
+                .metadata(
+                    crate::MetadataRequest::ImageState {
+                        kind: crate::DirectImageMetadataKind::ChangeLog
+                    },
+                    None
+                )
+                .unwrap()
+                .body,
+            history_answer
+        );
+        assert_graph_retention_row_source(
+            &graph_read::GraphReadRoot::Writer(control_writer.clone()),
+            true,
+        );
+        assert_graph_source_answers(
+            graph_read::GraphReadRoot::Writer(control_writer.clone()),
+            &predecessor,
+            true,
+            &entries,
+        );
+        assert_graph_retention_row_source(
+            &graph_read::GraphReadRoot::Image(control_source.clone()),
+            true,
+        );
+        assert_graph_source_answers(
+            graph_read::GraphReadRoot::Image(control_source.clone()),
+            &predecessor,
+            true,
+            &entries,
+        );
         drop(control_writer);
         drop(control_source);
         drop(control_session);
@@ -44804,32 +47073,71 @@ mod empty_declared_index_readiness_tests {
         let published_path = directory.join("graph-compaction-published-control.db");
         std::fs::copy(&fixture_path, &published_path).unwrap();
         let published_session = ReadSession::open(&published_path).unwrap();
-        let (image, _receipt, published_source) = load_read_image_with_memory(&published_path, Some(16 * 1024 * 1024)).unwrap().into_parts();
+        let (image, _receipt, published_source) =
+            load_read_image_with_memory(&published_path, Some(16 * 1024 * 1024))
+                .unwrap()
+                .into_parts();
         drop(image);
-        let fixture_open_accountant_43208 = Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-        let _fixture_decode_scope_43208 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43208).into()).unwrap();
+        let fixture_open_accountant_43208 =
+            Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+        let _fixture_decode_scope_43208 =
+            crate::read_image_memory::ImageMemory::enter_writer_operation(
+                std::sync::Arc::clone(&fixture_open_accountant_43208).into(),
+            )
+            .unwrap();
         let published = RedbPersistence::open(&published_path).unwrap();
-        published.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43208).into());
-        let published_writer = published.initialize_writer_snapshot(SnapshotId(100), Lsn(30)).unwrap();
+        published
+            .attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43208).into());
+        let published_writer = published
+            .initialize_writer_snapshot(SnapshotId(100), Lsn(30))
+            .unwrap();
         let scope = ReadWorkObservationScope::enter(ReadWorkPhase::Mutation);
         arm_currency_reclaim_fault_for_test(11, false);
         let error = graph_compaction_publication(&published).unwrap_err();
-        assert!(matches!(error, Error::Other(ref message) if message == "injected currency cleanup failure"));
+        assert!(
+            matches!(error, Error::Other(ref message) if message == "injected currency cleanup failure")
+        );
         assert_graph_compaction_observation(&scope, None);
         drop(scope);
         let first_publication = graph_compaction_state(&published);
-        assert_eq!(first_publication.0, first_successful_step.0, "allocator housekeeping does not change published data/proof/binding bytes");
-        assert_eq!(first_publication.1, first_successful_step.1, "the published successor checkpoint is independent of later housekeeping");
+        assert_eq!(
+            first_publication.0, first_successful_step.0,
+            "allocator housekeeping does not change published data/proof/binding bytes"
+        );
+        assert_eq!(
+            first_publication.1, first_successful_step.1,
+            "the published successor checkpoint is independent of later housekeeping"
+        );
         assert_ne!(first_publication.2, before.2);
-        assert_graph_source_answers(graph_read::GraphReadRoot::Writer(published_writer), &predecessor, true, &entries);
-        assert_graph_source_answers(graph_read::GraphReadRoot::Image(published_source), &predecessor, true, &entries);
+        assert_graph_source_answers(
+            graph_read::GraphReadRoot::Writer(published_writer),
+            &predecessor,
+            true,
+            &entries,
+        );
+        assert_graph_source_answers(
+            graph_read::GraphReadRoot::Image(published_source),
+            &predecessor,
+            true,
+            &entries,
+        );
         drop(_fixture_decode_scope_43208);
-        assert_eq!(published_session.execute("SELECT body FROM removed_rows", &HashMap::new()).unwrap().rows, row_answer);
+        assert_eq!(
+            published_session
+                .execute("SELECT body FROM removed_rows", &HashMap::new())
+                .unwrap()
+                .rows,
+            row_answer
+        );
         drop(published_session);
         drop(published);
 
         for &boundary in boundaries {
-            if (27..=31).contains(&boundary) { assert!((27..=31).contains(&boundary)); } else { assert!([10, 11].contains(&boundary) || (19..=26).contains(&boundary)); }
+            if (27..=31).contains(&boundary) {
+                assert!((27..=31).contains(&boundary));
+            } else {
+                assert!([10, 11].contains(&boundary) || (19..=26).contains(&boundary));
+            }
             for crash in [false, true] {
                 let path = directory.join(format!("graph-compaction-{boundary}-{crash}.db"));
                 std::fs::copy(&fixture_path, &path).unwrap();
@@ -44839,39 +47147,87 @@ mod empty_declared_index_readiness_tests {
                 assert!(old_registration.descriptor_open);
                 assert!(!old_registration.load_lock_held);
                 let old_snapshot = old_session.file_snapshot_for_test().unwrap();
-                let (image, _receipt, old_source) = load_read_image_with_memory(&path, Some(16 * 1024 * 1024)).unwrap().into_parts();
+                let (image, _receipt, old_source) =
+                    load_read_image_with_memory(&path, Some(16 * 1024 * 1024))
+                        .unwrap()
+                        .into_parts();
                 drop(image);
                 let old_source_pin = old_source.storage_identity();
-                assert_eq!(old_session.execute("SELECT body FROM removed_rows", &HashMap::new()).unwrap().rows, row_answer);
-                assert_eq!(old_session.metadata(crate::MetadataRequest::ImageState { kind: crate::DirectImageMetadataKind::ChangeLog }, None).unwrap().body, history_answer);
+                assert_eq!(
+                    old_session
+                        .execute("SELECT body FROM removed_rows", &HashMap::new())
+                        .unwrap()
+                        .rows,
+                    row_answer
+                );
+                assert_eq!(
+                    old_session
+                        .metadata(
+                            crate::MetadataRequest::ImageState {
+                                kind: crate::DirectImageMetadataKind::ChangeLog
+                            },
+                            None
+                        )
+                        .unwrap()
+                        .body,
+                    history_answer
+                );
                 if crash {
                     // The parent retains its registered reader handles across
                     // child writer acquisition and abort. It holds no writer.
                     let module = module_path!().split_once("::").unwrap().1;
-                    let exact_name = format!("{module}::empty_declared_index_publishes_marker_and_postings_for_a_lazy_ordered_read");
+                    let exact_name = format!(
+                        "{module}::empty_declared_index_publishes_marker_and_postings_for_a_lazy_ordered_read"
+                    );
                     let output = std::process::Command::new(std::env::current_exe().unwrap())
                         .args(["--exact", &exact_name, "--nocapture", "--test-threads=1"])
                         .env("CONTEXTDB_GRAPH_COMPACTION_PATH", &path)
                         .env("CONTEXTDB_GRAPH_COMPACTION_BOUNDARY", boundary.to_string())
-                        .current_dir(directory).output().unwrap();
+                        .current_dir(directory)
+                        .output()
+                        .unwrap();
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     let stdout = String::from_utf8_lossy(&output.stdout);
                     let marker = format!("RETENTION_RECLAIM_CRASH={boundary}");
-                    assert_eq!(stderr.lines().filter(|line| *line == marker).count(), 1, "specific compaction interruption marker required: {stderr}");
-                    assert_eq!(stderr.lines().filter(|line| line.starts_with("RETENTION_RECLAIM_CRASH=")).count(), 1);
+                    assert_eq!(
+                        stderr.lines().filter(|line| *line == marker).count(),
+                        1,
+                        "specific compaction interruption marker required: {stderr}"
+                    );
+                    assert_eq!(
+                        stderr
+                            .lines()
+                            .filter(|line| line.starts_with("RETENTION_RECLAIM_CRASH="))
+                            .count(),
+                        1
+                    );
                     assert!(!output.status.success());
-                    #[cfg(unix)] {
+                    #[cfg(unix)]
+                    {
                         use std::os::unix::process::ExitStatusExt;
-                        assert_eq!(output.status.signal(), Some(libc::SIGABRT), "generic child failure is not the selected compaction interruption: {stdout}\n{stderr}");
+                        assert_eq!(
+                            output.status.signal(),
+                            Some(libc::SIGABRT),
+                            "generic child failure is not the selected compaction interruption: {stdout}\n{stderr}"
+                        );
                     }
                     assert!(!stderr.contains("panicked at"));
                     assert!(!stdout.contains("FAILED"));
                 } else {
-                    let fixture_open_accountant_43266 = Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-                    let _fixture_decode_scope_43266 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43266).into()).unwrap();
+                    let fixture_open_accountant_43266 =
+                        Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+                    let _fixture_decode_scope_43266 =
+                        crate::read_image_memory::ImageMemory::enter_writer_operation(
+                            std::sync::Arc::clone(&fixture_open_accountant_43266).into(),
+                        )
+                        .unwrap();
                     let store = RedbPersistence::open(&path).unwrap();
-                    store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43266).into());
-                    let old_writer = store.initialize_writer_snapshot(SnapshotId(100), Lsn(30)).unwrap();
+                    store.attach_memory_accountant(
+                        std::sync::Arc::clone(&fixture_open_accountant_43266).into(),
+                    );
+                    let old_writer = store
+                        .initialize_writer_snapshot(SnapshotId(100), Lsn(30))
+                        .unwrap();
                     let old_writer_pin = old_writer.storage_identity();
                     {
                         let mut observed_state = graph_compaction_state(&store);
@@ -44882,7 +47238,9 @@ mod empty_declared_index_readiness_tests {
                     let scope = ReadWorkObservationScope::enter(ReadWorkPhase::Mutation);
                     arm_currency_reclaim_fault_for_test(boundary, false);
                     let error = graph_compaction_publication(&store).unwrap_err();
-                    assert!(matches!(error, Error::Other(ref message) if message == "injected currency cleanup failure"));
+                    assert!(
+                        matches!(error, Error::Other(ref message) if message == "injected currency cleanup failure")
+                    );
                     assert_graph_compaction_observation(&scope, Some(boundary));
                     drop(scope);
                     {
@@ -44890,18 +47248,40 @@ mod empty_declared_index_readiness_tests {
                         assert!(observed_identity.transaction_id >= old_writer_pin.transaction_id);
                         assert_eq!(observed_identity.user_root, old_writer_pin.user_root);
                     }
-                    assert_graph_retention_row_source(&graph_read::GraphReadRoot::Writer(old_writer.clone()), true);
-                    assert_graph_source_answers(graph_read::GraphReadRoot::Writer(old_writer), &predecessor, true, &entries);
+                    assert_graph_retention_row_source(
+                        &graph_read::GraphReadRoot::Writer(old_writer.clone()),
+                        true,
+                    );
+                    assert_graph_source_answers(
+                        graph_read::GraphReadRoot::Writer(old_writer),
+                        &predecessor,
+                        true,
+                        &entries,
+                    );
                     drop(store);
                     drop(_fixture_decode_scope_43266);
                 }
-                let expected = if boundary == 11 { &first_publication } else { &before };
-                let fixture_open_accountant_43283 = Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-                let _fixture_decode_scope_43283 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43283).into()).unwrap();
+                let expected = if boundary == 11 {
+                    &first_publication
+                } else {
+                    &before
+                };
+                let fixture_open_accountant_43283 =
+                    Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+                let _fixture_decode_scope_43283 =
+                    crate::read_image_memory::ImageMemory::enter_writer_operation(
+                        std::sync::Arc::clone(&fixture_open_accountant_43283).into(),
+                    )
+                    .unwrap();
                 let reopened = RedbPersistence::open(&path).unwrap();
-                reopened.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43283).into());
+                reopened.attach_memory_accountant(
+                    std::sync::Arc::clone(&fixture_open_accountant_43283).into(),
+                );
                 let reopened_state = graph_compaction_state(&reopened);
-                assert!(reopened_state.2.transaction_id >= before.2.transaction_id, "stage {boundary} recovery never moves the storage transaction counter backwards");
+                assert!(
+                    reopened_state.2.transaction_id >= before.2.transaction_id,
+                    "stage {boundary} recovery never moves the storage transaction counter backwards"
+                );
                 // Recovery may advance the counter; every committed content byte
                 // and every other physical snapshot identity field must match.
                 let reopened_content = (
@@ -44912,16 +47292,37 @@ mod empty_declared_index_readiness_tests {
                         ..reopened_state.2
                     },
                 );
-                assert_eq!(&reopened_content, expected, "stage {boundary} publishes the exact old/new root, persisted progress and complete data");
-                let new_writer = reopened.initialize_writer_snapshot(SnapshotId(100), Lsn(30)).unwrap();
-                assert_graph_retention_row_source(&graph_read::GraphReadRoot::Writer(new_writer.clone()), true);
-                assert_graph_source_answers(graph_read::GraphReadRoot::Writer(new_writer), &predecessor, true, &entries);
+                assert_eq!(
+                    &reopened_content, expected,
+                    "stage {boundary} publishes the exact old/new root, persisted progress and complete data"
+                );
+                let new_writer = reopened
+                    .initialize_writer_snapshot(SnapshotId(100), Lsn(30))
+                    .unwrap();
+                assert_graph_retention_row_source(
+                    &graph_read::GraphReadRoot::Writer(new_writer.clone()),
+                    true,
+                );
+                assert_graph_source_answers(
+                    graph_read::GraphReadRoot::Writer(new_writer),
+                    &predecessor,
+                    true,
+                    &entries,
+                );
                 drop(_fixture_decode_scope_43283);
                 {
-                    let mut observed_registration = old_session.file_storage_registration_for_test().unwrap();
-                    assert!(observed_registration.storage_transaction_id >= old_registration.storage_transaction_id);
-                    observed_registration.storage_transaction_id = old_registration.storage_transaction_id;
-                    assert_eq!(observed_registration, old_registration, "the same old descriptor/registration/root remains pinned");
+                    let mut observed_registration =
+                        old_session.file_storage_registration_for_test().unwrap();
+                    assert!(
+                        observed_registration.storage_transaction_id
+                            >= old_registration.storage_transaction_id
+                    );
+                    observed_registration.storage_transaction_id =
+                        old_registration.storage_transaction_id;
+                    assert_eq!(
+                        observed_registration, old_registration,
+                        "the same old descriptor/registration/root remains pinned"
+                    );
                 }
                 assert_eq!(old_session.file_snapshot_for_test().unwrap(), old_snapshot);
                 {
@@ -44929,21 +47330,83 @@ mod empty_declared_index_readiness_tests {
                     assert!(observed_identity.transaction_id >= old_source_pin.transaction_id);
                     assert_eq!(observed_identity.user_root, old_source_pin.user_root);
                 }
-                assert_eq!(old_session.execute("SELECT body FROM removed_rows", &HashMap::new()).unwrap().rows, row_answer);
-                assert_eq!(old_session.metadata(crate::MetadataRequest::ImageState { kind: crate::DirectImageMetadataKind::ChangeLog }, None).unwrap().body, history_answer);
-                assert_graph_retention_row_source(&graph_read::GraphReadRoot::Image(old_source.clone()), true);
-                assert_graph_source_answers(graph_read::GraphReadRoot::Image(old_source.clone()), &predecessor, true, &entries);
-                let _fixture_decode_scope_43283 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43283).into()).unwrap();
-                let current_root = reopened.initialize_writer_snapshot(SnapshotId(100), Lsn(30)).unwrap().storage_identity();
+                assert_eq!(
+                    old_session
+                        .execute("SELECT body FROM removed_rows", &HashMap::new())
+                        .unwrap()
+                        .rows,
+                    row_answer
+                );
+                assert_eq!(
+                    old_session
+                        .metadata(
+                            crate::MetadataRequest::ImageState {
+                                kind: crate::DirectImageMetadataKind::ChangeLog
+                            },
+                            None
+                        )
+                        .unwrap()
+                        .body,
+                    history_answer
+                );
+                assert_graph_retention_row_source(
+                    &graph_read::GraphReadRoot::Image(old_source.clone()),
+                    true,
+                );
+                assert_graph_source_answers(
+                    graph_read::GraphReadRoot::Image(old_source.clone()),
+                    &predecessor,
+                    true,
+                    &entries,
+                );
+                let _fixture_decode_scope_43283 =
+                    crate::read_image_memory::ImageMemory::enter_writer_operation(
+                        std::sync::Arc::clone(&fixture_open_accountant_43283).into(),
+                    )
+                    .unwrap();
+                let current_root = reopened
+                    .initialize_writer_snapshot(SnapshotId(100), Lsn(30))
+                    .unwrap()
+                    .storage_identity();
                 drop(_fixture_decode_scope_43283);
                 drop(reopened);
                 let fresh_session = ReadSession::open(&path).unwrap();
                 assert_eq!(fresh_session.route(), ReadRoute::File);
-                let fresh_registration = fresh_session.file_storage_registration_for_test().unwrap();
+                let fresh_registration =
+                    fresh_session.file_storage_registration_for_test().unwrap();
                 assert!(fresh_registration.storage_transaction_id >= current_root.transaction_id);
-                assert_eq!((fresh_registration.storage_root_page, fresh_registration.storage_root_checksum, fresh_registration.storage_root_length), (current_root.user_root.map(|root| root.page), current_root.user_root.map(|root| root.checksum), current_root.user_root.map(|root| root.length)), "fresh public session owns exactly the new current physical root");
-                assert_eq!(fresh_session.execute("SELECT body FROM removed_rows", &HashMap::new()).unwrap().rows, row_answer);
-                assert_eq!(fresh_session.metadata(crate::MetadataRequest::ImageState { kind: crate::DirectImageMetadataKind::ChangeLog }, None).unwrap().body, history_answer);
+                assert_eq!(
+                    (
+                        fresh_registration.storage_root_page,
+                        fresh_registration.storage_root_checksum,
+                        fresh_registration.storage_root_length
+                    ),
+                    (
+                        current_root.user_root.map(|root| root.page),
+                        current_root.user_root.map(|root| root.checksum),
+                        current_root.user_root.map(|root| root.length)
+                    ),
+                    "fresh public session owns exactly the new current physical root"
+                );
+                assert_eq!(
+                    fresh_session
+                        .execute("SELECT body FROM removed_rows", &HashMap::new())
+                        .unwrap()
+                        .rows,
+                    row_answer
+                );
+                assert_eq!(
+                    fresh_session
+                        .metadata(
+                            crate::MetadataRequest::ImageState {
+                                kind: crate::DirectImageMetadataKind::ChangeLog
+                            },
+                            None
+                        )
+                        .unwrap()
+                        .body,
+                    history_answer
+                );
             }
         }
     }
@@ -45209,26 +47672,37 @@ mod empty_declared_index_readiness_tests {
                             .expect("reopen the readiness matrix growth fixture");
                         database
                             .execute(
-                                &format!("INSERT INTO {table} VALUES (2, 'ready', $body, $embedding)"),
+                                &format!(
+                                    "INSERT INTO {table} VALUES (2, 'ready', $body, $embedding)"
+                                ),
                                 &HashMap::from([
-                                    ("body".to_owned(), Value::Text("bounded-readiness-body-".repeat(4096))),
+                                    (
+                                        "body".to_owned(),
+                                        Value::Text("bounded-readiness-body-".repeat(4096)),
+                                    ),
                                     ("embedding".to_owned(), Value::Vector(vec![0.0, 1.0])),
                                 ]),
                             )
                             .expect("double retained readiness bodies and append history");
-                        database.close().expect("publish the larger readiness fixture");
+                        database
+                            .close()
+                            .expect("publish the larger readiness fixture");
 
                         let larger_work = ReadWorkObservationScope::enter(ReadWorkPhase::Open);
-                        let larger_image = load_read_image_with_memory(&path, Some(2 * 1024 * 1024))
-                            .expect("the larger readiness fixture remains readable");
+                        let larger_image =
+                            load_read_image_with_memory(&path, Some(2 * 1024 * 1024))
+                                .expect("the larger readiness fixture remains readable");
                         assert!(larger_image.image.lazy_relational, "{case}");
                         assert_open_proves_bounded_history_and_startup_digest(
                             larger_work.counters(),
-                            &format!("{case} doubled retained bodies skip complete-image hydration"),
+                            &format!(
+                                "{case} doubled retained bodies skip complete-image hydration"
+                            ),
                             331,
                         );
                         assert_eq!(
-                            larger_work.counters(), first_open,
+                            larger_work.counters(),
+                            first_open,
                             "{case}: fixed 331 hash bytes and zero proof/row/vector work are identical at both store sizes"
                         );
                         drop(larger_image);
@@ -45260,109 +47734,277 @@ mod empty_declared_index_readiness_tests {
             let source_bytes = (64 * 1024)
                 + content_identity::READ_VERIFIER_MEMORY_BYTES
                 + std::mem::size_of::<Lsn>();
-            let source_memory = SourceMemoryReservation::new(image_memory.clone(), source_bytes).unwrap();
+            let source_memory =
+                SourceMemoryReservation::new(image_memory.clone(), source_bytes).unwrap();
             let limits = crate::read_session::ReadSessionOptions::default().limits;
-            let declared = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(limits.memory);
+            let declared =
+                crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(limits.memory);
             let open_context = crate::executor::bounded::ReadOpenContext::new(
-                declared.child().unwrap(), limits, crate::read_session::read_clock(),
+                declared.child().unwrap(),
+                limits,
+                crate::read_session::read_clock(),
                 OwnerReadCancellation::new(),
-            ).unwrap();
-            let load = image_memory.scope(|| {
-                let mut source = ReadImageSource::start(&path, 0, source_memory, None, None)?;
-                let image = source.with_read_transaction(|read| decode_complete_read_image(read, &path, image_memory.clone(), open_context.clone()))?;
-                source.finish(image)
-            }).unwrap();
+            )
+            .unwrap();
+            let load = image_memory
+                .scope(|| {
+                    let mut source = ReadImageSource::start(&path, 0, source_memory, None, None)?;
+                    let image = source.with_read_transaction(|read| {
+                        decode_complete_read_image(
+                            read,
+                            &path,
+                            image_memory.clone(),
+                            open_context.clone(),
+                        )
+                    })?;
+                    source.finish(image)
+                })
+                .unwrap();
             let (_, receipt, image) = load.into_parts();
             receipt.validate_released().unwrap();
-            let fixture_open_accountant_43602 = Arc::new(
-                crate::memory_accounting::MemoryAccountant::no_limit(),
-            );
-            let _fixture_decode_scope_43602 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43602).into()).unwrap();
+            let fixture_open_accountant_43602 =
+                Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+            let _fixture_decode_scope_43602 =
+                crate::read_image_memory::ImageMemory::enter_writer_operation(
+                    std::sync::Arc::clone(&fixture_open_accountant_43602).into(),
+                )
+                .unwrap();
             let store = RedbPersistence::open_with_cache(&path, 0).unwrap();
-            store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43602).into());
-            let writer = store.initialize_writer_snapshot(SnapshotId(100), Lsn(30)).unwrap();
-            (store, [graph_read::GraphReadRoot::Writer(writer), graph_read::GraphReadRoot::Image(image)])
+            store.attach_memory_accountant(
+                std::sync::Arc::clone(&fixture_open_accountant_43602).into(),
+            );
+            let writer = store
+                .initialize_writer_snapshot(SnapshotId(100), Lsn(30))
+                .unwrap();
+            (
+                store,
+                [
+                    graph_read::GraphReadRoot::Writer(writer),
+                    graph_read::GraphReadRoot::Image(image),
+                ],
+            )
         };
         let declared_child = 16 * 1024 * 1024;
         let key = RedbPersistence::graph_fwd_key(&predecessor);
-        let key_memory = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(declared_child));
-        let endpoint = SourceWindowOwner::Read(key_memory.clone()).endpoint(&[key.as_slice()], "graph_cursor").unwrap();
-        assert_eq!(key_memory.usage().used, key.len(), "the actual endpoint owns exactly its retained key");
+        let key_memory = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(
+            declared_child,
+        ));
+        let endpoint = SourceWindowOwner::Read(key_memory.clone())
+            .endpoint(&[key.as_slice()], "graph_cursor")
+            .unwrap();
+        assert_eq!(
+            key_memory.usage().used,
+            key.len(),
+            "the actual endpoint owns exactly its retained key"
+        );
         drop(endpoint);
-        assert_eq!(key_memory.usage().used, 0, "the endpoint credit returns at its own lifetime boundary");
+        assert_eq!(
+            key_memory.usage().used,
+            0,
+            "the endpoint credit returns at its own lifetime boundary"
+        );
         key_memory.set_budget(Some(key.len() - 1)).unwrap();
-        let error = SourceWindowOwner::Read(key_memory.clone()).endpoint(&[key.as_slice()], "graph_cursor").err().expect("one byte below the actual endpoint request refuses");
-        assert!(matches!(error, Error::MemoryBudgetExceeded { ref subsystem, ref operation, requested_bytes, budget_limit_bytes, .. }
+        let error = SourceWindowOwner::Read(key_memory.clone())
+            .endpoint(&[key.as_slice()], "graph_cursor")
+            .err()
+            .expect("one byte below the actual endpoint request refuses");
+        assert!(
+            matches!(error, Error::MemoryBudgetExceeded { ref subsystem, ref operation, requested_bytes, budget_limit_bytes, .. }
             if subsystem == "writer_source" && operation == "graph_cursor" && requested_bytes == key.len() && budget_limit_bytes == key.len() - 1),
-            "key admission keeps its original typed attribution: {error:?}");
-        assert_eq!(key_memory.usage().used, 0, "failed endpoint admission retains no credit");
+            "key admission keeps its original typed attribution: {error:?}"
+        );
+        assert_eq!(
+            key_memory.usage().used,
+            0,
+            "failed endpoint admission retains no credit"
+        );
         key_memory.set_budget(Some(declared_child)).unwrap();
         for route in 0..2 {
             for reverse in [false, true] {
                 let (store, roots) = cold_roots();
                 let root = &roots[route];
-                assert_eq!(store.resident_cache_stats_for_test().unwrap().3, 0, "the fresh reopened writer has zero resident cache bytes before this cold page read");
+                assert_eq!(
+                    store.resident_cache_stats_for_test().unwrap().3,
+                    0,
+                    "the fresh reopened writer has zero resident cache bytes before this cold page read"
+                );
                 if let graph_read::GraphReadRoot::Image(image) = root {
-                    assert_eq!(image.database.cache_stats().used_bytes(), 0, "the independent image fixture has no resident page cache before this cold page read");
+                    assert_eq!(
+                        image.database.cache_stats().used_bytes(),
+                        0,
+                        "the independent image fixture has no resident page cache before this cold page read"
+                    );
                 }
-                let key = if reverse { RedbPersistence::graph_rev_key(&predecessor) } else { RedbPersistence::graph_fwd_key(&predecessor) };
-                let page_memory = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(key.len() - 1));
+                let key = if reverse {
+                    RedbPersistence::graph_rev_key(&predecessor)
+                } else {
+                    RedbPersistence::graph_fwd_key(&predecessor)
+                };
+                let page_memory = Arc::new(
+                    crate::memory_accounting::MemoryAccountant::with_budget(key.len() - 1),
+                );
                 let error = graph_read::with_pages(page_memory.clone(), || {
                     let read_page = |read: &redb::ReadTransaction| -> Result<()> {
-                        let table = read.open_table(if reverse { GRAPH_REV_TABLE } else { GRAPH_FWD_TABLE }).map_err(RedbPersistence::storage_error)?;
-                        let value = table.get_bounded(&key).map_err(RedbPersistence::storage_error)?;
-                        assert!(value.is_some(), "the actual bounded page contains this primary/reverse edge");
+                        let table = read
+                            .open_table(if reverse {
+                                GRAPH_REV_TABLE
+                            } else {
+                                GRAPH_FWD_TABLE
+                            })
+                            .map_err(RedbPersistence::storage_error)?;
+                        let value = table
+                            .get_bounded(&key)
+                            .map_err(RedbPersistence::storage_error)?;
+                        assert!(
+                            value.is_some(),
+                            "the actual bounded page contains this primary/reverse edge"
+                        );
                         Ok(())
                     };
                     match root {
-                        graph_read::GraphReadRoot::Writer(writer) => read_page(writer.owner_read()?.as_ref()),
+                        graph_read::GraphReadRoot::Writer(writer) => {
+                            read_page(writer.owner_read()?.as_ref())
+                        }
                         graph_read::GraphReadRoot::Image(image) => image.with_read(read_page),
                     }
-                }).unwrap_err();
-                assert!(matches!(error, Error::MemoryBudgetExceeded { budget_limit_bytes, requested_bytes, available_bytes, .. }
+                })
+                .unwrap_err();
+                assert!(
+                    matches!(error, Error::MemoryBudgetExceeded { budget_limit_bytes, requested_bytes, available_bytes, .. }
                     if budget_limit_bytes == key.len() - 1 && requested_bytes > available_bytes),
-                    "real reject-only page admission restores the original memory error: {error:?}");
-                assert_eq!(page_memory.usage().used, 0, "failed bounded primary/reverse page read releases partial credits");
+                    "real reject-only page admission restores the original memory error: {error:?}"
+                );
+                assert_eq!(
+                    page_memory.usage().used,
+                    0,
+                    "failed bounded primary/reverse page read releases partial credits"
+                );
                 let read_stored = |read: &redb::ReadTransaction| -> Result<Vec<u8>> {
-                    let table = read.open_table(if reverse { GRAPH_REV_TABLE } else { GRAPH_FWD_TABLE }).map_err(RedbPersistence::storage_error)?;
-                    Ok(table.get(key.as_slice()).map_err(RedbPersistence::storage_error)?.unwrap().value().to_vec())
+                    let table = read
+                        .open_table(if reverse {
+                            GRAPH_REV_TABLE
+                        } else {
+                            GRAPH_FWD_TABLE
+                        })
+                        .map_err(RedbPersistence::storage_error)?;
+                    Ok(table
+                        .get(key.as_slice())
+                        .map_err(RedbPersistence::storage_error)?
+                        .unwrap()
+                        .value()
+                        .to_vec())
                 };
                 let raw = match root {
-                    graph_read::GraphReadRoot::Writer(writer) => read_stored(&writer.owner_read().unwrap()).unwrap(),
-                    graph_read::GraphReadRoot::Image(image) => image.with_read(read_stored).unwrap(),
+                    graph_read::GraphReadRoot::Writer(writer) => {
+                        read_stored(&writer.owner_read().unwrap()).unwrap()
+                    }
+                    graph_read::GraphReadRoot::Image(image) => {
+                        image.with_read(read_stored).unwrap()
+                    }
                 };
-                let decode_memory = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(declared_child));
-                let bridge = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(declared_child));
-                let decoder = crate::read_image_memory::ImageMemory::charging_reader_for(bridge.clone().into(), decode_memory.clone(), "graph_source", "edge_decode", "Raise the declared reader memory limit to read graph pages.");
-                let (decoded, consumed): (AdjEntry, usize) = decoder.scope(|| crate::read_image_memory::decode(&raw)).unwrap();
-                assert_eq!((&decoded, consumed), (&predecessor, raw.len()), "the actual stored primary/reverse payload has a valid complete decode");
+                let decode_memory = Arc::new(
+                    crate::memory_accounting::MemoryAccountant::with_budget(declared_child),
+                );
+                let bridge = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(
+                    declared_child,
+                ));
+                let decoder = crate::read_image_memory::ImageMemory::charging_reader_for(
+                    bridge.clone().into(),
+                    decode_memory.clone(),
+                    "graph_source",
+                    "edge_decode",
+                    "Raise the declared reader memory limit to read graph pages.",
+                );
+                let (decoded, consumed): (AdjEntry, usize) = decoder
+                    .scope(|| crate::read_image_memory::decode(&raw))
+                    .unwrap();
+                assert_eq!(
+                    (&decoded, consumed),
+                    (&predecessor, raw.len()),
+                    "the actual stored primary/reverse payload has a valid complete decode"
+                );
                 let required_decode = decode_memory.high_water_for_test();
                 drop(decoded);
                 drop(decoder);
-                assert_eq!(decode_memory.usage().used, 0, "the admitted stored decoder releases its scratch at the decoder lifetime boundary");
+                assert_eq!(
+                    decode_memory.usage().used,
+                    0,
+                    "the admitted stored decoder releases its scratch at the decoder lifetime boundary"
+                );
                 decode_memory.set_budget(Some(required_decode - 1)).unwrap();
-                let decoder = crate::read_image_memory::ImageMemory::charging_reader_for(bridge.clone().into(), decode_memory.clone(), "graph_source", "edge_decode", "Raise the declared reader memory limit to read graph pages.");
-                let decoded: Result<(AdjEntry, usize)> = decoder.scope(|| crate::read_image_memory::decode(&raw));
+                let decoder = crate::read_image_memory::ImageMemory::charging_reader_for(
+                    bridge.clone().into(),
+                    decode_memory.clone(),
+                    "graph_source",
+                    "edge_decode",
+                    "Raise the declared reader memory limit to read graph pages.",
+                );
+                let decoded: Result<(AdjEntry, usize)> =
+                    decoder.scope(|| crate::read_image_memory::decode(&raw));
                 let error = decoded.unwrap_err();
-                assert!(matches!(error, Error::MemoryBudgetExceeded { ref subsystem, ref operation, budget_limit_bytes, .. }
-                    if subsystem == "graph_source" && operation == "edge_decode" && budget_limit_bytes == required_decode - 1), "stored decoder admission preserves its original typed error: {error:?}");
+                assert!(
+                    matches!(error, Error::MemoryBudgetExceeded { ref subsystem, ref operation, budget_limit_bytes, .. }
+                    if subsystem == "graph_source" && operation == "edge_decode" && budget_limit_bytes == required_decode - 1),
+                    "stored decoder admission preserves its original typed error: {error:?}"
+                );
                 drop(decoder);
-                assert_eq!(decode_memory.usage().used, 0, "a refused stored decoder returns its partial credits");
-                assert_eq!(bridge.usage().used, 0, "reader decoder scratch never borrows the source accountant");
-                let memory = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(declared_child));
-                let mut control = root.cursor(reverse, Bound::Included(&key), Bound::Included(&key), memory.clone()).unwrap();
-                let window = control.next_edge().unwrap().expect("the same exact bounded door has a valid source");
+                assert_eq!(
+                    decode_memory.usage().used,
+                    0,
+                    "a refused stored decoder returns its partial credits"
+                );
+                assert_eq!(
+                    bridge.usage().used,
+                    0,
+                    "reader decoder scratch never borrows the source accountant"
+                );
+                let memory = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(
+                    declared_child,
+                ));
+                let mut control = root
+                    .cursor(
+                        reverse,
+                        Bound::Included(&key),
+                        Bound::Included(&key),
+                        memory.clone(),
+                    )
+                    .unwrap();
+                let window = control
+                    .next_edge()
+                    .unwrap()
+                    .expect("the same exact bounded door has a valid source");
                 assert_eq!(window.edge(), &predecessor);
                 drop(window);
                 drop(control);
-                assert_eq!(memory.usage().used, 0, "successful page, proof, decoder and cursor credits return");
+                assert_eq!(
+                    memory.usage().used,
+                    0,
+                    "successful page, proof, decoder and cursor credits return"
+                );
                 memory.reset_high_water_for_test();
-                let mut warm_control = root.cursor(reverse, Bound::Included(&key), Bound::Included(&key), memory.clone()).unwrap();
-                assert_eq!(warm_control.next_edge().unwrap().unwrap().edge(), &predecessor);
+                let mut warm_control = root
+                    .cursor(
+                        reverse,
+                        Bound::Included(&key),
+                        Bound::Included(&key),
+                        memory.clone(),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    warm_control.next_edge().unwrap().unwrap().edge(),
+                    &predecessor
+                );
                 let successful_peak = memory.high_water_for_test();
-                assert!(successful_peak > key.len(), "the warmed actual source operation retains its key/decoder/proof requirement");
+                assert!(
+                    successful_peak > key.len(),
+                    "the warmed actual source operation retains its key/decoder/proof requirement"
+                );
                 drop(warm_control);
-                assert_eq!(memory.usage().used, 0, "the warm control returns its operation credits before the refusal");
+                assert_eq!(
+                    memory.usage().used,
+                    0,
+                    "the warm control returns its operation credits before the refusal"
+                );
                 // The measured control is fully released before the refusing
                 // operation opens independent zero-cache captured roots. Its
                 // proof state and forward/reverse pages cannot warm the retry.
@@ -45370,21 +48012,62 @@ mod empty_declared_index_readiness_tests {
                 drop(store);
                 let (store, roots) = cold_roots();
                 let root = &roots[route];
-                assert_eq!(store.resident_cache_stats_for_test().unwrap().3, 0, "the independently reopened refusal writer has zero resident cache bytes");
+                assert_eq!(
+                    store.resident_cache_stats_for_test().unwrap().3,
+                    0,
+                    "the independently reopened refusal writer has zero resident cache bytes"
+                );
                 if let graph_read::GraphReadRoot::Image(image) = root {
-                    assert_eq!(image.database.cache_stats().used_bytes(), 0, "the independently reopened refusal image has no resident page cache");
+                    assert_eq!(
+                        image.database.cache_stats().used_bytes(),
+                        0,
+                        "the independently reopened refusal image has no resident page cache"
+                    );
                 }
                 memory.set_budget(Some(successful_peak - 1)).unwrap();
-                let outcome = root.cursor(reverse, Bound::Included(&key), Bound::Included(&key), memory.clone()).and_then(|mut cursor| cursor.next_edge().map(|_| ()));
-                let error = outcome.expect_err("one byte below the observed complete operation peak refuses");
-                assert!(matches!(error, Error::MemoryBudgetExceeded { budget_limit_bytes, .. } if budget_limit_bytes == successful_peak - 1),
-                    "page/decode admission preserves its memory refusal: {error:?}");
-                assert_eq!(memory.usage().used, 0, "failed page/decode operation releases every partial credit");
-                assert_eq!(memory.underflow_count_for_test(), 0, "credits return exactly once");
-                assert_eq!(graph_publication_state(&store), before, "read admission refusal changes no durable history, roots or progress");
+                let outcome = root
+                    .cursor(
+                        reverse,
+                        Bound::Included(&key),
+                        Bound::Included(&key),
+                        memory.clone(),
+                    )
+                    .and_then(|mut cursor| cursor.next_edge().map(|_| ()));
+                let error = outcome
+                    .expect_err("one byte below the observed complete operation peak refuses");
+                assert!(
+                    matches!(error, Error::MemoryBudgetExceeded { budget_limit_bytes, .. } if budget_limit_bytes == successful_peak - 1),
+                    "page/decode admission preserves its memory refusal: {error:?}"
+                );
+                assert_eq!(
+                    memory.usage().used,
+                    0,
+                    "failed page/decode operation releases every partial credit"
+                );
+                assert_eq!(
+                    memory.underflow_count_for_test(),
+                    0,
+                    "credits return exactly once"
+                );
+                assert_eq!(
+                    graph_publication_state(&store),
+                    before,
+                    "read admission refusal changes no durable history, roots or progress"
+                );
                 memory.set_budget(Some(declared_child)).unwrap();
-                let mut restored = root.cursor(reverse, Bound::Included(&key), Bound::Included(&key), memory.clone()).unwrap();
-                assert_eq!(restored.next_edge().unwrap().unwrap().edge(), &predecessor, "retry uses the same captured source after refusal");
+                let mut restored = root
+                    .cursor(
+                        reverse,
+                        Bound::Included(&key),
+                        Bound::Included(&key),
+                        memory.clone(),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    restored.next_edge().unwrap().unwrap().edge(),
+                    &predecessor,
+                    "retry uses the same captured source after refusal"
+                );
                 drop(restored);
                 assert_eq!(memory.usage().used, 0);
                 if reverse {
@@ -45394,11 +48077,21 @@ mod empty_declared_index_readiness_tests {
                 drop(store);
             }
         }
-        let fixture_open_accountant_43720 = std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-        let _fixture_decode_scope_43720 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43720).into()).unwrap();
+        let fixture_open_accountant_43720 =
+            std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+        let _fixture_decode_scope_43720 =
+            crate::read_image_memory::ImageMemory::enter_writer_operation(
+                std::sync::Arc::clone(&fixture_open_accountant_43720).into(),
+            )
+            .unwrap();
         let store = RedbPersistence::open_with_cache(&path, 0).unwrap();
-        store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43720).into());
-        assert_eq!(graph_publication_state(&store), before, "all refusals and retries leave the complete fixture unchanged");
+        store
+            .attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43720).into());
+        assert_eq!(
+            graph_publication_state(&store),
+            before,
+            "all refusals and retries leave the complete fixture unchanged"
+        );
     }
 
     #[cfg(any(test, feature = "test-seams"))]
@@ -45406,19 +48099,34 @@ mod empty_declared_index_readiness_tests {
     struct GraphDoorCancellationObserver {
         armed: std::sync::atomic::AtomicBool,
         first: std::sync::Mutex<Option<crate::read_session::ReadKernelSourceEvent>>,
-        caller_cancellation: std::sync::Mutex<Option<contextdb_core::read_contract::OwnerReadCancellation>>,
+        caller_cancellation:
+            std::sync::Mutex<Option<contextdb_core::read_contract::OwnerReadCancellation>>,
     }
     #[cfg(any(test, feature = "test-seams"))]
     impl crate::read_session::ReadKernelTestObserver for GraphDoorCancellationObserver {
-        fn before_source_touch(&self, event: crate::read_session::ReadKernelSourceEvent, cancellation: contextdb_core::read_contract::OwnerReadCancellation) {
+        fn before_source_touch(
+            &self,
+            event: crate::read_session::ReadKernelSourceEvent,
+            cancellation: contextdb_core::read_contract::OwnerReadCancellation,
+        ) {
             if event.source == crate::read_session::ReadKernelSource::GraphEdge
-                && self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                && self.armed.swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
                 *self.first.lock().unwrap() = Some(event);
                 let caller = self.caller_cancellation.lock().unwrap().clone();
-                if let Some(caller) = caller { caller.cancel(); } else { cancellation.cancel(); }
+                if let Some(caller) = caller {
+                    caller.cancel();
+                } else {
+                    cancellation.cancel();
+                }
             }
         }
-        fn cancellation_observed(&self, _: crate::read_session::ReadKernelCancellationEvent, _: contextdb_core::read_contract::OwnerReadCancellation) {}
+        fn cancellation_observed(
+            &self,
+            _: crate::read_session::ReadKernelCancellationEvent,
+            _: contextdb_core::read_contract::OwnerReadCancellation,
+        ) {
+        }
     }
 
     // Use stored ACL metadata and actual grant lookup. An allowed target and
@@ -45435,177 +48143,408 @@ mod empty_declared_index_readiness_tests {
         let allowed_acl = uuid::Uuid::from_u128(4);
         let query = "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) WHERE a.id = $source COLUMNS (b.id AS t))";
         let anchor = uuid::Uuid::from_u128(6);
-        let params = HashMap::from([("source".into(), Value::Uuid(source)), ("anchor".into(), Value::Uuid(anchor)), ("target".into(), Value::Uuid(target))]);
+        let params = HashMap::from([
+            ("source".into(), Value::Uuid(source)),
+            ("anchor".into(), Value::Uuid(anchor)),
+            ("target".into(), Value::Uuid(target)),
+        ]);
         for allow_source in [false, true] {
-          for malformed_projection in [None, Some(false), Some(true)] {
-            let malformed_source = malformed_projection.is_some();
-            let path = directory.join(format!("graph-real-source-permission-{allow_source}-{malformed_projection:?}.db"));
-            let observer = Arc::new(GraphDoorCancellationObserver::default());
-            let database = Database::open_with_options(&path, crate::DatabaseOpenOptions {
-                maintenance_policy: crate::database::MaintenancePolicy::CallerDriven,
-                test_kernel_observer: Some(observer.clone()), ..Default::default()
-            }).unwrap();
-            for sql in [
-                "CREATE TABLE acl_grants (id UUID PRIMARY KEY, principal_kind TEXT, principal_id TEXT, acl_id UUID) SYNC OFF",
-                // Non-unique id keeps the visibility controls list-shaped: a hidden
-                // PRIMARY KEY identity correctly returns AclDenied, not an empty list.
-                "CREATE TABLE nodes (id UUID, acl_id UUID ACL REFERENCES acl_grants(acl_id)) SYNC OFF",
-                "CREATE INDEX graph_permission_nodes_id ON nodes(id)",
-                "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT, acl_id UUID ACL REFERENCES acl_grants(acl_id)) SYNC OFF",
-            ] { database.execute(sql, &HashMap::new()).unwrap(); }
-            database.execute("INSERT INTO acl_grants VALUES ($id, 'Agent', $principal, $acl)", &HashMap::from([
-                ("id".into(), Value::Uuid(allowed_acl)), ("principal".into(), Value::Text(principal.into())), ("acl".into(), Value::Uuid(allowed_acl))
-            ])).unwrap();
-            if allow_source {
-                database.execute("INSERT INTO acl_grants VALUES ($id, 'Agent', $principal, $acl)", &HashMap::from([
-                    ("id".into(), Value::Uuid(source_acl)), ("principal".into(), Value::Text(principal.into())), ("acl".into(), Value::Uuid(source_acl))
-                ])).unwrap();
-            }
-            for (id, acl) in [(source, source_acl), (target, allowed_acl)] {
-                database.execute("INSERT INTO nodes VALUES ($id, $acl)", &HashMap::from([("id".into(), Value::Uuid(id)), ("acl".into(), Value::Uuid(acl))])).unwrap();
-            }
-            database.execute("INSERT INTO edges VALUES ($id, $source, $target, 'LINKS', $acl)", &HashMap::from([
-                ("id".into(), Value::Uuid(uuid::Uuid::from_u128(5))), ("source".into(), Value::Uuid(source)),
-                ("target".into(), Value::Uuid(target)), ("acl".into(), Value::Uuid(allowed_acl))
-            ])).unwrap();
-            if !allow_source {
-                database.execute("INSERT INTO nodes VALUES ($id, $acl)", &HashMap::from([("id".into(), Value::Uuid(anchor)), ("acl".into(), Value::Uuid(allowed_acl))])).unwrap();
-                // A real graph edge enters the denied source from a visible node.
-                // The original relational edge/grant controls remain unchanged.
-                let tx = database.begin().unwrap();
-                database.insert_edge(tx, anchor, source, "LINKS".into(), HashMap::new()).unwrap();
-                database.commit(tx).unwrap();
-            }
-            for query in std::iter::once(query).chain((!allow_source).then_some(
+            for malformed_projection in [None, Some(false), Some(true)] {
+                let malformed_source = malformed_projection.is_some();
+                let path = directory.join(format!(
+                    "graph-real-source-permission-{allow_source}-{malformed_projection:?}.db"
+                ));
+                let observer = Arc::new(GraphDoorCancellationObserver::default());
+                let database = Database::open_with_options(
+                    &path,
+                    crate::DatabaseOpenOptions {
+                        maintenance_policy: crate::database::MaintenancePolicy::CallerDriven,
+                        test_kernel_observer: Some(observer.clone()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                for sql in [
+                    "CREATE TABLE acl_grants (id UUID PRIMARY KEY, principal_kind TEXT, principal_id TEXT, acl_id UUID) SYNC OFF",
+                    // Non-unique id keeps the visibility controls list-shaped: a hidden
+                    // PRIMARY KEY identity correctly returns AclDenied, not an empty list.
+                    "CREATE TABLE nodes (id UUID, acl_id UUID ACL REFERENCES acl_grants(acl_id)) SYNC OFF",
+                    "CREATE INDEX graph_permission_nodes_id ON nodes(id)",
+                    "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT, acl_id UUID ACL REFERENCES acl_grants(acl_id)) SYNC OFF",
+                ] {
+                    database.execute(sql, &HashMap::new()).unwrap();
+                }
+                database
+                    .execute(
+                        "INSERT INTO acl_grants VALUES ($id, 'Agent', $principal, $acl)",
+                        &HashMap::from([
+                            ("id".into(), Value::Uuid(allowed_acl)),
+                            ("principal".into(), Value::Text(principal.into())),
+                            ("acl".into(), Value::Uuid(allowed_acl)),
+                        ]),
+                    )
+                    .unwrap();
+                if allow_source {
+                    database
+                        .execute(
+                            "INSERT INTO acl_grants VALUES ($id, 'Agent', $principal, $acl)",
+                            &HashMap::from([
+                                ("id".into(), Value::Uuid(source_acl)),
+                                ("principal".into(), Value::Text(principal.into())),
+                                ("acl".into(), Value::Uuid(source_acl)),
+                            ]),
+                        )
+                        .unwrap();
+                }
+                for (id, acl) in [(source, source_acl), (target, allowed_acl)] {
+                    database
+                        .execute(
+                            "INSERT INTO nodes VALUES ($id, $acl)",
+                            &HashMap::from([
+                                ("id".into(), Value::Uuid(id)),
+                                ("acl".into(), Value::Uuid(acl)),
+                            ]),
+                        )
+                        .unwrap();
+                }
+                database
+                    .execute(
+                        "INSERT INTO edges VALUES ($id, $source, $target, 'LINKS', $acl)",
+                        &HashMap::from([
+                            ("id".into(), Value::Uuid(uuid::Uuid::from_u128(5))),
+                            ("source".into(), Value::Uuid(source)),
+                            ("target".into(), Value::Uuid(target)),
+                            ("acl".into(), Value::Uuid(allowed_acl)),
+                        ]),
+                    )
+                    .unwrap();
+                if !allow_source {
+                    database
+                        .execute(
+                            "INSERT INTO nodes VALUES ($id, $acl)",
+                            &HashMap::from([
+                                ("id".into(), Value::Uuid(anchor)),
+                                ("acl".into(), Value::Uuid(allowed_acl)),
+                            ]),
+                        )
+                        .unwrap();
+                    // A real graph edge enters the denied source from a visible node.
+                    // The original relational edge/grant controls remain unchanged.
+                    let tx = database.begin().unwrap();
+                    database
+                        .insert_edge(tx, anchor, source, "LINKS".into(), HashMap::new())
+                        .unwrap();
+                    database.commit(tx).unwrap();
+                }
+                for query in std::iter::once(query).chain((!allow_source).then_some(
                 "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->{1,2}(b) WHERE a.id = $anchor AND b.id = $target COLUMNS (b.id AS t))"
             )) {
             assert_eq!(database.execute(query, &params).unwrap().rows, vec![vec![Value::Uuid(target)]], "admin control confirms the actual stored graph edge");
             }
-            database.close().unwrap();
-            drop(database);
-            if malformed_source {
-                let fixture_open_accountant_43807 = std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-                let _fixture_decode_scope_43807 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_43807).into()).unwrap();
-                let persistence = RedbPersistence::open(&path).unwrap();
-                persistence.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43807).into());
-                persistence.with_db(|db| {
-                    let write = db.begin_write().map_err(RedbPersistence::storage_error)?;
-                    {
-                        let mut table = write.open_table(if malformed_projection == Some(true) { GRAPH_REV_TABLE } else { GRAPH_FWD_TABLE }).map_err(RedbPersistence::storage_error)?;
-                        let (key, mut raw) = {
-                            let endpoints = if malformed_projection == Some(true) { [target.as_bytes().as_slice(), source.as_bytes().as_slice()].concat() } else { [source.as_bytes().as_slice(), target.as_bytes().as_slice()].concat() };
-                            let (key, raw) = table.iter().map_err(RedbPersistence::storage_error)?.map(|entry| entry.map_err(RedbPersistence::storage_error)).find(|entry| entry.as_ref().is_ok_and(|(key, _)| key.value().starts_with(&endpoints))).unwrap()?;
-                            (key.value().to_vec(), raw.value().to_vec())
-                        };
-                        raw.push(0);
-                        table.insert(key.as_slice(), raw.as_slice()).map_err(RedbPersistence::storage_error)?;
-                    }
-                    // Refresh the final physical descriptor bindings so the
-                    // reader reaches the damaged accessed payload, rather
-                    // than merely refusing an obsolete descriptor at open.
-                    RedbPersistence::write_writer_recovery_bounds_in_write(&write, None)?;
-                    write.commit().map_err(RedbPersistence::storage_error)?;
-                    Ok(())
-                }).unwrap();
-                drop(persistence);
+                database.close().unwrap();
+                drop(database);
+                if malformed_source {
+                    let fixture_open_accountant_43807 =
+                        std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+                    let _fixture_decode_scope_43807 =
+                        crate::read_image_memory::ImageMemory::enter_writer_operation(
+                            std::sync::Arc::clone(&fixture_open_accountant_43807).into(),
+                        )
+                        .unwrap();
+                    let persistence = RedbPersistence::open(&path).unwrap();
+                    persistence.attach_memory_accountant(
+                        std::sync::Arc::clone(&fixture_open_accountant_43807).into(),
+                    );
+                    persistence
+                        .with_db(|db| {
+                            let write = db.begin_write().map_err(RedbPersistence::storage_error)?;
+                            {
+                                let mut table = write
+                                    .open_table(if malformed_projection == Some(true) {
+                                        GRAPH_REV_TABLE
+                                    } else {
+                                        GRAPH_FWD_TABLE
+                                    })
+                                    .map_err(RedbPersistence::storage_error)?;
+                                let (key, mut raw) = {
+                                    let endpoints = if malformed_projection == Some(true) {
+                                        [target.as_bytes().as_slice(), source.as_bytes().as_slice()]
+                                            .concat()
+                                    } else {
+                                        [source.as_bytes().as_slice(), target.as_bytes().as_slice()]
+                                            .concat()
+                                    };
+                                    let (key, raw) = table
+                                        .iter()
+                                        .map_err(RedbPersistence::storage_error)?
+                                        .map(|entry| entry.map_err(RedbPersistence::storage_error))
+                                        .find(|entry| {
+                                            entry.as_ref().is_ok_and(|(key, _)| {
+                                                key.value().starts_with(&endpoints)
+                                            })
+                                        })
+                                        .unwrap()?;
+                                    (key.value().to_vec(), raw.value().to_vec())
+                                };
+                                raw.push(0);
+                                table
+                                    .insert(key.as_slice(), raw.as_slice())
+                                    .map_err(RedbPersistence::storage_error)?;
+                            }
+                            // Refresh the final physical descriptor bindings so the
+                            // reader reaches the damaged accessed payload, rather
+                            // than merely refusing an obsolete descriptor at open.
+                            RedbPersistence::write_writer_recovery_bounds_in_write(&write, None)?;
+                            write.commit().map_err(RedbPersistence::storage_error)?;
+                            Ok(())
+                        })
+                        .unwrap();
+                    drop(persistence);
+                }
+                let database = Database::open_with_options(
+                    &path,
+                    crate::DatabaseOpenOptions {
+                        maintenance_policy: crate::database::MaintenancePolicy::CallerDriven,
+                        test_kernel_observer: Some(observer.clone()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                let options = ReadSessionOptions {
+                    principal: Some(Principal::Agent(principal.into())),
+                    ..Default::default()
+                };
+                let owner = ReadSession::open_owner_only(&path, options.clone()).unwrap();
+                assert_eq!(owner.route(), ReadRoute::Owner);
+                assert_graph_permission_session(
+                    &owner,
+                    &observer,
+                    allow_source,
+                    malformed_source,
+                    query,
+                    &params,
+                    target,
+                );
+                drop(owner);
+                database.close().unwrap();
+                drop(database);
+                let file = ReadSession::open_with_kernel_observer_for_test(
+                    &path,
+                    options,
+                    observer.clone(),
+                )
+                .unwrap();
+                assert_eq!(file.route(), ReadRoute::File);
+                assert_graph_permission_session(
+                    &file,
+                    &observer,
+                    allow_source,
+                    malformed_source,
+                    query,
+                    &params,
+                    target,
+                );
             }
-            let database = Database::open_with_options(&path, crate::DatabaseOpenOptions {
-                maintenance_policy: crate::database::MaintenancePolicy::CallerDriven,
-                test_kernel_observer: Some(observer.clone()), ..Default::default()
-            }).unwrap();
-            let options = ReadSessionOptions { principal: Some(Principal::Agent(principal.into())), ..Default::default() };
-            let owner = ReadSession::open_owner_only(&path, options.clone()).unwrap();
-            assert_eq!(owner.route(), ReadRoute::Owner);
-            assert_graph_permission_session(&owner, &observer, allow_source, malformed_source, query, &params, target);
-            drop(owner);
-            database.close().unwrap();
-            drop(database);
-            let file = ReadSession::open_with_kernel_observer_for_test(&path, options, observer.clone()).unwrap();
-            assert_eq!(file.route(), ReadRoute::File);
-            assert_graph_permission_session(&file, &observer, allow_source, malformed_source, query, &params, target);
-          }
         }
     }
 
     #[cfg(any(test, feature = "test-seams"))]
-    fn assert_graph_permission_session(session: &crate::read_session::ReadSession, observer: &GraphDoorCancellationObserver, allow_source: bool, malformed_source: bool,
-        query: &str, params: &HashMap<String, Value>, target: uuid::Uuid) {
-        let expected = if allow_source { vec![vec![Value::Uuid(target)]] } else { Vec::new() };
-        assert_eq!(session.execute("SELECT id FROM nodes WHERE id = $target", &HashMap::from([("target".into(), Value::Uuid(target))])).unwrap().rows,
-            vec![vec![Value::Uuid(target)]], "the principal genuinely holds the target grant");
-        assert_eq!(session.execute("SELECT edge_type FROM edges", &HashMap::new()).unwrap().rows,
-            vec![vec![Value::Text("LINKS".into())]], "the principal genuinely holds the edge grant");
-        assert_eq!(session.execute("SELECT id FROM nodes WHERE id = $source", params).unwrap().rows,
-            if allow_source { vec![vec![params["source"].clone()]] } else { Vec::new() }, "the source permission is decided by stored ACL metadata");
+    fn assert_graph_permission_session(
+        session: &crate::read_session::ReadSession,
+        observer: &GraphDoorCancellationObserver,
+        allow_source: bool,
+        malformed_source: bool,
+        query: &str,
+        params: &HashMap<String, Value>,
+        target: uuid::Uuid,
+    ) {
+        let expected = if allow_source {
+            vec![vec![Value::Uuid(target)]]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(
+            session
+                .execute(
+                    "SELECT id FROM nodes WHERE id = $target",
+                    &HashMap::from([("target".into(), Value::Uuid(target))])
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Uuid(target)]],
+            "the principal genuinely holds the target grant"
+        );
+        assert_eq!(
+            session
+                .execute("SELECT edge_type FROM edges", &HashMap::new())
+                .unwrap()
+                .rows,
+            vec![vec![Value::Text("LINKS".into())]],
+            "the principal genuinely holds the edge grant"
+        );
+        assert_eq!(
+            session
+                .execute("SELECT id FROM nodes WHERE id = $source", params)
+                .unwrap()
+                .rows,
+            if allow_source {
+                vec![vec![params["source"].clone()]]
+            } else {
+                Vec::new()
+            },
+            "the source permission is decided by stored ACL metadata"
+        );
         if malformed_source && allow_source {
             let before = session.route_resources_for_test().unwrap();
             let error = session.execute(query, params).unwrap_err();
-            assert!(matches!(error, Error::StoreCorrupted { .. }), "an allowed source with a malformed accessed primary retains typed corruption: {error:?}");
+            assert!(
+                matches!(error, Error::StoreCorrupted { .. }),
+                "an allowed source with a malformed accessed primary retains typed corruption: {error:?}"
+            );
             let after = session.route_resources_for_test().unwrap();
-            assert_eq!(after.active_cursors, before.active_cursors, "typed accessed-source failure closes its operation lifetime");
+            assert_eq!(
+                after.active_cursors, before.active_cursors,
+                "typed accessed-source failure closes its operation lifetime"
+            );
             let error = session.execute(query, params).unwrap_err();
-            assert!(matches!(error, Error::StoreCorrupted { .. }), "the unchanged malformed source keeps refusing on a fresh operation: {error:?}");
+            assert!(
+                matches!(error, Error::StoreCorrupted { .. }),
+                "the unchanged malformed source keeps refusing on a fresh operation: {error:?}"
+            );
             return;
         }
         if !allow_source {
             let error = session.execute(query, params).unwrap_err();
-            assert!(matches!(error, Error::AclDenied { .. }), "a hidden pinned graph anchor keeps its existing typed denial: {error:?}");
+            assert!(
+                matches!(error, Error::AclDenied { .. }),
+                "a hidden pinned graph anchor keeps its existing typed denial: {error:?}"
+            );
         }
         // Hidden nodes reached by a walk are filtered; hidden pinned starts are refused.
-        let query = if allow_source { query } else {
+        let query = if allow_source {
+            query
+        } else {
             "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->{1,2}(b) WHERE a.id = $anchor AND b.id = $target COLUMNS (b.id AS t))"
         };
-        assert_eq!(session.execute(query, params).unwrap().rows, expected, "denied source plus allowed target and edge yields zero on this real route");
+        assert_eq!(
+            session.execute(query, params).unwrap().rows,
+            expected,
+            "denied source plus allowed target and edge yields zero on this real route"
+        );
         if allow_source {
             let before = session.route_resources_for_test().unwrap();
             let caller_cancellation = contextdb_core::read_contract::OwnerReadCancellation::new();
             *observer.caller_cancellation.lock().unwrap() = Some(caller_cancellation.clone());
-            observer.armed.store(true, std::sync::atomic::Ordering::SeqCst);
-            let error = session.execute_with_cancellation(query, params, &caller_cancellation).unwrap_err();
+            observer
+                .armed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let error = session
+                .execute_with_cancellation(query, params, &caller_cancellation)
+                .unwrap_err();
             observer.caller_cancellation.lock().unwrap().take();
-            assert!(matches!(error, Error::ReadCancelled), "source-boundary cancellation keeps its exact public type: {error:?}");
-            let event = observer.first.lock().unwrap().take().expect("the real graph source callback fired");
-            assert_eq!(event.completed_items, 0, "cancellation is driven before the first graph edge is fetched");
+            assert!(
+                matches!(error, Error::ReadCancelled),
+                "source-boundary cancellation keeps its exact public type: {error:?}"
+            );
+            let event = observer
+                .first
+                .lock()
+                .unwrap()
+                .take()
+                .expect("the real graph source callback fired");
+            assert_eq!(
+                event.completed_items, 0,
+                "cancellation is driven before the first graph edge is fetched"
+            );
             let after = session.route_resources_for_test().unwrap();
-            assert_eq!(after.active_cursors, before.active_cursors, "cancelled statement releases its cursor lifetime");
-            assert_eq!(session.execute(query, params).unwrap().rows, expected, "fresh operation survives cancellation without changing the pinned source");
+            assert_eq!(
+                after.active_cursors, before.active_cursors,
+                "cancelled statement releases its cursor lifetime"
+            );
+            assert_eq!(
+                session.execute(query, params).unwrap().rows,
+                expected,
+                "fresh operation survives cancellation without changing the pinned source"
+            );
         }
         let cancelled = contextdb_core::read_contract::OwnerReadCancellation::new();
         cancelled.cancel();
-        let error = session.execute_with_cancellation(query, params, &cancelled).unwrap_err();
-        assert!(matches!(error, Error::ReadCancelled), "pre-cancelled public read keeps cancellation distinct from denied permission: {error:?}");
-        assert_eq!(session.execute(query, params).unwrap().rows, expected, "typed refusal and cancellation leave authorization and source answers unchanged");
+        let error = session
+            .execute_with_cancellation(query, params, &cancelled)
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::ReadCancelled),
+            "pre-cancelled public read keeps cancellation distinct from denied permission: {error:?}"
+        );
+        assert_eq!(
+            session.execute(query, params).unwrap().rows,
+            expected,
+            "typed refusal and cancellation leave authorization and source answers unchanged"
+        );
     }
 
     #[test]
     fn empty_declared_index_publishes_marker_and_postings_for_a_lazy_ordered_read() {
-
         {
             use redb::ReadableTable;
             let mut failures = Vec::new();
-            for damage in ["malformed_current", "malformed_historical", "native_page", "healthy_budget"] {
+            for damage in [
+                "malformed_current",
+                "malformed_historical",
+                "native_page",
+                "healthy_budget",
+            ] {
                 let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let directory = tempfile::tempdir().unwrap();
                     let path = directory.path().join("typed-relational-refusal.db");
                     let database = Database::open(&path).unwrap();
-                    database.execute("CREATE TABLE typed_refusal_rows (id INT PRIMARY KEY, body TEXT)", &HashMap::new()).unwrap();
+                    database
+                        .execute(
+                            "CREATE TABLE typed_refusal_rows (id INT PRIMARY KEY, body TEXT)",
+                            &HashMap::new(),
+                        )
+                        .unwrap();
                     let payload = "typed-relational-native-page-unique-marker-".repeat(8192);
-                    database.execute("INSERT INTO typed_refusal_rows VALUES (1, $body)",
-                        &HashMap::from([("body".into(), Value::Text(payload.clone()))])).unwrap();
+                    database
+                        .execute(
+                            "INSERT INTO typed_refusal_rows VALUES (1, $body)",
+                            &HashMap::from([("body".into(), Value::Text(payload.clone()))]),
+                        )
+                        .unwrap();
                     let historical = database.writer_read_root().unwrap().unwrap().snapshot;
-                    let selected = database.scan("typed_refusal_rows", historical).unwrap().remove(0);
+                    let selected = database
+                        .scan("typed_refusal_rows", historical)
+                        .unwrap()
+                        .remove(0);
                     if damage == "malformed_historical" {
-                        database.execute("UPDATE typed_refusal_rows SET body = 'new head' WHERE id = 1", &HashMap::new()).unwrap();
+                        database
+                            .execute(
+                                "UPDATE typed_refusal_rows SET body = 'new head' WHERE id = 1",
+                                &HashMap::new(),
+                            )
+                            .unwrap();
                     }
                     let current = database.writer_read_root().unwrap().unwrap().snapshot;
-                    let snapshot = if damage == "malformed_historical" { historical } else { current };
+                    let snapshot = if damage == "malformed_historical" {
+                        historical
+                    } else {
+                        current
+                    };
                     let statements = [
                         "SELECT id, body FROM typed_refusal_rows WHERE id = 1",
                         "SELECT id, body FROM typed_refusal_rows WHERE id IN (1, 2)",
                         "SELECT id, body FROM typed_refusal_rows",
                     ];
-                    let controls = statements.map(|sql| database.execute_at_snapshot(sql, &HashMap::new(), snapshot).unwrap().rows);
-                    assert!(controls.iter().all(|rows| !rows.is_empty()), "{damage}: every actual read door has a healthy answer");
+                    let controls = statements.map(|sql| {
+                        database
+                            .execute_at_snapshot(sql, &HashMap::new(), snapshot)
+                            .unwrap()
+                            .rows
+                    });
+                    assert!(
+                        controls.iter().all(|rows| !rows.is_empty()),
+                        "{damage}: every actual read door has a healthy answer"
+                    );
                     database.close().unwrap();
                     drop(database);
                     let key = RedbPersistence::rel_row_key(&selected);
@@ -45616,9 +48555,17 @@ mod empty_declared_index_readiness_tests {
                         let write = raw.begin_write().unwrap();
                         {
                             let mut table = write.open_table(definition).unwrap();
-                            assert!(table.get(key.as_slice()).unwrap().is_some(), "the real version key exists before body damage");
-                            table.insert(key.as_slice(), b"{not a versioned row".as_slice()).unwrap();
-                            assert!(table.get(key.as_slice()).unwrap().is_some(), "malformed bytes preserve the valid physical key");
+                            assert!(
+                                table.get(key.as_slice()).unwrap().is_some(),
+                                "the real version key exists before body damage"
+                            );
+                            table
+                                .insert(key.as_slice(), b"{not a versioned row".as_slice())
+                                .unwrap();
+                            assert!(
+                                table.get(key.as_slice()).unwrap().is_some(),
+                                "malformed bytes preserve the valid physical key"
+                            );
                         }
                         write.commit().unwrap();
                         drop(raw);
@@ -45632,10 +48579,20 @@ mod empty_declared_index_readiness_tests {
                         };
                         drop(raw);
                         let mut file = std::fs::read(&path).unwrap();
-                        let offsets: Vec<_> = file.windows(encoded.len()).enumerate()
-                            .filter_map(|(offset, bytes)| (bytes == encoded.as_slice()).then_some(offset)).collect();
-                        assert!(!offsets.is_empty(), "locate the actual persisted relational body, without a guessed page offset");
-                        for offset in offsets { file[offset + encoded.len() - 2] ^= 1; }
+                        let offsets: Vec<_> = file
+                            .windows(encoded.len())
+                            .enumerate()
+                            .filter_map(|(offset, bytes)| {
+                                (bytes == encoded.as_slice()).then_some(offset)
+                            })
+                            .collect();
+                        assert!(
+                            !offsets.is_empty(),
+                            "locate the actual persisted relational body, without a guessed page offset"
+                        );
+                        for offset in offsets {
+                            file[offset + encoded.len() - 2] ^= 1;
+                        }
                         std::fs::write(&path, file).unwrap();
                     }
                     if damage == "healthy_budget" {
@@ -45650,50 +48607,89 @@ mod empty_declared_index_readiness_tests {
                         // vocabulary (dev contract); the store budget keeps its
                         // MemoryBudgetExceeded. Either is the typed memory refusal.
                         let typed_memory = match &error {
-                            Error::MemoryBudgetExceeded { requested_bytes, available_bytes, .. } => requested_bytes > available_bytes,
+                            Error::MemoryBudgetExceeded {
+                                requested_bytes,
+                                available_bytes,
+                                ..
+                            } => requested_bytes > available_bytes,
                             Error::ReadFailure(failure) => matches!(failure.detail(),
                                 contextdb_core::read_contract::ReadFailureDetail::OwnerLimitExceeded(detail)
                                     if detail.limit == contextdb_core::read_contract::ReadFailureLimit::Memory),
                             _ => false,
                         };
-                        assert!(typed_memory, "a healthy body that exceeds actual admission retains typed memory refusal: {error:?}");
-                        assert!(!matches!(&error, Error::StoreCorrupted { .. }),
-                            "a tight budget on healthy data must never report store corruption: {error:?}");
+                        assert!(
+                            typed_memory,
+                            "a healthy body that exceeds actual admission retains typed memory refusal: {error:?}"
+                        );
+                        assert!(
+                            !matches!(&error, Error::StoreCorrupted { .. }),
+                            "a tight budget on healthy data must never report store corruption: {error:?}"
+                        );
                         drop(reader);
-                        let reader = ReadSession::open_with_options(&path, ReadSessionOptions::default()).unwrap();
-                        assert_eq!(reader.execute(statements[2], &HashMap::new()).unwrap().rows, controls[2], "tight-budget refusal preserves the healthy store and its complete answer");
+                        let reader =
+                            ReadSession::open_with_options(&path, ReadSessionOptions::default())
+                                .unwrap();
+                        assert_eq!(
+                            reader.execute(statements[2], &HashMap::new()).unwrap().rows,
+                            controls[2],
+                            "tight-budget refusal preserves the healthy store and its complete answer"
+                        );
                     } else if damage == "native_page" {
-                        let result = ReadSession::open_with_options(&path, ReadSessionOptions::default())
-                            .and_then(|reader| reader.execute(statements[2], &HashMap::new()));
+                        let result =
+                            ReadSession::open_with_options(&path, ReadSessionOptions::default())
+                                .and_then(|reader| reader.execute(statements[2], &HashMap::new()));
                         match result {
-                            Err(Error::StoreCorrupted { reason, .. }) => assert!(!reason.is_empty(), "native relational page corruption explains its refusal"),
-                            other => panic!("native relational page corruption must refuse as StoreCorrupted: {other:?}"),
+                            Err(Error::StoreCorrupted { reason, .. }) => assert!(
+                                !reason.is_empty(),
+                                "native relational page corruption explains its refusal"
+                            ),
+                            other => panic!(
+                                "native relational page corruption must refuse as StoreCorrupted: {other:?}"
+                            ),
                         }
                     } else {
                         let database = Database::open(&path).unwrap();
                         let mut failed_doors = Vec::new();
                         for sql in statements {
-                            match if damage == "malformed_current" { database.execute(sql, &HashMap::new()) } else { database.execute_at_snapshot(sql, &HashMap::new(), snapshot) } {
-                                Err(Error::StoreCorrupted { reason, .. }) if !reason.is_empty() => {},
+                            match if damage == "malformed_current" {
+                                database.execute(sql, &HashMap::new())
+                            } else {
+                                database.execute_at_snapshot(sql, &HashMap::new(), snapshot)
+                            } {
+                                Err(Error::StoreCorrupted { reason, .. }) if !reason.is_empty() => {
+                                }
                                 other => failed_doors.push((sql, format!("{other:?}"))),
                             }
                         }
-                        assert!(failed_doors.is_empty(), "{damage}: every malformed valid-key point/list/scan door must refuse as StoreCorrupted with a reason: {failed_doors:?}");
+                        assert!(
+                            failed_doors.is_empty(),
+                            "{damage}: every malformed valid-key point/list/scan door must refuse as StoreCorrupted with a reason: {failed_doors:?}"
+                        );
                     }
                 }));
-                if attempt.is_err() { failures.push(damage); }
+                if attempt.is_err() {
+                    failures.push(damage);
+                }
             }
-            assert_eq!(failures, Vec::<&str>::new(), "malformed bodies and native page corruption retain StoreCorrupted while healthy admission exhaustion retains MemoryBudgetExceeded");
+            assert_eq!(
+                failures,
+                Vec::<&str>::new(),
+                "malformed bodies and native page corruption retain StoreCorrupted while healthy admission exhaustion retains MemoryBudgetExceeded"
+            );
         }
         {
-            use redb::{ReadableTable};
+            use redb::ReadableTable;
             let mut failures = Vec::new();
-            for damage in ["valid_key_historical_body", "missing_historical_version", "omitted_first_posting"] {
+            for damage in [
+                "valid_key_historical_body",
+                "missing_historical_version",
+                "omitted_first_posting",
+            ] {
                 let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let directory = tempfile::tempdir().unwrap();
                     let path = directory.path().join("public-writer-historical-gap.db");
                     let table_name = "public_history_rows";
-                                        let sql = if damage == "omitted_first_posting" {
+                    let sql = if damage == "omitted_first_posting" {
                         "SELECT id, body FROM public_history_rows ORDER BY bucket ASC LIMIT 1"
                     } else {
                         "SELECT id, body FROM public_history_rows WHERE bucket IN (1, 3)"
@@ -45706,96 +48702,196 @@ mod empty_declared_index_readiness_tests {
                         "INSERT INTO public_history_rows (id, bucket, body) VALUES (2, 2, 'unaffected')",
                         "UPDATE public_history_rows SET body = 'interior' WHERE id = 1",
                     ] {
-                        if statement.starts_with("CREATE INDEX") && damage != "omitted_first_posting" { continue; }
+                        if statement.starts_with("CREATE INDEX")
+                            && damage != "omitted_first_posting"
+                        {
+                            continue;
+                        }
                         database.execute(statement, &HashMap::new()).unwrap();
                     }
                     let historical = database.writer_read_root().unwrap().unwrap().snapshot;
-                    let expected = database.execute_at_snapshot(sql, &HashMap::new(), historical).unwrap();
-                    eprintln!("CDB137_PUBLIC_CONTROL {damage}: plan={:?}, index={:?}", expected.trace.physical_plan, expected.trace.index_used);
-                    let index_name = expected.trace.index_used.clone().expect("the public control selects a maintained index");
+                    let expected = database
+                        .execute_at_snapshot(sql, &HashMap::new(), historical)
+                        .unwrap();
+                    eprintln!(
+                        "CDB137_PUBLIC_CONTROL {damage}: plan={:?}, index={:?}",
+                        expected.trace.physical_plan, expected.trace.index_used
+                    );
+                    let index_name = expected
+                        .trace
+                        .index_used
+                        .clone()
+                        .expect("the public control selects a maintained index");
                     if damage != "omitted_first_posting" {
                         let meta = database.table_meta(table_name).unwrap();
-                        let selected = meta.indexes.iter().find(|declaration| declaration.name == index_name).unwrap();
-                        assert_eq!(selected.kind, contextdb_core::IndexKind::Auto, "the historical IN-list binds the actual automatic exact-index door");
-                        assert_eq!(selected.columns.len(), 1, "the automatic exact door has one declared key column");
+                        let selected = meta
+                            .indexes
+                            .iter()
+                            .find(|declaration| declaration.name == index_name)
+                            .unwrap();
+                        assert_eq!(
+                            selected.kind,
+                            contextdb_core::IndexKind::Auto,
+                            "the historical IN-list binds the actual automatic exact-index door"
+                        );
+                        assert_eq!(
+                            selected.columns.len(),
+                            1,
+                            "the automatic exact door has one declared key column"
+                        );
                     }
-                    assert!(!expected.rows.is_empty(), "{damage}: a real historical answer is owed");
-                    database.execute("UPDATE public_history_rows SET body = 'head' WHERE id = 1", &HashMap::new()).unwrap();
+                    assert!(
+                        !expected.rows.is_empty(),
+                        "{damage}: a real historical answer is owed"
+                    );
+                    database
+                        .execute(
+                            "UPDATE public_history_rows SET body = 'head' WHERE id = 1",
+                            &HashMap::new(),
+                        )
+                        .unwrap();
                     drop(database);
                     let reopened = Database::open(&path).unwrap();
-                    let complete = reopened.execute_at_snapshot(sql, &HashMap::new(), historical).unwrap();
-                    assert_eq!(complete.rows, expected.rows, "{damage}: cold public historical control equals the pre-close answer");
+                    let complete = reopened
+                        .execute_at_snapshot(sql, &HashMap::new(), historical)
+                        .unwrap();
+                    assert_eq!(
+                        complete.rows, expected.rows,
+                        "{damage}: cold public historical control equals the pre-close answer"
+                    );
                     drop(reopened);
-                    let fixture_open_accountant_44039 = std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-                    let _fixture_decode_scope_44039 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_44039).into()).unwrap();
+                    let fixture_open_accountant_44039 =
+                        std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+                    let _fixture_decode_scope_44039 =
+                        crate::read_image_memory::ImageMemory::enter_writer_operation(
+                            std::sync::Arc::clone(&fixture_open_accountant_44039).into(),
+                        )
+                        .unwrap();
                     let store = RedbPersistence::open(&path).unwrap();
-                    store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_44039).into());
-                    let metadata = store.load_all_table_meta().unwrap().remove(table_name).unwrap();
+                    store.attach_memory_accountant(
+                        std::sync::Arc::clone(&fixture_open_accountant_44039).into(),
+                    );
+                    let metadata = store
+                        .load_all_table_meta()
+                        .unwrap()
+                        .remove(table_name)
+                        .unwrap();
                     let versions = store.load_relational_table(table_name).unwrap();
-                    let interior = versions.into_iter().find(|row| row.values.get("body") == Some(&Value::Text("interior".into()))).unwrap();
+                    let interior = versions
+                        .into_iter()
+                        .find(|row| row.values.get("body") == Some(&Value::Text("interior".into())))
+                        .unwrap();
                     let key = RedbPersistence::rel_row_key(&interior);
                     drop(store);
                     drop(_fixture_decode_scope_44039);
                     let raw = redb::Database::open(&path).unwrap();
                     let write = raw.begin_write().unwrap();
                     if damage == "omitted_first_posting" {
-                        let name = RedbPersistence::relational_index_table_name(table_name, &index_name);
-                        let mut postings = write.open_table(TableDefinition::<DurableRelationalIndexKey, &[u8]>::new(&name)).unwrap();
-                        let first = postings.iter().unwrap().find_map(|item| {
-                            let (key, value) = item.unwrap();
-                            let position = key.value().decode_canonical().unwrap();
-                            let deleted: Option<TxId> = RedbPersistence::decode_exact(value.value()).unwrap();
-                            (position.row_id == interior.row_id && position.created_tx.0 <= historical.0 && deleted.is_none_or(|tx| tx.0 > historical.0)).then(|| key.value())
-                        }).unwrap();
-                        assert!(postings.remove(&first).unwrap().is_some(), "{damage}: the real first historical posting was omitted");
+                        let name =
+                            RedbPersistence::relational_index_table_name(table_name, &index_name);
+                        let mut postings = write
+                            .open_table(TableDefinition::<DurableRelationalIndexKey, &[u8]>::new(
+                                &name,
+                            ))
+                            .unwrap();
+                        let first = postings
+                            .iter()
+                            .unwrap()
+                            .find_map(|item| {
+                                let (key, value) = item.unwrap();
+                                let position = key.value().decode_canonical().unwrap();
+                                let deleted: Option<TxId> =
+                                    RedbPersistence::decode_exact(value.value()).unwrap();
+                                (position.row_id == interior.row_id
+                                    && position.created_tx.0 <= historical.0
+                                    && deleted.is_none_or(|tx| tx.0 > historical.0))
+                                .then(|| key.value())
+                            })
+                            .unwrap();
+                        assert!(
+                            postings.remove(&first).unwrap().is_some(),
+                            "{damage}: the real first historical posting was omitted"
+                        );
                     } else {
                         let name = RedbPersistence::rel_table_name(table_name);
-                        let mut rows = write.open_table(TableDefinition::<&[u8], &[u8]>::new(&name)).unwrap();
+                        let mut rows = write
+                            .open_table(TableDefinition::<&[u8], &[u8]>::new(&name))
+                            .unwrap();
                         if damage == "valid_key_historical_body" {
                             let mut changed = interior.clone();
-                            changed.values.insert("body".into(), Value::Text("wrong historical value".into()));
-                            assert_eq!(RedbPersistence::rel_row_key(&changed), key, "body tampering preserves the real physical version key");
-                            let body = RedbPersistence::encode_versioned_row(&changed, Some(&metadata)).unwrap();
+                            changed.values.insert(
+                                "body".into(),
+                                Value::Text("wrong historical value".into()),
+                            );
+                            assert_eq!(
+                                RedbPersistence::rel_row_key(&changed),
+                                key,
+                                "body tampering preserves the real physical version key"
+                            );
+                            let body =
+                                RedbPersistence::encode_versioned_row(&changed, Some(&metadata))
+                                    .unwrap();
                             rows.insert(key.as_slice(), body.as_slice()).unwrap();
                         } else {
-                            assert!(rows.remove(key.as_slice()).unwrap().is_some(), "the owed historical version was physically removed");
+                            assert!(
+                                rows.remove(key.as_slice()).unwrap().is_some(),
+                                "the owed historical version was physically removed"
+                            );
                         }
                     }
                     write.commit().unwrap();
                     drop(raw);
                     let database = Database::open(&path).unwrap();
                     match database.execute_at_snapshot(sql, &HashMap::new(), historical) {
-                        Err(Error::StoreCorrupted { path: logical, reason }) => {
-                            assert!(!logical.is_empty() && !reason.is_empty(), "{damage}: typed corruption identifies its logical source");
+                        Err(Error::StoreCorrupted {
+                            path: logical,
+                            reason,
+                        }) => {
+                            assert!(
+                                !logical.is_empty() && !reason.is_empty(),
+                                "{damage}: typed corruption identifies its logical source"
+                            );
                         }
-                        Ok(actual) => panic!("{damage}: required corruption refusal before wrong historical answer; actual={:?}; fresh_control={:?}", actual.rows, expected.rows),
+                        Ok(actual) => panic!(
+                            "{damage}: required corruption refusal before wrong historical answer; actual={:?}; fresh_control={:?}",
+                            actual.rows, expected.rows
+                        ),
                         Err(other) => panic!("{damage}: required typed corruption, got {other:?}"),
                     }
                     drop(database);
                 }));
-                if attempt.is_err() { failures.push(damage); }
-            }
-            assert_eq!(failures, Vec::<&str>::new(), "all three public historical writer gaps refuse before a wrong answer");
-        }
-        if graph_compaction_interruption_child() { return; }
-        if graph_durability_interruption_child() { return; }
-        {
-    
-        // One differential row, multiple adversarial cells, against the real serializer.
-        let window = 64_usize * 1024; // Exact native emitter window at emit_string_content.
-        let mut adversarial_json_values = Vec::new();
-        for character in ['é', '€', '🦀'] {
-            for split in 1..character.len_utf8() {
-                for output_prefix in [0_usize, 1, 2] {
-                    let mut text = "a".repeat(window - split - output_prefix);
-                    text.push(character);
-                    text.push_str("\0\u{0001}\u{0008}\t\n\r\u{001f}\"\\\u{2028}\u{2029}");
-                    text.push_str(&"z".repeat(window + character.len_utf8()));
-                    adversarial_json_values.push(serde_json::Value::String(text));
+                if attempt.is_err() {
+                    failures.push(damage);
                 }
             }
+            assert_eq!(
+                failures,
+                Vec::<&str>::new(),
+                "all three public historical writer gaps refuse before a wrong answer"
+            );
         }
-        adversarial_json_values.push(serde_json::json!({
+        if graph_compaction_interruption_child() {
+            return;
+        }
+        if graph_durability_interruption_child() {
+            return;
+        }
+        {
+            // One differential row, multiple adversarial cells, against the real serializer.
+            let window = 64_usize * 1024; // Exact native emitter window at emit_string_content.
+            let mut adversarial_json_values = Vec::new();
+            for character in ['é', '€', '🦀'] {
+                for split in 1..character.len_utf8() {
+                    for output_prefix in [0_usize, 1, 2] {
+                        let mut text = "a".repeat(window - split - output_prefix);
+                        text.push(character);
+                        text.push_str("\0\u{0001}\u{0008}\t\n\r\u{001f}\"\\\u{2028}\u{2029}");
+                        text.push_str(&"z".repeat(window + character.len_utf8()));
+                        adversarial_json_values.push(serde_json::Value::String(text));
+                    }
+                }
+            }
+            adversarial_json_values.push(serde_json::json!({
             "quoted\"key\\with\ncontrols\u{2028}": [
                 {"nested": "quoted\"text\\slashes\u{2029}", "empty": []},
                 {"numbers": [i64::MIN, i64::MAX, u64::MAX, -0.0_f64, f64::MAX, f64::MIN_POSITIVE, 5e-324_f64, -123456789.125_f64]},
@@ -45803,23 +48899,42 @@ mod empty_declared_index_readiness_tests {
             ],
             "empty-map": {}, "empty-string": ""
         }));
-        adversarial_json_values.push(serde_json::json!([
-            "\u{2028}\u{2029}", "\\\"\\\"", [], {},
-            {"large-string": "🌍".repeat(window), "nested-json": {"quoted": "\"\\"}}
-        ]));
-            let mut values: Vec<contextdb_core::Value> = adversarial_json_values.into_iter()
+            adversarial_json_values.push(serde_json::json!([
+                "\u{2028}\u{2029}", "\\\"\\\"", [], {},
+                {"large-string": "🌍".repeat(window), "nested-json": {"quoted": "\"\\"}}
+            ]));
+            let mut values: Vec<contextdb_core::Value> = adversarial_json_values
+                .into_iter()
                 .flat_map(|json| match json {
-                    serde_json::Value::String(text) => vec![contextdb_core::Value::Text(text.clone()), contextdb_core::Value::Json(serde_json::Value::String(text))],
+                    serde_json::Value::String(text) => vec![
+                        contextdb_core::Value::Text(text.clone()),
+                        contextdb_core::Value::Json(serde_json::Value::String(text)),
+                    ],
                     other => vec![contextdb_core::Value::Json(other)],
-                }).collect();
-            values.extend([contextdb_core::Value::Int64(i64::MIN), contextdb_core::Value::Int64(i64::MAX), contextdb_core::Value::Float64(-123456789.125), contextdb_core::Value::Float64(-0.0), contextdb_core::Value::Float64(f64::MAX)]);
+                })
+                .collect();
+            values.extend([
+                contextdb_core::Value::Int64(i64::MIN),
+                contextdb_core::Value::Int64(i64::MAX),
+                contextdb_core::Value::Float64(-123456789.125),
+                contextdb_core::Value::Float64(-0.0),
+                contextdb_core::Value::Float64(f64::MAX),
+            ]);
             for value in values {
-                let expected = serde_json::to_string(&value).expect("reference Value serialization");
+                let expected =
+                    serde_json::to_string(&value).expect("reference Value serialization");
                 let mut actual = Vec::new();
                 crate::persistence::content_identity::version_manifest::emit_value(
-                    &mut actual, &value, &mut || Ok(()),
-                ).expect("bounded native Value emission");
-                assert_eq!(actual, expected.as_bytes(), "bounded Value emission equals serde_json byte for byte");
+                    &mut actual,
+                    &value,
+                    &mut || Ok(()),
+                )
+                .expect("bounded native Value emission");
+                assert_eq!(
+                    actual,
+                    expected.as_bytes(),
+                    "bounded Value emission equals serde_json byte for byte"
+                );
             }
         }
         let root = tempfile::tempdir().expect("task-scoped empty-index directory");
@@ -45835,20 +48950,66 @@ mod empty_declared_index_readiness_tests {
             let fixture_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let path = root.path().join(format!("addressed-{damage}.db"));
                 let database = Database::open(&path).unwrap();
-                database.execute("CREATE TABLE addressed_rows (id INT PRIMARY KEY, body TEXT)", &HashMap::new()).unwrap();
-                database.execute("CREATE TABLE addressed_control (id INT PRIMARY KEY, body TEXT)", &HashMap::new()).unwrap();
-                database.execute("INSERT INTO addressed_control VALUES (1, 'unaffected')", &HashMap::new()).unwrap();
-                database.execute("INSERT INTO addressed_rows VALUES (1, 'first')", &HashMap::new()).unwrap();
-                database.execute("UPDATE addressed_rows SET body = 'interior' WHERE id = 1", &HashMap::new()).unwrap();
+                database
+                    .execute(
+                        "CREATE TABLE addressed_rows (id INT PRIMARY KEY, body TEXT)",
+                        &HashMap::new(),
+                    )
+                    .unwrap();
+                database
+                    .execute(
+                        "CREATE TABLE addressed_control (id INT PRIMARY KEY, body TEXT)",
+                        &HashMap::new(),
+                    )
+                    .unwrap();
+                database
+                    .execute(
+                        "INSERT INTO addressed_control VALUES (1, 'unaffected')",
+                        &HashMap::new(),
+                    )
+                    .unwrap();
+                database
+                    .execute(
+                        "INSERT INTO addressed_rows VALUES (1, 'first')",
+                        &HashMap::new(),
+                    )
+                    .unwrap();
+                database
+                    .execute(
+                        "UPDATE addressed_rows SET body = 'interior' WHERE id = 1",
+                        &HashMap::new(),
+                    )
+                    .unwrap();
                 let historical = database.writer_read_root().unwrap().unwrap().snapshot;
-                let historical_row = database.scan("addressed_rows", historical).unwrap().into_iter().next().unwrap();
-                database.execute("UPDATE addressed_rows SET body = 'head' WHERE id = 1", &HashMap::new()).unwrap();
+                let historical_row = database
+                    .scan("addressed_rows", historical)
+                    .unwrap()
+                    .into_iter()
+                    .next()
+                    .unwrap();
+                database
+                    .execute(
+                        "UPDATE addressed_rows SET body = 'head' WHERE id = 1",
+                        &HashMap::new(),
+                    )
+                    .unwrap();
                 if damage == "entirely_missing_deleted_group" {
-                    database.execute("DELETE FROM addressed_rows WHERE id = 1", &HashMap::new()).unwrap();
+                    database
+                        .execute("DELETE FROM addressed_rows WHERE id = 1", &HashMap::new())
+                        .unwrap();
                 }
                 let current = database.writer_read_root().unwrap().unwrap().snapshot;
-                let current_row = database.scan("addressed_rows", current).unwrap().into_iter().next();
-                let control = database.scan("addressed_control", current).unwrap().into_iter().next().unwrap();
+                let current_row = database
+                    .scan("addressed_rows", current)
+                    .unwrap()
+                    .into_iter()
+                    .next();
+                let control = database
+                    .scan("addressed_control", current)
+                    .unwrap()
+                    .into_iter()
+                    .next()
+                    .unwrap();
                 let meta = database.table_meta("addressed_rows").unwrap();
                 let control_meta = database.table_meta("addressed_control").unwrap();
                 let provider = database.declared_read_request_provider();
@@ -45858,23 +49019,38 @@ mod empty_declared_index_readiness_tests {
 
                 // Identify and save the physical member through the production
                 // row-key helper and decoder; no test codec or key layout.
-                let fixture_open_accountant_44167 = std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-                let _fixture_decode_scope_44167 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_44167).into()).unwrap();
+                let fixture_open_accountant_44167 =
+                    std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+                let _fixture_decode_scope_44167 =
+                    crate::read_image_memory::ImageMemory::enter_writer_operation(
+                        std::sync::Arc::clone(&fixture_open_accountant_44167).into(),
+                    )
+                    .unwrap();
                 let store = RedbPersistence::open(&path).unwrap();
-                store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_44167).into());
+                store.attach_memory_accountant(
+                    std::sync::Arc::clone(&fixture_open_accountant_44167).into(),
+                );
                 let versions = store.load_relational_table("addressed_rows").unwrap();
                 drop(store);
                 drop(_fixture_decode_scope_44167);
                 let interior_key = RedbPersistence::rel_row_key(&historical_row);
-                let group_keys = versions.iter().filter(|row| row.row_id == historical_row.row_id)
-                    .map(RedbPersistence::rel_row_key).collect::<Vec<_>>();
+                let group_keys = versions
+                    .iter()
+                    .filter(|row| row.row_id == historical_row.row_id)
+                    .map(RedbPersistence::rel_row_key)
+                    .collect::<Vec<_>>();
                 let table_name = RedbPersistence::rel_table_name("addressed_rows");
                 let definition = TableDefinition::<&[u8], &[u8]>::new(&table_name);
                 let raw = redb::Database::create(&path).unwrap();
                 let interior_bytes = {
                     let read = raw.begin_read().unwrap();
                     let table = read.open_table(definition).unwrap();
-                    table.get(interior_key.as_slice()).unwrap().unwrap().value().to_vec()
+                    table
+                        .get(interior_key.as_slice())
+                        .unwrap()
+                        .unwrap()
+                        .value()
+                        .to_vec()
                 };
                 drop(raw);
 
@@ -45884,13 +49060,21 @@ mod empty_declared_index_readiness_tests {
                             // Lawful replacement retires the exact member;
                             // restoring its saved bytes then makes it extra.
                             let fixture_open_accountant_44188 = fixture_writer_accountant.clone();
-                            let _fixture_decode_scope_44188 = crate::read_image_memory::ImageMemory::enter_writer_operation(fixture_open_accountant_44188.clone()).unwrap();
+                            let _fixture_decode_scope_44188 =
+                                crate::read_image_memory::ImageMemory::enter_writer_operation(
+                                    fixture_open_accountant_44188.clone(),
+                                )
+                                .unwrap();
                             let store = RedbPersistence::open(&path).unwrap();
                             store.attach_memory_accountant(fixture_open_accountant_44188.clone());
-                            let retained = versions.iter().filter(|row|
-                                RedbPersistence::rel_row_key(row) != interior_key
-                            ).cloned().collect::<Vec<_>>();
-                            store.rewrite_table_rows("addressed_rows", &retained).unwrap();
+                            let retained = versions
+                                .iter()
+                                .filter(|row| RedbPersistence::rel_row_key(row) != interior_key)
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            store
+                                .rewrite_table_rows("addressed_rows", &retained)
+                                .unwrap();
                             drop(store);
                             drop(_fixture_decode_scope_44188);
                         }
@@ -45903,11 +49087,21 @@ mod empty_declared_index_readiness_tests {
                                     table.remove(interior_key.as_slice()).unwrap().unwrap();
                                 }
                                 "injected_extra_version" => {
-                                    assert!(table.insert(interior_key.as_slice(), interior_bytes.as_slice()).unwrap().is_none(),
-                                        "{damage}: the lawful replacement retired exactly the injected physical member");
+                                    assert!(
+                                        table
+                                            .insert(
+                                                interior_key.as_slice(),
+                                                interior_bytes.as_slice()
+                                            )
+                                            .unwrap()
+                                            .is_none(),
+                                        "{damage}: the lawful replacement retired exactly the injected physical member"
+                                    );
                                 }
                                 "entirely_missing_deleted_group" | "false_terminal_absence" => {
-                                    for key in &group_keys { table.remove(key.as_slice()).unwrap().unwrap(); }
+                                    for key in &group_keys {
+                                        table.remove(key.as_slice()).unwrap().unwrap();
+                                    }
                                 }
                                 _ => unreachable!(),
                             }
@@ -45922,73 +49116,168 @@ mod empty_declared_index_readiness_tests {
                         ("current", current, current_row.as_ref()),
                     ] {
                         for door in ["point", "identity", "batch"] {
-                            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                let limits = ReadSessionOptions::default().limits;
-                                let context = crate::executor::bounded::ReadOpenContext::new(
-                                    provider.request_budget().unwrap(), limits,
-                                    crate::read_session::read_clock(), OwnerReadCancellation::new(),
-                                ).unwrap();
-                                context.checkpoint().unwrap();
-                                let memory = context.read_memory();
-                                let decoded = crate::read_image_memory::ImageMemory::charging_reader(
-                                    source._source_memory.memory.accountant.clone(), memory.clone(),
-                                );
-                                let (control_result, result) = graph_read::with_pages(memory, || decoded.scope(|| {
-                                    source.with_read(|read| {
-                                        context.checkpoint()?;
-                                        let pair = match door {
-                                            "point" => (
-                                                source.row_by_id_in_read(read, "addressed_control", &control_meta, control.row_id, snapshot),
-                                                source.row_by_id_in_read(read, "addressed_rows", &meta, historical_row.row_id, snapshot),
-                                            ),
-                                            "identity" => (
-                                                source.row_identity_by_id_in_read(read, "addressed_control", &control_meta, control.row_id, snapshot, None),
-                                                source.row_identity_by_id_in_read(read, "addressed_rows", &meta, historical_row.row_id, snapshot, None),
-                                            ),
-                                            "batch" => {
-                                                // The established verifier owns proof funding. Its
-                                                // constructor caps reuse at the existing source cap.
-                                                let mut batch = source.content_identity.batch(RETAINED_CONTENT_PROOF_BYTES);
-                                                (
-                                                    source.row_identity_by_id_in_read(read, "addressed_control", &control_meta, control.row_id, snapshot, Some(&mut batch)),
-                                                    source.row_identity_by_id_in_read(read, "addressed_rows", &meta, historical_row.row_id, snapshot, Some(&mut batch)),
-                                                )
+                            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                                || {
+                                    let limits = ReadSessionOptions::default().limits;
+                                    let context = crate::executor::bounded::ReadOpenContext::new(
+                                        provider.request_budget().unwrap(),
+                                        limits,
+                                        crate::read_session::read_clock(),
+                                        OwnerReadCancellation::new(),
+                                    )
+                                    .unwrap();
+                                    context.checkpoint().unwrap();
+                                    let memory = context.read_memory();
+                                    let decoded =
+                                        crate::read_image_memory::ImageMemory::charging_reader(
+                                            source._source_memory.memory.accountant.clone(),
+                                            memory.clone(),
+                                        );
+                                    let (control_result, result) =
+                                        graph_read::with_pages(memory, || {
+                                            decoded.scope(|| {
+                                                source.with_read(|read| {
+                                                    context.checkpoint()?;
+                                                    let pair = match door {
+                                                        "point" => (
+                                                            source.row_by_id_in_read(
+                                                                read,
+                                                                "addressed_control",
+                                                                &control_meta,
+                                                                control.row_id,
+                                                                snapshot,
+                                                            ),
+                                                            source.row_by_id_in_read(
+                                                                read,
+                                                                "addressed_rows",
+                                                                &meta,
+                                                                historical_row.row_id,
+                                                                snapshot,
+                                                            ),
+                                                        ),
+                                                        "identity" => (
+                                                            source.row_identity_by_id_in_read(
+                                                                read,
+                                                                "addressed_control",
+                                                                &control_meta,
+                                                                control.row_id,
+                                                                snapshot,
+                                                                None,
+                                                            ),
+                                                            source.row_identity_by_id_in_read(
+                                                                read,
+                                                                "addressed_rows",
+                                                                &meta,
+                                                                historical_row.row_id,
+                                                                snapshot,
+                                                                None,
+                                                            ),
+                                                        ),
+                                                        "batch" => {
+                                                            // The established verifier owns proof funding. Its
+                                                            // constructor caps reuse at the existing source cap.
+                                                            let mut batch =
+                                                                source.content_identity.batch(
+                                                                    RETAINED_CONTENT_PROOF_BYTES,
+                                                                );
+                                                            (
+                                                                source.row_identity_by_id_in_read(
+                                                                    read,
+                                                                    "addressed_control",
+                                                                    &control_meta,
+                                                                    control.row_id,
+                                                                    snapshot,
+                                                                    Some(&mut batch),
+                                                                ),
+                                                                source.row_identity_by_id_in_read(
+                                                                    read,
+                                                                    "addressed_rows",
+                                                                    &meta,
+                                                                    historical_row.row_id,
+                                                                    snapshot,
+                                                                    Some(&mut batch),
+                                                                ),
+                                                            )
+                                                        }
+                                                        _ => unreachable!(),
+                                                    };
+                                                    context.checkpoint()?;
+                                                    Ok(pair)
+                                                })
+                                            })
+                                        })
+                                        .unwrap();
+                                    assert_eq!(
+                                        control_result.unwrap().map(|(row, _memory)| (
+                                            row.row_id,
+                                            row.created_tx,
+                                            row.lsn,
+                                            row.values
+                                        )),
+                                        Some((
+                                            control.row_id,
+                                            control.created_tx,
+                                            control.lsn,
+                                            control.values.clone()
+                                        )),
+                                        "{damage}/{phase}/{snapshot_name}/{door}: the unaffected answer equals its fresh pre-close control"
+                                    );
+                                    if phase == "valid" {
+                                        assert_eq!(
+                                            result.unwrap().map(|(row, _memory)| (
+                                                row.row_id,
+                                                row.created_tx,
+                                                row.lsn,
+                                                row.values
+                                            )),
+                                            expected.map(|row| (
+                                                row.row_id,
+                                                row.created_tx,
+                                                row.lsn,
+                                                row.values.clone()
+                                            )),
+                                            "{damage}/{phase}/{snapshot_name}/{door}: reopened value, identity and lawful deletion absence equal the fresh DML control"
+                                        );
+                                    } else {
+                                        match result {
+                                            Err(Error::StoreCorrupted {
+                                                path: actual,
+                                                reason,
+                                            }) => {
+                                                assert_eq!(
+                                                    actual,
+                                                    path.display().to_string(),
+                                                    "{damage}/{snapshot_name}/{door}: pre-exposure refusal names the damaged store"
+                                                );
+                                                assert!(
+                                                    !reason.is_empty(),
+                                                    "{damage}/{snapshot_name}/{door}: pre-exposure refusal explains the incomplete group"
+                                                );
                                             }
-                                            _ => unreachable!(),
-                                        };
-                                        context.checkpoint()?;
-                                        Ok(pair)
-                                    })
-                                })).unwrap();
-                                assert_eq!(control_result.unwrap().map(|(row, _memory)| (row.row_id, row.created_tx, row.lsn, row.values)),
-                                    Some((control.row_id, control.created_tx, control.lsn, control.values.clone())),
-                                    "{damage}/{phase}/{snapshot_name}/{door}: the unaffected answer equals its fresh pre-close control");
-                                if phase == "valid" {
-                                    assert_eq!(result.unwrap().map(|(row, _memory)| (row.row_id, row.created_tx, row.lsn, row.values)),
-                                        expected.map(|row| (row.row_id, row.created_tx, row.lsn, row.values.clone())),
-                                        "{damage}/{phase}/{snapshot_name}/{door}: reopened value, identity and lawful deletion absence equal the fresh DML control");
-                                } else {
-                                    match result {
-                                        Err(Error::StoreCorrupted { path: actual, reason }) => {
-                                            assert_eq!(actual, path.display().to_string(),
-                                                "{damage}/{snapshot_name}/{door}: pre-exposure refusal names the damaged store");
-                                            assert!(!reason.is_empty(),
-                                                "{damage}/{snapshot_name}/{door}: pre-exposure refusal explains the incomplete group");
+                                            other => panic!(
+                                                "{damage}/{snapshot_name}/{door}: refuse before returning any affected value, identity or absence, got {other:?}"
+                                            ),
                                         }
-                                        other => panic!("{damage}/{snapshot_name}/{door}: refuse before returning any affected value, identity or absence, got {other:?}"),
                                     }
-                                }
-                            }));
-                            if outcome.is_err() { failed_addressed_rows.push((damage, phase, snapshot_name, door)); }
+                                },
+                            ));
+                            if outcome.is_err() {
+                                failed_addressed_rows.push((damage, phase, snapshot_name, door));
+                            }
                         }
                     }
                     drop((source, image));
                 }
             }));
-            if fixture_outcome.is_err() { failed_addressed_rows.push((damage, "setup", "setup", "setup")); }
+            if fixture_outcome.is_err() {
+                failed_addressed_rows.push((damage, "setup", "setup", "setup"));
+            }
         }
-        assert_eq!(failed_addressed_rows, Vec::<(&str, &str, &str, &str)>::new(),
-            "every named addressed-read row and clean control must run and satisfy its oracle before the inherited host");
+        assert_eq!(
+            failed_addressed_rows,
+            Vec::<(&str, &str, &str, &str)>::new(),
+            "every named addressed-read row and clean control must run and satisfy its oracle before the inherited host"
+        );
         #[cfg(any(test, feature = "test-seams"))]
         assert_graph_admission_rows(root.path());
         #[cfg(any(test, feature = "test-seams"))]
@@ -45999,7 +49288,10 @@ mod empty_declared_index_readiness_tests {
         #[cfg(any(test, feature = "test-seams"))]
         assert_public_owner_open_through_graph_capture_row(root.path());
         assert_graph_durability_rows(root.path());
-        assert_graph_compaction_pinned_rows(root.path(), &[10, 11, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]);
+        assert_graph_compaction_pinned_rows(
+            root.path(),
+            &[10, 11, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31],
+        );
         let path = root.path().join("empty-declared-index.db");
         let table = "empty_status_rows";
         let index = "empty_status_rows_status_idx";
@@ -46131,7 +49423,9 @@ mod empty_declared_index_readiness_tests {
                 &HashMap::from([("body".to_owned(), Value::Text(unrelated_payload.clone()))]),
             )
             .expect("double the unrelated retained row bodies and append history");
-        database.close().expect("publish the larger history fixture");
+        database
+            .close()
+            .expect("publish the larger history fixture");
 
         let persistence = RedbPersistence::open(&path).expect("reopen config writer");
         persistence
@@ -47360,7 +50654,9 @@ thread_local! {
 
 #[cfg(test)]
 pub(crate) fn returned_loader_rows_for_test() {
-    use crate::memory_accounting::{ControlCredit, MemoryAccountant, StoreAccountantHandle, WriterBudget};
+    use crate::memory_accounting::{
+        ControlCredit, MemoryAccountant, StoreAccountantHandle, WriterBudget,
+    };
     use content_identity::proof_allocation_oracle_tests::measured;
     use std::mem::{align_of, offset_of, size_of};
     // This predecessor is the exact immediately prior owner representation,
@@ -47371,32 +50667,73 @@ pub(crate) fn returned_loader_rows_for_test() {
         writer_use: Option<crate::memory_accounting::WriterUse>,
         control: Option<ControlCredit>,
     }
-    assert_eq!(size_of::<ProofAccountantSlot>(), size_of::<Arc<MemoryAccountant>>());
-    assert_eq!(align_of::<ProofAccountantSlot>(), align_of::<Arc<MemoryAccountant>>());
-    assert_eq!(size_of::<std::sync::OnceLock<ProofAccountantSlot>>(), size_of::<std::sync::OnceLock<Arc<MemoryAccountant>>>());
-    assert_eq!(align_of::<std::sync::OnceLock<ProofAccountantSlot>>(), align_of::<std::sync::OnceLock<Arc<MemoryAccountant>>>());
-    assert_eq!(size_of::<PersistenceProofOwner>(), size_of::<PriorProofOwner>());
-    assert_eq!(align_of::<PersistenceProofOwner>(), align_of::<PriorProofOwner>());
-    assert_eq!(offset_of!(PersistenceProofOwner, accountant), offset_of!(PriorProofOwner, accountant));
-    assert_eq!(offset_of!(PersistenceProofOwner, writer_use), offset_of!(PriorProofOwner, writer_use));
-    assert_eq!(offset_of!(PersistenceProofOwner, control), offset_of!(PriorProofOwner, control));
-    println!("CDB127_A_LAYOUT slot_size={} slot_align={} once_size={} once_align={} owner_size={} owner_align={} accountant={} writer_use={} control={} arc_request={} arc_align={}",
-        size_of::<ProofAccountantSlot>(), align_of::<ProofAccountantSlot>(),
-        size_of::<std::sync::OnceLock<ProofAccountantSlot>>(), align_of::<std::sync::OnceLock<ProofAccountantSlot>>(),
-        size_of::<PersistenceProofOwner>(), align_of::<PersistenceProofOwner>(),
-        offset_of!(PersistenceProofOwner, accountant), offset_of!(PersistenceProofOwner, writer_use), offset_of!(PersistenceProofOwner, control),
+    assert_eq!(
+        size_of::<ProofAccountantSlot>(),
+        size_of::<Arc<MemoryAccountant>>()
+    );
+    assert_eq!(
+        align_of::<ProofAccountantSlot>(),
+        align_of::<Arc<MemoryAccountant>>()
+    );
+    assert_eq!(
+        size_of::<std::sync::OnceLock<ProofAccountantSlot>>(),
+        size_of::<std::sync::OnceLock<Arc<MemoryAccountant>>>()
+    );
+    assert_eq!(
+        align_of::<std::sync::OnceLock<ProofAccountantSlot>>(),
+        align_of::<std::sync::OnceLock<Arc<MemoryAccountant>>>()
+    );
+    assert_eq!(
+        size_of::<PersistenceProofOwner>(),
+        size_of::<PriorProofOwner>()
+    );
+    assert_eq!(
+        align_of::<PersistenceProofOwner>(),
+        align_of::<PriorProofOwner>()
+    );
+    assert_eq!(
+        offset_of!(PersistenceProofOwner, accountant),
+        offset_of!(PriorProofOwner, accountant)
+    );
+    assert_eq!(
+        offset_of!(PersistenceProofOwner, writer_use),
+        offset_of!(PriorProofOwner, writer_use)
+    );
+    assert_eq!(
+        offset_of!(PersistenceProofOwner, control),
+        offset_of!(PriorProofOwner, control)
+    );
+    println!(
+        "CDB127_A_LAYOUT slot_size={} slot_align={} once_size={} once_align={} owner_size={} owner_align={} accountant={} writer_use={} control={} arc_request={} arc_align={}",
+        size_of::<ProofAccountantSlot>(),
+        align_of::<ProofAccountantSlot>(),
+        size_of::<std::sync::OnceLock<ProofAccountantSlot>>(),
+        align_of::<std::sync::OnceLock<ProofAccountantSlot>>(),
+        size_of::<PersistenceProofOwner>(),
+        align_of::<PersistenceProofOwner>(),
+        offset_of!(PersistenceProofOwner, accountant),
+        offset_of!(PersistenceProofOwner, writer_use),
+        offset_of!(PersistenceProofOwner, control),
         crate::memory_accounting::writer_adapter_type_layout::<PersistenceProofOwner>().size(),
-        crate::memory_accounting::writer_adapter_type_layout::<PersistenceProofOwner>().align());
+        crate::memory_accounting::writer_adapter_type_layout::<PersistenceProofOwner>().align()
+    );
 
     let reader = Arc::new(MemoryAccountant::no_limit());
     let (slot, peak, live) = measured(|| ProofAccountantSlot::attached(reader.clone().into()));
     assert_eq!((peak, live), (0, 0), "attachment cannot allocate");
     let strong = Arc::strong_count(&reader);
     let ((), peak, live) = measured(|| slot.prepare().unwrap());
-    assert_eq!((peak, live), (0, 0), "raw-reader preparation alone cannot allocate");
+    assert_eq!(
+        (peak, live),
+        (0, 0),
+        "raw-reader preparation alone cannot allocate"
+    );
     assert_eq!(reader.usage().used, 0);
     assert_eq!(Arc::strong_count(&reader), strong);
-    assert_eq!(slot.0.load(Ordering::Acquire).addr() & ProofAccountantSlot::MASK, ProofAccountantSlot::RAW_READER);
+    assert_eq!(
+        slot.0.load(Ordering::Acquire).addr() & ProofAccountantSlot::MASK,
+        ProofAccountantSlot::RAW_READER
+    );
     let writer = WriterBudget::from_accountant(reader.clone()).unwrap();
     let observed = reader.writer_registration_observation_for_test();
     let controls = reader.writer_fixed_ownership().2;
@@ -47406,7 +50743,11 @@ pub(crate) fn returned_loader_rows_for_test() {
     assert_eq!(reader.writer_registration_observation_for_test(), observed);
     assert_eq!(reader.writer_fixed_ownership().2, controls);
     assert_eq!(reader.usage().used, used);
-    let handle = slot.original_handle_for(&crate::memory_accounting::AccountantHandle::from_host(reader.clone())).unwrap();
+    let handle = slot
+        .original_handle_for(&crate::memory_accounting::AccountantHandle::from_host(
+            reader.clone(),
+        ))
+        .unwrap();
     assert!(!handle.is_writer());
     let copied = handle.clone();
     let budget = copied.vector_budget().unwrap();
@@ -47414,10 +50755,16 @@ pub(crate) fn returned_loader_rows_for_test() {
     drop((budget, copied, handle));
     drop(writer);
     assert_eq!(reader.writer_registration_observation_for_test().2, 0);
-    assert_eq!(reader.usage().used, 0, "reader source remains without a persistence-wide debit");
+    assert_eq!(
+        reader.usage().used,
+        0,
+        "reader source remains without a persistence-wide debit"
+    );
     drop(slot);
     assert_eq!(Arc::strong_count(&reader), 1);
-    println!("CDB127_A_ROW reader_prepare allocation_zero=true debit_zero=true immutable_reader=true later_writer_receipt_unchanged=true");
+    println!(
+        "CDB127_A_ROW reader_prepare allocation_zero=true debit_zero=true immutable_reader=true later_writer_receipt_unchanged=true"
+    );
 
     // Separate operation-control row kills current-association attribution;
     // the reader preparation no-op never admits this control.
@@ -47426,16 +50773,28 @@ pub(crate) fn returned_loader_rows_for_test() {
     let observation = reader.writer_registration_observation_for_test();
     let controls = reader.writer_fixed_ownership().2;
     let used = reader.usage().used;
-    let credit = ControlCredit::admit_from_handle(&reader_handle, 31, "proof", "original_reader_control", "proof").unwrap();
+    let credit = ControlCredit::admit_from_handle(
+        &reader_handle,
+        31,
+        "proof",
+        "original_reader_control",
+        "proof",
+    )
+    .unwrap();
     assert_eq!(reader.usage().used, used + 31);
     assert_eq!(reader.writer_fixed_ownership().2, controls);
-    assert_eq!(reader.writer_registration_observation_for_test(), observation);
+    assert_eq!(
+        reader.writer_registration_observation_for_test(),
+        observation
+    );
     drop(credit);
     assert_eq!(reader.usage().used, used);
     assert_eq!(reader.writer_fixed_ownership().2, controls);
     drop((writer, reader_handle));
     assert_eq!(reader.usage().used, 0);
-    println!("CDB127_A_ROW original_reader_operation_control exact_debit=31 original_receipt=true no_writer_use=true");
+    println!(
+        "CDB127_A_ROW original_reader_operation_control exact_debit=31 original_receipt=true no_writer_use=true"
+    );
 
     let raw_owner = Arc::new(MemoryAccountant::no_limit());
     let raw_writer = WriterBudget::from_accountant(raw_owner.clone()).unwrap();
@@ -47444,14 +50803,22 @@ pub(crate) fn returned_loader_rows_for_test() {
     drop(raw_writer);
     assert_eq!(raw_owner.writer_registration_observation_for_test().3, 1);
     let reopened = WriterBudget::from_accountant(raw_owner.clone()).unwrap();
-    assert_eq!(raw_owner.writer_registration_observation_for_test().2, raw_epoch);
+    assert_eq!(
+        raw_owner.writer_registration_observation_for_test().2,
+        raw_epoch
+    );
     drop(reopened);
     assert_eq!(raw_owner.writer_registration_observation_for_test().3, 1);
-    assert_eq!(raw_slot.0.load(Ordering::Acquire).addr() & ProofAccountantSlot::MASK, ProofAccountantSlot::RAW_WRITER);
+    assert_eq!(
+        raw_slot.0.load(Ordering::Acquire).addr() & ProofAccountantSlot::MASK,
+        ProofAccountantSlot::RAW_WRITER
+    );
     drop(raw_slot);
     assert_eq!(raw_owner.writer_registration_observation_for_test().2, 0);
     assert_eq!(raw_owner.usage().used, 0);
-    println!("CDB127_A_ROW raw_writer_source_only original_epoch_reopen=true single_use=true final_zero=true");
+    println!(
+        "CDB127_A_ROW raw_writer_source_only original_epoch_reopen=true single_use=true final_zero=true"
+    );
 
     let owner = Arc::new(MemoryAccountant::no_limit());
     let writer = WriterBudget::from_accountant(owner.clone()).unwrap();
@@ -47460,22 +50827,34 @@ pub(crate) fn returned_loader_rows_for_test() {
     let users = owner.writer_registration_observation_for_test().3;
     let (slot, peak, live) = measured(|| ProofAccountantSlot::attached(owner.clone().into()));
     assert_eq!((peak, live), (0, 0));
-    assert_eq!(owner.writer_registration_observation_for_test().3, users + 1);
+    assert_eq!(
+        owner.writer_registration_observation_for_test().3,
+        users + 1
+    );
     let address = &slot as *const ProofAccountantSlot;
     RETURNED_LOADER_AFTER_RAW_OBSERVATION_FOR_TEST.with(|hook| {
         *hook.borrow_mut() = Some(Box::new(move || {
             // Deterministically publish/release the raw winner after the
             // outer acquire-load, before its increment/retain. The resumed
             // outer operation must lose CAS without consuming the old raw use.
-            unsafe { (&*address).prepare().unwrap(); }
+            unsafe {
+                (&*address).prepare().unwrap();
+            }
         }));
     });
     slot.prepare().unwrap();
-    assert_eq!(owner.writer_registration_observation_for_test().3, users + 1);
-    let price = crate::memory_accounting::writer_adapter_type_layout::<PersistenceProofOwner>().size();
+    assert_eq!(
+        owner.writer_registration_observation_for_test().3,
+        users + 1
+    );
+    let price =
+        crate::memory_accounting::writer_adapter_type_layout::<PersistenceProofOwner>().size();
     assert_eq!(owner.usage().used, baseline + price);
     assert_eq!(owner.writer_fixed_ownership().2, controls + price);
-    assert_eq!(slot.0.load(Ordering::Acquire).addr() & ProofAccountantSlot::MASK, ProofAccountantSlot::READY_WRITER);
+    assert_eq!(
+        slot.0.load(Ordering::Acquire).addr() & ProofAccountantSlot::MASK,
+        ProofAccountantSlot::READY_WRITER
+    );
     let ((), peak, live) = measured(|| slot.prepare().unwrap());
     assert_eq!((peak, live), (0, 0));
     drop(writer);
@@ -47484,14 +50863,26 @@ pub(crate) fn returned_loader_rows_for_test() {
     assert_eq!(owner.writer_registration_observation_for_test().2, epoch);
     drop(reopened);
     assert_eq!(owner.writer_registration_observation_for_test().3, 1);
-    let escaped = slot.original_handle_for(&crate::memory_accounting::AccountantHandle::from_host(owner.clone())).unwrap().vector_budget().unwrap();
+    let escaped = slot
+        .original_handle_for(&crate::memory_accounting::AccountantHandle::from_host(
+            owner.clone(),
+        ))
+        .unwrap()
+        .vector_budget()
+        .unwrap();
     drop(slot);
-    assert_eq!(owner.writer_registration_observation_for_test().3, 1, "escaping adapter pins the original epoch");
+    assert_eq!(
+        owner.writer_registration_observation_for_test().3,
+        1,
+        "escaping adapter pins the original epoch"
+    );
     drop(escaped);
     assert_eq!(owner.writer_registration_observation_for_test().2, 0);
     assert_eq!(owner.usage().used, 0);
     assert_eq!(owner.underflow_count_for_test(), 0);
-    println!("CDB127_A_ROW delayed_raw_observer winner_then_loser=true single_slot_use=true original_epoch_reopen=true escaping_budget_final_zero=true");
+    println!(
+        "CDB127_A_ROW delayed_raw_observer winner_then_loser=true single_slot_use=true original_epoch_reopen=true escaping_budget_final_zero=true"
+    );
 
     // The observing thread pauses after its acquire-load. A scoped second
     // thread publishes the winner before the observer increments/retains;
@@ -47510,33 +50901,61 @@ pub(crate) fn returned_loader_rows_for_test() {
         }));
     });
     slot.prepare().unwrap();
-    assert_eq!(owner.writer_registration_observation_for_test().3, observed_users);
+    assert_eq!(
+        owner.writer_registration_observation_for_test().3,
+        observed_users
+    );
     assert_eq!(owner.writer_fixed_ownership().2, observed_controls + price);
-    assert_eq!(slot.0.load(Ordering::Acquire).addr() & ProofAccountantSlot::MASK, ProofAccountantSlot::READY_WRITER);
+    assert_eq!(
+        slot.0.load(Ordering::Acquire).addr() & ProofAccountantSlot::MASK,
+        ProofAccountantSlot::READY_WRITER
+    );
     drop((slot, writer));
     assert_eq!(owner.usage().used, 0);
     assert_eq!(owner.writer_registration_observation_for_test().2, 0);
     assert_eq!(owner.underflow_count_for_test(), 0);
-    println!("CDB127_A_ROW cross_thread_raw_observer acquire_before_retain=true winner_before_resume=true loser_attempt_only=true final_zero=true");
+    println!(
+        "CDB127_A_ROW cross_thread_raw_observer acquire_before_retain=true winner_before_resume=true loser_attempt_only=true final_zero=true"
+    );
 
     let installed_owner = Arc::new(MemoryAccountant::no_limit());
     let rejected_owner = Arc::new(MemoryAccountant::no_limit());
     let installed_writer = WriterBudget::from_accountant(installed_owner.clone()).unwrap();
     let rejected_writer = WriterBudget::from_accountant(rejected_owner.clone()).unwrap();
     let cell = std::sync::OnceLock::new();
-    assert!(cell.set(ProofAccountantSlot::attached(installed_owner.clone().into())).is_ok());
+    assert!(
+        cell.set(ProofAccountantSlot::attached(
+            installed_owner.clone().into()
+        ))
+        .is_ok()
+    );
     let installed = installed_owner.writer_registration_observation_for_test();
     let rejected = rejected_owner.writer_registration_observation_for_test();
     let attempt = cell.set(ProofAccountantSlot::attached(rejected_owner.clone().into()));
     assert!(attempt.is_err());
     drop(attempt);
-    assert_eq!(installed_owner.writer_registration_observation_for_test(), installed);
-    assert_eq!(rejected_owner.writer_registration_observation_for_test(), rejected);
-    assert!(cell.get().unwrap().original_handle_for(&crate::memory_accounting::AccountantHandle::from_host(rejected_owner.clone())).is_none());
+    assert_eq!(
+        installed_owner.writer_registration_observation_for_test(),
+        installed
+    );
+    assert_eq!(
+        rejected_owner.writer_registration_observation_for_test(),
+        rejected
+    );
+    assert!(
+        cell.get()
+            .unwrap()
+            .original_handle_for(&crate::memory_accounting::AccountantHandle::from_host(
+                rejected_owner.clone()
+            ))
+            .is_none()
+    );
     drop((cell, installed_writer, rejected_writer));
     assert_eq!(installed_owner.usage().used, 0);
     assert_eq!(rejected_owner.usage().used, 0);
-    println!("CDB127_A_ROW rejected_attachment different_funder=true installed_unchanged=true attempted_use_released=true");
+    println!(
+        "CDB127_A_ROW rejected_attachment different_funder=true installed_unchanged=true attempted_use_released=true"
+    );
 
     let constrained = Arc::new(MemoryAccountant::with_budget(1));
     let writer = WriterBudget::from_accountant(constrained.clone()).unwrap();
@@ -47545,10 +50964,16 @@ pub(crate) fn returned_loader_rows_for_test() {
     let strong = Arc::strong_count(&constrained);
     let used = constrained.usage().used;
     assert!(slot.prepare().is_err());
-    assert_eq!(constrained.writer_registration_observation_for_test(), observation);
+    assert_eq!(
+        constrained.writer_registration_observation_for_test(),
+        observation
+    );
     assert_eq!(Arc::strong_count(&constrained), strong);
     assert_eq!(constrained.usage().used, used);
-    assert_eq!(slot.0.load(Ordering::Acquire).addr() & ProofAccountantSlot::MASK, ProofAccountantSlot::RAW_WRITER);
+    assert_eq!(
+        slot.0.load(Ordering::Acquire).addr() & ProofAccountantSlot::MASK,
+        ProofAccountantSlot::RAW_WRITER
+    );
     drop((slot, writer));
     assert_eq!(constrained.usage().used, 0);
     println!("CDB127_A_ROW failed_prepare raw_custody_preserved=true attempt_rolled_back=true");
@@ -47562,11 +50987,16 @@ pub(crate) fn returned_loader_rows_for_test() {
     let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(slot)));
     assert!(unwind.is_err());
     assert_eq!(owner.usage().used, baseline);
-    assert_eq!(owner.writer_registration_observation_for_test().3, users - 1);
+    assert_eq!(
+        owner.writer_registration_observation_for_test().3,
+        users - 1
+    );
     drop(writer);
     assert_eq!(owner.usage().used, 0);
     assert_eq!(owner.underflow_count_for_test(), 0);
-    println!("CDB127_A_ROW owner_drop_unwind advancing_cleanup=true original_control_refunded=true underflow=0");
+    println!(
+        "CDB127_A_ROW owner_drop_unwind advancing_cleanup=true original_control_refunded=true underflow=0"
+    );
     for unwind in [false, true] {
         let partial_owner = Arc::new(MemoryAccountant::no_limit());
         let writer = WriterBudget::from_accountant(partial_owner.clone()).unwrap();
@@ -47585,10 +51015,15 @@ pub(crate) fn returned_loader_rows_for_test() {
         let mut initialized = [false; 19];
         initialized[0] = true;
         initialized[15] = true;
-        let construction = PersistenceConstruction { source: pointer, initialized };
+        let construction = PersistenceConstruction {
+            source: pointer,
+            initialized,
+        };
         drop(writer);
         crate::persistence::content_identity::proof_allocation_oracle_tests::watch_candidate_payload_for_test(payload_pointer, &partial_owner);
-        if unwind { RETURNED_LOADER_PARTIAL_PANIC_FOR_TEST.with(|flag| flag.set(Some(0))); }
+        if unwind {
+            RETURNED_LOADER_PARTIAL_PANIC_FOR_TEST.with(|flag| flag.set(Some(0)));
+        }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(construction)));
         assert_eq!(result.is_err(), unwind);
         let (census, payload_free, node_free) = crate::persistence::content_identity::proof_allocation_oracle_tests::candidate_payload_free_observation_for_test();
@@ -47596,9 +51031,15 @@ pub(crate) fn returned_loader_rows_for_test() {
         assert_eq!(payload_free, (true, true));
         assert_eq!(node_free, (registration.1, registration.1, true));
         assert_eq!(partial_owner.usage().used, 0);
-        assert_eq!(partial_owner.writer_registration_observation_for_test().2, 0);
+        assert_eq!(
+            partial_owner.writer_registration_observation_for_test().2,
+            0
+        );
         assert_eq!(partial_owner.underflow_count_for_test(), 0);
-        println!("CDB127_A_ROW partial_persistence_guard initialized_path=true initialized_slot=true unwind={} physical_payload_before_slot=true final_zero=true", unwind);
+        println!(
+            "CDB127_A_ROW partial_persistence_guard initialized_path=true initialized_slot=true unwind={} physical_payload_before_slot=true final_zero=true",
+            unwind
+        );
     }
     crate::database::returned_loader_rows_for_test();
 }
@@ -47625,15 +51066,27 @@ impl OwnedEventReadKey {
         sink: &str,
         memory: &Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Self> {
-        let bytes = "__sink_queue_".len().checked_add(sink.len()).ok_or_else(|| {
-            Error::Other("sink queue table name size overflow".into())
-        })?;
-        memory.try_reserve(bytes, "reader", "sink_queue_source", "Reduce concurrent queue reads or raise the declared reader memory limit.")?;
+        let bytes = "__sink_queue_"
+            .len()
+            .checked_add(sink.len())
+            .ok_or_else(|| Error::Other("sink queue table name size overflow".into()))?;
+        memory.try_reserve(
+            bytes,
+            "reader",
+            "sink_queue_source",
+            "Reduce concurrent queue reads or raise the declared reader memory limit.",
+        )?;
         // Install the refund before any fallible construction or validation.
-        let mut key = Self { value: String::new(), memory: memory.clone(), bytes };
+        let mut key = Self {
+            value: String::new(),
+            memory: memory.clone(),
+            bytes,
+        };
         key.value = String::with_capacity(bytes);
         if key.value.capacity() != bytes {
-            return Err(Error::Other("sink queue source key capacity differs from its admission".into()));
+            return Err(Error::Other(
+                "sink queue source key capacity differs from its admission".into(),
+            ));
         }
         key.value.push_str("__sink_queue_");
         key.value.push_str(sink);
@@ -47686,7 +51139,11 @@ impl OwnedEncodedEventSource<'_> {
                 visit(name)?;
             }
         }
-        for handle in self.read.list_tables().map_err(RedbPersistence::storage_error)? {
+        for handle in self
+            .read
+            .list_tables()
+            .map_err(RedbPersistence::storage_error)?
+        {
             if let Some(name) = handle.name().strip_prefix("__sink_queue_")
                 && !self.loaded.is_some_and(|loaded| loaded.contains_key(name))
             {
@@ -47705,7 +51162,11 @@ impl RedbPersistence {
     ) -> Result<R> {
         self.with_db(|db| {
             let read = db.begin_read().map_err(Self::storage_error)?;
-            let source = OwnedEncodedEventSource { read: &read, loaded: None, read_memory: &read_memory };
+            let source = OwnedEncodedEventSource {
+                read: &read,
+                loaded: None,
+                read_memory: &read_memory,
+            };
             f(&source)
         })
     }
@@ -47721,7 +51182,11 @@ impl RetainedReadSource {
         // begin_read verifies this transaction against the registered image
         // snapshot; unloaded queues never reopen the latest writer root.
         let read = self.begin_read()?;
-        let source = OwnedEncodedEventSource { read: &read, loaded: Some(loaded), read_memory: &read_memory };
+        let source = OwnedEncodedEventSource {
+            read: &read,
+            loaded: Some(loaded),
+            read_memory: &read_memory,
+        };
         f(&source)
     }
 }
@@ -47734,12 +51199,15 @@ pub(crate) struct OwnedEncodedBytes {
 struct OwnedEventEncodedLength(usize);
 impl std::io::Write for OwnedEventEncodedLength {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0 = self.0.checked_add(bytes.len()).ok_or_else(|| {
-            std::io::Error::from(std::io::ErrorKind::InvalidInput)
-        })?;
+        self.0 = self
+            .0
+            .checked_add(bytes.len())
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
         Ok(bytes.len())
     }
-    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 pub(crate) struct OwnedEventKey {
@@ -47763,18 +51231,26 @@ impl OwnedEventKey {
         id: u64,
     ) -> Result<Self> {
         use std::fmt::Write;
-        let sink_length = u64::try_from(sink.len()).map_err(|_| Error::Other("sink name size overflow".into()))?;
+        let sink_length = u64::try_from(sink.len())
+            .map_err(|_| Error::Other("sink name size overflow".into()))?;
         let bytes = owned_event_decimal_width(sink_length)
-            .checked_add(sink.len()).and_then(|n| n.checked_add(2))
+            .checked_add(sink.len())
+            .and_then(|n| n.checked_add(2))
             .and_then(|n| n.checked_add(owned_event_decimal_width(id)))
             .ok_or_else(|| Error::Other("sink queue identity size overflow".into()))?;
         let allocation = crate::memory_accounting::reserve_preparation_from_original(
-            original, bytes, "events", "sink_queue_identity", "Reduce pending deliveries or raise MEMORY_LIMIT.",
+            original,
+            bytes,
+            "events",
+            "sink_queue_identity",
+            "Reduce pending deliveries or raise MEMORY_LIMIT.",
         )?;
         let mut value = String::with_capacity(bytes);
         if value.capacity() != bytes {
             drop(value);
-            return Err(Error::Other("sink queue identity capacity differs from its admission".into()));
+            return Err(Error::Other(
+                "sink queue identity capacity differs from its admission".into(),
+            ));
         }
         if write!(&mut value, "{}:{sink}:{id}", sink.len()).is_err() {
             drop(value);
@@ -47782,7 +51258,9 @@ impl OwnedEventKey {
         }
         if value.len() != bytes || value.capacity() != bytes {
             drop(value);
-            return Err(Error::Other("sink queue identity differs from its measured size".into()));
+            return Err(Error::Other(
+                "sink queue identity differs from its measured size".into(),
+            ));
         }
         Ok(Self { value, allocation })
     }
@@ -47808,12 +51286,21 @@ impl RedbPersistence {
         let buffer = crate::memory_accounting::new_owned_native_vec::<u8>(original, measured.0)?;
         // Establish body-before-invoice custody before invoking Serialize,
         // which can return an error or unwind on its second pass.
-        let mut encoded = OwnedEncodedBytes { bytes: buffer.0, allocation: buffer.1 };
+        let mut encoded = OwnedEncodedBytes {
+            bytes: buffer.0,
+            allocation: buffer.1,
+        };
         encoded.bytes.resize(measured.0, 0);
-        let written = bincode::serde::encode_into_slice(value, encoded.bytes.as_mut_slice(), bincode::config::standard())
-            .map_err(|err| Error::Other(format!("bincode encode error: {err}")))?;
+        let written = bincode::serde::encode_into_slice(
+            value,
+            encoded.bytes.as_mut_slice(),
+            bincode::config::standard(),
+        )
+        .map_err(|err| Error::Other(format!("bincode encode error: {err}")))?;
         if written != measured.0 || encoded.bytes.capacity() != measured.0 {
-            return Err(Error::Other("sink event encoding differs from its measured size".into()));
+            return Err(Error::Other(
+                "sink event encoding differs from its measured size".into(),
+            ));
         }
         Ok(encoded)
     }
@@ -47840,19 +51327,24 @@ impl RedbPersistence {
         for id in ids {
             let key = OwnedEventKey::queue_identity(original, sink, *id)?;
             let namespace = b"sink-queue";
-            let length = 16_usize.checked_add(namespace.len()).and_then(|n| n.checked_add(key.value.len()))
+            let length = 16_usize
+                .checked_add(namespace.len())
+                .and_then(|n| n.checked_add(key.value.len()))
                 .ok_or_else(|| Error::Other("sink queue logical key size overflow".into()))?;
-            let (mut logical_key, allocation) = crate::memory_accounting::new_owned_native_vec::<u8>(original, length)?;
+            let (mut logical_key, allocation) =
+                crate::memory_accounting::new_owned_native_vec::<u8>(original, length)?;
             logical_key.extend_from_slice(&(namespace.len() as u64).to_le_bytes());
             logical_key.extend_from_slice(namespace);
             logical_key.extend_from_slice(&(key.value.len() as u64).to_le_bytes());
             logical_key.extend_from_slice(key.value.as_bytes());
-            prepared.mutations.push(content_identity::ContentIdentityMutation {
-                family: content_identity::LogicalFamily::Status,
-                logical_key,
-                logical_value: None,
-                row_head: None,
-            });
+            prepared
+                .mutations
+                .push(content_identity::ContentIdentityMutation {
+                    family: content_identity::LogicalFamily::Status,
+                    logical_key,
+                    logical_value: None,
+                    row_head: None,
+                });
             prepared.credits.push(allocation);
         }
         Ok(prepared)
@@ -47877,789 +51369,1072 @@ mod original_event_decode {
     }
     thread_local! { static ACTIVE: std::cell::Cell<*mut Ledger> = const { std::cell::Cell::new(std::ptr::null_mut()) }; }
     struct Scope(*mut Ledger);
-    impl Drop for Scope { fn drop(&mut self) { ACTIVE.with(|slot|slot.set(self.0)); } }
-    fn admit<E:de::Error>(bytes:usize)->std::result::Result<(),E>{
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            ACTIVE.with(|slot| slot.set(self.0));
+        }
+    }
+    fn admit<E: de::Error>(bytes: usize) -> std::result::Result<(), E> {
         ACTIVE.with(|slot| {
-            let ptr=slot.get();
-            if ptr.is_null(){return Err(E::custom("original decode requires its pinned seed"));}
+            let ptr = slot.get();
+            if ptr.is_null() {
+                return Err(E::custom("original decode requires its pinned seed"));
+            }
             // SAFETY: only decode installs this stack address; Scope restores
             // it before stack teardown. Serde invokes admission synchronously
             // and this function never retains a borrow across a nested call.
-            let ledger=unsafe { &mut *ptr };
-            if ledger.failure.is_some(){return Err(E::custom("read image admission refused"));}
-            if let Err(error)=crate::memory_accounting::grow_preparation_from_original(
-                &mut ledger.allocation,bytes,"events","decode_sink_queue_entry",
-                "Reduce pending deliveries or raise MEMORY_LIMIT.") {
-                ledger.failure=Some(error);return Err(E::custom("read image admission refused"));
+            let ledger = unsafe { &mut *ptr };
+            if ledger.failure.is_some() {
+                return Err(E::custom("read image admission refused"));
+            }
+            if let Err(error) = crate::memory_accounting::grow_preparation_from_original(
+                &mut ledger.allocation,
+                bytes,
+                "events",
+                "decode_sink_queue_entry",
+                "Reduce pending deliveries or raise MEMORY_LIMIT.",
+            ) {
+                ledger.failure = Some(error);
+                return Err(E::custom("read image admission refused"));
             }
             Ok(())
         })
     }
-    pub(super) fn decode<T:de::DeserializeOwned>(original:&crate::memory_accounting::OwnedMemoryReservation,bytes:&[u8])->Result<OriginalDecoded<T>>{
-        let control=std::mem::size_of::<T>().checked_mul(4).and_then(|n|n.checked_add(128))
-            .ok_or_else(||Error::Other("decode control size overflow".into()))?;
-        let _control=crate::memory_accounting::reserve_preparation_from_original(original,control,
-            "events","decode_sink_queue_entry","Reduce pending deliveries or raise MEMORY_LIMIT.")?;
-        let mut ledger=Ledger { allocation:crate::memory_accounting::reserve_preparation_from_original(original,0,
-            "events","decode_sink_queue_entry","Reduce pending deliveries or raise MEMORY_LIMIT.")?,failure:None };
-        let old=ACTIVE.with(|slot|slot.replace(&mut ledger));let scope=Scope(old);
-        let result=bincode::serde::seed_decode_from_slice(Seed(PhantomData::<T>),bytes,bincode::config::standard());
+    pub(super) fn decode<T: de::DeserializeOwned>(
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        bytes: &[u8],
+    ) -> Result<OriginalDecoded<T>> {
+        let control = std::mem::size_of::<T>()
+            .checked_mul(4)
+            .and_then(|n| n.checked_add(128))
+            .ok_or_else(|| Error::Other("decode control size overflow".into()))?;
+        let _control = crate::memory_accounting::reserve_preparation_from_original(
+            original,
+            control,
+            "events",
+            "decode_sink_queue_entry",
+            "Reduce pending deliveries or raise MEMORY_LIMIT.",
+        )?;
+        let mut ledger = Ledger {
+            allocation: crate::memory_accounting::reserve_preparation_from_original(
+                original,
+                0,
+                "events",
+                "decode_sink_queue_entry",
+                "Reduce pending deliveries or raise MEMORY_LIMIT.",
+            )?,
+            failure: None,
+        };
+        let old = ACTIVE.with(|slot| slot.replace(&mut ledger));
+        let scope = Scope(old);
+        let result = bincode::serde::seed_decode_from_slice(
+            Seed(PhantomData::<T>),
+            bytes,
+            bincode::config::standard(),
+        );
         drop(scope);
-        if let Some(error)=ledger.failure.take(){drop(result);return Err(error);}
-        let (value,consumed)=result.map_err(|error|Error::Other(format!("bincode decode error: {error}")))?;
-        if consumed!=bytes.len(){drop(value);return Err(Error::Other("bincode exact decode left trailing bytes".into()));}
-        Ok(OriginalDecoded { value,allocation:ledger.allocation })
-    }
-struct Seed<S>(S);
-impl<'de, S: DeserializeSeed<'de>> DeserializeSeed<'de> for Seed<S> {
-    type Value = S::Value;
-    fn deserialize<D: de::Deserializer<'de>>(
-        self,
-        d: D,
-    ) -> std::result::Result<Self::Value, D::Error> {
-        self.0.deserialize(Admitted(d))
-    }
-}
-struct Admitted<D>(D);
-struct V<VV> {
-    inner: VV,
-    heap: bool,
-}
-impl<'de, VV: Visitor<'de>> Visitor<'de> for V<VV> {
-    type Value = VV::Value;
-    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.inner.expecting(f)
-    }
-    fn visit_bool<E: de::Error>(self, value: bool) -> std::result::Result<Self::Value, E> {
-        self.inner.visit_bool(value)
-    }
-    fn visit_i8<E: de::Error>(self, value: i8) -> std::result::Result<Self::Value, E> {
-        self.inner.visit_i8(value)
-    }
-    fn visit_i16<E: de::Error>(self, value: i16) -> std::result::Result<Self::Value, E> {
-        self.inner.visit_i16(value)
-    }
-    fn visit_i32<E: de::Error>(self, value: i32) -> std::result::Result<Self::Value, E> {
-        self.inner.visit_i32(value)
-    }
-    fn visit_i64<E: de::Error>(self, value: i64) -> std::result::Result<Self::Value, E> {
-        self.inner.visit_i64(value)
-    }
-    fn visit_i128<E: de::Error>(self, value: i128) -> std::result::Result<Self::Value, E> {
-        self.inner.visit_i128(value)
-    }
-    fn visit_u8<E: de::Error>(self, value: u8) -> std::result::Result<Self::Value, E> {
-        self.inner.visit_u8(value)
-    }
-    fn visit_u16<E: de::Error>(self, value: u16) -> std::result::Result<Self::Value, E> {
-        self.inner.visit_u16(value)
-    }
-    fn visit_u32<E: de::Error>(self, value: u32) -> std::result::Result<Self::Value, E> {
-        self.inner.visit_u32(value)
-    }
-    fn visit_u64<E: de::Error>(self, value: u64) -> std::result::Result<Self::Value, E> {
-        self.inner.visit_u64(value)
-    }
-    fn visit_u128<E: de::Error>(self, value: u128) -> std::result::Result<Self::Value, E> {
-        self.inner.visit_u128(value)
-    }
-    fn visit_f32<E: de::Error>(self, value: f32) -> std::result::Result<Self::Value, E> {
-        self.inner.visit_f32(value)
-    }
-    fn visit_f64<E: de::Error>(self, value: f64) -> std::result::Result<Self::Value, E> {
-        self.inner.visit_f64(value)
-    }
-    fn visit_char<E: de::Error>(self, value: char) -> std::result::Result<Self::Value, E> {
-        self.inner.visit_char(value)
-    }
-    fn visit_unit<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
-        self.inner.visit_unit()
-    }
-    fn visit_none<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
-        self.inner.visit_none()
-    }
-    fn visit_some<D: de::Deserializer<'de>>(
-        self,
-        d: D,
-    ) -> std::result::Result<Self::Value, D::Error> {
-        self.inner.visit_some(Admitted(d))
-    }
-    fn visit_newtype_struct<D: de::Deserializer<'de>>(
-        self,
-        d: D,
-    ) -> std::result::Result<Self::Value, D::Error> {
-        self.inner.visit_newtype_struct(Admitted(d))
-    }
-    fn visit_str<E: de::Error>(self, value: &str) -> std::result::Result<Self::Value, E> {
-        admit(value.len())?;
-        self.inner.visit_str(value)
-    }
-    fn visit_borrowed_str<E: de::Error>(
-        self,
-        value: &'de str,
-    ) -> std::result::Result<Self::Value, E> {
-        admit(value.len())?;
-        self.inner.visit_borrowed_str(value)
-    }
-    fn visit_bytes<E: de::Error>(self, value: &[u8]) -> std::result::Result<Self::Value, E> {
-        admit(value.len())?;
-        self.inner.visit_bytes(value)
-    }
-    fn visit_borrowed_bytes<E: de::Error>(
-        self,
-        value: &'de [u8],
-    ) -> std::result::Result<Self::Value, E> {
-        admit(value.len())?;
-        self.inner.visit_borrowed_bytes(value)
-    }
-    fn visit_seq<A: de::SeqAccess<'de>>(self, a: A) -> std::result::Result<Self::Value, A::Error> {
-        self.inner.visit_seq(Seq {
-            inner: a,
-            heap: self.heap,
-            first: true,
+        if let Some(error) = ledger.failure.take() {
+            drop(result);
+            return Err(error);
+        }
+        let (value, consumed) =
+            result.map_err(|error| Error::Other(format!("bincode decode error: {error}")))?;
+        if consumed != bytes.len() {
+            drop(value);
+            return Err(Error::Other(
+                "bincode exact decode left trailing bytes".into(),
+            ));
+        }
+        Ok(OriginalDecoded {
+            value,
+            allocation: ledger.allocation,
         })
     }
-    fn visit_map<A: de::MapAccess<'de>>(self, a: A) -> std::result::Result<Self::Value, A::Error> {
-        self.inner.visit_map(Map {
-            inner: a,
-            first_key: true,
-            first_value: true,
-        })
-    }
-    fn visit_enum<A: de::EnumAccess<'de>>(
-        self,
-        a: A,
-    ) -> std::result::Result<Self::Value, A::Error> {
-        self.inner.visit_enum(Enum(a))
-    }
-}
-struct Seq<A> {
-    inner: A,
-    heap: bool,
-    first: bool,
-}
-impl<'de, A: de::SeqAccess<'de>> de::SeqAccess<'de> for Seq<A> {
-    type Error = A::Error;
-    fn next_element_seed<S: DeserializeSeed<'de>>(
-        &mut self,
-        seed: S,
-    ) -> std::result::Result<Option<S::Value>, A::Error> {
-        if self.heap && self.inner.size_hint() != Some(0) {
-            // With size_hint hidden, Vec grows geometrically. Include its
-            // minimum capacity and both allocations during a reallocation.
-            let slots = if self.first { 12 } else { 4 };
-            admit(std::mem::size_of::<S::Value>().saturating_mul(slots))?;
-            self.first = false;
-        }
-        self.inner.next_element_seed(Seed(seed))
-    }
-    fn size_hint(&self) -> Option<usize> {
-        if self.heap {
-            Some(0)
-        } else {
-            self.inner.size_hint()
+    struct Seed<S>(S);
+    impl<'de, S: DeserializeSeed<'de>> DeserializeSeed<'de> for Seed<S> {
+        type Value = S::Value;
+        fn deserialize<D: de::Deserializer<'de>>(
+            self,
+            d: D,
+        ) -> std::result::Result<Self::Value, D::Error> {
+            self.0.deserialize(Admitted(d))
         }
     }
-}
-struct Map<A> {
-    inner: A,
-    first_key: bool,
-    first_value: bool,
-}
-impl<'de, A: de::MapAccess<'de>> de::MapAccess<'de> for Map<A> {
-    type Error = A::Error;
-    fn next_key_seed<S: DeserializeSeed<'de>>(
-        &mut self,
-        seed: S,
-    ) -> std::result::Result<Option<S::Value>, A::Error> {
-        if self.inner.size_hint() != Some(0) {
-            let slots = if self.first_key { 16 } else { 4 };
+    struct Admitted<D>(D);
+    struct V<VV> {
+        inner: VV,
+        heap: bool,
+    }
+    impl<'de, VV: Visitor<'de>> Visitor<'de> for V<VV> {
+        type Value = VV::Value;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            self.inner.expecting(f)
+        }
+        fn visit_bool<E: de::Error>(self, value: bool) -> std::result::Result<Self::Value, E> {
+            self.inner.visit_bool(value)
+        }
+        fn visit_i8<E: de::Error>(self, value: i8) -> std::result::Result<Self::Value, E> {
+            self.inner.visit_i8(value)
+        }
+        fn visit_i16<E: de::Error>(self, value: i16) -> std::result::Result<Self::Value, E> {
+            self.inner.visit_i16(value)
+        }
+        fn visit_i32<E: de::Error>(self, value: i32) -> std::result::Result<Self::Value, E> {
+            self.inner.visit_i32(value)
+        }
+        fn visit_i64<E: de::Error>(self, value: i64) -> std::result::Result<Self::Value, E> {
+            self.inner.visit_i64(value)
+        }
+        fn visit_i128<E: de::Error>(self, value: i128) -> std::result::Result<Self::Value, E> {
+            self.inner.visit_i128(value)
+        }
+        fn visit_u8<E: de::Error>(self, value: u8) -> std::result::Result<Self::Value, E> {
+            self.inner.visit_u8(value)
+        }
+        fn visit_u16<E: de::Error>(self, value: u16) -> std::result::Result<Self::Value, E> {
+            self.inner.visit_u16(value)
+        }
+        fn visit_u32<E: de::Error>(self, value: u32) -> std::result::Result<Self::Value, E> {
+            self.inner.visit_u32(value)
+        }
+        fn visit_u64<E: de::Error>(self, value: u64) -> std::result::Result<Self::Value, E> {
+            self.inner.visit_u64(value)
+        }
+        fn visit_u128<E: de::Error>(self, value: u128) -> std::result::Result<Self::Value, E> {
+            self.inner.visit_u128(value)
+        }
+        fn visit_f32<E: de::Error>(self, value: f32) -> std::result::Result<Self::Value, E> {
+            self.inner.visit_f32(value)
+        }
+        fn visit_f64<E: de::Error>(self, value: f64) -> std::result::Result<Self::Value, E> {
+            self.inner.visit_f64(value)
+        }
+        fn visit_char<E: de::Error>(self, value: char) -> std::result::Result<Self::Value, E> {
+            self.inner.visit_char(value)
+        }
+        fn visit_unit<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+            self.inner.visit_unit()
+        }
+        fn visit_none<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+            self.inner.visit_none()
+        }
+        fn visit_some<D: de::Deserializer<'de>>(
+            self,
+            d: D,
+        ) -> std::result::Result<Self::Value, D::Error> {
+            self.inner.visit_some(Admitted(d))
+        }
+        fn visit_newtype_struct<D: de::Deserializer<'de>>(
+            self,
+            d: D,
+        ) -> std::result::Result<Self::Value, D::Error> {
+            self.inner.visit_newtype_struct(Admitted(d))
+        }
+        fn visit_str<E: de::Error>(self, value: &str) -> std::result::Result<Self::Value, E> {
+            admit(value.len())?;
+            self.inner.visit_str(value)
+        }
+        fn visit_borrowed_str<E: de::Error>(
+            self,
+            value: &'de str,
+        ) -> std::result::Result<Self::Value, E> {
+            admit(value.len())?;
+            self.inner.visit_borrowed_str(value)
+        }
+        fn visit_bytes<E: de::Error>(self, value: &[u8]) -> std::result::Result<Self::Value, E> {
+            admit(value.len())?;
+            self.inner.visit_bytes(value)
+        }
+        fn visit_borrowed_bytes<E: de::Error>(
+            self,
+            value: &'de [u8],
+        ) -> std::result::Result<Self::Value, E> {
+            admit(value.len())?;
+            self.inner.visit_borrowed_bytes(value)
+        }
+        fn visit_seq<A: de::SeqAccess<'de>>(
+            self,
+            a: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            self.inner.visit_seq(Seq {
+                inner: a,
+                heap: self.heap,
+                first: true,
+            })
+        }
+        fn visit_map<A: de::MapAccess<'de>>(
+            self,
+            a: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            self.inner.visit_map(Map {
+                inner: a,
+                first_key: true,
+                first_value: true,
+            })
+        }
+        fn visit_enum<A: de::EnumAccess<'de>>(
+            self,
+            a: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            self.inner.visit_enum(Enum(a))
+        }
+    }
+    struct Seq<A> {
+        inner: A,
+        heap: bool,
+        first: bool,
+    }
+    impl<'de, A: de::SeqAccess<'de>> de::SeqAccess<'de> for Seq<A> {
+        type Error = A::Error;
+        fn next_element_seed<S: DeserializeSeed<'de>>(
+            &mut self,
+            seed: S,
+        ) -> std::result::Result<Option<S::Value>, A::Error> {
+            if self.heap && self.inner.size_hint() != Some(0) {
+                // With size_hint hidden, Vec grows geometrically. Include its
+                // minimum capacity and both allocations during a reallocation.
+                let slots = if self.first { 12 } else { 4 };
+                admit(std::mem::size_of::<S::Value>().saturating_mul(slots))?;
+                self.first = false;
+            }
+            self.inner.next_element_seed(Seed(seed))
+        }
+        fn size_hint(&self) -> Option<usize> {
+            if self.heap {
+                Some(0)
+            } else {
+                self.inner.size_hint()
+            }
+        }
+    }
+    struct Map<A> {
+        inner: A,
+        first_key: bool,
+        first_value: bool,
+    }
+    impl<'de, A: de::MapAccess<'de>> de::MapAccess<'de> for Map<A> {
+        type Error = A::Error;
+        fn next_key_seed<S: DeserializeSeed<'de>>(
+            &mut self,
+            seed: S,
+        ) -> std::result::Result<Option<S::Value>, A::Error> {
+            if self.inner.size_hint() != Some(0) {
+                let slots = if self.first_key { 16 } else { 4 };
+                admit(
+                    std::mem::size_of::<S::Value>()
+                        .saturating_mul(slots)
+                        .saturating_add(128 + 11 * std::mem::size_of::<S::Value>()),
+                )?;
+                self.first_key = false;
+            }
+            self.inner.next_key_seed(Seed(seed))
+        }
+        fn next_value_seed<S: DeserializeSeed<'de>>(
+            &mut self,
+            seed: S,
+        ) -> std::result::Result<S::Value, A::Error> {
+            let slots = if self.first_value { 16 } else { 4 };
             admit(
                 std::mem::size_of::<S::Value>()
                     .saturating_mul(slots)
                     .saturating_add(128 + 11 * std::mem::size_of::<S::Value>()),
             )?;
-            self.first_key = false;
+            self.first_value = false;
+            self.inner.next_value_seed(Seed(seed))
         }
-        self.inner.next_key_seed(Seed(seed))
+        fn size_hint(&self) -> Option<usize> {
+            Some(0)
+        }
     }
-    fn next_value_seed<S: DeserializeSeed<'de>>(
-        &mut self,
-        seed: S,
-    ) -> std::result::Result<S::Value, A::Error> {
-        let slots = if self.first_value { 16 } else { 4 };
-        admit(
-            std::mem::size_of::<S::Value>()
-                .saturating_mul(slots)
-                .saturating_add(128 + 11 * std::mem::size_of::<S::Value>()),
-        )?;
-        self.first_value = false;
-        self.inner.next_value_seed(Seed(seed))
+    struct Enum<A>(A);
+    impl<'de, A: de::EnumAccess<'de>> de::EnumAccess<'de> for Enum<A> {
+        type Error = A::Error;
+        type Variant = Variant<A::Variant>;
+        fn variant_seed<S: DeserializeSeed<'de>>(
+            self,
+            seed: S,
+        ) -> std::result::Result<(S::Value, Self::Variant), A::Error> {
+            self.0
+                .variant_seed(Seed(seed))
+                .map(|(value, variant)| (value, Variant(variant)))
+        }
     }
-    fn size_hint(&self) -> Option<usize> {
-        Some(0)
+    struct Variant<A>(A);
+    impl<'de, A: de::VariantAccess<'de>> de::VariantAccess<'de> for Variant<A> {
+        type Error = A::Error;
+        fn unit_variant(self) -> std::result::Result<(), A::Error> {
+            self.0.unit_variant()
+        }
+        fn newtype_variant_seed<S: DeserializeSeed<'de>>(
+            self,
+            seed: S,
+        ) -> std::result::Result<S::Value, A::Error> {
+            self.0.newtype_variant_seed(Seed(seed))
+        }
+        fn tuple_variant<VV: Visitor<'de>>(
+            self,
+            len: usize,
+            visitor: VV,
+        ) -> std::result::Result<VV::Value, A::Error> {
+            self.0.tuple_variant(
+                len,
+                V {
+                    inner: visitor,
+                    heap: false,
+                },
+            )
+        }
+        fn struct_variant<VV: Visitor<'de>>(
+            self,
+            fields: &'static [&'static str],
+            visitor: VV,
+        ) -> std::result::Result<VV::Value, A::Error> {
+            self.0.struct_variant(
+                fields,
+                V {
+                    inner: visitor,
+                    heap: false,
+                },
+            )
+        }
     }
-}
-struct Enum<A>(A);
-impl<'de, A: de::EnumAccess<'de>> de::EnumAccess<'de> for Enum<A> {
-    type Error = A::Error;
-    type Variant = Variant<A::Variant>;
-    fn variant_seed<S: DeserializeSeed<'de>>(
-        self,
-        seed: S,
-    ) -> std::result::Result<(S::Value, Self::Variant), A::Error> {
-        self.0
-            .variant_seed(Seed(seed))
-            .map(|(value, variant)| (value, Variant(variant)))
-    }
-}
-struct Variant<A>(A);
-impl<'de, A: de::VariantAccess<'de>> de::VariantAccess<'de> for Variant<A> {
-    type Error = A::Error;
-    fn unit_variant(self) -> std::result::Result<(), A::Error> {
-        self.0.unit_variant()
-    }
-    fn newtype_variant_seed<S: DeserializeSeed<'de>>(
-        self,
-        seed: S,
-    ) -> std::result::Result<S::Value, A::Error> {
-        self.0.newtype_variant_seed(Seed(seed))
-    }
-    fn tuple_variant<VV: Visitor<'de>>(
-        self,
-        len: usize,
-        visitor: VV,
-    ) -> std::result::Result<VV::Value, A::Error> {
-        self.0.tuple_variant(
-            len,
-            V {
+    impl<'de, D: de::Deserializer<'de>> de::Deserializer<'de> for Admitted<D> {
+        type Error = D::Error;
+        fn deserialize_any<VV: Visitor<'de>>(
+            self,
+            visitor: VV,
+        ) -> std::result::Result<VV::Value, D::Error> {
+            self.0.deserialize_any(V {
                 inner: visitor,
                 heap: false,
-            },
-        )
-    }
-    fn struct_variant<VV: Visitor<'de>>(
-        self,
-        fields: &'static [&'static str],
-        visitor: VV,
-    ) -> std::result::Result<VV::Value, A::Error> {
-        self.0.struct_variant(
-            fields,
-            V {
+            })
+        }
+        fn deserialize_bool<VV: Visitor<'de>>(
+            self,
+            visitor: VV,
+        ) -> std::result::Result<VV::Value, D::Error> {
+            self.0.deserialize_bool(V {
                 inner: visitor,
                 heap: false,
-            },
-        )
-    }
-}
-impl<'de, D: de::Deserializer<'de>> de::Deserializer<'de> for Admitted<D> {
-    type Error = D::Error;
-    fn deserialize_any<VV: Visitor<'de>>(
-        self,
-        visitor: VV,
-    ) -> std::result::Result<VV::Value, D::Error> {
-        self.0.deserialize_any(V {
-            inner: visitor,
-            heap: false,
-        })
-    }
-    fn deserialize_bool<VV: Visitor<'de>>(
-        self,
-        visitor: VV,
-    ) -> std::result::Result<VV::Value, D::Error> {
-        self.0.deserialize_bool(V {
-            inner: visitor,
-            heap: false,
-        })
-    }
-    fn deserialize_i8<VV: Visitor<'de>>(
-        self,
-        visitor: VV,
-    ) -> std::result::Result<VV::Value, D::Error> {
-        self.0.deserialize_i8(V {
-            inner: visitor,
-            heap: false,
-        })
-    }
-    fn deserialize_i16<VV: Visitor<'de>>(
-        self,
-        visitor: VV,
-    ) -> std::result::Result<VV::Value, D::Error> {
-        self.0.deserialize_i16(V {
-            inner: visitor,
-            heap: false,
-        })
-    }
-    fn deserialize_i32<VV: Visitor<'de>>(
-        self,
-        visitor: VV,
-    ) -> std::result::Result<VV::Value, D::Error> {
-        self.0.deserialize_i32(V {
-            inner: visitor,
-            heap: false,
-        })
-    }
-    fn deserialize_i64<VV: Visitor<'de>>(
-        self,
-        visitor: VV,
-    ) -> std::result::Result<VV::Value, D::Error> {
-        self.0.deserialize_i64(V {
-            inner: visitor,
-            heap: false,
-        })
-    }
-    fn deserialize_i128<VV: Visitor<'de>>(
-        self,
-        visitor: VV,
-    ) -> std::result::Result<VV::Value, D::Error> {
-        self.0.deserialize_i128(V {
-            inner: visitor,
-            heap: false,
-        })
-    }
-    fn deserialize_u8<VV: Visitor<'de>>(
-        self,
-        visitor: VV,
-    ) -> std::result::Result<VV::Value, D::Error> {
-        self.0.deserialize_u8(V {
-            inner: visitor,
-            heap: false,
-        })
-    }
-    fn deserialize_u16<VV: Visitor<'de>>(
-        self,
-        visitor: VV,
-    ) -> std::result::Result<VV::Value, D::Error> {
-        self.0.deserialize_u16(V {
-            inner: visitor,
-            heap: false,
-        })
-    }
-    fn deserialize_u32<VV: Visitor<'de>>(
-        self,
-        visitor: VV,
-    ) -> std::result::Result<VV::Value, D::Error> {
-        self.0.deserialize_u32(V {
-            inner: visitor,
-            heap: false,
-        })
-    }
-    fn deserialize_u64<VV: Visitor<'de>>(
-        self,
-        visitor: VV,
-    ) -> std::result::Result<VV::Value, D::Error> {
-        self.0.deserialize_u64(V {
-            inner: visitor,
-            heap: false,
-        })
-    }
-    fn deserialize_u128<VV: Visitor<'de>>(
-        self,
-        visitor: VV,
-    ) -> std::result::Result<VV::Value, D::Error> {
-        self.0.deserialize_u128(V {
-            inner: visitor,
-            heap: false,
-        })
-    }
-    fn deserialize_f32<VV: Visitor<'de>>(
-        self,
-        visitor: VV,
-    ) -> std::result::Result<VV::Value, D::Error> {
-        self.0.deserialize_f32(V {
-            inner: visitor,
-            heap: false,
-        })
-    }
-    fn deserialize_f64<VV: Visitor<'de>>(
-        self,
-        visitor: VV,
-    ) -> std::result::Result<VV::Value, D::Error> {
-        self.0.deserialize_f64(V {
-            inner: visitor,
-            heap: false,
-        })
-    }
-    fn deserialize_char<VV: Visitor<'de>>(
-        self,
-        visitor: VV,
-    ) -> std::result::Result<VV::Value, D::Error> {
-        self.0.deserialize_char(V {
-            inner: visitor,
-            heap: false,
-        })
-    }
-    fn deserialize_str<VV: Visitor<'de>>(
-        self,
-        visitor: VV,
-    ) -> std::result::Result<VV::Value, D::Error> {
-        self.0.deserialize_str(V {
-            inner: visitor,
-            heap: false,
-        })
-    }
-    fn deserialize_string<VV: Visitor<'de>>(
-        self,
-        visitor: VV,
-    ) -> std::result::Result<VV::Value, D::Error> {
-        self.0.deserialize_str(V {
-            inner: visitor,
-            heap: false,
-        })
-    }
-    fn deserialize_bytes<VV: Visitor<'de>>(
-        self,
-        visitor: VV,
-    ) -> std::result::Result<VV::Value, D::Error> {
-        self.0.deserialize_bytes(V {
-            inner: visitor,
-            heap: false,
-        })
-    }
-    fn deserialize_byte_buf<VV: Visitor<'de>>(
-        self,
-        visitor: VV,
-    ) -> std::result::Result<VV::Value, D::Error> {
-        self.0.deserialize_bytes(V {
-            inner: visitor,
-            heap: false,
-        })
-    }
-    fn deserialize_option<VV: Visitor<'de>>(
-        self,
-        visitor: VV,
-    ) -> std::result::Result<VV::Value, D::Error> {
-        self.0.deserialize_option(V {
-            inner: visitor,
-            heap: false,
-        })
-    }
-    fn deserialize_unit<VV: Visitor<'de>>(
-        self,
-        visitor: VV,
-    ) -> std::result::Result<VV::Value, D::Error> {
-        self.0.deserialize_unit(V {
-            inner: visitor,
-            heap: false,
-        })
-    }
-    fn deserialize_seq<VV: Visitor<'de>>(
-        self,
-        visitor: VV,
-    ) -> std::result::Result<VV::Value, D::Error> {
-        self.0.deserialize_seq(V {
-            inner: visitor,
-            heap: true,
-        })
-    }
-    fn deserialize_map<VV: Visitor<'de>>(
-        self,
-        visitor: VV,
-    ) -> std::result::Result<VV::Value, D::Error> {
-        self.0.deserialize_map(V {
-            inner: visitor,
-            heap: true,
-        })
-    }
-    fn deserialize_identifier<VV: Visitor<'de>>(
-        self,
-        visitor: VV,
-    ) -> std::result::Result<VV::Value, D::Error> {
-        self.0.deserialize_identifier(V {
-            inner: visitor,
-            heap: false,
-        })
-    }
-    fn deserialize_ignored_any<VV: Visitor<'de>>(
-        self,
-        visitor: VV,
-    ) -> std::result::Result<VV::Value, D::Error> {
-        self.0.deserialize_ignored_any(V {
-            inner: visitor,
-            heap: false,
-        })
-    }
-    fn deserialize_unit_struct<VV: Visitor<'de>>(
-        self,
-        name: &'static str,
-        visitor: VV,
-    ) -> std::result::Result<VV::Value, D::Error> {
-        self.0.deserialize_unit_struct(
-            name,
-            V {
+            })
+        }
+        fn deserialize_i8<VV: Visitor<'de>>(
+            self,
+            visitor: VV,
+        ) -> std::result::Result<VV::Value, D::Error> {
+            self.0.deserialize_i8(V {
                 inner: visitor,
                 heap: false,
-            },
-        )
-    }
-    fn deserialize_newtype_struct<VV: Visitor<'de>>(
-        self,
-        name: &'static str,
-        visitor: VV,
-    ) -> std::result::Result<VV::Value, D::Error> {
-        self.0.deserialize_newtype_struct(
-            name,
-            V {
+            })
+        }
+        fn deserialize_i16<VV: Visitor<'de>>(
+            self,
+            visitor: VV,
+        ) -> std::result::Result<VV::Value, D::Error> {
+            self.0.deserialize_i16(V {
                 inner: visitor,
                 heap: false,
-            },
-        )
-    }
-    fn deserialize_tuple<VV: Visitor<'de>>(
-        self,
-        len: usize,
-        visitor: VV,
-    ) -> std::result::Result<VV::Value, D::Error> {
-        self.0.deserialize_tuple(
-            len,
-            V {
+            })
+        }
+        fn deserialize_i32<VV: Visitor<'de>>(
+            self,
+            visitor: VV,
+        ) -> std::result::Result<VV::Value, D::Error> {
+            self.0.deserialize_i32(V {
                 inner: visitor,
                 heap: false,
-            },
-        )
-    }
-    fn deserialize_tuple_struct<VV: Visitor<'de>>(
-        self,
-        name: &'static str,
-        len: usize,
-        visitor: VV,
-    ) -> std::result::Result<VV::Value, D::Error> {
-        self.0.deserialize_tuple_struct(
-            name,
-            len,
-            V {
+            })
+        }
+        fn deserialize_i64<VV: Visitor<'de>>(
+            self,
+            visitor: VV,
+        ) -> std::result::Result<VV::Value, D::Error> {
+            self.0.deserialize_i64(V {
                 inner: visitor,
                 heap: false,
-            },
-        )
-    }
-    fn deserialize_struct<VV: Visitor<'de>>(
-        self,
-        name: &'static str,
-        fields: &'static [&'static str],
-        visitor: VV,
-    ) -> std::result::Result<VV::Value, D::Error> {
-        self.0.deserialize_struct(
-            name,
-            fields,
-            V {
+            })
+        }
+        fn deserialize_i128<VV: Visitor<'de>>(
+            self,
+            visitor: VV,
+        ) -> std::result::Result<VV::Value, D::Error> {
+            self.0.deserialize_i128(V {
                 inner: visitor,
                 heap: false,
-            },
-        )
-    }
-    fn deserialize_enum<VV: Visitor<'de>>(
-        self,
-        name: &'static str,
-        variants: &'static [&'static str],
-        visitor: VV,
-    ) -> std::result::Result<VV::Value, D::Error> {
-        self.0.deserialize_enum(
-            name,
-            variants,
-            V {
+            })
+        }
+        fn deserialize_u8<VV: Visitor<'de>>(
+            self,
+            visitor: VV,
+        ) -> std::result::Result<VV::Value, D::Error> {
+            self.0.deserialize_u8(V {
                 inner: visitor,
                 heap: false,
-            },
-        )
+            })
+        }
+        fn deserialize_u16<VV: Visitor<'de>>(
+            self,
+            visitor: VV,
+        ) -> std::result::Result<VV::Value, D::Error> {
+            self.0.deserialize_u16(V {
+                inner: visitor,
+                heap: false,
+            })
+        }
+        fn deserialize_u32<VV: Visitor<'de>>(
+            self,
+            visitor: VV,
+        ) -> std::result::Result<VV::Value, D::Error> {
+            self.0.deserialize_u32(V {
+                inner: visitor,
+                heap: false,
+            })
+        }
+        fn deserialize_u64<VV: Visitor<'de>>(
+            self,
+            visitor: VV,
+        ) -> std::result::Result<VV::Value, D::Error> {
+            self.0.deserialize_u64(V {
+                inner: visitor,
+                heap: false,
+            })
+        }
+        fn deserialize_u128<VV: Visitor<'de>>(
+            self,
+            visitor: VV,
+        ) -> std::result::Result<VV::Value, D::Error> {
+            self.0.deserialize_u128(V {
+                inner: visitor,
+                heap: false,
+            })
+        }
+        fn deserialize_f32<VV: Visitor<'de>>(
+            self,
+            visitor: VV,
+        ) -> std::result::Result<VV::Value, D::Error> {
+            self.0.deserialize_f32(V {
+                inner: visitor,
+                heap: false,
+            })
+        }
+        fn deserialize_f64<VV: Visitor<'de>>(
+            self,
+            visitor: VV,
+        ) -> std::result::Result<VV::Value, D::Error> {
+            self.0.deserialize_f64(V {
+                inner: visitor,
+                heap: false,
+            })
+        }
+        fn deserialize_char<VV: Visitor<'de>>(
+            self,
+            visitor: VV,
+        ) -> std::result::Result<VV::Value, D::Error> {
+            self.0.deserialize_char(V {
+                inner: visitor,
+                heap: false,
+            })
+        }
+        fn deserialize_str<VV: Visitor<'de>>(
+            self,
+            visitor: VV,
+        ) -> std::result::Result<VV::Value, D::Error> {
+            self.0.deserialize_str(V {
+                inner: visitor,
+                heap: false,
+            })
+        }
+        fn deserialize_string<VV: Visitor<'de>>(
+            self,
+            visitor: VV,
+        ) -> std::result::Result<VV::Value, D::Error> {
+            self.0.deserialize_str(V {
+                inner: visitor,
+                heap: false,
+            })
+        }
+        fn deserialize_bytes<VV: Visitor<'de>>(
+            self,
+            visitor: VV,
+        ) -> std::result::Result<VV::Value, D::Error> {
+            self.0.deserialize_bytes(V {
+                inner: visitor,
+                heap: false,
+            })
+        }
+        fn deserialize_byte_buf<VV: Visitor<'de>>(
+            self,
+            visitor: VV,
+        ) -> std::result::Result<VV::Value, D::Error> {
+            self.0.deserialize_bytes(V {
+                inner: visitor,
+                heap: false,
+            })
+        }
+        fn deserialize_option<VV: Visitor<'de>>(
+            self,
+            visitor: VV,
+        ) -> std::result::Result<VV::Value, D::Error> {
+            self.0.deserialize_option(V {
+                inner: visitor,
+                heap: false,
+            })
+        }
+        fn deserialize_unit<VV: Visitor<'de>>(
+            self,
+            visitor: VV,
+        ) -> std::result::Result<VV::Value, D::Error> {
+            self.0.deserialize_unit(V {
+                inner: visitor,
+                heap: false,
+            })
+        }
+        fn deserialize_seq<VV: Visitor<'de>>(
+            self,
+            visitor: VV,
+        ) -> std::result::Result<VV::Value, D::Error> {
+            self.0.deserialize_seq(V {
+                inner: visitor,
+                heap: true,
+            })
+        }
+        fn deserialize_map<VV: Visitor<'de>>(
+            self,
+            visitor: VV,
+        ) -> std::result::Result<VV::Value, D::Error> {
+            self.0.deserialize_map(V {
+                inner: visitor,
+                heap: true,
+            })
+        }
+        fn deserialize_identifier<VV: Visitor<'de>>(
+            self,
+            visitor: VV,
+        ) -> std::result::Result<VV::Value, D::Error> {
+            self.0.deserialize_identifier(V {
+                inner: visitor,
+                heap: false,
+            })
+        }
+        fn deserialize_ignored_any<VV: Visitor<'de>>(
+            self,
+            visitor: VV,
+        ) -> std::result::Result<VV::Value, D::Error> {
+            self.0.deserialize_ignored_any(V {
+                inner: visitor,
+                heap: false,
+            })
+        }
+        fn deserialize_unit_struct<VV: Visitor<'de>>(
+            self,
+            name: &'static str,
+            visitor: VV,
+        ) -> std::result::Result<VV::Value, D::Error> {
+            self.0.deserialize_unit_struct(
+                name,
+                V {
+                    inner: visitor,
+                    heap: false,
+                },
+            )
+        }
+        fn deserialize_newtype_struct<VV: Visitor<'de>>(
+            self,
+            name: &'static str,
+            visitor: VV,
+        ) -> std::result::Result<VV::Value, D::Error> {
+            self.0.deserialize_newtype_struct(
+                name,
+                V {
+                    inner: visitor,
+                    heap: false,
+                },
+            )
+        }
+        fn deserialize_tuple<VV: Visitor<'de>>(
+            self,
+            len: usize,
+            visitor: VV,
+        ) -> std::result::Result<VV::Value, D::Error> {
+            self.0.deserialize_tuple(
+                len,
+                V {
+                    inner: visitor,
+                    heap: false,
+                },
+            )
+        }
+        fn deserialize_tuple_struct<VV: Visitor<'de>>(
+            self,
+            name: &'static str,
+            len: usize,
+            visitor: VV,
+        ) -> std::result::Result<VV::Value, D::Error> {
+            self.0.deserialize_tuple_struct(
+                name,
+                len,
+                V {
+                    inner: visitor,
+                    heap: false,
+                },
+            )
+        }
+        fn deserialize_struct<VV: Visitor<'de>>(
+            self,
+            name: &'static str,
+            fields: &'static [&'static str],
+            visitor: VV,
+        ) -> std::result::Result<VV::Value, D::Error> {
+            self.0.deserialize_struct(
+                name,
+                fields,
+                V {
+                    inner: visitor,
+                    heap: false,
+                },
+            )
+        }
+        fn deserialize_enum<VV: Visitor<'de>>(
+            self,
+            name: &'static str,
+            variants: &'static [&'static str],
+            visitor: VV,
+        ) -> std::result::Result<VV::Value, D::Error> {
+            self.0.deserialize_enum(
+                name,
+                variants,
+                V {
+                    inner: visitor,
+                    heap: false,
+                },
+            )
+        }
+        fn is_human_readable(&self) -> bool {
+            self.0.is_human_readable()
+        }
     }
-    fn is_human_readable(&self) -> bool {
-        self.0.is_human_readable()
-    }
-}
-
-
 }
 
 impl OwnedEventKey {
-    fn concatenated(original:&crate::memory_accounting::OwnedMemoryReservation,prefix:&str,suffix:&str)->Result<Self>{
-        let bytes=prefix.len().checked_add(suffix.len()).ok_or_else(||Error::Other("sink queue key size overflow".into()))?;
-        let allocation=crate::memory_accounting::reserve_preparation_from_original(original,bytes,"events","sink_queue_identity","Reduce pending deliveries or raise MEMORY_LIMIT.")?;
-        let mut value=String::with_capacity(bytes);value.push_str(prefix);value.push_str(suffix);
-        if value.capacity()!=bytes{return Err(Error::Other("sink queue key capacity differs from admission".into()));}
-        Ok(Self {value,allocation})
+    fn concatenated(
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        prefix: &str,
+        suffix: &str,
+    ) -> Result<Self> {
+        let bytes = prefix
+            .len()
+            .checked_add(suffix.len())
+            .ok_or_else(|| Error::Other("sink queue key size overflow".into()))?;
+        let allocation = crate::memory_accounting::reserve_preparation_from_original(
+            original,
+            bytes,
+            "events",
+            "sink_queue_identity",
+            "Reduce pending deliveries or raise MEMORY_LIMIT.",
+        )?;
+        let mut value = String::with_capacity(bytes);
+        value.push_str(prefix);
+        value.push_str(suffix);
+        if value.capacity() != bytes {
+            return Err(Error::Other(
+                "sink queue key capacity differs from admission".into(),
+            ));
+        }
+        Ok(Self { value, allocation })
     }
 }
 
 impl RedbPersistence {
-    pub(crate) fn decode_owned_event<T:serde::de::DeserializeOwned>(
-        original:&crate::memory_accounting::OwnedMemoryReservation,bytes:&[u8],
-    )->Result<OriginalDecoded<T>>{ original_event_decode::decode(original,bytes) }
+    pub(crate) fn decode_owned_event<T: serde::de::DeserializeOwned>(
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        bytes: &[u8],
+    ) -> Result<OriginalDecoded<T>> {
+        original_event_decode::decode(original, bytes)
+    }
 
-    pub(crate) fn update_owned_sink_queue_entry<T:serde::Serialize>(
-        &self,original:&crate::memory_accounting::OwnedMemoryReservation,sink:&str,
-        remove_id:Option<u64>,put:Option<(u64,&T)>,uncertain:bool,unconfirmed_delta:i8,
-    )->Result<()> {
-        if remove_id.is_none() && put.is_none(){return Ok(());}
+    pub(crate) fn update_owned_sink_queue_entry<T: serde::Serialize>(
+        &self,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        sink: &str,
+        remove_id: Option<u64>,
+        put: Option<(u64, &T)>,
+        uncertain: bool,
+        unconfirmed_delta: i8,
+    ) -> Result<()> {
+        if remove_id.is_none() && put.is_none() {
+            return Ok(());
+        }
         // All escaping serialization/key controls are paid by this immutable
         // seed before the transaction can publish their corresponding writes.
-        let table_name=OwnedEventKey::concatenated(original,"__sink_queue_",sink)?;
-        let remove_key=remove_id.map(|id|OwnedEventKey::queue_identity(original,sink,id)).transpose()?;
-        let put_key=put.map(|(id,_)|OwnedEventKey::queue_identity(original,sink,id)).transpose()?;
-        let encoded_put=put.map(|(_,entry)|Self::encode_owned_event(original,entry)).transpose()?;
-        let uncertain_key=uncertain.then(||OwnedEventKey::concatenated(original,
-            crate::database::event_bus::UNCERTAIN_COUNT_CONFIG_PREFIX,sink)).transpose()?;
-        let unconfirmed_key=(unconfirmed_delta!=0).then(||OwnedEventKey::concatenated(original,
-            crate::database::event_bus::UNCONFIRMED_COUNT_CONFIG_PREFIX,sink)).transpose()?;
-        let mut identity=content_identity::OriginalIdentityMutations::new(original,4)?;
-        let mut proof=content_identity::original_writer::ProofAdmission::new(original,self.proof_scratch_owner())?;
-        if let Some(key)=&remove_key {identity.push_status::<u64>(b"sink-queue",key.value.as_bytes(),None)?;}
-        if let (Some(key),Some((_,entry)))=(&put_key,put){identity.push_status(b"sink-queue",key.value.as_bytes(),Some(entry))?;}
+        let table_name = OwnedEventKey::concatenated(original, "__sink_queue_", sink)?;
+        let remove_key = remove_id
+            .map(|id| OwnedEventKey::queue_identity(original, sink, id))
+            .transpose()?;
+        let put_key = put
+            .map(|(id, _)| OwnedEventKey::queue_identity(original, sink, id))
+            .transpose()?;
+        let encoded_put = put
+            .map(|(_, entry)| Self::encode_owned_event(original, entry))
+            .transpose()?;
+        let uncertain_key = uncertain
+            .then(|| {
+                OwnedEventKey::concatenated(
+                    original,
+                    crate::database::event_bus::UNCERTAIN_COUNT_CONFIG_PREFIX,
+                    sink,
+                )
+            })
+            .transpose()?;
+        let unconfirmed_key = (unconfirmed_delta != 0)
+            .then(|| {
+                OwnedEventKey::concatenated(
+                    original,
+                    crate::database::event_bus::UNCONFIRMED_COUNT_CONFIG_PREFIX,
+                    sink,
+                )
+            })
+            .transpose()?;
+        let mut identity = content_identity::OriginalIdentityMutations::new(original, 4)?;
+        let mut proof = content_identity::original_writer::ProofAdmission::new(
+            original,
+            self.proof_scratch_owner(),
+        )?;
+        if let Some(key) = &remove_key {
+            identity.push_status::<u64>(b"sink-queue", key.value.as_bytes(), None)?;
+        }
+        if let (Some(key), Some((_, entry))) = (&put_key, put) {
+            identity.push_status(b"sink-queue", key.value.as_bytes(), Some(entry))?;
+        }
         self.with_db(|db| {
-            let write_txn=Self::begin_history_write(db)?;
-            #[cfg(any(test,feature="test-seams"))]
-            let mut graph_publication_attempt=crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
+            let write_txn = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
             {
-                let definition:TableDefinition<u64,&[u8]>=TableDefinition::new(&table_name.value);
-                let mut table=write_txn.open_table(definition).map_err(Self::storage_error)?;
-                if let Some(id)=remove_id {table.remove(id).map_err(Self::storage_error)?;}
-                if let (Some((id,_)),Some(encoded))=(put,&encoded_put){table.insert(id,encoded.bytes.as_slice()).map_err(Self::storage_error)?;}
+                let definition: TableDefinition<u64, &[u8]> =
+                    TableDefinition::new(&table_name.value);
+                let mut table = write_txn
+                    .open_table(definition)
+                    .map_err(Self::storage_error)?;
+                if let Some(id) = remove_id {
+                    table.remove(id).map_err(Self::storage_error)?;
+                }
+                if let (Some((id, _)), Some(encoded)) = (put, &encoded_put) {
+                    table
+                        .insert(id, encoded.bytes.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
             }
-            if let Some(key)=&uncertain_key {
-                let mut table=write_txn.open_table(CONFIG_TABLE).map_err(Self::storage_error)?;
-                let previous:u64=match table.get(key.value.as_str()).map_err(Self::storage_error)? {
-                    Some(value)=>Self::decode_owned_event::<u64>(original,value.value())?.value,None=>0,
+            if let Some(key) = &uncertain_key {
+                let mut table = write_txn
+                    .open_table(CONFIG_TABLE)
+                    .map_err(Self::storage_error)?;
+                let previous: u64 = match table
+                    .get(key.value.as_str())
+                    .map_err(Self::storage_error)?
+                {
+                    Some(value) => Self::decode_owned_event::<u64>(original, value.value())?.value,
+                    None => 0,
                 };
-                let encoded=Self::encode_owned_event(original,&previous.saturating_add(1))?;
-                table.insert(key.value.as_str(),encoded.bytes.as_slice()).map_err(Self::storage_error)?;
-                identity.push_config(&key.value,Some(&encoded.bytes))?;
+                let encoded = Self::encode_owned_event(original, &previous.saturating_add(1))?;
+                table
+                    .insert(key.value.as_str(), encoded.bytes.as_slice())
+                    .map_err(Self::storage_error)?;
+                identity.push_config(&key.value, Some(&encoded.bytes))?;
             }
-            if let Some(key)=&unconfirmed_key {
-                let mut table=write_txn.open_table(CONFIG_TABLE).map_err(Self::storage_error)?;
-                let previous:u64=match table.get(key.value.as_str()).map_err(Self::storage_error)? {
-                    Some(value)=>Self::decode_owned_event::<u64>(original,value.value())?.value,None=>0,
+            if let Some(key) = &unconfirmed_key {
+                let mut table = write_txn
+                    .open_table(CONFIG_TABLE)
+                    .map_err(Self::storage_error)?;
+                let previous: u64 = match table
+                    .get(key.value.as_str())
+                    .map_err(Self::storage_error)?
+                {
+                    Some(value) => Self::decode_owned_event::<u64>(original, value.value())?.value,
+                    None => 0,
                 };
-                let next=if unconfirmed_delta>0{previous.checked_add(1)}else{previous.checked_sub(1)}
-                    .ok_or_else(||Error::Other("sink attempt summary overflow".to_owned()))?;
-                let encoded=Self::encode_owned_event(original,&next)?;
-                table.insert(key.value.as_str(),encoded.bytes.as_slice()).map_err(Self::storage_error)?;
-                identity.push_config(&key.value,Some(&encoded.bytes))?;
+                let next = if unconfirmed_delta > 0 {
+                    previous.checked_add(1)
+                } else {
+                    previous.checked_sub(1)
+                }
+                .ok_or_else(|| Error::Other("sink attempt summary overflow".to_owned()))?;
+                let encoded = Self::encode_owned_event(original, &next)?;
+                table
+                    .insert(key.value.as_str(), encoded.bytes.as_slice())
+                    .map_err(Self::storage_error)?;
+                identity.push_config(&key.value, Some(&encoded.bytes))?;
             }
-            Self::apply_owned_content_identity_with_manifests_in_write(&write_txn,&identity.mutations,&[],&mut proof)?;
-            Self::write_writer_recovery_bounds_in_write(&write_txn,None)?;
+            Self::apply_owned_content_identity_with_manifests_in_write(
+                &write_txn,
+                &identity.mutations,
+                &[],
+                &mut proof,
+            )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             {
-                #[cfg(any(test,feature="test-seams"))] graph_observation_checkpoint(10)?;
-                let graph_commit_result=write_txn.commit();
-                #[cfg(any(test,feature="test-seams"))] if graph_commit_result.is_ok(){graph_publication_attempt.committed();graph_observation_checkpoint(11)?;}
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
                 graph_commit_result
-            }.map_err(Self::storage_error)?;
+            }
+            .map_err(Self::storage_error)?;
             Ok(())
         })
     }
 
     pub(crate) fn remove_owned_sink_queue_entries(
-        &self,original:&crate::memory_accounting::OwnedMemoryReservation,sink:&str,
-        remove_ids:&[u64],unconfirmed:u64,
-    )->Result<()> {
-        if remove_ids.is_empty(){return Ok(());}
-        let table_name=OwnedEventKey::concatenated(original,"__sink_queue_",sink)?;
-        let removals=Self::prepare_owned_sink_queue_removals(original,sink,remove_ids)?;
-        let summary_key=(unconfirmed>0).then(||OwnedEventKey::concatenated(original,
-            crate::database::event_bus::UNCONFIRMED_COUNT_CONFIG_PREFIX,sink)).transpose()?;
-        let mut identity=content_identity::OriginalIdentityMutations::new(original,1)?;
-        let mut proof=content_identity::original_writer::ProofAdmission::new(original,self.proof_scratch_owner())?;
+        &self,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        sink: &str,
+        remove_ids: &[u64],
+        unconfirmed: u64,
+    ) -> Result<()> {
+        if remove_ids.is_empty() {
+            return Ok(());
+        }
+        let table_name = OwnedEventKey::concatenated(original, "__sink_queue_", sink)?;
+        let removals = Self::prepare_owned_sink_queue_removals(original, sink, remove_ids)?;
+        let summary_key = (unconfirmed > 0)
+            .then(|| {
+                OwnedEventKey::concatenated(
+                    original,
+                    crate::database::event_bus::UNCONFIRMED_COUNT_CONFIG_PREFIX,
+                    sink,
+                )
+            })
+            .transpose()?;
+        let mut identity = content_identity::OriginalIdentityMutations::new(original, 1)?;
+        let mut proof = content_identity::original_writer::ProofAdmission::new(
+            original,
+            self.proof_scratch_owner(),
+        )?;
         self.with_db(|db| {
-            let write_txn=Self::begin_history_write(db)?;
-            #[cfg(any(test,feature="test-seams"))]
-            let mut graph_publication_attempt=crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
+            let write_txn = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
             {
-                let definition:TableDefinition<u64,&[u8]>=TableDefinition::new(&table_name.value);
-                let mut table=write_txn.open_table(definition).map_err(Self::storage_error)?;
-                for id in remove_ids {table.remove(*id).map_err(Self::storage_error)?;}
+                let definition: TableDefinition<u64, &[u8]> =
+                    TableDefinition::new(&table_name.value);
+                let mut table = write_txn
+                    .open_table(definition)
+                    .map_err(Self::storage_error)?;
+                for id in remove_ids {
+                    table.remove(*id).map_err(Self::storage_error)?;
+                }
             }
-            if let Some(key)=&summary_key {
-                let mut table=write_txn.open_table(CONFIG_TABLE).map_err(Self::storage_error)?;
-                let previous:u64=match table.get(key.value.as_str()).map_err(Self::storage_error)? {
-                    Some(value)=>Self::decode_owned_event::<u64>(original,value.value())?.value,None=>0,
+            if let Some(key) = &summary_key {
+                let mut table = write_txn
+                    .open_table(CONFIG_TABLE)
+                    .map_err(Self::storage_error)?;
+                let previous: u64 = match table
+                    .get(key.value.as_str())
+                    .map_err(Self::storage_error)?
+                {
+                    Some(value) => Self::decode_owned_event::<u64>(original, value.value())?.value,
+                    None => 0,
                 };
-                let next=previous.checked_sub(unconfirmed).ok_or_else(||Error::Other("sink attempt summary overflow".to_owned()))?;
-                let encoded=Self::encode_owned_event(original,&next)?;
-                table.insert(key.value.as_str(),encoded.bytes.as_slice()).map_err(Self::storage_error)?;
-                identity.push_config(&key.value,Some(&encoded.bytes))?;
+                let next = previous
+                    .checked_sub(unconfirmed)
+                    .ok_or_else(|| Error::Other("sink attempt summary overflow".to_owned()))?;
+                let encoded = Self::encode_owned_event(original, &next)?;
+                table
+                    .insert(key.value.as_str(), encoded.bytes.as_slice())
+                    .map_err(Self::storage_error)?;
+                identity.push_config(&key.value, Some(&encoded.bytes))?;
             }
-            Self::apply_owned_content_identity_with_manifests_in_write(&write_txn,&removals.mutations,&identity.mutations,&mut proof)?;
-            Self::write_writer_recovery_bounds_in_write(&write_txn,None)?;
+            Self::apply_owned_content_identity_with_manifests_in_write(
+                &write_txn,
+                &removals.mutations,
+                &identity.mutations,
+                &mut proof,
+            )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             {
-                #[cfg(any(test,feature="test-seams"))] graph_observation_checkpoint(10)?;
-                let graph_commit_result=write_txn.commit();
-                #[cfg(any(test,feature="test-seams"))] if graph_commit_result.is_ok(){graph_publication_attempt.committed();graph_observation_checkpoint(11)?;}
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
                 graph_commit_result
-            }.map_err(Self::storage_error)?;
+            }
+            .map_err(Self::storage_error)?;
             Ok(())
         })
     }
 
     // Dormant private queue companions retain the original methods above.
-    pub(crate) fn update_owned_sink_queue_entry_at_boundary<T:serde::Serialize>(
-        &self,original:&crate::memory_accounting::OwnedMemoryReservation,sink:&str,
-        remove_id:Option<u64>,put:Option<(u64,&T)>,uncertain:bool,unconfirmed_delta:i8,
-        completion:&crate::database::event_bus::OwnedQueueCommitToken<'_>,
-        failure:&mut crate::database::event_bus::OwnedNativeQueueFailure,
+    pub(crate) fn update_owned_sink_queue_entry_at_boundary<T: serde::Serialize>(
+        &self,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        sink: &str,
+        remove_id: Option<u64>,
+        put: Option<(u64, &T)>,
+        uncertain: bool,
+        unconfirmed_delta: i8,
+        completion: &crate::database::event_bus::OwnedQueueCommitToken<'_>,
+        failure: &mut crate::database::event_bus::OwnedNativeQueueFailure,
     ) {
-        if remove_id.is_none() && put.is_none(){return;}
+        if remove_id.is_none() && put.is_none() {
+            return;
+        }
         let prepared = (|| -> Result<_> {
-        // All escaping serialization/key controls are paid by this immutable
-        // seed before the transaction can publish their corresponding writes.
-        let table_name=OwnedEventKey::concatenated(original,"__sink_queue_",sink)?;
-        let remove_key=remove_id.map(|id|OwnedEventKey::queue_identity(original,sink,id)).transpose()?;
-        let put_key=put.map(|(id,_)|OwnedEventKey::queue_identity(original,sink,id)).transpose()?;
-        let encoded_put=put.map(|(_,entry)|Self::encode_owned_event(original,entry)).transpose()?;
-        let uncertain_key=uncertain.then(||OwnedEventKey::concatenated(original,
-            crate::database::event_bus::UNCERTAIN_COUNT_CONFIG_PREFIX,sink)).transpose()?;
-        let unconfirmed_key=(unconfirmed_delta!=0).then(||OwnedEventKey::concatenated(original,
-            crate::database::event_bus::UNCONFIRMED_COUNT_CONFIG_PREFIX,sink)).transpose()?;
-        let mut identity=content_identity::OriginalIdentityMutations::new(original,4)?;
-        let proof=content_identity::original_writer::ProofAdmission::new(original,self.proof_scratch_owner())?;
-        if let Some(key)=&remove_key {identity.push_status::<u64>(b"sink-queue",key.value.as_bytes(),None)?;}
-        if let (Some(key),Some((_,entry)))=(&put_key,put){identity.push_status(b"sink-queue",key.value.as_bytes(),Some(entry))?;}
-        Ok((table_name,remove_key,put_key,encoded_put,uncertain_key,unconfirmed_key,identity,proof))
+            // All escaping serialization/key controls are paid by this immutable
+            // seed before the transaction can publish their corresponding writes.
+            let table_name = OwnedEventKey::concatenated(original, "__sink_queue_", sink)?;
+            let remove_key = remove_id
+                .map(|id| OwnedEventKey::queue_identity(original, sink, id))
+                .transpose()?;
+            let put_key = put
+                .map(|(id, _)| OwnedEventKey::queue_identity(original, sink, id))
+                .transpose()?;
+            let encoded_put = put
+                .map(|(_, entry)| Self::encode_owned_event(original, entry))
+                .transpose()?;
+            let uncertain_key = uncertain
+                .then(|| {
+                    OwnedEventKey::concatenated(
+                        original,
+                        crate::database::event_bus::UNCERTAIN_COUNT_CONFIG_PREFIX,
+                        sink,
+                    )
+                })
+                .transpose()?;
+            let unconfirmed_key = (unconfirmed_delta != 0)
+                .then(|| {
+                    OwnedEventKey::concatenated(
+                        original,
+                        crate::database::event_bus::UNCONFIRMED_COUNT_CONFIG_PREFIX,
+                        sink,
+                    )
+                })
+                .transpose()?;
+            let mut identity = content_identity::OriginalIdentityMutations::new(original, 4)?;
+            let proof = content_identity::original_writer::ProofAdmission::new(
+                original,
+                self.proof_scratch_owner(),
+            )?;
+            if let Some(key) = &remove_key {
+                identity.push_status::<u64>(b"sink-queue", key.value.as_bytes(), None)?;
+            }
+            if let (Some(key), Some((_, entry))) = (&put_key, put) {
+                identity.push_status(b"sink-queue", key.value.as_bytes(), Some(entry))?;
+            }
+            Ok((
+                table_name,
+                remove_key,
+                put_key,
+                encoded_put,
+                uncertain_key,
+                unconfirmed_key,
+                identity,
+                proof,
+            ))
         })();
-        let (table_name,_remove_key,_put_key,encoded_put,uncertain_key,unconfirmed_key,mut identity,mut proof) = match prepared {
+        let (
+            table_name,
+            _remove_key,
+            _put_key,
+            encoded_put,
+            uncertain_key,
+            unconfirmed_key,
+            mut identity,
+            mut proof,
+        ) = match prepared {
             Ok(prepared) => prepared,
-            Err(error) => { failure.capture(Err(error)); return; }
+            Err(error) => {
+                failure.capture(Err(error));
+                return;
+            }
         };
         // Retain the actual paid preparation controls until the original
         // result is captured; no diagnostic dies in a postcommit refund gap.
         let result = self.with_db(|db| {
-            let write_txn=Self::begin_history_write(db)?;
-            #[cfg(any(test,feature="test-seams"))]
-            let mut graph_publication_attempt=crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
+            let write_txn = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
             {
-                let definition:TableDefinition<u64,&[u8]>=TableDefinition::new(&table_name.value);
-                let mut table=write_txn.open_table(definition).map_err(Self::storage_error)?;
-                if let Some(id)=remove_id {table.remove(id).map_err(Self::storage_error)?;}
-                if let (Some((id,_)),Some(encoded))=(put,&encoded_put){table.insert(id,encoded.bytes.as_slice()).map_err(Self::storage_error)?;}
+                let definition: TableDefinition<u64, &[u8]> =
+                    TableDefinition::new(&table_name.value);
+                let mut table = write_txn
+                    .open_table(definition)
+                    .map_err(Self::storage_error)?;
+                if let Some(id) = remove_id {
+                    table.remove(id).map_err(Self::storage_error)?;
+                }
+                if let (Some((id, _)), Some(encoded)) = (put, &encoded_put) {
+                    table
+                        .insert(id, encoded.bytes.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
             }
-            if let Some(key)=&uncertain_key {
-                let mut table=write_txn.open_table(CONFIG_TABLE).map_err(Self::storage_error)?;
-                let previous:u64=match table.get(key.value.as_str()).map_err(Self::storage_error)? {
-                    Some(value)=>Self::decode_owned_event::<u64>(original,value.value())?.value,None=>0,
+            if let Some(key) = &uncertain_key {
+                let mut table = write_txn
+                    .open_table(CONFIG_TABLE)
+                    .map_err(Self::storage_error)?;
+                let previous: u64 = match table
+                    .get(key.value.as_str())
+                    .map_err(Self::storage_error)?
+                {
+                    Some(value) => Self::decode_owned_event::<u64>(original, value.value())?.value,
+                    None => 0,
                 };
-                let encoded=Self::encode_owned_event(original,&previous.saturating_add(1))?;
-                table.insert(key.value.as_str(),encoded.bytes.as_slice()).map_err(Self::storage_error)?;
-                identity.push_config(&key.value,Some(&encoded.bytes))?;
+                let encoded = Self::encode_owned_event(original, &previous.saturating_add(1))?;
+                table
+                    .insert(key.value.as_str(), encoded.bytes.as_slice())
+                    .map_err(Self::storage_error)?;
+                identity.push_config(&key.value, Some(&encoded.bytes))?;
             }
-            if let Some(key)=&unconfirmed_key {
-                let mut table=write_txn.open_table(CONFIG_TABLE).map_err(Self::storage_error)?;
-                let previous:u64=match table.get(key.value.as_str()).map_err(Self::storage_error)? {
-                    Some(value)=>Self::decode_owned_event::<u64>(original,value.value())?.value,None=>0,
+            if let Some(key) = &unconfirmed_key {
+                let mut table = write_txn
+                    .open_table(CONFIG_TABLE)
+                    .map_err(Self::storage_error)?;
+                let previous: u64 = match table
+                    .get(key.value.as_str())
+                    .map_err(Self::storage_error)?
+                {
+                    Some(value) => Self::decode_owned_event::<u64>(original, value.value())?.value,
+                    None => 0,
                 };
-                let next=if unconfirmed_delta>0{previous.checked_add(1)}else{previous.checked_sub(1)}
-                    .ok_or_else(||Error::Other("sink attempt summary overflow".to_owned()))?;
-                let encoded=Self::encode_owned_event(original,&next)?;
-                table.insert(key.value.as_str(),encoded.bytes.as_slice()).map_err(Self::storage_error)?;
-                identity.push_config(&key.value,Some(&encoded.bytes))?;
+                let next = if unconfirmed_delta > 0 {
+                    previous.checked_add(1)
+                } else {
+                    previous.checked_sub(1)
+                }
+                .ok_or_else(|| Error::Other("sink attempt summary overflow".to_owned()))?;
+                let encoded = Self::encode_owned_event(original, &next)?;
+                table
+                    .insert(key.value.as_str(), encoded.bytes.as_slice())
+                    .map_err(Self::storage_error)?;
+                identity.push_config(&key.value, Some(&encoded.bytes))?;
             }
-            Self::apply_owned_content_identity_with_manifests_in_write(&write_txn,&identity.mutations,&[],&mut proof)?;
-            Self::write_writer_recovery_bounds_in_write(&write_txn,None)?;
+            Self::apply_owned_content_identity_with_manifests_in_write(
+                &write_txn,
+                &identity.mutations,
+                &[],
+                &mut proof,
+            )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             {
-                #[cfg(any(test,feature="test-seams"))] graph_observation_checkpoint(10)?;
-                let graph_commit_result=write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write_txn.commit();
                 // This is the first owning-engine action after redb reports
                 // success. It is not proof against redb's inner postflush gap.
                 if graph_commit_result.is_ok() {
                     completion.mark_success();
-                    #[cfg(any(test,feature="test-seams"))] {
+                    #[cfg(any(test, feature = "test-seams"))]
+                    {
                         graph_publication_attempt.committed();
                         if let Err(error) = graph_observation_checkpoint(11) {
                             failure.capture(Err(error));
@@ -48667,61 +52442,103 @@ impl RedbPersistence {
                     }
                 }
                 graph_commit_result
-            }.map_err(Self::storage_error)?;
+            }
+            .map_err(Self::storage_error)?;
             Ok(())
         });
         failure.capture(result);
     }
 
     pub(crate) fn remove_owned_sink_queue_entries_at_boundary(
-        &self,original:&crate::memory_accounting::OwnedMemoryReservation,sink:&str,
-        remove_ids:&[u64],unconfirmed:u64,
-        completion:&crate::database::event_bus::OwnedQueueCommitToken<'_>,
-        failure:&mut crate::database::event_bus::OwnedNativeQueueFailure,
+        &self,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        sink: &str,
+        remove_ids: &[u64],
+        unconfirmed: u64,
+        completion: &crate::database::event_bus::OwnedQueueCommitToken<'_>,
+        failure: &mut crate::database::event_bus::OwnedNativeQueueFailure,
     ) {
-        if remove_ids.is_empty(){return;}
+        if remove_ids.is_empty() {
+            return;
+        }
         let prepared = (|| -> Result<_> {
-        let table_name=OwnedEventKey::concatenated(original,"__sink_queue_",sink)?;
-        let removals=Self::prepare_owned_sink_queue_removals(original,sink,remove_ids)?;
-        let summary_key=(unconfirmed>0).then(||OwnedEventKey::concatenated(original,
-            crate::database::event_bus::UNCONFIRMED_COUNT_CONFIG_PREFIX,sink)).transpose()?;
-        let identity=content_identity::OriginalIdentityMutations::new(original,1)?;
-        let proof=content_identity::original_writer::ProofAdmission::new(original,self.proof_scratch_owner())?;
-        Ok((table_name,removals,summary_key,identity,proof))
+            let table_name = OwnedEventKey::concatenated(original, "__sink_queue_", sink)?;
+            let removals = Self::prepare_owned_sink_queue_removals(original, sink, remove_ids)?;
+            let summary_key = (unconfirmed > 0)
+                .then(|| {
+                    OwnedEventKey::concatenated(
+                        original,
+                        crate::database::event_bus::UNCONFIRMED_COUNT_CONFIG_PREFIX,
+                        sink,
+                    )
+                })
+                .transpose()?;
+            let identity = content_identity::OriginalIdentityMutations::new(original, 1)?;
+            let proof = content_identity::original_writer::ProofAdmission::new(
+                original,
+                self.proof_scratch_owner(),
+            )?;
+            Ok((table_name, removals, summary_key, identity, proof))
         })();
-        let (table_name,removals,summary_key,mut identity,mut proof) = match prepared {
+        let (table_name, removals, summary_key, mut identity, mut proof) = match prepared {
             Ok(prepared) => prepared,
-            Err(error) => { failure.capture(Err(error)); return; }
+            Err(error) => {
+                failure.capture(Err(error));
+                return;
+            }
         };
         let result = self.with_db(|db| {
-            let write_txn=Self::begin_history_write(db)?;
-            #[cfg(any(test,feature="test-seams"))]
-            let mut graph_publication_attempt=crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
+            let write_txn = Self::begin_history_write(db)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
             {
-                let definition:TableDefinition<u64,&[u8]>=TableDefinition::new(&table_name.value);
-                let mut table=write_txn.open_table(definition).map_err(Self::storage_error)?;
-                for id in remove_ids {table.remove(*id).map_err(Self::storage_error)?;}
+                let definition: TableDefinition<u64, &[u8]> =
+                    TableDefinition::new(&table_name.value);
+                let mut table = write_txn
+                    .open_table(definition)
+                    .map_err(Self::storage_error)?;
+                for id in remove_ids {
+                    table.remove(*id).map_err(Self::storage_error)?;
+                }
             }
-            if let Some(key)=&summary_key {
-                let mut table=write_txn.open_table(CONFIG_TABLE).map_err(Self::storage_error)?;
-                let previous:u64=match table.get(key.value.as_str()).map_err(Self::storage_error)? {
-                    Some(value)=>Self::decode_owned_event::<u64>(original,value.value())?.value,None=>0,
+            if let Some(key) = &summary_key {
+                let mut table = write_txn
+                    .open_table(CONFIG_TABLE)
+                    .map_err(Self::storage_error)?;
+                let previous: u64 = match table
+                    .get(key.value.as_str())
+                    .map_err(Self::storage_error)?
+                {
+                    Some(value) => Self::decode_owned_event::<u64>(original, value.value())?.value,
+                    None => 0,
                 };
-                let next=previous.checked_sub(unconfirmed).ok_or_else(||Error::Other("sink attempt summary overflow".to_owned()))?;
-                let encoded=Self::encode_owned_event(original,&next)?;
-                table.insert(key.value.as_str(),encoded.bytes.as_slice()).map_err(Self::storage_error)?;
-                identity.push_config(&key.value,Some(&encoded.bytes))?;
+                let next = previous
+                    .checked_sub(unconfirmed)
+                    .ok_or_else(|| Error::Other("sink attempt summary overflow".to_owned()))?;
+                let encoded = Self::encode_owned_event(original, &next)?;
+                table
+                    .insert(key.value.as_str(), encoded.bytes.as_slice())
+                    .map_err(Self::storage_error)?;
+                identity.push_config(&key.value, Some(&encoded.bytes))?;
             }
-            Self::apply_owned_content_identity_with_manifests_in_write(&write_txn,&removals.mutations,&identity.mutations,&mut proof)?;
-            Self::write_writer_recovery_bounds_in_write(&write_txn,None)?;
+            Self::apply_owned_content_identity_with_manifests_in_write(
+                &write_txn,
+                &removals.mutations,
+                &identity.mutations,
+                &mut proof,
+            )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             {
-                #[cfg(any(test,feature="test-seams"))] graph_observation_checkpoint(10)?;
-                let graph_commit_result=write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                graph_observation_checkpoint(10)?;
+                let graph_commit_result = write_txn.commit();
                 // This is the first owning-engine action after redb reports
                 // success. It is not proof against redb's inner postflush gap.
                 if graph_commit_result.is_ok() {
                     completion.mark_success();
-                    #[cfg(any(test,feature="test-seams"))] {
+                    #[cfg(any(test, feature = "test-seams"))]
+                    {
                         graph_publication_attempt.committed();
                         if let Err(error) = graph_observation_checkpoint(11) {
                             failure.capture(Err(error));
@@ -48729,7 +52546,8 @@ impl RedbPersistence {
                     }
                 }
                 graph_commit_result
-            }.map_err(Self::storage_error)?;
+            }
+            .map_err(Self::storage_error)?;
             Ok(())
         });
         failure.capture(result);
@@ -48744,129 +52562,320 @@ pub(crate) struct OriginalPersistenceFrame<'o> {
     work: std::cell::RefCell<crate::memory_accounting::OwnedMemoryReservation>,
 }
 impl<'o> OriginalPersistenceFrame<'o> {
-    pub(crate) fn new(original:&'o crate::memory_accounting::OwnedMemoryReservation)->Result<Self>{
-        Ok(Self {original,work:std::cell::RefCell::new(crate::memory_accounting::reserve_preparation_from_original(original,0,
-            "persistence","prepare_commit","Raise MEMORY_LIMIT to admit commit preparation.")?)})
+    pub(crate) fn new(
+        original: &'o crate::memory_accounting::OwnedMemoryReservation,
+    ) -> Result<Self> {
+        Ok(Self {
+            original,
+            work: std::cell::RefCell::new(
+                crate::memory_accounting::reserve_preparation_from_original(
+                    original,
+                    0,
+                    "persistence",
+                    "prepare_commit",
+                    "Raise MEMORY_LIMIT to admit commit preparation.",
+                )?,
+            ),
+        })
     }
-    pub(crate) fn into_reservation(self)->crate::memory_accounting::OwnedMemoryReservation{self.work.into_inner()}
-    pub(crate) fn reserve(&self,bytes:usize)->Result<()> {
-        crate::memory_accounting::grow_preparation_from_original(&mut self.work.borrow_mut(),bytes,
-            "persistence","prepare_commit","Raise MEMORY_LIMIT to admit commit preparation.")
+    pub(crate) fn into_reservation(self) -> crate::memory_accounting::OwnedMemoryReservation {
+        self.work.into_inner()
     }
-    pub(crate) fn retain(&self,credit:&mut crate::memory_accounting::OwnedMemoryReservation)->Result<()> {
-        crate::memory_accounting::merge_preparation_original(&mut self.work.borrow_mut(),credit)
+    pub(crate) fn reserve(&self, bytes: usize) -> Result<()> {
+        crate::memory_accounting::grow_preparation_from_original(
+            &mut self.work.borrow_mut(),
+            bytes,
+            "persistence",
+            "prepare_commit",
+            "Raise MEMORY_LIMIT to admit commit preparation.",
+        )
     }
-    pub(crate) fn take_mutation(&self,mut owned:content_identity::OriginalIdentityMutation)->Result<content_identity::ContentIdentityMutation>{
-        content_identity::retain_original_identity_mutation(self,&mut owned)?;
+    pub(crate) fn retain(
+        &self,
+        credit: &mut crate::memory_accounting::OwnedMemoryReservation,
+    ) -> Result<()> {
+        crate::memory_accounting::merge_preparation_original(&mut self.work.borrow_mut(), credit)
+    }
+    pub(crate) fn take_mutation(
+        &self,
+        mut owned: content_identity::OriginalIdentityMutation,
+    ) -> Result<content_identity::ContentIdentityMutation> {
+        content_identity::retain_original_identity_mutation(self, &mut owned)?;
         Ok(owned.mutation)
     }
-    pub(crate) fn canonical<T:serde::Serialize+?Sized>(&self,value:&T)->Result<Vec<u8>>{
-        content_identity::retain_original_canonical(self,value)
+    pub(crate) fn canonical<T: serde::Serialize + ?Sized>(&self, value: &T) -> Result<Vec<u8>> {
+        content_identity::retain_original_canonical(self, value)
     }
-    pub(crate) fn record<T:serde::Serialize+?Sized>(&self,value:&T)->Result<()> {
+    pub(crate) fn record<T: serde::Serialize + ?Sized>(&self, value: &T) -> Result<()> {
         self.reserve(content_identity::original_record_work_bytes(value)?)
     }
-    pub(crate) fn encode<T:serde::Serialize>(&self,value:&T)->Result<Vec<u8>>{
-        let mut encoded=RedbPersistence::encode_owned_event(self.original,value)?;
-        self.retain(&mut encoded.allocation)?;Ok(encoded.bytes)
+    pub(crate) fn encode<T: serde::Serialize>(&self, value: &T) -> Result<Vec<u8>> {
+        let mut encoded = RedbPersistence::encode_owned_event(self.original, value)?;
+        self.retain(&mut encoded.allocation)?;
+        Ok(encoded.bytes)
     }
-    pub(crate) fn decode<T:serde::de::DeserializeOwned>(&self,bytes:&[u8])->Result<T>{
-        let mut decoded=RedbPersistence::decode_owned_event(self.original,bytes)?;
-        self.retain(&mut decoded.allocation)?;Ok(decoded.value)
+    pub(crate) fn decode<T: serde::de::DeserializeOwned>(&self, bytes: &[u8]) -> Result<T> {
+        let mut decoded = RedbPersistence::decode_owned_event(self.original, bytes)?;
+        self.retain(&mut decoded.allocation)?;
+        Ok(decoded.value)
     }
-    pub(crate) fn copy_bytes(&self,bytes:&[u8])->Result<Vec<u8>>{self.reserve(bytes.len())?;Ok(bytes.to_vec())}
-    pub(crate) fn copy_text(&self,text:&str)->Result<String>{self.reserve(text.len())?;Ok(text.to_owned())}
-    pub(crate) fn array<T>(&self,count:usize)->Result<()> {
-        self.reserve(std::alloc::Layout::array::<T>(count).map_err(|_|Error::Other("commit preparation array overflow".into()))?.size())
+    pub(crate) fn copy_bytes(&self, bytes: &[u8]) -> Result<Vec<u8>> {
+        self.reserve(bytes.len())?;
+        Ok(bytes.to_vec())
     }
-    pub(crate) fn map<K,V>(&self,count:usize)->Result<()> {
-        self.reserve(crate::memory_accounting::native_map_plan::<K,V>(count)?.layout.size())
+    pub(crate) fn copy_text(&self, text: &str) -> Result<String> {
+        self.reserve(text.len())?;
+        Ok(text.to_owned())
     }
-    pub(crate) fn tree<K,V>(&self,count:usize)->Result<()> {
-        let node=std::mem::size_of::<(K,V)>().checked_mul(11).and_then(|n|n.checked_add(128))
-            .ok_or_else(||Error::Other("commit preparation tree overflow".into()))?;
-        self.reserve(node.checked_mul(count).ok_or_else(||Error::Other("commit preparation tree overflow".into()))?)
+    pub(crate) fn array<T>(&self, count: usize) -> Result<()> {
+        self.reserve(
+            std::alloc::Layout::array::<T>(count)
+                .map_err(|_| Error::Other("commit preparation array overflow".into()))?
+                .size(),
+        )
+    }
+    pub(crate) fn map<K, V>(&self, count: usize) -> Result<()> {
+        self.reserve(
+            crate::memory_accounting::native_map_plan::<K, V>(count)?
+                .layout
+                .size(),
+        )
+    }
+    pub(crate) fn tree<K, V>(&self, count: usize) -> Result<()> {
+        let node = std::mem::size_of::<(K, V)>()
+            .checked_mul(11)
+            .and_then(|n| n.checked_add(128))
+            .ok_or_else(|| Error::Other("commit preparation tree overflow".into()))?;
+        self.reserve(
+            node.checked_mul(count)
+                .ok_or_else(|| Error::Other("commit preparation tree overflow".into()))?,
+        )
     }
     fn plan_config(&self, key: &str, value: &[u8]) -> Result<()> {
         let derived = custody_groups::plan_bytes(key, value)?;
-        self.reserve(key.len().checked_add(value.len())
-            .and_then(|n| n.checked_add(derived))
-            .ok_or_else(||Error::Other("configuration copy overflow".into()))?)
+        self.reserve(
+            key.len()
+                .checked_add(value.len())
+                .and_then(|n| n.checked_add(derived))
+                .ok_or_else(|| Error::Other("configuration copy overflow".into()))?,
+        )
     }
-    fn plan_write_set(&self,ws:&WriteSet,sink_events:&[PreparedSinkEvent],trigger_audits:&[(u64,TriggerAuditEntry)])->Result<()> {
+    fn plan_write_set(
+        &self,
+        ws: &WriteSet,
+        sink_events: &[PreparedSinkEvent],
+        trigger_audits: &[(u64, TriggerAuditEntry)],
+    ) -> Result<()> {
         // Concrete per-branch directories coexist with their input bodies.
-        let rows=ws.relational_inserts.len().checked_add(ws.relational_deletes.len())
-            .ok_or_else(||Error::Other("commit row count overflow".into()))?;
-        self.tree::<&str,Vec<&VersionedRow>>(rows)?;
-        self.map::<(String,RowId,TxId,Lsn),HashMap<String,Vec<f32>>>(ws.vector_inserts.len().checked_add(ws.vector_deletes.len()).and_then(|n|n.checked_add(ws.vector_moves.len()*2)).ok_or_else(||Error::Other("commit vector count overflow".into()))?)?;
-        self.array::<Option<(Vec<u8>,TxId,u64)>>(ws.adj_deletes.len())?;
-        self.array::<&DdlChange>(sink_events.len().checked_add(trigger_audits.len()).ok_or_else(||Error::Other("commit event count overflow".into()))?)?;
-        self.tree::<&str,Vec<(usize,&SinkQueueEntry)>>(sink_events.len())?;
-        self.array::<(usize,&SinkQueueEntry)>(sink_events.len().checked_mul(4).ok_or_else(||Error::Other("sink event directory overflow".into()))?)?;
-        for (table,row) in &ws.relational_inserts {self.reserve(table.len())?;self.record(row)?;}
-        for (table,_,_) in &ws.relational_deletes {self.reserve(table.len().checked_mul(4).ok_or_else(||Error::Other("row delete key overflow".into()))?)?;}
-        for edge in &ws.adj_inserts {self.record(edge)?;}
-        for (_,kind,_,_) in &ws.adj_deletes {self.reserve(kind.len().checked_mul(4).and_then(|n|n.checked_add(256)).ok_or_else(||Error::Other("edge delete key overflow".into()))?)?;}
-        for vector in &ws.vector_inserts {self.record(vector)?;}
-        for (sink,entry) in sink_events {self.reserve(sink.len())?;self.record(entry)?;}
-        for (_,audit) in trigger_audits {self.record(audit)?;}
-        for (key,value) in &ws.config_writes {self.plan_config(key, value)?;}
+        let rows = ws
+            .relational_inserts
+            .len()
+            .checked_add(ws.relational_deletes.len())
+            .ok_or_else(|| Error::Other("commit row count overflow".into()))?;
+        self.tree::<&str, Vec<&VersionedRow>>(rows)?;
+        self.map::<(String, RowId, TxId, Lsn), HashMap<String, Vec<f32>>>(
+            ws.vector_inserts
+                .len()
+                .checked_add(ws.vector_deletes.len())
+                .and_then(|n| n.checked_add(ws.vector_moves.len() * 2))
+                .ok_or_else(|| Error::Other("commit vector count overflow".into()))?,
+        )?;
+        self.array::<Option<(Vec<u8>, TxId, u64)>>(ws.adj_deletes.len())?;
+        self.array::<&DdlChange>(
+            sink_events
+                .len()
+                .checked_add(trigger_audits.len())
+                .ok_or_else(|| Error::Other("commit event count overflow".into()))?,
+        )?;
+        self.tree::<&str, Vec<(usize, &SinkQueueEntry)>>(sink_events.len())?;
+        self.array::<(usize, &SinkQueueEntry)>(
+            sink_events
+                .len()
+                .checked_mul(4)
+                .ok_or_else(|| Error::Other("sink event directory overflow".into()))?,
+        )?;
+        for (table, row) in &ws.relational_inserts {
+            self.reserve(table.len())?;
+            self.record(row)?;
+        }
+        for (table, _, _) in &ws.relational_deletes {
+            self.reserve(
+                table
+                    .len()
+                    .checked_mul(4)
+                    .ok_or_else(|| Error::Other("row delete key overflow".into()))?,
+            )?;
+        }
+        for edge in &ws.adj_inserts {
+            self.record(edge)?;
+        }
+        for (_, kind, _, _) in &ws.adj_deletes {
+            self.reserve(
+                kind.len()
+                    .checked_mul(4)
+                    .and_then(|n| n.checked_add(256))
+                    .ok_or_else(|| Error::Other("edge delete key overflow".into()))?,
+            )?;
+        }
+        for vector in &ws.vector_inserts {
+            self.record(vector)?;
+        }
+        for (sink, entry) in sink_events {
+            self.reserve(sink.len())?;
+            self.record(entry)?;
+        }
+        for (_, audit) in trigger_audits {
+            self.record(audit)?;
+        }
+        for (key, value) in &ws.config_writes {
+            self.plan_config(key, value)?;
+        }
         Ok(())
     }
 }
 
-struct OriginalMutationVector<'f,'o> {
-    values:Vec<content_identity::ContentIdentityMutation>,
-    frame:&'f OriginalPersistenceFrame<'o>,
+struct OriginalMutationVector<'f, 'o> {
+    values: Vec<content_identity::ContentIdentityMutation>,
+    frame: &'f OriginalPersistenceFrame<'o>,
 }
-impl<'f,'o> OriginalMutationVector<'f,'o> {
-    fn new(frame:&'f OriginalPersistenceFrame<'o>)->Self{Self{values:Vec::new(),frame}}
-    fn from_vec(frame:&'f OriginalPersistenceFrame<'o>,values:Vec<content_identity::ContentIdentityMutation>)->Self{Self{values,frame}}
-    fn push(&mut self,value:content_identity::ContentIdentityMutation)->Result<()> {
-        if self.values.len()==self.values.capacity(){
-            let next=self.values.capacity().checked_mul(2).map(|n|n.max(4)).ok_or_else(||Error::Other("logical identity mutation capacity overflow".into()))?;
-            self.frame.array::<content_identity::ContentIdentityMutation>(next)?;
-            let mut successor=Vec::with_capacity(next);successor.append(&mut self.values);
-            let prior=std::mem::replace(&mut self.values,successor);drop(prior);
+impl<'f, 'o> OriginalMutationVector<'f, 'o> {
+    fn new(frame: &'f OriginalPersistenceFrame<'o>) -> Self {
+        Self {
+            values: Vec::new(),
+            frame,
         }
-        self.values.push(value);Ok(())
     }
-    fn extend(&mut self,values:impl IntoIterator<Item=content_identity::ContentIdentityMutation>)->Result<()> {for value in values{self.push(value)?;}Ok(())}
-    fn into_vec(self)->Vec<content_identity::ContentIdentityMutation>{self.values}
+    fn from_vec(
+        frame: &'f OriginalPersistenceFrame<'o>,
+        values: Vec<content_identity::ContentIdentityMutation>,
+    ) -> Self {
+        Self { values, frame }
+    }
+    fn push(&mut self, value: content_identity::ContentIdentityMutation) -> Result<()> {
+        if self.values.len() == self.values.capacity() {
+            let next = self
+                .values
+                .capacity()
+                .checked_mul(2)
+                .map(|n| n.max(4))
+                .ok_or_else(|| {
+                    Error::Other("logical identity mutation capacity overflow".into())
+                })?;
+            self.frame
+                .array::<content_identity::ContentIdentityMutation>(next)?;
+            let mut successor = Vec::with_capacity(next);
+            successor.append(&mut self.values);
+            let prior = std::mem::replace(&mut self.values, successor);
+            drop(prior);
+        }
+        self.values.push(value);
+        Ok(())
+    }
+    fn extend(
+        &mut self,
+        values: impl IntoIterator<Item = content_identity::ContentIdentityMutation>,
+    ) -> Result<()> {
+        for value in values {
+            self.push(value)?;
+        }
+        Ok(())
+    }
+    fn into_vec(self) -> Vec<content_identity::ContentIdentityMutation> {
+        self.values
+    }
 }
-impl std::ops::Deref for OriginalMutationVector<'_,'_>{type Target=Vec<content_identity::ContentIdentityMutation>;fn deref(&self)->&Self::Target{&self.values}}
-impl IntoIterator for OriginalMutationVector<'_,'_>{type Item=content_identity::ContentIdentityMutation;type IntoIter=std::vec::IntoIter<Self::Item>;fn into_iter(self)->Self::IntoIter{self.values.into_iter()}}
+impl std::ops::Deref for OriginalMutationVector<'_, '_> {
+    type Target = Vec<content_identity::ContentIdentityMutation>;
+    fn deref(&self) -> &Self::Target {
+        &self.values
+    }
+}
+impl IntoIterator for OriginalMutationVector<'_, '_> {
+    type Item = content_identity::ContentIdentityMutation;
+    type IntoIter = std::vec::IntoIter<Self::Item>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.values.into_iter()
+    }
+}
 
 struct OriginalWindowMemory(std::cell::RefCell<crate::memory_accounting::OwnedMemoryReservation>);
 impl OriginalWindowMemory {
-    fn new(original:&crate::memory_accounting::OwnedMemoryReservation)->Result<Self>{Ok(Self(std::cell::RefCell::new(crate::memory_accounting::reserve_preparation_from_original(original,0,"writer_source","graph_delete_window","Raise MEMORY_LIMIT to decode the selected edge version.")?)))}
-    fn reserve(&self,bytes:usize)->Result<()>{crate::memory_accounting::grow_preparation_from_original(&mut self.0.borrow_mut(),bytes,"writer_source","graph_delete_window","Raise MEMORY_LIMIT to decode the selected edge version.")}
-    fn scope<T>(&self,f:impl FnOnce()->T)->T{f()}
+    fn new(original: &crate::memory_accounting::OwnedMemoryReservation) -> Result<Self> {
+        Ok(Self(std::cell::RefCell::new(
+            crate::memory_accounting::reserve_preparation_from_original(
+                original,
+                0,
+                "writer_source",
+                "graph_delete_window",
+                "Raise MEMORY_LIMIT to decode the selected edge version.",
+            )?,
+        )))
+    }
+    fn reserve(&self, bytes: usize) -> Result<()> {
+        crate::memory_accounting::grow_preparation_from_original(
+            &mut self.0.borrow_mut(),
+            bytes,
+            "writer_source",
+            "graph_delete_window",
+            "Raise MEMORY_LIMIT to decode the selected edge version.",
+        )
+    }
+    fn scope<T>(&self, f: impl FnOnce() -> T) -> T {
+        f()
+    }
 }
 
 fn original_schema_config_values<'a>(
-    non_event:&'a [(String,Vec<u8>)],events:Option<&'a [(String,Vec<u8>)]>,cut:usize,
-)->Result<impl Iterator<Item=&'a (String,Vec<u8>)> + Clone> {
-    if cut>non_event.len(){return Err(Error::Other("native schema config insertion point exceeds projection".into()));}
-    Ok(non_event[..cut].iter().chain(events.into_iter().flatten()).chain(non_event[cut..].iter()))
+    non_event: &'a [(String, Vec<u8>)],
+    events: Option<&'a [(String, Vec<u8>)]>,
+    cut: usize,
+) -> Result<impl Iterator<Item = &'a (String, Vec<u8>)> + Clone> {
+    if cut > non_event.len() {
+        return Err(Error::Other(
+            "native schema config insertion point exceeds projection".into(),
+        ));
+    }
+    Ok(non_event[..cut]
+        .iter()
+        .chain(events.into_iter().flatten())
+        .chain(non_event[cut..].iter()))
 }
 
-pub(crate) fn original_schema_event_config_position(non_event:&[(String,Vec<u8>)])->usize {
+pub(crate) fn original_schema_event_config_position(non_event: &[(String, Vec<u8>)]) -> usize {
     // These are the existing private wire keys, not a consumer policy list.
     // The original builder appends the event config immediately before its
     // optional trigger projection; source-order and duplicate-key precedence
     // are therefore preserved without regrouping either projection.
-    non_event.iter().position(|(key,_)|key=="__trigger_declarations"||key=="__trigger_including_sync").unwrap_or(non_event.len())
+    non_event
+        .iter()
+        .position(|(key, _)| key == "__trigger_declarations" || key == "__trigger_including_sync")
+        .unwrap_or(non_event.len())
 }
 
 impl RedbPersistence {
-    fn encode_into_original<T:serde::Serialize>(frame:&OriginalPersistenceFrame<'_>,value:&T,encoded:&mut Vec<u8>)->Result<()> {
-        let next=frame.encode(value)?;let old=std::mem::replace(encoded,next);drop(old);Ok(())
+    fn encode_into_original<T: serde::Serialize>(
+        frame: &OriginalPersistenceFrame<'_>,
+        value: &T,
+        encoded: &mut Vec<u8>,
+    ) -> Result<()> {
+        let next = frame.encode(value)?;
+        let old = std::mem::replace(encoded, next);
+        drop(old);
+        Ok(())
     }
-    pub(crate) fn reserve_owned_writer_snapshot(&self,original:&crate::memory_accounting::OwnedMemoryReservation)->Result<crate::memory_accounting::OwnedMemoryReservation>{
-        self.prepare_proof_owner()?;let _schema=self.prepared_writer_schema()?;
-        crate::memory_accounting::reserve_preparation_from_original(original,std::mem::size_of::<WriterSnapshot>()+56,
-            "writer_source","published_root","Raise MEMORY_LIMIT to admit the published writer root.")
+    pub(crate) fn reserve_owned_writer_snapshot(
+        &self,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+    ) -> Result<crate::memory_accounting::OwnedMemoryReservation> {
+        self.prepare_proof_owner()?;
+        let _schema = self.prepared_writer_schema()?;
+        crate::memory_accounting::reserve_preparation_from_original(
+            original,
+            std::mem::size_of::<WriterSnapshot>() + 56,
+            "writer_source",
+            "published_root",
+            "Raise MEMORY_LIMIT to admit the published writer root.",
+        )
     }
 }
 
@@ -48875,313 +52884,374 @@ impl RedbPersistence {
 /// attempts and row identities are preserved for the companion's sanitization
 /// and next-id recovery at the original startup publication positions.
 pub(crate) struct OriginalLoadedSinkQueue {
-    pub(crate) entries:Vec<(u64,SinkQueueEntry)>,
-    _allocation:crate::memory_accounting::OwnedMemoryReservation,
+    pub(crate) entries: Vec<(u64, SinkQueueEntry)>,
+    _allocation: crate::memory_accounting::OwnedMemoryReservation,
 }
 impl OwnedEncodedEventSource<'_> {
-    pub(crate) fn decode_owned_sink_queue(&self,original:&crate::memory_accounting::OwnedMemoryReservation,sink:&str)->Result<OriginalLoadedSinkQueue>{
-        let mut count=0usize;self.visit(sink,|_,_|{count=count.checked_add(1).ok_or_else(||Error::Other("sink queue startup count overflow".into()))?;Ok(())})?;
-        let (entries,allocation)=crate::memory_accounting::new_owned_native_vec::<(u64,SinkQueueEntry)>(original,count)?;
-        let mut loaded=OriginalLoadedSinkQueue{entries,_allocation:allocation};
-        self.visit(sink,|id,bytes| {
-            let mut entry=RedbPersistence::decode_owned_event::<SinkQueueEntry>(original,bytes)?;
-            crate::memory_accounting::merge_preparation_original(&mut loaded._allocation,&mut entry.allocation)?;
-            loaded.entries.push((id,entry.value));Ok(())
+    pub(crate) fn decode_owned_sink_queue(
+        &self,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        sink: &str,
+    ) -> Result<OriginalLoadedSinkQueue> {
+        let mut count = 0usize;
+        self.visit(sink, |_, _| {
+            count = count
+                .checked_add(1)
+                .ok_or_else(|| Error::Other("sink queue startup count overflow".into()))?;
+            Ok(())
         })?;
-        if loaded.entries.len()!=count{return Err(Error::Other("captured sink queue changed between count and decode".into()));}
+        let (entries, allocation) = crate::memory_accounting::new_owned_native_vec::<(
+            u64,
+            SinkQueueEntry,
+        )>(original, count)?;
+        let mut loaded = OriginalLoadedSinkQueue {
+            entries,
+            _allocation: allocation,
+        };
+        self.visit(sink, |id, bytes| {
+            let mut entry = RedbPersistence::decode_owned_event::<SinkQueueEntry>(original, bytes)?;
+            crate::memory_accounting::merge_preparation_original(
+                &mut loaded._allocation,
+                &mut entry.allocation,
+            )?;
+            loaded.entries.push((id, entry.value));
+            Ok(())
+        })?;
+        if loaded.entries.len() != count {
+            return Err(Error::Other(
+                "captured sink queue changed between count and decode".into(),
+            ));
+        }
         Ok(loaded)
     }
 }
 
 mod original_relational_manifest {
-use super::*;
-use content_identity::original_version_manifest as manifest;
-struct OriginalManifestResume {bytes:Vec<u8>,credit:Option<crate::memory_accounting::OwnedMemoryReservation>}
-pub(super) struct OriginalPendingManifestPublication {
-    pub(super) mutations: Vec<content_identity::ContentIdentityMutation>,
-    admission: content_identity::original_writer::ProofAdmission,
-}
-impl OriginalPendingManifestPublication {
-    pub(super) fn new(admission: content_identity::original_writer::ProofAdmission) -> Self {
-        Self {
-            mutations: Vec::new(),
-            admission,
-        }
+    use super::*;
+    use content_identity::original_version_manifest as manifest;
+    struct OriginalManifestResume {
+        bytes: Vec<u8>,
+        credit: Option<crate::memory_accounting::OwnedMemoryReservation>,
     }
-    fn push(&mut self, coordinate: &[u8], present: bool) -> Result<()> {
-        if self.mutations.len() == self.mutations.capacity() {
-            let old = self.mutations.capacity();
-            let capacity = old
-                .checked_mul(2)
-                .map(|n| n.max(4))
-                .ok_or_else(|| Error::Other("manifest publication capacity overflow".into()))?;
-            let bytes = capacity
-                .checked_mul(std::mem::size_of::<content_identity::ContentIdentityMutation>())
-                .ok_or_else(|| Error::Other("manifest publication layout overflow".into()))?;
+    pub(super) struct OriginalPendingManifestPublication {
+        pub(super) mutations: Vec<content_identity::ContentIdentityMutation>,
+        admission: content_identity::original_writer::ProofAdmission,
+    }
+    impl OriginalPendingManifestPublication {
+        pub(super) fn new(admission: content_identity::original_writer::ProofAdmission) -> Self {
+            Self {
+                mutations: Vec::new(),
+                admission,
+            }
+        }
+        fn push(&mut self, coordinate: &[u8], present: bool) -> Result<()> {
+            if self.mutations.len() == self.mutations.capacity() {
+                let old = self.mutations.capacity();
+                let capacity = old
+                    .checked_mul(2)
+                    .map(|n| n.max(4))
+                    .ok_or_else(|| Error::Other("manifest publication capacity overflow".into()))?;
+                let bytes = capacity
+                    .checked_mul(std::mem::size_of::<content_identity::ContentIdentityMutation>())
+                    .ok_or_else(|| Error::Other("manifest publication layout overflow".into()))?;
+                self.admission.admit(bytes)?;
+                let mut next = Vec::with_capacity(capacity);
+                next.extend(std::mem::take(&mut self.mutations));
+                self.mutations = next;
+                self.admission.release(
+                    old * std::mem::size_of::<content_identity::ContentIdentityMutation>(),
+                );
+            }
+            let bytes = manifest::manifest_mutation_bytes(coordinate, present)?;
             self.admission.admit(bytes)?;
-            let mut next = Vec::with_capacity(capacity);
-            next.extend(std::mem::take(&mut self.mutations));
-            self.mutations = next;
-            self.admission
-                .release(old * std::mem::size_of::<content_identity::ContentIdentityMutation>());
+            let mutation = manifest::manifest_mutation(coordinate, present)?;
+            debug_assert_eq!(
+                mutation.logical_key.capacity()
+                    + mutation.logical_value.as_ref().map_or(0, Vec::capacity),
+                bytes
+            );
+            self.mutations.push(mutation);
+            Ok(())
         }
-        let bytes = manifest::manifest_mutation_bytes(coordinate, present)?;
-        self.admission.admit(bytes)?;
-        let mutation = manifest::manifest_mutation(coordinate, present)?;
-        debug_assert_eq!(
-            mutation.logical_key.capacity()
-                + mutation.logical_value.as_ref().map_or(0, Vec::capacity),
-            bytes
-        );
-        self.mutations.push(mutation);
-        Ok(())
     }
-}
 
-
-impl RedbPersistence {
-pub(crate) fn relational_manifest_has_successor_in_write_original(
-        &self,
-        original:&crate::memory_accounting::OwnedMemoryReservation,
-        write: &redb::WriteTransaction,
-        table: &str,
-        physical: &[u8],
-    ) -> Result<bool> {
-        if physical.len() != 24 {
-            return Err(self.relational_manifest_damage("invalid physical version identity"));
+    impl RedbPersistence {
+        pub(crate) fn relational_manifest_has_successor_in_write_original(
+            &self,
+            original: &crate::memory_accounting::OwnedMemoryReservation,
+            write: &redb::WriteTransaction,
+            table: &str,
+            physical: &[u8],
+        ) -> Result<bool> {
+            if physical.len() != 24 {
+                return Err(self.relational_manifest_damage("invalid physical version identity"));
+            }
+            let mut admission = content_identity::original_writer::ProofAdmission::new(
+                original,
+                self.proof_scratch_owner(),
+            )?;
+            admission.admit(table.len().checked_add(72).ok_or_else(|| {
+                self.relational_manifest_damage("identity allocation overflow")
+            })?)?;
+            let mut prefix = manifest::manifest_prefix(table)?;
+            prefix.extend_from_slice(physical);
+            let coordinate = manifest::writer_manifest_next(write, &prefix, false, &mut admission)
+                .map_err(|e| self.relational_manifest_error(e))?
+                .filter(|key| key.starts_with(&prefix))
+                .ok_or_else(|| {
+                    self.relational_manifest_damage("physical version member is missing")
+                })?;
+            let next = manifest::writer_manifest_next(write, &coordinate, true, &mut admission)
+                .map_err(|e| self.relational_manifest_error(e))?;
+            let Some(next) = next else {
+                return Ok(false);
+            };
+            if next.starts_with(&prefix) {
+                return Err(self.relational_manifest_damage("duplicate physical version member"));
+            }
+            let witness =
+                manifest::parse_manifest(&next).map_err(|e| self.relational_manifest_error(e))?;
+            Ok(witness.table == table && witness.identity[..8] == physical[..8])
         }
-        let mut admission = content_identity::original_writer::ProofAdmission::new(original,self.proof_scratch_owner())?;
-        admission.admit(
-            table
-                .len()
-                .checked_add(72)
-                .ok_or_else(|| self.relational_manifest_damage("identity allocation overflow"))?,
-        )?;
-        let mut prefix = manifest::manifest_prefix(table)?;
-        prefix.extend_from_slice(physical);
-        let coordinate = manifest::writer_manifest_next(write, &prefix, false, &mut admission)
-            .map_err(|e| self.relational_manifest_error(e))?
-            .filter(|key| key.starts_with(&prefix))
-            .ok_or_else(|| self.relational_manifest_damage("physical version member is missing"))?;
-        let next = manifest::writer_manifest_next(write, &coordinate, true, &mut admission)
-            .map_err(|e| self.relational_manifest_error(e))?;
-        let Some(next) = next else {
-            return Ok(false);
-        };
-        if next.starts_with(&prefix) {
-            return Err(self.relational_manifest_damage("duplicate physical version member"));
+        pub(crate) fn replace_relational_manifest_in_write_original(
+            &self,
+            original: &crate::memory_accounting::OwnedMemoryReservation,
+            write: &redb::WriteTransaction,
+            table: &str,
+            physical: &[u8],
+            old: Option<&[u8]>,
+            new: Option<&[u8]>,
+        ) -> Result<()> {
+            self.replace_relational_manifest_pending_in_write_original(
+                original, write, table, physical, old, new, None,
+            )
         }
-        let witness =
-            manifest::parse_manifest(&next).map_err(|e| self.relational_manifest_error(e))?;
-        Ok(witness.table == table && witness.identity[..8] == physical[..8])
-    }
-pub(crate) fn replace_relational_manifest_in_write_original(
-        &self,
-        original:&crate::memory_accounting::OwnedMemoryReservation,
-        write: &redb::WriteTransaction,
-        table: &str,
-        physical: &[u8],
-        old: Option<&[u8]>,
-        new: Option<&[u8]>,
-    ) -> Result<()> {
-        self.replace_relational_manifest_pending_in_write_original(original,write, table, physical, old, new, None)
-    }
-pub(crate) fn replace_relational_manifest_pending_in_write_original(
-        &self,
-        original:&crate::memory_accounting::OwnedMemoryReservation,
-        write: &redb::WriteTransaction,
-        table: &str,
-        physical: &[u8],
-        old: Option<&[u8]>,
-        new: Option<&[u8]>,
-        mut pending: Option<&mut OriginalPendingManifestPublication>,
-    ) -> Result<()> {
-        #[cfg(any(test, feature = "test-seams"))]
-        let _family_scope = content_identity::enter_passive_family(
-            content_identity::LogicalFamily::ChangeAndDdl,
-        );
-        let mut admission = content_identity::original_writer::ProofAdmission::new(original,self.proof_scratch_owner())?;
-        admission.admit(
-            table
-                .len()
-                .checked_add(72)
-                .ok_or_else(|| self.relational_manifest_damage("identity allocation overflow"))?,
-        )?;
-        let mut prefix = manifest::manifest_prefix(table)?;
-        prefix.extend_from_slice(physical);
-        let expected = manifest::writer_manifest_next_pending(
-            write,
-            &prefix,
-            false,
-            &mut admission,
-            pending.as_ref().map_or(&[], |p| p.mutations.as_slice()),
-        )
-        .map_err(|e| self.relational_manifest_error(e))?;
-        let old_coordinate = old
-            .map(|body| manifest::manifest_for_body(table, physical, body, &mut admission))
-            .transpose()
-            .map_err(|e| self.relational_manifest_error(e))?;
-        let addressed = expected.as_deref().filter(|key| key.starts_with(&prefix));
-        if addressed != old_coordinate.as_deref() {
-            return Err(self.relational_manifest_damage(
-                "persisted predecessor and rooted version member disagree",
-            ));
-        }
-        if let Some(coordinate) = &old_coordinate {
-            let next = manifest::writer_manifest_next_pending(
+        pub(crate) fn replace_relational_manifest_pending_in_write_original(
+            &self,
+            original: &crate::memory_accounting::OwnedMemoryReservation,
+            write: &redb::WriteTransaction,
+            table: &str,
+            physical: &[u8],
+            old: Option<&[u8]>,
+            new: Option<&[u8]>,
+            mut pending: Option<&mut OriginalPendingManifestPublication>,
+        ) -> Result<()> {
+            #[cfg(any(test, feature = "test-seams"))]
+            let _family_scope = content_identity::enter_passive_family(
+                content_identity::LogicalFamily::ChangeAndDdl,
+            );
+            let mut admission = content_identity::original_writer::ProofAdmission::new(
+                original,
+                self.proof_scratch_owner(),
+            )?;
+            admission.admit(table.len().checked_add(72).ok_or_else(|| {
+                self.relational_manifest_damage("identity allocation overflow")
+            })?)?;
+            let mut prefix = manifest::manifest_prefix(table)?;
+            prefix.extend_from_slice(physical);
+            let expected = manifest::writer_manifest_next_pending(
                 write,
-                coordinate,
-                true,
+                &prefix,
+                false,
                 &mut admission,
                 pending.as_ref().map_or(&[], |p| p.mutations.as_slice()),
             )
             .map_err(|e| self.relational_manifest_error(e))?;
-            if next.as_deref().is_some_and(|key| key.starts_with(&prefix)) {
-                return Err(self.relational_manifest_damage("duplicate physical version member"));
-            }
-        }
-        let new_coordinate = new
-            .map(|body| manifest::manifest_for_body(table, physical, body, &mut admission))
-            .transpose()
-            .map_err(|e| self.relational_manifest_error(e))?;
-        if old_coordinate == new_coordinate {
-            return Ok(());
-        }
-        if let Some(pending) = pending.as_mut() {
-            if let Some(key) = &old_coordinate {
-                pending.push(key, false)?;
-            }
-            if let Some(key) = &new_coordinate {
-                pending.push(key, true)?;
-            }
-            return Ok(());
-        }
-        let capacity = old_coordinate
-            .iter()
-            .chain(new_coordinate.iter())
-            .try_fold(
-                2 * std::mem::size_of::<content_identity::ContentIdentityMutation>(),
-                |n, key| {
-                    n.checked_add(key.len())
-                        .and_then(|n| n.checked_add(64))
-                        .ok_or_else(|| {
-                            self.relational_manifest_damage("mutation allocation overflow")
-                        })
-                },
-            )?;
-        admission.admit(capacity)?;
-        let mut mutations = Vec::with_capacity(2);
-        if let Some(key) = old_coordinate {
-            mutations.push(manifest::manifest_mutation(&key, false)?);
-        }
-        if let Some(key) = new_coordinate {
-            mutations.push(manifest::manifest_mutation(&key, true)?);
-        }
-        Self::apply_owned_content_identity_with_manifests_in_write(write, &mutations, &[], &mut admission)?;
-        Ok(())
-    }
-pub(crate) fn verify_relational_group_in_write_original(
-        &self,
-        original:&crate::memory_accounting::OwnedMemoryReservation,
-        write: &redb::WriteTransaction,
-        table: &str,
-        row_id: RowId,
-        relation: &impl ReadableTable<&'static [u8], &'static [u8]>,
-    ) -> Result<()> {
-        self.verify_relational_group_pending_in_write_original(original,write, table, row_id, relation, &[])
-    }
-pub(crate) fn verify_relational_group_pending_in_write_original(
-        &self,
-        original:&crate::memory_accounting::OwnedMemoryReservation,
-        write: &redb::WriteTransaction,
-        table: &str,
-        row_id: RowId,
-        relation: &impl ReadableTable<&'static [u8], &'static [u8]>,
-        pending: &[content_identity::ContentIdentityMutation],
-    ) -> Result<()> {
-        let mut admission = content_identity::original_writer::ProofAdmission::new(original,self.proof_scratch_owner())?;
-        admission.admit(
-            table
-                .len()
-                .checked_add(72)
-                .and_then(|n| n.checked_mul(3))
-                .ok_or_else(|| self.relational_manifest_damage("writer group bound overflow"))?,
-        )?;
-        let mut prefix = manifest::manifest_prefix(table)?;
-        prefix.extend_from_slice(&row_id.0.to_be_bytes());
-        let mut after = OriginalManifestResume {bytes:prefix.clone(),credit:None};
-        let mut exclusive = false;
-        let (low, high) = Self::rel_row_key_range(row_id);
-        let mut physical = relation
-            .range(low.as_slice()..high.as_slice())
-            .map_err(Self::storage_error)?;
-        let mut previous = None;
-        loop {
-            let mut window = content_identity::original_writer::ProofAdmission::new(original,self.proof_scratch_owner())?;
-            let next = manifest::writer_manifest_next_pending(
-                write,
-                &after.bytes,
-                exclusive,
-                &mut window,
-                pending,
-            )
-            .map_err(|e| self.relational_manifest_error(e))?;
-            let Some(coordinate) = next.filter(|key| key.starts_with(&prefix)) else {
-                if physical
-                    .next()
-                    .transpose()
-                    .map_err(Self::storage_error)?
-                    .is_some()
-                {
-                    return Err(self.relational_manifest_damage("unwitnessed writer group suffix"));
-                }
-                return Ok(());
-            };
-            let witness = manifest::parse_manifest(&coordinate)
+            let old_coordinate = old
+                .map(|body| manifest::manifest_for_body(table, physical, body, &mut admission))
+                .transpose()
                 .map_err(|e| self.relational_manifest_error(e))?;
-            if previous.is_some_and(|old| old >= witness.identity) {
-                return Err(
-                    self.relational_manifest_damage("duplicate or reordered writer version")
-                );
-            }
-            previous = Some(witness.identity);
-            let Some((key, body)) = physical.next().transpose().map_err(Self::storage_error)?
-            else {
-                return Err(
-                    self.relational_manifest_damage("writer group version is physically missing")
-                );
-            };
-            if key.value() != witness.identity {
-                return Err(
-                    self.relational_manifest_damage("writer group physical order disagrees")
-                );
-            }
-            let actual = manifest::manifest_for_body(table, key.value(), body.value(), &mut window)
-                .map_err(|e| self.relational_manifest_error(e))?;
-            if actual != coordinate {
+            let addressed = expected.as_deref().filter(|key| key.starts_with(&prefix));
+            if addressed != old_coordinate.as_deref() {
                 return Err(self.relational_manifest_damage(
-                    "writer group body or closure is unauthenticated",
+                    "persisted predecessor and rooted version member disagree",
                 ));
             }
-            let next_credit=window.detach_original(coordinate.capacity());
-            let old=std::mem::replace(&mut after.bytes,coordinate);drop(old);drop(after.credit.replace(next_credit));
-            exclusive = true;
+            if let Some(coordinate) = &old_coordinate {
+                let next = manifest::writer_manifest_next_pending(
+                    write,
+                    coordinate,
+                    true,
+                    &mut admission,
+                    pending.as_ref().map_or(&[], |p| p.mutations.as_slice()),
+                )
+                .map_err(|e| self.relational_manifest_error(e))?;
+                if next.as_deref().is_some_and(|key| key.starts_with(&prefix)) {
+                    return Err(
+                        self.relational_manifest_damage("duplicate physical version member")
+                    );
+                }
+            }
+            let new_coordinate = new
+                .map(|body| manifest::manifest_for_body(table, physical, body, &mut admission))
+                .transpose()
+                .map_err(|e| self.relational_manifest_error(e))?;
+            if old_coordinate == new_coordinate {
+                return Ok(());
+            }
+            if let Some(pending) = pending.as_mut() {
+                if let Some(key) = &old_coordinate {
+                    pending.push(key, false)?;
+                }
+                if let Some(key) = &new_coordinate {
+                    pending.push(key, true)?;
+                }
+                return Ok(());
+            }
+            let capacity = old_coordinate
+                .iter()
+                .chain(new_coordinate.iter())
+                .try_fold(
+                    2 * std::mem::size_of::<content_identity::ContentIdentityMutation>(),
+                    |n, key| {
+                        n.checked_add(key.len())
+                            .and_then(|n| n.checked_add(64))
+                            .ok_or_else(|| {
+                                self.relational_manifest_damage("mutation allocation overflow")
+                            })
+                    },
+                )?;
+            admission.admit(capacity)?;
+            let mut mutations = Vec::with_capacity(2);
+            if let Some(key) = old_coordinate {
+                mutations.push(manifest::manifest_mutation(&key, false)?);
+            }
+            if let Some(key) = new_coordinate {
+                mutations.push(manifest::manifest_mutation(&key, true)?);
+            }
+            Self::apply_owned_content_identity_with_manifests_in_write(
+                write,
+                &mutations,
+                &[],
+                &mut admission,
+            )?;
+            Ok(())
+        }
+        pub(crate) fn verify_relational_group_in_write_original(
+            &self,
+            original: &crate::memory_accounting::OwnedMemoryReservation,
+            write: &redb::WriteTransaction,
+            table: &str,
+            row_id: RowId,
+            relation: &impl ReadableTable<&'static [u8], &'static [u8]>,
+        ) -> Result<()> {
+            self.verify_relational_group_pending_in_write_original(
+                original,
+                write,
+                table,
+                row_id,
+                relation,
+                &[],
+            )
+        }
+        pub(crate) fn verify_relational_group_pending_in_write_original(
+            &self,
+            original: &crate::memory_accounting::OwnedMemoryReservation,
+            write: &redb::WriteTransaction,
+            table: &str,
+            row_id: RowId,
+            relation: &impl ReadableTable<&'static [u8], &'static [u8]>,
+            pending: &[content_identity::ContentIdentityMutation],
+        ) -> Result<()> {
+            let mut admission = content_identity::original_writer::ProofAdmission::new(
+                original,
+                self.proof_scratch_owner(),
+            )?;
+            admission.admit(
+                table
+                    .len()
+                    .checked_add(72)
+                    .and_then(|n| n.checked_mul(3))
+                    .ok_or_else(|| {
+                        self.relational_manifest_damage("writer group bound overflow")
+                    })?,
+            )?;
+            let mut prefix = manifest::manifest_prefix(table)?;
+            prefix.extend_from_slice(&row_id.0.to_be_bytes());
+            let mut after = OriginalManifestResume {
+                bytes: prefix.clone(),
+                credit: None,
+            };
+            let mut exclusive = false;
+            let (low, high) = Self::rel_row_key_range(row_id);
+            let mut physical = relation
+                .range(low.as_slice()..high.as_slice())
+                .map_err(Self::storage_error)?;
+            let mut previous = None;
+            loop {
+                let mut window = content_identity::original_writer::ProofAdmission::new(
+                    original,
+                    self.proof_scratch_owner(),
+                )?;
+                let next = manifest::writer_manifest_next_pending(
+                    write,
+                    &after.bytes,
+                    exclusive,
+                    &mut window,
+                    pending,
+                )
+                .map_err(|e| self.relational_manifest_error(e))?;
+                let Some(coordinate) = next.filter(|key| key.starts_with(&prefix)) else {
+                    if physical
+                        .next()
+                        .transpose()
+                        .map_err(Self::storage_error)?
+                        .is_some()
+                    {
+                        return Err(
+                            self.relational_manifest_damage("unwitnessed writer group suffix")
+                        );
+                    }
+                    return Ok(());
+                };
+                let witness = manifest::parse_manifest(&coordinate)
+                    .map_err(|e| self.relational_manifest_error(e))?;
+                if previous.is_some_and(|old| old >= witness.identity) {
+                    return Err(
+                        self.relational_manifest_damage("duplicate or reordered writer version")
+                    );
+                }
+                previous = Some(witness.identity);
+                let Some((key, body)) = physical.next().transpose().map_err(Self::storage_error)?
+                else {
+                    return Err(self
+                        .relational_manifest_damage("writer group version is physically missing"));
+                };
+                if key.value() != witness.identity {
+                    return Err(
+                        self.relational_manifest_damage("writer group physical order disagrees")
+                    );
+                }
+                let actual =
+                    manifest::manifest_for_body(table, key.value(), body.value(), &mut window)
+                        .map_err(|e| self.relational_manifest_error(e))?;
+                if actual != coordinate {
+                    return Err(self.relational_manifest_damage(
+                        "writer group body or closure is unauthenticated",
+                    ));
+                }
+                let next_credit = window.detach_original(coordinate.capacity());
+                let old = std::mem::replace(&mut after.bytes, coordinate);
+                drop(old);
+                drop(after.credit.replace(next_credit));
+                exclusive = true;
+            }
         }
     }
-}
 }
 
 impl RedbPersistence {
-pub(crate) fn flush_owned_data_with_logs_and_sink_events(
+    pub(crate) fn flush_owned_data_with_logs_and_sink_events(
         &self,
-original:&crate::memory_accounting::OwnedMemoryReservation,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
         ws: &WriteSet,
         change_log: &[ChangeLogEntry],
-        options: FlushDataOptions<'_>, schema_config:Option<&[(String,Vec<u8>)]>, config_cut:usize) -> Result<()> {
-        let frame=OriginalPersistenceFrame::new(original)?;
-        frame.plan_write_set(ws,options.sink_events,options.trigger_audits)?;
-
-
+        options: FlushDataOptions<'_>,
+        schema_config: Option<&[(String, Vec<u8>)]>,
+        config_cut: usize,
+    ) -> Result<()> {
+        let frame = OriginalPersistenceFrame::new(original)?;
+        frame.plan_write_set(ws, options.sink_events, options.trigger_audits)?;
 
         let deleted_rows_snapshot = options.snapshots.deleted_rows;
         let sink_events = options.sink_events;
@@ -49190,13 +53260,17 @@ original:&crate::memory_accounting::OwnedMemoryReservation,
         let max_sink_queue_depth = options.max_sink_queue_depth;
         let partition_mutations = options.partition_mutations;
         if let Some(received_schema) = options.received_schema {
-            return self.flush_owned_received_schema_stage(original,
+            return self.flush_owned_received_schema_stage(
+                original,
                 ws,
                 change_log,
                 received_schema,
                 sink_events,
                 trigger_audits,
-                max_sink_queue_depth,schema_config,config_cut);
+                max_sink_queue_depth,
+                schema_config,
+                config_cut,
+            );
         }
         let loaded_table_meta;
         let table_meta = match options.snapshots.table_meta {
@@ -49253,13 +53327,35 @@ original:&crate::memory_accounting::OwnedMemoryReservation,
             .map(|erasure| self.prepare_authoritative_purge_vector_generations(erasure.projection))
             .transpose()?
             .unwrap_or_default();
-        for (key, value) in schema_ddl.event_bus.into_iter().flat_map(|ddl| ddl.config_values.iter())
-            .chain(schema_ddl.trigger.into_iter().flat_map(|ddl| ddl.config_values.iter())) {
+        for (key, value) in schema_ddl
+            .event_bus
+            .into_iter()
+            .flat_map(|ddl| ddl.config_values.iter())
+            .chain(
+                schema_ddl
+                    .trigger
+                    .into_iter()
+                    .flat_map(|ddl| ddl.config_values.iter()),
+            )
+        {
             frame.plan_config(key, value)?;
         }
-        let group_plan = custody_groups::GroupPlan::prepaid(ws.config_writes.iter()
-            .chain(schema_ddl.event_bus.into_iter().flat_map(|ddl| ddl.config_values.iter()))
-            .chain(schema_ddl.trigger.into_iter().flat_map(|ddl| ddl.config_values.iter())))?;
+        let group_plan = custody_groups::GroupPlan::prepaid(
+            ws.config_writes
+                .iter()
+                .chain(
+                    schema_ddl
+                        .event_bus
+                        .into_iter()
+                        .flat_map(|ddl| ddl.config_values.iter()),
+                )
+                .chain(
+                    schema_ddl
+                        .trigger
+                        .into_iter()
+                        .flat_map(|ddl| ddl.config_values.iter()),
+                ),
+        )?;
         self.with_db(|db| {
             let write_txn = Self::begin_history_write(db)?;
 #[cfg(any(test, feature = "test-seams"))]
@@ -50340,25 +54436,41 @@ graph_commit_result }.map_err(Self::storage_error)?;
         })
     }
 
-pub(crate) fn flush_owned_received_schema_stage(
+    pub(crate) fn flush_owned_received_schema_stage(
         &self,
-original:&crate::memory_accounting::OwnedMemoryReservation,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
         ws: &WriteSet,
         change_log: &[ChangeLogEntry],
         stage: &ReceivedSchemaPersistenceProjection,
         sink_events: &[PreparedSinkEvent],
         trigger_audits: &[(u64, TriggerAuditEntry)],
-        max_sink_queue_depth: usize, schema_config:Option<&[(String,Vec<u8>)]>, config_cut:usize) -> Result<()> {
-        let frame=OriginalPersistenceFrame::new(original)?;
-        frame.plan_write_set(ws,sink_events,trigger_audits)?;
-        for meta in stage.table_meta.values(){frame.record(meta)?;}
-        for rows in stage.rows.values(){for row in rows{frame.record(row)?;}}
-        for edge in &stage.edges{frame.record(edge)?;}
-
-
+        max_sink_queue_depth: usize,
+        schema_config: Option<&[(String, Vec<u8>)]>,
+        config_cut: usize,
+    ) -> Result<()> {
+        let frame = OriginalPersistenceFrame::new(original)?;
+        frame.plan_write_set(ws, sink_events, trigger_audits)?;
+        for meta in stage.table_meta.values() {
+            frame.record(meta)?;
+        }
+        for rows in stage.rows.values() {
+            for row in rows {
+                frame.record(row)?;
+            }
+        }
+        for edge in &stage.edges {
+            frame.record(edge)?;
+        }
 
         if stage.schema_noop {
-            return self.flush_owned_received_schema_noop(original,ws, change_log, stage,schema_config,config_cut);
+            return self.flush_owned_received_schema_noop(
+                original,
+                ws,
+                change_log,
+                stage,
+                schema_config,
+                config_cut,
+            );
         }
         let partition_image = stage
             .replace_vectors
@@ -50378,11 +54490,15 @@ original:&crate::memory_accounting::OwnedMemoryReservation,
                 .iter()
                 .map(|(name, meta)| (name.as_str(), meta)),
         )?;
-        for (key, value) in original_schema_config_values(&stage.config_values, schema_config, config_cut)? {
+        for (key, value) in
+            original_schema_config_values(&stage.config_values, schema_config, config_cut)?
+        {
             frame.plan_config(key, value)?;
         }
         let group_plan = custody_groups::GroupPlan::prepaid(
-            original_schema_config_values(&stage.config_values, schema_config, config_cut)?.chain(&ws.config_writes))?;
+            original_schema_config_values(&stage.config_values, schema_config, config_cut)?
+                .chain(&ws.config_writes),
+        )?;
         self.with_db(|db| {
             let write_txn = Self::begin_history_write(db)?;
             #[cfg(any(test, feature = "test-seams"))]
@@ -50446,8 +54562,8 @@ original:&crate::memory_accounting::OwnedMemoryReservation,
             // generation stored for an affected table leaves the committed
             // identity in this transaction, ahead of the replacement's own
             // members, so the later mutation of one logical key wins.
-            let retired_identity =
-                self.retire_received_schema_generation_in_write_original(&frame,&write_txn, stage)?;
+            let retired_identity = self
+                .retire_received_schema_generation_in_write_original(&frame, &write_txn, stage)?;
 
             {
                 let mut meta_table = write_txn
@@ -50482,7 +54598,12 @@ original:&crate::memory_accounting::OwnedMemoryReservation,
                         &write_txn,
                         table,
                         meta,
-                        Some(crate::memory_accounting::persistence_original_projection(frame.original)?.as_handle()),
+                        Some(
+                            crate::memory_accounting::persistence_original_projection(
+                                frame.original,
+                            )?
+                            .as_handle(),
+                        ),
                     )?;
                 }
             }
@@ -50520,13 +54641,18 @@ original:&crate::memory_accounting::OwnedMemoryReservation,
                 for row in rows {
                     #[cfg(any(test, feature = "test-seams"))]
                     crate::database::record_received_schema_durable_row_rewrite_for_test();
-                    let encoded = Self::encode_versioned_row_original(&frame,row, stage.table_meta.get(table))?;
+                    let encoded = Self::encode_versioned_row_original(
+                        &frame,
+                        row,
+                        stage.table_meta.get(table),
+                    )?;
                     let key = Self::rel_row_key(row);
                     {
                         let predecessor = redb_table
                             .get(key.as_slice())
                             .map_err(Self::storage_error)?;
-                        self.replace_relational_manifest_in_write_original(&frame.original,
+                        self.replace_relational_manifest_in_write_original(
+                            &frame.original,
                             &write_txn,
                             table,
                             key.as_slice(),
@@ -50543,17 +54669,23 @@ original:&crate::memory_accounting::OwnedMemoryReservation,
                 if !indexes_to_rebuild.contains(table) {
                     continue;
                 }
-                Self::rebuild_relational_indexes_in_write_original(&frame,
+                Self::rebuild_relational_indexes_in_write_original(
+                    &frame,
                     &write_txn,
                     &self.path,
                     table,
                     meta,
                     stage.rows.get(table).map(Vec::as_slice),
-                    &mut content_identity::original_writer::ProofAdmission::new(&frame.original,self.proof_scratch_owner())?,
+                    &mut content_identity::original_writer::ProofAdmission::new(
+                        &frame.original,
+                        self.proof_scratch_owner(),
+                    )?,
                 )?;
             }
-            let operational_index_identity_mutations =
-                self.flush_received_schema_operational_rows_in_write_original(&frame,&write_txn, stage)?;
+            let operational_index_identity_mutations = self
+                .flush_received_schema_operational_rows_in_write_original(
+                    &frame, &write_txn, stage,
+                )?;
 
             {
                 let mut lsn_table = write_txn
@@ -50734,7 +54866,7 @@ original:&crate::memory_accounting::OwnedMemoryReservation,
                         .get(&entry.index)
                         .copied()
                         .unwrap_or_default();
-                    let encoded = Self::encode_vector_entry_original(&frame,entry, quantization)?;
+                    let encoded = Self::encode_vector_entry_original(&frame, entry, quantization)?;
                     let key = Self::vector_key(entry);
                     vectors
                         .insert(key.as_slice(), encoded.as_slice())
@@ -50751,7 +54883,12 @@ original:&crate::memory_accounting::OwnedMemoryReservation,
                         &write_txn,
                         table,
                         meta,
-                        Some(crate::memory_accounting::persistence_original_projection(frame.original)?.as_handle()),
+                        Some(
+                            crate::memory_accounting::persistence_original_projection(
+                                frame.original,
+                            )?
+                            .as_handle(),
+                        ),
                     )?;
                 }
             }
@@ -50866,7 +55003,9 @@ original:&crate::memory_accounting::OwnedMemoryReservation,
                             carried,
                         )?;
                         change_log_identity.push(
-                            content_identity::original_producers::remove_encoded_history_mutation(&frame,&key, &entry)?,
+                            content_identity::original_producers::remove_encoded_history_mutation(
+                                &frame, &key, &entry,
+                            )?,
                         )?;
                         if !Self::change_log_entry_references_any_table(
                             &entry,
@@ -50928,7 +55067,10 @@ original:&crate::memory_accounting::OwnedMemoryReservation,
                     Self::update_policy_hold_release_index(&write_txn, key, false)?;
                     config.remove(key.as_str()).map_err(Self::storage_error)?;
                 }
-                for (key, value) in original_schema_config_values(&stage.config_values,schema_config,config_cut)?.chain(&ws.config_writes) {
+                for (key, value) in
+                    original_schema_config_values(&stage.config_values, schema_config, config_cut)?
+                        .chain(&ws.config_writes)
+                {
                     Self::raise_config_identity_floors_in_write(&write_txn, key, value)?;
                     Self::update_policy_hold_release_index(&write_txn, key, true)?;
                     let value = if stage
@@ -51055,7 +55197,14 @@ original:&crate::memory_accounting::OwnedMemoryReservation,
                         .map(|value| frame.decode(value.value()))
                         .transpose()?
                         .unwrap_or_default();
-                    frame.array::<TriggerAuditEntry>(ring.len().checked_add(trigger_audits.len()).and_then(|n|n.checked_mul(4)).ok_or_else(||Error::Other("trigger audit ring preparation overflow".into()))?)?;
+                    frame.array::<TriggerAuditEntry>(
+                        ring.len()
+                            .checked_add(trigger_audits.len())
+                            .and_then(|n| n.checked_mul(4))
+                            .ok_or_else(|| {
+                                Error::Other("trigger audit ring preparation overflow".into())
+                            })?,
+                    )?;
                     ring.extend(trigger_audits.iter().map(|(_, entry)| entry.clone()));
                     let overflow = ring
                         .len()
@@ -51094,13 +55243,17 @@ original:&crate::memory_accounting::OwnedMemoryReservation,
                     ));
                 }
             }
-            let mut identity_mutations = OriginalMutationVector::from_vec(&frame,retired_identity);
+            let mut identity_mutations = OriginalMutationVector::from_vec(&frame, retired_identity);
             identity_mutations.extend(operational_index_identity_mutations)?;
             for table in &stage.affected_tables {
-                identity_mutations.extend(content_identity::original_producers::remove_schema_mutations(&frame,table)?)?;
+                identity_mutations.extend(
+                    content_identity::original_producers::remove_schema_mutations(&frame, table)?,
+                )?;
             }
             for (table, meta) in &stage.table_meta {
-                identity_mutations.extend(content_identity::original_producers::schema_mutations(&frame,table, meta)?)?;
+                identity_mutations.extend(
+                    content_identity::original_producers::schema_mutations(&frame, table, meta)?,
+                )?;
             }
             // The history retirement above, removals before the packed
             // survivors, so the physical store and the authenticated history
@@ -51118,7 +55271,8 @@ original:&crate::memory_accounting::OwnedMemoryReservation,
                     }
                 }
                 for row in latest.into_values().filter(|row| row.deleted_tx.is_none()) {
-                    identity_mutations.push(content_identity::original_producers::row_mutation(&frame,
+                    identity_mutations.push(content_identity::original_producers::row_mutation(
+                        &frame,
                         table,
                         row,
                         stage.table_meta.get(table),
@@ -51126,10 +55280,15 @@ original:&crate::memory_accounting::OwnedMemoryReservation,
                 }
             }
             for (table, row_id, _) in &ws.relational_deletes {
-                identity_mutations.push(content_identity::original_producers::remove_row_mutation(&frame,table, *row_id)?)?;
+                identity_mutations.push(
+                    content_identity::original_producers::remove_row_mutation(
+                        &frame, table, *row_id,
+                    )?,
+                )?;
             }
             for (table, row) in &stage.operational_write_set.relational_inserts {
-                identity_mutations.push(content_identity::original_producers::row_mutation(&frame,
+                identity_mutations.push(content_identity::original_producers::row_mutation(
+                    &frame,
                     table,
                     row,
                     stage.operational_table_meta.get(table),
@@ -51149,7 +55308,9 @@ original:&crate::memory_accounting::OwnedMemoryReservation,
                 .into_values()
                 .filter(|edge| edge.deleted_tx.is_none())
             {
-                identity_mutations.push(content_identity::original_producers::edge_mutation(&frame,edge)?)?;
+                identity_mutations.push(content_identity::original_producers::edge_mutation(
+                    &frame, edge,
+                )?)?;
             }
             let mut latest_vectors = BTreeMap::<(String, String, RowId), &VectorEntry>::new();
             for vector in &stage.vectors {
@@ -51157,10 +55318,13 @@ original:&crate::memory_accounting::OwnedMemoryReservation,
                     .get(&vector.index)
                     .copied()
                     .unwrap_or_default();
-                identity_mutations.push(content_identity::original_producers::vector_version_mutation(&frame,
-                    vector,
-                    quantization,
-                )?)?;
+                identity_mutations.push(
+                    content_identity::original_producers::vector_version_mutation(
+                        &frame,
+                        vector,
+                        quantization,
+                    )?,
+                )?;
                 let identity = (
                     vector.index.table.clone(),
                     vector.index.column.clone(),
@@ -51182,15 +55346,22 @@ original:&crate::memory_accounting::OwnedMemoryReservation,
                     .get(&vector.index)
                     .copied()
                     .unwrap_or_default();
-                identity_mutations.push(content_identity::original_producers::vector_mutation(&frame,vector, quantization)?)?;
+                identity_mutations.push(content_identity::original_producers::vector_mutation(
+                    &frame,
+                    vector,
+                    quantization,
+                )?)?;
             }
             for (table, row_id, lsn, kind) in &stage.sync_sources {
-                identity_mutations.push(content_identity::original_producers::sync_source_mutation(&frame,
-                    table,
-                    *row_id,
-                    lsn.0,
-                    sync_source_kind_to_u8(*kind),
-                )?)?;
+                identity_mutations.push(
+                    content_identity::original_producers::sync_source_mutation(
+                        &frame,
+                        table,
+                        *row_id,
+                        lsn.0,
+                        sync_source_kind_to_u8(*kind),
+                    )?,
+                )?;
             }
             let lsn = ws.commit_lsn.unwrap_or(Lsn(0));
             let mut change_key = String::with_capacity(Self::change_log_entry_key_len());
@@ -51208,21 +55379,36 @@ original:&crate::memory_accounting::OwnedMemoryReservation,
             for (ddl_lsn, changes) in grouped_ddl {
                 for (index, change) in changes.iter().enumerate() {
                     let key = Self::ddl_log_key_for_index(ddl_lsn, index, changes.len());
-                    identity_mutations
-                        .push(content_identity::original_producers::encoded_history_mutation(&frame,&key, *change)?);
+                    identity_mutations.push(
+                        content_identity::original_producers::encoded_history_mutation(
+                            &frame, &key, *change,
+                        )?,
+                    );
                 }
             }
             // The committed history records the very commit-index entry this
             // flush stores above, with the same transaction id.
             if let (Some(commit_lsn), Some(tx)) = (ws.commit_lsn, Self::write_set_visibility_tx(ws))
             {
-                identity_mutations.push(content_identity::original_producers::commit_index_mutation(&frame,commit_lsn, tx)?)?;
+                identity_mutations.push(
+                    content_identity::original_producers::commit_index_mutation(
+                        &frame, commit_lsn, tx,
+                    )?,
+                )?;
             }
             for key in &ws.config_deletes {
-                identity_mutations.extend(content_identity::original_producers::config_mutations(&frame,key, None)?)?;
+                identity_mutations.extend(
+                    content_identity::original_producers::config_mutations(&frame, key, None)?,
+                )?;
             }
             for (key, value) in &committed_config_values {
-                identity_mutations.extend(content_identity::original_producers::config_mutations(&frame,key, Some(value))?)?;
+                identity_mutations.extend(
+                    content_identity::original_producers::config_mutations(
+                        &frame,
+                        key,
+                        Some(value),
+                    )?,
+                )?;
             }
             if !sink_events.is_empty() {
                 let table = write_txn
@@ -51230,11 +55416,14 @@ original:&crate::memory_accounting::OwnedMemoryReservation,
                     .map_err(Self::storage_error)?;
                 for item in table.iter().map_err(Self::storage_error)? {
                     let (key, value) = item.map_err(Self::storage_error)?;
-                    identity_mutations.push(content_identity::original_producers::status_mutation(&frame,
-                        b"sink-audit",
-                        key.value().as_bytes(),
-                        value.value(),
-                    )?)?;
+                    identity_mutations.push(
+                        content_identity::original_producers::status_mutation(
+                            &frame,
+                            b"sink-audit",
+                            key.value().as_bytes(),
+                            value.value(),
+                        )?,
+                    )?;
                 }
             }
             if !trigger_audits.is_empty() {
@@ -51243,22 +55432,28 @@ original:&crate::memory_accounting::OwnedMemoryReservation,
                     .map_err(Self::storage_error)?;
                 for item in table.iter().map_err(Self::storage_error)? {
                     let (key, value) = item.map_err(Self::storage_error)?;
-                    identity_mutations.push(content_identity::original_producers::status_mutation(&frame,
-                        b"trigger-audit",
-                        key.value().as_bytes(),
-                        value.value(),
-                    )?)?;
+                    identity_mutations.push(
+                        content_identity::original_producers::status_mutation(
+                            &frame,
+                            b"trigger-audit",
+                            key.value().as_bytes(),
+                            value.value(),
+                        )?,
+                    )?;
                 }
                 let table = write_txn
                     .open_table(TRIGGER_AUDIT_STAMPS_TABLE)
                     .map_err(Self::storage_error)?;
                 for item in table.iter().map_err(Self::storage_error)? {
                     let (key, stamp) = item.map_err(Self::storage_error)?;
-                    identity_mutations.push(content_identity::original_producers::status_mutation(&frame,
-                        b"trigger-stamp",
-                        key.value().as_bytes(),
-                        &stamp.value().to_le_bytes(),
-                    )?)?;
+                    identity_mutations.push(
+                        content_identity::original_producers::status_mutation(
+                            &frame,
+                            b"trigger-stamp",
+                            key.value().as_bytes(),
+                            &stamp.value().to_le_bytes(),
+                        )?,
+                    )?;
                 }
             }
             for sink in &sink_queue_names {
@@ -51272,17 +55467,26 @@ original:&crate::memory_accounting::OwnedMemoryReservation,
                     let (id, value) = item.map_err(Self::storage_error)?;
                     let entry: SinkQueueEntry = frame.decode(value.value())?;
                     let key = format!("{}:{sink}:{}", sink.len(), id.value());
-                    identity_mutations.push(content_identity::original_producers::encoded_status_mutation(&frame,
-                        b"sink-queue",
-                        key.as_bytes(),
-                        &entry,
-                    )?)?;
+                    identity_mutations.push(
+                        content_identity::original_producers::encoded_status_mutation(
+                            &frame,
+                            b"sink-queue",
+                            key.as_bytes(),
+                            &entry,
+                        )?,
+                    )?;
                 }
             }
             Self::apply_owned_content_identity_with_manifests_and_groups_in_write(
                 &write_txn,
                 &identity_mutations,
-                &[], &mut content_identity::original_writer::ProofAdmission::new(&frame.original,self.proof_scratch_owner())?, Some(&group_plan))?;
+                &[],
+                &mut content_identity::original_writer::ProofAdmission::new(
+                    &frame.original,
+                    self.proof_scratch_owner(),
+                )?,
+                Some(&group_plan),
+            )?;
             if take_received_schema_pre_commit_fault_for_test() {
                 return Err(Error::Other(
                     "injected received-schema Redb pre-commit failure".to_string(),
@@ -51340,16 +55544,17 @@ original:&crate::memory_accounting::OwnedMemoryReservation,
         })
     }
 
-pub(crate) fn flush_owned_received_schema_noop(
+    pub(crate) fn flush_owned_received_schema_noop(
         &self,
-original:&crate::memory_accounting::OwnedMemoryReservation,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
         ws: &WriteSet,
         change_log: &[ChangeLogEntry],
-        stage: &ReceivedSchemaPersistenceProjection, schema_config:Option<&[(String,Vec<u8>)]>, config_cut:usize) -> Result<()> {
-        let frame=OriginalPersistenceFrame::new(original)?;
-        frame.plan_write_set(ws,&[],&[])?;
-
-
+        stage: &ReceivedSchemaPersistenceProjection,
+        schema_config: Option<&[(String, Vec<u8>)]>,
+        config_cut: usize,
+    ) -> Result<()> {
+        let frame = OriginalPersistenceFrame::new(original)?;
+        frame.plan_write_set(ws, &[], &[])?;
 
         #[cfg(any(test, feature = "test-seams"))]
         let flush_started = std::time::Instant::now();
@@ -51380,11 +55585,15 @@ original:&crate::memory_accounting::OwnedMemoryReservation,
                     as u64,
             );
         }
-        for (key, value) in original_schema_config_values(&stage.config_values, schema_config, config_cut)? {
+        for (key, value) in
+            original_schema_config_values(&stage.config_values, schema_config, config_cut)?
+        {
             frame.plan_config(key, value)?;
         }
         let group_plan = custody_groups::GroupPlan::prepaid(
-            original_schema_config_values(&stage.config_values, schema_config, config_cut)?.chain(&ws.config_writes))?;
+            original_schema_config_values(&stage.config_values, schema_config, config_cut)?
+                .chain(&ws.config_writes),
+        )?;
         self.with_db(|db| {
             #[cfg(any(test, feature = "test-seams"))]
             let begin_started = std::time::Instant::now();
@@ -51399,8 +55608,10 @@ original:&crate::memory_accounting::OwnedMemoryReservation,
                 "noop-begin-write",
                 begin_started,
             );
-            let operational_index_identity_mutations =
-                self.flush_received_schema_operational_rows_in_write_original(&frame,&write_txn, stage)?;
+            let operational_index_identity_mutations = self
+                .flush_received_schema_operational_rows_in_write_original(
+                    &frame, &write_txn, stage,
+                )?;
             if !stage.ddl_log.is_empty() {
                 let mut ddl = write_txn
                     .open_table(DDL_LOG_TABLE)
@@ -51428,7 +55639,10 @@ original:&crate::memory_accounting::OwnedMemoryReservation,
                     Self::update_policy_hold_release_index(&write_txn, key, false)?;
                     config.remove(key.as_str()).map_err(Self::storage_error)?;
                 }
-                for (key, value) in original_schema_config_values(&stage.config_values,schema_config,config_cut)?.chain(&ws.config_writes) {
+                for (key, value) in
+                    original_schema_config_values(&stage.config_values, schema_config, config_cut)?
+                        .chain(&ws.config_writes)
+                {
                     Self::raise_config_identity_floors_in_write(&write_txn, key, value)?;
                     Self::update_policy_hold_release_index(&write_txn, key, true)?;
                     let value = if ws.config_max_u64_keys.iter().any(|max_key| max_key == key) {
@@ -51480,12 +55694,21 @@ original:&crate::memory_accounting::OwnedMemoryReservation,
                     })?;
                 }
             }
-            let mut identity_mutations = OriginalMutationVector::from_vec(&frame,operational_index_identity_mutations);
+            let mut identity_mutations =
+                OriginalMutationVector::from_vec(&frame, operational_index_identity_mutations);
             for key in &ws.config_deletes {
-                identity_mutations.extend(content_identity::original_producers::config_mutations(&frame,key, None)?)?;
+                identity_mutations.extend(
+                    content_identity::original_producers::config_mutations(&frame, key, None)?,
+                )?;
             }
             for (key, value) in &committed_config_values {
-                identity_mutations.extend(content_identity::original_producers::config_mutations(&frame,key, Some(value))?)?;
+                identity_mutations.extend(
+                    content_identity::original_producers::config_mutations(
+                        &frame,
+                        key,
+                        Some(value),
+                    )?,
+                )?;
             }
             let mut grouped_ddl = BTreeMap::<Lsn, Vec<&DdlChange>>::new();
             for (ddl_lsn, change) in &stage.ddl_log {
@@ -51494,15 +55717,23 @@ original:&crate::memory_accounting::OwnedMemoryReservation,
             for (ddl_lsn, changes) in grouped_ddl {
                 for (index, change) in changes.iter().enumerate() {
                     let key = Self::ddl_log_key_for_index(ddl_lsn, index, changes.len());
-                    identity_mutations
-                        .push(content_identity::original_producers::encoded_history_mutation(&frame,&key, *change)?);
+                    identity_mutations.push(
+                        content_identity::original_producers::encoded_history_mutation(
+                            &frame, &key, *change,
+                        )?,
+                    );
                 }
             }
             for (table, row_id, _) in &stage.operational_write_set.relational_deletes {
-                identity_mutations.push(content_identity::original_producers::remove_row_mutation(&frame,table, *row_id)?)?;
+                identity_mutations.push(
+                    content_identity::original_producers::remove_row_mutation(
+                        &frame, table, *row_id,
+                    )?,
+                )?;
             }
             for (table, row) in &stage.operational_write_set.relational_inserts {
-                identity_mutations.push(content_identity::original_producers::row_mutation(&frame,
+                identity_mutations.push(content_identity::original_producers::row_mutation(
+                    &frame,
                     table,
                     row,
                     stage.operational_table_meta.get(table),
@@ -51518,13 +55749,23 @@ original:&crate::memory_accounting::OwnedMemoryReservation,
                 )?)?;
             }
             if let (Some(commit_lsn), Some(tx)) = (ws.commit_lsn, ws.visibility_floor) {
-                identity_mutations.push(content_identity::original_producers::commit_index_mutation(&frame,commit_lsn, tx)?)?;
+                identity_mutations.push(
+                    content_identity::original_producers::commit_index_mutation(
+                        &frame, commit_lsn, tx,
+                    )?,
+                )?;
             }
             if !identity_mutations.is_empty() {
                 Self::apply_owned_content_identity_with_manifests_and_groups_in_write(
                     &write_txn,
                     &identity_mutations,
-                    &[], &mut content_identity::original_writer::ProofAdmission::new(&frame.original,self.proof_scratch_owner())?, Some(&group_plan))?;
+                    &[],
+                    &mut content_identity::original_writer::ProofAdmission::new(
+                        &frame.original,
+                        self.proof_scratch_owner(),
+                    )?,
+                    Some(&group_plan),
+                )?;
             }
             if take_received_schema_pre_commit_fault_for_test() {
                 return Err(Error::Other(
@@ -51566,16 +55807,19 @@ original:&crate::memory_accounting::OwnedMemoryReservation,
         Ok(())
     }
 
-pub(crate) fn flush_owned_local_schema_stage(
+    pub(crate) fn flush_owned_local_schema_stage(
         &self,
-original:&crate::memory_accounting::OwnedMemoryReservation,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
         ws: &WriteSet,
-        stage: &LocalSchemaPersistenceProjection, schema_config:Option<&[(String,Vec<u8>)]>, config_cut:usize) -> Result<()> {
-        let frame=OriginalPersistenceFrame::new(original)?;
-        frame.plan_write_set(ws,&[],&[])?;
-        for meta in stage.affected_table_meta.values(){frame.record(meta)?;}
-
-
+        stage: &LocalSchemaPersistenceProjection,
+        schema_config: Option<&[(String, Vec<u8>)]>,
+        config_cut: usize,
+    ) -> Result<()> {
+        let frame = OriginalPersistenceFrame::new(original)?;
+        frame.plan_write_set(ws, &[], &[])?;
+        for meta in stage.affected_table_meta.values() {
+            frame.record(meta)?;
+        }
 
         let lsn = ws.commit_lsn.ok_or_else(|| {
             Error::Other("local schema stage is missing its commit LSN".to_string())
@@ -51592,11 +55836,15 @@ original:&crate::memory_accounting::OwnedMemoryReservation,
                 .iter()
                 .map(|(name, meta)| (name.as_str(), meta)),
         )?;
-        for (key, value) in original_schema_config_values(&stage.config_values, schema_config, config_cut)? {
+        for (key, value) in
+            original_schema_config_values(&stage.config_values, schema_config, config_cut)?
+        {
             frame.plan_config(key, value)?;
         }
         let group_plan = custody_groups::GroupPlan::prepaid(
-            original_schema_config_values(&stage.config_values, schema_config, config_cut)?.chain(&ws.config_writes))?;
+            original_schema_config_values(&stage.config_values, schema_config, config_cut)?
+                .chain(&ws.config_writes),
+        )?;
         self.with_db(|db| {
             let write_txn = Self::begin_history_write(db)?;
             #[cfg(any(test, feature = "test-seams"))]
@@ -51620,7 +55868,12 @@ original:&crate::memory_accounting::OwnedMemoryReservation,
                         &write_txn,
                         table,
                         meta,
-                        Some(crate::memory_accounting::persistence_original_projection(frame.original)?.as_handle()),
+                        Some(
+                            crate::memory_accounting::persistence_original_projection(
+                                frame.original,
+                            )?
+                            .as_handle(),
+                        ),
                     )?;
                 }
             }
@@ -51636,13 +55889,17 @@ original:&crate::memory_accounting::OwnedMemoryReservation,
                     content_size::open_rows(&write_txn, table_def).map_err(Self::storage_error)?;
             }
             for (table, meta) in &stage.affected_table_meta {
-                Self::rebuild_relational_indexes_in_write_original(&frame,
+                Self::rebuild_relational_indexes_in_write_original(
+                    &frame,
                     &write_txn,
                     &self.path,
                     table,
                     meta,
                     None,
-                    &mut content_identity::original_writer::ProofAdmission::new(&frame.original,self.proof_scratch_owner())?,
+                    &mut content_identity::original_writer::ProofAdmission::new(
+                        &frame.original,
+                        self.proof_scratch_owner(),
+                    )?,
                 )?;
             }
 
@@ -51656,7 +55913,10 @@ original:&crate::memory_accounting::OwnedMemoryReservation,
                         .remove(key.as_str())
                         .map_err(Self::storage_error)?;
                 }
-                for (key, encoded) in original_schema_config_values(&stage.config_values,schema_config,config_cut)?.chain(&ws.config_writes) {
+                for (key, encoded) in
+                    original_schema_config_values(&stage.config_values, schema_config, config_cut)?
+                        .chain(&ws.config_writes)
+                {
                     Self::raise_config_identity_floors_in_write(&write_txn, key, encoded)?;
                     Self::update_policy_hold_release_index(&write_txn, key, true)?;
                     config_table
@@ -51690,27 +55950,53 @@ original:&crate::memory_accounting::OwnedMemoryReservation,
 
             let mut identity_mutations = OriginalMutationVector::new(&frame);
             for (table, meta) in &stage.affected_table_meta {
-                identity_mutations.extend(content_identity::original_producers::schema_mutations(&frame,table, meta)?)?;
+                identity_mutations.extend(
+                    content_identity::original_producers::schema_mutations(&frame, table, meta)?,
+                )?;
             }
             for key in &ws.config_deletes {
-                identity_mutations.extend(content_identity::original_producers::config_mutations(&frame,key, None)?)?;
+                identity_mutations.extend(
+                    content_identity::original_producers::config_mutations(&frame, key, None)?,
+                )?;
             }
-            for (key, encoded) in original_schema_config_values(&stage.config_values,schema_config,config_cut)?.chain(&ws.config_writes) {
+            for (key, encoded) in
+                original_schema_config_values(&stage.config_values, schema_config, config_cut)?
+                    .chain(&ws.config_writes)
+            {
                 Self::raise_config_identity_floors_in_write(&write_txn, key, encoded)?;
-                identity_mutations.extend(content_identity::original_producers::config_mutations(&frame,key, Some(encoded))?)?;
+                identity_mutations.extend(
+                    content_identity::original_producers::config_mutations(
+                        &frame,
+                        key,
+                        Some(encoded),
+                    )?,
+                )?;
             }
             for (index, change) in stage.ddl.iter().enumerate() {
                 let key = Self::ddl_log_key_for_index(lsn, index, stage.ddl.len());
-                identity_mutations.push(content_identity::original_producers::encoded_history_mutation(&frame,&key, change)?)?;
+                identity_mutations.push(
+                    content_identity::original_producers::encoded_history_mutation(
+                        &frame, &key, change,
+                    )?,
+                )?;
             }
-            identity_mutations.push(content_identity::original_producers::commit_index_mutation(&frame,
-                lsn,
-                stage.commit_index_tx,
-            )?)?;
+            identity_mutations.push(
+                content_identity::original_producers::commit_index_mutation(
+                    &frame,
+                    lsn,
+                    stage.commit_index_tx,
+                )?,
+            )?;
             Self::apply_owned_content_identity_with_manifests_and_groups_in_write(
                 &write_txn,
                 &identity_mutations,
-                &[], &mut content_identity::original_writer::ProofAdmission::new(&frame.original,self.proof_scratch_owner())?, Some(&group_plan))?;
+                &[],
+                &mut content_identity::original_writer::ProofAdmission::new(
+                    &frame.original,
+                    self.proof_scratch_owner(),
+                )?,
+                Some(&group_plan),
+            )?;
 
             if take_received_schema_pre_commit_fault_for_test() {
                 return Err(Error::Other(
@@ -51740,13 +56026,12 @@ original:&crate::memory_accounting::OwnedMemoryReservation,
         })
     }
 
-pub(crate) fn retire_received_schema_generation_in_write_original(
+    pub(crate) fn retire_received_schema_generation_in_write_original(
         &self,
-frame:&OriginalPersistenceFrame<'_>,
+        frame: &OriginalPersistenceFrame<'_>,
         write_txn: &redb::WriteTransaction,
         stage: &ReceivedSchemaPersistenceProjection,
     ) -> Result<Vec<content_identity::ContentIdentityMutation>> {
-
         let mut mutations = OriginalMutationVector::new(frame);
         let mut affected = stage.affected_tables.iter().collect::<Vec<_>>();
         affected.sort();
@@ -51886,10 +56171,13 @@ frame:&OriginalPersistenceFrame<'_>,
                 .map_err(Self::storage_error)?
                 .is_some()
             {
-                mutations.push(content_identity::original_producers::remove_status_mutation(frame,
-                    RELATIONAL_INDEX_COUNT_READY_IDENTITY_NAMESPACE,
-                    table.as_bytes(),
-                )?)?;
+                mutations.push(
+                    content_identity::original_producers::remove_status_mutation(
+                        frame,
+                        RELATIONAL_INDEX_COUNT_READY_IDENTITY_NAMESPACE,
+                        table.as_bytes(),
+                    )?,
+                )?;
             }
             let prefix = format!(
                 "{}{}:{table}:",
@@ -51911,7 +56199,9 @@ frame:&OriginalPersistenceFrame<'_>,
                 .collect::<Result<Vec<_>>>()?;
             for key in expiries {
                 config.remove(key.as_str()).map_err(Self::storage_error)?;
-                mutations.extend(content_identity::original_producers::config_mutations(frame,&key, None)?)?;
+                mutations.extend(content_identity::original_producers::config_mutations(
+                    frame, &key, None,
+                )?)?;
             }
         }
 
@@ -51924,9 +56214,11 @@ frame:&OriginalPersistenceFrame<'_>,
                 if let Some((table, row_id)) = Self::decode_sync_row_source_lsn_key(key.value())
                     && stage.affected_tables.contains(&table)
                 {
-                    mutations.push(content_identity::original_producers::remove_sync_source_mutation(frame,
-                        &table, row_id,
-                    )?)?;
+                    mutations.push(
+                        content_identity::original_producers::remove_sync_source_mutation(
+                            frame, &table, row_id,
+                        )?,
+                    )?;
                 }
             }
         }
@@ -51941,18 +56233,24 @@ frame:&OriginalPersistenceFrame<'_>,
                             continue;
                         }
                         let quantization = entry.vector.quantization();
-                        mutations.push(content_identity::original_producers::remove_vector_version_mutation(frame,
-                            &entry.index,
-                            entry.row_id,
-                            entry.created_tx,
-                            entry.lsn,
-                            quantization,
-                        )?)?;
-                        mutations.push(content_identity::original_producers::remove_vector_mutation(frame,
-                            &entry.index,
-                            entry.row_id,
-                            quantization,
-                        )?)?;
+                        mutations.push(
+                            content_identity::original_producers::remove_vector_version_mutation(
+                                frame,
+                                &entry.index,
+                                entry.row_id,
+                                entry.created_tx,
+                                entry.lsn,
+                                quantization,
+                            )?,
+                        )?;
+                        mutations.push(
+                            content_identity::original_producers::remove_vector_mutation(
+                                frame,
+                                &entry.index,
+                                entry.row_id,
+                                quantization,
+                            )?,
+                        )?;
                     }
                 }
                 Err(redb::TableError::TableDoesNotExist(_)) => {}
@@ -51989,7 +56287,8 @@ frame:&OriginalPersistenceFrame<'_>,
                 );
                 let edge = frame.decode::<AdjEntry>(value.value())?;
                 if stage.affected_graph_edge_types.contains(&edge.edge_type) {
-                    mutations.push(content_identity::original_producers::remove_edge_mutation(frame,
+                    mutations.push(content_identity::original_producers::remove_edge_mutation(
+                        frame,
                         edge.source,
                         &edge.edge_type,
                         edge.target,
@@ -52000,9 +56299,9 @@ frame:&OriginalPersistenceFrame<'_>,
         Ok(mutations.into_vec())
     }
 
-pub(crate) fn flush_received_schema_operational_rows_in_write_original(
+    pub(crate) fn flush_received_schema_operational_rows_in_write_original(
         &self,
-frame:&OriginalPersistenceFrame<'_>,
+        frame: &OriginalPersistenceFrame<'_>,
         write_txn: &redb::WriteTransaction,
         stage: &ReceivedSchemaPersistenceProjection,
     ) -> Result<Vec<content_identity::ContentIdentityMutation>> {
@@ -52025,13 +56324,23 @@ frame:&OriginalPersistenceFrame<'_>,
                 TableDefinition::new(table_name.as_str());
             let mut relation =
                 content_size::open_rows(write_txn, definition).map_err(Self::storage_error)?;
-            self.verify_relational_group_in_write_original(frame.original,write_txn, table, *row_id, &*relation)?;
+            self.verify_relational_group_in_write_original(
+                frame.original,
+                write_txn,
+                table,
+                *row_id,
+                &*relation,
+            )?;
             let key = Self::rel_row_key(&deleted);
-            let encoded =
-                Self::encode_versioned_row_original(frame,&deleted, stage.operational_table_meta.get(table))?;
+            let encoded = Self::encode_versioned_row_original(
+                frame,
+                &deleted,
+                stage.operational_table_meta.get(table),
+            )?;
             {
                 let predecessor = relation.get(key.as_slice()).map_err(Self::storage_error)?;
-                self.replace_relational_manifest_in_write_original(frame.original,
+                self.replace_relational_manifest_in_write_original(
+                    frame.original,
                     write_txn,
                     table,
                     key.as_slice(),
@@ -52050,10 +56359,15 @@ frame:&OriginalPersistenceFrame<'_>,
             let mut relation =
                 content_size::open_rows(write_txn, definition).map_err(Self::storage_error)?;
             let key = Self::rel_row_key(row);
-            let encoded = Self::encode_versioned_row_original(frame,row, stage.operational_table_meta.get(table))?;
+            let encoded = Self::encode_versioned_row_original(
+                frame,
+                row,
+                stage.operational_table_meta.get(table),
+            )?;
             {
                 let predecessor = relation.get(key.as_slice()).map_err(Self::storage_error)?;
-                self.replace_relational_manifest_in_write_original(frame.original,
+                self.replace_relational_manifest_in_write_original(
+                    frame.original,
                     write_txn,
                     table,
                     key.as_slice(),
@@ -52065,7 +56379,8 @@ frame:&OriginalPersistenceFrame<'_>,
                 .insert(key.as_slice(), encoded.as_slice())
                 .map_err(Self::storage_error)?;
         }
-        Self::flush_relational_index_changes_in_write_original(frame,
+        Self::flush_relational_index_changes_in_write_original(
+            frame,
             write_txn,
             ws,
             &stage.operational_table_meta,
@@ -52073,34 +56388,45 @@ frame:&OriginalPersistenceFrame<'_>,
         )
     }
 
-pub(crate) fn encode_versioned_row_original(
-frame:&OriginalPersistenceFrame<'_>,row: &VersionedRow, meta: Option<&TableMeta>) -> Result<Vec<u8>> {
+    pub(crate) fn encode_versioned_row_original(
+        frame: &OriginalPersistenceFrame<'_>,
+        row: &VersionedRow,
+        meta: Option<&TableMeta>,
+    ) -> Result<Vec<u8>> {
         let mut encoded = Vec::new();
-        Self::encode_versioned_row_into_original(frame,row, meta, &mut encoded)?;
+        Self::encode_versioned_row_into_original(frame, row, meta, &mut encoded)?;
         Ok(encoded)
     }
 
-pub(crate) fn encode_versioned_row_into_original(
-frame:&OriginalPersistenceFrame<'_>,
+    pub(crate) fn encode_versioned_row_into_original(
+        frame: &OriginalPersistenceFrame<'_>,
         row: &VersionedRow,
         meta: Option<&TableMeta>,
         encoded: &mut Vec<u8>,
     ) -> Result<()> {
-        Self::encode_versioned_row_with_deleted_tx_into_original(frame,row, row.deleted_tx, meta, encoded)
+        Self::encode_versioned_row_with_deleted_tx_into_original(
+            frame,
+            row,
+            row.deleted_tx,
+            meta,
+            encoded,
+        )
     }
 
-pub(crate) fn encode_versioned_row_with_deleted_tx_into_original(
-frame:&OriginalPersistenceFrame<'_>,
+    pub(crate) fn encode_versioned_row_with_deleted_tx_into_original(
+        frame: &OriginalPersistenceFrame<'_>,
         row: &VersionedRow,
         deleted_tx: Option<TxId>,
         meta: Option<&TableMeta>,
         encoded: &mut Vec<u8>,
     ) -> Result<()> {
-        Self::encode_versioned_row_with_f32_overlay_into_original(frame,row, deleted_tx, meta, None, encoded)
+        Self::encode_versioned_row_with_f32_overlay_into_original(
+            frame, row, deleted_tx, meta, None, encoded,
+        )
     }
 
-pub(crate) fn encode_versioned_row_with_f32_overlay_into_original(
-frame:&OriginalPersistenceFrame<'_>,
+    pub(crate) fn encode_versioned_row_with_f32_overlay_into_original(
+        frame: &OriginalPersistenceFrame<'_>,
         row: &VersionedRow,
         deleted_tx: Option<TxId>,
         meta: Option<&TableMeta>,
@@ -52108,8 +56434,13 @@ frame:&OriginalPersistenceFrame<'_>,
         encoded: &mut Vec<u8>,
     ) -> Result<()> {
         frame.record(row)?;
-        frame.map::<String,PersistedValue>(row.values.len())?;
-        if let Some(vectors)=f32_overlay{for (name,value) in vectors{frame.reserve(name.len())?;frame.array::<f32>(value.len())?;}}
+        frame.map::<String, PersistedValue>(row.values.len())?;
+        if let Some(vectors) = f32_overlay {
+            for (name, value) in vectors {
+                frame.reserve(name.len())?;
+                frame.array::<f32>(value.len())?;
+            }
+        }
         let values = row
             .values
             .iter()
@@ -52144,7 +56475,8 @@ frame:&OriginalPersistenceFrame<'_>,
                 (column.clone(), persisted)
             })
             .collect::<HashMap<_, _>>();
-        Self::encode_into_original(frame,
+        Self::encode_into_original(
+            frame,
             &PersistedVersionedRow {
                 row_id: row.row_id,
                 values,
@@ -52157,13 +56489,15 @@ frame:&OriginalPersistenceFrame<'_>,
         )
     }
 
-pub(crate) fn f32_vectors_from_row_original(
-frame:&OriginalPersistenceFrame<'_>,
+    pub(crate) fn f32_vectors_from_row_original(
+        frame: &OriginalPersistenceFrame<'_>,
         row: &VersionedRow,
         meta: Option<&TableMeta>,
     ) -> Result<HashMap<String, Vec<f32>>> {
-        frame.record(row)?;frame.map::<String,Vec<f32>>(row.values.len())?;
-        Ok(row.values
+        frame.record(row)?;
+        frame.map::<String, Vec<f32>>(row.values.len())?;
+        Ok(row
+            .values
             .iter()
             .filter_map(|(column, value)| match value {
                 Value::Vector(vector)
@@ -52179,9 +56513,11 @@ frame:&OriginalPersistenceFrame<'_>,
             .collect())
     }
 
-pub(crate) fn decode_versioned_row_original(
-frame:&OriginalPersistenceFrame<'_>,bytes: &[u8], _meta: Option<&TableMeta>) -> Result<VersionedRow> {
-
+    pub(crate) fn decode_versioned_row_original(
+        frame: &OriginalPersistenceFrame<'_>,
+        bytes: &[u8],
+        _meta: Option<&TableMeta>,
+    ) -> Result<VersionedRow> {
         let persisted: PersistedVersionedRow = frame.decode(bytes)?;
         frame.reserve(
             persisted
@@ -52198,7 +56534,7 @@ frame:&OriginalPersistenceFrame<'_>,bytes: &[u8], _meta: Option<&TableMeta>) -> 
                 })
                 .sum(),
         )?;
-        frame.map::<String,Value>(persisted.values.len())?;
+        frame.map::<String, Value>(persisted.values.len())?;
         let values = persisted
             .values
             .into_iter()
@@ -52220,8 +56556,8 @@ frame:&OriginalPersistenceFrame<'_>,bytes: &[u8], _meta: Option<&TableMeta>) -> 
         })
     }
 
-pub(crate) fn encode_vector_entry_original(
-frame:&OriginalPersistenceFrame<'_>,
+    pub(crate) fn encode_vector_entry_original(
+        frame: &OriginalPersistenceFrame<'_>,
         entry: &VectorEntry,
         quantization: VectorQuantization,
     ) -> Result<Vec<u8>> {
@@ -52236,9 +56572,10 @@ frame:&OriginalPersistenceFrame<'_>,
         })
     }
 
-pub(crate) fn decode_vector_entry_original(
-frame:&OriginalPersistenceFrame<'_>,bytes: &[u8]) -> Result<VectorEntry> {
-
+    pub(crate) fn decode_vector_entry_original(
+        frame: &OriginalPersistenceFrame<'_>,
+        bytes: &[u8],
+    ) -> Result<VectorEntry> {
         let persisted: PersistedVectorEntry = frame.decode(bytes)?;
         frame.reserve(persisted.vector.decoded_bytes())?;
         Ok(VectorEntry {
@@ -52251,8 +56588,8 @@ frame:&OriginalPersistenceFrame<'_>,bytes: &[u8]) -> Result<VectorEntry> {
         })
     }
 
-pub(crate) fn flush_relational_index_changes_in_write_original(
-frame:&OriginalPersistenceFrame<'_>,
+    pub(crate) fn flush_relational_index_changes_in_write_original(
+        frame: &OriginalPersistenceFrame<'_>,
         write_txn: &redb::WriteTransaction,
         ws: &WriteSet,
         table_meta: &HashMap<String, TableMeta>,
@@ -52459,11 +56796,14 @@ frame:&OriginalPersistenceFrame<'_>,
                         .map_err(Self::storage_error)?;
                     #[cfg(any(test, feature = "test-seams"))]
                     observe_index_posting(table, &declaration);
-                    identity_mutations.push(content_identity::original_producers::relational_index_posting_mutation(frame,
-                        table,
-                        &declaration.name,
-                        &logical_key.0,
-                    )?)?;
+                    identity_mutations.push(
+                        content_identity::original_producers::relational_index_posting_mutation(
+                            frame,
+                            table,
+                            &declaration.name,
+                            &logical_key.0,
+                        )?,
+                    )?;
                 }
             }
         }
@@ -52496,12 +56836,14 @@ frame:&OriginalPersistenceFrame<'_>,
                     observe_index_prefix_count_value(&key, (next > 0).then_some(next));
                     if next == 0 {
                         counts.remove(key.as_slice()).map_err(Self::storage_error)?;
-                        identity_mutations.push(Self::remove_relational_index_count_mutation(&key))?;
+                        identity_mutations
+                            .push(Self::remove_relational_index_count_mutation(&key))?;
                     } else {
                         counts
                             .insert(key.as_slice(), next)
                             .map_err(Self::storage_error)?;
-                        identity_mutations.push(Self::relational_index_count_mutation(&key, next))?;
+                        identity_mutations
+                            .push(Self::relational_index_count_mutation(&key, next))?;
                     }
                 }
             }
@@ -52509,8 +56851,8 @@ frame:&OriginalPersistenceFrame<'_>,
         Ok(identity_mutations.into_vec())
     }
 
-pub(crate) fn retire_undeclared_relational_indexes_in_write_original(
-frame:&OriginalPersistenceFrame<'_>,
+    pub(crate) fn retire_undeclared_relational_indexes_in_write_original(
+        frame: &OriginalPersistenceFrame<'_>,
         write_txn: &redb::WriteTransaction,
         database_path: &Path,
         table: &str,
@@ -52572,12 +56914,17 @@ frame:&OriginalPersistenceFrame<'_>,
         if mutations.is_empty() {
             return Ok(());
         }
-        Self::apply_owned_content_identity_with_manifests_in_write(write_txn, &mutations, &[], admission)?;
+        Self::apply_owned_content_identity_with_manifests_in_write(
+            write_txn,
+            &mutations,
+            &[],
+            admission,
+        )?;
         Ok(())
     }
 
-pub(crate) fn rebuild_relational_indexes_in_write_original(
-frame:&OriginalPersistenceFrame<'_>,
+    pub(crate) fn rebuild_relational_indexes_in_write_original(
+        frame: &OriginalPersistenceFrame<'_>,
         write_txn: &redb::WriteTransaction,
         database_path: &Path,
         table: &str,
@@ -52694,7 +57041,11 @@ frame:&OriginalPersistenceFrame<'_>,
                             let _row_scope = crate::read_image_memory::active_owner()?
                                 .row_owner()?
                                 .enter();
-                            let row = Self::decode_versioned_row_original(frame,value.value(), Some(meta))?;
+                            let row = Self::decode_versioned_row_original(
+                                frame,
+                                value.value(),
+                                Some(meta),
+                            )?;
                             write_row(&row)?;
                         }
                     }
@@ -52716,11 +57067,14 @@ frame:&OriginalPersistenceFrame<'_>,
                 current
                     .insert(&logical_key, created.as_slice())
                     .map_err(Self::storage_error)?;
-                count_mutations.push(content_identity::original_producers::relational_index_posting_mutation(frame,
-                    table,
-                    &declaration.name,
-                    &logical_key.0,
-                )?)?;
+                count_mutations.push(
+                    content_identity::original_producers::relational_index_posting_mutation(
+                        frame,
+                        table,
+                        &declaration.name,
+                        &logical_key.0,
+                    )?,
+                )?;
                 for prefix_len in 1..=key.len() {
                     // The rebuild writes exactly the declared members, so a
                     // recompute after a declaration change lands the same set
@@ -52761,12 +57115,18 @@ frame:&OriginalPersistenceFrame<'_>,
             .map_err(Self::storage_error)?
             .insert(table, RELATIONAL_INDEX_READY_VERSION)
             .map_err(Self::storage_error)?;
-        count_mutations.push(content_identity::original_producers::status_mutation(frame,
+        count_mutations.push(content_identity::original_producers::status_mutation(
+            frame,
             RELATIONAL_INDEX_COUNT_READY_IDENTITY_NAMESPACE,
             table.as_bytes(),
             RELATIONAL_INDEX_READY_VERSION,
         )?)?;
-        Self::apply_owned_content_identity_with_manifests_in_write(write_txn, &count_mutations, &[], admission)?;
+        Self::apply_owned_content_identity_with_manifests_in_write(
+            write_txn,
+            &count_mutations,
+            &[],
+            admission,
+        )?;
         Ok(())
     }
 }

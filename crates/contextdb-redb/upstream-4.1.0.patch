@@ -1551,7 +1551,7 @@
              }
 --- a/src/lib.rs
 +++ b/src/lib.rs
-@@ -62,10 +62,13 @@
+@@ -62,10 +62,14 @@
  //! [lmdb]: https://www.lmdb.tech/doc/
  //! [design]: https://github.com/cberner/redb/blob/master/docs/design.md
  
@@ -1562,12 +1562,13 @@
      Builder, CacheStats, Database, MultimapTableDefinition, MultimapTableHandle, ReadOnlyDatabase,
 -    ReadableDatabase, RepairSession, StorageBackend, TableDefinition, TableHandle,
 -    UntypedMultimapTableHandle, UntypedTableHandle,
-+    ReadableDatabase, ReclaimBoundary, ReclaimStep, RepairSession, ScratchBackend, StorageBackend, TableDefinition, TableHandle,
-+    UntypedMultimapTableHandle, UntypedTableHandle, scratch_backend_in_directory,
++    ReadableDatabase, ReclaimBoundary, ReclaimStep, RepairSession, ScratchBackend, StorageBackend,
++    TableDefinition, TableHandle, UntypedMultimapTableHandle, UntypedTableHandle,
++    scratch_backend_in_directory,
  };
  pub use error::{
      CommitError, CompactionError, DatabaseError, Error, SavepointError, SetDurabilityError,
-@@ -79,19 +82,40 @@
+@@ -79,19 +83,40 @@
      ExtractIf, Range, ReadOnlyTable, ReadOnlyUntypedTable, ReadableTable, ReadableTableMetadata,
      Table, TableStats,
  };
@@ -1608,7 +1609,7 @@
  mod transaction_tracker;
  mod transactions;
  mod tree_store;
-@@ -106,3 +130,27 @@
+@@ -106,3 +131,30 @@
          tempfile::NamedTempFile::new().unwrap()
      }
  }
@@ -1617,7 +1618,10 @@
 +mod native_storage_admission;
 +#[cfg(feature = "contextdb-internal")]
 +#[doc(hidden)]
-+pub use native_storage_admission::{NativeColdFault, NativeColdReadError, NativeStorageAdmission, NativeStorageCredit, NativeStorageRefused, with_native_storage_admission};
++pub use native_storage_admission::{
++    NativeColdFault, NativeColdReadError, NativeStorageAdmission, NativeStorageCredit,
++    NativeStorageRefused, with_native_storage_admission,
++};
 +
 +mod read_admission;
 +#[doc(hidden)]
@@ -1672,7 +1676,7 @@
          }
 --- /dev/null
 +++ b/src/native_storage_admission.rs
-@@ -0,0 +1,256 @@
+@@ -0,0 +1,363 @@
 +//! Internal owned admission for exact byte reads; no host or engine dependency.
 +use std::alloc::{Layout, alloc, dealloc};
 +use std::cell::RefCell;
@@ -1708,17 +1712,27 @@
 +        retain: unsafe fn(NonNull<()>),
 +        finish: unsafe fn(NonNull<()>),
 +    ) -> Self {
-+        Self { receipt, retain, finish }
++        Self {
++            receipt,
++            retain,
++            finish,
++        }
 +    }
 +}
 +impl Clone for NativeStorageCredit {
 +    fn clone(&self) -> Self {
 +        unsafe { (self.retain)(self.receipt) };
-+        Self { receipt: self.receipt, retain: self.retain, finish: self.finish }
++        Self {
++            receipt: self.receipt,
++            retain: self.retain,
++            finish: self.finish,
++        }
 +    }
 +}
 +impl Drop for NativeStorageCredit {
-+    fn drop(&mut self) { unsafe { (self.finish)(self.receipt) } }
++    fn drop(&mut self) {
++        unsafe { (self.finish)(self.receipt) }
++    }
 +}
 +
 +#[doc(hidden)]
@@ -1737,11 +1751,19 @@
 +        finish: unsafe fn(NonNull<()>),
 +        admit: unsafe fn(NonNull<()>, Layout) -> Result<NativeStorageCredit, NativeStorageRefused>,
 +    ) -> Self {
-+        Self { owner: unsafe { NativeStorageCredit::from_owned_receipt(receipt, retain, finish) }, admit }
++        Self {
++            owner: unsafe { NativeStorageCredit::from_owned_receipt(receipt, retain, finish) },
++            admit,
++        }
 +    }
 +}
 +impl Clone for NativeStorageAdmission {
-+    fn clone(&self) -> Self { Self { owner: self.owner.clone(), admit: self.admit } }
++    fn clone(&self) -> Self {
++        Self {
++            owner: self.owner.clone(),
++            admit: self.admit,
++        }
++    }
 +}
 +thread_local! {
 +    static NATIVE: RefCell<Option<NativeStorageAdmission>> = const { RefCell::new(None) };
@@ -1762,11 +1784,18 @@
 +    operation: impl FnOnce() -> R,
 +) -> R {
 +    let previous = NATIVE.with(|slot| slot.replace(Some(admission)));
-+    let _restore = Restore { previous, _thread: PhantomData };
++    let _restore = Restore {
++        previous,
++        _thread: PhantomData,
++    };
 +    operation()
 +}
-+pub(crate) fn admit_native_storage(layout: Layout) -> Result<NativeStorageCredit, NativeStorageRefused> {
-+    let owner = NATIVE.with(|slot| slot.borrow().clone()).ok_or(NativeStorageRefused)?;
++pub(crate) fn admit_native_storage(
++    layout: Layout,
++) -> Result<NativeStorageCredit, NativeStorageRefused> {
++    let owner = NATIVE
++        .with(|slot| slot.borrow().clone())
++        .ok_or(NativeStorageRefused)?;
 +    unsafe { (owner.admit)(owner.owner.receipt, layout) }
 +}
 +pub(crate) fn native_storage_active() -> bool {
@@ -1784,7 +1813,13 @@
 +}
 +impl NativeColdFault {
 +    pub(crate) fn new(reason: &'static str) -> Self {
-+        Self { reason, page: [0; 8], offset: 0, expected: 0, actual: 0 }
++        Self {
++            reason,
++            page: [0; 8],
++            offset: 0,
++            expected: 0,
++            actual: 0,
++        }
 +    }
 +}
 +#[doc(hidden)]
@@ -1797,7 +1832,9 @@
 +    Io(std::io::Error),
 +}
 +impl From<NativeStorageRefused> for NativeColdReadError {
-+    fn from(_: NativeStorageRefused) -> Self { Self::AdmissionRefused }
++    fn from(_: NativeStorageRefused) -> Self {
++        Self::AdmissionRefused
++    }
 +}
 +
 +/// Exact fresh backing; its invoice is outside Vec's physical destruction.
@@ -1807,19 +1844,26 @@
 +}
 +impl<T> NativeStorageBuffer<T> {
 +    pub(crate) fn new() -> Self {
-+        Self { data: ManuallyDrop::new(Vec::new()), invoice: Mutex::new(None) }
++        Self {
++            data: ManuallyDrop::new(Vec::new()),
++            invoice: Mutex::new(None),
++        }
 +    }
 +    pub(crate) fn with_capacity(capacity: usize) -> Result<Self, NativeColdReadError> {
 +        let layout = Layout::array::<T>(capacity).map_err(|_| {
 +            NativeColdReadError::Corrupt(NativeColdFault::new("native buffer layout overflow"))
 +        })?;
-+        if layout.size() == 0 { return Ok(Self::new()); }
++        if layout.size() == 0 {
++            return Ok(Self::new());
++        }
 +        let invoice = admit_native_storage(layout)?;
 +        let pointer = unsafe { alloc(layout) }.cast::<T>();
 +        let Some(pointer) = NonNull::new(pointer) else {
 +            // Inline ErrorKind keeps the lower allocator failure unqualified,
 +            // with no diagnostic allocation or fabricated budget refusal.
-+            return Err(NativeColdReadError::Io(std::io::ErrorKind::OutOfMemory.into()));
++            return Err(NativeColdReadError::Io(
++                std::io::ErrorKind::OutOfMemory.into(),
++            ));
 +        };
 +        Ok(Self {
 +            data: ManuallyDrop::new(unsafe { Vec::from_raw_parts(pointer.as_ptr(), 0, capacity) }),
@@ -1828,13 +1872,25 @@
 +    }
 +    pub(crate) fn push(&mut self, item: T) -> Result<(), NativeColdReadError> {
 +        if self.data.len() == self.data.capacity() {
-+            let capacity = self.data.capacity().checked_mul(2).filter(|n| *n != 0)
++            let capacity = self
++                .data
++                .capacity()
++                .checked_mul(2)
++                .filter(|n| *n != 0)
 +                .or_else(|| self.data.is_empty().then_some(1))
-+                .ok_or_else(|| NativeColdReadError::Corrupt(NativeColdFault::new("native buffer capacity overflow")))?;
++                .ok_or_else(|| {
++                    NativeColdReadError::Corrupt(NativeColdFault::new(
++                        "native buffer capacity overflow",
++                    ))
++                })?;
 +            let mut next = Self::with_capacity(capacity)?;
 +            // No item callback or allocator is invoked while moving initialized items.
 +            unsafe {
-+                std::ptr::copy_nonoverlapping(self.data.as_ptr(), next.data.as_mut_ptr(), self.data.len());
++                std::ptr::copy_nonoverlapping(
++                    self.data.as_ptr(),
++                    next.data.as_mut_ptr(),
++                    self.data.len(),
++                );
 +                next.data.set_len(self.data.len());
 +                self.data.set_len(0);
 +            }
@@ -1844,22 +1900,35 @@
 +        self.data.push(item);
 +        Ok(())
 +    }
-+    pub(crate) fn pop(&mut self) -> Option<T> { self.data.pop() }
-+    pub(crate) fn as_slice(&self) -> &[T] { &self.data }
++    pub(crate) fn pop(&mut self) -> Option<T> {
++        self.data.pop()
++    }
++    pub(crate) fn as_slice(&self) -> &[T] {
++        &self.data
++    }
 +}
 +impl NativeStorageBuffer<u8> {
 +    pub(crate) fn zeroed(len: usize) -> Result<Self, NativeColdReadError> {
 +        let mut buffer = Self::with_capacity(len)?;
 +        if len != 0 {
-+            unsafe { std::ptr::write_bytes(buffer.data.as_mut_ptr(), 0, len); buffer.data.set_len(len); }
++            unsafe {
++                std::ptr::write_bytes(buffer.data.as_mut_ptr(), 0, len);
++                buffer.data.set_len(len);
++            }
 +        }
 +        Ok(buffer)
 +    }
-+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] { &mut self.data }
++    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
++        &mut self.data
++    }
 +}
 +impl<T> Drop for NativeStorageBuffer<T> {
 +    fn drop(&mut self) {
-+        let invoice = self.invoice.get_mut().unwrap_or_else(|e| e.into_inner()).take();
++        let invoice = self
++            .invoice
++            .get_mut()
++            .unwrap_or_else(|e| e.into_inner())
++            .take();
 +        // Vec's own drop glue releases its allocation even if an element panics.
 +        // The external local is unwound only after that glue has finished.
 +        unsafe { ManuallyDrop::drop(&mut self.data) };
@@ -1872,11 +1941,15 @@
 +    payload: ManuallyDrop<T>,
 +    ownership: Mutex<Option<NativeStorageCredit>>,
 +}
-+pub(crate) struct NativeStorageShared<T> { block: NonNull<NativeStorageSharedBlock<T>> }
++pub(crate) struct NativeStorageShared<T> {
++    block: NonNull<NativeStorageSharedBlock<T>>,
++}
 +unsafe impl<T: Send + Sync> Send for NativeStorageShared<T> {}
 +unsafe impl<T: Send + Sync> Sync for NativeStorageShared<T> {}
 +impl<T> NativeStorageShared<T> {
-+    pub(crate) fn layout() -> Layout { Layout::new::<NativeStorageSharedBlock<T>>() }
++    pub(crate) fn layout() -> Layout {
++        Layout::new::<NativeStorageSharedBlock<T>>()
++    }
 +    pub(crate) fn new(payload: T) -> Result<Self, NativeColdReadError> {
 +        let layout = Self::layout();
 +        let invoice = admit_native_storage(layout)?;
@@ -1886,42 +1959,80 @@
 +            // BEFORE returning this control invoice, including panic unwind.
 +            drop(payload);
 +            drop(invoice);
-+            return Err(NativeColdReadError::Io(std::io::ErrorKind::OutOfMemory.into()));
++            return Err(NativeColdReadError::Io(
++                std::io::ErrorKind::OutOfMemory.into(),
++            ));
 +        };
-+        unsafe { block.as_ptr().write(NativeStorageSharedBlock {
-+            owners: AtomicUsize::new(1), payload: ManuallyDrop::new(payload),
-+            ownership: Mutex::new(Some(invoice)),
-+        }); }
++        unsafe {
++            block.as_ptr().write(NativeStorageSharedBlock {
++                owners: AtomicUsize::new(1),
++                payload: ManuallyDrop::new(payload),
++                ownership: Mutex::new(Some(invoice)),
++            });
++        }
 +        Ok(Self { block })
 +    }
-+    pub(crate) fn get(&self) -> &T { unsafe { &self.block.as_ref().payload } }
++    pub(crate) fn get(&self) -> &T {
++        unsafe { &self.block.as_ref().payload }
++    }
 +    pub(crate) fn get_mut(&mut self) -> Option<&mut T> {
-+        if unsafe { self.block.as_ref() }.owners.load(Ordering::Acquire) != 1 { return None; }
++        if unsafe { self.block.as_ref() }
++            .owners
++            .load(Ordering::Acquire)
++            != 1
++        {
++            return None;
++        }
 +        Some(unsafe { &mut self.block.as_mut().payload })
 +    }
 +}
 +impl<T> Clone for NativeStorageShared<T> {
 +    fn clone(&self) -> Self {
-+        unsafe { self.block.as_ref() }.owners.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
-+            |n| n.checked_add(1).filter(|n| *n <= isize::MAX as usize)).expect("native strong count overflow");
++        unsafe { self.block.as_ref() }
++            .owners
++            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
++                n.checked_add(1).filter(|n| *n <= isize::MAX as usize)
++            })
++            .expect("native strong count overflow");
 +        Self { block: self.block }
 +    }
 +}
-+struct SharedFree<T> { block: NonNull<NativeStorageSharedBlock<T>>, invoice: Option<NativeStorageCredit> }
++struct SharedFree<T> {
++    block: NonNull<NativeStorageSharedBlock<T>>,
++    invoice: Option<NativeStorageCredit>,
++}
 +impl<T> Drop for SharedFree<T> {
 +    fn drop(&mut self) {
-+        unsafe { dealloc(self.block.as_ptr().cast(), NativeStorageShared::<T>::layout()) };
++        unsafe {
++            dealloc(
++                self.block.as_ptr().cast(),
++                NativeStorageShared::<T>::layout(),
++            )
++        };
 +        drop(self.invoice.take());
 +    }
 +}
 +impl<T> Drop for NativeStorageShared<T> {
 +    fn drop(&mut self) {
-+        if unsafe { self.block.as_ref() }.owners.fetch_sub(1, Ordering::Release) != 1 { return; }
++        if unsafe { self.block.as_ref() }
++            .owners
++            .fetch_sub(1, Ordering::Release)
++            != 1
++        {
++            return;
++        }
 +        fence(Ordering::Acquire);
 +        let block = unsafe { self.block.as_mut() };
-+        let invoice = block.ownership.get_mut().unwrap_or_else(|e| e.into_inner()).take()
++        let invoice = block
++            .ownership
++            .get_mut()
++            .unwrap_or_else(|e| e.into_inner())
++            .take()
 +            .expect("native header keeps its genuine original invoice");
-+        let _free = SharedFree { block: self.block, invoice: Some(invoice) };
++        let _free = SharedFree {
++            block: self.block,
++            invoice: Some(invoice),
++        };
 +        unsafe { ManuallyDrop::drop(&mut block.payload) };
 +    }
 +}
@@ -2568,7 +2679,7 @@
      valid_savepoints: BTreeMap<SavepointId, TransactionId>,
      // Non-durable commits that are still in-memory, and waiting for a durable commit to get flushed
      // We need to make sure that the freed-table does not get processed for these, since they are not durable yet
-@@ -89,33 +106,257 @@
+@@ -89,33 +106,262 @@
      pending_non_durable_commits: HashMap<TransactionId, TransactionId>,
      // Non-durable commits which have NOT been processed in the freed table
      unprocessed_freed_non_durable_commits: BTreeSet<TransactionId>,
@@ -2593,7 +2704,12 @@
  
  impl TransactionTracker {
      pub(crate) fn new(next_transaction_id: TransactionId) -> Self {
-+        Self::new_with_external_snapshots(next_transaction_id, None, (usize::MAX, usize::MAX), false)
++        Self::new_with_external_snapshots(
++            next_transaction_id,
++            None,
++            (usize::MAX, usize::MAX),
++            false,
++        )
 +    }
 +
 +    pub(crate) fn new_with_external_snapshots(
@@ -2827,7 +2943,7 @@
          }
          assert!(state.live_write_transaction.is_none());
          let transaction_id = state.next_transaction_id.increment();
-@@ -124,6 +365,10 @@
+@@ -124,6 +370,10 @@
          state.live_write_transaction = Some(transaction_id);
  
          transaction_id
@@ -2838,7 +2954,7 @@
      }
  
      pub(crate) fn end_write_transaction(&self, id: TransactionId) {
-@@ -293,13 +538,37 @@
+@@ -293,13 +543,37 @@
      }
  
      pub(crate) fn oldest_live_read_transaction(&self) -> Option<TransactionId> {
@@ -4447,7 +4563,7 @@
  
      const X: TableDefinition<&str, &str> = TableDefinition::new("x");
  
-@@ -2284,4 +3523,891 @@
+@@ -2284,4 +3523,919 @@
          let write_txn = db2.begin_write().unwrap();
          assert!(write_txn.transaction_id > first_txn_id);
      }
@@ -5297,8 +5413,11 @@
 +    /// are refused rather than retroactively assigned native receipt ownership.
 +    #[doc(hidden)]
 +    pub fn get_native_byte_value(
-+        &self, physical_name: &str, key: &[u8],
-+    ) -> std::result::Result<Option<AccessGuard<'static, &'static [u8]>>, crate::NativeColdReadError> {
++        &self,
++        physical_name: &str,
++        key: &[u8],
++    ) -> std::result::Result<Option<AccessGuard<'static, &'static [u8]>>, crate::NativeColdReadError>
++    {
 +        self.tree.get_native_byte_value(physical_name, key)
 +    }
 +}
@@ -5309,8 +5428,11 @@
 +    /// Existing byte lookup and all ordinary/public table APIs are unchanged.
 +    #[doc(hidden)]
 +    pub fn get_native_text_value(
-+        &self, physical_name: &str, key: &str,
-+    ) -> std::result::Result<Option<AccessGuard<'static, &'static [u8]>>, crate::NativeColdReadError> {
++        &self,
++        physical_name: &str,
++        key: &str,
++    ) -> std::result::Result<Option<AccessGuard<'static, &'static [u8]>>, crate::NativeColdReadError>
++    {
 +        self.tree.get_native_text_value(physical_name, key)
 +    }
 +}
@@ -5322,10 +5444,21 @@
 +    /// Raw endpoint bytes support a non-UTF-8 exclusive prefix successor.
 +    #[doc(hidden)]
 +    pub fn next_native_text_range(
-+        &self, physical_name: &str, lower: &[u8], exclusive: bool, upper: Option<&[u8]>,
++        &self,
++        physical_name: &str,
++        lower: &[u8],
++        exclusive: bool,
++        upper: Option<&[u8]>,
 +        before_page: &mut dyn FnMut() -> std::result::Result<(), crate::NativeColdReadError>,
-+    ) -> std::result::Result<Option<(AccessGuard<'static, &'static [u8]>, AccessGuard<'static, &'static [u8]>)>, crate::NativeColdReadError> {
-+        self.tree.next_native_text_range(physical_name, lower, exclusive, upper, before_page)
++    ) -> std::result::Result<
++        Option<(
++            AccessGuard<'static, &'static [u8]>,
++            AccessGuard<'static, &'static [u8]>,
++        )>,
++        crate::NativeColdReadError,
++    > {
++        self.tree
++            .next_native_text_range(physical_name, lower, exclusive, upper, before_page)
 +    }
 +}
 +
@@ -5334,10 +5467,21 @@
 +    /// Internal byte-key range over this captured transaction; exact raw bounds.
 +    #[doc(hidden)]
 +    pub fn next_native_byte_range(
-+        &self, physical_name: &str, lower: &[u8], exclusive: bool, upper: Option<&[u8]>,
++        &self,
++        physical_name: &str,
++        lower: &[u8],
++        exclusive: bool,
++        upper: Option<&[u8]>,
 +        before_page: &mut dyn FnMut() -> std::result::Result<(), crate::NativeColdReadError>,
-+    ) -> std::result::Result<Option<(AccessGuard<'static, &'static [u8]>, AccessGuard<'static, &'static [u8]>)>, crate::NativeColdReadError> {
-+        self.tree.next_native_byte_range(physical_name, lower, exclusive, upper, before_page)
++    ) -> std::result::Result<
++        Option<(
++            AccessGuard<'static, &'static [u8]>,
++            AccessGuard<'static, &'static [u8]>,
++        )>,
++        crate::NativeColdReadError,
++    > {
++        self.tree
++            .next_native_byte_range(physical_name, lower, exclusive, upper, before_page)
 +    }
 +}
 --- /dev/null
@@ -7880,7 +8024,7 @@
      }
  
      pub(crate) fn len(&self) -> Result<u64> {
-@@ -1118,3 +1467,185 @@
+@@ -1118,3 +1467,254 @@
          _ => unreachable!(),
      }
  }
@@ -7892,15 +8036,21 @@
 +}
 +#[cfg(feature = "contextdb-internal")]
 +impl Page for NativeBorrowedPage<'_> {
-+    fn memory(&self) -> &[u8] { self.memory }
-+    fn get_page_number(&self) -> PageNumber { self.number }
++    fn memory(&self) -> &[u8] {
++        self.memory
++    }
++    fn get_page_number(&self) -> PageNumber {
++        self.number
++    }
 +}
 +
 +/// Validate every offset, ordered key and child encoding before ordinary
 +/// accessors can index the bytes. Returns the exact checksummed node end.
 +#[cfg(feature = "contextdb-internal")]
 +fn native_validate_byte_node(
-+    bytes: &[u8], number: PageNumber, directory: bool,
++    bytes: &[u8],
++    number: PageNumber,
++    directory: bool,
 +) -> std::result::Result<usize, crate::NativeColdReadError> {
 +    use crate::{NativeColdFault, NativeColdReadError};
 +    let corrupt = || {
@@ -7910,7 +8060,9 @@
 +    };
 +    let header = bytes.get(..4).ok_or_else(corrupt)?;
 +    let count = usize::from(u16::from_le_bytes(header[2..4].try_into().unwrap()));
-+    if count == 0 { return Err(corrupt()); }
++    if count == 0 {
++        return Err(corrupt());
++    }
 +    let (offset_start, data_start, offset_count) = match header[0] {
 +        LEAF => (4, 4 + count * 8, count * 2),
 +        BRANCH => {
@@ -7929,7 +8081,9 @@
 +        _ => return Err(corrupt()),
 +    };
 +    let offsets = bytes.get(offset_start..data_start).ok_or_else(corrupt)?;
-+    if offsets.len() != offset_count * 4 { return Err(corrupt()); }
++    if offsets.len() != offset_count * 4 {
++        return Err(corrupt());
++    }
 +    let mut start = data_start;
 +    let mut previous: Option<&[u8]> = None;
 +    for (index, offset) in offsets.chunks_exact(4).enumerate() {
@@ -7937,7 +8091,8 @@
 +        let value = bytes.get(start..end).ok_or_else(corrupt)?;
 +        if index < count {
 +            if previous.is_some_and(|prior| prior >= value)
-+                || (directory && std::str::from_utf8(value).is_err()) {
++                || (directory && std::str::from_utf8(value).is_err())
++            {
 +                return Err(corrupt());
 +            }
 +            previous = Some(value);
@@ -7951,14 +8106,19 @@
 +/// decode owned metadata, construct iterator parents, or call get_page.
 +#[cfg(feature = "contextdb-internal")]
 +pub(crate) fn native_byte_get(
-+    root: Option<BtreeHeader>, mem: &TransactionalMemory, key: &[u8], directory: bool,
++    root: Option<BtreeHeader>,
++    mem: &TransactionalMemory,
++    key: &[u8],
++    directory: bool,
 +) -> std::result::Result<Option<AccessGuard<'static, &'static [u8]>>, crate::NativeColdReadError> {
 +    use crate::native_storage_admission::NativeStorageBuffer;
 +    use crate::{NativeColdFault, NativeColdReadError};
 +    if !crate::native_storage_admission::native_storage_active() {
 +        return Err(NativeColdReadError::AdmissionRefused);
 +    }
-+    let Some(mut header) = root else { return Ok(None); };
++    let Some(mut header) = root else {
++        return Ok(None);
++    };
 +    let mut ancestors = NativeStorageBuffer::<PageNumber>::new();
 +    loop {
 +        if ancestors.as_slice().contains(&header.root) {
@@ -7974,24 +8134,37 @@
 +        if actual != header.checksum {
 +            return Err(NativeColdReadError::Corrupt(NativeColdFault {
 +                reason: "captured native byte page failed checksum verification",
-+                page: header.root.to_le_bytes(), offset: end,
-+                expected: header.checksum, actual,
++                page: header.root.to_le_bytes(),
++                offset: end,
++                expected: header.checksum,
++                actual,
 +            }));
 +        }
 +        match memory[0] {
 +            LEAF => {
 +                let leaf = LeafAccessor::new(&memory, None, None);
 +                let range = leaf.find_key::<&[u8]>(key).map(|index| {
-+                    let (start, end) = leaf.value_range(index).expect("validated native leaf range");
++                    let (start, end) = leaf
++                        .value_range(index)
++                        .expect("validated native leaf range");
 +                    start..end
 +                });
 +                return Ok(range.map(|range| AccessGuard::with_arc_page(memory, range)));
 +            }
 +            BRANCH => {
-+                let page = NativeBorrowedPage { memory: &memory, number: header.root };
++                let page = NativeBorrowedPage {
++                    memory: &memory,
++                    number: header.root,
++                };
 +                let branch = BranchAccessor::new(&page, None);
 +                let (index, child) = branch.child_for_key::<&[u8]>(key);
-+                header = BtreeHeader::new(child, branch.child_checksum(index).expect("validated child checksum"), 0);
++                header = BtreeHeader::new(
++                    child,
++                    branch
++                        .child_checksum(index)
++                        .expect("validated child checksum"),
++                    0,
++                );
 +            }
 +            _ => unreachable!("validated native node kind"),
 +        }
@@ -8003,16 +8176,28 @@
 +/// is fully validated/checksummed, and navigation/page/header storage is prepaid.
 +#[cfg(feature = "contextdb-internal")]
 +pub(crate) fn native_text_range_next(
-+    root: Option<BtreeHeader>, mem: &TransactionalMemory,
-+    lower: &[u8], exclusive: bool, upper: Option<&[u8]>,
-+        text_keys: bool, before_page: &mut dyn FnMut() -> std::result::Result<(), crate::NativeColdReadError>,
-+) -> std::result::Result<Option<(AccessGuard<'static, &'static [u8]>, AccessGuard<'static, &'static [u8]>)>, crate::NativeColdReadError> {
++    root: Option<BtreeHeader>,
++    mem: &TransactionalMemory,
++    lower: &[u8],
++    exclusive: bool,
++    upper: Option<&[u8]>,
++    text_keys: bool,
++    before_page: &mut dyn FnMut() -> std::result::Result<(), crate::NativeColdReadError>,
++) -> std::result::Result<
++    Option<(
++        AccessGuard<'static, &'static [u8]>,
++        AccessGuard<'static, &'static [u8]>,
++    )>,
++    crate::NativeColdReadError,
++> {
 +    use crate::native_storage_admission::NativeStorageBuffer;
 +    use crate::{NativeColdFault, NativeColdReadError};
 +    if !crate::native_storage_admission::native_storage_active() {
 +        return Err(NativeColdReadError::AdmissionRefused);
 +    }
-+    let Some(mut header) = root else { return Ok(None); };
++    let Some(mut header) = root else {
++        return Ok(None);
++    };
 +    let mut parents = NativeStorageBuffer::<BtreeHeader>::new();
 +    // A monotone seek visits only the boundary descent and the next sibling's
 +    // left descent. Retaining visited identities also detects cross-sibling cycles.
@@ -8020,7 +8205,9 @@
 +    let mut leftmost = false;
 +    loop {
 +        if visited.as_slice().contains(&header.root) {
-+            return Err(NativeColdReadError::Corrupt(NativeColdFault::new("cycle in native text range descent")));
++            return Err(NativeColdReadError::Corrupt(NativeColdFault::new(
++                "cycle in native text range descent",
++            )));
 +        }
 +        before_page()?;
 +        visited.push(header.root)?;
@@ -8030,38 +8217,64 @@
 +        if actual != header.checksum {
 +            return Err(NativeColdReadError::Corrupt(NativeColdFault {
 +                reason: "captured native text range page failed checksum verification",
-+                page: header.root.to_le_bytes(), offset: end,
-+                expected: header.checksum, actual,
++                page: header.root.to_le_bytes(),
++                offset: end,
++                expected: header.checksum,
++                actual,
 +            }));
 +        }
 +        if memory[0] == BRANCH {
-+            let page = NativeBorrowedPage { memory: &memory, number: header.root };
++            let page = NativeBorrowedPage {
++                memory: &memory,
++                number: header.root,
++            };
 +            let branch = BranchAccessor::new(&page, None);
-+            let index = if leftmost { 0 } else { branch.child_for_key::<&[u8]>(lower).0 };
++            let index = if leftmost {
++                0
++            } else {
++                branch.child_for_key::<&[u8]>(lower).0
++            };
 +            let child = branch.child_page(index).expect("validated child");
-+            let checksum = branch.child_checksum(index).expect("validated child checksum");
++            let checksum = branch
++                .child_checksum(index)
++                .expect("validated child checksum");
 +            // Save the next sibling as scalar metadata before any child fetch.
 +            if index + 1 < branch.count_children() {
-+                let sibling = BtreeHeader::new(branch.child_page(index + 1).expect("validated sibling"),
-+                    branch.child_checksum(index + 1).expect("validated sibling checksum"), 0);
++                let sibling = BtreeHeader::new(
++                    branch.child_page(index + 1).expect("validated sibling"),
++                    branch
++                        .child_checksum(index + 1)
++                        .expect("validated sibling checksum"),
++                    0,
++                );
 +                parents.push(sibling)?;
 +            }
 +            header = BtreeHeader::new(child, checksum, 0);
 +            continue;
 +        }
 +        let leaf = LeafAccessor::new(&memory, None, None);
-+        let (position, found) = if leftmost { (0, false) } else { leaf.position::<&[u8]>(lower) };
++        let (position, found) = if leftmost {
++            (0, false)
++        } else {
++            leaf.position::<&[u8]>(lower)
++        };
 +        let index = position + usize::from(found && exclusive && !leftmost);
 +        if let Some((key_range, value_range)) = leaf.entry_ranges(index) {
 +            let key = &memory[key_range.clone()];
-+            if upper.is_some_and(|end| key >= end) { return Ok(None); }
++            if upper.is_some_and(|end| key >= end) {
++                return Ok(None);
++            }
 +            // UTF-8 for all node keys was checked before indexing. Both guards
 +            // share the actual admitted complete page, never an owned record.
-+            return Ok(Some((AccessGuard::with_arc_page(memory.clone(), key_range),
-+                AccessGuard::with_arc_page(memory, value_range))));
++            return Ok(Some((
++                AccessGuard::with_arc_page(memory.clone(), key_range),
++                AccessGuard::with_arc_page(memory, value_range),
++            )));
 +        }
 +        drop(memory);
-+        let Some(sibling) = parents.pop() else { return Ok(None); };
++        let Some(sibling) = parents.pop() else {
++            return Ok(None);
++        };
 +        header = sibling;
 +        leftmost = true;
 +    }
@@ -10172,7 +10385,7 @@
  use crate::{CacheStats, DatabaseError, Result, StorageBackend, StorageError};
  use std::ops::{Index, IndexMut};
  use std::slice::SliceIndex;
-@@ -15,6 +16,186 @@
+@@ -15,6 +16,190 @@
      std::iter::repeat_n(0u8, len).collect()
  }
  
@@ -10193,7 +10406,11 @@
 +    /// cache could not take, which the caller's own admission covers.
 +    Plain(Arc<[u8]>),
 +    #[cfg(feature = "contextdb-internal")]
-+    Native(crate::native_storage_admission::NativeStorageShared<crate::native_storage_admission::NativePagePayload>),
++    Native(
++        crate::native_storage_admission::NativeStorageShared<
++            crate::native_storage_admission::NativePagePayload,
++        >,
++    ),
 +}
 +
 +/// A page admitted to the read cache. Its bytes leave the cache's count when
@@ -10359,7 +10576,7 @@
  pub(super) struct WritablePage {
      buffer: Arc<Mutex<LRUWriteCache>>,
      offset: u64,
-@@ -56,7 +237,7 @@
+@@ -56,7 +241,7 @@
  
  #[derive(Default)]
  struct LRUWriteCache {
@@ -10368,7 +10585,7 @@
  }
  
  impl LRUWriteCache {
-@@ -165,6 +346,8 @@
+@@ -165,6 +350,8 @@
          let result = self.file.read(offset, out);
          if result.is_err() {
              self.io_failed.store(true, Ordering::Release);
@@ -10377,7 +10594,7 @@
          }
          result.map_err(StorageError::from)
      }
-@@ -172,7 +355,13 @@
+@@ -172,7 +359,13 @@
      fn set_len(&self, len: u64) -> Result<()> {
          self.check_failure()?;
          let result = self.file.set_len(len);
@@ -10392,7 +10609,7 @@
              self.io_failed.store(true, Ordering::Release);
          }
          result.map_err(StorageError::from)
-@@ -218,9 +407,13 @@
+@@ -218,9 +411,13 @@
      // soft limit and momentary over-/under-counting by one page is harmless.
      // A third "total" counter would add contention on every insert/remove for
      // negligible accuracy gain.
@@ -10408,7 +10625,7 @@
      // Rotates the starting stripe for read-cache eviction
      next_eviction_stripe: AtomicUsize,
      #[cfg(feature = "cache_metrics")]
-@@ -233,7 +426,7 @@
+@@ -233,7 +430,7 @@
      writes_hits: AtomicU64,
      #[cfg(feature = "cache_metrics")]
      evictions: AtomicU64,
@@ -10417,7 +10634,7 @@
      // TODO: maybe move this cache to WriteTransaction?
      write_buffer: Arc<Mutex<LRUWriteCache>>,
  }
-@@ -244,16 +437,14 @@
+@@ -244,16 +441,14 @@
          page_size: u64,
          max_cache_size: usize,
      ) -> Result<Self, DatabaseError> {
@@ -10437,7 +10654,7 @@
              next_eviction_stripe: AtomicUsize::new(0),
              #[cfg(feature = "cache_metrics")]
              reads_total: Default::default(),
-@@ -268,6 +459,57 @@
+@@ -268,6 +463,57 @@
              read_cache,
              write_buffer: Arc::new(Mutex::new(LRUWriteCache::new())),
          })
@@ -10495,7 +10712,7 @@
      }
  
      #[allow(clippy::unused_self)]
-@@ -301,6 +543,42 @@
+@@ -301,6 +547,42 @@
                  used_bytes: read_bytes + write_bytes,
              }
          }
@@ -10538,7 +10755,7 @@
      }
  
      pub(crate) fn close(&self) -> Result {
-@@ -339,13 +617,17 @@
+@@ -339,13 +621,17 @@
              let stripe = (start + i) % num_stripes;
              let mut lock = self.read_cache[stripe].write().unwrap();
              while freed < bytes_needed {
@@ -10559,7 +10776,7 @@
                  } else {
                      break;
                  }
-@@ -364,21 +646,27 @@
+@@ -364,21 +650,27 @@
          // drained, so the total check only considers the read cache size.
          for (offset, buffer) in write_buffer.cache.iter_mut() {
              let buffer = buffer.take().unwrap();
@@ -10596,7 +10813,7 @@
                  break;
              }
          }
-@@ -390,10 +678,28 @@
+@@ -390,10 +682,28 @@
  
      // Caller should invalidate all cached pages that are no longer valid
      pub(super) fn resize(&self, len: u64) -> Result {
@@ -10627,7 +10844,7 @@
      }
  
      pub(super) fn flush(&self) -> Result {
-@@ -419,15 +725,22 @@
+@@ -419,15 +729,22 @@
      // Like `read_direct`, but writes directly into an `Arc<[u8]>` instead of a
      // `Vec<u8>` that is then copied into an `Arc`. The buffer is zero-filled
      // because `StorageBackend::read` takes `&mut [u8]`.
@@ -10653,7 +10870,7 @@
          debug_assert_eq!(0, offset % self.page_size);
          #[cfg(feature = "cache_metrics")]
          self.reads_total.fetch_add(1, Ordering::AcqRel);
-@@ -438,7 +751,7 @@
+@@ -438,7 +755,7 @@
                  #[cfg(feature = "cache_metrics")]
                  self.reads_hits.fetch_add(1, Ordering::Release);
                  debug_assert_eq!(cached.len(), len);
@@ -10662,7 +10879,7 @@
              }
          }
  
-@@ -449,45 +762,163 @@
+@@ -449,45 +766,161 @@
                  #[cfg(feature = "cache_metrics")]
                  self.reads_hits.fetch_add(1, Ordering::Release);
                  debug_assert_eq!(cached.len(), len);
@@ -10787,9 +11004,7 @@
 +            .fetch_add(page_bytes, Ordering::AcqRel);
 +        let write_bytes = self.write_buffer_bytes.load(Ordering::Acquire);
 +        if previous + page_bytes + write_bytes <= self.max_cache_size.load(Ordering::Acquire) {
-+            debug_assert!(
-+                len >= self.page_size as usize || (offset == 0 && len == DB_HEADER_SIZE)
-+            );
++            debug_assert!(len >= self.page_size as usize || (offset == 0 && len == DB_HEADER_SIZE));
 +            let page = CachedPage::admitted(buffer.clone(), &self.read_cache_bytes);
 +            let mut write_lock = self.read_cache[cache_slot].write().unwrap();
 +            // A race could replace an existing buffer; dropping it gives back
@@ -10863,7 +11078,7 @@
      }
  
      // Discard pending writes to the given range
-@@ -507,18 +938,13 @@
+@@ -507,18 +940,13 @@
          let mut lock = self.read_cache[cache_slot].write().unwrap();
          if let Some(removed) = lock.remove(offset) {
              assert_eq!(len, removed.len());
@@ -10883,7 +11098,7 @@
          }
      }
  
-@@ -539,9 +965,9 @@
+@@ -539,9 +967,9 @@
                      "cache inconsistency {len} != {} for offset {offset}",
                      removed.len()
                  );
@@ -10896,7 +11111,7 @@
              } else {
                  None
              }
-@@ -554,7 +980,7 @@
+@@ -554,7 +982,7 @@
          } else {
              let previous = self.write_buffer_bytes.fetch_add(len, Ordering::AcqRel);
              let mut write_bytes = previous + len;
@@ -10905,7 +11120,7 @@
  
              // Rule 1: write buffer NEVER exceeds 50%.  Flush excess to disk.
              if write_bytes > half {
-@@ -586,8 +1012,11 @@
+@@ -586,8 +1014,11 @@
              // exceeds the budget then read must be > 50%, so evict from the
              // read cache (fairness: we only take from read when read > 50%).
              let read_bytes = self.read_cache_bytes.load(Ordering::Acquire);
@@ -10919,7 +11134,7 @@
              }
              let result = if let Some(data) = existing {
                  #[cfg(feature = "cache_metrics")]
-@@ -598,7 +1027,9 @@
+@@ -598,7 +1029,9 @@
                  self.writes_hits.fetch_add(1, Ordering::AcqRel);
                  zero_filled_arc(len)
              } else {
@@ -10930,7 +11145,7 @@
              };
              lock.insert(offset, result);
              lock.take_value(offset).unwrap()
-@@ -618,9 +1049,103 @@
+@@ -618,9 +1051,103 @@
      use crate::StorageBackend;
      use crate::backends::InMemoryBackend;
      use crate::tree_store::PageHint;
@@ -11036,7 +11251,7 @@
  
      #[test]
      fn cache_leak() {
-@@ -653,4 +1178,771 @@
+@@ -653,4 +1180,832 @@
          cached_file.invalidate_cache(0, 128);
          assert_eq!(cached_file.read_cache_bytes.load(Ordering::Acquire), 0);
      }
@@ -11610,11 +11825,16 @@
 +    }
 +    impl WritableHeaderFixture {
 +        fn new(len: u64) -> Self {
-+            Self { len: std::sync::atomic::AtomicU64::new(len), header: std::sync::Mutex::new([0; 320]) }
++            Self {
++                len: std::sync::atomic::AtomicU64::new(len),
++                header: std::sync::Mutex::new([0; 320]),
++            }
 +        }
 +    }
 +    impl StorageBackend for WritableHeaderFixture {
-+        fn len(&self) -> io::Result<u64> { Ok(self.len.load(Ordering::SeqCst)) }
++        fn len(&self) -> io::Result<u64> {
++            Ok(self.len.load(Ordering::SeqCst))
++        }
 +        fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
 +            assert!(offset + out.len() as u64 <= self.len.load(Ordering::SeqCst));
 +            out.fill(0);
@@ -11625,7 +11845,10 @@
 +            }
 +            Ok(())
 +        }
-+        fn set_len(&self, len: u64) -> io::Result<()> { self.len.store(len, Ordering::SeqCst); Ok(()) }
++        fn set_len(&self, len: u64) -> io::Result<()> {
++            self.len.store(len, Ordering::SeqCst);
++            Ok(())
++        }
 +        fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
 +            assert!(offset + data.len() as u64 <= self.len.load(Ordering::SeqCst));
 +            if offset == 0 {
@@ -11635,7 +11858,9 @@
 +            }
 +            Ok(())
 +        }
-+        fn sync_data(&self) -> io::Result<()> { Ok(()) }
++        fn sync_data(&self) -> io::Result<()> {
++            Ok(())
++        }
 +    }
 +
 +    // Actual header writes reach the read cache through the normal flush.
@@ -11650,9 +11875,7 @@
 +        for (cap, expected_index) in [(4 * 1024 * 1024, 63_436), (64 * 1024 * 1024, 903_768)] {
 +            for stride in [1, 131] {
 +                let full_pages = cap / full_bytes;
-+                let backend = WritableHeaderFixture::new(
-+                    ((full_pages + 1) * stride * 4096) as u64,
-+                );
++                let backend = WritableHeaderFixture::new(((full_pages + 1) * stride * 4096) as u64);
 +                let file = PagedCachedFile::new(Box::new(backend), 4096, cap).unwrap();
 +                let index_bytes = file.index_bytes();
 +                let mut writable = file.write(0, header_len, true).unwrap();
@@ -11667,7 +11890,10 @@
 +                for ordinal in 1..=full_pages {
 +                    let offset = (ordinal * stride * 4096) as u64;
 +                    let page = file.read(offset, 4096, PageHint::Clean).unwrap();
-+                    assert!(matches!(page, super::PageMemory::Cached(_)), "a byte-fitting full page must not exhaust the fixed index");
++                    assert!(
++                        matches!(page, super::PageMemory::Cached(_)),
++                        "a byte-fitting full page must not exhaust the fixed index"
++                    );
 +                    assert!(page.iter().all(|byte| *byte == 0));
 +                    drop(page);
 +                    assert_eq!(file.index_bytes(), index_bytes);
@@ -11677,14 +11903,33 @@
 +                assert_eq!(index_bytes, expected_index);
 +                assert!(resident_bytes <= cap);
 +                assert!(cap - resident_bytes < full_bytes);
-+                assert_eq!(file.read_cache.iter().map(|s| s.read().unwrap().len()).sum::<usize>(), full_pages + 1);
-+                assert_eq!(file.read_cache[0].read().unwrap().arena_capacity_for_test(), full_pages + 1);
++                assert_eq!(
++                    file.read_cache
++                        .iter()
++                        .map(|s| s.read().unwrap().len())
++                        .sum::<usize>(),
++                    full_pages + 1
++                );
++                assert_eq!(
++                    file.read_cache[0].read().unwrap().arena_capacity_for_test(),
++                    full_pages + 1
++                );
 +                if stride == 131 {
 +                    assert_eq!(file.read_cache[0].read().unwrap().len(), full_pages + 1);
-+                    assert!(file.read_cache[1..].iter().all(|s| s.read().unwrap().len() == 0));
++                    assert!(
++                        file.read_cache[1..]
++                            .iter()
++                            .all(|s| s.read().unwrap().len() == 0)
++                    );
 +                }
-+                assert_eq!(file.settle_startup_cache_budget(cap).unwrap(), cap + index_bytes);
-+                assert_eq!(file.settle_startup_cache_budget(cap).unwrap(), cap + index_bytes);
++                assert_eq!(
++                    file.settle_startup_cache_budget(cap).unwrap(),
++                    cap + index_bytes
++                );
++                assert_eq!(
++                    file.settle_startup_cache_budget(cap).unwrap(),
++                    cap + index_bytes
++                );
 +                assert_eq!(file.index_bytes(), index_bytes);
 +                assert_eq!(file.read_cache_bytes.load(Ordering::SeqCst), resident_bytes);
 +                assert!(header.iter().all(|byte| *byte == 0x7a));
@@ -11702,11 +11947,15 @@
 +                let file = PagedCachedFile::new(Box::new(backend), 4096, 4 * 1024 * 1024).unwrap();
 +                // Ensure the exhausted scan branch has a real evictable page to replace.
 +                drop(file.read(8192, 4096, PageHint::Clean).unwrap());
-+                let invalid = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-+                    match route {
-+                        "normal" => { let _page = file.read(offset, len, PageHint::Clean).unwrap(); }
++                let invalid =
++                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match route {
++                        "normal" => {
++                            let _page = file.read(offset, len, PageHint::Clean).unwrap();
++                        }
 +                        "scan" => crate::read_admission::with_scan_reads(|| {
-+                            assert!(crate::read_admission::take_scan_growth(crate::read_admission::SCAN_GROWTH_ALLOWANCE));
++                            assert!(crate::read_admission::take_scan_growth(
++                                crate::read_admission::SCAN_GROWTH_ALLOWANCE
++                            ));
 +                            let _page = file.read(offset, len, PageHint::Clean).unwrap();
 +                        }),
 +                        "flush" => {
@@ -11716,12 +11965,17 @@
 +                            file.flush().unwrap();
 +                        }
 +                        _ => unreachable!(),
-+                    }
-+                }));
++                    }));
 +                let panic = invalid.expect_err("an invalid subpage admission must panic");
-+                let message = panic.downcast_ref::<String>().map(String::as_str)
-+                    .or_else(|| panic.downcast_ref::<&str>().copied()).unwrap_or("");
-+                assert!(message.contains("DB_HEADER_SIZE"), "route {route} offset {offset} length {len} must fail its actual header invariant, not a fixture panic: {message}");
++                let message = panic
++                    .downcast_ref::<String>()
++                    .map(String::as_str)
++                    .or_else(|| panic.downcast_ref::<&str>().copied())
++                    .unwrap_or("");
++                assert!(
++                    message.contains("DB_HEADER_SIZE"),
++                    "route {route} offset {offset} length {len} must fail its actual header invariant, not a fixture panic: {message}"
++                );
 +            }
 +        }
 +    }
@@ -11773,34 +12027,56 @@
 +    /// A paid native page copies an original clean warm-cache hit; it never
 +    /// borrows or adopts a legacy cell and never probes the write buffer.
 +    pub(super) fn read_native_clean_miss(
-+        &self, offset: u64, len: usize,
++        &self,
++        offset: u64,
++        len: usize,
 +    ) -> std::result::Result<PageMemory, crate::NativeColdReadError> {
-+        use crate::native_storage_admission::{NativeColdFault, NativeColdReadError, NativePagePayload, NativeStorageBuffer, NativeStorageShared};
++        use crate::native_storage_admission::{
++            NativeColdFault, NativeColdReadError, NativePagePayload, NativeStorageBuffer,
++            NativeStorageShared,
++        };
 +        if !crate::native_storage_admission::native_storage_active() {
 +            return Err(NativeColdReadError::AdmissionRefused);
 +        }
 +        if self.file.io_failed.load(Ordering::Acquire) {
-+            return Err(NativeColdReadError::Corrupt(NativeColdFault::new("native read requires an available backend")));
++            return Err(NativeColdReadError::Corrupt(NativeColdFault::new(
++                "native read requires an available backend",
++            )));
 +        }
 +        // Admit both owners on the original scope before taking a cache lock.
 +        let bytes = NativeStorageBuffer::zeroed(len)?;
-+        let mut page = NativeStorageShared::new(NativePagePayload { bytes, checksum: Mutex::new(None) })?;
++        let mut page = NativeStorageShared::new(NativePagePayload {
++            bytes,
++            checksum: Mutex::new(None),
++        })?;
 +        let stripe = (offset % Self::lock_stripes()) as usize;
 +        {
 +            let cache = self.read_cache[stripe].read().unwrap();
 +            if let Some(cell) = cache.get(offset) {
 +                if cell.bytes.len() != len {
-+                    let mut fault = NativeColdFault::new("native cache page length does not match the requested extent");
++                    let mut fault = NativeColdFault::new(
++                        "native cache page length does not match the requested extent",
++                    );
 +                    fault.expected = len as u128;
 +                    fault.actual = cell.bytes.len() as u128;
 +                    return Err(NativeColdReadError::Corrupt(fault));
 +                }
-+                page.get_mut().expect("unpublished native page is unique").bytes.as_mut_slice().copy_from_slice(&cell.bytes);
++                page.get_mut()
++                    .expect("unpublished native page is unique")
++                    .bytes
++                    .as_mut_slice()
++                    .copy_from_slice(&cell.bytes);
 +                return Ok(PageMemory::Native(page));
 +            }
 +        }
 +        // Every page allocation and its receipt is admitted before backend I/O.
-+        let result = self.file.file.read(offset, page.get_mut().expect("unpublished native page is unique").bytes.as_mut_slice());
++        let result = self.file.file.read(
++            offset,
++            page.get_mut()
++                .expect("unpublished native page is unique")
++                .bytes
++                .as_mut_slice(),
++        );
 +        if let Err(error) = result {
 +            self.file.io_failed.store(true, Ordering::Release);
 +            return Err(NativeColdReadError::Io(error));
@@ -12401,7 +12677,7 @@
          }
      }
  
-@@ -21,83 +356,485 @@
+@@ -21,83 +356,488 @@
          self.cache.len()
      }
  
@@ -12952,14 +13228,17 @@
 +    }
 +}
 +
-+
 +#[cfg(test)]
 +impl<T> LRUCache<T> {
-+    pub(crate) fn arena_capacity_for_test(&self) -> usize { self.arena_capacity() }
++    pub(crate) fn arena_capacity_for_test(&self) -> usize {
++        self.arena_capacity()
++    }
 +}
 +#[cfg(test)]
 +impl<T> WriteCache<T> {
-+    pub(crate) fn map_capacity_for_test(&self) -> usize { self.cache.capacity() }
++    pub(crate) fn map_capacity_for_test(&self) -> usize {
++        self.cache.capacity()
++    }
 +}
 --- a/src/tree_store/page_store/mod.rs
 +++ b/src/tree_store/page_store/mod.rs
@@ -13115,7 +13394,7 @@
  use std::sync::atomic::{AtomicBool, Ordering};
  use std::thread;
  
-@@ -82,21 +193,44 @@
+@@ -82,21 +193,45 @@
  }
  
  impl InMemoryState {
@@ -13163,12 +13442,13 @@
 +    fn drop(&mut self) {
 +        if self.armed {
 +            self.needs_recovery.store(true, Ordering::Release);
-+            self.publication_needs_recovery.store(true, Ordering::Release);
++            self.publication_needs_recovery
++                .store(true, Ordering::Release);
 +        }
      }
  }
  
-@@ -108,6 +242,8 @@
+@@ -108,6 +243,8 @@
      // True if the allocator state was corrupted when the file was opened
      // TODO: maybe we can remove this flag now that CheckedBackend exists?
      needs_recovery: AtomicBool,
@@ -13177,7 +13457,7 @@
      storage: PagedCachedFile,
      state: Mutex<InMemoryState>,
      // The number of PageMut which are outstanding
-@@ -129,6 +265,38 @@
+@@ -129,6 +266,38 @@
  }
  
  impl TransactionalMemory {
@@ -13216,7 +13496,7 @@
      pub(crate) fn new(
          file: Box<dyn StorageBackend>,
          // Allow initializing a new database in an empty file
-@@ -137,9 +305,10 @@
+@@ -137,9 +306,10 @@
          requested_region_size: Option<u64>,
          cache_size: usize,
          read_only: bool,
@@ -13228,7 +13508,7 @@
          let region_size = requested_region_size.unwrap_or(MAX_USABLE_REGION_SPACE);
          let region_size = min(
              region_size,
-@@ -147,6 +316,11 @@
+@@ -147,6 +317,11 @@
          );
          assert!(region_size.is_power_of_two());
  
@@ -13240,7 +13520,7 @@
          let storage = PagedCachedFile::new(file, page_size as u64, cache_size)?;
  
          let initial_storage_len = storage.raw_file_len()?;
-@@ -226,12 +400,17 @@
+@@ -226,12 +401,17 @@
          }
          let header_bytes = storage.read_direct(0, DB_HEADER_SIZE)?;
          let (mut header, repair_info) = DatabaseHeader::from_bytes(&header_bytes)?;
@@ -13261,7 +13541,7 @@
              if read_only {
                  return Err(DatabaseError::RepairAborted);
              }
-@@ -252,12 +431,17 @@
+@@ -252,12 +432,17 @@
                  .copy_from_slice(&header.to_bytes(true));
              storage.flush()?;
          }
@@ -13282,7 +13562,7 @@
  
          assert!(page_size >= DB_HEADER_SIZE);
  
-@@ -265,6 +449,8 @@
+@@ -265,6 +450,8 @@
              allocated_since_commit: Mutex::new(Default::default()),
              unpersisted: Mutex::new(Default::default()),
              needs_recovery: AtomicBool::new(needs_recovery),
@@ -13291,7 +13571,7 @@
              storage,
              state: Mutex::new(state),
              #[cfg(debug_assertions)]
-@@ -280,12 +466,70 @@
+@@ -280,12 +467,70 @@
          })
      }
  
@@ -13362,7 +13642,7 @@
      }
  
      #[cfg(debug_assertions)]
-@@ -295,23 +539,30 @@
+@@ -295,23 +540,30 @@
  
      #[cfg(debug_assertions)]
      pub(crate) fn all_allocated_pages(&self) -> Vec<PageNumber> {
@@ -13399,7 +13679,7 @@
          }
      }
  
-@@ -346,7 +597,9 @@
+@@ -346,7 +598,9 @@
  
          self.needs_recovery
              .store(header.recovery_required, Ordering::Release);
@@ -13410,7 +13690,7 @@
  
          Ok(was_clean)
      }
-@@ -379,7 +632,8 @@
+@@ -379,7 +633,8 @@
  
      pub(crate) fn begin_repair(&self) -> Result<()> {
          let mut state = self.state.lock().unwrap();
@@ -13420,7 +13700,7 @@
          #[cfg(debug_assertions)]
          self.allocated_pages.lock().unwrap().clear();
  
-@@ -392,7 +646,9 @@
+@@ -392,7 +647,9 @@
          let allocator = state.get_region_mut(region_index);
          allocator.record_alloc(page_number.page_index, page_number.page_order);
          #[cfg(debug_assertions)]
@@ -13431,7 +13711,7 @@
      }
  
      fn write_header(&self, header: &DatabaseHeader) -> Result {
-@@ -405,6 +661,7 @@
+@@ -405,6 +662,7 @@
      }
  
      pub(crate) fn end_repair(&self) -> Result<()> {
@@ -13439,7 +13719,7 @@
          let mut state = self.state.lock().unwrap();
          state.header.recovery_required = false;
          self.write_header(&state.header)?;
-@@ -419,30 +676,25 @@
+@@ -419,30 +677,25 @@
          tree: &mut AllocatorStateTreeMut,
          transaction_id: TransactionId,
      ) -> Result<u32> {
@@ -13483,7 +13763,7 @@
  
          tree.insert(
              &AllocatorStateKey::TransactionId,
-@@ -458,43 +710,43 @@
+@@ -458,43 +711,43 @@
          tree: &mut AllocatorStateTreeMut,
          num_regions: u32,
      ) -> Result<bool> {
@@ -13553,7 +13833,7 @@
          Ok(true)
      }
  
-@@ -519,12 +771,58 @@
+@@ -519,12 +772,58 @@
      pub(crate) fn load_allocator_state(&self, tree: &AllocatorStateTree) -> Result {
          assert!(self.is_valid_allocator_state(tree)?);
  
@@ -13614,7 +13894,7 @@
          }
  
          let region_tracker = RegionTracker::from_bytes(
-@@ -536,12 +834,13 @@
+@@ -536,12 +835,13 @@
          let mut state = self.state.lock().unwrap();
          state.allocators = Allocators {
              region_tracker,
@@ -13630,7 +13910,7 @@
          drop(state);
  
          self.state.lock().unwrap().header.recovery_required = false;
-@@ -554,8 +853,15 @@
+@@ -554,8 +854,15 @@
      pub(crate) fn is_allocated(&self, page: PageNumber) -> bool {
          #[cfg(debug_assertions)]
          {
@@ -13648,7 +13928,7 @@
          }
          #[cfg(not(debug_assertions))]
          {
-@@ -586,6 +892,32 @@
+@@ -586,6 +893,32 @@
          result
      }
  
@@ -13681,7 +13961,7 @@
      #[allow(clippy::too_many_arguments)]
      fn commit_inner(
          &self,
-@@ -612,6 +944,7 @@
+@@ -612,6 +945,7 @@
          // Copy the header so that we can release the state lock, while we flush the file
          let mut header = state.header.clone();
          drop(state);
@@ -13689,7 +13969,7 @@
  
          let old_transaction_id = header.secondary_slot().transaction_id;
          let secondary = header.secondary_slot_mut();
-@@ -658,6 +991,96 @@
+@@ -658,6 +992,96 @@
          );
          state.header = header;
          self.read_from_secondary.store(false, Ordering::Release);
@@ -13786,7 +14066,7 @@
          // Hold lock until read_from_secondary is set to false, so that the new primary state is read.
          // TODO: maybe we can remove the whole read_from_secondary flag?
          drop(state);
-@@ -678,6 +1101,7 @@
+@@ -678,6 +1102,7 @@
          #[cfg(debug_assertions)]
          debug_assert!(self.open_dirty_pages.lock().unwrap().is_empty());
          assert!(!self.needs_recovery.load(Ordering::Acquire));
@@ -13794,7 +14074,7 @@
  
          let mut unpersisted = self.unpersisted.lock().unwrap();
          let mut allocated_since_commit = self.allocated_since_commit.lock().unwrap();
-@@ -726,7 +1150,9 @@
+@@ -726,7 +1151,9 @@
                  .get_region_mut(region_index)
                  .free(page_number.page_index, page_number.page_order);
              #[cfg(debug_assertions)]
@@ -13805,7 +14085,7 @@
  
              let address = page_number.address_range(
                  self.page_size.into(),
-@@ -776,6 +1202,23 @@
+@@ -776,6 +1203,23 @@
          })
      }
  
@@ -13829,7 +14109,7 @@
      // NOTE: the caller must ensure that the read cache has been invalidated or stale reads my occur
      pub(crate) fn get_page_mut<'txn>(&self, page_number: PageNumber) -> Result<PageMut<'txn>> {
          #[cfg(debug_assertions)]
-@@ -871,7 +1314,9 @@
+@@ -871,7 +1315,9 @@
                      .unwrap()
                      .contains_key(&page)
              );
@@ -13840,7 +14120,7 @@
              assert!(!self.open_dirty_pages.lock().unwrap().contains(&page));
          }
          allocated.remove(page);
-@@ -953,12 +1398,32 @@
+@@ -953,12 +1399,32 @@
              page_number
          } else {
              self.grow(&mut state, required_order)?;
@@ -13875,7 +14155,7 @@
              assert!(
                  !self
                      .read_page_ref_counts
-@@ -1024,7 +1489,27 @@
+@@ -1024,7 +1490,27 @@
              } else {
                  region.alloc(required_order)
              };
@@ -13903,7 +14183,7 @@
                  return Ok(Some(PageNumber::new(
                      candidate_region,
                      page,
-@@ -1061,7 +1546,7 @@
+@@ -1061,7 +1547,7 @@
  
          let mut new_layout = layout;
          new_layout.reduce_last_region(reduce_by);
@@ -13912,7 +14192,7 @@
          assert!(new_layout.len() <= layout.len());
          state.header.set_layout(new_layout);
  
-@@ -1107,13 +1592,20 @@
+@@ -1107,13 +1593,20 @@
  
          let result = self.storage.resize(new_layout.len());
          if result.is_err() {
@@ -13934,7 +14214,7 @@
          state.header.set_layout(new_layout);
          Ok(())
      }
-@@ -1135,7 +1627,7 @@
+@@ -1135,7 +1628,7 @@
      }
  
      pub(crate) fn count_allocated_pages(&self) -> Result<u64> {
@@ -13943,7 +14223,7 @@
          let mut count = 0u64;
          for i in 0..state.header.layout().num_regions() {
              count += u64::from(state.get_region(i).count_allocated_pages());
-@@ -1145,7 +1637,7 @@
+@@ -1145,7 +1638,7 @@
      }
  
      pub(crate) fn count_free_pages(&self) -> Result<u64> {
@@ -13952,7 +14232,7 @@
          let mut count = 0u64;
          for i in 0..state.header.layout().num_regions() {
              count += u64::from(state.get_region(i).count_free_pages());
-@@ -1158,8 +1650,41 @@
+@@ -1158,8 +1651,41 @@
          self.page_size.try_into().unwrap()
      }
  
@@ -13995,7 +14275,7 @@
              let mut state = self.state.lock()?;
              if self.storage.flush().is_ok() {
                  state.header.recovery_required = false;
-@@ -1228,4 +1753,143 @@
+@@ -1228,4 +1754,157 @@
          let mut db = Database::open(tmpfile).unwrap();
          assert!(db.check_integrity().unwrap());
      }
@@ -14103,7 +14383,8 @@
 +#[cfg(feature = "contextdb-internal")]
 +impl TransactionalMemory {
 +    pub(crate) fn get_native_page_memory(
-+        &self, page: PageNumber,
++        &self,
++        page: PageNumber,
 +    ) -> std::result::Result<super::cached_file::PageMemory, crate::NativeColdReadError> {
 +        use crate::{NativeColdFault, NativeColdReadError};
 +        let corrupt = || {
@@ -14111,15 +14392,20 @@
 +            fault.page = page.to_le_bytes();
 +            NativeColdReadError::Corrupt(fault)
 +        };
-+        if page.page_order > MAX_MAX_PAGE_ORDER { return Err(corrupt()); }
++        if page.page_order > MAX_MAX_PAGE_ORDER {
++            return Err(corrupt());
++        }
 +        let pages = 1u64 << page.page_order;
-+        let end_page = u64::from(page.page_index).checked_add(1)
-+            .and_then(|n| n.checked_mul(pages)).ok_or_else(corrupt)?;
++        let end_page = u64::from(page.page_index)
++            .checked_add(1)
++            .and_then(|n| n.checked_mul(pages))
++            .ok_or_else(corrupt)?;
 +        {
 +            let state = self.state.lock().unwrap();
 +            let layout = state.header.layout();
 +            if page.region >= layout.num_regions()
-+                || end_page > u64::from(layout.region_layout(page.region).num_pages()) {
++                || end_page > u64::from(layout.region_layout(page.region).num_pages())
++            {
 +                return Err(corrupt());
 +            }
 +        }
@@ -14127,11 +14413,19 @@
 +        if self.open_dirty_pages.lock().unwrap().contains(&page) {
 +            return Err(corrupt());
 +        }
-+        let len = pages.checked_mul(u64::from(self.page_size)).ok_or_else(corrupt)?;
-+        let offset = u64::from(page.page_index).checked_mul(len)
++        let len = pages
++            .checked_mul(u64::from(self.page_size))
++            .ok_or_else(corrupt)?;
++        let offset = u64::from(page.page_index)
++            .checked_mul(len)
 +            .and_then(|n| n.checked_add(self.region_header_with_padding_size))
-+            .and_then(|n| u64::from(page.region).checked_mul(self.region_size).and_then(|r| r.checked_add(n)))
-+            .and_then(|n| n.checked_add(u64::from(self.page_size))).ok_or_else(corrupt)?;
++            .and_then(|n| {
++                u64::from(page.region)
++                    .checked_mul(self.region_size)
++                    .and_then(|r| r.checked_add(n))
++            })
++            .and_then(|n| n.checked_add(u64::from(self.page_size)))
++            .ok_or_else(corrupt)?;
 +        offset.checked_add(len).ok_or_else(corrupt)?;
 +        let len = usize::try_from(len).map_err(|_| corrupt())?;
 +        // Like existing get_page_window, this lends immutable PageMemory.
@@ -15034,7 +15328,7 @@
          Ok(())
      }
  
-@@ -783,3 +961,57 @@
+@@ -783,3 +961,107 @@
          assert_eq!(x, y);
      }
  }
@@ -15042,10 +15336,16 @@
 +#[cfg(feature = "contextdb-internal")]
 +impl TableTree {
 +    pub(crate) fn get_native_byte_value(
-+        &self, physical_name: &str, key: &[u8],
-+    ) -> std::result::Result<Option<crate::AccessGuard<'static, &'static [u8]>>, crate::NativeColdReadError> {
-+        let directory = super::btree::native_byte_get(self.root(), &self.mem, physical_name.as_bytes(), true)?
-+            .ok_or(crate::NativeColdReadError::TableAbsent)?;
++        &self,
++        physical_name: &str,
++        key: &[u8],
++    ) -> std::result::Result<
++        Option<crate::AccessGuard<'static, &'static [u8]>>,
++        crate::NativeColdReadError,
++    > {
++        let directory =
++            super::btree::native_byte_get(self.root(), &self.mem, physical_name.as_bytes(), true)?
++                .ok_or(crate::NativeColdReadError::TableAbsent)?;
 +        let root = super::table_tree_base::native_byte_table_root(directory.value())?;
 +        // The raw directory guard remains alive until scalar header validation
 +        // completes; no borrowed metadata escapes it or names a newer root.
@@ -15056,10 +15356,16 @@
 +#[cfg(feature = "contextdb-internal")]
 +impl TableTree {
 +    pub(crate) fn get_native_text_value(
-+        &self, physical_name: &str, key: &str,
-+    ) -> std::result::Result<Option<crate::AccessGuard<'static, &'static [u8]>>, crate::NativeColdReadError> {
-+        let directory = super::btree::native_byte_get(self.root(), &self.mem, physical_name.as_bytes(), true)?
-+            .ok_or(crate::NativeColdReadError::TableAbsent)?;
++        &self,
++        physical_name: &str,
++        key: &str,
++    ) -> std::result::Result<
++        Option<crate::AccessGuard<'static, &'static [u8]>>,
++        crate::NativeColdReadError,
++    > {
++        let directory =
++            super::btree::native_byte_get(self.root(), &self.mem, physical_name.as_bytes(), true)?
++                .ok_or(crate::NativeColdReadError::TableAbsent)?;
 +        let root = super::table_tree_base::native_text_table_root(directory.value())?;
 +        super::btree::native_byte_get(root, &self.mem, key.as_bytes(), false)
 +    }
@@ -15068,28 +15374,66 @@
 +#[cfg(feature = "contextdb-internal")]
 +impl TableTree {
 +    pub(crate) fn next_native_text_range(
-+        &self, physical_name: &str, lower: &[u8], exclusive: bool, upper: Option<&[u8]>,
++        &self,
++        physical_name: &str,
++        lower: &[u8],
++        exclusive: bool,
++        upper: Option<&[u8]>,
 +        before_page: &mut dyn FnMut() -> std::result::Result<(), crate::NativeColdReadError>,
-+    ) -> std::result::Result<Option<(crate::AccessGuard<'static, &'static [u8]>, crate::AccessGuard<'static, &'static [u8]>)>, crate::NativeColdReadError> {
++    ) -> std::result::Result<
++        Option<(
++            crate::AccessGuard<'static, &'static [u8]>,
++            crate::AccessGuard<'static, &'static [u8]>,
++        )>,
++        crate::NativeColdReadError,
++    > {
 +        before_page()?;
-+        let directory = super::btree::native_byte_get(self.root(), &self.mem, physical_name.as_bytes(), true)?
-+            .ok_or(crate::NativeColdReadError::TableAbsent)?;
++        let directory =
++            super::btree::native_byte_get(self.root(), &self.mem, physical_name.as_bytes(), true)?
++                .ok_or(crate::NativeColdReadError::TableAbsent)?;
 +        let root = super::table_tree_base::native_text_table_root(directory.value())?;
-+        super::btree::native_text_range_next(root, &self.mem, lower, exclusive, upper, true, before_page)
++        super::btree::native_text_range_next(
++            root,
++            &self.mem,
++            lower,
++            exclusive,
++            upper,
++            true,
++            before_page,
++        )
 +    }
 +}
 +
 +#[cfg(feature = "contextdb-internal")]
 +impl TableTree {
 +    pub(crate) fn next_native_byte_range(
-+        &self, physical_name: &str, lower: &[u8], exclusive: bool, upper: Option<&[u8]>,
++        &self,
++        physical_name: &str,
++        lower: &[u8],
++        exclusive: bool,
++        upper: Option<&[u8]>,
 +        before_page: &mut dyn FnMut() -> std::result::Result<(), crate::NativeColdReadError>,
-+    ) -> std::result::Result<Option<(crate::AccessGuard<'static, &'static [u8]>, crate::AccessGuard<'static, &'static [u8]>)>, crate::NativeColdReadError> {
++    ) -> std::result::Result<
++        Option<(
++            crate::AccessGuard<'static, &'static [u8]>,
++            crate::AccessGuard<'static, &'static [u8]>,
++        )>,
++        crate::NativeColdReadError,
++    > {
 +        before_page()?;
-+        let directory = super::btree::native_byte_get(self.root(), &self.mem, physical_name.as_bytes(), true)?
-+            .ok_or(crate::NativeColdReadError::TableAbsent)?;
++        let directory =
++            super::btree::native_byte_get(self.root(), &self.mem, physical_name.as_bytes(), true)?
++                .ok_or(crate::NativeColdReadError::TableAbsent)?;
 +        let root = super::table_tree_base::native_byte_table_root(directory.value())?;
-+        super::btree::native_text_range_next(root, &self.mem, lower, exclusive, upper, false, before_page)
++        super::btree::native_text_range_next(
++            root,
++            &self.mem,
++            lower,
++            exclusive,
++            upper,
++            false,
++            before_page,
++        )
 +    }
 +}
 --- a/src/tree_store/table_tree_base.rs
@@ -15118,7 +15462,7 @@
      fn private_get_root(&self) -> Option<BtreeHeader> {
          match self {
              InternalTableDefinition::Normal { table_root, .. }
-@@ -505,3 +522,69 @@
+@@ -505,3 +522,94 @@
          TypeName::internal("redb::InternalTableDefinition")
      }
  }
@@ -15143,10 +15487,13 @@
 +
 +#[cfg(feature = "contextdb-internal")]
 +fn native_variable_table_root(
-+    data: &[u8], expected_key_type: &[u8],
++    data: &[u8],
++    expected_key_type: &[u8],
 +) -> std::result::Result<Option<BtreeHeader>, crate::NativeColdReadError> {
 +    use crate::{NativeColdFault, NativeColdReadError};
-+    let corrupt = || NativeColdReadError::Corrupt(NativeColdFault::new("invalid native byte table descriptor"));
++    let corrupt = || {
++        NativeColdReadError::Corrupt(NativeColdFault::new("invalid native byte table descriptor"))
++    };
 +    // Existing serialization: kind, length, optional 32-byte root, optional
 +    // key/value widths, alignments, key type length and two borrowed type names.
 +    let root_start = 10;
@@ -15155,24 +15502,41 @@
 +    let type_start = type_length_start + 4;
 +    let fixed = data.get(..type_start).ok_or_else(corrupt)?;
 +    if fixed[0] != 3 {
-+        return if fixed[0] == 4 { Err(NativeColdReadError::TypeMismatch) } else { Err(corrupt()) };
++        return if fixed[0] == 4 {
++            Err(NativeColdReadError::TypeMismatch)
++        } else {
++            Err(corrupt())
++        };
 +    }
-+    if fixed[9] > 1 || fixed[width_start] > 1 || fixed[width_start + 5] > 1 { return Err(corrupt()); }
++    if fixed[9] > 1 || fixed[width_start] > 1 || fixed[width_start + 5] > 1 {
++        return Err(corrupt());
++    }
 +    if fixed[width_start] != 0 || fixed[width_start + 5] != 0 {
 +        return Err(NativeColdReadError::TypeMismatch);
 +    }
 +    let alignment_start = width_start + 10;
-+    if u32::from_le_bytes(fixed[alignment_start..alignment_start + 4].try_into().unwrap()) != ALIGNMENT as u32
-+        || u32::from_le_bytes(fixed[alignment_start + 4..alignment_start + 8].try_into().unwrap()) != ALIGNMENT as u32 {
++    if u32::from_le_bytes(
++        fixed[alignment_start..alignment_start + 4]
++            .try_into()
++            .unwrap(),
++    ) != ALIGNMENT as u32
++        || u32::from_le_bytes(
++            fixed[alignment_start + 4..alignment_start + 8]
++                .try_into()
++                .unwrap(),
++        ) != ALIGNMENT as u32
++    {
 +        return Err(NativeColdReadError::TypeMismatch);
 +    }
-+    let key_type_len = u32::from_le_bytes(fixed[type_length_start..type_start].try_into().unwrap()) as usize;
++    let key_type_len =
++        u32::from_le_bytes(fixed[type_length_start..type_start].try_into().unwrap()) as usize;
 +    let key_type_end = type_start.checked_add(key_type_len).ok_or_else(corrupt)?;
 +    let key_type = data.get(type_start..key_type_end).ok_or_else(corrupt)?;
 +    let value_type = data.get(key_type_end..).ok_or_else(corrupt)?;
 +    for name in [key_type, value_type] {
 +        if !matches!(name.first(), Some(1 | 2 | 3))
-+            || std::str::from_utf8(name.get(1..).ok_or_else(corrupt)?).is_err() {
++            || std::str::from_utf8(name.get(1..).ok_or_else(corrupt)?).is_err()
++        {
 +            return Err(corrupt());
 +        }
 +    }
@@ -15180,11 +15544,16 @@
 +    if key_type != expected_key_type || value_type != b"\x01&[u8]" {
 +        return Err(NativeColdReadError::TypeMismatch);
 +    }
-+    if fixed[9] == 0 { return Ok(None); }
++    if fixed[9] == 0 {
++        return Ok(None);
++    }
 +    let root_bytes = fixed[root_start..width_start].try_into().unwrap();
-+    let page = PageNumber::validated_from_le_bytes(fixed[root_start..root_start + 8].try_into().unwrap())
-+        .ok_or_else(corrupt)?;
++    let page =
++        PageNumber::validated_from_le_bytes(fixed[root_start..root_start + 8].try_into().unwrap())
++            .ok_or_else(corrupt)?;
 +    let root = BtreeHeader::from_le_bytes(root_bytes);
-+    if root.root != page { return Err(corrupt()); }
++    if root.root != page {
++        return Err(corrupt());
++    }
 +    Ok(Some(root))
 +}

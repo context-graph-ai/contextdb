@@ -3008,7 +3008,12 @@ pub trait PagedVectorObserver: Send + Sync {
 #[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PagedVectorStorageWork { SourceRead, DescriptorDecode, PageRecordDecode, Authentication }
+pub enum PagedVectorStorageWork {
+    SourceRead,
+    DescriptorDecode,
+    PageRecordDecode,
+    Authentication,
+}
 #[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub fn observe_paged_storage_work(kind: PagedVectorStorageWork, bytes: usize) {
@@ -3028,7 +3033,9 @@ pub fn observe_paged_native_control_allocation() {
 #[cfg(feature = "test-seams")]
 #[doc(hidden)]
 pub fn observe_paged_resident_admission(requested_bytes: usize, metadata_workspace: usize) {
-    observe_paged_vector(|observer| observer.resident_admission_requested(requested_bytes, metadata_workspace));
+    observe_paged_vector(|observer| {
+        observer.resident_admission_requested(requested_bytes, metadata_workspace)
+    });
 }
 
 /// Chain producer observations through the same operation collector and its
@@ -3036,7 +3043,8 @@ pub fn observe_paged_resident_admission(requested_bytes: usize, metadata_workspa
 #[cfg(feature = "test-seams")]
 #[doc(hidden)]
 pub fn with_additional_paged_vector_observer<T>(
-    observer: Arc<dyn PagedVectorObserver>, action: impl FnOnce() -> T,
+    observer: Arc<dyn PagedVectorObserver>,
+    action: impl FnOnce() -> T,
 ) -> T {
     struct Additional {
         observer: Arc<dyn PagedVectorObserver>,
@@ -3045,43 +3053,64 @@ pub fn with_additional_paged_vector_observer<T>(
     impl PagedVectorObserver for Additional {
         fn storage_work(&self, kind: PagedVectorStorageWork, bytes: usize) {
             self.observer.storage_work(kind, bytes);
-            if let Some(prior) = &self.prior { prior.storage_work(kind, bytes); }
+            if let Some(prior) = &self.prior {
+                prior.storage_work(kind, bytes);
+            }
         }
         fn page_cache_constructed(&self, slots: usize) {
             self.observer.page_cache_constructed(slots);
-            if let Some(prior) = &self.prior { prior.page_cache_constructed(slots); }
+            if let Some(prior) = &self.prior {
+                prior.page_cache_constructed(slots);
+            }
         }
         fn page_control_allocated(&self, offset: usize) {
             self.observer.page_control_allocated(offset);
-            if let Some(prior) = &self.prior { prior.page_control_allocated(offset); }
+            if let Some(prior) = &self.prior {
+                prior.page_control_allocated(offset);
+            }
         }
         fn resident_admission_requested(&self, requested_bytes: usize, metadata_workspace: usize) {
-            self.observer.resident_admission_requested(requested_bytes, metadata_workspace);
-            if let Some(prior) = &self.prior { prior.resident_admission_requested(requested_bytes, metadata_workspace); }
+            self.observer
+                .resident_admission_requested(requested_bytes, metadata_workspace);
+            if let Some(prior) = &self.prior {
+                prior.resident_admission_requested(requested_bytes, metadata_workspace);
+            }
         }
         fn page_cache_locked(&self) {
             self.observer.page_cache_locked();
-            if let Some(prior) = &self.prior { prior.page_cache_locked(); }
+            if let Some(prior) = &self.prior {
+                prior.page_cache_locked();
+            }
         }
         fn page_filled(&self) {
             self.observer.page_filled();
-            if let Some(prior) = &self.prior { prior.page_filled(); }
+            if let Some(prior) = &self.prior {
+                prior.page_filled();
+            }
         }
         fn page_looked_up(&self, hit: bool) {
             self.observer.page_looked_up(hit);
-            if let Some(prior) = &self.prior { prior.page_looked_up(hit); }
+            if let Some(prior) = &self.prior {
+                prior.page_looked_up(hit);
+            }
         }
         fn vector_decoded(&self) {
             self.observer.vector_decoded();
-            if let Some(prior) = &self.prior { prior.vector_decoded(); }
+            if let Some(prior) = &self.prior {
+                prior.vector_decoded();
+            }
         }
         fn query_norm_computed(&self) {
             self.observer.query_norm_computed();
-            if let Some(prior) = &self.prior { prior.query_norm_computed(); }
+            if let Some(prior) = &self.prior {
+                prior.query_norm_computed();
+            }
         }
         fn walk_compared(&self, work: PagedWalkWork) {
             self.observer.walk_compared(work);
-            if let Some(prior) = &self.prior { prior.walk_compared(work); }
+            if let Some(prior) = &self.prior {
+                prior.walk_compared(work);
+            }
         }
     }
     let prior = PAGED_VECTOR_OBSERVER.with(|slot| slot.borrow().clone());
@@ -3276,11 +3305,17 @@ struct ParallelCandidateObserver {
 #[cfg(feature = "test-seams")]
 impl HnswCandidateObserver for ParallelCandidateObserver {
     fn before_candidate_distance(&self, _: HnswCandidateDistanceEvent) {
-        let completed_candidates = self.completed.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| Some(n.saturating_add(1)))
+        let completed_candidates = self
+            .completed
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                Some(n.saturating_add(1))
+            })
             .expect("candidate ordinal update cannot fail");
-        self.caller.before_candidate_distance(HnswCandidateDistanceEvent {
-            completed_candidates, _source_loop_provenance: (),
-        });
+        self.caller
+            .before_candidate_distance(HnswCandidateDistanceEvent {
+                completed_candidates,
+                _source_loop_provenance: (),
+            });
     }
     fn after_residual_rejection(&self, event: HnswResidualRejectionEvent) {
         self.caller.after_residual_rejection(event);
@@ -3295,17 +3330,23 @@ impl ParallelCandidateObservation {
     fn capture() -> Option<Self> {
         let caller = HNSW_CANDIDATE_OBSERVER.with(|slot| slot.borrow().as_ref().map(Arc::clone))?;
         let completed = HNSW_COMPLETED_CANDIDATES.with(Cell::get);
-        Some(Self { observer: Arc::new(ParallelCandidateObserver {
-            caller, completed: std::sync::atomic::AtomicU64::new(completed),
-        }) })
+        Some(Self {
+            observer: Arc::new(ParallelCandidateObserver {
+                caller,
+                completed: std::sync::atomic::AtomicU64::new(completed),
+            }),
+        })
     }
     fn joined(&self) {
-        HNSW_COMPLETED_CANDIDATES.with(|slot| slot.set(self.observer.completed.load(Ordering::SeqCst)));
+        HNSW_COMPLETED_CANDIDATES
+            .with(|slot| slot.set(self.observer.completed.load(Ordering::SeqCst)));
     }
 }
 #[cfg(feature = "test-seams")]
 impl Drop for ParallelCandidateObservation {
-    fn drop(&mut self) { self.joined(); }
+    fn drop(&mut self) {
+        self.joined();
+    }
 }
 
 /// Install an observer only for the dynamic extent of one bounded vector
@@ -3564,7 +3605,15 @@ impl HnswIndex {
         policy: crate::store::ResolvedVectorPolicy,
         progress: impl FnMut(usize) -> Result<()>,
     ) -> Result<Self> {
-        Self::new_with_policy_and_workers(entries, dimension, quantization, policy, 1, || false, progress)
+        Self::new_with_policy_and_workers(
+            entries,
+            dimension,
+            quantization,
+            policy,
+            1,
+            || false,
+            progress,
+        )
     }
 
     /// Maintenance-only borrowed insertion pool. The caller admits the worker
@@ -3580,10 +3629,19 @@ impl HnswIndex {
         mut progress: impl FnMut(usize) -> Result<()>,
     ) -> Result<Self> {
         progress(0)?;
-        let stored = entries.iter()
+        let stored = entries
+            .iter()
             .map(|entry| StoredVectorEntry::from_vector_entry_ref(entry, quantization))
             .collect::<Vec<_>>();
-        Self::new_with_policy_and_workers(&stored, dimension, quantization, policy, workers, cancelled, progress)
+        Self::new_with_policy_and_workers(
+            &stored,
+            dimension,
+            quantization,
+            policy,
+            workers,
+            cancelled,
+            progress,
+        )
     }
 
     pub const INSERTION_WORKER_STACK_BYTES: usize = 4 * 1024 * 1024;
@@ -3592,10 +3650,20 @@ impl HnswIndex {
     /// process-lifetime owner separately admits the requested native stacks
     /// and the measured stack-cache/arena/TLS runtime retention.
     #[doc(hidden)]
-    pub fn parallel_insertion_extra_bytes(points: usize, policy: crate::store::ResolvedVectorPolicy, workers: usize) -> Result<usize> {
-        if workers <= 1 { return Ok(0); }
-        let scratch = Hnsw::<f32, HnswF32Distance>::insertion_scratch_bound(points, policy.hnsw_ef_construction, policy.hnsw_m)
-            .ok_or_else(|| Error::Other("graph insertion scratch size overflow".into()))?;
+    pub fn parallel_insertion_extra_bytes(
+        points: usize,
+        policy: crate::store::ResolvedVectorPolicy,
+        workers: usize,
+    ) -> Result<usize> {
+        if workers <= 1 {
+            return Ok(0);
+        }
+        let scratch = Hnsw::<f32, HnswF32Distance>::insertion_scratch_bound(
+            points,
+            policy.hnsw_ef_construction,
+            policy.hnsw_m,
+        )
+        .ok_or_else(|| Error::Other("graph insertion scratch size overflow".into()))?;
         // Stack, native TLS, allocator arenas and stack-cache retention are
         // admitted once by the engine's process-lifetime runtime owner. This
         // operation admits only insertion containers and borrowed job controls.
@@ -3604,12 +3672,16 @@ impl HnswIndex {
         let controls = std::mem::size_of::<std::thread::ScopedJoinHandle<'_, usize>>() * 2
             + 32 * std::mem::size_of::<usize>();
         #[cfg(feature = "test-seams")]
-        let observer_bytes = std::mem::size_of::<ParallelCandidateObserver>() + 2 * std::mem::size_of::<usize>();
+        let observer_bytes =
+            std::mem::size_of::<ParallelCandidateObserver>() + 2 * std::mem::size_of::<usize>();
         #[cfg(not(feature = "test-seams"))]
         let observer_bytes = 0usize;
-        scratch.checked_add(controls)
+        scratch
+            .checked_add(controls)
             .and_then(|n| n.checked_mul(workers))
-            .and_then(|n| n.checked_add(points.checked_mul(std::mem::size_of::<Option<PointId>>())?))
+            .and_then(|n| {
+                n.checked_add(points.checked_mul(std::mem::size_of::<Option<PointId>>())?)
+            })
             .and_then(|n| n.checked_add(observer_bytes))
             .ok_or_else(|| Error::Other("graph worker size overflow".into()))
     }
@@ -3693,7 +3765,13 @@ impl HnswIndex {
                 if workers > 1 && sorted_entries.len() > 1 {
                     // Establish the sole initial entry before concurrent
                     // insertions can observe an empty entry directory.
-                    index.insert_slice((sorted_entries[0].vector.as_f32_slice().expect("validated F32 entry"), 0));
+                    index.insert_slice((
+                        sorted_entries[0]
+                            .vector
+                            .as_f32_slice()
+                            .expect("validated F32 entry"),
+                        0,
+                    ));
                     inserted_count = 1;
                     progress(inserted_count)?;
                     let width = workers.min(sorted_entries.len());
@@ -3704,7 +3782,9 @@ impl HnswIndex {
                     // joins on spawn failure, cancellation and unwinding too.
                     for (wave_number, wave) in sorted_entries[1..].chunks(width * 32).enumerate() {
                         progress(inserted_count)?;
-                        if cancelled() { return Err(Error::Other("graph build cancelled".into())); }
+                        if cancelled() {
+                            return Err(Error::Other("graph build cancelled".into()));
+                        }
                         let first = 1 + wave_number * width * 32;
                         let done = std::thread::scope(|scope| -> Result<usize> {
                             let mut handles = Vec::with_capacity(width);
@@ -3714,15 +3794,25 @@ impl HnswIndex {
                                 let cancelled = &cancelled;
                                 let offset = first + chunk_number * 32;
                                 #[cfg(feature = "test-seams")]
-                                let observer = observation.as_ref().map(|context| Arc::clone(&context.observer));
+                                let observer = observation
+                                    .as_ref()
+                                    .map(|context| Arc::clone(&context.observer));
                                 match std::thread::Builder::new()
                                     .stack_size(Self::INSERTION_WORKER_STACK_BYTES)
                                     .spawn_scoped(scope, move || {
                                         let insert = || {
                                             let mut count = 0;
                                             for (position, entry) in chunk.iter().enumerate() {
-                                                if stop.load(Ordering::Acquire) || cancelled() { break; }
-                                                index.insert_slice((entry.vector.as_f32_slice().expect("validated F32 entry"), offset + position));
+                                                if stop.load(Ordering::Acquire) || cancelled() {
+                                                    break;
+                                                }
+                                                index.insert_slice((
+                                                    entry
+                                                        .vector
+                                                        .as_f32_slice()
+                                                        .expect("validated F32 entry"),
+                                                    offset + position,
+                                                ));
                                                 count += 1;
                                             }
                                             count
@@ -3736,7 +3826,9 @@ impl HnswIndex {
                                     Ok(handle) => handles.push(handle),
                                     Err(error) => {
                                         stop.store(true, Ordering::Release);
-                                        failure = Some(Error::Other(format!("cannot start graph worker: {error}")));
+                                        failure = Some(Error::Other(format!(
+                                            "cannot start graph worker: {error}"
+                                        )));
                                         break;
                                     }
                                 }
@@ -3747,35 +3839,56 @@ impl HnswIndex {
                                     Ok(count) => done += count,
                                     Err(_) => {
                                         stop.store(true, Ordering::Release);
-                                        failure = Some(Error::Other("graph insertion worker panicked".into()));
+                                        failure = Some(Error::Other(
+                                            "graph insertion worker panicked".into(),
+                                        ));
                                     }
                                 }
                             }
-                            if let Some(error) = failure { Err(error) } else { Ok(done) }
+                            if let Some(error) = failure {
+                                Err(error)
+                            } else {
+                                Ok(done)
+                            }
                         })?;
                         #[cfg(feature = "test-seams")]
-                        if let Some(observation) = &observation { observation.joined(); }
+                        if let Some(observation) = &observation {
+                            observation.joined();
+                        }
                         inserted_count += done;
                         progress(inserted_count)?;
-                        if done != wave.len() { return Err(Error::Other("graph build cancelled".into())); }
+                        if done != wave.len() {
+                            return Err(Error::Other("graph build cancelled".into()));
+                        }
                     }
                     // No reinsertion: bind each stable origin to its actual
                     // physical rank after all workers and stacks have died.
                     let mut physical = vec![None; inserted_count];
                     for point in index.get_point_indexation() {
-                        let slot = physical.get_mut(point.get_origin_id())
-                            .ok_or_else(|| Error::Other("graph worker emitted unknown origin".into()))?;
+                        let slot = physical.get_mut(point.get_origin_id()).ok_or_else(|| {
+                            Error::Other("graph worker emitted unknown origin".into())
+                        })?;
                         if slot.replace(point.get_point_id()).is_some() {
-                            return Err(Error::Other("graph worker emitted duplicate origin".into()));
+                            return Err(Error::Other(
+                                "graph worker emitted duplicate origin".into(),
+                            ));
                         }
                     }
                     for (origin, point) in physical.into_iter().enumerate() {
-                        let point = point.ok_or_else(|| Error::Other("graph worker origin coverage is incomplete".into()))?;
+                        let point = point.ok_or_else(|| {
+                            Error::Other("graph worker origin coverage is incomplete".into())
+                        })?;
                         row_to_point.insert(id_to_row[&origin], point);
                     }
                 } else {
                     for (data_id, entry) in sorted_entries.iter().enumerate() {
-                        row_to_point.insert(entry.row_id, index.insert_slice_with_point_id((entry.vector.as_f32_slice().expect("validated F32 entry"), data_id)));
+                        row_to_point.insert(
+                            entry.row_id,
+                            index.insert_slice_with_point_id((
+                                entry.vector.as_f32_slice().expect("validated F32 entry"),
+                                data_id,
+                            )),
+                        );
                         inserted_count += 1;
                         progress(inserted_count)?;
                     }
@@ -6267,7 +6380,11 @@ impl HnswIndex {
     {
         let mut native_reader = tail.graph_reader().map_err(E::from)?;
         let reclaim = || navigation.is_some_and(|session| session.reclaim());
-        let mut reader = paged_builder::AdmittedPagedReader::with_reclamation(native_reader.as_mut(), navigation.and_then(|session| session.owner()), &reclaim);
+        let mut reader = paged_builder::AdmittedPagedReader::with_reclamation(
+            native_reader.as_mut(),
+            navigation.and_then(|session| session.owner()),
+            &reclaim,
+        );
         before_source_entry()?;
         let bounds = reader.row_bounds().map_err(E::from)?;
         let count = bounds.map_or(0, |(_, _, count)| count);

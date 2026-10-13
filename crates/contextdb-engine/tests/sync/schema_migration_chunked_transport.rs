@@ -21,7 +21,6 @@ fn open_oversized_source(path: &Path) -> contextdb_core::Result<Database> {
     Database::open_with_options(path, options)
 }
 
-
 struct RealHub {
     endpoint: Option<IrohServer>,
     controller: LargeRequestTestController,
@@ -640,9 +639,15 @@ async fn oversized_authenticated_schema_stays_invisible_until_one_commit_and_ret
     let (file, open_history_work) = contextdb_engine::persistence::read_persistence_test_scaffold::observe_open_history_work_for_test(|| {
         contextdb_engine::ReadSession::open_with_options(&hub_path, file_options).unwrap()
     });
-    println!("OVERSIZED_SCHEMA_FILE_OPEN tables={oversized_schema_table_count} padding_tables={PADDING_TABLES} padding_default_bytes={} history_work={open_history_work:?}", PADDING_TABLES * DEFAULT_BYTES);
-    assert_eq!(open_history_work, contextdb_engine::persistence::read_persistence_test_scaffold::OpenHistoryWork::default(),
-        "the larger fixture time declaration funds current schema, never history walks");
+    println!(
+        "OVERSIZED_SCHEMA_FILE_OPEN tables={oversized_schema_table_count} padding_tables={PADDING_TABLES} padding_default_bytes={} history_work={open_history_work:?}",
+        PADDING_TABLES * DEFAULT_BYTES
+    );
+    assert_eq!(
+        open_history_work,
+        contextdb_engine::persistence::read_persistence_test_scaffold::OpenHistoryWork::default(),
+        "the larger fixture time declaration funds current schema, never history walks"
+    );
     assert_eq!(file.route(), contextdb_core::read_contract::ReadRoute::File);
     support::assert_cg_artifact_queries(|sql, p| file.execute(sql, p).unwrap().rows, 0x90000);
 }

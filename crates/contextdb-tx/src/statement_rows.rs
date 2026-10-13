@@ -2194,7 +2194,9 @@ impl NativeStatementRoot {
     ) -> Result<NativeImage<Self>> {
         use crate::staged_source::{Entry, FundedArc, insert, remove_by};
         if row.sequence() >= self.next_sequence {
-            return Err(contextdb_core::Error::Other("exact statement sequence mismatch".into()));
+            return Err(contextdb_core::Error::Other(
+                "exact statement sequence mismatch".into(),
+            ));
         }
         let next_sequence = self.next_sequence;
         let id = row.row().row_id;
@@ -2275,29 +2277,44 @@ impl NativeStatementRoot {
 }
 
 impl NativeEagerRow {
-    pub(crate) fn prepare_exact_cell(cell: &crate::staged_source::RowCellHandle,
+    pub(crate) fn prepare_exact_cell(
+        cell: &crate::staged_source::RowCellHandle,
         funder: &crate::staged_source::SourceFunder,
     ) -> Result<Self> {
         let custody = cell.custody.lock();
-        let Some(crate::staged_source::RowCustody::Sealed { row, .. }) = custody.as_ref()
-            else { return Err(contextdb_core::Error::Other("unsealed native exact cell".into())); };
+        let Some(crate::staged_source::RowCustody::Sealed { row, .. }) = custody.as_ref() else {
+            return Err(contextdb_core::Error::Other(
+                "unsealed native exact cell".into(),
+            ));
+        };
         let original = funder.copy_eager_row(row)?;
-        let control = crate::staged_source::FundedArc::<NativeEagerRowBody>::prepare(funder.clone())?;
+        let control =
+            crate::staged_source::FundedArc::<NativeEagerRowBody>::prepare(funder.clone())?;
         let mut keys = crate::staged_source::SourceBuffer::with_capacity(cell.keys.len(), funder)?;
         for (name, key) in cell.keys.as_slice() {
             keys.push((name.clone(), funder.copy_key(&key.position.0)?));
         }
-        Ok(Self(crate::staged_source::FundedArc::from_prepared(NativeEagerRowBody {
-            original, sequence: cell.identity.sequence, keys,
-            schema: cell.identity.schema.clone(),
-        }, control)))
+        Ok(Self(crate::staged_source::FundedArc::from_prepared(
+            NativeEagerRowBody {
+                original,
+                sequence: cell.identity.sequence,
+                keys,
+                schema: cell.identity.schema.clone(),
+            },
+            control,
+        )))
     }
 }
 
 impl NativeEagerRow {
-    pub(crate) fn validate_exact_funder(&self, funder: &crate::staged_source::SourceFunder) -> Result<()> {
+    pub(crate) fn validate_exact_funder(
+        &self,
+        funder: &crate::staged_source::SourceFunder,
+    ) -> Result<()> {
         if !self.0.is_funded_by(funder) {
-            return Err(contextdb_core::Error::Other("native exact row control funding mismatch".into()));
+            return Err(contextdb_core::Error::Other(
+                "native exact row control funding mismatch".into(),
+            ));
         }
         self.0.original.validate_exact_funder(funder)
     }
@@ -2305,16 +2322,21 @@ impl NativeEagerRow {
 
 impl NativeEagerRow {
     pub(crate) fn copy_original_row_for(
-        &self, funder: &crate::staged_source::SourceFunder,
+        &self,
+        funder: &crate::staged_source::SourceFunder,
     ) -> Result<crate::staged_source::AdmittedSourceRow> {
         self.validate_exact_funder(funder)?;
-        self.0.original.original_copy.copy_original_row_for(self.row(), funder)
+        self.0
+            .original
+            .original_copy
+            .copy_original_row_for(self.row(), funder)
     }
 }
 
 impl NativeEagerRow {
     pub(crate) fn copy_original_vector_input_for(
-        &self, input: crate::staged_source::BorrowedOriginalVectorCopyInput<'_>,
+        &self,
+        input: crate::staged_source::BorrowedOriginalVectorCopyInput<'_>,
         funder: &crate::staged_source::SourceFunder,
     ) -> Result<crate::staged_source::AdmittedEagerSourceVector> {
         self.validate_exact_funder(funder)?;
@@ -2322,35 +2344,49 @@ impl NativeEagerRow {
             || self.row().created_tx != input.created_tx()
             || self.row().deleted_tx != input.deleted_tx()
             || self.row().lsn != input.lsn()
-            || !self.schema().layout().iter().any(|(column, kind)|
+            || !self.schema().layout().iter().any(|(column, kind)| {
                 column.as_str() == input.column()
                     && matches!(kind, contextdb_core::ColumnType::Vector(dimension)
-                        if *dimension == input.vector().len()))
-        { return Err(crate::ordered_staged::exact_native_error()); }
-        self.0.original.original_copy.copy_original_eager_vector_input_for(input, funder)
+                        if *dimension == input.vector().len())
+            })
+        {
+            return Err(crate::ordered_staged::exact_native_error());
+        }
+        self.0
+            .original
+            .original_copy
+            .copy_original_eager_vector_input_for(input, funder)
     }
 }
 
-
 impl NativeEagerRow {
     pub(crate) fn copy_changed_original_row_for(
-        &self, expected: &VersionedRow, replacement: &VersionedRow,
+        &self,
+        expected: &VersionedRow,
+        replacement: &VersionedRow,
         funder: &crate::staged_source::SourceFunder,
     ) -> Result<crate::staged_source::AdmittedSourceRow> {
         self.validate_exact_funder(funder)?;
         if !crate::staged_source::changed_original_rows_identical(self.row(), expected) {
             return Err(crate::ordered_staged::exact_native_error());
         }
-        self.0.original.original_copy.copy_original_row_for(replacement, funder)
+        self.0
+            .original
+            .original_copy
+            .copy_original_row_for(replacement, funder)
     }
 
     pub(crate) fn copy_changed_original_eager_row_for(
-        &self, expected: &VersionedRow, replacement: &VersionedRow,
+        &self,
+        expected: &VersionedRow,
+        replacement: &VersionedRow,
         funder: &crate::staged_source::SourceFunder,
     ) -> Result<crate::staged_source::AdmittedEagerSourceRow> {
         let copied = self.copy_changed_original_row_for(expected, replacement, funder)?;
         Ok(crate::staged_source::AdmittedEagerSourceRow::new(
-            copied.row, copied.invoice, self.0.original.original_copy.clone(),
+            copied.row,
+            copied.invoice,
+            self.0.original.original_copy.clone(),
         ))
     }
 
@@ -2363,15 +2399,20 @@ impl NativeEagerRow {
         if !cell.identity.matches_row(&original.row) {
             return Err(crate::ordered_staged::exact_native_error());
         }
-        let control = crate::staged_source::FundedArc::<NativeEagerRowBody>::prepare(funder.clone())?;
+        let control =
+            crate::staged_source::FundedArc::<NativeEagerRowBody>::prepare(funder.clone())?;
         let mut keys = crate::staged_source::SourceBuffer::with_capacity(cell.keys.len(), funder)?;
         for (name, key) in cell.keys.as_slice() {
             keys.push((name.clone(), funder.copy_key(&key.position.0)?));
         }
-        Ok(Self(crate::staged_source::FundedArc::from_prepared(NativeEagerRowBody {
-            original, sequence: cell.identity.sequence, keys,
-            schema: cell.identity.schema.clone(),
-        }, control)))
+        Ok(Self(crate::staged_source::FundedArc::from_prepared(
+            NativeEagerRowBody {
+                original,
+                sequence: cell.identity.sequence,
+                keys,
+                schema: cell.identity.schema.clone(),
+            },
+            control,
+        )))
     }
 }
-

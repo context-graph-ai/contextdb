@@ -118,10 +118,14 @@ fn reopen_crash_child() {
     let db = Arc::new(open_writable(std::path::Path::new(&path), "child creation"));
     declare(&db);
     insert_route(&db, alpha(), 0xA000, 0);
-    let pause = db.__arm_one_shot_vector_maintenance_preparation_pause_for_test(&alpha_route(), phase);
+    let pause =
+        db.__arm_one_shot_vector_maintenance_preparation_pause_for_test(&alpha_route(), phase);
     let worker_db = Arc::clone(&db);
     let worker = std::thread::spawn(move || worker_db.run_maintenance_cycle());
-    if pause.wait_until_reached_timeout(Duration::from_secs(120)).is_ok() {
+    if pause
+        .wait_until_reached_timeout(Duration::from_secs(120))
+        .is_ok()
+    {
         println!("{CRASH_MARKER}");
         std::process::abort();
     }
@@ -169,7 +173,10 @@ fn a_crash_inside_a_maintenance_build_leaves_a_store_that_reopens_for_writing() 
             panic!("a read session opens a store crashed at {phase:?}: {error:?}")
         });
     }
-    assert!(crashes > 0, "at least one build phase after the construction floor is reached");
+    assert!(
+        crashes > 0,
+        "at least one build phase after the construction floor is reached"
+    );
 }
 
 #[test]

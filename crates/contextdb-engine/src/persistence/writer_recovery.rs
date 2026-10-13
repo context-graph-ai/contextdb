@@ -239,103 +239,124 @@ impl RedbPersistence {
         let SourceWindowOwner::Write(accountant, _) = &owner else {
             unreachable!("internal writer retention owner")
         };
-        let memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget> = accountant.read_budget()?;
+        let memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget> =
+            accountant.read_budget()?;
         graph_read::with_pages(memory, || {
-        let _controls = owner.reserve(
-            2 * std::mem::size_of::<redb::ReadOnlyTable<&[u8], &[u8]>>()
-                + std::mem::size_of::<redb::Range<'_, &[u8], &[u8]>>()
-                + 2 * std::mem::size_of::<redb::AccessGuard<'_, &[u8]>>(),
-            "graph_retirement_probe",
-        )?;
-        let read = root.owner_read()?;
-        let lifecycle = read
-            .open_table(graph_history_record::GRAPH_PREDECESSOR_LIFECYCLE)
-            .map_err(Self::storage_error)?;
-        // This captured-root filter deliberately over-retains. The writer
-        // separately checks final net R before any commit-directory mutation.
-        // With a retained witness there is no inverse public-LSN index that
-        // would authorize retiring any existing nonzero support entry.
-        if lifecycle.first().map_err(Self::storage_error)?.is_some() {
-            return Ok(Vec::new());
-        }
-        let contributions = read
-            .open_table(graph_history_record::GRAPH_CONTRIBUTIONS)
-            .map_err(Self::storage_error)?;
-        let counts = read
-            .open_table(writer_history::CHANGE_LOG_LSN_COUNT)
-            .map_err(Self::storage_error)?;
-        let mut floor = None;
-        for entry in counts.iter().map_err(Self::storage_error)? {
-            let (lsn, count) = entry.map_err(Self::storage_error)?;
-            #[cfg(feature = "test-seams")]
-            crate::database::resident_history_test_seams::note(|work| work.log_keys_examined += 1);
-            let lsn = Lsn(lsn.value());
-            if count.value() > removed.get(&lsn).copied().unwrap_or(0) {
-                floor = Some(lsn);
-                break;
+            let _controls = owner.reserve(
+                2 * std::mem::size_of::<redb::ReadOnlyTable<&[u8], &[u8]>>()
+                    + std::mem::size_of::<redb::Range<'_, &[u8], &[u8]>>()
+                    + 2 * std::mem::size_of::<redb::AccessGuard<'_, &[u8]>>(),
+                "graph_retirement_probe",
+            )?;
+            let read = root.owner_read()?;
+            let lifecycle = read
+                .open_table(graph_history_record::GRAPH_PREDECESSOR_LIFECYCLE)
+                .map_err(Self::storage_error)?;
+            // This captured-root filter deliberately over-retains. The writer
+            // separately checks final net R before any commit-directory mutation.
+            // With a retained witness there is no inverse public-LSN index that
+            // would authorize retiring any existing nonzero support entry.
+            if lifecycle.first().map_err(Self::storage_error)?.is_some() {
+                return Ok(Vec::new());
             }
-        }
-        let anchor = floor_probe(
-            floor.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded),
-        )?
-            .map(|(lsn, _)| lsn);
-        let mut candidates = Vec::new();
-        for lsn in affected {
-            #[cfg(feature = "test-seams")]
-            crate::database::resident_history_test_seams::note(|work| work.log_keys_examined += 1);
-            if Some(*lsn) != anchor
-                && root.change_log_occurrences(*lsn)? <= removed.get(lsn).copied().unwrap_or(0)
-            {
-                if lsn.0 == 0 {
-                    continue;
+            let contributions = read
+                .open_table(graph_history_record::GRAPH_CONTRIBUTIONS)
+                .map_err(Self::storage_error)?;
+            let counts = read
+                .open_table(writer_history::CHANGE_LOG_LSN_COUNT)
+                .map_err(Self::storage_error)?;
+            let mut floor = None;
+            for entry in counts.iter().map_err(Self::storage_error)? {
+                let (lsn, count) = entry.map_err(Self::storage_error)?;
+                #[cfg(feature = "test-seams")]
+                crate::database::resident_history_test_seams::note(|work| {
+                    work.log_keys_examined += 1
+                });
+                let lsn = Lsn(lsn.value());
+                if count.value() > removed.get(&lsn).copied().unwrap_or(0) {
+                    floor = Some(lsn);
+                    break;
                 }
-                let _prefix = owner.reserve(
-                    9 + std::mem::size_of::<redb::Range<'_, &[u8], &[u8]>>()
-                        + 2 * std::mem::size_of::<redb::AccessGuard<'_, &[u8]>>(),
-                    "graph_creation_probe",
-                )?;
-                let mut prefix = [0; 9];
-                prefix[0] = 1;
-                prefix[1..].copy_from_slice(&lsn.0.to_be_bytes());
-                // R is empty, so a valid publication has no witnessed deletion
-                // contributions. Still inspect tags instead of treating a
-                // physical deletion prefix as public commit membership.
-                #[cfg(any(test, feature = "test-seams"))]
-                crate::read_work_probe::note_graph("graph_contribution", "range", &prefix, Some(contextdb_core::Lsn(lsn.0)), Some("commit_reclamation_candidate"));
-                let mut entries = contributions
-                    .range(prefix.as_slice()..)
-                    .map_err(Self::storage_error)?.inspect(|_entry| { #[cfg(any(test, feature = "test-seams"))] if let Ok((key, _)) = _entry { crate::read_work_probe::graph_storage_key("graph_contribution", "iteration_step", key.value()); } });
-                let mut has_creation = false;
-                if let Some(entry) = entries.next() {
-                    let (key, _) = entry.map_err(Self::storage_error)?;
-                    let key = key.value();
-                    if !key.starts_with(&prefix) {
-                        candidates.push(*lsn);
+            }
+            let anchor =
+                floor_probe(floor.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded))?
+                    .map(|(lsn, _)| lsn);
+            let mut candidates = Vec::new();
+            for lsn in affected {
+                #[cfg(feature = "test-seams")]
+                crate::database::resident_history_test_seams::note(|work| {
+                    work.log_keys_examined += 1
+                });
+                if Some(*lsn) != anchor
+                    && root.change_log_occurrences(*lsn)? <= removed.get(lsn).copied().unwrap_or(0)
+                {
+                    if lsn.0 == 0 {
                         continue;
                     }
-                    if key.len() < 18 || !matches!(key[17], 0 | 1) {
-                        return Err(Error::StoreCorrupted {
-                            path: "graph_contributions_v1".into(),
-                            reason: "invalid graph contribution key".into(),
+                    let _prefix = owner.reserve(
+                        9 + std::mem::size_of::<redb::Range<'_, &[u8], &[u8]>>()
+                            + 2 * std::mem::size_of::<redb::AccessGuard<'_, &[u8]>>(),
+                        "graph_creation_probe",
+                    )?;
+                    let mut prefix = [0; 9];
+                    prefix[0] = 1;
+                    prefix[1..].copy_from_slice(&lsn.0.to_be_bytes());
+                    // R is empty, so a valid publication has no witnessed deletion
+                    // contributions. Still inspect tags instead of treating a
+                    // physical deletion prefix as public commit membership.
+                    #[cfg(any(test, feature = "test-seams"))]
+                    crate::read_work_probe::note_graph(
+                        "graph_contribution",
+                        "range",
+                        &prefix,
+                        Some(contextdb_core::Lsn(lsn.0)),
+                        Some("commit_reclamation_candidate"),
+                    );
+                    let mut entries = contributions
+                        .range(prefix.as_slice()..)
+                        .map_err(Self::storage_error)?
+                        .inspect(|_entry| {
+                            #[cfg(any(test, feature = "test-seams"))]
+                            if let Ok((key, _)) = _entry {
+                                crate::read_work_probe::graph_storage_key(
+                                    "graph_contribution",
+                                    "iteration_step",
+                                    key.value(),
+                                );
+                            }
                         });
+                    let mut has_creation = false;
+                    if let Some(entry) = entries.next() {
+                        let (key, _) = entry.map_err(Self::storage_error)?;
+                        let key = key.value();
+                        if !key.starts_with(&prefix) {
+                            candidates.push(*lsn);
+                            continue;
+                        }
+                        if key.len() < 18 || !matches!(key[17], 0 | 1) {
+                            return Err(Error::StoreCorrupted {
+                                path: "graph_contributions_v1".into(),
+                                reason: "invalid graph contribution key".into(),
+                            });
+                        }
+                        if key[17] == 0 {
+                            has_creation = true;
+                        } else {
+                            // A deletion cannot survive without positive-count R.
+                            return Err(Error::StoreCorrupted {
+                                path: "graph_contributions_v1".into(),
+                                reason: "deletion contribution survives empty lifecycle state"
+                                    .into(),
+                            });
+                        }
                     }
-                    if key[17] == 0 {
-                        has_creation = true;
-                    } else {
-                        // A deletion cannot survive without positive-count R.
-                        return Err(Error::StoreCorrupted {
-                            path: "graph_contributions_v1".into(),
-                            reason: "deletion contribution survives empty lifecycle state".into(),
-                        });
+                    if has_creation {
+                        continue;
                     }
+                    candidates.push(*lsn);
                 }
-                if has_creation {
-                    continue;
-                }
-                candidates.push(*lsn);
             }
-        }
-        Ok(candidates)
+            Ok(candidates)
         })
     }
 
@@ -402,8 +423,9 @@ impl RedbPersistence {
             .transpose()?;
         self.with_db(|db| {
             let write = db.begin_write().map_err(Self::storage_error)?;
-#[cfg(any(test, feature = "test-seams"))]
-let mut graph_publication_attempt = crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write);
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut graph_publication_attempt =
+                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write);
             {
                 let mut table = write
                     .open_table(RECOVERY_TABLE)
@@ -443,10 +465,16 @@ let mut graph_publication_attempt = crate::read_work_probe::GraphPublicationAtte
             graph_observation_checkpoint(34)?;
             #[cfg(any(test, feature = "test-seams"))]
             graph_observation_checkpoint(10)?;
-            { let graph_commit_result = write.commit();
-#[cfg(any(test, feature = "test-seams"))]
-if graph_commit_result.is_ok() { graph_publication_attempt.committed(); graph_observation_checkpoint(11)?; }
-graph_commit_result }.map_err(Self::storage_error)
+            {
+                let graph_commit_result = write.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    graph_publication_attempt.committed();
+                    graph_observation_checkpoint(11)?;
+                }
+                graph_commit_result
+            }
+            .map_err(Self::storage_error)
         })
     }
 
@@ -695,16 +723,26 @@ graph_commit_result }.map_err(Self::storage_error)
 
         let mut roots = [0u8; 130];
         roots[..32].copy_from_slice(
-            &{ let acquired_root = write.table_root_fingerprint(RECOVERY_TABLE); #[cfg(any(test, feature = "test-seams"))] crate::read_work_probe::note_graph_root("recovery", &[], &acquired_root); acquired_root }
-                .map_err(Self::storage_error)?
-                .unwrap_or([0; 32]),
+            &{
+                let acquired_root = write.table_root_fingerprint(RECOVERY_TABLE);
+                #[cfg(any(test, feature = "test-seams"))]
+                crate::read_work_probe::note_graph_root("recovery", &[], &acquired_root);
+                acquired_root
+            }
+            .map_err(Self::storage_error)?
+            .unwrap_or([0; 32]),
         );
         #[cfg(any(test, feature = "test-seams"))]
         graph_observation_checkpoint(19)?;
         roots[32..64].copy_from_slice(
-            &{ let acquired_root = write.table_root_fingerprint(READ_LSN_BOUNDS); #[cfg(any(test, feature = "test-seams"))] crate::read_work_probe::note_graph_root("scoped_bounds", &[], &acquired_root); acquired_root }
-                .map_err(Self::storage_error)?
-                .unwrap_or([0; 32]),
+            &{
+                let acquired_root = write.table_root_fingerprint(READ_LSN_BOUNDS);
+                #[cfg(any(test, feature = "test-seams"))]
+                crate::read_work_probe::note_graph_root("scoped_bounds", &[], &acquired_root);
+                acquired_root
+            }
+            .map_err(Self::storage_error)?
+            .unwrap_or([0; 32]),
         );
         #[cfg(any(test, feature = "test-seams"))]
         graph_observation_checkpoint(20)?;
@@ -717,8 +755,23 @@ graph_commit_result }.map_err(Self::storage_error)
                 5 => graph_history_record::GRAPH_PREDECESSOR_LIFECYCLE,
                 _ => unreachable!("fixed graph table tags"),
             };
-            let acquired = { let acquired_root = write.table_root_fingerprint(table); #[cfg(any(test, feature = "test-seams"))] crate::read_work_probe::note_graph_root(match tag { 1 => "graph_fwd", 2 => "graph_rev", 3 => "graph_contribution", 4 => "graph_location", _ => "graph_lifecycle" }, &[tag], &acquired_root); acquired_root }
-                .map_err(Self::storage_error)?;
+            let acquired = {
+                let acquired_root = write.table_root_fingerprint(table);
+                #[cfg(any(test, feature = "test-seams"))]
+                crate::read_work_probe::note_graph_root(
+                    match tag {
+                        1 => "graph_fwd",
+                        2 => "graph_rev",
+                        3 => "graph_contribution",
+                        4 => "graph_location",
+                        _ => "graph_lifecycle",
+                    },
+                    &[tag],
+                    &acquired_root,
+                );
+                acquired_root
+            }
+            .map_err(Self::storage_error)?;
             #[cfg(any(test, feature = "test-seams"))]
             graph_observation_checkpoint(20 + tag)?;
             Ok(acquired)
@@ -728,16 +781,21 @@ graph_commit_result }.map_err(Self::storage_error)
         let identity_roots = write.table_root_fingerprint(CONTENT_IDENTITY_ROOTS_TABLE);
         #[cfg(any(test, feature = "test-seams"))]
         crate::read_work_probe::note_graph_root(
-            CONTENT_IDENTITY_ROOTS_TABLE.name(), &[], &identity_roots,
+            CONTENT_IDENTITY_ROOTS_TABLE.name(),
+            &[],
+            &identity_roots,
         );
         roots[97..129].copy_from_slice(
-            &identity_roots.map_err(Self::storage_error)?.unwrap_or([0; 32]),
+            &identity_roots
+                .map_err(Self::storage_error)?
+                .unwrap_or([0; 32]),
         );
         roots[129] = 1;
         let mut metadata = write
             .open_table(CONTENT_IDENTITY_METADATA_TABLE)
             .map_err(Self::storage_error)?;
-        if metadata.get(observed_graph_key!("metadata", "get", READ_BOUNDS_ROOT_KEY))
+        if metadata
+            .get(observed_graph_key!("metadata", "get", READ_BOUNDS_ROOT_KEY))
             .map_err(Self::storage_error)?
             .is_none_or(|existing| existing.value() != roots)
         {
@@ -771,7 +829,8 @@ graph_commit_result }.map_err(Self::storage_error)
         let metadata = read
             .open_table(CONTENT_IDENTITY_METADATA_TABLE)
             .map_err(Self::storage_error)?;
-        let expected = metadata.get(observed_graph_key!("metadata", "get", READ_BOUNDS_ROOT_KEY))
+        let expected = metadata
+            .get(observed_graph_key!("metadata", "get", READ_BOUNDS_ROOT_KEY))
             .map_err(Self::storage_error)?
             .ok_or_else(|| damage("missing committed read-bounds root binding"))?;
         drop(
@@ -807,14 +866,24 @@ graph_commit_result }.map_err(Self::storage_error)
         crate::read_work_probe::bind_graph_root(read.storage_snapshot_identity());
         let mut roots = [0u8; 130];
         roots[..32].copy_from_slice(
-            &{ let acquired_root = read.table_root_fingerprint(RECOVERY_TABLE); #[cfg(any(test, feature = "test-seams"))] crate::read_work_probe::note_graph_root("recovery", &[], &acquired_root); acquired_root }
-                .map_err(Self::storage_error)?
-                .unwrap_or([0; 32]),
+            &{
+                let acquired_root = read.table_root_fingerprint(RECOVERY_TABLE);
+                #[cfg(any(test, feature = "test-seams"))]
+                crate::read_work_probe::note_graph_root("recovery", &[], &acquired_root);
+                acquired_root
+            }
+            .map_err(Self::storage_error)?
+            .unwrap_or([0; 32]),
         );
         roots[32..64].copy_from_slice(
-            &{ let acquired_root = read.table_root_fingerprint(READ_LSN_BOUNDS); #[cfg(any(test, feature = "test-seams"))] crate::read_work_probe::note_graph_root("scoped_bounds", &[], &acquired_root); acquired_root }
-                .map_err(Self::storage_error)?
-                .unwrap_or([0; 32]),
+            &{
+                let acquired_root = read.table_root_fingerprint(READ_LSN_BOUNDS);
+                #[cfg(any(test, feature = "test-seams"))]
+                crate::read_work_probe::note_graph_root("scoped_bounds", &[], &acquired_root);
+                acquired_root
+            }
+            .map_err(Self::storage_error)?
+            .unwrap_or([0; 32]),
         );
         roots[64..96].copy_from_slice(&Self::graph_roots_digest(|tag| {
             let table = match tag {
@@ -827,20 +896,44 @@ graph_commit_result }.map_err(Self::storage_error)
             };
             #[cfg(any(test, feature = "test-seams"))]
             crate::read_work_probe::bind_graph_root(read.storage_snapshot_identity());
-            { let acquired_root = read.table_root_fingerprint(table); #[cfg(any(test, feature = "test-seams"))] crate::read_work_probe::note_graph_root(match tag { 1 => "graph_fwd", 2 => "graph_rev", 3 => "graph_contribution", 4 => "graph_location", _ => "graph_lifecycle" }, &[tag], &acquired_root); acquired_root }
-                .map_err(Self::storage_error)
+            {
+                let acquired_root = read.table_root_fingerprint(table);
+                #[cfg(any(test, feature = "test-seams"))]
+                crate::read_work_probe::note_graph_root(
+                    match tag {
+                        1 => "graph_fwd",
+                        2 => "graph_rev",
+                        3 => "graph_contribution",
+                        4 => "graph_location",
+                        _ => "graph_lifecycle",
+                    },
+                    &[tag],
+                    &acquired_root,
+                );
+                acquired_root
+            }
+            .map_err(Self::storage_error)
         })?);
         // Named catalog presence is independent of the root header (empty != absent).
-        for definition in [CONTENT_IDENTITY_ROOTS_TABLE.name(), CONTENT_IDENTITY_NODES_TABLE.name()] {
+        for definition in [
+            CONTENT_IDENTITY_ROOTS_TABLE.name(),
+            CONTENT_IDENTITY_NODES_TABLE.name(),
+        ] {
             read.open_untyped_table(redb::TableDefinition::<&[u8], &[u8]>::new(definition))
                 .map_err(Self::storage_error)?;
         }
         roots[96] = 1;
         let identity_roots = read.table_root_fingerprint(CONTENT_IDENTITY_ROOTS_TABLE);
         #[cfg(any(test, feature = "test-seams"))]
-        crate::read_work_probe::note_graph_root(CONTENT_IDENTITY_ROOTS_TABLE.name(), &[], &identity_roots);
+        crate::read_work_probe::note_graph_root(
+            CONTENT_IDENTITY_ROOTS_TABLE.name(),
+            &[],
+            &identity_roots,
+        );
         roots[97..129].copy_from_slice(
-            &identity_roots.map_err(Self::storage_error)?.unwrap_or([0; 32]),
+            &identity_roots
+                .map_err(Self::storage_error)?
+                .unwrap_or([0; 32]),
         );
         roots[129] = 1;
         if expected.value() != roots {
@@ -863,9 +956,14 @@ graph_commit_result }.map_err(Self::storage_error)
     pub(super) fn write_commit_directory_root_in_write(
         write: &redb::WriteTransaction,
     ) -> Result<()> {
-        let root = { let acquired_root = write.table_root_fingerprint(COMMIT_INDEX_TABLE); #[cfg(any(test, feature = "test-seams"))] crate::read_work_probe::note_graph_root("commit_directory", &[], &acquired_root); acquired_root }
-            .map_err(Self::storage_error)?
-            .unwrap_or([0; 32]);
+        let root = {
+            let acquired_root = write.table_root_fingerprint(COMMIT_INDEX_TABLE);
+            #[cfg(any(test, feature = "test-seams"))]
+            crate::read_work_probe::note_graph_root("commit_directory", &[], &acquired_root);
+            acquired_root
+        }
+        .map_err(Self::storage_error)?
+        .unwrap_or([0; 32]);
         let mut table = write
             .open_table(RECOVERY_TABLE)
             .map_err(Self::storage_error)?;
@@ -976,7 +1074,9 @@ graph_commit_result }.map_err(Self::storage_error)
         read: &redb::ReadTransaction,
         stored: WriterRecoveryBounds,
     ) -> Result<(u64, Option<(Lsn, TxId)>, Option<(Lsn, TxId)>)> {
-        let record = read.open_table(RECOVERY_TABLE).map_err(Self::storage_error)?;
+        let record = read
+            .open_table(RECOVERY_TABLE)
+            .map_err(Self::storage_error)?;
         let expected_root = record
             .get(COMMIT_ROOT_KEY)
             .map_err(Self::storage_error)?
@@ -984,9 +1084,14 @@ graph_commit_result }.map_err(Self::storage_error)
                 path: "writer_recovery".into(),
                 reason: "missing authenticated commit directory root".into(),
             })?;
-        let actual_root = { let acquired_root = read.table_root_fingerprint(COMMIT_INDEX_TABLE); #[cfg(any(test, feature = "test-seams"))] crate::read_work_probe::note_graph_root("commit_directory", &[], &acquired_root); acquired_root }
-            .map_err(Self::storage_error)?
-            .unwrap_or([0; 32]);
+        let actual_root = {
+            let acquired_root = read.table_root_fingerprint(COMMIT_INDEX_TABLE);
+            #[cfg(any(test, feature = "test-seams"))]
+            crate::read_work_probe::note_graph_root("commit_directory", &[], &acquired_root);
+            acquired_root
+        }
+        .map_err(Self::storage_error)?
+        .unwrap_or([0; 32]);
         if expected_root.value() != actual_root {
             return Err(Error::StoreCorrupted {
                 path: "writer_recovery".into(),

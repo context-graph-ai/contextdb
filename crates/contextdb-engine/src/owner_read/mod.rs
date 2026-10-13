@@ -30,10 +30,10 @@ mod native_request;
 mod service;
 
 pub use admission::{OwnerAdmission, RequestLease};
-pub(crate) use native_request::NativeReadRequest;
 pub use client::OwnerClient;
 #[cfg(unix)]
 pub use client::OwnerDisconnectHandle;
+pub(crate) use native_request::NativeReadRequest;
 pub use service::{
     ConnectionState, CursorEntry, CursorIdentifierAllocator, OwnerReadResourceSnapshot,
     OwnerReadService, OwnerServiceSpec, ValidatedOwnerListener,

@@ -38,7 +38,8 @@ impl Hub {
                 .map_err(|_| "cannot open vector verifier hub database".to_string())?,
         );
         declare(&db)?;
-        let server = SyncServer::new(db.clone(), &endpoint, TenantId::from(TENANT)).map_err(|e| format!("cannot construct smoke server: {e}"))?;
+        let server = SyncServer::new(db.clone(), &endpoint, TenantId::from(TENANT))
+            .map_err(|e| format!("cannot construct smoke server: {e}"))?;
         let shutdown = Arc::new(AtomicBool::new(false));
         let task = tokio::spawn({
             let shutdown = shutdown.clone();
@@ -90,7 +91,8 @@ fn edge(root: &Path, name: &str, ticket: &str) -> Result<Edge, String> {
         db.clone(),
         &peer_dial_spec(ticket, &directory.join("edge.identity")),
         TenantId::from(TENANT),
-    ).map_err(|e| format!("cannot construct smoke client: {e}"))?;
+    )
+    .map_err(|e| format!("cannot construct smoke client: {e}"))?;
     Ok(Edge { db, client })
 }
 

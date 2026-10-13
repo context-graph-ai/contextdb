@@ -1,8 +1,8 @@
 //! Relational bodies and their private authenticated version membership share
 //! the caller's existing publication transaction.
+use super::writer_source::BorrowedRelationalIndexKey;
 use super::*;
 use content_identity::version_manifest as manifest;
-use super::writer_source::BorrowedRelationalIndexKey;
 
 impl RedbPersistence {
     /// Coalesced postings need an interval subtraction only when another
@@ -64,9 +64,8 @@ impl RedbPersistence {
         mut pending: Option<&mut PendingManifestPublication>,
     ) -> Result<()> {
         #[cfg(any(test, feature = "test-seams"))]
-        let _family_scope = content_identity::enter_passive_family(
-            content_identity::LogicalFamily::ChangeAndDdl,
-        );
+        let _family_scope =
+            content_identity::enter_passive_family(content_identity::LogicalFamily::ChangeAndDdl);
         let mut admission = self.proof_admission();
         admission.admit(
             table
@@ -156,8 +155,10 @@ impl RedbPersistence {
     }
     pub(super) fn relational_manifest_error(&self, error: Error) -> Error {
         match error {
-            Error::MemoryBudgetExceeded { .. } | Error::StoreCorrupted { .. }
-            | Error::ReadCancelled | Error::ReadFailure(_) => error,
+            Error::MemoryBudgetExceeded { .. }
+            | Error::StoreCorrupted { .. }
+            | Error::ReadCancelled
+            | Error::ReadFailure(_) => error,
             other => self.relational_manifest_damage(other),
         }
     }
@@ -309,54 +310,99 @@ impl RetainedReadSource {
     /// Captured-frontier row reading preserves the existing native traversal
     /// and current-row authentication without descending the history manifest.
     pub(super) fn current_relational_group<E: From<Error>>(
-        &self, read: &redb::ReadTransaction, table: &str, meta: &TableMeta,
-        row_id: RowId, snapshot: SnapshotId,
+        &self,
+        read: &redb::ReadTransaction,
+        table: &str,
+        meta: &TableMeta,
+        row_id: RowId,
+        snapshot: SnapshotId,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         before: &mut dyn FnMut() -> std::result::Result<(), E>,
         mut observed: Option<&mut dyn FnMut(&VersionedRow) -> std::result::Result<(), E>>,
-        before_clone: &mut dyn FnMut(crate::read_image_memory::RowReadAdmission<'_>) -> std::result::Result<(), E>,
+        before_clone: &mut dyn FnMut(
+            crate::read_image_memory::RowReadAdmission<'_>,
+        ) -> std::result::Result<(), E>,
         last: &mut Option<[u8; 24]>,
     ) -> std::result::Result<Option<VersionedRow>, E> {
         before()?;
         let _controls = contextdb_core::read_memory::ReadCredit::try_new(
-            read_memory.clone(), std::mem::size_of::<Option<(VersionedRow,
-                Arc<crate::read_image_memory::ImageMemory>)>>()
-                + 2 * (std::mem::size_of::<crate::read_image_memory::ImageMemory>()
+            read_memory.clone(),
+            std::mem::size_of::<Option<(VersionedRow, Arc<crate::read_image_memory::ImageMemory>)>>(
+            ) + 2
+                * (std::mem::size_of::<crate::read_image_memory::ImageMemory>()
                     + 2 * std::mem::size_of::<usize>()),
-            "reader", "current_row_controls", "Raise the declared reader memory limit.").map_err(E::from)?;
-        let _name = contextdb_core::read_memory::ReadCredit::try_new(read_memory.clone(),
-            table.len().checked_add(4).ok_or_else(|| E::from(self.content_identity_corruption("row table name overflow")))?,
-            "reader", "current_row_table", "Raise the declared reader memory limit.").map_err(E::from)?;
+            "reader",
+            "current_row_controls",
+            "Raise the declared reader memory limit.",
+        )
+        .map_err(E::from)?;
+        let _name = contextdb_core::read_memory::ReadCredit::try_new(
+            read_memory.clone(),
+            table.len().checked_add(4).ok_or_else(|| {
+                E::from(self.content_identity_corruption("row table name overflow"))
+            })?,
+            "reader",
+            "current_row_table",
+            "Raise the declared reader memory limit.",
+        )
+        .map_err(E::from)?;
         let name = RedbPersistence::rel_table_name(table);
-        let relation = read.open_table(TableDefinition::<&[u8], &[u8]>::new(&name))
+        let relation = read
+            .open_table(TableDefinition::<&[u8], &[u8]>::new(&name))
             .map_err(|error| E::from(RedbPersistence::relational_table_error(table, error)))?;
         let (low, high) = RedbPersistence::rel_row_key_range(row_id);
-        let mut versions = relation.range(low.as_slice()..high.as_slice())
-            .map_err(|error| RedbPersistence::relational_storage_error(table, error)).map_err(E::from)?;
+        let mut versions = relation
+            .range(low.as_slice()..high.as_slice())
+            .map_err(|error| RedbPersistence::relational_storage_error(table, error))
+            .map_err(E::from)?;
         let enumerate = observed.is_some();
         let mut selected = None;
         loop {
             before()?;
-            let entry = if enumerate { versions.next() } else { versions.next_back() };
-            let Some((key, body)) = entry.transpose().map_err(|error| RedbPersistence::relational_storage_error(table, error)).map_err(E::from)? else { break; };
-            let identity: [u8; 24] = key.value().try_into().map_err(|_| E::from(
-                self.content_identity_corruption("current row key has invalid width")))?;
+            let entry = if enumerate {
+                versions.next()
+            } else {
+                versions.next_back()
+            };
+            let Some((key, body)) = entry
+                .transpose()
+                .map_err(|error| RedbPersistence::relational_storage_error(table, error))
+                .map_err(E::from)?
+            else {
+                break;
+            };
+            let identity: [u8; 24] = key.value().try_into().map_err(|_| {
+                E::from(self.content_identity_corruption("current row key has invalid width"))
+            })?;
             let memory = crate::read_image_memory::ImageMemory::charging_reader(
-                self._source_memory.memory.accountant.clone(), read_memory.clone());
+                self._source_memory.memory.accountant.clone(),
+                read_memory.clone(),
+            );
             before()?;
-            let row = memory.scope(|| RedbPersistence::decode_relational_source_row(table, meta, body.value()))
+            let row = memory
+                .scope(|| RedbPersistence::decode_relational_source_row(table, meta, body.value()))
                 .map_err(E::from)?;
-            self.authenticate_relational_physical_key(table, &identity, &row).map_err(E::from)?;
+            self.authenticate_relational_physical_key(table, &identity, &row)
+                .map_err(E::from)?;
             *last = Some(identity);
-            if let Some(callback) = observed.as_deref_mut() { callback(&row)?; }
+            if let Some(callback) = observed.as_deref_mut() {
+                callback(&row)?;
+            }
             if row.created_tx.0 <= snapshot.0 {
                 selected = Some((row, memory));
-                if !enumerate { break; }
+                if !enumerate {
+                    break;
+                }
             }
         }
-        let Some((row, memory)) = selected else { return Ok(None); };
+        let Some((row, memory)) = selected else {
+            return Ok(None);
+        };
         before()?;
-        if !self.authenticate_relational_row(table, meta, &row).map_err(E::from)? {
+        if !self
+            .authenticate_relational_row(table, meta, &row)
+            .map_err(E::from)?
+        {
             return Ok(None);
         }
         before_clone(crate::read_image_memory::RowReadAdmission::Move(&memory))?;
@@ -375,25 +421,52 @@ impl RetainedReadSource {
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), E>,
         observed: Option<&mut dyn FnMut(&VersionedRow) -> std::result::Result<(), E>>,
-        before_clone: &mut dyn FnMut(crate::read_image_memory::RowReadAdmission<'_>) -> std::result::Result<(), E>,
+        before_clone: &mut dyn FnMut(
+            crate::read_image_memory::RowReadAdmission<'_>,
+        ) -> std::result::Result<(), E>,
         last_proved: &mut Option<[u8; 24]>,
     ) -> std::result::Result<Option<VersionedRow>, E>
     where
         E: From<Error>,
     {
         let witness_names = crate::read_image_memory::ImageMemory::charging_reader(
-            self._source_memory.memory.accountant.clone(), read_memory.clone(),
+            self._source_memory.memory.accountant.clone(),
+            read_memory.clone(),
         );
-        witness_names.reserve(table.len().saturating_add(64)).map_err(E::from)?;
-        self.verify_history_root_in_read(read, &RedbPersistence::rel_table_name(table)).map_err(E::from)?;
+        witness_names
+            .reserve(table.len().saturating_add(64))
+            .map_err(E::from)?;
+        self.verify_history_root_in_read(read, &RedbPersistence::rel_table_name(table))
+            .map_err(E::from)?;
         // Public CURRENT keeps its existing projection path; addressed private
         // doors call the complete group reconciler explicitly below.
         if exact_lsn.is_none() && snapshot == self.logical_frontier {
-            return self.current_relational_group(read, table, meta, row_id, snapshot,
-                read_memory, before_touch, observed, before_clone, last_proved);
+            return self.current_relational_group(
+                read,
+                table,
+                meta,
+                row_id,
+                snapshot,
+                read_memory,
+                before_touch,
+                observed,
+                before_clone,
+                last_proved,
+            );
         }
-        self.reconcile_addressed_relational_group(read, table, meta, row_id, snapshot,
-            exact_lsn, read_memory, before_touch, observed, before_clone, last_proved)
+        self.reconcile_addressed_relational_group(
+            read,
+            table,
+            meta,
+            row_id,
+            snapshot,
+            exact_lsn,
+            read_memory,
+            before_touch,
+            observed,
+            before_clone,
+            last_proved,
+        )
     }
 
     pub(super) fn reconcile_addressed_relational_group<E>(
@@ -407,7 +480,9 @@ impl RetainedReadSource {
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), E>,
         mut observed: Option<&mut dyn FnMut(&VersionedRow) -> std::result::Result<(), E>>,
-        before_clone: &mut dyn FnMut(crate::read_image_memory::RowReadAdmission<'_>) -> std::result::Result<(), E>,
+        before_clone: &mut dyn FnMut(
+            crate::read_image_memory::RowReadAdmission<'_>,
+        ) -> std::result::Result<(), E>,
         last_proved: &mut Option<[u8; 24]>,
     ) -> std::result::Result<Option<VersionedRow>, E>
     where
@@ -455,9 +530,13 @@ impl RetainedReadSource {
         .map_err(E::from)?;
         credit
             .try_grow_for(
-                72usize.checked_add(table.len()).and_then(|bytes| bytes.checked_mul(3))
+                72usize
+                    .checked_add(table.len())
+                    .and_then(|bytes| bytes.checked_mul(3))
                     .and_then(|bytes| bytes.checked_add(table.len().checked_add(4)?))
-                    .ok_or_else(|| E::from(self.content_identity_corruption("version key length overflow")))?,
+                    .ok_or_else(|| {
+                        E::from(self.content_identity_corruption("version key length overflow"))
+                    })?,
                 "reader",
                 "version_group_bounds",
                 "Raise the declared reader memory limit.",
@@ -467,7 +546,9 @@ impl RetainedReadSource {
             manifest::prefix_with_checkpoint(table, checkpoint)
         })?;
         prefix.extend_from_slice(&row_id.0.to_be_bytes());
-        let name = content_identity::checkpoint_operation(before_touch, |checkpoint| manifest::relation_name_with_checkpoint(table, checkpoint))?;
+        let name = content_identity::checkpoint_operation(before_touch, |checkpoint| {
+            manifest::relation_name_with_checkpoint(table, checkpoint)
+        })?;
         let definition: TableDefinition<&[u8], &[u8]> = TableDefinition::new(name.as_str());
         let relation = read.open_table(definition).map_err(|error| {
             E::from(match error {
@@ -583,10 +664,9 @@ impl RetainedReadSource {
                 ));
                 self.authenticate_version_bounds(table, lsn, created, witness.deleted_tx)
                     .map_err(E::from)?;
-                let eligible = exact_lsn.map_or(
-                    created.0 <= snapshot.0,
-                    |wanted| wanted == lsn && selected.is_none(),
-                );
+                let eligible = exact_lsn.map_or(created.0 <= snapshot.0, |wanted| {
+                    wanted == lsn && selected.is_none()
+                });
                 if eligible {
                     let decode_controls = contextdb_core::read_memory::ReadCredit::try_new(
                         read_memory.clone(),
@@ -672,7 +752,9 @@ impl RetainedReadSource {
             }
         }
         *last_proved = previous_identity;
-        if let Some((row, memory, _decode_controls)) = selected.filter(|(row, _, _)| exact_lsn.is_some() || row.visible_at(snapshot)) {
+        if let Some((row, memory, _decode_controls)) =
+            selected.filter(|(row, _, _)| exact_lsn.is_some() || row.visible_at(snapshot))
+        {
             if previous_identity
                 == Some(
                     RedbPersistence::rel_row_key_from_parts(row.row_id, row.created_tx, row.lsn)
@@ -752,7 +834,9 @@ impl CheckpointReadSource {
             .read
             .open_table(definition)
             .map_err(|error| RedbPersistence::relational_table_error(table, error))?;
-        let mut physical = relation.iter().map_err(|error| RedbPersistence::relational_storage_error(table, error))?;
+        let mut physical = relation
+            .iter()
+            .map_err(|error| RedbPersistence::relational_storage_error(table, error))?;
         let owner = ReadHistoryProofOwner::new(read_memory.clone())?;
         let proof = content_identity::ProofMemory::growable(0, owner.clone());
         let mut previous = None::<[u8; 24]>;
@@ -858,18 +942,29 @@ impl RedbPersistence {
     /// The mutation owns this collection until the same transaction finishes.
     /// Its decoder and vector slots reserve against the existing writer owner.
     pub(super) fn collect_relational_rows_in_write(
-        &self, write: &redb::WriteTransaction, table: &str,
+        &self,
+        write: &redb::WriteTransaction,
+        table: &str,
         memory: &Arc<crate::read_image_memory::ImageMemory>,
     ) -> Result<Vec<VersionedRow>> {
         memory.scope(|| {
-            memory.reserve(table.len().checked_add(4)
-                .ok_or_else(|| self.relational_manifest_damage("table name overflow"))?)?;
+            memory.reserve(
+                table
+                    .len()
+                    .checked_add(4)
+                    .ok_or_else(|| self.relational_manifest_damage("table name overflow"))?,
+            )?;
             let name = Self::rel_table_name(table);
             let definition: TableDefinition<&[u8], &[u8]> = TableDefinition::new(&name);
             let relation = write.open_table(definition).map_err(Self::storage_error)?;
             let mut bounds = self.proof_admission();
-            bounds.admit(table.len().checked_add(72).and_then(|n| n.checked_mul(2))
-                .ok_or_else(|| self.relational_manifest_damage("collection bound overflow"))?)?;
+            bounds.admit(
+                table
+                    .len()
+                    .checked_add(72)
+                    .and_then(|n| n.checked_mul(2))
+                    .ok_or_else(|| self.relational_manifest_damage("collection bound overflow"))?,
+            )?;
             let prefix = manifest::manifest_prefix(table)?;
             let mut after = prefix.clone();
             let mut exclusive = false;
@@ -880,30 +975,49 @@ impl RedbPersistence {
                 let next = manifest::writer_manifest_next(write, &after, exclusive, &mut proof)
                     .map_err(|e| self.relational_manifest_error(e))?;
                 let Some(coordinate) = next.filter(|key| key.starts_with(&prefix)) else {
-                    if physical.next().transpose().map_err(Self::storage_error)?.is_some() {
-                        return Err(self.relational_manifest_damage("unwitnessed mutation row suffix"));
+                    if physical
+                        .next()
+                        .transpose()
+                        .map_err(Self::storage_error)?
+                        .is_some()
+                    {
+                        return Err(
+                            self.relational_manifest_damage("unwitnessed mutation row suffix")
+                        );
                     }
                     return Ok(rows);
                 };
                 let witness = manifest::parse_manifest(&coordinate)
                     .map_err(|e| self.relational_manifest_error(e))?;
-                let Some((key, body)) = physical.next().transpose().map_err(Self::storage_error)? else {
+                let Some((key, body)) = physical.next().transpose().map_err(Self::storage_error)?
+                else {
                     return Err(self.relational_manifest_damage("mutation row member is missing"));
                 };
                 if key.value() != witness.identity {
-                    return Err(self.relational_manifest_damage("mutation row membership order differs"));
+                    return Err(
+                        self.relational_manifest_damage("mutation row membership order differs")
+                    );
                 }
-                let actual = manifest::manifest_for_body(table, key.value(), body.value(), &mut proof)
-                    .map_err(|e| self.relational_manifest_error(e))?;
+                let actual =
+                    manifest::manifest_for_body(table, key.value(), body.value(), &mut proof)
+                        .map_err(|e| self.relational_manifest_error(e))?;
                 if actual != coordinate {
                     return Err(self.relational_manifest_damage("mutation row body differs"));
                 }
                 if rows.len() == rows.capacity() {
                     let old_capacity = rows.capacity();
-                    let capacity = old_capacity.checked_mul(2).map(|n| n.max(4))
-                        .ok_or_else(|| self.relational_manifest_damage("collection capacity overflow"))?;
-                    let bytes = capacity.checked_mul(std::mem::size_of::<VersionedRow>())
-                        .ok_or_else(|| self.relational_manifest_damage("collection layout overflow"))?;
+                    let capacity =
+                        old_capacity
+                            .checked_mul(2)
+                            .map(|n| n.max(4))
+                            .ok_or_else(|| {
+                                self.relational_manifest_damage("collection capacity overflow")
+                            })?;
+                    let bytes = capacity
+                        .checked_mul(std::mem::size_of::<VersionedRow>())
+                        .ok_or_else(|| {
+                            self.relational_manifest_damage("collection layout overflow")
+                        })?;
                     memory.reserve(bytes)?;
                     rows.try_reserve_exact(capacity - rows.len())
                         .map_err(|e| Error::Other(format!("row collection allocation: {e}")))?;
@@ -1007,148 +1121,349 @@ impl RedbPersistence {
     }
 }
 
-
 impl RetainedReadSource {
     pub(crate) fn historical_index_preflight<E: From<Error>>(
-        &self, table: &str, meta: &TableMeta, declaration: &IndexDecl,
+        &self,
+        table: &str,
+        meta: &TableMeta,
+        declaration: &IndexDecl,
         snapshot: SnapshotId,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         before: &mut dyn FnMut() -> std::result::Result<(), E>,
     ) -> std::result::Result<(), E> {
-        if snapshot == self.logical_frontier { return Ok(()); }
+        if snapshot == self.logical_frontier {
+            return Ok(());
+        }
         let mut refused = None;
-        let result = self.historical_index_preflight_core(table, meta, declaration, snapshot,
-            read_memory, &mut || before().map_err(|error| { refused = Some(error); Error::ReadCancelled }));
-        match refused { Some(error) => Err(error), None => result.map_err(E::from) }
+        let result = self.historical_index_preflight_core(
+            table,
+            meta,
+            declaration,
+            snapshot,
+            read_memory,
+            &mut || {
+                before().map_err(|error| {
+                    refused = Some(error);
+                    Error::ReadCancelled
+                })
+            },
+        );
+        match refused {
+            Some(error) => Err(error),
+            None => result.map_err(E::from),
+        }
     }
 
     fn historical_index_preflight_core(
-        &self, table: &str, meta: &TableMeta, declaration: &IndexDecl,
+        &self,
+        table: &str,
+        meta: &TableMeta,
+        declaration: &IndexDecl,
         snapshot: SnapshotId,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         before: &mut dyn FnMut() -> Result<()>,
     ) -> Result<()> {
         if snapshot.0 > self.logical_frontier.0 {
-            return Err(Error::Other("index snapshot exceeds captured frontier".into()));
+            return Err(Error::Other(
+                "index snapshot exceeds captured frontier".into(),
+            ));
         }
         let memory = crate::read_image_memory::ImageMemory::charging_reader(
-            self._source_memory.memory.accountant.clone(), read_memory.clone());
-        let _state = contextdb_core::read_memory::ReadCredit::try_new(read_memory.clone(),
-            std::mem::size_of::<(u64, u64, contextdb_relational::mem::BoundedPhysicalCursor, Option<Vec<u8>>)>(),
-            "reader", "index_preflight_controls", "Raise the declared reader memory limit.")?;
-        graph_read::with_pages(read_memory.clone(), || memory.scope(|| {
-            before()?;
-            let read = self.begin_read()?;
-            // The existing name codec emits twelve ASCII prefix bytes and
-            // sixty-four hex bytes; its hasher is fixed stack scratch.
-            memory.reserve(76usize.checked_add(std::mem::size_of::<blake3::Hasher>())
-                .ok_or_else(|| self.content_identity_corruption("index table name overflow"))?)?;
-            let name = RedbPersistence::relational_index_table_name(table, &declaration.name);
-            let index = read.open_table(TableDefinition::<BorrowedRelationalIndexKey, &[u8]>::new(&name))
-                .map_err(|error| RedbPersistence::relational_table_error(table, error))?;
-            let mut rows = contextdb_relational::mem::BoundedPhysicalCursor::default();
-            let mut expected = 0u64;
-            loop {
-                let mut row_credit = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
-                let row = self.bounded_relational_physical_next_admitted(table, meta, snapshot, &mut rows,
-                    before, &mut |_| Ok(()), &mut |admission: crate::read_image_memory::RowReadAdmission<'_>| admission.retain_into(&mut row_credit,
-                        "reader", "index_preflight_row", "Raise the declared reader memory limit."), read_memory.clone())?;
-                let Some(row) = row else { break; };
+            self._source_memory.memory.accountant.clone(),
+            read_memory.clone(),
+        );
+        let _state = contextdb_core::read_memory::ReadCredit::try_new(
+            read_memory.clone(),
+            std::mem::size_of::<(
+                u64,
+                u64,
+                contextdb_relational::mem::BoundedPhysicalCursor,
+                Option<Vec<u8>>,
+            )>(),
+            "reader",
+            "index_preflight_controls",
+            "Raise the declared reader memory limit.",
+        )?;
+        graph_read::with_pages(read_memory.clone(), || {
+            memory.scope(|| {
                 before()?;
-                let endpoint_memory = crate::read_image_memory::ImageMemory::charging_reader(
-                    self._source_memory.memory.accountant.clone(), read_memory.clone());
-                let low = DurableRelationalIndexKey(admitted_relational_row_index_endpoint_with_checkpoint(declaration, &row, TxId(0), &endpoint_memory, before)?);
-                before()?;
-                let high = DurableRelationalIndexKey(admitted_relational_row_index_endpoint_with_checkpoint(declaration, &row, TxId(u64::MAX), &endpoint_memory, before)?);
-                let mut count = 0u64;
-                for posting in index.range::<&[u8]>(low.0.as_slice()..=high.0.as_slice()).map_err(|error| RedbPersistence::relational_storage_error(table, error))? {
+                let read = self.begin_read()?;
+                // The existing name codec emits twelve ASCII prefix bytes and
+                // sixty-four hex bytes; its hasher is fixed stack scratch.
+                memory.reserve(
+                    76usize
+                        .checked_add(std::mem::size_of::<blake3::Hasher>())
+                        .ok_or_else(|| {
+                            self.content_identity_corruption("index table name overflow")
+                        })?,
+                )?;
+                let name = RedbPersistence::relational_index_table_name(table, &declaration.name);
+                let index = read
+                    .open_table(TableDefinition::<BorrowedRelationalIndexKey, &[u8]>::new(
+                        &name,
+                    ))
+                    .map_err(|error| RedbPersistence::relational_table_error(table, error))?;
+                let mut rows = contextdb_relational::mem::BoundedPhysicalCursor::default();
+                let mut expected = 0u64;
+                loop {
+                    let mut row_credit =
+                        contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
+                    let row = self.bounded_relational_physical_next_admitted(
+                        table,
+                        meta,
+                        snapshot,
+                        &mut rows,
+                        before,
+                        &mut |_| Ok(()),
+                        &mut |admission: crate::read_image_memory::RowReadAdmission<'_>| {
+                            admission.retain_into(
+                                &mut row_credit,
+                                "reader",
+                                "index_preflight_row",
+                                "Raise the declared reader memory limit.",
+                            )
+                        },
+                        read_memory.clone(),
+                    )?;
+                    let Some(row) = row else {
+                        break;
+                    };
+                    before()?;
+                    let endpoint_memory = crate::read_image_memory::ImageMemory::charging_reader(
+                        self._source_memory.memory.accountant.clone(),
+                        read_memory.clone(),
+                    );
+                    let low = DurableRelationalIndexKey(
+                        admitted_relational_row_index_endpoint_with_checkpoint(
+                            declaration,
+                            &row,
+                            TxId(0),
+                            &endpoint_memory,
+                            before,
+                        )?,
+                    );
+                    before()?;
+                    let high = DurableRelationalIndexKey(
+                        admitted_relational_row_index_endpoint_with_checkpoint(
+                            declaration,
+                            &row,
+                            TxId(u64::MAX),
+                            &endpoint_memory,
+                            before,
+                        )?,
+                    );
+                    let mut count = 0u64;
+                    for posting in index
+                        .range::<&[u8]>(low.0.as_slice()..=high.0.as_slice())
+                        .map_err(|error| RedbPersistence::relational_storage_error(table, error))?
+                    {
+                        before()?;
+                        let decode = crate::read_image_memory::ImageMemory::charging_reader(
+                            self._source_memory.memory.accountant.clone(),
+                            read_memory.clone(),
+                        );
+                        let (key_guard, value_guard) = posting.map_err(|error| {
+                            RedbPersistence::relational_storage_error(table, error)
+                        })?;
+                        let encoded = key_guard.value();
+                        let (position, deleted) = self.decode_preflight_posting(
+                            encoded,
+                            value_guard.value(),
+                            &decode,
+                            before,
+                        )?;
+                        RedbPersistence::validated_index_position(declaration, meta, &position)
+                            .map_err(|reason| self.content_identity_corruption(reason))?;
+                        if position.created_tx.0 > self.logical_frontier.0
+                            || deleted.is_some_and(|tx| {
+                                tx <= position.created_tx || tx.0 > self.logical_frontier.0
+                            })
+                        {
+                            return Err(self.content_identity_corruption(
+                                "historical posting lifecycle exceeds capture",
+                            ));
+                        }
+                        if position.created_tx.0 <= snapshot.0
+                            && deleted.is_none_or(|tx| tx.0 > snapshot.0)
+                        {
+                            before()?;
+                            let canonical = admitted_relational_row_index_endpoint_with_checkpoint(
+                                declaration,
+                                &row,
+                                position.created_tx,
+                                &decode,
+                                before,
+                            )?;
+                            if position.row_id != row.row_id
+                                || !manifest::equal_with_checkpoint(&canonical, encoded, before)?
+                            {
+                                return Err(self.content_identity_corruption(
+                                    "historical posting differs from authenticated row key",
+                                ));
+                            }
+                            count = count.checked_add(1).ok_or_else(|| {
+                                self.content_identity_corruption("posting count overflow")
+                            })?;
+                        }
+                    }
+                    if count != 1 {
+                        return Err(self.content_identity_corruption(
+                            "visible row lacks exactly one historical posting",
+                        ));
+                    }
+                    expected = expected.checked_add(1).ok_or_else(|| {
+                        self.content_identity_corruption("visible row count overflow")
+                    })?;
+                }
+                let mut previous = None::<(Vec<u8>, contextdb_core::read_memory::ReadCredit)>;
+                let mut actual = 0u64;
+                for posting in index
+                    .iter()
+                    .map_err(|error| RedbPersistence::relational_storage_error(table, error))?
+                {
                     before()?;
                     let decode = crate::read_image_memory::ImageMemory::charging_reader(
-                        self._source_memory.memory.accountant.clone(), read_memory.clone());
-                    let (key_guard, value_guard) = posting.map_err(|error| RedbPersistence::relational_storage_error(table, error))?;
+                        self._source_memory.memory.accountant.clone(),
+                        read_memory.clone(),
+                    );
+                    let (key_guard, value_guard) = posting
+                        .map_err(|error| RedbPersistence::relational_storage_error(table, error))?;
                     let encoded = key_guard.value();
-                    let (position, deleted) = self.decode_preflight_posting(encoded, value_guard.value(), &decode, before)?;
+                    let (position, deleted) = self.decode_preflight_posting(
+                        encoded,
+                        value_guard.value(),
+                        &decode,
+                        before,
+                    )?;
                     RedbPersistence::validated_index_position(declaration, meta, &position)
                         .map_err(|reason| self.content_identity_corruption(reason))?;
                     if position.created_tx.0 > self.logical_frontier.0
-                        || deleted.is_some_and(|tx| tx <= position.created_tx || tx.0 > self.logical_frontier.0) {
-                        return Err(self.content_identity_corruption("historical posting lifecycle exceeds capture"));
+                        || deleted.is_some_and(|tx| {
+                            tx <= position.created_tx || tx.0 > self.logical_frontier.0
+                        })
+                    {
+                        return Err(self.content_identity_corruption(
+                            "historical posting lifecycle exceeds capture",
+                        ));
                     }
-                    if position.created_tx.0 <= snapshot.0 && deleted.is_none_or(|tx| tx.0 > snapshot.0) {
-                        before()?;
-                        let canonical = admitted_relational_row_index_endpoint_with_checkpoint(declaration, &row, position.created_tx, &decode, before)?;
-                        if position.row_id != row.row_id || !manifest::equal_with_checkpoint(&canonical, encoded, before)? {
-                            return Err(self.content_identity_corruption("historical posting differs from authenticated row key"));
-                        }
-                        count = count.checked_add(1).ok_or_else(|| self.content_identity_corruption("posting count overflow"))?;
-                    }
-                }
-                if count != 1 { return Err(self.content_identity_corruption("visible row lacks exactly one historical posting")); }
-                expected = expected.checked_add(1).ok_or_else(|| self.content_identity_corruption("visible row count overflow"))?;
-            }
-            let mut previous = None::<(Vec<u8>, contextdb_core::read_memory::ReadCredit)>;
-            let mut actual = 0u64;
-            for posting in index.iter().map_err(|error| RedbPersistence::relational_storage_error(table, error))? {
-                before()?;
-                let decode = crate::read_image_memory::ImageMemory::charging_reader(
-                    self._source_memory.memory.accountant.clone(), read_memory.clone());
-                let (key_guard, value_guard) = posting.map_err(|error| RedbPersistence::relational_storage_error(table, error))?;
-                let encoded = key_guard.value();
-                let (position, deleted) = self.decode_preflight_posting(encoded, value_guard.value(), &decode, before)?;
-                RedbPersistence::validated_index_position(declaration, meta, &position)
-                    .map_err(|reason| self.content_identity_corruption(reason))?;
-                if position.created_tx.0 > self.logical_frontier.0
-                    || deleted.is_some_and(|tx| tx <= position.created_tx || tx.0 > self.logical_frontier.0) {
-                    return Err(self.content_identity_corruption("historical posting lifecycle exceeds capture"));
-                }
-                if let Some((prior, _)) = &previous
-                    && content_identity::validated_preflight_posting_order(prior, encoded, before)
+                    if let Some((prior, _)) = &previous
+                        && content_identity::validated_preflight_posting_order(
+                            prior, encoded, before,
+                        )
                         .map_err(|error| match error {
-                            Error::ReadCancelled | Error::ReadFailure(_) | Error::MemoryBudgetExceeded { .. } => error,
+                            Error::ReadCancelled
+                            | Error::ReadFailure(_)
+                            | Error::MemoryBudgetExceeded { .. } => error,
                             other => self.content_identity_error(other),
-                        })? != std::cmp::Ordering::Less {
-                    return Err(self.content_identity_corruption("duplicate or reordered historical posting"));
+                        })? != std::cmp::Ordering::Less
+                    {
+                        return Err(self.content_identity_corruption(
+                            "duplicate or reordered historical posting",
+                        ));
+                    }
+                    let previous_credit = contextdb_core::read_memory::ReadCredit::try_new(
+                        read_memory.clone(),
+                        encoded.len(),
+                        "reader",
+                        "index_preflight_previous",
+                        "Raise the declared reader memory limit.",
+                    )?;
+                    previous = Some((encoded.to_vec(), previous_credit));
+                    let mut row_credit =
+                        contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
+                    let mut last = None;
+                    let row = self.reconcile_relational_group(
+                        &read,
+                        table,
+                        meta,
+                        position.row_id,
+                        snapshot,
+                        None,
+                        read_memory.clone(),
+                        before,
+                        None,
+                        &mut |admission: crate::read_image_memory::RowReadAdmission<'_>| {
+                            admission.retain_into(
+                                &mut row_credit,
+                                "reader",
+                                "index_preflight_row",
+                                "Raise the declared reader memory limit.",
+                            )
+                        },
+                        &mut last,
+                    )?;
+                    if position.created_tx.0 <= snapshot.0
+                        && deleted.is_none_or(|tx| tx.0 > snapshot.0)
+                    {
+                        let row = row.ok_or_else(|| {
+                            self.content_identity_corruption(
+                                "visible historical posting has no authenticated visible row",
+                            )
+                        })?;
+                        before()?;
+                        let canonical = admitted_relational_row_index_endpoint_with_checkpoint(
+                            declaration,
+                            &row,
+                            position.created_tx,
+                            &decode,
+                            before,
+                        )?;
+                        if !manifest::equal_with_checkpoint(&canonical, encoded, before)? {
+                            return Err(self.content_identity_corruption(
+                                "extra or moved historical visible candidate",
+                            ));
+                        }
+                        actual = actual.checked_add(1).ok_or_else(|| {
+                            self.content_identity_corruption("visible posting count overflow")
+                        })?;
+                    }
                 }
-                let previous_credit = contextdb_core::read_memory::ReadCredit::try_new(read_memory.clone(), encoded.len(),
-                    "reader", "index_preflight_previous", "Raise the declared reader memory limit.")?;
-                previous = Some((encoded.to_vec(), previous_credit));
-                let mut row_credit = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
-                let mut last = None;
-                let row = self.reconcile_relational_group(&read, table, meta, position.row_id, snapshot, None,
-                    read_memory.clone(), before, None, &mut |admission: crate::read_image_memory::RowReadAdmission<'_>| admission.retain_into(&mut row_credit,
-                        "reader", "index_preflight_row", "Raise the declared reader memory limit."), &mut last)?;
-                if position.created_tx.0 <= snapshot.0 && deleted.is_none_or(|tx| tx.0 > snapshot.0) {
-                    let row = row.ok_or_else(|| self.content_identity_corruption("visible historical posting has no authenticated visible row"))?;
-                    before()?;
-                    let canonical = admitted_relational_row_index_endpoint_with_checkpoint(declaration, &row, position.created_tx, &decode, before)?;
-                    if !manifest::equal_with_checkpoint(&canonical, encoded, before)? { return Err(self.content_identity_corruption("extra or moved historical visible candidate")); }
-                    actual = actual.checked_add(1).ok_or_else(|| self.content_identity_corruption("visible posting count overflow"))?;
+                if actual != expected {
+                    return Err(
+                        self.content_identity_corruption("historical candidate counts differ")
+                    );
                 }
-            }
-            if actual != expected { return Err(self.content_identity_corruption("historical candidate counts differ")); }
-            before()?;
-            Ok(())
-        }))
+                before()?;
+                Ok(())
+            })
+        })
     }
 }
 
 impl RetainedReadSource {
     fn decode_preflight_posting(
-        &self, key: &[u8], value: &[u8], memory: &Arc<crate::read_image_memory::ImageMemory>,
+        &self,
+        key: &[u8],
+        value: &[u8],
+        memory: &Arc<crate::read_image_memory::ImageMemory>,
         before: &mut dyn FnMut() -> Result<()>,
     ) -> Result<(RelationalIndexPosition, Option<TxId>)> {
         memory.scope(|| {
             before()?;
-            let (encoded, consumed): (EncodedRelationalIndexPosition, usize) = crate::read_image_memory::decode(key)
-                .map_err(|error| self.content_identity_error(error))?;
+            let (encoded, consumed): (EncodedRelationalIndexPosition, usize) =
+                crate::read_image_memory::decode(key)
+                    .map_err(|error| self.content_identity_error(error))?;
             if consumed != key.len() {
-                return Err(self.content_identity_corruption("historical posting has trailing bytes"));
+                return Err(
+                    self.content_identity_corruption("historical posting has trailing bytes")
+                );
             }
             before()?;
-            memory.reserve(encoded.key.len().checked_mul(std::mem::size_of::<DirectedValue>())
-                .ok_or_else(|| self.content_identity_corruption("posting layout overflow"))?)?;
+            memory.reserve(
+                encoded
+                    .key
+                    .len()
+                    .checked_mul(std::mem::size_of::<DirectedValue>())
+                    .ok_or_else(|| self.content_identity_corruption("posting layout overflow"))?,
+            )?;
             let position: RelationalIndexPosition = encoded.into();
-            let canonical = admitted_relational_index_endpoint_with_checkpoint(&position.key, position.row_id, position.created_tx, memory, before)?;
+            let canonical = admitted_relational_index_endpoint_with_checkpoint(
+                &position.key,
+                position.row_id,
+                position.created_tx,
+                memory,
+                before,
+            )?;
             if !manifest::equal_with_checkpoint(&canonical, key, before)? {
                 return Err(self.content_identity_corruption("historical posting is not canonical"));
             }

@@ -605,9 +605,11 @@ fn decode_member(key: &[u8], encoded: &[u8]) -> Result<VectorPartitionMembership
         .map_err(|reason| corruption(&reason))?;
     prevalidate_vector_partition_metadata_routes(VectorPartitionRecordKind::Membership, payload)
         .map_err(|reason| corruption(&reason))?;
-    let record: VectorPartitionMembershipRecord =
-        decode_vector_partition_record_payload_checked(VectorPartitionRecordKind::Membership, encoded)
-            .map_err(|failure| failure.into_error(|reason| corruption(&reason)))?;
+    let record: VectorPartitionMembershipRecord = decode_vector_partition_record_payload_checked(
+        VectorPartitionRecordKind::Membership,
+        encoded,
+    )
+    .map_err(|failure| failure.into_error(|reason| corruption(&reason)))?;
     if source_key(&record) != key {
         return Err(corruption(
             "membership source key does not match its authenticated identity",
@@ -624,9 +626,11 @@ fn decode_primary_member(
         .map_err(|reason| corruption(&reason))?;
     prevalidate_vector_partition_metadata_routes(VectorPartitionRecordKind::Membership, payload)
         .map_err(|reason| corruption(&reason))?;
-    let record: VectorPartitionMembershipRecord =
-        decode_vector_partition_record_payload_checked(VectorPartitionRecordKind::Membership, encoded)
-            .map_err(|failure| failure.into_error(|reason| corruption(&reason)))?;
+    let record: VectorPartitionMembershipRecord = decode_vector_partition_record_payload_checked(
+        VectorPartitionRecordKind::Membership,
+        encoded,
+    )
+    .map_err(|failure| failure.into_error(|reason| corruption(&reason)))?;
     if RedbPersistence::vector_partition_membership_key(&record) != membership_key {
         return Err(corruption(
             "one owning row version has conflicting vector placements",
@@ -776,11 +780,12 @@ fn validate_body_placement_transition<const CHECK_OVERLAP: bool>(
                 )
             })
             .transpose()?;
-        let other: VectorPartitionMembershipRecord = decode_vector_partition_record_payload_checked(
-            VectorPartitionRecordKind::Membership,
-            value.value(),
-        )
-        .map_err(|failure| failure.into_error(|reason| corruption(&reason)))?;
+        let other: VectorPartitionMembershipRecord =
+            decode_vector_partition_record_payload_checked(
+                VectorPartitionRecordKind::Membership,
+                value.value(),
+            )
+            .map_err(|failure| failure.into_error(|reason| corruption(&reason)))?;
         if reverse_key(&other).as_slice() != key.value() {
             return Err(corruption(
                 "reverse membership key disagrees with its body identity",
@@ -853,7 +858,9 @@ fn publish_membership_impl<const CHECK_OVERLAP: bool>(
     let _call_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
     // Authenticated previous/next records are temporary to this transition;
     // their payloads drop before this scope returns their reader credits.
-    let _decode_scope = crate::read_image_memory::active_owner()?.row_owner()?.enter();
+    let _decode_scope = crate::read_image_memory::active_owner()?
+        .row_owner()?
+        .enter();
     let _scratch = accountant
         .as_ref()
         .map(|accountant| {
@@ -991,7 +998,10 @@ fn publish_membership_impl<const CHECK_OVERLAP: bool>(
         accountant.as_ref(),
     )?;
     super::vector_current_identity::transition::<CHECK_OVERLAP>(
-        write, previous_record.as_ref(), next_record.as_ref(), accountant.as_ref(),
+        write,
+        previous_record.as_ref(),
+        next_record.as_ref(),
+        accountant.as_ref(),
     )?;
     content_size::membership_transition(write, previous_record.as_ref(), next_record.as_ref())?;
     let boundary_before = partition.max_tx;
@@ -1101,7 +1111,9 @@ fn decode_occupancy(route: &[u8], key: &[u8], value: &[u8]) -> Result<(u64, u64)
         .map_err(|_| corruption("occupancy interval value has the wrong length"))?;
     let end = u64::from_be_bytes(value[..8].try_into().unwrap());
     if value[8..] != occupancy_checksum(key, end) || end <= start {
-        return Err(corruption("occupancy interval checksum or bounds are invalid"));
+        return Err(corruption(
+            "occupancy interval checksum or bounds are invalid",
+        ));
     }
     Ok((start, end))
 }
@@ -1247,7 +1259,9 @@ fn rebuild_route_occupancy(
     for entry in source.prefix_bounded(route).map_err(metadata_error)? {
         let (key, value) = entry.map_err(metadata_error)?;
         let interval = {
-            let _row_scope = crate::read_image_memory::active_owner()?.row_owner()?.enter();
+            let _row_scope = crate::read_image_memory::active_owner()?
+                .row_owner()?
+                .enter();
             let record = decode_member(key.value(), value.value())?;
             membership_interval(&record)
         };
@@ -1352,7 +1366,9 @@ fn occupancy_transition(
                     return Err(corruption("an open membership has no occupancy interval"));
                 };
                 if last_end != OPEN_END {
-                    return Err(corruption("an open membership's occupancy interval is closed"));
+                    return Err(corruption(
+                        "an open membership's occupancy interval is closed",
+                    ));
                 }
                 if closed > last_start {
                     put_occupancy(&mut table, route, last_start, closed)?;
@@ -1722,7 +1738,8 @@ pub(super) fn validate_in_read(read: &redb::ReadTransaction) -> Result<()> {
             // A store without its membership directory takes the full-image
             // reconstruction route, which trusts nothing from the absent
             // tables; only a PRESENT table must match its fingerprint.
-            Some(_) if actual.is_none() && (key == MEMBERSHIP_ROOT || key == OPEN_DIRECTORY_ROOT) => {}
+            Some(_)
+                if actual.is_none() && (key == MEMBERSHIP_ROOT || key == OPEN_DIRECTORY_ROOT) => {}
             Some(_) => {
                 return Err(corruption(
                     "membership page root differs from its committed fingerprint",
@@ -1750,9 +1767,11 @@ pub(super) fn decode_reverse_member(
         .map_err(|reason| corruption(&reason))?;
     prevalidate_vector_partition_metadata_routes(VectorPartitionRecordKind::Membership, payload)
         .map_err(|reason| corruption(&reason))?;
-    let record: VectorPartitionMembershipRecord =
-        decode_vector_partition_record_payload_checked(VectorPartitionRecordKind::Membership, encoded)
-            .map_err(|failure| failure.into_error(|reason| corruption(&reason)))?;
+    let record: VectorPartitionMembershipRecord = decode_vector_partition_record_payload_checked(
+        VectorPartitionRecordKind::Membership,
+        encoded,
+    )
+    .map_err(|failure| failure.into_error(|reason| corruption(&reason)))?;
     if reverse_key(&record) != key {
         return Err(corruption(
             "reverse membership key disagrees with its authenticated identity",
@@ -1840,25 +1859,45 @@ pub(super) fn verify_summary_projection(
     let expected = decode_summary(prefix, encoded)?;
     let mut actual = MembershipSummary::default();
     let source = open_optional_read_table(read, SOURCE)?;
-    let mut cursor = source.as_ref().map(|table| table.prefix_bounded(prefix).map_err(metadata_error)).transpose()?;
+    let mut cursor = source
+        .as_ref()
+        .map(|table| table.prefix_bounded(prefix).map_err(metadata_error))
+        .transpose()?;
     loop {
         before()?;
-        let Some(item) = cursor.as_mut().and_then(Iterator::next) else { break; };
+        let Some(item) = cursor.as_mut().and_then(Iterator::next) else {
+            break;
+        };
         let (key, value) = item.map_err(metadata_error)?;
         let mut window = owner.scratch();
-        window.reserve(key.value().len().checked_add(value.value().len())
-            .and_then(|n| n.checked_mul(6)).and_then(|n| n.checked_add(std::mem::size_of::<VectorPartitionMembershipRecord>()))
-            .ok_or_else(|| corruption("summary projection window overflow"))?)?;
-        let payload = vector_partition_record_payload(VectorPartitionRecordKind::Membership, value.value())
-            .map_err(|reason| corruption(&reason))?;
-        window.reserve(vector_partition_route_native_capacity(payload).map_err(|reason| corruption(&reason))?
-            .checked_mul(3).ok_or_else(|| corruption("summary route native capacity overflow"))?)?;
+        window.reserve(
+            key.value()
+                .len()
+                .checked_add(value.value().len())
+                .and_then(|n| n.checked_mul(6))
+                .and_then(|n| n.checked_add(std::mem::size_of::<VectorPartitionMembershipRecord>()))
+                .ok_or_else(|| corruption("summary projection window overflow"))?,
+        )?;
+        let payload =
+            vector_partition_record_payload(VectorPartitionRecordKind::Membership, value.value())
+                .map_err(|reason| corruption(&reason))?;
+        window.reserve(
+            vector_partition_route_native_capacity(payload)
+                .map_err(|reason| corruption(&reason))?
+                .checked_mul(3)
+                .ok_or_else(|| corruption("summary route native capacity overflow"))?,
+        )?;
         let record = decode_source_member(key.value(), value.value())?;
         adjust(&mut actual, key.value(), value.value(), &record, true)?;
     }
-    if expected.entries != actual.entries || expected.live_entries != actual.live_entries
-        || expected.digest != actual.digest || expected.max_tx < actual.max_tx {
-        return Err(corruption("summary disagrees with its complete captured source projection"));
+    if expected.entries != actual.entries
+        || expected.live_entries != actual.live_entries
+        || expected.digest != actual.digest
+        || expected.max_tx < actual.max_tx
+    {
+        return Err(corruption(
+            "summary disagrees with its complete captured source projection",
+        ));
     }
     before()?;
     Ok(())

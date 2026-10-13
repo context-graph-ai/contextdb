@@ -410,9 +410,13 @@ fn t19_09_closed_handle_rejects_normal_reads() {
         matches!(&err, Error::Other(msg) if msg.contains("closed")),
         "expected closed-handle error, got: {err:?}"
     );
-    let changes = db.changes_since(Lsn(0)).expect_err("closed changes_since refuses stale state");
-    assert!(matches!(changes, Error::Other(ref message) if message.contains("closed")),
-        "closed changes_since returns the typed closed-handle error: {changes:?}");
+    let changes = db
+        .changes_since(Lsn(0))
+        .expect_err("closed changes_since refuses stale state");
+    assert!(
+        matches!(changes, Error::Other(ref message) if message.contains("closed")),
+        "closed changes_since returns the typed closed-handle error: {changes:?}"
+    );
 
     let _reopened = Database::open(&path).expect("released path can be reopened");
 }

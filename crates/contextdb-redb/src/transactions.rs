@@ -4368,8 +4368,11 @@ impl ReadTransaction {
     /// are refused rather than retroactively assigned native receipt ownership.
     #[doc(hidden)]
     pub fn get_native_byte_value(
-        &self, physical_name: &str, key: &[u8],
-    ) -> std::result::Result<Option<AccessGuard<'static, &'static [u8]>>, crate::NativeColdReadError> {
+        &self,
+        physical_name: &str,
+        key: &[u8],
+    ) -> std::result::Result<Option<AccessGuard<'static, &'static [u8]>>, crate::NativeColdReadError>
+    {
         self.tree.get_native_byte_value(physical_name, key)
     }
 }
@@ -4380,8 +4383,11 @@ impl ReadTransaction {
     /// Existing byte lookup and all ordinary/public table APIs are unchanged.
     #[doc(hidden)]
     pub fn get_native_text_value(
-        &self, physical_name: &str, key: &str,
-    ) -> std::result::Result<Option<AccessGuard<'static, &'static [u8]>>, crate::NativeColdReadError> {
+        &self,
+        physical_name: &str,
+        key: &str,
+    ) -> std::result::Result<Option<AccessGuard<'static, &'static [u8]>>, crate::NativeColdReadError>
+    {
         self.tree.get_native_text_value(physical_name, key)
     }
 }
@@ -4393,10 +4399,21 @@ impl ReadTransaction {
     /// Raw endpoint bytes support a non-UTF-8 exclusive prefix successor.
     #[doc(hidden)]
     pub fn next_native_text_range(
-        &self, physical_name: &str, lower: &[u8], exclusive: bool, upper: Option<&[u8]>,
+        &self,
+        physical_name: &str,
+        lower: &[u8],
+        exclusive: bool,
+        upper: Option<&[u8]>,
         before_page: &mut dyn FnMut() -> std::result::Result<(), crate::NativeColdReadError>,
-    ) -> std::result::Result<Option<(AccessGuard<'static, &'static [u8]>, AccessGuard<'static, &'static [u8]>)>, crate::NativeColdReadError> {
-        self.tree.next_native_text_range(physical_name, lower, exclusive, upper, before_page)
+    ) -> std::result::Result<
+        Option<(
+            AccessGuard<'static, &'static [u8]>,
+            AccessGuard<'static, &'static [u8]>,
+        )>,
+        crate::NativeColdReadError,
+    > {
+        self.tree
+            .next_native_text_range(physical_name, lower, exclusive, upper, before_page)
     }
 }
 
@@ -4405,9 +4422,20 @@ impl ReadTransaction {
     /// Internal byte-key range over this captured transaction; exact raw bounds.
     #[doc(hidden)]
     pub fn next_native_byte_range(
-        &self, physical_name: &str, lower: &[u8], exclusive: bool, upper: Option<&[u8]>,
+        &self,
+        physical_name: &str,
+        lower: &[u8],
+        exclusive: bool,
+        upper: Option<&[u8]>,
         before_page: &mut dyn FnMut() -> std::result::Result<(), crate::NativeColdReadError>,
-    ) -> std::result::Result<Option<(AccessGuard<'static, &'static [u8]>, AccessGuard<'static, &'static [u8]>)>, crate::NativeColdReadError> {
-        self.tree.next_native_byte_range(physical_name, lower, exclusive, upper, before_page)
+    ) -> std::result::Result<
+        Option<(
+            AccessGuard<'static, &'static [u8]>,
+            AccessGuard<'static, &'static [u8]>,
+        )>,
+        crate::NativeColdReadError,
+    > {
+        self.tree
+            .next_native_byte_range(physical_name, lower, exclusive, upper, before_page)
     }
 }

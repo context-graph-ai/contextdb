@@ -293,7 +293,8 @@ struct RequestContext {
     limits: ReadLimits,
     vector_copies: Mutex<contextdb_vector::VectorCopyAdmission>,
     /// The first validated vector capture fixes intent and roots across fetches.
-    vector_read_capture: Mutex<Option<Arc<crate::persistence::vector_membership_source::VectorReadOperation>>>,
+    vector_read_capture:
+        Mutex<Option<Arc<crate::persistence::vector_membership_source::VectorReadOperation>>>,
     /// How this read ends when an operator runs out of budget mid-answer:
     /// refused, or paused for the next fetch.
     resumption: ReadResumption,
@@ -345,8 +346,11 @@ pub(crate) struct VectorReadCheckpoint(std::sync::Weak<RequestContext>);
 
 impl VectorReadCheckpoint {
     pub(crate) fn checkpoint(&self) -> contextdb_core::Result<()> {
-        self.0.upgrade().ok_or(Error::ReadCancelled)?
-            .checkpoint().map_err(ReadOpenContext::engine_error)
+        self.0
+            .upgrade()
+            .ok_or(Error::ReadCancelled)?
+            .checkpoint()
+            .map_err(ReadOpenContext::engine_error)
     }
 
     pub(crate) fn belongs_to(&self, context: &ReadOpenContext) -> bool {
@@ -398,17 +402,30 @@ impl ReadOpenContext {
     pub(crate) fn vector_read_capture(
         &self,
     ) -> Option<Arc<crate::persistence::vector_membership_source::VectorReadOperation>> {
-        self.0.vector_read_capture.lock().unwrap_or_else(|poison| poison.into_inner()).clone()
+        self.0
+            .vector_read_capture
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
     }
 
     pub(crate) fn retain_vector_read_capture(
         &self,
         capture: Arc<crate::persistence::vector_membership_source::VectorReadOperation>,
     ) -> contextdb_core::Result<()> {
-        let mut slot = self.0.vector_read_capture.lock().unwrap_or_else(|poison| poison.into_inner());
-        if slot.as_ref().is_some_and(|prior| !Arc::ptr_eq(prior, &capture)) {
-            return Err(Error::StoreCorrupted { path: "vector_partition_memberships".into(),
-                reason: "request attempted to replace its immutable vector capture".into() });
+        let mut slot = self
+            .0
+            .vector_read_capture
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if slot
+            .as_ref()
+            .is_some_and(|prior| !Arc::ptr_eq(prior, &capture))
+        {
+            return Err(Error::StoreCorrupted {
+                path: "vector_partition_memberships".into(),
+                reason: "request attempted to replace its immutable vector capture".into(),
+            });
         }
         *slot = Some(capture);
         Ok(())
@@ -2041,7 +2058,10 @@ impl RequestContext {
                     .admit_source_page(source, bytes)
                     .map(|charge| {
                         #[cfg(any(test, feature = "test-seams"))]
-                        crate::read_work_probe::note_worker_page_admitted(bytes, crate::read_work_probe::funding_owner_name(&context.reader_budget));
+                        crate::read_work_probe::note_worker_page_admitted(
+                            bytes,
+                            crate::read_work_probe::funding_owner_name(&context.reader_budget),
+                        );
                         Box::new(charge) as redb::ReadPageCharge
                     })
                     .map_err(|error| {
@@ -3246,15 +3266,16 @@ impl WindowState {
                     .checked_sub(self.rank as u64)
                     .ok_or_else(|| Error::Other("window prefix demand underflow".to_string()))?;
                 if let PullKind::Scan(scan) = &mut self.input.kind
-                    && let ScanMode::Ordered { cursor, .. } = &mut scan.mode {
-                        // A maintained overlay needs only the next committed
-                        // comparator head, irrespective of remaining rank demand.
-                        cursor.source_set_prefix_quota(Some(if scan.transaction.is_some() {
-                            1
-                        } else {
-                            remaining
-                        }));
-                    }
+                    && let ScanMode::Ordered { cursor, .. } = &mut scan.mode
+                {
+                    // A maintained overlay needs only the next committed
+                    // comparator head, irrespective of remaining rank demand.
+                    cursor.source_set_prefix_quota(Some(if scan.transaction.is_some() {
+                        1
+                    } else {
+                        remaining
+                    }));
+                }
             }
             self.pending = match self.group_binding {
                 Some(binding) if self.ceiling.is_some() => {
@@ -5271,7 +5292,9 @@ fn pull_continuation_bytes(node: &PullNode) -> std::result::Result<usize, Bounde
         PullKind::Vector(state) => {
             let mut state_bytes = checked_size_add(
                 checked_size_add(
-                    size_of::<VectorState>(), state.table.capacity(), "vector control",
+                    size_of::<VectorState>(),
+                    state.table.capacity(),
+                    "vector control",
                 )?,
                 checked_size_add(
                     state.index.table.capacity(),
@@ -7277,10 +7300,9 @@ impl ScanState {
             };
             // The statement decides whether it names one row, on every target and source; only a
             // source that carries its keys with no statement filter is asked about itself.
-            let statement_pins = self
-                .filter
-                .as_ref()
-                .map(|filter| crate::executor::statement_names_one_row(&self.meta, filter, &self.params));
+            let statement_pins = self.filter.as_ref().map(|filter| {
+                crate::executor::statement_names_one_row(&self.meta, filter, &self.params)
+            });
             let names_one_row = statement_pins.unwrap_or_else(|| match (exact_index, index_pick) {
                 // An exact-lookup source asked a whole key: it is already
                 // reading the row that key names.
@@ -11366,20 +11388,30 @@ fn bounded_resolve_graph_start_nodes(
 /// Validate the complete declared inputs before building a kernel, including
 /// sources whose join/candidate branch execution can subsequently bypass.
 fn preflight_plan_indexes(
-    db: &dyn ReadExecutionTarget, plan: &PhysicalPlan, params: &HashMap<String, Value>,
-    snapshot: SnapshotId, context: &Arc<RequestContext>,
+    db: &dyn ReadExecutionTarget,
+    plan: &PhysicalPlan,
+    params: &HashMap<String, Value>,
+    snapshot: SnapshotId,
+    context: &Arc<RequestContext>,
 ) -> std::result::Result<(), BoundedExecutionError> {
     let memory = context.reader_budget.clone();
-    if db.ordered_prefix_snapshot_is_current(snapshot, memory.clone())? { return Ok(()); }
-    let preflight = |table: &str, index: &str| context.with_source_page_admission(
-        BoundedWorkSource::IndexRange, || db.preflight_historical_index(table, index, snapshot,
-            memory.clone(), &mut || context.charge_operator(BoundedWorkSource::IndexRange)));
+    if db.ordered_prefix_snapshot_is_current(snapshot, memory.clone())? {
+        return Ok(());
+    }
+    let preflight = |table: &str, index: &str| {
+        context.with_source_page_admission(BoundedWorkSource::IndexRange, || {
+            db.preflight_historical_index(table, index, snapshot, memory.clone(), &mut || {
+                context.charge_operator(BoundedWorkSource::IndexRange)
+            })
+        })
+    };
     match plan {
         PhysicalPlan::Limit { count: 0, .. } => Ok(()),
         PhysicalPlan::Scan { table, filter, .. } => {
             if let Some(filter) = filter.as_ref()
                 && let Some(meta) = db.table_meta(table)
-                && let Some(pick) = analyze_filter_for_index(table, &meta, filter, params).pick {
+                && let Some(pick) = analyze_filter_for_index(table, &meta, filter, params).pick
+            {
                 preflight(table, &pick.name)?;
             }
             Ok(())
@@ -11391,27 +11423,41 @@ fn preflight_plan_indexes(
             }
             preflight_plan_indexes(db, input, params, snapshot, context)
         }
-        PhysicalPlan::WindowRank { input, .. } | PhysicalPlan::Project { input, .. }
-        | PhysicalPlan::Filter { input, .. } | PhysicalPlan::Distinct { input }
-        | PhysicalPlan::Limit { input, .. } | PhysicalPlan::MaterializeCte { input, .. }
-        | PhysicalPlan::GroupedCount { input, .. } => preflight_plan_indexes(db, input, params, snapshot, context),
+        PhysicalPlan::WindowRank { input, .. }
+        | PhysicalPlan::Project { input, .. }
+        | PhysicalPlan::Filter { input, .. }
+        | PhysicalPlan::Distinct { input }
+        | PhysicalPlan::Limit { input, .. }
+        | PhysicalPlan::MaterializeCte { input, .. }
+        | PhysicalPlan::GroupedCount { input, .. } => {
+            preflight_plan_indexes(db, input, params, snapshot, context)
+        }
         PhysicalPlan::Join { left, right, .. } => {
             preflight_plan_indexes(db, left, params, snapshot, context)?;
             preflight_plan_indexes(db, right, params, snapshot, context)
         }
         PhysicalPlan::Union { inputs, .. } | PhysicalPlan::Pipeline(inputs) => {
-            for input in inputs { preflight_plan_indexes(db, input, params, snapshot, context)?; }
+            for input in inputs {
+                preflight_plan_indexes(db, input, params, snapshot, context)?;
+            }
             Ok(())
         }
-        PhysicalPlan::GraphBfs { start_candidates, .. } => {
-            db.preflight_historical_graph(snapshot,
-                context.reader_budget.clone(),
-                &mut || context.charge_operator(BoundedWorkSource::GraphTraversal))?;
-            if let Some(input) = start_candidates { preflight_plan_indexes(db, input, params, snapshot, context)?; }
+        PhysicalPlan::GraphBfs {
+            start_candidates, ..
+        } => {
+            db.preflight_historical_graph(snapshot, context.reader_budget.clone(), &mut || {
+                context.charge_operator(BoundedWorkSource::GraphTraversal)
+            })?;
+            if let Some(input) = start_candidates {
+                preflight_plan_indexes(db, input, params, snapshot, context)?;
+            }
             Ok(())
         }
-        PhysicalPlan::VectorSearch { candidates, .. } | PhysicalPlan::HnswSearch { candidates, .. } => {
-            if let Some(candidates) = candidates { preflight_plan_indexes(db, candidates, params, snapshot, context)?; }
+        PhysicalPlan::VectorSearch { candidates, .. }
+        | PhysicalPlan::HnswSearch { candidates, .. } => {
+            if let Some(candidates) = candidates {
+                preflight_plan_indexes(db, candidates, params, snapshot, context)?;
+            }
             Ok(())
         }
         _ => Ok(()),
@@ -11425,12 +11471,23 @@ fn enter_vector_read(
     snapshot: SnapshotId,
     context: &Arc<RequestContext>,
     required: bool,
-) -> std::result::Result<Option<crate::persistence::vector_membership_source::VectorReadScope>, BoundedExecutionError> {
-    if !required { return Ok(None); }
-    context.with_vector_copies(|copies| db.vector_read_preflight(
-        snapshot, context.reader_budget.clone(), copies,
-        Some(ReadOpenContext::from_request(context)),
-    )).map_err(BoundedExecutionError::from)
+) -> std::result::Result<
+    Option<crate::persistence::vector_membership_source::VectorReadScope>,
+    BoundedExecutionError,
+> {
+    if !required {
+        return Ok(None);
+    }
+    context
+        .with_vector_copies(|copies| {
+            db.vector_read_preflight(
+                snapshot,
+                context.reader_budget.clone(),
+                copies,
+                Some(ReadOpenContext::from_request(context)),
+            )
+        })
+        .map_err(BoundedExecutionError::from)
 }
 
 // Include branches that execution can bypass after deriving empty candidates.
@@ -11438,13 +11495,25 @@ fn plan_needs_vector_read(plan: &PhysicalPlan) -> bool {
     match plan {
         PhysicalPlan::Limit { count: 0, .. } => false,
         PhysicalPlan::VectorSearch { k, .. } | PhysicalPlan::HnswSearch { k, .. } => *k != 0,
-        PhysicalPlan::WindowRank { input, .. } | PhysicalPlan::Project { input, .. }
-        | PhysicalPlan::Filter { input, .. } | PhysicalPlan::Distinct { input }
-        | PhysicalPlan::Limit { input, .. } | PhysicalPlan::MaterializeCte { input, .. }
-        | PhysicalPlan::GroupedCount { input, .. } | PhysicalPlan::Sort { input, .. } => plan_needs_vector_read(input),
-        PhysicalPlan::Join { left, right, .. } => plan_needs_vector_read(left) || plan_needs_vector_read(right),
-        PhysicalPlan::Union { inputs, .. } | PhysicalPlan::Pipeline(inputs) => inputs.iter().any(plan_needs_vector_read),
-        PhysicalPlan::GraphBfs { start_candidates, .. } => start_candidates.as_deref().is_some_and(plan_needs_vector_read),
+        PhysicalPlan::WindowRank { input, .. }
+        | PhysicalPlan::Project { input, .. }
+        | PhysicalPlan::Filter { input, .. }
+        | PhysicalPlan::Distinct { input }
+        | PhysicalPlan::Limit { input, .. }
+        | PhysicalPlan::MaterializeCte { input, .. }
+        | PhysicalPlan::GroupedCount { input, .. }
+        | PhysicalPlan::Sort { input, .. } => plan_needs_vector_read(input),
+        PhysicalPlan::Join { left, right, .. } => {
+            plan_needs_vector_read(left) || plan_needs_vector_read(right)
+        }
+        PhysicalPlan::Union { inputs, .. } | PhysicalPlan::Pipeline(inputs) => {
+            inputs.iter().any(plan_needs_vector_read)
+        }
+        PhysicalPlan::GraphBfs {
+            start_candidates, ..
+        } => start_candidates
+            .as_deref()
+            .is_some_and(plan_needs_vector_read),
         _ => false,
     }
 }
@@ -12205,13 +12274,13 @@ fn ranked_prefix_group_filter(
                     .partition_by
                     .iter()
                     .position(|partition| partition.column == column.column)
-                {
-                    return Ok(Expr::BinaryOp {
-                        left: Box::new(Expr::Column(column.clone())),
-                        op: BinOp::Eq,
-                        right: Box::new(super::value_to_literal(key[position].clone())?),
-                    });
-                }
+            {
+                return Ok(Expr::BinaryOp {
+                    left: Box::new(Expr::Column(column.clone())),
+                    op: BinOp::Eq,
+                    right: Box::new(super::value_to_literal(key[position].clone())?),
+                });
+            }
             Ok(original.clone())
         }
         _ => Ok(expr.clone()),
@@ -12427,9 +12496,9 @@ fn build_ranked_prefix(
                 || declaration.columns[group.key.len() + 1..]
                     .iter()
                     .any(|(_, direction)| *direction != contextdb_core::SortDirection::Asc))
-            {
-                return Ok(None);
-            }
+        {
+            return Ok(None);
+        }
         fn represented(
             expr: &Expr,
             pushed: &[String],
@@ -12488,9 +12557,9 @@ fn build_ranked_prefix(
                 .staged_rows
                 .as_ref()
                 .is_none_or(|rows| rows.has_index_for(&declaration.name, &meta))
-            {
-                return Ok(None);
-            }
+        {
+            return Ok(None);
+        }
         let ScanMode::Ordered { cursor, .. } = &mut state.mode else {
             return Ok(None);
         };
@@ -12996,41 +13065,41 @@ fn build_kernel_with_ctes<'plan>(
                 input: selected,
                 predicate,
             } = input.as_ref()
-                && let Some((_, columns, window, binding)) = ranked_prefix_shape(selected) {
-                    let matches = keys.len() == window.partition_by.len() + 1
-                        && keys.iter().enumerate().all(|(position, key)| {
-                            if key.direction != SortDirection::Asc {
-                                return false;
-                            }
-                            let Expr::Column(reference) = &key.expr else {
-                                return false;
-                            };
-                            match ranked_prefix_project_expr(reference, columns) {
-                                Some(Expr::Column(column))
-                                    if position < window.partition_by.len() =>
-                                {
-                                    *column == window.partition_by[position]
-                                }
-                                Some(Expr::WindowRank(found))
-                                    if position == window.partition_by.len() =>
-                                {
-                                    *found == binding
-                                }
-                                _ => false,
-                            }
-                        });
-                    if matches
-                        && let Some(prefix) = build_ranked_prefix(
-                            db,
-                            selected,
-                            predicate,
-                            Arc::clone(&params),
-                            snapshot,
-                            context,
-                        )? {
-                            return Ok(prefix);
+                && let Some((_, columns, window, binding)) = ranked_prefix_shape(selected)
+            {
+                let matches = keys.len() == window.partition_by.len() + 1
+                    && keys.iter().enumerate().all(|(position, key)| {
+                        if key.direction != SortDirection::Asc {
+                            return false;
                         }
+                        let Expr::Column(reference) = &key.expr else {
+                            return false;
+                        };
+                        match ranked_prefix_project_expr(reference, columns) {
+                            Some(Expr::Column(column)) if position < window.partition_by.len() => {
+                                *column == window.partition_by[position]
+                            }
+                            Some(Expr::WindowRank(found))
+                                if position == window.partition_by.len() =>
+                            {
+                                *found == binding
+                            }
+                            _ => false,
+                        }
+                    });
+                if matches
+                    && let Some(prefix) = build_ranked_prefix(
+                        db,
+                        selected,
+                        predicate,
+                        Arc::clone(&params),
+                        snapshot,
+                        context,
+                    )?
+                {
+                    return Ok(prefix);
                 }
+            }
             // An ordered index run is the committed rows in order and nothing
             // else, so with a transaction open the rows it staged have to be
             // put where they belong. The scan does that as it walks, which is
@@ -14040,8 +14109,7 @@ fn candidate_runs_admit_whole_partitions(
             return Ok(None);
         }
         if values.iter().any(|value| {
-            !(matches!(value, Value::Bool(_))
-                || declared.nullable && matches!(value, Value::Null))
+            !(matches!(value, Value::Bool(_)) || declared.nullable && matches!(value, Value::Null))
         }) {
             return Ok(None);
         }
@@ -14089,7 +14157,11 @@ fn candidate_runs_admit_whole_partitions(
         let rejected_count = domain.len() - admitted_count;
         rejected_per_partition = checked_size_add(
             rejected_per_partition,
-            checked_size_mul(admitted_heads, rejected_count, "candidate rejected prefixes")?,
+            checked_size_mul(
+                admitted_heads,
+                rejected_count,
+                "candidate rejected prefixes",
+            )?,
             "candidate rejected prefixes",
         )?;
         admitted_heads = checked_size_mul(
@@ -14122,9 +14194,8 @@ fn candidate_runs_admit_whole_partitions(
         std::mem::size_of::<IndexKey>(),
         "candidate proof prefixes",
     )?;
-    let prefix_value_slots = (leading..pick.pushed_columns.len()).try_fold(
-        0usize,
-        |bytes, position| {
+    let prefix_value_slots =
+        (leading..pick.pushed_columns.len()).try_fold(0usize, |bytes, position| {
             let domain = suffix_domain(position);
             let admitted_before = (leading..position).try_fold(1usize, |count, earlier| {
                 checked_size_mul(
@@ -14154,8 +14225,7 @@ fn candidate_runs_admit_whole_partitions(
                 )?,
                 "candidate proof key slots",
             )
-        },
-    )?;
+        })?;
     let scratch_slots = checked_size_mul(
         leading.saturating_mul(2),
         std::mem::size_of::<Value>(),
@@ -14203,7 +14273,11 @@ fn candidate_runs_admit_whole_partitions(
                 partition_count / values.len()
             };
             let dimension_payload = values.iter().try_fold(0usize, |bytes, value| {
-                checked_size_add(bytes, value_capacity_bytes(value)?, "candidate partition payload")
+                checked_size_add(
+                    bytes,
+                    value_capacity_bytes(value)?,
+                    "candidate partition payload",
+                )
             })?;
             leading_payload_per_all_runs = checked_size_add(
                 leading_payload_per_all_runs,
@@ -14246,11 +14320,7 @@ fn candidate_runs_admit_whole_partitions(
             payload_copies_per_partition,
             "candidate coverage payload",
         )?,
-        checked_size_mul(
-            maximum_partition_payload,
-            3,
-            "candidate partition scratch",
-        )?,
+        checked_size_mul(maximum_partition_payload, 3, "candidate partition scratch")?,
         "candidate coverage payload",
     )?;
     let planned = checked_size_add(
@@ -14270,13 +14340,16 @@ fn candidate_runs_admit_whole_partitions(
     keys.try_reserve_exact(partition_count)
         .map_err(|_| Error::Other("bounded candidate partition allocation failed".to_string()))?;
     let mut prefixes = Vec::new();
-    prefixes.try_reserve_exact(prefix_count)
+    prefixes
+        .try_reserve_exact(prefix_count)
         .map_err(|_| Error::Other("bounded candidate prefix allocation failed".to_string()))?;
     let mut leading_values = Vec::new();
-    leading_values.try_reserve_exact(leading)
-        .map_err(|_| Error::Other("bounded candidate prefix scratch allocation failed".to_string()))?;
+    leading_values.try_reserve_exact(leading).map_err(|_| {
+        Error::Other("bounded candidate prefix scratch allocation failed".to_string())
+    })?;
     let mut ordered_values = Vec::new();
-    ordered_values.try_reserve_exact(leading)
+    ordered_values
+        .try_reserve_exact(leading)
         .map_err(|_| Error::Other("bounded candidate key scratch allocation failed".to_string()))?;
 
     let directed = |value: &Value, direction: contextdb_core::SortDirection| match direction {
@@ -14336,14 +14409,7 @@ fn candidate_runs_admit_whole_partitions(
             if position == target {
                 visit(prefix)?;
             } else {
-                visit_suffix_rejections(
-                    pick,
-                    meta,
-                    position + 1,
-                    target,
-                    prefix,
-                    visit,
-                )?;
+                visit_suffix_rejections(pick, meta, position + 1, target, prefix, visit)?;
             }
             prefix.pop();
         }
@@ -14360,7 +14426,9 @@ fn candidate_runs_admit_whole_partitions(
                 .iter()
                 .position(|column| column == partition_key)
             else {
-                return Err(Error::Other("candidate partition column disappeared".to_string()).into());
+                return Err(
+                    Error::Other("candidate partition column disappeared".to_string()).into(),
+                );
             };
             ordered_values.push(values[position].clone());
         }
@@ -14374,9 +14442,11 @@ fn candidate_runs_admit_whole_partitions(
         }
         keys.push(key);
         let mut partition_prefix = IndexKey::new();
-        partition_prefix.try_reserve_exact(pick.pushed_columns.len()).map_err(|_| {
-            Error::Other("bounded candidate proof-key allocation failed".to_string())
-        })?;
+        partition_prefix
+            .try_reserve_exact(pick.pushed_columns.len())
+            .map_err(|_| {
+                Error::Other("bounded candidate proof-key allocation failed".to_string())
+            })?;
         for (value, (_, direction)) in values.iter().zip(&pick.columns) {
             partition_prefix.push(directed(value, *direction));
         }
@@ -14413,9 +14483,8 @@ fn candidate_runs_admit_whole_partitions(
         } else {
             &pick.suffix_shapes[position - 1]
         };
-        let choices = super::finite_shape_values(shape).ok_or_else(|| {
-            Error::Other("finite partition prefix lost its shape".to_string())
-        })?;
+        let choices = super::finite_shape_values(shape)
+            .ok_or_else(|| Error::Other("finite partition prefix lost its shape".to_string()))?;
         for value in choices {
             values.push(value.clone());
             visit_leading_shapes(pick, leading, position + 1, values, visit)?;
@@ -14437,29 +14506,47 @@ fn candidate_runs_admit_whole_partitions(
     }
 
     let prefix_bytes = prefixes.iter().try_fold(
-        checked_size_mul(prefixes.capacity(), std::mem::size_of::<IndexKey>(), "candidate proof prefixes")?,
+        checked_size_mul(
+            prefixes.capacity(),
+            std::mem::size_of::<IndexKey>(),
+            "candidate proof prefixes",
+        )?,
         |bytes, prefix| {
             prefix.iter().try_fold(
                 checked_size_add(
                     bytes,
-                    checked_size_mul(prefix.capacity(), std::mem::size_of::<DirectedValue>(), "candidate proof key")?,
+                    checked_size_mul(
+                        prefix.capacity(),
+                        std::mem::size_of::<DirectedValue>(),
+                        "candidate proof key",
+                    )?,
                     "candidate proof key",
                 )?,
                 |bytes, value| {
                     let value = match value {
-                        DirectedValue::Asc(TotalOrdAsc(value)) | DirectedValue::Desc(TotalOrdDesc(value)) => value,
+                        DirectedValue::Asc(TotalOrdAsc(value))
+                        | DirectedValue::Desc(TotalOrdDesc(value)) => value,
                     };
-                    checked_size_add(bytes, value_capacity_bytes(value)?, "candidate proof payload")
+                    checked_size_add(
+                        bytes,
+                        value_capacity_bytes(value)?,
+                        "candidate proof payload",
+                    )
                 },
             )
         },
     )?;
     let key_bytes = keys.iter().try_fold(
-        checked_size_mul(keys.capacity(), std::mem::size_of::<VectorPartitionKey>(), "candidate partition keys")?,
+        checked_size_mul(
+            keys.capacity(),
+            std::mem::size_of::<VectorPartitionKey>(),
+            "candidate partition keys",
+        )?,
         |bytes, key| {
             checked_size_add(
                 bytes,
-                key.estimated_bytes().saturating_sub(std::mem::size_of::<VectorPartitionKey>()),
+                key.estimated_bytes()
+                    .saturating_sub(std::mem::size_of::<VectorPartitionKey>()),
                 "candidate partition payload",
             )
         },
@@ -14918,7 +15005,10 @@ fn build_vector_kernel<'plan>(
     let restricted_candidates =
         candidates.is_some_and(|candidate| !is_unrestricted_scan_for_table(candidate, table));
     let trace = vector_search_trace_with_source(operator, candidate_trace, query_vector_source);
-    context.reserve(BoundedWorkSource::VectorCandidates, size_of::<VectorState>())?;
+    context.reserve(
+        BoundedWorkSource::VectorCandidates,
+        size_of::<VectorState>(),
+    )?;
     Ok(PullNode {
         columns,
         trace,
@@ -15558,9 +15648,13 @@ fn build_scan(
         ScanMode::Physical { .. } => None,
     };
     if let Some(index) = selected_index {
-        db.preflight_historical_index(table, index, snapshot,
+        db.preflight_historical_index(
+            table,
+            index,
+            snapshot,
             context.source_read_memory(BoundedWorkSource::IndexRange),
-            &mut || context.charge_operator(BoundedWorkSource::IndexRange))?;
+            &mut || context.charge_operator(BoundedWorkSource::IndexRange),
+        )?;
     }
     capture_scan_membership(db, table, snapshot, &mut mode, context)?;
     let offers_every_committed_row = matches!(mode, ScanMode::Physical { .. });
@@ -15966,9 +16060,13 @@ fn build_direct_index_scan(
             cursor: db.bounded_physical_table_cursor(table)?,
         }
     };
-    db.preflight_historical_index(table, index, snapshot,
+    db.preflight_historical_index(
+        table,
+        index,
+        snapshot,
         context.source_read_memory(BoundedWorkSource::IndexRange),
-        &mut || context.charge_operator(BoundedWorkSource::IndexRange))?;
+        &mut || context.charge_operator(BoundedWorkSource::IndexRange),
+    )?;
     capture_scan_membership(db, table, snapshot, &mut mode, context)?;
     let offers_every_committed_row = matches!(mode, ScanMode::Physical { .. });
     let mut columns = vec!["row_id".to_string()];
@@ -17009,27 +17107,51 @@ fn statement_needs_vector_read(statement: &contextdb_parser::ast::Statement) -> 
     fn expr(value: &Expr) -> bool {
         match value {
             Expr::CosineDistance { .. } | Expr::RowVectorSource { .. } => true,
-            Expr::InSubquery { expr: input, subquery, .. } => expr(input) || body(subquery),
-            Expr::BinaryOp { left, right, .. } | Expr::Like { expr: left, pattern: right, .. } => expr(left) || expr(right),
+            Expr::InSubquery {
+                expr: input,
+                subquery,
+                ..
+            } => expr(input) || body(subquery),
+            Expr::BinaryOp { left, right, .. }
+            | Expr::Like {
+                expr: left,
+                pattern: right,
+                ..
+            } => expr(left) || expr(right),
             Expr::UnaryOp { operand, .. } | Expr::IsNull { expr: operand, .. } => expr(operand),
             Expr::FunctionCall { args, .. } | Expr::Row(args) => args.iter().any(expr),
-            Expr::InList { expr: input, list, .. } => expr(input) || list.iter().any(expr),
+            Expr::InList {
+                expr: input, list, ..
+            } => expr(input) || list.iter().any(expr),
             _ => false,
         }
     }
     fn body(select: &SelectBody) -> bool {
-        if select.limit == Some(0) { return false; }
-        select.order_by.iter().any(|item| item.direction == SortDirection::CosineDistance || expr(&item.expr))
+        if select.limit == Some(0) {
+            return false;
+        }
+        select
+            .order_by
+            .iter()
+            .any(|item| item.direction == SortDirection::CosineDistance || expr(&item.expr))
             || select.columns.iter().any(|column| expr(&column.expr))
             || select.where_clause.as_ref().is_some_and(expr)
             || select.joins.iter().any(|join| expr(&join.on))
     }
     match statement {
-        Statement::Select(select) => body(&select.body) || select.ctes.iter().any(|cte| match cte {
-            Cte::SqlCte { query, .. } => body(query),
-            Cte::MatchCte { match_clause, .. } => match_clause.where_clause.as_ref().is_some_and(expr)
-                || match_clause.return_cols.iter().any(|column| expr(&column.expr)),
-        }),
+        Statement::Select(select) => {
+            body(&select.body)
+                || select.ctes.iter().any(|cte| match cte {
+                    Cte::SqlCte { query, .. } => body(query),
+                    Cte::MatchCte { match_clause, .. } => {
+                        match_clause.where_clause.as_ref().is_some_and(expr)
+                            || match_clause
+                                .return_cols
+                                .iter()
+                                .any(|column| expr(&column.expr))
+                    }
+                })
+        }
         _ => false,
     }
 }
@@ -17078,8 +17200,12 @@ pub(super) fn execute(
             writer_root,
             context.source_read_memory(BoundedWorkSource::TableScan),
         );
-        let _vector_read = enter_vector_read(db, snapshot, &context,
-            statement_needs_vector_read(&statement))?;
+        let _vector_read = enter_vector_read(
+            db,
+            snapshot,
+            &context,
+            statement_needs_vector_read(&statement),
+        )?;
         #[cfg(any(test, feature = "test-seams"))]
         if let Some(probe) = context.probe() {
             probe.registered_snapshot_for_test(snapshot);
@@ -17106,8 +17232,8 @@ pub(super) fn execute(
                 }),
             )
         })?;
-        let _vector_plan_read = enter_vector_read(db, snapshot, &context,
-            plan_needs_vector_read(&plan))?;
+        let _vector_plan_read =
+            enter_vector_read(db, snapshot, &context, plan_needs_vector_read(&plan))?;
         let publication = context.publication_scope(
             publication_lsn,
             publication_tables(&plan),
@@ -17826,8 +17952,12 @@ impl CursorState {
             self.context
                 .source_read_memory(BoundedWorkSource::TableScan),
         );
-        let _vector_read = enter_vector_read(self.database.as_ref(), self._snapshot,
-            &self.context, self.vector_read)?;
+        let _vector_read = enter_vector_read(
+            self.database.as_ref(),
+            self._snapshot,
+            &self.context,
+            self.vector_read,
+        )?;
         let row_limit = u64::try_from(rows.get()).map_err(|_| {
             RequestContext::limit_failure(
                 ReadFailureLimit::ResultRows,
@@ -18026,10 +18156,11 @@ impl CursorState {
                     break;
                 };
                 if let Some(binding) = row.group_binding
-                    && let Err(error) = self.context.stage_group_return(binding) {
-                        self.replay_push_front(row)?;
-                        return Err(error);
-                    }
+                    && let Err(error) = self.context.stage_group_return(binding)
+                {
+                    self.replay_push_front(row)?;
+                    return Err(error);
+                }
                 retained.push((row.retained_bytes, row.group_binding));
                 page.rows.push(row.values);
                 page.has_more =
@@ -19723,7 +19854,9 @@ impl<T> NativeControlStrong<T> {
     fn downgrade(&self) -> NativeControlWeak<T> {
         // The borrowed strong prevents logical final Drop; cloning the physical
         // count alone gives the weak identity its independent storage lifetime.
-        NativeControlWeak { cell: self.cell.clone() }
+        NativeControlWeak {
+            cell: self.cell.clone(),
+        }
     }
 }
 
@@ -19733,13 +19866,15 @@ impl<T> Clone for NativeControlStrong<T> {
         // Acquire a physical owner first. The borrowed source strong already
         // protects T throughout logical registration, so Relaxed is sufficient.
         let cell = self.cell.clone();
-        let retained = cell.strong.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
-            if count != 0 && count < isize::MAX as usize {
-                Some(count + 1)
-            } else {
-                None
-            }
-        });
+        let retained = cell
+            .strong
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                if count != 0 && count < isize::MAX as usize {
+                    Some(count + 1)
+                } else {
+                    None
+                }
+            });
         if retained.is_err() {
             // Match the existing shared-count exhaustion contract. Never wrap,
             // unwind with an unregistered logical owner, or resurrect zero.
@@ -19782,7 +19917,9 @@ impl<T> Drop for NativeControlStrong<T> {
 
 impl<T> Clone for NativeControlWeak<T> {
     fn clone(&self) -> Self {
-        Self { cell: self.cell.clone() }
+        Self {
+            cell: self.cell.clone(),
+        }
     }
 }
 
@@ -19882,16 +20019,26 @@ impl NativeReadExecutionEntry {
         let started_ms = clock.now_ms();
         let owner = operation.owner();
         let cancellation = operation.cancellation().clone();
-        let control = NativeControlStrong::try_new_with(owner.clone(), || Ok(NativeRequestControl {
-            limits, clock, owner, cancellation,
-            state: Mutex::new(NativeRequestState {
-                started_ms, work_units: 0, rows_so_far: 0, bytes_so_far: 0,
-            }),
-        }))?;
+        let control = NativeControlStrong::try_new_with(owner.clone(), || {
+            Ok(NativeRequestControl {
+                limits,
+                clock,
+                owner,
+                cancellation,
+                state: Mutex::new(NativeRequestState {
+                    started_ms,
+                    work_units: 0,
+                    rows_so_far: 0,
+                    bytes_so_far: 0,
+                }),
+            })
+        })?;
         Ok(Self { control })
     }
     pub(crate) fn open_context(&self) -> NativeReadOpenContext {
-        NativeReadOpenContext { control: self.control.downgrade() }
+        NativeReadOpenContext {
+            control: self.control.downgrade(),
+        }
     }
     pub(crate) fn belongs_to(&self, context: &NativeReadOpenContext) -> bool {
         context.control.belongs_to(&self.control)
@@ -19899,37 +20046,53 @@ impl NativeReadExecutionEntry {
 }
 impl NativeRequestControl {
     fn checkpoint(&self) -> contextdb_core::Result<()> {
-        if self.cancellation.is_cancelled() { return Err(Error::ReadCancelled); }
-        let started = self.state.lock().unwrap_or_else(|p| p.into_inner()).started_ms;
+        if self.cancellation.is_cancelled() {
+            return Err(Error::ReadCancelled);
+        }
+        let started = self
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .started_ms;
         let now = self.clock.now_ms();
         // A backwards clock cannot authorize more work. Use the existing
         // deadline refusal; no allocating diagnostic is built in this slice.
         if now < started || now - started > self.limits.active_ms {
-            return Err(ReadOpenContext::engine_error(RequestContext::limit_failure(
-                ReadFailureLimit::ActiveMs, self.limits.active_ms,
-            )));
+            return Err(ReadOpenContext::engine_error(
+                RequestContext::limit_failure(ReadFailureLimit::ActiveMs, self.limits.active_ms),
+            ));
         }
         Ok(())
     }
 }
 impl NativeReadOpenContext {
     pub(crate) fn checkpoint(&self) -> contextdb_core::Result<()> {
-        self.control.upgrade().ok_or(Error::ReadCancelled)?.checkpoint()
+        self.control
+            .upgrade()
+            .ok_or(Error::ReadCancelled)?
+            .checkpoint()
     }
     pub(crate) fn same_control(&self, other: &Self) -> bool {
         self.control.ptr_eq(&other.control)
     }
-    pub(crate) fn owner(&self) -> contextdb_core::Result<contextdb_core::read_memory::ReadMemoryOwner> {
-        Ok(self.control.upgrade().ok_or(Error::ReadCancelled)?.owner.clone())
+    pub(crate) fn owner(
+        &self,
+    ) -> contextdb_core::Result<contextdb_core::read_memory::ReadMemoryOwner> {
+        Ok(self
+            .control
+            .upgrade()
+            .ok_or(Error::ReadCancelled)?
+            .owner
+            .clone())
     }
     pub(crate) fn touch_row(&self) -> contextdb_core::Result<()> {
         let control = self.control.upgrade().ok_or(Error::ReadCancelled)?;
         control.checkpoint()?;
         let mut state = control.state.lock().unwrap_or_else(|p| p.into_inner());
         if state.work_units >= control.limits.work {
-            return Err(ReadOpenContext::engine_error(RequestContext::limit_failure(
-                ReadFailureLimit::Work, control.limits.work,
-            )));
+            return Err(ReadOpenContext::engine_error(
+                RequestContext::limit_failure(ReadFailureLimit::Work, control.limits.work),
+            ));
         }
         state.work_units += 1;
         Ok(())
@@ -19939,13 +20102,31 @@ impl NativeReadOpenContext {
         control.checkpoint()?;
         let mut state = control.state.lock().unwrap_or_else(|p| p.into_inner());
         let rows = state.rows_so_far.checked_add(u64::from(present));
-        let total = u64::try_from(bytes).ok().and_then(|b| state.bytes_so_far.checked_add(b));
+        let total = u64::try_from(bytes)
+            .ok()
+            .and_then(|b| state.bytes_so_far.checked_add(b));
         for (exceeded, limit, value) in [
-            (rows.is_none_or(|n| n > control.limits.result_rows), ReadFailureLimit::ResultRows, control.limits.result_rows),
-            (total.is_none_or(|n| n > control.limits.result_bytes), ReadFailureLimit::ResultBytes, control.limits.result_bytes),
-            (u64::try_from(bytes).map_or(true, |n| n > control.limits.memory), ReadFailureLimit::Memory, control.limits.memory),
+            (
+                rows.is_none_or(|n| n > control.limits.result_rows),
+                ReadFailureLimit::ResultRows,
+                control.limits.result_rows,
+            ),
+            (
+                total.is_none_or(|n| n > control.limits.result_bytes),
+                ReadFailureLimit::ResultBytes,
+                control.limits.result_bytes,
+            ),
+            (
+                u64::try_from(bytes).map_or(true, |n| n > control.limits.memory),
+                ReadFailureLimit::Memory,
+                control.limits.memory,
+            ),
         ] {
-            if exceeded { return Err(ReadOpenContext::engine_error(RequestContext::limit_failure(limit, value))); }
+            if exceeded {
+                return Err(ReadOpenContext::engine_error(
+                    RequestContext::limit_failure(limit, value),
+                ));
+            }
         }
         state.rows_so_far = rows.expect("checked result rows");
         state.bytes_so_far = total.expect("checked result bytes");

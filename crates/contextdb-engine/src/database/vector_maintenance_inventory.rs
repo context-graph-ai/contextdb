@@ -126,7 +126,9 @@ struct MaintenanceIndexes {
 
 impl MaintenanceContext {
     fn maintenance_indexes(&self) -> Result<MaintenanceIndexes> {
-        let mut memory = OwnedMemoryReservation::new(crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant));
+        let mut memory = OwnedMemoryReservation::new(
+            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
+        );
         let mut indexes = Vec::new();
         let metadata = self.relational.table_meta.read();
         for (table, meta) in metadata.iter() {
@@ -161,8 +163,12 @@ impl MaintenanceContext {
         bytes: usize,
         operation: &str,
     ) -> Result<VectorWorkspaceReservation> {
-        self.vector
-            .reserve_workspace(Arc::clone(&self.finalization.vector_accountant), bytes, operation, HINT)
+        self.vector.reserve_workspace(
+            Arc::clone(&self.finalization.vector_accountant),
+            bytes,
+            operation,
+            HINT,
+        )
     }
 
     fn admit_inventory_slot<T>(
@@ -198,7 +204,11 @@ impl MaintenanceContext {
                     complete: false,
                     indexes: MaintenanceIndexes {
                         indexes: Vec::new(),
-                        _memory: OwnedMemoryReservation::new(crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant)),
+                        _memory: OwnedMemoryReservation::new(
+                            crate::memory_accounting::AccountantHandle::clone(
+                                &self.finalization.accountant,
+                            ),
+                        ),
                     },
                     sources: Vec::new(),
                     catalogs: Vec::new(),
@@ -206,8 +216,16 @@ impl MaintenanceContext {
                     failures: MaintenanceMetadataFailures {
                         first: Some(VectorMaintenanceFailureDetails::from_error(&error)),
                     },
-                    source_memory: OwnedMemoryReservation::new(crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant)),
-                    memory: OwnedMemoryReservation::new(crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant)),
+                    source_memory: OwnedMemoryReservation::new(
+                        crate::memory_accounting::AccountantHandle::clone(
+                            &self.finalization.accountant,
+                        ),
+                    ),
+                    memory: OwnedMemoryReservation::new(
+                        crate::memory_accounting::AccountantHandle::clone(
+                            &self.finalization.accountant,
+                        ),
+                    ),
                 });
             }
             Err(error) => return Err(error),
@@ -219,8 +237,12 @@ impl MaintenanceContext {
             catalogs: Vec::new(),
             misplaced: Vec::new(),
             failures: MaintenanceMetadataFailures::default(),
-            source_memory: OwnedMemoryReservation::new(crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant)),
-            memory: OwnedMemoryReservation::new(crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant)),
+            source_memory: OwnedMemoryReservation::new(
+                crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
+            ),
+            memory: OwnedMemoryReservation::new(crate::memory_accounting::AccountantHandle::clone(
+                &self.finalization.accountant,
+            )),
         };
         for (index_position, index) in phase.indexes.indexes.iter().enumerate() {
             let sampled = self
@@ -273,8 +295,11 @@ impl MaintenanceContext {
                                     if physical_source.is_some() {
                                         return Ok(());
                                     }
-                                    let mut frames =
-                                        OwnedMemoryReservation::new(crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant));
+                                    let mut frames = OwnedMemoryReservation::new(
+                                        crate::memory_accounting::AccountantHandle::clone(
+                                            &self.finalization.accountant,
+                                        ),
+                                    );
                                     frames.try_grow_for(
                                         RedbPersistence::maintenance_catalog_key_frame_bytes(key),
                                         "vector_maintenance",
@@ -404,7 +429,11 @@ impl MaintenanceContext {
                     };
                     // The authenticated route is the sole payload attribution
                     // authority. Reject-only windows supply only physical equality.
-                    let mut frames = OwnedMemoryReservation::new(crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant));
+                    let mut frames = OwnedMemoryReservation::new(
+                        crate::memory_accounting::AccountantHandle::clone(
+                            &self.finalization.accountant,
+                        ),
+                    );
                     frames.try_grow_for(
                         RedbPersistence::maintenance_catalog_key_frame_bytes(
                             &catalog.partition_key,
@@ -516,14 +545,22 @@ impl MaintenanceContext {
             complete: false,
             indexes: MaintenanceIndexes {
                 indexes: Vec::new(),
-                _memory: OwnedMemoryReservation::new(crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant)),
+                _memory: OwnedMemoryReservation::new(
+                    crate::memory_accounting::AccountantHandle::clone(
+                        &self.finalization.accountant,
+                    ),
+                ),
             },
             sources: Vec::new(),
             catalogs: Vec::new(),
             misplaced: Vec::new(),
             failures,
-            source_memory: OwnedMemoryReservation::new(crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant)),
-            memory: OwnedMemoryReservation::new(crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant)),
+            source_memory: OwnedMemoryReservation::new(
+                crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
+            ),
+            memory: OwnedMemoryReservation::new(crate::memory_accounting::AccountantHandle::clone(
+                &self.finalization.accountant,
+            )),
         }
     }
 
@@ -709,7 +746,9 @@ impl MaintenanceContext {
         for entry in &mut inventory.catalogs {
             let catalog = &entry.catalog;
             let heap = RedbPersistence::maintenance_vector_catalog_heap_bytes(catalog);
-            let mut route_memory = OwnedMemoryReservation::new(crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant));
+            let mut route_memory = OwnedMemoryReservation::new(
+                crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
+            );
             let result = route_memory
                 .try_grow_for(heap, "vector_maintenance", PREPARE, HINT)
                 .and_then(|()| {
@@ -752,7 +791,9 @@ impl MaintenanceContext {
                         HINT,
                     )?;
                     vector_source_page_admission::with_catalog_reclamation_source_page_admission(
-                        crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
+                        crate::memory_accounting::AccountantHandle::clone(
+                            &self.finalization.accountant,
+                        ),
                         || {
                             self.build_checkpoint()?;
                             publication.reserve()?;
@@ -785,8 +826,9 @@ impl MaintenanceContext {
     }
 
     pub(super) fn maintenance_build_candidates(&self) -> Result<MaintenanceBuildCandidates> {
-        let mut maintenance_vector_copy_owner =
-            contextdb_vector::VectorCopyAdmission::new(Arc::clone(&self.finalization.vector_accountant));
+        let mut maintenance_vector_copy_owner = contextdb_vector::VectorCopyAdmission::new(
+            Arc::clone(&self.finalization.vector_accountant),
+        );
         self.tx_mgr.with_commit_lock(|| {
             let mut phase = self.maintenance_inventory_phase_locked()?;
             if !phase.complete {

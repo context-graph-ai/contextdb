@@ -80,7 +80,10 @@ fn seed(path: &std::path::Path) {
                 tx,
                 "paged_items",
                 HashMap::from([
-                    ("id".to_owned(), Value::Uuid(Uuid::from_u128(first + ordinal))),
+                    (
+                        "id".to_owned(),
+                        Value::Uuid(Uuid::from_u128(first + ordinal)),
+                    ),
                     ("scope_id".to_owned(), Value::Uuid(scope)),
                     ("embedding".to_owned(), Value::Vector(ranked(axis, ordinal))),
                 ]),
@@ -215,7 +218,9 @@ fn a_healthy_route_is_verified_once_per_load_with_its_actual_page_set() {
     let first = reader(&path, None);
     let start = Database::__paged_route_verifications_for_test();
     assert_eq!(
-        find(&first, alpha(), axis(0)).expect("alpha answers").first(),
+        find(&first, alpha(), axis(0))
+            .expect("alpha answers")
+            .first(),
         Some(&Uuid::from_u128(0xA000))
     );
     let loaded = Database::__paged_route_verifications_for_test();

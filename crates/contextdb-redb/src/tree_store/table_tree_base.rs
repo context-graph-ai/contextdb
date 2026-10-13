@@ -543,10 +543,13 @@ pub(crate) fn native_text_table_root(
 
 #[cfg(feature = "contextdb-internal")]
 fn native_variable_table_root(
-    data: &[u8], expected_key_type: &[u8],
+    data: &[u8],
+    expected_key_type: &[u8],
 ) -> std::result::Result<Option<BtreeHeader>, crate::NativeColdReadError> {
     use crate::{NativeColdFault, NativeColdReadError};
-    let corrupt = || NativeColdReadError::Corrupt(NativeColdFault::new("invalid native byte table descriptor"));
+    let corrupt = || {
+        NativeColdReadError::Corrupt(NativeColdFault::new("invalid native byte table descriptor"))
+    };
     // Existing serialization: kind, length, optional 32-byte root, optional
     // key/value widths, alignments, key type length and two borrowed type names.
     let root_start = 10;
@@ -555,24 +558,41 @@ fn native_variable_table_root(
     let type_start = type_length_start + 4;
     let fixed = data.get(..type_start).ok_or_else(corrupt)?;
     if fixed[0] != 3 {
-        return if fixed[0] == 4 { Err(NativeColdReadError::TypeMismatch) } else { Err(corrupt()) };
+        return if fixed[0] == 4 {
+            Err(NativeColdReadError::TypeMismatch)
+        } else {
+            Err(corrupt())
+        };
     }
-    if fixed[9] > 1 || fixed[width_start] > 1 || fixed[width_start + 5] > 1 { return Err(corrupt()); }
+    if fixed[9] > 1 || fixed[width_start] > 1 || fixed[width_start + 5] > 1 {
+        return Err(corrupt());
+    }
     if fixed[width_start] != 0 || fixed[width_start + 5] != 0 {
         return Err(NativeColdReadError::TypeMismatch);
     }
     let alignment_start = width_start + 10;
-    if u32::from_le_bytes(fixed[alignment_start..alignment_start + 4].try_into().unwrap()) != ALIGNMENT as u32
-        || u32::from_le_bytes(fixed[alignment_start + 4..alignment_start + 8].try_into().unwrap()) != ALIGNMENT as u32 {
+    if u32::from_le_bytes(
+        fixed[alignment_start..alignment_start + 4]
+            .try_into()
+            .unwrap(),
+    ) != ALIGNMENT as u32
+        || u32::from_le_bytes(
+            fixed[alignment_start + 4..alignment_start + 8]
+                .try_into()
+                .unwrap(),
+        ) != ALIGNMENT as u32
+    {
         return Err(NativeColdReadError::TypeMismatch);
     }
-    let key_type_len = u32::from_le_bytes(fixed[type_length_start..type_start].try_into().unwrap()) as usize;
+    let key_type_len =
+        u32::from_le_bytes(fixed[type_length_start..type_start].try_into().unwrap()) as usize;
     let key_type_end = type_start.checked_add(key_type_len).ok_or_else(corrupt)?;
     let key_type = data.get(type_start..key_type_end).ok_or_else(corrupt)?;
     let value_type = data.get(key_type_end..).ok_or_else(corrupt)?;
     for name in [key_type, value_type] {
         if !matches!(name.first(), Some(1 | 2 | 3))
-            || std::str::from_utf8(name.get(1..).ok_or_else(corrupt)?).is_err() {
+            || std::str::from_utf8(name.get(1..).ok_or_else(corrupt)?).is_err()
+        {
             return Err(corrupt());
         }
     }
@@ -580,11 +600,16 @@ fn native_variable_table_root(
     if key_type != expected_key_type || value_type != b"\x01&[u8]" {
         return Err(NativeColdReadError::TypeMismatch);
     }
-    if fixed[9] == 0 { return Ok(None); }
+    if fixed[9] == 0 {
+        return Ok(None);
+    }
     let root_bytes = fixed[root_start..width_start].try_into().unwrap();
-    let page = PageNumber::validated_from_le_bytes(fixed[root_start..root_start + 8].try_into().unwrap())
-        .ok_or_else(corrupt)?;
+    let page =
+        PageNumber::validated_from_le_bytes(fixed[root_start..root_start + 8].try_into().unwrap())
+            .ok_or_else(corrupt)?;
     let root = BtreeHeader::from_le_bytes(root_bytes);
-    if root.root != page { return Err(corrupt()); }
+    if root.root != page {
+        return Err(corrupt());
+    }
     Ok(Some(root))
 }

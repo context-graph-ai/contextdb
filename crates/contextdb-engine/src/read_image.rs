@@ -354,7 +354,8 @@ pub(crate) fn project_change_state(
     database
         .ensure_image_history_with_read_memory(checkpoint, read_memory.clone())
         .map_err(image_history_answer_error)?;
-    project_loaded_change_state(database, checkpoint, charge, read_memory).map_err(history_answer_error)
+    project_loaded_change_state(database, checkpoint, charge, read_memory)
+        .map_err(history_answer_error)
 }
 
 fn project_loaded_change_state(
@@ -1483,11 +1484,13 @@ pub(crate) fn write_metadata_body(
 pub(crate) fn read_metadata_body(
     bytes: &mut crate::read_contract::CanonicalReader<'_>,
 ) -> std::result::Result<DirectMetadataBody, crate::read_contract::ReadEncodingError> {
-    let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call().map_err(|error| {
-        crate::read_contract::encoding_error_from_core(
-            error, contextdb_core::read_contract::ReadLimits::SHIPPED_MEMORY,
-        )
-    })?;
+    let _decode_scope =
+        crate::read_image_memory::ImageMemory::enter_decode_call().map_err(|error| {
+            crate::read_contract::encoding_error_from_core(
+                error,
+                contextdb_core::read_contract::ReadLimits::SHIPPED_MEMORY,
+            )
+        })?;
     match bytes.tag()? {
         0 => {
             let count = bytes.element_count()?;
@@ -1672,11 +1675,13 @@ fn read_image_state(
 fn read_rendered<T: serde::de::DeserializeOwned>(
     bytes: &mut crate::read_contract::CanonicalReader<'_>,
 ) -> std::result::Result<Vec<T>, crate::read_contract::ReadEncodingError> {
-    let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call().map_err(|error| {
-        crate::read_contract::encoding_error_from_core(
-            error, contextdb_core::read_contract::ReadLimits::SHIPPED_MEMORY,
-        )
-    })?;
+    let _decode_scope =
+        crate::read_image_memory::ImageMemory::enter_decode_call().map_err(|error| {
+            crate::read_contract::encoding_error_from_core(
+                error,
+                contextdb_core::read_contract::ReadLimits::SHIPPED_MEMORY,
+            )
+        })?;
     let count = bytes.element_count()?;
     let mut values = Vec::new();
     for _ in 0..count {

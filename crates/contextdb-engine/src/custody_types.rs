@@ -432,7 +432,9 @@ pub(crate) fn decode_outcome_projection(
         #[serde(deserialize_with = "required_nullable")]
         conflicts: Option<Vec<Conflict>>,
     }
-    let Some(p): Option<OutcomeProjection> = crate::read_image_memory::decode_json(text.as_bytes())? else {
+    let Some(p): Option<OutcomeProjection> =
+        crate::read_image_memory::decode_json(text.as_bytes())?
+    else {
         return Ok(None);
     };
     if p.tenant_id != p.cursor.tenant_id

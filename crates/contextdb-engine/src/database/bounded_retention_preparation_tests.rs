@@ -7,10 +7,20 @@ fn durable_edge_count(db: &Database) -> usize {
     use std::ops::Bound;
     let root = durable_observation::root(db);
     let owner = SourceWindowOwner::Read(db.declared_reader_memory().unwrap());
-    let mut cursor = root.cursor(owner, "graph_fwd", WriterCursorFamily::Bytes,
-        Bound::Unbounded, Bound::Unbounded, false).unwrap();
+    let mut cursor = root
+        .cursor(
+            owner,
+            "graph_fwd",
+            WriterCursorFamily::Bytes,
+            Bound::Unbounded,
+            Bound::Unbounded,
+            false,
+        )
+        .unwrap();
     let mut count = 0;
-    while cursor.next(|_, _| Ok(())).unwrap().is_some() { count += 1; }
+    while cursor.next(|_, _| Ok(())).unwrap().is_some() {
+        count += 1;
+    }
     count
 }
 
@@ -224,10 +234,7 @@ fn impossible_expiry_limit_preserves_old_state_with_typed_refusal() {
     let reopened = Database::open_with_options(&path, options).unwrap();
     let tables = durable_observation::rows(&reopened, "retained");
     assert_eq!(tables.len(), 3);
-    assert!(
-        tables.iter()
-            .all(|row| row.deleted_tx.is_none())
-    );
+    assert!(tables.iter().all(|row| row.deleted_tx.is_none()));
     drop(tables);
     reopened.close().unwrap();
 }
@@ -324,10 +331,7 @@ fn reclamation_admits_vector_and_edge_identities_without_payload_copies() {
     );
     assert_eq!(db.accountant.usage().used, used);
     assert_eq!(durable_observation::version_count(&db, "retained"), 1);
-    assert_eq!(
-        durable_edge_count(&db),
-        64
-    );
+    assert_eq!(durable_edge_count(&db), 64);
     let index = VectorIndexRef::new("retained", "v");
     let vector_fixture_reader_1 = db
         .declared_reader_memory()
@@ -466,12 +470,20 @@ fn reader_deferred_edges_remain_charged_and_carry_only_retries_are_admitted() {
     let mut pruned = 0;
     for _ in 0..4 {
         let report = db.run_pruning_cycle_checked().unwrap();
-        assert!(report.pruned_rows <= 32, "one finite prune selection stays within its batch");
+        assert!(
+            report.pruned_rows <= 32,
+            "one finite prune selection stays within its batch"
+        );
         pruned += report.pruned_rows;
         let carry = db.retention_deferred_edge_nodes.lock();
         assert_eq!(carry.nodes.len() as u64, pruned);
-        assert_eq!(carry._memory.as_ref().unwrap().bytes(), carry.nodes.len() * 128);
-        if pruned == 64 { break; }
+        assert_eq!(
+            carry._memory.as_ref().unwrap().bytes(),
+            carry.nodes.len() * 128
+        );
+        if pruned == 64 {
+            break;
+        }
     }
     assert_eq!(pruned, 64);
     assert!((durable_observation::version_count(&db, "retained") == 0));
@@ -489,10 +501,7 @@ fn reader_deferred_edges_remain_charged_and_carry_only_retries_are_admitted() {
     );
     assert_eq!(db.accountant.usage().used, used);
     assert_eq!(db.retention_deferred_edge_nodes.lock().nodes.len(), 64);
-    assert_eq!(
-        durable_edge_count(&db),
-        64
-    );
+    assert_eq!(durable_edge_count(&db), 64);
     db.accountant.set_budget(Some(used + 64 * 1024)).unwrap();
     assert_eq!(db.run_pruning_cycle_checked().unwrap().pruned_rows, 0);
     assert_eq!(db.retention_deferred_edge_nodes.lock().nodes.len(), 64);
@@ -508,10 +517,7 @@ fn reader_deferred_edges_remain_charged_and_carry_only_retries_are_admitted() {
         if requested_bytes > available_bytes)
     );
     assert_eq!(reopened.accountant.usage().used, used);
-    assert_eq!(
-        durable_edge_count(&reopened),
-        64
-    );
+    assert_eq!(durable_edge_count(&reopened), 64);
     reopened
         .accountant
         .set_budget(Some(used + 256 * 1024))
@@ -519,8 +525,13 @@ fn reader_deferred_edges_remain_charged_and_carry_only_retries_are_admitted() {
     for _ in 0..4 {
         assert_eq!(reopened.run_pruning_cycle_checked().unwrap().pruned_rows, 0);
         let carry = reopened.retention_deferred_edge_nodes.lock();
-        assert_eq!(carry._memory.as_ref().unwrap().bytes(), carry.nodes.len() * 128);
-        if carry.nodes.is_empty() { break; }
+        assert_eq!(
+            carry._memory.as_ref().unwrap().bytes(),
+            carry.nodes.len() * 128
+        );
+        if carry.nodes.is_empty() {
+            break;
+        }
     }
     assert_eq!(durable_edge_count(&reopened), 0);
     assert!(
@@ -854,7 +865,9 @@ fn current_row_identity_body_is_admitted_for_selected_lifetime_only() {
         let rows = durable_observation::rows(&db, "retained");
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].row_id, rows[1].row_id);
-        assert!(matches!(rows[1].values.get("payload"), Some(Value::Text(body)) if body.len() > 128 * 1024));
+        assert!(
+            matches!(rows[1].values.get("payload"), Some(Value::Text(body)) if body.len() > 128 * 1024)
+        );
     }
     let used = db.accountant.usage().used;
     db.accountant.set_budget(Some(used + 128 * 1024)).unwrap();

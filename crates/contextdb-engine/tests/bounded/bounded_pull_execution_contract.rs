@@ -286,16 +286,12 @@ fn bounded_limits_are_data_derived_exact_and_return_typed_refusals() {
     seed_relational(&dual_charge, "dual_charge_rows", 37, 19);
     let dual_sql = "SELECT id, payload FROM dual_charge_rows WHERE id < 7 ORDER BY id";
     let writer_baseline = accountant.usage().used;
-    let reader = dual_charge.declared_read_memory_for_test(
-        );
+    let reader = dual_charge.declared_read_memory_for_test();
     let baseline = reader.retained_bytes_for_test();
-    let probe = Arc::new(SourceLoopPoisonProbe::new(clock.clone(),
-        reader.clone(), 0));
+    let probe = Arc::new(SourceLoopPoisonProbe::new(clock.clone(), reader.clone(), 0));
     let mut dual_request = request(dual_sql, HashMap::new(), roomy_limits(), &clock);
     dual_request.probe = Some(probe.clone());
-    let dual_profile = bounded_success(
-        &dual_charge,
-        &dual_request);
+    let dual_profile = bounded_success(&dual_charge, &dual_request);
     let peak = dual_profile.telemetry.peak_temporary_bytes;
     assert!(peak > 0);
     assert!(probe.peak_temporary_accounted_bytes() >= peak);
@@ -314,12 +310,8 @@ fn bounded_limits_are_data_derived_exact_and_return_typed_refusals() {
         ReadFailureLimit::Memory,
         short.memory,
     );
-    assert_eq!(reader.retained_bytes_for_test(),
-        baseline);
-    assert_eq!(
-        accountant
-        .usage().used,
-        writer_baseline);
+    assert_eq!(reader.retained_bytes_for_test(), baseline);
+    assert_eq!(accountant.usage().used, writer_baseline);
 }
 
 /// LIMIT stops the table source, while an unindexed sort cannot pretend it can
@@ -1638,9 +1630,7 @@ impl bounded::ExecutionProbe for SourceLoopPoisonProbe {
         _reserved_bytes: u64,
         held_temporary_bytes: u64,
     ) {
-        let actually_accounted = self
-            .reader.retained_bytes_for_test()
-            ;
+        let actually_accounted = self.reader.retained_bytes_for_test();
         assert!(
             actually_accounted >= held_temporary_bytes,
             "the bounded request's claimed temporary state is reserved in the reader owner: accounted={actually_accounted}, held={held_temporary_bytes}, baseline={}",
@@ -1866,9 +1856,13 @@ fn assert_exact_n_and_n_minus_one_matrix_case(
     let cancellation_clock = ManualClock::default();
     let cancellation = OwnerReadCancellation::new();
     let cancellation_probe = Arc::new(
-        SourceLoopPoisonProbe::new(cancellation_clock.clone(), case.db.declared_read_memory_for_test(), baseline)
-            .cancel_on_first_touch(case.touch, cancellation.clone())
-            .poison_source_after(case.touch, 1),
+        SourceLoopPoisonProbe::new(
+            cancellation_clock.clone(),
+            case.db.declared_read_memory_for_test(),
+            baseline,
+        )
+        .cancel_on_first_touch(case.touch, cancellation.clone())
+        .poison_source_after(case.touch, 1),
     );
     let mut cancellation_request =
         request(case.sql, case.params, roomy_limits(), &cancellation_clock);
@@ -2902,7 +2896,7 @@ fn cursor_terminal_paths_release_accounted_memory_and_snapshot_pin() {
         .close()
         .expect("release the exhausted cursor's columns");
     assert_eq!(
-        reader.retained_bytes_for_test()- baseline_memory,
+        reader.retained_bytes_for_test() - baseline_memory,
         closed_receipt_bytes,
         "the same query retains exactly one observation after close"
     );
@@ -2945,7 +2939,7 @@ fn cursor_terminal_paths_release_accounted_memory_and_snapshot_pin() {
     assert!(snapshot_cursor.first_page.has_more);
     drop(snapshot_cursor.first_page);
     assert!(
-        reader.retained_bytes_for_test()> snapshot_baseline_memory,
+        reader.retained_bytes_for_test() > snapshot_baseline_memory,
         "the live snapshot cursor keeps its retained bytes in the reader owner"
     );
     memory_db
@@ -3073,7 +3067,7 @@ fn cursor_terminal_paths_release_accounted_memory_and_snapshot_pin() {
             .fetch(NonZeroUsize::new(2), OwnerReadCancellation::new())
             .expect_err("an expired cursor has no continuation to reuse"),
     );
-drop(expiry_cursor.cursor);
+    drop(expiry_cursor.cursor);
     assert_eq!(
         reader.retained_bytes_for_test(),
         snapshot_baseline_memory,

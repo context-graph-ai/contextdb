@@ -209,8 +209,12 @@ impl<T> SharedVectorPayload<T> {
             if let Some(charge) = charge.as_mut() {
                 let header_bytes = shared_payload_header_bytes();
                 charge.header_bytes = header_bytes;
-                charge.header_accountant = header_accountant
-                    .filter(|accountant| !crate::memory_budget::same_funder(charge.accountant.as_ref(), accountant.as_ref()));
+                charge.header_accountant = header_accountant.filter(|accountant| {
+                    !crate::memory_budget::same_funder(
+                        charge.accountant.as_ref(),
+                        accountant.as_ref(),
+                    )
+                });
                 charge
                     .live_header_bytes
                     .fetch_add(header_bytes, Ordering::SeqCst);

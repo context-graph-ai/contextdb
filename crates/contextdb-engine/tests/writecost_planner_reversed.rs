@@ -26,7 +26,10 @@ fn none() -> HashMap<String, Value> {
 }
 
 fn params(pairs: Vec<(&str, Value)>) -> HashMap<String, Value> {
-    pairs.into_iter().map(|(name, value)| (name.to_owned(), value)).collect()
+    pairs
+        .into_iter()
+        .map(|(name, value)| (name.to_owned(), value))
+        .collect()
 }
 
 fn uuid(id: u128) -> Value {
@@ -48,7 +51,9 @@ fn roomy() -> ReadLimits {
 }
 
 fn contexts(ids: &[u128]) -> BTreeSet<ContextId> {
-    ids.iter().map(|id| ContextId::new(Uuid::from_u128(*id))).collect()
+    ids.iter()
+        .map(|id| ContextId::new(Uuid::from_u128(*id)))
+        .collect()
 }
 
 /// `members`: membership_id UNIQUE, context-scoped, optionally a nonunique (context_id,
@@ -61,8 +66,11 @@ fn world(extra_index: bool) -> Database {
     )
     .unwrap();
     if extra_index {
-        db.execute("CREATE INDEX members_ctx_gen ON members (context_id, generation_id)", &none())
-            .unwrap();
+        db.execute(
+            "CREATE INDEX members_ctx_gen ON members (context_id, generation_id)",
+            &none(),
+        )
+        .unwrap();
     }
     for (id, membership, context) in [(1, M_A, CTX_A), (2, M_B, CTX_B)] {
         db.execute(
@@ -96,14 +104,30 @@ fn classify(result: Result<usize, Error>) -> Answer {
 }
 
 /// Live handle, bounded read session, retained cursor, and a transaction with a staged row.
-fn every_route(db: &Database, sql: &str, binds: &HashMap<String, Value>) -> Vec<(&'static str, Answer)> {
+fn every_route(
+    db: &Database,
+    sql: &str,
+    binds: &HashMap<String, Value>,
+) -> Vec<(&'static str, Answer)> {
     let narrowed = db.scoped_with_contexts(contexts(&[CTX_A]));
-    let mut answers = vec![("eager", classify(narrowed.execute(sql, binds).map(|r| r.rows.len())))];
-    let session = narrowed.read_session(roomy()).expect("open a bounded read view");
-    answers.push(("bounded", classify(session.execute(sql, binds).map(|r| r.rows.len()))));
+    let mut answers = vec![(
+        "eager",
+        classify(narrowed.execute(sql, binds).map(|r| r.rows.len())),
+    )];
+    let session = narrowed
+        .read_session(roomy())
+        .expect("open a bounded read view");
+    answers.push((
+        "bounded",
+        classify(session.execute(sql, binds).map(|r| r.rows.len())),
+    ));
     answers.push((
         "retained cursor",
-        classify(session.open_cursor(sql, binds).map(|cursor| cursor.first_page().rows.len())),
+        classify(
+            session
+                .open_cursor(sql, binds)
+                .map(|cursor| cursor.first_page().rows.len()),
+        ),
     ));
     let tx = narrowed.begin().expect("begin");
     narrowed
@@ -121,7 +145,13 @@ fn every_route(db: &Database, sql: &str, binds: &HashMap<String, Value>) -> Vec<
     answers
 }
 
-fn all_routes_answer(db: &Database, sql: &str, binds: &HashMap<String, Value>, expected: &Answer, label: &str) {
+fn all_routes_answer(
+    db: &Database,
+    sql: &str,
+    binds: &HashMap<String, Value>,
+    expected: &Answer,
+    label: &str,
+) {
     for (route, answer) in every_route(db, sql, binds) {
         assert_eq!(&answer, expected, "{label}: route `{route}` for `{sql}`");
     }
@@ -133,7 +163,11 @@ fn all_routes_answer(db: &Database, sql: &str, binds: &HashMap<String, Value>, e
 fn a_hidden_row_named_with_reversed_operands_is_refused_on_every_route() {
     for extra_index in [false, true] {
         let db = world(extra_index);
-        let label = if extra_index { "with secondary index" } else { "unique key only" };
+        let label = if extra_index {
+            "with secondary index"
+        } else {
+            "unique key only"
+        };
         all_routes_answer(
             &db,
             "SELECT id FROM members WHERE $m = membership_id",
@@ -193,8 +227,12 @@ fn explain_plans_reversed_equality_exactly_as_column_first() {
                 format!("SELECT id FROM members WHERE '{m}' = membership_id"),
             ),
             (
-                format!("SELECT id FROM members WHERE context_id = '{b}' AND generation_id = '{g}' AND membership_id = '{m}'"),
-                format!("SELECT id FROM members WHERE '{b}' = context_id AND '{g}' = generation_id AND '{m}' = membership_id"),
+                format!(
+                    "SELECT id FROM members WHERE context_id = '{b}' AND generation_id = '{g}' AND membership_id = '{m}'"
+                ),
+                format!(
+                    "SELECT id FROM members WHERE '{b}' = context_id AND '{g}' = generation_id AND '{m}' = membership_id"
+                ),
             ),
         ];
         for (column_first, reversed) in pairs {

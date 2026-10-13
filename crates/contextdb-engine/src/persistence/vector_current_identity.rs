@@ -381,7 +381,12 @@ mod tests {
         }
     }
 
-    fn open_fixture(path: &Path) -> (Arc<RedbPersistence>, crate::memory_accounting::AccountantHandle) {
+    fn open_fixture(
+        path: &Path,
+    ) -> (
+        Arc<RedbPersistence>,
+        crate::memory_accounting::AccountantHandle,
+    ) {
         let persistence = Arc::new(RedbPersistence::open_with_cache(path, 0).unwrap());
         // Writable recovery may already have installed the source's accountant.
         // Qualify the actual installed funder, never a rejected later attachment.
@@ -390,7 +395,10 @@ mod tests {
             .unwrap_or_else(|| Arc::new(MemoryAccountant::with_budget(64 * 1024 * 1024)).into());
         writer.set_budget(Some(64 * 1024 * 1024)).unwrap();
         persistence.attach_memory_accountant(writer.clone());
-        assert_eq!(persistence.proof_accountant().unwrap().as_ptr(), writer.as_ptr());
+        assert_eq!(
+            persistence.proof_accountant().unwrap().as_ptr(),
+            writer.as_ptr()
+        );
         (persistence, writer)
     }
 

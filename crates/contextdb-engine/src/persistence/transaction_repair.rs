@@ -94,7 +94,17 @@ impl RedbPersistence {
             for (definition, reverse) in [(GRAPH_FWD_TABLE, false), (GRAPH_REV_TABLE, true)] {
                 self.transform_transaction_records(&write, definition, |_key, bytes| {
                     #[cfg(any(test, feature = "test-seams"))]
-                    crate::read_work_probe::note_graph("graph_payload", "payload_decode", _key, None, Some(if reverse { "transaction_repair_reverse" } else { "transaction_repair_forward" }));
+                    crate::read_work_probe::note_graph(
+                        "graph_payload",
+                        "payload_decode",
+                        _key,
+                        None,
+                        Some(if reverse {
+                            "transaction_repair_reverse"
+                        } else {
+                            "transaction_repair_forward"
+                        }),
+                    );
                     let mut entry: AdjEntry = Self::decode(bytes)?;
                     remap(&mut entry.created_tx);
                     if let Some(deleted) = &mut entry.deleted_tx {

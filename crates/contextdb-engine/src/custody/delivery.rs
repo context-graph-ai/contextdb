@@ -990,10 +990,19 @@ pub(crate) fn native_outcome_cursor_after(
     edge: &str,
     edge_incarnation: contextdb_core::Incarnation,
     since: Option<&[u8]>,
-) -> std::result::Result<Option<(contextdb_core::Lsn, u32)>, crate::sync_native_delivery::DecodeError> {
-    since.map(|bytes| {
-        crate::sync_native_delivery::validate_cursor_after(
-            memory, bytes, tenant.as_str(), hub, hub_incarnation, edge, edge_incarnation,
-        )
-    }).transpose()
+) -> std::result::Result<Option<(contextdb_core::Lsn, u32)>, crate::sync_native_delivery::DecodeError>
+{
+    since
+        .map(|bytes| {
+            crate::sync_native_delivery::validate_cursor_after(
+                memory,
+                bytes,
+                tenant.as_str(),
+                hub,
+                hub_incarnation,
+                edge,
+                edge_incarnation,
+            )
+        })
+        .transpose()
 }

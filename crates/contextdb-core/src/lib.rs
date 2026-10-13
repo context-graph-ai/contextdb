@@ -16,9 +16,9 @@ pub use companion::{store_companion_path, store_holders_path};
 pub use error::{
     CallbackKind, Error, Result, VectorPartitionDeclarationIssue, VectorPolicyDeclarationIssue,
 };
+pub use memory::*;
 #[doc(hidden)]
 pub use read_memory::{NativeReadWake, ReadOwnedFuture};
-pub use memory::*;
 // Explicit re-exports only — do NOT glob-export `table_meta::*`. `SortDirection`
 // collides by name with `contextdb_parser::ast::SortDirection`, so downstream
 // crates must use fully-qualified paths at ambiguous sites.

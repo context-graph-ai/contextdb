@@ -51,19 +51,33 @@ struct InProcessServer {
 
 impl ClientTransport for InProcessClient {
     fn request_stream_admitted<'a>(
-        &'a self, subject: &'a str, body: super::BoundedWireBody, timeout: Duration,
+        &'a self,
+        subject: &'a str,
+        body: super::BoundedWireBody,
+        timeout: Duration,
     ) -> super::WireResult<super::DispatchedWireFuture<'a, super::BoundedWireReply>> {
         #[cfg(target_os = "linux")]
         {
             let mailbox = {
                 let installed = self.inner.native.lock().unwrap_or_else(|p| p.into_inner());
-                installed.as_ref().map(native_serving::Mailbox::acquire_client).transpose()?
+                installed
+                    .as_ref()
+                    .map(native_serving::Mailbox::acquire_client)
+                    .transpose()?
             };
             if let Some(mailbox) = mailbox {
-                return native_serving::request(mailbox, subject, body, timeout, self.node_id.as_deref());
+                return native_serving::request(
+                    mailbox,
+                    subject,
+                    body,
+                    timeout,
+                    self.node_id.as_deref(),
+                );
             }
         }
-        Ok(super::DispatchedWireFuture::legacy(self.request_stream(subject, body, timeout)))
+        Ok(super::DispatchedWireFuture::legacy(
+            self.request_stream(subject, body, timeout),
+        ))
     }
 
     fn local_node_id(&self) -> Option<String> {
@@ -148,7 +162,9 @@ impl ClientTransport for InProcessClient {
 
 impl ServerTransport for InProcessServer {
     fn serve_native_installation<'a>(
-        &'a self, legacy: Vec<HandlerRegistration>, bound: super::ReadBoundStreamInstallation,
+        &'a self,
+        legacy: Vec<HandlerRegistration>,
+        bound: super::ReadBoundStreamInstallation,
         stop: super::NativeStop,
     ) -> super::WireResult<super::DispatchedWireFuture<'a, ()>> {
         if bound.native_routes().is_none() {
@@ -156,11 +172,18 @@ impl ServerTransport for InProcessServer {
         }
         // Mixing unowned eager handlers into a Native root needs the real
         // explicit-owner route companions, not an unpaid callback adapter.
-        if !legacy.is_empty() { return Err(TransportError::NoResponder.into()); }
+        if !legacy.is_empty() {
+            return Err(TransportError::NoResponder.into());
+        }
         #[cfg(target_os = "linux")]
-        { native_serving::serve(&self.inner, bound, stop) }
+        {
+            native_serving::serve(&self.inner, bound, stop)
+        }
         #[cfg(not(target_os = "linux"))]
-        { let _ = (bound, stop); Err(TransportError::NoResponder.into()) }
+        {
+            let _ = (bound, stop);
+            Err(TransportError::NoResponder.into())
+        }
     }
 
     fn serve<'a>(
@@ -374,7 +397,6 @@ fn receive_read_bound_eager(
     })
 }
 
-
 /// A native eager receive copies from external eager custody into a buffer
 /// admitted on the original operation. It never wraps an already allocated
 /// Vec with a late invoice. The supplied Vec itself remains unqualified.
@@ -497,17 +519,29 @@ pub(crate) fn begin_native_in_process(
     contextdb_core::read_memory::ReadShared<Mutex<Option<super::BoundedWireBody>>>,
 )> {
     use contextdb_core::read_memory::ReadShared;
-    let routes = installation.native_routes().ok_or(super::TransportError::NoResponder)?;
-    let route = routes.find(subject).ok_or(super::TransportError::NoResponder)?;
+    let routes = installation
+        .native_routes()
+        .ok_or(super::TransportError::NoResponder)?;
+    let route = routes
+        .find(subject)
+        .ok_or(super::TransportError::NoResponder)?;
     // begin is the ONLY provider acquisition, before receive/control/frame.
     let (operation, cancellation) = match route.begin_request()? {
-        super::native_wire::NativeReadStreamBegin::Native { operation, cancellation } => (operation, cancellation),
-        super::native_wire::NativeReadStreamBegin::Legacy(_) => return Err(super::TransportError::NoResponder.into()),
+        super::native_wire::NativeReadStreamBegin::Native {
+            operation,
+            cancellation,
+        } => (operation, cancellation),
+        super::native_wire::NativeReadStreamBegin::Legacy(_) => {
+            return Err(super::TransportError::NoResponder.into());
+        }
     };
     let owner = operation.owner();
     let body = receive_native_read_borrowed(&operation, request)?;
-    let invoice = super::native_wire::wire_credit(owner.clone(),
-        ReadShared::<Mutex<Option<super::BoundedWireBody>>>::layout().size(), "native_in_process_reply")?;
+    let invoice = super::native_wire::wire_credit(
+        owner.clone(),
+        ReadShared::<Mutex<Option<super::BoundedWireBody>>>::layout().size(),
+        "native_in_process_reply",
+    )?;
     let reply = ReadShared::try_from_prepaid_with(invoice, || Ok(Mutex::new(None)))?;
     let sink = reply.clone();
     let finish_owner = owner.clone();
@@ -516,18 +550,29 @@ pub(crate) fn begin_native_in_process(
         Ok(move |body| {
             // Admission includes the concrete body and slot captures, before
             // constructing this callback future. No oneshot/Notify/waker clone.
-            super::native_wire::admit_wire_future_with(finish_owner, || Ok(async move {
-                let mut slot = sink.lock().unwrap_or_else(|p| p.into_inner());
-                if finish_cancellation.is_cancelled() { return Err(contextdb_core::Error::ReadCancelled.into()); }
-                if slot.is_some() { return Err(super::TransportError::NoResponder.into()); }
-                *slot = Some(body);
-                Ok(())
-            }))
+            super::native_wire::admit_wire_future_with(finish_owner, || {
+                Ok(async move {
+                    let mut slot = sink.lock().unwrap_or_else(|p| p.into_inner());
+                    if finish_cancellation.is_cancelled() {
+                        return Err(contextdb_core::Error::ReadCancelled.into());
+                    }
+                    if slot.is_some() {
+                        return Err(super::TransportError::NoResponder.into());
+                    }
+                    *slot = Some(body);
+                    Ok(())
+                })
+            })
         })
     })?;
-    let future = route.dispatch_native(super::ReadBoundIncomingRequest {
-        body, responder: super::ReadBoundResponder::Native(responder), node_id: None,
-    }, operation)?;
+    let future = route.dispatch_native(
+        super::ReadBoundIncomingRequest {
+            body,
+            responder: super::ReadBoundResponder::Native(responder),
+            node_id: None,
+        },
+        operation,
+    )?;
     Ok((cancellation, future, reply))
 }
 
@@ -536,17 +581,23 @@ pub(crate) fn begin_native_in_process(
 #[cfg(target_os = "linux")]
 mod native_serving {
     use super::*;
-    use contextdb_core::read_contract::{NativeCancellationListener, NativeDriverPark, NativeReadCancellation};
+    use contextdb_core::read_contract::{
+        NativeCancellationListener, NativeDriverPark, NativeReadCancellation,
+    };
     use contextdb_core::read_memory::{ReadMemoryOwner, ReadShared};
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::atomic::AtomicU32;
     use std::task::{Context, Poll};
-    fn shared<T>(owner: ReadMemoryOwner, make: impl FnOnce() -> contextdb_core::Result<T>)
-        -> super::super::WireResult<ReadShared<T>>
-    {
+    fn shared<T>(
+        owner: ReadMemoryOwner,
+        make: impl FnOnce() -> contextdb_core::Result<T>,
+    ) -> super::super::WireResult<ReadShared<T>> {
         let invoice = super::super::native_wire::wire_credit(
-            owner, ReadShared::<T>::layout().size(), "in_process_control")?;
+            owner,
+            ReadShared::<T>::layout().size(),
+            "in_process_control",
+        )?;
         Ok(ReadShared::try_from_prepaid_with(invoice, make)?)
     }
 
@@ -556,11 +607,17 @@ mod native_serving {
 
     impl NativeInProcessWake {
         fn try_new_owned(owner: ReadMemoryOwner) -> super::super::WireResult<ReadShared<Self>> {
-            shared(owner, || Ok(Self { ready: AtomicU32::new(0) }))
+            shared(owner, || {
+                Ok(Self {
+                    ready: AtomicU32::new(0),
+                })
+            })
         }
 
         fn park_once(&self, timeout_ms: Option<u64>) -> contextdb_core::Result<()> {
-            if self.ready.swap(0, Ordering::AcqRel) != 0 { return Ok(()); }
+            if self.ready.swap(0, Ordering::AcqRel) != 0 {
+                return Ok(());
+            }
             // Relative FUTEX_WAIT uses CLOCK_MONOTONIC. The entire timespec
             // stays on this already-owned caller's stack through the syscall.
             // Cap only to the platform's representable relative interval; the
@@ -569,14 +626,20 @@ mod native_serving {
                 tv_sec: libc::time_t::try_from(ms / 1_000).unwrap_or(libc::time_t::MAX),
                 tv_nsec: ((ms % 1_000) * 1_000_000) as libc::c_long,
             });
-            let timeout_pointer = timeout.as_ref()
+            let timeout_pointer = timeout
+                .as_ref()
                 .map_or(std::ptr::null(), |value| value as *const libc::timespec);
             // SAFETY: the paid shared borrow keeps the aligned word live. A
             // concurrent wake stores one before FUTEX_WAKE; expected zero
             // prevents losing that wake between our swap and kernel enqueue.
             let result = unsafe {
-                libc::syscall(libc::SYS_futex, self.ready.as_ptr(),
-                    libc::FUTEX_WAIT | libc::FUTEX_PRIVATE_FLAG, 0u32, timeout_pointer)
+                libc::syscall(
+                    libc::SYS_futex,
+                    self.ready.as_ptr(),
+                    libc::FUTEX_WAIT | libc::FUTEX_PRIVATE_FLAG,
+                    0u32,
+                    timeout_pointer,
+                )
             };
             if result == -1 {
                 // No diagnostic allocation, retry loop, worker or timer registry.
@@ -587,7 +650,6 @@ mod native_serving {
             }
             Ok(())
         }
-
     }
 
     impl contextdb_core::read_memory::NativeReadWake for NativeInProcessWake {
@@ -596,8 +658,12 @@ mod native_serving {
             // SAFETY: this callback retains the same paid cell; wake neither
             // copies a host waker nor creates a scheduler/task/channel node.
             unsafe {
-                libc::syscall(libc::SYS_futex, self.ready.as_ptr(),
-                    libc::FUTEX_WAKE | libc::FUTEX_PRIVATE_FLAG, 1i32);
+                libc::syscall(
+                    libc::SYS_futex,
+                    self.ready.as_ptr(),
+                    libc::FUTEX_WAKE | libc::FUTEX_PRIVATE_FLAG,
+                    1i32,
+                );
             }
         }
     }
@@ -615,13 +681,16 @@ mod native_serving {
         }
     }
     impl contextdb_core::read_contract::NativeDriverPark for NativeInProcessPark {
-        fn park(&self) -> contextdb_core::Result<()> { self.wake.park_once(None) }
-        fn park_for_ms(&self, ms: u64) -> contextdb_core::Result<()> { self.wake.park_once(Some(ms)) }
+        fn park(&self) -> contextdb_core::Result<()> {
+            self.wake.park_once(None)
+        }
+        fn park_for_ms(&self, ms: u64) -> contextdb_core::Result<()> {
+            self.wake.park_once(Some(ms))
+        }
         fn wake_lease(&self) -> contextdb_core::read_memory::NativeReadWakeLease {
             self.wake.clone().into_native_wake_lease()
         }
     }
-
 
     pub(super) struct Mailbox {
         routes: ReadShared<super::super::native_wire::NativeWireRoutes>,
@@ -643,7 +712,10 @@ mod native_serving {
             while *handles != 0 {
                 // This inline condition variable is part of the prepaid cell's
                 // exact layout. Release is the event; no count/time polling.
-                handles = self.released.wait(handles).unwrap_or_else(|p| p.into_inner());
+                handles = self
+                    .released
+                    .wait(handles)
+                    .unwrap_or_else(|p| p.into_inner());
             }
         }
     }
@@ -660,7 +732,9 @@ mod native_serving {
     unsafe impl Send for Mailbox {}
     unsafe impl Sync for Mailbox {}
     impl ClientHandle {
-        fn mailbox(&self) -> &Mailbox { self.mailbox.as_ref().expect("live client handle") }
+        fn mailbox(&self) -> &Mailbox {
+            self.mailbox.as_ref().expect("live client handle")
+        }
     }
     impl Drop for ClientHandle {
         fn drop(&mut self) {
@@ -684,17 +758,26 @@ mod native_serving {
     }
     // A reservation is admitted at the gate before begin_request invokes the
     // provider. Stop waits for these original reservations, including Err/panic.
-    struct BeginTicket { handle: ClientHandle }
+    struct BeginTicket {
+        handle: ClientHandle,
+    }
     impl Drop for BeginTicket {
         fn drop(&mut self) {
-            let mut state = self.handle.mailbox().state.lock().unwrap_or_else(|p| p.into_inner());
+            let mut state = self
+                .handle
+                .mailbox()
+                .state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             state.builders -= 1;
             drop(state);
             contextdb_core::read_memory::NativeReadWake::wake_read(&*self.handle.mailbox().wake);
         }
     }
     impl Mailbox {
-        pub(super) fn acquire_client(mailbox: &ReadShared<Self>) -> super::super::WireResult<ClientHandle> {
+        pub(super) fn acquire_client(
+            mailbox: &ReadShared<Self>,
+        ) -> super::super::WireResult<ClientHandle> {
             // Caller holds inner.native, which excludes root retirement and
             // serializes this acquisition with shutdown's admission barrier.
             let state = mailbox.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -704,7 +787,10 @@ mod native_serving {
             let completion = unsafe { mailbox.completion.as_ref() };
             let mut handles = completion.handles.lock().unwrap_or_else(|p| p.into_inner());
             *handles = handles.checked_add(1).ok_or(TransportError::NoResponder)?;
-            Ok(ClientHandle { mailbox: Some(mailbox.clone()), completion: mailbox.completion })
+            Ok(ClientHandle {
+                mailbox: Some(mailbox.clone()),
+                completion: mailbox.completion,
+            })
         }
         fn begin(handle: ClientHandle) -> super::super::WireResult<BeginTicket> {
             {
@@ -713,7 +799,10 @@ mod native_serving {
                 if !state.accepting || mailbox.stop.is_stopped() {
                     return Err(TransportError::NoResponder.into());
                 }
-                state.builders = state.builders.checked_add(1).ok_or(TransportError::NoResponder)?;
+                state.builders = state
+                    .builders
+                    .checked_add(1)
+                    .ok_or(TransportError::NoResponder)?;
             }
             Ok(BeginTicket { handle })
         }
@@ -721,7 +810,8 @@ mod native_serving {
             let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
             if state.retired {
                 drop(state);
-                node.cancel(); node.finish(Err(contextdb_core::Error::ReadCancelled.into()));
+                node.cancel();
+                node.finish(Err(contextdb_core::Error::ReadCancelled.into()));
                 drop(node);
                 return Err(contextdb_core::Error::ReadCancelled.into());
             }
@@ -763,7 +853,9 @@ mod native_serving {
     }
     impl Drop for RequestWakeAdmission {
         fn drop(&mut self) {
-            if !self.transferred { self.wake.detach(); }
+            if !self.transferred {
+                self.wake.detach();
+            }
         }
     }
     struct RequestNode {
@@ -783,7 +875,12 @@ mod native_serving {
             // Physical dispatch destruction (including all nested futures and
             // their original invoices) precedes the terminal reply publication.
             drop(worker);
-            drop(self.listener.lock().unwrap_or_else(|p| p.into_inner()).take());
+            drop(
+                self.listener
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .take(),
+            );
             self.request_wake.detach();
             let mut response = self.response.lock().unwrap_or_else(|p| p.into_inner());
             response.completed = Some(result);
@@ -791,22 +888,38 @@ mod native_serving {
             contextdb_core::read_memory::NativeReadWake::wake_read(&*self.reply_wake);
         }
         fn cancel(&self) {
-            if let Some(cancel) = &self.cancellation { cancel.cancel(); }
+            if let Some(cancel) = &self.cancellation {
+                cancel.cancel();
+            }
         }
     }
     impl Drop for RequestNode {
         fn drop(&mut self) {
-            if self.worker.get_mut().unwrap_or_else(|p| p.into_inner()).is_some() {
+            if self
+                .worker
+                .get_mut()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_some()
+            {
                 self.cancel();
                 self.finish(Err(contextdb_core::Error::ReadCancelled.into()));
             }
             // A dispatch-construction refusal can leave no worker but still
             // have an in-flight cancellation snapshot holding the bridge.
-            drop(self.listener.get_mut().unwrap_or_else(|p| p.into_inner()).take());
+            drop(
+                self.listener
+                    .get_mut()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .take(),
+            );
             self.request_wake.detach();
             // Pending worker then frees before listener/token/response fields.
             // Detach list iteratively, avoiding recursive list destruction.
-            let mut next = self.next.get_mut().unwrap_or_else(|p| p.into_inner()).take();
+            let mut next = self
+                .next
+                .get_mut()
+                .unwrap_or_else(|p| p.into_inner())
+                .take();
             while let Some(node) = next {
                 next = node.next.lock().unwrap_or_else(|p| p.into_inner()).take();
                 node.cancel();
@@ -832,106 +945,182 @@ mod native_serving {
                 if let Some(result) = response.completed.take() {
                     this.completed = true;
                     return Poll::Ready(result.and_then(|()| {
-                        response.body.take().map(super::super::BoundedWireReply::legacy)
+                        response
+                            .body
+                            .take()
+                            .map(super::super::BoundedWireReply::legacy)
                             .ok_or_else(|| TransportError::NoResponder.into())
                     }));
                 }
                 drop(response);
-                if let Err(error) = this.wake.park_once(None) { return Poll::Ready(Err(error.into())); }
+                if let Err(error) = this.wake.park_once(None) {
+                    return Poll::Ready(Err(error.into()));
+                }
             }
         }
     }
     impl Drop for ClientWait {
         fn drop(&mut self) {
             if !self.completed {
-                self.response.lock().unwrap_or_else(|p| p.into_inner()).abandoned = true;
-                if let Some(cancel) = &self.cancellation { cancel.cancel(); }
+                self.response
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .abandoned = true;
+                if let Some(cancel) = &self.cancellation {
+                    cancel.cancel();
+                }
                 self.request_wake.wake();
             }
         }
     }
 
     pub(super) fn request(
-        handle: ClientHandle, subject: &str,
-        input: super::super::BoundedWireBody, timeout: Duration, node_id: Option<&str>,
-    ) -> super::super::WireResult<super::super::DispatchedWireFuture<'static, super::super::BoundedWireReply>> {
+        handle: ClientHandle,
+        subject: &str,
+        input: super::super::BoundedWireBody,
+        timeout: Duration,
+        node_id: Option<&str>,
+    ) -> super::super::WireResult<
+        super::super::DispatchedWireFuture<'static, super::super::BoundedWireReply>,
+    > {
         let ticket = Mailbox::begin(handle)?;
         let mailbox = ticket.handle.mailbox();
-        let route = mailbox.routes.find(subject).ok_or(TransportError::NoResponder)?;
+        let route = mailbox
+            .routes
+            .find(subject)
+            .ok_or(TransportError::NoResponder)?;
         // Provider selection is exactly once, using the original installed root.
         let selected = route.begin_request()?;
         let (owner, cancellation) = match &selected {
-            super::super::native_wire::NativeReadStreamBegin::Native { operation, cancellation }
-                => (operation.owner(), Some(cancellation.clone())),
+            super::super::native_wire::NativeReadStreamBegin::Native {
+                operation,
+                cancellation,
+            } => (operation.owner(), Some(cancellation.clone())),
             super::super::native_wire::NativeReadStreamBegin::Legacy(acquired) => {
-                let crate::vector_read_memory::RequestReadRoute::Legacy(reader) = acquired.share().into_route()
-                    else { return Err(TransportError::NoResponder.into()); };
+                let crate::vector_read_memory::RequestReadRoute::Legacy(reader) =
+                    acquired.share().into_route()
+                else {
+                    return Err(TransportError::NoResponder.into());
+                };
                 (ReadMemoryOwner::from_legacy(reader), None)
             }
         };
-        let timeout_ms = u64::try_from(timeout.as_millis()).map_err(|_| TransportError::NoResponder)?;
-        let deadline = mailbox.routes.clock().now_ms().checked_add(timeout_ms).ok_or(TransportError::NoResponder)?;
+        let timeout_ms =
+            u64::try_from(timeout.as_millis()).map_err(|_| TransportError::NoResponder)?;
+        let deadline = mailbox
+            .routes
+            .clock()
+            .now_ms()
+            .checked_add(timeout_ms)
+            .ok_or(TransportError::NoResponder)?;
         let future = super::super::native_wire::admit_wire_future_with(owner.clone(), || {
-            let bytes = input.native_contiguous_bytes().ok_or(TransportError::NoResponder)?;
+            let bytes = input
+                .native_contiguous_bytes()
+                .ok_or(TransportError::NoResponder)?;
             let body = super::super::BoundedWireBody::from_native_reply(
-                super::super::AdmittedWireVec::copy_from(bytes, owner.clone())?);
-            let response = shared(owner.clone(), || Ok(Mutex::new(ReplyState {
-                body: None, completed: None, abandoned: false,
-            })))?;
+                super::super::AdmittedWireVec::copy_from(bytes, owner.clone())?,
+            );
+            let response = shared(owner.clone(), || {
+                Ok(Mutex::new(ReplyState {
+                    body: None,
+                    completed: None,
+                    abandoned: false,
+                }))
+            })?;
             let reply_wake = NativeInProcessWake::try_new_owned(owner.clone())?;
             let sink = response.clone();
             let sink_owner = owner.clone();
             let finish_owner = owner.clone();
-            let responder = super::super::native_wire::NativeStreamResponder::try_new_with(owner.clone(), || {
-                Ok(move |body: super::super::BoundedWireBody| {
-                    super::super::native_wire::admit_wire_future_with(finish_owner, || Ok(async move {
-                        if !body.owner().same_owner(&sink_owner) { return Err(TransportError::NoResponder.into()); }
-                        let mut slot = sink.lock().unwrap_or_else(|p| p.into_inner());
-                        if slot.abandoned { return Err(contextdb_core::Error::ReadCancelled.into()); }
-                        if slot.body.is_some() { return Err(TransportError::NoResponder.into()); }
-                        slot.body = Some(body);
-                        Ok(())
-                    }))
-                })
-            })?;
+            let responder = super::super::native_wire::NativeStreamResponder::try_new_with(
+                owner.clone(),
+                || {
+                    Ok(move |body: super::super::BoundedWireBody| {
+                        super::super::native_wire::admit_wire_future_with(finish_owner, || {
+                            Ok(async move {
+                                if !body.owner().same_owner(&sink_owner) {
+                                    return Err(TransportError::NoResponder.into());
+                                }
+                                let mut slot = sink.lock().unwrap_or_else(|p| p.into_inner());
+                                if slot.abandoned {
+                                    return Err(contextdb_core::Error::ReadCancelled.into());
+                                }
+                                if slot.body.is_some() {
+                                    return Err(TransportError::NoResponder.into());
+                                }
+                                slot.body = Some(body);
+                                Ok(())
+                            })
+                        })
+                    })
+                },
+            )?;
             // Identity bytes carry their own same-owner invoice through worker
             // destruction; String adopts the admitted Vec without allocation.
             let identity = match node_id {
-                Some(value) => Some(super::super::AdmittedWireVec::copy_from(value.as_bytes(), owner.clone())?),
+                Some(value) => Some(super::super::AdmittedWireVec::copy_from(
+                    value.as_bytes(),
+                    owner.clone(),
+                )?),
                 None => None,
             };
             let (identity_value, identity_credit) = match identity {
-                Some(super::super::AdmittedWireVec { bytes, _credit, reader: _ })
-                    => (Some(unsafe { String::from_utf8_unchecked(bytes) }), Some(_credit)),
+                Some(super::super::AdmittedWireVec {
+                    bytes,
+                    _credit,
+                    reader: _,
+                }) => (
+                    Some(unsafe { String::from_utf8_unchecked(bytes) }),
+                    Some(_credit),
+                ),
                 None => (None, None),
             };
             let request = super::super::ReadBoundIncomingRequest {
-                body, responder: super::super::ReadBoundResponder::Native(responder), node_id: identity_value,
+                body,
+                responder: super::super::ReadBoundResponder::Native(responder),
+                node_id: identity_value,
             };
-            let request_wake = shared(owner.clone(), || Ok(RequestWake {
-                coordinator: Mutex::new(Some(mailbox.wake.clone())),
-            }))?;
+            let request_wake = shared(owner.clone(), || {
+                Ok(RequestWake {
+                    coordinator: Mutex::new(Some(mailbox.wake.clone())),
+                })
+            })?;
             let mut wake_admission = RequestWakeAdmission {
-                wake: request_wake.clone(), transferred: false,
+                wake: request_wake.clone(),
+                transferred: false,
             };
             let listener = match &cancellation {
                 Some(cancel) => {
                     let wake = request_wake.clone();
-                    Some(cancel.try_tell_on_cancel(move || { wake.wake(); })?)
+                    Some(cancel.try_tell_on_cancel(move || {
+                        wake.wake();
+                    })?)
                 }
                 None => None,
             };
-            let node = shared(owner.clone(), || Ok(RequestNode {
-                worker: Mutex::new(None), listener: Mutex::new(listener), request_wake: request_wake.clone(),
-                cancellation: cancellation.clone(),
-                response: response.clone(), reply_wake: reply_wake.clone(), deadline, next: Mutex::new(None),
-            }))?;
+            let node = shared(owner.clone(), || {
+                Ok(RequestNode {
+                    worker: Mutex::new(None),
+                    listener: Mutex::new(listener),
+                    request_wake: request_wake.clone(),
+                    cancellation: cancellation.clone(),
+                    response: response.clone(),
+                    reply_wake: reply_wake.clone(),
+                    deadline,
+                    next: Mutex::new(None),
+                })
+            })?;
             let worker = match selected {
                 super::super::native_wire::NativeReadStreamBegin::Native { operation, .. } => {
-                    super::super::native_wire::admit_native_operation_future_with(operation, |original| {
-                        let worker = route.dispatch_native(request, original.share())?;
-                        Ok(async move { let _identity_credit = identity_credit; worker.await })
-                    })?
+                    super::super::native_wire::admit_native_operation_future_with(
+                        operation,
+                        |original| {
+                            let worker = route.dispatch_native(request, original.share())?;
+                            Ok(async move {
+                                let _identity_credit = identity_credit;
+                                worker.await
+                            })
+                        },
+                    )?
                 }
                 super::super::native_wire::NativeReadStreamBegin::Legacy(acquired) => {
                     // Selected Legacy executes the original companion with the
@@ -945,15 +1134,21 @@ mod native_serving {
                                 let _identity_credit = identity_credit;
                                 worker.await
                             })
-                        })?)
+                        })?,
+                    )
                 }
             };
             *node.worker.lock().unwrap_or_else(|p| p.into_inner()) = Some(worker);
             mailbox.enqueue(node)?;
             wake_admission.transferred = true;
             drop(wake_admission);
-            Ok(ClientWait { response, wake: reply_wake, request_wake,
-                cancellation, completed: false })
+            Ok(ClientWait {
+                response,
+                wake: reply_wake,
+                request_wake,
+                cancellation,
+                completed: false,
+            })
         })?;
         // All route/mailbox borrows end here. The ticket owns the only client
         // mailbox handle, including provider refusal and unwind paths.
@@ -982,10 +1177,14 @@ mod native_serving {
             // This producer owns its caller thread until stop/drain completes.
             loop {
                 let stopping = this.mailbox.stop.is_stopped();
-                if stopping { this.close_admission(); }
+                if stopping {
+                    this.close_admission();
+                }
                 let (mut pending, builders) = {
                     let mut state = this.mailbox.state.lock().unwrap_or_else(|p| p.into_inner());
-                    if stopping { state.accepting = false; }
+                    if stopping {
+                        state.accepting = false;
+                    }
                     (state.pending.take(), state.builders)
                 };
                 while let Some(node) = pending {
@@ -1008,44 +1207,81 @@ mod native_serving {
                     let terminal = match polled {
                         Poll::Ready(result) => Some(result),
                         Poll::Pending => {
-                            let abandoned = node.response.lock().unwrap_or_else(|p| p.into_inner()).abandoned;
+                            let abandoned = node
+                                .response
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .abandoned;
                             let now = this.mailbox.routes.clock().now_ms();
-                            if abandoned || node.cancellation.as_ref().is_some_and(|cancel| cancel.is_cancelled()) { node.cancel(); Some(Err(contextdb_core::Error::ReadCancelled.into())) }
-                            else if this.drain_target.is_some_and(|target| now >= target) {
+                            if abandoned
+                                || node
+                                    .cancellation
+                                    .as_ref()
+                                    .is_some_and(|cancel| cancel.is_cancelled())
+                            {
+                                node.cancel();
+                                Some(Err(contextdb_core::Error::ReadCancelled.into()))
+                            } else if this.drain_target.is_some_and(|target| now >= target) {
                                 this.drain_failed = true;
-                                node.cancel(); Some(Err(contextdb_core::Error::OwnerReadDrainTimeout.into()))
+                                node.cancel();
+                                Some(Err(contextdb_core::Error::OwnerReadDrainTimeout.into()))
                             } else if now >= node.deadline {
-                                node.cancel(); Some(Err(TransportError::Timeout.into()))
-                            } else { None }
+                                node.cancel();
+                                Some(Err(TransportError::Timeout.into()))
+                            } else {
+                                None
+                            }
                         }
                     };
-                    if let Some(result) = terminal { node.finish(result); drop(node); }
-                    else {
+                    if let Some(result) = terminal {
+                        node.finish(result);
+                        drop(node);
+                    } else {
                         nearest = Some(nearest.map_or(node.deadline, |old| old.min(node.deadline)));
                         *node.next.lock().unwrap_or_else(|p| p.into_inner()) = this.active.take();
                         this.active = Some(node);
                     }
                 }
                 if stopping && this.drain_target.is_none() {
-                    this.drain_target = Some(this.mailbox.routes.clock().now_ms().checked_add(
-                        this.mailbox.routes.shutdown_drain_ms())
-                        .ok_or(TransportError::NoResponder)?);
-                    nearest = Some(nearest.map_or(this.drain_target.unwrap(), |old| old.min(this.drain_target.unwrap())));
+                    this.drain_target = Some(
+                        this.mailbox
+                            .routes
+                            .clock()
+                            .now_ms()
+                            .checked_add(this.mailbox.routes.shutdown_drain_ms())
+                            .ok_or(TransportError::NoResponder)?,
+                    );
+                    nearest = Some(nearest.map_or(this.drain_target.unwrap(), |old| {
+                        old.min(this.drain_target.unwrap())
+                    }));
                 }
                 if stopping && builders == 0 && this.active.is_none() {
                     // Recheck under gate: no admitted builder can publish after
                     // final finish, and every original dispatch is already free.
                     let state = this.mailbox.state.lock().unwrap_or_else(|p| p.into_inner());
-                    if state.builders == 0 && state.pending.is_none()
-                        && *this.completion.handles.lock().unwrap_or_else(|p| p.into_inner()) == 0 {
-                        return Poll::Ready(if this.drain_failed { Err(contextdb_core::Error::OwnerReadDrainTimeout.into()) } else { Ok(()) });
+                    if state.builders == 0
+                        && state.pending.is_none()
+                        && *this
+                            .completion
+                            .handles
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            == 0
+                    {
+                        return Poll::Ready(if this.drain_failed {
+                            Err(contextdb_core::Error::OwnerReadDrainTimeout.into())
+                        } else {
+                            Ok(())
+                        });
                     }
                     drop(state);
                 }
                 // Once pending workers are physically gone, a building
                 // admission alone wakes this caller when it publishes/releases.
                 // An expired drain target must not make that wait busy-poll.
-                if this.active.is_none() { nearest = None; }
+                if this.active.is_none() {
+                    nearest = None;
+                }
                 match nearest {
                     Some(target) => this.mailbox.routes.clock().park_until(target, &park)?,
                     None => park.park()?,
@@ -1059,11 +1295,18 @@ mod native_serving {
             // examining the physical-release count. Keep the installed root
             // as a refusal gate through drain; clients must not fall to Legacy.
             let _native = self.inner.native.lock().unwrap_or_else(|p| p.into_inner());
-            self.mailbox.state.lock().unwrap_or_else(|p| p.into_inner()).accepting = false;
+            self.mailbox
+                .state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .accepting = false;
         }
         fn retire_root(&self) {
             let mut native = self.inner.native.lock().unwrap_or_else(|p| p.into_inner());
-            if native.as_ref().is_some_and(|current| std::ptr::eq(&**current, &*self.mailbox)) {
+            if native
+                .as_ref()
+                .is_some_and(|current| std::ptr::eq(&**current, &*self.mailbox))
+            {
                 drop(native.take());
             }
         }
@@ -1080,12 +1323,16 @@ mod native_serving {
             let mut active = self.active.take();
             while let Some(node) = active {
                 active = node.next.lock().unwrap_or_else(|p| p.into_inner()).take();
-                node.cancel(); node.finish(Err(contextdb_core::Error::ReadCancelled.into())); drop(node);
+                node.cancel();
+                node.finish(Err(contextdb_core::Error::ReadCancelled.into()));
+                drop(node);
             }
             let mut pending = pending;
             while let Some(node) = pending {
                 pending = node.next.lock().unwrap_or_else(|p| p.into_inner()).take();
-                node.cancel(); node.finish(Err(contextdb_core::Error::ReadCancelled.into())); drop(node);
+                node.cancel();
+                node.finish(Err(contextdb_core::Error::ReadCancelled.into()));
+                drop(node);
             }
             // Installation/source remains retained through all dispatch free.
             // Source has no worker to join; its physical destruction follows.
@@ -1124,38 +1371,70 @@ mod native_serving {
             }
         }
     }
-    pub(super) fn serve<'a>(inner: &'a Inner,
-        installation: super::super::ReadBoundStreamInstallation, stop: super::super::NativeStop,
+    pub(super) fn serve<'a>(
+        inner: &'a Inner,
+        installation: super::super::ReadBoundStreamInstallation,
+        stop: super::super::NativeStop,
     ) -> super::super::WireResult<super::super::DispatchedWireFuture<'a, ()>> {
-        let routes = installation.native_routes().ok_or(TransportError::NoResponder)?.clone();
+        let routes = installation
+            .native_routes()
+            .ok_or(TransportError::NoResponder)?
+            .clone();
         let owner = routes.installation_owner();
-        if !stop.is_funded_by(&owner) { return Err(TransportError::NoResponder.into()); }
+        if !stop.is_funded_by(&owner) {
+            return Err(TransportError::NoResponder.into());
+        }
         // Price the entire completion frame before building its nested
         // standing coordinator. Completion frees that coordinator physically
         // (and its clock binding) before the caller observes final Ready.
         let completion = super::super::native_wire::admit_wire_future_with(owner.clone(), || {
-          let wake = NativeInProcessWake::try_new_owned(owner.clone())?;
-          let completion = shared(owner.clone(), || Ok(ReleaseCompletion {
-              handles: Mutex::new(0), released: std::sync::Condvar::new(), wake: wake.clone(),
-          }))?;
-          let frame = super::super::native_wire::admit_wire_future_with(owner.clone(), || {
-            let listener = stop.try_register_wake(wake.clone())?;
-            let mailbox = shared(owner, || Ok(Mailbox {
-                routes: routes.clone(), stop, wake,
-                state: Mutex::new(MailboxState { accepting: true, retired: false, builders: 0, pending: None }),
-                completion: std::ptr::NonNull::from(&*completion),
-            }))?;
-            {
-                let mut installed = inner.native.lock().unwrap_or_else(|p| p.into_inner());
-                if installed.is_some() { return Err(TransportError::NoResponder.into()); }
-                *installed = Some(mailbox.clone());
-            }
-            Ok(Serving { active: None, mailbox, inner, _listener: listener,
-                drain_target: None, _installation: installation, drain_failed: false, completion: completion.clone() })
-        })?;
-          Ok(ServingCompletion { frame: Some(frame), completion: Some(completion) })
+            let wake = NativeInProcessWake::try_new_owned(owner.clone())?;
+            let completion = shared(owner.clone(), || {
+                Ok(ReleaseCompletion {
+                    handles: Mutex::new(0),
+                    released: std::sync::Condvar::new(),
+                    wake: wake.clone(),
+                })
+            })?;
+            let frame = super::super::native_wire::admit_wire_future_with(owner.clone(), || {
+                let listener = stop.try_register_wake(wake.clone())?;
+                let mailbox = shared(owner, || {
+                    Ok(Mailbox {
+                        routes: routes.clone(),
+                        stop,
+                        wake,
+                        state: Mutex::new(MailboxState {
+                            accepting: true,
+                            retired: false,
+                            builders: 0,
+                            pending: None,
+                        }),
+                        completion: std::ptr::NonNull::from(&*completion),
+                    })
+                })?;
+                {
+                    let mut installed = inner.native.lock().unwrap_or_else(|p| p.into_inner());
+                    if installed.is_some() {
+                        return Err(TransportError::NoResponder.into());
+                    }
+                    *installed = Some(mailbox.clone());
+                }
+                Ok(Serving {
+                    active: None,
+                    mailbox,
+                    inner,
+                    _listener: listener,
+                    drain_target: None,
+                    _installation: installation,
+                    drain_failed: false,
+                    completion: completion.clone(),
+                })
+            })?;
+            Ok(ServingCompletion {
+                frame: Some(frame),
+                completion: Some(completion),
+            })
         })?;
         Ok(super::super::DispatchedWireFuture::native(completion))
     }
-
 }

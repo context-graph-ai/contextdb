@@ -1686,7 +1686,7 @@
 +                        q_point_neighbours[l_n] = selected;
 @@ -1272,0 +2611 @@
 +                    q_point_neighbours[l_n].sort_unstable();
-@@ -1277 +2616,20 @@
+@@ -1277 +2616,32 @@
 -    } // end of reverse_update_neighborhood_simple
 +    } // end of reverse_update_neighborhood
 +
@@ -1702,29 +1702,41 @@
 +        // At most N distinct visited nodes, one pending candidate per node,
 +        // ef return/discarded nodes and conversion heaps. Eight full-capacity
 +        // heap buffers dominate their simultaneous old/new growth buffers.
-+        let heaps = n.checked_next_power_of_two()?.checked_mul(8)?.checked_mul(heap_slot)?;
-+        let maps = buckets.checked_mul(map_slot)?.checked_mul(2)?.checked_add(32)?;
++        let heaps = n
++            .checked_next_power_of_two()?
++            .checked_mul(8)?
++            .checked_mul(heap_slot)?;
++        let maps = buckets
++            .checked_mul(map_slot)?
++            .checked_mul(2)?
++            .checked_add(32)?;
 +        // Copy one reciprocal list and prune it while its old list stays live.
-+        let links = m.checked_mul(2)?.checked_add(1)?.checked_mul(8)?.checked_mul(heap_slot)?;
-+        maps.checked_add(heaps)?.checked_add(links)?.checked_add(4096)
++        let links = m
++            .checked_mul(2)?
++            .checked_add(1)?
++            .checked_mul(8)?
++            .checked_mul(heap_slot)?;
++        maps.checked_add(heaps)?
++            .checked_add(links)?
++            .checked_add(4096)
 +    }
-@@ -1290 +2648 @@
+@@ -1290 +2660 @@
 -        candidates: &mut BinaryHeap<Arc<PointWithOrder<'b, T>>>,
 +        candidates: &mut BinaryHeap<PointWithOrder<'b, T>>,
-@@ -1295 +2653 @@
+@@ -1295 +2665 @@
 -        neighbours_vec: &mut Vec<Arc<PointWithOrder<'b, T>>>,
 +        neighbours_vec: &mut Vec<PointWithOrder<'b, T>>,
-@@ -1312,2 +2670 @@
+@@ -1312,2 +2682 @@
 -                    neighbours_vec
 -                        .push(Arc::new(PointWithOrder::new(&p.point_ref, -p.dist_to_ref)));
 +                    neighbours_vec.push(PointWithOrder::new(&p.point_ref, -p.dist_to_ref));
-@@ -1325 +2682 @@
+@@ -1325 +2694 @@
 -            let mut candidates_set = HashMap::<PointId, Arc<Point<T>>>::new();
 +            let mut candidates_set = BTreeMap::<PointId, Arc<Point<T>>>::new();
-@@ -1329 +2686 @@
+@@ -1329 +2698 @@
 -            let mut new_candidates_set = HashMap::<PointId, Arc<Point<T>>>::new();
 +            let mut new_candidates_set = BTreeMap::<PointId, Arc<Point<T>>>::new();
-@@ -1331,2 +2688,6 @@
+@@ -1331,2 +2700,6 @@
 -            for (_p_id, p_point) in candidates_set.iter() {
 -                let n_p_layer = &p_point.neighbours.read()[layer as usize];
 +            for p_point in candidates_set.values() {
@@ -1733,34 +1745,34 @@
 +                    .get(layer as usize)
 +                    .map(Vec::as_slice)
 +                    .unwrap_or_default();
-@@ -1346 +2707 @@
+@@ -1346 +2719 @@
 -            for (_p_id, p_point) in new_candidates_set.iter() {
 +            for p_point in new_candidates_set.values() {
-@@ -1348 +2709 @@
+@@ -1348 +2721 @@
 -                candidates.push(Arc::new(PointWithOrder::new(p_point, -dist_topoint)));
 +                candidates.push(PointWithOrder::new(p_point, -dist_topoint));
-@@ -1352 +2713 @@
+@@ -1352 +2725 @@
 -        let mut discarded_points = BinaryHeap::<Arc<PointWithOrder<T>>>::new();
 +        let mut discarded_points = BinaryHeap::<PointWithOrder<T>>::new();
-@@ -1367,4 +2728 @@
+@@ -1367,4 +2740 @@
 -                    neighbours_vec.push(Arc::new(PointWithOrder::new(
 -                        &e_p.point_ref,
 -                        -e_p.dist_to_ref,
 -                    )));
 +                    neighbours_vec.push(PointWithOrder::new(&e_p.point_ref, -e_p.dist_to_ref));
-@@ -1376,4 +2734 @@
+@@ -1376,4 +2746 @@
 -                        discarded_points.push(Arc::new(PointWithOrder::new(
 -                            &e_p.point_ref,
 -                            e_p.dist_to_ref,
 -                        )));
 +                        discarded_points.push(PointWithOrder::new(&e_p.point_ref, e_p.dist_to_ref));
-@@ -1392 +2747 @@
+@@ -1392 +2759 @@
 -                neighbours_vec.push(Arc::new(PointWithOrder::new(
 +                neighbours_vec.push(PointWithOrder::new(
-@@ -1395 +2750 @@
+@@ -1395 +2762 @@
 -                )));
 +                ));
-@@ -1460,7 +2815 @@
+@@ -1460,7 +2827 @@
 -            .map(|p| {
 -                Neighbour::new(
 -                    p.as_ref().point_ref.origin_id,
@@ -1769,29 +1781,29 @@
 -                )
 -            })
 +            .map(|p| Neighbour::new(p.point_ref.origin_id, p.dist_to_ref, p.point_ref.p_id))
-@@ -1472,2 +2821,2 @@
+@@ -1472,2 +2833,2 @@
 -    /// a filtered version of [`Self::search`].  
 -    /// A filter can be added to the search to get nodes with a particular property or id constraint.  
 +    /// a filtered version of [`Self::search`].
 +    /// A filter can be added to the search to get nodes with a particular property or id constraint.
-@@ -1503 +2852,5 @@
+@@ -1503 +2864,5 @@
 -                let neighbours = &pivot.neighbours.read()[layer as usize];
 +                let neighbours_guard = pivot.neighbours.read();
 +                let neighbours = neighbours_guard
 +                    .get(layer as usize)
 +                    .map(Vec::as_slice)
 +                    .unwrap_or_default();
-@@ -1541 +2894 @@
+@@ -1541 +2906 @@
 -                    if filter_t.hnsw_filter(&p.as_ref().point_ref.origin_id) {
 +                    if filter_t.hnsw_filter(&p.point_ref.origin_id) {
-@@ -1543,3 +2896,3 @@
+@@ -1543,3 +2908,3 @@
 -                            p.as_ref().point_ref.origin_id,
 -                            p.as_ref().dist_to_ref,
 -                            p.as_ref().point_ref.p_id,
 +                            p.point_ref.origin_id,
 +                            p.dist_to_ref,
 +                            p.point_ref.p_id,
-@@ -1559,7 +2912 @@
+@@ -1559,7 +2924 @@
 -                .map(|p| {
 -                    Neighbour::new(
 -                        p.as_ref().point_ref.origin_id,
@@ -1800,13 +1812,13 @@
 -                    )
 -                })
 +                .map(|p| Neighbour::new(p.point_ref.origin_id, p.dist_to_ref, p.point_ref.p_id))
-@@ -1583 +2930 @@
+@@ -1583 +2942 @@
 -    /// search the first knbn nearest neigbours of a data and returns a Vector of Neighbour.   
 +    /// search the first knbn nearest neigbours of a data and returns a Vector of Neighbour.
-@@ -1585 +2932 @@
+@@ -1585 +2944 @@
 -    /// than number of neighbours asked.  
 +    /// than number of neighbours asked.
-@@ -1588,0 +2936,439 @@
+@@ -1588,0 +2948,439 @@
 +    }
 +
 +    /// Additive request-bounded search. Source-entry and distance controls are
@@ -2246,29 +2258,29 @@
 +            .map(HnswAllowedSearchStatus::Incomplete)
 +            .unwrap_or(HnswAllowedSearchStatus::Complete);
 +        Ok(traversal.result(result, status))
-@@ -1633,2 +3419,2 @@
+@@ -1633,2 +3431,2 @@
 -    heap_points: &mut BinaryHeap<Arc<PointWithOrder<'b, T>>>,
 -) -> Vec<Arc<PointWithOrder<'b, T>>> {
 +    heap_points: &mut BinaryHeap<PointWithOrder<'b, T>>,
 +) -> Vec<PointWithOrder<'b, T>> {
-@@ -1636 +3422 @@
+@@ -1636 +3434 @@
 -    let mut vec_points = Vec::<Arc<PointWithOrder<T>>>::with_capacity(nb_points);
 +    let mut vec_points = Vec::<PointWithOrder<T>>::with_capacity(nb_points);
-@@ -1640 +3426 @@
+@@ -1640 +3438 @@
 -        let reverse_p = Arc::new(PointWithOrder::new(&p.point_ref, -p.dist_to_ref));
 +        let reverse_p = PointWithOrder::new(&p.point_ref, -p.dist_to_ref);
-@@ -1655,2 +3441,2 @@
+@@ -1655,2 +3453,2 @@
 -    positive_heap: &mut BinaryHeap<Arc<PointWithOrder<'b, T>>>,
 -) -> BinaryHeap<Arc<PointWithOrder<'b, T>>> {
 +    positive_heap: &mut BinaryHeap<PointWithOrder<'b, T>>,
 +) -> BinaryHeap<PointWithOrder<'b, T>> {
-@@ -1658 +3444 @@
+@@ -1658 +3456 @@
 -    let mut negative_heap = BinaryHeap::<Arc<PointWithOrder<T>>>::with_capacity(nb_points);
 +    let mut negative_heap = BinaryHeap::<PointWithOrder<T>>::with_capacity(nb_points);
-@@ -1662 +3448 @@
+@@ -1662 +3460 @@
 -        let reverse_p = Arc::new(PointWithOrder::new(&p.point_ref, -p.dist_to_ref));
 +        let reverse_p = PointWithOrder::new(&p.point_ref, -p.dist_to_ref);
-@@ -1751,0 +3538,75 @@
+@@ -1751,0 +3550,75 @@
 +    #[test]
 +    fn reverse_edge_pruning_preserves_a_distinct_direction_within_the_degree_limit() {
 +        let mut graph = Hnsw::new_with_seed(2, 6, 16, 8, dist::DistL1, 17);
@@ -2344,7 +2356,7 @@
 +        assert_eq!(result.neighbours[0].d_id, 3);
 +    }
 +
-@@ -1804,0 +3666,6 @@
+@@ -1804,0 +3678,6 @@
 +    fn iterating_a_graph_with_no_points_yields_nothing() {
 +        let hns = Hnsw::<f32, dist::DistL1>::new(10, 1, 16, 25, dist::DistL1 {});
 +        assert_eq!(hns.get_point_indexation().into_iter().count(), 0);

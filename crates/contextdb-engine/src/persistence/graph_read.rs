@@ -31,9 +31,17 @@ impl GraphReadRoot {
             Self::Writer(root) => {
                 if snapshot.0 < root.snapshot.0 {
                     with_pages(memory.clone(), || {
-                        let _credit = ReadCredit::try_new(memory.clone(), 130,
-                            "reader", "graph_root_binding", HINT)?;
-                        RedbPersistence::read_authenticated_bounds_in_read(root.owner_read()?.as_ref()).map(|_| ())
+                        let _credit = ReadCredit::try_new(
+                            memory.clone(),
+                            130,
+                            "reader",
+                            "graph_root_binding",
+                            HINT,
+                        )?;
+                        RedbPersistence::read_authenticated_bounds_in_read(
+                            root.owner_read()?.as_ref(),
+                        )
+                        .map(|_| ())
                     })?;
                 }
                 if snapshot.0 > root.snapshot.0 {
@@ -56,20 +64,26 @@ impl GraphReadRoot {
         memory: Arc<dyn ReadMemoryBudget>,
     ) -> Result<GraphReadCursor> {
         with_pages(memory.clone(), || {
-            let _credit = ReadCredit::try_new(memory.clone(), 130,
-                "reader", "graph_root_binding", HINT)?;
+            let _credit =
+                ReadCredit::try_new(memory.clone(), 130, "reader", "graph_root_binding", HINT)?;
             match self {
-                Self::Writer(root) => RedbPersistence::read_authenticated_bounds_in_read(root.owner_read()?.as_ref()).map(|_| ()),
-                Self::Image(source) => source.with_read(|read| RedbPersistence::read_authenticated_bounds_in_read(read).map(|_| ())),
+                Self::Writer(root) => {
+                    RedbPersistence::read_authenticated_bounds_in_read(root.owner_read()?.as_ref())
+                        .map(|_| ())
+                }
+                Self::Image(source) => source.with_read(|read| {
+                    RedbPersistence::read_authenticated_bounds_in_read(read).map(|_| ())
+                }),
             }
         })?;
         match self {
             Self::Writer(root) => {
                 // The concrete Box is admitted to the executing child before
                 // allocation, and freed before this separate control credit.
-                let control = credit(memory.clone(), std::mem::size_of::<
-                    writer_source::WriterReadCursor,
-                >())?;
+                let control = credit(
+                    memory.clone(),
+                    std::mem::size_of::<writer_source::WriterReadCursor>(),
+                )?;
                 let cursor = root.cursor(
                     writer_source::SourceWindowOwner::Read(memory),
                     if reverse { "graph_rev" } else { "graph_fwd" },
@@ -82,7 +96,7 @@ impl GraphReadRoot {
                     cursor: Box::new(cursor),
                     _control: control,
                 }))
-            },
+            }
             Self::Image(source) => Ok(GraphReadCursor::Image(RetainedGraphCursor::new(
                 source.clone(),
                 reverse,
@@ -113,7 +127,8 @@ impl GraphReadCursor {
     ) -> Result<Option<GraphReadWindow>> {
         checkpoint()?;
         match self {
-            Self::Writer(cursor) => cursor.cursor
+            Self::Writer(cursor) => cursor
+                .cursor
                 .next_edge()
                 .map(|edge| edge.map(GraphReadWindow::Writer)),
             Self::Image(cursor) => cursor
@@ -156,7 +171,9 @@ impl GraphReadSource for RetainedGraphSource {
         if snapshot.0 < self.0.logical_frontier.0 {
             with_pages(memory.clone(), || {
                 let _credit = credit(memory.clone(), 130)?;
-                self.0.with_read(|read| RedbPersistence::read_authenticated_bounds_in_read(read).map(|_| ()))
+                self.0.with_read(|read| {
+                    RedbPersistence::read_authenticated_bounds_in_read(read).map(|_| ())
+                })
             })?;
         }
         let control = credit(memory.clone(), std::mem::size_of::<RetainedGraphSnapshot>())?;
@@ -264,7 +281,9 @@ impl RetainedGraphCursor {
     ) -> Result<Self> {
         with_pages(memory.clone(), || {
             let _binding = credit(memory.clone(), 130)?;
-            source.with_read(|read| RedbPersistence::read_authenticated_bounds_in_read(read).map(|_| ()))
+            source.with_read(|read| {
+                RedbPersistence::read_authenticated_bounds_in_read(read).map(|_| ())
+            })
         })?;
         let control = credit(memory.clone(), std::mem::size_of::<Self>())?;
         let lower = owned_bound(lower, memory.clone())?;
@@ -287,7 +306,8 @@ impl RetainedGraphCursor {
         &mut self,
         checkpoint: &dyn Fn() -> Result<()>,
     ) -> Result<Option<RetainedGraphWindow>> {
-        self.source.check_history_directory(self.memory.clone(), checkpoint)?;
+        self.source
+            .check_history_directory(self.memory.clone(), checkpoint)?;
         if self.finished {
             return Ok(None);
         }
@@ -318,7 +338,13 @@ impl RetainedGraphCursor {
                     }
                 };
                 #[cfg(any(test, feature = "test-seams"))]
-                crate::read_work_probe::note_graph(redb::TableHandle::name(&definition), "range", &[], None, None);
+                crate::read_work_probe::note_graph(
+                    redb::TableHandle::name(&definition),
+                    "range",
+                    &[],
+                    None,
+                    None,
+                );
                 let mut range = table
                     .range::<&[u8]>((lower, upper))
                     .map_err(|error| diagnosis(self.source.as_ref(), read_storage_error(error)))?;
@@ -331,8 +357,20 @@ impl RetainedGraphCursor {
                 };
                 #[cfg(any(test, feature = "test-seams"))]
                 {
-                    crate::read_work_probe::note_graph(redb::TableHandle::name(&definition), "iteration_step", key.value(), None, None);
-                    crate::read_work_probe::note_graph(redb::TableHandle::name(&definition), "supplied_primary", key.value(), None, None);
+                    crate::read_work_probe::note_graph(
+                        redb::TableHandle::name(&definition),
+                        "iteration_step",
+                        key.value(),
+                        None,
+                        None,
+                    );
+                    crate::read_work_probe::note_graph(
+                        redb::TableHandle::name(&definition),
+                        "supplied_primary",
+                        key.value(),
+                        None,
+                        None,
+                    );
                 }
                 let memory = self.source.graph_window_memory(self.memory.clone());
                 let edge = memory.scope(|| {
@@ -446,9 +484,9 @@ fn decode_edge(
     bytes: &[u8],
     reverse: bool,
 ) -> Result<AdjEntry> {
-        let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
+    let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
     #[cfg(any(test, feature = "test-seams"))]
-crate::read_work_probe::note_graph("graph_payload", "payload_decode", key, None, None);
+    crate::read_work_probe::note_graph("graph_payload", "payload_decode", key, None, None);
     let (edge, consumed): (AdjEntry, usize) =
         crate::read_image_memory::decode(bytes).map_err(|error| match error {
             Error::Other(reason) => source.corruption(reason),
@@ -583,7 +621,8 @@ impl RetainedReadSource {
         let scratch = self.graph_window_memory(memory.clone());
         with_pages(memory.clone(), || {
             scratch.scope(|| {
-                GraphProofContext::image(self, memory.clone()).verify_stored_graph_history(read, key, bytes, memory)
+                GraphProofContext::image(self, memory.clone())
+                    .verify_stored_graph_history(read, key, bytes, memory)
             })
         })
     }
@@ -637,7 +676,9 @@ impl<'a> GraphProofContext<'a> {
         mutation: &content_identity::ContentIdentityMutation,
     ) -> Result<()> {
         match self.image {
-            Some(source) => source.content_identity.verify_with_read_memory(mutation, self.proof_memory.clone()),
+            Some(source) => source
+                .content_identity
+                .verify_with_read_memory(mutation, self.proof_memory.clone()),
             None => self
                 .verifier
                 .expect("writer proof verifier")
@@ -701,7 +742,13 @@ impl<'a> GraphProofContext<'a> {
                 Err(error) => return Err(diagnosis(self, read_table_error(error))),
             };
             #[cfg(any(test, feature = "test-seams"))]
-crate::read_work_probe::note_graph(if reverse { "graph_fwd" } else { "graph_rev" }, "get", &key.key, None, None);
+            crate::read_work_probe::note_graph(
+                if reverse { "graph_fwd" } else { "graph_rev" },
+                "get",
+                &key.key,
+                None,
+                None,
+            );
             let value = table
                 .get(key.key.as_ref())
                 .map_err(|error| diagnosis(self, read_storage_error(error)))?
@@ -749,7 +796,13 @@ crate::read_work_probe::note_graph(if reverse { "graph_fwd" } else { "graph_rev"
             .open_table(definition)
             .map_err(|e| diagnosis(self, read_table_error(e)))?;
         #[cfg(any(test, feature = "test-seams"))]
-crate::read_work_probe::note_graph(redb::TableHandle::name(&definition), "get", key, None, None);
+        crate::read_work_probe::note_graph(
+            redb::TableHandle::name(&definition),
+            "get",
+            key,
+            None,
+            None,
+        );
         let value = table
             .get(key)
             .map_err(|e| diagnosis(self, read_storage_error(e)))?;
@@ -765,7 +818,10 @@ crate::read_work_probe::note_graph(redb::TableHandle::name(&definition), "get", 
         _role: &str,
     ) -> Result<()> {
         if let Some(source) = self.image {
-            let _controls = credit(self.proof_memory.clone(), content_identity::history_open_control::DIRECTORY_CHECK_SCRATCH_BYTES)?;
+            let _controls = credit(
+                self.proof_memory.clone(),
+                content_identity::history_open_control::DIRECTORY_CHECK_SCRATCH_BYTES,
+            )?;
             source.history_open_control.check_directory(read)?;
         }
         if q.0 > self.logical_frontier.0 || j > self.graph_lsn_frontier {
@@ -791,7 +847,13 @@ crate::read_work_probe::note_graph(redb::TableHandle::name(&definition), "get", 
             Err(e) => return Err(diagnosis(self, read_table_error(e))),
         };
         #[cfg(any(test, feature = "test-seams"))]
-crate::read_work_probe::note_graph("commit_index", "get", &j.0.to_be_bytes(), Some(contextdb_core::Lsn(j.0)), Some(_role));
+        crate::read_work_probe::note_graph(
+            "commit_index",
+            "get",
+            &j.0.to_be_bytes(),
+            Some(contextdb_core::Lsn(j.0)),
+            Some(_role),
+        );
         let value = table
             .get(j.0)
             .map_err(|e| diagnosis(self, read_storage_error(e)))?
@@ -832,7 +894,13 @@ crate::read_work_probe::note_graph("commit_index", "get", &j.0.to_be_bytes(), So
             .open_table(graph_history_record::GRAPH_CONTRIBUTIONS)
             .map_err(|e| diagnosis(self, read_table_error(e)))?;
         #[cfg(any(test, feature = "test-seams"))]
-crate::read_work_probe::note_graph("graph_contribution", "maximum_seek", &prefix.key, Some(contextdb_core::Lsn(a.0)), None);
+        crate::read_work_probe::note_graph(
+            "graph_contribution",
+            "maximum_seek",
+            &prefix.key,
+            Some(contextdb_core::Lsn(a.0)),
+            None,
+        );
         let mut range = table
             .range::<&[u8]>((
                 Bound::Included(prefix.key.as_ref()),
@@ -846,7 +914,11 @@ crate::read_work_probe::note_graph("graph_contribution", "maximum_seek", &prefix
             .map_err(|e| diagnosis(self, read_storage_error(e)))?
             .ok_or_else(|| self.content_identity_corruption("physical graph maximum is missing"))?;
         #[cfg(any(test, feature = "test-seams"))]
-        crate::read_work_probe::graph_storage_key("graph_contribution", "iteration_step", key.value());
+        crate::read_work_probe::graph_storage_key(
+            "graph_contribution",
+            "iteration_step",
+            key.value(),
+        );
         let k = key.value();
         if k.len() < 18 || !k.starts_with(prefix.key.as_ref()) {
             return Err(self.content_identity_corruption("malformed graph maximum key"));
@@ -1050,9 +1122,21 @@ crate::read_work_probe::note_graph("graph_contribution", "maximum_seek", &prefix
     ) -> Result<()> {
         let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
         #[cfg(any(test, feature = "test-seams"))]
-        { crate::read_work_probe::bind_graph_root(read.storage_snapshot_identity()); crate::read_work_probe::note_graph("history", "supplied_primary", key.as_bytes(), None, None); }
+        {
+            crate::read_work_probe::bind_graph_root(read.storage_snapshot_identity());
+            crate::read_work_probe::note_graph(
+                "history",
+                "supplied_primary",
+                key.as_bytes(),
+                None,
+                None,
+            );
+        }
         if let Some(source) = self.image {
-            let _controls = credit(memory.clone(), content_identity::history_open_control::DIRECTORY_CHECK_SCRATCH_BYTES)?;
+            let _controls = credit(
+                memory.clone(),
+                content_identity::history_open_control::DIRECTORY_CHECK_SCRATCH_BYTES,
+            )?;
             source.history_open_control.check_directory(read)?;
         }
         self.authenticate_mutation(&RedbPersistence::stored_change_log_mutation(key, bytes)?)?;
@@ -1180,9 +1264,12 @@ pub(super) fn with_pages_result<T, E>(
     let admission = Arc::new(move |bytes| match credit(memory.clone(), bytes) {
         Ok(charge) => {
             #[cfg(any(test, feature = "test-seams"))]
-            crate::read_work_probe::note_worker_page_admitted(bytes, crate::read_work_probe::funding_owner_name(&memory));
+            crate::read_work_probe::note_worker_page_admitted(
+                bytes,
+                crate::read_work_probe::funding_owner_name(&memory),
+            );
             Ok(Box::new(charge) as redb::ReadPageCharge)
-        },
+        }
         Err(error) => {
             *captured.lock().unwrap_or_else(|error| error.into_inner()) = Some(error);
             Err(std::io::Error::from(std::io::ErrorKind::OutOfMemory))
@@ -1260,7 +1347,9 @@ pub(super) fn with_graph_proof_in_read<T>(
     crate::read_work_probe::bind_graph_root(read.storage_snapshot_identity());
     let memory: Arc<dyn ReadMemoryBudget> = match owner {
         writer_source::SourceWindowOwner::Read(memory) => memory.clone(),
-        writer_source::SourceWindowOwner::Write(memory, original_use) => memory.read_budget_for_original(original_use.clone())?,
+        writer_source::SourceWindowOwner::Write(memory, original_use) => {
+            memory.read_budget_for_original(original_use.clone())?
+        }
     };
     with_pages(memory.clone(), || {
         scratch.scope(|| {

@@ -163,12 +163,16 @@ fn native_scopes_bind_only_the_open_record_and_keep_legacy_json_equivalent() {
         lock_gap_lines[4]["counts"]["graph_reclaim_required_bytes"],
         44
     );
-    assert!(lock_gap_lines[5]["counts"]
-        .get("graph_reclaims_over_budget")
-        .is_none());
-    assert!(lock_gap_lines[5]["counts"]
-        .get("graph_reclaim_required_bytes")
-        .is_none());
+    assert!(
+        lock_gap_lines[5]["counts"]
+            .get("graph_reclaims_over_budget")
+            .is_none()
+    );
+    assert!(
+        lock_gap_lines[5]["counts"]
+            .get("graph_reclaim_required_bytes")
+            .is_none()
+    );
 
     // A final-pass observation is present even if it gave back zero bytes.
     begin("zero-serving-pass");

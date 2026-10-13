@@ -67,8 +67,11 @@ fn seed(path: &std::path::Path) {
         &HashMap::new(),
     )
     .expect("declare an unrelated table");
-    db.execute("CREATE INDEX notes_label_idx ON notes (label)", &HashMap::new())
-        .expect("declare an index on the unrelated table");
+    db.execute(
+        "CREATE INDEX notes_label_idx ON notes (label)",
+        &HashMap::new(),
+    )
+    .expect("declare an index on the unrelated table");
     for partition in 0..PARTITIONS {
         for local in 0..ROWS_PER_PARTITION {
             let ordinal = partition * ROWS_PER_PARTITION + local;
@@ -98,7 +101,8 @@ fn seed(path: &std::path::Path) {
     for _ in 0..256 {
         db.run_maintenance_cycle().expect("advance maintenance");
         let mut owner = contextdb_engine::vector_read_memory::admission(
-            db.declared_reader_memory().expect("admit the observation reader"),
+            db.declared_reader_memory()
+                .expect("admit the observation reader"),
         );
         let ready = db
             .vector_store_for_test()
@@ -132,7 +136,9 @@ fn reader(path: &std::path::Path) -> ReadSession {
     .expect("the reader opens over index damage")
 }
 
-fn ids(result: contextdb_core::Result<contextdb_engine::QueryResult>) -> contextdb_core::Result<Vec<i64>> {
+fn ids(
+    result: contextdb_core::Result<contextdb_engine::QueryResult>,
+) -> contextdb_core::Result<Vec<i64>> {
     result.map(|result| {
         result
             .rows
@@ -163,7 +169,11 @@ fn whole_pair(reader: &ReadSession, partition: usize) -> contextdb_core::Result<
 
 /// The find that proves candidates through a window over the index's
 /// physical postings.
-fn window(reader: &ReadSession, partition: usize, limit: usize) -> contextdb_core::Result<Vec<i64>> {
+fn window(
+    reader: &ReadSession,
+    partition: usize,
+    limit: usize,
+) -> contextdb_core::Result<Vec<i64>> {
     ids(reader.execute(
         &format!(
             "SELECT id FROM scoped_rows WHERE context_id = $context \
@@ -171,7 +181,10 @@ fn window(reader: &ReadSession, partition: usize, limit: usize) -> contextdb_cor
         ),
         &HashMap::from([
             ("context".into(), Value::Uuid(context_id(partition))),
-            ("query".into(), Value::Vector(embedding(partition * ROWS_PER_PARTITION))),
+            (
+                "query".into(),
+                Value::Vector(embedding(partition * ROWS_PER_PARTITION)),
+            ),
         ]),
     ))
 }
@@ -192,7 +205,10 @@ fn assert_own_rows(outcome: contextdb_core::Result<Vec<i64>>, partition: usize, 
     );
 }
 
-fn damaged_store(name: &str, damage: impl FnOnce(&std::path::Path)) -> (tempfile::TempDir, std::path::PathBuf) {
+fn damaged_store(
+    name: &str,
+    damage: impl FnOnce(&std::path::Path),
+) -> (tempfile::TempDir, std::path::PathBuf) {
     let root = tempfile::tempdir().expect("temporary store directory");
     let path = root.path().join(name);
     seed(&path);
@@ -251,8 +267,15 @@ fn missing_and_hidden_postings_refuse_every_physical_read() {
             .expect("damage one posting");
         });
         let session = reader(&path);
-        assert_own_rows(whole_pair(&session, 0), 0, &format!("{damage:?}: whole-pair find"));
-        assert_corrupt(&window(&session, 0, LIMIT), &format!("{damage:?}: window find"));
+        assert_own_rows(
+            whole_pair(&session, 0),
+            0,
+            &format!("{damage:?}: whole-pair find"),
+        );
+        assert_corrupt(
+            &window(&session, 0, LIMIT),
+            &format!("{damage:?}: window find"),
+        );
         assert_corrupt(
             &ids(session.execute(
                 "SELECT id FROM scoped_rows WHERE context_id = $context AND generation_id = $generation \
@@ -324,7 +347,11 @@ fn reads_that_do_not_consume_the_damaged_postings_answer() {
         .expect("a read of another table answers"),
         vec![1, 3, 5, 7]
     );
-    assert_own_rows(whole_pair(&session, 2), 2, "a whole-pair find over an untouched Context");
+    assert_own_rows(
+        whole_pair(&session, 2),
+        2,
+        "a whole-pair find over an untouched Context",
+    );
     let grouped = session.execute(
         "SELECT COUNT(*) FROM scoped_rows WHERE context_id = $context AND generation_id = $generation \
          AND is_current = TRUE",
@@ -348,7 +375,10 @@ fn row_table_damage_and_writes_into_a_damaged_index_still_refuse() {
         damage_relational_row_table_for_test(path, "scoped_rows").expect("damage the row table");
     });
     let session = reader(&rows_damaged);
-    assert_corrupt(&whole_pair(&session, 0), "whole-pair find over a damaged row table");
+    assert_corrupt(
+        &whole_pair(&session, 0),
+        "whole-pair find over a damaged row table",
+    );
     drop(session);
 
     let (_root, path) = damaged_store("write.db", misfile);
@@ -387,7 +417,9 @@ fn an_undamaged_store_discloses_no_index_damage() {
     let session = reader(&path);
     assert_own_rows(whole_pair(&session, 0), 0, "a healthy whole-pair find");
     assert_eq!(
-        window(&session, 0, LIMIT).expect("a healthy window answers").len(),
+        window(&session, 0, LIMIT)
+            .expect("a healthy window answers")
+            .len(),
         LIMIT
     );
     assert!(
@@ -398,7 +430,9 @@ fn an_undamaged_store_discloses_no_index_damage() {
     );
     let db = Database::open(&path).expect("open the healthy store");
     assert!(
-        db.index_root_damage().expect("the verifier answers").is_empty(),
+        db.index_root_damage()
+            .expect("the verifier answers")
+            .is_empty(),
         "the verifier lists no index of a healthy store"
     );
     db.close().expect("close");

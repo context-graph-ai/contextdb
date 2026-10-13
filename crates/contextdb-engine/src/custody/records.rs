@@ -996,24 +996,38 @@ pub(crate) fn validate_record(record: &Record, records: &[&Record]) -> Result<()
 // Compact native COPY plans. A producer must use the source native Value
 // copier and exact-capacity containers; derived Clone is not a copy authority.
 fn native_sum(parts: impl IntoIterator<Item = Result<usize>>) -> Result<usize> {
-    parts.into_iter().try_fold(0usize, |sum, bytes| sum.checked_add(bytes?).ok_or_else(invalid))
+    parts.into_iter().try_fold(0usize, |sum, bytes| {
+        sum.checked_add(bytes?).ok_or_else(invalid)
+    })
 }
 fn native_vec<T>(items: &[T], child: impl Fn(&T) -> Result<usize>) -> Result<usize> {
-    items.iter().try_fold(super::preparation::preparation_array_bytes::<T>(items.len())?,
-        |sum, item| sum.checked_add(child(item)?).ok_or_else(invalid))
+    items.iter().try_fold(
+        super::preparation::preparation_array_bytes::<T>(items.len())?,
+        |sum, item| sum.checked_add(child(item)?).ok_or_else(invalid),
+    )
 }
 pub(crate) fn count_key_native(key: &crate::sync_types::NaturalKey) -> Result<usize> {
     use crate::memory_accounting::preparation_value_copy_bytes;
     native_sum([
-        Ok(key.column.len()), preparation_value_copy_bytes(&key.value),
-        native_vec(&key.rest, |(name, value)| native_sum([Ok(name.len()), preparation_value_copy_bytes(value)])),
+        Ok(key.column.len()),
+        preparation_value_copy_bytes(&key.value),
+        native_vec(&key.rest, |(name, value)| {
+            native_sum([Ok(name.len()), preparation_value_copy_bytes(value)])
+        }),
     ])
 }
-pub(crate) fn copy_key_native(key: &crate::sync_types::NaturalKey) -> Result<crate::sync_types::NaturalKey> {
+pub(crate) fn copy_key_native(
+    key: &crate::sync_types::NaturalKey,
+) -> Result<crate::sync_types::NaturalKey> {
     let mut rest = Vec::with_capacity(key.rest.len());
-    if rest.capacity() != key.rest.len() { return Err(invalid()); }
+    if rest.capacity() != key.rest.len() {
+        return Err(invalid());
+    }
     for (column, value) in &key.rest {
-        rest.push((column.as_str().to_owned(), crate::memory_accounting::preparation_copy_value(value)?));
+        rest.push((
+            column.as_str().to_owned(),
+            crate::memory_accounting::preparation_copy_value(value)?,
+        ));
     }
     Ok(crate::sync_types::NaturalKey {
         column: key.column.as_str().to_owned(),
@@ -1026,68 +1040,123 @@ pub(crate) fn count_reference_native(reference: &RowRef) -> Result<usize> {
     native_sum([Ok(reference.table.len()), count_key_native(&reference.key)])
 }
 pub(crate) fn count_policy_native(policy: &ApplicationTablePolicy) -> Result<usize> {
-    policy.manifest_tables.as_ref().map_or(Ok(0), |tables| native_vec(tables, |name| Ok(name.len())))
+    policy
+        .manifest_tables
+        .as_ref()
+        .map_or(Ok(0), |tables| native_vec(tables, |name| Ok(name.len())))
 }
 fn count_namespace_native(ns: &Namespace) -> Result<usize> {
-    native_sum([Ok(ns.tenant.as_str().len()), Ok(ns.hub_node.len()), Ok(ns.edge_node.len())])
+    native_sum([
+        Ok(ns.tenant.as_str().len()),
+        Ok(ns.hub_node.len()),
+        Ok(ns.edge_node.len()),
+    ])
 }
 fn count_bound_policy_native(policy: &BoundPolicy) -> Result<usize> {
     native_sum([Ok(policy.table.len()), count_policy_native(&policy.policy)])
 }
 fn count_policy_evidence_native(policy: &PolicyEvidence) -> Result<usize> {
-    native_sum([Ok(policy.table.len()), count_policy_native(&policy.installed),
-        policy.bound.as_ref().map_or(Ok(0), count_bound_policy_native)])
+    native_sum([
+        Ok(policy.table.len()),
+        count_policy_native(&policy.installed),
+        policy
+            .bound
+            .as_ref()
+            .map_or(Ok(0), count_bound_policy_native),
+    ])
 }
 fn count_binding_native(binding: &SignedBinding) -> Result<usize> {
-    native_sum([count_namespace_native(&binding.namespace),
-        native_vec(&binding.tables, count_bound_policy_native), Ok(binding.signature.len())])
+    native_sum([
+        count_namespace_native(&binding.namespace),
+        native_vec(&binding.tables, count_bound_policy_native),
+        Ok(binding.signature.len()),
+    ])
 }
 fn count_row_evidence_native(row: &RowEvidence) -> Result<usize> {
-    native_sum([count_reference_native(&row.reference), Ok(row.creator.author_node_id.len()),
-        Ok(row.creator.lineage_root.len()), Ok(row.creator.attestation.len())])
+    native_sum([
+        count_reference_native(&row.reference),
+        Ok(row.creator.author_node_id.len()),
+        Ok(row.creator.lineage_root.len()),
+        Ok(row.creator.attestation.len()),
+    ])
 }
 fn count_schema_native(schema: &SchemaDependency) -> Result<usize> {
-    native_sum([Ok(schema.tenant.as_str().len()), Ok(schema.author_node.len()),
-        Ok(schema.table.len()), Ok(schema.ddl_bytes.len()), Ok(schema.signature.len())])
+    native_sum([
+        Ok(schema.tenant.as_str().len()),
+        Ok(schema.author_node.len()),
+        Ok(schema.table.len()),
+        Ok(schema.ddl_bytes.len()),
+        Ok(schema.signature.len()),
+    ])
 }
 pub(crate) fn count_manifest_native(manifest: &ManifestRecord) -> Result<usize> {
-    native_sum([Ok(manifest.tenant.as_str().len()), Ok(manifest.edge_node.len()),
+    native_sum([
+        Ok(manifest.tenant.as_str().len()),
+        Ok(manifest.edge_node.len()),
         Ok(manifest.root_life.original_table.len()),
         native_vec(&manifest.member_lives, |life| Ok(life.original_table.len())),
         count_reference_native(&manifest.seal.root),
         native_vec(&manifest.rows, count_row_evidence_native),
         native_vec(&manifest.schemas, count_schema_native),
         native_vec(&manifest.policies, count_policy_evidence_native),
-        manifest.binding.as_ref().map_or(Ok(0), count_binding_native), Ok(manifest.signature.len())])
+        manifest
+            .binding
+            .as_ref()
+            .map_or(Ok(0), count_binding_native),
+        Ok(manifest.signature.len()),
+    ])
 }
 fn count_birth_native(birth: &super::authority::Birth) -> Result<usize> {
-    native_sum([super::preparation::preparation_array_bytes::<Digest>(birth.triggers.len()),
-        super::preparation::preparation_array_bytes::<super::authority::BirthRef>(birth.retired.len())])
+    native_sum([
+        super::preparation::preparation_array_bytes::<Digest>(birth.triggers.len()),
+        super::preparation::preparation_array_bytes::<super::authority::BirthRef>(
+            birth.retired.len(),
+        ),
+    ])
 }
 fn count_certificate_native(certificate: &super::authority::Certificate) -> Result<usize> {
-    native_sum([Ok(certificate.tenant.as_str().len()), Ok(certificate.hub_node.len()),
+    native_sum([
+        Ok(certificate.tenant.as_str().len()),
+        Ok(certificate.hub_node.len()),
         count_birth_native(&certificate.birth),
-        native_vec(&certificate.retired_births, count_birth_native), Ok(certificate.signature.len())])
+        native_vec(&certificate.retired_births, count_birth_native),
+        Ok(certificate.signature.len()),
+    ])
 }
 fn count_checkpoint_native(checkpoint: &super::checkpoint::Checkpoint) -> Result<usize> {
-    native_sum([count_namespace_native(&checkpoint.namespace), Ok(checkpoint.signature.len())])
+    native_sum([
+        count_namespace_native(&checkpoint.namespace),
+        Ok(checkpoint.signature.len()),
+    ])
 }
 fn count_terminal_native(terminal: &TerminalRecord) -> Result<usize> {
-    native_sum([count_namespace_native(&terminal.namespace), count_reference_native(&terminal.root),
-        Ok(terminal.cause.as_ref().map_or(0, String::len)), Ok(terminal.signature.len())])
+    native_sum([
+        count_namespace_native(&terminal.namespace),
+        count_reference_native(&terminal.root),
+        Ok(terminal.cause.as_ref().map_or(0, String::len)),
+        Ok(terminal.signature.len()),
+    ])
 }
 fn count_diagnostic_native(block: &DiagnosticBlock) -> Result<usize> {
     native_sum([
-        native_vec(&block.subjects, |(reference, _)| count_reference_native(reference)),
-        native_vec(&block.conflicts, |conflict| native_sum([
-            count_key_native(&conflict.natural_key),
-            Ok(conflict.reason.as_ref().map_or(0, String::len)),
-            Ok(conflict.table.as_ref().map_or(0, String::len)),
-            Ok(conflict.mutation_kind.as_ref().map_or(0, String::len)),
-            Ok(conflict.winning_author_node_id.as_ref().map_or(0, String::len)),
-            conflict.refusal_cause.as_ref().map_or(Ok(0), |cause|
-                native_sum([Ok(cause.table.len()), count_key_native(&cause.natural_key)])),
-        ])),
+        native_vec(&block.subjects, |(reference, _)| {
+            count_reference_native(reference)
+        }),
+        native_vec(&block.conflicts, |conflict| {
+            native_sum([
+                count_key_native(&conflict.natural_key),
+                Ok(conflict.reason.as_ref().map_or(0, String::len)),
+                Ok(conflict.table.as_ref().map_or(0, String::len)),
+                Ok(conflict.mutation_kind.as_ref().map_or(0, String::len)),
+                Ok(conflict
+                    .winning_author_node_id
+                    .as_ref()
+                    .map_or(0, String::len)),
+                conflict.refusal_cause.as_ref().map_or(Ok(0), |cause| {
+                    native_sum([Ok(cause.table.len()), count_key_native(&cause.natural_key)])
+                }),
+            ])
+        }),
     ])
 }
 pub(crate) fn count_record_native(record: &Record) -> Result<usize> {
@@ -1099,93 +1168,163 @@ pub(crate) fn count_record_native(record: &Record) -> Result<usize> {
         Record::CheckpointNode(node) => count_namespace_native(&node.namespace),
         Record::EdgeCheckpoint(checkpoint) => count_checkpoint_native(checkpoint),
         Record::MaterializedOwner(owner) => native_sum([
-            count_namespace_native(&owner.namespace), count_row_evidence_native(&owner.source),
-            Ok(owner.incumbent.original_table.len()), count_reference_native(&owner.incumbent_reference),
+            count_namespace_native(&owner.namespace),
+            count_row_evidence_native(&owner.source),
+            Ok(owner.incumbent.original_table.len()),
+            count_reference_native(&owner.incumbent_reference),
             Ok(owner.root_incumbent.original_table.len()),
         ]),
-        Record::Policy(policy) => native_sum([Ok(policy.table.len()), count_policy_native(&policy.policy),
-            Ok(policy.tenant.as_ref().map_or(0, |tenant| tenant.as_str().len()))]),
+        Record::Policy(policy) => native_sum([
+            Ok(policy.table.len()),
+            count_policy_native(&policy.policy),
+            Ok(policy
+                .tenant
+                .as_ref()
+                .map_or(0, |tenant| tenant.as_str().len())),
+        ]),
         Record::Binding(binding) => count_binding_native(binding),
         Record::State(_) => Ok(0),
-        Record::Control(control) => native_sum([Ok(control.hub_node.as_ref().map_or(0, String::len)),
-            Ok(control.tenant.as_ref().map_or(0, |tenant| tenant.as_str().len()))]),
+        Record::Control(control) => native_sum([
+            Ok(control.hub_node.as_ref().map_or(0, String::len)),
+            Ok(control
+                .tenant
+                .as_ref()
+                .map_or(0, |tenant| tenant.as_str().len())),
+        ]),
         Record::Birth(birth) => count_birth_native(birth),
         Record::Certificate(certificate) => count_certificate_native(certificate),
         Record::Destination(authority) => count_namespace_native(&authority.namespace),
-        Record::ObjectAdmission(admission) => count_namespace_native(&admission.authority.namespace),
+        Record::ObjectAdmission(admission) => {
+            count_namespace_native(&admission.authority.namespace)
+        }
         Record::Root { life, .. } => Ok(life.original_table.len()),
-        Record::Manifest(manifest) => native_sum([Ok(std::alloc::Layout::new::<ManifestRecord>().size()),
-            count_manifest_native(manifest)]),
+        Record::Manifest(manifest) => native_sum([
+            Ok(std::alloc::Layout::new::<ManifestRecord>().size()),
+            count_manifest_native(manifest),
+        ]),
         Record::MemberOwner { member, root, .. } => native_sum([
-            Ok(member.original_table.len()), Ok(root.original_table.len())]),
+            Ok(member.original_table.len()),
+            Ok(root.original_table.len()),
+        ]),
         Record::Terminal { record, .. } => count_terminal_native(record),
-        Record::Diagnostic { namespace, block, .. } => native_sum([
-            count_namespace_native(namespace), count_diagnostic_native(block)]),
-        Record::DiagnosticOwner { namespace, life, .. } => native_sum([
-            count_namespace_native(namespace), Ok(life.original_table.len())]),
+        Record::Diagnostic {
+            namespace, block, ..
+        } => native_sum([
+            count_namespace_native(namespace),
+            count_diagnostic_native(block),
+        ]),
+        Record::DiagnosticOwner {
+            namespace, life, ..
+        } => native_sum([
+            count_namespace_native(namespace),
+            Ok(life.original_table.len()),
+        ]),
         Record::SourceHistory { root, .. } => Ok(root.original_table.len()),
         Record::PolicyProfile { life, profile, .. } => native_sum([
-            Ok(life.original_table.len()), count_policy_evidence_native(profile)]),
+            Ok(life.original_table.len()),
+            count_policy_evidence_native(profile),
+        ]),
         Record::Order { namespace, .. } => count_namespace_native(namespace),
     }
 }
 
 fn copy_native_vec<T, U>(items: &[T], mut copy: impl FnMut(&T) -> Result<U>) -> Result<Vec<U>> {
     let mut output = Vec::with_capacity(items.len());
-    if output.capacity() != items.len() { return Err(invalid()); }
-    for item in items { output.push(copy(item)?); }
+    if output.capacity() != items.len() {
+        return Err(invalid());
+    }
+    for item in items {
+        output.push(copy(item)?);
+    }
     Ok(output)
 }
 fn copy_reference_native(reference: &RowRef) -> Result<RowRef> {
-    Ok(RowRef { table: reference.table.as_str().to_owned(), key: copy_key_native(&reference.key)? })
+    Ok(RowRef {
+        table: reference.table.as_str().to_owned(),
+        key: copy_key_native(&reference.key)?,
+    })
 }
 fn copy_row_evidence_native(row: &RowEvidence) -> Result<RowEvidence> {
-    Ok(RowEvidence { reference: copy_reference_native(&row.reference)?,
-        creator: row.creator.clone(), authored_source: row.authored_source, row_digest: row.row_digest })
+    Ok(RowEvidence {
+        reference: copy_reference_native(&row.reference)?,
+        creator: row.creator.clone(),
+        authored_source: row.authored_source,
+        row_digest: row.row_digest,
+    })
 }
 fn copy_manifest_native(manifest: &ManifestRecord) -> Result<ManifestRecord> {
     let seal = &manifest.seal;
     Ok(ManifestRecord {
-        tenant: manifest.tenant.clone(), edge_node: manifest.edge_node.as_str().to_owned(),
-        edge_incarnation: manifest.edge_incarnation, id: manifest.id,
+        tenant: manifest.tenant.clone(),
+        edge_node: manifest.edge_node.as_str().to_owned(),
+        edge_incarnation: manifest.edge_incarnation,
+        id: manifest.id,
         root_life: manifest.root_life.clone(),
         member_lives: copy_native_vec(&manifest.member_lives, |life| Ok(life.clone()))?,
         seal: Seal {
-            root: copy_reference_native(&seal.root)?, root_digest: seal.root_digest,
-            origin_life_digest: seal.origin_life_digest, membership_revision: seal.membership_revision,
-            source: seal.source, kind: seal.kind, registered_count: seal.registered_count,
-            unit_digest: seal.unit_digest, last_complete: seal.last_complete,
-            projection_digest: seal.projection_digest, authority_digest: seal.authority_digest,
+            root: copy_reference_native(&seal.root)?,
+            root_digest: seal.root_digest,
+            origin_life_digest: seal.origin_life_digest,
+            membership_revision: seal.membership_revision,
+            source: seal.source,
+            kind: seal.kind,
+            registered_count: seal.registered_count,
+            unit_digest: seal.unit_digest,
+            last_complete: seal.last_complete,
+            projection_digest: seal.projection_digest,
+            authority_digest: seal.authority_digest,
         },
         rows: copy_native_vec(&manifest.rows, copy_row_evidence_native)?,
         schemas: copy_native_vec(&manifest.schemas, |schema| Ok(schema.clone()))?,
         policies: copy_native_vec(&manifest.policies, |policy| Ok(policy.clone()))?,
-        binding: manifest.binding.clone(), signature: manifest.signature.as_slice().to_vec(),
+        binding: manifest.binding.clone(),
+        signature: manifest.signature.as_slice().to_vec(),
     })
 }
 fn copy_terminal_native(terminal: &TerminalRecord) -> Result<TerminalRecord> {
     Ok(TerminalRecord {
-        namespace: terminal.namespace.clone(), root: copy_reference_native(&terminal.root)?,
-        origin_life_digest: terminal.origin_life_digest, submission: terminal.submission,
-        seal_digest: terminal.seal_digest, unit_digest: terminal.unit_digest, source: terminal.source,
-        kind: terminal.kind, cause: terminal.cause.clone(), position: terminal.position,
-        state: terminal.state.clone(), diagnostics: terminal.diagnostics.clone(),
+        namespace: terminal.namespace.clone(),
+        root: copy_reference_native(&terminal.root)?,
+        origin_life_digest: terminal.origin_life_digest,
+        submission: terminal.submission,
+        seal_digest: terminal.seal_digest,
+        unit_digest: terminal.unit_digest,
+        source: terminal.source,
+        kind: terminal.kind,
+        cause: terminal.cause.clone(),
+        position: terminal.position,
+        state: terminal.state.clone(),
+        diagnostics: terminal.diagnostics.clone(),
         signature: terminal.signature.as_slice().to_vec(),
     })
 }
 fn copy_diagnostic_native(block: &DiagnosticBlock) -> Result<DiagnosticBlock> {
     Ok(DiagnosticBlock {
         salt: block.salt,
-        subjects: copy_native_vec(&block.subjects, |(reference, kind)| Ok((copy_reference_native(reference)?, *kind)))?,
-        conflicts: copy_native_vec(&block.conflicts, |conflict| Ok(Conflict {
-            natural_key: copy_key_native(&conflict.natural_key)?, resolution: conflict.resolution,
-            reason: conflict.reason.clone(), table: conflict.table.clone(),
-            mutation_kind: conflict.mutation_kind.clone(), winning_author_node_id: conflict.winning_author_node_id.clone(),
-            hub_acceptance_position: conflict.hub_acceptance_position,
-            refusal_cause: conflict.refusal_cause.as_ref().map(|cause| -> Result<crate::sync_types::RefusalCause> { Ok(crate::sync_types::RefusalCause {
-                table: cause.table.as_str().to_owned(), natural_key: copy_key_native(&cause.natural_key)?,
-            }) }).transpose()?,
-        }))?,
+        subjects: copy_native_vec(&block.subjects, |(reference, kind)| {
+            Ok((copy_reference_native(reference)?, *kind))
+        })?,
+        conflicts: copy_native_vec(&block.conflicts, |conflict| {
+            Ok(Conflict {
+                natural_key: copy_key_native(&conflict.natural_key)?,
+                resolution: conflict.resolution,
+                reason: conflict.reason.clone(),
+                table: conflict.table.clone(),
+                mutation_kind: conflict.mutation_kind.clone(),
+                winning_author_node_id: conflict.winning_author_node_id.clone(),
+                hub_acceptance_position: conflict.hub_acceptance_position,
+                refusal_cause: conflict
+                    .refusal_cause
+                    .as_ref()
+                    .map(|cause| -> Result<crate::sync_types::RefusalCause> {
+                        Ok(crate::sync_types::RefusalCause {
+                            table: cause.table.as_str().to_owned(),
+                            natural_key: copy_key_native(&cause.natural_key)?,
+                        })
+                    })
+                    .transpose()?,
+            })
+        })?,
     })
 }
 fn copy_record_native(record: &Record) -> Result<Record> {
@@ -1194,10 +1333,13 @@ fn copy_record_native(record: &Record) -> Result<Record> {
         Record::CheckpointNode(node) => Record::CheckpointNode(node.clone()),
         Record::EdgeCheckpoint(checkpoint) => Record::EdgeCheckpoint(checkpoint.clone()),
         Record::MaterializedOwner(owner) => Record::MaterializedOwner(MaterializedOwner {
-            namespace: owner.namespace.clone(), submission: owner.submission,
-            source: copy_row_evidence_native(&owner.source)?, incumbent: owner.incumbent.clone(),
+            namespace: owner.namespace.clone(),
+            submission: owner.submission,
+            source: copy_row_evidence_native(&owner.source)?,
+            incumbent: owner.incumbent.clone(),
             incumbent_reference: copy_reference_native(&owner.incumbent_reference)?,
-            incumbent_row_digest: owner.incumbent_row_digest, root_incumbent: owner.root_incumbent.clone(),
+            incumbent_row_digest: owner.incumbent_row_digest,
+            root_incumbent: owner.root_incumbent.clone(),
         }),
         Record::Policy(policy) => Record::Policy(policy.clone()),
         Record::Binding(binding) => Record::Binding(binding.clone()),
@@ -1207,26 +1349,78 @@ fn copy_record_native(record: &Record) -> Result<Record> {
         Record::Certificate(certificate) => Record::Certificate(certificate.clone()),
         Record::Destination(authority) => Record::Destination(authority.clone()),
         Record::ObjectAdmission(admission) => Record::ObjectAdmission(admission.clone()),
-        Record::Root { life, submission } => Record::Root { life: life.clone(), submission: *submission },
+        Record::Root { life, submission } => Record::Root {
+            life: life.clone(),
+            submission: *submission,
+        },
         Record::Manifest(manifest) => Record::Manifest(Box::new(copy_manifest_native(manifest)?)),
-        Record::MemberOwner { member, root, submission } => Record::MemberOwner {
-            member: member.clone(), root: root.clone(), submission: *submission },
-        Record::Terminal { edge, record } => Record::Terminal { edge: *edge, record: copy_terminal_native(record)? },
-        Record::Diagnostic { namespace, submission, block } => Record::Diagnostic {
-            namespace: namespace.clone(), submission: *submission, block: copy_diagnostic_native(block)? },
-        Record::DiagnosticOwner { namespace, submission, life } => Record::DiagnosticOwner {
-            namespace: namespace.clone(), submission: *submission, life: life.clone() },
-        Record::SourceHistory { root, submission, seal_digest, source } => Record::SourceHistory {
-            root: root.clone(), submission: *submission, seal_digest: *seal_digest, source: *source },
-        Record::PolicyProfile { life, submission, profile } => Record::PolicyProfile {
-            life: life.clone(), submission: *submission, profile: profile.clone() },
-        Record::Order { namespace, position, submission } => Record::Order {
-            namespace: namespace.clone(), position: *position, submission: *submission },
+        Record::MemberOwner {
+            member,
+            root,
+            submission,
+        } => Record::MemberOwner {
+            member: member.clone(),
+            root: root.clone(),
+            submission: *submission,
+        },
+        Record::Terminal { edge, record } => Record::Terminal {
+            edge: *edge,
+            record: copy_terminal_native(record)?,
+        },
+        Record::Diagnostic {
+            namespace,
+            submission,
+            block,
+        } => Record::Diagnostic {
+            namespace: namespace.clone(),
+            submission: *submission,
+            block: copy_diagnostic_native(block)?,
+        },
+        Record::DiagnosticOwner {
+            namespace,
+            submission,
+            life,
+        } => Record::DiagnosticOwner {
+            namespace: namespace.clone(),
+            submission: *submission,
+            life: life.clone(),
+        },
+        Record::SourceHistory {
+            root,
+            submission,
+            seal_digest,
+            source,
+        } => Record::SourceHistory {
+            root: root.clone(),
+            submission: *submission,
+            seal_digest: *seal_digest,
+            source: *source,
+        },
+        Record::PolicyProfile {
+            life,
+            submission,
+            profile,
+        } => Record::PolicyProfile {
+            life: life.clone(),
+            submission: *submission,
+            profile: profile.clone(),
+        },
+        Record::Order {
+            namespace,
+            position,
+            submission,
+        } => Record::Order {
+            namespace: namespace.clone(),
+            position: *position,
+            submission: *submission,
+        },
     })
 }
 /// A native copy and its ORIGINAL body grant become one opaque result owner.
-pub(crate) fn copy_record_owned(db: &crate::Database, record: &Record)
-    -> Result<super::preparation::OwnedPreparationValue<Record>> {
+pub(crate) fn copy_record_owned(
+    db: &crate::Database,
+    record: &Record,
+) -> Result<super::preparation::OwnedPreparationValue<Record>> {
     let bytes = count_record_native(record)?;
     super::preparation::OwnedPreparationValue::try_produce(db, bytes, || copy_record_native(record))
 }
@@ -1236,11 +1430,15 @@ pub(crate) fn count_named_encoding<T: Serialize + ?Sized>(value: &T) -> Result<u
     struct Count(usize);
     impl std::io::Write for Count {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0 = self.0.checked_add(bytes.len())
+            self.0 = self
+                .0
+                .checked_add(bytes.len())
                 .ok_or_else(|| std::io::Error::other("delivery encoding size overflow"))?;
             Ok(bytes.len())
         }
-        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
     let mut count = Count(0);
     rmp_serde::encode::write_named(&mut count, value)
@@ -1249,31 +1447,43 @@ pub(crate) fn count_named_encoding<T: Serialize + ?Sized>(value: &T) -> Result<u
 }
 
 /// Existing serializer and tags, with a writer that refuses capacity growth.
-pub(crate) fn emit_named_encoding<T: Serialize + ?Sized>(value: &T, output: &mut Vec<u8>) -> Result<()> {
+pub(crate) fn emit_named_encoding<T: Serialize + ?Sized>(
+    value: &T,
+    output: &mut Vec<u8>,
+) -> Result<()> {
     struct Bounded<'a>(&'a mut Vec<u8>);
     impl std::io::Write for Bounded<'_> {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
             if bytes.len() > self.0.capacity() - self.0.len() {
-                return Err(std::io::Error::other("delivery encoding exceeded admitted capacity"));
+                return Err(std::io::Error::other(
+                    "delivery encoding exceeded admitted capacity",
+                ));
             }
             self.0.extend_from_slice(bytes);
             Ok(bytes.len())
         }
-        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
     rmp_serde::encode::write_named(&mut Bounded(output), value)
         .map_err(|e| contextdb_core::Error::SyncError(format!("delivery metadata encode: {e}")))
 }
 
 pub(crate) fn prepare_named_encoding_owned<T: Serialize + ?Sized>(
-    db: &crate::Database, value: &T,
+    db: &crate::Database,
+    value: &T,
 ) -> Result<super::preparation::OwnedPreparationValue<Vec<u8>>> {
     let count = count_named_encoding(value)?;
     super::preparation::OwnedPreparationValue::try_produce(db, count, || {
         let mut encoded = Vec::with_capacity(count);
-        if encoded.capacity() != count { return Err(invalid()); }
+        if encoded.capacity() != count {
+            return Err(invalid());
+        }
         emit_named_encoding(value, &mut encoded)?;
-        if encoded.len() != count { return Err(invalid()); }
+        if encoded.len() != count {
+            return Err(invalid());
+        }
         Ok(encoded)
     })
 }

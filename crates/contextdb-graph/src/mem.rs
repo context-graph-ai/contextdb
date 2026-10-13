@@ -430,9 +430,7 @@ where
     if storage.len() < storage.capacity() {
         return Ok(());
     }
-    let capacity = storage
-        .capacity().saturating_mul(2)
-        .max(4);
+    let capacity = storage.capacity().saturating_mul(2).max(4);
     let requested = checked_graph_add(
         bounded_capacity_bytes::<T>(capacity, "predecessor storage").map_err(E::from)?,
         16,
@@ -841,7 +839,9 @@ impl<S: WriteSetApplicator> ExecutorTransactions<S> {
             Self::Owned(handle) => handle.with_transactions(|transactions| transactions.snapshot()),
         }
     }
-    fn with_write_set<R>(&self, tx: TxId,
+    fn with_write_set<R>(
+        &self,
+        tx: TxId,
         f: impl FnOnce(&mut contextdb_tx::WriteSet) -> R,
     ) -> Result<R> {
         match self {
@@ -871,7 +871,10 @@ pub struct PreparedDagEdgeTypes {
 
 impl<S: WriteSetApplicator> MemGraphExecutor<S> {
     #[doc(hidden)]
-    pub fn new_engine(store: Arc<GraphStore>, transactions: contextdb_tx::manager::EngineTransactionHandle<S>) -> Self {
+    pub fn new_engine(
+        store: Arc<GraphStore>,
+        transactions: contextdb_tx::manager::EngineTransactionHandle<S>,
+    ) -> Self {
         Self {
             store,
             tx_mgr: ExecutorTransactions::Owned(transactions),
@@ -1992,7 +1995,7 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
             .bfs_visited_cap
             .load(std::sync::atomic::Ordering::Relaxed);
         let mut nodes = Vec::new();
-        let (mut emitted , mut emitted_bytes ) =
+        let (mut emitted, mut emitted_bytes) =
             bounded_graph_visited(start, &mut admit, &mut |bytes| {
                 credit
                     .borrow_mut()

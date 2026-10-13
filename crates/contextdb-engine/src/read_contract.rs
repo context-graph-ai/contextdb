@@ -926,14 +926,16 @@ pub(crate) fn decoder_memory(
     let accountant = std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(
         usize::try_from(memory_ceiling).unwrap_or(usize::MAX),
     ));
-    let memory =
-        match crate::read_image_memory::ImageMemory::operation_reader(accountant.into(), child.clone()) {
-            Ok(memory) => memory,
-            Err(error) => {
-                child.release(controls);
-                return Err(error);
-            }
-        };
+    let memory = match crate::read_image_memory::ImageMemory::operation_reader(
+        accountant.into(),
+        child.clone(),
+    ) {
+        Ok(memory) => memory,
+        Err(error) => {
+            child.release(controls);
+            return Err(error);
+        }
+    };
     memory.adopt_reader_credit(&child, controls)?;
     Ok(memory)
 }

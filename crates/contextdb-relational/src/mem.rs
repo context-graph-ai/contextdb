@@ -23,7 +23,11 @@ impl<S: WriteSetApplicator> ExecutorTransactions<S> {
         }
     }
     // Existing standalone/public mutations retain their genuine Legacy route.
-    fn with_write_set<R>(&self, tx: TxId, f: impl FnOnce(&mut contextdb_tx::WriteSet) -> R) -> Result<R> {
+    fn with_write_set<R>(
+        &self,
+        tx: TxId,
+        f: impl FnOnce(&mut contextdb_tx::WriteSet) -> R,
+    ) -> Result<R> {
         match self {
             Self::Legacy(manager) => manager.with_write_set(tx, f),
             Self::Owned(_) => Err(Error::InvalidStateTransition(
@@ -702,7 +706,10 @@ impl BoundedPhysicalCursor {
 
     #[doc(hidden)]
     pub fn source_position(&self) -> Option<&[u8]> {
-        self.source_position_charge.as_ref().map(|position| position.key.as_slice()).or(self.source_key.as_deref())
+        self.source_position_charge
+            .as_ref()
+            .map(|position| position.key.as_slice())
+            .or(self.source_key.as_deref())
     }
 
     #[doc(hidden)]
@@ -727,7 +734,10 @@ impl BoundedPhysicalCursor {
         credit: contextdb_core::read_memory::ReadCredit,
     ) {
         self.source_key = None;
-        self.source_position_charge = Some(Arc::new(ChargedPhysicalPosition { key, _credit: credit }));
+        self.source_position_charge = Some(Arc::new(ChargedPhysicalPosition {
+            key,
+            _credit: credit,
+        }));
         self.last_inspected = Some((row.row_id, row.created_tx));
     }
 
@@ -1013,12 +1023,24 @@ fn push_admitted_source_row(
 
 impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
     #[doc(hidden)]
-    pub fn new_engine(store: Arc<RelationalStore>, transactions: contextdb_tx::manager::EngineTransactionHandle<S>) -> Self {
-        Self { store, tx_mgr: ExecutorTransactions::Owned(transactions), staged_posting_admission: None }
+    pub fn new_engine(
+        store: Arc<RelationalStore>,
+        transactions: contextdb_tx::manager::EngineTransactionHandle<S>,
+    ) -> Self {
+        Self {
+            store,
+            tx_mgr: ExecutorTransactions::Owned(transactions),
+            staged_posting_admission: None,
+        }
     }
     #[doc(hidden)]
-    pub fn stage_engine_row(&self, tx: TxId, table: &str, row: VersionedRow,
-        invoice: contextdb_tx::staged_source::OriginalRowInvoice) -> Result<RowId> {
+    pub fn stage_engine_row(
+        &self,
+        tx: TxId,
+        table: &str,
+        row: VersionedRow,
+        invoice: contextdb_tx::staged_source::OriginalRowInvoice,
+    ) -> Result<RowId> {
         struct Original {
             row: VersionedRow,
             invoice: contextdb_tx::staged_source::OriginalRowInvoice,
@@ -1026,15 +1048,22 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         let original = Original { row, invoice };
         let row_id = original.row.row_id;
         let ExecutorTransactions::Owned(handle) = &self.tx_mgr else {
-            return Err(Error::InvalidStateTransition("engine row requires owned executor".into()));
+            return Err(Error::InvalidStateTransition(
+                "engine row requires owned executor".into(),
+            ));
         };
         let meta = self.store.table_meta.read();
-        let meta = meta.get(table).ok_or_else(|| Error::TableNotFound(table.into()))?;
-        handle.with_transactions(|transactions| transactions.with_engine(tx, |guard| {
-            let prepared = guard.prepare_row_from_meta(table, original.row, meta, original.invoice)?;
-            guard.publish(prepared);
-            Ok(row_id)
-        }))
+        let meta = meta
+            .get(table)
+            .ok_or_else(|| Error::TableNotFound(table.into()))?;
+        handle.with_transactions(|transactions| {
+            transactions.with_engine(tx, |guard| {
+                let prepared =
+                    guard.prepare_row_from_meta(table, original.row, meta, original.invoice)?;
+                guard.publish(prepared);
+                Ok(row_id)
+            })
+        })
     }
 
     pub fn new(store: Arc<RelationalStore>, tx_mgr: Arc<TransactionManager<S>>) -> Self {

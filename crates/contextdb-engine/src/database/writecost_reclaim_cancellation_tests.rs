@@ -17,9 +17,18 @@ struct Store {
 }
 
 fn seed(db: &Database) {
-    db.execute("CREATE TABLE churn (id INTEGER PRIMARY KEY, payload TEXT)", &p()).unwrap();
-    db.execute("CREATE TABLE bulk (id INTEGER PRIMARY KEY, payload TEXT)", &p()).unwrap();
-    db.execute("INSERT INTO churn (id, payload) VALUES (0, 'seed')", &p()).unwrap();
+    db.execute(
+        "CREATE TABLE churn (id INTEGER PRIMARY KEY, payload TEXT)",
+        &p(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE bulk (id INTEGER PRIMARY KEY, payload TEXT)",
+        &p(),
+    )
+    .unwrap();
+    db.execute("INSERT INTO churn (id, payload) VALUES (0, 'seed')", &p())
+        .unwrap();
     for chunk in 0..2 {
         let mut sql = String::from("INSERT INTO bulk (id, payload) VALUES ");
         for i in 0..200 {
@@ -35,7 +44,10 @@ fn seed(db: &Database) {
 fn churn(db: &Database, commits: usize) {
     for generation in 0..commits {
         db.execute(
-            &format!("UPDATE churn SET payload = 'g{generation}{}' WHERE id = 0", "y".repeat(8192)),
+            &format!(
+                "UPDATE churn SET payload = 'g{generation}{}' WHERE id = 0",
+                "y".repeat(8192)
+            ),
             &p(),
         )
         .unwrap();
@@ -61,12 +73,18 @@ fn store_with_backlog_in(path: PathBuf, dir: Option<tempfile::TempDir>) -> Store
     );
     seed(&db);
     let session = db.read_session(ReadLimits::default()).unwrap();
-    let cursor = session.open_cursor("SELECT id FROM bulk ORDER BY id", &p()).unwrap();
+    let cursor = session
+        .open_cursor("SELECT id FROM bulk ORDER BY id", &p())
+        .unwrap();
     assert!(cursor.first_page().has_more);
     churn(&db, 140);
     drop(cursor);
     drop(session);
-    Store { _dir: dir, path, db }
+    Store {
+        _dir: dir,
+        path,
+        db,
+    }
 }
 
 fn store_with_backlog() -> Store {
@@ -88,7 +106,9 @@ struct Observed {
 fn account(observed: &Observed) {
     let work = redb::commit_work::take_commit_pages_for_test();
     observed.commits.fetch_add(work.commits, Ordering::SeqCst);
-    observed.reclaimed_pages.fetch_add(work.reclaimed_pages, Ordering::SeqCst);
+    observed
+        .reclaimed_pages
+        .fetch_add(work.reclaimed_pages, Ordering::SeqCst);
     observed.checkpoints.fetch_add(1, Ordering::SeqCst);
 }
 
@@ -106,8 +126,14 @@ fn assert_one_committed_step(store: &Store, before: (usize, usize), observed: &O
         "exactly one full bounded step (not the ordinary 64-extent commit): {reclaimed}"
     );
     let after = backlog(&store.db);
-    assert!(before.1 > STEP_EXTENTS, "fixture must exceed one step: {before:?}");
-    assert!(after.1 < before.1, "the committed step stays durable: {before:?} -> {after:?}");
+    assert!(
+        before.1 > STEP_EXTENTS,
+        "fixture must exceed one step: {before:?}"
+    );
+    assert!(
+        after.1 < before.1,
+        "the committed step stays durable: {before:?} -> {after:?}"
+    );
     assert!(
         after.1 + reclaimed >= before.1,
         "the remainder is untouched beyond that one step: {before:?} -> {after:?} (reclaimed {reclaimed})"
@@ -138,7 +164,11 @@ fn worker_stop_after_one_committed_step_leaves_a_resumable_remainder() {
     );
     account(&observed);
     assert!(matches!(result, Err(Error::ReadCancelled)), "{result:?}");
-    assert_eq!(observed.commits.load(Ordering::SeqCst), 1, "exactly one commit before the stop");
+    assert_eq!(
+        observed.commits.load(Ordering::SeqCst),
+        1,
+        "exactly one commit before the stop"
+    );
     assert_one_committed_step(&store, before, &observed);
     drop(context);
     // A later ordinary cycle resumes and finishes it.
@@ -169,7 +199,11 @@ fn resource_closed_after_one_committed_step_leaves_a_resumable_remainder() {
     account(&observed);
     store.db.resource_closed.store(false, Ordering::SeqCst);
     assert!(matches!(result, Err(Error::ReadCancelled)), "{result:?}");
-    assert_eq!(observed.commits.load(Ordering::SeqCst), 1, "exactly one commit before the stop");
+    assert_eq!(
+        observed.commits.load(Ordering::SeqCst),
+        1,
+        "exactly one commit before the stop"
+    );
     assert_one_committed_step(&store, before, &observed);
     drop(context);
     for _ in 0..4 {
@@ -187,8 +221,11 @@ fn foreground_writes_between_steps_do_not_extend_the_cycle_or_lose_data() {
     let observed = Arc::new(Observed::default());
     let added = Arc::new(AtomicU64::new(0));
     redb::commit_work::reset_commit_pages_for_test();
-    let (observer_state, observer_added, db) =
-        (Arc::clone(&observed), Arc::clone(&added), Arc::clone(&store.db));
+    let (observer_state, observer_added, db) = (
+        Arc::clone(&observed),
+        Arc::clone(&added),
+        Arc::clone(&store.db),
+    );
     let result = resident_history_test_seams::with_checkpoint_observer(
         Arc::new(move || {
             account(&observer_state);
@@ -205,9 +242,16 @@ fn foreground_writes_between_steps_do_not_extend_the_cycle_or_lose_data() {
     );
     account(&observed);
     result.unwrap();
-    assert!(added.load(Ordering::SeqCst) >= 1, "the writer must have run between steps");
+    assert!(
+        added.load(Ordering::SeqCst) >= 1,
+        "the writer must have run between steps"
+    );
     // At most 64 reclaim steps plus the cycle's other checkpoints.
-    assert!(observed.checkpoints.load(Ordering::SeqCst) <= 64 + 16, "{}", observed.checkpoints.load(Ordering::SeqCst));
+    assert!(
+        observed.checkpoints.load(Ordering::SeqCst) <= 64 + 16,
+        "{}",
+        observed.checkpoints.load(Ordering::SeqCst)
+    );
     drop(context);
     for _ in 0..6 {
         store.db.run_maintenance_cycle().unwrap();
@@ -254,9 +298,16 @@ fn a_crash_between_steps_leaves_the_remainder_and_reopen_resumes_it() {
     assert!(!status.success(), "the child must die by abort");
     let db = Database::open(&path).unwrap();
     let rows = db.execute("SELECT COUNT(*) FROM bulk", &p()).unwrap();
-    assert_eq!(rows.rows, vec![vec![Value::Int64(400)]], "committed data survives the crash");
+    assert_eq!(
+        rows.rows,
+        vec![vec![Value::Int64(400)]],
+        "committed data survives the crash"
+    );
     let remainder = backlog(&db);
-    assert!(remainder.1 > 0, "the durable remainder survives: {remainder:?}");
+    assert!(
+        remainder.1 > 0,
+        "the durable remainder survives: {remainder:?}"
+    );
     for _ in 0..4 {
         db.run_maintenance_cycle().unwrap();
     }

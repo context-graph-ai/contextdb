@@ -786,15 +786,31 @@ where
             for position in 0..partition.len() {
                 before_source_entry()?;
                 before_candidate()?;
-                if partition.entry(position).is_some_and(|entry|
+                if partition.entry(position).is_some_and(|entry| {
                     entry.membership.visible_from.0 <= snapshot.0
-                        && entry.membership.deleted_tx.is_none_or(|tx| tx.0 > snapshot.0)) {
+                        && entry
+                            .membership
+                            .deleted_tx
+                            .is_none_or(|tx| tx.0 > snapshot.0)
+                }) {
                     before_distance()?;
                 }
-                if let Some(score) = state.historical_partition_score(&partition, position, snapshot, query).map_err(E::from)? {
-                    compared = compared.checked_add(1).ok_or_else(|| E::from(Error::Other("bounded exact vector count overflow".into())))?;
-                    merge_bounded_vector_score(scores, retained_bytes, score, k,
-                        before_source_entry, before_retain, release_retained)?;
+                if let Some(score) = state
+                    .historical_partition_score(&partition, position, snapshot, query)
+                    .map_err(E::from)?
+                {
+                    compared = compared.checked_add(1).ok_or_else(|| {
+                        E::from(Error::Other("bounded exact vector count overflow".into()))
+                    })?;
+                    merge_bounded_vector_score(
+                        scores,
+                        retained_bytes,
+                        score,
+                        k,
+                        before_source_entry,
+                        before_retain,
+                        release_retained,
+                    )?;
                 }
             }
             return Ok(compared);
@@ -808,12 +824,13 @@ where
     // refused does the comparison read the bodies one at a time instead, so a
     // find the reader could not hold is answered rather than refused, and a
     // find it could hold does not re-read every body on every call.
-    let stream = historical_stream || state.streams_raw_bodies()
-        && match state.ensure_raw_vectors_loaded(owner) {
-            Ok(()) => false,
-            Err(Error::MemoryBudgetExceeded { .. }) => true,
-            Err(error) => return Err(E::from(error)),
-        };
+    let stream = historical_stream
+        || state.streams_raw_bodies()
+            && match state.ensure_raw_vectors_loaded(owner) {
+                Ok(()) => false,
+                Err(Error::MemoryBudgetExceeded { .. }) => true,
+                Err(error) => return Err(E::from(error)),
+            };
     if stream {
         let mut compared = 0usize;
         let mut position = 0usize;
@@ -2388,7 +2405,11 @@ impl<S: WriteSetApplicator> ExecutorTransactions<S> {
         }
     }
     // Existing standalone/public mutations retain their genuine Legacy route.
-    fn with_write_set<R>(&self, tx: TxId, f: impl FnOnce(&mut contextdb_tx::WriteSet) -> R) -> Result<R> {
+    fn with_write_set<R>(
+        &self,
+        tx: TxId,
+        f: impl FnOnce(&mut contextdb_tx::WriteSet) -> R,
+    ) -> Result<R> {
         match self {
             Self::Legacy(manager) => manager.with_write_set(tx, f),
             Self::Owned(_) => Err(Error::InvalidStateTransition(
@@ -2406,27 +2427,45 @@ pub struct MemVectorExecutor<S: WriteSetApplicator> {
 
 impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     #[doc(hidden)]
-    pub fn new_engine(store: Arc<VectorStore>, transactions: contextdb_tx::manager::EngineTransactionHandle<S>,
-        _hnsw: Arc<OnceLock<RwLock<Option<HnswIndex>>>>, accountant: Arc<dyn MemoryBudget>) -> Self {
-        Self { store, tx_mgr: ExecutorTransactions::Owned(transactions), _accountant: accountant }
+    pub fn new_engine(
+        store: Arc<VectorStore>,
+        transactions: contextdb_tx::manager::EngineTransactionHandle<S>,
+        _hnsw: Arc<OnceLock<RwLock<Option<HnswIndex>>>>,
+        accountant: Arc<dyn MemoryBudget>,
+    ) -> Self {
+        Self {
+            store,
+            tx_mgr: ExecutorTransactions::Owned(transactions),
+            _accountant: accountant,
+        }
     }
     #[doc(hidden)]
-    pub fn stage_engine_vector(&self, tx: TxId, entry: VectorEntry, scalar: Option<(RowId, ColName)>,
-        invoice: contextdb_tx::staged_source::OriginalVectorInvoice) -> Result<()> {
+    pub fn stage_engine_vector(
+        &self,
+        tx: TxId,
+        entry: VectorEntry,
+        scalar: Option<(RowId, ColName)>,
+        invoice: contextdb_tx::staged_source::OriginalVectorInvoice,
+    ) -> Result<()> {
         struct Original {
             entry: VectorEntry,
             invoice: contextdb_tx::staged_source::OriginalVectorInvoice,
         }
         let original = Original { entry, invoice };
         let ExecutorTransactions::Owned(handle) = &self.tx_mgr else {
-            return Err(Error::InvalidStateTransition("engine vector requires owned executor".into()));
+            return Err(Error::InvalidStateTransition(
+                "engine vector requires owned executor".into(),
+            ));
         };
-        self.store.validate_vector(&original.entry.index, original.entry.vector.len())?;
-        handle.with_transactions(|transactions| transactions.with_engine(tx, |guard| {
-            let prepared = guard.prepare_vector(original.entry, scalar, original.invoice)?;
-            guard.publish(prepared);
-            Ok(())
-        }))
+        self.store
+            .validate_vector(&original.entry.index, original.entry.vector.len())?;
+        handle.with_transactions(|transactions| {
+            transactions.with_engine(tx, |guard| {
+                let prepared = guard.prepare_vector(original.entry, scalar, original.invoice)?;
+                guard.publish(prepared);
+                Ok(())
+            })
+        })
     }
 
     /// The accountant must belong to the actual executing statement.
@@ -2635,7 +2674,10 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         E: From<Error>,
     {
         before_checkpoint()?;
-        let layout = self.store.scoped_index_layout(index, owner).map_err(E::from)?;
+        let layout = self
+            .store
+            .scoped_index_layout(index, owner)
+            .map_err(E::from)?;
         let filtered = candidates.is_some();
         if candidates.is_some_and(<[u64]>::is_empty) {
             return Ok(BoundedVectorCandidateGroups {
@@ -3181,7 +3223,8 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 }
                 Ok(None) => {}
                 Err(Error::MemoryBudgetExceeded { .. })
-                    if cursor.stream_when_refused && source.state.streams_raw_bodies() => {
+                    if cursor.stream_when_refused && source.state.streams_raw_bodies() =>
+                {
                     cursor.streaming_source = true;
                     cursor.state_end = Some(usize::MAX);
                 }
@@ -3405,31 +3448,40 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         // future versions still consumed this physical scan step.
         before_exhaustive_candidate()?;
         let scored = if let Some(partition) = cursor.historical_partition.as_ref() {
-            if partition.entry(position).is_some_and(|entry|
+            if partition.entry(position).is_some_and(|entry| {
                 entry.membership.visible_from.0 <= cursor.snapshot.0
-                    && entry.membership.deleted_tx.is_none_or(|tx| tx.0 > cursor.snapshot.0)) {
+                    && entry
+                        .membership
+                        .deleted_tx
+                        .is_none_or(|tx| tx.0 > cursor.snapshot.0)
+            }) {
                 before_distance()?;
             }
-            source.state.historical_partition_score(partition, position, cursor.snapshot, &cursor.query).map_err(E::from)?
+            source
+                .state
+                .historical_partition_score(partition, position, cursor.snapshot, &cursor.query)
+                .map_err(E::from)?
         } else {
-            source.state.with_entries(|entries| -> std::result::Result<Option<_>, E> {
-                let entry = entries.get(position).ok_or_else(|| {
-                    E::from(Error::ReadFailure(ReadFailure::invalid_continuation(
+            source
+                .state
+                .with_entries(|entries| -> std::result::Result<Option<_>, E> {
+                    let entry = entries.get(position).ok_or_else(|| {
+                        E::from(Error::ReadFailure(ReadFailure::invalid_continuation(
                         "the candidate this read left off at was removed while it was suspended"
                             .to_string(),
                     )))
-                })?;
-                if !entry.visible_at(cursor.snapshot) {
-                    return Ok(None);
-                }
-                before_distance()?;
-                #[cfg(feature = "test-seams")]
-                observe_native_vector_score_for_test();
-                Ok(Some((
-                    entry.row_id,
-                    entry.vector.cosine_similarity(&cursor.query),
-                )))
-            })?
+                    })?;
+                    if !entry.visible_at(cursor.snapshot) {
+                        return Ok(None);
+                    }
+                    before_distance()?;
+                    #[cfg(feature = "test-seams")]
+                    observe_native_vector_score_for_test();
+                    Ok(Some((
+                        entry.row_id,
+                        entry.vector.cosine_similarity(&cursor.query),
+                    )))
+                })?
         };
         cursor.position = cursor.position.checked_add(1).ok_or_else(|| {
             E::from(Error::Other(
@@ -3442,7 +3494,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
 
     /// Enumerate scoped membership without loading or scoring vector bodies.
     /// Every directory touch and retained source handle uses the caller's budget.
-#[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
+    #[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
     pub fn bounded_visit_visible_ids<E>(
         &self,
         index: &VectorIndexRef,
@@ -3457,7 +3509,10 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         E: From<Error>,
     {
         before_entry()?;
-        let layout = self.store.scoped_index_layout(index, owner).map_err(E::from)?;
+        let layout = self
+            .store
+            .scoped_index_layout(index, owner)
+            .map_err(E::from)?;
         let (sources, bytes) = self.bounded_snapshot_sources(
             index,
             &layout,
@@ -3634,7 +3689,10 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         let snapshot = groups.snapshot;
         let aggregate_allowed_count = groups.aggregate_allowed_count();
         before_source_entry()?;
-        let layout = self.store.scoped_index_layout(index, owner).map_err(E::from)?;
+        let layout = self
+            .store
+            .scoped_index_layout(index, owner)
+            .map_err(E::from)?;
         if query.len() != layout.dimension {
             return Err(E::from(Error::VectorIndexDimensionMismatch {
                 index: index.clone(),
@@ -3906,8 +3964,9 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
 
                 let mut preload_checkpoint =
                     || before_source_entry().map_err(QuarantineAwarePreloadError::Control);
-                let mut preload_retain =
-                    |bytes| before_retain(bytes).map_err(QuarantineAwarePreloadError::RetainControl);
+                let mut preload_retain = |bytes| {
+                    before_retain(bytes).map_err(QuarantineAwarePreloadError::RetainControl)
+                };
                 let preload = match &source.serving_selection {
                     Some(selection) => state.preload_captured_serving_selection(
                         selection,
@@ -3931,8 +3990,10 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     {
                         preload_memory_refused = true;
                     }
-                    Err(QuarantineAwarePreloadError::Control(error)
-                        | QuarantineAwarePreloadError::RetainControl(error)) => return Err(error),
+                    Err(
+                        QuarantineAwarePreloadError::Control(error)
+                        | QuarantineAwarePreloadError::RetainControl(error),
+                    ) => return Err(error),
                     Err(QuarantineAwarePreloadError::Store(error @ Error::ReadCancelled)) => {
                         return Err(E::from(error));
                     }
@@ -3968,17 +4029,21 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 before_retain(admitted_layer_bytes)?;
                 let (availability, owned_layers) = if preload_memory_refused {
                     (VectorGraphLayerAvailability::Unavailable, Vec::new())
-                } else { match &source.serving_selection {
-                    Some(selection) => {
-                        let layers = selection.owned_layers();
-                        #[cfg(any(test, feature = "test-seams"))]
-                        if layers.0 == VectorGraphLayerAvailability::Ready && !layers.1.is_empty() {
-                            state.pause_graph_callback_for_test();
+                } else {
+                    match &source.serving_selection {
+                        Some(selection) => {
+                            let layers = selection.owned_layers();
+                            #[cfg(any(test, feature = "test-seams"))]
+                            if layers.0 == VectorGraphLayerAvailability::Ready
+                                && !layers.1.is_empty()
+                            {
+                                state.pause_graph_callback_for_test();
+                            }
+                            layers
                         }
-                        layers
-                    },
-                    None => state.snapshot_compatible_owned_layers(snapshot),
-                }};
+                        None => state.snapshot_compatible_owned_layers(snapshot),
+                    }
+                };
                 if availability == VectorGraphLayerAvailability::Ready && !owned_layers.is_empty() {
                     self.store.mark_sealed_graph_used(state);
                     let charged_bytes = std::mem::size_of::<UnionPartition<'_>>().saturating_add(
@@ -4082,75 +4147,90 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             // would score, or every layer cannot reach its k-floor beam inside
             // the cap, the union answers by EXACT without opening a layer.
             // INDEXED always attempts the walk; the cap then refuses it by type.
-            let crossover_to_exact = mode == VectorSearchMode::Auto && !union_partitions.is_empty() && {
-                let layer_count = union_partitions
-                    .iter()
-                    .map(|partition| partition.layers.len())
-                    .fold(0usize, usize::saturating_add);
-                let degree = union_partitions
-                    .iter()
-                    .flat_map(|partition| partition.layers.iter())
-                    .filter_map(|layer| layer.graph())
-                    .map(|graph| graph.layer0_max_degree())
-                    .max()
-                    .unwrap_or(0)
-                    .max(1);
-                let rows = union_partitions
-                    .iter()
-                    .map(|partition| partition.allowed_count)
-                    .fold(0usize, usize::saturating_add);
-                let cap = crate::hnsw::union_candidate_budget(statement_policy.hnsw_ef_search, k, degree);
-                crate::hnsw::union::graph_work_cannot_beat_exact(cap, rows, layer_count, k, degree)
-            };
+            let crossover_to_exact =
+                mode == VectorSearchMode::Auto && !union_partitions.is_empty() && {
+                    let layer_count = union_partitions
+                        .iter()
+                        .map(|partition| partition.layers.len())
+                        .fold(0usize, usize::saturating_add);
+                    let degree = union_partitions
+                        .iter()
+                        .flat_map(|partition| partition.layers.iter())
+                        .filter_map(|layer| layer.graph())
+                        .map(|graph| graph.layer0_max_degree())
+                        .max()
+                        .unwrap_or(0)
+                        .max(1);
+                    let rows = union_partitions
+                        .iter()
+                        .map(|partition| partition.allowed_count)
+                        .fold(0usize, usize::saturating_add);
+                    let cap = crate::hnsw::union_candidate_budget(
+                        statement_policy.hnsw_ef_search,
+                        k,
+                        degree,
+                    );
+                    crate::hnsw::union::graph_work_cannot_beat_exact(
+                        cap,
+                        rows,
+                        layer_count,
+                        k,
+                        degree,
+                    )
+                };
             if crossover_to_exact {
                 first_fallback_reason.get_or_insert("graph_work_not_below_exact");
             }
             if !union_partitions.is_empty() {
-                let outcome = if crossover_to_exact { None } else { Some(self.bounded_union_search(
-                    index,
-                    query,
-                    k,
-                    snapshot,
-                    snapshot_sources,
-                    &mut union_partitions,
-                    statement_policy.hnsw_ef_search,
-                    allowed_search_limits,
-                    &mut query_self_scores,
-                    &mut before_source_entry,
-                    &mut before_distance,
-                    &mut before_retain,
-                    &mut release_retained,
-                    owner,
-                )?) };
+                let outcome = if crossover_to_exact {
+                    None
+                } else {
+                    Some(self.bounded_union_search(
+                        index,
+                        query,
+                        k,
+                        snapshot,
+                        snapshot_sources,
+                        &mut union_partitions,
+                        statement_policy.hnsw_ef_search,
+                        allowed_search_limits,
+                        &mut query_self_scores,
+                        &mut before_source_entry,
+                        &mut before_distance,
+                        &mut before_retain,
+                        &mut release_retained,
+                        owner,
+                    )?)
+                };
                 let resolved = match outcome {
                     None => None,
                     Some(outcome) => {
-                union_receipt = Some(outcome.receipt);
-                match outcome.outcome {
-                    UnionOutcome::Answered {
-                        accepted,
-                        accepted_bytes,
-                        walked,
-                        walked_bytes,
-                        contributing,
-                        short,
-                        short_bytes,
-                    } => Some((
-                        accepted,
-                        accepted_bytes,
-                        walked,
-                        walked_bytes,
-                        contributing,
-                        short,
-                        short_bytes,
-                    )),
-                    UnionOutcome::Unresolved(reason) => {
-                        if mode == VectorSearchMode::Indexed {
-                            return Ok(BoundedHnswOutcome::Incomplete { reason });
+                        union_receipt = Some(outcome.receipt);
+                        match outcome.outcome {
+                            UnionOutcome::Answered {
+                                accepted,
+                                accepted_bytes,
+                                walked,
+                                walked_bytes,
+                                contributing,
+                                short,
+                                short_bytes,
+                            } => Some((
+                                accepted,
+                                accepted_bytes,
+                                walked,
+                                walked_bytes,
+                                contributing,
+                                short,
+                                short_bytes,
+                            )),
+                            UnionOutcome::Unresolved(reason) => {
+                                if mode == VectorSearchMode::Indexed {
+                                    return Ok(BoundedHnswOutcome::Incomplete { reason });
+                                }
+                                None
+                            }
                         }
-                        None
-                    }
-                }
                     }
                 };
                 match resolved {
@@ -4612,96 +4692,120 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         // per-index cap, admission included. The request logical work limit
         // remains shared across all partitions.
         let funder = owner.funder();
-        let mut run_layer = |slice: &[crate::hnsw::HnswUnionLayer<'_>], remaining: usize, spent: usize| crate::hnsw::union::search_union_allowed_bounded_with_navigation(
-            slice,
-            query,
-            k,
-            ef_search,
-            remaining,
-            // The declared work limit is one too: what earlier partitions
-            // spent is gone from it; the per-index cap is funded separately.
-            HnswAllowedSearchLimits {
-                max_vector_evaluations: limits
-                    .max_vector_evaluations
-                    .saturating_sub(spent)
-                    .min(remaining),
-                ..limits
-            },
-            graph_scores_are_current,
-            true,
-            query_self_scores,
-            |position, row_id| {
-                partitions.get(position).is_some_and(|partition| {
-                    partition
-                        .candidates
-                        .is_none_or(|candidates| candidates.binary_search(&row_id.0).is_ok())
-                        && sources
-                            .get(partition.source_position)
-                            .is_some_and(|source| {
-                                if membership_error.borrow().is_some() {
-                                    return false;
-                                }
-                                match source.state.try_directory_has_visible_row_with_copy_admission(
-                                    row_id,
-                                    snapshot,
-                                    &mut admitted_owner.borrow_mut(),
-                                    &mut |token, bytes, component, operation, hint| navigation_session.reserve_for(token, bytes, component, operation, hint),
-                                ) {
-                                    Ok(visible) => visible,
-                                    Err(error) => {
-                                        *membership_error.borrow_mut() = Some(error);
-                                        false
+        let mut run_layer = |slice: &[crate::hnsw::HnswUnionLayer<'_>],
+                             remaining: usize,
+                             spent: usize| {
+            crate::hnsw::union::search_union_allowed_bounded_with_navigation(
+                slice,
+                query,
+                k,
+                ef_search,
+                remaining,
+                // The declared work limit is one too: what earlier partitions
+                // spent is gone from it; the per-index cap is funded separately.
+                HnswAllowedSearchLimits {
+                    max_vector_evaluations: limits
+                        .max_vector_evaluations
+                        .saturating_sub(spent)
+                        .min(remaining),
+                    ..limits
+                },
+                graph_scores_are_current,
+                true,
+                query_self_scores,
+                |position, row_id| {
+                    partitions.get(position).is_some_and(|partition| {
+                        partition
+                            .candidates
+                            .is_none_or(|candidates| candidates.binary_search(&row_id.0).is_ok())
+                            && sources
+                                .get(partition.source_position)
+                                .is_some_and(|source| {
+                                    if membership_error.borrow().is_some() {
+                                        return false;
                                     }
-                                }
-                            })
-                })
-            },
-            |position, row_id, source_entry, distance| {
-                let partition = &partitions[position];
-                let state = &sources[partition.source_position].state;
-                state.bounded_score_visible_candidate_with_copy_admission(
-                    index,
-                    row_id,
-                    snapshot,
-                    query,
-                    None,
-                    source_entry,
-                    distance,
-                    &mut |bytes| {
-                        // Probe the same operation owner before the existing
-                        // retained callback admits and observes its charge.
+                                    match source
+                                        .state
+                                        .try_directory_has_visible_row_with_copy_admission(
+                                            row_id,
+                                            snapshot,
+                                            &mut admitted_owner.borrow_mut(),
+                                            &mut |token, bytes, component, operation, hint| {
+                                                navigation_session.reserve_for(
+                                                    token, bytes, component, operation, hint,
+                                                )
+                                            },
+                                        ) {
+                                        Ok(visible) => visible,
+                                        Err(error) => {
+                                            *membership_error.borrow_mut() = Some(error);
+                                            false
+                                        }
+                                    }
+                                })
+                    })
+                },
+                |position, row_id, source_entry, distance| {
+                    let partition = &partitions[position];
+                    let state = &sources[partition.source_position].state;
+                    state.bounded_score_visible_candidate_with_copy_admission(
+                        index,
+                        row_id,
+                        snapshot,
+                        query,
+                        None,
+                        source_entry,
+                        distance,
+                        &mut |bytes| {
+                            // Probe the same operation owner before the existing
+                            // retained callback admits and observes its charge.
+                            let mut admission = owner.scratch();
+                            navigation_session
+                                .reserve(&mut admission, bytes)
+                                .map_err(E::from)?;
+                            drop(admission);
+                            (*retained.borrow_mut())(bytes)
+                        },
+                        &mut |bytes| (*released.borrow_mut())(bytes),
+                        &mut admitted_owner.borrow_mut(),
+                        &mut |token, bytes, component, operation, hint| {
+                            navigation_session.reserve_for(token, bytes, component, operation, hint)
+                        },
+                    )
+                },
+                &mut *before_source_entry,
+                &mut *before_distance,
+                |event| {
+                    apply_hnsw_scratch_acquire(event, &mut |bytes| {
+                        // Actual admission fails before LRU reclamation. The scoped
+                        // probe releases before the original scratch callback reserves
+                        // and observes its unchanged charge; no cache eviction merely
+                        // for invoking a callback, and no double retained reservation.
                         let mut admission = owner.scratch();
-                        navigation_session.reserve(&mut admission, bytes).map_err(E::from)?;
+                        navigation_session
+                            .reserve(&mut admission, bytes)
+                            .map_err(E::from)?;
                         drop(admission);
                         (*retained.borrow_mut())(bytes)
-                    },
-                    &mut |bytes| (*released.borrow_mut())(bytes),
-                    &mut admitted_owner.borrow_mut(),
-                    &mut |token, bytes, component, operation, hint| navigation_session.reserve_for(token, bytes, component, operation, hint),
-                )
-            },
-            &mut *before_source_entry,
-            &mut *before_distance,
-            |event| apply_hnsw_scratch_acquire(event, &mut |bytes| {
-                // Actual admission fails before LRU reclamation. The scoped
-                // probe releases before the original scratch callback reserves
-                // and observes its unchanged charge; no cache eviction merely
-                // for invoking a callback, and no double retained reservation.
-                let mut admission = owner.scratch();
-                navigation_session.reserve(&mut admission, bytes).map_err(E::from)?;
-                drop(admission);
-                (*retained.borrow_mut())(bytes)
-            }),
-            |event| apply_hnsw_scratch_release(event, &mut |bytes| (*released.borrow_mut())(bytes)),
-            Some(&crate::hnsw::union::NavigationSession::new(Some(funder.clone()))),
-        );
+                    })
+                },
+                |event| {
+                    apply_hnsw_scratch_release(event, &mut |bytes| (*released.borrow_mut())(bytes))
+                },
+                Some(&crate::hnsw::union::NavigationSession::new(Some(
+                    funder.clone(),
+                ))),
+            )
+        };
         // Layers are grouped by partition: a partition's base, change and
         // fresh tail jointly hold its rows, so they are searched together;
         // separate partitions are separate graphs and each runs its own search.
         let mut partition_runs = Vec::<(usize, usize)>::new();
         for (position, layer) in layers.iter().enumerate() {
             match partition_runs.last_mut() {
-                Some((start, end)) if layers[*start].partition == layer.partition && *end == position => {
+                Some((start, end))
+                    if layers[*start].partition == layer.partition && *end == position =>
+                {
                     *end = position + 1;
                 }
                 _ => partition_runs.push((position, position + 1)),
@@ -4716,7 +4820,9 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 run_layer(&layers[start..end], remaining, spent).map(|mut result| {
                     partitions[layers[start].partition].rescore_credit.set(
                         remaining.saturating_sub(
-                            result.admission_evaluations.saturating_add(result.expansion_evaluations),
+                            result
+                                .admission_evaluations
+                                .saturating_add(result.expansion_evaluations),
                         ),
                     );
                     for candidate in &mut result.candidates {
@@ -5021,8 +5127,15 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 }) {
                     continue;
                 }
-                let resolved_score = if owner.historical_durable_reads() { None } else { candidate.resolved_score };
-                if !owner.historical_durable_reads() && page_scoring.is_none() && resolved_score.is_none() {
+                let resolved_score = if owner.historical_durable_reads() {
+                    None
+                } else {
+                    candidate.resolved_score
+                };
+                if !owner.historical_durable_reads()
+                    && page_scoring.is_none()
+                    && resolved_score.is_none()
+                {
                     *page_scoring = Some(state.sealed_page_scoring(
                         snapshot,
                         source.serving_selection.as_deref(),
@@ -5038,7 +5151,9 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                         rescore_exhausted = true;
                         return Ok(());
                     }
-                    partitions[candidate.partition].rescore_credit.set(credit - 1);
+                    partitions[candidate.partition]
+                        .rescore_credit
+                        .set(credit - 1);
                 }
                 let score = match resolved_score {
                     Some(score) => Some(score),
@@ -5171,11 +5286,16 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 for id in candidates.iter() {
                     let row = RowId(id);
                     let selected = self.store.with_snapshot_visible_partition_for_row(
-                        index, row, snapshot, &mut || Ok::<(), Error>(()),
+                        index,
+                        row,
+                        snapshot,
+                        &mut || Ok::<(), Error>(()),
                         |key, state, _, owner| {
                             owner.reserve(key.estimated_bytes())?;
                             Ok(Some((key.clone(), state.clone())))
-                        }, owner)?;
+                        },
+                        owner,
+                    )?;
                     let Some((key, state)) = selected else {
                         narrowed = false;
                         break;
@@ -5297,11 +5417,17 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             match source.state.historical_partition(owner) {
                 Ok(Some(partition)) => {
                     for position in 0..partition.len() {
-                        if candidates.is_some_and(|candidates|
-                            partition.entry(position).is_none_or(|entry| !candidates.contains(entry.entry.row_id.0))) {
+                        if candidates.is_some_and(|candidates| {
+                            partition
+                                .entry(position)
+                                .is_none_or(|entry| !candidates.contains(entry.entry.row_id.0))
+                        }) {
                             continue;
                         }
-                        if let Some(score) = source.state.historical_partition_score(&partition, position, snapshot, query)? {
+                        if let Some(score) = source
+                            .state
+                            .historical_partition_score(&partition, position, snapshot, query)?
+                        {
                             source_consider(score)?;
                         }
                     }
@@ -5310,8 +5436,17 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 }
                 Ok(None) => {}
                 Err(Error::MemoryBudgetExceeded { .. })
-                    if stream_when_refused && source.state.streams_raw_bodies() => {
-                    self.stream_source_bodies(index, source, query, snapshot, candidates, &mut source_consider, owner)?;
+                    if stream_when_refused && source.state.streams_raw_bodies() =>
+                {
+                    self.stream_source_bodies(
+                        index,
+                        source,
+                        query,
+                        snapshot,
+                        candidates,
+                        &mut source_consider,
+                        owner,
+                    )?;
                     partition_count += usize::from(source_has_rows);
                     continue;
                 }
@@ -5378,7 +5513,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     /// row's own stored vector through a point read, admitting each body
     /// against the database's memory before it is read and returning it
     /// straight after, so the comparison never needs room for the partition.
-#[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
+    #[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
     fn stream_source_bodies(
         &self,
         index: &VectorIndexRef,
@@ -5735,7 +5870,10 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         E: From<Error>,
     {
         before_source()?;
-        let layout = self.store.scoped_index_layout(index, owner).map_err(E::from)?;
+        let layout = self
+            .store
+            .scoped_index_layout(index, owner)
+            .map_err(E::from)?;
         let mut breadth = limit;
         let mut allowed = 0usize;
         for source in &groups.sources {
@@ -5762,7 +5900,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         Ok(breadth.min(allowed).max(limit))
     }
 
-#[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
+    #[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
     pub fn search_with_mode(
         &self,
         index: VectorIndexRef,
@@ -5776,7 +5914,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         self.search_with_mode_owned(index, query, k, candidates, snapshot, mode, executing_owner)
     }
 
-#[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
+    #[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
     pub fn search_with_mode_owned(
         &self,
         index: VectorIndexRef,
@@ -5789,7 +5927,12 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     ) -> Result<(SearchScores, OwnedVectorSearchTrace)> {
         let route_owner = crate::VectorCopyAdmission::new(executing_owner.clone());
         self.search_with_mode_route(
-            index, query, k, candidates, (snapshot, mode), (executing_owner, route_owner),
+            index,
+            query,
+            k,
+            candidates,
+            (snapshot, mode),
+            (executing_owner, route_owner),
         )
     }
 
@@ -5806,7 +5949,12 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         owner: &mut crate::VectorCopyAdmission,
     ) -> Result<(SearchScores, OwnedVectorSearchTrace)> {
         self.search_with_mode_route(
-            index, query, k, candidates, snapshot_mode, (owner.funder(), owner.scratch()),
+            index,
+            query,
+            k,
+            candidates,
+            snapshot_mode,
+            (owner.funder(), owner.scratch()),
         )
     }
 

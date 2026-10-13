@@ -36,6 +36,6 @@ pub(crate) mod native_records;
 // Borrowed writer-side inspection is needed on every producer route.
 pub(crate) mod native_selection;
 // Borrowed writer-side inspection is needed on every producer route.
-pub(crate) mod native_record_codec;
 #[cfg(feature = "sync-orchestration")]
 pub(crate) mod native_json;
+pub(crate) mod native_record_codec;

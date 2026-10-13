@@ -5,15 +5,18 @@ use crate::protocol::{MessageType, PROTOCOL_VERSION};
 use crate::read_image_memory::{NativeDeliveryBytes, NativeDeliveryImage};
 use contextdb_core::{Incarnation, Lsn};
 use serde::Serialize;
+mod borrowed_packet;
 mod canonical;
 mod packet;
-mod borrowed_packet;
 mod paid_request;
+pub(crate) use borrowed_packet::{
+    NativeBorrowedOutcomeBatch, NativePacketNamespace, encode_custody_outcomes,
+};
 pub(crate) use paid_request::paid_delivery_response;
-pub(crate) use borrowed_packet::{encode_custody_outcomes, NativeBorrowedOutcomeBatch, NativePacketNamespace};
 mod wire_views;
 pub(crate) use packet::encode_packet;
 
+#[derive(Debug)]
 pub(crate) enum DecodeError {
     Resource(contextdb_core::Error),
     Allocation(crate::read_image_memory::NativeDeliveryAllocationError),
@@ -205,8 +208,7 @@ impl<'a, 'm, M: DeliveryMemory> Input<'a, 'm, M> {
             0xdb | 0xc6 => self.be(4)?,
             _ => return Err(M::malformed("expected MessagePack text")),
         };
-        let length =
-            usize::try_from(length).map_err(|_| M::malformed("text length overflow"))?;
+        let length = usize::try_from(length).map_err(|_| M::malformed("text length overflow"))?;
         std::str::from_utf8(self.take(length)?).map_err(|_| M::malformed("invalid UTF-8"))
     }
     fn binary(&mut self) -> Result<&'a [u8], M::Error> {
@@ -217,10 +219,7 @@ impl<'a, 'm, M: DeliveryMemory> Input<'a, 'm, M> {
             0xc6 => self.be(4)?,
             _ => return Err(M::malformed("expected MessagePack binary")),
         };
-        self.take(
-            usize::try_from(length)
-                .map_err(|_| M::malformed("binary length overflow"))?,
-        )
+        self.take(usize::try_from(length).map_err(|_| M::malformed("binary length overflow"))?)
     }
     fn incarnation(&mut self) -> Result<Incarnation, M::Error> {
         // rmp-serde's deserialize_tuple permits bin as a u8 sequence too.
@@ -552,8 +551,7 @@ pub(crate) fn decode_request<'a, M: DeliveryMemory>(
     Ok(NativeOutcomesRequest {
         format: format.ok_or(M::malformed("missing format"))?,
         tenant_id: tenant_id.ok_or(M::malformed("missing tenant_id"))?,
-        edge_incarnation: edge_incarnation
-            .ok_or(M::malformed("missing edge_incarnation"))?,
+        edge_incarnation: edge_incarnation.ok_or(M::malformed("missing edge_incarnation"))?,
         request_nonce: request_nonce.ok_or(M::malformed("missing request_nonce"))?,
         since: since.ok_or(M::malformed("missing since"))?,
     })
@@ -649,11 +647,9 @@ pub(crate) fn decode_cursor<'a, M: DeliveryMemory>(
     Ok(NativeOutcomeCursor {
         tenant_id: tenant_id.ok_or(M::malformed("missing tenant_id"))?,
         hub_node_id: hub_node_id.ok_or(M::malformed("missing hub_node_id"))?,
-        hub_incarnation: hub_incarnation
-            .ok_or(M::malformed("missing hub_incarnation"))?,
+        hub_incarnation: hub_incarnation.ok_or(M::malformed("missing hub_incarnation"))?,
         edge_node_id: edge_node_id.ok_or(M::malformed("missing edge_node_id"))?,
-        edge_incarnation: edge_incarnation
-            .ok_or(M::malformed("missing edge_incarnation"))?,
+        edge_incarnation: edge_incarnation.ok_or(M::malformed("missing edge_incarnation"))?,
         position: position.ok_or(M::malformed("missing position"))?,
         ordinal: ordinal.ok_or(M::malformed("missing ordinal"))?,
     })
@@ -727,10 +723,7 @@ impl<B: DeliveryBuffer> Serialize for NativeOutcome<B> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
         let mut value = serializer.serialize_struct("WireDeliveryOutcome", 6)?;
-        value.serialize_field(
-            "lookup_submission",
-            &Binary(self.lookup_submission.bytes()),
-        )?;
+        value.serialize_field("lookup_submission", &Binary(self.lookup_submission.bytes()))?;
         value.serialize_field("lookup_seal_digest", &self.lookup_seal_digest)?;
         value.serialize_field("lookup_origin_life_digest", &self.lookup_origin_life_digest)?;
         value.serialize_field("lookup_source", &Binary(self.lookup_source.bytes()))?;

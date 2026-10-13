@@ -1,14 +1,14 @@
 //! Capacity custody for the enlarged inline received-schema metadata charges.
 //! Only CDB-127's element-layout delta is admitted; pre2 backing remains outside
 //! this correction, and individual payload/sole prepaid Box owners are unchanged.
-use super::{Error, Result, StagedCopyCharge};
 #[cfg(test)]
 use super::MemoryAccountant;
-#[cfg(test)]
-use std::sync::Arc;
+use super::{Error, Result, StagedCopyCharge};
 use crate::memory_accounting::{ControlCredit, PendingControlRefund, WriterUse};
 use std::alloc::Layout;
 use std::mem::ManuallyDrop;
+#[cfg(test)]
+use std::sync::Arc;
 
 // Field-for-field pre2 database.rs StagedCopyCharge. Never constructed: its
 // compiler layout is the same-capacity baseline, not a guessed word count.
@@ -166,47 +166,93 @@ impl Drop for MetadataCopyCharges {
 
 #[cfg(test)]
 pub(super) fn initialized_rows_for_test() {
-    use crate::persistence::content_identity::proof_allocation_oracle_tests::{measured,
-        last_request_for_test, watch_registry_free_for_test, registry_free_observation_for_test};
+    use crate::persistence::content_identity::proof_allocation_oracle_tests::{
+        last_request_for_test, measured, registry_free_observation_for_test,
+        watch_registry_free_for_test,
+    };
     let accountant = Arc::new(MemoryAccountant::no_limit());
-    let writer = crate::memory_accounting::WriterBudget::from_accountant(accountant.clone()).unwrap();
+    let writer =
+        crate::memory_accounting::WriterBudget::from_accountant(accountant.clone()).unwrap();
     let registration = accountant.writer_registration_observation_for_test();
     let baseline = accountant.usage().used;
     let final_element = Layout::new::<StagedCopyCharge>();
     let pre2_element = Layout::new::<Pre2StagedCopyCharge>();
-    let delta = final_element.size().checked_sub(pre2_element.size()).unwrap();
-    let charge = || StagedCopyCharge::admit(&crate::memory_accounting::AccountantHandle::from_host(accountant.clone()), accountant.clone(), 0, "metadata_initialized_proof").unwrap();
-    let mut charges = MetadataCopyCharges::new(&crate::memory_accounting::AccountantHandle::from_host(accountant.clone()));
+    let delta = final_element
+        .size()
+        .checked_sub(pre2_element.size())
+        .unwrap();
+    let charge = || {
+        StagedCopyCharge::admit(
+            &crate::memory_accounting::AccountantHandle::from_host(accountant.clone()),
+            accountant.clone(),
+            0,
+            "metadata_initialized_proof",
+        )
+        .unwrap()
+    };
+    let mut charges = MetadataCopyCharges::new(
+        &crate::memory_accounting::AccountantHandle::from_host(accountant.clone()),
+    );
     assert_eq!(charges.charges.capacity(), 0);
     assert_eq!(accountant.usage().used, baseline);
     let ((), _, _) = measured(|| charges.push(charge()).unwrap());
     let first_request = last_request_for_test(false);
     assert_eq!(charges.charges.capacity(), 4);
-    assert_eq!((first_request.0, first_request.1), (final_element.size() * 4, final_element.align()));
+    assert_eq!(
+        (first_request.0, first_request.1),
+        (final_element.size() * 4, final_element.align())
+    );
     assert_eq!(accountant.usage().used, baseline + delta * 4);
-    for _ in 0..3 { charges.push(charge()).unwrap(); }
+    for _ in 0..3 {
+        charges.push(charge()).unwrap();
+    }
     let old = charges.charges.as_ptr() as usize;
     watch_registry_free_for_test(old, registration.4);
     let ((), _, _) = measured(|| charges.push(charge()).unwrap());
     let growth_request = last_request_for_test(false);
     assert_eq!(charges.charges.capacity(), 8);
-    assert_eq!((growth_request.0, growth_request.1), (final_element.size() * 8, final_element.align()));
-    assert_eq!(registry_free_observation_for_test(true), (baseline + delta * 12, baseline + delta * 12, true), "old backing physically frees with whole old and whole new correction live");
+    assert_eq!(
+        (growth_request.0, growth_request.1),
+        (final_element.size() * 8, final_element.align())
+    );
+    assert_eq!(
+        registry_free_observation_for_test(true),
+        (baseline + delta * 12, baseline + delta * 12, true),
+        "old backing physically frees with whole old and whole new correction live"
+    );
     assert_eq!(accountant.usage().used, baseline + delta * 8);
     let final_pointer = charges.charges.as_ptr() as usize;
     watch_registry_free_for_test(final_pointer, registration.4);
     drop(charges);
-    assert_eq!(registry_free_observation_for_test(true), (baseline + delta * 8, baseline + delta * 8, true), "final backing physically frees before its scoped refund");
+    assert_eq!(
+        registry_free_observation_for_test(true),
+        (baseline + delta * 8, baseline + delta * 8, true),
+        "final backing physically frees before its scoped refund"
+    );
     assert_eq!(accountant.usage().used, baseline);
-    let (exact, _, _) = measured(|| MetadataCopyCharges::from_array(&crate::memory_accounting::AccountantHandle::from_host(accountant.clone()), [charge(), charge(), charge()]).unwrap());
+    let (exact, _, _) = measured(|| {
+        MetadataCopyCharges::from_array(
+            &crate::memory_accounting::AccountantHandle::from_host(accountant.clone()),
+            [charge(), charge(), charge()],
+        )
+        .unwrap()
+    });
     assert_eq!(exact.charges.capacity(), 3);
     let exact_request = last_request_for_test(false);
-    assert_eq!((exact_request.0, exact_request.1), (final_element.size() * 3, final_element.align()));
+    assert_eq!(
+        (exact_request.0, exact_request.1),
+        (final_element.size() * 3, final_element.align())
+    );
     assert_eq!(accountant.usage().used, baseline + delta * 3);
     drop(exact);
     assert_eq!(accountant.usage().used, baseline);
     drop(writer);
     assert_eq!(accountant.usage().used, 0);
     assert_eq!(accountant.underflow_count_for_test(), 0);
-    println!("CDB127_R1_ROW metadata_vec_initialized final_element={} pre2_element={} align={} first_capacity=4 growth_capacity=8 exact_capacity=3 old_new_overlap=true old_final_physical_free_before_refund=true original_funder=true", final_element.size(), pre2_element.size(), final_element.align());
+    println!(
+        "CDB127_R1_ROW metadata_vec_initialized final_element={} pre2_element={} align={} first_capacity=4 growth_capacity=8 exact_capacity=3 old_new_overlap=true old_final_physical_free_before_refund=true original_funder=true",
+        final_element.size(),
+        pre2_element.size(),
+        final_element.align()
+    );
 }

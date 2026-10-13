@@ -52,7 +52,11 @@ impl RedbPersistence {
             // A u64 BTreeSet node holds at most eleven keys; 64 bytes per
             // input key plus one node covers leaf/internal nodes and headers.
             crate::read_image_memory::reserve(
-                schema.incarnations.len().saturating_mul(64).saturating_add(128),
+                schema
+                    .incarnations
+                    .len()
+                    .saturating_mul(64)
+                    .saturating_add(128),
             )?;
             if schema.incarnations.len() != meta.columns.len()
                 || schema

@@ -221,12 +221,17 @@ impl Drop for WriterReadScope {
 }
 impl Database {
     pub(crate) fn preflight_historical_graph<E: From<Error>>(
-        &self, snapshot: SnapshotId,
+        &self,
+        snapshot: SnapshotId,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         before: &mut dyn FnMut() -> std::result::Result<(), E>,
     ) -> std::result::Result<(), E> {
-        let Some(root) = self.graph_read_root().map_err(E::from)? else { return Ok(()); };
-        if snapshot == root.frontier() { return Ok(()); }
+        let Some(root) = self.graph_read_root().map_err(E::from)? else {
+            return Ok(());
+        };
+        if snapshot == root.frontier() {
+            return Ok(());
+        }
         before()?;
         let capture = root.snapshot(snapshot, read_memory).map_err(E::from)?;
         before()?;
@@ -237,25 +242,63 @@ impl Database {
     /// Reconcile an indexed plan input against this operation's captured root.
     /// No successful plan output may depend on whether this input was pulled.
     pub(crate) fn preflight_historical_index<E: From<Error>>(
-        &self, table: &str, index: &str, snapshot: SnapshotId,
+        &self,
+        table: &str,
+        index: &str,
+        snapshot: SnapshotId,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         before: &mut dyn FnMut() -> std::result::Result<(), E>,
     ) -> std::result::Result<(), E> {
         if let Some(source) = &self.retained_relational_source {
-            if source.ordered_prefix_snapshot_is_current(snapshot) { return Ok(()); }
-            let meta = self.table_meta(table).ok_or_else(|| E::from(Error::TableNotFound(table.into())))?;
-            let declaration = meta.indexes.iter().find(|declaration| declaration.name == index)
-                .ok_or_else(|| E::from(Error::IndexNotFound { table: table.into(), index: index.into() }))?;
-            return source.historical_index_preflight(table, &meta, declaration, snapshot, read_memory, before);
+            if source.ordered_prefix_snapshot_is_current(snapshot) {
+                return Ok(());
+            }
+            let meta = self
+                .table_meta(table)
+                .ok_or_else(|| E::from(Error::TableNotFound(table.into())))?;
+            let declaration = meta
+                .indexes
+                .iter()
+                .find(|declaration| declaration.name == index)
+                .ok_or_else(|| {
+                    E::from(Error::IndexNotFound {
+                        table: table.into(),
+                        index: index.into(),
+                    })
+                })?;
+            return source.historical_index_preflight(
+                table,
+                &meta,
+                declaration,
+                snapshot,
+                read_memory,
+                before,
+            );
         }
-        let Some(root) = self.writer_read_root().map_err(E::from)? else { return Ok(()); };
-        if snapshot == root.snapshot { return Ok(()); }
-        let source = crate::persistence::writer_adapters::WriterRelationalSource::new_for_read_at_snapshot(
-            root, read_memory, snapshot).map_err(E::from)?;
+        let Some(root) = self.writer_read_root().map_err(E::from)? else {
+            return Ok(());
+        };
+        if snapshot == root.snapshot {
+            return Ok(());
+        }
+        let source =
+            crate::persistence::writer_adapters::WriterRelationalSource::new_for_read_at_snapshot(
+                root,
+                read_memory,
+                snapshot,
+            )
+            .map_err(E::from)?;
         let mut refusal = None;
-        let result = source.historical_index_preflight(table, index, snapshot,
-            &mut || before().map_err(|error| { refusal = Some(error); Error::ReadCancelled }));
-        match refusal { Some(error) => Err(error), None => result.map_err(E::from) }
+        let result = source.historical_index_preflight(table, index, snapshot, &mut || {
+            before().map_err(|error| {
+                refusal = Some(error);
+                Error::ReadCancelled
+            })
+        });
+        match refusal {
+            Some(error) => Err(error),
+            None => result.map_err(E::from),
+        }
     }
 
     /// Retain a selected immutable staged row before touching its committed
@@ -476,8 +519,9 @@ impl Database {
             "Raise MEMORY_LIMIT to inspect this metadata key.",
         )?;
         let key = index_key_from_values(&index.columns[..columns.len()], values);
-        source.historical_index_preflight(table, &index.name, snapshot,
-            &mut || work(crate::executor::GraphPredicateWork::Checkpoint))?;
+        source.historical_index_preflight(table, &index.name, snapshot, &mut || {
+            work(crate::executor::GraphPredicateWork::Checkpoint)
+        })?;
         let current = snapshot == source.snapshot();
         let mut cursor = if index.columns.len() == columns.len() {
             source.exact_index_cursor(table, &index.name, current, &key)?
@@ -576,7 +620,12 @@ impl Database {
             root.clone(),
             read_memory.clone(),
         )?;
-        source.historical_index_preflight(&policy.joined_table, &index.name, snapshot, &mut || Ok(()))?;
+        source.historical_index_preflight(
+            &policy.joined_table,
+            &index.name,
+            snapshot,
+            &mut || Ok(()),
+        )?;
         let current = snapshot == source.snapshot();
         let mut cursor = if index.columns.len() == 1 {
             source.exact_index_cursor(&policy.joined_table, &index.name, current, &key)?
@@ -888,9 +937,10 @@ impl Database {
                         image.visit_retained_copy_credit(self.accountant.as_ref(), visit);
                     } else if let Some(credit) =
                         owner.downcast_ref::<contextdb_core::read_memory::ReadCredit>()
-                        && credit.bytes() != 0 {
-                            visit(credit as *const _ as usize, credit.bytes(), false);
-                        }
+                        && credit.bytes() != 0
+                    {
+                        visit(credit as *const _ as usize, credit.bytes(), false);
+                    }
                 }
             }
         });
@@ -1056,12 +1106,22 @@ impl Database {
         };
         use std::ops::Bound;
         let mut preflight_refusal = None;
-        let preflight = source.historical_index_preflight(table,
-            cursor.index_name().ok_or_else(|| E::from(Error::Other("ordered cursor has no index".into())))?,
-            snapshot, &mut || touch().map_err(|error| {
-                preflight_refusal = Some(error); Error::ReadCancelled
-            }));
-        if let Some(error) = preflight_refusal { return Err(error); }
+        let preflight = source.historical_index_preflight(
+            table,
+            cursor
+                .index_name()
+                .ok_or_else(|| E::from(Error::Other("ordered cursor has no index".into())))?,
+            snapshot,
+            &mut || {
+                touch().map_err(|error| {
+                    preflight_refusal = Some(error);
+                    Error::ReadCancelled
+                })
+            },
+        );
+        if let Some(error) = preflight_refusal {
+            return Err(error);
+        }
         preflight.map_err(E::from)?;
         if cursor.is_exhausted()
             || cursor.source_prefix_stopped()
@@ -1076,21 +1136,23 @@ impl Database {
                 match cursor.source_seek() {
                     Bound::Included(key) => Some((
                         true,
-                        source
-                            .index_position_key_before(
-                                current,
-                                key,
-                                if reverse { RowId(u64::MAX) } else { RowId(0) },
-                                if reverse { TxId(u64::MAX) } else { TxId(0) }, &mut touch)?,
+                        source.index_position_key_before(
+                            current,
+                            key,
+                            if reverse { RowId(u64::MAX) } else { RowId(0) },
+                            if reverse { TxId(u64::MAX) } else { TxId(0) },
+                            &mut touch,
+                        )?,
                     )),
                     Bound::Excluded(key) => Some((
                         false,
-                        source
-                            .index_position_key_before(
-                                current,
-                                key,
-                                if reverse { RowId(0) } else { RowId(u64::MAX) },
-                                if reverse { TxId(0) } else { TxId(u64::MAX) }, &mut touch)?,
+                        source.index_position_key_before(
+                            current,
+                            key,
+                            if reverse { RowId(0) } else { RowId(u64::MAX) },
+                            if reverse { TxId(0) } else { TxId(u64::MAX) },
+                            &mut touch,
+                        )?,
                     )),
                     Bound::Unbounded => None,
                 }
@@ -1203,21 +1265,23 @@ impl Database {
             let terminal = match terminal_bound {
                 Bound::Included(key) => Some((
                     true,
-                    source
-                        .index_position_key_before(
-                            current,
-                            key,
-                            if reverse { RowId(0) } else { RowId(u64::MAX) },
-                            if reverse { TxId(0) } else { TxId(u64::MAX) }, &mut touch)?,
+                    source.index_position_key_before(
+                        current,
+                        key,
+                        if reverse { RowId(0) } else { RowId(u64::MAX) },
+                        if reverse { TxId(0) } else { TxId(u64::MAX) },
+                        &mut touch,
+                    )?,
                 )),
                 Bound::Excluded(key) => Some((
                     false,
-                    source
-                        .index_position_key_before(
-                            current,
-                            key,
-                            if reverse { RowId(u64::MAX) } else { RowId(0) },
-                            if reverse { TxId(u64::MAX) } else { TxId(0) }, &mut touch)?,
+                    source.index_position_key_before(
+                        current,
+                        key,
+                        if reverse { RowId(u64::MAX) } else { RowId(0) },
+                        if reverse { TxId(u64::MAX) } else { TxId(0) },
+                        &mut touch,
+                    )?,
                 )),
                 Bound::Unbounded => None,
             };
@@ -1326,19 +1390,37 @@ impl Database {
         mut release: impl FnMut(usize) -> std::result::Result<(), E>,
         mut clone: impl FnMut(usize) -> std::result::Result<(), E>,
     ) -> std::result::Result<Option<VersionedRow>, E> {
-        use contextdb_relational::source::{RelationalIndexRange, RelationalReadSource, visible_row};
+        use contextdb_relational::source::{
+            RelationalIndexRange, RelationalReadSource, visible_row,
+        };
         use std::ops::Bound;
         let mut preflight_refusal = None;
-        let preflight = source.historical_index_preflight(table, index, snapshot,
-            &mut || storage_step().map_err(|error| { preflight_refusal = Some(error); Error::ReadCancelled }));
-        if let Some(error) = preflight_refusal { return Err(error); }
+        let preflight = source.historical_index_preflight(table, index, snapshot, &mut || {
+            storage_step().map_err(|error| {
+                preflight_refusal = Some(error);
+                Error::ReadCancelled
+            })
+        });
+        if let Some(error) = preflight_refusal {
+            return Err(error);
+        }
         preflight.map_err(E::from)?;
         while let Some(key) = cursor.source_probe() {
             let current = snapshot == source.snapshot();
-            let start = source
-                .index_position_key_before(current, key, RowId(0), TxId(0), &mut storage_step)?;
-            let end = source
-                .index_position_key_before(current, key, RowId(u64::MAX), TxId(u64::MAX), &mut storage_step)?;
+            let start = source.index_position_key_before(
+                current,
+                key,
+                RowId(0),
+                TxId(0),
+                &mut storage_step,
+            )?;
+            let end = source.index_position_key_before(
+                current,
+                key,
+                RowId(u64::MAX),
+                TxId(u64::MAX),
+                &mut storage_step,
+            )?;
             let lower = cursor
                 .source_position()
                 .map_or(Bound::Included(start.as_bytes()), Bound::Excluded);
@@ -1639,25 +1721,41 @@ impl Database {
         )?;
         let key = index.map(|index| index_key_from_values(&index.columns[..columns.len()], values));
         if let DatabaseTransactionHost::Owned(handle) = &self.tx_mgr {
-            let rows = handle.with_host(|host| host.transactions.with_transactions(
-                |transactions| transactions.capture_sealed(tx, table, read_memory.clone()),
-            ))?;
+            let rows = handle.with_host(|host| {
+                host.transactions.with_transactions(|transactions| {
+                    transactions.capture_sealed(tx, table, read_memory.clone())
+                })
+            })?;
             if let (Some(index), Some(key)) = (index, key.as_ref())
                 && rows.has_index_for(&index.name, &meta)
             {
                 let start = std::ops::Bound::Included(key.clone());
                 let end = std::ops::Bound::Included(key.clone());
                 return rows.with_next_ordered(
-                    &index.name, false, None, &start, &end, columns.len(),
+                    &index.name,
+                    false,
+                    None,
+                    &start,
+                    &end,
+                    columns.len(),
                     |entry| {
-                        let Some((position, id)) = entry else { return Ok(None); };
+                        let Some((position, id)) = entry else {
+                            return Ok(None);
+                        };
                         #[cfg(feature = "in-process-test-seams")]
                         crate::writer_query_test_seams::note_constraint_staged_row();
                         #[cfg(feature = "test-seams")]
                         crate::writer_query_test_seams::note_target_entry(table);
-                        if Some(id) != skip { return Ok(Some(id)); }
+                        if Some(id) != skip {
+                            return Ok(Some(id));
+                        }
                         rows.with_next_ordered(
-                            &index.name, false, Some(position), &start, &end, columns.len(),
+                            &index.name,
+                            false,
+                            Some(position),
+                            &start,
+                            &end,
+                            columns.len(),
                             |entry| {
                                 if entry.is_some() {
                                     #[cfg(feature = "in-process-test-seams")]
@@ -1772,9 +1870,7 @@ impl Database {
 
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Option<Option<RowId>>> {
-        use contextdb_relational::source::{
-            RelationalIndexRange, RelationalReadSource,
-        };
+        use contextdb_relational::source::{RelationalIndexRange, RelationalReadSource};
         use std::ops::Bound;
         let Some(root) = self.writer_read_root()? else {
             return Ok(None);
@@ -1843,7 +1939,9 @@ impl Database {
             }
             if let Some((tx, skip)) = overlay
                 && (skip == Some(posting.entry.row_id)
-                    || self.tx_mgr.row_shadows_committed(tx, table, posting.entry.row_id)?)
+                    || self
+                        .tx_mgr
+                        .row_shadows_committed(tx, table, posting.entry.row_id)?)
             {
                 continue;
             }
@@ -1851,16 +1949,22 @@ impl Database {
                 // An unchanged index key can retain its older posting while
                 // scalar row versions advance; compare the indexed values.
                 if posting.key.len() != index.columns.len()
-                    || index.columns.iter().zip(&posting.key).any(|((column, _), value)| {
-                        let value = match value {
-                            DirectedValue::Asc(value) => &value.0,
-                            DirectedValue::Desc(value) => &value.0,
-                        };
-                        row.value().values.get(column) != Some(value)
-                    })
+                    || index
+                        .columns
+                        .iter()
+                        .zip(&posting.key)
+                        .any(|((column, _), value)| {
+                            let value = match value {
+                                DirectedValue::Asc(value) => &value.0,
+                                DirectedValue::Desc(value) => &value.0,
+                            };
+                            row.value().values.get(column) != Some(value)
+                        })
                 {
-                    return Err(Error::StoreCorrupted { path: table.into(),
-                        reason: "indexed point posting differs from its captured row".into() });
+                    return Err(Error::StoreCorrupted {
+                        path: table.into(),
+                        reason: "indexed point posting differs from its captured row".into(),
+                    });
                 }
                 if let Some((tx, _)) = overlay
                     && self.tx_mgr.with_read(tx, |ws| {
@@ -1927,9 +2031,10 @@ impl Database {
             return Err(closed_database_error());
         }
         if let Some(snapshot) = SNAPSHOT_OVERRIDE.with(|cell| *cell.borrow())
-            && let Some(root) = self.snapshot_registry.pinned_root(snapshot) {
-                return Ok((snapshot, Some(root)));
-            }
+            && let Some(root) = self.snapshot_registry.pinned_root(snapshot)
+        {
+            return Ok((snapshot, Some(root)));
+        }
         if let Some(root) = ROOT.with(|slot| {
             slot.borrow()
                 .as_ref()
@@ -1974,9 +2079,10 @@ impl Database {
             .tx_mgr
             .transaction_read(tx.expect("checked transaction"))?;
         if let Some(snapshot) = SNAPSHOT_OVERRIDE.with(|cell| *cell.borrow())
-            && let Some(root) = self.snapshot_registry.pinned_root(snapshot) {
-                return Ok((snapshot, Some(root)));
-            }
+            && let Some(root) = self.snapshot_registry.pinned_root(snapshot)
+        {
+            return Ok((snapshot, Some(root)));
+        }
         let snapshot = SNAPSHOT_OVERRIDE.with(|cell| cell.borrow().unwrap_or(published.snapshot));
         Ok((snapshot, durable_root(published.handle)?))
     }
@@ -2086,7 +2192,9 @@ pub(super) struct WriterStagedPostingAdmission {
     control: Option<crate::memory_accounting::ControlCredit>,
 }
 impl WriterStagedPostingAdmission {
-    pub(super) fn prepare(accountant: crate::memory_accounting::AccountantHandle) -> Result<Arc<Self>> {
+    pub(super) fn prepare(
+        accountant: crate::memory_accounting::AccountantHandle,
+    ) -> Result<Arc<Self>> {
         let mut value = Self {
             writer_use: crate::memory_accounting::WriterUse::retain_if_writer(&accountant),
             accountant: Some(accountant),
@@ -2095,7 +2203,8 @@ impl WriterStagedPostingAdmission {
         let bytes = crate::memory_accounting::writer_adapter_layout(&value).size();
         value.control = Some(crate::memory_accounting::ControlCredit::admit_assembly(
             value.accountant.as_ref().expect("provider has its funder"),
-            bytes, "staged_posting_provider",
+            bytes,
+            "staged_posting_provider",
         )?);
         Ok(Arc::new(value))
     }
@@ -2103,17 +2212,30 @@ impl WriterStagedPostingAdmission {
 impl contextdb_relational::mem::StagedPostingAdmission for WriterStagedPostingAdmission {
     fn reserve(&self, bytes: usize) -> Result<Arc<dyn contextdb_tx::StagedPostingCharge>> {
         crate::memory_accounting::OwnedMemoryReservation::try_new_for(
-            self.accountant.as_ref().expect("live provider has its funder").clone(),
-            bytes, "relational", "staged_index_posting",
+            self.accountant
+                .as_ref()
+                .expect("live provider has its funder")
+                .clone(),
+            bytes,
+            "relational",
+            "staged_index_posting",
             "Reduce staged rows or raise MEMORY_LIMIT.",
-        )?.into_admitted_arc().map(|owner| owner as Arc<dyn contextdb_tx::StagedPostingCharge>)
+        )?
+        .into_admitted_arc()
+        .map(|owner| owner as Arc<dyn contextdb_tx::StagedPostingCharge>)
     }
 }
 impl Drop for WriterStagedPostingAdmission {
     fn drop(&mut self) {
-        let refund = self.control.take().map(crate::memory_accounting::ControlCredit::prepare);
+        let refund = self
+            .control
+            .take()
+            .map(crate::memory_accounting::ControlCredit::prepare);
         let mut cleanup = crate::memory_accounting::ReservationCleanup::new(
-            self.accountant.take(), self.writer_use.take(), 0, refund,
+            self.accountant.take(),
+            self.writer_use.take(),
+            0,
+            refund,
         );
         cleanup.finish();
     }
@@ -2167,7 +2289,8 @@ impl ScopedGraphSource {
         assert!(
             self.manager
                 .set(match manager {
-                    DatabaseTransactionHost::Legacy(manager) => GraphPublicationWeak::Legacy(Arc::downgrade(manager)),
+                    DatabaseTransactionHost::Legacy(manager) =>
+                        GraphPublicationWeak::Legacy(Arc::downgrade(manager)),
                     DatabaseTransactionHost::Owned(handle) => GraphPublicationWeak::owned(handle),
                 })
                 .is_ok(),
@@ -2178,9 +2301,7 @@ impl ScopedGraphSource {
     #[allow(dead_code)]
     pub(super) fn bind_owned(&self, host: &EngineDatabaseHandle) {
         assert!(
-            self.manager
-                .set(GraphPublicationWeak::owned(host))
-                .is_ok(),
+            self.manager.set(GraphPublicationWeak::owned(host)).is_ok(),
             "graph source bound once"
         );
     }
@@ -2285,11 +2406,19 @@ pub(super) fn visit_graph_versions(
     if let Some(root) = root {
         // All-version enumeration is historical even at frontier equality.
         let graph = crate::persistence::graph_read::GraphReadRoot::Writer(root);
-        let mut cursor = graph.cursor(false, std::ops::Bound::Unbounded,
-            std::ops::Bound::Unbounded, read_memory.clone())?;
-        while let Some(window) = cursor.next_edge()? { visit(window.edge())?; }
+        let mut cursor = graph.cursor(
+            false,
+            std::ops::Bound::Unbounded,
+            std::ops::Bound::Unbounded,
+            read_memory.clone(),
+        )?;
+        while let Some(window) = cursor.next_edge()? {
+            visit(window.edge())?;
+        }
     } else {
-        for edge in store.forward_adj.read().values().flatten() { visit(edge)?; }
+        for edge in store.forward_adj.read().values().flatten() {
+            visit(edge)?;
+        }
     }
     Ok(())
 }
@@ -2588,26 +2717,58 @@ mod indexed_lineage_growth_tests {
         let directory = tempfile::tempdir().unwrap();
         let db = Database::open(directory.path().join("lineage-growth.db")).unwrap();
         db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
-        db.execute("CREATE TABLE notes (id INT PRIMARY KEY, body TEXT) HISTORY ALL", &HashMap::new()).unwrap();
-        db.execute("INSERT INTO notes VALUES (0, 'original')", &HashMap::new()).unwrap();
+        db.execute(
+            "CREATE TABLE notes (id INT PRIMARY KEY, body TEXT) HISTORY ALL",
+            &HashMap::new(),
+        )
+        .unwrap();
+        db.execute("INSERT INTO notes VALUES (0, 'original')", &HashMap::new())
+            .unwrap();
         let snapshot = db.snapshot();
         let mut previous = 0;
         for count in [16, 32, 64] {
             for id in previous..count {
-                db.execute("INSERT INTO notes VALUES ($id, 'neighbor')",
-                    &HashMap::from([("id".into(), Value::Int64(id + 1))])).unwrap();
+                db.execute(
+                    "INSERT INTO notes VALUES ($id, 'neighbor')",
+                    &HashMap::from([("id".into(), Value::Int64(id + 1))]),
+                )
+                .unwrap();
             }
             previous = count;
             let reader = db.declared_reader_memory().unwrap();
             let work = ReadWorkObservationScope::enter(ReadWorkPhase::Query);
-            let row = db.required_indexed_visible_row_by_columns("notes", &["id".into()], &[Value::Int64(0)],
-                snapshot, &HashSet::new(), reader).unwrap().unwrap();
-            assert_eq!(row.values.get("body"), Some(&Value::Text("original".into())));
+            let row = db
+                .required_indexed_visible_row_by_columns(
+                    "notes",
+                    &["id".into()],
+                    &[Value::Int64(0)],
+                    snapshot,
+                    &HashSet::new(),
+                    reader,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                row.values.get("body"),
+                Some(&Value::Text("original".into()))
+            );
             let observed = work.counters();
-            assert_eq!(observed.decoded_rows, 2, "one served lineage at history {count}: {observed:?}");
-            assert_eq!(observed.hashed_rows, 0, "producer root witnesses replace history hashing");
-            assert_eq!(observed.hashed_bytes, 0, "the indexed seek hashes no unrelated history");
-            assert_eq!(observed.proof_nodes_hashed, 0, "producer witnesses avoid a history proof walk");
+            assert_eq!(
+                observed.decoded_rows, 2,
+                "one served lineage at history {count}: {observed:?}"
+            );
+            assert_eq!(
+                observed.hashed_rows, 0,
+                "producer root witnesses replace history hashing"
+            );
+            assert_eq!(
+                observed.hashed_bytes, 0,
+                "the indexed seek hashes no unrelated history"
+            );
+            assert_eq!(
+                observed.proof_nodes_hashed, 0,
+                "producer witnesses avoid a history proof walk"
+            );
             println!("LINEAGE_GROWTH history={count} {observed:?}");
         }
     }
@@ -2619,12 +2780,22 @@ mod vector_write_copy_budget_tests {
 
     fn staged_fixture(db: &Database) -> TxId {
         db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
-        db.execute("CREATE TABLE vectors (id INT PRIMARY KEY, v VECTOR(1024))", &HashMap::new()).unwrap();
+        db.execute(
+            "CREATE TABLE vectors (id INT PRIMARY KEY, v VECTOR(1024))",
+            &HashMap::new(),
+        )
+        .unwrap();
         let tx = db.begin().unwrap();
         for id in 0..40 {
-            db.execute_in_tx(tx, "INSERT INTO vectors VALUES ($id, $v)", &HashMap::from([
-                ("id".into(), Value::Int64(id)), ("v".into(), Value::Vector(vec![1.0; 1024])),
-            ])).unwrap();
+            db.execute_in_tx(
+                tx,
+                "INSERT INTO vectors VALUES ($id, $v)",
+                &HashMap::from([
+                    ("id".into(), Value::Int64(id)),
+                    ("v".into(), Value::Vector(vec![1.0; 1024])),
+                ]),
+            )
+            .unwrap();
         }
         tx
     }
@@ -2634,12 +2805,17 @@ mod vector_write_copy_budget_tests {
         let directory = tempfile::tempdir().unwrap();
         let mut options = crate::DatabaseOpenOptions::default();
         options.owner_reads.limits.limits.memory = 128 * 1024;
-        let db = Database::open_with_options(directory.path().join("write-copies.db"), options).unwrap();
+        let db =
+            Database::open_with_options(directory.path().join("write-copies.db"), options).unwrap();
         let tx = staged_fixture(&db);
         let reader_before = db.declared_read_memory.standing_control_bytes();
-        db.commit(tx).expect("write copies exceed reader memory but fit writer memory");
-        assert_eq!(db.declared_read_memory.standing_control_bytes(), reader_before,
-            "publication releases its source-reader controls and owns INSERT copies on the writer");
+        db.commit(tx)
+            .expect("write copies exceed reader memory but fit writer memory");
+        assert_eq!(
+            db.declared_read_memory.standing_control_bytes(),
+            reader_before,
+            "publication releases its source-reader controls and owns INSERT copies on the writer"
+        );
     }
 
     #[test]
@@ -2650,14 +2826,21 @@ mod vector_write_copy_budget_tests {
         let frontier = db.current_lsn();
         let used = db.accountant().usage().used;
         db.set_memory_limit(Some(used + 16 * 1024)).unwrap();
-        let error = db.commit(tx).expect_err("writer copy preparation must admit before mutation");
-        assert!(matches!(&error, Error::MemoryBudgetExceeded { subsystem, operation, .. }
-            if subsystem == "writer" && operation == "prepare_vector_insert_copies"), "{error:?}");
+        let error = db
+            .commit(tx)
+            .expect_err("writer copy preparation must admit before mutation");
+        assert!(
+            matches!(&error, Error::MemoryBudgetExceeded { subsystem, operation, .. }
+            if subsystem == "writer" && operation == "prepare_vector_insert_copies"),
+            "{error:?}"
+        );
         assert_eq!(db.current_lsn(), frontier);
         db.set_memory_limit(None).unwrap();
         // A refused public commit already aborts the staged transaction.
         assert!(matches!(db.rollback(tx), Err(Error::TxNotFound(_))));
-        let rows = db.execute("SELECT COUNT(*) FROM vectors", &HashMap::new()).unwrap();
+        let rows = db
+            .execute("SELECT COUNT(*) FROM vectors", &HashMap::new())
+            .unwrap();
         assert_eq!(rows.rows, vec![vec![Value::Int64(0)]]);
     }
 }
@@ -2672,16 +2855,20 @@ impl Database {
         tenant: &TenantId,
         operation: &crate::owner_read::NativeReadRequest,
         context: &crate::executor::bounded::NativeReadOpenContext,
-    ) -> std::result::Result<Option<crate::persistence::writer_source::NativeConfigWindow>,
-        crate::persistence::writer_source::NativeConfigFailure> {
-        use crate::persistence::writer_source::NativeConfigFailure;
+    ) -> std::result::Result<
+        Option<crate::persistence::writer_source::NativeConfigWindow>,
+        crate::persistence::writer_source::NativeConfigFailure,
+    > {
         use crate::persistence::native_storage_admission::NativeStorageFailure;
+        use crate::persistence::writer_source::NativeConfigFailure;
         let published = self.tx_mgr.capture_published_read();
         let root = durable_root(published.handle)
             .map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?
-            .ok_or_else(|| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(
-                Error::Other("writer publication has no durable root".into()),
-            )))?;
+            .ok_or_else(|| {
+                NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(Error::Other(
+                    "writer publication has no durable root".into(),
+                )))
+            })?;
         root.native_config_text(operation, context, prefix, tenant)
     }
 }
@@ -2691,19 +2878,26 @@ impl Database {
     /// Independently capture the committed publication for THIS raw prefix call.
     /// The returned cursor pins that exact root while using the original request.
     pub(super) fn read_native_committed_config_prefix(
-        &self, prefix: &str,
+        &self,
+        prefix: &str,
         operation: &crate::owner_read::NativeReadRequest,
         context: &crate::executor::bounded::NativeReadOpenContext,
-    ) -> std::result::Result<contextdb_core::read_memory::ReadShared<std::sync::Mutex<crate::persistence::writer_source::NativeRawConfigCursor>>,
-        crate::persistence::writer_source::NativeConfigFailure> {
-        use crate::persistence::writer_source::NativeConfigFailure;
+    ) -> std::result::Result<
+        contextdb_core::read_memory::ReadShared<
+            std::sync::Mutex<crate::persistence::writer_source::NativeRawConfigCursor>,
+        >,
+        crate::persistence::writer_source::NativeConfigFailure,
+    > {
         use crate::persistence::native_storage_admission::NativeStorageFailure;
+        use crate::persistence::writer_source::NativeConfigFailure;
         let published = self.tx_mgr.capture_published_read();
         let root = durable_root(published.handle)
             .map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?
-            .ok_or_else(|| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(
-                Error::Other("writer publication has no durable root".into()),
-            )))?;
+            .ok_or_else(|| {
+                NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(Error::Other(
+                    "writer publication has no durable root".into(),
+                )))
+            })?;
         root.native_raw_config_prefix(operation, context, prefix)
     }
 }
@@ -2716,13 +2910,20 @@ impl Database {
         &self,
         operation: &crate::owner_read::NativeReadRequest,
         context: &crate::executor::bounded::NativeReadOpenContext,
-    ) -> std::result::Result<Arc<crate::persistence::writer_source::WriterSnapshot>,
-        crate::persistence::writer_source::NativeConfigFailure> {
-        use crate::persistence::writer_source::NativeConfigFailure;
+    ) -> std::result::Result<
+        Arc<crate::persistence::writer_source::WriterSnapshot>,
+        crate::persistence::writer_source::NativeConfigFailure,
+    > {
         use crate::persistence::native_storage_admission::NativeStorageFailure;
-        context.checkpoint().map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?;
-        if !operation.owner().same_owner(&context.owner().map_err(|e|
-            NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?) {
+        use crate::persistence::writer_source::NativeConfigFailure;
+        context
+            .checkpoint()
+            .map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?;
+        if !operation.owner().same_owner(
+            &context
+                .owner()
+                .map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?,
+        ) {
             return Err(NativeConfigFailure::OwnerMismatch);
         }
         let published = self.tx_mgr.capture_published_read();
@@ -2730,7 +2931,8 @@ impl Database {
             .map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?
             .ok_or(NativeConfigFailure::Storage(NativeStorageFailure::Refused(
                 contextdb_core::read_memory::NativeRefusal::NativeUnsupported {
-                    subsystem: "custody", operation: "durable_root",
+                    subsystem: "custody",
+                    operation: "durable_root",
                 },
             )))
     }

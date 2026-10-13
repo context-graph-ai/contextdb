@@ -829,12 +829,15 @@ pub(crate) mod arena_index_tests {
     }
 }
 
-
 #[cfg(test)]
 impl<T> LRUCache<T> {
-    pub(crate) fn arena_capacity_for_test(&self) -> usize { self.arena_capacity() }
+    pub(crate) fn arena_capacity_for_test(&self) -> usize {
+        self.arena_capacity()
+    }
 }
 #[cfg(test)]
 impl<T> WriteCache<T> {
-    pub(crate) fn map_capacity_for_test(&self) -> usize { self.cache.capacity() }
+    pub(crate) fn map_capacity_for_test(&self) -> usize {
+        self.cache.capacity()
+    }
 }

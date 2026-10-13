@@ -166,9 +166,10 @@ fn a_single_large_refused_outcome_is_admitted_before_decode() {
     let used = db.accountant().usage().used;
     db.set_memory_limit(Some(used.saturating_add(4096)))
         .expect("leave less room than the encoded outcome needs");
-    let fixture_operation_reader_5 = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(4096)
-        .child()
-        .expect("admit the bounded fixture reader");
+    let fixture_operation_reader_5 =
+        crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(4096)
+            .child()
+            .expect("admit the bounded fixture reader");
 
     let refused = match db.refused_schema_unit_outcomes_for_digests(
         &tenant,

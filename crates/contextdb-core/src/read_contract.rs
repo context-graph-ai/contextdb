@@ -4,14 +4,14 @@
 //! persistence, channel framing, deadline waiting, and query execution are performed by the
 //! route and transport layers that consume this vocabulary.
 
+use crate::Value;
 use crate::read_memory::{
     NativeCancellationCallback, OwnedReadBox, ReadCredit, ReadMemoryOwner, ReadShared,
 };
-use crate::Value;
 use serde::{Deserialize, Serialize};
+use std::cell::UnsafeCell;
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::cell::UnsafeCell;
 use std::marker::PhantomPinned;
 use std::pin::Pin;
 use std::ptr::NonNull;
@@ -485,9 +485,12 @@ pub trait DeadlineClock: Send + Sync + 'static {
     fn wait_until(&self, deadline_ms: u64) -> DeadlineWait<'_>;
 
     #[doc(hidden)]
-    fn try_native_source(&self, _standing: &ReadMemoryOwner)
-        -> crate::Result<Option<OwnedReadBox<dyn NativeDeadlineSource>>>
-    { Ok(None) }
+    fn try_native_source(
+        &self,
+        _standing: &ReadMemoryOwner,
+    ) -> crate::Result<Option<OwnedReadBox<dyn NativeDeadlineSource>>> {
+        Ok(None)
+    }
 }
 
 /// Synchronous parking on the driver caller's already-owned thread. A call
@@ -527,12 +530,16 @@ impl NativeClockBinding {
         clock: &Arc<dyn DeadlineClock>,
         standing: &ReadMemoryOwner,
     ) -> crate::Result<Self> {
-        let source = clock.try_native_source(standing)?
+        let source = clock
+            .try_native_source(standing)?
             .ok_or(crate::Error::ReadSessionNotImplemented)?;
         if !source.is_funded_by(standing) {
             return Err(crate::Error::ReadSessionNotImplemented);
         }
-        Ok(Self { source, clock: Arc::clone(clock) })
+        Ok(Self {
+            source,
+            clock: Arc::clone(clock),
+        })
     }
 
     #[doc(hidden)]
@@ -541,18 +548,14 @@ impl NativeClockBinding {
     }
 
     #[doc(hidden)]
-    pub fn park_until(
-        &self,
-        deadline_ms: u64,
-        park: &dyn NativeDriverPark,
-    ) -> crate::Result<()> {
+    pub fn park_until(&self, deadline_ms: u64, park: &dyn NativeDriverPark) -> crate::Result<()> {
         let now_ms = self.clock.now_ms();
-        if now_ms >= deadline_ms { return Ok(()); }
+        if now_ms >= deadline_ms {
+            return Ok(());
+        }
         self.source.park_until(now_ms, deadline_ms, park)
     }
 }
-
-
 
 /// A callback registered to run the moment a read is cancelled.
 type CancellationCallback = Arc<dyn Fn() + Send + Sync>;
@@ -721,7 +724,9 @@ pub struct NativeReadCancellation {
 
 impl Clone for NativeReadCancellation {
     fn clone(&self) -> Self {
-        Self { token: self.token.clone() }
+        Self {
+            token: self.token.clone(),
+        }
     }
 }
 
@@ -802,10 +807,7 @@ impl NativeReadCancellation {
         self.token.identity
     }
 
-    pub fn try_tell_on_cancel<F>(
-        &self,
-        told: F,
-    ) -> crate::Result<NativeCancellationListener>
+    pub fn try_tell_on_cancel<F>(&self, told: F) -> crate::Result<NativeCancellationListener>
     where
         F: Fn() + Send + Sync + 'static,
     {
@@ -825,12 +827,9 @@ impl NativeReadCancellation {
             "native cancellation listener",
             "admit the listener node before registration",
         )?;
-        let callback = ReadShared::try_from_prepaid(told, callback_credit)?
-            .into_cancellation_callback();
-        let node = ReadShared::try_from_prepaid(
-            NativeListenerNode::new(callback),
-            node_credit,
-        )?;
+        let callback =
+            ReadShared::try_from_prepaid(told, callback_credit)?.into_cancellation_callback();
+        let node = ReadShared::try_from_prepaid(NativeListenerNode::new(callback), node_credit)?;
         {
             let mut directory = lock_directory(&self.token);
             directory.append(node.clone());
@@ -846,7 +845,8 @@ impl NativeReadCancellation {
             listener.node.callback_clone()
         };
         if self.is_cancelled()
-            && let Some(callback) = callback {
+            && let Some(callback) = callback
+        {
             callback.call();
         }
         Ok(listener)
@@ -1005,7 +1005,11 @@ impl<'a> NativeCancellationSnapshot<'a> {
         Self {
             token,
             record: UnsafeCell::new(NativeSnapshotRecord {
-                newer: None, older: None, next: None, last: None, linked: false,
+                newer: None,
+                older: None,
+                next: None,
+                last: None,
+                linked: false,
             }),
             _pin: PhantomPinned,
         }
@@ -1047,7 +1051,8 @@ impl<'a> NativeCancellationSnapshot<'a> {
                     data.next.as_deref().map(NonNull::from)
                 };
                 if node_eligible(record, data)
-                    && let Some(callback) = data.callback.clone() {
+                    && let Some(callback) = data.callback.clone()
+                {
                     return Some(callback);
                 }
             }
@@ -1067,8 +1072,13 @@ impl Drop for NativeCancellationSnapshot<'_> {
     }
 }
 
-fn lock_directory(token: &NativeCancellationToken) -> std::sync::MutexGuard<'_, NativeListenerDirectory> {
-    token.directory.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+fn lock_directory(
+    token: &NativeCancellationToken,
+) -> std::sync::MutexGuard<'_, NativeListenerDirectory> {
+    token
+        .directory
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn node_eligible(record: &NativeSnapshotRecord, data: &NativeListenerNodeData) -> bool {
@@ -1122,7 +1132,10 @@ unsafe fn snapshot_contains(
             if Some(node) == record.last {
                 break;
             }
-            current = (*node.as_ref().data.get()).next.as_deref().map(NonNull::from);
+            current = (*node.as_ref().data.get())
+                .next
+                .as_deref()
+                .map(NonNull::from);
         }
         false
     }
@@ -1174,7 +1187,10 @@ enum NativeReclaimed {
 }
 
 fn reclaim_retired(token: &NativeCancellationToken) {
-    let mut guard = NativeReclaimGuard { token, complete: false };
+    let mut guard = NativeReclaimGuard {
+        token,
+        complete: false,
+    };
     loop {
         let reclaimed = {
             let mut directory = lock_directory(token);
@@ -1210,9 +1226,7 @@ impl Drop for NativeReclaimGuard<'_> {
     }
 }
 
-unsafe fn take_one_reclaimable(
-    directory: &mut NativeListenerDirectory,
-) -> Option<NativeReclaimed> {
+unsafe fn take_one_reclaimable(directory: &mut NativeListenerDirectory) -> Option<NativeReclaimed> {
     let mut link: *mut Option<ReadShared<NativeListenerNode>> = &mut directory.head;
     let mut previous = None;
     // SAFETY: caller holds the directory mutex. This pointer is either the
@@ -1226,7 +1240,8 @@ unsafe fn take_one_reclaimable(
                 // tombstone: an ineligible snapshot preserves its cursor but
                 // cannot invoke this callback.
                 if !any_eligible_snapshot_contains(directory, node_ptr, data)
-                    && let Some(callback) = data.callback.take() {
+                    && let Some(callback) = data.callback.take()
+                {
                     return Some(NativeReclaimed::Callback(callback));
                 }
                 // Keep the tombstone until every active traversal has passed
@@ -1913,39 +1928,56 @@ impl MetadataPage {
     }
 }
 
-
 #[cfg(test)]
 mod native_snapshot_tests {
     use super::*;
     use crate::read_memory::native_control_tests::{SERIAL, Watch};
     use std::sync::atomic::AtomicUsize;
 
-    fn register_callback<F: Fn() + Send + Sync + 'static>(w: &Watch, token: &NativeReadCancellation, callback: F) -> NativeCancellationListener {
+    fn register_callback<F: Fn() + Send + Sync + 'static>(
+        w: &Watch,
+        token: &NativeReadCancellation,
+        callback: F,
+    ) -> NativeCancellationListener {
         let listener = w.allocating(|| token.try_tell_on_cancel(callback)).unwrap();
         w.assert_shared(&listener.node, &token.token.owner);
         let _directory = lock_directory(&token.token);
         let callback = listener.node.callback_clone().unwrap();
         w.assert_callback::<F>(&callback, &token.token.owner);
-        drop(callback); drop(_directory);
+        drop(callback);
+        drop(_directory);
         listener
     }
-    fn register(w: &Watch, token: &NativeReadCancellation, count: &Arc<AtomicUsize>) -> NativeCancellationListener {
+    fn register(
+        w: &Watch,
+        token: &NativeReadCancellation,
+        count: &Arc<AtomicUsize>,
+    ) -> NativeCancellationListener {
         let count = count.clone();
-        register_callback(w, token, move || { count.fetch_add(1, Ordering::SeqCst); })
+        register_callback(w, token, move || {
+            count.fetch_add(1, Ordering::SeqCst);
+        })
     }
     fn empty(token: &NativeReadCancellation) {
         let d = lock_directory(&token.token);
-        assert!(d.newest.is_none(), "no pinned stack record survives completion or unwind");
-        assert!(d.head.is_none()); assert!(d.tail.is_none());
+        assert!(
+            d.newest.is_none(),
+            "no pinned stack record survives completion or unwind"
+        );
+        assert!(d.head.is_none());
+        assert!(d.tail.is_none());
     }
     fn run(w: &Watch, f: impl FnOnce(&NativeReadCancellation)) {
         let owner = w.native(false);
-        let token = w.allocating(|| NativeReadCancellation::try_new(owner.clone())).unwrap();
+        let token = w
+            .allocating(|| NativeReadCancellation::try_new(owner.clone()))
+            .unwrap();
         assert!(token.token.owner.same_owner(&owner));
         w.assert_shared(&token.token, &owner);
         let clone = token.clone();
         assert_eq!(token.identity(), clone.identity());
-        drop(clone); drop(owner);
+        drop(clone);
+        drop(owner);
         f(&token);
         drop(token);
         w.finish();
@@ -1967,88 +1999,130 @@ mod native_snapshot_tests {
                 // This outer stack storage is never moved while linked. Its
                 // pinned reference ends before the stack storage is destroyed.
                 {
-                let mut newer_storage = NativeCancellationSnapshot::new(&token.token);
-                let mut newer = unsafe { Pin::new_unchecked(&mut newer_storage) };
-                let before_retire = w.frees();
-                {
-                    let older = NativeCancellationSnapshot::new(&token.token);
-                    let mut older = std::pin::pin!(older);
-                    older.as_mut().link_and_capture();
-                    std::thread::scope(|s| { s.spawn(move || drop(first)).join().unwrap(); });
-                    assert_eq!(w.frees(), before_retire, "eligible captured membership retains callback and node");
-                    newer.as_mut().link_and_capture();
-                    let new_tail = register(&w, token, &new_count);
-                    assert_eq!(new_count.load(Ordering::SeqCst), 1, "cancelled token calls new registrations immediately");
+                    let mut newer_storage = NativeCancellationSnapshot::new(&token.token);
+                    let mut newer = unsafe { Pin::new_unchecked(&mut newer_storage) };
+                    let before_retire = w.frees();
                     {
-                        let _d = lock_directory(&token.token);
-                        // SAFETY: both pinned intervals and the mutex keep
-                        // the retired node and stack pointers alive.
+                        let older = NativeCancellationSnapshot::new(&token.token);
+                        let mut older = std::pin::pin!(older);
+                        older.as_mut().link_and_capture();
+                        std::thread::scope(|s| {
+                            s.spawn(move || drop(first)).join().unwrap();
+                        });
+                        assert_eq!(
+                            w.frees(),
+                            before_retire,
+                            "eligible captured membership retains callback and node"
+                        );
+                        newer.as_mut().link_and_capture();
+                        let new_tail = register(&w, token, &new_count);
+                        assert_eq!(
+                            new_count.load(Ordering::SeqCst),
+                            1,
+                            "cancelled token calls new registrations immediately"
+                        );
+                        {
+                            let _d = lock_directory(&token.token);
+                            // SAFETY: both pinned intervals and the mutex keep
+                            // the retired node and stack pointers alive.
+                            unsafe {
+                                assert_eq!((*newer.record.get()).last, Some(later_pointer));
+                                let data = &*first_pointer.as_ref().data.get();
+                                assert!(!data.registered);
+                                assert!(data.callback.is_some());
+                                assert!(node_eligible(&*older.record.get(), data));
+                                assert!(!node_eligible(&*newer.record.get(), data));
+                            }
+                        }
+                        older.as_mut().take_next_callback().unwrap().call();
+                        assert_eq!(first_count.load(Ordering::SeqCst), 1);
+                        // Retiring an appended tail cannot extend either capture.
+                        drop(new_tail);
+                    }
+                    {
+                        let d = lock_directory(&token.token);
                         unsafe {
-                            assert_eq!((*newer.record.get()).last, Some(later_pointer));
+                            assert_eq!(d.newest, Some(NonNull::new_unchecked(newer.record.get())));
                             let data = &*first_pointer.as_ref().data.get();
-                            assert!(!data.registered); assert!(data.callback.is_some());
-                            assert!(node_eligible(&*older.record.get(), data));
-                            assert!(!node_eligible(&*newer.record.get(), data));
+                            assert!(!data.registered);
+                            assert!(data.callback.is_none());
+                            assert!(data.retired_through.is_none());
+                            assert_eq!((*newer.record.get()).next, Some(first_pointer));
                         }
                     }
-                    older.as_mut().take_next_callback().unwrap().call();
+                    // The actual production traversal must skip this retained
+                    // tombstone and reach the later eligible listener.
+                    newer
+                        .as_mut()
+                        .take_next_callback()
+                        .expect("ineligible tombstone must not stop later listener")
+                        .call();
+                    assert!(newer.as_mut().take_next_callback().is_none());
                     assert_eq!(first_count.load(Ordering::SeqCst), 1);
-                    // Retiring an appended tail cannot extend either capture.
-                    drop(new_tail);
+                    assert_eq!(later_count.load(Ordering::SeqCst), 1);
+                    assert_eq!(new_count.load(Ordering::SeqCst), 1);
+                    drop(newer);
+                    // The linked value drops in place here, including unwind.
                 }
-                {
-                    let d = lock_directory(&token.token);
-                    unsafe {
-                        assert_eq!(d.newest, Some(NonNull::new_unchecked(newer.record.get())));
-                        let data = &*first_pointer.as_ref().data.get();
-                        assert!(!data.registered); assert!(data.callback.is_none());
-                        assert!(data.retired_through.is_none());
-                        assert_eq!((*newer.record.get()).next, Some(first_pointer));
-                    }
-                }
-                // The actual production traversal must skip this retained
-                // tombstone and reach the later eligible listener.
-                newer.as_mut().take_next_callback().expect("ineligible tombstone must not stop later listener").call();
-                assert!(newer.as_mut().take_next_callback().is_none());
-                assert_eq!(first_count.load(Ordering::SeqCst), 1);
-                assert_eq!(later_count.load(Ordering::SeqCst), 1);
-                assert_eq!(new_count.load(Ordering::SeqCst), 1);
-                drop(newer);
-                // The linked value drops in place here, including unwind.
-                }
-                drop(later); empty(token);
+                drop(later);
+                empty(token);
             });
         }
-        for operation in ["native cancellation token", "native cancellation callback", "native cancellation listener"] {
+        for operation in [
+            "native cancellation token",
+            "native cancellation callback",
+            "native cancellation listener",
+        ] {
             let w = Watch::new(operation);
             let owner = w.native(false);
             w.refuse(Some(operation));
             let before = w.cells();
             if operation == "native cancellation token" {
-                assert!(w.allocating(|| NativeReadCancellation::try_new(owner.clone())).is_err());
+                assert!(
+                    w.allocating(|| NativeReadCancellation::try_new(owner.clone()))
+                        .is_err()
+                );
                 assert_eq!(w.cells(), before);
             } else {
                 w.refuse(None);
-                let token = w.allocating(|| NativeReadCancellation::try_new(owner.clone())).unwrap();
+                let token = w
+                    .allocating(|| NativeReadCancellation::try_new(owner.clone()))
+                    .unwrap();
                 w.refuse(Some(operation));
                 let before = w.cells();
                 assert!(w.allocating(|| token.try_tell_on_cancel(|| {})).is_err());
-                assert_eq!(w.cells(), before, "both admissions precede either allocation");
-                empty(&token); drop(token);
+                assert_eq!(
+                    w.cells(),
+                    before,
+                    "both admissions precede either allocation"
+                );
+                empty(&token);
+                drop(token);
             }
-            w.refuse(None); drop(owner); w.finish();
+            w.refuse(None);
+            drop(owner);
+            w.finish();
         }
         {
             let w = Watch::new("token-null-allocation");
             let owner = w.native(false);
             w.null(ReadShared::<NativeCancellationToken>::layout());
-            assert!(w.allocating(|| NativeReadCancellation::try_new(owner.clone())).is_err());
-            assert_eq!(w.cells(), 1); drop(owner); w.finish();
+            assert!(
+                w.allocating(|| NativeReadCancellation::try_new(owner.clone()))
+                    .is_err()
+            );
+            assert_eq!(w.cells(), 1);
+            drop(owner);
+            w.finish();
         }
         {
             let w = Watch::new("callback-null-allocation");
             run(&w, |token| {
-                fn null_callback<F: Fn() + Send + Sync + 'static>(w: &Watch, token: &NativeReadCancellation, f: F) {
+                fn null_callback<F: Fn() + Send + Sync + 'static>(
+                    w: &Watch,
+                    token: &NativeReadCancellation,
+                    f: F,
+                ) {
                     w.null(ReadShared::<F>::layout());
                     let before = w.cells();
                     assert!(w.allocating(|| token.try_tell_on_cancel(f)).is_err());
@@ -2074,7 +2148,14 @@ mod native_snapshot_tests {
                 let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
                 let (continue_tx, continue_rx) = std::sync::mpsc::sync_channel(0);
                 let continue_rx = Mutex::new(continue_rx);
-                let blocker = w.allocating(|| token.try_tell_on_cancel(move || { entered_tx.send(()).unwrap(); continue_rx.lock().unwrap().recv().unwrap(); })).unwrap();
+                let blocker = w
+                    .allocating(|| {
+                        token.try_tell_on_cancel(move || {
+                            entered_tx.send(()).unwrap();
+                            continue_rx.lock().unwrap().recv().unwrap();
+                        })
+                    })
+                    .unwrap();
                 std::thread::scope(|s| {
                     let clone = token.clone();
                     let cancel = s.spawn(move || clone.cancel());
@@ -2084,10 +2165,12 @@ mod native_snapshot_tests {
                     let tail = register(&w, token, &immediate);
                     assert_eq!(immediate.load(Ordering::SeqCst), 1);
                     drop(tail);
-                    continue_tx.send(()).unwrap(); cancel.join().unwrap();
+                    continue_tx.send(()).unwrap();
+                    cancel.join().unwrap();
                 });
                 assert_eq!(count.load(Ordering::SeqCst), 1);
-                drop(blocker); empty(token);
+                drop(blocker);
+                empty(token);
             });
         }
         {
@@ -2097,36 +2180,64 @@ mod native_snapshot_tests {
                 let count = Arc::new(AtomicUsize::new(0));
                 let nested_token = token.clone();
                 let entered_c = entered.clone();
-                let first = w.allocating(|| token.try_tell_on_cancel(move || { if !entered_c.swap(true, Ordering::SeqCst) { nested_token.cancel(); } })).unwrap();
+                let first = w
+                    .allocating(|| {
+                        token.try_tell_on_cancel(move || {
+                            if !entered_c.swap(true, Ordering::SeqCst) {
+                                nested_token.cancel();
+                            }
+                        })
+                    })
+                    .unwrap();
                 let later = register(&w, token, &count);
                 token.cancel();
                 assert!(entered.load(Ordering::SeqCst));
                 assert_eq!(count.load(Ordering::SeqCst), 2);
                 assert!(lock_directory(&token.token).newest.is_none());
-                drop(first); drop(later); empty(token);
+                drop(first);
+                drop(later);
+                empty(token);
             });
         }
         {
             let w = Watch::new("callback-panic-stack-cutoff-restoration");
             run(&w, |token| {
-                let listener = w.allocating(|| token.try_tell_on_cancel(|| panic!("callback invocation panic"))).unwrap();
-                assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| token.cancel())).is_err());
+                let listener = w
+                    .allocating(|| token.try_tell_on_cancel(|| panic!("callback invocation panic")))
+                    .unwrap();
+                assert!(
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| token.cancel()))
+                        .is_err()
+                );
                 assert!(lock_directory(&token.token).newest.is_none());
-                drop(listener); empty(token);
+                drop(listener);
+                empty(token);
                 let count = Arc::new(AtomicUsize::new(0));
                 let immediate = register(&w, token, &count);
                 assert_eq!(count.load(Ordering::SeqCst), 1);
-                token.cancel(); assert_eq!(count.load(Ordering::SeqCst), 2);
-                drop(immediate); empty(token);
+                token.cancel();
+                assert_eq!(count.load(Ordering::SeqCst), 2);
+                drop(immediate);
+                empty(token);
             });
         }
         {
             struct PanicDrop;
-            impl Drop for PanicDrop { fn drop(&mut self) { panic!("callback destructor panic"); } }
+            impl Drop for PanicDrop {
+                fn drop(&mut self) {
+                    panic!("callback destructor panic");
+                }
+            }
             let w = Watch::new("callback-drop-panic-reclamation");
             run(&w, |token| {
                 let payload = PanicDrop;
-                let first = w.allocating(|| token.try_tell_on_cancel(move || { std::hint::black_box(&payload); })).unwrap();
+                let first = w
+                    .allocating(|| {
+                        token.try_tell_on_cancel(move || {
+                            std::hint::black_box(&payload);
+                        })
+                    })
+                    .unwrap();
                 let count = Arc::new(AtomicUsize::new(0));
                 let later = register(&w, token, &count);
                 // An older actual pinned interval retains both callbacks.
@@ -2134,7 +2245,8 @@ mod native_snapshot_tests {
                     let snapshot = NativeCancellationSnapshot::new(&token.token);
                     let mut snapshot = std::pin::pin!(snapshot);
                     snapshot.as_mut().link_and_capture();
-                    drop(first); drop(later);
+                    drop(first);
+                    drop(later);
                     // Leaving the scope unlinks the stack record then really
                     // drops the retired callback outside the mutex.
                 }));
@@ -2144,36 +2256,46 @@ mod native_snapshot_tests {
             });
         }
         for panic in [false, true] {
-            let w = Watch::new(if panic { "snapshot-cutoff-panic-unlink" } else { "snapshot-cutoff-error-unlink" });
+            let w = Watch::new(if panic {
+                "snapshot-cutoff-panic-unlink"
+            } else {
+                "snapshot-cutoff-error-unlink"
+            });
             run(&w, |token| {
                 let count = Arc::new(AtomicUsize::new(0));
                 let listener = register(&w, token, &count);
                 {
-                let mut outer_storage = NativeCancellationSnapshot::new(&token.token);
-                let mut outer = unsafe { Pin::new_unchecked(&mut outer_storage) };
-                outer.as_mut().link_and_capture();
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> crate::Result<()> {
-                    let inner = NativeCancellationSnapshot::new(&token.token);
-                    let mut inner = std::pin::pin!(inner);
-                    inner.as_mut().link_and_capture();
-                    drop(listener);
-                    if panic { panic!("snapshot body panic"); }
-                    Err(crate::Error::Other("snapshot body error".into()))
-                }));
-                assert_eq!(result.is_err(), panic);
-                if !panic { assert!(result.unwrap().is_err()); }
-                {
-                    let d = lock_directory(&token.token);
-                    unsafe {
-                        assert_eq!(d.newest, Some(NonNull::new_unchecked(outer.record.get())));
-                        let node = d.head.as_ref().unwrap();
-                        assert_eq!((*node.data.get()).retired_through, d.newest);
-                        assert!((*outer.record.get()).newer.is_none());
+                    let mut outer_storage = NativeCancellationSnapshot::new(&token.token);
+                    let mut outer = unsafe { Pin::new_unchecked(&mut outer_storage) };
+                    outer.as_mut().link_and_capture();
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                        || -> crate::Result<()> {
+                            let inner = NativeCancellationSnapshot::new(&token.token);
+                            let mut inner = std::pin::pin!(inner);
+                            inner.as_mut().link_and_capture();
+                            drop(listener);
+                            if panic {
+                                panic!("snapshot body panic");
+                            }
+                            Err(crate::Error::Other("snapshot body error".into()))
+                        },
+                    ));
+                    assert_eq!(result.is_err(), panic);
+                    if !panic {
+                        assert!(result.unwrap().is_err());
                     }
-                }
-                outer.as_mut().take_next_callback().unwrap().call();
-                assert_eq!(count.load(Ordering::SeqCst), 1);
-                drop(outer);
+                    {
+                        let d = lock_directory(&token.token);
+                        unsafe {
+                            assert_eq!(d.newest, Some(NonNull::new_unchecked(outer.record.get())));
+                            let node = d.head.as_ref().unwrap();
+                            assert_eq!((*node.data.get()).retired_through, d.newest);
+                            assert!((*outer.record.get()).newer.is_none());
+                        }
+                    }
+                    outer.as_mut().take_next_callback().unwrap().call();
+                    assert_eq!(count.load(Ordering::SeqCst), 1);
+                    drop(outer);
                 }
                 empty(token);
             });

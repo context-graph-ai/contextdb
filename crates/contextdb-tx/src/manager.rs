@@ -1398,13 +1398,11 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
     where
         F: FnOnce() -> R,
     {
-        let _lock = self
-            .commit_release
-            .with_release(|release| {
-                self.commit_mutex
-                    .try_lock_for(duration)
-                    .map(|lock| self.commit_guard(lock, release))
-            })?;
+        let _lock = self.commit_release.with_release(|release| {
+            self.commit_mutex
+                .try_lock_for(duration)
+                .map(|lock| self.commit_guard(lock, release))
+        })?;
         Some(f())
     }
 
@@ -2282,7 +2280,10 @@ impl<P: 'static> EngineTerminalWriteSet<P> {
     /// nonallocating and nonpanicking field-move function.
     pub fn map_peer<Q: 'static>(self, move_peer: fn(P) -> Q) -> EngineTerminalWriteSet<Q> {
         let Self { source, peer } = self;
-        EngineTerminalWriteSet { source, peer: move_peer(peer) }
+        EngineTerminalWriteSet {
+            source,
+            peer: move_peer(peer),
+        }
     }
 
     pub fn identity(&self) -> EngineTerminalIdentity {
@@ -2473,20 +2474,27 @@ fn validate_terminal_source(tx: TxId, host: &EngineWriteSet) -> EngineTerminalId
     }
 }
 
-
 fn validate_temporary_source(tx: TxId, host: &EngineWriteSet) -> Result<EngineTerminalIdentity> {
-    if tx != host.tx || host.checkpoint_depth != 0 || host.frames.len() != 0
-        || host.undo.len() != 0 || host.undo.active.0.is_some()
-        || host.undo.spare_len != 0 || host.undo.spare.0.is_some()
+    if tx != host.tx
+        || host.checkpoint_depth != 0
+        || host.frames.len() != 0
+        || host.undo.len() != 0
+        || host.undo.active.0.is_some()
+        || host.undo.spare_len != 0
+        || host.undo.spare.0.is_some()
         || host.commit_error.is_some()
     {
         return Err(source_identity_error());
     }
-    Ok(EngineTerminalIdentity { original_tx: tx, generation: host.generation })
+    Ok(EngineTerminalIdentity {
+        original_tx: tx,
+        generation: host.generation,
+    })
 }
 
 fn validate_temporary_source_return(
-    identity: EngineTerminalIdentity, owned: &EngineOwnedWriteSet,
+    identity: EngineTerminalIdentity,
+    owned: &EngineOwnedWriteSet,
 ) -> Result<()> {
     crate::staged_source::validate_original_singleton(&owned.entry)?;
     if *owned.entry.key() != identity.original_tx
@@ -2522,14 +2530,19 @@ impl<S: WriteSetApplicator> EngineCommitScope<'_, '_, S> {
         reinstall_peer: fn(U, P),
     ) -> std::result::Result<R, EngineTerminalFailure<P>> {
         let _held = self.held;
-        self.transactions.manager.ensure_writable().map_err(EngineTerminalFailure::from_error)?;
+        self.transactions
+            .manager
+            .ensure_writable()
+            .map_err(EngineTerminalFailure::from_error)?;
         let (identity, mut pair) = {
             let mut active = self.transactions.manager.active_txs.lock();
             let sources = active.engine_mut();
-            let host = sources.get(&tx).ok_or(Error::TxNotFound(tx))
+            let host = sources
+                .get(&tx)
+                .ok_or(Error::TxNotFound(tx))
                 .map_err(EngineTerminalFailure::from_error)?;
-            let identity = validate_temporary_source(tx, host)
-                .map_err(EngineTerminalFailure::from_error)?;
+            let identity =
+                validate_temporary_source(tx, host).map_err(EngineTerminalFailure::from_error)?;
             if sources.len() == 0 {
                 return Err(EngineTerminalFailure::from_error(source_identity_error()));
             }
@@ -2540,7 +2553,13 @@ impl<S: WriteSetApplicator> EngineCommitScope<'_, '_, S> {
                 return Err(EngineTerminalFailure::from_error(Error::TxNotFound(tx)));
             };
             let peer = consume_peer(peer_ticket);
-            (identity, EngineTerminalWriteSet { source: EngineOwnedWriteSet { entry }, peer })
+            (
+                identity,
+                EngineTerminalWriteSet {
+                    source: EngineOwnedWriteSet { entry },
+                    peer,
+                },
+            )
         };
         // This pipeline owns A. On every refusal its unused closures/captures
         // and A retire before restoration. with_engine retires deferred nodes
@@ -2558,12 +2577,16 @@ impl<S: WriteSetApplicator> EngineCommitScope<'_, '_, S> {
             match validate_return(identity, &pair.peer) {
                 Err(error) => error,
                 Ok(peer_ticket) => {
-                    match validate_temporary_source_return(identity, &pair.source)
-                        .and_then(|()| crate::staged_source::prepare_original_reinstall(
-                            sources, identity.original_tx,
-                        ))
-                    {
-                        Err(error) => { drop(peer_ticket); error }
+                    match validate_temporary_source_return(identity, &pair.source).and_then(|()| {
+                        crate::staged_source::prepare_original_reinstall(
+                            sources,
+                            identity.original_tx,
+                        )
+                    }) {
+                        Err(error) => {
+                            drop(peer_ticket);
+                            error
+                        }
                         Ok(source_ticket) => {
                             // Both current-map and journal tickets have now
                             // succeeded. Nothing fallible follows first move.
@@ -2582,8 +2605,14 @@ impl<S: WriteSetApplicator> EngineCommitScope<'_, '_, S> {
         // Only failed return validation reaches here, always with originals.
         // A callback error has precedence over the validation diagnostic.
         let error = match outcome {
-            Err(error) => { drop(restoration_error); error }
-            Ok(result) => { drop(result); restoration_error }
+            Err(error) => {
+                drop(restoration_error);
+                error
+            }
+            Ok(result) => {
+                drop(result);
+                restoration_error
+            }
         };
         Err(EngineTerminalFailure::new(error, Some(pair)))
     }
@@ -2922,7 +2951,11 @@ impl<S: WriteSetApplicator> EngineTransactions<S> {
         tx: TxId,
         read_memory: Arc<dyn ReadMemoryBudget>,
         requires_commit: impl FnOnce() -> Result<bool>,
-        active_prepare: impl for<'b, 'm> FnOnce(&EngineCommitScope<'b, 'm, S>, Lsn, TxId)
+        active_prepare: impl for<'b, 'm> FnOnce(
+            &EngineCommitScope<'b, 'm, S>,
+            Lsn,
+            TxId,
+        )
             -> std::result::Result<(), EngineTerminalFailure<P>>,
         prepare: impl for<'g, 'h, 'p> FnOnce(&'g mut EngineGuard<'h>, &'p mut P) -> Result<()>,
         after_apply: impl for<'w> FnOnce(Lsn, &'w WriteSet),
@@ -3051,7 +3084,10 @@ impl<S: WriteSetApplicator> EngineTransactions<S> {
         &self,
         tx: TxId,
         read_memory: Arc<dyn ReadMemoryBudget>,
-        before_commit: impl for<'b, 'm> FnOnce(&EngineCommitScope<'b, 'm, S>, Lsn)
+        before_commit: impl for<'b, 'm> FnOnce(
+            &EngineCommitScope<'b, 'm, S>,
+            Lsn,
+        )
             -> std::result::Result<(), EngineTerminalFailure<P>>,
         prepare: impl for<'g, 'h, 'p> FnOnce(&'g mut EngineGuard<'h>, &'p mut P) -> Result<()>,
         validate_peer: impl FnOnce(EngineTerminalIdentity) -> V,
@@ -3354,9 +3390,12 @@ impl<S: WriteSetApplicator> EngineTransactions<S> {
         let host = active.engine().get(&tx).ok_or(Error::TxNotFound(tx))?;
         Ok(host.state.root.table(table).is_some_and(|root| {
             crate::staged_source::get_by(&root.by_id, |id| row.cmp(id)).is_some()
-        }) || host.state.ws.relational_deletes.iter().any(|(name, id, _)| {
-            name == table && *id == row
-        }))
+        }) || host
+            .state
+            .ws
+            .relational_deletes
+            .iter()
+            .any(|(name, id, _)| name == table && *id == row))
     }
     pub fn with_read<R>(&self, tx: TxId, f: impl FnOnce(EngineRead<'_>) -> R) -> Result<R> {
         let active = self.manager.active_txs.lock();
@@ -3500,7 +3539,9 @@ impl<S: WriteSetApplicator + 'static> EngineTransactions<S> {
     /// Select canonical owners at the same protected frontier as the resolver.
     #[doc(hidden)]
     pub fn capture_vectors(
-        &self, tx: TxId, index: &contextdb_core::VectorIndexRef,
+        &self,
+        tx: TxId,
+        index: &contextdb_core::VectorIndexRef,
         reader: Arc<dyn ReadMemoryBudget>,
     ) -> Result<crate::staged_source::CanonicalStatementVectors> {
         let active = self.manager.active_txs.lock();
@@ -3508,37 +3549,64 @@ impl<S: WriteSetApplicator + 'static> EngineTransactions<S> {
         if host.state.vector_slots.len() != host.state.ws.vector_inserts.len() {
             return Err(source_identity_error());
         }
-        let base = host.state.ws.base_read.clone().ok_or_else(source_identity_error)?;
+        let base = host
+            .state
+            .ws
+            .base_read
+            .clone()
+            .ok_or_else(source_identity_error)?;
         let source = CanonicalStatementRows::capture(
             host.state.root.table(&index.table).cloned(),
-            CapturedIdentity { tx, generation: host.generation, base },
-            CaptureResolver::Sealed, reader.clone(),
+            CapturedIdentity {
+                tx,
+                generation: host.generation,
+                base,
+            },
+            CaptureResolver::Sealed,
+            reader.clone(),
         )?;
         let root = host.state.root.vector(&index.table, &index.column);
         let selected = |position: usize, entry: &VectorEntry| {
-            if entry.index != *index { return None; }
+            if entry.index != *index {
+                return None;
+            }
             let root = root?;
             let vector = crate::staged_source::get_by(&root.rows, |id| entry.row_id.cmp(id))?;
             let slot = host.state.vector_slots.as_slice().get(position)?;
             vector.owner.ptr_eq(slot).then_some(vector)
         };
-        let count = host.state.ws.vector_inserts.iter().enumerate()
-            .filter(|(position, entry)| selected(*position, entry).is_some()).count();
-        let bytes = count.checked_mul(std::mem::size_of::<crate::staged_source::CanonicalVectorRef>())
+        let count = host
+            .state
+            .ws
+            .vector_inserts
+            .iter()
+            .enumerate()
+            .filter(|(position, entry)| selected(*position, entry).is_some())
+            .count();
+        let bytes = count
+            .checked_mul(std::mem::size_of::<crate::staged_source::CanonicalVectorRef>())
             .ok_or_else(source_identity_error)?;
         let credit = contextdb_core::read_memory::ReadCredit::try_new(
-            reader, bytes, "writer_source", "statement_vector_capture",
+            reader,
+            bytes,
+            "writer_source",
+            "statement_vector_capture",
             "Release statement captures or raise READ_MEMORY_LIMIT.",
         )?;
         // The buffer owns no writer data. Each selected native count retains its
         // existing writer debit; the reader pays only its selection storage.
         let mut vectors = Vec::with_capacity(count);
         for (position, entry) in host.state.ws.vector_inserts.iter().enumerate() {
-            if let Some(vector) = selected(position, entry) { vectors.push(vector.clone()); }
+            if let Some(vector) = selected(position, entry) {
+                vectors.push(vector.clone());
+            }
         }
-        Ok(crate::staged_source::CanonicalStatementVectors { vectors, source, _credit: credit })
+        Ok(crate::staged_source::CanonicalStatementVectors {
+            vectors,
+            source,
+            _credit: credit,
+        })
     }
-
 }
 
 impl<S: WriteSetApplicator> EngineTransactions<S> {
@@ -3970,7 +4038,10 @@ struct PreparedRowRemoval {
 impl EngineGuard<'_> {
     /// Build source keys only after admitting their temporary native storage.
     pub fn prepare_row_from_meta(
-        &self, table: &str, row: VersionedRow, meta: &contextdb_core::TableMeta,
+        &self,
+        table: &str,
+        row: VersionedRow,
+        meta: &contextdb_core::TableMeta,
         invoice: crate::staged_source::OriginalRowInvoice,
     ) -> Result<PreparedSourceMutation> {
         let original = crate::staged_source::AdmittedSourceRow::new(row, invoice);
@@ -3981,36 +4052,60 @@ impl EngineGuard<'_> {
             keys: Vec<(String, contextdb_core::IndexKey)>,
             _credit: crate::staged_source::SourceCharge,
         }
-        let mut bytes = meta.indexes.len().checked_mul(
-            std::mem::size_of::<(String, contextdb_core::IndexKey)>(),
-        ).ok_or_else(source_identity_error)?;
+        let mut bytes = meta
+            .indexes
+            .len()
+            .checked_mul(std::mem::size_of::<(String, contextdb_core::IndexKey)>())
+            .ok_or_else(source_identity_error)?;
         for index in &meta.indexes {
-            bytes = bytes.checked_add(index.name.len())
-                .and_then(|n| n.checked_add(index.columns.len().checked_mul(
-                    std::mem::size_of::<contextdb_core::DirectedValue>(),
-                )?)).ok_or_else(source_identity_error)?;
+            bytes = bytes
+                .checked_add(index.name.len())
+                .and_then(|n| {
+                    n.checked_add(
+                        index
+                            .columns
+                            .len()
+                            .checked_mul(std::mem::size_of::<contextdb_core::DirectedValue>())?,
+                    )
+                })
+                .ok_or_else(source_identity_error)?;
             for (column, _) in &index.columns {
-                let value_bytes = original.row.values.get(column)
+                let value_bytes = original
+                    .row
+                    .values
+                    .get(column)
                     .map_or(0, contextdb_core::Value::estimated_bytes);
-                bytes = bytes.checked_add(value_bytes.checked_mul(4)
-                    .and_then(|n| n.checked_add(128)).ok_or_else(source_identity_error)?)
+                bytes = bytes
+                    .checked_add(
+                        value_bytes
+                            .checked_mul(4)
+                            .and_then(|n| n.checked_add(128))
+                            .ok_or_else(source_identity_error)?,
+                    )
                     .ok_or_else(source_identity_error)?;
             }
         }
         let credit = crate::staged_source::SourceCharge::admit_funded(self.funder.clone(), bytes)?;
         let mut scratch = KeyScratch {
-            keys: Vec::with_capacity(meta.indexes.len()), _credit: credit,
+            keys: Vec::with_capacity(meta.indexes.len()),
+            _credit: credit,
         };
         for index in &meta.indexes {
             let mut key = Vec::with_capacity(index.columns.len());
             for (column, direction) in &index.columns {
-                let value = original.row.values.get(column).cloned()
+                let value = original
+                    .row
+                    .values
+                    .get(column)
+                    .cloned()
                     .unwrap_or(contextdb_core::Value::Null);
                 key.push(match direction {
-                    contextdb_core::SortDirection::Asc => contextdb_core::DirectedValue::Asc(
-                        contextdb_core::TotalOrdAsc(value)),
-                    contextdb_core::SortDirection::Desc => contextdb_core::DirectedValue::Desc(
-                        contextdb_core::TotalOrdDesc(value)),
+                    contextdb_core::SortDirection::Asc => {
+                        contextdb_core::DirectedValue::Asc(contextdb_core::TotalOrdAsc(value))
+                    }
+                    contextdb_core::SortDirection::Desc => {
+                        contextdb_core::DirectedValue::Desc(contextdb_core::TotalOrdDesc(value))
+                    }
                 });
             }
             scratch.keys.push((index.name.clone(), key));
@@ -4150,18 +4245,25 @@ impl EngineGuard<'_> {
             return Err(source_identity_error());
         }
         let eager = if eager_enabled {
-            Some(self.host.state.ws.ordered_staged_rows.prepare_native_row(
-                table,
-                crate::ordered_staged::StagedPosition {
-                    row_id: ordinary_row.row.row_id,
-                    created_tx: ordinary_row.row.created_tx,
-                    position,
-                },
-                &ordinary_row.row,
-                keys,
-                eager_schema,
-                self.funder,
-            )?.prepare_retain_row(cell.clone(), self.funder)?)
+            Some(
+                self.host
+                    .state
+                    .ws
+                    .ordered_staged_rows
+                    .prepare_native_row(
+                        table,
+                        crate::ordered_staged::StagedPosition {
+                            row_id: ordinary_row.row.row_id,
+                            created_tx: ordinary_row.row.created_tx,
+                            position,
+                        },
+                        &ordinary_row.row,
+                        keys,
+                        eager_schema,
+                        self.funder,
+                    )?
+                    .prepare_retain_row(cell.clone(), self.funder)?,
+            )
         } else {
             None
         };
@@ -7122,7 +7224,8 @@ impl EngineGuard<'_> {
     }
     /// Move an original debit into a singleton auxiliary batch before publication.
     pub fn prepare_owned_aux(
-        &self, body: crate::staged_source::AuxBody,
+        &self,
+        body: crate::staged_source::AuxBody,
         invoice: crate::staged_source::OriginalAuxInvoice,
     ) -> Result<crate::staged_source::AdmittedAuxBatch> {
         struct OriginalAux {
@@ -7134,34 +7237,86 @@ impl EngineGuard<'_> {
             return Err(source_identity_error());
         }
         let body_bytes = match &original.body {
-            crate::staged_source::AuxBody::RelationalDelete(_) => std::mem::size_of::<(contextdb_core::TableName, contextdb_core::RowId, contextdb_core::TxId)>(),
-            crate::staged_source::AuxBody::Predicate(_) => std::mem::size_of::<crate::write_set::RelationalDeletePredicate>(),
-            crate::staged_source::AuxBody::AdjInsert(_) => std::mem::size_of::<contextdb_core::AdjEntry>(),
-            crate::staged_source::AuxBody::AdjDelete(_) => std::mem::size_of::<(contextdb_core::NodeId, contextdb_core::EdgeType, contextdb_core::NodeId, contextdb_core::TxId)>(),
-            crate::staged_source::AuxBody::VectorDelete(_) => std::mem::size_of::<(contextdb_core::VectorIndexRef, contextdb_core::RowId, contextdb_core::TxId)>(),
-            crate::staged_source::AuxBody::VectorMove(_) => std::mem::size_of::<(contextdb_core::VectorIndexRef, contextdb_core::RowId, contextdb_core::RowId, contextdb_core::TxId)>(),
-            crate::staged_source::AuxBody::Provenance(_) => std::mem::size_of::<(contextdb_core::TableName, contextdb_core::RowId, contextdb_core::Lsn, u8)>(),
-            crate::staged_source::AuxBody::ConfigWrite(_) => std::mem::size_of::<(String, Vec<u8>)>(),
+            crate::staged_source::AuxBody::RelationalDelete(_) => std::mem::size_of::<(
+                contextdb_core::TableName,
+                contextdb_core::RowId,
+                contextdb_core::TxId,
+            )>(),
+            crate::staged_source::AuxBody::Predicate(_) => {
+                std::mem::size_of::<crate::write_set::RelationalDeletePredicate>()
+            }
+            crate::staged_source::AuxBody::AdjInsert(_) => {
+                std::mem::size_of::<contextdb_core::AdjEntry>()
+            }
+            crate::staged_source::AuxBody::AdjDelete(_) => std::mem::size_of::<(
+                contextdb_core::NodeId,
+                contextdb_core::EdgeType,
+                contextdb_core::NodeId,
+                contextdb_core::TxId,
+            )>(),
+            crate::staged_source::AuxBody::VectorDelete(_) => std::mem::size_of::<(
+                contextdb_core::VectorIndexRef,
+                contextdb_core::RowId,
+                contextdb_core::TxId,
+            )>(),
+            crate::staged_source::AuxBody::VectorMove(_) => std::mem::size_of::<(
+                contextdb_core::VectorIndexRef,
+                contextdb_core::RowId,
+                contextdb_core::RowId,
+                contextdb_core::TxId,
+            )>(),
+            crate::staged_source::AuxBody::Provenance(_) => std::mem::size_of::<(
+                contextdb_core::TableName,
+                contextdb_core::RowId,
+                contextdb_core::Lsn,
+                u8,
+            )>(),
+            crate::staged_source::AuxBody::ConfigWrite(_) => {
+                std::mem::size_of::<(String, Vec<u8>)>()
+            }
             crate::staged_source::AuxBody::ConfigDelete(_) => std::mem::size_of::<String>(),
             crate::staged_source::AuxBody::ConfigMaxU64Key(_) => std::mem::size_of::<String>(),
         };
-        let bytes = body_bytes.checked_add(std::mem::size_of::<crate::staged_source::OriginalAuxInvoice>())
+        let bytes = body_bytes
+            .checked_add(std::mem::size_of::<crate::staged_source::OriginalAuxInvoice>())
             .ok_or_else(source_identity_error)?;
         let credit = crate::staged_source::SourceCharge::admit_funded(self.funder.clone(), bytes)?;
         let bodies = match original.body {
-            crate::staged_source::AuxBody::RelationalDelete(body) => crate::staged_source::AuxBodies::RelationalDeletes(vec![body]),
-            crate::staged_source::AuxBody::Predicate(body) => crate::staged_source::AuxBodies::Predicates(vec![body]),
-            crate::staged_source::AuxBody::AdjInsert(body) => crate::staged_source::AuxBodies::AdjInserts(vec![body]),
-            crate::staged_source::AuxBody::AdjDelete(body) => crate::staged_source::AuxBodies::AdjDeletes(vec![body]),
-            crate::staged_source::AuxBody::VectorDelete(body) => crate::staged_source::AuxBodies::VectorDeletes(vec![body]),
-            crate::staged_source::AuxBody::VectorMove(body) => crate::staged_source::AuxBodies::VectorMoves(vec![body]),
-            crate::staged_source::AuxBody::Provenance(body) => crate::staged_source::AuxBodies::Provenance(vec![body]),
-            crate::staged_source::AuxBody::ConfigWrite(body) => crate::staged_source::AuxBodies::ConfigWrites(vec![body]),
-            crate::staged_source::AuxBody::ConfigDelete(body) => crate::staged_source::AuxBodies::ConfigDeletes(vec![body]),
-            crate::staged_source::AuxBody::ConfigMaxU64Key(body) => crate::staged_source::AuxBodies::ConfigMaxU64Keys(vec![body]),
+            crate::staged_source::AuxBody::RelationalDelete(body) => {
+                crate::staged_source::AuxBodies::RelationalDeletes(vec![body])
+            }
+            crate::staged_source::AuxBody::Predicate(body) => {
+                crate::staged_source::AuxBodies::Predicates(vec![body])
+            }
+            crate::staged_source::AuxBody::AdjInsert(body) => {
+                crate::staged_source::AuxBodies::AdjInserts(vec![body])
+            }
+            crate::staged_source::AuxBody::AdjDelete(body) => {
+                crate::staged_source::AuxBodies::AdjDeletes(vec![body])
+            }
+            crate::staged_source::AuxBody::VectorDelete(body) => {
+                crate::staged_source::AuxBodies::VectorDeletes(vec![body])
+            }
+            crate::staged_source::AuxBody::VectorMove(body) => {
+                crate::staged_source::AuxBodies::VectorMoves(vec![body])
+            }
+            crate::staged_source::AuxBody::Provenance(body) => {
+                crate::staged_source::AuxBodies::Provenance(vec![body])
+            }
+            crate::staged_source::AuxBody::ConfigWrite(body) => {
+                crate::staged_source::AuxBodies::ConfigWrites(vec![body])
+            }
+            crate::staged_source::AuxBody::ConfigDelete(body) => {
+                crate::staged_source::AuxBodies::ConfigDeletes(vec![body])
+            }
+            crate::staged_source::AuxBody::ConfigMaxU64Key(body) => {
+                crate::staged_source::AuxBodies::ConfigMaxU64Keys(vec![body])
+            }
         };
         Ok(crate::staged_source::AdmittedAuxBatch::from_parts(
-            bodies, vec![original.invoice], credit,
+            bodies,
+            vec![original.invoice],
+            credit,
         ))
     }
     pub fn copy_aux(
@@ -7625,14 +7780,21 @@ impl EngineGuard<'_> {
         let PreparedSourceMutationKind::Row(body) = &prepared.mutation else {
             unreachable!()
         };
-        prepared.eager = Some(self.host.state.ws.ordered_staged_rows.prepare_native_row(
-            table,
-            position,
-            &body.row.row,
-            keys,
-            schema_copy,
-            self.funder,
-        )?.prepare_retain_row(body.cell.clone(), self.funder)?);
+        prepared.eager = Some(
+            self.host
+                .state
+                .ws
+                .ordered_staged_rows
+                .prepare_native_row(
+                    table,
+                    position,
+                    &body.row.row,
+                    keys,
+                    schema_copy,
+                    self.funder,
+                )?
+                .prepare_retain_row(body.cell.clone(), self.funder)?,
+        );
         Ok(prepared)
     }
     pub fn prepare_eager_vector(
@@ -7685,7 +7847,9 @@ impl EngineCapturedWriteSet {
     ) -> Result<R> {
         let funder = self.host.funder.clone();
         let preparation_scope = self.host.open_guard()?;
-        let drain = DetachedRetirementDrain { host: &mut self.host };
+        let drain = DetachedRetirementDrain {
+            host: &mut self.host,
+        };
         f(&mut EngineGuard {
             host: &mut *drain.host,
             funder: &funder,
@@ -8364,17 +8528,37 @@ impl EngineGuard<'_> {
 
 impl EngineGuard<'_> {
     pub fn prepare_replace_row_at_from_meta(
-        &self, position: usize, table: &str, row: VersionedRow, meta: &contextdb_core::TableMeta,
+        &self,
+        position: usize,
+        table: &str,
+        row: VersionedRow,
+        meta: &contextdb_core::TableMeta,
         invoice: crate::staged_source::OriginalRowInvoice,
     ) -> Result<PreparedSourceMutation> {
         let original = crate::staged_source::AdmittedSourceRow::new(row, invoice);
         if !self.eager_preparation() {
-            return self.prepare_replace_row_at_from_meta_ordinary(position, table, original.row, meta, original.invoice);
+            return self.prepare_replace_row_at_from_meta_ordinary(
+                position,
+                table,
+                original.row,
+                meta,
+                original.invoice,
+            );
         }
-        self.prepare_replace_row_slot_from_meta(position, table, original.row, meta, original.invoice)
+        self.prepare_replace_row_slot_from_meta(
+            position,
+            table,
+            original.row,
+            meta,
+            original.invoice,
+        )
     }
     fn prepare_replace_row_at_from_meta_ordinary(
-        &self, position: usize, table: &str, row: VersionedRow, meta: &contextdb_core::TableMeta,
+        &self,
+        position: usize,
+        table: &str,
+        row: VersionedRow,
+        meta: &contextdb_core::TableMeta,
         invoice: crate::staged_source::OriginalRowInvoice,
     ) -> Result<PreparedSourceMutation> {
         let original = crate::staged_source::AdmittedSourceRow::new(row, invoice);
@@ -8386,36 +8570,60 @@ impl EngineGuard<'_> {
             keys: Vec<(String, contextdb_core::IndexKey)>,
             _credit: crate::staged_source::SourceCharge,
         }
-        let mut bytes = meta.indexes.len().checked_mul(
-            std::mem::size_of::<(String, contextdb_core::IndexKey)>(),
-        ).ok_or_else(source_identity_error)?;
+        let mut bytes = meta
+            .indexes
+            .len()
+            .checked_mul(std::mem::size_of::<(String, contextdb_core::IndexKey)>())
+            .ok_or_else(source_identity_error)?;
         for index in &meta.indexes {
-            bytes = bytes.checked_add(index.name.len())
-                .and_then(|n| n.checked_add(index.columns.len().checked_mul(
-                    std::mem::size_of::<contextdb_core::DirectedValue>(),
-                )?)).ok_or_else(source_identity_error)?;
+            bytes = bytes
+                .checked_add(index.name.len())
+                .and_then(|n| {
+                    n.checked_add(
+                        index
+                            .columns
+                            .len()
+                            .checked_mul(std::mem::size_of::<contextdb_core::DirectedValue>())?,
+                    )
+                })
+                .ok_or_else(source_identity_error)?;
             for (column, _) in &index.columns {
-                let value_bytes = original.row.values.get(column)
+                let value_bytes = original
+                    .row
+                    .values
+                    .get(column)
                     .map_or(0, contextdb_core::Value::estimated_bytes);
-                bytes = bytes.checked_add(value_bytes.checked_mul(4)
-                    .and_then(|n| n.checked_add(128)).ok_or_else(source_identity_error)?)
+                bytes = bytes
+                    .checked_add(
+                        value_bytes
+                            .checked_mul(4)
+                            .and_then(|n| n.checked_add(128))
+                            .ok_or_else(source_identity_error)?,
+                    )
                     .ok_or_else(source_identity_error)?;
             }
         }
         let credit = crate::staged_source::SourceCharge::admit_funded(self.funder.clone(), bytes)?;
         let mut scratch = KeyScratch {
-            keys: Vec::with_capacity(meta.indexes.len()), _credit: credit,
+            keys: Vec::with_capacity(meta.indexes.len()),
+            _credit: credit,
         };
         for index in &meta.indexes {
             let mut key = Vec::with_capacity(index.columns.len());
             for (column, direction) in &index.columns {
-                let value = original.row.values.get(column).cloned()
+                let value = original
+                    .row
+                    .values
+                    .get(column)
+                    .cloned()
                     .unwrap_or(contextdb_core::Value::Null);
                 key.push(match direction {
-                    contextdb_core::SortDirection::Asc => contextdb_core::DirectedValue::Asc(
-                        contextdb_core::TotalOrdAsc(value)),
-                    contextdb_core::SortDirection::Desc => contextdb_core::DirectedValue::Desc(
-                        contextdb_core::TotalOrdDesc(value)),
+                    contextdb_core::SortDirection::Asc => {
+                        contextdb_core::DirectedValue::Asc(contextdb_core::TotalOrdAsc(value))
+                    }
+                    contextdb_core::SortDirection::Desc => {
+                        contextdb_core::DirectedValue::Desc(contextdb_core::TotalOrdDesc(value))
+                    }
                 });
             }
             scratch.keys.push((index.name.clone(), key));
@@ -8458,109 +8666,194 @@ struct PreparedConditionalSlice {
     root: FundedArc<SourceRoot>,
     relational_deletes: PreparedSplice<(contextdb_core::TableName, RowId, TxId)>,
     adj_inserts: PreparedSplice<contextdb_core::AdjEntry>,
-    adj_deletes: PreparedSplice<(contextdb_core::NodeId, contextdb_core::EdgeType, contextdb_core::NodeId, TxId)>,
+    adj_deletes: PreparedSplice<(
+        contextdb_core::NodeId,
+        contextdb_core::EdgeType,
+        contextdb_core::NodeId,
+        TxId,
+    )>,
     vector_deletes: PreparedSplice<(VectorIndexRef, RowId, TxId)>,
     vector_moves: PreparedSplice<(VectorIndexRef, RowId, RowId, TxId)>,
 }
 fn prepare_exact_positions(
-    positions: &[usize], length: usize, funder: &SourceFunder,
+    positions: &[usize],
+    length: usize,
+    funder: &SourceFunder,
 ) -> Result<SourceBuffer<usize>> {
     let mut selected = SourceBuffer::with_capacity(positions.len(), funder)?;
     for &position in positions {
-        if position >= length { return Err(source_identity_error()); }
+        if position >= length {
+            return Err(source_identity_error());
+        }
         selected.push(position);
     }
     selected.values_mut().sort_unstable();
-    if selected.as_slice().windows(2).any(|pair| pair[0] == pair[1]) {
+    if selected
+        .as_slice()
+        .windows(2)
+        .any(|pair| pair[0] == pair[1])
+    {
         return Err(source_identity_error());
     }
     Ok(selected)
 }
 fn prepare_empty_slice<T>(
-    values: &Vec<T>, funding: &AuxFunding, start: usize, end: usize,
+    values: &Vec<T>,
+    funding: &AuxFunding,
+    start: usize,
+    end: usize,
     funder: &SourceFunder,
 ) -> Result<PreparedSplice<T>> {
-    if start > end || end > values.len() { return Err(source_identity_error()); }
+    if start > end || end > values.len() {
+        return Err(source_identity_error());
+    }
     let mut positions = SourceBuffer::with_capacity(end - start, funder)?;
-    for position in start..end { positions.push(position); }
-    prepare_splice(values, funding, start, positions.as_slice(), AuxInput {
-        values: Vec::new(), invoices: SourceBuffer::empty(), credit: None,
-    }, funder)
+    for position in start..end {
+        positions.push(position);
+    }
+    prepare_splice(
+        values,
+        funding,
+        start,
+        positions.as_slice(),
+        AuxInput {
+            values: Vec::new(),
+            invoices: SourceBuffer::empty(),
+            credit: None,
+        },
+        funder,
+    )
 }
 impl EngineGuard<'_> {
     fn validate_slot_inventory(&self) -> Result<()> {
         let state = &self.host.state;
         let rows = &state.ws.relational_inserts;
         let vectors = &state.ws.vector_inserts;
-        if rows.len() != state.row_slots.len() || rows.len() != state.row_debits.len()
+        if rows.len() != state.row_slots.len()
+            || rows.len() != state.row_debits.len()
             || rows.len() != state.row_table_charges.len()
-            || vectors.len() != state.vector_slots.len() || vectors.len() != state.vector_debits.len()
-        { return Err(source_identity_error()); }
+            || vectors.len() != state.vector_slots.len()
+            || vectors.len() != state.vector_debits.len()
+        {
+            return Err(source_identity_error());
+        }
         for (position, (table, row)) in rows.iter().enumerate() {
             let cell = &state.row_slots.as_slice()[position];
-            if cell.identity.table.as_str() != table || !cell.identity.matches_row(row)
-                || cell.identity.tx != self.host.tx || cell.identity.generation != self.host.generation
+            if cell.identity.table.as_str() != table
+                || !cell.identity.matches_row(row)
+                || cell.identity.tx != self.host.tx
+                || cell.identity.generation != self.host.generation
                 || !state.row_debits.as_slice()[position].matches(self.funder)
                 || !state.row_table_charges.as_slice()[position].matches_funder(self.funder)
-                || !state.ws.base_read.as_ref().is_some_and(|base| same_published_source(base, &cell.identity.base))
-            { return Err(source_identity_error()); }
+                || !state
+                    .ws
+                    .base_read
+                    .as_ref()
+                    .is_some_and(|base| same_published_source(base, &cell.identity.base))
+            {
+                return Err(source_identity_error());
+            }
             let custody = cell.custody.lock();
-            if !matches!(custody.as_ref(), Some(RowCustody::Sealed { row: body, .. }) if cell.identity.matches_row(body)) {
+            if !matches!(custody.as_ref(), Some(RowCustody::Sealed { row: body, .. }) if cell.identity.matches_row(body))
+            {
                 return Err(source_identity_error());
             }
         }
         for (position, entry) in vectors.iter().enumerate() {
             let cell = &state.vector_slots.as_slice()[position];
-            if !cell.identity.matches_entry(entry) || cell.identity.tx != self.host.tx
+            if !cell.identity.matches_entry(entry)
+                || cell.identity.tx != self.host.tx
                 || cell.identity.generation != self.host.generation
                 || !state.vector_debits.as_slice()[position].matches(self.funder)
-                || !state.ws.base_read.as_ref().is_some_and(|base| same_published_source(base, &cell.identity.base))
-            { return Err(source_identity_error()); }
+                || !state
+                    .ws
+                    .base_read
+                    .as_ref()
+                    .is_some_and(|base| same_published_source(base, &cell.identity.base))
+            {
+                return Err(source_identity_error());
+            }
             let custody = cell.custody.lock();
-            if !matches!(custody.as_ref(), Some(crate::staged_source::VectorCustody::Sealed { entry: body, .. }) if cell.identity.matches_entry(body)) {
+            if !matches!(custody.as_ref(), Some(crate::staged_source::VectorCustody::Sealed { entry: body, .. }) if cell.identity.matches_entry(body))
+            {
                 return Err(source_identity_error());
             }
         }
         Ok(())
     }
     fn prepare_replace_row_at_inner(
-        &self, position: usize, table: &str,
+        &self,
+        position: usize,
+        table: &str,
         original: crate::staged_source::AdmittedSourceRow,
         keys: &[(String, contextdb_core::IndexKey)],
         schema: crate::staged_source::SchemaHandle,
     ) -> Result<PreparedSourceMutation> {
-        let old = self.host.state.row_slots.as_slice().get(position)
+        let old = self
+            .host
+            .state
+            .row_slots
+            .as_slice()
+            .get(position)
             .ok_or_else(source_identity_error)?;
-        if old.identity.table.as_str() != table || !old.identity.matches_row(&original.row)
-
-        { return Err(source_identity_error()); }
+        if old.identity.table.as_str() != table || !old.identity.matches_row(&original.row) {
+            return Err(source_identity_error());
+        }
         let ordinary = self.funder.copy_row(&original.row)?;
         let mut bundle = SourceBuffer::with_capacity(keys.len(), self.funder)?;
         for (index, key) in keys {
             let name = schema.index_name(index).ok_or_else(source_identity_error)?;
-            let control = FundedArc::<crate::staged_source::PostingAtom>::prepare(self.funder.clone())?;
+            let control =
+                FundedArc::<crate::staged_source::PostingAtom>::prepare(self.funder.clone())?;
             let key = self.funder.copy_key(key)?;
-            bundle.push((name, FundedArc::from_prepared(crate::staged_source::PostingAtom {
-                position: (key.key, original.row.row_id), _payload: key.charge,
-            }, control)));
+            bundle.push((
+                name,
+                FundedArc::from_prepared(
+                    crate::staged_source::PostingAtom {
+                        position: (key.key, original.row.row_id),
+                        _payload: key.charge,
+                    },
+                    control,
+                ),
+            ));
         }
         let mut identity = old.identity.clone();
         identity.schema = schema;
         let cell = crate::staged_source::RowCell::sealed(identity, bundle, original, self.funder)?;
-        let prior = self.host.state.root.table(table).ok_or_else(source_identity_error)?;
+        let prior = self
+            .host
+            .state
+            .root
+            .table(table)
+            .ok_or_else(source_identity_error)?;
         let current = crate::staged_source::get_by(&prior.by_id, |id| cell.identity.row.cmp(id))
             .ok_or_else(source_identity_error)?;
         let root = if current.ptr_eq(old) {
             let next = prior.prepare_replace(cell.clone(), self.funder)?;
-            self.host.state.root.prepare_table(old.identity.table.clone(), next, self.funder)?
-        } else { self.host.state.root.clone() };
-        let table_charge = crate::staged_source::SourceCharge::admit_funded(self.funder.clone(), table.len())?;
+            self.host
+                .state
+                .root
+                .prepare_table(old.identity.table.clone(), next, self.funder)?
+        } else {
+            self.host.state.root.clone()
+        };
+        let table_charge =
+            crate::staged_source::SourceCharge::admit_funded(self.funder.clone(), table.len())?;
         let table_owned = table.to_owned();
-        if table_owned.capacity() != table.len() { return Err(source_identity_error()); }
+        if table_owned.capacity() != table.len() {
+            return Err(source_identity_error());
+        }
         Ok(PreparedSourceMutation {
-            binding: self.binding()?, eager: None, sidecars: None,
+            binding: self.binding()?,
+            eager: None,
+            sidecars: None,
             mutation: PreparedSourceMutationKind::ReplaceSlot(PreparedSlotReplacement {
-                position, row: ordinary, table: table_owned, table_charge, cell, root,
+                position,
+                row: ordinary,
+                table: table_owned,
+                table_charge,
+                cell,
+                root,
                 undo: self.prepare_undo(2)?,
             }),
         })
@@ -8578,33 +8871,62 @@ impl EngineGuard<'_> {
         assert!(length <= state.row_table_charges.capacity());
         self.publish_undo(p.undo.take());
         self.remove_ordinary_row(p.position);
-        self.host.state.ws.relational_inserts.insert(p.position, (p.table, p.row.row));
+        self.host
+            .state
+            .ws
+            .relational_inserts
+            .insert(p.position, (p.table, p.row.row));
         self.host.state.row_debits.insert(p.position, p.row.invoice);
-        self.host.state.row_table_charges.insert(p.position, p.table_charge);
+        self.host
+            .state
+            .row_table_charges
+            .insert(p.position, p.table_charge);
         self.host.state.row_slots.insert(p.position, p.cell);
         self.record_undo(SourceUndo::InsertedRow(p.position));
         self.host.state.root = p.root;
     }
     fn prepare_root_without_positions(
-        &self, rows: &[usize], vectors: &[usize],
+        &self,
+        rows: &[usize],
+        vectors: &[usize],
     ) -> Result<FundedArc<SourceRoot>> {
-        use crate::staged_source::{Entry, insert, get_by};
+        use crate::staged_source::{Entry, get_by, insert};
         let mut row_winners = None;
         if !rows.is_empty() {
             for (ordinal, cell) in self.host.state.row_slots.as_slice().iter().enumerate() {
-                if rows.binary_search(&ordinal).is_ok() { continue; }
-                row_winners = insert(&row_winners, FundedArc::try_new(Entry {
-                    key: (cell.identity.table.clone(), cell.identity.row), value: cell.clone(),
-                }, self.funder.clone())?, self.funder)?;
+                if rows.binary_search(&ordinal).is_ok() {
+                    continue;
+                }
+                row_winners = insert(
+                    &row_winners,
+                    FundedArc::try_new(
+                        Entry {
+                            key: (cell.identity.table.clone(), cell.identity.row),
+                            value: cell.clone(),
+                        },
+                        self.funder.clone(),
+                    )?,
+                    self.funder,
+                )?;
             }
         }
         let mut vector_winners = None;
         if !vectors.is_empty() {
             for (ordinal, cell) in self.host.state.vector_slots.as_slice().iter().enumerate() {
-                if vectors.binary_search(&ordinal).is_ok() { continue; }
-                vector_winners = insert(&vector_winners, FundedArc::try_new(Entry {
-                    key: (cell.identity.index.clone(), cell.identity.row), value: cell.clone(),
-                }, self.funder.clone())?, self.funder)?;
+                if vectors.binary_search(&ordinal).is_ok() {
+                    continue;
+                }
+                vector_winners = insert(
+                    &vector_winners,
+                    FundedArc::try_new(
+                        Entry {
+                            key: (cell.identity.index.clone(), cell.identity.row),
+                            value: cell.clone(),
+                        },
+                        self.funder.clone(),
+                    )?,
+                    self.funder,
+                )?;
             }
         }
         let mut root = self.host.state.root.clone();
@@ -8614,10 +8936,15 @@ impl EngineGuard<'_> {
             let id = old.identity.row;
             let prior = root.table(table).ok_or_else(source_identity_error)?;
             let current = crate::staged_source::get_by(&prior.by_id, |row| id.cmp(row));
-            if !current.is_some_and(|cell| cell.ptr_eq(old)) { continue; }
-            let survivor = get_by(&row_winners,
-                |key: &(crate::staged_source::SourceName, RowId)|
-                    (table, id).cmp(&(key.0.as_str(), key.1)));
+            if !current.is_some_and(|cell| cell.ptr_eq(old)) {
+                continue;
+            }
+            let survivor = get_by(
+                &row_winners,
+                |key: &(crate::staged_source::SourceName, RowId)| {
+                    (table, id).cmp(&(key.0.as_str(), key.1))
+                },
+            );
             let next = match survivor {
                 Some(cell) => prior.prepare_restore_slot(cell.clone(), self.funder)?,
                 None => prior.prepare_remove(id, self.funder)?,
@@ -8627,16 +8954,28 @@ impl EngineGuard<'_> {
         for &position in vectors {
             let old = &self.host.state.vector_slots.as_slice()[position];
             let name = &old.identity.index;
-            let prior = root.vector(name.table.as_str(), name.column.as_str())
+            let prior = root
+                .vector(name.table.as_str(), name.column.as_str())
                 .ok_or_else(source_identity_error)?;
-            let current = crate::staged_source::get_by(&prior.rows, |row| old.identity.row.cmp(row));
-            if !current.is_some_and(|reference| reference.owner.ptr_eq(old)) { continue; }
-            let survivor = get_by(&vector_winners,
-                |key: &(crate::staged_source::VectorName, RowId)|
-                    (name, old.identity.row).cmp(&(&key.0, key.1)));
+            let current =
+                crate::staged_source::get_by(&prior.rows, |row| old.identity.row.cmp(row));
+            if !current.is_some_and(|reference| reference.owner.ptr_eq(old)) {
+                continue;
+            }
+            let survivor = get_by(
+                &vector_winners,
+                |key: &(crate::staged_source::VectorName, RowId)| {
+                    (name, old.identity.row).cmp(&(&key.0, key.1))
+                },
+            );
             let next = match survivor {
                 Some(cell) => prior.prepare_insert(
-                    crate::staged_source::CanonicalVectorRef::owned(cell.identity.row, cell.clone()), self.funder)?,
+                    crate::staged_source::CanonicalVectorRef::owned(
+                        cell.identity.row,
+                        cell.clone(),
+                    ),
+                    self.funder,
+                )?,
                 None => prior.prepare_remove(old.identity.row, self.funder)?,
             };
             root = root.prepare_vector(name.clone(), next, self.funder)?;
@@ -8645,33 +8984,65 @@ impl EngineGuard<'_> {
     }
     /// Remove exactly the selected insertion slots, including older same-key slots.
     #[doc(hidden)]
-    pub fn prepare_remove_vector_positions(&self, positions: &[usize]) -> Result<PreparedSourceMutation> {
-        if !self.eager_preparation() { return self.prepare_remove_vector_positions_ordinary(positions); }
+    pub fn prepare_remove_vector_positions(
+        &self,
+        positions: &[usize],
+    ) -> Result<PreparedSourceMutation> {
+        if !self.eager_preparation() {
+            return self.prepare_remove_vector_positions_ordinary(positions);
+        }
         self.validate_slot_inventory()?;
         // Sorting stays in caller preparation, after genuine original admissions.
-        if positions.iter().any(|slot| *slot >= self.host.state.vector_slots.len()) {
+        if positions
+            .iter()
+            .any(|slot| *slot >= self.host.state.vector_slots.len())
+        {
             return Err(source_identity_error());
         }
-        let admission = self.host.state.ws.ordered_staged_rows.prepare_native_exact_admission(
-            self.host.state.row_slots.as_slice(), self.host.state.vector_slots.as_slice(),
-            crate::ordered_staged::NativeExactRowChange::Unchanged)?;
-        let (mut prepared, eager) = admission.prepare(self.funder,
-            || Ok((self.prepare_remove_vector_positions_ordinary(positions)?, None)),
+        let admission = self
+            .host
+            .state
+            .ws
+            .ordered_staged_rows
+            .prepare_native_exact_admission(
+                self.host.state.row_slots.as_slice(),
+                self.host.state.vector_slots.as_slice(),
+                crate::ordered_staged::NativeExactRowChange::Unchanged,
+            )?;
+        let (mut prepared, eager) = admission.prepare(
+            self.funder,
+            || {
+                Ok((
+                    self.prepare_remove_vector_positions_ordinary(positions)?,
+                    None,
+                ))
+            },
             |p| match &p.mutation {
                 PreparedSourceMutationKind::VectorPositions(p) => (&[], p.positions.as_slice()),
                 _ => unreachable!(),
-            })?;
+            },
+        )?;
         prepared.eager = Some(eager);
         Ok(prepared)
     }
-    fn prepare_remove_vector_positions_ordinary(&self, positions: &[usize]) -> Result<PreparedSourceMutation> {
+    fn prepare_remove_vector_positions_ordinary(
+        &self,
+        positions: &[usize],
+    ) -> Result<PreparedSourceMutation> {
         self.validate_slot_inventory()?;
-        let positions = prepare_exact_positions(positions, self.host.state.vector_slots.len(), self.funder)?;
+        let positions =
+            prepare_exact_positions(positions, self.host.state.vector_slots.len(), self.funder)?;
         let root = self.prepare_root_without_positions(&[], positions.as_slice())?;
         let undo = self.prepare_undo(positions.len())?;
         Ok(PreparedSourceMutation {
-            binding: self.binding()?, eager: None, sidecars: None,
-            mutation: PreparedSourceMutationKind::VectorPositions(PreparedVectorPositions { positions, root, undo }),
+            binding: self.binding()?,
+            eager: None,
+            sidecars: None,
+            mutation: PreparedSourceMutationKind::VectorPositions(PreparedVectorPositions {
+                positions,
+                root,
+                undo,
+            }),
         })
     }
     fn publish_vector_positions(&mut self, mut p: PreparedVectorPositions) {
@@ -8681,97 +9052,275 @@ impl EngineGuard<'_> {
         assert_eq!(length, state.vector_debits.len());
         validate_exact_positions(p.positions.as_slice(), length);
         self.publish_undo(p.undo.take());
-        for &position in p.positions.as_slice().iter().rev() { self.remove_ordinary_vector(position); }
+        for &position in p.positions.as_slice().iter().rev() {
+            self.remove_ordinary_vector(position);
+        }
         self.host.state.root = p.root;
     }
     /// Prepare all seven exact ranges against the same held source root.
     #[doc(hidden)]
-    pub fn prepare_remove_conditional_slice(&self, before: WriteSetCounts, after: WriteSetCounts) -> Result<PreparedTxMutation> {
-        if !self.eager_preparation() { return self.prepare_remove_conditional_slice_ordinary(before, after); }
+    pub fn prepare_remove_conditional_slice(
+        &self,
+        before: WriteSetCounts,
+        after: WriteSetCounts,
+    ) -> Result<PreparedTxMutation> {
+        if !self.eager_preparation() {
+            return self.prepare_remove_conditional_slice_ordinary(before, after);
+        }
         self.validate_slot_inventory()?;
         self.validate_aux_inventory()?;
         let ws = &self.host.state.ws;
         for (start, end, len) in [
-            (before.relational_inserts, after.relational_inserts, ws.relational_inserts.len()),
-            (before.relational_deletes, after.relational_deletes, ws.relational_deletes.len()),
+            (
+                before.relational_inserts,
+                after.relational_inserts,
+                ws.relational_inserts.len(),
+            ),
+            (
+                before.relational_deletes,
+                after.relational_deletes,
+                ws.relational_deletes.len(),
+            ),
             (before.adj_inserts, after.adj_inserts, ws.adj_inserts.len()),
             (before.adj_deletes, after.adj_deletes, ws.adj_deletes.len()),
-            (before.vector_inserts, after.vector_inserts, ws.vector_inserts.len()),
-            (before.vector_deletes, after.vector_deletes, ws.vector_deletes.len()),
-            (before.vector_moves, after.vector_moves, ws.vector_moves.len()),
-        ] { if start > end || end > len { return Err(source_identity_error()); } }
+            (
+                before.vector_inserts,
+                after.vector_inserts,
+                ws.vector_inserts.len(),
+            ),
+            (
+                before.vector_deletes,
+                after.vector_deletes,
+                ws.vector_deletes.len(),
+            ),
+            (
+                before.vector_moves,
+                after.vector_moves,
+                ws.vector_moves.len(),
+            ),
+        ] {
+            if start > end || end > len {
+                return Err(source_identity_error());
+            }
+        }
         let admission = ws.ordered_staged_rows.prepare_native_exact_admission(
-            self.host.state.row_slots.as_slice(), self.host.state.vector_slots.as_slice(),
+            self.host.state.row_slots.as_slice(),
+            self.host.state.vector_slots.as_slice(),
             crate::ordered_staged::NativeExactRowChange::RemoveRange {
-                start: before.relational_inserts, end: after.relational_inserts,
-            })?;
-        let (mut prepared, eager) = admission.prepare(self.funder,
-            || Ok((self.prepare_remove_conditional_slice_ordinary(before, after)?, None)),
+                start: before.relational_inserts,
+                end: after.relational_inserts,
+            },
+        )?;
+        let (mut prepared, eager) = admission.prepare(
+            self.funder,
+            || {
+                Ok((
+                    self.prepare_remove_conditional_slice_ordinary(before, after)?,
+                    None,
+                ))
+            },
             |p| match &p.kind {
                 TxMutationKind::ConditionalSlice(p) => (p.rows.as_slice(), p.vectors.as_slice()),
                 _ => unreachable!(),
-            })?;
-        let TxMutationKind::ConditionalSlice(slice) = &mut prepared.kind else { unreachable!() };
+            },
+        )?;
+        let TxMutationKind::ConditionalSlice(slice) = &mut prepared.kind else {
+            unreachable!()
+        };
         slice.eager = Some(eager);
         Ok(prepared)
     }
-    fn prepare_remove_conditional_slice_ordinary(&self, before: WriteSetCounts, after: WriteSetCounts) -> Result<PreparedTxMutation> {
+    fn prepare_remove_conditional_slice_ordinary(
+        &self,
+        before: WriteSetCounts,
+        after: WriteSetCounts,
+    ) -> Result<PreparedTxMutation> {
         self.validate_slot_inventory()?;
         self.validate_aux_inventory()?;
         let ws = &self.host.state.ws;
         let ranges = [
-            (before.relational_inserts, after.relational_inserts, ws.relational_inserts.len()),
-            (before.relational_deletes, after.relational_deletes, ws.relational_deletes.len()),
+            (
+                before.relational_inserts,
+                after.relational_inserts,
+                ws.relational_inserts.len(),
+            ),
+            (
+                before.relational_deletes,
+                after.relational_deletes,
+                ws.relational_deletes.len(),
+            ),
             (before.adj_inserts, after.adj_inserts, ws.adj_inserts.len()),
             (before.adj_deletes, after.adj_deletes, ws.adj_deletes.len()),
-            (before.vector_inserts, after.vector_inserts, ws.vector_inserts.len()),
-            (before.vector_deletes, after.vector_deletes, ws.vector_deletes.len()),
-            (before.vector_moves, after.vector_moves, ws.vector_moves.len()),
+            (
+                before.vector_inserts,
+                after.vector_inserts,
+                ws.vector_inserts.len(),
+            ),
+            (
+                before.vector_deletes,
+                after.vector_deletes,
+                ws.vector_deletes.len(),
+            ),
+            (
+                before.vector_moves,
+                after.vector_moves,
+                ws.vector_moves.len(),
+            ),
         ];
-        for (start, end, length) in ranges { if start > end || end > length { return Err(source_identity_error()); } }
-        let mut rows = SourceBuffer::with_capacity(after.relational_inserts - before.relational_inserts, self.funder)?;
-        for position in before.relational_inserts..after.relational_inserts { rows.push(position); }
-        let mut vectors = SourceBuffer::with_capacity(after.vector_inserts - before.vector_inserts, self.funder)?;
-        for position in before.vector_inserts..after.vector_inserts { vectors.push(position); }
+        for (start, end, length) in ranges {
+            if start > end || end > length {
+                return Err(source_identity_error());
+            }
+        }
+        let mut rows = SourceBuffer::with_capacity(
+            after.relational_inserts - before.relational_inserts,
+            self.funder,
+        )?;
+        for position in before.relational_inserts..after.relational_inserts {
+            rows.push(position);
+        }
+        let mut vectors =
+            SourceBuffer::with_capacity(after.vector_inserts - before.vector_inserts, self.funder)?;
+        for position in before.vector_inserts..after.vector_inserts {
+            vectors.push(position);
+        }
         let root = self.prepare_root_without_positions(rows.as_slice(), vectors.as_slice())?;
         let state = &self.host.state;
         let slice = PreparedConditionalSlice {
-            eager: None, root,
-            relational_deletes: prepare_empty_slice(&ws.relational_deletes, &state.relational_deletes_funding, before.relational_deletes, after.relational_deletes, self.funder)?,
-            adj_inserts: prepare_empty_slice(&ws.adj_inserts, &state.adj_inserts_funding, before.adj_inserts, after.adj_inserts, self.funder)?,
-            adj_deletes: prepare_empty_slice(&ws.adj_deletes, &state.adj_deletes_funding, before.adj_deletes, after.adj_deletes, self.funder)?,
-            vector_deletes: prepare_empty_slice(&ws.vector_deletes, &state.vector_deletes_funding, before.vector_deletes, after.vector_deletes, self.funder)?,
-            vector_moves: prepare_empty_slice(&ws.vector_moves, &state.vector_moves_funding, before.vector_moves, after.vector_moves, self.funder)?,
-            rows, vectors,
+            eager: None,
+            root,
+            relational_deletes: prepare_empty_slice(
+                &ws.relational_deletes,
+                &state.relational_deletes_funding,
+                before.relational_deletes,
+                after.relational_deletes,
+                self.funder,
+            )?,
+            adj_inserts: prepare_empty_slice(
+                &ws.adj_inserts,
+                &state.adj_inserts_funding,
+                before.adj_inserts,
+                after.adj_inserts,
+                self.funder,
+            )?,
+            adj_deletes: prepare_empty_slice(
+                &ws.adj_deletes,
+                &state.adj_deletes_funding,
+                before.adj_deletes,
+                after.adj_deletes,
+                self.funder,
+            )?,
+            vector_deletes: prepare_empty_slice(
+                &ws.vector_deletes,
+                &state.vector_deletes_funding,
+                before.vector_deletes,
+                after.vector_deletes,
+                self.funder,
+            )?,
+            vector_moves: prepare_empty_slice(
+                &ws.vector_moves,
+                &state.vector_moves_funding,
+                before.vector_moves,
+                after.vector_moves,
+                self.funder,
+            )?,
+            rows,
+            vectors,
         };
-        let records = slice.rows.len().checked_add(slice.vectors.len()).and_then(|n| n.checked_add(5)).ok_or_else(source_identity_error)?;
-        Ok(PreparedTxMutation { binding: self.binding()?, kind: TxMutationKind::ConditionalSlice(slice), undo: self.prepare_undo(records)? })
+        let records = slice
+            .rows
+            .len()
+            .checked_add(slice.vectors.len())
+            .and_then(|n| n.checked_add(5))
+            .ok_or_else(source_identity_error)?;
+        Ok(PreparedTxMutation {
+            binding: self.binding()?,
+            kind: TxMutationKind::ConditionalSlice(slice),
+            undo: self.prepare_undo(records)?,
+        })
     }
-    fn publish_conditional_slice(&mut self, mut p: PreparedConditionalSlice, undo: Option<PreparedSourceUndo>) {
-        let eager = p.eager.take().map(|p| self.host.state.ws.ordered_staged_rows
-            .validate_native_change(p).expect("validated exact native compound source"));
+    fn publish_conditional_slice(
+        &mut self,
+        mut p: PreparedConditionalSlice,
+        undo: Option<PreparedSourceUndo>,
+    ) {
+        let eager = p.eager.take().map(|p| {
+            self.host
+                .state
+                .ws
+                .ordered_staged_rows
+                .validate_native_change(p)
+                .expect("validated exact native compound source")
+        });
         let state = &self.host.state;
         assert_eq!(state.ws.relational_inserts.len(), state.row_slots.len());
         assert_eq!(state.ws.relational_inserts.len(), state.row_debits.len());
-        assert_eq!(state.ws.relational_inserts.len(), state.row_table_charges.len());
+        assert_eq!(
+            state.ws.relational_inserts.len(),
+            state.row_table_charges.len()
+        );
         assert_eq!(state.ws.vector_inserts.len(), state.vector_slots.len());
         assert_eq!(state.ws.vector_inserts.len(), state.vector_debits.len());
         validate_exact_positions(p.rows.as_slice(), state.row_slots.len());
         validate_exact_positions(p.vectors.as_slice(), state.vector_slots.len());
-        validate_empty_slice(&state.ws.relational_deletes, &state.relational_deletes_funding, &p.relational_deletes);
-        validate_empty_slice(&state.ws.adj_inserts, &state.adj_inserts_funding, &p.adj_inserts);
-        validate_empty_slice(&state.ws.adj_deletes, &state.adj_deletes_funding, &p.adj_deletes);
-        validate_empty_slice(&state.ws.vector_deletes, &state.vector_deletes_funding, &p.vector_deletes);
-        validate_empty_slice(&state.ws.vector_moves, &state.vector_moves_funding, &p.vector_moves);
+        validate_empty_slice(
+            &state.ws.relational_deletes,
+            &state.relational_deletes_funding,
+            &p.relational_deletes,
+        );
+        validate_empty_slice(
+            &state.ws.adj_inserts,
+            &state.adj_inserts_funding,
+            &p.adj_inserts,
+        );
+        validate_empty_slice(
+            &state.ws.adj_deletes,
+            &state.adj_deletes_funding,
+            &p.adj_deletes,
+        );
+        validate_empty_slice(
+            &state.ws.vector_deletes,
+            &state.vector_deletes_funding,
+            &p.vector_deletes,
+        );
+        validate_empty_slice(
+            &state.ws.vector_moves,
+            &state.vector_moves_funding,
+            &p.vector_moves,
+        );
         self.publish_undo(undo);
-        for &position in p.rows.as_slice().iter().rev() { self.remove_ordinary_row(position); }
-        for &position in p.vectors.as_slice().iter().rev() { self.remove_ordinary_vector(position); }
+        for &position in p.rows.as_slice().iter().rev() {
+            self.remove_ordinary_row(position);
+        }
+        for &position in p.vectors.as_slice().iter().rev() {
+            self.remove_ordinary_vector(position);
+        }
         let state = &mut self.host.state;
-        let deletes = publish_splice(&mut state.ws.relational_deletes, &mut state.relational_deletes_funding, p.relational_deletes);
-        let adj_inserts = publish_splice(&mut state.ws.adj_inserts, &mut state.adj_inserts_funding, p.adj_inserts);
-        let adj_deletes = publish_splice(&mut state.ws.adj_deletes, &mut state.adj_deletes_funding, p.adj_deletes);
-        let vector_deletes = publish_splice(&mut state.ws.vector_deletes, &mut state.vector_deletes_funding, p.vector_deletes);
-        let vector_moves = publish_splice(&mut state.ws.vector_moves, &mut state.vector_moves_funding, p.vector_moves);
+        let deletes = publish_splice(
+            &mut state.ws.relational_deletes,
+            &mut state.relational_deletes_funding,
+            p.relational_deletes,
+        );
+        let adj_inserts = publish_splice(
+            &mut state.ws.adj_inserts,
+            &mut state.adj_inserts_funding,
+            p.adj_inserts,
+        );
+        let adj_deletes = publish_splice(
+            &mut state.ws.adj_deletes,
+            &mut state.adj_deletes_funding,
+            p.adj_deletes,
+        );
+        let vector_deletes = publish_splice(
+            &mut state.ws.vector_deletes,
+            &mut state.vector_deletes_funding,
+            p.vector_deletes,
+        );
+        let vector_moves = publish_splice(
+            &mut state.ws.vector_moves,
+            &mut state.vector_moves_funding,
+            p.vector_moves,
+        );
         self.record_undo(SourceUndo::Aux(AuxInverse::RelationalDeletes(deletes)));
         self.record_undo(SourceUndo::Aux(AuxInverse::AdjInserts(adj_inserts)));
         self.record_undo(SourceUndo::Aux(AuxInverse::AdjDeletes(adj_deletes)));
@@ -8779,7 +9328,11 @@ impl EngineGuard<'_> {
         self.record_undo(SourceUndo::Aux(AuxInverse::VectorMoves(vector_moves)));
         self.host.state.root = p.root;
         if let Some(eager) = eager {
-            self.host.state.ws.ordered_staged_rows.publish_validated_native_change(eager);
+            self.host
+                .state
+                .ws
+                .ordered_staged_rows
+                .publish_validated_native_change(eager);
         }
     }
 }
@@ -8799,7 +9352,9 @@ fn validate_empty_slice<T>(values: &Vec<T>, funding: &AuxFunding, p: &PreparedSp
 
 impl EngineGuard<'_> {
     pub(crate) fn prepare_append_vector_slot(
-        &self, entry: VectorEntry, scalar: Option<(RowId, contextdb_core::ColName)>,
+        &self,
+        entry: VectorEntry,
+        scalar: Option<(RowId, contextdb_core::ColName)>,
         invoice: crate::staged_source::OriginalVectorInvoice,
     ) -> Result<PreparedSourceMutation> {
         self.prepare_vector_slot_inner(self.eager_preparation(), entry, scalar, invoice)
@@ -9012,38 +9567,83 @@ impl EngineGuard<'_> {
 
 impl EngineGuard<'_> {
     pub(crate) fn prepare_replace_row_slot_from_meta(
-        &self, position: usize, table: &str, row: VersionedRow, meta: &contextdb_core::TableMeta,
+        &self,
+        position: usize,
+        table: &str,
+        row: VersionedRow,
+        meta: &contextdb_core::TableMeta,
         invoice: crate::staged_source::OriginalRowInvoice,
     ) -> Result<PreparedSourceMutation> {
         let original = crate::staged_source::AdmittedSourceRow::new(row, invoice);
         if !self.eager_preparation() {
-            return self.prepare_replace_row_slot_from_meta_ordinary(position, table, original.row, meta, original.invoice);
+            return self.prepare_replace_row_slot_from_meta_ordinary(
+                position,
+                table,
+                original.row,
+                meta,
+                original.invoice,
+            );
         }
         self.validate_slot_inventory()?;
-        let old = self.host.state.row_slots.as_slice().get(position)
-            .ok_or_else(source_identity_error)?.clone();
-        if old.identity.table.as_str() != table
-            || !original.invoice.matches(self.funder) { return Err(source_identity_error()); }
-        let admission = self.host.state.ws.ordered_staged_rows.prepare_native_exact_admission(
-            self.host.state.row_slots.as_slice(), self.host.state.vector_slots.as_slice(),
-            crate::ordered_staged::NativeExactRowChange::Replace {
-                ordinal: position, row: original.row.row_id,
-            })?;
-        let (mut prepared, eager) = admission.prepare(self.funder, || {
-            let prepared = self.prepare_replace_row_slot_from_meta_ordinary(
-                position, table, original.row, meta, original.invoice)?;
-            let PreparedSourceMutationKind::ReplaceSlot(slot) = &prepared.mutation else { unreachable!() };
-            let body = crate::statement_rows::NativeEagerRow::prepare_exact_cell(&slot.cell, self.funder)?;
-            let replacement = crate::ordered_staged::NativeExactReplacement {
-                old, cell: slot.cell.clone(), body,
-            };
-            Ok((prepared, Some(replacement)))
-        }, |_| (&[], &[]))?;
+        let old = self
+            .host
+            .state
+            .row_slots
+            .as_slice()
+            .get(position)
+            .ok_or_else(source_identity_error)?
+            .clone();
+        if old.identity.table.as_str() != table || !original.invoice.matches(self.funder) {
+            return Err(source_identity_error());
+        }
+        let admission = self
+            .host
+            .state
+            .ws
+            .ordered_staged_rows
+            .prepare_native_exact_admission(
+                self.host.state.row_slots.as_slice(),
+                self.host.state.vector_slots.as_slice(),
+                crate::ordered_staged::NativeExactRowChange::Replace {
+                    ordinal: position,
+                    row: original.row.row_id,
+                },
+            )?;
+        let (mut prepared, eager) = admission.prepare(
+            self.funder,
+            || {
+                let prepared = self.prepare_replace_row_slot_from_meta_ordinary(
+                    position,
+                    table,
+                    original.row,
+                    meta,
+                    original.invoice,
+                )?;
+                let PreparedSourceMutationKind::ReplaceSlot(slot) = &prepared.mutation else {
+                    unreachable!()
+                };
+                let body = crate::statement_rows::NativeEagerRow::prepare_exact_cell(
+                    &slot.cell,
+                    self.funder,
+                )?;
+                let replacement = crate::ordered_staged::NativeExactReplacement {
+                    old,
+                    cell: slot.cell.clone(),
+                    body,
+                };
+                Ok((prepared, Some(replacement)))
+            },
+            |_| (&[], &[]),
+        )?;
         prepared.eager = Some(eager);
         Ok(prepared)
     }
     fn prepare_replace_row_slot_from_meta_ordinary(
-        &self, position: usize, table: &str, row: VersionedRow, meta: &contextdb_core::TableMeta,
+        &self,
+        position: usize,
+        table: &str,
+        row: VersionedRow,
+        meta: &contextdb_core::TableMeta,
         invoice: crate::staged_source::OriginalRowInvoice,
     ) -> Result<PreparedSourceMutation> {
         let original = crate::staged_source::AdmittedSourceRow::new(row, invoice);
@@ -9055,62 +9655,102 @@ impl EngineGuard<'_> {
             keys: Vec<(String, contextdb_core::IndexKey)>,
             _credit: crate::staged_source::SourceCharge,
         }
-        let mut bytes = meta.indexes.len().checked_mul(
-            std::mem::size_of::<(String, contextdb_core::IndexKey)>(),
-        ).ok_or_else(source_identity_error)?;
+        let mut bytes = meta
+            .indexes
+            .len()
+            .checked_mul(std::mem::size_of::<(String, contextdb_core::IndexKey)>())
+            .ok_or_else(source_identity_error)?;
         for index in &meta.indexes {
-            bytes = bytes.checked_add(index.name.len())
-                .and_then(|n| n.checked_add(index.columns.len().checked_mul(
-                    std::mem::size_of::<contextdb_core::DirectedValue>(),
-                )?)).ok_or_else(source_identity_error)?;
+            bytes = bytes
+                .checked_add(index.name.len())
+                .and_then(|n| {
+                    n.checked_add(
+                        index
+                            .columns
+                            .len()
+                            .checked_mul(std::mem::size_of::<contextdb_core::DirectedValue>())?,
+                    )
+                })
+                .ok_or_else(source_identity_error)?;
             for (column, _) in &index.columns {
-                let value_bytes = original.row.values.get(column)
+                let value_bytes = original
+                    .row
+                    .values
+                    .get(column)
                     .map_or(0, contextdb_core::Value::estimated_bytes);
-                bytes = bytes.checked_add(value_bytes.checked_mul(4)
-                    .and_then(|n| n.checked_add(128)).ok_or_else(source_identity_error)?)
+                bytes = bytes
+                    .checked_add(
+                        value_bytes
+                            .checked_mul(4)
+                            .and_then(|n| n.checked_add(128))
+                            .ok_or_else(source_identity_error)?,
+                    )
                     .ok_or_else(source_identity_error)?;
             }
         }
         let credit = crate::staged_source::SourceCharge::admit_funded(self.funder.clone(), bytes)?;
         let mut scratch = KeyScratch {
-            keys: Vec::with_capacity(meta.indexes.len()), _credit: credit,
+            keys: Vec::with_capacity(meta.indexes.len()),
+            _credit: credit,
         };
         for index in &meta.indexes {
             let mut key = Vec::with_capacity(index.columns.len());
             for (column, direction) in &index.columns {
-                let value = original.row.values.get(column).cloned()
+                let value = original
+                    .row
+                    .values
+                    .get(column)
+                    .cloned()
                     .unwrap_or(contextdb_core::Value::Null);
                 key.push(match direction {
-                    contextdb_core::SortDirection::Asc => contextdb_core::DirectedValue::Asc(
-                        contextdb_core::TotalOrdAsc(value)),
-                    contextdb_core::SortDirection::Desc => contextdb_core::DirectedValue::Desc(
-                        contextdb_core::TotalOrdDesc(value)),
+                    contextdb_core::SortDirection::Asc => {
+                        contextdb_core::DirectedValue::Asc(contextdb_core::TotalOrdAsc(value))
+                    }
+                    contextdb_core::SortDirection::Desc => {
+                        contextdb_core::DirectedValue::Desc(contextdb_core::TotalOrdDesc(value))
+                    }
                 });
             }
             scratch.keys.push((index.name.clone(), key));
         }
         let schema = self.prepare_schema(table, meta)?;
         self.prepare_replace_row_slot_inner(position, table, original, &scratch.keys, schema)
-    }    fn prepare_replace_row_slot_inner(
-        &self, position: usize, table: &str,
+    }
+    fn prepare_replace_row_slot_inner(
+        &self,
+        position: usize,
+        table: &str,
         original: crate::staged_source::AdmittedSourceRow,
         keys: &[(String, contextdb_core::IndexKey)],
         schema: crate::staged_source::SchemaHandle,
     ) -> Result<PreparedSourceMutation> {
-        let old = self.host.state.row_slots.as_slice().get(position)
+        let old = self
+            .host
+            .state
+            .row_slots
+            .as_slice()
+            .get(position)
             .ok_or_else(source_identity_error)?;
-        if old.identity.table.as_str() != table
-
-        { return Err(source_identity_error()); }
+        if old.identity.table.as_str() != table {
+            return Err(source_identity_error());
+        }
         let ordinary = self.funder.copy_row(&original.row)?;
         let mut bundle = SourceBuffer::with_capacity(keys.len(), self.funder)?;
         for (index, key) in keys {
             let name = schema.index_name(index).ok_or_else(source_identity_error)?;
-            let control = FundedArc::<crate::staged_source::PostingAtom>::prepare(self.funder.clone())?;
+            let control =
+                FundedArc::<crate::staged_source::PostingAtom>::prepare(self.funder.clone())?;
             let key = self.funder.copy_key(key)?;
-            bundle.push((name, FundedArc::from_prepared(crate::staged_source::PostingAtom {
-                position: (key.key, original.row.row_id), _payload: key.charge,
-            }, control)));
+            bundle.push((
+                name,
+                FundedArc::from_prepared(
+                    crate::staged_source::PostingAtom {
+                        position: (key.key, original.row.row_id),
+                        _payload: key.charge,
+                    },
+                    control,
+                ),
+            ));
         }
         let mut identity = old.identity.clone();
         identity.schema = schema;
@@ -9120,37 +9760,74 @@ impl EngineGuard<'_> {
         identity.lsn = original.row.lsn;
         identity.created_at = original.row.created_at;
         let cell = crate::staged_source::RowCell::sealed(identity, bundle, original, self.funder)?;
-        let prior = self.host.state.root.table(table).ok_or_else(source_identity_error)?;
+        let prior = self
+            .host
+            .state
+            .root
+            .table(table)
+            .ok_or_else(source_identity_error)?;
         let mut old_winner = None;
         let mut new_winner = None;
         for (ordinal, have) in self.host.state.row_slots.as_slice().iter().enumerate() {
             let have = if ordinal == position { &cell } else { have };
-            if have.identity.table.as_str() != table { continue; }
-            if have.identity.row == old.identity.row { old_winner = Some(have.clone()); }
-            if have.identity.row == cell.identity.row { new_winner = Some(have.clone()); }
+            if have.identity.table.as_str() != table {
+                continue;
+            }
+            if have.identity.row == old.identity.row {
+                old_winner = Some(have.clone());
+            }
+            if have.identity.row == cell.identity.row {
+                new_winner = Some(have.clone());
+            }
         }
         let mut next = None;
-        for (id, winner) in [(old.identity.row, old_winner), (cell.identity.row, new_winner)] {
-            let current_table = next.as_ref().map_or(&**prior, |table: &FundedArc<crate::staged_source::TableRoot>| &**table);
+        for (id, winner) in [
+            (old.identity.row, old_winner),
+            (cell.identity.row, new_winner),
+        ] {
+            let current_table = next.as_ref().map_or(
+                &**prior,
+                |table: &FundedArc<crate::staged_source::TableRoot>| &**table,
+            );
             let current = crate::staged_source::get_by(&current_table.by_id, |key| id.cmp(key));
-            if current.zip(winner.as_ref()).is_some_and(|(a, b)| a.ptr_eq(b))
-                || current.is_none() && winner.is_none() { continue; }
+            if current
+                .zip(winner.as_ref())
+                .is_some_and(|(a, b)| a.ptr_eq(b))
+                || current.is_none() && winner.is_none()
+            {
+                continue;
+            }
             next = Some(match winner {
                 Some(winner) => current_table.prepare_restore_slot(winner, self.funder)?,
                 None => current_table.prepare_remove(id, self.funder)?,
             });
         }
         let root = match next {
-            Some(next) => self.host.state.root.prepare_table(old.identity.table.clone(), next, self.funder)?,
+            Some(next) => {
+                self.host
+                    .state
+                    .root
+                    .prepare_table(old.identity.table.clone(), next, self.funder)?
+            }
             None => self.host.state.root.clone(),
         };
-        let table_charge = crate::staged_source::SourceCharge::admit_funded(self.funder.clone(), table.len())?;
+        let table_charge =
+            crate::staged_source::SourceCharge::admit_funded(self.funder.clone(), table.len())?;
         let table_owned = table.to_owned();
-        if table_owned.capacity() != table.len() { return Err(source_identity_error()); }
+        if table_owned.capacity() != table.len() {
+            return Err(source_identity_error());
+        }
         Ok(PreparedSourceMutation {
-            binding: self.binding()?, eager: None, sidecars: None,
+            binding: self.binding()?,
+            eager: None,
+            sidecars: None,
             mutation: PreparedSourceMutationKind::ReplaceSlot(PreparedSlotReplacement {
-                position, row: ordinary, table: table_owned, table_charge, cell, root,
+                position,
+                row: ordinary,
+                table: table_owned,
+                table_charge,
+                cell,
+                root,
                 undo: self.prepare_undo(2)?,
             }),
         })
@@ -9162,24 +9839,41 @@ impl EngineGuard<'_> {
     /// place of an earlier original slot with the same table and row identity.
     #[doc(hidden)]
     pub fn copy_existing_row_at(
-        &self, position: usize,
+        &self,
+        position: usize,
     ) -> Result<crate::staged_source::AdmittedSourceRow> {
         let binding = self.binding()?;
         self.validate_binding(&binding);
         self.validate_slot_inventory()?;
-        let cell = self.host.state.row_slots.as_slice().get(position)
+        let cell = self
+            .host
+            .state
+            .row_slots
+            .as_slice()
+            .get(position)
             .ok_or_else(source_identity_error)?;
-        self.host.state.ws.ordered_staged_rows.copy_exact_original_row_for(cell, self.funder)
+        self.host
+            .state
+            .ws
+            .ordered_staged_rows
+            .copy_exact_original_row_for(cell, self.funder)
     }
 
     /// Keep the original row and its invoice paired through exact preparation.
     #[doc(hidden)]
     pub fn prepare_replace_admitted_row_at_from_meta(
-        &self, position: usize, table: &str,
+        &self,
+        position: usize,
+        table: &str,
         original: crate::staged_source::AdmittedSourceRow,
         meta: &contextdb_core::TableMeta,
     ) -> Result<PreparedSourceMutation> {
-        let cell = self.host.state.row_slots.as_slice().get(position)
+        let cell = self
+            .host
+            .state
+            .row_slots
+            .as_slice()
+            .get(position)
             .ok_or_else(source_identity_error)?;
         if cell.identity.table.as_str() != table
             || !cell.identity.matches_row(&original.row)
@@ -9194,7 +9888,9 @@ impl EngineGuard<'_> {
     // Reuse the exact replacement kernels while keeping the selected schema.
     // The legacy meta entry points retain their existing schema-selection body.
     fn prepare_replace_row_at_with_selected_schema(
-        &self, position: usize, table: &str,
+        &self,
+        position: usize,
+        table: &str,
         original: crate::staged_source::AdmittedSourceRow,
         meta: &contextdb_core::TableMeta,
         schema: crate::staged_source::SchemaHandle,
@@ -9209,42 +9905,73 @@ impl EngineGuard<'_> {
                 keys: Vec<(String, contextdb_core::IndexKey)>,
                 _credit: crate::staged_source::SourceCharge,
             }
-            let mut bytes = meta.indexes.len().checked_mul(
-                std::mem::size_of::<(String, contextdb_core::IndexKey)>(),
-            ).ok_or_else(source_identity_error)?;
+            let mut bytes = meta
+                .indexes
+                .len()
+                .checked_mul(std::mem::size_of::<(String, contextdb_core::IndexKey)>())
+                .ok_or_else(source_identity_error)?;
             for index in &meta.indexes {
-                bytes = bytes.checked_add(index.name.len())
-                    .and_then(|n| n.checked_add(index.columns.len().checked_mul(
-                        std::mem::size_of::<contextdb_core::DirectedValue>(),
-                    )?)).ok_or_else(source_identity_error)?;
+                bytes = bytes
+                    .checked_add(index.name.len())
+                    .and_then(|n| {
+                        n.checked_add(
+                            index
+                                .columns
+                                .len()
+                                .checked_mul(std::mem::size_of::<contextdb_core::DirectedValue>())?,
+                        )
+                    })
+                    .ok_or_else(source_identity_error)?;
                 for (column, _) in &index.columns {
-                    let value_bytes = original.row.values.get(column)
+                    let value_bytes = original
+                        .row
+                        .values
+                        .get(column)
                         .map_or(0, contextdb_core::Value::estimated_bytes);
-                    bytes = bytes.checked_add(value_bytes.checked_mul(4)
-                        .and_then(|n| n.checked_add(128)).ok_or_else(source_identity_error)?)
+                    bytes = bytes
+                        .checked_add(
+                            value_bytes
+                                .checked_mul(4)
+                                .and_then(|n| n.checked_add(128))
+                                .ok_or_else(source_identity_error)?,
+                        )
                         .ok_or_else(source_identity_error)?;
                 }
             }
-            let credit = crate::staged_source::SourceCharge::admit_funded(self.funder.clone(), bytes)?;
+            let credit =
+                crate::staged_source::SourceCharge::admit_funded(self.funder.clone(), bytes)?;
             let mut scratch = KeyScratch {
-                keys: Vec::with_capacity(meta.indexes.len()), _credit: credit,
+                keys: Vec::with_capacity(meta.indexes.len()),
+                _credit: credit,
             };
             for index in &meta.indexes {
                 let mut key = Vec::with_capacity(index.columns.len());
                 for (column, direction) in &index.columns {
-                    let value = original.row.values.get(column).cloned()
+                    let value = original
+                        .row
+                        .values
+                        .get(column)
+                        .cloned()
                         .unwrap_or(contextdb_core::Value::Null);
                     key.push(match direction {
-                        contextdb_core::SortDirection::Asc => contextdb_core::DirectedValue::Asc(
-                            contextdb_core::TotalOrdAsc(value)),
-                        contextdb_core::SortDirection::Desc => contextdb_core::DirectedValue::Desc(
-                            contextdb_core::TotalOrdDesc(value)),
+                        contextdb_core::SortDirection::Asc => {
+                            contextdb_core::DirectedValue::Asc(contextdb_core::TotalOrdAsc(value))
+                        }
+                        contextdb_core::SortDirection::Desc => {
+                            contextdb_core::DirectedValue::Desc(contextdb_core::TotalOrdDesc(value))
+                        }
                     });
                 }
                 scratch.keys.push((index.name.clone(), key));
             }
             if self.eager_preparation() {
-                self.prepare_replace_row_slot_inner(position, table, original, &scratch.keys, schema)
+                self.prepare_replace_row_slot_inner(
+                    position,
+                    table,
+                    original,
+                    &scratch.keys,
+                    schema,
+                )
             } else {
                 self.prepare_replace_row_at_inner(position, table, original, &scratch.keys, schema)
             }
@@ -9252,22 +9979,47 @@ impl EngineGuard<'_> {
         if !self.eager_preparation() {
             return prepare();
         }
-        let old = self.host.state.row_slots.as_slice().get(position)
-            .ok_or_else(source_identity_error)?.clone();
-        let admission = self.host.state.ws.ordered_staged_rows.prepare_native_exact_admission(
-            self.host.state.row_slots.as_slice(), self.host.state.vector_slots.as_slice(),
-            crate::ordered_staged::NativeExactRowChange::Replace {
-                ordinal: position, row: row_id,
-            })?;
-        let (mut prepared, eager) = admission.prepare(self.funder, || {
-            let prepared = prepare()?;
-            let PreparedSourceMutationKind::ReplaceSlot(slot) = &prepared.mutation else { unreachable!() };
-            let body = crate::statement_rows::NativeEagerRow::prepare_exact_cell(&slot.cell, self.funder)?;
-            let replacement = crate::ordered_staged::NativeExactReplacement {
-                old, cell: slot.cell.clone(), body,
-            };
-            Ok((prepared, Some(replacement)))
-        }, |_| (&[], &[]))?;
+        let old = self
+            .host
+            .state
+            .row_slots
+            .as_slice()
+            .get(position)
+            .ok_or_else(source_identity_error)?
+            .clone();
+        let admission = self
+            .host
+            .state
+            .ws
+            .ordered_staged_rows
+            .prepare_native_exact_admission(
+                self.host.state.row_slots.as_slice(),
+                self.host.state.vector_slots.as_slice(),
+                crate::ordered_staged::NativeExactRowChange::Replace {
+                    ordinal: position,
+                    row: row_id,
+                },
+            )?;
+        let (mut prepared, eager) = admission.prepare(
+            self.funder,
+            || {
+                let prepared = prepare()?;
+                let PreparedSourceMutationKind::ReplaceSlot(slot) = &prepared.mutation else {
+                    unreachable!()
+                };
+                let body = crate::statement_rows::NativeEagerRow::prepare_exact_cell(
+                    &slot.cell,
+                    self.funder,
+                )?;
+                let replacement = crate::ordered_staged::NativeExactReplacement {
+                    old,
+                    cell: slot.cell.clone(),
+                    body,
+                };
+                Ok((prepared, Some(replacement)))
+            },
+            |_| (&[], &[]),
+        )?;
         prepared.eager = Some(eager);
         Ok(prepared)
     }
@@ -9277,42 +10029,72 @@ impl EngineGuard<'_> {
     /// Dispatch through the selected original archive, not its canonical winner.
     #[doc(hidden)]
     pub fn copy_existing_vector_at(
-        &self, position: usize,
+        &self,
+        position: usize,
     ) -> Result<crate::staged_source::AdmittedEagerSourceVector> {
         let binding = self.binding()?;
         self.validate_binding(&binding);
         self.validate_slot_inventory()?;
-        let cell = self.host.state.vector_slots.as_slice().get(position)
+        let cell = self
+            .host
+            .state
+            .vector_slots
+            .as_slice()
+            .get(position)
             .ok_or_else(source_identity_error)?;
-        let entry = self.host.state.ws.vector_inserts.get(position)
+        let entry = self
+            .host
+            .state
+            .ws
+            .vector_inserts
+            .get(position)
             .ok_or_else(source_identity_error)?;
-        self.host.state.ws.ordered_staged_rows.copy_exact_original_vector_for(cell, entry, self.funder)
+        self.host
+            .state
+            .ws
+            .ordered_staged_rows
+            .copy_exact_original_vector_for(cell, entry, self.funder)
     }
-
 }
 
 impl EngineGuard<'_> {
     /// Return only the body/invoice pair admitted by the selected row's O.
     #[doc(hidden)]
     pub fn copy_vector_from_original_row_at(
-        &self, position: usize, column: &str, values: &[f32],
+        &self,
+        position: usize,
+        column: &str,
+        values: &[f32],
         meta: &contextdb_core::TableMeta,
     ) -> Result<crate::staged_source::AdmittedEagerSourceVector> {
         let binding = self.binding()?;
         self.validate_binding(&binding);
         self.validate_slot_inventory()?;
-        let cell = self.host.state.row_slots.as_slice().get(position)
+        let cell = self
+            .host
+            .state
+            .row_slots
+            .as_slice()
+            .get(position)
             .ok_or_else(source_identity_error)?;
-        if !cell.identity.schema.matches_all_meta(meta) { return Err(source_identity_error()); }
-        self.host.state.ws.ordered_staged_rows
+        if !cell.identity.schema.matches_all_meta(meta) {
+            return Err(source_identity_error());
+        }
+        self.host
+            .state
+            .ws
+            .ordered_staged_rows
             .copy_exact_original_vector_input_for_row(cell, column, values, self.funder)
     }
 
     /// Scalar retargeting cannot allocate a new payload or lose its O invoice.
     #[doc(hidden)]
     pub fn prepare_append_retargeted_original_vector(
-        &self, mut original: crate::staged_source::AdmittedEagerSourceVector,
-        row: RowId, tx: TxId, lsn: contextdb_core::Lsn,
+        &self,
+        mut original: crate::staged_source::AdmittedEagerSourceVector,
+        row: RowId,
+        tx: TxId,
+        lsn: contextdb_core::Lsn,
     ) -> Result<PreparedSourceMutation> {
         original.entry.row_id = row;
         original.entry.created_tx = tx;
@@ -9324,12 +10106,14 @@ impl EngineGuard<'_> {
 
 impl EngineGuard<'_> {
     fn prepare_vector_slot_with_selected_original(
-        &self, eager_original: crate::staged_source::AdmittedEagerSourceVector,
+        &self,
+        eager_original: crate::staged_source::AdmittedEagerSourceVector,
     ) -> Result<PreparedSourceMutation> {
         eager_original.validate_original_pairing(self.funder)?;
         let eager_enabled = self.eager_preparation();
         let scalar: Option<(RowId, contextdb_core::ColName)> = None;
-        let original = eager_original.original_copy
+        let original = eager_original
+            .original_copy
             .copy_original_vector_for(&eager_original.entry, self.funder)?;
         if !original.invoice.matches(self.funder) {
             return Err(source_identity_error());
@@ -9457,7 +10241,10 @@ impl EngineGuard<'_> {
                     .ws
                     .ordered_staged_rows
                     .prepare_native_admitted_original_vector(
-                        &ordinary_vector.entry, eager_original, self.funder)?
+                        &ordinary_vector.entry,
+                        eager_original,
+                        self.funder,
+                    )?
                     .prepare_retain_vector_slot(cell.clone(), self.funder)?,
             )
         } else {
@@ -9485,44 +10272,73 @@ impl EngineGuard<'_> {
     }
 }
 
-
 impl EngineGuard<'_> {
     /// The engine borrows a C-admitted replacement; the selected archive O
     /// copies both retained bodies. Expected identity remains the old slot.
     #[doc(hidden)]
     pub fn prepare_changed_row_at_from_meta(
-        &self, position: usize, table: &str,
-        expected: &VersionedRow, replacement: &VersionedRow,
+        &self,
+        position: usize,
+        table: &str,
+        expected: &VersionedRow,
+        replacement: &VersionedRow,
         meta: &contextdb_core::TableMeta,
     ) -> Result<PreparedSourceMutation> {
         if replacement.created_tx != expected.created_tx
-            || replacement.deleted_tx != expected.deleted_tx || replacement.lsn != expected.lsn
+            || replacement.deleted_tx != expected.deleted_tx
+            || replacement.lsn != expected.lsn
             || replacement.created_at != expected.created_at
-        { return Err(source_identity_error()); }
+        {
+            return Err(source_identity_error());
+        }
         let binding = self.binding()?;
         self.validate_binding(&binding);
         self.validate_slot_inventory()?;
-        let cell = self.host.state.row_slots.as_slice().get(position)
+        let cell = self
+            .host
+            .state
+            .row_slots
+            .as_slice()
+            .get(position)
             .ok_or_else(source_identity_error)?;
-        let (current_table, current) = self.host.state.ws.relational_inserts.get(position)
+        let (current_table, current) = self
+            .host
+            .state
+            .ws
+            .relational_inserts
+            .get(position)
             .ok_or_else(source_identity_error)?;
-        if current_table != table || cell.identity.table.as_str() != table
-            || !cell.identity.matches_row(expected) || !crate::staged_source::changed_original_rows_identical(current, expected)
+        if current_table != table
+            || cell.identity.table.as_str() != table
+            || !cell.identity.matches_row(expected)
+            || !crate::staged_source::changed_original_rows_identical(current, expected)
             || !cell.identity.schema.matches_all_meta(meta)
-        { return Err(source_identity_error()); }
+        {
+            return Err(source_identity_error());
+        }
         let schema = cell.identity.schema.clone();
-        let (original, eager_original) = self.host.state.ws.ordered_staged_rows
+        let (original, eager_original) = self
+            .host
+            .state
+            .ws
+            .ordered_staged_rows
             .copy_changed_exact_original_rows_for(cell, expected, replacement, self.funder)?;
         self.prepare_changed_row_with_selected_schema(
-            position, table, original, eager_original, meta, schema,
+            position,
+            table,
+            original,
+            eager_original,
+            meta,
+            schema,
         )
     }
 }
 
-
 impl EngineGuard<'_> {
-fn prepare_changed_row_with_selected_schema(
-        &self, position: usize, table: &str,
+    fn prepare_changed_row_with_selected_schema(
+        &self,
+        position: usize,
+        table: &str,
         original: crate::staged_source::AdmittedSourceRow,
         eager_original: crate::staged_source::AdmittedEagerSourceRow,
         meta: &contextdb_core::TableMeta,
@@ -9533,66 +10349,121 @@ fn prepare_changed_row_with_selected_schema(
             return Err(source_identity_error());
         }
         eager_original.validate_exact_funder(self.funder)?;
-        if !crate::staged_source::changed_original_rows_identical(&eager_original.row, &original.row) { return Err(source_identity_error()); }
+        if !crate::staged_source::changed_original_rows_identical(
+            &eager_original.row,
+            &original.row,
+        ) {
+            return Err(source_identity_error());
+        }
         let row_id = original.row.row_id;
         let prepare = || {
             struct KeyScratch {
                 keys: Vec<(String, contextdb_core::IndexKey)>,
                 _credit: crate::staged_source::SourceCharge,
             }
-            let mut bytes = meta.indexes.len().checked_mul(
-                std::mem::size_of::<(String, contextdb_core::IndexKey)>(),
-            ).ok_or_else(source_identity_error)?;
+            let mut bytes = meta
+                .indexes
+                .len()
+                .checked_mul(std::mem::size_of::<(String, contextdb_core::IndexKey)>())
+                .ok_or_else(source_identity_error)?;
             for index in &meta.indexes {
-                bytes = bytes.checked_add(index.name.len())
-                    .and_then(|n| n.checked_add(index.columns.len().checked_mul(
-                        std::mem::size_of::<contextdb_core::DirectedValue>(),
-                    )?)).ok_or_else(source_identity_error)?;
+                bytes = bytes
+                    .checked_add(index.name.len())
+                    .and_then(|n| {
+                        n.checked_add(
+                            index
+                                .columns
+                                .len()
+                                .checked_mul(std::mem::size_of::<contextdb_core::DirectedValue>())?,
+                        )
+                    })
+                    .ok_or_else(source_identity_error)?;
                 for (column, _) in &index.columns {
-                    let value_bytes = original.row.values.get(column)
+                    let value_bytes = original
+                        .row
+                        .values
+                        .get(column)
                         .map_or(0, contextdb_core::Value::estimated_bytes);
-                    bytes = bytes.checked_add(value_bytes.checked_mul(4)
-                        .and_then(|n| n.checked_add(128)).ok_or_else(source_identity_error)?)
+                    bytes = bytes
+                        .checked_add(
+                            value_bytes
+                                .checked_mul(4)
+                                .and_then(|n| n.checked_add(128))
+                                .ok_or_else(source_identity_error)?,
+                        )
                         .ok_or_else(source_identity_error)?;
                 }
             }
-            let credit = crate::staged_source::SourceCharge::admit_funded(self.funder.clone(), bytes)?;
+            let credit =
+                crate::staged_source::SourceCharge::admit_funded(self.funder.clone(), bytes)?;
             let mut scratch = KeyScratch {
-                keys: Vec::with_capacity(meta.indexes.len()), _credit: credit,
+                keys: Vec::with_capacity(meta.indexes.len()),
+                _credit: credit,
             };
             for index in &meta.indexes {
                 let mut key = Vec::with_capacity(index.columns.len());
                 for (column, direction) in &index.columns {
-                    let value = original.row.values.get(column).cloned()
+                    let value = original
+                        .row
+                        .values
+                        .get(column)
+                        .cloned()
                         .unwrap_or(contextdb_core::Value::Null);
                     key.push(match direction {
-                        contextdb_core::SortDirection::Asc => contextdb_core::DirectedValue::Asc(
-                            contextdb_core::TotalOrdAsc(value)),
-                        contextdb_core::SortDirection::Desc => contextdb_core::DirectedValue::Desc(
-                            contextdb_core::TotalOrdDesc(value)),
+                        contextdb_core::SortDirection::Asc => {
+                            contextdb_core::DirectedValue::Asc(contextdb_core::TotalOrdAsc(value))
+                        }
+                        contextdb_core::SortDirection::Desc => {
+                            contextdb_core::DirectedValue::Desc(contextdb_core::TotalOrdDesc(value))
+                        }
                     });
                 }
                 scratch.keys.push((index.name.clone(), key));
             }
             self.prepare_replace_row_slot_inner(position, table, original, &scratch.keys, schema)
         };
-        let old = self.host.state.row_slots.as_slice().get(position)
-            .ok_or_else(source_identity_error)?.clone();
-        let admission = self.host.state.ws.ordered_staged_rows.prepare_native_exact_admission(
-            self.host.state.row_slots.as_slice(), self.host.state.vector_slots.as_slice(),
-            crate::ordered_staged::NativeExactRowChange::Replace {
-                ordinal: position, row: row_id,
-            })?;
-        let (mut prepared, eager) = admission.prepare(self.funder, || {
-            let prepared = prepare()?;
-            let PreparedSourceMutationKind::ReplaceSlot(slot) = &prepared.mutation else { unreachable!() };
-            let body = crate::statement_rows::NativeEagerRow::prepare_changed_exact_cell(
-                &slot.cell, eager_original, self.funder)?;
-            let replacement = crate::ordered_staged::NativeExactReplacement {
-                old, cell: slot.cell.clone(), body,
-            };
-            Ok((prepared, Some(replacement)))
-        }, |_| (&[], &[]))?;
+        let old = self
+            .host
+            .state
+            .row_slots
+            .as_slice()
+            .get(position)
+            .ok_or_else(source_identity_error)?
+            .clone();
+        let admission = self
+            .host
+            .state
+            .ws
+            .ordered_staged_rows
+            .prepare_native_exact_admission(
+                self.host.state.row_slots.as_slice(),
+                self.host.state.vector_slots.as_slice(),
+                crate::ordered_staged::NativeExactRowChange::Replace {
+                    ordinal: position,
+                    row: row_id,
+                },
+            )?;
+        let (mut prepared, eager) = admission.prepare(
+            self.funder,
+            || {
+                let prepared = prepare()?;
+                let PreparedSourceMutationKind::ReplaceSlot(slot) = &prepared.mutation else {
+                    unreachable!()
+                };
+                let body = crate::statement_rows::NativeEagerRow::prepare_changed_exact_cell(
+                    &slot.cell,
+                    eager_original,
+                    self.funder,
+                )?;
+                let replacement = crate::ordered_staged::NativeExactReplacement {
+                    old,
+                    cell: slot.cell.clone(),
+                    body,
+                };
+                Ok((prepared, Some(replacement)))
+            },
+            |_| (&[], &[]),
+        )?;
         prepared.eager = Some(eager);
         Ok(prepared)
     }
@@ -9600,20 +10471,33 @@ fn prepare_changed_row_with_selected_schema(
 
 impl EngineGuard<'_> {
     #[doc(hidden)]
-pub fn prepare_new_commit_row_from_meta(
-        &self, table: &str, replacement: &VersionedRow, meta: &contextdb_core::TableMeta,
+    pub fn prepare_new_commit_row_from_meta(
+        &self,
+        table: &str,
+        replacement: &VersionedRow,
+        meta: &contextdb_core::TableMeta,
     ) -> Result<PreparedSourceMutation> {
         if (replacement.created_tx != self.host.tx
             && self.host.state.ws.finalized_tx != Some(replacement.created_tx))
             || replacement.deleted_tx.is_some()
-            || replacement.lsn != self.host.state.ws.commit_lsn.unwrap_or(contextdb_core::Lsn(0))
+            || replacement.lsn
+                != self
+                    .host
+                    .state
+                    .ws
+                    .commit_lsn
+                    .unwrap_or(contextdb_core::Lsn(0))
             || replacement.created_at.is_none()
-        { return Err(source_identity_error()); }
+        {
+            return Err(source_identity_error());
+        }
         let binding = self.binding()?;
         self.validate_binding(&binding);
         self.validate_slot_inventory()?;
         let eager = self.funder.copy_eager_row(replacement)?;
-        let original = eager.original_copy.copy_original_row_for(replacement, self.funder)?;
+        let original = eager
+            .original_copy
+            .copy_original_row_for(replacement, self.funder)?;
         if !original.invoice.matches(self.funder) {
             return Err(source_identity_error());
         }
@@ -9621,78 +10505,158 @@ pub fn prepare_new_commit_row_from_meta(
             keys: Vec<(String, contextdb_core::IndexKey)>,
             _credit: crate::staged_source::SourceCharge,
         }
-        let mut bytes = meta.indexes.len().checked_mul(
-            std::mem::size_of::<(String, contextdb_core::IndexKey)>(),
-        ).ok_or_else(source_identity_error)?;
+        let mut bytes = meta
+            .indexes
+            .len()
+            .checked_mul(std::mem::size_of::<(String, contextdb_core::IndexKey)>())
+            .ok_or_else(source_identity_error)?;
         for index in &meta.indexes {
-            bytes = bytes.checked_add(index.name.len())
-                .and_then(|n| n.checked_add(index.columns.len().checked_mul(
-                    std::mem::size_of::<contextdb_core::DirectedValue>(),
-                )?)).ok_or_else(source_identity_error)?;
+            bytes = bytes
+                .checked_add(index.name.len())
+                .and_then(|n| {
+                    n.checked_add(
+                        index
+                            .columns
+                            .len()
+                            .checked_mul(std::mem::size_of::<contextdb_core::DirectedValue>())?,
+                    )
+                })
+                .ok_or_else(source_identity_error)?;
             for (column, _) in &index.columns {
-                let value_bytes = original.row.values.get(column)
+                let value_bytes = original
+                    .row
+                    .values
+                    .get(column)
                     .map_or(0, contextdb_core::Value::estimated_bytes);
-                bytes = bytes.checked_add(value_bytes.checked_mul(4)
-                    .and_then(|n| n.checked_add(128)).ok_or_else(source_identity_error)?)
+                bytes = bytes
+                    .checked_add(
+                        value_bytes
+                            .checked_mul(4)
+                            .and_then(|n| n.checked_add(128))
+                            .ok_or_else(source_identity_error)?,
+                    )
                     .ok_or_else(source_identity_error)?;
             }
         }
         let credit = crate::staged_source::SourceCharge::admit_funded(self.funder.clone(), bytes)?;
         let mut scratch = KeyScratch {
-            keys: Vec::with_capacity(meta.indexes.len()), _credit: credit,
+            keys: Vec::with_capacity(meta.indexes.len()),
+            _credit: credit,
         };
         for index in &meta.indexes {
             let mut key = Vec::with_capacity(index.columns.len());
             for (column, direction) in &index.columns {
-                let value = original.row.values.get(column).cloned()
+                let value = original
+                    .row
+                    .values
+                    .get(column)
+                    .cloned()
                     .unwrap_or(contextdb_core::Value::Null);
                 key.push(match direction {
-                    contextdb_core::SortDirection::Asc => contextdb_core::DirectedValue::Asc(
-                        contextdb_core::TotalOrdAsc(value)),
-                    contextdb_core::SortDirection::Desc => contextdb_core::DirectedValue::Desc(
-                        contextdb_core::TotalOrdDesc(value)),
+                    contextdb_core::SortDirection::Asc => {
+                        contextdb_core::DirectedValue::Asc(contextdb_core::TotalOrdAsc(value))
+                    }
+                    contextdb_core::SortDirection::Desc => {
+                        contextdb_core::DirectedValue::Desc(contextdb_core::TotalOrdDesc(value))
+                    }
                 });
             }
             scratch.keys.push((index.name.clone(), key));
         }
         let schema = self.prepare_schema(table, meta)?;
         let eager_schema = schema.clone();
-        let mut prepared = self.prepare_row_inner(false, table, original.row, &scratch.keys, schema, original.invoice)?;
-        let PreparedSourceMutationKind::Row(body) = &prepared.mutation else { unreachable!() };
+        let mut prepared = self.prepare_row_inner(
+            false,
+            table,
+            original.row,
+            &scratch.keys,
+            schema,
+            original.invoice,
+        )?;
+        let PreparedSourceMutationKind::Row(body) = &prepared.mutation else {
+            unreachable!()
+        };
         let position = crate::ordered_staged::StagedPosition {
-            row_id: body.row.row.row_id, created_tx: body.row.row.created_tx,
+            row_id: body.row.row.row_id,
+            created_tx: body.row.row.created_tx,
             position: self.host.state.ws.relational_inserts.len(),
         };
-        prepared.eager = Some(self.host.state.ws.ordered_staged_rows.prepare_native_admitted_original_row(
-            table, position, &body.row.row, eager, &scratch.keys, eager_schema, self.funder,
-        )?.prepare_retain_row(body.cell.clone(), self.funder)?);
+        prepared.eager = Some(
+            self.host
+                .state
+                .ws
+                .ordered_staged_rows
+                .prepare_native_admitted_original_row(
+                    table,
+                    position,
+                    &body.row.row,
+                    eager,
+                    &scratch.keys,
+                    eager_schema,
+                    self.funder,
+                )?
+                .prepare_retain_row(body.cell.clone(), self.funder)?,
+        );
         Ok(prepared)
     }
 }
 
 impl EngineGuard<'_> {
     #[doc(hidden)]
-pub fn prepare_append_changed_row_at_from_meta(
-        &self, position: usize, table: &str, expected: &VersionedRow, replacement: &VersionedRow, meta: &contextdb_core::TableMeta,
+    pub fn prepare_append_changed_row_at_from_meta(
+        &self,
+        position: usize,
+        table: &str,
+        expected: &VersionedRow,
+        replacement: &VersionedRow,
+        meta: &contextdb_core::TableMeta,
     ) -> Result<PreparedSourceMutation> {
         if (replacement.created_tx != self.host.tx
             && self.host.state.ws.finalized_tx != Some(replacement.created_tx))
             || replacement.deleted_tx.is_some()
-            || replacement.lsn != self.host.state.ws.commit_lsn.unwrap_or(contextdb_core::Lsn(0))
+            || replacement.lsn
+                != self
+                    .host
+                    .state
+                    .ws
+                    .commit_lsn
+                    .unwrap_or(contextdb_core::Lsn(0))
             || replacement.created_at.is_none()
             || replacement.row_id != expected.row_id
-        { return Err(source_identity_error()); }
+        {
+            return Err(source_identity_error());
+        }
         let binding = self.binding()?;
         self.validate_binding(&binding);
         self.validate_slot_inventory()?;
-        let cell = self.host.state.row_slots.as_slice().get(position).ok_or_else(source_identity_error)?;
-        let (current_table, current) = self.host.state.ws.relational_inserts.get(position).ok_or_else(source_identity_error)?;
-        if current_table != table || !crate::staged_source::changed_original_rows_identical(current, expected) || !cell.identity.matches_row(expected)
-            || !cell.identity.schema.matches_all_meta(meta) { return Err(source_identity_error()); }
+        let cell = self
+            .host
+            .state
+            .row_slots
+            .as_slice()
+            .get(position)
+            .ok_or_else(source_identity_error)?;
+        let (current_table, current) = self
+            .host
+            .state
+            .ws
+            .relational_inserts
+            .get(position)
+            .ok_or_else(source_identity_error)?;
+        if current_table != table
+            || !crate::staged_source::changed_original_rows_identical(current, expected)
+            || !cell.identity.matches_row(expected)
+            || !cell.identity.schema.matches_all_meta(meta)
+        {
+            return Err(source_identity_error());
+        }
         let selected_schema = cell.identity.schema.clone();
-        let (original, eager) = self.host.state.ws.ordered_staged_rows.copy_changed_exact_original_rows_for(
-            cell, expected, replacement, self.funder,
-        )?;
+        let (original, eager) = self
+            .host
+            .state
+            .ws
+            .ordered_staged_rows
+            .copy_changed_exact_original_rows_for(cell, expected, replacement, self.funder)?;
         if !original.invoice.matches(self.funder) {
             return Err(source_identity_error());
         }
@@ -9700,51 +10664,98 @@ pub fn prepare_append_changed_row_at_from_meta(
             keys: Vec<(String, contextdb_core::IndexKey)>,
             _credit: crate::staged_source::SourceCharge,
         }
-        let mut bytes = meta.indexes.len().checked_mul(
-            std::mem::size_of::<(String, contextdb_core::IndexKey)>(),
-        ).ok_or_else(source_identity_error)?;
+        let mut bytes = meta
+            .indexes
+            .len()
+            .checked_mul(std::mem::size_of::<(String, contextdb_core::IndexKey)>())
+            .ok_or_else(source_identity_error)?;
         for index in &meta.indexes {
-            bytes = bytes.checked_add(index.name.len())
-                .and_then(|n| n.checked_add(index.columns.len().checked_mul(
-                    std::mem::size_of::<contextdb_core::DirectedValue>(),
-                )?)).ok_or_else(source_identity_error)?;
+            bytes = bytes
+                .checked_add(index.name.len())
+                .and_then(|n| {
+                    n.checked_add(
+                        index
+                            .columns
+                            .len()
+                            .checked_mul(std::mem::size_of::<contextdb_core::DirectedValue>())?,
+                    )
+                })
+                .ok_or_else(source_identity_error)?;
             for (column, _) in &index.columns {
-                let value_bytes = original.row.values.get(column)
+                let value_bytes = original
+                    .row
+                    .values
+                    .get(column)
                     .map_or(0, contextdb_core::Value::estimated_bytes);
-                bytes = bytes.checked_add(value_bytes.checked_mul(4)
-                    .and_then(|n| n.checked_add(128)).ok_or_else(source_identity_error)?)
+                bytes = bytes
+                    .checked_add(
+                        value_bytes
+                            .checked_mul(4)
+                            .and_then(|n| n.checked_add(128))
+                            .ok_or_else(source_identity_error)?,
+                    )
                     .ok_or_else(source_identity_error)?;
             }
         }
         let credit = crate::staged_source::SourceCharge::admit_funded(self.funder.clone(), bytes)?;
         let mut scratch = KeyScratch {
-            keys: Vec::with_capacity(meta.indexes.len()), _credit: credit,
+            keys: Vec::with_capacity(meta.indexes.len()),
+            _credit: credit,
         };
         for index in &meta.indexes {
             let mut key = Vec::with_capacity(index.columns.len());
             for (column, direction) in &index.columns {
-                let value = original.row.values.get(column).cloned()
+                let value = original
+                    .row
+                    .values
+                    .get(column)
+                    .cloned()
                     .unwrap_or(contextdb_core::Value::Null);
                 key.push(match direction {
-                    contextdb_core::SortDirection::Asc => contextdb_core::DirectedValue::Asc(
-                        contextdb_core::TotalOrdAsc(value)),
-                    contextdb_core::SortDirection::Desc => contextdb_core::DirectedValue::Desc(
-                        contextdb_core::TotalOrdDesc(value)),
+                    contextdb_core::SortDirection::Asc => {
+                        contextdb_core::DirectedValue::Asc(contextdb_core::TotalOrdAsc(value))
+                    }
+                    contextdb_core::SortDirection::Desc => {
+                        contextdb_core::DirectedValue::Desc(contextdb_core::TotalOrdDesc(value))
+                    }
                 });
             }
             scratch.keys.push((index.name.clone(), key));
         }
         let schema = selected_schema;
         let eager_schema = schema.clone();
-        let mut prepared = self.prepare_row_inner(false, table, original.row, &scratch.keys, schema, original.invoice)?;
-        let PreparedSourceMutationKind::Row(body) = &prepared.mutation else { unreachable!() };
+        let mut prepared = self.prepare_row_inner(
+            false,
+            table,
+            original.row,
+            &scratch.keys,
+            schema,
+            original.invoice,
+        )?;
+        let PreparedSourceMutationKind::Row(body) = &prepared.mutation else {
+            unreachable!()
+        };
         let position = crate::ordered_staged::StagedPosition {
-            row_id: body.row.row.row_id, created_tx: body.row.row.created_tx,
+            row_id: body.row.row.row_id,
+            created_tx: body.row.row.created_tx,
             position: self.host.state.ws.relational_inserts.len(),
         };
-        prepared.eager = Some(self.host.state.ws.ordered_staged_rows.prepare_native_admitted_original_row(
-            table, position, &body.row.row, eager, &scratch.keys, eager_schema, self.funder,
-        )?.prepare_retain_row(body.cell.clone(), self.funder)?);
+        prepared.eager = Some(
+            self.host
+                .state
+                .ws
+                .ordered_staged_rows
+                .prepare_native_admitted_original_row(
+                    table,
+                    position,
+                    &body.row.row,
+                    eager,
+                    &scratch.keys,
+                    eager_schema,
+                    self.funder,
+                )?
+                .prepare_retain_row(body.cell.clone(), self.funder)?,
+        );
         Ok(prepared)
     }
 }

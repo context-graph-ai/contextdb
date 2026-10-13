@@ -1,7 +1,9 @@
 //! Fixed native custody slots and scratch on the original request capability.
 use super::native_decode::Invalid;
 #[cfg(feature = "sync-orchestration")]
-use crate::persistence::{native_storage_admission::NativeStorageFailure, writer_source::NativeConfigFailure};
+use crate::persistence::{
+    native_storage_admission::NativeStorageFailure, writer_source::NativeConfigFailure,
+};
 use contextdb_core::read_memory::{NativeRefusal, ReadCredit, ReadMemoryOwner};
 #[derive(Debug)]
 pub(crate) enum Failure {

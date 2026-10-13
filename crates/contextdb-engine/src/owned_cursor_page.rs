@@ -100,13 +100,14 @@ impl SharedRows {
 impl Drop for SharedRows {
     fn drop(&mut self) {
         if let Some(root) = self.root.take()
-            && let Some(inner) = Arc::into_inner(root) {
-                // Every holder uses into_inner, so exactly one concurrent drop
-                // obtains the payload after releasing the Arc control block.
-                let RowsInner { rows, credit } = inner;
-                drop(rows);
-                drop(credit);
-            }
+            && let Some(inner) = Arc::into_inner(root)
+        {
+            // Every holder uses into_inner, so exactly one concurrent drop
+            // obtains the payload after releasing the Arc control block.
+            let RowsInner { rows, credit } = inner;
+            drop(rows);
+            drop(credit);
+        }
     }
 }
 impl Deref for SharedRows {

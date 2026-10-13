@@ -33,7 +33,11 @@ pub(crate) enum PageMemory {
     /// cache could not take, which the caller's own admission covers.
     Plain(Arc<[u8]>),
     #[cfg(feature = "contextdb-internal")]
-    Native(crate::native_storage_admission::NativeStorageShared<crate::native_storage_admission::NativePagePayload>),
+    Native(
+        crate::native_storage_admission::NativeStorageShared<
+            crate::native_storage_admission::NativePagePayload,
+        >,
+    ),
 }
 
 /// A page admitted to the read cache. Its bytes leave the cache's count when
@@ -846,9 +850,7 @@ impl PagedCachedFile {
             .fetch_add(page_bytes, Ordering::AcqRel);
         let write_bytes = self.write_buffer_bytes.load(Ordering::Acquire);
         if previous + page_bytes + write_bytes <= self.max_cache_size.load(Ordering::Acquire) {
-            debug_assert!(
-                len >= self.page_size as usize || (offset == 0 && len == DB_HEADER_SIZE)
-            );
+            debug_assert!(len >= self.page_size as usize || (offset == 0 && len == DB_HEADER_SIZE));
             let page = CachedPage::admitted(buffer.clone(), &self.read_cache_bytes);
             let mut write_lock = self.read_cache[cache_slot].write().unwrap();
             // A race could replace an existing buffer; dropping it gives back
@@ -1747,11 +1749,16 @@ mod test {
     }
     impl WritableHeaderFixture {
         fn new(len: u64) -> Self {
-            Self { len: std::sync::atomic::AtomicU64::new(len), header: std::sync::Mutex::new([0; 320]) }
+            Self {
+                len: std::sync::atomic::AtomicU64::new(len),
+                header: std::sync::Mutex::new([0; 320]),
+            }
         }
     }
     impl StorageBackend for WritableHeaderFixture {
-        fn len(&self) -> io::Result<u64> { Ok(self.len.load(Ordering::SeqCst)) }
+        fn len(&self) -> io::Result<u64> {
+            Ok(self.len.load(Ordering::SeqCst))
+        }
         fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
             assert!(offset + out.len() as u64 <= self.len.load(Ordering::SeqCst));
             out.fill(0);
@@ -1762,7 +1769,10 @@ mod test {
             }
             Ok(())
         }
-        fn set_len(&self, len: u64) -> io::Result<()> { self.len.store(len, Ordering::SeqCst); Ok(()) }
+        fn set_len(&self, len: u64) -> io::Result<()> {
+            self.len.store(len, Ordering::SeqCst);
+            Ok(())
+        }
         fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
             assert!(offset + data.len() as u64 <= self.len.load(Ordering::SeqCst));
             if offset == 0 {
@@ -1772,7 +1782,9 @@ mod test {
             }
             Ok(())
         }
-        fn sync_data(&self) -> io::Result<()> { Ok(()) }
+        fn sync_data(&self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
     // Actual header writes reach the read cache through the normal flush.
@@ -1787,9 +1799,7 @@ mod test {
         for (cap, expected_index) in [(4 * 1024 * 1024, 63_436), (64 * 1024 * 1024, 903_768)] {
             for stride in [1, 131] {
                 let full_pages = cap / full_bytes;
-                let backend = WritableHeaderFixture::new(
-                    ((full_pages + 1) * stride * 4096) as u64,
-                );
+                let backend = WritableHeaderFixture::new(((full_pages + 1) * stride * 4096) as u64);
                 let file = PagedCachedFile::new(Box::new(backend), 4096, cap).unwrap();
                 let index_bytes = file.index_bytes();
                 let mut writable = file.write(0, header_len, true).unwrap();
@@ -1804,7 +1814,10 @@ mod test {
                 for ordinal in 1..=full_pages {
                     let offset = (ordinal * stride * 4096) as u64;
                     let page = file.read(offset, 4096, PageHint::Clean).unwrap();
-                    assert!(matches!(page, super::PageMemory::Cached(_)), "a byte-fitting full page must not exhaust the fixed index");
+                    assert!(
+                        matches!(page, super::PageMemory::Cached(_)),
+                        "a byte-fitting full page must not exhaust the fixed index"
+                    );
                     assert!(page.iter().all(|byte| *byte == 0));
                     drop(page);
                     assert_eq!(file.index_bytes(), index_bytes);
@@ -1814,14 +1827,33 @@ mod test {
                 assert_eq!(index_bytes, expected_index);
                 assert!(resident_bytes <= cap);
                 assert!(cap - resident_bytes < full_bytes);
-                assert_eq!(file.read_cache.iter().map(|s| s.read().unwrap().len()).sum::<usize>(), full_pages + 1);
-                assert_eq!(file.read_cache[0].read().unwrap().arena_capacity_for_test(), full_pages + 1);
+                assert_eq!(
+                    file.read_cache
+                        .iter()
+                        .map(|s| s.read().unwrap().len())
+                        .sum::<usize>(),
+                    full_pages + 1
+                );
+                assert_eq!(
+                    file.read_cache[0].read().unwrap().arena_capacity_for_test(),
+                    full_pages + 1
+                );
                 if stride == 131 {
                     assert_eq!(file.read_cache[0].read().unwrap().len(), full_pages + 1);
-                    assert!(file.read_cache[1..].iter().all(|s| s.read().unwrap().len() == 0));
+                    assert!(
+                        file.read_cache[1..]
+                            .iter()
+                            .all(|s| s.read().unwrap().len() == 0)
+                    );
                 }
-                assert_eq!(file.settle_startup_cache_budget(cap).unwrap(), cap + index_bytes);
-                assert_eq!(file.settle_startup_cache_budget(cap).unwrap(), cap + index_bytes);
+                assert_eq!(
+                    file.settle_startup_cache_budget(cap).unwrap(),
+                    cap + index_bytes
+                );
+                assert_eq!(
+                    file.settle_startup_cache_budget(cap).unwrap(),
+                    cap + index_bytes
+                );
                 assert_eq!(file.index_bytes(), index_bytes);
                 assert_eq!(file.read_cache_bytes.load(Ordering::SeqCst), resident_bytes);
                 assert!(header.iter().all(|byte| *byte == 0x7a));
@@ -1839,11 +1871,15 @@ mod test {
                 let file = PagedCachedFile::new(Box::new(backend), 4096, 4 * 1024 * 1024).unwrap();
                 // Ensure the exhausted scan branch has a real evictable page to replace.
                 drop(file.read(8192, 4096, PageHint::Clean).unwrap());
-                let invalid = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    match route {
-                        "normal" => { let _page = file.read(offset, len, PageHint::Clean).unwrap(); }
+                let invalid =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match route {
+                        "normal" => {
+                            let _page = file.read(offset, len, PageHint::Clean).unwrap();
+                        }
                         "scan" => crate::read_admission::with_scan_reads(|| {
-                            assert!(crate::read_admission::take_scan_growth(crate::read_admission::SCAN_GROWTH_ALLOWANCE));
+                            assert!(crate::read_admission::take_scan_growth(
+                                crate::read_admission::SCAN_GROWTH_ALLOWANCE
+                            ));
                             let _page = file.read(offset, len, PageHint::Clean).unwrap();
                         }),
                         "flush" => {
@@ -1853,12 +1889,17 @@ mod test {
                             file.flush().unwrap();
                         }
                         _ => unreachable!(),
-                    }
-                }));
+                    }));
                 let panic = invalid.expect_err("an invalid subpage admission must panic");
-                let message = panic.downcast_ref::<String>().map(String::as_str)
-                    .or_else(|| panic.downcast_ref::<&str>().copied()).unwrap_or("");
-                assert!(message.contains("DB_HEADER_SIZE"), "route {route} offset {offset} length {len} must fail its actual header invariant, not a fixture panic: {message}");
+                let message = panic
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| panic.downcast_ref::<&str>().copied())
+                    .unwrap_or("");
+                assert!(
+                    message.contains("DB_HEADER_SIZE"),
+                    "route {route} offset {offset} length {len} must fail its actual header invariant, not a fixture panic: {message}"
+                );
             }
         }
     }
@@ -1910,34 +1951,56 @@ impl PagedCachedFile {
     /// A paid native page copies an original clean warm-cache hit; it never
     /// borrows or adopts a legacy cell and never probes the write buffer.
     pub(super) fn read_native_clean_miss(
-        &self, offset: u64, len: usize,
+        &self,
+        offset: u64,
+        len: usize,
     ) -> std::result::Result<PageMemory, crate::NativeColdReadError> {
-        use crate::native_storage_admission::{NativeColdFault, NativeColdReadError, NativePagePayload, NativeStorageBuffer, NativeStorageShared};
+        use crate::native_storage_admission::{
+            NativeColdFault, NativeColdReadError, NativePagePayload, NativeStorageBuffer,
+            NativeStorageShared,
+        };
         if !crate::native_storage_admission::native_storage_active() {
             return Err(NativeColdReadError::AdmissionRefused);
         }
         if self.file.io_failed.load(Ordering::Acquire) {
-            return Err(NativeColdReadError::Corrupt(NativeColdFault::new("native read requires an available backend")));
+            return Err(NativeColdReadError::Corrupt(NativeColdFault::new(
+                "native read requires an available backend",
+            )));
         }
         // Admit both owners on the original scope before taking a cache lock.
         let bytes = NativeStorageBuffer::zeroed(len)?;
-        let mut page = NativeStorageShared::new(NativePagePayload { bytes, checksum: Mutex::new(None) })?;
+        let mut page = NativeStorageShared::new(NativePagePayload {
+            bytes,
+            checksum: Mutex::new(None),
+        })?;
         let stripe = (offset % Self::lock_stripes()) as usize;
         {
             let cache = self.read_cache[stripe].read().unwrap();
             if let Some(cell) = cache.get(offset) {
                 if cell.bytes.len() != len {
-                    let mut fault = NativeColdFault::new("native cache page length does not match the requested extent");
+                    let mut fault = NativeColdFault::new(
+                        "native cache page length does not match the requested extent",
+                    );
                     fault.expected = len as u128;
                     fault.actual = cell.bytes.len() as u128;
                     return Err(NativeColdReadError::Corrupt(fault));
                 }
-                page.get_mut().expect("unpublished native page is unique").bytes.as_mut_slice().copy_from_slice(&cell.bytes);
+                page.get_mut()
+                    .expect("unpublished native page is unique")
+                    .bytes
+                    .as_mut_slice()
+                    .copy_from_slice(&cell.bytes);
                 return Ok(PageMemory::Native(page));
             }
         }
         // Every page allocation and its receipt is admitted before backend I/O.
-        let result = self.file.file.read(offset, page.get_mut().expect("unpublished native page is unique").bytes.as_mut_slice());
+        let result = self.file.file.read(
+            offset,
+            page.get_mut()
+                .expect("unpublished native page is unique")
+                .bytes
+                .as_mut_slice(),
+        );
         if let Err(error) = result {
             self.file.io_failed.store(true, Ordering::Release);
             return Err(NativeColdReadError::Io(error));

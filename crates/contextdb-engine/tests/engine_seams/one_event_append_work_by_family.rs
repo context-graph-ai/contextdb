@@ -29,7 +29,7 @@ mod pinned;
 
 use contextdb_core::{TxId, Value};
 use contextdb_engine::append_work::{
-    self, with_coalesced_mutation_observer_for_test, FamilyWork, IndexPrefixCountTouch,
+    self, FamilyWork, IndexPrefixCountTouch, with_coalesced_mutation_observer_for_test,
 };
 use contextdb_engine::{Database, MaintenancePolicy};
 use std::cell::RefCell;

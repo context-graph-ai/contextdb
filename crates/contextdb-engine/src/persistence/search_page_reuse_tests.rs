@@ -550,7 +550,10 @@ fn a_changed_row_body_is_typed_corruption_although_its_proof_chunks_are_resident
         "row-head authentication refuses the changed body before retaining proof chunks"
     );
     assert!(matches!(cold_result, Err(Error::StoreCorrupted { .. })));
-    assert_eq!(cold.chunk_reads, 0, "the damaged body refuses before proof loading");
+    assert_eq!(
+        cold.chunk_reads, 0,
+        "the damaged body refuses before proof loading"
+    );
 }
 
 /// Rewrite one stored row body in place, keeping its physical key, so the
@@ -630,8 +633,11 @@ fn a_repeat_resident_search_on_the_public_reader_re_proves_fewer_chunks() {
         other.chunk_reads,
         cold.chunk_reads
     );
-    assert_eq!((cold.chunk_reads, warm.chunk_reads, other.chunk_reads), (13, 0, 5),
-        "fixed proof windows on this authenticated engine path");
+    assert_eq!(
+        (cold.chunk_reads, warm.chunk_reads, other.chunk_reads),
+        (13, 0, 5),
+        "fixed proof windows on this authenticated engine path"
+    );
     assert!(
         other.work.hashed_bytes < cold.work.hashed_bytes,
         "and hashes less: {} against {}",

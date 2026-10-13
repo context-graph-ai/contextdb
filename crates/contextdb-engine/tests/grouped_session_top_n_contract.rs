@@ -29,8 +29,8 @@ fn execute(db: &Database, sql: &str) -> QueryResult {
         // large-history fixture. These rows use the same public reader budget.
         use contextdb_core::read_memory::ReadMemoryBudget;
         use std::sync::{
-            atomic::{AtomicUsize, Ordering},
             Arc,
+            atomic::{AtomicUsize, Ordering},
         };
         #[derive(Debug)]
         struct RankedPeakBudget {
@@ -169,8 +169,10 @@ fn execute(db: &Database, sql: &str) -> QueryResult {
             ]])
         );
         assert_eq!(peak_observations[0].0, peak_observations[1].0);
-        assert!(peak_observations[0].1 <= peak_observations[1].1,
-            "a cap that never binds has no greater actual reader peak than full Sort: {peak_observations:?}");
+        assert!(
+            peak_observations[0].1 <= peak_observations[1].1,
+            "a cap that never binds has no greater actual reader peak than full Sort: {peak_observations:?}"
+        );
         assert!(
             matches!(&division_control, Err(error) if error.to_ascii_lowercase().contains("division by zero")),
             "the unpruned control reaches the second row's division: {division_control:?}"

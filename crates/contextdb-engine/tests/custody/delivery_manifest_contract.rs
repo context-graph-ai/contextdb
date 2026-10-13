@@ -1185,9 +1185,10 @@ async fn oversized_manifested_unit() {
     let ticket = endpoint.ticket();
     let mut oversized_reader = contextdb_engine::DatabaseOpenOptions::default();
     oversized_reader.owner_reads.limits.limits.memory = 2 * 1024 * 1024 * 1024;
-    let iroh_hub_db = Arc::new(Database::open_with_options(
-        root.path().join("hub.db"), oversized_reader.clone(),
-    ).expect("open hub store"));
+    let iroh_hub_db = Arc::new(
+        Database::open_with_options(root.path().join("hub.db"), oversized_reader.clone())
+            .expect("open hub store"),
+    );
     declare_hub_tables(&iroh_hub_db);
     iroh_hub_db
         .__seed_tenant_table_policies_for_test(TenantId::from(iroh_tenant), expectation())
@@ -1206,8 +1207,10 @@ async fn oversized_manifested_unit() {
     let edge_identity_path = root.path().join("edge.db.fabric-identity.key");
     FabricIdentity::load_or_generate(&edge_identity_path).expect("persist the edge identity");
     let dial_spec = peer_dial_spec(&ticket, &edge_identity_path);
-    let iroh_edge_db =
-        Arc::new(Database::open_with_options(root.path().join("edge.db"), oversized_reader).expect("open edge store"));
+    let iroh_edge_db = Arc::new(
+        Database::open_with_options(root.path().join("edge.db"), oversized_reader)
+            .expect("open edge store"),
+    );
     let iroh_edge = SyncClient::new(
         iroh_edge_db.clone(),
         &dial_spec,

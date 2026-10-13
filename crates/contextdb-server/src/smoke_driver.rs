@@ -1025,12 +1025,17 @@ fn custody_expectation() -> Result<ApplicationTablePolicyExpectation, String> {
         .map_err(|e| e.to_string())
 }
 
-fn custody_client(db: &Arc<Database>, hub: &CustodyHub, identity: &Path) -> Result<SyncClient, String> {
+fn custody_client(
+    db: &Arc<Database>,
+    hub: &CustodyHub,
+    identity: &Path,
+) -> Result<SyncClient, String> {
     SyncClient::new(
         db.clone(),
         &peer_dial_spec(&hub.ticket, identity),
         TenantId::from(CUSTODY_TENANT),
-    ).map_err(|e| format!("cannot construct smoke client: {e}"))
+    )
+    .map_err(|e| format!("cannot construct smoke client: {e}"))
 }
 
 async fn custody_within<T>(
@@ -1788,7 +1793,8 @@ async fn run_hub(args: HubArgs) -> Result<(), String> {
         database.clone(),
         &endpoint,
         TenantId::from(args.tenant_id.as_str()),
-    ).map_err(|e| format!("cannot construct smoke server: {e}"))?;
+    )
+    .map_err(|e| format!("cannot construct smoke server: {e}"))?;
     let reported_db = args.db.display().to_string();
     std::thread::spawn(move || {
         while let Ok(checkpoint) = checkpoints.recv() {
@@ -1903,7 +1909,8 @@ async fn run_ddl_source(args: DdlSourceArgs) -> Result<(), String> {
         database.clone(),
         &dial,
         TenantId::from(args.tenant_id.as_str()),
-    ).map_err(|e| format!("cannot construct smoke client: {e}"))?;
+    )
+    .map_err(|e| format!("cannot construct smoke client: {e}"))?;
     match args.phase {
         DdlPhase::AuthorPush => {
             print_ddl_vector(&database, "authored_ddl_vector")?;
@@ -1961,7 +1968,9 @@ async fn run_ddl_source(args: DdlSourceArgs) -> Result<(), String> {
 }
 
 fn print_ddl_vector(database: &Database, event: &str) -> Result<(), String> {
-    let authored = database.changes_since(contextdb_core::Lsn(0)).map_err(|e| format!("cannot read smoke changes: {e}"))?;
+    let authored = database
+        .changes_since(contextdb_core::Lsn(0))
+        .map_err(|e| format!("cannot read smoke changes: {e}"))?;
     let (kinds, ddl_lsn) = exact_fixture_ddl_vector(&authored)?;
     println!(
         "{}",
@@ -2029,12 +2038,16 @@ fn print_refused_ddl_state(database: &Database) -> Result<(), String> {
     let canonical = Database::open_memory();
     contextdb_server::work_ledger::install_node_contacts_schema(&canonical)
         .map_err(|_| "cannot construct canonical transport schema".to_string())?;
-    let canonical_changes = canonical.changes_since(contextdb_core::Lsn(0)).map_err(|e| format!("cannot read smoke changes: {e}"))?;
+    let canonical_changes = canonical
+        .changes_since(contextdb_core::Lsn(0))
+        .map_err(|e| format!("cannot read smoke changes: {e}"))?;
     let canonical_meta = canonical
         .table_meta(CONTACT_TABLE)
         .ok_or_else(|| "canonical transport schema has no table metadata".to_string())?;
 
-    let changes = database.changes_since(contextdb_core::Lsn(0)).map_err(|e| format!("cannot read smoke changes: {e}"))?;
+    let changes = database
+        .changes_since(contextdb_core::Lsn(0))
+        .map_err(|e| format!("cannot read smoke changes: {e}"))?;
     validate_refused_ddl_state(
         &table_names,
         database.list_triggers().len(),
@@ -2103,7 +2116,8 @@ async fn run_oversized_source(args: OversizedSourceArgs) -> Result<(), String> {
         database.clone(),
         &dial,
         TenantId::from(args.tenant_id.as_str()),
-    ).map_err(|e| format!("cannot construct smoke client: {e}"))?;
+    )
+    .map_err(|e| format!("cannot construct smoke client: {e}"))?;
     if matches!(args.phase, OversizedPhase::BootstrapAndSeed) {
         let fixture_table = match args.fixture {
             RequestFixture::Ordinary => "smoke_ordinary",
@@ -2649,7 +2663,9 @@ mod ddl_vector_tests {
                 &HashMap::new(),
             )
             .unwrap();
-        let mut changes = database.changes_since(Lsn(0)).expect("read transport schema changes");
+        let mut changes = database
+            .changes_since(Lsn(0))
+            .expect("read transport schema changes");
         let canonical_ddl = changes.ddl.clone();
         let canonical_meta = database.table_meta("work_node_contacts").unwrap();
         let DdlChange::CreateTable { columns, .. } = &mut changes.ddl[0] else {

@@ -35,41 +35,61 @@ impl Source<'_> {
         // Each selector seeks its own exact interval. Membership checks against
         // earlier selectors keep a union from retaining any record twice.
         for (i, selector) in selectors.iter().enumerate() {
-            let covered = selectors[..i].iter().any(|earlier| match (selector, earlier) {
-                (Selector::Prefix(p), Selector::Prefix(q)) => p.starts_with(*q),
-                (Selector::Group(p), Selector::Group(q)) => p == q,
-                _ => false,
-            });
-            if covered { continue; }
+            let covered = selectors[..i]
+                .iter()
+                .any(|earlier| match (selector, earlier) {
+                    (Selector::Prefix(p), Selector::Prefix(q)) => p.starts_with(*q),
+                    (Selector::Group(p), Selector::Group(q)) => p == q,
+                    _ => false,
+                });
+            if covered {
+                continue;
+            }
             let cursor = match selector {
                 Selector::Prefix(prefix) => self.cursor(prefix)?,
-                Selector::Group(group) => self.root.native_raw_custody_group(self.operation, self.context, group)?,
+                Selector::Group(group) => {
+                    self.root
+                        .native_raw_custody_group(self.operation, self.context, group)?
+                }
             };
             loop {
-                let window = cursor.lock().unwrap_or_else(|p| p.into_inner()).visit_next(Ok)?;
+                let window = cursor
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .visit_next(Ok)?;
                 let Some(window) = window else { break };
                 let selected = {
                     let view = window.view()?;
                     if !crate::custody::records::owned_key(view.key()) {
-                        if matches!(selector, Selector::Group(_)) { return Err(Invalid::Canonical.into()); }
+                        if matches!(selector, Selector::Group(_)) {
+                            return Err(Invalid::Canonical.into());
+                        }
                         false
                     } else {
                         let record = decode_record(view.stored_bytes())?;
                         if let Selector::Group(group) = selector {
-                            if !record.group_matches(&self.operation.owner(), group)? { return Err(Invalid::Canonical.into()); }
+                            if !record.group_matches(&self.operation.owner(), group)? {
+                                return Err(Invalid::Canonical.into());
+                            }
                         }
                         let mut duplicate = false;
                         for earlier in &selectors[..i] {
                             duplicate = match earlier {
                                 Selector::Prefix(prefix) => view.key().starts_with(*prefix),
-                                Selector::Group(group) => record.group_matches(&self.operation.owner(), group)?,
+                                Selector::Group(group) => {
+                                    record.group_matches(&self.operation.owner(), group)?
+                                }
                             };
-                            if duplicate { break; }
+                            if duplicate {
+                                break;
+                            }
                         }
                         !duplicate
                     }
                 };
-                if selected { visit(window)?; }
+                if selected {
+                    visit(window)?;
+                }
             }
         }
         Ok(())
@@ -77,7 +97,10 @@ impl Source<'_> {
 }
 impl Source<'_> {
     fn collect(&self, selectors: &[Selector<'_>]) -> Selected<NativeCustodySelection> {
-        if selectors.iter().any(|selector| matches!(selector, Selector::Group(_))) {
+        if selectors
+            .iter()
+            .any(|selector| matches!(selector, Selector::Group(_)))
+        {
             self.root.require_native_custody_groups()?;
         }
         let owner = self.operation.owner();
@@ -199,7 +222,8 @@ impl Database {
         context: &NativeReadOpenContext,
     ) -> Selected<NativeCustodySelection> {
         if selectors.iter().any(|selector| selector.starts_with('@')) {
-            self.read_native_custody_root(operation, context)?.require_native_custody_groups()?;
+            self.read_native_custody_root(operation, context)?
+                .require_native_custody_groups()?;
         }
         let owner = operation.owner();
         let mut admitted = NativeSelectionHold::try_new(&owner, selectors.len())?;
@@ -217,7 +241,8 @@ impl Database {
         operation: &NativeReadRequest,
         context: &NativeReadOpenContext,
     ) -> Selected<NativeCustodySelection> {
-        self.read_native_custody_root(operation, context)?.require_native_custody_groups()?;
+        self.read_native_custody_root(operation, context)?
+            .require_native_custody_groups()?;
         let group =
             NativeBuffer::format(&operation.owner(), format_args!("submission:{submission}"))?;
         self.native_custody_selection_on(operation, context, &[Selector::Group(group.text()?)])
@@ -314,8 +339,15 @@ impl Database {
         operation: &NativeReadRequest,
         context: &NativeReadOpenContext,
     ) -> Selected<NativeOutcomeSelection> {
-        self.custody_outcomes_native_with_after(tenant, hub, edge, edge_incarnation,
-            operation, context, |_| Ok(after))
+        self.custody_outcomes_native_with_after(
+            tenant,
+            hub,
+            edge,
+            edge_incarnation,
+            operation,
+            context,
+            |_| Ok(after),
+        )
     }
     #[allow(clippy::too_many_arguments)] // Keep the existing selector inputs and private validator explicit.
     pub(crate) fn custody_outcomes_native_with_after(
@@ -330,7 +362,8 @@ impl Database {
     ) -> Selected<NativeOutcomeSelection> {
         // A missing derived root refuses before any allocated query or CONFIG
         // visit, including incarnation lookup. This scalar is already pinned.
-        self.read_native_custody_root(operation, context)?.require_native_custody_groups()?;
+        self.read_native_custody_root(operation, context)?
+            .require_native_custody_groups()?;
         // First independently captured incarnation query, before ANY view.
         let hub_incarnation = self
             .existing_sync_incarnation_native(tenant, operation, context)?
@@ -346,32 +379,54 @@ impl Database {
         let ns_bytes = finite_bytes(&operation.owner(), |e| ns.encode(e))?;
         let prefix = NativeBuffer::format(
             &operation.owner(),
-            format_args!("delivery_hub_order.v1.{}.",
-                crate::custody::preparation::BorrowedHex(ns_bytes.bytes())),
+            format_args!(
+                "delivery_hub_order.v1.{}.",
+                crate::custody::preparation::BorrowedHex(ns_bytes.bytes())
+            ),
         )?;
         let prefix_text = prefix.text()?;
-        let lower = after.map(|p| NativeBuffer::format(&operation.owner(),
-            format_args!("{}{:016x}.{:08x}", prefix_text, p.0.0, p.1))).transpose()?;
+        let lower = after
+            .map(|p| {
+                NativeBuffer::format(
+                    &operation.owner(),
+                    format_args!("{}{:016x}.{:08x}", prefix_text, p.0.0, p.1),
+                )
+            })
+            .transpose()?;
         // One pinned view covers order seek, group members, companion checks
         // and persisted-byte verification. Nothing before after is visited.
         let cache = self.custody_cache.lock();
         let publications = cache.as_ref().map(|store| &store.publications);
-        let source = Source { root: self.read_native_custody_root(operation, context)?, operation, context };
+        let source = Source {
+            root: self.read_native_custody_root(operation, context)?,
+            operation,
+            context,
+        };
         source.root.require_native_custody_groups()?;
         let count_orders = || -> Selected<usize> {
-            let cursor = source.root.native_raw_config_prefix_after(operation, context,
-                prefix.text()?, lower.as_ref().map(NativeBuffer::text).transpose()?)?;
+            let cursor = source.root.native_raw_config_prefix_after(
+                operation,
+                context,
+                prefix.text()?,
+                lower.as_ref().map(NativeBuffer::text).transpose()?,
+            )?;
             let mut count = 0usize;
             loop {
-                let raw = cursor.lock().unwrap_or_else(|p| p.into_inner()).visit_next(Ok)?;
+                let raw = cursor
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .visit_next(Ok)?;
                 let Some(raw) = raw else { break };
                 let selected = NativeCustodyWindow::admit(raw, &operation.owner())?;
                 let view = selected.view()?;
                 match view.record()? {
-                    RecordView::Order { namespace, position, .. }
-                        if ns.matches(&namespace) && after.is_none_or(|p| position > p) => {
-                            count = count.checked_add(1).ok_or(Invalid::Codec)?;
-                        }
+                    RecordView::Order {
+                        namespace,
+                        position,
+                        ..
+                    } if ns.matches(&namespace) && after.is_none_or(|p| position > p) => {
+                        count = count.checked_add(1).ok_or(Invalid::Codec)?;
+                    }
                     _ => return Err(Invalid::Canonical.into()),
                 }
             }
@@ -381,40 +436,67 @@ impl Database {
         let mut terminals = NativeCustodySelection::try_new(&operation.owner(), count)?;
         let mut positions = NativeSelectionHold::try_new(&operation.owner(), count)?;
         let mut submissions = NativeSelectionHold::try_new(&operation.owner(), count)?;
-        let cursor = source.root.native_raw_config_prefix_after(operation, context,
-            prefix.text()?, lower.as_ref().map(NativeBuffer::text).transpose()?)?;
+        let cursor = source.root.native_raw_config_prefix_after(
+            operation,
+            context,
+            prefix.text()?,
+            lower.as_ref().map(NativeBuffer::text).transpose()?,
+        )?;
         loop {
-            let raw = cursor.lock().unwrap_or_else(|p| p.into_inner()).visit_next(Ok)?;
+            let raw = cursor
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .visit_next(Ok)?;
             let Some(raw) = raw else { break };
             let order = NativeCustodyWindow::admit(raw, &operation.owner())?;
             let (submission, position) = {
                 let view = order.view()?;
                 match view.record()? {
-                    RecordView::Order { namespace, submission, position }
-                        if ns.matches(&namespace) && after.is_none_or(|p| position > p) => (submission, position),
+                    RecordView::Order {
+                        namespace,
+                        submission,
+                        position,
+                    } if ns.matches(&namespace) && after.is_none_or(|p| position > p) => {
+                        (submission, position)
+                    }
                     _ => return Err(Invalid::Canonical.into()),
                 }
             };
-            let group = NativeBuffer::format(&operation.owner(), format_args!("submission:{submission}"))?;
+            let group =
+                NativeBuffer::format(&operation.owner(), format_args!("submission:{submission}"))?;
             let selection = source.collect(&[Selector::Group(group.text()?)])?;
             source.validate_companions(&selection)?;
             self.verify_native_custody_selection(&selection, operation, context, publications)?;
             let mut terminal_key = None;
             for member in selection.windows() {
                 let view = member.view()?;
-                if let RecordView::Terminal { edge: false, record: t } = view.record()? {
-                    if !ns.matches(&t.namespace) || t.position != position || t.submission != submission || terminal_key.is_some() {
+                if let RecordView::Terminal {
+                    edge: false,
+                    record: t,
+                } = view.record()?
+                {
+                    if !ns.matches(&t.namespace)
+                        || t.position != position
+                        || t.submission != submission
+                        || terminal_key.is_some()
+                    {
                         return Err(Invalid::Canonical.into());
                     }
-                    terminal_key = Some(NativeBuffer::format(&operation.owner(), format_args!("{}", view.key()))?);
+                    terminal_key = Some(NativeBuffer::format(
+                        &operation.owner(),
+                        format_args!("{}", view.key()),
+                    )?);
                 }
             }
             let terminal_key = terminal_key.ok_or(Invalid::Companions)?;
             // Fetch one terminal loan at this same root. The packet adapter's
             // fields and terminal indexes remain exactly their original shape.
             let exact = source.cursor("")?;
-            let raw = exact.lock().unwrap_or_else(|p| p.into_inner())
-                .visit_exact(terminal_key.text()?, Ok)?.ok_or(Invalid::Canonical)?;
+            let raw = exact
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .visit_exact(terminal_key.text()?, Ok)?
+                .ok_or(Invalid::Canonical)?;
             terminals.retain(NativeCustodyWindow::admit(raw, &operation.owner())?)?;
             positions.retain((terminals.windows().len() - 1, position))?;
             submissions.retain(selection)?;

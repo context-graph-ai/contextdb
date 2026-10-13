@@ -50,7 +50,8 @@ fn combined_schema_commit_keeps_event_bus_and_trigger_sidecar_ordinals_aligned()
     );
     assert!(
         trigger.contains("start_ordinal: u32")
-            && trigger.contains("self.ddl_generation_sidecar_values(lsn, ddl, start_ordinal, read_memory.clone())?"
+            && trigger.contains(
+                "self.ddl_generation_sidecar_values(lsn, ddl, start_ordinal, read_memory.clone())?"
             ),
         "staged trigger DDL must receive the preceding event-bus ordinal count"
     );
@@ -93,7 +94,8 @@ fn local_schema_authoring_persists_one_projected_ddl_batch_before_memory_publish
     );
     assert!(
         database.contains("including any CASCADEd index drops")
-            && database.contains("ddl_generation_sidecar_values(lsn, ddl, 0, read_memory.clone())?"),
+            && database
+                .contains("ddl_generation_sidecar_values(lsn, ddl, 0, read_memory.clone())?"),
         "the projected durable batch must assign one same-LSN sidecar sequence"
     );
 }
@@ -202,13 +204,11 @@ fn outbound_changeset_extraction_holds_the_schema_gate_before_commit_sampling() 
         "outbound base extraction must retain its schema gate before sampling committed changes"
     );
     assert!(
-        database
-            .contains("fn changes_since_with_read_memory(")
+        database.contains("fn changes_since_with_read_memory(")
             && database.contains("fn changes_since_with_arrivals_with_read_memory(")
             && checked.contains("let _operation = self.open_operation()?;")
             && database
-                .contains("let _schema_publication = self.enter_schema_publication_gate(false);")
-            ,
+                .contains("let _schema_publication = self.enter_schema_publication_gate(false);"),
         "public changes, arrival-bearing changes, checked sync extraction, and EXPLAIN must retain a schema read guard"
     );
     let guard = checked
@@ -217,7 +217,7 @@ fn outbound_changeset_extraction_holds_the_schema_gate_before_commit_sampling() 
     let pending = checked
         .find("self.durable_pending_deletes_projected(")
         .expect("durable pending-delete obligations");
-    let base= checked
+    let base = checked
         .find("self.changes_since_base_projected(")
         .expect("commit-locked base extraction");
     let reconcile = checked

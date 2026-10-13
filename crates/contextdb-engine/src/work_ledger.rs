@@ -742,7 +742,10 @@ fn input_refs_from_json(value: &serde_json::Value) -> Result<Vec<InputRef>> {
                     Error::Other("work ledger: every input ref needs a string kind".to_string())
                 })?
                 .to_string();
-            let detail = item.get("detail").cloned().unwrap_or(serde_json::Value::Null);
+            let detail = item
+                .get("detail")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
             Ok(InputRef { kind, detail })
         })
         .collect()
@@ -1766,11 +1769,7 @@ pub mod read {
     }
 
     /// Compute one job's state through the supplied read session.
-    pub fn job_state(
-        session: &ReadSession,
-        job_id: &str,
-        now_ms: i64,
-    ) -> Result<JobState> {
+    pub fn job_state(session: &ReadSession, job_id: &str, now_ms: i64) -> Result<JobState> {
         let Some(job) = job_row(session, job_id)? else {
             return Err(Error::NotFound(format!("work ledger job {job_id}")));
         };
@@ -1799,10 +1798,7 @@ pub mod read {
     }
 
     /// Read a job's completed result through the supplied read session.
-    pub fn job_result(
-        session: &ReadSession,
-        job_id: &str,
-    ) -> Result<Option<JobResult>> {
+    pub fn job_result(session: &ReadSession, job_id: &str) -> Result<Option<JobResult>> {
         let mut params = HashMap::new();
         params.insert("job_id".to_string(), text(job_id));
         let result =
@@ -2521,10 +2517,7 @@ pub fn advertise_capability_with_read_memory(
     params.insert("capability_key".to_string(), text(&key));
     params.insert("node_id".to_string(), text(node_id));
     params.insert("capability_id".to_string(), text(capability_id));
-    params.insert(
-        "tags".to_string(),
-        Value::Json(serde_json::json!(tags)),
-    );
+    params.insert("tags".to_string(), Value::Json(serde_json::json!(tags)));
     params.insert("detail".to_string(), Value::Null);
     params.insert("advertised_at".to_string(), Value::Timestamp(now_ms));
     db.execute_with_read_memory(

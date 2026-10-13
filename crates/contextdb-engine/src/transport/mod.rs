@@ -13,11 +13,11 @@ pub(crate) use iroh_blobs_adapter as adapter;
 #[cfg(feature = "iroh")]
 mod large_request_staging;
 mod native_wire;
-pub(crate) use native_wire::{admit_wire_future, NativeStreamResponder, NativeWireString};
 #[doc(hidden)]
 pub use native_wire::ReadBoundStreamInstallation;
 #[doc(hidden)]
 pub use native_wire::{AdmittedWireFuture, DispatchedWireFuture};
+pub(crate) use native_wire::{NativeStreamResponder, NativeWireString, admit_wire_future};
 
 // Transport-neutral surface for embedding consumers (e.g. a downstream fabric
 // runtime): a peer-endpoint alias plus scheme-free spec builders, so an
@@ -764,12 +764,18 @@ impl NativeStop {
         let wake = contextdb_core::read_memory::ReadShared::try_from_prepaid_with(invoice, || {
             Ok(NativeStopControl {
                 state: std::sync::Mutex::new(NativeStopState {
-                    registered: false, writers: 0, waker: None,
+                    registered: false,
+                    writers: 0,
+                    waker: None,
                 }),
                 released: std::sync::Condvar::new(),
             })
         })?;
-        Ok(Self { flag, standing: standing.clone(), wake })
+        Ok(Self {
+            flag,
+            standing: standing.clone(),
+            wake,
+        })
     }
 
     #[doc(hidden)]
@@ -783,7 +789,10 @@ impl NativeStop {
                 // Removal and admission are one mutex transaction. There is
                 // only one slot, so at most one writer per registration.
                 state.writers += 1;
-                NativeStopWriter { control: &self.wake, waker: Some(waker) }
+                NativeStopWriter {
+                    control: &self.wake,
+                    waker: Some(waker),
+                }
             })
         };
         if let Some(writer) = writer {
@@ -800,7 +809,9 @@ impl NativeStop {
     }
 
     #[doc(hidden)]
-    pub fn flag(&self) -> Arc<AtomicBool> { Arc::clone(&self.flag) }
+    pub fn flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.flag)
+    }
 
     pub(crate) fn is_funded_by(&self, standing: &ReadMemoryOwner) -> bool {
         self.standing.same_owner(standing)
@@ -812,12 +823,17 @@ impl NativeStop {
         &self,
         wake: contextdb_core::read_memory::ReadShared<T>,
     ) -> WireResult<NativeStopListener>
-    where T: contextdb_core::read_memory::NativeReadWake,
+    where
+        T: contextdb_core::read_memory::NativeReadWake,
     {
         let mut state = self.wake.state.lock().unwrap_or_else(|p| p.into_inner());
-        if state.registered { return Err(TransportError::NoResponder.into()); }
+        if state.registered {
+            return Err(TransportError::NoResponder.into());
+        }
         state.registered = true;
-        let listener = NativeStopListener { wake: self.wake.clone() };
+        let listener = NativeStopListener {
+            wake: self.wake.clone(),
+        };
         let waker = wake.into_native_wake_lease();
         if self.is_stopped() {
             drop(state);
@@ -827,8 +843,6 @@ impl NativeStop {
         }
         Ok(listener)
     }
-
-
 }
 
 pub(crate) struct NativeStopListener {
@@ -845,7 +859,11 @@ impl Drop for NativeStopListener {
         drop(waker);
         let mut state = self.wake.state.lock().unwrap_or_else(|p| p.into_inner());
         while state.writers != 0 {
-            state = self.wake.released.wait(state).unwrap_or_else(|p| p.into_inner());
+            state = self
+                .wake
+                .released
+                .wait(state)
+                .unwrap_or_else(|p| p.into_inner());
         }
         state.registered = false;
     }
@@ -878,10 +896,14 @@ pub trait ServerTransport: Send + Sync {
     /// silently executes Legacy. Empty/Bound retain their existing delegation.
     #[doc(hidden)]
     fn serve_native_installation<'a>(
-        &'a self, legacy: Vec<HandlerRegistration>,
-        bound: ReadBoundStreamInstallation, stop: NativeStop,
+        &'a self,
+        legacy: Vec<HandlerRegistration>,
+        bound: ReadBoundStreamInstallation,
+        stop: NativeStop,
     ) -> WireResult<DispatchedWireFuture<'a, ()>> {
-        if bound.native_routes().is_some() { return Err(TransportError::NoResponder.into()); }
+        if bound.native_routes().is_some() {
+            return Err(TransportError::NoResponder.into());
+        }
         self.serve_read_bound_installation(legacy, bound, stop.flag())
     }
 
@@ -1089,23 +1111,33 @@ pub(crate) fn encode_native_point_row(
     context: &crate::executor::bounded::NativeReadOpenContext,
 ) -> std::result::Result<Option<AdmittedWireVec>, crate::executor::BoundedExecutionError> {
     use crate::executor::BoundedExecutionError;
-    let mut size = NativeRowSize { bytes: 0, overflow: false };
+    let mut size = NativeRowSize {
+        bytes: 0,
+        overflow: false,
+    };
     write_native_point_row(&mut size, row).map_err(|_| BoundedExecutionError::Unimplemented)?;
-    if size.overflow { return Err(BoundedExecutionError::Unimplemented); }
+    if size.overflow {
+        return Err(BoundedExecutionError::Unimplemented);
+    }
     context.admit_result(row.is_some(), size.bytes)?;
-    let mut answer = AdmittedWireVec::allocate(size.bytes, context.owner()?).map_err(|error| {
-        match error {
+    let mut answer =
+        AdmittedWireVec::allocate(size.bytes, context.owner()?).map_err(|error| match error {
             WireError::Resource(error) => BoundedExecutionError::from(error),
             WireError::Transport(_) => BoundedExecutionError::Unimplemented,
-        }
-    })?;
+        })?;
     let mut destination = answer.bytes.as_mut_slice();
-    write_native_point_row(&mut destination, row).map_err(|_| BoundedExecutionError::Unimplemented)?;
-    if !destination.is_empty() { return Err(BoundedExecutionError::Unimplemented); }
+    write_native_point_row(&mut destination, row)
+        .map_err(|_| BoundedExecutionError::Unimplemented)?;
+    if !destination.is_empty() {
+        return Err(BoundedExecutionError::Unimplemented);
+    }
     context.checkpoint()?;
     Ok(Some(answer))
 }
-struct NativeRowSize { bytes: usize, overflow: bool }
+struct NativeRowSize {
+    bytes: usize,
+    overflow: bool,
+}
 impl std::io::Write for NativeRowSize {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         match self.bytes.checked_add(bytes.len()) {
@@ -1114,7 +1146,9 @@ impl std::io::Write for NativeRowSize {
         }
         Ok(bytes.len())
     }
-    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 impl BoundedWireBody {
@@ -1139,14 +1173,20 @@ impl BoundedWireBody {
 // Match VersionedRow's derived JSON field order and Value's externally tagged
 // enum representation. In particular Json remains an encoded JSON STRING;
 // serializing the whole Value would call json_as_string::to_string and allocate.
-fn write_native_point_row<W: std::io::Write>(writer: &mut W,
-    row: Option<&contextdb_core::VersionedRow>) -> std::io::Result<()> {
-    let Some(row) = row else { return writer.write_all(b"null"); };
+fn write_native_point_row<W: std::io::Write>(
+    writer: &mut W,
+    row: Option<&contextdb_core::VersionedRow>,
+) -> std::io::Result<()> {
+    let Some(row) = row else {
+        return writer.write_all(b"null");
+    };
     writer.write_all(b"{\"row_id\":")?;
     native_json_scalar(writer, &row.row_id)?;
     writer.write_all(b",\"values\":{")?;
     for (index, (name, value)) in row.values.iter().enumerate() {
-        if index != 0 { writer.write_all(b",")?; }
+        if index != 0 {
+            writer.write_all(b",")?;
+        }
         native_json_scalar(writer, name)?;
         writer.write_all(b":")?;
         write_native_row_value(writer, value)?;
@@ -1161,25 +1201,57 @@ fn write_native_point_row<W: std::io::Write>(writer: &mut W,
     native_json_scalar(writer, &row.created_at)?;
     writer.write_all(b"}")
 }
-fn native_json_scalar<W: std::io::Write, T: serde::Serialize + ?Sized>(writer: &mut W, value: &T) -> std::io::Result<()> {
+fn native_json_scalar<W: std::io::Write, T: serde::Serialize + ?Sized>(
+    writer: &mut W,
+    value: &T,
+) -> std::io::Result<()> {
     // These borrowed scalar/array/serde_json::Value serializers allocate no
     // nested storage. The exact-sized writer cannot fail on valid source data.
     serde_json::to_writer(writer, value).map_err(|_| std::io::ErrorKind::InvalidData.into())
 }
-fn write_native_row_value<W: std::io::Write>(writer: &mut W, value: &contextdb_core::Value) -> std::io::Result<()> {
+fn write_native_row_value<W: std::io::Write>(
+    writer: &mut W,
+    value: &contextdb_core::Value,
+) -> std::io::Result<()> {
     use contextdb_core::Value;
-    if matches!(value, Value::Null) { return writer.write_all(b"\"Null\""); }
+    if matches!(value, Value::Null) {
+        return writer.write_all(b"\"Null\"");
+    }
     writer.write_all(b"{")?;
     match value {
         Value::Null => unreachable!("handled unit value"),
-        Value::Bool(value) => { writer.write_all(b"\"Bool\":")?; native_json_scalar(writer, value)?; }
-        Value::Int64(value) => { writer.write_all(b"\"Int64\":")?; native_json_scalar(writer, value)?; }
-        Value::Float64(value) => { writer.write_all(b"\"Float64\":")?; native_json_scalar(writer, value)?; }
-        Value::Text(value) => { writer.write_all(b"\"Text\":")?; native_json_scalar(writer, value)?; }
-        Value::Uuid(value) => { writer.write_all(b"\"Uuid\":")?; native_json_scalar(writer, value)?; }
-        Value::Timestamp(value) => { writer.write_all(b"\"Timestamp\":")?; native_json_scalar(writer, value)?; }
-        Value::Vector(value) => { writer.write_all(b"\"Vector\":")?; native_json_scalar(writer, value)?; }
-        Value::TxId(value) => { writer.write_all(b"\"TxId\":")?; native_json_scalar(writer, value)?; }
+        Value::Bool(value) => {
+            writer.write_all(b"\"Bool\":")?;
+            native_json_scalar(writer, value)?;
+        }
+        Value::Int64(value) => {
+            writer.write_all(b"\"Int64\":")?;
+            native_json_scalar(writer, value)?;
+        }
+        Value::Float64(value) => {
+            writer.write_all(b"\"Float64\":")?;
+            native_json_scalar(writer, value)?;
+        }
+        Value::Text(value) => {
+            writer.write_all(b"\"Text\":")?;
+            native_json_scalar(writer, value)?;
+        }
+        Value::Uuid(value) => {
+            writer.write_all(b"\"Uuid\":")?;
+            native_json_scalar(writer, value)?;
+        }
+        Value::Timestamp(value) => {
+            writer.write_all(b"\"Timestamp\":")?;
+            native_json_scalar(writer, value)?;
+        }
+        Value::Vector(value) => {
+            writer.write_all(b"\"Vector\":")?;
+            native_json_scalar(writer, value)?;
+        }
+        Value::TxId(value) => {
+            writer.write_all(b"\"TxId\":")?;
+            native_json_scalar(writer, value)?;
+        }
         Value::Json(value) => {
             writer.write_all(b"\"Json\":\"")?;
             // Escape borrowed inner JSON directly as the outer string. No
@@ -1203,11 +1275,20 @@ impl<W: std::io::Write> std::io::Write for NativeJsonStringWriter<'_, W> {
                 b'\t' => self.0.write_all(b"\\t")?,
                 8 => self.0.write_all(b"\\b")?,
                 12 => self.0.write_all(b"\\f")?,
-                0..=31 => self.0.write_all(&[b'\\', b'u', b'0', b'0', HEX[(byte >> 4) as usize], HEX[(byte & 15) as usize]])?,
+                0..=31 => self.0.write_all(&[
+                    b'\\',
+                    b'u',
+                    b'0',
+                    b'0',
+                    HEX[(byte >> 4) as usize],
+                    HEX[(byte & 15) as usize],
+                ])?,
                 _ => self.0.write_all(&[byte])?,
             }
         }
         Ok(bytes.len())
     }
-    fn flush(&mut self) -> std::io::Result<()> { self.0.flush() }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
 }

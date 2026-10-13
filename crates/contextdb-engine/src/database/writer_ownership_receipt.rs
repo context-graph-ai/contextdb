@@ -43,9 +43,18 @@ impl Database {
             })
             .collect::<serde_json::Map<String, serde_json::Value>>();
         let mut owners = serde_json::Map::new();
-        owners.insert("writer_registration".into(), serde_json::json!(receipt.writer_registration));
-        owners.insert("engine_accountant_backing".into(), serde_json::json!(receipt.engine_accountant_backing));
-        owners.insert("writer_adapter_controls".into(), serde_json::json!(receipt.writer_adapter_controls));
+        owners.insert(
+            "writer_registration".into(),
+            serde_json::json!(receipt.writer_registration),
+        );
+        owners.insert(
+            "engine_accountant_backing".into(),
+            serde_json::json!(receipt.engine_accountant_backing),
+        );
+        owners.insert(
+            "writer_adapter_controls".into(),
+            serde_json::json!(receipt.writer_adapter_controls),
+        );
         owners.insert(
             "vector".into(),
             serde_json::json!({

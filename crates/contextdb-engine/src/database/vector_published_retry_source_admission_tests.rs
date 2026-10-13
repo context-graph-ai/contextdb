@@ -108,7 +108,9 @@ fn published_retry_admits_cold_sources_and_keeps_cleanup_pending_on_refusal() {
         .unwrap();
     assert!(!pending.1.is_empty());
     // A producer's current generation owns both native pages and a captured root.
-    let source_root = persistence.initialize_writer_snapshot(db.snapshot(), db.current_lsn()).unwrap();
+    let source_root = persistence
+        .initialize_writer_snapshot(db.snapshot(), db.current_lsn())
+        .unwrap();
     let retained_root = Arc::clone(&source_root);
     persistence.set_paged_root_capture(
         Arc::new(move || Ok(Arc::clone(&retained_root))),

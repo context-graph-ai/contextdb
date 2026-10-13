@@ -339,7 +339,10 @@ fn actual_current_point_list_and_index_work_stays_bounded_at_n_2n_4n_on_both_rou
                     "file {versions}/{query}: {touches}"
                 );
                 let expected = *file_work.entry(query).or_insert(touches);
-                assert_eq!(touches, expected, "file {versions}/{query}: N/2N/4N work is invariant");
+                assert_eq!(
+                    touches, expected,
+                    "file {versions}/{query}: N/2N/4N work is invariant"
+                );
             }
         }
         let db = Database::open_with_options(
@@ -373,7 +376,10 @@ fn actual_current_point_list_and_index_work_stays_bounded_at_n_2n_4n_on_both_rou
                 "owner {versions}/{query}: {touches}"
             );
             let expected = *owner_work.entry(query).or_insert(touches);
-            assert_eq!(touches, expected, "owner {versions}/{query}: N/2N/4N work is invariant");
+            assert_eq!(
+                touches, expected,
+                "owner {versions}/{query}: N/2N/4N work is invariant"
+            );
         }
         drop(session);
         db.close().unwrap();
@@ -421,8 +427,13 @@ fn export_rebuild_prune_and_drop_recreate_keep_producer_witnesses() {
         );
     }
     {
-        let fixture_open_accountant_415 = std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-        let _fixture_decode_scope_415 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_415).into()).unwrap();
+        let fixture_open_accountant_415 =
+            std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+        let _fixture_decode_scope_415 =
+            crate::read_image_memory::ImageMemory::enter_writer_operation(
+                std::sync::Arc::clone(&fixture_open_accountant_415).into(),
+            )
+            .unwrap();
         let store = RedbPersistence::open(&path).unwrap();
         store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_415).into());
         let metas = store.load_all_table_meta().unwrap();
@@ -435,8 +446,13 @@ fn export_rebuild_prune_and_drop_recreate_keep_producer_witnesses() {
     }
     assert_all_history_witnesses(&path);
     {
-        let fixture_open_accountant_426 = std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-        let _fixture_decode_scope_426 = crate::read_image_memory::ImageMemory::enter_writer_operation(std::sync::Arc::clone(&fixture_open_accountant_426).into()).unwrap();
+        let fixture_open_accountant_426 =
+            std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+        let _fixture_decode_scope_426 =
+            crate::read_image_memory::ImageMemory::enter_writer_operation(
+                std::sync::Arc::clone(&fixture_open_accountant_426).into(),
+            )
+            .unwrap();
         let store = RedbPersistence::open(&path).unwrap();
         store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_426).into());
         let rows = store.load_relational_table("integrity_rows").unwrap();

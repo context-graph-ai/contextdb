@@ -31,12 +31,18 @@ impl serde::Serialize for RowsAsObjects<'_> {
         use serde::ser::SerializeSeq;
         let mut seq = serializer.serialize_seq(Some(self.rows.len()))?;
         for row in self.rows {
-            seq.serialize_element(&ObjectRow { columns: self.columns, row })?;
+            seq.serialize_element(&ObjectRow {
+                columns: self.columns,
+                row,
+            })?;
         }
         seq.end()
     }
 }
-struct ObjectRow<'a> { columns: &'a [String], row: &'a [Value] }
+struct ObjectRow<'a> {
+    columns: &'a [String],
+    row: &'a [Value],
+}
 impl serde::Serialize for ObjectRow<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;

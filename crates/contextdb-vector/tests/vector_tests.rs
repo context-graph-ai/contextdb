@@ -623,9 +623,13 @@ fn public_search_ties_order_by_row_id_in_bruteforce_and_hnsw_paths() {
     // searchable through AUTO's exact route; INDEXED preserves the refusal.
     {
         use contextdb_core::{VectorPartitionKey, VectorSearchMode};
-        use contextdb_vector::hnsw::{ReadOnlyVectorGraphPageReader, ReadOnlyVectorGraphPageSource};
-        use contextdb_vector::store::{DormantVectorGraphGeneration, DormantVectorGraphLoader,
-            DormantVectorLoadRequest, LoadedVectorGraphGeneration, VectorGraphGeneration};
+        use contextdb_vector::hnsw::{
+            ReadOnlyVectorGraphPageReader, ReadOnlyVectorGraphPageSource,
+        };
+        use contextdb_vector::store::{
+            DormantVectorGraphGeneration, DormantVectorGraphLoader, DormantVectorLoadRequest,
+            LoadedVectorGraphGeneration, VectorGraphGeneration,
+        };
         use contextdb_vector::{HnswIndex, VectorPartitionRef};
 
         struct SavedGraphSource(Arc<Vec<u8>>);
@@ -657,15 +661,25 @@ fn public_search_ties_order_by_row_id_in_bruteforce_and_hnsw_paths() {
                 if !request(DormantVectorLoadRequest::Checkpoint) {
                     return Err(Error::ReadCancelled);
                 }
-                self.attempts.lock().unwrap().push((generation, caller_reserved_load_bytes));
+                self.attempts
+                    .lock()
+                    .unwrap()
+                    .push((generation, caller_reserved_load_bytes));
                 let graph = HnswIndex::decode_paged_durable_generation(
-                    &self.bytes, Arc::new(SavedGraphSource(self.bytes.clone())),
-                    self.dimension, self.quantization, caller_reserved_load_bytes, self.cache_bytes,
+                    &self.bytes,
+                    Arc::new(SavedGraphSource(self.bytes.clone())),
+                    self.dimension,
+                    self.quantization,
+                    caller_reserved_load_bytes,
+                    self.cache_bytes,
                 )?;
                 let resident_bytes = graph.estimated_resident_bytes();
                 Ok(LoadedVectorGraphGeneration {
-                    graph, resident_bytes, accountant: self.owner.clone(),
-                    caller_adopted_bytes: resident_bytes, fresh_tail: None,
+                    graph,
+                    resident_bytes,
+                    accountant: self.owner.clone(),
+                    caller_adopted_bytes: resident_bytes,
+                    fresh_tail: None,
                 })
             }
         }
@@ -678,23 +692,42 @@ fn public_search_ties_order_by_row_id_in_bruteforce_and_hnsw_paths() {
         let layout = store.index_layout(&r, &mut fixture_owner).unwrap();
         let policy = layout.resolve_policy(entries.len(), limit_rows);
         let graph = HnswIndex::from_vector_entries_with_policy(
-            &entries, layout.dimension, layout.quantization, policy,
+            &entries,
+            layout.dimension,
+            layout.quantization,
+            policy,
         );
         let (m, ef_construction, _) = graph.policy_values();
         let bytes = Arc::new(graph.encode_durable_generation().unwrap());
         drop(graph);
         let cache_bytes = SavedGraphSource(bytes.clone()).page_bytes();
         let admitted = HnswIndex::durable_reader_resident_bound_for_cache(
-            &bytes, layout.dimension, layout.quantization, m, cache_bytes,
-        ).unwrap();
+            &bytes,
+            layout.dimension,
+            layout.quantization,
+            m,
+            cache_bytes,
+        )
+        .unwrap();
         let control = HnswIndex::decode_paged_durable_generation(
-            &bytes, Arc::new(SavedGraphSource(bytes.clone())), layout.dimension,
-            layout.quantization, admitted, cache_bytes,
-        ).expect("a fresh public decoder control fits the real saved generation");
+            &bytes,
+            Arc::new(SavedGraphSource(bytes.clone())),
+            layout.dimension,
+            layout.quantization,
+            admitted,
+            cache_bytes,
+        )
+        .expect("a fresh public decoder control fits the real saved generation");
         let requested = control.estimated_resident_bytes();
-        assert_eq!(control.len(), entries.len(), "the saved generation contains every authoritative fixture vector");
+        assert_eq!(
+            control.len(),
+            entries.len(),
+            "the saved generation contains every authoritative fixture vector"
+        );
         drop(control);
-        let limit = requested.checked_sub(1).expect("the fresh control retains resident bytes");
+        let limit = requested
+            .checked_sub(1)
+            .expect("the fresh control retains resident bytes");
         let partition = VectorPartitionRef::new(r.clone(), VectorPartitionKey::unpartitioned());
         store.clear_hnsw_for(&r, accountant.as_ref());
         let descriptor = DormantVectorGraphGeneration {
@@ -707,40 +740,94 @@ fn public_search_ties_order_by_row_id_in_bruteforce_and_hnsw_paths() {
                 hnsw_m: u32::try_from(m).unwrap(),
                 hnsw_ef_construction: u32::try_from(ef_construction).unwrap(),
             },
-            resident_bytes: limit, load_bytes: limit, reclaim_bytes: limit,
+            resident_bytes: limit,
+            load_bytes: limit,
+            reclaim_bytes: limit,
         };
         let loader = Arc::new(SavedGraphLoader {
-            bytes, dimension: layout.dimension, quantization: layout.quantization,
-            cache_bytes, owner: accountant.clone(), attempts: std::sync::Mutex::new(Vec::new()),
+            bytes,
+            dimension: layout.dimension,
+            quantization: layout.quantization,
+            cache_bytes,
+            owner: accountant.clone(),
+            attempts: std::sync::Mutex::new(Vec::new()),
         });
-        store.register_dormant_partition_generation(&partition, true, descriptor, loader.clone()).unwrap();
+        store
+            .register_dormant_partition_generation(&partition, true, descriptor, loader.clone())
+            .unwrap();
         assert_eq!(store.partition_route_quarantine(&partition), None);
-        let (exact, exact_trace) = exec.search_with_mode(
-            r.clone(), &query, limit_rows, None, snapshot, VectorSearchMode::Exact, accountant.clone(),
-        ).expect("the same snapshot completes its authoritative EXACT control");
-        assert!(loader.attempts.lock().unwrap().is_empty(), "EXACT reads authoritative bodies without loading the saved graph");
-        assert_eq!(&*exact, &*hnsw, "the same-snapshot control retains the established ordered row and score tie oracle");
+        let (exact, exact_trace) = exec
+            .search_with_mode(
+                r.clone(),
+                &query,
+                limit_rows,
+                None,
+                snapshot,
+                VectorSearchMode::Exact,
+                accountant.clone(),
+            )
+            .expect("the same snapshot completes its authoritative EXACT control");
+        assert!(
+            loader.attempts.lock().unwrap().is_empty(),
+            "EXACT reads authoritative bodies without loading the saved graph"
+        );
+        assert_eq!(
+            &*exact, &*hnsw,
+            "the same-snapshot control retains the established ordered row and score tie oracle"
+        );
         drop(exact_trace);
         let mut route_failures = Vec::new();
         let before_auto = accountant.usage().used;
         let automatic = exec.search_with_mode(
-            r.clone(), &query, limit_rows, None, snapshot, VectorSearchMode::Auto, accountant.clone(),
+            r.clone(),
+            &query,
+            limit_rows,
+            None,
+            snapshot,
+            VectorSearchMode::Auto,
+            accountant.clone(),
         );
         match automatic {
             Ok((automatic, automatic_trace)) => {
-                assert_eq!(&*automatic, &*exact, "AUTO's complete ordered row IDs and scores equal fresh EXACT after a decoder refusal");
-                assert_eq!(automatic_trace.fallback_reason(), Some("maintained_graph_memory_refused"));
+                assert_eq!(
+                    &*automatic, &*exact,
+                    "AUTO's complete ordered row IDs and scores equal fresh EXACT after a decoder refusal"
+                );
+                assert_eq!(
+                    automatic_trace.fallback_reason(),
+                    Some("maintained_graph_memory_refused")
+                );
                 drop(automatic);
                 drop(automatic_trace);
             }
-            Err(error) => route_failures.push(format!("AUTO must complete exact work after the public decoder refusal, received {error:?}")),
+            Err(error) => route_failures.push(format!(
+                "AUTO must complete exact work after the public decoder refusal, received {error:?}"
+            )),
         }
-        assert_eq!(*loader.attempts.lock().unwrap(), vec![(descriptor, limit)], "AUTO reached the real decoder with exactly the supplied one-byte-short admission");
-        assert_eq!(store.partition_route_quarantine(&partition), None, "memory refusal does not quarantine this valid generation");
-        assert_eq!(accountant.usage().used, before_auto, "AUTO refunds its temporary loader and search reservations");
+        assert_eq!(
+            *loader.attempts.lock().unwrap(),
+            vec![(descriptor, limit)],
+            "AUTO reached the real decoder with exactly the supplied one-byte-short admission"
+        );
+        assert_eq!(
+            store.partition_route_quarantine(&partition),
+            None,
+            "memory refusal does not quarantine this valid generation"
+        );
+        assert_eq!(
+            accountant.usage().used,
+            before_auto,
+            "AUTO refunds its temporary loader and search reservations"
+        );
         let before_indexed = accountant.usage().used;
         let indexed = exec.search_with_mode(
-            r.clone(), &query, limit_rows, None, snapshot, VectorSearchMode::Indexed, accountant.clone(),
+            r.clone(),
+            &query,
+            limit_rows,
+            None,
+            snapshot,
+            VectorSearchMode::Indexed,
+            accountant.clone(),
         );
         match indexed {
             Err(Error::MemoryBudgetExceeded { requested_bytes, available_bytes, budget_limit_bytes, .. }) => {
@@ -751,10 +838,21 @@ fn public_search_ties_order_by_row_id_in_bruteforce_and_hnsw_paths() {
             Err(other) => route_failures.push(format!("INDEXED must preserve the real public decoder's typed memory refusal, received {other:?}")),
             Ok(_) => route_failures.push("INDEXED must refuse a saved graph one byte below its measured residency".to_string()),
         }
-        assert_eq!(*loader.attempts.lock().unwrap(), vec![(descriptor, limit), (descriptor, limit)], "INDEXED also reaches the same real decoder and admission");
+        assert_eq!(
+            *loader.attempts.lock().unwrap(),
+            vec![(descriptor, limit), (descriptor, limit)],
+            "INDEXED also reaches the same real decoder and admission"
+        );
         assert_eq!(store.partition_route_quarantine(&partition), None);
-        assert_eq!(accountant.usage().used, before_indexed, "INDEXED refunds its temporary reservation after the decoder refuses");
-        assert!(route_failures.is_empty(), "AUTO and INDEXED must preserve the public decoder refusal contract: {route_failures:?}");
+        assert_eq!(
+            accountant.usage().used,
+            before_indexed,
+            "INDEXED refunds its temporary reservation after the decoder refuses"
+        );
+        assert!(
+            route_failures.is_empty(),
+            "AUTO and INDEXED must preserve the public decoder refusal contract: {route_failures:?}"
+        );
     }
 }
 

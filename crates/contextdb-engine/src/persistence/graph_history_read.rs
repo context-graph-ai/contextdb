@@ -49,24 +49,46 @@ impl RetainedReadSource {
                 let _pool = owner.reserve(READ_HISTORY_PROOF_POOL_BYTES, "history_stream_proof")?;
                 let proof =
                     content_identity::ProofMemory::with_limit(READ_HISTORY_PROOF_POOL_BYTES);
-                #[cfg(any(test, feature = "test-seams"))] { crate::read_work_probe::bind_graph_root(read.storage_snapshot_identity()); crate::read_work_probe::note_graph(redb::TableHandle::name(&definition), "population_walk", &[], None, None); }
+                #[cfg(any(test, feature = "test-seams"))]
+                {
+                    crate::read_work_probe::bind_graph_root(read.storage_snapshot_identity());
+                    crate::read_work_probe::note_graph(
+                        redb::TableHandle::name(&definition),
+                        "population_walk",
+                        &[],
+                        None,
+                        None,
+                    );
+                }
                 let table = open_optional_read_table(read, definition)?;
                 let mut ddl_last = None;
                 let _ddl_controls = if kind == content_identity::HistoryKind::DdlLog {
                     Some(contextdb_core::read_memory::ReadCredit::try_new(
                         memory.clone(),
-                        std::mem::size_of::<Option<(u64, Lsn, [u8;32], [u8;32])>>()
+                        std::mem::size_of::<Option<(u64, Lsn, [u8; 32], [u8; 32])>>()
                             + std::mem::size_of::<blake3::Hasher>(),
-                        "reader", "ddl_complete_controls", "Raise the declared reader memory limit.",
+                        "reader",
+                        "ddl_complete_controls",
+                        "Raise the declared reader memory limit.",
                     )?)
-                } else { None };
+                } else {
+                    None
+                };
                 let mut stored = match &table {
                     Some(table) => Some(
                         table
                             .iter()
                             .map_err(RedbPersistence::storage_error)?
                             .inspect(|_entry| {
-#[cfg(any(test, feature = "test-seams"))] if let Ok((key, _)) = _entry { crate::read_work_probe::graph_storage_key(redb::TableHandle::name(&definition), "iteration_step", key.value()); }                            }),
+                                #[cfg(any(test, feature = "test-seams"))]
+                                if let Ok((key, _)) = _entry {
+                                    crate::read_work_probe::graph_storage_key(
+                                        redb::TableHandle::name(&definition),
+                                        "iteration_step",
+                                        key.value(),
+                                    );
+                                }
+                            }),
                     ),
                     None => None,
                 };
@@ -117,9 +139,14 @@ impl RetainedReadSource {
                             }
                             if kind == content_identity::HistoryKind::DdlLog {
                                 ddl_last = Some((
-                                    u64::try_from(key.len()).map_err(|_| self.history_damage("DDL coordinate length overflow"))?,
+                                    u64::try_from(key.len()).map_err(|_| {
+                                        self.history_damage("DDL coordinate length overflow")
+                                    })?,
                                     RedbPersistence::ddl_lsn_from_key(key)?,
-                                    content_identity::history_open_control::ddl_coordinate_digest(key.as_bytes(), Some(checkpoint))?,
+                                    content_identity::history_open_control::ddl_coordinate_digest(
+                                        key.as_bytes(),
+                                        Some(checkpoint),
+                                    )?,
                                     actual,
                                 ));
                             }
@@ -303,7 +330,13 @@ impl RetainedReadSource {
                         let entry = entry.transpose().map_err(RedbPersistence::storage_error)?;
                         #[cfg(any(test, feature = "test-seams"))]
                         if let Some((key, _)) = &entry {
-                            crate::read_work_probe::note_graph("commit_index", "iteration_step", &key.value().to_be_bytes(), Some(contextdb_core::Lsn(key.value())), None);
+                            crate::read_work_probe::note_graph(
+                                "commit_index",
+                                "iteration_step",
+                                &key.value().to_be_bytes(),
+                                Some(contextdb_core::Lsn(key.value())),
+                                None,
+                            );
                         }
                         entry
                     }

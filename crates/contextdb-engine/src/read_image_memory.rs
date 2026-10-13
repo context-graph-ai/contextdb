@@ -29,7 +29,8 @@ impl ImageMemory {
             accountant: Arc::new(match limit {
                 Some(limit) => MemoryAccountant::with_budget(limit),
                 None => MemoryAccountant::no_limit(),
-            }).into(),
+            })
+            .into(),
             subsystem: "direct_read",
             operation: "hydrate_owned_image",
             hint: "Raise MEMORY_LIMIT to admit the complete committed read image.",
@@ -45,7 +46,9 @@ impl ImageMemory {
     /// where the session's limit sees it, allocation by allocation, and given
     /// back when this charge is dropped.
     #[cfg(any(test, feature = "test-seams"))]
-    pub(crate) fn charging(accountant: impl Into<crate::memory_accounting::AccountantHandle>) -> Arc<Self> {
+    pub(crate) fn charging(
+        accountant: impl Into<crate::memory_accounting::AccountantHandle>,
+    ) -> Arc<Self> {
         Self::charging_for(
             accountant.into(),
             "direct_read",
@@ -59,7 +62,8 @@ impl ImageMemory {
         operation: &'static str,
         hint: &'static str,
     ) -> Arc<Self> {
-        let writer_custody = crate::memory_accounting::StoreAccountantHandle::retain_if_writer(&accountant);
+        let writer_custody =
+            crate::memory_accounting::StoreAccountantHandle::retain_if_writer(&accountant);
         Arc::new(Self {
             accountant,
             subsystem,
@@ -148,12 +152,15 @@ impl ImageMemory {
 
     /// Actual write-side decoding borrows the existing writer accountant;
     /// the operation owner holds and releases only its own admitted payloads.
-    pub(crate) fn operation_writer(accountant: crate::memory_accounting::AccountantHandle) -> Result<Arc<Self>> {
+    pub(crate) fn operation_writer(
+        accountant: crate::memory_accounting::AccountantHandle,
+    ) -> Result<Arc<Self>> {
         let control = std::mem::size_of::<Self>() + 2 * std::mem::size_of::<usize>();
         // Fixed decode control is named open residue; growing payloads below
         // still use this writer's declared working-memory limit.
         crate::memory_accounting::admit_open_residue(control, "writer_decode_open_residue")?;
-        let writer_custody = crate::memory_accounting::StoreAccountantHandle::retain_if_writer(&accountant);
+        let writer_custody =
+            crate::memory_accounting::StoreAccountantHandle::retain_if_writer(&accountant);
         Ok(Arc::new(Self {
             accountant,
             subsystem: "writer_source",
@@ -174,7 +181,8 @@ impl ImageMemory {
         Arc::new(match limit {
             Some(bytes) => MemoryAccountant::with_budget(bytes),
             None => MemoryAccountant::no_limit(),
-        }).into()
+        })
+        .into()
     }
 
     /// Reuse an operation's owner; otherwise admit a fresh call-local owner.
@@ -199,7 +207,9 @@ impl ImageMemory {
     /// A boxed source window's control credit can survive its payload. Keep
     /// the original explicit reader funder, or a counted writer adapter, for
     /// that escaping credit instead of borrowing the payload's source epoch.
-    pub(crate) fn source_box_budget(&self) -> Result<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>> {
+    pub(crate) fn source_box_budget(
+        &self,
+    ) -> Result<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>> {
         match &self.reader_budget {
             Some(reader) => Ok(reader.clone()),
             None => self.accountant.read_budget(),
@@ -244,11 +254,25 @@ impl ImageMemory {
     }
     /// The direct source's existing fixed reservation adopts a concrete
     /// control owner without refunding or admitting those bytes again.
-    pub(crate) fn detach_direct_source_credit(&self, bytes: usize) -> Result<crate::memory_accounting::ControlCredit> {
-        assert!(self.reader_budget.is_none(), "direct source owns its original accountant credit");
-        self.held.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| held.checked_sub(bytes))
-            .map_err(|_| Error::Other("direct source control exceeds its existing image credit".into()))?;
-        Ok(crate::memory_accounting::ControlCredit::from_admitted(&self.accountant, bytes))
+    pub(crate) fn detach_direct_source_credit(
+        &self,
+        bytes: usize,
+    ) -> Result<crate::memory_accounting::ControlCredit> {
+        assert!(
+            self.reader_budget.is_none(),
+            "direct source owns its original accountant credit"
+        );
+        self.held
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
+                held.checked_sub(bytes)
+            })
+            .map_err(|_| {
+                Error::Other("direct source control exceeds its existing image credit".into())
+            })?;
+        Ok(crate::memory_accounting::ControlCredit::from_admitted(
+            &self.accountant,
+            bytes,
+        ))
     }
     /// Detach only the caller's explicitly prepaid copy credit. No funding
     /// is returned or admitted while the consuming bridge changes ownership.
@@ -342,7 +366,10 @@ impl ImageMemory {
         }
     }
 
-    pub(crate) fn funded_by_writer(&self, accountant: &crate::memory_accounting::AccountantHandle) -> bool {
+    pub(crate) fn funded_by_writer(
+        &self,
+        accountant: &crate::memory_accounting::AccountantHandle,
+    ) -> bool {
         self.reader_budget.is_none() && std::ptr::eq(self.accountant.as_ptr(), accountant.as_ptr())
     }
 
@@ -369,11 +396,13 @@ impl ImageMemory {
     }
 
     pub(crate) fn retained_payload_bytes(&self) -> usize {
-        self.held().saturating_sub(if self.control_bytes & crate::memory_accounting::OPEN_RESIDUE_TAG != 0 {
-            0
-        } else {
-            self.control_bytes
-        })
+        self.held().saturating_sub(
+            if self.control_bytes & crate::memory_accounting::OPEN_RESIDUE_TAG != 0 {
+                0
+            } else {
+                self.control_bytes
+            },
+        )
     }
 
     pub(crate) fn held(&self) -> usize {
@@ -498,7 +527,9 @@ impl Drop for ImageMemory {
     fn drop(&mut self) {
         self.release(self.held.load(Ordering::SeqCst));
         if self.control_bytes & crate::memory_accounting::OPEN_RESIDUE_TAG != 0 {
-            crate::memory_accounting::refund_open_residue(self.control_bytes & !crate::memory_accounting::OPEN_RESIDUE_TAG);
+            crate::memory_accounting::refund_open_residue(
+                self.control_bytes & !crate::memory_accounting::OPEN_RESIDUE_TAG,
+            );
         }
     }
 }
@@ -1416,22 +1447,35 @@ impl NativeDeliveryImage {
         use contextdb_core::read_memory::{ReadCredit, ReadShared};
         let owner = context.owner()?;
         let invoice = ReadCredit::try_new_owned(
-            owner.clone(), ReadShared::<Self>::layout().size(), "reader",
-            "decode_sync_owner", "Reduce simultaneous requests or raise the declared reader memory limit.",
+            owner.clone(),
+            ReadShared::<Self>::layout().size(),
+            "reader",
+            "decode_sync_owner",
+            "Reduce simultaneous requests or raise the declared reader memory limit.",
         )?;
         ReadShared::try_from_prepaid_with(invoice, || Ok(Self { owner, context }))
     }
-    pub(crate) fn checkpoint(&self) -> Result<()> { self.context.checkpoint() }
-    pub(crate) fn allocate(&self, length: usize) -> std::result::Result<NativeDeliveryBytes, NativeDeliveryAllocationError> {
+    pub(crate) fn checkpoint(&self) -> Result<()> {
+        self.context.checkpoint()
+    }
+    pub(crate) fn allocate(
+        &self,
+        length: usize,
+    ) -> std::result::Result<NativeDeliveryBytes, NativeDeliveryAllocationError> {
         use contextdb_core::read_memory::ReadCredit;
         self.checkpoint()?;
         let layout = std::alloc::Layout::array::<u8>(length)
             .map_err(|_| NativeDeliveryAllocationError::Layout)?;
         let invoice = ReadCredit::try_new_owned(
-            self.owner.clone(), layout.size(), "reader", "decode_sync_bytes",
+            self.owner.clone(),
+            layout.size(),
+            "reader",
+            "decode_sync_bytes",
             "Reduce the request or raise the declared reader memory limit.",
         )?;
-        let bytes = if length == 0 { Vec::new() } else {
+        let bytes = if length == 0 {
+            Vec::new()
+        } else {
             // SAFETY: the exact u8 layout is prepaid. A null allocation is a
             // fallible result. Every byte is initialized before Vec takes it;
             // this buffer is never grown, shrunk or reallocated.
@@ -1459,11 +1503,16 @@ pub(crate) struct NativeDeliveryBytes {
 }
 #[cfg(feature = "sync-orchestration")]
 impl NativeDeliveryBytes {
-    pub(crate) fn as_slice(&self) -> &[u8] { &self.bytes }
-    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] { &mut self.bytes }
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        &self.bytes
+    }
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.bytes
+    }
 }
 
 #[cfg(feature = "sync-orchestration")]
+#[derive(Debug)]
 pub(crate) enum NativeDeliveryAllocationError {
     Resource(Error),
     Layout,
@@ -1471,7 +1520,9 @@ pub(crate) enum NativeDeliveryAllocationError {
 }
 #[cfg(feature = "sync-orchestration")]
 impl From<Error> for NativeDeliveryAllocationError {
-    fn from(error: Error) -> Self { Self::Resource(error) }
+    fn from(error: Error) -> Self {
+        Self::Resource(error)
+    }
 }
 
 /// Fixed native selection storage, paid by the concrete existing request owner.
@@ -1490,12 +1541,18 @@ impl<T> NativeSelectionHold<T> {
         owner: &contextdb_core::read_memory::ReadMemoryOwner,
         slots: usize,
     ) -> std::result::Result<Self, NativeDeliveryAllocationError> {
-        let layout = std::alloc::Layout::array::<T>(slots).map_err(|_| NativeDeliveryAllocationError::Layout)?;
+        let layout = std::alloc::Layout::array::<T>(slots)
+            .map_err(|_| NativeDeliveryAllocationError::Layout)?;
         let invoice = contextdb_core::read_memory::ReadCredit::try_new_owned(
-            owner.clone(), layout.size(), "reader", "retain_custody_selection",
+            owner.clone(),
+            layout.size(),
+            "reader",
+            "retain_custody_selection",
             "Reduce custody metadata selected by this operation.",
         )?;
-        let values = if layout.size() == 0 { Vec::new() } else {
+        let values = if layout.size() == 0 {
+            Vec::new()
+        } else {
             // SAFETY: exact prepaid T-array storage. Vec owns capacity only;
             // the initialized prefix starts empty and grows without allocation.
             let storage = unsafe { std::alloc::alloc(layout) };
@@ -1504,18 +1561,31 @@ impl<T> NativeSelectionHold<T> {
             };
             unsafe { Vec::from_raw_parts(storage.as_ptr(), 0, slots) }
         };
-        Ok(Self { values, invoice, slots })
+        Ok(Self {
+            values,
+            invoice,
+            slots,
+        })
     }
     pub(crate) fn retain(&mut self, value: T) -> std::result::Result<(), T> {
-        if self.values.len() == self.slots { return Err(value); }
+        if self.values.len() == self.slots {
+            return Err(value);
+        }
         // For nonzero T the exact fixed capacity was allocated above. For a
         // zero-sized T push cannot allocate and slots still bounds its count.
         self.values.push(value);
         Ok(())
     }
-    pub(crate) fn as_slice(&self) -> &[T] { &self.values }
-    pub(crate) fn as_mut_slice(&mut self) -> &mut [T] { &mut self.values }
-    pub(crate) fn is_funded_by(&self, owner: &contextdb_core::read_memory::ReadMemoryOwner) -> bool {
+    pub(crate) fn as_slice(&self) -> &[T] {
+        &self.values
+    }
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [T] {
+        &mut self.values
+    }
+    pub(crate) fn is_funded_by(
+        &self,
+        owner: &contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> bool {
         self.invoice.is_funded_by(owner)
     }
 }

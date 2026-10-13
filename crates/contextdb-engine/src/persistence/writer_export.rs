@@ -105,7 +105,13 @@ impl RedbPersistence {
                 .insert(key, encoded)
                 .map_err(Self::storage_error)?;
             let mutations = content_identity::config_mutations(key, Some(encoded));
-            Self::apply_content_identity_with_manifests_and_groups_in_write(&write, &mutations, &[], &mut admission, Some(&group_plan))?;
+            Self::apply_content_identity_with_manifests_and_groups_in_write(
+                &write,
+                &mutations,
+                &[],
+                &mut admission,
+                Some(&group_plan),
+            )?;
             Self::write_writer_recovery_bounds_in_write(&write, None)?;
             write.commit().map_err(Self::storage_error)
         })

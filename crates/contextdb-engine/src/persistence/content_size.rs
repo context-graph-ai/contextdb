@@ -445,19 +445,20 @@ pub(super) fn reconcile_row_heads(
             )
         };
         if let (Some((prior_head, _)), Some(next_head)) = (prior, head)
-            && rank(prior_head) > rank(next_head) {
-                let relation_name = RedbPersistence::rel_table_name(table);
-                let relation = write
-                    .open_table(TableDefinition::<&[u8], &[u8]>::new(&relation_name))
-                    .map_err(RedbPersistence::storage_error)?;
-                if relation
-                    .get(prior_head.as_slice())
-                    .map_err(RedbPersistence::storage_error)?
-                    .is_some()
-                {
-                    continue;
-                }
+            && rank(prior_head) > rank(next_head)
+        {
+            let relation_name = RedbPersistence::rel_table_name(table);
+            let relation = write
+                .open_table(TableDefinition::<&[u8], &[u8]>::new(&relation_name))
+                .map_err(RedbPersistence::storage_error)?;
+            if relation
+                .get(prior_head.as_slice())
+                .map_err(RedbPersistence::storage_error)?
+                .is_some()
+            {
+                continue;
             }
+        }
         let new = if mutation.logical_value.is_some() {
             let head = head.ok_or_else(|| corrupt("live row has no physical head"))?;
             let relation_name = RedbPersistence::rel_table_name(table);

@@ -1,8 +1,8 @@
+use std::alloc::Layout;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::ptr::NonNull;
 use std::mem::ManuallyDrop;
-use std::alloc::Layout;
+use std::ptr::NonNull;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, OnceLock};
@@ -22,13 +22,15 @@ pub(crate) fn admit_open_residue(bytes: usize, operation: &str) -> contextdb_cor
     assert!(bytes < OPEN_RESIDUE_TAG);
     let domain = PROCESS_WRITER_BUDGET_DOMAIN.read();
     let ceiling = domain.ceiling.unwrap_or_else(inherited_process_ceiling);
-    aggregate_try_reserve(bytes, ceiling).map_err(|available| contextdb_core::Error::MemoryBudgetExceeded {
-        subsystem: "process_native_ceiling".to_string(),
-        operation: operation.to_string(),
-        requested_bytes: bytes,
-        available_bytes: available,
-        budget_limit_bytes: ceiling,
-        hint: "The inherited process ceiling funds fixed writer open residue.".to_string(),
+    aggregate_try_reserve(bytes, ceiling).map_err(|available| {
+        contextdb_core::Error::MemoryBudgetExceeded {
+            subsystem: "process_native_ceiling".to_string(),
+            operation: operation.to_string(),
+            requested_bytes: bytes,
+            available_bytes: available,
+            budget_limit_bytes: ceiling,
+            hint: "The inherited process ceiling funds fixed writer open residue.".to_string(),
+        }
     })
 }
 
@@ -39,8 +41,13 @@ pub(crate) fn refund_open_residue(bytes: usize) {
 fn aggregate_refund(bytes: usize) {
     if bytes != 0 {
         PROCESS_WRITER_AGGREGATE
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| held.checked_sub(bytes))
-            .map_or_else(|_| refund_invariant_broken("process aggregate refund is owned"), |_| ());
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
+                held.checked_sub(bytes)
+            })
+            .map_or_else(
+                |_| refund_invariant_broken("process aggregate refund is owned"),
+                |_| (),
+            );
     }
 }
 
@@ -88,14 +95,21 @@ impl WriterCounter {
     /// decremented -- the one member decrement that skips the aggregate.
     fn rollback_local_only(&self, bytes: usize) {
         self.used
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| used.checked_sub(bytes))
-            .map_or_else(|_| refund_invariant_broken("local rollback is owned"), |_| ());
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
+                used.checked_sub(bytes)
+            })
+            .map_or_else(
+                |_| refund_invariant_broken("local rollback is owned"),
+                |_| (),
+            );
     }
     /// Unconditional charge (retained startup floors); a member's bytes join
     /// the aggregate without a ceiling check, as the local charge has none.
     fn charge(&self, bytes: usize) {
         self.used
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| used.checked_add(bytes))
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
+                used.checked_add(bytes)
+            })
             .expect("retained ownership cannot overflow its counter");
         if self.is_member() {
             PROCESS_WRITER_AGGREGATE.fetch_add(bytes, Ordering::SeqCst);
@@ -104,7 +118,9 @@ impl WriterCounter {
     /// Return owned bytes; a member's bytes leave the aggregate once, here.
     pub(crate) fn release_owned(&self, bytes: usize) -> Result<(), usize> {
         self.used
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| used.checked_sub(bytes))?;
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
+                used.checked_sub(bytes)
+            })?;
         if self.is_member() {
             aggregate_refund(bytes);
         }
@@ -115,7 +131,9 @@ impl WriterCounter {
     fn release_saturating(&self, bytes: usize) -> usize {
         let before = self
             .used
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| Some(used.saturating_sub(bytes)))
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
+                Some(used.saturating_sub(bytes))
+            })
             .expect("release update always supplies a value");
         if self.is_member() {
             aggregate_refund(bytes.min(before));
@@ -145,12 +163,18 @@ impl Drop for WriterCounter {
 #[derive(Debug, Clone)]
 pub(crate) struct WriterCounterHandle(ManuallyDrop<Arc<ManuallyDrop<WriterCounter>>>);
 impl WriterCounterHandle {
-    fn new(counter: WriterCounter) -> Self { Self(ManuallyDrop::new(Arc::new(ManuallyDrop::new(counter)))) }
-    pub(crate) fn as_ptr(&self) -> *const WriterCounter { Arc::as_ptr(&self.0).cast() }
+    fn new(counter: WriterCounter) -> Self {
+        Self(ManuallyDrop::new(Arc::new(ManuallyDrop::new(counter))))
+    }
+    pub(crate) fn as_ptr(&self) -> *const WriterCounter {
+        Arc::as_ptr(&self.0).cast()
+    }
 }
 impl std::ops::Deref for WriterCounterHandle {
     type Target = WriterCounter;
-    fn deref(&self) -> &WriterCounter { &self.0 }
+    fn deref(&self) -> &WriterCounter {
+        &self.0
+    }
 }
 impl Drop for WriterCounterHandle {
     fn drop(&mut self) {
@@ -180,16 +204,25 @@ impl AccountantHandle {
     fn from_standard(accountant: Arc<MemoryAccountant>) -> Self {
         Self(NonNull::new(Arc::into_raw(accountant).cast_mut()).expect("live accountant"))
     }
-    fn is_engine(&self) -> bool { self.0.addr().get() & ACCOUNTANT_ORIGIN != 0 }
+    fn is_engine(&self) -> bool {
+        self.0.addr().get() & ACCOUNTANT_ORIGIN != 0
+    }
     pub(crate) fn as_ptr(&self) -> *const MemoryAccountant {
-        self.0.as_ptr().map_addr(|address| address & !ACCOUNTANT_TAGS)
+        self.0
+            .as_ptr()
+            .map_addr(|address| address & !ACCOUNTANT_TAGS)
     }
     // Checked clone for genuine standard-Arc observation only. Engine writer
     // callers cannot manufacture an unrestricted Arc or Weak from this seam.
     pub(crate) fn standard_arc(&self) -> Option<Arc<MemoryAccountant>> {
-        if self.is_engine() { return None; }
+        if self.is_engine() {
+            return None;
+        }
         let raw = self.as_ptr();
-        Some(unsafe { Arc::increment_strong_count(raw); Arc::from_raw(raw) })
+        Some(unsafe {
+            Arc::increment_strong_count(raw);
+            Arc::from_raw(raw)
+        })
     }
     fn into_owned_raw(self) -> *mut MemoryAccountant {
         ManuallyDrop::new(self).0.as_ptr()
@@ -198,7 +231,11 @@ impl AccountantHandle {
         Self(NonNull::new(raw).expect("owned accountant"))
     }
     fn backing_bytes(&self) -> usize {
-        if self.is_engine() { engine_writer_backing_bytes() } else { 0 }
+        if self.is_engine() {
+            engine_writer_backing_bytes()
+        } else {
+            0
+        }
     }
     #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn writer_fixed_ownership(&self) -> (usize, usize, usize) {
@@ -207,11 +244,23 @@ impl AccountantHandle {
     }
     #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn native_backing_for_test(&self) -> (bool, [(usize, Layout); 3]) {
-        (self.is_engine(), [
-            (self.as_ptr() as usize, writer_adapter_type_layout::<MemoryAccountant>()),
-            (Arc::as_ptr(&self.limit) as usize, writer_adapter_type_layout::<AtomicUsize>()),
-            (self.used.as_ptr() as usize, writer_adapter_type_layout::<WriterCounter>()),
-        ])
+        (
+            self.is_engine(),
+            [
+                (
+                    self.as_ptr() as usize,
+                    writer_adapter_type_layout::<MemoryAccountant>(),
+                ),
+                (
+                    Arc::as_ptr(&self.limit) as usize,
+                    writer_adapter_type_layout::<AtomicUsize>(),
+                ),
+                (
+                    self.used.as_ptr() as usize,
+                    writer_adapter_type_layout::<WriterCounter>(),
+                ),
+            ],
+        )
     }
     fn engine(limit: Option<usize>) -> contextdb_core::Result<Self> {
         let counter = WriterCounter::default();
@@ -227,30 +276,50 @@ impl AccountantHandle {
         let accountant = MemoryAccountant::with_controls(limit_control, used, limit);
         #[cfg(any(test, feature = "test-seams"))]
         {
-            accountant.high_water_for_test.store(backing_bytes, Ordering::SeqCst);
-            accountant.admitted_bytes_for_test.store(backing_bytes, Ordering::SeqCst);
-            accountant.retained_charge_bytes_for_test.store(backing_bytes, Ordering::SeqCst);
+            accountant
+                .high_water_for_test
+                .store(backing_bytes, Ordering::SeqCst);
+            accountant
+                .admitted_bytes_for_test
+                .store(backing_bytes, Ordering::SeqCst);
+            accountant
+                .retained_charge_bytes_for_test
+                .store(backing_bytes, Ordering::SeqCst);
             note_budget_ledger("charge_retained", backing_bytes, backing_bytes);
         }
-        let raw = Arc::into_raw(Arc::new(ManuallyDrop::new(accountant))).cast_mut().cast::<MemoryAccountant>();
-        Ok(Self(NonNull::new(raw.map_addr(|address| address | ACCOUNTANT_ORIGIN)).expect("native accountant")))
+        let raw = Arc::into_raw(Arc::new(ManuallyDrop::new(accountant)))
+            .cast_mut()
+            .cast::<MemoryAccountant>();
+        Ok(Self(
+            NonNull::new(raw.map_addr(|address| address | ACCOUNTANT_ORIGIN))
+                .expect("native accountant"),
+        ))
     }
 }
 impl From<Arc<MemoryAccountant>> for AccountantHandle {
-    fn from(accountant: Arc<MemoryAccountant>) -> Self { Self::from_standard(accountant) }
+    fn from(accountant: Arc<MemoryAccountant>) -> Self {
+        Self::from_standard(accountant)
+    }
 }
 impl std::ops::Deref for AccountantHandle {
     type Target = MemoryAccountant;
-    fn deref(&self) -> &MemoryAccountant { unsafe { &*self.as_ptr() } }
+    fn deref(&self) -> &MemoryAccountant {
+        unsafe { &*self.as_ptr() }
+    }
 }
 impl AsRef<MemoryAccountant> for AccountantHandle {
-    fn as_ref(&self) -> &MemoryAccountant { self }
+    fn as_ref(&self) -> &MemoryAccountant {
+        self
+    }
 }
 impl Clone for AccountantHandle {
     fn clone(&self) -> Self {
         unsafe {
-            if self.is_engine() { Arc::increment_strong_count(self.as_ptr().cast::<ManuallyDrop<MemoryAccountant>>()); }
-            else { Arc::increment_strong_count(self.as_ptr()); }
+            if self.is_engine() {
+                Arc::increment_strong_count(self.as_ptr().cast::<ManuallyDrop<MemoryAccountant>>());
+            } else {
+                Arc::increment_strong_count(self.as_ptr());
+            }
         }
         Self(self.0)
     }
@@ -258,10 +327,13 @@ impl Clone for AccountantHandle {
 impl Drop for AccountantHandle {
     fn drop(&mut self) {
         if !self.is_engine() {
-            unsafe { drop(Arc::from_raw(self.as_ptr())); }
+            unsafe {
+                drop(Arc::from_raw(self.as_ptr()));
+            }
             return;
         }
-        let owner = unsafe { Arc::from_raw(self.as_ptr().cast::<ManuallyDrop<MemoryAccountant>>()) };
+        let owner =
+            unsafe { Arc::from_raw(self.as_ptr().cast::<ManuallyDrop<MemoryAccountant>>()) };
         if let Some(accountant) = Arc::into_inner(owner) {
             let accountant = ManuallyDrop::into_inner(accountant);
             let counter = accountant.used.clone();
@@ -269,9 +341,13 @@ impl Drop for AccountantHandle {
             // frees its unique limit block before the original-counter refund.
             drop(accountant);
             let domain = PROCESS_WRITER_BUDGET_DOMAIN.read();
-            let refund = counter.release_owned(writer_adapter_type_layout::<MemoryAccountant>().size()
-                + writer_adapter_type_layout::<AtomicUsize>().size());
-            if !std::thread::panicking() { refund.expect("native accountant backing refund is owned"); }
+            let refund = counter.release_owned(
+                writer_adapter_type_layout::<MemoryAccountant>().size()
+                    + writer_adapter_type_layout::<AtomicUsize>().size(),
+            );
+            if !std::thread::panicking() {
+                refund.expect("native accountant backing refund is owned");
+            }
             drop(domain);
             drop(counter);
         }
@@ -691,7 +767,12 @@ fn inherited_process_ceiling() -> usize {
     #[cfg(unix)]
     {
         // SAFETY: sysconf has no preconditions and reads process-global values.
-        let (pages, page) = unsafe { (libc::sysconf(libc::_SC_PHYS_PAGES), libc::sysconf(libc::_SC_PAGESIZE)) };
+        let (pages, page) = unsafe {
+            (
+                libc::sysconf(libc::_SC_PHYS_PAGES),
+                libc::sysconf(libc::_SC_PAGESIZE),
+            )
+        };
         if pages > 0 && page > 0 {
             return (pages as usize).saturating_mul(page as usize);
         }
@@ -716,7 +797,9 @@ fn cgroup_memory_max() -> Option<usize> {
     let visit = |dir: &[u8], limit: &mut Option<usize>| {
         let mut file = [0_u8; 4096];
         let full_len = dir.len().checked_add(LIMIT.len())?;
-        if full_len > file.len() { return None; }
+        if full_len > file.len() {
+            return None;
+        }
         file[..dir.len()].copy_from_slice(dir);
         file[dir.len()..full_len].copy_from_slice(LIMIT);
         let mut contents = [0_u8; 64];
@@ -726,9 +809,14 @@ fn cgroup_memory_max() -> Option<usize> {
         Some(())
     };
     let _ = visit(&current[..current_len], &mut limit);
-    for component in path.split(|byte| *byte == b'/').filter(|part| !part.is_empty()) {
+    for component in path
+        .split(|byte| *byte == b'/')
+        .filter(|part| !part.is_empty())
+    {
         let next_len = current_len.checked_add(1 + component.len())?;
-        if next_len >= current.len() { return limit; }
+        if next_len >= current.len() {
+            return limit;
+        }
         current[current_len] = b'/';
         current[current_len + 1..next_len].copy_from_slice(component);
         current_len = next_len;
@@ -739,20 +827,34 @@ fn cgroup_memory_max() -> Option<usize> {
 
 #[cfg(target_os = "linux")]
 fn read_linux_file(path: &[u8], destination: &mut [u8]) -> Option<usize> {
-    if path.last() != Some(&0) { return None; }
+    if path.last() != Some(&0) {
+        return None;
+    }
     // SAFETY: `path` is NUL-terminated, `destination` is writable for its
     // declared length, and the descriptor is closed on every successful open.
     let descriptor = unsafe { libc::open(path.as_ptr().cast(), libc::O_RDONLY | libc::O_CLOEXEC) };
-    if descriptor < 0 { return None; }
-    let read = unsafe { libc::read(descriptor, destination.as_mut_ptr().cast(), destination.len()) };
+    if descriptor < 0 {
+        return None;
+    }
+    let read = unsafe {
+        libc::read(
+            descriptor,
+            destination.as_mut_ptr().cast(),
+            destination.len(),
+        )
+    };
     unsafe { libc::close(descriptor) };
     (read >= 0).then_some(read as usize)
 }
 
 #[cfg(target_os = "linux")]
 fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
-    while bytes.first().is_some_and(u8::is_ascii_whitespace) { bytes = &bytes[1..]; }
-    while bytes.last().is_some_and(u8::is_ascii_whitespace) { bytes = &bytes[..bytes.len() - 1]; }
+    while bytes.first().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[1..];
+    }
+    while bytes.last().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[..bytes.len() - 1];
+    }
     bytes
 }
 
@@ -761,7 +863,9 @@ fn parse_ascii_usize(bytes: &[u8]) -> Option<usize> {
     let mut value = 0_usize;
     let mut saw_digit = false;
     for byte in trim_ascii(bytes) {
-        if !byte.is_ascii_digit() { break; }
+        if !byte.is_ascii_digit() {
+            break;
+        }
         saw_digit = true;
         value = value.checked_mul(10)?.checked_add((byte - b'0') as usize)?;
     }
@@ -794,7 +898,10 @@ pub(crate) fn process_aggregate_bytes_for_test() -> usize {
 #[allow(dead_code)] // Keep the aggregate receipt seam available to memory-accounting tests.
 pub(crate) fn process_aggregate_snapshot() -> (usize, Option<usize>) {
     let domain = PROCESS_WRITER_BUDGET_DOMAIN.read();
-    (PROCESS_WRITER_AGGREGATE.load(Ordering::SeqCst), domain.ceiling)
+    (
+        PROCESS_WRITER_AGGREGATE.load(Ordering::SeqCst),
+        domain.ceiling,
+    )
 }
 
 // Ordinary writer mutations share this gate. Runtime activation alone takes
@@ -833,7 +940,9 @@ impl ProcessWriterBudgetDomain {
     fn lookup_in(&self, stable_identity: usize) -> Option<&WriterRegistration> {
         let mut next = self.writers.as_deref();
         while let Some(record) = next {
-            if record.stable_identity == stable_identity { return Some(record); }
+            if record.stable_identity == stable_identity {
+                return Some(record);
+            }
             next = record.next.as_deref();
         }
         None
@@ -841,24 +950,36 @@ impl ProcessWriterBudgetDomain {
     fn lookup_mut_in(&mut self, stable_identity: usize) -> Option<&mut WriterRegistration> {
         let mut next = self.writers.as_deref_mut();
         while let Some(record) = next {
-            if record.stable_identity == stable_identity { return Some(record); }
+            if record.stable_identity == stable_identity {
+                return Some(record);
+            }
             next = record.next.as_deref_mut();
         }
         None
     }
     fn retain_in(&mut self, stable_identity: usize, epoch: usize) {
-        let record = self.lookup_mut_in(stable_identity).expect("live use has its registration");
+        let record = self
+            .lookup_mut_in(stable_identity)
+            .expect("live use has its registration");
         assert_eq!(record.epoch, epoch, "live use cannot change epoch");
-        record.users = record.users.checked_add(1).expect("writer use count overflow");
+        record.users = record
+            .users
+            .checked_add(1)
+            .expect("writer use count overflow");
     }
     fn release_in(&mut self, accountant: &MemoryAccountant, stable_identity: usize, epoch: usize) {
         let mut slot = &mut self.writers;
         while slot.is_some() {
-            if slot.as_ref().is_some_and(|record| record.stable_identity == stable_identity) {
+            if slot
+                .as_ref()
+                .is_some_and(|record| record.stable_identity == stable_identity)
+            {
                 let record = slot.as_mut().expect("live registration");
                 assert_eq!(record.epoch, epoch, "live use cannot change epoch");
                 record.users = record.users.checked_sub(1).expect("writer use underflow");
-                if record.users != 0 { return; }
+                if record.users != 0 {
+                    return;
+                }
                 let mut record = slot.take().expect("last-use registration");
                 *slot = record.next.take();
                 // Retirement frees/refunds only the registration. Native
@@ -896,19 +1017,31 @@ impl WriterUse {
         let stable_identity = accountant.writer_identity.get().copied()?;
         let epoch = domain.lookup_in(stable_identity)?.epoch;
         domain.retain_in(stable_identity, epoch);
-        Some(Self { accountant: accountant.clone(), stable_identity, epoch })
+        Some(Self {
+            accountant: accountant.clone(),
+            stable_identity,
+            epoch,
+        })
     }
 }
 impl Clone for WriterUse {
     fn clone(&self) -> Self {
         let mut domain = PROCESS_WRITER_BUDGET_DOMAIN.write();
         domain.retain_in(self.stable_identity, self.epoch);
-        Self { accountant: self.accountant.clone(), stable_identity: self.stable_identity, epoch: self.epoch }
+        Self {
+            accountant: self.accountant.clone(),
+            stable_identity: self.stable_identity,
+            epoch: self.epoch,
+        }
     }
 }
 impl Drop for WriterUse {
     fn drop(&mut self) {
-        PROCESS_WRITER_BUDGET_DOMAIN.write().release_in(&self.accountant, self.stable_identity, self.epoch);
+        PROCESS_WRITER_BUDGET_DOMAIN.write().release_in(
+            &self.accountant,
+            self.stable_identity,
+            self.epoch,
+        );
     }
 }
 
@@ -958,9 +1091,14 @@ impl StoreAccountantHandle {
         )
     }
     fn decoded(&self) -> NonNull<MemoryAccountant> {
-        self.0.map_addr(|address| std::num::NonZeroUsize::new(address.get() & !ACCOUNTANT_TAGS).expect("Arc pointer is non-null"))
+        self.0.map_addr(|address| {
+            std::num::NonZeroUsize::new(address.get() & !ACCOUNTANT_TAGS)
+                .expect("Arc pointer is non-null")
+        })
     }
-    pub(crate) fn is_writer(&self) -> bool { self.0.addr().get() & 1 != 0 }
+    pub(crate) fn is_writer(&self) -> bool {
+        self.0.addr().get() & 1 != 0
+    }
     pub(crate) fn retain_if_writer(accountant: &AccountantHandle) -> Option<Self> {
         // Construct and check the tag from the same exclusive-gate snapshot.
         let handle = Self::new(accountant.clone());
@@ -971,13 +1109,23 @@ impl StoreAccountantHandle {
     }
     pub(crate) fn new(accountant: AccountantHandle) -> Self {
         let mut domain = PROCESS_WRITER_BUDGET_DOMAIN.write();
-        let active = accountant.writer_identity.get().copied()
+        let active = accountant
+            .writer_identity
+            .get()
+            .copied()
             .and_then(|key| domain.lookup_in(key).map(|record| (key, record.epoch)));
-        if let Some((key, epoch)) = active { domain.retain_in(key, epoch); }
+        if let Some((key, epoch)) = active {
+            domain.retain_in(key, epoch);
+        }
         let raw = NonNull::new(accountant.into_owned_raw()).expect("Arc pointer is non-null");
         Self(if active.is_some() {
-            raw.map_addr(|address| std::num::NonZeroUsize::new(address.get() | 1).expect("tagged Arc pointer is non-null"))
-        } else { raw })
+            raw.map_addr(|address| {
+                std::num::NonZeroUsize::new(address.get() | 1)
+                    .expect("tagged Arc pointer is non-null")
+            })
+        } else {
+            raw
+        })
     }
     // CDB127 returned-loader slot projection. The raw word owns this exact
     // handle's Arc/use; moving it preserves the attach-time role without a
@@ -1001,16 +1149,22 @@ impl StoreAccountantHandle {
     }
     // A resident cache carries this original role in its existing word;
     // admission and escaping chunk clones must never rediscover a later role.
-    pub(crate) fn try_allocate_for_original(&self, bytes: usize, subsystem: &str,
-        operation: &str, hint: &str) -> contextdb_core::Result<()> {
+    pub(crate) fn try_allocate_for_original(
+        &self,
+        bytes: usize,
+        subsystem: &str,
+        operation: &str,
+        hint: &str,
+    ) -> contextdb_core::Result<()> {
         self.try_allocate_for_provenance(bytes, subsystem, operation, hint, Some(self))
     }
     pub(crate) fn same_accountant(&self, accountant: &AccountantHandle) -> bool {
         std::ptr::eq(self.decoded().as_ptr(), accountant.as_ptr())
     }
     pub(crate) fn as_handle(&self) -> AccountantHandle {
-        let original = ManuallyDrop::new(unsafe { AccountantHandle::from_owned_raw(
-            self.0.as_ptr().map_addr(|address| address & !1)) });
+        let original = ManuallyDrop::new(unsafe {
+            AccountantHandle::from_owned_raw(self.0.as_ptr().map_addr(|address| address & !1))
+        });
         AccountantHandle::clone(&original)
     }
     pub(crate) fn vector_budget(
@@ -1026,7 +1180,10 @@ impl StoreAccountantHandle {
         Ok(accountant.budget_adapter(Some(writer_use), false)?)
     }
     fn original_writer_use(&self, accountant: &AccountantHandle) -> WriterUse {
-        assert!(self.is_writer(), "only an original writer retains its epoch");
+        assert!(
+            self.is_writer(),
+            "only an original writer retains its epoch"
+        );
         {
             let mut domain = PROCESS_WRITER_BUDGET_DOMAIN.write();
             let stable_identity = *accountant
@@ -1045,12 +1202,15 @@ impl StoreAccountantHandle {
             }
         }
     }
-    pub(crate) fn read_budget(&self) -> contextdb_core::Result<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>> {
+    pub(crate) fn read_budget(
+        &self,
+    ) -> contextdb_core::Result<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>> {
         let accountant = self.as_handle();
-        let writer_use = self.is_writer().then(|| self.original_writer_use(&accountant));
+        let writer_use = self
+            .is_writer()
+            .then(|| self.original_writer_use(&accountant));
         accountant.read_budget_for_original(writer_use)
     }
-
 }
 impl std::ops::Deref for StoreAccountantHandle {
     type Target = MemoryAccountant;
@@ -1067,25 +1227,44 @@ impl Clone for StoreAccountantHandle {
         let accountant = self.as_handle();
         if self.is_writer() {
             let mut domain = PROCESS_WRITER_BUDGET_DOMAIN.write();
-            let key = *accountant.writer_identity.get().expect("tagged handle has a stable key");
-            let epoch = domain.lookup_in(key).expect("tagged handle pins its record").epoch;
+            let key = *accountant
+                .writer_identity
+                .get()
+                .expect("tagged handle has a stable key");
+            let epoch = domain
+                .lookup_in(key)
+                .expect("tagged handle pins its record")
+                .epoch;
             domain.retain_in(key, epoch);
         }
         let raw = NonNull::new(accountant.into_owned_raw()).expect("Arc pointer is non-null");
         Self(if self.is_writer() {
-            raw.map_addr(|address| std::num::NonZeroUsize::new(address.get() | 1).expect("tagged Arc pointer is non-null"))
-        } else { raw })
+            raw.map_addr(|address| {
+                std::num::NonZeroUsize::new(address.get() | 1)
+                    .expect("tagged Arc pointer is non-null")
+            })
+        } else {
+            raw
+        })
     }
 }
 impl Drop for StoreAccountantHandle {
     fn drop(&mut self) {
         // SAFETY: exactly one into_raw ownership is consumed per handle and
         // only the decoded pointer is passed to Arc's ownership operations.
-        let accountant = unsafe { AccountantHandle::from_owned_raw(self.0.as_ptr().map_addr(|address| address & !1)) };
+        let accountant = unsafe {
+            AccountantHandle::from_owned_raw(self.0.as_ptr().map_addr(|address| address & !1))
+        };
         if self.is_writer() {
             let mut domain = PROCESS_WRITER_BUDGET_DOMAIN.write();
-            let key = *accountant.writer_identity.get().expect("tagged handle has a stable key");
-            let epoch = domain.lookup_in(key).expect("tagged handle pins its record").epoch;
+            let key = *accountant
+                .writer_identity
+                .get()
+                .expect("tagged handle has a stable key");
+            let epoch = domain
+                .lookup_in(key)
+                .expect("tagged handle pins its record")
+                .epoch;
             domain.release_in(&accountant, key, epoch);
         }
         drop(accountant);
@@ -1137,51 +1316,93 @@ impl WriterBudget {
         // paired count; it never makes Weak or exposes a permanent raw count.
         Ok(unsafe { contextdb_tx::SourceFunder::from_prepared_native(provider, origin) })
     }
-    pub(crate) fn from_accountant(accountant: Arc<MemoryAccountant>) -> contextdb_core::Result<Self> {
+    pub(crate) fn from_accountant(
+        accountant: Arc<MemoryAccountant>,
+    ) -> contextdb_core::Result<Self> {
         Self::from_handle(AccountantHandle::from_host(accountant))
     }
     pub(crate) fn from_handle(accountant: AccountantHandle) -> contextdb_core::Result<Self> {
         let engine_backing_bytes = accountant.backing_bytes();
         let mut domain = PROCESS_WRITER_BUDGET_DOMAIN.write();
-        let stable_identity = if let Some(key) = accountant.writer_identity.get() { *key } else {
+        let stable_identity = if let Some(key) = accountant.writer_identity.get() {
+            *key
+        } else {
             let key = domain.next_identity;
-            domain.next_identity = key.checked_add(1)
+            domain.next_identity = key
+                .checked_add(1)
                 .ok_or_else(|| contextdb_core::Error::Other("writer identity overflow".into()))?;
-            accountant.writer_identity.set(key).expect("association published under the exclusive gate");
+            accountant
+                .writer_identity
+                .set(key)
+                .expect("association published under the exclusive gate");
             key
         };
         let epoch = if let Some(record) = domain.lookup_in(stable_identity) {
             let epoch = record.epoch;
-            assert_eq!(record.engine_backing_bytes.load(Ordering::SeqCst), engine_backing_bytes, "existing writer backing retains its origin");
+            assert_eq!(
+                record.engine_backing_bytes.load(Ordering::SeqCst),
+                engine_backing_bytes,
+                "existing writer backing retains its origin"
+            );
             domain.retain_in(stable_identity, epoch);
             epoch
         } else {
             let epoch = domain.next_identity;
-            let next_identity = epoch.checked_add(1)
+            let next_identity = epoch
+                .checked_add(1)
                 .ok_or_else(|| contextdb_core::Error::Other("writer identity overflow".into()))?;
             let registration_bytes = Layout::new::<WriterRegistration>().size();
-            accountant.used.load(Ordering::SeqCst).checked_add(registration_bytes)
-                .ok_or_else(|| contextdb_core::Error::Other("writer registration size overflow".into()))?;
+            accountant
+                .used
+                .load(Ordering::SeqCst)
+                .checked_add(registration_bytes)
+                .ok_or_else(|| {
+                    contextdb_core::Error::Other("writer registration size overflow".into())
+                })?;
             accountant.charge_retained_under_admission(registration_bytes);
             accountant.used.join_aggregate();
             let registration = Box::new(WriterRegistration {
-                stable_identity, epoch, users: 1,
-                limit: accountant.limit.clone(), used: accountant.used.clone(),
+                stable_identity,
+                epoch,
+                users: 1,
+                limit: accountant.limit.clone(),
+                used: accountant.used.clone(),
                 engine_backing_bytes: AtomicUsize::new(engine_backing_bytes),
-                adapter_control_bytes: AtomicUsize::new(0), next: domain.writers.take(),
+                adapter_control_bytes: AtomicUsize::new(0),
+                next: domain.writers.take(),
             });
             domain.writers = Some(registration);
             domain.next_identity = next_identity;
             epoch
         };
         drop(domain);
-        let writer_use = WriterUse { accountant: accountant.clone(), stable_identity, epoch };
+        let writer_use = WriterUse {
+            accountant: accountant.clone(),
+            stable_identity,
+            epoch,
+        };
         let vector_accountant = accountant.vector_budget_for_startup()?;
-        Ok(Self { accountant, writer_use, vector_accountant })
+        Ok(Self {
+            accountant,
+            writer_use,
+            vector_accountant,
+        })
     }
-    pub(crate) fn accountant(&self) -> AccountantHandle { self.accountant.clone() }
-    pub(crate) fn into_parts(self) -> (AccountantHandle, WriterUse, Arc<dyn contextdb_vector::MemoryBudget>) { (self.accountant, self.writer_use, self.vector_accountant) }
-    pub(crate) fn vector_accountant(&self) -> Arc<dyn contextdb_vector::MemoryBudget> { self.vector_accountant.clone() }
+    pub(crate) fn accountant(&self) -> AccountantHandle {
+        self.accountant.clone()
+    }
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        AccountantHandle,
+        WriterUse,
+        Arc<dyn contextdb_vector::MemoryBudget>,
+    ) {
+        (self.accountant, self.writer_use, self.vector_accountant)
+    }
+    pub(crate) fn vector_accountant(&self) -> Arc<dyn contextdb_vector::MemoryBudget> {
+        self.vector_accountant.clone()
+    }
 }
 
 // Pinned Rust 1.94.1 alloc::sync ArcInner layout derivation: repr(C, align(2)),
@@ -1189,12 +1410,18 @@ impl WriterBudget {
 // a typed request; independent allocator observation must verify each native
 // accountant, limit and counter request in its actual compilation profile.
 pub(crate) fn writer_adapter_layout<T>(adapter: &T) -> Layout {
-    Layout::new::<[AtomicUsize; 2]>().extend(Layout::for_value(adapter))
-        .expect("adapter Arc layout overflow").0.pad_to_align()
+    Layout::new::<[AtomicUsize; 2]>()
+        .extend(Layout::for_value(adapter))
+        .expect("adapter Arc layout overflow")
+        .0
+        .pad_to_align()
 }
 pub(crate) fn writer_adapter_type_layout<T>() -> Layout {
-    Layout::new::<[AtomicUsize; 2]>().extend(Layout::new::<T>())
-        .expect("adapter Arc layout overflow").0.pad_to_align()
+    Layout::new::<[AtomicUsize; 2]>()
+        .extend(Layout::new::<T>())
+        .expect("adapter Arc layout overflow")
+        .0
+        .pad_to_align()
 }
 
 // The complete workspace transition is the only operation permitted to use
@@ -1233,12 +1460,7 @@ struct WriterHeadroom {
     combined_used: Option<usize>,
     within_limit: bool,
 }
-fn writer_headroom(
-    limit: usize,
-    used: usize,
-    releasing: usize,
-    private: usize,
-) -> WriterHeadroom {
+fn writer_headroom(limit: usize, used: usize, releasing: usize, private: usize) -> WriterHeadroom {
     let occupied = used
         .checked_sub(releasing)
         .expect("replacement credit must be owned by this accountant");
@@ -1587,7 +1809,9 @@ fn note_budget_admission(subsystem: &str, operation: &str, bytes: usize, used_af
     BUDGET_LEDGER.with(|ledger| {
         if let Some(entries) = ledger.borrow_mut().as_mut() {
             entries.push(BudgetLedgerEntry {
-                what: format!("{subsystem}/{operation}"), bytes, used_after,
+                what: format!("{subsystem}/{operation}"),
+                bytes,
+                used_after,
             });
         }
     });
@@ -1621,27 +1845,63 @@ impl ControlCredit {
     // creating handle's provenance and the existing family's refusal door.
     // An untagged reader never acquires a later writer's receipt/epoch.
     pub(crate) fn admit_from_handle(
-        accountant: &StoreAccountantHandle, bytes: usize,
-        subsystem: &str, operation: &str, hint: &str,
+        accountant: &StoreAccountantHandle,
+        bytes: usize,
+        subsystem: &str,
+        operation: &str,
+        hint: &str,
     ) -> contextdb_core::Result<Self> {
-        accountant.try_allocate_for_provenance(bytes, subsystem, operation, hint, Some(accountant))?;
+        accountant.try_allocate_for_provenance(
+            bytes,
+            subsystem,
+            operation,
+            hint,
+            Some(accountant),
+        )?;
         let registration = if accountant.is_writer() {
             let domain = PROCESS_WRITER_BUDGET_DOMAIN.read();
-            let key = *accountant.writer_identity.get().expect("tagged handle has its original key");
-            let record = domain.lookup_in(key).expect("tagged handle pins its original epoch");
-            record.adapter_control_bytes.fetch_update(Ordering::SeqCst, Ordering::SeqCst,
-                |current| current.checked_add(bytes)).expect("control receipt arithmetic must be owned");
+            let key = *accountant
+                .writer_identity
+                .get()
+                .expect("tagged handle has its original key");
+            let record = domain
+                .lookup_in(key)
+                .expect("tagged handle pins its original epoch");
+            record
+                .adapter_control_bytes
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                    current.checked_add(bytes)
+                })
+                .expect("control receipt arithmetic must be owned");
             Some((key, record.epoch))
-        } else { None };
-        Ok(Self { accountant: Some(accountant.as_handle()), bytes, registration })
+        } else {
+            None
+        };
+        Ok(Self {
+            accountant: Some(accountant.as_handle()),
+            bytes,
+            registration,
+        })
     }
-    pub(crate) fn admit_open_residue(accountant: &StoreAccountantHandle, bytes: usize, operation: &str) -> contextdb_core::Result<Self> {
+    pub(crate) fn admit_open_residue(
+        accountant: &StoreAccountantHandle,
+        bytes: usize,
+        operation: &str,
+    ) -> contextdb_core::Result<Self> {
         admit_open_residue(bytes, operation)?;
-        Ok(Self { accountant: Some(accountant.as_handle()), bytes: bytes | OPEN_RESIDUE_TAG, registration: None })
+        Ok(Self {
+            accountant: Some(accountant.as_handle()),
+            bytes: bytes | OPEN_RESIDUE_TAG,
+            registration: None,
+        })
     }
     // Only constant per-assembly controls call this door. Growing write
     // payloads, including staged posting charges, retain ordinary admission.
-    pub(crate) fn admit_assembly(accountant: &AccountantHandle, bytes: usize, operation: &str) -> contextdb_core::Result<Self> {
+    pub(crate) fn admit_assembly(
+        accountant: &AccountantHandle,
+        bytes: usize,
+        operation: &str,
+    ) -> contextdb_core::Result<Self> {
         let handle = StoreAccountantHandle::new(accountant.clone());
         if handle.is_writer() {
             Self::admit_open_residue(&handle, bytes, operation)
@@ -1649,30 +1909,57 @@ impl ControlCredit {
             Self::admit(accountant, bytes, operation)
         }
     }
-    pub(crate) fn admit(accountant: &AccountantHandle, bytes: usize, operation: &str) -> contextdb_core::Result<Self> {
-        accountant.admit_box_control(bytes, operation, "Raise MEMORY_LIMIT for this fixed writer control.")?;
-        Ok(Self { accountant: Some(accountant.clone()), bytes, registration: accountant.prepare_control_refund().1 })
+    pub(crate) fn admit(
+        accountant: &AccountantHandle,
+        bytes: usize,
+        operation: &str,
+    ) -> contextdb_core::Result<Self> {
+        accountant.admit_box_control(
+            bytes,
+            operation,
+            "Raise MEMORY_LIMIT for this fixed writer control.",
+        )?;
+        Ok(Self {
+            accountant: Some(accountant.clone()),
+            bytes,
+            registration: accountant.prepare_control_refund().1,
+        })
     }
     pub(crate) fn from_admitted(accountant: &AccountantHandle, bytes: usize) -> Self {
         // Transfer a named portion of an existing control reservation. No
         // admission, refund or payer substitution happens at this handoff.
         accountant.change_adapter_control_receipt(bytes, true);
-        Self { accountant: Some(accountant.clone()), bytes, registration: accountant.prepare_control_refund().1 }
+        Self {
+            accountant: Some(accountant.clone()),
+            bytes,
+            registration: accountant.prepare_control_refund().1,
+        }
     }
     pub(crate) fn retained_startup(accountant: &AccountantHandle, bytes: usize) -> Self {
         // Preserve the existing captured-schema startup floor: accounted
         // before allocation, but never refused solely by a persisted limit.
         accountant.charge_retained(bytes);
         accountant.change_adapter_control_receipt(bytes, true);
-        Self { accountant: Some(accountant.clone()), bytes, registration: accountant.prepare_control_refund().1 }
+        Self {
+            accountant: Some(accountant.clone()),
+            bytes,
+            registration: accountant.prepare_control_refund().1,
+        }
     }
     pub(crate) fn prepare(mut self) -> PendingControlRefund {
-        let accountant = self.accountant.take().expect("live control credit has its original funder");
+        let accountant = self
+            .accountant
+            .take()
+            .expect("live control credit has its original funder");
         let bytes = std::mem::take(&mut self.bytes);
         let counter = accountant.original_control_counter();
         let registration = self.registration.take();
         drop(accountant);
-        PendingControlRefund { counter, bytes, registration }
+        PendingControlRefund {
+            counter,
+            bytes,
+            registration,
+        }
     }
 }
 impl Drop for ControlCredit {
@@ -1681,7 +1968,11 @@ impl Drop for ControlCredit {
             let counter = accountant.original_control_counter();
             let registration = self.registration.take();
             drop(accountant);
-            drop(PendingControlRefund { counter, bytes: std::mem::take(&mut self.bytes), registration });
+            drop(PendingControlRefund {
+                counter,
+                bytes: std::mem::take(&mut self.bytes),
+                registration,
+            });
         }
     }
 }
@@ -1718,8 +2009,11 @@ impl Drop for PendingControlRefund {
         if let Some((key, epoch)) = self.registration
             && let Some(record) = domain.lookup_in(key).filter(|record| record.epoch == epoch)
         {
-            let receipt = record.adapter_control_bytes.fetch_update(Ordering::SeqCst, Ordering::SeqCst,
-                |used| used.checked_sub(self.bytes));
+            let receipt = record.adapter_control_bytes.fetch_update(
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+                |used| used.checked_sub(self.bytes),
+            );
             if !unwinding {
                 receipt.expect("final control receipt is owned");
             }
@@ -1744,15 +2038,30 @@ pub(crate) struct ReservationCleanup {
     next: u8,
 }
 impl ReservationCleanup {
-    pub(crate) fn new(accountant: Option<AccountantHandle>, writer_use: Option<WriterUse>,
-        payload: usize, refund: Option<PendingControlRefund>) -> Self {
-        Self { accountant, writer_use, payload, refund, next: 0 }
+    pub(crate) fn new(
+        accountant: Option<AccountantHandle>,
+        writer_use: Option<WriterUse>,
+        payload: usize,
+        refund: Option<PendingControlRefund>,
+    ) -> Self {
+        Self {
+            accountant,
+            writer_use,
+            payload,
+            refund,
+            next: 0,
+        }
     }
     pub(crate) fn finish(&mut self) {
         while self.next < 4 {
-            let step = self.next; self.next += 1;
+            let step = self.next;
+            self.next += 1;
             match step {
-                0 => if let Some(accountant) = &self.accountant { accountant.release(std::mem::take(&mut self.payload)); },
+                0 => {
+                    if let Some(accountant) = &self.accountant {
+                        accountant.release(std::mem::take(&mut self.payload));
+                    }
+                }
                 1 => drop(self.writer_use.take()),
                 2 => drop(self.accountant.take()),
                 3 => drop(self.refund.take()),
@@ -1761,7 +2070,11 @@ impl ReservationCleanup {
         }
     }
 }
-impl Drop for ReservationCleanup { fn drop(&mut self) { self.finish(); } }
+impl Drop for ReservationCleanup {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
 
 /// An owned database-accountant charge used by suspendable read operations.
 ///
@@ -1788,13 +2101,20 @@ pub(crate) struct ContainedMemoryReservation {
 impl ContainedMemoryReservation {
     pub(crate) fn from_owned(mut reservation: OwnedMemoryReservation) -> Self {
         let bytes = std::mem::take(&mut reservation.bytes);
-        Self { accountant: reservation.accountant().clone(), bytes }
+        Self {
+            accountant: reservation.accountant().clone(),
+            bytes,
+        }
     }
     #[cfg(any(test, feature = "test-seams"))]
-    pub(crate) fn bytes(&self) -> usize { self.bytes }
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
 }
 impl Drop for ContainedMemoryReservation {
-    fn drop(&mut self) { self.accountant.release(self.bytes); }
+    fn drop(&mut self) {
+        self.accountant.release(self.bytes);
+    }
 }
 
 /// Admission transferred from a displaced ordinary write into mutation undo.
@@ -1809,33 +2129,52 @@ impl TransferredRowReservation {
     pub(crate) fn adopt(&self, bytes: usize) {
         self.bytes.store(bytes, Ordering::Relaxed);
     }
-    pub(crate) fn prepare_control(accountant: &AccountantHandle) -> contextdb_core::Result<ControlCredit> {
-        ControlCredit::admit(accountant, writer_adapter_type_layout::<Self>().size(), "transferred_row_control")
+    pub(crate) fn prepare_control(
+        accountant: &AccountantHandle,
+    ) -> contextdb_core::Result<ControlCredit> {
+        ControlCredit::admit(
+            accountant,
+            writer_adapter_type_layout::<Self>().size(),
+            "transferred_row_control",
+        )
     }
     pub(crate) fn from_admitted_with_control(
-        accountant: AccountantHandle, bytes: usize, control: ControlCredit,
+        accountant: AccountantHandle,
+        bytes: usize,
+        control: ControlCredit,
     ) -> Arc<Self> {
         Arc::new(Self {
             _writer_use: crate::memory_accounting::WriterUse::retain_if_writer(&accountant),
-            accountant: Some(accountant), bytes: AtomicUsize::new(bytes),
+            accountant: Some(accountant),
+            bytes: AtomicUsize::new(bytes),
             own_control: Some(control),
         })
     }
-    pub(crate) fn try_from_admitted(accountant: AccountantHandle, bytes: usize) -> contextdb_core::Result<Arc<Self>> {
+    pub(crate) fn try_from_admitted(
+        accountant: AccountantHandle,
+        bytes: usize,
+    ) -> contextdb_core::Result<Arc<Self>> {
         // Admission failure leaves the original payload's credit untouched.
         let control = Self::prepare_control(&accountant)?;
         Ok(Self::from_admitted_with_control(accountant, bytes, control))
     }
 }
 impl contextdb_tx::StagedPostingCharge for TransferredRowReservation {
-    fn retained_bytes(&self) -> usize { self.bytes.load(Ordering::Relaxed) }
-    fn transfer_back(&self) -> usize { self.bytes.swap(0, Ordering::Relaxed) }
+    fn retained_bytes(&self) -> usize {
+        self.bytes.load(Ordering::Relaxed)
+    }
+    fn transfer_back(&self) -> usize {
+        self.bytes.swap(0, Ordering::Relaxed)
+    }
 }
 impl Drop for TransferredRowReservation {
     fn drop(&mut self) {
         let refund = self.own_control.take().map(ControlCredit::prepare);
         let mut cleanup = ReservationCleanup::new(
-            self.accountant.take(), self._writer_use.take(), self.bytes.swap(0, Ordering::Relaxed), refund,
+            self.accountant.take(),
+            self._writer_use.take(),
+            self.bytes.swap(0, Ordering::Relaxed),
+            refund,
         );
         cleanup.finish();
     }
@@ -2128,10 +2467,18 @@ impl OwnedMemoryReservation {
             .map(contextdb_tx::OriginalAuxInvoice::from_charge)
     }
     pub(crate) fn accountant(&self) -> &AccountantHandle {
-        self.accountant.as_ref().expect("live reservation has its accountant")
+        self.accountant
+            .as_ref()
+            .expect("live reservation has its accountant")
     }
-    pub(crate) fn with_enclosing_arc_control<T>(mut self, retained_startup: bool) -> contextdb_core::Result<Self> {
-        assert!(self.own_control.is_none(), "one reservation owns one enclosing control");
+    pub(crate) fn with_enclosing_arc_control<T>(
+        mut self,
+        retained_startup: bool,
+    ) -> contextdb_core::Result<Self> {
+        assert!(
+            self.own_control.is_none(),
+            "one reservation owns one enclosing control"
+        );
         let bytes = writer_adapter_type_layout::<T>().size();
         self.own_control = Some(if retained_startup {
             ControlCredit::retained_startup(self.accountant(), bytes)
@@ -2142,19 +2489,33 @@ impl OwnedMemoryReservation {
     }
     pub(crate) fn into_admitted_arc(mut self) -> contextdb_core::Result<Arc<Self>> {
         let layout = writer_adapter_layout(&self);
-        self.own_control = Some(ControlCredit::admit(self.accountant(), layout.size(), "reservation_control")?);
+        self.own_control = Some(ControlCredit::admit(
+            self.accountant(),
+            layout.size(),
+            "reservation_control",
+        )?);
         Ok(Arc::new(self))
     }
-    pub(crate) fn into_admitted_mutex_arc(self) -> contextdb_core::Result<Arc<parking_lot::Mutex<Self>>> {
+    pub(crate) fn into_admitted_mutex_arc(
+        self,
+    ) -> contextdb_core::Result<Arc<parking_lot::Mutex<Self>>> {
         let mut value = parking_lot::Mutex::new(self);
         let layout = writer_adapter_layout(&value);
         let reservation = value.get_mut();
-        reservation.own_control = Some(ControlCredit::admit(reservation.accountant(), layout.size(), "reservation_mutex_control")?);
+        reservation.own_control = Some(ControlCredit::admit(
+            reservation.accountant(),
+            layout.size(),
+            "reservation_mutex_control",
+        )?);
         Ok(Arc::new(value))
     }
     pub(crate) fn from_admitted(accountant: AccountantHandle, bytes: usize) -> Self {
-        Self { _writer_use: crate::memory_accounting::WriterUse::retain_if_writer(&(accountant)),
-accountant: Some(accountant), bytes, own_control: None }
+        Self {
+            _writer_use: crate::memory_accounting::WriterUse::retain_if_writer(&(accountant)),
+            accountant: Some(accountant),
+            bytes,
+            own_control: None,
+        }
     }
     pub(crate) fn transfer_to_staged(mut self) {
         self.bytes = 0;
@@ -2163,7 +2524,7 @@ accountant: Some(accountant), bytes, own_control: None }
     pub(crate) fn new(accountant: AccountantHandle) -> Self {
         Self {
             _writer_use: crate::memory_accounting::WriterUse::retain_if_writer(&(accountant)),
-accountant: Some(accountant),
+            accountant: Some(accountant),
             bytes: 0,
             own_control: None,
         }
@@ -2254,8 +2615,12 @@ impl OwnedMemoryReservation {
         hint: &str,
     ) -> contextdb_core::Result<Self> {
         accountant.try_allocate_for(bytes, subsystem, operation, hint)?;
-        Ok(Self { _writer_use: crate::memory_accounting::WriterUse::retain_if_writer(&(accountant)),
-accountant: Some(accountant), bytes, own_control: None })
+        Ok(Self {
+            _writer_use: crate::memory_accounting::WriterUse::retain_if_writer(&(accountant)),
+            accountant: Some(accountant),
+            bytes,
+            own_control: None,
+        })
     }
 }
 
@@ -2263,7 +2628,10 @@ impl Drop for OwnedMemoryReservation {
     fn drop(&mut self) {
         let refund = self.own_control.take().map(ControlCredit::prepare);
         let mut cleanup = ReservationCleanup::new(
-            self.accountant.take(), self._writer_use.take(), std::mem::take(&mut self.bytes), refund,
+            self.accountant.take(),
+            self._writer_use.take(),
+            std::mem::take(&mut self.bytes),
+            refund,
         );
         cleanup.finish();
     }
@@ -2292,21 +2660,35 @@ impl MemoryAccountant {
     }
 
     /// No budget enforcement. All allocations succeed. Default behavior.
-    pub fn no_limit() -> Self { Self::with_initial_budget(None, false) }
+    pub fn no_limit() -> Self {
+        Self::with_initial_budget(None, false)
+    }
 
     /// Set a byte ceiling. Allocations exceeding this fail.
-    pub fn with_budget(bytes: usize) -> Self { Self::with_initial_budget(Some(bytes), true) }
+    pub fn with_budget(bytes: usize) -> Self {
+        Self::with_initial_budget(Some(bytes), true)
+    }
 
     /// Restore a persisted live setting without establishing a startup ceiling.
-    pub(crate) fn with_runtime_budget(bytes: usize) -> Self { Self::with_initial_budget(Some(bytes), false) }
+    pub(crate) fn with_runtime_budget(bytes: usize) -> Self {
+        Self::with_initial_budget(Some(bytes), false)
+    }
 
     fn with_initial_budget(limit: Option<usize>, startup: bool) -> Self {
-        Self::with_controls(Arc::new(AtomicUsize::new(limit.unwrap_or(0))),
-            WriterCounterHandle::new(WriterCounter::default()), limit.filter(|_| startup))
+        Self::with_controls(
+            Arc::new(AtomicUsize::new(limit.unwrap_or(0))),
+            WriterCounterHandle::new(WriterCounter::default()),
+            limit.filter(|_| startup),
+        )
     }
-    fn with_controls(limit: Arc<AtomicUsize>, used: WriterCounterHandle, startup: Option<usize>) -> Self {
+    fn with_controls(
+        limit: Arc<AtomicUsize>,
+        used: WriterCounterHandle,
+        startup: Option<usize>,
+    ) -> Self {
         Self {
-            limit, used,
+            limit,
+            used,
             #[cfg(any(test, feature = "test-seams"))]
             high_water_for_test: AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-seams"))]
@@ -2368,39 +2750,71 @@ impl MemoryAccountant {
     #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn writer_fixed_ownership(&self) -> (usize, usize, usize) {
         let domain = PROCESS_WRITER_BUDGET_DOMAIN.read();
-        self.writer_identity.get().and_then(|key| domain.lookup_in(*key)).map_or((0, 0, 0), |record| (
-            Layout::new::<WriterRegistration>().size(),
-            record.engine_backing_bytes.load(Ordering::Relaxed),
-            record.adapter_control_bytes.load(Ordering::Relaxed),
-        ))
+        self.writer_identity
+            .get()
+            .and_then(|key| domain.lookup_in(*key))
+            .map_or((0, 0, 0), |record| {
+                (
+                    Layout::new::<WriterRegistration>().size(),
+                    record.engine_backing_bytes.load(Ordering::Relaxed),
+                    record.adapter_control_bytes.load(Ordering::Relaxed),
+                )
+            })
     }
     fn change_adapter_control_receipt(&self, bytes: usize, adding: bool) {
-        assert!(self.exclusive_activation().is_none(), "control allocation is outside borrowed activation");
+        assert!(
+            self.exclusive_activation().is_none(),
+            "control allocation is outside borrowed activation"
+        );
         let domain = PROCESS_WRITER_BUDGET_DOMAIN.read();
-        if let Some(record) = self.writer_identity.get().and_then(|key| domain.lookup_in(*key)) {
-            record.adapter_control_bytes.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
-                if adding { current.checked_add(bytes) } else { current.checked_sub(bytes) }
-            }).expect("adapter control receipt arithmetic must be owned");
+        if let Some(record) = self
+            .writer_identity
+            .get()
+            .and_then(|key| domain.lookup_in(*key))
+        {
+            record
+                .adapter_control_bytes
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                    if adding {
+                        current.checked_add(bytes)
+                    } else {
+                        current.checked_sub(bytes)
+                    }
+                })
+                .expect("adapter control receipt arithmetic must be owned");
         }
     }
     // A ControlCredit already captured its original registration. Refund
     // custody needs only that accountant's source counter, never a new epoch.
     fn original_control_counter(&self) -> WriterCounterHandle {
-        assert!(self.exclusive_activation().is_none(), "control cleanup is outside borrowed activation");
+        assert!(
+            self.exclusive_activation().is_none(),
+            "control cleanup is outside borrowed activation"
+        );
         self.used.clone()
     }
     fn prepare_control_refund(&self) -> (WriterCounterHandle, Option<(usize, usize)>) {
-        assert!(self.exclusive_activation().is_none(), "control cleanup is outside borrowed activation");
+        assert!(
+            self.exclusive_activation().is_none(),
+            "control cleanup is outside borrowed activation"
+        );
         let domain = PROCESS_WRITER_BUDGET_DOMAIN.read();
-        let registration = self.writer_identity.get().and_then(|key|
-            domain.lookup_in(*key).map(|record| (*key, record.epoch)));
+        let registration = self
+            .writer_identity
+            .get()
+            .and_then(|key| domain.lookup_in(*key).map(|record| (*key, record.epoch)));
         (self.used.clone(), registration)
     }
     pub(crate) fn retain_box_control_refund(&self, bytes: usize) -> WriterCounterHandle {
         self.change_adapter_control_receipt(bytes, false);
         self.used.clone()
     }
-    pub(crate) fn admit_box_control(&self, bytes: usize, operation: &str, hint: &str) -> contextdb_core::Result<()> {
+    pub(crate) fn admit_box_control(
+        &self,
+        bytes: usize,
+        operation: &str,
+        hint: &str,
+    ) -> contextdb_core::Result<()> {
         self.try_allocate_for(bytes, "vector_maintenance", operation, hint)?;
         self.change_adapter_control_receipt(bytes, true);
         Ok(())
@@ -2412,30 +2826,58 @@ impl MemoryAccountant {
     }
     fn exclusive_activation(&self) -> Option<usize> {
         let address = self as *const Self as usize;
-        ACTIVATING_WRITER.with(|slot| slot.get().filter(|(id, _)| *id == address).map(|(_, bytes)| bytes))
+        ACTIVATING_WRITER.with(|slot| {
+            slot.get()
+                .filter(|(id, _)| *id == address)
+                .map(|(_, bytes)| bytes)
+        })
     }
     // Private admissions derived from counted custody must use its original
     // tag. The retained tagged handle prevents epoch replacement; a reader
     // handle intentionally ignores any later association of this accountant.
-    fn writer_admission_for_provenance(&self, provenance: Option<&StoreAccountantHandle>) -> WriterAdmission {
-        let Some(handle) = provenance else { return self.writer_admission(); };
-        assert!(std::ptr::eq(self, &**handle), "admission retains its original accountant");
-        assert!(self.exclusive_activation().is_none(), "registry admission is outside borrowed activation");
+    fn writer_admission_for_provenance(
+        &self,
+        provenance: Option<&StoreAccountantHandle>,
+    ) -> WriterAdmission {
+        let Some(handle) = provenance else {
+            return self.writer_admission();
+        };
+        assert!(
+            std::ptr::eq(self, &**handle),
+            "admission retains its original accountant"
+        );
+        assert!(
+            self.exclusive_activation().is_none(),
+            "registry admission is outside borrowed activation"
+        );
         let gate = PROCESS_WRITER_BUDGET_DOMAIN.read();
         if handle.is_writer() {
-            let key = *self.writer_identity.get().expect("tagged handle has its original key");
-            gate.lookup_in(key).expect("tagged handle pins its original epoch");
+            let key = *self
+                .writer_identity
+                .get()
+                .expect("tagged handle has its original key");
+            gate.lookup_in(key)
+                .expect("tagged handle pins its original epoch");
         }
         let ceiling = gate.ceiling.filter(|_| self.used.is_member());
-        WriterAdmission { _gate: Some(gate), ceiling }
+        WriterAdmission {
+            _gate: Some(gate),
+            ceiling,
+        }
     }
     fn writer_admission(&self) -> WriterAdmission {
         if self.exclusive_activation().is_some() {
-            return WriterAdmission { _gate: None, ceiling: None };
+            return WriterAdmission {
+                _gate: None,
+                ceiling: None,
+            };
         }
         let gate = PROCESS_WRITER_BUDGET_DOMAIN.read();
         let ceiling = gate.ceiling.filter(|_| self.used.is_member());
-        WriterAdmission { _gate: Some(gate), ceiling }
+        WriterAdmission {
+            _gate: Some(gate),
+            ceiling,
+        }
     }
     // Exclusive activation validates ALL live records and admits the requesting
     // build's complete local peak before publishing the one permanent owner.
@@ -2449,17 +2891,33 @@ impl MemoryAccountant {
         admit_workspace: impl FnOnce() -> contextdb_core::Result<()>,
     ) -> contextdb_core::Result<bool> {
         let mut domain = PROCESS_WRITER_BUDGET_DOMAIN.write();
-        let identity = *self.writer_identity.get().expect("resident insertion requires a stable association");
-        domain.lookup_in(identity).expect("resident insertion requires a retained writer use");
-        if domain.native.is_some() { return Ok(false); }
+        let identity = *self
+            .writer_identity
+            .get()
+            .expect("resident insertion requires a stable association");
+        domain
+            .lookup_in(identity)
+            .expect("resident insertion requires a retained writer use");
+        if domain.native.is_some() {
+            return Ok(false);
+        }
         let mut next = domain.writers.as_deref();
         while let Some(record) = next {
             let limit = record.limit.load(Ordering::SeqCst);
             let used = record.used.load(Ordering::SeqCst);
             // Activation has no private transition allowance on other writers.
-            let releasing = if record.stable_identity == identity { old_workspace } else { 0 };
-            let requested = if record.stable_identity == identity { complete_peak } else { 0 };
-            let local = used.checked_sub(releasing)
+            let releasing = if record.stable_identity == identity {
+                old_workspace
+            } else {
+                0
+            };
+            let requested = if record.stable_identity == identity {
+                complete_peak
+            } else {
+                0
+            };
+            let local = used
+                .checked_sub(releasing)
                 .and_then(|bytes| bytes.checked_add(requested))
                 .ok_or_else(|| {
                     contextdb_core::Error::Other("runtime activation envelope overflow".into())
@@ -2479,19 +2937,25 @@ impl MemoryAccountant {
             .checked_sub(old_workspace)
             .and_then(|bytes| bytes.checked_add(complete_peak))
             .and_then(|bytes| bytes.checked_add(native_bytes))
-            .ok_or_else(|| contextdb_core::Error::Other("runtime activation combined size overflow".into()))?;
+            .ok_or_else(|| {
+                contextdb_core::Error::Other("runtime activation combined size overflow".into())
+            })?;
         if after > ceiling {
             return Ok(false);
         }
-        let previous = ACTIVATING_WRITER.with(|slot| slot.replace(Some((self as *const Self as usize, native_bytes))));
+        let previous = ACTIVATING_WRITER
+            .with(|slot| slot.replace(Some((self as *const Self as usize, native_bytes))));
         let scope = ActivationScope(previous);
         admit_workspace()?;
         drop(scope);
         PROCESS_WRITER_AGGREGATE.fetch_add(native_bytes, Ordering::SeqCst);
         domain.ceiling = Some(ceiling);
         domain.native = Some(ResidentInsertionRuntime {
-            width, funder_identity: self.used.as_ptr() as usize,
-            reservation: ProcessNativeReservation { bytes: native_bytes },
+            width,
+            funder_identity: self.used.as_ptr() as usize,
+            reservation: ProcessNativeReservation {
+                bytes: native_bytes,
+            },
         });
         // Drop the exclusive gate before bodies, spawn, joins, export or callbacks.
         drop(domain);
@@ -2510,7 +2974,9 @@ impl MemoryAccountant {
         )
         .available;
         // The released workspace is this member's own aggregate share.
-        let process = admission.process_available().map(|room| room.saturating_add(bytes));
+        let process = admission
+            .process_available()
+            .map(|room| room.saturating_add(bytes));
         min_available(local, process)
     }
 
@@ -2520,7 +2986,11 @@ impl MemoryAccountant {
     /// rolls back ONLY the local counter: those bytes never entered the
     /// aggregate, the one member decrement that does not refund it.
     fn admit_to_process_aggregate(
-        &self, admission: &WriterAdmission, bytes: usize, operation: &str, hint: &str,
+        &self,
+        admission: &WriterAdmission,
+        bytes: usize,
+        operation: &str,
+        hint: &str,
     ) -> contextdb_core::Result<()> {
         if !self.used.is_member() {
             return Ok(());
@@ -2549,7 +3019,11 @@ impl MemoryAccountant {
     pub fn try_allocate(&self, bytes: usize) -> contextdb_core::Result<()> {
         self.try_allocate_with_provenance(bytes, None)
     }
-    fn try_allocate_with_provenance(&self, bytes: usize, provenance: Option<&StoreAccountantHandle>) -> contextdb_core::Result<()> {
+    fn try_allocate_with_provenance(
+        &self,
+        bytes: usize,
+        provenance: Option<&StoreAccountantHandle>,
+    ) -> contextdb_core::Result<()> {
         if bytes == 0 {
             return Ok(());
         }
@@ -2563,8 +3037,7 @@ impl MemoryAccountant {
             let limit = if published == 0 {
                 0
             } else {
-                published
-                    .saturating_add(self.private_transition_headroom())
+                published.saturating_add(self.private_transition_headroom())
             };
             if limit != 0 {
                 let available = writer_headroom(limit, used, 0, 0)
@@ -2576,7 +3049,13 @@ impl MemoryAccountant {
                     // below closes that window. In test builds a hook lets a
                     // unit test land exactly that interleaving deterministically.
                     #[cfg(test)]
-                    if self.fire_accounting_hook_without_gate_for_provenance(&mut admission, provenance, false) { continue; }
+                    if self.fire_accounting_hook_without_gate_for_provenance(
+                        &mut admission,
+                        provenance,
+                        false,
+                    ) {
+                        continue;
+                    }
                     if self.limit.load(Ordering::SeqCst) != published {
                         continue;
                     }
@@ -2609,7 +3088,13 @@ impl MemoryAccountant {
             // here, and the CAS below still runs. In test builds a hook lands
             // exactly that order deterministically.
             #[cfg(test)]
-            if self.fire_accounting_hook_without_gate_for_provenance(&mut admission, provenance, true) { continue; }
+            if self.fire_accounting_hook_without_gate_for_provenance(
+                &mut admission,
+                provenance,
+                true,
+            ) {
+                continue;
+            }
             if self.used.compare_exchange_local(used, next) {
                 // Admission and publication share ONE linearization boundary,
                 // and it is this load. An admission is not SUCCESSFUL until it
@@ -2626,8 +3111,7 @@ impl MemoryAccountant {
                 let admissible = if current == 0 {
                     0
                 } else {
-                    current
-                        .saturating_add(self.private_transition_headroom())
+                    current.saturating_add(self.private_transition_headroom())
                 };
                 if writer_headroom(admissible, used, 0, 0)
                     .available
@@ -2638,8 +3122,12 @@ impl MemoryAccountant {
                     self.used.rollback_local_only(bytes);
                     continue;
                 }
-                self.admit_to_process_aggregate(&admission, bytes, "allocate",
-                    "Reduce retained data, lower working-set size, or raise MEMORY_LIMIT.")?;
+                self.admit_to_process_aggregate(
+                    &admission,
+                    bytes,
+                    "allocate",
+                    "Reduce retained data, lower working-set size, or raise MEMORY_LIMIT.",
+                )?;
                 #[cfg(any(test, feature = "test-seams"))]
                 self.high_water_for_test.fetch_max(next, Ordering::SeqCst);
                 #[cfg(any(test, feature = "test-seams"))]
@@ -2673,8 +3161,7 @@ impl MemoryAccountant {
             let limit = if published == 0 {
                 0
             } else {
-                published
-                    .saturating_add(self.private_transition_headroom())
+                published.saturating_add(self.private_transition_headroom())
             };
             let available = writer_headroom(limit, used, old_bytes, 0)
                 .available
@@ -2724,8 +3211,7 @@ impl MemoryAccountant {
             let admissible = if current == 0 {
                 0
             } else {
-                current
-                    .saturating_add(self.private_transition_headroom())
+                current.saturating_add(self.private_transition_headroom())
             };
             if new_bytes > old_bytes
                 && writer_headroom(admissible, used, old_bytes, 0)
@@ -2737,7 +3223,12 @@ impl MemoryAccountant {
                 continue;
             }
             if new_bytes > old_bytes {
-                self.admit_to_process_aggregate(&admission, new_bytes - old_bytes, operation, hint)?;
+                self.admit_to_process_aggregate(
+                    &admission,
+                    new_bytes - old_bytes,
+                    operation,
+                    hint,
+                )?;
             } else if self.used.is_member() {
                 aggregate_refund(old_bytes - new_bytes);
             }
@@ -3005,16 +3496,28 @@ impl MemoryAccountant {
     ) -> contextdb_core::Result<()> {
         self.try_allocate_for_provenance(bytes, subsystem, operation, hint, None)
     }
-    fn available_for_provenance(&self, provenance: Option<&StoreAccountantHandle>) -> Option<usize> {
+    fn available_for_provenance(
+        &self,
+        provenance: Option<&StoreAccountantHandle>,
+    ) -> Option<usize> {
         let admission = self.writer_admission_for_provenance(provenance);
         min_available(
-            writer_headroom(self.limit.load(Ordering::SeqCst), self.used.load(Ordering::SeqCst), 0, 0)
-                .available,
+            writer_headroom(
+                self.limit.load(Ordering::SeqCst),
+                self.used.load(Ordering::SeqCst),
+                0,
+                0,
+            )
+            .available,
             admission.process_available(),
         )
     }
     fn try_allocate_for_provenance(
-        &self, bytes: usize, subsystem: &str, operation: &str, hint: &str,
+        &self,
+        bytes: usize,
+        subsystem: &str,
+        operation: &str,
+        hint: &str,
         provenance: Option<&StoreAccountantHandle>,
     ) -> contextdb_core::Result<()> {
         #[cfg(any(test, feature = "test-seams"))]
@@ -3030,7 +3533,8 @@ impl MemoryAccountant {
                 requested_bytes: bytes,
                 available_bytes: 0,
                 budget_limit_bytes: self.used.load(Ordering::SeqCst),
-                hint: "Injected current vector identity publication admission exhaustion.".to_owned(),
+                hint: "Injected current vector identity publication admission exhaustion."
+                    .to_owned(),
             });
         }
         #[cfg(any(test, feature = "test-seams"))]
@@ -3052,7 +3556,12 @@ impl MemoryAccountant {
         let mut allocation = self.try_allocate_with_provenance(bytes, provenance);
         #[cfg(any(test, feature = "test-seams"))]
         if allocation.is_ok() {
-            note_budget_admission(subsystem, operation, bytes, self.used.load(Ordering::SeqCst));
+            note_budget_admission(
+                subsystem,
+                operation,
+                bytes,
+                self.used.load(Ordering::SeqCst),
+            );
         }
         // A saved graph whose topology does not fit is admitted once the
         // serving pages already resident give way to it: they are re-readable,
@@ -3066,7 +3575,12 @@ impl MemoryAccountant {
                 .as_ref()
                 .and_then(std::sync::Weak::upgrade);
             if let Some(vector) = vector {
-                let short = || bytes.saturating_sub(self.available_for_provenance(provenance).unwrap_or(usize::MAX));
+                let short = || {
+                    bytes.saturating_sub(
+                        self.available_for_provenance(provenance)
+                            .unwrap_or(usize::MAX),
+                    )
+                };
                 if vector.make_room_for_graph_load(short()) != 0 {
                     allocation = self.try_allocate_with_provenance(bytes, provenance);
                 }
@@ -3085,7 +3599,10 @@ impl MemoryAccountant {
                 .lock()
                 .as_ref()
                 .and_then(std::sync::Weak::upgrade);
-            let short = bytes.saturating_sub(self.available_for_provenance(provenance).unwrap_or(usize::MAX));
+            let short = bytes.saturating_sub(
+                self.available_for_provenance(provenance)
+                    .unwrap_or(usize::MAX),
+            );
             if vector.is_some_and(|vector| vector.give_back_serving_pages(short) != 0) {
                 allocation = self.try_allocate_with_provenance(bytes, provenance);
             }
@@ -3156,7 +3673,9 @@ pub(crate) struct WriterVectorBudget {
 }
 impl WriterVectorBudget {
     fn accountant(&self) -> &AccountantHandle {
-        self.accountant.as_ref().expect("live adapter has its accountant")
+        self.accountant
+            .as_ref()
+            .expect("live adapter has its accountant")
     }
 }
 impl Drop for WriterVectorBudget {
@@ -3190,38 +3709,89 @@ impl Drop for WriterVectorBudget {
 }
 impl contextdb_core::read_memory::ReadMemoryBudget for WriterVectorBudget {
     fn try_reserve_native(
-        &self, bytes: usize, subsystem: &'static str,
-        operation: &'static str, hint: &'static str,
+        &self,
+        bytes: usize,
+        subsystem: &'static str,
+        operation: &'static str,
+        hint: &'static str,
     ) -> std::result::Result<(), contextdb_core::read_memory::NativeRefusal> {
-        self.accountant().try_allocate_for_native(bytes, subsystem, operation, hint)
+        self.accountant()
+            .try_allocate_for_native(bytes, subsystem, operation, hint)
     }
 
-
-    fn try_reserve(&self, bytes: usize, subsystem: &'static str, operation: &'static str, hint: &'static str) -> contextdb_core::Result<()> {
-        self.accountant().try_allocate_for(bytes, subsystem, operation, hint)
+    fn try_reserve(
+        &self,
+        bytes: usize,
+        subsystem: &'static str,
+        operation: &'static str,
+        hint: &'static str,
+    ) -> contextdb_core::Result<()> {
+        self.accountant()
+            .try_allocate_for(bytes, subsystem, operation, hint)
     }
-    fn release(&self, bytes: usize) { self.accountant().release(bytes); }
+    fn release(&self, bytes: usize) {
+        self.accountant().release(bytes);
+    }
 }
 impl contextdb_vector::MemoryBudget for WriterVectorBudget {
     fn stable_funder_identity(&self) -> usize {
         self.accountant().as_ptr() as usize
     }
-    fn transition_reservation_for(&self, old: usize, new: usize, subsystem: &str, operation: &str, hint: &str) -> contextdb_core::Result<()> {
-        contextdb_vector::MemoryBudget::transition_reservation_for(&**self.accountant(), old, new, subsystem, operation, hint)
+    fn transition_reservation_for(
+        &self,
+        old: usize,
+        new: usize,
+        subsystem: &str,
+        operation: &str,
+        hint: &str,
+    ) -> contextdb_core::Result<()> {
+        contextdb_vector::MemoryBudget::transition_reservation_for(
+            &**self.accountant(),
+            old,
+            new,
+            subsystem,
+            operation,
+            hint,
+        )
     }
-    fn try_allocate_for(&self, bytes: usize, subsystem: &str, operation: &str, hint: &str) -> contextdb_core::Result<()> {
-        self.accountant().try_allocate_for(bytes, subsystem, operation, hint)
+    fn try_allocate_for(
+        &self,
+        bytes: usize,
+        subsystem: &str,
+        operation: &str,
+        hint: &str,
+    ) -> contextdb_core::Result<()> {
+        self.accountant()
+            .try_allocate_for(bytes, subsystem, operation, hint)
     }
-    fn release(&self, bytes: usize) { self.accountant().release(bytes); }
-    fn available_bytes(&self) -> Option<usize> { self.accountant().usage().available }
-    fn adopt_caller_reservation(&self, bytes: usize) -> contextdb_core::Result<bool> { adopt_vector_load_reservation(self.accountant(), bytes) }
+    fn release(&self, bytes: usize) {
+        self.accountant().release(bytes);
+    }
+    fn available_bytes(&self) -> Option<usize> {
+        self.accountant().usage().available
+    }
+    fn adopt_caller_reservation(&self, bytes: usize) -> contextdb_core::Result<bool> {
+        adopt_vector_load_reservation(self.accountant(), bytes)
+    }
 }
 impl MemoryAccountant {
     #[cfg(test)]
-    pub(crate) fn writer_registration_observation_for_test(&self) -> (usize, usize, usize, usize, usize) {
+    pub(crate) fn writer_registration_observation_for_test(
+        &self,
+    ) -> (usize, usize, usize, usize, usize) {
         let domain = PROCESS_WRITER_BUDGET_DOMAIN.read();
-        if let Some(record) = self.writer_identity.get().and_then(|key| domain.lookup_in(*key)) {
-            return (record as *const WriterRegistration as usize, Layout::new::<WriterRegistration>().size(), record.epoch, record.users, self.used.as_ptr() as usize);
+        if let Some(record) = self
+            .writer_identity
+            .get()
+            .and_then(|key| domain.lookup_in(*key))
+        {
+            return (
+                record as *const WriterRegistration as usize,
+                Layout::new::<WriterRegistration>().size(),
+                record.epoch,
+                record.users,
+                self.used.as_ptr() as usize,
+            );
         }
         (0, 0, 0, 0, self.used.as_ptr() as usize)
     }
@@ -3242,7 +3812,7 @@ impl AccountantHandle {
         self.try_allocate_for(bytes, subsystem, operation, hint)?;
         Ok(SchemaUnitReservation {
             _writer_use: crate::memory_accounting::WriterUse::retain_if_writer(&(self.clone())),
-accountant: self.clone(),
+            accountant: self.clone(),
             remaining: std::cell::Cell::new(bytes),
         })
     }
@@ -3250,57 +3820,102 @@ accountant: self.clone(),
     #[cfg(test)]
     pub(crate) fn writer_vector_adapter_layout_for_test(&self) -> Layout {
         crate::persistence::returned_loader_rows_for_test();
-        crate::persistence::content_identity::proof_allocation_oracle_tests::r1_mapped_control_rows();
-        let adapter = WriterVectorBudget { accountant: Some(self.clone()), layout: Layout::new::<()>(), _writer_use: WriterUse::retain_if_writer(self) };
+        crate::persistence::content_identity::proof_allocation_oracle_tests::r1_mapped_control_rows(
+        );
+        let adapter = WriterVectorBudget {
+            accountant: Some(self.clone()),
+            layout: Layout::new::<()>(),
+            _writer_use: WriterUse::retain_if_writer(self),
+        };
         writer_adapter_layout(&adapter)
     }
-    fn budget_adapter(&self, writer_use: Option<WriterUse>, open_residue: bool) -> contextdb_core::Result<Arc<WriterVectorBudget>> {
+    fn budget_adapter(
+        &self,
+        writer_use: Option<WriterUse>,
+        open_residue: bool,
+    ) -> contextdb_core::Result<Arc<WriterVectorBudget>> {
         let mut adapter = WriterVectorBudget {
-            accountant: Some(self.clone()), layout: Layout::new::<()>(),
+            accountant: Some(self.clone()),
+            layout: Layout::new::<()>(),
             _writer_use: writer_use,
         };
         let layout = writer_adapter_layout(&adapter);
         if open_residue {
             assert!(layout.align() > 1);
             admit_open_residue(layout.size(), "assembly_budget_adapter_open_residue")?;
-            adapter.layout = Layout::from_size_align(layout.size(), 1).expect("receipt size is already valid");
+            adapter.layout =
+                Layout::from_size_align(layout.size(), 1).expect("receipt size is already valid");
         } else {
-            self.try_allocate_for(layout.size(), "writer", "adapter_control", "Raise MEMORY_LIMIT for the writer adapter.")?;
+            self.try_allocate_for(
+                layout.size(),
+                "writer",
+                "adapter_control",
+                "Raise MEMORY_LIMIT for the writer adapter.",
+            )?;
             adapter.layout = layout;
             self.change_adapter_control_receipt(layout.size(), true);
         }
         Ok(Arc::new(adapter))
     }
-    pub(crate) fn vector_budget_for_original_reader(&self) -> contextdb_core::Result<Arc<dyn contextdb_vector::MemoryBudget>> {
-        match self.standard_arc() { Some(arc) => Ok(arc), None => Ok(self.budget_adapter(None, false)?), }
+    pub(crate) fn vector_budget_for_original_reader(
+        &self,
+    ) -> contextdb_core::Result<Arc<dyn contextdb_vector::MemoryBudget>> {
+        match self.standard_arc() {
+            Some(arc) => Ok(arc),
+            None => Ok(self.budget_adapter(None, false)?),
+        }
     }
-    fn vector_budget_for_startup(&self) -> contextdb_core::Result<Arc<dyn contextdb_vector::MemoryBudget>> {
-        let writer_use = WriterUse::retain_if_writer(self).expect("construction root retains the writer epoch");
+    fn vector_budget_for_startup(
+        &self,
+    ) -> contextdb_core::Result<Arc<dyn contextdb_vector::MemoryBudget>> {
+        let writer_use =
+            WriterUse::retain_if_writer(self).expect("construction root retains the writer epoch");
         Ok(self.budget_adapter(Some(writer_use), true)?)
     }
-    pub(crate) fn vector_budget(&self) -> contextdb_core::Result<Arc<dyn contextdb_vector::MemoryBudget>> {
+    pub(crate) fn vector_budget(
+        &self,
+    ) -> contextdb_core::Result<Arc<dyn contextdb_vector::MemoryBudget>> {
         match WriterUse::retain_if_writer(self) {
             Some(writer_use) => Ok(self.budget_adapter(Some(writer_use), false)?),
-            None => match self.standard_arc() { Some(arc) => Ok(arc), None => Ok(self.budget_adapter(None, false)?), },
+            None => match self.standard_arc() {
+                Some(arc) => Ok(arc),
+                None => Ok(self.budget_adapter(None, false)?),
+            },
         }
     }
-    pub(crate) fn assembly_read_budget(&self) -> contextdb_core::Result<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>> {
+    pub(crate) fn assembly_read_budget(
+        &self,
+    ) -> contextdb_core::Result<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>> {
         match WriterUse::retain_if_writer(self) {
             Some(writer_use) => Ok(self.budget_adapter(Some(writer_use), true)?),
-            None => match self.standard_arc() { Some(arc) => Ok(arc), None => Ok(self.budget_adapter(None, false)?), },
+            None => match self.standard_arc() {
+                Some(arc) => Ok(arc),
+                None => Ok(self.budget_adapter(None, false)?),
+            },
         }
     }
-    pub(crate) fn read_budget_for_original(&self, writer_use: Option<WriterUse>) -> contextdb_core::Result<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>> {
-        if writer_use.is_none() && let Some(arc) = self.standard_arc() { return Ok(arc); }
+    pub(crate) fn read_budget_for_original(
+        &self,
+        writer_use: Option<WriterUse>,
+    ) -> contextdb_core::Result<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>> {
+        if writer_use.is_none()
+            && let Some(arc) = self.standard_arc()
+        {
+            return Ok(arc);
+        }
         Ok(self.budget_adapter(writer_use, false)?)
     }
-    pub(crate) fn read_budget(&self) -> contextdb_core::Result<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>> {
+    pub(crate) fn read_budget(
+        &self,
+    ) -> contextdb_core::Result<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>> {
         match WriterUse::retain_if_writer(self) {
             Some(writer_use) => Ok(self.budget_adapter(Some(writer_use), false)?),
-            None => match self.standard_arc() { Some(arc) => Ok(arc), None => Ok(self.budget_adapter(None, false)?), },
+            None => match self.standard_arc() {
+                Some(arc) => Ok(arc),
+                None => Ok(self.budget_adapter(None, false)?),
+            },
         }
     }
-
 }
 
 impl contextdb_vector::MemoryBudget for MemoryAccountant {
@@ -3363,12 +3978,14 @@ impl contextdb_vector::MemoryBudget for MemoryAccountant {
 
 impl contextdb_core::read_memory::ReadMemoryBudget for MemoryAccountant {
     fn try_reserve_native(
-        &self, bytes: usize, subsystem: &'static str,
-        operation: &'static str, hint: &'static str,
+        &self,
+        bytes: usize,
+        subsystem: &'static str,
+        operation: &'static str,
+        hint: &'static str,
     ) -> std::result::Result<(), contextdb_core::read_memory::NativeRefusal> {
         self.try_allocate_for_native(bytes, subsystem, operation, hint)
     }
-
 
     fn try_reserve(
         &self,
@@ -3391,17 +4008,30 @@ impl MemoryAccountant {
     // snapshot afterward. If activation changed it, price again before CAS.
     // Exclusive activation performs only the counter/token transition and
     // never calls these arbitrary test callbacks while holding its gate.
-    fn fire_accounting_hook_without_gate(&self, admission: &mut WriterAdmission, success: bool) -> bool {
+    fn fire_accounting_hook_without_gate(
+        &self,
+        admission: &mut WriterAdmission,
+        success: bool,
+    ) -> bool {
         self.fire_accounting_hook_without_gate_for_provenance(admission, None, success)
     }
     #[cfg(test)]
     fn fire_accounting_hook_without_gate_for_provenance(
-        &self, admission: &mut WriterAdmission, provenance: Option<&StoreAccountantHandle>, success: bool,
+        &self,
+        admission: &mut WriterAdmission,
+        provenance: Option<&StoreAccountantHandle>,
+        success: bool,
     ) -> bool {
-        if self.exclusive_activation().is_some() { return false; }
+        if self.exclusive_activation().is_some() {
+            return false;
+        }
         let ceiling_before = admission.ceiling;
         drop(admission._gate.take());
-        if success { self.fire_admission_race_hook(); } else { self.fire_alloc_race_hook(); }
+        if success {
+            self.fire_admission_race_hook();
+        } else {
+            self.fire_alloc_race_hook();
+        }
         *admission = self.writer_admission_for_provenance(provenance);
         admission.ceiling != ceiling_before
     }
@@ -3930,7 +4560,10 @@ impl contextdb_tx::SourceFunding for NativeSourceProvider {
         // Use the actual original control-first reservation kernel before copying.
         let writer = self.writer.as_ref().expect("live native source writer");
         let grant = OwnedMemoryReservation::try_new_arc_for_original(
-            writer, bytes, "relational", "staged_index_posting",
+            writer,
+            bytes,
+            "relational",
+            "staged_index_posting",
             "Reduce staged rows or raise MEMORY_LIMIT.",
         )?;
         let mut original = Arc::into_inner(grant).expect("private copy grant has one owner");
@@ -4020,7 +4653,10 @@ impl contextdb_tx::SourceFunding for NativeSourceProvider {
         // Use the actual original control-first reservation kernel before copying.
         let writer = self.writer.as_ref().expect("live native source writer");
         let grant = OwnedMemoryReservation::try_new_arc_for_original(
-            writer, bytes, "relational", "staged_index_posting",
+            writer,
+            bytes,
+            "relational",
+            "staged_index_posting",
             "Reduce staged rows or raise MEMORY_LIMIT.",
         )?;
         let mut original = Arc::into_inner(grant).expect("private copy grant has one owner");
@@ -4100,7 +4736,10 @@ impl contextdb_tx::SourceFunding for NativeSourceProvider {
         // Use the actual original control-first reservation kernel before copying.
         let writer = self.writer.as_ref().expect("live native source writer");
         let grant = OwnedMemoryReservation::try_new_arc_for_original(
-            writer, bytes, "relational", "staged_index_posting",
+            writer,
+            bytes,
+            "relational",
+            "staged_index_posting",
             "Reduce staged rows or raise MEMORY_LIMIT.",
         )?;
         let mut original = Arc::into_inner(grant).expect("private copy grant has one owner");
@@ -4222,12 +4861,18 @@ impl contextdb_tx::staged_source::SourceFunding for MemoryAccountant {
         let held_writer = WriterUse::retain_if_writer(&accountant);
         let grant = if let Some(writer) = &held_writer {
             OwnedMemoryReservation::try_new_arc_for_original(
-                writer, bytes, "relational", "staged_index_posting",
+                writer,
+                bytes,
+                "relational",
+                "staged_index_posting",
                 "Reduce staged rows or raise MEMORY_LIMIT.",
             )?
         } else {
             OwnedMemoryReservation::try_new_arc_for_nonwriter(
-                &accountant, bytes, "relational", "staged_index_posting",
+                &accountant,
+                bytes,
+                "relational",
+                "staged_index_posting",
                 "Reduce staged rows or raise MEMORY_LIMIT.",
             )?
         };
@@ -4329,12 +4974,18 @@ impl contextdb_tx::staged_source::SourceFunding for MemoryAccountant {
         let held_writer = WriterUse::retain_if_writer(&accountant);
         let grant = if let Some(writer) = &held_writer {
             OwnedMemoryReservation::try_new_arc_for_original(
-                writer, bytes, "relational", "staged_index_posting",
+                writer,
+                bytes,
+                "relational",
+                "staged_index_posting",
                 "Reduce staged rows or raise MEMORY_LIMIT.",
             )?
         } else {
             OwnedMemoryReservation::try_new_arc_for_nonwriter(
-                &accountant, bytes, "relational", "staged_index_posting",
+                &accountant,
+                bytes,
+                "relational",
+                "staged_index_posting",
                 "Reduce staged rows or raise MEMORY_LIMIT.",
             )?
         };
@@ -4424,12 +5075,18 @@ impl contextdb_tx::staged_source::SourceFunding for MemoryAccountant {
         let held_writer = WriterUse::retain_if_writer(&accountant);
         let grant = if let Some(writer) = &held_writer {
             OwnedMemoryReservation::try_new_arc_for_original(
-                writer, bytes, "relational", "staged_index_posting",
+                writer,
+                bytes,
+                "relational",
+                "staged_index_posting",
                 "Reduce staged rows or raise MEMORY_LIMIT.",
             )?
         } else {
             OwnedMemoryReservation::try_new_arc_for_nonwriter(
-                &accountant, bytes, "relational", "staged_index_posting",
+                &accountant,
+                bytes,
+                "relational",
+                "staged_index_posting",
                 "Reduce staged rows or raise MEMORY_LIMIT.",
             )?
         };
@@ -4504,20 +5161,35 @@ impl contextdb_tx::OriginalCopyChargeSource for OwnedMemoryReservation {
         Some(self.copy_retained_original_row_for(row, funder))
     }
     fn copy_original_vector_for(
-        &self, entry: &contextdb_core::VectorEntry, funder: &contextdb_tx::SourceFunder,
-    ) -> Option<contextdb_core::Result<contextdb_tx::AdmittedSourceVector>> {
-        Some(self.copy_retained_original_vector_parts_for(
-            &entry.index.table, &entry.index.column, &entry.vector, entry.row_id,
-            entry.created_tx, entry.deleted_tx, entry.lsn, funder,
-        ))
-    }
-    fn copy_original_vector_input_for(
-        &self, input: contextdb_tx::staged_source::BorrowedOriginalVectorCopyInput<'_>,
+        &self,
+        entry: &contextdb_core::VectorEntry,
         funder: &contextdb_tx::SourceFunder,
     ) -> Option<contextdb_core::Result<contextdb_tx::AdmittedSourceVector>> {
         Some(self.copy_retained_original_vector_parts_for(
-            input.table(), input.column(), input.vector(), input.row_id(),
-            input.created_tx(), input.deleted_tx(), input.lsn(), funder,
+            &entry.index.table,
+            &entry.index.column,
+            &entry.vector,
+            entry.row_id,
+            entry.created_tx,
+            entry.deleted_tx,
+            entry.lsn,
+            funder,
+        ))
+    }
+    fn copy_original_vector_input_for(
+        &self,
+        input: contextdb_tx::staged_source::BorrowedOriginalVectorCopyInput<'_>,
+        funder: &contextdb_tx::SourceFunder,
+    ) -> Option<contextdb_core::Result<contextdb_tx::AdmittedSourceVector>> {
+        Some(self.copy_retained_original_vector_parts_for(
+            input.table(),
+            input.column(),
+            input.vector(),
+            input.row_id(),
+            input.created_tx(),
+            input.deleted_tx(),
+            input.lsn(),
+            funder,
         ))
     }
     fn original_source_origin(&self) -> Option<contextdb_tx::NativeSourceOrigin> {
@@ -4625,27 +5297,45 @@ fn source_add(a: usize, b: usize) -> contextdb_core::Result<usize> {
 }
 // Private preparation copies use the same native layout and exact copy kernels
 // as source funding. A caller must admit the returned plan BEFORE this copy.
-pub(crate) fn preparation_row_copy_bytes(row: &contextdb_core::VersionedRow) -> contextdb_core::Result<usize> {
-    row.values.iter().try_fold(source_row_map_bytes(row.values.len())?, |bytes, (name, value)| {
-        source_add(source_add(bytes, name.len())?, source_value_copy_bytes(value)?)
-    })
+pub(crate) fn preparation_row_copy_bytes(
+    row: &contextdb_core::VersionedRow,
+) -> contextdb_core::Result<usize> {
+    row.values.iter().try_fold(
+        source_row_map_bytes(row.values.len())?,
+        |bytes, (name, value)| {
+            source_add(
+                source_add(bytes, name.len())?,
+                source_value_copy_bytes(value)?,
+            )
+        },
+    )
 }
-pub(crate) fn preparation_copy_row(row: &contextdb_core::VersionedRow) -> contextdb_core::Result<contextdb_core::VersionedRow> {
+pub(crate) fn preparation_copy_row(
+    row: &contextdb_core::VersionedRow,
+) -> contextdb_core::Result<contextdb_core::VersionedRow> {
     let mut values = HashMap::with_capacity(row.values.len());
     for (name, value) in &row.values {
         values.insert(name.as_str().to_owned(), source_copy_value(value));
     }
     let copied = contextdb_core::VersionedRow {
-        row_id: row.row_id, values, created_tx: row.created_tx,
-        deleted_tx: row.deleted_tx, lsn: row.lsn, created_at: row.created_at,
+        row_id: row.row_id,
+        values,
+        created_tx: row.created_tx,
+        deleted_tx: row.deleted_tx,
+        lsn: row.lsn,
+        created_at: row.created_at,
     };
     source_check_row_capacity(&copied)?;
     Ok(copied)
 }
-pub(crate) fn preparation_value_copy_bytes(value: &contextdb_core::Value) -> contextdb_core::Result<usize> {
+pub(crate) fn preparation_value_copy_bytes(
+    value: &contextdb_core::Value,
+) -> contextdb_core::Result<usize> {
     source_value_copy_bytes(value)
 }
-pub(crate) fn preparation_copy_value(value: &contextdb_core::Value) -> contextdb_core::Result<contextdb_core::Value> {
+pub(crate) fn preparation_copy_value(
+    value: &contextdb_core::Value,
+) -> contextdb_core::Result<contextdb_core::Value> {
     let copied = source_copy_value(value);
     source_check_value_capacity(&copied)?;
     Ok(copied)
@@ -4654,7 +5344,9 @@ pub(crate) fn preparation_row_map_bytes(members: usize) -> contextdb_core::Resul
     source_row_map_bytes(members)
 }
 
-pub(crate) fn preparation_check_row_capacity(row: &contextdb_core::VersionedRow) -> contextdb_core::Result<()> {
+pub(crate) fn preparation_check_row_capacity(
+    row: &contextdb_core::VersionedRow,
+) -> contextdb_core::Result<()> {
     source_check_row_capacity(row)
 }
 
@@ -5624,11 +6316,13 @@ pub(crate) fn general_checkpoint_native_rows() {
 mod general_checkpoint_native_fixture {
     use super::*;
     use crate::persistence::content_identity::proof_allocation_oracle_tests as oracle;
-    use contextdb_core::{AdjEntry, DirectedValue, Error, Lsn, NodeId, Result, RowId,
-        TableMeta, TotalOrdAsc, TxId, Value, VectorEntry, VectorIndexRef, VersionedRow};
-    use contextdb_tx::{EngineCapturedWriteSet, EngineFlags, WriteSet, WriteSetApplicator};
+    use contextdb_core::{
+        AdjEntry, DirectedValue, Error, Lsn, NodeId, Result, RowId, TableMeta, TotalOrdAsc, TxId,
+        Value, VectorEntry, VectorIndexRef, VersionedRow,
+    };
     use contextdb_tx::manager::{EngineGuard, EngineRead, EngineTransactions};
     use contextdb_tx::staged_source::{AuxBodies, CanonicalStatementRows, SourceFunder};
+    use contextdb_tx::{EngineCapturedWriteSet, EngineFlags, WriteSet, WriteSetApplicator};
     use std::collections::{BTreeSet, HashMap};
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
@@ -5636,10 +6330,16 @@ mod general_checkpoint_native_fixture {
     // never invoked: these are staging/rollback proofs, not Database activation.
     struct StagingOnly;
     impl WriteSetApplicator for StagingOnly {
-        fn apply(&self, _: &WriteSet, _: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>) -> Result<()> {
+        fn apply(
+            &self,
+            _: &WriteSet,
+            _: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        ) -> Result<()> {
             panic!("checkpoint proof must not publish to a durable store")
         }
-        fn new_row_id(&self) -> RowId { RowId(91) }
+        fn new_row_id(&self) -> RowId {
+            RowId(91)
+        }
     }
     type Transactions = EngineTransactions<StagingOnly>;
 
@@ -5667,64 +6367,162 @@ mod general_checkpoint_native_fixture {
     }
     fn image(r: EngineRead<'_>) -> Image {
         Image {
-            base: r.base_read.as_ref().map(|b| (b.snapshot, b.lsn,
-                b.handle.as_ref().map_or(0, |h| Arc::as_ptr(h) as *const () as usize))),
-            rows: r.relational_inserts.clone(), relational_deletes: r.relational_deletes.clone(),
-            predicates: r.relational_delete_predicates.clone(), adj_inserts: r.adj_inserts.clone(),
-            adj_deletes: r.adj_deletes.clone(), vectors: r.vector_inserts.clone(),
-            vector_deletes: r.vector_deletes.clone(), vector_moves: r.vector_moves.clone(),
-            lsns: r.relational_insert_source_lsns.clone(), kinds: r.relational_insert_source_kinds.clone(),
-            admitted: r.relational_insert_admitted_bytes.clone(), provenance: r.sync_source_provenance_marks.clone(),
-            config_writes: r.config_writes.clone(), config_deletes: r.config_deletes.clone(),
+            base: r.base_read.as_ref().map(|b| {
+                (
+                    b.snapshot,
+                    b.lsn,
+                    b.handle
+                        .as_ref()
+                        .map_or(0, |h| Arc::as_ptr(h) as *const () as usize),
+                )
+            }),
+            rows: r.relational_inserts.clone(),
+            relational_deletes: r.relational_deletes.clone(),
+            predicates: r.relational_delete_predicates.clone(),
+            adj_inserts: r.adj_inserts.clone(),
+            adj_deletes: r.adj_deletes.clone(),
+            vectors: r.vector_inserts.clone(),
+            vector_deletes: r.vector_deletes.clone(),
+            vector_moves: r.vector_moves.clone(),
+            lsns: r.relational_insert_source_lsns.clone(),
+            kinds: r.relational_insert_source_kinds.clone(),
+            admitted: r.relational_insert_admitted_bytes.clone(),
+            provenance: r.sync_source_provenance_marks.clone(),
+            config_writes: r.config_writes.clone(),
+            config_deletes: r.config_deletes.clone(),
             config_max: r.config_max_u64_keys.clone(),
-            flags: (*r.commit_lsn, *r.finalized_tx, *r.requires_commit_lsn, *r.visibility_floor, *r.propagation_in_progress),
-            capacities: [r.relational_inserts.capacity(), r.relational_deletes.capacity(),
-                r.relational_delete_predicates.capacity(), r.adj_inserts.capacity(), r.adj_deletes.capacity(),
-                r.vector_inserts.capacity(), r.vector_deletes.capacity(), r.vector_moves.capacity(),
-                r.sync_source_provenance_marks.capacity(), r.config_writes.capacity(),
-                r.config_deletes.capacity(), r.config_max_u64_keys.capacity()],
+            flags: (
+                *r.commit_lsn,
+                *r.finalized_tx,
+                *r.requires_commit_lsn,
+                *r.visibility_floor,
+                *r.propagation_in_progress,
+            ),
+            capacities: [
+                r.relational_inserts.capacity(),
+                r.relational_deletes.capacity(),
+                r.relational_delete_predicates.capacity(),
+                r.adj_inserts.capacity(),
+                r.adj_deletes.capacity(),
+                r.vector_inserts.capacity(),
+                r.vector_deletes.capacity(),
+                r.vector_moves.capacity(),
+                r.sync_source_provenance_marks.capacity(),
+                r.config_writes.capacity(),
+                r.config_deletes.capacity(),
+                r.config_max_u64_keys.capacity(),
+            ],
             sidecar_capacities: [
-                (r.relational_insert_source_lsns.capacity(), r.relational_insert_source_lsns.values().map(HashMap::capacity).sum()),
-                (r.relational_insert_source_kinds.capacity(), r.relational_insert_source_kinds.values().map(HashMap::capacity).sum()),
-                (r.relational_insert_admitted_bytes.capacity(), r.relational_insert_admitted_bytes.values().map(HashMap::capacity).sum()),
+                (
+                    r.relational_insert_source_lsns.capacity(),
+                    r.relational_insert_source_lsns
+                        .values()
+                        .map(HashMap::capacity)
+                        .sum(),
+                ),
+                (
+                    r.relational_insert_source_kinds.capacity(),
+                    r.relational_insert_source_kinds
+                        .values()
+                        .map(HashMap::capacity)
+                        .sum(),
+                ),
+                (
+                    r.relational_insert_admitted_bytes.capacity(),
+                    r.relational_insert_admitted_bytes
+                        .values()
+                        .map(HashMap::capacity)
+                        .sum(),
+                ),
             ],
         }
     }
-    fn snapshot(t: &Transactions, tx: TxId) -> Image { t.with_read(tx, image).unwrap() }
-    fn row(tx: TxId, id: u64, value: u64) -> VersionedRow {
-        VersionedRow { row_id: RowId(id), values: [
-            ("text".into(), Value::Text(format!("body-{value}-{}", "p".repeat(83)))),
-            ("rank".into(), Value::Int64(value as i64)),
-        ].into(), created_tx: tx, deleted_tx: Some(TxId(811)), lsn: Lsn(43),
-            created_at: Some(contextdb_core::Wallclock::now()) }
+    fn snapshot(t: &Transactions, tx: TxId) -> Image {
+        t.with_read(tx, image).unwrap()
     }
-    fn index() -> VectorIndexRef { VectorIndexRef { table: "table".into(), column: "embedding".into() } }
-    fn original_row(writer: &WriterBudget, funder: &SourceFunder, template: &VersionedRow)
-        -> Result<(VersionedRow, contextdb_tx::OriginalRowInvoice)> {
-        let bytes = template.values.iter().try_fold(source_row_map_bytes(template.values.len())?,
-            |bytes, (name, value)| source_add(source_add(bytes, name.len())?, source_value_copy_bytes(value)?))?;
-        let reservation = OwnedMemoryReservation::try_new_arc_for_original(&writer.writer_use,
-            bytes, "relational", "statement_overlay", "checkpoint proof original row")?;
+    fn row(tx: TxId, id: u64, value: u64) -> VersionedRow {
+        VersionedRow {
+            row_id: RowId(id),
+            values: [
+                (
+                    "text".into(),
+                    Value::Text(format!("body-{value}-{}", "p".repeat(83))),
+                ),
+                ("rank".into(), Value::Int64(value as i64)),
+            ]
+            .into(),
+            created_tx: tx,
+            deleted_tx: Some(TxId(811)),
+            lsn: Lsn(43),
+            created_at: Some(contextdb_core::Wallclock::now()),
+        }
+    }
+    fn index() -> VectorIndexRef {
+        VectorIndexRef {
+            table: "table".into(),
+            column: "embedding".into(),
+        }
+    }
+    fn original_row(
+        writer: &WriterBudget,
+        funder: &SourceFunder,
+        template: &VersionedRow,
+    ) -> Result<(VersionedRow, contextdb_tx::OriginalRowInvoice)> {
+        let bytes = template.values.iter().try_fold(
+            source_row_map_bytes(template.values.len())?,
+            |bytes, (name, value)| {
+                source_add(
+                    source_add(bytes, name.len())?,
+                    source_value_copy_bytes(value)?,
+                )
+            },
+        )?;
+        let reservation = OwnedMemoryReservation::try_new_arc_for_original(
+            &writer.writer_use,
+            bytes,
+            "relational",
+            "statement_overlay",
+            "checkpoint proof original row",
+        )?;
         let mut original = Arc::into_inner(reservation).expect("one genuine original owner");
         original.finish_freed_enclosing_control();
         let invoice = original.into_source_row_invoice_for(funder)?;
         let mut values = HashMap::with_capacity(template.values.len());
-        for (name, value) in &template.values { values.insert(name.as_str().to_owned(), source_copy_value(value)); }
-        let body = VersionedRow { row_id:template.row_id, values, created_tx:template.created_tx,
-            deleted_tx:template.deleted_tx, lsn:template.lsn, created_at:template.created_at };
+        for (name, value) in &template.values {
+            values.insert(name.as_str().to_owned(), source_copy_value(value));
+        }
+        let body = VersionedRow {
+            row_id: template.row_id,
+            values,
+            created_tx: template.created_tx,
+            deleted_tx: template.deleted_tx,
+            lsn: template.lsn,
+            created_at: template.created_at,
+        };
         source_check_row_capacity(&body)?;
         Ok((body, invoice))
     }
-    fn original_vector(writer: &WriterBudget, funder: &SourceFunder, template: &VectorEntry)
-        -> Result<(VectorEntry, contextdb_tx::OriginalVectorInvoice)> {
-        let bytes = source_add(source_add(template.index.table.len(), template.index.column.len())?,
-            source_array::<f32>(template.vector.len())?)?;
-        let reservation = OwnedMemoryReservation::try_new_arc_for_original(&writer.writer_use,
-            bytes, "vector", "statement_overlay", "checkpoint proof original vector")?;
+    fn original_vector(
+        writer: &WriterBudget,
+        funder: &SourceFunder,
+        template: &VectorEntry,
+    ) -> Result<(VectorEntry, contextdb_tx::OriginalVectorInvoice)> {
+        let bytes = source_add(
+            source_add(template.index.table.len(), template.index.column.len())?,
+            source_array::<f32>(template.vector.len())?,
+        )?;
+        let reservation = OwnedMemoryReservation::try_new_arc_for_original(
+            &writer.writer_use,
+            bytes,
+            "vector",
+            "statement_overlay",
+            "checkpoint proof original vector",
+        )?;
         let mut original = Arc::into_inner(reservation).expect("one genuine original owner");
         original.finish_freed_enclosing_control();
         let invoice = original.into_source_vector_invoice_for(funder)?;
-        let body = source_copy_vector(template); source_check_vector_capacity(&body)?;
+        let body = source_copy_vector(template);
+        source_check_vector_capacity(&body)?;
         Ok((body, invoice))
     }
     fn duplicate_checkpoint_id(id: &contextdb_tx::TxCheckpointId) -> contextdb_tx::TxCheckpointId {
@@ -5734,35 +6532,93 @@ mod general_checkpoint_native_fixture {
         unsafe { std::ptr::read(id) }
     }
     fn meta() -> TableMeta {
-        TableMeta { indexes: vec![contextdb_core::IndexDecl {
-            name:"by_rank".into(), columns:vec![("rank".into(), contextdb_core::SortDirection::Asc)],
-            kind:contextdb_core::IndexKind::UserDeclared,
-        }], ..TableMeta::default() }
+        TableMeta {
+            indexes: vec![contextdb_core::IndexDecl {
+                name: "by_rank".into(),
+                columns: vec![("rank".into(), contextdb_core::SortDirection::Asc)],
+                kind: contextdb_core::IndexKind::UserDeclared,
+            }],
+            ..TableMeta::default()
+        }
     }
-    fn stage(g: &mut EngineGuard<'_>, f: &SourceFunder, writer: &WriterBudget, tx: TxId, id: u64, value: u64) -> Result<()> {
+    fn stage(
+        g: &mut EngineGuard<'_>,
+        f: &SourceFunder,
+        writer: &WriterBudget,
+        tx: TxId,
+        id: u64,
+        value: u64,
+    ) -> Result<()> {
         let (body, invoice) = original_row(writer, f, &row(tx, id, value))?;
         let schema = g.prepare_schema("table", &meta())?;
-        let keys = [("by_rank".into(), vec![DirectedValue::Asc(TotalOrdAsc(Value::Int64(value as i64)))])];
+        let keys = [(
+            "by_rank".into(),
+            vec![DirectedValue::Asc(TotalOrdAsc(Value::Int64(value as i64)))],
+        )];
         let p = g.prepare_eager_row("table", body, &keys, schema, invoice)?;
         g.publish(p);
-        let p = g.prepare_sidecars("table", RowId(id), Some((Lsn(value + 10), 3)), Some(value as usize + 19))?;
+        let p = g.prepare_sidecars(
+            "table",
+            RowId(id),
+            Some((Lsn(value + 10), 3)),
+            Some(value as usize + 19),
+        )?;
         g.publish_tx(p);
         Ok(())
     }
-    fn populate_aux(g: &mut EngineGuard<'_>, tx: TxId, value: u64, replace: bool, count: usize) -> Result<()> {
-        let a = NodeId::from_u128(11); let b = NodeId::from_u128(13);
+    fn populate_aux(
+        g: &mut EngineGuard<'_>,
+        tx: TxId,
+        value: u64,
+        replace: bool,
+        count: usize,
+    ) -> Result<()> {
+        let a = NodeId::from_u128(11);
+        let b = NodeId::from_u128(13);
         let batches = vec![
-            AuxBodies::RelationalDeletes(vec![(format!("delete-{value}"), RowId(value), tx); count]),
-            AuxBodies::Predicates(vec![contextdb_tx::write_set::RelationalDeletePredicate {
-                table: format!("predicate-{value}"), predicates: vec![("text".into(), Value::Text(format!("predicate-body-{value}")))] }; count]),
-            AuxBodies::AdjInserts(vec![AdjEntry { source:a, target:b, edge_type:format!("edge-{value}"),
-                properties:[("property".into(), Value::Text(format!("edge-body-{value}")))].into(),
-                created_tx:tx, deleted_tx:Some(TxId(812)), lsn:Lsn(value) }; count]),
+            AuxBodies::RelationalDeletes(vec![
+                (format!("delete-{value}"), RowId(value), tx);
+                count
+            ]),
+            AuxBodies::Predicates(vec![
+                contextdb_tx::write_set::RelationalDeletePredicate {
+                    table: format!("predicate-{value}"),
+                    predicates: vec![(
+                        "text".into(),
+                        Value::Text(format!("predicate-body-{value}"))
+                    )]
+                };
+                count
+            ]),
+            AuxBodies::AdjInserts(vec![
+                AdjEntry {
+                    source: a,
+                    target: b,
+                    edge_type: format!("edge-{value}"),
+                    properties: [("property".into(), Value::Text(format!("edge-body-{value}")))]
+                        .into(),
+                    created_tx: tx,
+                    deleted_tx: Some(TxId(812)),
+                    lsn: Lsn(value)
+                };
+                count
+            ]),
             AuxBodies::AdjDeletes(vec![(a, format!("removed-edge-{value}"), b, tx); count]),
             AuxBodies::VectorDeletes(vec![(index(), RowId(value), tx); count]),
-            AuxBodies::VectorMoves(vec![(index(), RowId(value), RowId(value+1), tx); count]),
-            AuxBodies::Provenance(vec![(format!("provenance-{value}"), RowId(value), Lsn(value), 5); count]),
-            AuxBodies::ConfigWrites(vec![(format!("config-{value}"), vec![value as u8; 73]); count]),
+            AuxBodies::VectorMoves(vec![(index(), RowId(value), RowId(value + 1), tx); count]),
+            AuxBodies::Provenance(vec![
+                (
+                    format!("provenance-{value}"),
+                    RowId(value),
+                    Lsn(value),
+                    5
+                );
+                count
+            ]),
+            AuxBodies::ConfigWrites(vec![
+                (format!("config-{value}"), vec![value as u8; 73]);
+                count
+            ]),
             AuxBodies::ConfigDeletes(vec![format!("config-delete-{value}"); count]),
             AuxBodies::ConfigMaxU64Keys(vec![format!("frontier-{value}"); count]),
         ];
@@ -5773,73 +6629,157 @@ mod general_checkpoint_native_fixture {
         }
         Ok(())
     }
-    fn populate(g: &mut EngineGuard<'_>, f: &SourceFunder, writer: &WriterBudget, tx: TxId, value: u64) -> Result<()> {
-        stage(g, f, writer, tx, 1, value)?; stage(g, f, writer, tx, 2, value+1)?; stage(g, f, writer, tx, 3, value+2)?;
-        let v = VectorEntry { index:index(), row_id:RowId(1), vector:vec![value as f32; 17],
-            created_tx:tx, deleted_tx:Some(TxId(813)), lsn:Lsn(value) };
+    fn populate(
+        g: &mut EngineGuard<'_>,
+        f: &SourceFunder,
+        writer: &WriterBudget,
+        tx: TxId,
+        value: u64,
+    ) -> Result<()> {
+        stage(g, f, writer, tx, 1, value)?;
+        stage(g, f, writer, tx, 2, value + 1)?;
+        stage(g, f, writer, tx, 3, value + 2)?;
+        let v = VectorEntry {
+            index: index(),
+            row_id: RowId(1),
+            vector: vec![value as f32; 17],
+            created_tx: tx,
+            deleted_tx: Some(TxId(813)),
+            lsn: Lsn(value),
+        };
         let (v, invoice) = original_vector(writer, f, &v)?;
-        let p = g.prepare_eager_vector(v, None, invoice)?; g.publish(p);
+        let p = g.prepare_eager_vector(v, None, invoice)?;
+        g.publish(p);
         populate_aux(g, tx, value, false, 1)?;
-        let p = g.prepare_flags(EngineFlags { commit_lsn:Some(Lsn(value)), finalized_tx:Some(TxId(value+50)),
-            requires_commit_lsn:true, visibility_floor:Some(TxId(value+70)), propagation_in_progress:true })?;
+        let p = g.prepare_flags(EngineFlags {
+            commit_lsn: Some(Lsn(value)),
+            finalized_tx: Some(TxId(value + 50)),
+            requires_commit_lsn: true,
+            visibility_floor: Some(TxId(value + 70)),
+            propagation_in_progress: true,
+        })?;
         g.publish_tx(p);
         Ok(())
     }
-    fn mutate(g: &mut EngineGuard<'_>, f: &SourceFunder, writer: &WriterBudget, tx: TxId) -> Result<()> {
+    fn mutate(
+        g: &mut EngineGuard<'_>,
+        f: &SourceFunder,
+        writer: &WriterBudget,
+        tx: TxId,
+    ) -> Result<()> {
         // Same-length displaced bodies in ten auxiliary lanes, then growth.
         populate_aux(g, tx, 211, true, 1)?;
         populate_aux(g, tx, 311, false, 4)?;
-        let p = g.prepare_remove("table", RowId(2))?; g.publish(p);
+        let p = g.prepare_remove("table", RowId(2))?;
+        g.publish(p);
         let selected = [("table".into(), RowId(1)), ("table".into(), RowId(3))].into();
-        let p = g.prepare_remove_rows(&selected)?; g.publish(p);
-        for id in 4..=8 { stage(g, f, writer, tx, id, 411+id)?; }
-        let p = g.prepare_remove_vector(&index(), RowId(1))?; g.publish(p);
-        for id in 4..=5 {
-            let template = VectorEntry { index:index(), row_id:RowId(id), vector:vec![id as f32; 19],
-                created_tx:tx, deleted_tx:Some(TxId(814)), lsn:Lsn(419) };
-            let (body, invoice) = original_vector(writer, f, &template)?;
-            let p = g.prepare_eager_vector(body, None, invoice)?; g.publish(p);
+        let p = g.prepare_remove_rows(&selected)?;
+        g.publish(p);
+        for id in 4..=8 {
+            stage(g, f, writer, tx, id, 411 + id)?;
         }
-        let p = g.prepare_flags(EngineFlags { commit_lsn:Some(Lsn(511)), finalized_tx:Some(TxId(512)),
-            requires_commit_lsn:false, visibility_floor:Some(TxId(513)), propagation_in_progress:false })?;
+        let p = g.prepare_remove_vector(&index(), RowId(1))?;
+        g.publish(p);
+        for id in 4..=5 {
+            let template = VectorEntry {
+                index: index(),
+                row_id: RowId(id),
+                vector: vec![id as f32; 19],
+                created_tx: tx,
+                deleted_tx: Some(TxId(814)),
+                lsn: Lsn(419),
+            };
+            let (body, invoice) = original_vector(writer, f, &template)?;
+            let p = g.prepare_eager_vector(body, None, invoice)?;
+            g.publish(p);
+        }
+        let p = g.prepare_flags(EngineFlags {
+            commit_lsn: Some(Lsn(511)),
+            finalized_tx: Some(TxId(512)),
+            requires_commit_lsn: false,
+            visibility_floor: Some(TxId(513)),
+            propagation_in_progress: false,
+        })?;
         g.publish_tx(p);
-        let p = g.prepare_identity(tx, TxId(611), Lsn(612))?; g.publish_identity(p);
-        let p = g.prepare_canonicalize()?; g.publish(p);
+        let p = g.prepare_identity(tx, TxId(611), Lsn(612))?;
+        g.publish_identity(p);
+        let p = g.prepare_canonicalize()?;
+        g.publish(p);
         Ok(())
     }
-    fn no_admission<T>(o: &AccountantHandle, c: &AccountantHandle, operation: impl FnOnce() -> T) -> T {
-        let before = (o.admitted_bytes_for_test(), c.admitted_bytes_for_test(),
-            o.retained_charge_bytes_for_test(), c.retained_charge_bytes_for_test());
+    fn no_admission<T>(
+        o: &AccountantHandle,
+        c: &AccountantHandle,
+        operation: impl FnOnce() -> T,
+    ) -> T {
+        let before = (
+            o.admitted_bytes_for_test(),
+            c.admitted_bytes_for_test(),
+            o.retained_charge_bytes_for_test(),
+            c.retained_charge_bytes_for_test(),
+        );
         // Fixed allocator storage counts every request even if more than 32;
         // assertions and snapshot creation are outside the observed interval.
         let (result, _, allocations) = oracle::native_requests_for_test(operation);
-        assert_eq!(allocations, 0, "inverse rollback/abort must request no allocation");
-        assert_eq!((o.admitted_bytes_for_test(), c.admitted_bytes_for_test(),
-            o.retained_charge_bytes_for_test(), c.retained_charge_bytes_for_test()), before,
-            "inverse rollback/abort must neither admit nor unconditionally retain");
+        assert_eq!(
+            allocations, 0,
+            "inverse rollback/abort must request no allocation"
+        );
+        assert_eq!(
+            (
+                o.admitted_bytes_for_test(),
+                c.admitted_bytes_for_test(),
+                o.retained_charge_bytes_for_test(),
+                c.retained_charge_bytes_for_test()
+            ),
+            before,
+            "inverse rollback/abort must neither admit nor unconditionally retain"
+        );
         result
     }
     fn assert_canonical(source: &CanonicalStatementRows, tx: TxId, value: u64) {
         assert_eq!(source.len(), 3);
         assert!(source.has_index_for("by_rank", &meta()));
-        let mut changed_schema = meta(); changed_schema.indexes[0].columns[0].1 = contextdb_core::SortDirection::Desc;
+        let mut changed_schema = meta();
+        changed_schema.indexes[0].columns[0].1 = contextdb_core::SortDirection::Desc;
         assert!(!source.has_index_for("by_rank", &changed_schema));
         let mut after_key = None;
         for id in 1..=3 {
-            after_key = source.with_next_ordered("by_rank", false, after_key.as_ref(),
-                &std::ops::Bound::Unbounded, &std::ops::Bound::Unbounded, 0, |next| {
-                    let (key, found) = next.unwrap(); assert_eq!(found, RowId(id));
-                    assert_eq!(key.0, vec![DirectedValue::Asc(TotalOrdAsc(Value::Int64((value+id-1) as i64)))]);
-                    Ok(Some(key.clone()))
-                }).unwrap();
+            after_key = source
+                .with_next_ordered(
+                    "by_rank",
+                    false,
+                    after_key.as_ref(),
+                    &std::ops::Bound::Unbounded,
+                    &std::ops::Bound::Unbounded,
+                    0,
+                    |next| {
+                        let (key, found) = next.unwrap();
+                        assert_eq!(found, RowId(id));
+                        assert_eq!(
+                            key.0,
+                            vec![DirectedValue::Asc(TotalOrdAsc(Value::Int64(
+                                (value + id - 1) as i64
+                            )))]
+                        );
+                        Ok(Some(key.clone()))
+                    },
+                )
+                .unwrap();
         }
         let mut after = None;
-        for (sequence, id) in [(0,1), (1,2), (2,3)] {
+        for (sequence, id) in [(0, 1), (1, 2), (2, 3)] {
             assert_eq!(source.next_unordered(after), Some((sequence, RowId(id))));
-            source.with_row(RowId(id), |r| { let r = r.unwrap();
-                assert_eq!(r.created_tx, tx); assert_eq!(r.lsn, Lsn(43));
-                assert_eq!(r.values["rank"], Value::Int64((value+id-1) as i64));
-                assert_eq!(r.deleted_tx, Some(TxId(811))); Ok(()) }).unwrap();
+            source
+                .with_row(RowId(id), |r| {
+                    let r = r.unwrap();
+                    assert_eq!(r.created_tx, tx);
+                    assert_eq!(r.lsn, Lsn(43));
+                    assert_eq!(r.values["rank"], Value::Int64((value + id - 1) as i64));
+                    assert_eq!(r.deleted_tx, Some(TxId(811)));
+                    Ok(())
+                })
+                .unwrap();
             after = Some(sequence);
         }
         assert_eq!(source.next_unordered(after), None);
@@ -5852,37 +6792,71 @@ mod general_checkpoint_native_fixture {
             for (_, row) in &expected.rows {
                 assert_eq!(rows.row(row.row_id), Some(row));
                 let (key, ordered) = rows.next_ordered("by_rank", false, after.as_ref()).unwrap();
-                assert_eq!(ordered, row); after = Some(key.clone());
+                assert_eq!(ordered, row);
+                after = Some(key.clone());
             }
-            assert!(rows.next_ordered("by_rank", false, after.as_ref()).is_none());
-            let v = ws.ordered_staged_rows.vector_capability(&index(), RowId(1)).unwrap();
+            assert!(
+                rows.next_ordered("by_rank", false, after.as_ref())
+                    .is_none()
+            );
+            let v = ws
+                .ordered_staged_rows
+                .vector_capability(&index(), RowId(1))
+                .unwrap();
             assert_eq!(v.vector(), expected.vectors[0].vector.as_slice());
         });
     }
     fn typed_refusal(error: Error) {
-        match error { Error::MemoryBudgetExceeded { requested_bytes, available_bytes, .. } => {
-            assert!(requested_bytes > available_bytes);
-        }, other => panic!("expected actual typed original/caller refusal, got {other:?}") }
+        match error {
+            Error::MemoryBudgetExceeded {
+                requested_bytes,
+                available_bytes,
+                ..
+            } => {
+                assert!(requested_bytes > available_bytes);
+            }
+            other => panic!("expected actual typed original/caller refusal, got {other:?}"),
+        }
     }
-    fn removal_admission_cuts(t: &Transactions, tx: TxId, owner: &AccountantHandle,
-        expected: &Image, retained: &CanonicalStatementRows, eager: &EngineCapturedWriteSet) {
+    fn removal_admission_cuts(
+        t: &Transactions,
+        tx: TxId,
+        owner: &AccountantHandle,
+        expected: &Image,
+        retained: &CanonicalStatementRows,
+        eager: &EngineCapturedWriteSet,
+    ) {
         for bulk in [false, true] {
             let prepare = |g: &mut EngineGuard<'_>| {
-                if bulk { g.prepare_remove_rows(&[("table".into(), RowId(1)), ("table".into(), RowId(3))].into()) }
-                else { g.prepare_remove("table", RowId(2)) }
+                if bulk {
+                    g.prepare_remove_rows(
+                        &[("table".into(), RowId(1)), ("table".into(), RowId(3))].into(),
+                    )
+                } else {
+                    g.prepare_remove("table", RowId(2))
+                }
             };
             let base = owner.usage().used;
             watch_budget_ledger_for_test();
             let prepared = t.with_engine(tx, prepare).unwrap();
             let ledger = take_budget_ledger_for_test();
-            drop(prepared); assert_eq!(owner.usage().used, base);
-            let first_c = ledger.iter().position(|entry| entry.what == "relational/staged_source")
+            drop(prepared);
+            assert_eq!(owner.usage().used, base);
+            let first_c = ledger
+                .iter()
+                .position(|entry| entry.what == "relational/staged_source")
                 .expect("real caller source admission after original grants");
             let original = &ledger[..first_c];
             assert!(!original.is_empty());
-            assert!(original.iter().filter(|entry| entry.what != "release").all(|entry|
-                entry.what == "vector_maintenance/reservation_control" || entry.what == "relational/statement_overlay"));
-            let original_credit = original.iter().filter(|entry| entry.what != "release").map(|entry| entry.bytes).sum::<usize>();
+            assert!(original.iter().filter(|entry| entry.what != "release").all(
+                |entry| entry.what == "vector_maintenance/reservation_control"
+                    || entry.what == "relational/statement_overlay"
+            ));
+            let original_credit = original
+                .iter()
+                .filter(|entry| entry.what != "release")
+                .map(|entry| entry.bytes)
+                .sum::<usize>();
             assert!(original_credit > 0);
             // Limit at the observed O boundary, never at a fabricated balance:
             // every actual original reservation fits, first actual C refuses.
@@ -5891,33 +6865,62 @@ mod general_checkpoint_native_fixture {
             let outcome = t.with_engine(tx, prepare);
             let cut = take_budget_ledger_for_test();
             owner.set_budget(None).unwrap();
-            typed_refusal(outcome.err().expect("caller refusal after genuine original grant"));
+            typed_refusal(
+                outcome
+                    .err()
+                    .expect("caller refusal after genuine original grant"),
+            );
             let admitted: Vec<_> = cut.iter().filter(|entry| entry.what != "release").collect();
-            assert_eq!(admitted.iter().map(|entry| entry.bytes).sum::<usize>(), original_credit);
-            assert!(admitted.iter().all(|entry| entry.what != "relational/staged_source"));
+            assert_eq!(
+                admitted.iter().map(|entry| entry.bytes).sum::<usize>(),
+                original_credit
+            );
+            assert!(
+                admitted
+                    .iter()
+                    .all(|entry| entry.what != "relational/staged_source")
+            );
             assert_eq!(owner.usage().used, base);
-            assert_eq!(snapshot(t, tx), *expected); assert_canonical(retained, tx, 101); assert_eager(eager, expected);
+            assert_eq!(snapshot(t, tx), *expected);
+            assert_canonical(retained, tx, 101);
+            assert_eager(eager, expected);
             // Original refuses with no caller source admission at all.
-            owner.set_budget(Some(base)).unwrap(); watch_budget_ledger_for_test();
-            let outcome = t.with_engine(tx, prepare); let cut = take_budget_ledger_for_test();
-            owner.set_budget(None).unwrap(); typed_refusal(outcome.err().expect("original refuses first"));
+            owner.set_budget(Some(base)).unwrap();
+            watch_budget_ledger_for_test();
+            let outcome = t.with_engine(tx, prepare);
+            let cut = take_budget_ledger_for_test();
+            owner.set_budget(None).unwrap();
+            typed_refusal(outcome.err().expect("original refuses first"));
             assert!(cut.iter().all(|entry| entry.what == "release"));
-            assert_eq!(owner.usage().used, base); assert_eq!(snapshot(t, tx), *expected);
+            assert_eq!(owner.usage().used, base);
+            assert_eq!(snapshot(t, tx), *expected);
         }
     }
-    fn run_frames(owner: &AccountantHandle, writer: &WriterBudget, funder: &SourceFunder,
-        caller_owner: &AccountantHandle, caller_funder: &SourceFunder) {
+    fn run_frames(
+        owner: &AccountantHandle,
+        writer: &WriterBudget,
+        funder: &SourceFunder,
+        caller_owner: &AccountantHandle,
+        caller_funder: &SourceFunder,
+    ) {
         let t = Arc::new(Transactions::new_funded(StagingOnly, funder.clone()));
         let tx = t.try_begin().unwrap();
-        t.with_engine(tx, |g| populate(g, funder, writer, tx, 101)).unwrap();
+        t.with_engine(tx, |g| populate(g, funder, writer, tx, 101))
+            .unwrap();
         let expected = snapshot(&t, tx);
         assert!(expected.base.is_some());
         assert!(expected.capacities.iter().all(|capacity| *capacity > 0));
-        assert!(expected.sidecar_capacities.iter().all(|(outer, inner)| *outer > 0 && *inner > 0));
+        assert!(
+            expected
+                .sidecar_capacities
+                .iter()
+                .all(|(outer, inner)| *outer > 0 && *inner > 0)
+        );
         let reader = Arc::new(MemoryAccountant::no_limit());
         let retained = t.capture(tx, "table", reader.clone()).unwrap();
         let eager = t.with_engine(tx, |g| g.capture_private()).unwrap();
-        assert_canonical(&retained, tx, 101); assert_eager(&eager, &expected);
+        assert_canonical(&retained, tx, 101);
+        assert_eager(&eager, &expected);
         removal_admission_cuts(&t, tx, owner, &expected, &retained, &eager);
 
         // The retained rows were funded by O. Reborrow the same live guard with
@@ -5937,56 +6940,79 @@ mod general_checkpoint_native_fixture {
                 &|limit| owner.set_budget(limit).unwrap(),
                 &|limit| caller_owner.set_budget(limit).unwrap(),
             )
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(snapshot(&t, tx), expected);
-        assert_canonical(&retained, tx, 101); assert_eager(&eager, &expected);
+        assert_canonical(&retained, tx, 101);
+        assert_eager(&eager, &expected);
 
         // Both inner scopes settle; the outer scope must still own all inverses.
         let outer = t.checkpoint(tx).unwrap();
-        t.with_engine(tx, |g| g.with_tx_checkpoint(|g| {
-            mutate(g, funder, writer, tx)?;
+        t.with_engine(tx, |g| {
             g.with_tx_checkpoint(|g| {
-                let p = g.prepare_general_adoption(|candidate| populate(candidate, funder, writer, tx, 701))?;
-                g.publish_general_adoption(p); Ok(())
+                mutate(g, funder, writer, tx)?;
+                g.with_tx_checkpoint(|g| {
+                    let p = g.prepare_general_adoption(|candidate| {
+                        populate(candidate, funder, writer, tx, 701)
+                    })?;
+                    g.publish_general_adoption(p);
+                    Ok(())
+                })
             })
-        })).unwrap();
+        })
+        .unwrap();
         assert_ne!(snapshot(&t, tx), expected);
-        assert_canonical(&retained, tx, 101); assert_eager(&eager, &expected);
+        assert_canonical(&retained, tx, 101);
+        assert_eager(&eager, &expected);
         no_admission(owner, owner, || outer.restore());
         assert_eq!(snapshot(&t, tx), expected);
         let current_eager = t.with_engine(tx, |g| g.capture_private()).unwrap();
-        assert_eager(&current_eager, &expected); drop(current_eager);
+        assert_eager(&current_eager, &expected);
+        drop(current_eager);
         let current = t.capture(tx, "table", reader.clone()).unwrap();
-        assert_canonical(&current, tx, 101); drop(current);
+        assert_canonical(&current, tx, 101);
+        drop(current);
 
         // Err and panic restore after every mutation has completed. Allocation
         // assertions observe only restore/abort, never the user's panic machinery.
         let outer = t.checkpoint(tx).unwrap();
         let inner = t.checkpoint(tx).unwrap();
-        t.with_engine(tx, |g| mutate(g, funder, writer, tx)).unwrap();
+        t.with_engine(tx, |g| mutate(g, funder, writer, tx))
+            .unwrap();
         no_admission(owner, owner, || drop(inner));
         assert_eq!(snapshot(&t, tx), expected);
         no_admission(owner, owner, || outer.settle());
         let refusal = Error::Other("inner refusal".into());
         let admissions = owner.admitted_bytes_for_test();
         let admission_at_abort = std::cell::Cell::new(admissions);
-        let outcome: Result<()> = t.with_engine(tx, |g| g.with_tx_checkpoint(|g| {
-            mutate(g, funder, writer, tx)?;
-            admission_at_abort.set(owner.admitted_bytes_for_test());
-            oracle::arm_inverse_window(); Err(refusal)
-        }));
+        let outcome: Result<()> = t.with_engine(tx, |g| {
+            g.with_tx_checkpoint(|g| {
+                mutate(g, funder, writer, tx)?;
+                admission_at_abort.set(owner.admitted_bytes_for_test());
+                oracle::arm_inverse_window();
+                Err(refusal)
+            })
+        });
         let allocations = oracle::disarm_inverse_window();
-        assert!(outcome.is_err()); assert_eq!(allocations, 0);
+        assert!(outcome.is_err());
+        assert_eq!(allocations, 0);
         assert_eq!(owner.admitted_bytes_for_test(), admission_at_abort.get());
         assert_eq!(snapshot(&t, tx), expected);
         let panic_payload: Box<dyn std::any::Any + Send> = Box::new("inner callback unwind");
-        assert!(catch_unwind(AssertUnwindSafe(|| {
-            t.with_engine(tx, |g| g.with_tx_checkpoint::<()>(|g| {
-                mutate(g, funder, writer, tx)?;
-                admission_at_abort.set(owner.admitted_bytes_for_test());
-                oracle::arm_inverse_window(); std::panic::resume_unwind(panic_payload)
-            })).unwrap();
-        })).is_err());
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                t.with_engine(tx, |g| {
+                    g.with_tx_checkpoint::<()>(|g| {
+                        mutate(g, funder, writer, tx)?;
+                        admission_at_abort.set(owner.admitted_bytes_for_test());
+                        oracle::arm_inverse_window();
+                        std::panic::resume_unwind(panic_payload)
+                    })
+                })
+                .unwrap();
+            }))
+            .is_err()
+        );
         let allocations = oracle::disarm_inverse_window();
         assert_eq!(allocations, 0);
         assert_eq!(owner.admitted_bytes_for_test(), admission_at_abort.get());
@@ -5995,28 +7021,43 @@ mod general_checkpoint_native_fixture {
         // Retired nonce and non-LIFO attempts use real handles first, then the
         // authorized private replay constructor, never invented field layouts.
         t.with_engine(tx, |g| {
-            let prepared = g.prepare_checkpoint()?; let outer = g.begin_checkpoint(prepared);
+            let prepared = g.prepare_checkpoint()?;
+            let outer = g.begin_checkpoint(prepared);
             let stale_outer = duplicate_checkpoint_id(&outer);
-            let prepared = g.prepare_checkpoint()?; let inner = g.begin_checkpoint(prepared);
+            let prepared = g.prepare_checkpoint()?;
+            let inner = g.begin_checkpoint(prepared);
             assert!(catch_unwind(AssertUnwindSafe(|| g.restore_checkpoint(stale_outer))).is_err());
             let retired_inner = duplicate_checkpoint_id(&inner);
             g.settle_checkpoint(inner);
-            let prepared = g.prepare_checkpoint()?; let new_inner = g.begin_checkpoint(prepared);
-            assert!(catch_unwind(AssertUnwindSafe(|| g.restore_checkpoint(retired_inner))).is_err());
+            let prepared = g.prepare_checkpoint()?;
+            let new_inner = g.begin_checkpoint(prepared);
+            assert!(
+                catch_unwind(AssertUnwindSafe(|| g.restore_checkpoint(retired_inner))).is_err()
+            );
             no_admission(owner, owner, || g.restore_checkpoint(new_inner));
-            no_admission(owner, owner, || g.restore_checkpoint(outer)); Ok(())
-        }).unwrap();
+            no_admission(owner, owner, || g.restore_checkpoint(outer));
+            Ok(())
+        })
+        .unwrap();
         assert_eq!(snapshot(&t, tx), expected);
 
         // Prepared token stale in the same guard after a real rollback, avoiding
         // an accidental proof only of preparation-scope mismatch.
         t.with_engine(tx, |g| {
-            let p = g.prepare_flags(EngineFlags { commit_lsn:None, finalized_tx:None,
-                requires_commit_lsn:false, visibility_floor:None, propagation_in_progress:false })?;
-            let checkpoint = g.prepare_checkpoint()?; let id = g.begin_checkpoint(checkpoint);
+            let p = g.prepare_flags(EngineFlags {
+                commit_lsn: None,
+                finalized_tx: None,
+                requires_commit_lsn: false,
+                visibility_floor: None,
+                propagation_in_progress: false,
+            })?;
+            let checkpoint = g.prepare_checkpoint()?;
+            let id = g.begin_checkpoint(checkpoint);
             no_admission(owner, owner, || g.restore_checkpoint(id));
-            assert!(catch_unwind(AssertUnwindSafe(|| g.publish_tx(p))).is_err()); Ok(())
-        }).unwrap();
+            assert!(catch_unwind(AssertUnwindSafe(|| g.publish_tx(p))).is_err());
+            Ok(())
+        })
+        .unwrap();
         assert_eq!(snapshot(&t, tx), expected);
 
         // Refused checkpoint, adoption, single and real lower bulk preparation
@@ -6026,65 +7067,136 @@ mod general_checkpoint_native_fixture {
             owner.set_budget(Some(held)).unwrap();
             let outcome = t.with_engine(tx, |g| match operation {
                 0 => g.prepare_checkpoint().map(drop),
-                1 => g.prepare_general_adoption(|candidate| populate(candidate, funder, writer, tx, 901)).map(drop),
+                1 => g
+                    .prepare_general_adoption(|candidate| {
+                        populate(candidate, funder, writer, tx, 901)
+                    })
+                    .map(drop),
                 2 => g.prepare_remove("table", RowId(2)).map(drop),
-                _ => g.prepare_remove_rows(&[("table".into(), RowId(1)), ("table".into(), RowId(3))].into()).map(drop),
+                _ => g
+                    .prepare_remove_rows(
+                        &[("table".into(), RowId(1)), ("table".into(), RowId(3))].into(),
+                    )
+                    .map(drop),
             });
             owner.set_budget(None).unwrap();
             typed_refusal(outcome.unwrap_err());
             assert_eq!(owner.usage().used, held);
             assert_eq!(snapshot(&t, tx), expected);
-            assert_canonical(&retained, tx, 101); assert_eager(&eager, &expected);
+            assert_canonical(&retained, tx, 101);
+            assert_eager(&eager, &expected);
         }
 
         // Publication coherence at each actual single/bulk removal boundary.
         let frame = t.checkpoint(tx).unwrap();
-        t.with_engine(tx, |g| { let p = g.prepare_remove("table", RowId(2))?; g.publish(p); Ok(()) }).unwrap();
-        let single = snapshot(&t, tx);
-        assert_eq!(single.rows.iter().map(|(_, r)| r.row_id).collect::<Vec<_>>(), vec![RowId(1), RowId(3)]);
-        let single_source = t.capture(tx, "table", reader.clone()).unwrap();
-        assert_eq!(single_source.len(), 2); assert!(!single_source.contains(&RowId(2)));
-        for maps_row in [single.lsns["table"].contains_key(&RowId(2)), single.kinds["table"].contains_key(&RowId(2)),
-            single.admitted["table"].contains_key(&RowId(2))] { assert!(!maps_row); }
         t.with_engine(tx, |g| {
-            let selected: BTreeSet<_> = [("table".into(), RowId(1)), ("table".into(), RowId(3))].into();
-            let p = g.prepare_remove_rows(&selected)?; g.publish(p); Ok(())
-        }).unwrap();
-        let bulk = snapshot(&t, tx); assert!(bulk.rows.is_empty());
+            let p = g.prepare_remove("table", RowId(2))?;
+            g.publish(p);
+            Ok(())
+        })
+        .unwrap();
+        let single = snapshot(&t, tx);
+        assert_eq!(
+            single
+                .rows
+                .iter()
+                .map(|(_, r)| r.row_id)
+                .collect::<Vec<_>>(),
+            vec![RowId(1), RowId(3)]
+        );
+        let single_source = t.capture(tx, "table", reader.clone()).unwrap();
+        assert_eq!(single_source.len(), 2);
+        assert!(!single_source.contains(&RowId(2)));
+        for maps_row in [
+            single.lsns["table"].contains_key(&RowId(2)),
+            single.kinds["table"].contains_key(&RowId(2)),
+            single.admitted["table"].contains_key(&RowId(2)),
+        ] {
+            assert!(!maps_row);
+        }
+        t.with_engine(tx, |g| {
+            let selected: BTreeSet<_> =
+                [("table".into(), RowId(1)), ("table".into(), RowId(3))].into();
+            let p = g.prepare_remove_rows(&selected)?;
+            g.publish(p);
+            Ok(())
+        })
+        .unwrap();
+        let bulk = snapshot(&t, tx);
+        assert!(bulk.rows.is_empty());
         assert!(bulk.lsns.is_empty() && bulk.kinds.is_empty() && bulk.admitted.is_empty());
-        let bulk_source = t.capture(tx, "table", reader.clone()).unwrap(); assert!(bulk_source.is_empty());
+        let bulk_source = t.capture(tx, "table", reader.clone()).unwrap();
+        assert!(bulk_source.is_empty());
         let bulk_eager = t.with_engine(tx, |g| g.capture_private()).unwrap();
-        bulk_eager.with_legacy(|ws| assert!(ws.ordered_staged_rows.statement_rows("table").is_none_or(|rows| rows.is_empty())));
-        assert_eq!(single_source.len(), 2); assert_canonical(&retained, tx, 101);
-        no_admission(owner, owner, || frame.restore()); assert_eq!(snapshot(&t, tx), expected);
-        drop(bulk_eager); drop(bulk_source); drop(single_source);
+        bulk_eager.with_legacy(|ws| {
+            assert!(
+                ws.ordered_staged_rows
+                    .statement_rows("table")
+                    .is_none_or(|rows| rows.is_empty())
+            )
+        });
+        assert_eq!(single_source.len(), 2);
+        assert_canonical(&retained, tx, 101);
+        no_admission(owner, owner, || frame.restore());
+        assert_eq!(snapshot(&t, tx), expected);
+        drop(bulk_eager);
+        drop(bulk_source);
+        drop(single_source);
 
         // Real cross-transaction handles must refuse before touching either host.
         let other = t.try_begin().unwrap();
-        let id = t.with_engine(tx, |g| { let p = g.prepare_checkpoint()?; Ok(g.begin_checkpoint(p)) }).unwrap();
+        let id = t
+            .with_engine(tx, |g| {
+                let p = g.prepare_checkpoint()?;
+                Ok(g.begin_checkpoint(p))
+            })
+            .unwrap();
         let valid_id = duplicate_checkpoint_id(&id);
         let other_frame = t.checkpoint(other).unwrap();
         let other_image = snapshot(&t, other);
-        assert!(catch_unwind(AssertUnwindSafe(|| {
-            t.with_engine(other, |g| { g.restore_checkpoint(id); Ok(()) }).unwrap();
-        })).is_err());
-        assert_eq!(snapshot(&t, tx), expected); assert_eq!(snapshot(&t, other), other_image);
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                t.with_engine(other, |g| {
+                    g.restore_checkpoint(id);
+                    Ok(())
+                })
+                .unwrap();
+            }))
+            .is_err()
+        );
+        assert_eq!(snapshot(&t, tx), expected);
+        assert_eq!(snapshot(&t, other), other_image);
         other_frame.restore();
-        t.with_engine(tx, |g| { no_admission(owner, owner, || g.restore_checkpoint(valid_id)); Ok(()) }).unwrap();
+        t.with_engine(tx, |g| {
+            no_admission(owner, owner, || g.restore_checkpoint(valid_id));
+            Ok(())
+        })
+        .unwrap();
         assert_eq!(snapshot(&t, tx), expected);
         drop(t.rollback_owned(tx).unwrap());
         drop(t.rollback_owned(other).unwrap());
-        drop(eager); drop(retained); drop(t); assert_eq!(reader.usage().used, 0);
+        drop(eager);
+        drop(retained);
+        drop(t);
+        assert_eq!(reader.usage().used, 0);
     }
     fn physical_originals(owner: &AccountantHandle, writer: &WriterBudget, funder: &SourceFunder) {
         let counter = owner.used.as_ptr() as usize;
         let template = row(TxId(17), 19, 23);
         let before = owner.usage().used;
-        let (body, requests, count) = oracle::source_requests_for_test(counter, || funder.copy_row(&template).unwrap());
+        let (body, requests, count) =
+            oracle::source_requests_for_test(counter, || funder.copy_row(&template).unwrap());
         assert!(count > 1 && count <= 32);
         let held = owner.usage().used;
-        assert_eq!(held-before, requests[..count].iter().map(|r| r.1).sum::<usize>());
-        assert!(oracle::source_request_credit_for_test()[..count].iter().all(|credit| *credit == held));
+        assert_eq!(
+            held - before,
+            requests[..count].iter().map(|r| r.1).sum::<usize>()
+        );
+        assert!(
+            oracle::source_request_credit_for_test()[..count]
+                .iter()
+                .all(|credit| *credit == held)
+        );
         oracle::watch_source_free_for_test(&requests[..count], counter);
         drop(body);
         let frees = oracle::source_free_for_test(count);
@@ -6095,47 +7207,88 @@ mod general_checkpoint_native_fixture {
 
         let payload: Box<dyn std::any::Any + Send> = Box::new("positive native cleanup unwind");
         let before = owner.usage().used;
-        let (body, requests, count) = oracle::source_requests_for_test(counter, || funder.copy_row(&template).unwrap());
-        assert!(count > 1 && count <= 32); let held = owner.usage().used;
+        let (body, requests, count) =
+            oracle::source_requests_for_test(counter, || funder.copy_row(&template).unwrap());
+        assert!(count > 1 && count <= 32);
+        let held = owner.usage().used;
         oracle::watch_source_free_for_test(&requests[..count], counter);
         let outcome = catch_unwind(AssertUnwindSafe(|| {
-            let _original_body = body; std::panic::resume_unwind(payload)
+            let _original_body = body;
+            std::panic::resume_unwind(payload)
         }));
-        let frees = oracle::source_free_for_test(count); oracle::disarm_source_free_watch();
-        assert!(outcome.is_err()); assert!(frees[..count].iter().all(|free| *free == (held, held, 1)));
+        let frees = oracle::source_free_for_test(count);
+        oracle::disarm_source_free_watch();
+        assert!(outcome.is_err());
+        assert!(frees[..count].iter().all(|free| *free == (held, held, 1)));
         assert_eq!(owner.usage().used, before);
         macro_rules! physical_copy {
             ($operation:expr) => {{
                 let before = owner.usage().used;
-                let (copy, requests, count) = oracle::source_requests_for_test(counter, || $operation.unwrap());
-                assert!(count > 1 && count <= 32); let held = owner.usage().used;
-                assert_eq!(held-before, requests[..count].iter().map(|r| r.1).sum::<usize>());
-                assert!(oracle::source_request_credit_for_test()[..count].iter().all(|credit| *credit == held));
+                let (copy, requests, count) =
+                    oracle::source_requests_for_test(counter, || $operation.unwrap());
+                assert!(count > 1 && count <= 32);
+                let held = owner.usage().used;
+                assert_eq!(
+                    held - before,
+                    requests[..count].iter().map(|r| r.1).sum::<usize>()
+                );
+                assert!(
+                    oracle::source_request_credit_for_test()[..count]
+                        .iter()
+                        .all(|credit| *credit == held)
+                );
                 oracle::watch_source_free_for_test(&requests[..count], counter);
-                drop(copy); let frees = oracle::source_free_for_test(count); oracle::disarm_source_free_watch();
+                drop(copy);
+                let frees = oracle::source_free_for_test(count);
+                oracle::disarm_source_free_watch();
                 assert!(frees[..count].iter().all(|free| *free == (held, held, 1)));
                 assert_eq!(owner.usage().used, before);
             }};
         }
-        let key = vec![DirectedValue::Asc(TotalOrdAsc(Value::Text("positive-key".repeat(7))))];
+        let key = vec![DirectedValue::Asc(TotalOrdAsc(Value::Text(
+            "positive-key".repeat(7),
+        )))];
         physical_copy!(funder.copy_key(&key));
-        let vector = VectorEntry { index:index(), row_id:RowId(19), vector:vec![0.5; 17],
-            created_tx:TxId(17), deleted_tx:None, lsn:Lsn(23) };
+        let vector = VectorEntry {
+            index: index(),
+            row_id: RowId(19),
+            vector: vec![0.5; 17],
+            created_tx: TxId(17),
+            deleted_tx: None,
+            lsn: Lsn(23),
+        };
         physical_copy!(funder.copy_vector(&vector));
 
-        let reservation = OwnedMemoryReservation::try_new_arc_for_original(&writer.writer_use,
-            17, "relational", "statement_overlay", "actual original copy proof").unwrap();
-        let mut reservation = Arc::into_inner(reservation).unwrap(); reservation.finish_freed_enclosing_control();
+        let reservation = OwnedMemoryReservation::try_new_arc_for_original(
+            &writer.writer_use,
+            17,
+            "relational",
+            "statement_overlay",
+            "actual original copy proof",
+        )
+        .unwrap();
+        let mut reservation = Arc::into_inner(reservation).unwrap();
+        reservation.finish_freed_enclosing_control();
         let before = owner.usage().used;
-        let (grant, requests, count) = oracle::source_requests_for_test(counter, ||
-            <OwnedMemoryReservation as contextdb_tx::OriginalCopyChargeSource>::reserve_private_original_copy(&reservation, 148).unwrap());
-        assert_eq!(count, 1); assert_eq!(grant.retained_bytes(), 148);
+        let (grant, requests, count) = oracle::source_requests_for_test(counter, || {
+            <OwnedMemoryReservation as contextdb_tx::OriginalCopyChargeSource>::reserve_private_original_copy(&reservation, 148).unwrap()
+        });
+        assert_eq!(count, 1);
+        assert_eq!(grant.retained_bytes(), 148);
         let held = owner.usage().used;
-        assert_eq!(held-before, 148 + writer_adapter_type_layout::<OwnedMemoryReservation>().size());
+        assert_eq!(
+            held - before,
+            148 + writer_adapter_type_layout::<OwnedMemoryReservation>().size()
+        );
         oracle::watch_source_free_for_test(&requests[..count], counter);
-        let retained = grant.clone(); drop(grant); assert_eq!(oracle::source_free_for_test(1)[0].2, 0);
-        drop(retained); let frees = oracle::source_free_for_test(count); oracle::disarm_source_free_watch();
-        assert_eq!(frees[0], (held, held, 1)); assert_eq!(owner.usage().used, before);
+        let retained = grant.clone();
+        drop(grant);
+        assert_eq!(oracle::source_free_for_test(1)[0].2, 0);
+        drop(retained);
+        let frees = oracle::source_free_for_test(count);
+        oracle::disarm_source_free_watch();
+        assert_eq!(frees[0], (held, held, 1));
+        assert_eq!(owner.usage().used, before);
         drop(reservation);
     }
     pub(super) fn run() {
@@ -6145,11 +7298,16 @@ mod general_checkpoint_native_fixture {
         let caller_owner = AccountantHandle::engine(None).unwrap();
         let caller_writer = WriterBudget::from_handle(caller_owner.clone()).unwrap();
         let counter = owner.used.as_ptr() as usize;
-        let (funder, provider_requests, provider_count) = oracle::source_requests_for_test(counter,
-            || writer.prepare_source_funder().unwrap());
+        let (funder, provider_requests, provider_count) =
+            oracle::source_requests_for_test(counter, || writer.prepare_source_funder().unwrap());
         assert_eq!(provider_count, 1);
-        assert_eq!((provider_requests[0].1, provider_requests[0].2),
-            (writer_adapter_type_layout::<NativeSourceProvider>().size(), writer_adapter_type_layout::<NativeSourceProvider>().align()));
+        assert_eq!(
+            (provider_requests[0].1, provider_requests[0].2),
+            (
+                writer_adapter_type_layout::<NativeSourceProvider>().size(),
+                writer_adapter_type_layout::<NativeSourceProvider>().align()
+            )
+        );
         let epoch = owner.writer_registration_observation_for_test().2;
         assert_ne!(epoch, 0);
         let caller_funder = caller_writer.prepare_source_funder().unwrap();
@@ -6161,8 +7319,13 @@ mod general_checkpoint_native_fixture {
         let held = owner.usage().used;
         oracle::watch_source_free_for_test(&provider_requests[..provider_count], counter);
         drop(funder);
-        let frees = oracle::source_free_for_test(provider_count); oracle::disarm_source_free_watch();
-        assert_eq!(frees[0], (held, held, 1), "actual original provider remains funded through its physical free");
+        let frees = oracle::source_free_for_test(provider_count);
+        oracle::disarm_source_free_watch();
+        assert_eq!(
+            frees[0],
+            (held, held, 1),
+            "actual original provider remains funded through its physical free"
+        );
         assert_eq!(owner.writer_registration_observation_for_test().2, 0);
         assert_eq!(owner.usage().used, owner.backing_bytes());
         drop(caller_funder);
@@ -6170,7 +7333,8 @@ mod general_checkpoint_native_fixture {
         assert_eq!(caller_owner.writer_registration_observation_for_test().2, 0);
         assert_eq!(caller_owner.usage().used, caller_owner.backing_bytes());
         drop(caller_owner);
-        drop(owner); assert_eq!(process_aggregate_snapshot().0, aggregate);
+        drop(owner);
+        assert_eq!(process_aggregate_snapshot().0, aggregate);
     }
 }
 
@@ -6227,47 +7391,71 @@ impl OwnedMemoryReservation {
             return self.copy_retained_original_nonwriter_row_for(row, funder);
         }
         let writer = self._writer_use.as_ref().ok_or_else(|| {
-            contextdb_core::Error::Other("native source transfer requires its held writer use".into())
+            contextdb_core::Error::Other(
+                "native source transfer requires its held writer use".into(),
+            )
         })?;
         let lease = contextdb_tx::SourceLease {
-            identity: writer.stable_identity, epoch: writer.epoch,
+            identity: writer.stable_identity,
+            epoch: writer.epoch,
         };
         if !self.accountant().is_engine()
             || writer.accountant.as_ptr() != self.accountant().as_ptr()
-            || lease.identity == 0 || lease.epoch == 0
+            || lease.identity == 0
+            || lease.epoch == 0
             || !funder.matches_native_origin(self.accountant().as_ptr() as usize, lease)
         {
-            return Err(contextdb_core::Error::Other("native source transfer origin mismatch".into()));
+            return Err(contextdb_core::Error::Other(
+                "native source transfer origin mismatch".into(),
+            ));
         }
         let bytes = contextdb_tx::OriginalRowInvoice::original_copy_allocation_bytes(
-            preparation_row_copy_bytes(row)?)?;
+            preparation_row_copy_bytes(row)?,
+        )?;
         // The retained O admits both payload and invoice header before copying.
         // The current producer is only the validated recipient of that debit.
-        let allocation = Self::try_new_arc_for_original(writer, bytes, "relational",
-            "staged_index_posting", "Reduce staged rows or raise MEMORY_LIMIT.")?;
+        let allocation = Self::try_new_arc_for_original(
+            writer,
+            bytes,
+            "relational",
+            "staged_index_posting",
+            "Reduce staged rows or raise MEMORY_LIMIT.",
+        )?;
         let mut original = Arc::into_inner(allocation).expect("private copy grant has one owner");
         original.finish_freed_enclosing_control();
-        let origin = contextdb_tx::NativeSourceOrigin::new(self.accountant().as_ptr() as usize, lease);
+        let origin =
+            contextdb_tx::NativeSourceOrigin::new(self.accountant().as_ptr() as usize, lease);
         // SAFETY: the genuine O kernel holds the full measured allocation; the
         // invoice's control is included, and success disarms its sole debit.
         let invoice = unsafe {
             contextdb_tx::OriginalRowInvoice::from_original_copy_allocation(
-                funder, original.bytes, origin, lease)?
+                funder,
+                original.bytes,
+                origin,
+                lease,
+            )?
         };
         original.bytes = 0;
         // Refusal/unwind frees an incomplete body inside this kernel before
         // the invoice on this stack can refund the original allocation.
         let copied = preparation_copy_row(row)?;
-        Ok(contextdb_tx::staged_source::AdmittedSourceRow::new(copied, invoice))
+        Ok(contextdb_tx::staged_source::AdmittedSourceRow::new(
+            copied, invoice,
+        ))
     }
 }
 
 impl OwnedMemoryReservation {
     #[allow(clippy::too_many_arguments)]
     fn copy_retained_original_vector_parts_for(
-        &self, table: &str, column: &str, vector: &[f32],
-        row_id: contextdb_core::RowId, created_tx: contextdb_core::TxId,
-        deleted_tx: Option<contextdb_core::TxId>, lsn: contextdb_core::Lsn,
+        &self,
+        table: &str,
+        column: &str,
+        vector: &[f32],
+        row_id: contextdb_core::RowId,
+        created_tx: contextdb_core::TxId,
+        deleted_tx: Option<contextdb_core::TxId>,
+        lsn: contextdb_core::Lsn,
         funder: &contextdb_tx::SourceFunder,
     ) -> contextdb_core::Result<contextdb_tx::AdmittedSourceVector> {
         if self._writer_use.is_none() {
@@ -6276,38 +7464,72 @@ impl OwnedMemoryReservation {
             );
         }
         let writer = self._writer_use.as_ref().ok_or_else(|| {
-            contextdb_core::Error::Other("native source transfer requires its held writer use".into())
+            contextdb_core::Error::Other(
+                "native source transfer requires its held writer use".into(),
+            )
         })?;
-        let lease = contextdb_tx::SourceLease { identity: writer.stable_identity, epoch: writer.epoch };
+        let lease = contextdb_tx::SourceLease {
+            identity: writer.stable_identity,
+            epoch: writer.epoch,
+        };
         if !self.accountant().is_engine()
             || writer.accountant.as_ptr() != self.accountant().as_ptr()
-            || lease.identity == 0 || lease.epoch == 0
+            || lease.identity == 0
+            || lease.epoch == 0
             || !funder.matches_native_origin(self.accountant().as_ptr() as usize, lease)
-        { return Err(contextdb_core::Error::Other("native source transfer origin mismatch".into())); }
-        let payload = source_add(source_add(table.len(), column.len())?, source_array::<f32>(vector.len())?)?;
+        {
+            return Err(contextdb_core::Error::Other(
+                "native source transfer origin mismatch".into(),
+            ));
+        }
+        let payload = source_add(
+            source_add(table.len(), column.len())?,
+            source_array::<f32>(vector.len())?,
+        )?;
         let bytes = contextdb_tx::OriginalVectorInvoice::original_copy_allocation_bytes(payload)?;
-        let allocation = Self::try_new_arc_for_original(writer, bytes, "relational",
-            "staged_index_posting", "Reduce staged rows or raise MEMORY_LIMIT.")?;
+        let allocation = Self::try_new_arc_for_original(
+            writer,
+            bytes,
+            "relational",
+            "staged_index_posting",
+            "Reduce staged rows or raise MEMORY_LIMIT.",
+        )?;
         let mut original = Arc::into_inner(allocation).expect("private copy grant has one owner");
         original.finish_freed_enclosing_control();
-        let origin = contextdb_tx::NativeSourceOrigin::new(self.accountant().as_ptr() as usize, lease);
+        let origin =
+            contextdb_tx::NativeSourceOrigin::new(self.accountant().as_ptr() as usize, lease);
         // SAFETY: O holds the complete measured allocation; success transfers
         // its sole debit into the invoice and the stack reservation is disarmed.
-        let invoice = unsafe { contextdb_tx::OriginalVectorInvoice::from_original_copy_allocation(
-            funder, original.bytes, origin, lease)? };
+        let invoice = unsafe {
+            contextdb_tx::OriginalVectorInvoice::from_original_copy_allocation(
+                funder,
+                original.bytes,
+                origin,
+                lease,
+            )?
+        };
         original.bytes = 0;
         // The partially constructed entry is dropped before the invoice during
         // refusal or unwind. No unadmitted owned input precedes this reservation.
         let copied = contextdb_core::VectorEntry {
-            index: contextdb_core::VectorIndexRef { table: table.to_owned(), column: column.to_owned() },
-            row_id, vector: vector.to_vec(), created_tx, deleted_tx, lsn,
+            index: contextdb_core::VectorIndexRef {
+                table: table.to_owned(),
+                column: column.to_owned(),
+            },
+            row_id,
+            vector: vector.to_vec(),
+            created_tx,
+            deleted_tx,
+            lsn,
         };
         if copied.index.table.capacity() != table.len()
             || copied.index.column.capacity() != column.len()
             || copied.vector.capacity() != vector.len()
         {
             drop(copied);
-            return Err(contextdb_core::Error::Other("source native capacity mismatch".into()));
+            return Err(contextdb_core::Error::Other(
+                "source native capacity mismatch".into(),
+            ));
         }
         Ok(contextdb_tx::AdmittedSourceVector::new(copied, invoice))
     }
@@ -6315,8 +7537,12 @@ impl OwnedMemoryReservation {
 
 // Count borrowed debug projections without building a String. Each field,
 // element and escaped payload contributes to the conservative clone envelope.
-pub(crate) fn preparation_debug_len<T: std::fmt::Debug + ?Sized>(value: &T) -> contextdb_core::Result<usize> {
-    struct Count { bytes: usize }
+pub(crate) fn preparation_debug_len<T: std::fmt::Debug + ?Sized>(
+    value: &T,
+) -> contextdb_core::Result<usize> {
+    struct Count {
+        bytes: usize,
+    }
     impl std::fmt::Write for Count {
         fn write_str(&mut self, text: &str) -> std::fmt::Result {
             self.bytes = self.bytes.checked_add(text.len()).ok_or(std::fmt::Error)?;
@@ -6329,21 +7555,32 @@ pub(crate) fn preparation_debug_len<T: std::fmt::Debug + ?Sized>(value: &T) -> c
     Ok(count.bytes)
 }
 
-pub(crate) fn preparation_debug_native_bound<T: std::fmt::Debug + ?Sized>(value: &T) -> contextdb_core::Result<usize> {
+pub(crate) fn preparation_debug_native_bound<T: std::fmt::Debug + ?Sized>(
+    value: &T,
+) -> contextdb_core::Result<usize> {
     // One printed element includes at least one byte; the largest constituent
     // slot accounts for nested AST/metadata containers and allocation overlap.
     let slot = std::mem::size_of::<contextdb_parser::ast::Expr>()
         .max(std::mem::size_of::<contextdb_core::TableMeta>())
         .max(std::mem::size_of::<contextdb_core::Value>());
-    preparation_debug_len(value)?.checked_mul(slot)
-        .and_then(|n| n.checked_mul(2)).ok_or_else(source_size_overflow)
+    preparation_debug_len(value)?
+        .checked_mul(slot)
+        .and_then(|n| n.checked_mul(2))
+        .ok_or_else(source_size_overflow)
 }
 
 pub(crate) fn preparation_values_copy_bytes(
     values: &HashMap<String, contextdb_core::Value>,
 ) -> contextdb_core::Result<usize> {
-    values.iter().try_fold(source_row_map_bytes(values.len())?, |bytes, (name, value)|
-        source_add(source_add(bytes, name.len())?, source_value_copy_bytes(value)?))
+    values.iter().try_fold(
+        source_row_map_bytes(values.len())?,
+        |bytes, (name, value)| {
+            source_add(
+                source_add(bytes, name.len())?,
+                source_value_copy_bytes(value)?,
+            )
+        },
+    )
 }
 
 pub(crate) fn preparation_assignment_sizes(
@@ -6367,15 +7604,23 @@ pub(crate) fn preparation_assignment_sizes(
             Ok((name.len(), bytes, bytes))
         }
         Expr::Column(column) => {
-            let plan = source_add(column.column.len(), column.table.as_ref().map_or(0, String::len))?;
-            let bytes = values.get(&column.column).map_or(Ok(0), source_value_copy_bytes)?;
+            let plan = source_add(
+                column.column.len(),
+                column.table.as_ref().map_or(0, String::len),
+            )?;
+            let bytes = values
+                .get(&column.column)
+                .map_or(Ok(0), source_value_copy_bytes)?;
             Ok((plan, bytes, bytes))
         }
         Expr::BinaryOp { left, right, .. } => {
             let left = preparation_assignment_sizes(left, values, params)?;
             let right = preparation_assignment_sizes(right, values, params)?;
-            Ok((source_add(source_add(left.0, right.0)?, source_array::<Expr>(2)?)?,
-                source_add(left.1, right.1)?, 0))
+            Ok((
+                source_add(source_add(left.0, right.0)?, source_array::<Expr>(2)?)?,
+                source_add(left.1, right.1)?,
+                0,
+            ))
         }
         Expr::UnaryOp { operand, .. } => {
             let child = preparation_assignment_sizes(operand, values, params)?;
@@ -6383,11 +7628,20 @@ pub(crate) fn preparation_assignment_sizes(
         }
         Expr::FunctionCall { name, args } => {
             let mut plan = source_add(name.len(), source_array::<Expr>(args.len())?)?;
-            let capacity = if args.is_empty() { 0 } else {
-                args.len().max(4).checked_next_power_of_two().ok_or_else(source_size_overflow)?
+            let capacity = if args.is_empty() {
+                0
+            } else {
+                args.len()
+                    .max(4)
+                    .checked_next_power_of_two()
+                    .ok_or_else(source_size_overflow)?
             };
-            let mut working = source_add(name.len(), source_array::<contextdb_core::Value>(
-                capacity.checked_mul(2).ok_or_else(source_size_overflow)?)?)?;
+            let mut working = source_add(
+                name.len(),
+                source_array::<contextdb_core::Value>(
+                    capacity.checked_mul(2).ok_or_else(source_size_overflow)?,
+                )?,
+            )?;
             let mut output = 0;
             for argument in args {
                 let child = preparation_assignment_sizes(argument, values, params)?;
@@ -6402,42 +7656,78 @@ pub(crate) fn preparation_assignment_sizes(
         _ => {
             // Preserve the original evaluator's unsupported-expression error;
             // count its copied AST before constructing the original plan.
-            Ok((preparation_debug_len(expr)?.checked_mul(slot)
-                .and_then(|n| n.checked_mul(2)).ok_or_else(source_size_overflow)?, 0, 0))
+            Ok((
+                preparation_debug_len(expr)?
+                    .checked_mul(slot)
+                    .and_then(|n| n.checked_mul(2))
+                    .ok_or_else(source_size_overflow)?,
+                0,
+                0,
+            ))
         }
     }
 }
 
 impl OwnedMemoryReservation {
     fn prepare_original_nonwriter_copy(
-        &self, bytes: usize, funder: &contextdb_tx::SourceFunder,
-    ) -> contextdb_core::Result<(Self, contextdb_tx::NativeSourceOrigin, contextdb_tx::SourceLease)> {
+        &self,
+        bytes: usize,
+        funder: &contextdb_tx::SourceFunder,
+    ) -> contextdb_core::Result<(
+        Self,
+        contextdb_tx::NativeSourceOrigin,
+        contextdb_tx::SourceLease,
+    )> {
         if self._writer_use.is_some() || self.accountant().is_engine() {
-            return Err(contextdb_core::Error::Other("original nonwriter copy origin mismatch".into()));
+            return Err(contextdb_core::Error::Other(
+                "original nonwriter copy origin mismatch".into(),
+            ));
         }
-        let lease = contextdb_tx::SourceLease { identity: 0, epoch: 0 };
-        let origin = contextdb_tx::NativeSourceOrigin::new(self.accountant().as_ptr() as usize, lease);
+        let lease = contextdb_tx::SourceLease {
+            identity: 0,
+            epoch: 0,
+        };
+        let origin =
+            contextdb_tx::NativeSourceOrigin::new(self.accountant().as_ptr() as usize, lease);
         if !funder.accepts_retained_original_copy(origin, lease) {
-            return Err(contextdb_core::Error::Other("original nonwriter copy recipient mismatch".into()));
+            return Err(contextdb_core::Error::Other(
+                "original nonwriter copy recipient mismatch".into(),
+            ));
         }
         // Use this exact untagged original, even if a writer was registered
         // later. No WriterUse lookup or current provider supplies its debit.
-        let allocation = Self::try_new_arc_for_nonwriter(self.accountant(), bytes,
-            "relational", "staged_index_posting", "Reduce staged rows or raise MEMORY_LIMIT.")?;
-        let mut original = Arc::into_inner(allocation).expect("private original copy has one owner");
+        let allocation = Self::try_new_arc_for_nonwriter(
+            self.accountant(),
+            bytes,
+            "relational",
+            "staged_index_posting",
+            "Reduce staged rows or raise MEMORY_LIMIT.",
+        )?;
+        let mut original =
+            Arc::into_inner(allocation).expect("private original copy has one owner");
         original.finish_freed_enclosing_control();
         Ok((original, origin, lease))
     }
 
     fn copy_retained_original_nonwriter_row_for(
-        &self, row: &contextdb_core::VersionedRow, funder: &contextdb_tx::SourceFunder,
+        &self,
+        row: &contextdb_core::VersionedRow,
+        funder: &contextdb_tx::SourceFunder,
     ) -> contextdb_core::Result<contextdb_tx::AdmittedSourceRow> {
-        let bytes = contextdb_tx::OriginalRowInvoice::original_copy_allocation_bytes(preparation_row_copy_bytes(row)?)?;
+        let bytes = contextdb_tx::OriginalRowInvoice::original_copy_allocation_bytes(
+            preparation_row_copy_bytes(row)?,
+        )?;
         let (mut original, origin, lease) = self.prepare_original_nonwriter_copy(bytes, funder)?;
         // SAFETY: this genuine original holds payload plus invoice control.
         // Transfer retains its zero reader lease and disarms the sole debit.
-        let invoice = unsafe { contextdb_tx::OriginalRowInvoice::from_original_copy_allocation(
-            funder, original.bytes, origin, lease)? };
+        let invoice = unsafe {
+            contextdb_tx::OriginalRowInvoice::from_original_copy_allocation(
+                funder,
+                original.bytes,
+                origin,
+                lease,
+            )?
+        };
         original.bytes = 0;
         let copied = preparation_copy_row(row)?;
         Ok(contextdb_tx::AdmittedSourceRow::new(copied, invoice))
@@ -6445,21 +7735,43 @@ impl OwnedMemoryReservation {
 
     #[allow(clippy::too_many_arguments)]
     fn copy_retained_original_nonwriter_vector_parts_for(
-        &self, table: &str, column: &str, vector: &[f32], row_id: contextdb_core::RowId,
-        created_tx: contextdb_core::TxId, deleted_tx: Option<contextdb_core::TxId>, lsn: contextdb_core::Lsn,
+        &self,
+        table: &str,
+        column: &str,
+        vector: &[f32],
+        row_id: contextdb_core::RowId,
+        created_tx: contextdb_core::TxId,
+        deleted_tx: Option<contextdb_core::TxId>,
+        lsn: contextdb_core::Lsn,
         funder: &contextdb_tx::SourceFunder,
     ) -> contextdb_core::Result<contextdb_tx::AdmittedSourceVector> {
-        let payload = source_add(source_add(table.len(), column.len())?, source_array::<f32>(vector.len())?)?;
+        let payload = source_add(
+            source_add(table.len(), column.len())?,
+            source_array::<f32>(vector.len())?,
+        )?;
         let bytes = contextdb_tx::OriginalVectorInvoice::original_copy_allocation_bytes(payload)?;
         let (mut original, origin, lease) = self.prepare_original_nonwriter_copy(bytes, funder)?;
         // SAFETY: the original reader reserve owns the complete measured
         // allocation, and success transfers rather than refunds that debit.
-        let invoice = unsafe { contextdb_tx::OriginalVectorInvoice::from_original_copy_allocation(
-            funder, original.bytes, origin, lease)? };
+        let invoice = unsafe {
+            contextdb_tx::OriginalVectorInvoice::from_original_copy_allocation(
+                funder,
+                original.bytes,
+                origin,
+                lease,
+            )?
+        };
         original.bytes = 0;
         let copied = contextdb_core::VectorEntry {
-            index: contextdb_core::VectorIndexRef { table: table.to_owned(), column: column.to_owned() },
-            row_id, vector: vector.to_vec(), created_tx, deleted_tx, lsn,
+            index: contextdb_core::VectorIndexRef {
+                table: table.to_owned(),
+                column: column.to_owned(),
+            },
+            row_id,
+            vector: vector.to_vec(),
+            created_tx,
+            deleted_tx,
+            lsn,
         };
         source_check_vector_capacity(&copied)?;
         Ok(contextdb_tx::AdmittedSourceVector::new(copied, invoice))
@@ -6594,18 +7906,26 @@ pub(crate) fn reserve_native_storage_from_writer_use(
     projection: &StoreAccountantHandle,
     bytes: usize,
 ) -> Result<OwnedMemoryReservation, contextdb_core::read_memory::NativeRefusal> {
-    assert!(projection.is_writer() && projection.same_accountant(&original.accountant),
-        "native storage projection belongs to its held original writer");
+    assert!(
+        projection.is_writer() && projection.same_accountant(&original.accountant),
+        "native storage projection belongs to its held original writer"
+    );
     // from_writer_use created this projection while the original pins its epoch;
     // neither clone retags or selects a different writer registration.
     let writer = original.clone();
     let accountant = projection.as_handle();
     projection.try_allocate_for_provenance_native(
-        bytes, "redb", "exact_byte_read",
-        "Reduce the selected read or raise its declared memory limit.", Some(projection),
+        bytes,
+        "redb",
+        "exact_byte_read",
+        "Reduce the selected read or raise its declared memory limit.",
+        Some(projection),
     )?;
     Ok(OwnedMemoryReservation {
-        accountant: Some(accountant), bytes, _writer_use: Some(writer), own_control: None,
+        accountant: Some(accountant),
+        bytes,
+        _writer_use: Some(writer),
+        own_control: None,
     })
 }
 
@@ -6985,7 +8305,9 @@ pub(crate) fn copy_owned_native_value(
 pub(crate) fn persistence_original_projection(
     original: &OwnedMemoryReservation,
 ) -> contextdb_core::Result<StoreAccountantHandle> {
-    Ok(StoreAccountantHandle::from_writer_use(preparation_original_writer(original)?))
+    Ok(StoreAccountantHandle::from_writer_use(
+        preparation_original_writer(original)?,
+    ))
 }
 
 pub(crate) fn grow_preparation_from_original(
@@ -6995,7 +8317,10 @@ pub(crate) fn grow_preparation_from_original(
     operation: &str,
     hint: &str,
 ) -> contextdb_core::Result<()> {
-    let next = original.bytes.checked_add(bytes).ok_or_else(source_size_overflow)?;
+    let next = original
+        .bytes
+        .checked_add(bytes)
+        .ok_or_else(source_size_overflow)?;
     let projection = persistence_original_projection(original)?;
     projection.try_allocate_for_original(bytes, subsystem, operation, hint)?;
     original.bytes = next;
@@ -7004,7 +8329,11 @@ pub(crate) fn grow_preparation_from_original(
 
 pub(crate) fn release_preparation_original(original: &mut OwnedMemoryReservation, bytes: usize) {
     let bytes = bytes.min(original.bytes);
-    original.accountant.as_ref().expect("validated original").release(bytes);
+    original
+        .accountant
+        .as_ref()
+        .expect("validated original")
+        .release(bytes);
     original.bytes -= bytes;
 }
 
@@ -7012,11 +8341,18 @@ pub(crate) fn detach_preparation_original(
     original: &mut OwnedMemoryReservation,
     bytes: usize,
 ) -> contextdb_core::Result<OwnedMemoryReservation> {
-    if bytes > original.bytes { return Err(source_size_overflow()); }
+    if bytes > original.bytes {
+        return Err(source_size_overflow());
+    }
     // Clone precisely the held use before transferring any debit. Failure
     // therefore leaves the caller's charge and lifetime completely intact.
-    let mut detached = reserve_preparation_from_original(original, 0,
-        "content_identity", "maintain_committed_proof", "Raise MEMORY_LIMIT to admit the proof this transaction maintains.")?;
+    let mut detached = reserve_preparation_from_original(
+        original,
+        0,
+        "content_identity",
+        "maintain_committed_proof",
+        "Raise MEMORY_LIMIT to admit the proof this transaction maintains.",
+    )?;
     original.bytes -= bytes;
     detached.bytes = bytes;
     Ok(detached)
@@ -7028,37 +8364,54 @@ pub(crate) fn merge_preparation_original(
 ) -> contextdb_core::Result<()> {
     let left = preparation_original_writer(original)?;
     let right = preparation_original_writer(credit)?;
-    if left.stable_identity != right.stable_identity || left.epoch != right.epoch
-        || left.accountant.as_ptr() != right.accountant.as_ptr() {
-        return Err(contextdb_core::Error::Other("original persistence credit origin mismatch".into()));
+    if left.stable_identity != right.stable_identity
+        || left.epoch != right.epoch
+        || left.accountant.as_ptr() != right.accountant.as_ptr()
+    {
+        return Err(contextdb_core::Error::Other(
+            "original persistence credit origin mismatch".into(),
+        ));
     }
-    let next = original.bytes.checked_add(credit.bytes).ok_or_else(source_size_overflow)?;
+    let next = original
+        .bytes
+        .checked_add(credit.bytes)
+        .ok_or_else(source_size_overflow)?;
     original.bytes = next;
     credit.bytes = 0;
     Ok(())
 }
 
 pub(crate) fn clone_persistence_original_writer(
-    original:&OwnedMemoryReservation,
-)->contextdb_core::Result<WriterUse>{Ok(preparation_original_writer(original)?.clone())}
+    original: &OwnedMemoryReservation,
+) -> contextdb_core::Result<WriterUse> {
+    Ok(preparation_original_writer(original)?.clone())
+}
 
 // Native siblings preserve the original counter, gates and reclamation order.
 // Legacy kernels above remain byte-identical. Only the refusal representation
 // is static; no owned Error is constructed and subsequently mapped.
 impl MemoryAccountant {
-    pub(crate) fn try_allocate_native(&self, bytes: usize)
-        -> std::result::Result<(), contextdb_core::read_memory::NativeRefusal>
-    {
+    pub(crate) fn try_allocate_native(
+        &self,
+        bytes: usize,
+    ) -> std::result::Result<(), contextdb_core::read_memory::NativeRefusal> {
         self.try_allocate_with_provenance_native(bytes, None)
     }
     pub(crate) fn try_allocate_for_native(
-        &self, bytes: usize, subsystem: &'static str,
-        operation: &'static str, hint: &'static str,
+        &self,
+        bytes: usize,
+        subsystem: &'static str,
+        operation: &'static str,
+        hint: &'static str,
     ) -> std::result::Result<(), contextdb_core::read_memory::NativeRefusal> {
         self.try_allocate_for_provenance_native(bytes, subsystem, operation, hint, None)
     }
     fn admit_to_process_aggregate_native(
-        &self, admission: &WriterAdmission, bytes: usize, operation: &'static str, hint: &'static str,
+        &self,
+        admission: &WriterAdmission,
+        bytes: usize,
+        operation: &'static str,
+        hint: &'static str,
     ) -> std::result::Result<(), contextdb_core::read_memory::NativeRefusal> {
         if !self.used.is_member() {
             return Ok(());
@@ -7069,17 +8422,23 @@ impl MemoryAccountant {
         };
         if let Err(available) = aggregate_try_reserve(bytes, ceiling) {
             self.used.rollback_local_only(bytes);
-            return Err(contextdb_core::read_memory::NativeRefusal::ProcessMemoryBudgetExceeded {
-                operation: operation,
-                requested_bytes: bytes,
-                available_bytes: available,
-                budget_limit_bytes: ceiling,
-                hint,
-            });
+            return Err(
+                contextdb_core::read_memory::NativeRefusal::ProcessMemoryBudgetExceeded {
+                    operation: operation,
+                    requested_bytes: bytes,
+                    available_bytes: available,
+                    budget_limit_bytes: ceiling,
+                    hint,
+                },
+            );
         }
         Ok(())
     }
-    fn try_allocate_with_provenance_native(&self, bytes: usize, provenance: Option<&StoreAccountantHandle>) -> std::result::Result<(), contextdb_core::read_memory::NativeRefusal> {
+    fn try_allocate_with_provenance_native(
+        &self,
+        bytes: usize,
+        provenance: Option<&StoreAccountantHandle>,
+    ) -> std::result::Result<(), contextdb_core::read_memory::NativeRefusal> {
         if bytes == 0 {
             return Ok(());
         }
@@ -7093,8 +8452,7 @@ impl MemoryAccountant {
             let limit = if published == 0 {
                 0
             } else {
-                published
-                    .saturating_add(self.private_transition_headroom())
+                published.saturating_add(self.private_transition_headroom())
             };
             if limit != 0 {
                 let available = writer_headroom(limit, used, 0, 0)
@@ -7106,31 +8464,40 @@ impl MemoryAccountant {
                     // below closes that window. In test builds a hook lets a
                     // unit test land exactly that interleaving deterministically.
                     #[cfg(test)]
-                    if self.fire_accounting_hook_without_gate_for_provenance(&mut admission, provenance, false) { continue; }
+                    if self.fire_accounting_hook_without_gate_for_provenance(
+                        &mut admission,
+                        provenance,
+                        false,
+                    ) {
+                        continue;
+                    }
                     if self.limit.load(Ordering::SeqCst) != published {
                         continue;
                     }
-                    return Err(contextdb_core::read_memory::NativeRefusal::MemoryBudgetExceeded {
-                        subsystem: "memory",
-                        operation: "allocate",
-                        requested_bytes: bytes,
-                        available_bytes: available,
-                        budget_limit_bytes: limit,
-                        hint:
-                            "Reduce retained data, lower working-set size, or raise MEMORY_LIMIT.",
-                    });
+                    return Err(
+                        contextdb_core::read_memory::NativeRefusal::MemoryBudgetExceeded {
+                            subsystem: "memory",
+                            operation: "allocate",
+                            requested_bytes: bytes,
+                            available_bytes: available,
+                            budget_limit_bytes: limit,
+                            hint: "Reduce retained data, lower working-set size, or raise MEMORY_LIMIT.",
+                        },
+                    );
                 }
             }
 
             let Some(next) = used.checked_add(bytes) else {
-                return Err(contextdb_core::read_memory::NativeRefusal::MemoryBudgetExceeded {
-                    subsystem: "memory",
-                    operation: "allocate",
-                    requested_bytes: bytes,
-                    available_bytes: usize::MAX - used,
-                    budget_limit_bytes: usize::MAX,
-                    hint: "Reduce retained data or working-set size.",
-                });
+                return Err(
+                    contextdb_core::read_memory::NativeRefusal::MemoryBudgetExceeded {
+                        subsystem: "memory",
+                        operation: "allocate",
+                        requested_bytes: bytes,
+                        available_bytes: usize::MAX - used,
+                        budget_limit_bytes: usize::MAX,
+                        hint: "Reduce retained data or working-set size.",
+                    },
+                );
             };
             // The interleaving a narrowing limit has to survive: this
             // allocator has already read `published` and decided the request
@@ -7138,7 +8505,13 @@ impl MemoryAccountant {
             // here, and the CAS below still runs. In test builds a hook lands
             // exactly that order deterministically.
             #[cfg(test)]
-            if self.fire_accounting_hook_without_gate_for_provenance(&mut admission, provenance, true) { continue; }
+            if self.fire_accounting_hook_without_gate_for_provenance(
+                &mut admission,
+                provenance,
+                true,
+            ) {
+                continue;
+            }
             if self.used.compare_exchange_local(used, next) {
                 // Admission and publication share ONE linearization boundary,
                 // and it is this load. An admission is not SUCCESSFUL until it
@@ -7155,8 +8528,7 @@ impl MemoryAccountant {
                 let admissible = if current == 0 {
                     0
                 } else {
-                    current
-                        .saturating_add(self.private_transition_headroom())
+                    current.saturating_add(self.private_transition_headroom())
                 };
                 if writer_headroom(admissible, used, 0, 0)
                     .available
@@ -7167,8 +8539,12 @@ impl MemoryAccountant {
                     self.used.rollback_local_only(bytes);
                     continue;
                 }
-                self.admit_to_process_aggregate_native(&admission, bytes, "allocate",
-                    "Reduce retained data, lower working-set size, or raise MEMORY_LIMIT.")?;
+                self.admit_to_process_aggregate_native(
+                    &admission,
+                    bytes,
+                    "allocate",
+                    "Reduce retained data, lower working-set size, or raise MEMORY_LIMIT.",
+                )?;
                 #[cfg(any(test, feature = "test-seams"))]
                 self.high_water_for_test.fetch_max(next, Ordering::SeqCst);
                 #[cfg(any(test, feature = "test-seams"))]
@@ -7179,140 +8555,164 @@ impl MemoryAccountant {
         }
     }
     fn try_allocate_for_provenance_native(
-        &self, bytes: usize, subsystem: &'static str, operation: &'static str, hint: &'static str,
+        &self,
+        bytes: usize,
+        subsystem: &'static str,
+        operation: &'static str,
+        hint: &'static str,
         provenance: Option<&StoreAccountantHandle>,
     ) -> std::result::Result<(), contextdb_core::read_memory::NativeRefusal> {
-        let native_reclaim_meters =
-            contextdb_core::find_attribution::native_reclaim_meter_scope();
+        let native_reclaim_meters = contextdb_core::find_attribution::native_reclaim_meter_scope();
         let allocation = (|| {
-        #[cfg(any(test, feature = "test-seams"))]
-        if operation == "current_identity_delta"
-            && self
-                .tail_admission_failure
-                .compare_exchange(3, 4, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-        {
-            return Err(contextdb_core::read_memory::NativeRefusal::MemoryBudgetExceeded {
-                subsystem: subsystem,
-                operation: operation,
-                requested_bytes: bytes,
-                available_bytes: 0,
-                budget_limit_bytes: self.used.load(Ordering::SeqCst),
-                hint: "Injected current vector identity publication admission exhaustion.",
-            });
-        }
-        #[cfg(any(test, feature = "test-seams"))]
-        if operation == "prepare_hnsw_tail"
-            && self
-                .tail_admission_failure
-                .compare_exchange(1, 2, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-        {
-            return Err(contextdb_core::read_memory::NativeRefusal::MemoryBudgetExceeded {
-                subsystem: subsystem,
-                operation: operation,
-                requested_bytes: bytes,
-                available_bytes: 0,
-                budget_limit_bytes: self.used.load(Ordering::SeqCst),
-                hint: "Injected fresh-tail admission exhaustion.",
-            });
-        }
-        let mut allocation = self.try_allocate_with_provenance_native(bytes, provenance);
-        #[cfg(any(test, feature = "test-seams"))]
-        if allocation.is_ok() {
-            note_budget_admission(subsystem, operation, bytes, self.used.load(Ordering::SeqCst));
-        }
-        // A saved graph whose topology does not fit is admitted once the
-        // serving pages already resident give way to it: they are re-readable,
-        // the topology is what makes its partition searchable at all.
-        // Idle graphs of partitions the statement is not searching go first;
-        // serving pages give way only after them.
-        if allocation.is_err() && operation == "load_retained_vector_generation" {
-            let vector = self
-                .idle_graph_reclaimer
-                .lock()
-                .as_ref()
-                .and_then(std::sync::Weak::upgrade);
-            if let Some(vector) = vector {
-                let short = || bytes.saturating_sub(self.available_for_provenance(provenance).unwrap_or(usize::MAX));
-                if vector.make_room_for_graph_load_native(short()) != 0 {
+            #[cfg(any(test, feature = "test-seams"))]
+            if operation == "current_identity_delta"
+                && self
+                    .tail_admission_failure
+                    .compare_exchange(3, 4, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            {
+                return Err(
+                    contextdb_core::read_memory::NativeRefusal::MemoryBudgetExceeded {
+                        subsystem: subsystem,
+                        operation: operation,
+                        requested_bytes: bytes,
+                        available_bytes: 0,
+                        budget_limit_bytes: self.used.load(Ordering::SeqCst),
+                        hint: "Injected current vector identity publication admission exhaustion.",
+                    },
+                );
+            }
+            #[cfg(any(test, feature = "test-seams"))]
+            if operation == "prepare_hnsw_tail"
+                && self
+                    .tail_admission_failure
+                    .compare_exchange(1, 2, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            {
+                return Err(
+                    contextdb_core::read_memory::NativeRefusal::MemoryBudgetExceeded {
+                        subsystem: subsystem,
+                        operation: operation,
+                        requested_bytes: bytes,
+                        available_bytes: 0,
+                        budget_limit_bytes: self.used.load(Ordering::SeqCst),
+                        hint: "Injected fresh-tail admission exhaustion.",
+                    },
+                );
+            }
+            let mut allocation = self.try_allocate_with_provenance_native(bytes, provenance);
+            #[cfg(any(test, feature = "test-seams"))]
+            if allocation.is_ok() {
+                note_budget_admission(
+                    subsystem,
+                    operation,
+                    bytes,
+                    self.used.load(Ordering::SeqCst),
+                );
+            }
+            // A saved graph whose topology does not fit is admitted once the
+            // serving pages already resident give way to it: they are re-readable,
+            // the topology is what makes its partition searchable at all.
+            // Idle graphs of partitions the statement is not searching go first;
+            // serving pages give way only after them.
+            if allocation.is_err() && operation == "load_retained_vector_generation" {
+                let vector = self
+                    .idle_graph_reclaimer
+                    .lock()
+                    .as_ref()
+                    .and_then(std::sync::Weak::upgrade);
+                if let Some(vector) = vector {
+                    let short = || {
+                        bytes.saturating_sub(
+                            self.available_for_provenance(provenance)
+                                .unwrap_or(usize::MAX),
+                        )
+                    };
+                    if vector.make_room_for_graph_load_native(short()) != 0 {
+                        allocation = self.try_allocate_with_provenance_native(bytes, provenance);
+                    }
+                    if allocation.is_err() && vector.give_back_serving_pages_native(short()) != 0 {
+                        allocation = self.try_allocate_with_provenance_native(bytes, provenance);
+                    }
+                }
+            }
+            // Serving pages are a cache a read can always refill, so nothing is
+            // refused while they hold the memory it needs: they give way to any
+            // allocation exactly as they give way to a graph load. The give-back
+            // only tries its locks, so it is safe from inside any caller.
+            if allocation.is_err() && operation != "load_retained_vector_generation" {
+                let vector = self
+                    .idle_graph_reclaimer
+                    .lock()
+                    .as_ref()
+                    .and_then(std::sync::Weak::upgrade);
+                let short = bytes.saturating_sub(
+                    self.available_for_provenance(provenance)
+                        .unwrap_or(usize::MAX),
+                );
+                if vector.is_some_and(|vector| vector.give_back_serving_pages_native(short) != 0) {
                     allocation = self.try_allocate_with_provenance_native(bytes, provenance);
                 }
-                if allocation.is_err() && vector.give_back_serving_pages_native(short()) != 0 {
+            }
+            if allocation.is_err() && matches!(operation, "read/table_scan" | "read/index_range") {
+                let vector = self
+                    .idle_graph_reclaimer
+                    .lock()
+                    .as_ref()
+                    .and_then(std::sync::Weak::upgrade);
+                let graphs = vector
+                    .as_ref()
+                    .map_or(0, |vector| vector.evict_idle_graphs());
+                if graphs != 0 {
                     allocation = self.try_allocate_with_provenance_native(bytes, provenance);
                 }
             }
-        }
-        // Serving pages are a cache a read can always refill, so nothing is
-        // refused while they hold the memory it needs: they give way to any
-        // allocation exactly as they give way to a graph load. The give-back
-        // only tries its locks, so it is safe from inside any caller.
-        if allocation.is_err() && operation != "load_retained_vector_generation" {
-            let vector = self
-                .idle_graph_reclaimer
-                .lock()
-                .as_ref()
-                .and_then(std::sync::Weak::upgrade);
-            let short = bytes.saturating_sub(self.available_for_provenance(provenance).unwrap_or(usize::MAX));
-            if vector.is_some_and(|vector| vector.give_back_serving_pages_native(short) != 0) {
-                allocation = self.try_allocate_with_provenance_native(bytes, provenance);
+            // A received schema unit that was already ADMITTED AS A WHOLE is
+            // applying against THIS accountant, and an allocation it did not model
+            // does not fit. It draws on the reservation the preflight is holding
+            // for it, and past that on a BOUNDED excess.
+            //
+            // The unit was priced and admitted before its first item mutated
+            // anything, so a limit genuinely too small for it was already refused
+            // there, leaving the receiver's old complete state. Refusing at the
+            // first byte the model got slightly wrong would instead leave a proper
+            // subset of an arriving schema installed and durable -- the one outcome
+            // the design's "Atomic schema installation" row forbids outright -- and
+            // there is no way back: a received DROP TABLE cannot be taken back at
+            // all, and compensating DDL written to undo it lands in the REPLICATED
+            // log, so one node's memory shortfall would propagate a schema revert
+            // to every peer.
+            //
+            // But the model's error is driven by what a PEER sent, so absorbing it
+            // without a ceiling would hand the peer the operator's declared limit.
+            // Past `ADMITTED_SCHEMA_UNIT_EXCESS_BYTES` the ordinary typed refusal
+            // fires: the limit the operator declared bounds the process, and the
+            // most a unit can take past what it was priced at is that constant.
+            if allocation.is_err() && self.charge_admitted_unit_excess(bytes) {
+                return Ok(());
             }
-        }
-        if allocation.is_err() && matches!(operation, "read/table_scan" | "read/index_range") {
-            let vector = self
-                .idle_graph_reclaimer
-                .lock()
-                .as_ref()
-                .and_then(std::sync::Weak::upgrade);
-            let graphs = vector
-                .as_ref()
-                .map_or(0, |vector| vector.evict_idle_graphs());
-            if graphs != 0 {
-                allocation = self.try_allocate_with_provenance_native(bytes, provenance);
-            }
-        }
-        // A received schema unit that was already ADMITTED AS A WHOLE is
-        // applying against THIS accountant, and an allocation it did not model
-        // does not fit. It draws on the reservation the preflight is holding
-        // for it, and past that on a BOUNDED excess.
-        //
-        // The unit was priced and admitted before its first item mutated
-        // anything, so a limit genuinely too small for it was already refused
-        // there, leaving the receiver's old complete state. Refusing at the
-        // first byte the model got slightly wrong would instead leave a proper
-        // subset of an arriving schema installed and durable -- the one outcome
-        // the design's "Atomic schema installation" row forbids outright -- and
-        // there is no way back: a received DROP TABLE cannot be taken back at
-        // all, and compensating DDL written to undo it lands in the REPLICATED
-        // log, so one node's memory shortfall would propagate a schema revert
-        // to every peer.
-        //
-        // But the model's error is driven by what a PEER sent, so absorbing it
-        // without a ceiling would hand the peer the operator's declared limit.
-        // Past `ADMITTED_SCHEMA_UNIT_EXCESS_BYTES` the ordinary typed refusal
-        // fires: the limit the operator declared bounds the process, and the
-        // most a unit can take past what it was priced at is that constant.
-        if allocation.is_err() && self.charge_admitted_unit_excess(bytes) {
-            return Ok(());
-        }
-        allocation.map_err(|err| match err {
-            contextdb_core::read_memory::NativeRefusal::MemoryBudgetExceeded {
-                requested_bytes,
-                budget_limit_bytes,
-                available_bytes,
-                ..
-            } | contextdb_core::read_memory::NativeRefusal::ProcessMemoryBudgetExceeded {
-                requested_bytes, budget_limit_bytes, available_bytes, ..
-            } => contextdb_core::read_memory::NativeRefusal::MemoryBudgetExceeded {
-                subsystem: subsystem,
-                operation: operation,
-                requested_bytes,
-                budget_limit_bytes,
-                available_bytes,
-                hint: hint,
-            },
-            other => other,
-        })
+            allocation.map_err(|err| match err {
+                contextdb_core::read_memory::NativeRefusal::MemoryBudgetExceeded {
+                    requested_bytes,
+                    budget_limit_bytes,
+                    available_bytes,
+                    ..
+                }
+                | contextdb_core::read_memory::NativeRefusal::ProcessMemoryBudgetExceeded {
+                    requested_bytes,
+                    budget_limit_bytes,
+                    available_bytes,
+                    ..
+                } => contextdb_core::read_memory::NativeRefusal::MemoryBudgetExceeded {
+                    subsystem: subsystem,
+                    operation: operation,
+                    requested_bytes,
+                    budget_limit_bytes,
+                    available_bytes,
+                    hint: hint,
+                },
+                other => other,
+            })
         })();
         // The fixed scope binds observations to the currently open record on
         // completion and on unwind, or drops them when no record is open.
@@ -7324,16 +8724,13 @@ impl MemoryAccountant {
 
 impl StoreAccountantHandle {
     pub(crate) fn try_allocate_for_original_native(
-        &self, bytes: usize, subsystem: &'static str,
-        operation: &'static str, hint: &'static str,
+        &self,
+        bytes: usize,
+        subsystem: &'static str,
+        operation: &'static str,
+        hint: &'static str,
     ) -> std::result::Result<(), contextdb_core::read_memory::NativeRefusal> {
-        self.try_allocate_for_provenance_native(
-            bytes,
-            subsystem,
-            operation,
-            hint,
-            Some(self),
-        )
+        self.try_allocate_for_provenance_native(bytes, subsystem, operation, hint, Some(self))
     }
 }
 
@@ -7341,20 +8738,28 @@ impl OwnedMemoryReservation {
     /// A genuine new grant from the originating reservation, retaining its
     /// existing writer epoch rather than discovering a later registration.
     pub(crate) fn reserve_copy_native(
-        &self, bytes: usize, subsystem: &'static str,
-        operation: &'static str, hint: &'static str,
+        &self,
+        bytes: usize,
+        subsystem: &'static str,
+        operation: &'static str,
+        hint: &'static str,
     ) -> std::result::Result<Self, contextdb_core::read_memory::NativeRefusal> {
         let mut copy = Self {
-            accountant: Some(self.accountant().clone()), bytes: 0,
-            _writer_use: self._writer_use.clone(), own_control: None,
+            accountant: Some(self.accountant().clone()),
+            bytes: 0,
+            _writer_use: self._writer_use.clone(),
+            own_control: None,
         };
         copy.try_grow_for_native(bytes, subsystem, operation, hint)?;
         Ok(copy)
     }
 
     pub(crate) fn try_new_for_native(
-        accountant: AccountantHandle, bytes: usize, subsystem: &'static str,
-        operation: &'static str, hint: &'static str,
+        accountant: AccountantHandle,
+        bytes: usize,
+        subsystem: &'static str,
+        operation: &'static str,
+        hint: &'static str,
     ) -> std::result::Result<Self, contextdb_core::read_memory::NativeRefusal> {
         // Capture the epoch before admission, as a zero-byte guard. It remains
         // pinned through success, refusal, and later body destruction.
@@ -7364,16 +8769,24 @@ impl OwnedMemoryReservation {
     }
 
     pub(crate) fn try_grow_for_native(
-        &mut self, bytes: usize, subsystem: &'static str,
-        operation: &'static str, hint: &'static str,
+        &mut self,
+        bytes: usize,
+        subsystem: &'static str,
+        operation: &'static str,
+        hint: &'static str,
     ) -> std::result::Result<(), contextdb_core::read_memory::NativeRefusal> {
         let next = self.bytes.checked_add(bytes).ok_or(
             contextdb_core::read_memory::NativeRefusal::MemoryBudgetExceeded {
-                subsystem, operation, requested_bytes: bytes,
+                subsystem,
+                operation,
+                requested_bytes: bytes,
                 available_bytes: usize::MAX - self.bytes,
-                budget_limit_bytes: usize::MAX, hint,
-            })?;
-        self.accountant().try_allocate_for_native(bytes, subsystem, operation, hint)?;
+                budget_limit_bytes: usize::MAX,
+                hint,
+            },
+        )?;
+        self.accountant()
+            .try_allocate_for_native(bytes, subsystem, operation, hint)?;
         self.bytes = next;
         Ok(())
     }

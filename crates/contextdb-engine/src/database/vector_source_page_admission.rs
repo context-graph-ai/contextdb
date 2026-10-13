@@ -18,7 +18,9 @@ struct SourcePageCharge {
 
 impl Drop for SourcePageCharge {
     fn drop(&mut self) {
-        let Some(accountant) = self.accountant.take() else { return; };
+        let Some(accountant) = self.accountant.take() else {
+            return;
+        };
         accountant.release(self.bytes);
         if self.own_layout.size() == 0 {
             drop(self._writer_use.take());
@@ -28,7 +30,9 @@ impl Drop for SourcePageCharge {
         // All engine cleanup precedes the narrowly authorized own-Box refund.
         drop(self._writer_use.take());
         drop(accountant);
-        refund.release_owned(self.own_layout.size()).expect("source charge control refund is owned");
+        refund
+            .release_owned(self.own_layout.size())
+            .expect("source charge control refund is owned");
         // Remaining fields are empty or Copy; refund's Arc drop runs only std
         // counter cleanup before std deallocates this uniquely owned Box.
     }
@@ -107,7 +111,8 @@ fn with_source_page_admission_for<T>(
             accountant.try_allocate_for(bytes, "vector_maintenance", operation, hint)?;
             let mut charge = SourcePageCharge {
                 _writer_use: crate::memory_accounting::WriterUse::retain_if_writer(&accountant),
-                accountant: Some(accountant.clone()), bytes,
+                accountant: Some(accountant.clone()),
+                bytes,
                 own_layout: std::alloc::Layout::new::<()>(),
             };
             let layout = std::alloc::Layout::for_value(&charge);
@@ -149,8 +154,12 @@ mod cleanup_attribution_tests {
             read: impl FnOnce() -> Result<T>,
         ) -> Result<T> {
             match self {
-                Self::Catalog => with_catalog_reclamation_source_page_admission(accountant.into(), read),
-                Self::Journal => with_journal_cleanup_source_page_admission(accountant.into(), read),
+                Self::Catalog => {
+                    with_catalog_reclamation_source_page_admission(accountant.into(), read)
+                }
+                Self::Journal => {
+                    with_journal_cleanup_source_page_admission(accountant.into(), read)
+                }
             }
         }
     }

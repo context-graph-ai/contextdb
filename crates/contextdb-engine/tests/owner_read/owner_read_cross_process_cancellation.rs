@@ -8,6 +8,7 @@
 //! the cursor the caller opened before the interrupt must still hand back its
 //! next page.
 
+use super::owner_cursor_test_support;
 use contextdb_core::read_contract::{
     DeadlineClock, LocalUserIdentity, OwnerReadCancellation, OwnerRequestHandler,
     ReadClientTimeouts, ReadLimits,
@@ -18,7 +19,6 @@ use contextdb_engine::local_transport::{
 };
 use contextdb_engine::owner_read::{OwnerClient, OwnerReadScaffoldError};
 use contextdb_engine::persistence::read_persistence_test_scaffold::inspect_companion_record_for_test;
-use super::owner_cursor_test_support;
 use owner_cursor_test_support::decode_owner_cursor_page as decode_cursor_page;
 
 use contextdb_engine::{Database, DatabaseOpenOptions};

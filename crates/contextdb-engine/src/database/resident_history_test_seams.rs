@@ -408,7 +408,6 @@ pub(crate) fn source_unit_boundaries_for_test<'a>(
     })
 }
 
-
 // These controls reach the manager already installed in this Database. They
 // never build a detached directory, context, or memory owner for a test.
 impl Database {
@@ -424,7 +423,9 @@ impl Database {
         context: &contextdb_tx::ReadCommitContext<'_>,
     ) -> Result<Option<TxId>> {
         self.note_commit_directory_funding(context);
-        let result = self.tx_mgr.try_commit_index_get_with_context(lsn, context)?;
+        let result = self
+            .tx_mgr
+            .try_commit_index_get_with_context(lsn, context)?;
         self.__sample_commit_directory_residency_with_context_for_test(context)?;
         Ok(result)
     }
@@ -436,7 +437,9 @@ impl Database {
         context: &contextdb_tx::ReadCommitContext<'_>,
     ) -> Result<bool> {
         self.note_commit_directory_funding(context);
-        let result = self.tx_mgr.try_commit_index_contains_with_context(lsn, context)?;
+        let result = self
+            .tx_mgr
+            .try_commit_index_contains_with_context(lsn, context)?;
         self.__sample_commit_directory_residency_with_context_for_test(context)?;
         Ok(result)
     }
@@ -448,7 +451,9 @@ impl Database {
         context: &contextdb_tx::ReadCommitContext<'_>,
     ) -> Result<Option<(Lsn, TxId)>> {
         self.note_commit_directory_funding(context);
-        let result = self.tx_mgr.try_commit_index_floor_with_context(upper, context)?;
+        let result = self
+            .tx_mgr
+            .try_commit_index_floor_with_context(upper, context)?;
         self.__sample_commit_directory_residency_with_context_for_test(context)?;
         Ok(result)
     }
@@ -472,7 +477,9 @@ impl Database {
         context: &contextdb_tx::ReadCommitContext<'_>,
     ) -> Result<Box<dyn contextdb_tx::ReadCommitCursor>> {
         self.note_commit_directory_funding(context);
-        let cursor = self.tx_mgr.read_commit_directory_cursor(lower, upper, context)?;
+        let cursor = self
+            .tx_mgr
+            .read_commit_directory_cursor(lower, upper, context)?;
         self.__sample_commit_directory_residency_with_context_for_test(context)?;
         Ok(Box::new(ObservedReadCommitCursor {
             cursor,
@@ -491,7 +498,9 @@ impl Database {
     }
 
     fn note_commit_directory_funding(&self, context: &contextdb_tx::ReadCommitContext<'_>) {
-        self.tx_mgr.visit_captured_read_memory_for_test(crate::read_work_probe::note_commit_directory_open_funding);
+        self.tx_mgr.visit_captured_read_memory_for_test(
+            crate::read_work_probe::note_commit_directory_open_funding,
+        );
         if let Some(image) = self.read_image_memory.as_ref() {
             crate::read_work_probe::note_commit_directory_image_memory(image);
         }
@@ -507,8 +516,8 @@ impl Database {
 fn note_commit_directory_sample(manager: &DatabaseTransactionHost, durable_entries: usize) {
     // retained_entry_bytes counts the actual decoded pair slots; source cache
     // pages and caller-owned cursor output are not resident directory entries.
-    let resident_entries = manager.retained_commit_directory_bytes_for_test()
-        / std::mem::size_of::<(Lsn, TxId)>();
+    let resident_entries =
+        manager.retained_commit_directory_bytes_for_test() / std::mem::size_of::<(Lsn, TxId)>();
     crate::read_work_probe::note_commit_directory_residency(
         resident_entries as u64,
         durable_entries as u64,
@@ -526,7 +535,9 @@ impl contextdb_tx::ReadCommitCursor for ObservedReadCommitCursor {
         &mut self,
         context: &contextdb_tx::ReadCommitContext<'_>,
     ) -> Result<Option<(Lsn, TxId)>> {
-        self.manager.visit_captured_read_memory_for_test(crate::read_work_probe::note_commit_directory_open_funding);
+        self.manager.visit_captured_read_memory_for_test(
+            crate::read_work_probe::note_commit_directory_open_funding,
+        );
         if let Some(image) = self.image.as_ref().and_then(std::sync::Weak::upgrade) {
             crate::read_work_probe::note_commit_directory_image_memory(&image);
         }

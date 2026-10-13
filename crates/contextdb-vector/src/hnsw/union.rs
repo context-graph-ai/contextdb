@@ -129,13 +129,18 @@ impl NavigationCache {
         if self.tick == usize::MAX {
             let mut previous = 0usize;
             let mut rank = 0usize;
-            while let Some((key, stamp)) = self.entries.iter()
+            while let Some((key, stamp)) = self
+                .entries
+                .iter()
                 .filter(|(_, entry)| entry.last_used > previous)
                 .min_by_key(|(_, entry)| entry.last_used)
                 .map(|(key, entry)| (*key, entry.last_used))
             {
                 rank += 1;
-                self.entries.get_mut(&key).expect("navigation recency entry").last_used = rank;
+                self.entries
+                    .get_mut(&key)
+                    .expect("navigation recency entry")
+                    .last_used = rank;
                 previous = stamp;
             }
             self.tick = rank;
@@ -151,13 +156,27 @@ impl NavigationCache {
     }
     fn insert(&mut self, key: NavigationKey, value: NavigationValue, bytes: usize) {
         let last_used = self.next_tick();
-        self.entries.insert(key, NavigationEntry { value, bytes, last_used });
+        self.entries.insert(
+            key,
+            NavigationEntry {
+                value,
+                bytes,
+                last_used,
+            },
+        );
     }
     fn reserve(&mut self, bytes: usize) -> bool {
         let Some(owner) = &self.accountant else {
             return false;
         };
-        owner.try_allocate_for(bytes, "vector_navigation", "retain_authenticated_navigation", "Optional navigation retention.").is_ok()
+        owner
+            .try_allocate_for(
+                bytes,
+                "vector_navigation",
+                "retain_authenticated_navigation",
+                "Optional navigation retention.",
+            )
+            .is_ok()
     }
 
     fn table_slot(&mut self) -> bool {
@@ -269,13 +288,14 @@ impl NavigationCache {
         }) else {
             return;
         };
-        if self.payload_bytes.checked_add(bytes).is_none()
-            || !self.reserve(bytes)
-        {
+        if self.payload_bytes.checked_add(bytes).is_none() || !self.reserve(bytes) {
             return;
         }
         if !self.table_slot() {
-            self.accountant.as_ref().expect("optional funder").release(bytes);
+            self.accountant
+                .as_ref()
+                .expect("optional funder")
+                .release(bytes);
             return;
         }
         let mut compact = Vec::with_capacity(neighbours.len());
@@ -284,20 +304,43 @@ impl NavigationCache {
             copied.extend(edges.iter().map(|edge| (edge.point_id, edge.origin_id)));
             compact.push(copied);
         }
-        self.payload_bytes = self.payload_bytes.checked_add(bytes).expect("admitted navigation payload");
-        let mut cached = NavigationPoint { origin, neighbours: compact, values: None };
+        self.payload_bytes = self
+            .payload_bytes
+            .checked_add(bytes)
+            .expect("admitted navigation payload");
+        let mut cached = NavigationPoint {
+            origin,
+            neighbours: compact,
+            values: None,
+        };
         // Upper-layer bodies remain optional. Do not evict the admitted new
         // table while this entry is pending insertion; refusal is a body miss.
         if id.0 != 0
             && let paged_builder::PagedVectorPoint::F32(point) = value
             && let Some(body_bytes) = point.values.len().checked_mul(std::mem::size_of::<f32>())
             && self.payload_bytes.checked_add(body_bytes).is_some()
-            && self.accountant.as_ref().is_some_and(|owner| owner.try_allocate_for(body_bytes, "vector_navigation", "retain_authenticated_navigation", "Optional navigation body.").is_ok())
+            && self.accountant.as_ref().is_some_and(|owner| {
+                owner
+                    .try_allocate_for(
+                        body_bytes,
+                        "vector_navigation",
+                        "retain_authenticated_navigation",
+                        "Optional navigation body.",
+                    )
+                    .is_ok()
+            })
         {
             cached.values = Some(point.values.clone());
             self.payload_bytes += body_bytes;
         }
-        let retained = bytes.checked_add(cached.values.as_ref().map_or(0, |v| v.len() * std::mem::size_of::<f32>())).expect("admitted navigation entry");
+        let retained = bytes
+            .checked_add(
+                cached
+                    .values
+                    .as_ref()
+                    .map_or(0, |v| v.len() * std::mem::size_of::<f32>()),
+            )
+            .expect("admitted navigation entry");
         self.insert(
             NavigationKey::Point(layer, id),
             NavigationValue::Point(cached),
@@ -328,7 +371,9 @@ pub(crate) struct NavigationSession {
 }
 impl NavigationSession {
     pub(crate) fn new(owner: Option<Arc<dyn crate::memory_budget::MemoryBudget>>) -> Self {
-        Self { navigation: parking_lot::Mutex::new(NavigationCache::new(owner)) }
+        Self {
+            navigation: parking_lot::Mutex::new(NavigationCache::new(owner)),
+        }
     }
     fn lock(&self) -> parking_lot::MutexGuard<'_, NavigationCache> {
         self.navigation.lock()
@@ -338,7 +383,9 @@ impl NavigationSession {
     }
     pub(crate) fn reclaim(&self) -> bool {
         // Never evict underneath an active navigation borrow.
-        self.navigation.try_lock().is_some_and(|mut cache| cache.evict_lru())
+        self.navigation
+            .try_lock()
+            .is_some_and(|mut cache| cache.evict_lru())
     }
     pub(crate) fn reserve_for(
         &self,
@@ -351,13 +398,23 @@ impl NavigationSession {
         loop {
             match token.reserve_for(bytes, component, operation, hint) {
                 Ok(()) => return Ok(()),
-                Err(error) if navigation_memory_refusal(&error) && self.reclaim() => {},
+                Err(error) if navigation_memory_refusal(&error) && self.reclaim() => {}
                 Err(error) => return Err(error),
             }
         }
     }
-    pub(crate) fn reserve(&self, token: &mut crate::memory_budget::VectorCopyAdmission, bytes: usize) -> contextdb_core::Result<()> {
-        self.reserve_for(token, bytes, "vector_copy", "materialize", "Reduce the selected copy or raise the executing statement's memory limit.")
+    pub(crate) fn reserve(
+        &self,
+        token: &mut crate::memory_budget::VectorCopyAdmission,
+        bytes: usize,
+    ) -> contextdb_core::Result<()> {
+        self.reserve_for(
+            token,
+            bytes,
+            "vector_copy",
+            "materialize",
+            "Reduce the selected copy or raise the executing statement's memory limit.",
+        )
     }
 }
 
@@ -695,22 +752,26 @@ impl<'a> OpenLayer<'a> {
         before_source: &mut S,
     ) -> std::result::Result<Option<usize>, E> {
         Ok(match &self.graph {
-            LayerGraph::Durable { reader, .. } => {
-                (|| -> std::result::Result<Option<usize>, E> {
-                    before_source()?;
-                    if let Some(cached) = self.navigation.lock().point(self.source_layer, point) {
-                        return Ok(Some(cached.origin));
-                    }
-                    let value = paged_builder::AdmittedPagedReader::with_reclamation(reader.borrow_mut().as_mut(), self.navigation.owner(), &|| self.navigation.reclaim()).load_point(point).map_err(E::from)?;
-                    self.navigation
-                        .lock()
-                        .remember_point(self.source_layer, point, &value);
-                    Ok(Some(match &*value {
-                        paged_builder::PagedVectorPoint::F32(p) => p.origin_id,
-                        paged_builder::PagedVectorPoint::Quantized(p) => p.origin_id,
-                    }))
-                })()?
-            }
+            LayerGraph::Durable { reader, .. } => (|| -> std::result::Result<Option<usize>, E> {
+                before_source()?;
+                if let Some(cached) = self.navigation.lock().point(self.source_layer, point) {
+                    return Ok(Some(cached.origin));
+                }
+                let value = paged_builder::AdmittedPagedReader::with_reclamation(
+                    reader.borrow_mut().as_mut(),
+                    self.navigation.owner(),
+                    &|| self.navigation.reclaim(),
+                )
+                .load_point(point)
+                .map_err(E::from)?;
+                self.navigation
+                    .lock()
+                    .remember_point(self.source_layer, point, &value);
+                Ok(Some(match &*value {
+                    paged_builder::PagedVectorPoint::F32(p) => p.origin_id,
+                    paged_builder::PagedVectorPoint::Quantized(p) => p.origin_id,
+                }))
+            })()?,
             LayerGraph::Paged { paged, .. } => paged.point(point).map(|point| point.origin_id),
             LayerGraph::ResidentF32 { points, .. } => points
                 .resident_point(&point)
@@ -726,20 +787,24 @@ impl<'a> OpenLayer<'a> {
         before_source: &mut S,
     ) -> std::result::Result<Option<RowId>, E> {
         match &self.graph {
-            LayerGraph::Durable { reader, .. } => {
-                (|| {
-                    before_source()?;
-                    if let Some(row) = self.navigation.lock().row(self.source_layer, origin) {
-                        return Ok(Some(row));
-                    }
-                    let identity = paged_builder::AdmittedPagedReader::with_reclamation(reader.borrow_mut().as_mut(), self.navigation.owner(), &|| self.navigation.reclaim()).identity(origin).map_err(E::from)?;
-                    let row = identity.row_id;
-                    self.navigation
-                        .lock()
-                        .remember_identity(self.source_layer, origin, &identity);
-                    Ok(Some(row))
-                })()
-            }
+            LayerGraph::Durable { reader, .. } => (|| {
+                before_source()?;
+                if let Some(row) = self.navigation.lock().row(self.source_layer, origin) {
+                    return Ok(Some(row));
+                }
+                let identity = paged_builder::AdmittedPagedReader::with_reclamation(
+                    reader.borrow_mut().as_mut(),
+                    self.navigation.owner(),
+                    &|| self.navigation.reclaim(),
+                )
+                .identity(origin)
+                .map_err(E::from)?;
+                let row = identity.row_id;
+                self.navigation
+                    .lock()
+                    .remember_identity(self.source_layer, origin, &identity);
+                Ok(Some(row))
+            })(),
             _ => Ok(self.id_to_row.get(&origin).copied()),
         }
     }
@@ -794,7 +859,13 @@ impl<'a> OpenLayer<'a> {
                             return Ok(Some(Hops::Copied(&scratch.ids)));
                         }
                     }
-                    let value = paged_builder::AdmittedPagedReader::with_reclamation(reader.borrow_mut().as_mut(), self.navigation.owner(), &|| self.navigation.reclaim()).load_point(point).map_err(E::from)?;
+                    let value = paged_builder::AdmittedPagedReader::with_reclamation(
+                        reader.borrow_mut().as_mut(),
+                        self.navigation.owner(),
+                        &|| self.navigation.reclaim(),
+                    )
+                    .load_point(point)
+                    .map_err(E::from)?;
                     self.navigation
                         .lock()
                         .remember_point(self.source_layer, point, &value);
@@ -862,61 +933,65 @@ impl<'a> OpenLayer<'a> {
         R: FnMut(HnswSearchScratchEvent),
     {
         match &mut self.graph {
-            LayerGraph::Durable { tail, reader } => {
-                (|| {
-                    before_source_entry()?;
-                    let cached = {
-                        let mut navigation = self.navigation.lock();
-                        navigation
-                            .point(self.source_layer, point)
-                            .and_then(|point| point.values.as_ref())
-                            .is_some()
-                    };
-                    if cached {
-                        before_distance()?;
-                        let mut navigation = self.navigation.lock();
-                        if let Some(values) = navigation
-                            .point(self.source_layer, point)
-                            .and_then(|point| point.values.as_ref())
-                        {
-                            let distance = hnsw_f32_distance().eval(query.values, values);
-                            if !distance.is_finite() {
-                                return Err(E::from(Error::Other(
-                                    "invalid paged graph distance".into(),
-                                )));
-                            }
-                            return Ok(Some(distance));
+            LayerGraph::Durable { tail, reader } => (|| {
+                before_source_entry()?;
+                let cached = {
+                    let mut navigation = self.navigation.lock();
+                    navigation
+                        .point(self.source_layer, point)
+                        .and_then(|point| point.values.as_ref())
+                        .is_some()
+                };
+                if cached {
+                    before_distance()?;
+                    let mut navigation = self.navigation.lock();
+                    if let Some(values) = navigation
+                        .point(self.source_layer, point)
+                        .and_then(|point| point.values.as_ref())
+                    {
+                        let distance = hnsw_f32_distance().eval(query.values, values);
+                        if !distance.is_finite() {
+                            return Err(E::from(Error::Other(
+                                "invalid paged graph distance".into(),
+                            )));
                         }
+                        return Ok(Some(distance));
                     }
-                    let value = paged_builder::AdmittedPagedReader::with_reclamation(reader.borrow_mut().as_mut(), self.navigation.owner(), &|| self.navigation.reclaim()).load_point(point).map_err(E::from)?;
-                    self.navigation
-                        .lock()
-                        .remember_point(self.source_layer, point, &value);
-                    if !cached {
-                        before_distance()?;
+                }
+                let value = paged_builder::AdmittedPagedReader::with_reclamation(
+                    reader.borrow_mut().as_mut(),
+                    self.navigation.owner(),
+                    &|| self.navigation.reclaim(),
+                )
+                .load_point(point)
+                .map_err(E::from)?;
+                self.navigation
+                    .lock()
+                    .remember_point(self.source_layer, point, &value);
+                if !cached {
+                    before_distance()?;
+                }
+                let distance = match &*value {
+                    paged_builder::PagedVectorPoint::F32(point) => {
+                        hnsw_f32_distance().eval(query.values, &point.values)
                     }
-                    let distance = match &*value {
-                        paged_builder::PagedVectorPoint::F32(point) => {
-                            hnsw_f32_distance().eval(query.values, &point.values)
-                        }
-                        paged_builder::PagedVectorPoint::Quantized(point) => DistQuantizedCosine {
-                            quantization: tail.definition().1,
-                        }
-                        .eval(
-                            query.encoded.ok_or_else(|| {
-                                E::from(Error::Other(
-                                    "paged quantized graph requires an encoded query".into(),
-                                ))
-                            })?,
-                            &point.values,
-                        ),
-                    };
-                    if !distance.is_finite() {
-                        return Err(E::from(Error::Other("invalid paged graph distance".into())));
+                    paged_builder::PagedVectorPoint::Quantized(point) => DistQuantizedCosine {
+                        quantization: tail.definition().1,
                     }
-                    Ok(Some(distance))
-                })()
-            }
+                    .eval(
+                        query.encoded.ok_or_else(|| {
+                            E::from(Error::Other(
+                                "paged quantized graph requires an encoded query".into(),
+                            ))
+                        })?,
+                        &point.values,
+                    ),
+                };
+                if !distance.is_finite() {
+                    return Err(E::from(Error::Other("invalid paged graph distance".into())));
+                }
+                Ok(Some(distance))
+            })(),
             LayerGraph::Paged { paged, reader } => {
                 let Some(stored) = paged.point(point) else {
                     return Ok(None);
@@ -1577,22 +1652,20 @@ where
                 continue;
             };
             let directory = match &graph {
-                LayerGraph::Durable { tail, .. } => {
-                    layer.graph.paged_seed_directory(
-                        tail,
-                        Some(navigation),
-                        k,
-                        required_results.min(layer.allowed_count),
-                        layer.allowed_count,
-                        ef,
-                        &seed_rows,
-                        seed_all,
-                        &mut layer_allowed,
-                        &mut before_source_entry,
-                        &mut acquire,
-                        &mut release,
-                    )?
-                }
+                LayerGraph::Durable { tail, .. } => layer.graph.paged_seed_directory(
+                    tail,
+                    Some(navigation),
+                    k,
+                    required_results.min(layer.allowed_count),
+                    layer.allowed_count,
+                    ef,
+                    &seed_rows,
+                    seed_all,
+                    &mut layer_allowed,
+                    &mut before_source_entry,
+                    &mut acquire,
+                    &mut release,
+                )?,
                 _ => layer.graph.allowed_seed_directory(
                     k,
                     required_results.min(layer.allowed_count),
@@ -1946,10 +2019,14 @@ where
                 for open_layer in &open {
                     if let LayerGraph::Durable { reader, .. } = &open_layer.graph {
                         before_source_entry()?;
-                        if paged_builder::AdmittedPagedReader::with_reclamation(reader.borrow_mut().as_mut(), navigation.owner(), &|| navigation.reclaim())
-                            .exact_graph_row_after(key, None)
-                            .map_err(E::from)?
-                            .is_some()
+                        if paged_builder::AdmittedPagedReader::with_reclamation(
+                            reader.borrow_mut().as_mut(),
+                            navigation.owner(),
+                            &|| navigation.reclaim(),
+                        )
+                        .exact_graph_row_after(key, None)
+                        .map_err(E::from)?
+                        .is_some()
                         {
                             equal_vector_filed = true;
                             break;
@@ -2046,9 +2123,13 @@ where
                     let mut after = None;
                     loop {
                         before_source_entry()?;
-                        let Some(row_id) = paged_builder::AdmittedPagedReader::with_reclamation(reader.borrow_mut().as_mut(), navigation.owner(), &|| navigation.reclaim())
-                            .exact_graph_row_after(key, after)
-                            .map_err(E::from)?
+                        let Some(row_id) = paged_builder::AdmittedPagedReader::with_reclamation(
+                            reader.borrow_mut().as_mut(),
+                            navigation.owner(),
+                            &|| navigation.reclaim(),
+                        )
+                        .exact_graph_row_after(key, after)
+                        .map_err(E::from)?
                         else {
                             break;
                         };

@@ -218,8 +218,12 @@ fn write_json_string(writer: &mut impl Write, value: &str) -> std::io::Result<()
                 b'\x0c' => writer.write_all(b"\\f")?,
                 b'\r' => writer.write_all(b"\\r")?,
                 _ => writer.write_all(&[
-                    b'\\', b'u', b'0', b'0',
-                    HEX[(byte >> 4) as usize], HEX[(byte & 15) as usize],
+                    b'\\',
+                    b'u',
+                    b'0',
+                    b'0',
+                    HEX[(byte >> 4) as usize],
+                    HEX[(byte & 15) as usize],
                 ])?,
             }
             start = index + 1;
@@ -233,17 +237,13 @@ fn write_json_millis(writer: &mut impl Write, value: f64) -> std::io::Result<()>
     if value.is_finite() {
         // Use the existing JSON formatter's fixed float buffer directly,
         // without Serializer's allocating error conversion on I/O failure.
-        serde_json::ser::Formatter::write_f64(
-            &mut serde_json::ser::CompactFormatter, writer, value,
-        )
+        serde_json::ser::Formatter::write_f64(&mut serde_json::ser::CompactFormatter, writer, value)
     } else {
         writer.write_all(b"null")
     }
 }
 
-fn write_json_key(
-    writer: &mut impl Write, name: &str, first: &mut bool,
-) -> std::io::Result<()> {
+fn write_json_key(writer: &mut impl Write, name: &str, first: &mut bool) -> std::io::Result<()> {
     if !*first {
         writer.write_all(b",")?;
     }
@@ -281,7 +281,8 @@ fn write_native_counts(writer: &mut impl Write, record: &Record) -> std::io::Res
 }
 
 fn write_native_entries(
-    writer: &mut impl Write, entries: &[Vec<(String, Field)>],
+    writer: &mut impl Write,
+    entries: &[Vec<(String, Field)>],
 ) -> std::io::Result<()> {
     writer.write_all(b"[")?;
     let mut first_entry = true;
@@ -295,11 +296,18 @@ fn write_native_entries(
         let mut previous: Option<&str> = None;
         // The legacy JSON map sorts keys and retains the last duplicate. Do
         // the same over borrowed views, without building another map.
-        while let Some(name) = entry.iter().map(|(name, _)| name.as_str())
-            .filter(|name| previous.is_none_or(|previous| *name > previous)).min()
+        while let Some(name) = entry
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .filter(|name| previous.is_none_or(|previous| *name > previous))
+            .min()
         {
-            let value = &entry.iter().rev().find(|(key, _)| key.as_str() == name)
-                .expect("borrowed entry key").1;
+            let value = &entry
+                .iter()
+                .rev()
+                .find(|(key, _)| key.as_str() == name)
+                .expect("borrowed entry key")
+                .1;
             write_json_key(writer, name, &mut first)?;
             match value {
                 Field::Text(value) => write_json_string(writer, value)?,
@@ -314,7 +322,9 @@ fn write_native_entries(
 }
 
 fn write_native_record(
-    writer: &mut impl Write, record: &Record, total_nanos: u64,
+    writer: &mut impl Write,
+    record: &Record,
+    total_nanos: u64,
 ) -> std::io::Result<()> {
     writer.write_all(b"{\"counts\":")?;
     write_native_counts(writer, record)?;
@@ -644,7 +654,9 @@ pub fn note_native_graph_reclaim_available_bytes(bytes: usize) {
 pub fn note_native_sealed_generations_evicted(evicted: usize) {
     NATIVE_RECLAIM_METERS.with(|meters| {
         let mut now = meters.get();
-        now.sealed_generations_evicted = now.sealed_generations_evicted.saturating_add(evicted as u64);
+        now.sealed_generations_evicted = now
+            .sealed_generations_evicted
+            .saturating_add(evicted as u64);
         meters.set(now);
     });
 }
@@ -657,7 +669,10 @@ pub fn native_reclaim_meter_scope() -> NativeReclaimMeterScope {
         meters.set(NativeReclaimMeters::default());
         prior
     });
-    NativeReclaimMeterScope { prior, active: true }
+    NativeReclaimMeterScope {
+        prior,
+        active: true,
+    }
 }
 
 impl NativeReclaimMeterScope {
@@ -689,15 +704,13 @@ fn restore_native_reclaim_meter_scope(prior: NativeReclaimMeters) -> NativeRecla
     // enclosing active scope is restored separately, so nested work is never
     // counted again when that scope closes. With no open record, drop the
     // observation just as legacy count does; never initialize the sink here.
-    if ENABLED.load(Ordering::Relaxed) {
-        if let Some(Some(sink)) = SINK.get() {
-            if let Ok(mut sink) = sink.lock() {
-                if let Some(record) = sink.record.as_mut() {
-                    record.native_reclaim.merge(local);
-                    record.native_reclaim_present = true;
-                }
-            }
-        }
+    if ENABLED.load(Ordering::Relaxed)
+        && let Some(Some(sink)) = SINK.get()
+        && let Ok(mut sink) = sink.lock()
+        && let Some(record) = sink.record.as_mut()
+    {
+        record.native_reclaim.merge(local);
+        record.native_reclaim_present = true;
     }
     local
 }
@@ -719,14 +732,32 @@ impl NativeReclaimMeters {
     fn labels(self) -> [(&'static str, Option<u64>); 6] {
         let graph = self.graph_reclaims_over_budget != 0;
         [
-            ("graph_reclaim_available_bytes", graph.then_some(self.graph_reclaim_available_bytes)),
-            ("graph_reclaim_required_bytes", graph.then_some(self.graph_reclaim_required_bytes)),
-            ("graph_reclaims_over_budget", graph.then_some(self.graph_reclaims_over_budget)),
-            ("sealed_generations_evicted", graph.then_some(self.sealed_generations_evicted)),
-            ("serving_page_bytes_given_back", self.serving_page_give_back_reached_final_pass
-                .then_some(self.serving_page_bytes_given_back)),
-            ("serving_page_give_back_short", (self.serving_page_give_back_short != 0)
-                .then_some(self.serving_page_give_back_short)),
+            (
+                "graph_reclaim_available_bytes",
+                graph.then_some(self.graph_reclaim_available_bytes),
+            ),
+            (
+                "graph_reclaim_required_bytes",
+                graph.then_some(self.graph_reclaim_required_bytes),
+            ),
+            (
+                "graph_reclaims_over_budget",
+                graph.then_some(self.graph_reclaims_over_budget),
+            ),
+            (
+                "sealed_generations_evicted",
+                graph.then_some(self.sealed_generations_evicted),
+            ),
+            (
+                "serving_page_bytes_given_back",
+                self.serving_page_give_back_reached_final_pass
+                    .then_some(self.serving_page_bytes_given_back),
+            ),
+            (
+                "serving_page_give_back_short",
+                (self.serving_page_give_back_short != 0)
+                    .then_some(self.serving_page_give_back_short),
+            ),
         ]
     }
 }

@@ -138,13 +138,20 @@ impl RedbPersistence {
             .open_table(COMMIT_INDEX_TABLE)
             .map_err(Self::storage_error)?;
         #[cfg(any(test, feature = "test-seams"))]
-        crate::read_work_probe::note_graph("commit_index", "get", &lsn.0.to_be_bytes(), Some(contextdb_core::Lsn(lsn.0)), Some(_role));
+        crate::read_work_probe::note_graph(
+            "commit_index",
+            "get",
+            &lsn.0.to_be_bytes(),
+            Some(contextdb_core::Lsn(lsn.0)),
+            Some(_role),
+        );
         let bound = table
             .get(lsn.0)
             .map_err(Self::storage_error)?
             .ok_or_else(|| corrupt("graph contribution required commit is absent"))?;
         if tx.0 > bound.value() {
-            return Err(corrupt("graph contribution exceeds its committed source position",
+            return Err(corrupt(
+                "graph contribution exceeds its committed source position",
             ));
         }
         Ok(())
@@ -175,7 +182,10 @@ impl RedbPersistence {
                     ));
                 }
                 receipts
-                    .insert(observed_graph_key!("graph_lifecycle", "insert", rk.as_slice(), 6), receipt(d, count, 0).as_slice())
+                    .insert(
+                        observed_graph_key!("graph_lifecycle", "insert", rk.as_slice(), 6),
+                        receipt(d, count, 0).as_slice(),
+                    )
                     .map_err(Self::storage_error)?;
             }
         }
@@ -183,7 +193,8 @@ impl RedbPersistence {
         write
             .open_table(GRAPH_CONTRIBUTIONS)
             .map_err(Self::storage_error)?
-            .insert(observed_graph_key!("graph_contribution", "insert", ck.as_slice(), 4),
+            .insert(
+                observed_graph_key!("graph_contribution", "insert", ck.as_slice(), 4),
                 digest_value(contribution_digest(true, &p, encoded)?).as_slice(),
             )
             .map_err(Self::storage_error)?;
@@ -197,7 +208,7 @@ impl RedbPersistence {
         Self::require_graph_proof_tables_in_write(write)?;
         let (_, _, _, _, lsn) = parse_physical_predecessor(p)?;
         #[cfg(any(test, feature = "test-seams"))]
-crate::read_work_probe::note_graph("graph_payload", "payload_decode", &[], None, None);
+        crate::read_work_probe::note_graph("graph_payload", "payload_decode", &[], None, None);
 
         let edge: AdjEntry = Self::decode(encoded)?;
         if Self::graph_fwd_key(&edge).as_slice() != p {
@@ -208,7 +219,12 @@ crate::read_work_probe::note_graph("graph_payload", "payload_decode", &[], None,
             .open_table(GRAPH_CONTRIBUTIONS)
             .map_err(Self::storage_error)?;
         let removed = contributions
-            .remove(observed_graph_key!("graph_contribution", "remove", ck.as_slice(), 4))
+            .remove(observed_graph_key!(
+                "graph_contribution",
+                "remove",
+                ck.as_slice(),
+                4
+            ))
             .map_err(Self::storage_error)?
             .ok_or_else(|| corrupt("reclaimed graph creation contribution is missing"))?;
         if removed.value() != digest_value(contribution_digest(true, p, encoded)?).as_slice() {
@@ -229,7 +245,10 @@ crate::read_work_probe::note_graph("graph_payload", "payload_decode", &[], None,
                     return Err(corrupt("reclaimed graph predecessor is already retired"));
                 }
                 receipts
-                    .insert(observed_graph_key!("graph_lifecycle", "insert", rk.as_slice(), 6), receipt(d, count, 1).as_slice())
+                    .insert(
+                        observed_graph_key!("graph_lifecycle", "insert", rk.as_slice(), 6),
+                        receipt(d, count, 1).as_slice(),
+                    )
                     .map_err(Self::storage_error)?;
             }
         }
@@ -273,12 +292,27 @@ crate::read_work_probe::note_graph("graph_payload", "payload_decode", &[], None,
             .map_err(Self::storage_error)?;
         {
             let final_keys = write.open_table(FINAL).map_err(Self::storage_error)?;
-            for item in fwd.iter().map_err(Self::storage_error)?.inspect(|_entry| { #[cfg(any(test, feature = "test-seams"))] if let Ok((key, _)) = _entry { crate::read_work_probe::graph_storage_key("graph_fwd", "iteration_step", key.value()); } }) {
+            for item in fwd.iter().map_err(Self::storage_error)?.inspect(|_entry| {
+                #[cfg(any(test, feature = "test-seams"))]
+                if let Ok((key, _)) = _entry {
+                    crate::read_work_probe::graph_storage_key(
+                        "graph_fwd",
+                        "iteration_step",
+                        key.value(),
+                    );
+                }
+            }) {
                 let (p, body) = item.map_err(Self::storage_error)?;
                 self.graph_writer_window(|| {
                     let selected = if let Some(types) = selected_types {
                         #[cfg(any(test, feature = "test-seams"))]
-                        crate::read_work_probe::note_graph("graph_payload", "payload_decode", p.value(), None, Some("replacement_type_selection"));
+                        crate::read_work_probe::note_graph(
+                            "graph_payload",
+                            "payload_decode",
+                            p.value(),
+                            None,
+                            Some("replacement_type_selection"),
+                        );
                         types.contains(&Self::decode::<AdjEntry>(body.value())?.edge_type)
                     } else {
                         true
@@ -290,7 +324,13 @@ crate::read_work_probe::note_graph("graph_payload", "payload_decode", &[], None,
                             .is_none()
                     {
                         #[cfg(any(test, feature = "test-seams"))]
-crate::read_work_probe::note_graph("graph_payload", "payload_decode", &[], None, None);
+                        crate::read_work_probe::note_graph(
+                            "graph_payload",
+                            "payload_decode",
+                            &[],
+                            None,
+                            None,
+                        );
 
                         let edge: AdjEntry = Self::decode(body.value())?;
                         let reverse = write
@@ -331,7 +371,7 @@ crate::read_work_probe::note_graph("graph_payload", "payload_decode", &[], None,
             .map_err(Self::storage_error)?
             .ok_or_else(|| corrupt("present predecessor forward projection is missing"))?;
         #[cfg(any(test, feature = "test-seams"))]
-crate::read_work_probe::note_graph("graph_payload", "payload_decode", &[], None, None);
+        crate::read_work_probe::note_graph("graph_payload", "payload_decode", &[], None, None);
 
         let edge: AdjEntry = Self::decode(body.value())?;
         if edge.source != source
@@ -359,7 +399,11 @@ crate::read_work_probe::note_graph("graph_payload", "payload_decode", &[], None,
             .open_table(GRAPH_CONTRIBUTIONS)
             .map_err(Self::storage_error)?;
         let proof = c
-            .get(observed_graph_key!("graph_contribution", "get", ck.as_slice()))
+            .get(observed_graph_key!(
+                "graph_contribution",
+                "get",
+                ck.as_slice()
+            ))
             .map_err(Self::storage_error)?
             .ok_or_else(|| corrupt("predecessor creation contribution is missing"))?;
         if proof.value() != digest_value(contribution_digest(true, p, body.value())?).as_slice() {
@@ -393,7 +437,11 @@ crate::read_work_probe::note_graph("graph_payload", "payload_decode", &[], None,
             || write
                 .open_table(GRAPH_CONTRIBUTIONS)
                 .map_err(Self::storage_error)?
-                .get(observed_graph_key!("graph_contribution", "get", creation_contribution_key(p)?.as_slice()))
+                .get(observed_graph_key!(
+                    "graph_contribution",
+                    "get",
+                    creation_contribution_key(p)?.as_slice()
+                ))
                 .map_err(Self::storage_error)?
                 .is_some()
         {
@@ -424,7 +472,17 @@ crate::read_work_probe::note_graph("graph_payload", "payload_decode", &[], None,
                 .map_err(Self::storage_error)?;
             for item in fwd
                 .range(prefix.as_slice()..)
-                .map_err(Self::storage_error)?.inspect(|_entry| { #[cfg(any(test, feature = "test-seams"))] if let Ok((key, _)) = _entry { crate::read_work_probe::graph_storage_key("graph_fwd", "iteration_step", key.value()); } })
+                .map_err(Self::storage_error)?
+                .inspect(|_entry| {
+                    #[cfg(any(test, feature = "test-seams"))]
+                    if let Ok((key, _)) = _entry {
+                        crate::read_work_probe::graph_storage_key(
+                            "graph_fwd",
+                            "iteration_step",
+                            key.value(),
+                        );
+                    }
+                })
             {
                 let (p, body) = item.map_err(Self::storage_error)?;
                 if !p.value().starts_with(&prefix) {
@@ -436,7 +494,13 @@ crate::read_work_probe::note_graph("graph_payload", "payload_decode", &[], None,
                         return Ok(None);
                     }
                     #[cfg(any(test, feature = "test-seams"))]
-crate::read_work_probe::note_graph("graph_payload", "payload_decode", &[], None, None);
+                    crate::read_work_probe::note_graph(
+                        "graph_payload",
+                        "payload_decode",
+                        &[],
+                        None,
+                        None,
+                    );
 
                     let edge: AdjEntry = Self::decode(body.value())?;
                     if Self::graph_fwd_key(&edge).as_slice() != p.value() {
@@ -469,7 +533,11 @@ crate::read_work_probe::note_graph("graph_payload", "payload_decode", &[], None,
                         .open_table(GRAPH_CONTRIBUTIONS)
                         .map_err(Self::storage_error)?;
                     let proof = c
-                        .get(observed_graph_key!("graph_contribution", "get", ck.as_slice()))
+                        .get(observed_graph_key!(
+                            "graph_contribution",
+                            "get",
+                            ck.as_slice()
+                        ))
                         .map_err(Self::storage_error)?
                         .ok_or_else(|| corrupt("physical candidate contribution absent"))?;
                     if proof.value()
@@ -479,7 +547,13 @@ crate::read_work_probe::note_graph("graph_payload", "payload_decode", &[], None,
                         return Err(corrupt("physical candidate digest mismatch"));
                     }
                     Self::require_graph_commit_in_write(write, lsn, tx, true, "predecessor")?;
-                    Self::require_graph_commit_in_write(write, deletion_lsn, d, false, "requested_own")?;
+                    Self::require_graph_commit_in_write(
+                        write,
+                        deletion_lsn,
+                        d,
+                        false,
+                        "requested_own",
+                    )?;
                     Ok(Some((d, lsn, tx)))
                 })?;
                 if let Some((d, lsn, tx)) = candidate
@@ -487,17 +561,17 @@ crate::read_work_probe::note_graph("graph_payload", "payload_decode", &[], None,
                         .as_ref()
                         .is_none_or(|(_, _, order)| (lsn, tx) > *order)
                 {
-                        if let Some((old, old_d, old_order)) = &mut winner {
-                            if old.len() != p.value().len() {
-                                return Err(corrupt("identity predecessor width changed"));
-                            }
-                            old.copy_from_slice(p.value());
-                            *old_d = d;
-                            *old_order = (lsn, tx);
-                        } else {
-                            crate::read_image_memory::reserve(p.value().len())?;
-                            winner = Some((p.value().to_vec(), d, (lsn, tx)));
+                    if let Some((old, old_d, old_order)) = &mut winner {
+                        if old.len() != p.value().len() {
+                            return Err(corrupt("identity predecessor width changed"));
                         }
+                        old.copy_from_slice(p.value());
+                        *old_d = d;
+                        *old_order = (lsn, tx);
+                    } else {
+                        crate::read_image_memory::reserve(p.value().len())?;
+                        winner = Some((p.value().to_vec(), d, (lsn, tx)));
+                    }
                 }
             }
         }
@@ -515,7 +589,20 @@ crate::read_work_probe::note_graph("graph_payload", "payload_decode", &[], None,
         let r = write
             .open_table(GRAPH_PREDECESSOR_LIFECYCLE)
             .map_err(Self::storage_error)?;
-        for item in r.range(rprefix.as_slice()..).map_err(Self::storage_error)?.inspect(|_entry| { #[cfg(any(test, feature = "test-seams"))] if let Ok((key, _)) = _entry { crate::read_work_probe::graph_storage_key("graph_lifecycle", "iteration_step", key.value()); } }) {
+        for item in r
+            .range(rprefix.as_slice()..)
+            .map_err(Self::storage_error)?
+            .inspect(|_entry| {
+                #[cfg(any(test, feature = "test-seams"))]
+                if let Ok((key, _)) = _entry {
+                    crate::read_work_probe::graph_storage_key(
+                        "graph_lifecycle",
+                        "iteration_step",
+                        key.value(),
+                    );
+                }
+            })
+        {
             let (key, value) = item.map_err(Self::storage_error)?;
             if !key.value().starts_with(&rprefix) {
                 break;
@@ -533,7 +620,13 @@ crate::read_work_probe::note_graph("graph_payload", "payload_decode", &[], None,
                 if lsn >= deletion_lsn {
                     return Ok(None);
                 }
-                Self::require_graph_commit_in_write(write, deletion_lsn, d, false, "requested_own")?;
+                Self::require_graph_commit_in_write(
+                    write,
+                    deletion_lsn,
+                    d,
+                    false,
+                    "requested_own",
+                )?;
                 if state == 0 {
                     Self::validate_present_predecessor_in_write(write, p, d)?;
                 } else {
@@ -614,8 +707,9 @@ crate::read_work_probe::note_graph("graph_payload", "payload_decode", &[], None,
                         let receipts = write
                             .open_table(GRAPH_PREDECESSOR_LIFECYCLE)
                             .map_err(Self::storage_error)?;
-                        if let Some(value) =
-                            receipts.get(observed_graph_key!("graph_lifecycle", "get", rk.as_slice())).map_err(Self::storage_error)?
+                        if let Some(value) = receipts
+                            .get(observed_graph_key!("graph_lifecycle", "get", rk.as_slice()))
+                            .map_err(Self::storage_error)?
                         {
                             let (d, count, _) = lifecycle(value.value())?;
                             if d != deletion_tx {
@@ -675,7 +769,11 @@ crate::read_work_probe::note_graph("graph_payload", "payload_decode", &[], None,
                 .open_table(GRAPH_OCCURRENCE_LOCATIONS)
                 .map_err(Self::storage_error)?;
             let loc = t
-                .get(observed_graph_key!("graph_location", "get", location_key(w.id).as_slice()))
+                .get(observed_graph_key!(
+                    "graph_location",
+                    "get",
+                    location_key(w.id).as_slice()
+                ))
                 .map_err(Self::storage_error)?
                 .ok_or_else(|| corrupt("graph occurrence location missing"))?;
             if loc.value() != location(position).as_slice() {
@@ -689,7 +787,11 @@ crate::read_work_probe::note_graph("graph_payload", "payload_decode", &[], None,
                 .map_err(Self::storage_error)?;
             let key = deletion_contribution_key(stored_lsn, &w);
             let proof = c
-                .get(observed_graph_key!("graph_contribution", "get", key.as_slice()))
+                .get(observed_graph_key!(
+                    "graph_contribution",
+                    "get",
+                    key.as_slice()
+                ))
                 .map_err(Self::storage_error)?
                 .ok_or_else(|| corrupt("graph deletion contribution missing"))?;
             if proof.value()
@@ -760,7 +862,11 @@ crate::read_work_probe::note_graph("graph_payload", "payload_decode", &[], None,
                 .open_table(GRAPH_CONTRIBUTIONS)
                 .map_err(Self::storage_error)?;
             let previous = c
-                .get(observed_graph_key!("graph_contribution", "get", old_key.as_slice()))
+                .get(observed_graph_key!(
+                    "graph_contribution",
+                    "get",
+                    old_key.as_slice()
+                ))
                 .map_err(Self::storage_error)?
                 .ok_or_else(|| corrupt("carried occurrence contribution missing"))?;
             if previous.value() != digest.as_slice() {
@@ -768,10 +874,22 @@ crate::read_work_probe::note_graph("graph_payload", "payload_decode", &[], None,
             }
             drop(previous);
             if old_lsn != final_lsn {
-                c.remove(observed_graph_key!("graph_contribution", "remove", old_key.as_slice(), 4)).map_err(Self::storage_error)?;
+                c.remove(observed_graph_key!(
+                    "graph_contribution",
+                    "remove",
+                    old_key.as_slice(),
+                    4
+                ))
+                .map_err(Self::storage_error)?;
             }
         } else {
-            Self::require_graph_commit_in_write(write, record.entry.lsn(), w.deletion_tx, false, "requested_own")?;
+            Self::require_graph_commit_in_write(
+                write,
+                record.entry.lsn(),
+                w.deletion_tx,
+                false,
+                "requested_own",
+            )?;
             let rk = lifecycle_key(&w.predecessor)?;
             let mut r = write
                 .open_table(GRAPH_PREDECESSOR_LIFECYCLE)
@@ -800,7 +918,8 @@ crate::read_work_probe::note_graph("graph_payload", "payload_decode", &[], None,
                 Self::validate_present_predecessor_in_write(write, &w.predecessor, w.deletion_tx)?;
                 (1, 0)
             };
-            r.insert(observed_graph_key!("graph_lifecycle", "insert", rk.as_slice(), 6),
+            r.insert(
+                observed_graph_key!("graph_lifecycle", "insert", rk.as_slice(), 6),
                 receipt(w.deletion_tx, count, state).as_slice(),
             )
             .map_err(Self::storage_error)?;
@@ -808,14 +927,23 @@ crate::read_work_probe::note_graph("graph_payload", "payload_decode", &[], None,
         write
             .open_table(GRAPH_CONTRIBUTIONS)
             .map_err(Self::storage_error)?
-            .insert(observed_graph_key!("graph_contribution", "insert", deletion_contribution_key(final_lsn, &w).as_slice(), 4),
+            .insert(
+                observed_graph_key!(
+                    "graph_contribution",
+                    "insert",
+                    deletion_contribution_key(final_lsn, &w).as_slice(),
+                    4
+                ),
                 digest.as_slice(),
             )
             .map_err(Self::storage_error)?;
         write
             .open_table(GRAPH_OCCURRENCE_LOCATIONS)
             .map_err(Self::storage_error)?
-            .insert(observed_graph_key!("graph_location", "insert", tk.as_slice(), 7), location(position).as_slice())
+            .insert(
+                observed_graph_key!("graph_location", "insert", tk.as_slice(), 7),
+                location(position).as_slice(),
+            )
             .map_err(Self::storage_error)?;
         Ok(())
     }
@@ -833,7 +961,12 @@ crate::read_work_probe::note_graph("graph_payload", "payload_decode", &[], None,
             .open_table(GRAPH_OCCURRENCE_LOCATIONS)
             .map_err(Self::storage_error)?;
         let loc = locations
-            .remove(observed_graph_key!("graph_location", "remove", tk.as_slice(), 7))
+            .remove(observed_graph_key!(
+                "graph_location",
+                "remove",
+                tk.as_slice(),
+                7
+            ))
             .map_err(Self::storage_error)?
             .ok_or_else(|| corrupt("removed occurrence location missing"))?;
         if loc.value() != location(position).as_slice() {
@@ -847,7 +980,12 @@ crate::read_work_probe::note_graph("graph_payload", "payload_decode", &[], None,
             .open_table(GRAPH_CONTRIBUTIONS)
             .map_err(Self::storage_error)?;
         let value = contributions
-            .remove(observed_graph_key!("graph_contribution", "remove", key.as_slice(), 4))
+            .remove(observed_graph_key!(
+                "graph_contribution",
+                "remove",
+                key.as_slice(),
+                4
+            ))
             .map_err(Self::storage_error)?
             .ok_or_else(|| corrupt("removed occurrence contribution missing"))?;
         if value.value()
@@ -873,19 +1011,36 @@ crate::read_work_probe::note_graph("graph_payload", "payload_decode", &[], None,
             .checked_sub(1)
             .ok_or_else(|| corrupt("graph reference count underflow"))?;
         if next == 0 {
-            r.remove(observed_graph_key!("graph_lifecycle", "remove", rk.as_slice(), 6)).map_err(Self::storage_error)?;
+            r.remove(observed_graph_key!(
+                "graph_lifecycle",
+                "remove",
+                rk.as_slice(),
+                6
+            ))
+            .map_err(Self::storage_error)?;
         } else {
-            r.insert(observed_graph_key!("graph_lifecycle", "insert", rk.as_slice(), 6), receipt(d, next, state).as_slice())
-                .map_err(Self::storage_error)?;
+            r.insert(
+                observed_graph_key!("graph_lifecycle", "insert", rk.as_slice(), 6),
+                receipt(d, next, state).as_slice(),
+            )
+            .map_err(Self::storage_error)?;
         }
         Ok(())
     }
     pub(super) fn final_graph_receipts_nonempty(write: &redb::WriteTransaction) -> Result<bool> {
         Self::require_graph_proof_tables_in_write(write)?;
-        let table = write.open_table(GRAPH_PREDECESSOR_LIFECYCLE).map_err(Self::storage_error)?;
+        let table = write
+            .open_table(GRAPH_PREDECESSOR_LIFECYCLE)
+            .map_err(Self::storage_error)?;
         let first = table.first().map_err(Self::storage_error)?;
         #[cfg(any(test, feature = "test-seams"))]
-        crate::read_work_probe::note_graph("graph_lifecycle", "support_probe", first.as_ref().map_or(&[][..], |(key, _)| key.value()), None, Some("final_nonempty_receipts"));
+        crate::read_work_probe::note_graph(
+            "graph_lifecycle",
+            "support_probe",
+            first.as_ref().map_or(&[][..], |(key, _)| key.value()),
+            None,
+            Some("final_nonempty_receipts"),
+        );
         Ok(first.is_some())
     }
     pub(super) fn has_graph_creation_at_lsn(
@@ -898,7 +1053,19 @@ crate::read_work_probe::note_graph("graph_payload", "payload_decode", &[], None,
         let c = write
             .open_table(GRAPH_CONTRIBUTIONS)
             .map_err(Self::storage_error)?;
-        let mut range = c.range(prefix.as_slice()..).map_err(Self::storage_error)?.inspect(|_entry| { #[cfg(any(test, feature = "test-seams"))] if let Ok((key, _)) = _entry { crate::read_work_probe::graph_storage_key("graph_contribution", "iteration_step", key.value()); } });
+        let mut range = c
+            .range(prefix.as_slice()..)
+            .map_err(Self::storage_error)?
+            .inspect(|_entry| {
+                #[cfg(any(test, feature = "test-seams"))]
+                if let Ok((key, _)) = _entry {
+                    crate::read_work_probe::graph_storage_key(
+                        "graph_contribution",
+                        "iteration_step",
+                        key.value(),
+                    );
+                }
+            });
         let Some((key, _)) = range.next().transpose().map_err(Self::storage_error)? else {
             return Ok(false);
         };
@@ -1001,7 +1168,20 @@ impl RedbPersistence {
                     return Err(corrupt("history primary and selector populations disagree"));
                 }
                 drop(primary);
-                for item in source.iter().map_err(Self::storage_error)?.inspect(|_entry| { #[cfg(any(test, feature = "test-seams"))] if let Ok((key, _)) = _entry { crate::read_work_probe::graph_storage_key("history", "iteration_step", key.value()); } }) {
+                for item in source
+                    .iter()
+                    .map_err(Self::storage_error)?
+                    .inspect(|_entry| {
+                        #[cfg(any(test, feature = "test-seams"))]
+                        if let Ok((key, _)) = _entry {
+                            crate::read_work_probe::graph_storage_key(
+                                "history",
+                                "iteration_step",
+                                key.value(),
+                            );
+                        }
+                    })
+                {
                     let (position, bytes) = item.map_err(Self::storage_error)?;
                     self.stage_old_graph_history_match(
                         write,
@@ -1016,8 +1196,9 @@ impl RedbPersistence {
                     .map_err(Self::storage_error)?;
                 for item in target.iter().map_err(Self::storage_error)? {
                     let (position, _) = item.map_err(Self::storage_error)?;
-                    if let Some(bytes) =
-                        source.get(observed_graph_key!("history", "get", position.value())).map_err(Self::storage_error)?
+                    if let Some(bytes) = source
+                        .get(observed_graph_key!("history", "get", position.value()))
+                        .map_err(Self::storage_error)?
                     {
                         self.stage_old_graph_history_match(
                             write,
@@ -1210,7 +1391,21 @@ impl RedbPersistence {
                         }),
                         std::ops::Bound::Unbounded,
                     ))
-                    .map_err(Self::storage_error)?.inspect(|_entry| { #[cfg(any(test, feature = "test-seams"))] if let Ok((key, _)) = _entry { crate::read_work_probe::graph_storage_key(if whole { "history" } else { "history_match_target" }, "iteration_step", key.value()); } });
+                    .map_err(Self::storage_error)?
+                    .inspect(|_entry| {
+                        #[cfg(any(test, feature = "test-seams"))]
+                        if let Ok((key, _)) = _entry {
+                            crate::read_work_probe::graph_storage_key(
+                                if whole {
+                                    "history"
+                                } else {
+                                    "history_match_target"
+                                },
+                                "iteration_step",
+                                key.value(),
+                            );
+                        }
+                    });
                 let Some((p, _)) = range.next().transpose().map_err(Self::storage_error)? else {
                     return Ok(None);
                 };
@@ -1284,8 +1479,7 @@ impl RedbPersistence {
                             std::ops::Bound::Unbounded,
                         ))
                         .map_err(Self::storage_error)?;
-                    let Some((p, bytes)) =
-                        range.next().transpose().map_err(Self::storage_error)?
+                    let Some((p, bytes)) = range.next().transpose().map_err(Self::storage_error)?
                     else {
                         return Ok(None);
                     };
@@ -1301,10 +1495,16 @@ impl RedbPersistence {
                     write
                         .open_table(CHANGE_LOG_TABLE)
                         .map_err(Self::storage_error)?
-                        .insert(observed_graph_key!("history", "insert", key.as_str(), 8), bytes.value())
+                        .insert(
+                            observed_graph_key!("history", "insert", key.as_str(), 8),
+                            bytes.value(),
+                        )
                         .map_err(Self::storage_error)?;
                     Self::write_change_log_selectors_in_write(write, &key, bytes.value())?;
-                    (position, Self::stored_change_log_mutation(&key, bytes.value())?)
+                    (
+                        position,
+                        Self::stored_change_log_mutation(&key, bytes.value())?,
+                    )
                 };
                 let (position, mutation) = next;
                 Self::apply_content_identity_mutations_in_write(
@@ -1340,7 +1540,11 @@ impl RedbPersistence {
             .map_err(Self::storage_error)?;
         let mut mutations = Vec::new();
         for lsn in lsns {
-            if table.get(observed_graph_key!("commit_index", "get", lsn.0, "support")).map_err(Self::storage_error)?.is_none() {
+            if table
+                .get(observed_graph_key!("commit_index", "get", lsn.0, "support"))
+                .map_err(Self::storage_error)?
+                .is_none()
+            {
                 mutations.push(content_identity::remove_commit_index_mutation(*lsn));
             }
         }
@@ -1518,10 +1722,26 @@ impl RedbPersistence {
             .open_table(GRAPH_CONTRIBUTIONS)
             .map_err(Self::storage_error)?;
         #[cfg(any(test, feature = "test-seams"))]
-crate::read_work_probe::note_graph("graph_contribution", "maximum_seek", &low, Some(contextdb_core::Lsn(address.0)), None);
+        crate::read_work_probe::note_graph(
+            "graph_contribution",
+            "maximum_seek",
+            &low,
+            Some(contextdb_core::Lsn(address.0)),
+            None,
+        );
         let mut range = c
             .range::<&[u8]>(low.as_slice()..high.as_slice())
-            .map_err(Self::storage_error)?.inspect(|_entry| { #[cfg(any(test, feature = "test-seams"))] if let Ok((key, _)) = _entry { crate::read_work_probe::graph_storage_key("graph_contribution", "iteration_step", key.value()); } });
+            .map_err(Self::storage_error)?
+            .inspect(|_entry| {
+                #[cfg(any(test, feature = "test-seams"))]
+                if let Ok((key, _)) = _entry {
+                    crate::read_work_probe::graph_storage_key(
+                        "graph_contribution",
+                        "iteration_step",
+                        key.value(),
+                    );
+                }
+            });
         let (key, digest) = range
             .next_back()
             .transpose()
@@ -1558,7 +1778,13 @@ crate::read_work_probe::note_graph("graph_contribution", "maximum_seek", &low, S
                     .map_err(Self::storage_error)?
                     .ok_or_else(|| corrupt("creation maximum source missing"))?;
                 #[cfg(any(test, feature = "test-seams"))]
-crate::read_work_probe::note_graph("graph_payload", "payload_decode", &[], None, None);
+                crate::read_work_probe::note_graph(
+                    "graph_payload",
+                    "payload_decode",
+                    &[],
+                    None,
+                    None,
+                );
 
                 let edge: AdjEntry = Self::decode(body.value())?;
                 if Self::graph_fwd_key(&edge).as_slice() != p {
@@ -1596,7 +1822,11 @@ crate::read_work_probe::note_graph("graph_payload", "payload_decode", &[], None,
                     .open_table(GRAPH_OCCURRENCE_LOCATIONS)
                     .map_err(Self::storage_error)?;
                 let loc = locations
-                    .get(observed_graph_key!("graph_location", "get", location_key(id).as_slice()))
+                    .get(observed_graph_key!(
+                        "graph_location",
+                        "get",
+                        location_key(id).as_slice()
+                    ))
                     .map_err(Self::storage_error)?
                     .ok_or_else(|| corrupt("deletion maximum location missing"))?;
                 if loc.value().len() != 17 || loc.value()[0] != 1 {
@@ -1632,7 +1862,13 @@ crate::read_work_probe::note_graph("graph_payload", "payload_decode", &[], None,
                 {
                     return Err(corrupt("deletion maximum source digest mismatch"));
                 }
-                Self::require_graph_commit_in_write(write, record.entry.lsn(), q, false, "maximum_source")?;
+                Self::require_graph_commit_in_write(
+                    write,
+                    record.entry.lsn(),
+                    q,
+                    false,
+                    "maximum_source",
+                )?;
             }
             _ => return Err(corrupt("unknown graph maximum contribution kind")),
         }

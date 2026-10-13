@@ -2627,11 +2627,23 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
         // At most N distinct visited nodes, one pending candidate per node,
         // ef return/discarded nodes and conversion heaps. Eight full-capacity
         // heap buffers dominate their simultaneous old/new growth buffers.
-        let heaps = n.checked_next_power_of_two()?.checked_mul(8)?.checked_mul(heap_slot)?;
-        let maps = buckets.checked_mul(map_slot)?.checked_mul(2)?.checked_add(32)?;
+        let heaps = n
+            .checked_next_power_of_two()?
+            .checked_mul(8)?
+            .checked_mul(heap_slot)?;
+        let maps = buckets
+            .checked_mul(map_slot)?
+            .checked_mul(2)?
+            .checked_add(32)?;
         // Copy one reciprocal list and prune it while its old list stays live.
-        let links = m.checked_mul(2)?.checked_add(1)?.checked_mul(8)?.checked_mul(heap_slot)?;
-        maps.checked_add(heaps)?.checked_add(links)?.checked_add(4096)
+        let links = m
+            .checked_mul(2)?
+            .checked_add(1)?
+            .checked_mul(8)?
+            .checked_mul(heap_slot)?;
+        maps.checked_add(heaps)?
+            .checked_add(links)?
+            .checked_add(4096)
     }
 
     pub fn get_point_indexation(&self) -> &PointIndexation<'b, T> {

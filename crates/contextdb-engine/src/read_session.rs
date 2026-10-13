@@ -3651,7 +3651,9 @@ impl OwnerRoute {
         limits: ReadLimits,
         request: crate::local_transport::LocalRequest,
         cancellation: Option<&OwnerReadCancellation>,
-        #[cfg(any(test, feature = "test-seams"))] observer: Option<&Arc<dyn ReadSessionTestObserver>>,
+        #[cfg(any(test, feature = "test-seams"))] observer: Option<
+            &Arc<dyn ReadSessionTestObserver>,
+        >,
     ) -> Result<Vec<crate::local_transport::LocalResponse>> {
         self.ask_with_cursor_memory(
             limits,
@@ -3669,7 +3671,9 @@ impl OwnerRoute {
         request: crate::local_transport::LocalRequest,
         cancellation: Option<&OwnerReadCancellation>,
         cursor_memory: Option<u64>,
-        #[cfg(any(test, feature = "test-seams"))] observer: Option<&Arc<dyn ReadSessionTestObserver>>,
+        #[cfg(any(test, feature = "test-seams"))] observer: Option<
+            &Arc<dyn ReadSessionTestObserver>,
+        >,
     ) -> Result<Vec<crate::local_transport::LocalResponse>> {
         self.resources.note_channel_operation();
         let progress = crate::read_progress::observer_for_this_read();
@@ -4545,9 +4549,7 @@ impl OwnerGroupBaseline {
             memory: memory.clone(),
             bytes,
         };
-        let groups = trace
-            .groups.to_vec()
-            .into_boxed_slice();
+        let groups = trace.groups.to_vec().into_boxed_slice();
         let ordinals = trace
             .groups
             .iter()
@@ -4640,13 +4642,14 @@ impl OwnerCursorContinuation {
                 .limits
                 .cursor_page_rows
                 .min(self.delivered.max(1) as u64);
-            let reader = crate::direct_file_reader::DirectFileReader::from_owner_snapshot_with_cancellation(
-                &self.path,
-                config,
-                registration,
-                cancellation,
-            )
-            .map_err(|error| direct_error(&self.path, error))?;
+            let reader =
+                crate::direct_file_reader::DirectFileReader::from_owner_snapshot_with_cancellation(
+                    &self.path,
+                    config,
+                    registration,
+                    cancellation,
+                )
+                .map_err(|error| direct_error(&self.path, error))?;
             let (opened, examined, open_observation) =
                 crate::executor::bounded::with_cursor_open_work(|| {
                     reader.open_cursor_with_cancellation(
@@ -4929,24 +4932,25 @@ impl OwnedCursorExecution for OwnerCursorExecution {
             return Ok(Some(observation));
         }
         if let Some(continuation) = self.continuation.as_ref()
-            && let Some(cursor) = &continuation.cursor {
-                let observation = cursor
-                    .work_observation()
-                    .map_err(|error| direct_error(&continuation.path, error))?;
-                return observation
-                    .map(|observation| {
-                        let mut observation = self.merge_replay_groups(observation)?;
-                        observation.rows_examined = self
-                            .owner_rows_examined
-                            .checked_add(continuation.discarded_rows_examined)
-                            .and_then(|total| total.checked_add(observation.rows_examined))
-                            .ok_or_else(|| {
-                                Error::Other("cursor rows-examined counter overflow".into())
-                            })?;
-                        Ok(observation)
-                    })
-                    .transpose();
-            }
+            && let Some(cursor) = &continuation.cursor
+        {
+            let observation = cursor
+                .work_observation()
+                .map_err(|error| direct_error(&continuation.path, error))?;
+            return observation
+                .map(|observation| {
+                    let mut observation = self.merge_replay_groups(observation)?;
+                    observation.rows_examined = self
+                        .owner_rows_examined
+                        .checked_add(continuation.discarded_rows_examined)
+                        .and_then(|total| total.checked_add(observation.rows_examined))
+                        .ok_or_else(|| {
+                            Error::Other("cursor rows-examined counter overflow".into())
+                        })?;
+                    Ok(observation)
+                })
+                .transpose();
+        }
         Ok(None)
     }
     fn take_work_trace_charge(&mut self) -> Option<Arc<OwnerTraceCharge>> {
@@ -5445,15 +5449,16 @@ impl ReadCursor {
         let _ = (&self.state.observer, &self.state.kernel_observer);
         let fetched = execution.fetch(rows, cancellation);
         if fetched.is_err()
-            && let Ok(Some(observation)) = execution.work_observation() {
-                let observation = observation
-                    .unpublished_groups_withdrawn()
-                    .map_err(read_error)?;
-                (self.trace, self.observation) = take_cursor_observation(observation);
-                if let Some(charge) = execution.take_work_trace_charge() {
-                    self.owner_trace_charge = Some(charge);
-                }
+            && let Ok(Some(observation)) = execution.work_observation()
+        {
+            let observation = observation
+                .unpublished_groups_withdrawn()
+                .map_err(read_error)?;
+            (self.trace, self.observation) = take_cursor_observation(observation);
+            if let Some(charge) = execution.take_work_trace_charge() {
+                self.owner_trace_charge = Some(charge);
             }
+        }
         if fetched.is_err() && !execution.is_live() {
             let _ = execution.close();
         }

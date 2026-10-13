@@ -2886,8 +2886,10 @@ fn assert_sequential_vector_source_unit_credit() {
                 Lsn(initial_lsn.0 + unit as u64),
                 "a cut follows the real durable source-unit commit, in order"
             );
-            assert_eq!(cut.used, 257,
-                "after unit {unit}, no earlier materialized copy credit survives into the next unit");
+            assert_eq!(
+                cut.used, 257,
+                "after unit {unit}, no earlier materialized copy credit survives into the next unit"
+            );
         }
         assert_eq!(
             credit.before_caller_drop, 257,

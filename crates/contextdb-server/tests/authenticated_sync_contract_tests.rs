@@ -1345,9 +1345,7 @@ async fn a_maintained_count_declaration_crosses_sync_or_holds_back_its_table() {
     assert!(
         matches!(
             count.trace.maintained_count.as_deref(),
-            Some(
-                contextdb_engine::maintained_counts::MaintainedCountDisclosure::Used { .. }
-            )
+            Some(contextdb_engine::maintained_counts::MaintainedCountDisclosure::Used { .. })
         ),
         "a writable handle serves the same exact maintained count: {:?}",
         count.trace.maintained_count

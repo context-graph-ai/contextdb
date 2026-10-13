@@ -170,10 +170,12 @@ fn canonical_incremental_insert_delete_cascades_match_sorted_rebuild_and_compact
     RedbPersistence::initialize_content_identity_in_write(&write).unwrap();
     write.commit().unwrap();
     let schema_fixture = crate::Database::open_memory();
-    schema_fixture.execute(
-        "CREATE TABLE fixture (id INTEGER PRIMARY KEY)",
-        &std::collections::HashMap::new(),
-    ).unwrap();
+    schema_fixture
+        .execute(
+            "CREATE TABLE fixture (id INTEGER PRIMARY KEY)",
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
     let schema_meta = schema_fixture.table_meta("fixture").unwrap();
     for family in LogicalFamily::ALL {
         let records = (0..4096u64)
@@ -182,7 +184,11 @@ fn canonical_incremental_insert_delete_cascades_match_sorted_rebuild_and_compact
                     let name = format!("fixture_{i:016x}");
                     schema_mutations(&name, &schema_meta).unwrap().remove(0)
                 } else if family == LogicalFamily::Configuration {
-                    ContentIdentityMutation::put(family, format!("fixture_{i:016x}").into_bytes(), (i * 7).to_be_bytes().to_vec())
+                    ContentIdentityMutation::put(
+                        family,
+                        format!("fixture_{i:016x}").into_bytes(),
+                        (i * 7).to_be_bytes().to_vec(),
+                    )
                 } else {
                     ContentIdentityMutation::put(
                         family,

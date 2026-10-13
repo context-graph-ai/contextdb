@@ -18,8 +18,11 @@ use crate::transport::adapter::{self, BlobStoreHandle, FetchFailure, FetchVerdic
 use crate::transport::iroh::IrohServer;
 use crate::vector_read_memory::ReadRequestBudgetProvider;
 use crate::work_ledger::{
-    BlobHash, MovementPolicy, any_node_holds_claim_for_blob_with_read_memory as any_node_holds_claim_for_blob, blob_ref_retention_eligible_with_read_memory as blob_ref_retention_eligible,
-    node_claim_permits_movement_with_read_memory as node_claim_permits_movement, node_holds_claim_for_blob_with_read_memory as node_holds_claim_for_blob,
+    BlobHash, MovementPolicy,
+    any_node_holds_claim_for_blob_with_read_memory as any_node_holds_claim_for_blob,
+    blob_ref_retention_eligible_with_read_memory as blob_ref_retention_eligible,
+    node_claim_permits_movement_with_read_memory as node_claim_permits_movement,
+    node_holds_claim_for_blob_with_read_memory as node_holds_claim_for_blob,
 };
 use contextdb_core::{Error, Result, Wallclock, read_memory::ReadMemoryBudget};
 #[cfg(any(test, feature = "test-seams"))]
@@ -469,18 +472,23 @@ impl BlobStore {
                 // same-thread root scope, then captures its updated root once.
                 let authorize = || -> Result<Option<FetchVerdict>> {
                     let _read = db.writer_temporary_output_scope(read_memory.clone())?;
-                    if !node_holds_claim_for_blob(
-                        &db, &node_id, &hash, now, read_memory.clone(),
-                    )? {
+                    if !node_holds_claim_for_blob(&db, &node_id, &hash, now, read_memory.clone())? {
                         return Ok(None);
                     }
-                    Ok(Some(if node_claim_permits_movement(
-                        &db, &node_id, &hash, policy, now, read_memory.clone(),
-                    )? {
-                        FetchVerdict::Allow(read_memory.clone())
-                    } else {
-                        FetchVerdict::PolicyForbidden
-                    }))
+                    Ok(Some(
+                        if node_claim_permits_movement(
+                            &db,
+                            &node_id,
+                            &hash,
+                            policy,
+                            now,
+                            read_memory.clone(),
+                        )? {
+                            FetchVerdict::Allow(read_memory.clone())
+                        } else {
+                            FetchVerdict::PolicyForbidden
+                        },
+                    ))
                 };
                 match authorize() {
                     Ok(Some(verdict)) => return verdict,
@@ -584,8 +592,12 @@ impl BlobStore {
         holder_ticket: &str,
         sink: &mut (dyn Write + Send),
     ) -> std::result::Result<u64, ResolveError> {
-        let read_memory = self.db.declared_reader_memory().map_err(ResolveError::LedgerRead)?;
-        self.resolve_blob_ref_with_read_memory(read_memory, hash, holder_ticket, sink).await
+        let read_memory = self
+            .db
+            .declared_reader_memory()
+            .map_err(ResolveError::LedgerRead)?;
+        self.resolve_blob_ref_with_read_memory(read_memory, hash, holder_ticket, sink)
+            .await
     }
 
     /// Resolve using the executing host operation's READ owner.
@@ -604,7 +616,9 @@ impl BlobStore {
         // holder's own `node_holds_claim_for_blob` check against the
         // authenticated peer identity is the actual security boundary.
         let entitled = {
-            let _read = self.db.writer_temporary_output_scope(read_memory.clone())
+            let _read = self
+                .db
+                .writer_temporary_output_scope(read_memory.clone())
                 .map_err(ResolveError::LedgerRead)?;
             any_node_holds_claim_for_blob(&self.db, hash, self.now_ms(), read_memory.clone())
         };
@@ -956,7 +970,11 @@ impl BlobStore {
     /// store's GC interval. Returns the count reclaimed. One operation child
     /// funds the captured ledger root throughout the sweep.
     pub fn reclaim_unreferenced(&self, now_ms: i64, grace_ms: i64) -> Result<usize> {
-        self.reclaim_unreferenced_with_read_memory(self.db.declared_reader_memory()?, now_ms, grace_ms)
+        self.reclaim_unreferenced_with_read_memory(
+            self.db.declared_reader_memory()?,
+            now_ms,
+            grace_ms,
+        )
     }
 
     /// Reclaim using the executing host operation's READ owner.
@@ -1007,9 +1025,9 @@ impl BlobStore {
             loop {
                 ticker.tick().await;
                 let now = Wallclock::now().0 as i64;
-                let result = read_budgets
-                    .request_budget()
-                    .and_then(|read_memory| self.reclaim_unreferenced_with_read_memory(read_memory, now, grace_ms));
+                let result = read_budgets.request_budget().and_then(|read_memory| {
+                    self.reclaim_unreferenced_with_read_memory(read_memory, now, grace_ms)
+                });
                 if let Err(err) = result {
                     tracing::warn!("blob reclaim sweep failed: {err}");
                 }

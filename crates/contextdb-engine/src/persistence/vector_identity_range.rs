@@ -1,6 +1,6 @@
 //! Key-only vector identities for admitted schema and integrity walks.
 use super::*;
-use crate::memory_accounting::{OwnedMemoryReservation};
+use crate::memory_accounting::OwnedMemoryReservation;
 use std::ops::Bound;
 
 pub(crate) struct VectorBodyIdentity {

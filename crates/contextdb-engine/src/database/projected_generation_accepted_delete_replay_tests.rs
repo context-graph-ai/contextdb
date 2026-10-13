@@ -288,7 +288,11 @@ fn durable_accepted_delete_classification_restores_the_retained_reader_root() {
         .expect("classify at the current durable frontier while the reply retains its old root");
     assert!(suppressed.changes.rows.is_empty());
     assert!(suppressed.suppressed_live_replay);
-    let observed_identity = receiver.writer_read_root().unwrap().unwrap().storage_identity();
+    let observed_identity = receiver
+        .writer_read_root()
+        .unwrap()
+        .unwrap()
+        .storage_identity();
     assert!(observed_identity.transaction_id >= physical.transaction_id);
     assert_eq!(observed_identity.user_root, physical.user_root);
     let fixture_operation_reader_7 = receiver

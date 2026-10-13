@@ -8,7 +8,8 @@
 //! alone: a step that freed a page the reader still needed would let a later write overwrite it.
 
 use redb::{
-    Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, ReclaimBoundary, ReclaimStep, TableDefinition,
+    Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, ReclaimBoundary, ReclaimStep,
+    TableDefinition,
 };
 use std::path::Path;
 
@@ -86,7 +87,9 @@ fn churn(db: &Database, generation: u64) {
     {
         let mut table = tx.open_table(TABLE).unwrap();
         for key in (0..ROWS).step_by(3) {
-            table.insert(key, payload(generation, key).as_slice()).unwrap();
+            table
+                .insert(key, payload(generation, key).as_slice())
+                .unwrap();
         }
     }
     tx.commit().unwrap();
@@ -109,13 +112,21 @@ fn assert_snapshot(read: &redb::ReadTransaction, generation: u64) {
         (row.0.value(), row.1.value().to_vec())
     }) {
         let expected = if key % 3 == 0 { generation } else { 0 };
-        assert_eq!(value, payload(expected, key), "key {key} at generation {generation}");
+        assert_eq!(
+            value,
+            payload(expected, key),
+            "key {key} at generation {generation}"
+        );
     }
 }
 
 /// Call the step until it stops progressing. Returns the final non-progress verdict, the boundary
 /// and how many steps progressed.
-fn drive(db: &Database, mut boundary: Option<ReclaimBoundary>, limit: usize) -> (ReclaimStep, Option<ReclaimBoundary>, usize) {
+fn drive(
+    db: &Database,
+    mut boundary: Option<ReclaimBoundary>,
+    limit: usize,
+) -> (ReclaimStep, Option<ReclaimBoundary>, usize) {
     let mut progressed = 0;
     for _ in 0..limit {
         match db.reclaim_deferred_step(boundary, 4096, 4096).unwrap() {
@@ -143,14 +154,20 @@ fn an_idle_tail_drains_through_steps_alone() {
     drop(reader);
     churn(&db, 41);
     let before = total(backlog(&db));
-    assert!(before.1 > 64 * 4, "the final write must leave a material backlog: {before:?}");
+    assert!(
+        before.1 > 64 * 4,
+        "the final write must leave a material backlog: {before:?}"
+    );
     let (verdict, boundary, progressed) = drive(&db, None, 200);
     assert_eq!(verdict, ReclaimStep::Drained);
     assert!(boundary.is_some() && progressed >= 1);
     // The last write's own frees are inside the sampled prefix, so nothing of the pre-step history
     // is left. Only the steps' own bookkeeping may remain, never more than the steps took.
     let after = total(backlog(&db));
-    assert!(after.0 <= progressed + 1, "{before:?} -> {after:?} after {progressed} steps");
+    assert!(
+        after.0 <= progressed + 1,
+        "{before:?} -> {after:?} after {progressed} steps"
+    );
     assert!(after.1 < before.1 / 8, "{before:?} -> {after:?}");
     assert_snapshot(&db.begin_read().unwrap(), 41);
 }
@@ -180,12 +197,18 @@ fn one_oversized_pending_entry_drains_across_several_steps() {
     }
     tx.commit().unwrap();
     let work = redb::commit_work::take_commit_pages_for_test();
-    assert!(work.freed_pages > 2 * 4096, "one commit must free more than two steps' extents: {work:?}");
+    assert!(
+        work.freed_pages > 2 * 4096,
+        "one commit must free more than two steps' extents: {work:?}"
+    );
     drop(reader);
     let before = backlog(&db);
     let (verdict, _, progressed) = drive(&db, None, 200);
     assert_eq!(verdict, ReclaimStep::Drained);
-    assert!(progressed >= 3, "an oversized entry needs several steps: {progressed} from {before:?}");
+    assert!(
+        progressed >= 3,
+        "an oversized entry needs several steps: {progressed} from {before:?}"
+    );
     assert!(total(backlog(&db)).1 < 64, "{:?}", backlog(&db));
 }
 
@@ -200,7 +223,11 @@ fn a_held_reader_yields_reader_held_and_loses_nothing_it_needs() {
     }
     let before = backlog(&db);
     let (verdict, _, progressed) = drive(&db, None, 50);
-    assert_eq!(verdict, ReclaimStep::ReaderHeld, "everything is held by the reader");
+    assert_eq!(
+        verdict,
+        ReclaimStep::ReaderHeld,
+        "everything is held by the reader"
+    );
     assert_eq!(progressed, 0);
     assert_eq!(backlog(&db), before, "a held step must change nothing");
     // Reuse pages as hard as possible, then check the reader still sees its snapshot.
@@ -250,7 +277,10 @@ fn releasing_older_readers_one_at_a_time_never_frees_what_the_newer_one_reads() 
         previous = now;
     }
     let _ = previous;
-    assert!(released_with_progress >= 3, "each release must let steps progress");
+    assert!(
+        released_with_progress >= 3,
+        "each release must let steps progress"
+    );
 }
 
 #[test]
@@ -273,7 +303,11 @@ fn frees_added_after_the_boundary_are_never_reclaimed_by_that_cycle() {
     }
     let entries_before = total(backlog(&db)).0;
     let (verdict, _, _) = drive(&db, Some(boundary), 200);
-    assert_eq!(verdict, ReclaimStep::Drained, "nothing below the boundary remains");
+    assert_eq!(
+        verdict,
+        ReclaimStep::Drained,
+        "nothing below the boundary remains"
+    );
     let entries_after = total(backlog(&db)).0;
     assert!(
         entries_after >= added as usize,
@@ -299,7 +333,10 @@ fn a_savepoint_blocks_every_step() {
         churn(&db, generation);
     }
     let before = backlog(&db);
-    assert_eq!(db.reclaim_deferred_step(None, 4096, 4096).unwrap(), ReclaimStep::Blocked);
+    assert_eq!(
+        db.reclaim_deferred_step(None, 4096, 4096).unwrap(),
+        ReclaimStep::Blocked
+    );
     assert_eq!(backlog(&db), before);
     drop(savepoint);
     let (verdict, _, progressed) = drive(&db, None, 200);
@@ -321,7 +358,10 @@ fn one_step_is_bounded_by_its_extent_and_entry_budget() {
     let work = redb::commit_work::take_commit_pages_for_test();
     assert!(matches!(step, ReclaimStep::Progressed(_)));
     assert_eq!(work.commits, 1);
-    assert!(work.reclaimed_pages <= 8 && work.reclaimed_pages >= 1, "{work:?}");
+    assert!(
+        work.reclaimed_pages <= 8 && work.reclaimed_pages >= 1,
+        "{work:?}"
+    );
     assert!(work.reclaimed_entries <= 8, "{work:?} from {before:?}");
 }
 
@@ -345,16 +385,27 @@ fn a_crash_between_steps_leaves_the_remainder_and_recovers() {
     }
     let exe = std::env::current_exe().unwrap();
     let status = std::process::Command::new(exe)
-        .args(["--exact", "crash_child_steps_then_aborts", "--nocapture", "--test-threads=1"])
+        .args([
+            "--exact",
+            "crash_child_steps_then_aborts",
+            "--nocapture",
+            "--test-threads=1",
+        ])
         .env(ROLE, "1")
         .env(PATH, &path)
         .status()
         .unwrap();
     assert!(!status.success(), "the child must die by abort");
     let mut db = open(&path);
-    assert!(db.check_integrity().unwrap(), "store must verify after the crash");
+    assert!(
+        db.check_integrity().unwrap(),
+        "store must verify after the crash"
+    );
     let remainder = total(backlog(&db));
-    assert!(remainder.0 > 0, "a crash between steps leaves the durable remainder");
+    assert!(
+        remainder.0 > 0,
+        "a crash between steps leaves the durable remainder"
+    );
     assert_snapshot(&db.begin_read().unwrap(), 40);
     let (verdict, _, _) = drive(&db, None, 200);
     assert_eq!(verdict, ReclaimStep::Drained);
@@ -387,7 +438,9 @@ fn big_commit(db: &Database, generation: u64, rows: u64) -> redb::commit_work::C
     {
         let mut table = tx.open_table(TABLE).unwrap();
         for key in (0..rows).step_by(1) {
-            table.insert(key, payload(generation, key).as_slice()).unwrap();
+            table
+                .insert(key, payload(generation, key).as_slice())
+                .unwrap();
         }
     }
     tx.commit().unwrap();
@@ -410,7 +463,10 @@ fn a_large_commit_reclaims_at_least_what_it_frees_and_never_past_the_floor() {
         // Everything above is older than the next commit and no reader holds it.
         let freed_probe = big_commit(&db, 13, ROWS);
         let freed = freed_probe.freed_pages;
-        assert!(freed > 64, "the commit must free more than the ordinary budget: {freed_probe:?}");
+        assert!(
+            freed > 64,
+            "the commit must free more than the ordinary budget: {freed_probe:?}"
+        );
         let work = big_commit(&db, 14, ROWS);
         let own = work.freed_pages;
         if keep_pace {
@@ -418,7 +474,10 @@ fn a_large_commit_reclaims_at_least_what_it_frees_and_never_past_the_floor() {
                 work.reclaimed_pages >= own.min(1_000_000) || backlog(&db) == [(0, 0); 2],
                 "keep-pace must reclaim at least what the commit freed: {work:?}"
             );
-            assert!(work.reclaimed_pages <= own.max(64), "never more than max(64, freed): {work:?}");
+            assert!(
+                work.reclaimed_pages <= own.max(64),
+                "never more than max(64, freed): {work:?}"
+            );
             assert!(work.reclaimed_pages > 64, "{work:?}");
         } else {
             assert!(work.reclaimed_pages <= 64, "baseline budget: {work:?}");
@@ -429,7 +488,10 @@ fn a_large_commit_reclaims_at_least_what_it_frees_and_never_past_the_floor() {
         let table = read.open_table(TABLE).unwrap();
         assert_eq!(table.len().unwrap(), ROWS);
     }
-    assert!(measured[1] > measured[0], "keep-pace reclaims more: {measured:?}");
+    assert!(
+        measured[1] > measured[0],
+        "keep-pace reclaims more: {measured:?}"
+    );
 }
 
 #[test]
@@ -442,7 +504,10 @@ fn keep_pace_never_frees_pages_a_held_reader_still_needs() {
         big_commit(&db, generation, ROWS);
     }
     let work = big_commit(&db, 13, ROWS);
-    assert_eq!(work.reclaimed_pages, 0, "everything is held by the reader: {work:?}");
+    assert_eq!(
+        work.reclaimed_pages, 0,
+        "everything is held by the reader: {work:?}"
+    );
     for generation in 14..=20 {
         big_commit(&db, generation, ROWS);
     }
@@ -451,7 +516,11 @@ fn keep_pace_never_frees_pages_a_held_reader_still_needs() {
         let row = row.unwrap();
         (row.0.value(), row.1.value().to_vec())
     }) {
-        assert_eq!(value, payload(0, key), "the held snapshot must stay intact at key {key}");
+        assert_eq!(
+            value,
+            payload(0, key),
+            "the held snapshot must stay intact at key {key}"
+        );
     }
 }
 
@@ -471,7 +540,10 @@ fn small_commits_stay_within_the_ordinary_budget_under_keep_pace() {
     }
     tx.commit().unwrap();
     let work = redb::commit_work::take_commit_pages_for_test();
-    assert!(work.freed_pages <= 64, "a one-row commit frees few extents: {work:?}");
+    assert!(
+        work.freed_pages <= 64,
+        "a one-row commit frees few extents: {work:?}"
+    );
     assert!(work.reclaimed_pages <= 64, "{work:?}");
     assert!(work.reclaimed_entries <= 64, "{work:?}");
 }
@@ -503,22 +575,43 @@ fn a_kill_at_any_moment_of_a_step_loop_recovers_through_ordinary_storage_recover
     }
     let socket = dir.path().join("reclaim-commit.sock");
     let ready = UnixDatagram::bind(&socket).unwrap();
-    ready.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
-    let mut child = ReclaimChild::new(std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "a_kill_at_any_moment_of_a_step_loop_recovers_through_ordinary_storage_recovery", "--nocapture", "--test-threads=1"])
-        .env(ROLE, &path)
-        .env(PAUSE_SOCKET, &socket)
-        .spawn()
-        .unwrap());
+    ready
+        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .unwrap();
+    let mut child = ReclaimChild::new(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "a_kill_at_any_moment_of_a_step_loop_recovers_through_ordinary_storage_recovery",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(ROLE, &path)
+            .env(PAUSE_SOCKET, &socket)
+            .spawn()
+            .unwrap(),
+    );
     let mut marker = [0; MARKER.len()];
     let received = ready.recv(&mut marker);
-    assert_eq!(received.unwrap_or_else(|_| panic!("child must signal before the rendezvous deadline: {:?}", child.status().unwrap())), MARKER.len());
-    assert_eq!(marker, MARKER, "child must stop in the staged reclaim transaction");
+    assert_eq!(
+        received.unwrap_or_else(|_| panic!(
+            "child must signal before the rendezvous deadline: {:?}",
+            child.status().unwrap()
+        )),
+        MARKER.len()
+    );
+    assert_eq!(
+        marker, MARKER,
+        "child must stop in the staged reclaim transaction"
+    );
     child.kill_and_reap().unwrap();
     drop(ready);
     std::fs::remove_file(&socket).unwrap();
     let mut db = open(&path);
-    assert!(db.check_integrity().unwrap(), "store must verify after the staged reclaim kill");
+    assert!(
+        db.check_integrity().unwrap(),
+        "store must verify after the staged reclaim kill"
+    );
     let read = db.begin_read().unwrap();
     let table = read.open_table(TABLE).unwrap();
     assert_eq!(table.len().unwrap(), ROWS);
@@ -528,7 +621,10 @@ fn a_kill_at_any_moment_of_a_step_loop_recovers_through_ordinary_storage_recover
             let expected = if key % 3 == 0 { generation } else { 0 };
             value == payload(expected, key)
         });
-        assert!(known, "key {key} holds a value no committed generation wrote");
+        assert!(
+            known,
+            "key {key} holds a value no committed generation wrote"
+        );
     }
     drop(table);
     drop(read);

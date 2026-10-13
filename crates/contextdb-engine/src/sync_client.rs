@@ -3628,7 +3628,7 @@ impl SyncClient {
     /// A consumed frontier is not acceptance. Reconcile the exact request
     /// through its existing push response; the hub's durable apply record
     /// returns the original result without reapplying rows, vectors or DDL.
-#[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
+    #[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
     async fn finish_interrupted_push(
         &self,
         transport_err: Error,
@@ -6271,6 +6271,9 @@ pub(crate) fn decode_native_sync_envelope(
     memory: &crate::read_image_memory::NativeDeliveryImage,
     data: &[u8],
     expected: Option<u8>,
-) -> std::result::Result<crate::sync_native_delivery::NativeEnvelope, crate::sync_native_delivery::DecodeError> {
+) -> std::result::Result<
+    crate::sync_native_delivery::NativeEnvelope,
+    crate::sync_native_delivery::DecodeError,
+> {
     crate::sync_native_delivery::decode_envelope(memory, data, expected)
 }

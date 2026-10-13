@@ -378,11 +378,12 @@ fn first_bounded_restart_query_charges_lazy_decode_and_replay_to_the_store_budge
     // Under the same store budget, find the least statement memory the paged
     // answer needs. One byte below it the STATEMENT budget refuses by type,
     // naming its own limit, and the route stays dormant and uncharged.
-    let answers = |memory: u64| {
-        bounded::execute(&db, &request(ReadLimits { memory, ..limits() }))
-    };
+    let answers = |memory: u64| bounded::execute(&db, &request(ReadLimits { memory, ..limits() }));
     let (mut low, mut high) = (1u64, limits().memory);
-    assert!(answers(high).is_ok(), "the ample statement budget answers through the paged route");
+    assert!(
+        answers(high).is_ok(),
+        "the ample statement budget answers through the paged route"
+    );
     while low < high {
         let middle = low + (high - low) / 2;
         if answers(middle).is_ok() {
@@ -391,18 +392,32 @@ fn first_bounded_restart_query_charges_lazy_decode_and_replay_to_the_store_budge
             low = middle + 1;
         }
     }
-    assert!(high > 1, "the paged route's reads are charged to the statement");
+    assert!(
+        high > 1,
+        "the paged route's reads are charged to the statement"
+    );
     let error = answers(high - 1)
         .expect_err("one byte below the paged route's reads the statement budget refuses");
     let bounded::TestError::Refused(statement_refusal) = error else {
         panic!("the statement refusal uses the bounded read refusal vocabulary, got {error:?}");
     };
-    assert_eq!(statement_refusal.kind(), ReadFailureKind::OwnerLimitExceeded);
+    assert_eq!(
+        statement_refusal.kind(),
+        ReadFailureKind::OwnerLimitExceeded
+    );
     let ReadFailureDetail::OwnerLimitExceeded(detail) = statement_refusal.detail() else {
         panic!("the crossed statement ceiling carries typed detail");
     };
-    assert_eq!(detail.limit, ReadFailureLimit::Memory, "the refusal names memory");
-    assert_eq!(detail.value, high - 1, "the refusal names the statement's own declared memory");
+    assert_eq!(
+        detail.limit,
+        ReadFailureLimit::Memory,
+        "the refusal names memory"
+    );
+    assert_eq!(
+        detail.value,
+        high - 1,
+        "the refusal names the statement's own declared memory"
+    );
     assert_dormant_and_uncharged(&db, before, expected_base);
 
     db.set_memory_limit(None)

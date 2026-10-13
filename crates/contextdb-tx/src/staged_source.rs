@@ -2123,9 +2123,15 @@ pub struct CanonicalStatementVectors {
     pub(crate) _credit: contextdb_core::read_memory::ReadCredit,
 }
 impl CanonicalStatementVectors {
-    pub fn len(&self) -> usize { self.vectors.len() }
-    pub fn is_empty(&self) -> bool { self.vectors.is_empty() }
-    pub fn with_vector<R>(&self, position: usize,
+    pub fn len(&self) -> usize {
+        self.vectors.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.vectors.is_empty()
+    }
+    pub fn with_vector<R>(
+        &self,
+        position: usize,
         f: impl for<'v> FnOnce(Option<(contextdb_core::RowId, &'v [f32])>) -> Result<R>,
     ) -> Result<R> {
         match self.vectors.get(position) {
@@ -2408,7 +2414,8 @@ pub(crate) fn validate_original_singleton<V>(
     entry: &PreparedMapEntry<contextdb_core::TxId, V>,
 ) -> Result<()> {
     let node = entry.0.get();
-    if entry.0.charge.0.is_none() || node.left.is_some() || node.right.is_some() || node.height != 1 {
+    if entry.0.charge.0.is_none() || node.left.is_some() || node.right.is_some() || node.height != 1
+    {
         return Err(source_identity_error());
     }
     Ok(())
@@ -2431,12 +2438,10 @@ pub(crate) fn prepare_original_reinstall<V>(
             || u32::from(node.height) != 1 + left.max(right)
             || usize::from(node.height) >= 2 * usize::BITS as usize
             || node.left.as_ref().is_some_and(|child| {
-                child.get().key >= node.key
-                    || lower.is_some_and(|bound| child.get().key <= bound)
+                child.get().key >= node.key || lower.is_some_and(|bound| child.get().key <= bound)
             })
             || node.right.as_ref().is_some_and(|child| {
-                child.get().key <= node.key
-                    || upper.is_some_and(|bound| child.get().key >= bound)
+                child.get().key <= node.key || upper.is_some_and(|bound| child.get().key >= bound)
             })
         {
             return Err(source_identity_error());
@@ -2468,7 +2473,9 @@ pub(crate) fn prepare_original_reinstall<V>(
             Ordering::Less => false,
             Ordering::Greater => true,
         };
-        *directions.get_mut(depth).ok_or_else(source_identity_error)? = right;
+        *directions
+            .get_mut(depth)
+            .ok_or_else(source_identity_error)? = right;
         depth += 1;
         if depth > map.len {
             return Err(source_identity_error());
@@ -2481,13 +2488,16 @@ pub(crate) fn prepare_original_reinstall<V>(
             cursor = node.left.as_ref();
         }
     }
-    Ok(ValidatedVacantSourceSlot { map, directions, depth, new_len })
+    Ok(ValidatedVacantSourceSlot {
+        map,
+        directions,
+        depth,
+        new_len,
+    })
 }
 
 impl<V> ValidatedVacantSourceSlot<'_, V> {
-    pub(crate) fn install_nonfallible(
-        self, entry: PreparedMapEntry<contextdb_core::TxId, V>,
-    ) {
+    pub(crate) fn install_nonfallible(self, entry: PreparedMapEntry<contextdb_core::TxId, V>) {
         fn install<V>(
             link: &mut MutableLink<contextdb_core::TxId, V>,
             directions: &mut std::slice::Iter<'_, bool>,
@@ -2498,7 +2508,11 @@ impl<V> ValidatedVacantSourceSlot<'_, V> {
             if let Some(node) = link.as_mut() {
                 let right = directions.next().is_some_and(|right| *right);
                 let node = node.get_mut();
-                let child = if right { &mut node.right } else { &mut node.left };
+                let child = if right {
+                    &mut node.right
+                } else {
+                    &mut node.left
+                };
                 install(child, directions, entry);
             } else {
                 // Assignment replaces only None, never an installed payload.
@@ -2509,7 +2523,12 @@ impl<V> ValidatedVacantSourceSlot<'_, V> {
                 *link = Some(mutable_balance_nonfallible(node));
             }
         }
-        let Self { map, directions, depth, new_len } = self;
+        let Self {
+            map,
+            directions,
+            depth,
+            new_len,
+        } = self;
         // Build the bounded iterator before moving the original entry.
         let mut path = directions[..depth].iter();
         install(&mut map.root, &mut path, entry.0);
@@ -2935,7 +2954,9 @@ pub trait OriginalCopyChargeSource: Send + Sync {
     /// The selected original receiver admits the complete vector allocation.
     #[doc(hidden)]
     fn copy_original_vector_for(
-        &self, entry: &contextdb_core::VectorEntry, funder: &SourceFunder,
+        &self,
+        entry: &contextdb_core::VectorEntry,
+        funder: &SourceFunder,
     ) -> Option<Result<AdmittedSourceVector>> {
         let _ = (entry, funder);
         None
@@ -2943,7 +2964,9 @@ pub trait OriginalCopyChargeSource: Send + Sync {
     /// Replacement content stays borrowed until the original receiver admits it.
     #[doc(hidden)]
     fn copy_original_vector_input_for(
-        &self, input: BorrowedOriginalVectorCopyInput<'_>, funder: &SourceFunder,
+        &self,
+        input: BorrowedOriginalVectorCopyInput<'_>,
+        funder: &SourceFunder,
     ) -> Option<Result<AdmittedSourceVector>> {
         let _ = (input, funder);
         None
@@ -3444,13 +3467,46 @@ impl OriginalAuxInvoice {
 }
 #[doc(hidden)]
 pub enum AuxBody {
-    RelationalDelete((contextdb_core::TableName, contextdb_core::RowId, contextdb_core::TxId)),
+    RelationalDelete(
+        (
+            contextdb_core::TableName,
+            contextdb_core::RowId,
+            contextdb_core::TxId,
+        ),
+    ),
     Predicate(crate::write_set::RelationalDeletePredicate),
     AdjInsert(contextdb_core::AdjEntry),
-    AdjDelete((contextdb_core::NodeId, contextdb_core::EdgeType, contextdb_core::NodeId, contextdb_core::TxId)),
-    VectorDelete((contextdb_core::VectorIndexRef, contextdb_core::RowId, contextdb_core::TxId)),
-    VectorMove((contextdb_core::VectorIndexRef, contextdb_core::RowId, contextdb_core::RowId, contextdb_core::TxId)),
-    Provenance((contextdb_core::TableName, contextdb_core::RowId, contextdb_core::Lsn, u8)),
+    AdjDelete(
+        (
+            contextdb_core::NodeId,
+            contextdb_core::EdgeType,
+            contextdb_core::NodeId,
+            contextdb_core::TxId,
+        ),
+    ),
+    VectorDelete(
+        (
+            contextdb_core::VectorIndexRef,
+            contextdb_core::RowId,
+            contextdb_core::TxId,
+        ),
+    ),
+    VectorMove(
+        (
+            contextdb_core::VectorIndexRef,
+            contextdb_core::RowId,
+            contextdb_core::RowId,
+            contextdb_core::TxId,
+        ),
+    ),
+    Provenance(
+        (
+            contextdb_core::TableName,
+            contextdb_core::RowId,
+            contextdb_core::Lsn,
+            u8,
+        ),
+    ),
     ConfigWrite((String, Vec<u8>)),
     ConfigDelete(String),
     ConfigMaxU64Key(String),
@@ -3753,14 +3809,24 @@ pub(crate) fn native_map_bytes<K, V>(members: usize) -> Result<usize> {
 
 impl<T> FundedArc<T> {
     pub(crate) fn is_funded_by(&self, funder: &SourceFunder) -> bool {
-        self.charge.as_ref().expect("live native control charge").matches_funder(funder)
+        self.charge
+            .as_ref()
+            .expect("live native control charge")
+            .matches_funder(funder)
     }
 }
 impl AdmittedEagerSourceRow {
     pub(crate) fn validate_exact_funder(&self, funder: &SourceFunder) -> Result<()> {
         if !self.invoice.matches(funder)
-            || !self.original_copy.charge.as_ref().expect("live original bridge charge").matches_funder(funder)
-        { return Err(Error::Other("native exact row funding mismatch".into())); }
+            || !self
+                .original_copy
+                .charge
+                .as_ref()
+                .expect("live original bridge charge")
+                .matches_funder(funder)
+        {
+            return Err(Error::Other("native exact row funding mismatch".into()));
+        }
         Ok(())
     }
 }
@@ -3769,7 +3835,8 @@ impl OriginalRowInvoice {
     /// The actual payload and invoice control are both reserved by O.
     #[doc(hidden)]
     pub fn original_copy_allocation_bytes(payload_bytes: usize) -> Result<usize> {
-        payload_bytes.checked_add(source_arc_layout::<SourceInvoice>().size())
+        payload_bytes
+            .checked_add(source_arc_layout::<SourceInvoice>().size())
             .ok_or_else(|| Error::Other("source allocation size overflow".into()))
     }
 
@@ -3790,7 +3857,9 @@ impl OriginalRowInvoice {
         if admitted_bytes < source_arc_layout::<SourceInvoice>().size()
             || !funder.matches_original_source_origin(origin, lease)
         {
-            return Err(Error::Other("native source transfer origin mismatch".into()));
+            return Err(Error::Other(
+                "native source transfer origin mismatch".into(),
+            ));
         }
         struct RetainedLease<'a> {
             funder: &'a SourceFunder,
@@ -3805,13 +3874,22 @@ impl OriginalRowInvoice {
             }
         }
         funder.retain_source_lease(lease);
-        let mut retained = RetainedLease { funder, lease, armed: true };
+        let mut retained = RetainedLease {
+            funder,
+            lease,
+            armed: true,
+        };
         let invoice_funder = funder.clone();
         // Keep the invoice uninitialized through allocation: on unwind only
         // the stack guard releases the lease, and the caller still owns bytes.
         let mut allocation = Arc::<SourceInvoice>::new_uninit();
-        Arc::get_mut(&mut allocation).expect("private original invoice has one owner")
-            .write(SourceInvoice { funder: invoice_funder, lease, bytes: admitted_bytes });
+        Arc::get_mut(&mut allocation)
+            .expect("private original invoice has one owner")
+            .write(SourceInvoice {
+                funder: invoice_funder,
+                lease,
+                bytes: admitted_bytes,
+            });
         // SAFETY: the unique allocation was initialized above. No fallible
         // operation separates initialization, installation and guard disarm.
         let invoice = Self::from_charge(SourceCharge(Some(unsafe { allocation.assume_init() })));
@@ -3822,18 +3900,25 @@ impl OriginalRowInvoice {
 
 impl OriginalCopyBridge {
     pub(crate) fn copy_original_row_for(
-        &self, row: &contextdb_core::VersionedRow, funder: &SourceFunder,
+        &self,
+        row: &contextdb_core::VersionedRow,
+        funder: &SourceFunder,
     ) -> Result<AdmittedSourceRow> {
         let original = self.data.as_ref().expect("live original copy bridge");
-        let charge = self.charge.as_ref().expect("live original copy bridge charge");
+        let charge = self
+            .charge
+            .as_ref()
+            .expect("live original copy bridge charge");
         let invoice = charge.0.as_ref().expect("live original bridge invoice");
         if !charge.matches_funder(funder)
-            || original.original_source_origin().is_none_or(|origin|
-                !funder.matches_original_source_origin(origin, invoice.lease))
+            || original
+                .original_source_origin()
+                .is_none_or(|origin| !funder.matches_original_source_origin(origin, invoice.lease))
         {
             return Err(crate::ordered_staged::exact_native_error());
         }
-        let copied = original.copy_original_row_for(row, funder)
+        let copied = original
+            .copy_original_row_for(row, funder)
             .ok_or_else(crate::ordered_staged::exact_native_error)??;
         if !copied.invoice.matches(funder) {
             return Err(crate::ordered_staged::exact_native_error());
@@ -3846,10 +3931,14 @@ impl AdmittedSourceRow {
     /// Replace only existing TxId scalars; the funded map and names stay put.
     #[doc(hidden)]
     pub fn rewrite_txid_placeholders(
-        &mut self, origin_tx: contextdb_core::TxId, meta: &contextdb_core::TableMeta,
+        &mut self,
+        origin_tx: contextdb_core::TxId,
+        meta: &contextdb_core::TableMeta,
     ) {
-        for column in meta.columns.iter().filter(|column|
-            matches!(column.column_type, contextdb_core::ColumnType::TxId))
+        for column in meta
+            .columns
+            .iter()
+            .filter(|column| matches!(column.column_type, contextdb_core::ColumnType::TxId))
         {
             if let Some(contextdb_core::Value::TxId(tx)) = self.row.values.get_mut(&column.name)
                 && *tx == origin_tx
@@ -3873,32 +3962,59 @@ pub struct BorrowedOriginalVectorCopyInput<'a> {
 }
 impl<'a> BorrowedOriginalVectorCopyInput<'a> {
     pub(crate) fn new(
-        table: &'a str, column: &'a str, vector: &'a [f32],
-        row_id: contextdb_core::RowId, created_tx: contextdb_core::TxId,
-        deleted_tx: Option<contextdb_core::TxId>, lsn: contextdb_core::Lsn,
+        table: &'a str,
+        column: &'a str,
+        vector: &'a [f32],
+        row_id: contextdb_core::RowId,
+        created_tx: contextdb_core::TxId,
+        deleted_tx: Option<contextdb_core::TxId>,
+        lsn: contextdb_core::Lsn,
     ) -> Self {
-        Self { table, column, vector, row_id, created_tx, deleted_tx, lsn }
+        Self {
+            table,
+            column,
+            vector,
+            row_id,
+            created_tx,
+            deleted_tx,
+            lsn,
+        }
     }
     #[doc(hidden)]
-    pub fn table(&self) -> &'a str { self.table }
+    pub fn table(&self) -> &'a str {
+        self.table
+    }
     #[doc(hidden)]
-    pub fn column(&self) -> &'a str { self.column }
+    pub fn column(&self) -> &'a str {
+        self.column
+    }
     #[doc(hidden)]
-    pub fn vector(&self) -> &'a [f32] { self.vector }
+    pub fn vector(&self) -> &'a [f32] {
+        self.vector
+    }
     #[doc(hidden)]
-    pub fn row_id(&self) -> contextdb_core::RowId { self.row_id }
+    pub fn row_id(&self) -> contextdb_core::RowId {
+        self.row_id
+    }
     #[doc(hidden)]
-    pub fn created_tx(&self) -> contextdb_core::TxId { self.created_tx }
+    pub fn created_tx(&self) -> contextdb_core::TxId {
+        self.created_tx
+    }
     #[doc(hidden)]
-    pub fn deleted_tx(&self) -> Option<contextdb_core::TxId> { self.deleted_tx }
+    pub fn deleted_tx(&self) -> Option<contextdb_core::TxId> {
+        self.deleted_tx
+    }
     #[doc(hidden)]
-    pub fn lsn(&self) -> contextdb_core::Lsn { self.lsn }
+    pub fn lsn(&self) -> contextdb_core::Lsn {
+        self.lsn
+    }
 }
 
 impl OriginalVectorInvoice {
     #[doc(hidden)]
     pub fn original_copy_allocation_bytes(payload_bytes: usize) -> Result<usize> {
-        payload_bytes.checked_add(source_arc_layout::<SourceInvoice>().size())
+        payload_bytes
+            .checked_add(source_arc_layout::<SourceInvoice>().size())
             .ok_or_else(|| Error::Other("source allocation size overflow".into()))
     }
 
@@ -3910,13 +4026,17 @@ impl OriginalVectorInvoice {
     /// disarms that reservation; refusal leaves its byte credit with the caller.
     #[doc(hidden)]
     pub unsafe fn from_original_copy_allocation(
-        funder: &SourceFunder, admitted_bytes: usize,
-        origin: NativeSourceOrigin, lease: SourceLease,
+        funder: &SourceFunder,
+        admitted_bytes: usize,
+        origin: NativeSourceOrigin,
+        lease: SourceLease,
     ) -> Result<Self> {
         if admitted_bytes < source_arc_layout::<SourceInvoice>().size()
             || !funder.matches_original_source_origin(origin, lease)
         {
-            return Err(Error::Other("native source transfer origin mismatch".into()));
+            return Err(Error::Other(
+                "native source transfer origin mismatch".into(),
+            ));
         }
         struct RetainedLease<'a> {
             funder: &'a SourceFunder,
@@ -3925,15 +4045,26 @@ impl OriginalVectorInvoice {
         }
         impl Drop for RetainedLease<'_> {
             fn drop(&mut self) {
-                if self.armed { self.funder.release_source(0, self.lease); }
+                if self.armed {
+                    self.funder.release_source(0, self.lease);
+                }
             }
         }
         funder.retain_source_lease(lease);
-        let mut retained = RetainedLease { funder, lease, armed: true };
+        let mut retained = RetainedLease {
+            funder,
+            lease,
+            armed: true,
+        };
         let invoice_funder = funder.clone();
         let mut allocation = Arc::<SourceInvoice>::new_uninit();
-        Arc::get_mut(&mut allocation).expect("private original invoice has one owner")
-            .write(SourceInvoice { funder: invoice_funder, lease, bytes: admitted_bytes });
+        Arc::get_mut(&mut allocation)
+            .expect("private original invoice has one owner")
+            .write(SourceInvoice {
+                funder: invoice_funder,
+                lease,
+                bytes: admitted_bytes,
+            });
         // SAFETY: uniquely initialized; installation and disarm cannot fail.
         let invoice = Self::from_charge(SourceCharge(Some(unsafe { allocation.assume_init() })));
         retained.armed = false;
@@ -3944,24 +4075,47 @@ impl OriginalVectorInvoice {
 impl OriginalCopyBridge {
     fn validate_vector_copy_receiver(&self, funder: &SourceFunder) -> Result<()> {
         let original = self.data.as_ref().expect("live original copy bridge");
-        let charge = self.charge.as_ref().expect("live original copy bridge charge");
+        let charge = self
+            .charge
+            .as_ref()
+            .expect("live original copy bridge charge");
         let invoice = charge.0.as_ref().expect("live original bridge invoice");
         if !charge.matches_funder(funder)
-            || original.original_source_origin().is_none_or(|origin|
-                !funder.matches_original_source_origin(origin, invoice.lease))
-        { return Err(crate::ordered_staged::exact_native_error()); }
+            || original
+                .original_source_origin()
+                .is_none_or(|origin| !funder.matches_original_source_origin(origin, invoice.lease))
+        {
+            return Err(crate::ordered_staged::exact_native_error());
+        }
         Ok(())
     }
     fn validate_original_vector_copy(
-        &self, copied: &AdmittedSourceVector, funder: &SourceFunder,
+        &self,
+        copied: &AdmittedSourceVector,
+        funder: &SourceFunder,
     ) -> Result<()> {
-        let bridge = self.charge.as_ref().expect("live original bridge charge")
-            .0.as_ref().expect("live original bridge invoice");
-        let invoice = copied.invoice.charge.0.as_ref().expect("live original vector invoice");
+        let bridge = self
+            .charge
+            .as_ref()
+            .expect("live original bridge charge")
+            .0
+            .as_ref()
+            .expect("live original bridge invoice");
+        let invoice = copied
+            .invoice
+            .charge
+            .0
+            .as_ref()
+            .expect("live original vector invoice");
         let entry = &copied.entry;
         let vector_bytes = Layout::array::<f32>(entry.vector.len())
-            .map_err(|_| crate::ordered_staged::exact_native_error())?.size();
-        let payload = entry.index.table.len().checked_add(entry.index.column.len())
+            .map_err(|_| crate::ordered_staged::exact_native_error())?
+            .size();
+        let payload = entry
+            .index
+            .table
+            .len()
+            .checked_add(entry.index.column.len())
             .and_then(|bytes| bytes.checked_add(vector_bytes))
             .ok_or_else(crate::ordered_staged::exact_native_error)?;
         if !copied.invoice.matches(funder)
@@ -3971,82 +4125,143 @@ impl OriginalCopyBridge {
             || entry.index.table.capacity() != entry.index.table.len()
             || entry.index.column.capacity() != entry.index.column.len()
             || entry.vector.capacity() != entry.vector.len()
-        { return Err(crate::ordered_staged::exact_native_error()); }
+        {
+            return Err(crate::ordered_staged::exact_native_error());
+        }
         Ok(())
     }
     pub(crate) fn copy_original_vector_for(
-        &self, entry: &contextdb_core::VectorEntry, funder: &SourceFunder,
+        &self,
+        entry: &contextdb_core::VectorEntry,
+        funder: &SourceFunder,
     ) -> Result<AdmittedSourceVector> {
         self.validate_vector_copy_receiver(funder)?;
-        let copied = self.data.as_ref().expect("live original copy bridge")
+        let copied = self
+            .data
+            .as_ref()
+            .expect("live original copy bridge")
             .copy_original_vector_for(entry, funder)
             .ok_or_else(crate::ordered_staged::exact_native_error)??;
         self.validate_original_vector_copy(&copied, funder)?;
         if !copied.invoice.matches(funder)
-            || copied.entry.index != entry.index || copied.entry.row_id != entry.row_id
-            || copied.entry.vector != entry.vector || copied.entry.created_tx != entry.created_tx
-            || copied.entry.deleted_tx != entry.deleted_tx || copied.entry.lsn != entry.lsn
-        { return Err(crate::ordered_staged::exact_native_error()); }
+            || copied.entry.index != entry.index
+            || copied.entry.row_id != entry.row_id
+            || copied.entry.vector != entry.vector
+            || copied.entry.created_tx != entry.created_tx
+            || copied.entry.deleted_tx != entry.deleted_tx
+            || copied.entry.lsn != entry.lsn
+        {
+            return Err(crate::ordered_staged::exact_native_error());
+        }
         Ok(copied)
     }
     pub(crate) fn copy_original_vector_input_for(
-        &self, input: BorrowedOriginalVectorCopyInput<'_>, funder: &SourceFunder,
+        &self,
+        input: BorrowedOriginalVectorCopyInput<'_>,
+        funder: &SourceFunder,
     ) -> Result<AdmittedSourceVector> {
         self.validate_vector_copy_receiver(funder)?;
-        let expected = (input.table, input.column, input.vector, input.row_id,
-            input.created_tx, input.deleted_tx, input.lsn);
-        let copied = self.data.as_ref().expect("live original copy bridge")
+        let expected = (
+            input.table,
+            input.column,
+            input.vector,
+            input.row_id,
+            input.created_tx,
+            input.deleted_tx,
+            input.lsn,
+        );
+        let copied = self
+            .data
+            .as_ref()
+            .expect("live original copy bridge")
             .copy_original_vector_input_for(input, funder)
             .ok_or_else(crate::ordered_staged::exact_native_error)??;
         self.validate_original_vector_copy(&copied, funder)?;
         if !copied.invoice.matches(funder)
-            || copied.entry.index.table != expected.0 || copied.entry.index.column != expected.1
-            || copied.entry.vector.as_slice() != expected.2 || copied.entry.row_id != expected.3
-            || copied.entry.created_tx != expected.4 || copied.entry.deleted_tx != expected.5
+            || copied.entry.index.table != expected.0
+            || copied.entry.index.column != expected.1
+            || copied.entry.vector.as_slice() != expected.2
+            || copied.entry.row_id != expected.3
+            || copied.entry.created_tx != expected.4
+            || copied.entry.deleted_tx != expected.5
             || copied.entry.lsn != expected.6
-        { return Err(crate::ordered_staged::exact_native_error()); }
+        {
+            return Err(crate::ordered_staged::exact_native_error());
+        }
         Ok(copied)
     }
 }
 
 impl OriginalCopyBridge {
     pub(crate) fn copy_original_eager_vector_for(
-        &self, entry: &contextdb_core::VectorEntry, funder: &SourceFunder,
+        &self,
+        entry: &contextdb_core::VectorEntry,
+        funder: &SourceFunder,
     ) -> Result<AdmittedEagerSourceVector> {
         let original = self.copy_original_vector_for(entry, funder)?;
         let bridge = self.clone();
-        Ok(AdmittedEagerSourceVector::new(original.entry, original.invoice, bridge))
+        Ok(AdmittedEagerSourceVector::new(
+            original.entry,
+            original.invoice,
+            bridge,
+        ))
     }
     pub(crate) fn copy_original_eager_vector_input_for(
-        &self, input: BorrowedOriginalVectorCopyInput<'_>, funder: &SourceFunder,
+        &self,
+        input: BorrowedOriginalVectorCopyInput<'_>,
+        funder: &SourceFunder,
     ) -> Result<AdmittedEagerSourceVector> {
         let original = self.copy_original_vector_input_for(input, funder)?;
         let bridge = self.clone();
-        Ok(AdmittedEagerSourceVector::new(original.entry, original.invoice, bridge))
+        Ok(AdmittedEagerSourceVector::new(
+            original.entry,
+            original.invoice,
+            bridge,
+        ))
     }
 }
 
 impl SourceFunder {
     /// Immutable exact-origin check for the retained original copy kernels.
     #[doc(hidden)]
-    pub fn accepts_retained_original_copy(&self, origin: NativeSourceOrigin, lease: SourceLease) -> bool {
+    pub fn accepts_retained_original_copy(
+        &self,
+        origin: NativeSourceOrigin,
+        lease: SourceLease,
+    ) -> bool {
         self.matches_original_source_origin(origin, lease)
     }
 }
 
 pub(crate) fn changed_original_rows_identical(
-    left: &contextdb_core::VersionedRow, right: &contextdb_core::VersionedRow,
+    left: &contextdb_core::VersionedRow,
+    right: &contextdb_core::VersionedRow,
 ) -> bool {
-    if left.row_id != right.row_id || left.created_tx != right.created_tx
-        || left.deleted_tx != right.deleted_tx || left.lsn != right.lsn
-        || left.created_at != right.created_at || left.values.len() != right.values.len()
-    { return false; }
-    left.values.iter().all(|(name, value)| right.values.get(name).is_some_and(|other| {
-        match (value, other) {
-            (contextdb_core::Value::Float64(left), contextdb_core::Value::Float64(right)) => left.to_bits() == right.to_bits(),
-            (contextdb_core::Value::Vector(left), contextdb_core::Value::Vector(right)) => left.len() == right.len()
-                && left.iter().zip(right).all(|(left, right)| left.to_bits() == right.to_bits()),
-            _ => value == other,
-        }
-    }))
+    if left.row_id != right.row_id
+        || left.created_tx != right.created_tx
+        || left.deleted_tx != right.deleted_tx
+        || left.lsn != right.lsn
+        || left.created_at != right.created_at
+        || left.values.len() != right.values.len()
+    {
+        return false;
+    }
+    left.values.iter().all(|(name, value)| {
+        right
+            .values
+            .get(name)
+            .is_some_and(|other| match (value, other) {
+                (contextdb_core::Value::Float64(left), contextdb_core::Value::Float64(right)) => {
+                    left.to_bits() == right.to_bits()
+                }
+                (contextdb_core::Value::Vector(left), contextdb_core::Value::Vector(right)) => {
+                    left.len() == right.len()
+                        && left
+                            .iter()
+                            .zip(right)
+                            .all(|(left, right)| left.to_bits() == right.to_bits())
+                }
+                _ => value == other,
+            })
+    })
 }

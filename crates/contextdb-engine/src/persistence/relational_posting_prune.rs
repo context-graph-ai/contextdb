@@ -301,11 +301,14 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("terminal-codec.db");
         let persistence = RedbPersistence::create(&path).unwrap();
-        let writer = persistence
-            .proof_accountant()
-            .unwrap_or_else(|| Arc::new(crate::memory_accounting::MemoryAccountant::no_limit()).into());
+        let writer = persistence.proof_accountant().unwrap_or_else(|| {
+            Arc::new(crate::memory_accounting::MemoryAccountant::no_limit()).into()
+        });
         persistence.attach_memory_accountant(writer.clone());
-        assert_eq!(persistence.proof_accountant().unwrap().as_ptr(), writer.as_ptr());
+        assert_eq!(
+            persistence.proof_accountant().unwrap().as_ptr(),
+            writer.as_ptr()
+        );
         let row = VersionedRow {
             row_id: RowId(u64::MAX - 1),
             values: HashMap::from([

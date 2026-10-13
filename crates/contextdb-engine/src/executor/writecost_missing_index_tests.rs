@@ -10,13 +10,7 @@ use uuid::Uuid;
 struct TestVectorBudget;
 
 impl MemoryBudget for TestVectorBudget {
-    fn try_allocate_for(
-        &self,
-        _: usize,
-        _: &str,
-        _: &str,
-        _: &str,
-    ) -> contextdb_core::Result<()> {
+    fn try_allocate_for(&self, _: usize, _: &str, _: &str, _: &str) -> contextdb_core::Result<()> {
         Ok(())
     }
 
@@ -34,8 +28,11 @@ fn fixture() -> Database {
         &HashMap::new(),
     )
     .unwrap();
-    db.execute("CREATE TABLE residual_values (value INTEGER PRIMARY KEY)", &HashMap::new())
-        .unwrap();
+    db.execute(
+        "CREATE TABLE residual_values (value INTEGER PRIMARY KEY)",
+        &HashMap::new(),
+    )
+    .unwrap();
     for value in [1_i64, 2] {
         db.execute(
             "INSERT INTO residual_values VALUES ($value)",
@@ -99,4 +96,3 @@ fn eager_missing_unique_storage_preserves_hide_refuse_and_residual_contracts() {
         "a complete residual mismatch is hidden before the refusal gate"
     );
 }
-

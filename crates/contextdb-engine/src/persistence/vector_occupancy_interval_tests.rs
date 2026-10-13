@@ -66,15 +66,24 @@ impl Harness {
     fn reopen(&mut self) {
         self.db = None;
         let path = self.dir.path().join("occupancy.db");
-        let file = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
         let owner = super::super::writer_file::LockedWriterFile::lock(file, path.parent()).unwrap();
-        let database = redb::Database::builder().create_with_backend(owner.view()).unwrap();
+        let database = redb::Database::builder()
+            .create_with_backend(owner.view())
+            .unwrap();
         self.db = Some(ProofFixtureDatabase { database, owner });
     }
 
     /// Stage a set of membership writes in one transaction. `Some` puts the
     /// record, `None` removes the row's membership. Returns the open write.
-    fn stage(&self, ops: &[(u64, Option<VectorPartitionMembershipRecord>)]) -> redb::WriteTransaction {
+    fn stage(
+        &self,
+        ops: &[(u64, Option<VectorPartitionMembershipRecord>)],
+    ) -> redb::WriteTransaction {
         let write = self.db().begin_write().unwrap();
         for (row, next) in ops {
             let identity = record(*row, 1, None);
@@ -134,7 +143,10 @@ impl Harness {
         for item in table.prefix_bounded(route.as_slice()).unwrap() {
             let (key, value) = item.unwrap();
             let record = pages::decode_source_member(key.value(), value.value()).unwrap();
-            out.push((record.visible_from.0, record.deleted_tx.map_or(OPEN, |tx| tx.0)));
+            out.push((
+                record.visible_from.0,
+                record.deleted_tx.map_or(OPEN, |tx| tx.0),
+            ));
         }
         out
     }
@@ -147,7 +159,9 @@ impl Harness {
 }
 
 fn scan_answer(directory: &[(u64, u64)], hold: u64) -> bool {
-    directory.iter().any(|(from, to)| *from <= hold && hold < *to)
+    directory
+        .iter()
+        .any(|(from, to)| *from <= hold && hold < *to)
 }
 
 fn reference_union(directory: &[(u64, u64)]) -> Vec<(u64, u64)> {
@@ -167,14 +181,27 @@ fn reference_union(directory: &[(u64, u64)]) -> Vec<(u64, u64)> {
 fn check(h: &Harness, holds: &[u64], context: &str) {
     let directory = h.directory();
     let rows = h.rows();
-    assert_eq!(rows, reference_union(&directory), "{context}: rows equal the union of the directory");
+    assert_eq!(
+        rows,
+        reference_union(&directory),
+        "{context}: rows equal the union of the directory"
+    );
     for pair in rows.windows(2) {
-        assert!(pair[0].1 < pair[1].0, "{context}: rows {pair:?} must be non-adjacent");
+        assert!(
+            pair[0].1 < pair[1].0,
+            "{context}: rows {pair:?} must be non-adjacent"
+        );
     }
     for (start, end) in &rows {
-        assert!(end > start, "{context}: row ({start},{end}) must be non-empty");
+        assert!(
+            end > start,
+            "{context}: row ({start},{end}) must be non-empty"
+        );
     }
-    assert!(!h.dirty(), "{context}: the route is not left on the dirty list");
+    assert!(
+        !h.dirty(),
+        "{context}: the route is not left on the dirty list"
+    );
     for hold in holds {
         assert_eq!(
             h.answer(*hold),
@@ -209,7 +236,12 @@ fn all_holds(h: &Harness) -> Vec<u64> {
 // ---------------------------------------------------------------------------
 
 /// Publish `ops` on top of `setup`, checking all four moments.
-fn case(setup: &[(u64, Option<VectorPartitionMembershipRecord>)], ops: &[(u64, Option<VectorPartitionMembershipRecord>)], expect_rows: &[(u64, u64)], holds: &[u64]) {
+fn case(
+    setup: &[(u64, Option<VectorPartitionMembershipRecord>)],
+    ops: &[(u64, Option<VectorPartitionMembershipRecord>)],
+    expect_rows: &[(u64, u64)],
+    holds: &[u64],
+) {
     let mut h = Harness::new();
     h.commit(setup, true);
     let before = h.rows();
@@ -238,7 +270,12 @@ fn put(row: u64, from: u64, to: Option<u64>) -> (u64, Option<VectorPartitionMemb
 #[test]
 fn a_received_closed_membership_above_an_existing_one_is_its_own_row() {
     // [10,20) then a received closed [30,40): a hold at 25 must NOT see the route.
-    case(&[put(1, 10, Some(20))], &[put(2, 30, Some(40))], &[(10, 20), (30, 40)], &[15, 25, 35, 45]);
+    case(
+        &[put(1, 10, Some(20))],
+        &[put(2, 30, Some(40))],
+        &[(10, 20), (30, 40)],
+        &[15, 25, 35, 45],
+    );
 }
 
 #[test]
@@ -248,8 +285,18 @@ fn the_first_loaded_closed_membership_on_an_empty_table_gets_a_row() {
 
 #[test]
 fn a_received_open_membership_below_and_above_the_newest_start() {
-    case(&[put(1, 20, Some(30))], &[put(2, 5, None)], &[(5, OPEN)], &[4, 5, 25, 99]);
-    case(&[put(1, 20, Some(30))], &[put(2, 50, None)], &[(20, 30), (50, OPEN)], &[25, 35, 50, 99]);
+    case(
+        &[put(1, 20, Some(30))],
+        &[put(2, 5, None)],
+        &[(5, OPEN)],
+        &[4, 5, 25, 99],
+    );
+    case(
+        &[put(1, 20, Some(30))],
+        &[put(2, 50, None)],
+        &[(20, 30), (50, OPEN)],
+        &[25, 35, 50, 99],
+    );
 }
 
 #[test]
@@ -505,24 +552,23 @@ fn removing_the_only_membership_of_a_route_clears_its_rows() {
     spy.fail_at.store(usize::MAX, Ordering::SeqCst);
     let owner = ImageMemory::operation_reader(handle.clone(), spy.clone()).unwrap();
     let mut workspace = crate::memory_accounting::OwnedMemoryReservation::new(handle.clone());
-    let result = owner
-        .scope(|| {
-            persistence.with_db(|db| {
-                let write = db.begin_write().unwrap();
-                persistence.prune_vector_memberships_in_write(
-                    &write,
-                    records[..2].iter().map(|record| {
-                        (
-                            &record.index,
-                            record.row_id,
-                            record.vector_created_tx,
-                            record.vector_lsn,
-                        )
-                    }),
-                    Some(&mut workspace),
-                )
-            })
-        });
+    let result = owner.scope(|| {
+        persistence.with_db(|db| {
+            let write = db.begin_write().unwrap();
+            persistence.prune_vector_memberships_in_write(
+                &write,
+                records[..2].iter().map(|record| {
+                    (
+                        &record.index,
+                        record.row_id,
+                        record.vector_created_tx,
+                        record.vector_lsn,
+                    )
+                }),
+                Some(&mut workspace),
+            )
+        })
+    });
     spy.assert_payload_lifetime();
     let error = result.unwrap_err();
     assert!(
@@ -654,7 +700,11 @@ fn run_sequence(seed: u64, steps: usize) {
             }
             // append-close: close an open membership at the publishing tx
             1 => {
-                let open: Vec<u64> = model.iter().filter(|(_, (_, to))| to.is_none()).map(|(r, _)| *r).collect();
+                let open: Vec<u64> = model
+                    .iter()
+                    .filter(|(_, (_, to))| to.is_none())
+                    .map(|(r, _)| *r)
+                    .collect();
                 if open.is_empty() {
                     continue;
                 }
@@ -670,7 +720,11 @@ fn run_sequence(seed: u64, steps: usize) {
             // receive / load: an arbitrary closed or open membership
             2 | 3 => {
                 let from = 1 + rng.below(clock + 10);
-                let to = if rng.below(3) == 0 { None } else { Some(from + 1 + rng.below(12)) };
+                let to = if rng.below(3) == 0 {
+                    None
+                } else {
+                    Some(from + 1 + rng.below(12))
+                };
                 let row = next_row;
                 next_row += 1;
                 model.insert(row, (from, to));
@@ -716,7 +770,11 @@ fn run_sequence(seed: u64, steps: usize) {
             }
             // same publication: close one membership and open another at the same tx
             _ => {
-                let open: Vec<u64> = model.iter().filter(|(_, (_, to))| to.is_none()).map(|(r, _)| *r).collect();
+                let open: Vec<u64> = model
+                    .iter()
+                    .filter(|(_, (_, to))| to.is_none())
+                    .map(|(r, _)| *r)
+                    .collect();
                 if open.is_empty() {
                     continue;
                 }
@@ -735,7 +793,10 @@ fn run_sequence(seed: u64, steps: usize) {
         };
         h.commit(&ops, settle);
         let directory = h.directory();
-        let expected: Vec<(u64, u64)> = model.values().map(|(f, t)| (*f, t.unwrap_or(OPEN))).collect();
+        let expected: Vec<(u64, u64)> = model
+            .values()
+            .map(|(f, t)| (*f, t.unwrap_or(OPEN)))
+            .collect();
         let (mut a, mut b) = (directory.clone(), expected);
         a.sort_unstable();
         b.sort_unstable();
@@ -928,8 +989,13 @@ fn a_hold_is_answered_from_the_interval_rows_without_reading_any_membership() {
             h.commit(chunk, true);
         }
         let directory = h.directory();
-        let holds = [0_u64, 99, 100, 199, 200, 250, 299, 300, 399, 400, 450, 499, 500, 10_000];
-        let expected: Vec<bool> = holds.iter().map(|hold| scan_answer(&directory, *hold)).collect();
+        let holds = [
+            0_u64, 99, 100, 199, 200, 250, 299, 300, 399, 400, 450, 499, 500, 10_000,
+        ];
+        let expected: Vec<bool> = holds
+            .iter()
+            .map(|hold| scan_answer(&directory, *hold))
+            .collect();
         assert_eq!(h.rows(), vec![(100, 200), (300, 400), (500, OPEN)]);
 
         // Remove every membership record; keep only the interval rows.
@@ -950,7 +1016,10 @@ fn a_hold_is_answered_from_the_interval_rows_without_reading_any_membership() {
         let answers: Vec<Option<bool>> = holds.iter().map(|hold| h.answer(*hold)).collect();
         assert_eq!(
             answers,
-            expected.iter().map(|answer| Some(*answer)).collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|answer| Some(*answer))
+                .collect::<Vec<_>>(),
             "history {history}: every hold is answered from the interval rows alone"
         );
     }
@@ -970,7 +1039,11 @@ const SCENARIO_ENV: &str = "CDB120_CRASH_WINDOW_SCENARIO";
 const STORE_ENV: &str = "CDB120_CRASH_WINDOW_STORE";
 const MARKER_ENV: &str = "CDB120_CRASH_WINDOW_MARKER";
 
-fn sql(db: &crate::Database, text: &str, pairs: Vec<(&str, contextdb_core::Value)>) -> contextdb_core::Result<()> {
+fn sql(
+    db: &crate::Database,
+    text: &str,
+    pairs: Vec<(&str, contextdb_core::Value)>,
+) -> contextdb_core::Result<()> {
     let params = pairs.into_iter().map(|(k, v)| (k.to_owned(), v)).collect();
     db.execute(text, &params).map(|_| ())
 }
@@ -980,7 +1053,10 @@ fn put_row(db: &crate::Database, row: u128, scope: &str) -> contextdb_core::Resu
         db,
         "INSERT INTO items (id, scope, embedding) VALUES ($id, $scope, $v)",
         vec![
-            ("id", contextdb_core::Value::Uuid(uuid::Uuid::from_u128(row))),
+            (
+                "id",
+                contextdb_core::Value::Uuid(uuid::Uuid::from_u128(row)),
+            ),
             ("scope", contextdb_core::Value::Text(scope.to_owned())),
             ("v", contextdb_core::Value::Vector(vec![1.0, 0.5])),
         ],
@@ -991,7 +1067,10 @@ fn drop_row(db: &crate::Database, row: u128) {
     sql(
         db,
         "DELETE FROM items WHERE id = $id",
-        vec![("id", contextdb_core::Value::Uuid(uuid::Uuid::from_u128(row)))],
+        vec![(
+            "id",
+            contextdb_core::Value::Uuid(uuid::Uuid::from_u128(row)),
+        )],
     )
     .unwrap();
 }
@@ -1023,7 +1102,12 @@ fn cdb120_crash_window_child() {
         drop_row(&db, 1);
     }
     // Arm the seam for exactly the commit under test.
-    unsafe { std::env::set_var(crate::composite_store::ABORT_BEFORE_VECTOR_PUBLICATION_ENV, &marker) };
+    unsafe {
+        std::env::set_var(
+            crate::composite_store::ABORT_BEFORE_VECTOR_PUBLICATION_ENV,
+            &marker,
+        )
+    };
     match scenario.as_str() {
         "last-vector-leaves" => drop_row(&db, 1),
         "new-key-at-the-cap" => put_row(&db, 9, "k9").unwrap(),
@@ -1034,20 +1118,27 @@ fn cdb120_crash_window_child() {
 
 /// Every route's interval rows against the union of its durable memberships.
 fn assert_durable_intervals_match_memberships(store: &std::path::Path) {
-    let file = std::fs::OpenOptions::new().read(true).write(true).open(store).unwrap();
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(store)
+        .unwrap();
     let owner = super::super::writer_file::LockedWriterFile::lock(file, store.parent()).unwrap();
-    let database = redb::Database::builder().create_with_backend(owner.view()).unwrap();
+    let database = redb::Database::builder()
+        .create_with_backend(owner.view())
+        .unwrap();
     let read = database.begin_read().unwrap();
     let mut directory: BTreeMap<Vec<u8>, Vec<(u64, u64)>> = BTreeMap::new();
     if let Ok(source) = read.open_table(pages::SOURCE) {
         for item in source.iter().unwrap() {
             let (key, value) = item.unwrap();
             let record = pages::decode_source_member(key.value(), value.value()).unwrap();
-            let route = RedbPersistence::vector_partition_prefix(&record.index, &record.partition_key);
-            directory
-                .entry(route)
-                .or_default()
-                .push((record.visible_from.0, record.deleted_tx.map_or(OPEN, |tx| tx.0)));
+            let route =
+                RedbPersistence::vector_partition_prefix(&record.index, &record.partition_key);
+            directory.entry(route).or_default().push((
+                record.visible_from.0,
+                record.deleted_tx.map_or(OPEN, |tx| tx.0),
+            ));
         }
     }
     let mut rows: BTreeMap<Vec<u8>, Vec<(u64, u64)>> = BTreeMap::new();
@@ -1057,7 +1148,9 @@ fn assert_durable_intervals_match_memberships(store: &std::path::Path) {
             let split = key.value().len() - 8;
             let start = u64::from_be_bytes(key.value()[split..].try_into().unwrap());
             let end = u64::from_be_bytes(value.value()[..8].try_into().unwrap());
-            rows.entry(key.value()[..split].to_vec()).or_default().push((start, end));
+            rows.entry(key.value()[..split].to_vec())
+                .or_default()
+                .push((start, end));
         }
     }
     let dirty = read
@@ -1070,7 +1163,10 @@ fn assert_durable_intervals_match_memberships(store: &std::path::Path) {
         .map(|(route, intervals)| (route.clone(), reference_union(intervals)))
         .filter(|(_, union)| !union.is_empty())
         .collect();
-    assert_eq!(rows, expected, "durable interval rows equal the union of the durable memberships, route by route");
+    assert_eq!(
+        rows, expected,
+        "durable interval rows equal the union of the durable memberships, route by route"
+    );
 }
 
 fn crash_window(scenario: &str, expect_rows: usize, expect_occupied: usize) {
@@ -1084,7 +1180,11 @@ fn crash_window(scenario: &str, expect_rows: usize, expect_occupied: usize) {
         .env(MARKER_ENV, &marker)
         .output()
         .expect("spawn the crash child");
-    assert!(!output.status.success(), "{scenario}: the child must die, got {:?}", output.status);
+    assert!(
+        !output.status.success(),
+        "{scenario}: the child must die, got {:?}",
+        output.status
+    );
     assert_eq!(
         std::fs::read(&marker).unwrap_or_default(),
         b"reached",
@@ -1095,23 +1195,56 @@ fn crash_window(scenario: &str, expect_rows: usize, expect_occupied: usize) {
     {
         let db = crate::Database::open(&store).expect("reopen after the process death");
         db.set_maintenance_policy(crate::MaintenancePolicy::CallerDriven);
-        let rows = db.execute("SELECT id FROM items", &std::collections::HashMap::new()).unwrap().rows.len();
-        assert_eq!(rows, expect_rows, "{scenario}: the durable commit survived the death");
-        let audit = db.vector_store_for_test().partition_limit_audit_for_test(&index()).unwrap();
-        assert_eq!(audit.occupied, audit.recounted_occupied, "{scenario}: occupied");
-        assert_eq!(audit.directory_bytes, audit.recounted_directory_bytes, "{scenario}: directory bytes");
-        assert_eq!(audit.occupied, expect_occupied, "{scenario}: counted routes after reopen");
+        let rows = db
+            .execute("SELECT id FROM items", &std::collections::HashMap::new())
+            .unwrap()
+            .rows
+            .len();
+        assert_eq!(
+            rows, expect_rows,
+            "{scenario}: the durable commit survived the death"
+        );
+        let audit = db
+            .vector_store_for_test()
+            .partition_limit_audit_for_test(&index())
+            .unwrap();
+        assert_eq!(
+            audit.occupied, audit.recounted_occupied,
+            "{scenario}: occupied"
+        );
+        assert_eq!(
+            audit.directory_bytes, audit.recounted_directory_bytes,
+            "{scenario}: directory bytes"
+        );
+        assert_eq!(
+            audit.occupied, expect_occupied,
+            "{scenario}: counted routes after reopen"
+        );
         // The exact boundary: the free slots admit, the next key refuses.
         for n in 0..(4 - expect_occupied) {
-            put_row(&db, 100 + n as u128, &format!("fresh{n}")).unwrap_or_else(|e| panic!("{scenario}: free slot {n}: {e}"));
+            put_row(&db, 100 + n as u128, &format!("fresh{n}"))
+                .unwrap_or_else(|e| panic!("{scenario}: free slot {n}: {e}"));
         }
         let refusal = put_row(&db, 200, "one-too-many").unwrap_err();
         assert!(
-            matches!(refusal, contextdb_core::Error::VectorPartitionLimitExceeded { max_partitions: 4, .. }),
+            matches!(
+                refusal,
+                contextdb_core::Error::VectorPartitionLimitExceeded {
+                    max_partitions: 4,
+                    ..
+                }
+            ),
             "{scenario}: {refusal:?}"
         );
-        let audit = db.vector_store_for_test().partition_limit_audit_for_test(&index()).unwrap();
-        assert_eq!((audit.occupied, audit.recounted_occupied), (4, 4), "{scenario}: full and exact");
+        let audit = db
+            .vector_store_for_test()
+            .partition_limit_audit_for_test(&index())
+            .unwrap();
+        assert_eq!(
+            (audit.occupied, audit.recounted_occupied),
+            (4, 4),
+            "{scenario}: full and exact"
+        );
     }
     assert_durable_intervals_match_memberships(&store);
 }

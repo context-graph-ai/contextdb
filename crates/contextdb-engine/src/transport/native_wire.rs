@@ -45,7 +45,8 @@ pub(crate) fn admit_wire_future_with<'a, T, F>(
     owner: ReadMemoryOwner,
     make: impl FnOnce() -> WireResult<F>,
 ) -> WireResult<AdmittedWireFuture<'a, T>>
-where F: Future<Output = WireResult<T>> + Send + 'a,
+where
+    F: Future<Output = WireResult<T>> + Send + 'a,
 {
     let mut refusal = None;
     let frame = contextdb_core::read_memory::ReadOwnedFuture::try_new_with(owner, || {
@@ -77,10 +78,12 @@ where
         "wire_future_frame",
         "reduce simultaneous wire operations or raise the declared reader memory limit",
     )?;
-    Ok(AdmittedWireFuture(AdmittedWireFrame::Legacy(LegacyAdmittedWireFuture {
-        frame: Box::pin(future),
-        _credit: credit,
-    })))
+    Ok(AdmittedWireFuture(AdmittedWireFrame::Legacy(
+        LegacyAdmittedWireFuture {
+            frame: Box::pin(future),
+            _credit: credit,
+        },
+    )))
 }
 
 pub(crate) fn admit_native_request_future<'a, T, F>(
@@ -362,7 +365,9 @@ impl ReadBoundStreamInstallation {
             _ => None,
         }
     }
-    pub(crate) fn native_routes(&self) -> Option<&contextdb_core::read_memory::ReadShared<NativeWireRoutes>> {
+    pub(crate) fn native_routes(
+        &self,
+    ) -> Option<&contextdb_core::read_memory::ReadShared<NativeWireRoutes>> {
         match self.routes.as_ref() {
             Some(InstalledReadRoutes::Native(routes)) => Some(routes),
             _ => None,
@@ -538,7 +543,6 @@ impl Drop for ReadBoundRouteBuilder {
     }
 }
 
-
 /// Starting a request never supplies a fabricated cancellation to a Legacy
 /// provider. The actual caller must keep the native capability before dispatch.
 pub(crate) enum NativeReadStreamBegin {
@@ -648,7 +652,8 @@ where
         if !responder_matches {
             return Err(super::TransportError::Other(
                 "native request responder belongs to another route or reader".into(),
-            ).into());
+            )
+            .into());
         }
         if operation.cancellation().is_cancelled() {
             return Err(contextdb_core::Error::ReadCancelled.into());
@@ -662,12 +667,12 @@ where
         // allocating the retaining driver; rejection destroys the returned
         // frame under its existing invoice, without repricing it.
         let future = match future.0 {
-            DispatchKind::Native(future)
-                if future.is_funded_by(&retained.owner()) => future,
+            DispatchKind::Native(future) if future.is_funded_by(&retained.owner()) => future,
             _ => {
                 return Err(super::TransportError::Other(
                     "native handler did not return an originally funded native future".into(),
-                ).into());
+                )
+                .into());
             }
         };
         admit_native_operation_future_with(retained, |_| Ok(future))
@@ -690,7 +695,9 @@ impl<T, F: Future<Output = WireResult<T>>> Future for NativeOperationFuture<F> {
         // retained through F's Drop, and no Drop implementation moves F.
         let this = unsafe { self.get_unchecked_mut() };
         let result = unsafe { Pin::new_unchecked(&mut this.future) }.poll(cx);
-        if result.is_ready() { this.completed = true; }
+        if result.is_ready() {
+            this.completed = true;
+        }
         result
     }
 }
@@ -721,47 +728,77 @@ pub(crate) fn admit_native_operation_future_with<'a, T, F>(
     operation: crate::owner_read::NativeReadRequest,
     make: impl FnOnce(&crate::owner_read::NativeReadRequest) -> WireResult<F>,
 ) -> WireResult<DispatchedWireFuture<'a, T>>
-where F: Future<Output = WireResult<T>> + Send + 'a,
+where
+    F: Future<Output = WireResult<T>> + Send + 'a,
 {
     let owner = operation.owner();
     admit_wire_future_with(owner, || {
         let future = make(&operation)?;
-        Ok(NativeOperationFuture { future, _operation: operation, completed: false })
-    }).map(DispatchedWireFuture::native)
+        Ok(NativeOperationFuture {
+            future,
+            _operation: operation,
+            completed: false,
+        })
+    })
+    .map(DispatchedWireFuture::native)
 }
 
 impl NativeStreamResponder {
-    pub(crate) fn try_new_with<H>(owner: ReadMemoryOwner, make: impl FnOnce() -> WireResult<H>) -> WireResult<Self>
-    where H: FnOnce(super::BoundedWireBody) -> WireResult<AdmittedWireFuture<'static, ()>> + Send + 'static,
+    pub(crate) fn try_new_with<H>(
+        owner: ReadMemoryOwner,
+        make: impl FnOnce() -> WireResult<H>,
+    ) -> WireResult<Self>
+    where
+        H: FnOnce(super::BoundedWireBody) -> WireResult<AdmittedWireFuture<'static, ()>>
+            + Send
+            + 'static,
     {
         // The callback itself has an erased FnOnce signature; no credit or raw
         // payload is extracted from Core's opaque OwnedReadBox.
-        let invoice = wire_credit(owner.clone(), Layout::new::<H>().size(), "native_finish_callback")?;
+        let invoice = wire_credit(
+            owner.clone(),
+            Layout::new::<H>().size(),
+            "native_finish_callback",
+        )?;
         let layout = Layout::new::<H>();
         let storage = if layout.size() == 0 {
             NonNull::<H>::dangling()
         } else {
             NonNull::new(unsafe { alloc(layout) }.cast::<H>()).ok_or_else(allocation_error)?
         };
-        let guard = NativeInitGuard { storage: storage.cast(), layout, invoice };
+        let guard = NativeInitGuard {
+            storage: storage.cast(),
+            layout,
+            invoice,
+        };
         let finish = make()?;
-        unsafe { storage.as_ptr().write(finish); }
+        unsafe {
+            storage.as_ptr().write(finish);
+        }
         // No fallible action after initialization, before Box takes custody.
         let finish: Box<NativeFinish> = unsafe { Box::from_raw(storage.as_ptr()) };
         let guard = ManuallyDrop::new(guard);
         let invoice = unsafe { std::ptr::read(&guard.invoice) };
-        Ok(Self { finish: Some(finish), _credit: invoice, owner })
+        Ok(Self {
+            finish: Some(finish),
+            _credit: invoice,
+            owner,
+        })
     }
 }
 
 // This private construction guard frees uninitialized storage before its
 // external invoice, on producer Err/panic. It is never a refund API.
 struct NativeInitGuard {
-    storage: NonNull<u8>, layout: Layout, invoice: ReadCredit,
+    storage: NonNull<u8>,
+    layout: Layout,
+    invoice: ReadCredit,
 }
 impl Drop for NativeInitGuard {
     fn drop(&mut self) {
-        if self.layout.size() != 0 { unsafe { dealloc(self.storage.as_ptr(), self.layout) }; }
+        if self.layout.size() != 0 {
+            unsafe { dealloc(self.storage.as_ptr(), self.layout) };
+        }
     }
 }
 
@@ -769,24 +806,42 @@ impl Drop for NativeInitGuard {
 pub(crate) trait NativeRouteDispatch: Send + Sync {
     fn subject(&self) -> &str;
     fn begin_request(&self) -> WireResult<NativeReadStreamBegin>;
-    fn dispatch_native(&self, request: super::ReadBoundIncomingRequest,
-        operation: crate::owner_read::NativeReadRequest) -> WireResult<DispatchedWireFuture<'static, ()>>;
-    fn dispatch_legacy(&self, request: super::ReadBoundIncomingRequest,
-        owner: crate::vector_read_memory::RequestReadOwner) -> WireResult<DispatchedWireFuture<'static, ()>>;
+    fn dispatch_native(
+        &self,
+        request: super::ReadBoundIncomingRequest,
+        operation: crate::owner_read::NativeReadRequest,
+    ) -> WireResult<DispatchedWireFuture<'static, ()>>;
+    fn dispatch_legacy(
+        &self,
+        request: super::ReadBoundIncomingRequest,
+        owner: crate::vector_read_memory::RequestReadOwner,
+    ) -> WireResult<DispatchedWireFuture<'static, ()>>;
 }
 pub(crate) struct NativeWireRoutes {
-    entries: contextdb_core::read_memory::OwnedReadBox<[contextdb_core::read_memory::OwnedReadBox<dyn NativeRouteDispatch>]>,
+    entries: contextdb_core::read_memory::OwnedReadBox<
+        [contextdb_core::read_memory::OwnedReadBox<dyn NativeRouteDispatch>],
+    >,
     clock: contextdb_core::read_contract::NativeClockBinding,
     installation: ReadMemoryOwner,
     timeouts: contextdb_core::read_contract::OwnerServiceTimeouts,
 }
 impl NativeWireRoutes {
-    pub(crate) fn installation_owner(&self) -> ReadMemoryOwner { self.installation.clone() }
-    pub(crate) fn clock(&self) -> &contextdb_core::read_contract::NativeClockBinding { &self.clock }
-    pub(super) fn shutdown_drain_ms(&self) -> u64 { self.timeouts.shutdown_drain_ms }
+    pub(crate) fn installation_owner(&self) -> ReadMemoryOwner {
+        self.installation.clone()
+    }
+    pub(crate) fn clock(&self) -> &contextdb_core::read_contract::NativeClockBinding {
+        &self.clock
+    }
+    pub(super) fn shutdown_drain_ms(&self) -> u64 {
+        self.timeouts.shutdown_drain_ms
+    }
 
     pub(crate) fn find(&self, subject: &str) -> Option<&dyn NativeRouteDispatch> {
-        self.entries.iter().rev().find(|entry| entry.subject() == subject).map(|entry| entry.as_ref())
+        self.entries
+            .iter()
+            .rev()
+            .find(|entry| entry.subject() == subject)
+            .map(|entry| entry.as_ref())
     }
 }
 struct NativeRoute<H, L> {
@@ -797,40 +852,69 @@ struct NativeRoute<H, L> {
 }
 impl<H, L> NativeRouteDispatch for NativeRoute<H, L>
 where
-    H: Fn(super::ReadBoundIncomingRequest, crate::owner_read::NativeReadRequest)
-        -> WireResult<DispatchedWireFuture<'static, ()>> + Send + Sync + 'static,
-    L: Fn(super::ReadBoundIncomingRequest, crate::vector_read_memory::RequestReadOwner)
-        -> WireResult<DispatchedWireFuture<'static, ()>> + Send + Sync + 'static,
+    H: Fn(
+            super::ReadBoundIncomingRequest,
+            crate::owner_read::NativeReadRequest,
+        ) -> WireResult<DispatchedWireFuture<'static, ()>>
+        + Send
+        + Sync
+        + 'static,
+    L: Fn(
+            super::ReadBoundIncomingRequest,
+            crate::vector_read_memory::RequestReadOwner,
+        ) -> WireResult<DispatchedWireFuture<'static, ()>>
+        + Send
+        + Sync
+        + 'static,
 {
-    fn subject(&self) -> &str { self.subject.as_str() }
+    fn subject(&self) -> &str {
+        self.subject.as_str()
+    }
     fn begin_request(&self) -> WireResult<NativeReadStreamBegin> {
         use crate::vector_read_memory::{RequestReadOwner, RequestReadRoute};
         match self.provider.request_budget_owner()?.into_route() {
-            RequestReadRoute::Legacy(reader) => Ok(NativeReadStreamBegin::Legacy(RequestReadOwner::legacy(reader))),
+            RequestReadRoute::Legacy(reader) => Ok(NativeReadStreamBegin::Legacy(
+                RequestReadOwner::legacy(reader),
+            )),
             RequestReadRoute::Native(receipt) => {
-                let (operation, cancellation) = crate::owner_read::NativeReadRequest::try_new(receipt)?;
-                Ok(NativeReadStreamBegin::Native { operation, cancellation })
+                let (operation, cancellation) =
+                    crate::owner_read::NativeReadRequest::try_new(receipt)?;
+                Ok(NativeReadStreamBegin::Native {
+                    operation,
+                    cancellation,
+                })
             }
         }
     }
-    fn dispatch_native(&self, request: super::ReadBoundIncomingRequest,
-        operation: crate::owner_read::NativeReadRequest) -> WireResult<DispatchedWireFuture<'static, ()>> {
-        if !operation.owner().same_owner(&request.body.owner()) ||
-            !matches!(&request.responder, super::ReadBoundResponder::Native(reply) if reply.is_funded_by(&operation.owner())) {
+    fn dispatch_native(
+        &self,
+        request: super::ReadBoundIncomingRequest,
+        operation: crate::owner_read::NativeReadRequest,
+    ) -> WireResult<DispatchedWireFuture<'static, ()>> {
+        if !operation.owner().same_owner(&request.body.owner())
+            || !matches!(&request.responder, super::ReadBoundResponder::Native(reply) if reply.is_funded_by(&operation.owner()))
+        {
             return Err(super::TransportError::NoResponder.into());
         }
-        if operation.cancellation().is_cancelled() { return Err(contextdb_core::Error::ReadCancelled.into()); }
+        if operation.cancellation().is_cancelled() {
+            return Err(contextdb_core::Error::ReadCancelled.into());
+        }
         // The selected handler's _with frame owns its original operation. A
         // second wrapper and a second operation invoice are unnecessary.
         let owner = operation.owner();
         let future = (self.native)(request, operation)?;
         match &future.0 {
-            DispatchKind::Native(frame) if matches!(&frame.0, AdmittedWireFrame::Native(native) if native.is_funded_by(&owner)) => Ok(future),
+            DispatchKind::Native(frame) if matches!(&frame.0, AdmittedWireFrame::Native(native) if native.is_funded_by(&owner)) => {
+                Ok(future)
+            }
             _ => Err(super::TransportError::NoResponder.into()),
         }
     }
-    fn dispatch_legacy(&self, request: super::ReadBoundIncomingRequest,
-        owner: crate::vector_read_memory::RequestReadOwner) -> WireResult<DispatchedWireFuture<'static, ()>> {
+    fn dispatch_legacy(
+        &self,
+        request: super::ReadBoundIncomingRequest,
+        owner: crate::vector_read_memory::RequestReadOwner,
+    ) -> WireResult<DispatchedWireFuture<'static, ()>> {
         (self.legacy)(request, owner)
     }
 }
@@ -838,80 +922,174 @@ where
 // Exact fixed slots, independently paid before any route factory runs.
 pub(crate) struct NativeRouteBuilder {
     storage: Option<NonNull<contextdb_core::read_memory::OwnedReadBox<dyn NativeRouteDispatch>>>,
-    slots: usize, initialized: usize, invoice: Option<ReadCredit>, installation: ReadMemoryOwner,
+    slots: usize,
+    initialized: usize,
+    invoice: Option<ReadCredit>,
+    installation: ReadMemoryOwner,
     clock: Option<contextdb_core::read_contract::NativeClockBinding>,
     timeouts: contextdb_core::read_contract::OwnerServiceTimeouts,
 }
 impl NativeRouteBuilder {
-    pub(crate) fn try_new(installation: NativeReadChildReceipt, slots: usize,
+    pub(crate) fn try_new(
+        installation: NativeReadChildReceipt,
+        slots: usize,
         clock: &std::sync::Arc<dyn contextdb_core::read_contract::DeadlineClock>,
-        timeouts: contextdb_core::read_contract::OwnerServiceTimeouts) -> WireResult<Self> {
-        timeouts.validate_at(clock.now_ms()).map_err(|_| super::TransportError::NoResponder)?;
+        timeouts: contextdb_core::read_contract::OwnerServiceTimeouts,
+    ) -> WireResult<Self> {
+        timeouts
+            .validate_at(clock.now_ms())
+            .map_err(|_| super::TransportError::NoResponder)?;
         let installation = installation.into_owner();
-        let clock = if slots == 0 { None } else {
-            Some(contextdb_core::read_contract::NativeClockBinding::try_select(clock, &installation)?)
+        let clock = if slots == 0 {
+            None
+        } else {
+            Some(
+                contextdb_core::read_contract::NativeClockBinding::try_select(
+                    clock,
+                    &installation,
+                )?,
+            )
         };
-        let layout = Layout::array::<contextdb_core::read_memory::OwnedReadBox<dyn NativeRouteDispatch>>(slots)
-            .map_err(|_| allocation_error())?;
+        let layout = Layout::array::<
+            contextdb_core::read_memory::OwnedReadBox<dyn NativeRouteDispatch>,
+        >(slots)
+        .map_err(|_| allocation_error())?;
         let invoice = wire_credit(installation.clone(), layout.size(), "native_route_slots")?;
-        let storage = if slots == 0 { None } else {
+        let storage = if slots == 0 {
+            None
+        } else {
             Some(NonNull::new(unsafe { alloc(layout) }.cast()).ok_or_else(allocation_error)?)
         };
-        Ok(Self { storage, slots, initialized: 0, invoice: Some(invoice), installation, clock, timeouts })
+        Ok(Self {
+            storage,
+            slots,
+            initialized: 0,
+            invoice: Some(invoice),
+            installation,
+            clock,
+            timeouts,
+        })
     }
-    pub(crate) fn try_push<H, L>(&mut self, subject: &str,
+    pub(crate) fn try_push<H, L>(
+        &mut self,
+        subject: &str,
         provider: std::sync::Arc<dyn crate::vector_read_memory::ReadRequestBudgetProvider>,
         make_native: impl FnOnce(ReadMemoryOwner) -> WireResult<H>,
-        make_legacy: impl FnOnce(ReadMemoryOwner) -> WireResult<L>) -> WireResult<()>
+        make_legacy: impl FnOnce(ReadMemoryOwner) -> WireResult<L>,
+    ) -> WireResult<()>
     where
-        H: Fn(super::ReadBoundIncomingRequest, crate::owner_read::NativeReadRequest)
-            -> WireResult<DispatchedWireFuture<'static, ()>> + Send + Sync + 'static,
-        L: Fn(super::ReadBoundIncomingRequest, crate::vector_read_memory::RequestReadOwner)
-            -> WireResult<DispatchedWireFuture<'static, ()>> + Send + Sync + 'static,
+        H: Fn(
+                super::ReadBoundIncomingRequest,
+                crate::owner_read::NativeReadRequest,
+            ) -> WireResult<DispatchedWireFuture<'static, ()>>
+            + Send
+            + Sync
+            + 'static,
+        L: Fn(
+                super::ReadBoundIncomingRequest,
+                crate::vector_read_memory::RequestReadOwner,
+            ) -> WireResult<DispatchedWireFuture<'static, ()>>
+            + Send
+            + Sync
+            + 'static,
     {
-        if subject.is_empty() || self.initialized == self.slots { return Err(super::TransportError::NoResponder.into()); }
+        if subject.is_empty() || self.initialized == self.slots {
+            return Err(super::TransportError::NoResponder.into());
+        }
         let owner = self.installation.clone();
         let subject = NativeWireString::try_from_parts(owner.clone(), &[subject])?;
         let layout = Layout::new::<NativeRoute<H, L>>();
         let invoice = wire_credit(owner.clone(), layout.size(), "native_route_dispatch")?;
-        let storage = NonNull::new(unsafe { alloc(layout) }.cast::<NativeRoute<H,L>>()).ok_or_else(allocation_error)?;
-        let guard = NativeInitGuard { storage: storage.cast(), layout, invoice };
+        let storage = NonNull::new(unsafe { alloc(layout) }.cast::<NativeRoute<H, L>>())
+            .ok_or_else(allocation_error)?;
+        let guard = NativeInitGuard {
+            storage: storage.cast(),
+            layout,
+            invoice,
+        };
         // The concrete route, including H/L inline captures, is prepaid before
         // either factory. Their separately allocating captures keep own grants.
         let native = make_native(owner.clone())?;
         let legacy = make_legacy(owner)?;
-        unsafe { storage.as_ptr().write(NativeRoute { subject, provider, native, legacy }); }
+        unsafe {
+            storage.as_ptr().write(NativeRoute {
+                subject,
+                provider,
+                native,
+                legacy,
+            });
+        }
         let route: Box<dyn NativeRouteDispatch> = unsafe { Box::from_raw(storage.as_ptr()) };
         let guard = ManuallyDrop::new(guard);
         let invoice = unsafe { std::ptr::read(&guard.invoice) };
         let route = contextdb_core::read_memory::OwnedReadBox::new(route, invoice);
-        unsafe { self.storage.expect("nonempty native slots").as_ptr().add(self.initialized).write(route); }
+        unsafe {
+            self.storage
+                .expect("nonempty native slots")
+                .as_ptr()
+                .add(self.initialized)
+                .write(route);
+        }
         self.initialized += 1;
         Ok(())
     }
     pub(crate) fn finish(mut self) -> WireResult<ReadBoundStreamInstallation> {
-        if self.initialized != self.slots { return Err(super::TransportError::NoResponder.into()); }
-        if self.slots == 0 { return Ok(ReadBoundStreamInstallation::empty()); }
-        let invoice = wire_credit(self.installation.clone(), contextdb_core::read_memory::ReadShared::<NativeWireRoutes>::layout().size(), "native_route_root")?;
+        if self.initialized != self.slots {
+            return Err(super::TransportError::NoResponder.into());
+        }
+        if self.slots == 0 {
+            return Ok(ReadBoundStreamInstallation::empty());
+        }
+        let invoice = wire_credit(
+            self.installation.clone(),
+            contextdb_core::read_memory::ReadShared::<NativeWireRoutes>::layout().size(),
+            "native_route_root",
+        )?;
         let storage = self.storage.take().expect("complete native slots");
         let slot_invoice = self.invoice.take().expect("native slots paid");
-        let entries = unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(storage.as_ptr(), self.slots)) };
+        let entries = unsafe {
+            Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                storage.as_ptr(),
+                self.slots,
+            ))
+        };
         self.initialized = 0;
         let entries = contextdb_core::read_memory::OwnedReadBox::new(entries, slot_invoice);
         let installation = self.installation.clone();
-        let routes = contextdb_core::read_memory::ReadShared::try_from_prepaid_with(invoice,
-            || Ok(NativeWireRoutes { entries, clock: self.clock.take().expect("nonempty native clock"), installation, timeouts: self.timeouts }))?;
-        Ok(ReadBoundStreamInstallation { routes: Some(InstalledReadRoutes::Native(routes)) })
+        let routes =
+            contextdb_core::read_memory::ReadShared::try_from_prepaid_with(invoice, || {
+                Ok(NativeWireRoutes {
+                    entries,
+                    clock: self.clock.take().expect("nonempty native clock"),
+                    installation,
+                    timeouts: self.timeouts,
+                })
+            })?;
+        Ok(ReadBoundStreamInstallation {
+            routes: Some(InstalledReadRoutes::Native(routes)),
+        })
     }
 }
 impl Drop for NativeRouteBuilder {
     fn drop(&mut self) {
-        let Some(storage) = self.storage.take() else { return; };
-        let layout = Layout::array::<contextdb_core::read_memory::OwnedReadBox<dyn NativeRouteDispatch>>(self.slots)
-            .expect("checked native slots");
-        let guard = NativeInitGuard { storage: storage.cast(), layout,
-            invoice: self.invoice.take().expect("partial native slots paid") };
-        unsafe { std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(storage.as_ptr(), self.initialized)); }
+        let Some(storage) = self.storage.take() else {
+            return;
+        };
+        let layout = Layout::array::<
+            contextdb_core::read_memory::OwnedReadBox<dyn NativeRouteDispatch>,
+        >(self.slots)
+        .expect("checked native slots");
+        let guard = NativeInitGuard {
+            storage: storage.cast(),
+            layout,
+            invoice: self.invoice.take().expect("partial native slots paid"),
+        };
+        unsafe {
+            std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(
+                storage.as_ptr(),
+                self.initialized,
+            ));
+        }
         drop(guard);
     }
 }
@@ -931,48 +1109,79 @@ pub(crate) fn install_native_point_route(
     timeouts: contextdb_core::read_contract::OwnerServiceTimeouts,
 ) -> WireResult<ReadBoundStreamInstallation> {
     let mut builder = NativeRouteBuilder::try_new(installation, 1, &clock, timeouts)?;
-    builder.try_push(subject, provider, |owner| {
-        let table = NativeWireString::try_from_parts(owner, &[table])?;
-        Ok(move |request: super::ReadBoundIncomingRequest, operation: crate::owner_read::NativeReadRequest| {
-            let database = database.clone();
-            let clock = clock.clone();
-            // The table stays on its original installation invoice; this alias
-            // has its own per-request physical buffer, prepaid before copying.
-            let table = NativeWireString::try_from_parts(operation.owner(), &[table.as_str()])?;
-            admit_native_operation_future_with(operation, |operation| {
-                let entry = crate::executor::bounded::NativeReadExecutionEntry::try_new(operation, limits, clock)?;
-                Ok(async move {
-                    let body = request.body.native_contiguous_bytes().ok_or(super::TransportError::NoResponder)?;
-                    // Two original scalar identities, copied from borrowed
-                    // admitted custody; no allocating decode or plan wrapper.
-                    if body.len() != 16 { return Err(super::TransportError::NoResponder.into()); }
-                    let row_id = contextdb_core::RowId(u64::from_le_bytes(body[..8].try_into().expect("eight row bytes")));
-                    let snapshot = contextdb_core::SnapshotId(u64::from_le_bytes(body[8..].try_into().expect("eight snapshot bytes")));
-                    let key = table.into_point_key(row_id);
-                    let context = entry.open_context();
-                    context.checkpoint()?;
-                    let answer = crate::executor::native_point_row(&database, &key.value, snapshot, &entry)
-                        .map_err(native_point_error)?
-                        .ok_or(super::TransportError::NoResponder)?;
-                    context.checkpoint()?;
-                    request.responder.try_finish(super::BoundedWireBody::from_native_reply(answer))?.await?;
-                    // entry's only persistent logical strong then drops. Any
-                    // weak decoder/source holder now expires with ReadCancelled.
-                    Ok(())
-                })
-            })
-        })
-    }, |_| Ok(|_, _| Err(super::TransportError::NoResponder.into())))?;
+    builder.try_push(
+        subject,
+        provider,
+        |owner| {
+            let table = NativeWireString::try_from_parts(owner, &[table])?;
+            Ok(
+                move |request: super::ReadBoundIncomingRequest,
+                      operation: crate::owner_read::NativeReadRequest| {
+                    let database = database.clone();
+                    let clock = clock.clone();
+                    // The table stays on its original installation invoice; this alias
+                    // has its own per-request physical buffer, prepaid before copying.
+                    let table =
+                        NativeWireString::try_from_parts(operation.owner(), &[table.as_str()])?;
+                    admit_native_operation_future_with(operation, |operation| {
+                        let entry = crate::executor::bounded::NativeReadExecutionEntry::try_new(
+                            operation, limits, clock,
+                        )?;
+                        Ok(async move {
+                            let body = request
+                                .body
+                                .native_contiguous_bytes()
+                                .ok_or(super::TransportError::NoResponder)?;
+                            // Two original scalar identities, copied from borrowed
+                            // admitted custody; no allocating decode or plan wrapper.
+                            if body.len() != 16 {
+                                return Err(super::TransportError::NoResponder.into());
+                            }
+                            let row_id = contextdb_core::RowId(u64::from_le_bytes(
+                                body[..8].try_into().expect("eight row bytes"),
+                            ));
+                            let snapshot = contextdb_core::SnapshotId(u64::from_le_bytes(
+                                body[8..].try_into().expect("eight snapshot bytes"),
+                            ));
+                            let key = table.into_point_key(row_id);
+                            let context = entry.open_context();
+                            context.checkpoint()?;
+                            let answer = crate::executor::native_point_row(
+                                &database, &key.value, snapshot, &entry,
+                            )
+                            .map_err(native_point_error)?
+                            .ok_or(super::TransportError::NoResponder)?;
+                            context.checkpoint()?;
+                            request
+                                .responder
+                                .try_finish(super::BoundedWireBody::from_native_reply(answer))?
+                                .await?;
+                            // entry's only persistent logical strong then drops. Any
+                            // weak decoder/source holder now expires with ReadCancelled.
+                            Ok(())
+                        })
+                    })
+                },
+            )
+        },
+        |_| Ok(|_, _| Err(super::TransportError::NoResponder.into())),
+    )?;
     builder.finish()
 }
 fn native_point_error(error: crate::executor::BoundedExecutionError) -> super::WireError {
     match error {
         crate::executor::BoundedExecutionError::Engine(error) => error.into(),
-        crate::executor::BoundedExecutionError::Cancelled => contextdb_core::Error::ReadCancelled.into(),
-        crate::executor::BoundedExecutionError::Refused(failure) => contextdb_core::Error::ReadFailure(failure).into(),
+        crate::executor::BoundedExecutionError::Cancelled => {
+            contextdb_core::Error::ReadCancelled.into()
+        }
+        crate::executor::BoundedExecutionError::Refused(failure) => {
+            contextdb_core::Error::ReadFailure(failure).into()
+        }
         // This private storage slice has no public unsupported-query vocabulary.
         // Unsupported sources remain unactivated; they never call Legacy.
-        crate::executor::BoundedExecutionError::Unimplemented => super::TransportError::NoResponder.into(),
+        crate::executor::BoundedExecutionError::Unimplemented => {
+            super::TransportError::NoResponder.into()
+        }
     }
 }
 
@@ -980,7 +1189,9 @@ impl<F> Drop for NativeOperationFuture<F> {
     fn drop(&mut self) {
         // Notify the ORIGINAL token before dropping a pending frame. The
         // frame/resource fields then drop before request custody, as declared.
-        if !self.completed { self._operation.cancellation().cancel(); }
+        if !self.completed {
+            self._operation.cancellation().cancel();
+        }
     }
 }
 
@@ -993,6 +1204,9 @@ struct NativePointKey {
 }
 impl NativeWireString {
     fn into_point_key(self, row_id: contextdb_core::RowId) -> NativePointKey {
-        NativePointKey { value: (self.value, row_id), _credit: self._credit }
+        NativePointKey {
+            value: (self.value, row_id),
+            _credit: self._credit,
+        }
     }
 }

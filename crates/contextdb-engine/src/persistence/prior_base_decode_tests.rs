@@ -312,7 +312,11 @@ fn declare_raw_fixture(
         &HashMap::new(),
     )?;
     let mut meta = fixture.table_meta("fixture").unwrap();
-    let column = meta.columns.iter_mut().find(|column| column.name == "embedding").unwrap();
+    let column = meta
+        .columns
+        .iter_mut()
+        .find(|column| column.name == "embedding")
+        .unwrap();
     column.name = membership.index.column.clone();
     column.column_type = ColumnType::Vector(dimension);
     column.quantization = quantization;
@@ -359,7 +363,10 @@ fn write_and_load_raw_entry(
         };
         RedbPersistence::apply_content_identity_mutations_in_write(
             &write,
-            &[content_identity::decoded_vector_version_mutation(&entry, quantization)],
+            &[content_identity::decoded_vector_version_mutation(
+                &entry,
+                quantization,
+            )],
             &mut persistence.proof_admission(),
         )?;
         write.commit().map_err(RedbPersistence::storage_error)?;

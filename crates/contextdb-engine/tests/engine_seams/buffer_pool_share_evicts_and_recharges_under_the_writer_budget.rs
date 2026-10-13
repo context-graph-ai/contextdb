@@ -246,7 +246,8 @@ fn buffer_pool_share_evicts_and_recharges_under_the_writer_budget() {
         receipt.persistence_cache,
         (LIMIT / 16)
             .min(64 * 1024 * 1024)
-            .max((LIMIT / 16).min(256 * 1024)) + index_bytes,
+            .max((LIMIT / 16).min(256 * 1024))
+            + index_bytes,
         "declared bounded writer share"
     );
     let inventory = &receipt.relational_inventory;

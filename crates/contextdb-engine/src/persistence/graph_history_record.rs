@@ -134,9 +134,9 @@ impl std::io::Write for PublicLength {
 
 impl RedbPersistence {
     pub(super) fn decode_stored_change_log(bytes: &[u8]) -> Result<StoredChangeLogEntry> {
-    let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
-#[cfg(any(test, feature = "test-seams"))]
-crate::read_work_probe::note_graph("history", "private_history_decode", &[], None, None);
+        let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
+        #[cfg(any(test, feature = "test-seams"))]
+        crate::read_work_probe::note_graph("history", "private_history_decode", &[], None, None);
 
         if bytes.len() < 6 || bytes[0] != VERSION {
             return Err(malformed("invalid private history version or length"));
@@ -267,7 +267,7 @@ crate::read_work_probe::note_graph("history", "private_history_decode", &[], Non
         key: &str,
         bytes: &[u8],
     ) -> Result<content_identity::ContentIdentityMutation> {
-    let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
+        let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
         Self::decode_stored_change_log(bytes)?;
         content_identity::private_history_mutation(key, bytes)
     }

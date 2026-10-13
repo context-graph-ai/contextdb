@@ -80,7 +80,8 @@ fn short_authenticated_metadata_hints_are_rejected_before_the_serde_vec_reservat
     ] {
         let bytes = envelope(kind, &hostile_route(&index));
         let (unrestricted, old_peak, _) = measured(|| {
-            persistence.decode_vector_partition_record::<VectorPartitionMembershipRecord>(kind, &bytes)
+            persistence
+                .decode_vector_partition_record::<VectorPartitionMembershipRecord>(kind, &bytes)
         });
         assert!(unrestricted.is_err());
         assert!(

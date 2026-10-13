@@ -150,7 +150,10 @@ impl RedbPersistence {
                 }
                 Ok(matches(bytes, root))
             }
-            _ => Err(corruption(name, "does not match the captured historical root")),
+            _ => Err(corruption(
+                name,
+                "does not match the captured historical root",
+            )),
         }
     }
 
@@ -205,7 +208,12 @@ static OBSERVED_INDEX_ROOT_DAMAGE: parking_lot::Mutex<
     std::collections::BTreeMap<std::path::PathBuf, std::collections::BTreeSet<(String, String)>>,
 > = parking_lot::Mutex::new(std::collections::BTreeMap::new());
 
-pub(crate) fn note_index_root_damage(path: &std::path::Path, table: &str, index: &str, damaged: bool) {
+pub(crate) fn note_index_root_damage(
+    path: &std::path::Path,
+    table: &str,
+    index: &str,
+    damaged: bool,
+) {
     let mut observed = OBSERVED_INDEX_ROOT_DAMAGE.lock();
     if damaged {
         observed
