@@ -116,6 +116,7 @@ required-features = ["test-seams"]
 [[test]]
 name = "acceptance"
 path = "../../tests/acceptance.rs"
+required-features = ["test-seams"]
 
 [[test]]
 name = "cdb120_partition_insert_cost"
@@ -139,6 +140,7 @@ path = "tests/durable_public_api.rs"
 [[test]]
 name = "engine"
 path = "tests/engine.rs"
+required-features = ["test-seams"]
 
 [[test]]
 name = "engine_seams"
@@ -173,6 +175,7 @@ required-features = ["test-seams"]
 [[test]]
 name = "sql_surface"
 path = "tests/sql_surface.rs"
+required-features = ["test-seams"]
 
 [[test]]
 name = "sync"
@@ -202,6 +205,7 @@ required-features = ["test-seams"]
 [[test]]
 name = "indexed_row_memory_charge_measurement"
 path = "tests/indexed_row_memory_charge_measurement.rs"
+required-features = ["test-seams"]
 
 [[test]]
 name = "declared_memory_limit_bounds_a_writer"
@@ -221,14 +225,17 @@ required-features = ["test-seams"]
 [[test]]
 name = "memory_limit_admission_holds_for_vectors"
 path = "tests/memory_limit_admission_holds_for_vectors.rs"
+required-features = ["test-seams"]
 
 [[test]]
 name = "graph_property_memory_charge_measurement"
 path = "tests/graph_property_memory_charge_measurement.rs"
+required-features = ["test-seams"]
 
 [[test]]
 name = "text_memory_charge_measurement"
 path = "tests/text_memory_charge_measurement.rs"
+required-features = ["test-seams"]
 
 [[test]]
 name = "direct_file_image_memory_lifetime"
@@ -246,6 +253,7 @@ required-features = ["test-seams"]
 name = "engine_throughput"
 harness = false
 path = "../../benches/engine_throughput.rs"
+required-features = ["test-seams"]
 
 [[bench]]
 name = "engine_full_throughput"
@@ -266,16 +274,19 @@ path = "../../benches/subscriptions_pr.rs"
 name = "rank_policy_recall"
 harness = false
 path = "../../benches/rank_policy_recall.rs"
+required-features = ["test-seams"]
 
 [[bench]]
 name = "indexed_scan_filter_pk_inserts"
 harness = false
 path = "../../benches/indexed_scan_filter_pk_inserts.rs"
+required-features = ["test-seams"]
 
 [[bench]]
 name = "indexed_scan_filter_file_backed_open"
 harness = false
 path = "../../benches/indexed_scan_filter_file_backed_open.rs"
+required-features = ["test-seams"]
 
 [[bench]]
 name = "indexed_scan_filter_in_memory_pk_inserts"
@@ -286,16 +297,19 @@ path = "../../benches/indexed_scan_filter_in_memory_pk_inserts.rs"
 name = "indexed_scan_filter_entity_list"
 harness = false
 path = "../../benches/indexed_scan_filter_entity_list.rs"
+required-features = ["test-seams"]
 
 [[bench]]
 name = "indexed_scan_filter_non_id_pk_inserts"
 harness = false
 path = "../../benches/indexed_scan_filter_non_id_pk_inserts.rs"
+required-features = ["test-seams"]
 
 [[bench]]
 name = "storage_scale_hardening"
 harness = false
 path = "../../benches/storage_scale_hardening.rs"
+required-features = ["test-seams"]
 
 [[bench]]
 name = "acceptance_three_paradigm_query"
@@ -311,11 +325,13 @@ path = "../../benches/sql_surface_distinct.rs"
 name = "graph_adjacency_probe"
 harness = false
 path = "../../benches/graph_adjacency_probe.rs"
+required-features = ["test-seams"]
 
 [[bench]]
 name = "composite_index_routing"
 harness = false
 path = "../../benches/composite_index_routing.rs"
+required-features = ["test-seams"]
 
 [[bench]]
 name = "tier1_atomic_visibility_under_contention"
@@ -361,6 +377,7 @@ path = "../../benches/tier2_state_machine_overhead.rs"
 name = "commit_write_volume_scaling"
 harness = false
 path = "../../benches/commit_write_volume_scaling.rs"
+required-features = ["test-seams"]
 
 [[bench]]
 name = "sigterm_drain_in_flight_persistence"
