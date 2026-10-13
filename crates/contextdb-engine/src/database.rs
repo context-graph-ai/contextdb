@@ -42371,10 +42371,9 @@ impl Database {
                 Some(_) => {
                     // Pinned to the receiver's committed root at preparation:
                     // every custody read of the unit sees that one root.
-                    *working.custody_cache.lock() =
-                        Some(crate::custody::store::Store::durable_pinned(
-                            self.latest_custody_root()?,
-                        )?);
+                    *working.custody_cache.lock() = Some(
+                        crate::custody::store::Store::durable_pinned(self.latest_custody_root()?)?,
+                    );
                 }
                 None => {
                     *working.custody_metadata.lock() = self

@@ -422,7 +422,9 @@ impl Store {
         self.durable.is_some()
     }
     pub fn pinned_root(&self) -> Option<&Arc<crate::persistence::writer_source::WriterSnapshot>> {
-        self.durable.as_ref().and_then(|source| source.pinned.as_ref())
+        self.durable
+            .as_ref()
+            .and_then(|source| source.pinned.as_ref())
     }
     /// Set (or clear) the captured root for the reads of one call.
     pub fn set_read_root(
@@ -790,8 +792,8 @@ impl Store {
     ) -> Result<(BTreeMap<String, Option<Record>>, CustodyCharge)> {
         if self.durable.is_some() {
             let durable_memory = memory.clone();
-            if let Some((delta, visits, retained)) = self
-                .durable_read(|r| durable::validate_delta(r, writes, deletes, durable_memory))?
+            if let Some((delta, visits, retained)) =
+                self.durable_read(|r| durable::validate_delta(r, writes, deletes, durable_memory))?
             {
                 self.validation_visits += visits;
                 return Ok((delta, retained));
@@ -995,7 +997,10 @@ mod durable {
     /// A malformed stored record refuses with the custody codec's established
     /// diagnostic. Any admission refusal raised while decoding passes through
     /// unchanged.
-    fn established_codec_error(error: contextdb_core::Error, bytes: &[u8]) -> contextdb_core::Error {
+    fn established_codec_error(
+        error: contextdb_core::Error,
+        bytes: &[u8],
+    ) -> contextdb_core::Error {
         match error {
             contextdb_core::Error::SyncError(message)
                 if message.starts_with("MessagePack decode error") =>
@@ -1184,7 +1189,9 @@ mod durable {
             call.admit(
                 companions
                     .len()
-                    .checked_mul(std::mem::size_of::<(String, Probed)>() + std::mem::size_of::<&Record>())
+                    .checked_mul(
+                        std::mem::size_of::<(String, Probed)>() + std::mem::size_of::<&Record>(),
+                    )
                     .and_then(|n| n.checked_add(2 * ALLOCATION_BYTES))
                     .ok_or_else(invalid)?,
             )?;
@@ -1205,8 +1212,15 @@ mod durable {
                     .iter()
                     .filter_map(|key| {
                         in_answer(key)
-                            .or_else(|| memo.iter().find(|(k, _)| k == key).map(|(_, p)| p.record()))
-                            .or_else(|| loaded.iter().find(|(k, _)| k == key).map(|(_, p)| p.record()))
+                            .or_else(|| {
+                                memo.iter().find(|(k, _)| k == key).map(|(_, p)| p.record())
+                            })
+                            .or_else(|| {
+                                loaded
+                                    .iter()
+                                    .find(|(k, _)| k == key)
+                                    .map(|(_, p)| p.record())
+                            })
                     })
                     .collect::<Vec<_>>();
                 super::super::records::validate_record(record, &view)?;

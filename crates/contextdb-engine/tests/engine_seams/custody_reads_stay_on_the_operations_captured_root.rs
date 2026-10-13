@@ -5,7 +5,11 @@ use crate::custody_fixture::*;
 use contextdb_engine::Database;
 use contextdb_server::InProcessBroker;
 
-fn sorted(db: &Database, held: Option<&contextdb_engine::database::HeldCustodyRootForTest>, selector: &str) -> Vec<String> {
+fn sorted(
+    db: &Database,
+    held: Option<&contextdb_engine::database::HeldCustodyRootForTest>,
+    selector: &str,
+) -> Vec<String> {
     let mut keys = db.__custody_keys_for_test(held, selector).unwrap();
     keys.sort();
     keys
@@ -42,14 +46,16 @@ async fn custody_reads_stay_on_the_operations_captured_root() {
     // The held operation still answers exactly its captured journal, for
     // prefix and group selections alike, on every successive call.
     for _ in 0..2 {
-        assert_eq!(sorted(&edge, Some(&held), "delivery_root.v1."), before_roots);
+        assert_eq!(
+            sorted(&edge, Some(&held), "delivery_root.v1."),
+            before_roots
+        );
         assert_eq!(
             sorted(&edge, Some(&held), "delivery_manifest.v1."),
             before_manifests
         );
         assert!(
-            sorted(&edge, Some(&held), "@policies").len()
-                <= sorted(&edge, None, "@policies").len()
+            sorted(&edge, Some(&held), "@policies").len() <= sorted(&edge, None, "@policies").len()
         );
     }
     let later_group = now_manifests

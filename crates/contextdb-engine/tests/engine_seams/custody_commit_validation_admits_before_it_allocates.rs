@@ -40,7 +40,10 @@ fn roots(db: &Database) -> u64 {
         .unwrap()
 }
 fn rows(db: &Database) -> usize {
-    db.execute("SELECT id FROM records", &p()).unwrap().rows.len()
+    db.execute("SELECT id FROM records", &p())
+        .unwrap()
+        .rows
+        .len()
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -89,7 +92,10 @@ async fn custody_commit_validation_admits_before_it_allocates() {
     Database::__limit_custody_validation_for_test(Some(64 * 1024 * 1024));
     try_unit(&edge, 3).unwrap();
     let (held, retained) = Database::__last_custody_validation_for_test();
-    assert!(retained > 0, "the validated delta was charged until publication");
+    assert!(
+        retained > 0,
+        "the validated delta was charged until publication"
+    );
     assert_eq!(held, Some(0), "publication released the delta's admission");
     assert_eq!(roots(&edge), roots_before + 1);
     Database::__limit_custody_validation_for_test(None);

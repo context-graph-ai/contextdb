@@ -158,7 +158,11 @@ fn declare(db: &Database) {
         .unwrap();
 }
 /// A bound, declared file-backed edge at `edge.db`/`key` in `dir`.
-async fn bound_edge(broker: &InProcessBroker, dir: &Path, name: &str) -> (Arc<Database>, SyncClient) {
+async fn bound_edge(
+    broker: &InProcessBroker,
+    dir: &Path,
+    name: &str,
+) -> (Arc<Database>, SyncClient) {
     let edge = Arc::new(open(&dir.join(format!("{name}.db")), Some(CEILING)));
     let client = edge_client(&edge, broker, &dir.join(format!("{name}.key")));
     client
@@ -190,8 +194,11 @@ fn cache_pressure(db: &Database) {
             })
             .collect::<Vec<_>>()
             .join(",");
-        db.execute(&format!("INSERT INTO cache_pressure VALUES {values}"), &params)
-            .unwrap();
+        db.execute(
+            &format!("INSERT INTO cache_pressure VALUES {values}"),
+            &params,
+        )
+        .unwrap();
     }
 }
 /// The arms differ only in how many units the edge registered and delivered
@@ -374,10 +381,14 @@ fn arm(dir: &Path, n: usize) -> Arm {
         .find(|key| key.ends_with(&root_id(n).simple().to_string()))
         .cloned()
         .unwrap_or_else(|| history[history.len() - 1].clone());
-    edge.__tamper_custody_record_for_test(&victim, None).unwrap();
+    edge.__tamper_custody_record_for_test(&victim, None)
+        .unwrap();
     let tampered_refused = edge
         .__custody_keys_for_test(None, "delivery_root.v1.")
-        .is_err_and(|e| e.to_string().contains("invalid canonical delivery metadata"));
+        .is_err_and(|e| {
+            e.to_string()
+                .contains("invalid canonical delivery metadata")
+        });
     Arm {
         cache_occupancy: cache.3,
         allocated_start,
@@ -522,7 +533,10 @@ fn custody_history_commits_do_not_hydrate_the_delivery_journal() {
         );
         assert_eq!(ca.hydrated + cb.hydrated, 0);
     }
-    assert!(fa.decoded > 0, "the measured commits did real custody work: {arms:?}");
+    assert!(
+        fa.decoded > 0,
+        "the measured commits did real custody work: {arms:?}"
+    );
     // Each commit decodes its own unit's records, their same-unit companions
     // and the authority records a registration reads: a fixed multiple of one
     // unit's records per commit, whatever the history.
@@ -546,7 +560,10 @@ fn custody_history_commits_do_not_hydrate_the_delivery_journal() {
             cb.charged <= ca.charged + SETTLING_SLACK,
             "charged ownership cannot grow with registered history: {arms:?}"
         );
-        assert!(ca.gap == 0 && cb.gap == 0, "every charged owner reconciles: {arms:?}");
+        assert!(
+            ca.gap == 0 && cb.gap == 0,
+            "every charged owner reconciles: {arms:?}"
+        );
     }
     // 5. Live allocation, with the writer cache saturated and every moving
     // owner attributed at each growth checkpoint.
@@ -626,12 +643,18 @@ fn custody_history_commits_do_not_hydrate_the_delivery_journal() {
     let (_, ha) = &hubs[0];
     let (_, hb) = &hubs[1];
     for (n, hub) in &hubs {
-        assert_eq!(hub.hydrated, 0, "the hub never hydrates its journal: {hubs:?}");
+        assert_eq!(
+            hub.hydrated, 0,
+            "the hub never hydrates its journal: {hubs:?}"
+        );
         assert_eq!(hub.resident, (0, 0), "{hubs:?}");
         assert_eq!(hub.applied_rows, K + K / 2, "{hubs:?}");
         assert_eq!(hub.hub_received, (*n + K) as u64, "{hubs:?}");
     }
-    assert!(ha.decoded > 0, "the received units did real custody work: {hubs:?}");
+    assert!(
+        ha.decoded > 0,
+        "the received units did real custody work: {hubs:?}"
+    );
     assert_eq!(
         ha.decoded, hb.decoded,
         "the hub's custody decodes cannot grow with received history: {hubs:?}"

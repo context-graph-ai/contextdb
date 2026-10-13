@@ -27,7 +27,10 @@ async fn a_malformed_custody_record_refuses_with_the_custody_codec_diagnostic() 
 
     // A healthy record decodes on both paths.
     let (durable, resident) = Database::__custody_decode_refusals_for_test(&key, &good, None);
-    assert!(durable.is_none() && resident.is_none(), "{durable:?} {resident:?}");
+    assert!(
+        durable.is_none() && resident.is_none(),
+        "{durable:?} {resident:?}"
+    );
 
     let mut trailing = good.clone();
     trailing.push(0xc0);
@@ -53,7 +56,11 @@ async fn a_malformed_custody_record_refuses_with_the_custody_codec_diagnostic() 
     }
 
     // A refusal by the decode's own memory owner passes through unchanged.
-    let (durable, _) = Database::__custody_decode_refusals_for_test(&key, &good, Some(good.len() + key.len() + 64));
+    let (durable, _) = Database::__custody_decode_refusals_for_test(
+        &key,
+        &good,
+        Some(good.len() + key.len() + 64),
+    );
     assert!(
         matches!(durable, Some(Error::MemoryBudgetExceeded { .. })),
         "a decode-time admission refusal is not rewritten: {durable:?}"

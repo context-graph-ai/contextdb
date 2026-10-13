@@ -21,7 +21,12 @@ async fn delivery_status_answers_exactly_on_an_admitted_custody_fixture() {
     }
     let status = edge.delivery_status("records").unwrap();
     assert_eq!(
-        (status.eligible, status.accepted, status.pending, status.refused),
+        (
+            status.eligible,
+            status.accepted,
+            status.pending,
+            status.refused
+        ),
         (15, 12, 3, 0)
     );
     update_root(&edge, 4);
@@ -42,6 +47,9 @@ async fn delivery_status_answers_exactly_on_an_admitted_custody_fixture() {
     Arc::into_inner(edge).unwrap().close().unwrap();
     let edge = open(&dir.path().join("edge.db"), None);
     let status = edge.delivery_status("records").unwrap();
-    assert_eq!((status.eligible, status.accepted, status.pending), (14, 11, 3));
+    assert_eq!(
+        (status.eligible, status.accepted, status.pending),
+        (14, 11, 3)
+    );
     hub.stop().await;
 }

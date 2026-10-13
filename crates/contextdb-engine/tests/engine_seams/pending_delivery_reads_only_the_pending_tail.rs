@@ -25,7 +25,10 @@ async fn arm(delivered: usize) -> (u64, u64) {
     }
     client.push().await.unwrap();
     let (keys, _) = edge.__custody_pending_for_test().unwrap();
-    assert!(keys.is_empty(), "every registered unit was delivered: {keys:?}");
+    assert!(
+        keys.is_empty(),
+        "every registered unit was delivered: {keys:?}"
+    );
 
     for unit in delivered..delivered + TAIL {
         commit_unit(&edge, unit);
@@ -70,7 +73,10 @@ async fn arm(delivered: usize) -> (u64, u64) {
     // The next push offers exactly the tail; the hub's outcomes clear it.
     client.push().await.unwrap();
     let (cleared, _) = edge.__custody_pending_for_test().unwrap();
-    assert!(cleared.is_empty(), "the pushed tail was delivered: {cleared:?}");
+    assert!(
+        cleared.is_empty(),
+        "the pushed tail was delivered: {cleared:?}"
+    );
 
     // A destination change makes every current root pending again.
     first.stop().await;
@@ -103,7 +109,10 @@ async fn arm(delivered: usize) -> (u64, u64) {
         .iter()
         .find(|(selector, _, _)| selector == "pending")
         .unwrap();
-    assert_eq!(resident, durable, "the pending index agrees with the resident journal");
+    assert_eq!(
+        resident, durable,
+        "the pending index agrees with the resident journal"
+    );
 
     // Delivery to the new destination clears it.
     client.push().await.unwrap();
@@ -122,5 +131,8 @@ async fn pending_delivery_reads_only_the_pending_tail() {
         small, large,
         "doubling delivered history leaves the pending read's work unchanged"
     );
-    assert_eq!((small_moved, large_moved), (8 + TAIL as u64, 16 + TAIL as u64));
+    assert_eq!(
+        (small_moved, large_moved),
+        (8 + TAIL as u64, 16 + TAIL as u64)
+    );
 }

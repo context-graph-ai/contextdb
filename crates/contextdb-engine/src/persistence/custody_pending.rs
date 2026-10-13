@@ -72,7 +72,10 @@ fn index_complete(write: &redb::WriteTransaction) -> Result<bool> {
 
 /// Parse the trailing 32-hex-digit submission of an edge outcome key.
 fn outcome_submission(key: &str) -> Result<[u8; 16]> {
-    let hex = key.rsplit('.').next().ok_or_else(crate::custody::canonical::invalid)?;
+    let hex = key
+        .rsplit('.')
+        .next()
+        .ok_or_else(crate::custody::canonical::invalid)?;
     let mut out = [0u8; 16];
     if hex.len() != 32 {
         return Err(crate::custody::canonical::invalid());
@@ -181,15 +184,23 @@ pub(super) fn recompute_all(write: &redb::WriteTransaction) -> Result<()> {
         .map_err(RedbPersistence::storage_error)?;
     let destination = destination
         .as_ref()
-        .map(|value| match decode_record(value.value()).map_err(damage)? {
-            RecordView::Destination(d) => Ok(d.namespace),
-            _ => Err(crate::custody::canonical::invalid()),
-        })
+        .map(
+            |value| match decode_record(value.value()).map_err(damage)? {
+                RecordView::Destination(d) => Ok(d.namespace),
+                _ => Err(crate::custody::canonical::invalid()),
+            },
+        )
         .transpose()?;
     for entry in submissions.iter().map_err(RedbPersistence::storage_error)? {
         let (submission, _) = entry.map_err(RedbPersistence::storage_error)?;
         let submission = <[u8; 16]>::try_from(submission.value()).map_err(damage)?;
-        set_pending(&groups, &config, &mut pending, destination.as_ref(), submission)?;
+        set_pending(
+            &groups,
+            &config,
+            &mut pending,
+            destination.as_ref(),
+            submission,
+        )?;
     }
     Ok(())
 }
@@ -210,13 +221,21 @@ fn recompute(write: &redb::WriteTransaction, which: &[[u8; 16]]) -> Result<()> {
         .map_err(RedbPersistence::storage_error)?;
     let destination = destination
         .as_ref()
-        .map(|value| match decode_record(value.value()).map_err(damage)? {
-            RecordView::Destination(d) => Ok(d.namespace),
-            _ => Err(crate::custody::canonical::invalid()),
-        })
+        .map(
+            |value| match decode_record(value.value()).map_err(damage)? {
+                RecordView::Destination(d) => Ok(d.namespace),
+                _ => Err(crate::custody::canonical::invalid()),
+            },
+        )
         .transpose()?;
     for submission in which {
-        set_pending(&groups, &config, &mut pending, destination.as_ref(), *submission)?;
+        set_pending(
+            &groups,
+            &config,
+            &mut pending,
+            destination.as_ref(),
+            *submission,
+        )?;
     }
     Ok(())
 }

@@ -134,8 +134,8 @@ use contextdb_core::{
 use contextdb_relational::store::SyncSourceKind;
 use contextdb_tx::WriteSet;
 // Custody-only checked key reads.
-mod custody_records;
 mod custody_pending;
+mod custody_records;
 pub(crate) mod custody_source;
 use contextdb_vector::VectorWorkspaceReservation;
 use contextdb_vector::hnsw::{ReadOnlyVectorGraphPageReader, ReadOnlyVectorGraphPageSource};

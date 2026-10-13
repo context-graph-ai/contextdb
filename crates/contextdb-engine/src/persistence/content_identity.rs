@@ -7122,7 +7122,7 @@ impl RedbPersistence {
                             Some(plan) => super::custody_groups::Funding::Prepaid(plan),
                             None => super::custody_groups::Funding::Legacy(admission),
                         },
- false,
+                        false,
                     )?;
                 }
             }
@@ -9105,7 +9105,7 @@ pub(crate) mod original_writer {
                                 Some(plan) => super::super::custody_groups::Funding::Prepaid(plan),
                                 None => super::super::custody_groups::Funding::Unavailable,
                             },
- false,
+                            false,
                         )?;
                     }
                 }

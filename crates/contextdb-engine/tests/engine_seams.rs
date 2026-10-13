@@ -101,35 +101,35 @@ mod writer_recycle_baseline_cost;
 #[path = "engine_seams/writer_file_ownership_survives_recycle.rs"]
 mod writer_file_ownership_survives_recycle;
 
+#[path = "engine_seams/a_malformed_custody_record_refuses_with_the_custody_codec_diagnostic.rs"]
+mod a_malformed_custody_record_refuses_with_the_custody_codec_diagnostic;
+#[path = "engine_seams/an_incomplete_custody_index_refuses_without_loading_the_journal.rs"]
+mod an_incomplete_custody_index_refuses_without_loading_the_journal;
 #[path = "engine_seams/buffer_pool_share_evicts_and_recharges_under_the_writer_budget.rs"]
 mod buffer_pool_share_evicts_and_recharges_under_the_writer_budget;
+#[path = "engine_seams/custody_commit_validation_admits_before_it_allocates.rs"]
+mod custody_commit_validation_admits_before_it_allocates;
 #[path = "engine_seams/custody_durable_selection_matches_the_resident_journal.rs"]
 mod custody_durable_selection_matches_the_resident_journal;
+#[path = "engine_seams/custody_fixture.rs"]
+mod custody_fixture;
 #[cfg(target_os = "linux")]
 #[path = "engine_seams/custody_history_commits_do_not_hydrate_the_delivery_journal.rs"]
 mod custody_history_commits_do_not_hydrate_the_delivery_journal;
+#[path = "engine_seams/custody_reads_stay_on_the_operations_captured_root.rs"]
+mod custody_reads_stay_on_the_operations_captured_root;
+#[path = "engine_seams/delivery_status_answers_exactly_on_an_admitted_custody_fixture.rs"]
+mod delivery_status_answers_exactly_on_an_admitted_custody_fixture;
+#[path = "engine_seams/durable_custody_reads_refuse_missing_or_tampered_companions.rs"]
+mod durable_custody_reads_refuse_missing_or_tampered_companions;
 #[path = "engine_seams/history_sync_and_commit_cursors_reload_without_full_directories.rs"]
 mod history_sync_and_commit_cursors_reload_without_full_directories;
 #[path = "engine_seams/identity_preparation_refusal_leaves_the_store_unchanged.rs"]
 mod identity_preparation_refusal_leaves_the_store_unchanged;
-#[path = "engine_seams/custody_fixture.rs"]
-mod custody_fixture;
-#[path = "engine_seams/custody_reads_stay_on_the_operations_captured_root.rs"]
-mod custody_reads_stay_on_the_operations_captured_root;
-#[path = "engine_seams/an_incomplete_custody_index_refuses_without_loading_the_journal.rs"]
-mod an_incomplete_custody_index_refuses_without_loading_the_journal;
-#[path = "engine_seams/a_malformed_custody_record_refuses_with_the_custody_codec_diagnostic.rs"]
-mod a_malformed_custody_record_refuses_with_the_custody_codec_diagnostic;
-#[path = "engine_seams/durable_custody_reads_refuse_missing_or_tampered_companions.rs"]
-mod durable_custody_reads_refuse_missing_or_tampered_companions;
-#[path = "engine_seams/custody_commit_validation_admits_before_it_allocates.rs"]
-mod custody_commit_validation_admits_before_it_allocates;
-#[path = "engine_seams/pending_delivery_reads_only_the_pending_tail.rs"]
-mod pending_delivery_reads_only_the_pending_tail;
-#[path = "engine_seams/delivery_status_answers_exactly_on_an_admitted_custody_fixture.rs"]
-mod delivery_status_answers_exactly_on_an_admitted_custody_fixture;
 #[path = "engine_seams/paged_initial_replacement_and_reclamation_progress_under_writes.rs"]
 mod paged_initial_replacement_and_reclamation_progress_under_writes;
+#[path = "engine_seams/pending_delivery_reads_only_the_pending_tail.rs"]
+mod pending_delivery_reads_only_the_pending_tail;
 #[path = "engine_seams/unpartitioned_vector_membership_pages_reload_at_constant_residency.rs"]
 mod unpartitioned_vector_membership_pages_reload_at_constant_residency;
 #[path = "engine_seams/version_pruning_and_compaction_resume_finite_safe_batches.rs"]

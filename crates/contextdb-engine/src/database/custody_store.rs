@@ -222,7 +222,8 @@ impl Database {
         selector: &str,
     ) -> Result<Vec<String>> {
         let read_memory = self.declared_reader_memory()?;
-        let _scope = held.map(|held| self.enter_writer_read(Some(held.0.clone()), read_memory.clone()));
+        let _scope =
+            held.map(|held| self.enter_writer_read(Some(held.0.clone()), read_memory.clone()));
         let records = self.custody_records_in(&[selector.to_owned()], read_memory)?;
         records.iter().map(Record::key).collect()
     }
@@ -252,14 +253,22 @@ impl Database {
     /// consistent while the journal itself is damaged.
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
-    pub fn __tamper_custody_record_for_test(&self, key: &str, value: Option<Vec<u8>>) -> Result<()> {
+    pub fn __tamper_custody_record_for_test(
+        &self,
+        key: &str,
+        value: Option<Vec<u8>>,
+    ) -> Result<()> {
         self.raw_custody_commit_for_test(key, value, true)
     }
     /// Measurement only: commit a raw custody CONFIG write or delete through
     /// the ordinary commit path, with its ordinary custody validation.
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
-    pub fn __commit_custody_record_for_test(&self, key: &str, value: Option<Vec<u8>>) -> Result<()> {
+    pub fn __commit_custody_record_for_test(
+        &self,
+        key: &str,
+        value: Option<Vec<u8>>,
+    ) -> Result<()> {
         self.raw_custody_commit_for_test(key, value, false)
     }
     /// Measurement only: the manifest keys the ordinary pending-delivery read
@@ -270,7 +279,10 @@ impl Database {
         let before = crate::custody::store::work::pending_examined_total();
         let answer = self.custody_pending_manifests(self.declared_reader_memory()?)?;
         let keys = answer.iter().map(Record::key).collect::<Result<Vec<_>>>()?;
-        Ok((keys, crate::custody::store::work::pending_examined_total() - before))
+        Ok((
+            keys,
+            crate::custody::store::work::pending_examined_total() - before,
+        ))
     }
     #[cfg(feature = "test-seams")]
     fn raw_custody_commit_for_test(
@@ -721,7 +733,9 @@ impl Database {
                         .as_ref()
                         .map(|members| (name, members))
                 })
-                .flat_map(|(name, members)| std::iter::once(name.clone()).chain(members.iter().cloned()))
+                .flat_map(|(name, members)| {
+                    std::iter::once(name.clone()).chain(members.iter().cloned())
+                })
                 .collect::<HashSet<String>>()
         };
         if !ws

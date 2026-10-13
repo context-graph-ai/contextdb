@@ -28,7 +28,10 @@ pub(super) fn invalidate(write: &redb::WriteTransaction) -> Result<()> {
 /// maintains every committed custody entry into it with funded scratch, so the
 /// marker is true again when the transaction commits.
 pub(super) fn reset_complete(write: &redb::WriteTransaction) -> Result<()> {
-    for result in [write.delete_table(GROUP_TABLE), write.delete_table(REVERSE_TABLE)] {
+    for result in [
+        write.delete_table(GROUP_TABLE),
+        write.delete_table(REVERSE_TABLE),
+    ] {
         match result {
             Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
             Err(error) => return Err(RedbPersistence::storage_error(error)),

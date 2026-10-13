@@ -78,7 +78,11 @@ async fn an_incomplete_custody_index_refuses_without_loading_the_journal() {
         updated.as_ref().is_err_and(incomplete),
         "a retiring update refuses: {updated:?}"
     );
-    assert_eq!(bodies(&edge), rows_before, "no refused commit published a row");
+    assert_eq!(
+        bodies(&edge),
+        rows_before,
+        "no refused commit published a row"
+    );
     let work_after = edge.__custody_writer_work_for_test();
     assert_eq!(
         work_after.0, work_before.0,
@@ -115,7 +119,10 @@ async fn an_incomplete_custody_index_refuses_without_loading_the_journal() {
         .unwrap()
         .expect("the rebuilt index is complete");
     for (selector, resident, durable) in parity {
-        assert_eq!(resident, durable, "rebuilt index answers {selector} exactly");
+        assert_eq!(
+            resident, durable,
+            "rebuilt index answers {selector} exactly"
+        );
     }
     drop(client);
     hub.stop().await;

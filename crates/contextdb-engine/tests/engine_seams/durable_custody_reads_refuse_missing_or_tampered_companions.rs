@@ -10,7 +10,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 fn corruption(error: &Error) -> bool {
-    error.to_string().contains("invalid canonical delivery metadata")
+    error
+        .to_string()
+        .contains("invalid canonical delivery metadata")
 }
 
 async fn damaged_edge(
@@ -22,7 +24,9 @@ async fn damaged_edge(
     for unit in 0..4 {
         commit_unit(&edge, unit);
     }
-    let healthy = edge.__custody_keys_for_test(None, "delivery_root.v1.").unwrap();
+    let healthy = edge
+        .__custody_keys_for_test(None, "delivery_root.v1.")
+        .unwrap();
     assert_eq!(healthy.len(), 4, "the undamaged journal answers");
     damage(&edge);
     drop(client);
