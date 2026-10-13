@@ -18,6 +18,8 @@ mod a_held_savepoint_makes_every_commit_list_its_allocated_pages;
 mod aggregate_reads_complete_across_bounded_pages;
 #[path = "engine_seams/an_arriving_count_declaration_meets_the_same_door_a_local_one_does.rs"]
 mod an_arriving_count_declaration_meets_the_same_door_a_local_one_does;
+#[path = "engine_seams/an_import_tail_larger_than_the_reader_default_completes.rs"]
+mod an_import_tail_larger_than_the_reader_default_completes;
 #[path = "engine_seams/an_undeclared_prefix_count_still_answers_exactly.rs"]
 mod an_undeclared_prefix_count_still_answers_exactly;
 #[path = "engine_seams/append_measurement_costs_a_build_that_did_not_ask_for_it_nothing.rs"]
