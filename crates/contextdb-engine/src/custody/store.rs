@@ -356,6 +356,15 @@ thread_local! {
 pub(crate) fn set_admission_probe_for_test(probe: Option<fn(usize)>) {
     ADMISSION_PROBE.with(|cell| cell.set(probe));
 }
+/// The start of commit validation: production-dead outside the seam. The
+/// probe receives `usize::MAX` so a test can take its baseline here.
+#[inline]
+pub(crate) fn admission_probe_start() {
+    #[cfg(feature = "test-seams")]
+    if let Some(probe) = ADMISSION_PROBE.with(std::cell::Cell::get) {
+        probe(usize::MAX);
+    }
+}
 /// One admission point: production-dead outside the measurement seam.
 #[inline]
 pub(crate) fn admission_probe(_held: usize) {
@@ -1793,6 +1802,7 @@ mod durable {
         memory: Arc<ImageMemory>,
         db: &crate::Database,
     ) -> Result<(BTreeMap<String, Option<Record>>, u64, Scratch)> {
+        admission_probe_start();
         let mut retained = Scratch::new(memory.clone());
         let mut scratch = Scratch::new(memory.clone());
         let mut delta = BTreeMap::new();

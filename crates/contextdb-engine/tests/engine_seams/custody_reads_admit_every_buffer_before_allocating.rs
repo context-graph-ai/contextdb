@@ -24,12 +24,21 @@ const SLACK: isize = 16 * 1024;
 static BASE: AtomicUsize = AtomicUsize::new(0);
 static EXCESS: AtomicIsize = AtomicIsize::new(isize::MIN);
 static PROBES: AtomicUsize = AtomicUsize::new(0);
-/// Measure from the first admission point instead of from `BASE`.
+/// Measure from the start of commit validation (or, failing that, its first
+/// admission point) instead of from `BASE`.
 static FROM_FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static FIRST: AtomicIsize = AtomicIsize::new(0);
 
 fn probe(held: usize) {
     let live = live_allocations_for_test() as isize;
+    if held == usize::MAX {
+        // Commit validation starts: measure from here, with nothing admitted.
+        if FROM_FIRST.load(Ordering::SeqCst) {
+            FIRST.store(live, Ordering::SeqCst);
+            PROBES.store(1, Ordering::SeqCst);
+        }
+        return;
+    }
     let unadmitted = live - held as isize;
     if FROM_FIRST.load(Ordering::SeqCst) && PROBES.load(Ordering::SeqCst) == 0 {
         FIRST.store(unadmitted, Ordering::SeqCst);
@@ -219,7 +228,7 @@ fn stage_wide_unit(edge: &Database, unit: usize) -> contextdb_core::TxId {
 
 /// Commit validation admits its companion planning before allocating it:
 /// commits of wide units under a sweep of validation limits, measured from
-/// validation's first admission point.
+/// the start of commit validation.
 async fn companion_planning() {
     let dir = tempfile::tempdir().unwrap();
     let (edge, _hub) = edge_with_units(dir.path(), 1).await;
