@@ -294,6 +294,20 @@ fn groups(r: &Record) -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// Measurement only: the refusal one stored record produces on the durable
+/// decode path (under an optional image limit) and on the resident load path.
+#[cfg(feature = "test-seams")]
+pub(crate) fn decode_refusals_for_test(
+    key: &str,
+    bytes: &[u8],
+    durable_limit: Option<usize>,
+) -> (Option<contextdb_core::Error>, Option<contextdb_core::Error>) {
+    let memory = crate::read_image_memory::ImageMemory::new(durable_limit);
+    let durable = durable::decode_stored(&memory, key, bytes).err();
+    let resident = Store::from_entries(BTreeMap::from([(key.to_owned(), bytes.to_vec())])).err();
+    (durable, resident)
+}
+
 impl Store {
     /// Resident delivery-journal records and an estimate of their owned bytes
     /// (keys, decoded records, encoded bodies and group membership).
@@ -845,7 +859,11 @@ mod durable {
     /// Decode one stored record into an answer charged to `memory`, once:
     /// canonical bytes, matching key, valid signature. The transient
     /// canonical re-encode is admitted before it allocates.
-    fn decode_stored(memory: &Arc<ImageMemory>, key: &str, bytes: &[u8]) -> Result<Record> {
+    pub(super) fn decode_stored(
+        memory: &Arc<ImageMemory>,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<Record> {
         let credit = bytes
             .len()
             .checked_add(key.len())
@@ -854,7 +872,9 @@ mod durable {
         memory.reserve(credit)?;
         let decoded = (|| {
             work::decoded(1);
-            let record = memory.decode_msgpack::<Record>(bytes)?;
+            let record = memory
+                .decode_msgpack::<Record>(bytes)
+                .map_err(|error| established_codec_error(error, bytes))?;
             if encode(&record)? != bytes || record.key()? != key {
                 return Err(invalid());
             }
@@ -863,6 +883,20 @@ mod durable {
         })();
         memory.release(credit);
         decoded
+    }
+
+    /// A malformed stored record refuses with the custody codec's established
+    /// diagnostic. Any admission refusal raised while decoding passes through
+    /// unchanged.
+    fn established_codec_error(error: contextdb_core::Error, bytes: &[u8]) -> contextdb_core::Error {
+        match error {
+            contextdb_core::Error::SyncError(message)
+                if message.starts_with("MessagePack decode error") =>
+            {
+                decode(bytes).err().unwrap_or_else(invalid)
+            }
+            other => other,
+        }
     }
 
     /// A transient check of one stored record (canonical, keyed, signed):

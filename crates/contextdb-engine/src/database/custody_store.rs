@@ -2,6 +2,11 @@
 use super::*;
 use crate::custody::{records::*, store::Store};
 
+#[cfg(feature = "test-seams")]
+thread_local! {
+    static SKIP_CUSTODY_VALIDATION_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// A captured writer root held by a test.
 #[cfg(feature = "test-seams")]
 #[doc(hidden)]
@@ -214,6 +219,45 @@ impl Database {
         let _scope = held.map(|held| self.enter_writer_read(Some(held.0.clone()), read_memory.clone()));
         let records = self.custody_records_in(&[selector.to_owned()], read_memory)?;
         records.iter().map(Record::key).collect()
+    }
+    /// Measurement only: the refusals one stored custody record produces on
+    /// the durable decode path and on the resident load path.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __custody_decode_refusals_for_test(
+        key: &str,
+        bytes: &[u8],
+        durable_limit: Option<usize>,
+    ) -> (Option<Error>, Option<Error>) {
+        crate::custody::store::decode_refusals_for_test(key, bytes, durable_limit)
+    }
+    /// Measurement only: the committed bytes of one custody CONFIG key.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __custody_record_bytes_for_test(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        self.persistence
+            .as_ref()
+            .expect("file-backed fixture")
+            .load_config_value_raw(key)
+    }
+    /// Measurement only: commit a raw custody CONFIG write (`Some`) or delete
+    /// (`None`) through the ordinary commit path with custody validation
+    /// skipped, so storage, mirrors, group index and content identity all stay
+    /// consistent while the journal itself is damaged.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __tamper_custody_record_for_test(&self, key: &str, value: Option<Vec<u8>>) -> Result<()> {
+        let tx = self.begin()?;
+        self.tx_mgr.with_write_set(tx, |ws| match value {
+            Some(value) => ws.config_writes.push((key.to_owned(), value)),
+            None => ws.config_deletes.push(key.to_owned()),
+        })?;
+        SKIP_CUSTODY_VALIDATION_FOR_TEST.with(|skip| skip.set(true));
+        let committed = self.commit(tx);
+        SKIP_CUSTODY_VALIDATION_FOR_TEST.with(|skip| skip.set(false));
+        // A later reader starts from the committed (damaged) journal.
+        *self.custody_cache.lock() = None;
+        committed
     }
     /// Measurement only: drop the custody group index completion marker.
     /// Takes effect for roots captured after the next open.
@@ -693,6 +737,10 @@ impl Database {
         ws: &mut WriteSet,
         read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Option<CustodyDelta>> {
+        #[cfg(feature = "test-seams")]
+        if SKIP_CUSTODY_VALIDATION_FOR_TEST.with(|skip| skip.get()) {
+            return Ok(None);
+        }
         self.retire_changed_custody_roots(
             ws,
             self.scoped_writer_root()
