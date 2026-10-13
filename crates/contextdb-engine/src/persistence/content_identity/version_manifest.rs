@@ -1404,7 +1404,8 @@ pub(in super::super) mod commit_row_work {
         PROTECTED_ROOT_EVENTS.with(|count| count.replace(0))
     }
 
-    /// Pending manifest deltas examined to answer one overlay query.
+    /// Overlay work: pending deltas compared by the unindexed overlay, one
+    /// probe per lookup or candidate step by the indexed overlay.
     pub(in super::super::super) fn count_overlay_entries(entries: usize) {
         OVERLAY_ENTRIES.with(|count| count.set(count.get().saturating_add(entries as u64)));
     }

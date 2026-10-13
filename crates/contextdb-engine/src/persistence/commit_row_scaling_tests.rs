@@ -1,11 +1,15 @@
 //! A commit's durable write must cost work proportional to its rows.
 //!
-//! One transaction of N rows (an import file, a bulk insert, then a bulk
-//! delete of the same rows) is committed at N = 1,024, 2,048, 4,096 and 8,192. Two exact work counters are read around
+//! One transaction of N rows (an import file, a bulk insert) is committed at
+//! N = 1,024, 2,048, 4,096 and 8,192; one transaction deleting all of them is
+//! committed at N = 512, 1,024, 2,048 and 4,096. (One 8,192-row delete of
+//! these rows is refused by the writer's fixed 16 MiB source budget, on the
+//! base revision as well; that limit is not this test's subject.) Two exact work counters are read around
 //! each commit, on the committing thread:
 //!
-//! * pending manifest deltas examined while each row's version membership is
-//!   overlaid on the unpublished deltas of the rows before it;
+//! * pending manifest overlay probes made while each row's version membership
+//!   is overlaid on the unpublished deltas of the rows before it (each probe
+//!   is a binary search per sorted run of pending positions);
 //! * opens, closes, deletes and relocations of historical-root-protected
 //!   tables, each of which makes redb finalize the checksums of every page the
 //!   transaction has dirtied in the tables closed since the previous one.
@@ -20,7 +24,8 @@ use crate::{Database, MaintenancePolicy};
 use contextdb_core::Value;
 use std::collections::HashMap;
 
-const ROW_COUNTS: [usize; 4] = [1_024, 2_048, 4_096, 8_192];
+const INSERT_ROW_COUNTS: [usize; 4] = [1_024, 2_048, 4_096, 8_192];
+const DELETE_ROW_COUNTS: [usize; 4] = [512, 1_024, 2_048, 4_096];
 const FIXED_ALLOWANCE: u64 = 1_024;
 const PROTECTED_ROOT_EVENT_ALLOWANCE: u64 = 64;
 
@@ -112,7 +117,11 @@ fn commit_one_transaction(rows: usize, measured: Measured) -> CommitWork {
 
 fn assert_linear(measured: Measured) {
     let mut previous: Option<CommitWork> = None;
-    for rows in ROW_COUNTS {
+    let row_counts = match measured {
+        Measured::Insert => INSERT_ROW_COUNTS,
+        Measured::Delete => DELETE_ROW_COUNTS,
+    };
+    for rows in row_counts {
         let work = commit_one_transaction(rows, measured);
         assert!(
             work.overlay_entries >= rows as u64,
