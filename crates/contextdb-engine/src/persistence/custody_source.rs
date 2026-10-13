@@ -58,11 +58,34 @@ pub(crate) struct CustodyReader {
     config: Option<redb::ReadOnlyTable<&'static str, &'static [u8]>>,
     groups: Option<redb::ReadOnlyTable<&'static [u8], &'static [u8]>>,
     pending: Option<redb::ReadOnlyTable<&'static [u8], &'static [u8]>>,
+    /// A digest of the captured storage root these tables read.
+    root: [u8; 32],
+    /// The owning store's memo of companion checks already passed.
+    checked: Option<Arc<crate::custody::store::CompanionMemo>>,
 }
 
 impl CustodyReader {
     /// Open the custody tables of one already pinned storage view.
+    /// The fingerprint of the captured storage root this view reads.
+    pub(crate) fn root_fingerprint(&self) -> &[u8] {
+        &self.root
+    }
+    pub(crate) fn companion_memo(&self) -> Option<&crate::custody::store::CompanionMemo> {
+        self.checked.as_deref()
+    }
     fn open(read: &redb::ReadTransaction) -> Result<Self> {
+        struct Fingerprint(blake3::Hasher);
+        impl std::hash::Hasher for Fingerprint {
+            fn finish(&self) -> u64 {
+                0
+            }
+            fn write(&mut self, bytes: &[u8]) {
+                self.0.update(bytes);
+            }
+        }
+        let mut fingerprint = Fingerprint(blake3::Hasher::new());
+        std::hash::Hash::hash(&read.storage_snapshot_identity(), &mut fingerprint);
+        let root = *fingerprint.0.finalize().as_bytes();
         let config = match read.open_table(CONFIG_TABLE) {
             Ok(table) => Some(table),
             Err(redb::TableError::TableDoesNotExist(_)) => None,
@@ -82,6 +105,8 @@ impl CustodyReader {
             config,
             groups,
             pending,
+            root,
+            checked: None,
         })
     }
     /// Visit exactly `key`'s stored value, if committed.
@@ -258,13 +283,15 @@ impl super::writer_source::WriterSnapshot {
     /// incomplete answers `None`: its membership answers could be partial.
     pub(crate) fn with_custody_read<T>(
         &self,
+        checked: Option<Arc<crate::custody::store::CompanionMemo>>,
         read: impl FnOnce(&CustodyReader) -> Result<T>,
     ) -> Result<Option<T>> {
         if !self.custody_groups_complete() {
             return Ok(None);
         }
         let txn = self.owner_read()?;
-        let reader = CustodyReader::open(&txn)?;
+        let mut reader = CustodyReader::open(&txn)?;
+        reader.checked = checked;
         read(&reader).map(Some)
     }
 }

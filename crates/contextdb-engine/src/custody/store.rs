@@ -153,6 +153,7 @@ fn copy_records<'a>(
 
 /// Admitted bytes held by one custody operation, released on drop.
 pub(crate) use durable::Scratch as CustodyCharge;
+pub(crate) use verified::CompanionMemo;
 
 /// Test-seam measurement of custody-journal work (process-wide).
 /// `HYDRATED` counts delivery-journal records loaded into a resident store;
@@ -212,6 +213,8 @@ pub(crate) struct Store {
     /// delivery journal durably. The maps above then mirror only the bounded
     /// tenant policy and binding records; no delivery record stays resident.
     durable: Option<DurableSource>,
+    /// Fixed-size memo of companion checks already passed at a captured root.
+    checked: Option<Arc<CompanionMemo>>,
     /// The captured writer root every durable read of the current call uses.
     read_root: Option<Arc<crate::persistence::writer_source::WriterSnapshot>>,
     pub selected_records: u64,
@@ -381,6 +384,7 @@ impl Store {
         }
         let mut store = Self::from_entries(tenant_entries)?;
         store.durable = Some(DurableSource { pinned: None });
+        store.checked = Some(Arc::new(CompanionMemo::new()));
         Ok(store)
     }
     /// A durable view that reads only `root`, whoever asks.
@@ -417,7 +421,7 @@ impl Store {
             return Ok(None);
         }
         let root = self.read_root.clone().ok_or_else(invalid)?;
-        root.with_custody_read(read)?
+        root.with_custody_read(self.checked.clone(), read)?
             .map(Some)
             .ok_or_else(crate::persistence::custody_source::incomplete_custody_index)
     }
@@ -828,6 +832,68 @@ impl Store {
     }
 }
 
+/// Results of pure custody checks, memoized in fixed tables that never
+/// allocate: a signature check depends only on a record's stored bytes, and a
+/// companion check only on the record's key at one immutable captured root.
+/// A hit skips repeating the check; a miss (including a slot reused by another
+/// entry) repeats it. Nothing here grows with the journal.
+mod verified {
+    const SLOTS: usize = 1024;
+    type Table = parking_lot::Mutex<[[u8; 32]; SLOTS]>;
+    static SIGNATURES: Table = parking_lot::const_mutex([[0; 32]; SLOTS]);
+
+    /// One store's companion checks, keyed by captured root and record key.
+    /// Allocated once per durable store at a fixed size.
+    pub(crate) struct CompanionMemo(parking_lot::Mutex<Box<[[u8; 32]; SLOTS]>>);
+    impl CompanionMemo {
+        pub(crate) fn new() -> Self {
+            Self(parking_lot::Mutex::new(Box::new([[0; 32]; SLOTS])))
+        }
+        pub(crate) fn known(&self, digest: &[u8; 32]) -> bool {
+            self.0.lock()[slot(digest)] == *digest
+        }
+        pub(crate) fn remember(&self, digest: [u8; 32]) {
+            self.0.lock()[slot(&digest)] = digest;
+        }
+    }
+
+    pub(super) fn digest(parts: &[&[u8]]) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        for part in parts {
+            hasher.update(&(part.len() as u64).to_be_bytes());
+            hasher.update(part);
+        }
+        *hasher.finalize().as_bytes()
+    }
+    fn slot(digest: &[u8; 32]) -> usize {
+        usize::from(u16::from_le_bytes([digest[0], digest[1]])) % SLOTS
+    }
+    fn known(table: &Table, digest: &[u8; 32]) -> bool {
+        table.lock()[slot(digest)] == *digest
+    }
+    fn remember(table: &Table, digest: [u8; 32]) {
+        table.lock()[slot(&digest)] = digest;
+    }
+    pub(super) fn signature_known(digest: &[u8; 32]) -> bool {
+        known(&SIGNATURES, digest)
+    }
+    pub(super) fn remember_signature(digest: [u8; 32]) {
+        remember(&SIGNATURES, digest)
+    }
+}
+
+/// Verify a stored record's signature unless these exact stored bytes were
+/// verified before.
+fn verify_stored(key: &str, bytes: &[u8], record: &Record) -> Result<()> {
+    let digest = verified::digest(&[key.as_bytes(), bytes]);
+    if verified::signature_known(&digest) {
+        return Ok(());
+    }
+    record.verify()?;
+    verified::remember_signature(digest);
+    Ok(())
+}
+
 /// Durable custody reads for a file-backed store with a complete group index.
 /// Every key list, decoded record and scratch copy is admitted to the
 /// requesting operation's memory before it is allocated, and released when
@@ -835,6 +901,7 @@ impl Store {
 /// returned, already-charged answer.
 mod durable {
     use super::*;
+    use super::{verified, verify_stored};
     use crate::persistence::custody_source::CustodyReader;
     use crate::read_image_memory::ImageMemory;
     use crate::sync_types::held::ALLOCATION_BYTES;
@@ -897,7 +964,7 @@ mod durable {
             if encode(&record)? != bytes || record.key()? != key {
                 return Err(invalid());
             }
-            record.verify()?;
+            verify_stored(key, bytes, &record)?;
             Ok(record)
         })();
         memory.release(credit);
@@ -933,7 +1000,7 @@ mod durable {
         if record.key()? != key {
             return Err(invalid());
         }
-        record.verify()?;
+        verify_stored(key, bytes, &record)?;
         probed.record = Some(record);
         Ok(probed)
     }
@@ -1084,7 +1151,13 @@ mod durable {
         )?;
         let mut memo: std::collections::VecDeque<(String, Probed)> =
             std::collections::VecDeque::with_capacity(COMPANION_MEMO);
-        for record in records {
+        for (index, record) in records.iter().enumerate() {
+            // At one immutable root a key names one record and one companion
+            // set, so a check that passed there before need not repeat.
+            let checked = verified::digest(&[r.root_fingerprint(), keys[index].as_bytes()]);
+            if r.companion_memo().is_some_and(|memo| memo.known(&checked)) {
+                continue;
+            }
             let mut call = Scratch::new(memory.clone());
             let companions = companion_keys(r, record, &empty, &mut call)?;
             call.admit(
@@ -1116,6 +1189,9 @@ mod durable {
                     })
                     .collect::<Vec<_>>();
                 super::super::records::validate_record(record, &view)?;
+            }
+            if let Some(memo) = r.companion_memo() {
+                memo.remember(checked);
             }
             for entry in loaded {
                 if memo.len() == COMPANION_MEMO {
@@ -1404,7 +1480,7 @@ mod durable {
                         if record.key()? != key {
                             return Err(invalid());
                         }
-                        record.verify()?;
+                        verify_stored(key, bytes, &record)?;
                         Ok(record)
                     })
                     .transpose()?;
