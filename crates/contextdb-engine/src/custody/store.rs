@@ -1023,7 +1023,89 @@ mod durable {
                 decode_stored(&memory, key, value.ok_or_else(invalid)?)
             })?);
         }
+        validate_answer(r, keys, &records, &memory)?;
         Ok(AdmittedRecords { records, memory })
+    }
+
+    /// Companions kept from earlier answer records, so one group's members are
+    /// not re-read for each sibling.
+    const COMPANION_MEMO: usize = 64;
+
+    /// Every answer record's required companions exist and agree at this same
+    /// root, exactly as the resident journal checked them when it loaded. A
+    /// missing or damaged companion refuses with the custody corruption error.
+    fn validate_answer(
+        r: &CustodyReader,
+        keys: &[String],
+        records: &[Record],
+        memory: &Arc<ImageMemory>,
+    ) -> Result<()> {
+        let empty = BTreeMap::new();
+        let mut scratch = Scratch::new(memory.clone());
+        // Positions of the answer by key, for companions the answer already holds.
+        scratch.admit(
+            keys.len()
+                .checked_mul(std::mem::size_of::<usize>())
+                .and_then(|n| n.checked_add(ALLOCATION_BYTES))
+                .ok_or_else(invalid)?,
+        )?;
+        let mut by_key = (0..keys.len()).collect::<Vec<_>>();
+        by_key.sort_unstable_by(|a, b| keys[*a].cmp(&keys[*b]));
+        let in_answer = |key: &str| {
+            by_key
+                .binary_search_by(|i| keys[*i].as_str().cmp(key))
+                .ok()
+                .map(|i| &records[by_key[i]])
+        };
+        scratch.admit(
+            COMPANION_MEMO
+                .checked_mul(std::mem::size_of::<(String, Probed)>())
+                .and_then(|n| n.checked_add(ALLOCATION_BYTES))
+                .ok_or_else(invalid)?,
+        )?;
+        let mut memo: std::collections::VecDeque<(String, Probed)> =
+            std::collections::VecDeque::with_capacity(COMPANION_MEMO);
+        for record in records {
+            let mut call = Scratch::new(memory.clone());
+            let companions = companion_keys(r, record, &empty, &mut call)?;
+            call.admit(
+                companions
+                    .len()
+                    .checked_mul(std::mem::size_of::<(String, Probed)>() + std::mem::size_of::<&Record>())
+                    .and_then(|n| n.checked_add(2 * ALLOCATION_BYTES))
+                    .ok_or_else(invalid)?,
+            )?;
+            let mut loaded: Vec<(String, Probed)> = Vec::with_capacity(companions.len());
+            for key in &companions {
+                if in_answer(key).is_some() || memo.iter().any(|(k, _)| k == key) {
+                    continue;
+                }
+                // An absent companion is simply not in the view; a required
+                // one then fails validation below.
+                if let Some(probed) = load(r, memory, key)? {
+                    call.admit_key(key)?;
+                    loaded.push((key.clone(), probed));
+                }
+            }
+            {
+                let view = companions
+                    .iter()
+                    .filter_map(|key| {
+                        in_answer(key)
+                            .or_else(|| memo.iter().find(|(k, _)| k == key).map(|(_, p)| p.record()))
+                            .or_else(|| loaded.iter().find(|(k, _)| k == key).map(|(_, p)| p.record()))
+                    })
+                    .collect::<Vec<_>>();
+                super::super::records::validate_record(record, &view)?;
+            }
+            for entry in loaded {
+                if memo.len() == COMPANION_MEMO {
+                    memo.pop_front();
+                }
+                memo.push_back(entry);
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn select(
