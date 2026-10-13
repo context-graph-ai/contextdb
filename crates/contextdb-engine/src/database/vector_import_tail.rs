@@ -24,6 +24,18 @@ impl Database {
 }
 
 impl MaintenanceContext {
+    /// The uncovered suffix is writer maintenance: its decoded bodies were
+    /// already admitted against this writer's workspace, so decoding them is
+    /// funded by the same writer budget. Without an active owner, persistence
+    /// would open a private reader at the shipped default reader memory and
+    /// refuse any suffix whose vectors exceed it, however much the consumer
+    /// declared for its own reads or writes.
+    fn writer_suffix_decode(&self) -> Result<crate::read_image_memory::ImageMemoryScope> {
+        crate::read_image_memory::ImageMemory::enter_writer_operation(
+            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
+        )
+    }
+
     fn persist_import_vector_tails(
         &self,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
@@ -196,11 +208,14 @@ impl MaintenanceContext {
                 self.tx_mgr.with_commit_lock(|| {
                     let through_tx = self.tx_mgr.current_tx_max();
                     let pin = self.snapshot_registry.register(SnapshotId(through_tx.0));
-                    let entries = persistence.load_vector_partition_tail_entries(
-                        &partition.index,
-                        &partition.partition_key,
-                        covered,
-                    )?;
+                    let entries = {
+                        let _decode = self.writer_suffix_decode()?;
+                        persistence.load_vector_partition_tail_entries(
+                            &partition.index,
+                            &partition.partition_key,
+                            covered,
+                        )?
+                    };
                     Ok::<_, Error>((entries, through_tx, pin))
                 })?;
             if entries.len() > count {
@@ -350,13 +365,15 @@ impl MaintenanceContext {
         let (mut entries, frontier_tx, _pin) = self.tx_mgr.with_commit_lock(|| {
             let tx = self.tx_mgr.current_tx_max();
             let pin = self.snapshot_registry.register(SnapshotId(tx.0));
-            let (entries, loaded_through) = persistence
-                .load_vector_partition_tail_entries_through(
+            let (entries, loaded_through) = {
+                let _decode = self.writer_suffix_decode()?;
+                persistence.load_vector_partition_tail_entries_through(
                     &partition.index,
                     &partition.partition_key,
                     progress.frontier_lsn,
                     Some(through_lsn),
-                )?;
+                )?
+            };
             if loaded_through != through_lsn || entries.len() > count {
                 return Err(Error::Other(
                     "native candidate cohort changed during admission".into(),
