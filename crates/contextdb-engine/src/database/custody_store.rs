@@ -5,6 +5,9 @@ use crate::custody::{records::*, store::Store};
 #[cfg(feature = "test-seams")]
 thread_local! {
     static SKIP_CUSTODY_VALIDATION_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static CUSTODY_VALIDATION_LIMIT_FOR_TEST: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static LAST_CUSTODY_VALIDATION_MEMORY_FOR_TEST: std::cell::RefCell<Option<Arc<crate::read_image_memory::ImageMemory>>> = const { std::cell::RefCell::new(None) };
+    static LAST_CUSTODY_RETAINED_BYTES_FOR_TEST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// A captured writer root held by a test.
@@ -25,6 +28,9 @@ pub(crate) struct CustodyDelta {
     _publication: crate::custody::store::Publication,
     records: BTreeMap<String, Option<Record>>,
     bytes: BTreeMap<String, Option<Vec<u8>>>,
+    /// The writer admission of `records`, released only after they are
+    /// published or the commit aborts. Declared last so it drops last.
+    _retained: crate::custody::store::CustodyCharge,
 }
 
 impl Database {
@@ -258,6 +264,26 @@ impl Database {
         // A later reader starts from the committed (damaged) journal.
         *self.custody_cache.lock() = None;
         committed
+    }
+    /// Measurement only: validate this thread's next custody commits under a
+    /// standalone image limit instead of the writer accountant (`None` restores
+    /// the writer accountant).
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __limit_custody_validation_for_test(limit: Option<usize>) {
+        CUSTODY_VALIDATION_LIMIT_FOR_TEST.with(|cell| cell.set(limit));
+    }
+    /// Measurement only: `(bytes still admitted by this thread's last custody
+    /// validation memory, bytes its validated delta held admitted until
+    /// publication)`.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __last_custody_validation_for_test() -> (Option<usize>, usize) {
+        (
+            LAST_CUSTODY_VALIDATION_MEMORY_FOR_TEST
+                .with(|last| last.borrow().as_ref().map(|memory| memory.held())),
+            LAST_CUSTODY_RETAINED_BYTES_FOR_TEST.with(std::cell::Cell::get),
+        )
     }
     /// Measurement only: drop the custody group index completion marker.
     /// Takes effect for roots captured after the next open.
@@ -760,13 +786,26 @@ impl Database {
             "validate_custody_commit",
             "Reduce the custody records one commit touches or raise MEMORY_LIMIT.",
         );
-        let (records, publication) = self.with_custody_store_at(CustodyRoot::Latest, |store| {
-            let records = store.validate_delta(&ws.config_writes, &ws.config_deletes, memory)?;
-            Ok((
-                records,
-                crate::custody::store::Publication::begin(&store.publications),
-            ))
-        })?;
+        #[cfg(feature = "test-seams")]
+        let memory = match CUSTODY_VALIDATION_LIMIT_FOR_TEST.with(std::cell::Cell::get) {
+            Some(limit) => crate::read_image_memory::ImageMemory::new(Some(limit)),
+            None => memory,
+        };
+        #[cfg(feature = "test-seams")]
+        LAST_CUSTODY_VALIDATION_MEMORY_FOR_TEST
+            .with(|last| *last.borrow_mut() = Some(memory.clone()));
+        let (records, retained, publication) =
+            self.with_custody_store_at(CustodyRoot::Latest, |store| {
+                let (records, retained) =
+                    store.validate_delta(&ws.config_writes, &ws.config_deletes, memory)?;
+                Ok((
+                    records,
+                    retained,
+                    crate::custody::store::Publication::begin(&store.publications),
+                ))
+            })?;
+        #[cfg(feature = "test-seams")]
+        LAST_CUSTODY_RETAINED_BYTES_FOR_TEST.with(|last| last.set(retained.bytes()));
         let mut bytes = BTreeMap::new();
         if self.persistence.is_none() {
             for (key, record) in &records {
@@ -777,6 +816,7 @@ impl Database {
             _publication: publication,
             records,
             bytes,
+            _retained: retained,
         }))
     }
     pub(super) fn publish_custody_delta(&self, delta: CustodyDelta) {

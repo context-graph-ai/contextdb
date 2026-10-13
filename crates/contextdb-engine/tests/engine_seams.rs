@@ -122,6 +122,8 @@ mod an_incomplete_custody_index_refuses_without_loading_the_journal;
 mod a_malformed_custody_record_refuses_with_the_custody_codec_diagnostic;
 #[path = "engine_seams/durable_custody_reads_refuse_missing_or_tampered_companions.rs"]
 mod durable_custody_reads_refuse_missing_or_tampered_companions;
+#[path = "engine_seams/custody_commit_validation_admits_before_it_allocates.rs"]
+mod custody_commit_validation_admits_before_it_allocates;
 #[path = "engine_seams/paged_initial_replacement_and_reclamation_progress_under_writes.rs"]
 mod paged_initial_replacement_and_reclamation_progress_under_writes;
 #[path = "engine_seams/unpartitioned_vector_membership_pages_reload_at_constant_residency.rs"]

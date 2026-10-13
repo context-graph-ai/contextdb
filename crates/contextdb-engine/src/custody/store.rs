@@ -151,6 +151,9 @@ fn copy_records<'a>(
     Ok(AdmittedRecords { records, memory })
 }
 
+/// Admitted bytes held by one custody operation, released on drop.
+pub(crate) use durable::Scratch as CustodyCharge;
+
 /// Test-seam measurement of custody-journal work (process-wide).
 /// `HYDRATED` counts delivery-journal records loaded into a resident store;
 /// `DECODED` counts every custody record decode the store layer performs.
@@ -750,14 +753,17 @@ impl Store {
         writes: &[(String, Vec<u8>)],
         deletes: &[String],
         memory: Arc<crate::read_image_memory::ImageMemory>,
-    ) -> Result<BTreeMap<String, Option<Record>>> {
-        if self.durable.is_some()
-            && let Some((delta, visits)) =
-                self.durable_read(|r| durable::validate_delta(r, writes, deletes, memory))?
-        {
-            self.validation_visits += visits;
-            return Ok(delta);
+    ) -> Result<(BTreeMap<String, Option<Record>>, CustodyCharge)> {
+        if self.durable.is_some() {
+            let durable_memory = memory.clone();
+            if let Some((delta, visits, retained)) = self
+                .durable_read(|r| durable::validate_delta(r, writes, deletes, durable_memory))?
+            {
+                self.validation_visits += visits;
+                return Ok((delta, retained));
+            }
         }
+        let retained = CustodyCharge::new(memory);
         let mut delta = BTreeMap::new();
         for key in deletes.iter().filter(|k| owned_key(k)) {
             delta.insert(key.clone(), None);
@@ -809,7 +815,7 @@ impl Store {
                 super::records::validate_record(record, &self.companions(record, &delta)?)?;
             }
         }
-        Ok(delta)
+        Ok((delta, retained))
     }
 }
 
@@ -825,13 +831,17 @@ mod durable {
     use crate::sync_types::held::ALLOCATION_BYTES;
 
     /// Bytes admitted for scratch that this operation releases on drop.
-    pub(super) struct Scratch {
+    pub(crate) struct Scratch {
         memory: Arc<ImageMemory>,
         bytes: usize,
     }
     impl Scratch {
         pub(super) fn new(memory: Arc<ImageMemory>) -> Self {
             Self { memory, bytes: 0 }
+        }
+        /// Bytes this owner holds admitted now.
+        pub(crate) fn bytes(&self) -> usize {
+            self.bytes
         }
         pub(super) fn admit(&mut self, bytes: usize) -> Result<()> {
             self.memory.reserve(bytes)?;
@@ -1303,15 +1313,50 @@ mod durable {
     /// Touched-record validation over the committed journal plus `delta`.
     /// Affected keys are the delta and the durable members of every group a
     /// touched record joins or leaves; companions are point reads.
+    /// Bytes a decoded record of `encoded` stored bytes may own, with its key
+    /// and its map entry: an upper bound admitted before the decode allocates.
+    fn retained_record_bytes(key: &str, encoded: usize) -> Result<usize> {
+        encoded
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(key.len()))
+            .and_then(|n| n.checked_add(std::mem::size_of::<(String, Option<Record>)>()))
+            .and_then(|n| n.checked_add(std::mem::size_of::<Record>()))
+            .and_then(|n| n.checked_add(4 * ALLOCATION_BYTES))
+            .ok_or_else(invalid)
+    }
+    /// Upper bound of the group strings one record of `encoded` stored bytes
+    /// joins: each is a short prefix and a hex rendering of the record's own
+    /// content, so all together stay within four times its encoding.
+    fn group_bytes(record: &Record, encoded: usize) -> Result<usize> {
+        let count = match record {
+            Record::Manifest(m) => m.rows.len().checked_add(2).ok_or_else(invalid)?,
+            Record::Terminal { .. } => 3,
+            Record::Certificate(_) => 2,
+            _ => 3,
+        };
+        count
+            .checked_mul(std::mem::size_of::<String>() + 2 * ALLOCATION_BYTES + 96)
+            .and_then(|n| n.checked_add(encoded.checked_mul(4)?))
+            .ok_or_else(invalid)
+    }
+
+    /// Touched-record validation over the committed journal plus `delta`.
+    /// Affected keys are the delta and the durable members of every group a
+    /// touched record joins or leaves; companions are point reads. Every key,
+    /// map entry, decoded body, group list, plan and verification workspace is
+    /// admitted before it is allocated. The returned delta's own bytes stay
+    /// admitted in the returned charge until the caller publishes or aborts.
     pub(super) fn validate_delta(
         r: &CustodyReader,
         writes: &[(String, Vec<u8>)],
         deletes: &[String],
         memory: Arc<ImageMemory>,
-    ) -> Result<(BTreeMap<String, Option<Record>>, u64)> {
+    ) -> Result<(BTreeMap<String, Option<Record>>, u64, Scratch)> {
+        let mut retained = Scratch::new(memory.clone());
         let mut scratch = Scratch::new(memory.clone());
         let mut delta = BTreeMap::new();
         for key in deletes.iter().filter(|k| owned_key(k)) {
+            retained.admit(retained_record_bytes(key, 0)?)?;
             delta.insert(key.clone(), None);
         }
         for (key, bytes) in writes.iter().filter(|(k, _)| owned_key(k)) {
@@ -1320,27 +1365,47 @@ mod durable {
             if !delta.contains_key(key) && r.get(key, |old| Ok(old == Some(bytes.as_slice())))? {
                 continue;
             }
+            retained.admit(retained_record_bytes(key, bytes.len())?)?;
+            // Verification workspace: the canonical re-encode and signature input.
+            let mut workspace = Scratch::new(memory.clone());
+            workspace.admit(
+                bytes
+                    .len()
+                    .checked_mul(2)
+                    .and_then(|n| n.checked_add(2 * ALLOCATION_BYTES))
+                    .ok_or_else(invalid)?,
+            )?;
             work::decoded(1);
             let record = decode(bytes)?;
             if record.key()? != *key {
                 return Err(invalid());
             }
             record.verify()?;
+            drop(workspace);
             delta.insert(key.clone(), Some(record));
         }
         // Committed records this validation reads, each decoded once.
-        let mut committed: BTreeMap<String, Option<Record>> = BTreeMap::new();
-        let fetch = |committed: &mut BTreeMap<String, Option<Record>>,
+        let mut committed: BTreeMap<String, (Option<Record>, usize)> = BTreeMap::new();
+        let fetch = |committed: &mut BTreeMap<String, (Option<Record>, usize)>,
                      scratch: &mut Scratch,
                      key: &str|
          -> Result<()> {
             if committed.contains_key(key) {
                 return Ok(());
             }
-            let record = r.get(key, |value| {
-                value
+            let entry = r.get(key, |value| {
+                let encoded = value.map_or(0, <[u8]>::len);
+                scratch.admit(retained_record_bytes(key, encoded)?)?;
+                let record = value
                     .map(|bytes| {
-                        scratch.admit(probe_credit(key, bytes)?)?;
+                        let mut workspace = Scratch::new(memory.clone());
+                        workspace.admit(
+                            bytes
+                                .len()
+                                .checked_mul(2)
+                                .and_then(|n| n.checked_add(2 * ALLOCATION_BYTES))
+                                .ok_or_else(invalid)?,
+                        )?;
                         work::decoded(1);
                         let record = decode(bytes)?;
                         if record.key()? != key {
@@ -1349,18 +1414,34 @@ mod durable {
                         record.verify()?;
                         Ok(record)
                     })
-                    .transpose()
+                    .transpose()?;
+                Ok((record, encoded))
             })?;
-            committed.insert(key.to_owned(), record);
+            committed.insert(key.to_owned(), entry);
             Ok(())
         };
         let mut affected = BTreeSet::new();
         for (key, next) in &delta {
-            scratch.admit_key(key)?;
-            affected.insert(key.clone());
+            if !affected.contains(key) {
+                scratch.admit_key(key)?;
+                affected.insert(key.clone());
+            }
             fetch(&mut committed, &mut scratch, key)?;
-            let old = committed.get(key).and_then(Option::as_ref);
-            for record in old.into_iter().chain(next.as_ref()) {
+            let (old, old_encoded) = committed
+                .get(key)
+                .map(|(record, encoded)| (record.as_ref(), *encoded))
+                .unwrap_or((None, 0));
+            let next_encoded = writes
+                .iter()
+                .find(|(k, _)| k == key)
+                .map_or(0, |(_, bytes)| bytes.len());
+            for (record, encoded) in old
+                .map(|r| (r, old_encoded))
+                .into_iter()
+                .chain(next.as_ref().map(|r| (r, next_encoded)))
+            {
+                let mut lists = Scratch::new(memory.clone());
+                lists.admit(group_bytes(record, encoded)?)?;
                 let mut joined = groups(record)?
                     .into_iter()
                     .filter(|g| {
@@ -1371,8 +1452,8 @@ mod durable {
                 if let Record::Certificate(c) = record {
                     joined.push(certificate_group(&c.id()?));
                 }
-                for group in joined {
-                    r.visit_group(&group, |member| {
+                for group in &joined {
+                    r.visit_group(group, |member| {
                         if !affected.contains(member) {
                             scratch.admit_key(member)?;
                             affected.insert(member.to_owned());
@@ -1380,6 +1461,8 @@ mod durable {
                         Ok(())
                     })?;
                 }
+                drop(joined);
+                drop(lists);
             }
         }
         let visits = affected.len() as u64;
@@ -1388,6 +1471,13 @@ mod durable {
                 fetch(&mut committed, &mut scratch, key)?;
             }
         }
+        scratch.admit(
+            affected
+                .len()
+                .checked_mul(std::mem::size_of::<(&String, BTreeSet<String>)>())
+                .and_then(|n| n.checked_add(ALLOCATION_BYTES))
+                .ok_or_else(invalid)?,
+        )?;
         let mut plans = Vec::with_capacity(affected.len());
         for key in &affected {
             if let Some(record) = current(&delta, &committed, key) {
@@ -1403,28 +1493,39 @@ mod durable {
         }
         for (key, companions) in &plans {
             let record = current(&delta, &committed, key).ok_or_else(invalid)?;
+            // The companion view and the verifier's own copies of it.
+            let mut view_memory = Scratch::new(memory.clone());
+            view_memory.admit(
+                companions
+                    .len()
+                    .checked_mul(std::mem::size_of::<&Record>() + 2 * std::mem::size_of::<Record>())
+                    .and_then(|n| n.checked_add(2 * ALLOCATION_BYTES))
+                    .ok_or_else(invalid)?,
+            )?;
             let view = companions
                 .iter()
                 .filter_map(|key| current(&delta, &committed, key))
                 .collect::<Vec<_>>();
             super::super::records::validate_record(record, &view)?;
+            drop(view);
+            drop(view_memory);
         }
         drop(plans);
         drop(committed);
         drop(affected);
         drop(scratch);
-        Ok((delta, visits))
+        Ok((delta, visits, retained))
     }
 
     /// The in-commit record at `key`, else the committed one.
     fn current<'a>(
         delta: &'a BTreeMap<String, Option<Record>>,
-        committed: &'a BTreeMap<String, Option<Record>>,
+        committed: &'a BTreeMap<String, (Option<Record>, usize)>,
         key: &str,
     ) -> Option<&'a Record> {
         match delta.get(key) {
             Some(next) => next.as_ref(),
-            None => committed.get(key).and_then(Option::as_ref),
+            None => committed.get(key).and_then(|(record, _)| record.as_ref()),
         }
     }
 
