@@ -141,7 +141,7 @@ async fn custody_decoding_charges_what_it_allocates() {
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines().filter(|line| line.starts_with("S3_DECODE")) {
+    for line in stdout.lines().filter(|line| line.contains("S3_DECODE")) {
         println!("{line}");
     }
     assert!(

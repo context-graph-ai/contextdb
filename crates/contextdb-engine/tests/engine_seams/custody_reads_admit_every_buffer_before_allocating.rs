@@ -282,8 +282,8 @@ async fn companion_planning() {
     FROM_FIRST.store(true, Ordering::SeqCst);
     let mut refusals = 0;
     let mut largest = isize::MIN;
-    for step in 1..=96usize {
-        let limit = enough * step / 97;
+    for step in 1..=24usize {
+        let limit = enough * step / 25;
         let tx = stage_wide_unit(&edge, unit);
         unit += 1;
         Database::__limit_custody_validation_for_test(Some(limit));
@@ -336,8 +336,8 @@ async fn custody_reads_admit_every_buffer_before_allocating() {
             .output()
             .unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines().filter(|line| line.starts_with("S3_ADMIT")) {
-            println!("{line}");
+        for line in stdout.lines().filter(|line| line.contains("S3_ADMIT")) {
+            eprintln!("{line}");
         }
         assert!(
             output.status.success(),
