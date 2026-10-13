@@ -131,7 +131,10 @@ impl Database {
                 for prefix in ["tenant_table_policy.v1.", "tenant_policy_binding.v1."] {
                     entries.extend(persistence.load_config_values_raw_with_prefix(prefix)?);
                 }
-                *cache = Some(Store::durable(persistence.clone(), entries)?);
+                *cache = Some(Store::durable(
+                    persistence.clone(),
+                    std::mem::take(&mut entries),
+                )?);
             } else if let Some(persistence) = &self.persistence {
                 // Never dump unrelated config; each owned journal is a Redb prefix range.
                 for prefix in [
