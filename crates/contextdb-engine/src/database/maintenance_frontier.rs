@@ -565,7 +565,7 @@ impl<'a> MaintenanceFrontier<'a> {
                     .collect::<Vec<_>>();
                 let mut cursor = source.exact_index_cursor(table, &index.name, true, &key)?;
                 while let Some(posting) = cursor.next_window()? {
-                    #[cfg(feature = "test-seams")]
+                    #[cfg(any(test, feature = "test-seams"))]
                     resident_history_test_seams::note(|work| work.retention_keys_examined += 1);
                     if let Some(row) = contextdb_relational::source::visible_row(
                         source,

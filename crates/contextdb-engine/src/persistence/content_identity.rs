@@ -10428,7 +10428,7 @@ pub(crate) mod original_writer {
                     .get(stored.as_slice())
                     .map_err(RedbPersistence::storage_error)?
                     .ok_or_else(|| Error::Other("authenticated separator key is missing".into()))?;
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 observe_node_read(guard.value().len());
                 // Acquire only a transient storage guard before this admission. Its
                 // retained backing pages remain charged through both nested operands.
@@ -10470,7 +10470,7 @@ pub(crate) mod original_writer {
                     .ok_or_else(|| {
                         Error::Other("logical identity tree references a missing chunk".into())
                     })?;
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 {
                     crate::read_work_probe::note_proof_node_read();
                     observe_node_read(guard.value().len());
@@ -10603,7 +10603,7 @@ pub(crate) mod original_writer {
                         .as_ref()
                         .is_some_and(|node| node.id == id && node.hash == expected)
                     {
-                        #[cfg(feature = "test-seams")]
+                        #[cfg(any(test, feature = "test-seams"))]
                         observe_cache_hit();
                         self.cache_next.set((index + 1) % slots.len());
                         return Ok(index);
@@ -11097,7 +11097,7 @@ pub(crate) mod original_writer {
                 if self.build_count == 0 {
                     return Ok(());
                 }
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 let started = std::time::Instant::now();
                 let hash = *self.build_hash.finalize().as_bytes();
                 let len = self.build_len + 32;
@@ -11121,7 +11121,7 @@ pub(crate) mod original_writer {
                     value: Some(hash),
                 })?;
                 self.begin(level);
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 observe_identity_span(IdentitySpan::BuildAndHash, started);
                 Ok(())
             }
@@ -11406,7 +11406,7 @@ pub(crate) mod original_writer {
                 let mut buffer = self
                     .workspace
                     .array(capacity, |_| Write::removal([0; 33]))?;
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 observe_proof_memory(0, buffer._charge.charge.bytes);
                 let mut reader = self.writes.reader();
                 if count <= capacity as u64 {
@@ -11548,7 +11548,7 @@ pub(crate) mod original_writer {
                     }
                 }
                 let height = self.initialize(root)?;
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 observe_tree_height(height);
                 for level in 0..=height {
                     self.edit_level(root, level)?;
@@ -11694,11 +11694,11 @@ pub(crate) mod original_writer {
                     table
                         .remove(action.key.as_slice())
                         .map_err(RedbPersistence::storage_error)?;
-                    #[cfg(feature = "test-seams")]
+                    #[cfg(any(test, feature = "test-seams"))]
                     observe_node_remove();
                 } else {
                     let len = position(action.len)?;
-                    #[cfg(feature = "test-seams")]
+                    #[cfg(any(test, feature = "test-seams"))]
                     let before = redb::commit_work::freed_pages_so_far();
                     // The zeroed guard owns the destination pages. Reading directly
                     // into them avoids a full-body zero Vec and a duplicate IO buffer.
@@ -11732,7 +11732,7 @@ pub(crate) mod original_writer {
                         }
                     }
                     drop(destination);
-                    #[cfg(feature = "test-seams")]
+                    #[cfg(any(test, feature = "test-seams"))]
                     {
                         observe_node_write(len);
                         observe_written_key(&action.key, action.kind == 1);
@@ -11785,7 +11785,7 @@ pub(crate) mod original_writer {
             *coalesced_key_bytes = coalesced_key_bytes.saturating_sub(input_bytes);
             admission.release(list_frames);
             replay(&scratch, first, table, family)?;
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             observe_proof_memory(scratch._charge.bytes, 0);
             Ok(result)
         }

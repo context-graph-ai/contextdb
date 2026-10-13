@@ -594,7 +594,7 @@ pub(crate) fn encode_metadata_body_measured(
         counting: false,
     };
     crate::read_image::write_metadata_body(&mut bytes, body);
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     crate::read_image::answer_encoded_for_test();
     bytes.finish()
 }

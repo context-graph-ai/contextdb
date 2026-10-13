@@ -191,7 +191,7 @@ impl RedbPersistence {
         admit: &mut dyn FnMut(usize) -> Result<()>,
         ownership: &mut SavedExportOwnership,
     ) -> Result<VectorPartitionGraphBytes> {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::vector_observations::observe_saved_topology_export(
             route,
             descriptor.covered_lsn,

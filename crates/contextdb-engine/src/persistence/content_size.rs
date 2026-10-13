@@ -629,7 +629,7 @@ pub(crate) fn read_totals(
             continue;
         };
         before_table()?;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::writer_query_test_seams::note_content_size_table_total();
         let value = totals
             .get(table_name)

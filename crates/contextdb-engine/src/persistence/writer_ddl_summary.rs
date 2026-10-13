@@ -155,7 +155,7 @@ impl RedbPersistence {
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
             Err(error) => return Err(Self::storage_error(error)),
         };
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         {
             crate::database::resident_history_test_seams::note(|work| {
                 work.direction_summary_reads += 1;

@@ -159,10 +159,10 @@ impl PersistentCompositeStore {
                     .map(|trigger| trigger.take_staged_persistence_audits(lsn))
             })
             .unwrap_or_default();
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         let mut stage_started = std::time::Instant::now();
         let table_meta = self.inner.relational.table_meta.read();
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::persistence::observe_append_stage(
             crate::persistence::AppendStage::TableMetaClone,
             &mut stage_started,
@@ -205,7 +205,7 @@ impl PersistentCompositeStore {
         };
         let erasure_stages = self.inner.local_erasure_stages.lock();
         let erasure = ws.commit_lsn.and_then(|lsn| erasure_stages.get(&lsn));
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::persistence::observe_append_stage(
             crate::persistence::AppendStage::WriteSetPreparation,
             &mut stage_started,
