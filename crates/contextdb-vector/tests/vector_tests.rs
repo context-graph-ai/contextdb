@@ -1016,6 +1016,7 @@ fn a_durable_generation_with_no_live_vectors_loads_as_an_empty_graph() {
     }
 }
 
+#[cfg(feature = "test-seams")]
 #[test]
 fn restricted_layered_search_returns_all_current_rows_with_fixed_history_work() {
     use contextdb_core::{VectorPartitionKey, VectorSearchMode};
