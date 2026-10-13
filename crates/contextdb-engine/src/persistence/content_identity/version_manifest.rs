@@ -1278,29 +1278,72 @@ pub(in super::super) fn relation_name_with_checkpoint(
     Ok(name)
 }
 
+/// The admitted but unpublished manifest deltas a writer overlays on its
+/// unchanged authenticated root. Only the latest delta at a coordinate counts.
+pub(in super::super) trait ManifestOverlay {
+    /// `Some(true)` when the latest delta at `coordinate` adds it,
+    /// `Some(false)` when it removes it, `None` when there is no delta.
+    fn latest_present(&self, coordinate: &[u8]) -> Option<bool>;
+    /// The smallest coordinate whose latest delta adds it, at or after `start`
+    /// (strictly after when `exclusive`).
+    fn first_present_from(&self, start: &[u8], exclusive: bool) -> Option<&[u8]>;
+}
+
+fn overlay_coordinate(mutation: &ContentIdentityMutation) -> &[u8] {
+    &mutation.logical_key[ORDERED_HISTORY_MAGIC.len() + 1..]
+}
+
+/// Unindexed deltas in publication order: each query rescans the list.
+impl ManifestOverlay for [ContentIdentityMutation] {
+    fn latest_present(&self, coordinate: &[u8]) -> Option<bool> {
+        latest_in_slice(self, coordinate).map(|mutation| mutation.logical_value.is_some())
+    }
+
+    fn first_present_from(&self, start: &[u8], exclusive: bool) -> Option<&[u8]> {
+        let mut selected: Option<&[u8]> = None;
+        for mutation in self {
+            #[cfg(any(test, feature = "test-seams"))]
+            commit_row_work::count_overlay_entries(1);
+            let key = overlay_coordinate(mutation);
+            if mutation.logical_value.is_none()
+                || !std::ptr::eq(latest_in_slice(self, key).expect("overlay member"), mutation)
+                || key < start
+                || (exclusive && key == start)
+                || selected.is_some_and(|selected| key >= selected)
+            {
+                continue;
+            }
+            selected = Some(key);
+        }
+        selected
+    }
+}
+
+fn latest_in_slice<'a>(
+    pending: &'a [ContentIdentityMutation],
+    coordinate: &[u8],
+) -> Option<&'a ContentIdentityMutation> {
+    pending.iter().rev().find(|mutation| {
+        #[cfg(any(test, feature = "test-seams"))]
+        commit_row_work::count_overlay_entries(1);
+        overlay_coordinate(mutation) == coordinate
+    })
+}
+
 /// Overlay admitted unpublished deltas on the unchanged authenticated root.
 /// Rooted seeks still authenticate every stored candidate, including removed
 /// predecessors; the overlay cannot make a damaged stored member disappear.
-pub(in super::super) fn writer_manifest_next_pending(
+pub(in super::super) fn writer_manifest_next_pending<O: ManifestOverlay + ?Sized>(
     write: &redb::WriteTransaction,
     start: &[u8],
     exclusive: bool,
     admission: &mut ProofAdmission,
-    pending: &[ContentIdentityMutation],
+    pending: &O,
 ) -> Result<Option<Vec<u8>>> {
-    fn coordinate(mutation: &ContentIdentityMutation) -> &[u8] {
-        &mutation.logical_key[ORDERED_HISTORY_MAGIC.len() + 1..]
-    }
-    let latest = |key: &[u8]| {
-        pending
-            .iter()
-            .rev()
-            .find(|mutation| coordinate(mutation) == key)
-    };
     let mut stored = writer_manifest_next(write, start, exclusive, admission)?;
     while stored
         .as_deref()
-        .is_some_and(|key| latest(key).is_some_and(|mutation| mutation.logical_value.is_none()))
+        .is_some_and(|key| pending.latest_present(key) == Some(false))
     {
         let key = stored.take().expect("selected predecessor");
         stored = writer_manifest_next(write, &key, true, admission)?;
@@ -1308,20 +1351,9 @@ pub(in super::super) fn writer_manifest_next_pending(
         drop(key);
         admission.release(bytes);
     }
-    let mut selected: Option<&[u8]> = None;
-    for mutation in pending {
-        let key = coordinate(mutation);
-        if mutation.logical_value.is_none()
-            || !std::ptr::eq(latest(key).expect("overlay member"), mutation)
-            || key < start
-            || (exclusive && key == start)
-            || stored.as_deref().is_some_and(|stored| key >= stored)
-            || selected.is_some_and(|selected| key >= selected)
-        {
-            continue;
-        }
-        selected = Some(key);
-    }
+    let selected = pending
+        .first_present_from(start, exclusive)
+        .filter(|key| stored.as_deref().is_none_or(|stored| *key < stored));
     if let Some(key) = selected {
         admission.admit(key.len())?;
         let selected = key.to_vec();
@@ -1333,6 +1365,37 @@ pub(in super::super) fn writer_manifest_next_pending(
         Ok(Some(selected))
     } else {
         Ok(stored)
+    }
+}
+
+/// Work counters for one writer's commit, read by the row-scaling tests.
+#[cfg(any(test, feature = "test-seams"))]
+pub(in super::super) mod commit_row_work {
+    use std::cell::Cell;
+
+    thread_local! {
+        static OVERLAY_ENTRIES: Cell<u64> = const { Cell::new(0) };
+        static PROTECTED_ROOT_EVENTS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// One open, close, delete or relocation of a historical-root-protected
+    /// table. Each one makes redb finalize the checksums of every page the
+    /// write transaction has dirtied in the tables closed since the last one.
+    pub(in super::super::super) fn count_protected_root_event() {
+        PROTECTED_ROOT_EVENTS.with(|count| count.set(count.get().saturating_add(1)));
+    }
+
+    pub(in super::super::super) fn take_protected_root_events() -> u64 {
+        PROTECTED_ROOT_EVENTS.with(|count| count.replace(0))
+    }
+
+    /// Pending manifest deltas examined to answer one overlay query.
+    pub(in super::super::super) fn count_overlay_entries(entries: usize) {
+        OVERLAY_ENTRIES.with(|count| count.set(count.get().saturating_add(entries as u64)));
+    }
+
+    pub(in super::super::super) fn take_overlay_entries() -> u64 {
+        OVERLAY_ENTRIES.with(|count| count.replace(0))
     }
 }
 

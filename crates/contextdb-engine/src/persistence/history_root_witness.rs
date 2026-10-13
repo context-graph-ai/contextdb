@@ -53,6 +53,8 @@ impl RedbPersistence {
         if !protected(name) {
             return Ok(());
         }
+        #[cfg(any(test, feature = "test-seams"))]
+        content_identity::version_manifest::commit_row_work::count_protected_root_event();
         Self::historical_root_event_inner(write, name, event)
             .map_err(|error| redb::StorageError::AdmissionRefused(Box::new(error)))
     }

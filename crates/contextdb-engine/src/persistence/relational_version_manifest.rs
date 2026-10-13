@@ -4,6 +4,10 @@ use super::writer_source::BorrowedRelationalIndexKey;
 use super::*;
 use content_identity::version_manifest as manifest;
 
+#[cfg(all(test, feature = "test-seams"))]
+#[path = "commit_row_scaling_tests.rs"]
+mod commit_row_scaling_tests;
+
 impl RedbPersistence {
     /// Coalesced postings need an interval subtraction only when another
     /// physical version of this row survives. Fully retired postings keep the
@@ -80,7 +84,9 @@ impl RedbPersistence {
             &prefix,
             false,
             &mut admission,
-            pending.as_ref().map_or(&[], |p| p.mutations.as_slice()),
+            pending
+                .as_ref()
+                .map_or(&[] as &[_], |p| p.mutations.as_slice()),
         )
         .map_err(|e| self.relational_manifest_error(e))?;
         let old_coordinate = old
@@ -99,7 +105,9 @@ impl RedbPersistence {
                 coordinate,
                 true,
                 &mut admission,
-                pending.as_ref().map_or(&[], |p| p.mutations.as_slice()),
+                pending
+                .as_ref()
+                .map_or(&[] as &[_], |p| p.mutations.as_slice()),
             )
             .map_err(|e| self.relational_manifest_error(e))?;
             if next.as_deref().is_some_and(|key| key.starts_with(&prefix)) {
