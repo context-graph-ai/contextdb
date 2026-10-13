@@ -109,6 +109,8 @@ impl DeclaredReadMemory {
             .map(|_| ())
     }
     pub fn from_reader_limit(limit: u64) -> Arc<Self> {
+        #[cfg(any(test, feature = "test-seams"))]
+        READER_PARENTS_CREATED.with(|created| created.set(created.get() + 1));
         Arc::new(Self {
             limit,
             file_child_high_water: std::sync::atomic::AtomicU64::new(0),
@@ -327,6 +329,20 @@ fn reader_memory_refusal(
         hint: hint.into(),
     }
 }
+#[cfg(any(test, feature = "test-seams"))]
+thread_local! {
+    static READER_PARENTS_CREATED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Declared reader parents constructed on this thread so far. A caller that
+/// should be funded by an existing owner proves it created none by comparing
+/// this count before and after.
+#[cfg(any(test, feature = "test-seams"))]
+#[doc(hidden)]
+pub fn reader_parents_created_for_test() -> u64 {
+    READER_PARENTS_CREATED.with(std::cell::Cell::get)
+}
+
 #[cfg(any(test, feature = "test-seams"))]
 thread_local! {
     static READER_BUDGET_LEDGER: std::cell::RefCell<Option<Vec<crate::memory_accounting::BudgetLedgerEntry>>> = const { std::cell::RefCell::new(None) };
