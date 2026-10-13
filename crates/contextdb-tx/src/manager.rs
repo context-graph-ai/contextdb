@@ -7121,13 +7121,13 @@ pub struct PreparedTxMutation {
     kind: TxMutationKind,
     undo: Option<PreparedSourceUndo>,
 }
+// Variants sized by design; boxing would add an uncharged allocation per mutation.
+#[allow(clippy::large_enum_variant)]
 enum TxMutationKind {
-    ConditionalSlice(Box<PreparedConditionalSlice>),
+    ConditionalSlice(PreparedConditionalSlice),
     RowWithSidecars(
-        Box<(
-            PreparedSourceMutation,
-            crate::staged_source::AdmittedSidecars,
-        )>,
+        PreparedSourceMutation,
+        crate::staged_source::AdmittedSidecars,
     ),
     Aux(PreparedAux),
     Sidecars(crate::staged_source::AdmittedSidecars),
@@ -7532,12 +7532,11 @@ impl EngineGuard<'_> {
     pub fn publish_tx(&mut self, mut p: PreparedTxMutation) {
         self.validate_binding(&p.binding);
         if let TxMutationKind::ConditionalSlice(slice) = p.kind {
-            self.publish_conditional_slice(*slice, p.undo.take());
+            self.publish_conditional_slice(slice, p.undo.take());
             self.host.revision = p.binding.next_revision;
             return;
         }
-        if let TxMutationKind::RowWithSidecars(row_and_maps) = p.kind {
-            let (row, maps) = *row_and_maps;
+        if let TxMutationKind::RowWithSidecars(row, maps) = p.kind {
             self.publish(row);
             let old = self.swap_sidecars(maps);
             self.record_undo(SourceUndo::Sidecars(old));
@@ -7547,7 +7546,7 @@ impl EngineGuard<'_> {
         self.host.revision = p.binding.next_revision;
         match p.kind {
             TxMutationKind::ConditionalSlice(_) => unreachable!(),
-            TxMutationKind::RowWithSidecars(_) => unreachable!(),
+            TxMutationKind::RowWithSidecars(_, _) => unreachable!(),
             TxMutationKind::Flags(flags) => {
                 let old = EngineFlags::from_ws(&self.host.state.ws);
                 self.record_undo(SourceUndo::Flags(old));
@@ -7891,7 +7890,7 @@ impl EngineGuard<'_> {
         body.undo = self.prepare_undo(6)?;
         Ok(PreparedTxMutation {
             binding: self.binding()?,
-            kind: TxMutationKind::RowWithSidecars(Box::new((row, maps))),
+            kind: TxMutationKind::RowWithSidecars(row, maps),
             undo: None,
         })
     }
@@ -9248,7 +9247,7 @@ impl EngineGuard<'_> {
             .ok_or_else(source_identity_error)?;
         Ok(PreparedTxMutation {
             binding: self.binding()?,
-            kind: TxMutationKind::ConditionalSlice(Box::new(slice)),
+            kind: TxMutationKind::ConditionalSlice(slice),
             undo: self.prepare_undo(records)?,
         })
     }

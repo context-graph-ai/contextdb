@@ -671,7 +671,7 @@ pub(crate) fn visit_link_debits<'a, K, V>(
     }
 }
 /// Borrow entries without copying keys, values, or allocating traversal storage.
-// activated by bounded-storage S3/S4; remove allow at activation
+// retained for the native route; remove when a caller lands
 #[allow(dead_code)]
 pub(crate) fn for_each_entry<'a, K, V>(root: &'a Link<K, V>, visit: &mut impl FnMut(&'a K, &'a V)) {
     if let Some(node) = root {
@@ -943,7 +943,7 @@ impl<T> SourceBuffer<T> {
     pub(crate) fn pop(&mut self) -> Option<T> {
         self.values.pop()
     }
-    // activated by bounded-storage S3/S4; remove allow at activation
+    // retained for the native route; remove when a caller lands
     #[allow(dead_code)]
     pub(crate) fn clear(&mut self) {
         self.values.clear();
