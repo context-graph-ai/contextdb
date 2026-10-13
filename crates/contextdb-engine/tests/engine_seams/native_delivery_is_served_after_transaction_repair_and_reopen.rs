@@ -44,10 +44,7 @@ async fn native_delivery_is_served_after_transaction_repair_and_reopen() {
         "S3_MARKER complete outcomes={} counts={counts:?}",
         fetched.len()
     );
-    assert!(
-        counts.0 >= 1 && counts.1 == 0,
-        "served natively: {counts:?}"
-    );
+    assert_eq!(counts, (1, 0), "one request, served by the native route");
     hub.stop();
 
     // The marker is lost; a reopened hub refuses native delivery.
@@ -60,10 +57,10 @@ async fn native_delivery_is_served_after_transaction_repair_and_reopen() {
     let counts = hub.server.delivery_route_counts_for_test();
     println!("S3_MARKER refused={refused:?} counts={counts:?}");
     assert!(
-        refused.is_err(),
-        "an incomplete index is never served: {refused:?}"
+        matches!(&refused, Err(error) if error.to_string().contains("custody/durable_group_index")),
+        "an incomplete index is refused by the native route, never served: {refused:?}"
     );
-    assert_eq!(counts.1, 0, "no Legacy fetch answered in its place");
+    assert_eq!(counts, (1, 0), "no Legacy fetch answered in its place");
     hub.stop();
 
     // Transaction repair, then a fresh process view of the hub.
