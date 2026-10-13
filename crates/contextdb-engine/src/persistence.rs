@@ -41976,9 +41976,10 @@ graph_commit_result }.map_err(Self::storage_error)?;
         value: Option<&[u8]>,
         funding: custody_groups::Funding<'_>,
         defer_pending: bool,
+        verification: &custody_pending::Owner,
     ) -> Result<()> {
         custody_groups::maintain(write_txn, key, value, funding)?;
-        custody_pending::maintain(write_txn, key, value, defer_pending)?;
+        custody_pending::maintain(write_txn, key, value, defer_pending, verification)?;
         Self::write_compact_config_entry(
             write_txn,
             READ_CUSTODY_CONFIG_TABLE,
@@ -42123,6 +42124,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
             Err(error) => return Err(Self::storage_error(error)),
         };
+        let verification = admission.verification_owner()?;
         for entry in config.iter().map_err(Self::storage_error)? {
             let (key, value) = entry.map_err(Self::storage_error)?;
             if crate::custody::records::owned_key(key.value()) {
@@ -42133,6 +42135,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                     Some(value.value()),
                     custody_groups::Funding::Legacy(&mut *admission),
                     true,
+                    &verification,
                 )?;
                 // The entry's reverse scratch is already dropped; return its
                 // debit so the rebuild holds one entry, never the journal sum.
@@ -42140,8 +42143,9 @@ graph_commit_result }.map_err(Self::storage_error)?;
             }
         }
         drop(config);
-        // Pending membership is recomputed once the whole journal is indexed.
-        custody_pending::recompute_all(write_txn)
+        // Pending membership is recomputed, and every exclusion verified, once
+        // the whole journal is indexed.
+        custody_pending::recompute_all(write_txn, &verification)
     }
 
     /// Rebuild after a bulk schema or repair rewrite. Ordinary row commits

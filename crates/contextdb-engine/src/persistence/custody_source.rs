@@ -66,6 +66,8 @@ pub(crate) struct CustodyReader {
     config: Option<redb::ReadOnlyTable<&'static str, &'static [u8]>>,
     groups: Option<redb::ReadOnlyTable<&'static [u8], &'static [u8]>>,
     pending: Option<redb::ReadOnlyTable<&'static [u8], &'static [u8]>>,
+    /// Submissions whose exclusion evidence failed verification.
+    damaged: Option<redb::ReadOnlyTable<&'static [u8], &'static [u8]>>,
     /// A digest of the captured storage root these tables read.
     root: [u8; 32],
     /// The owning store's memo of companion checks already passed.
@@ -109,10 +111,16 @@ impl CustodyReader {
             Err(redb::TableError::TableDoesNotExist(_)) => None,
             Err(err) => return Err(RedbPersistence::storage_error(err)),
         };
+        let damaged = match read.open_table(custody_pending::DAMAGED) {
+            Ok(table) => Some(table),
+            Err(redb::TableError::TableDoesNotExist(_)) => None,
+            Err(err) => return Err(RedbPersistence::storage_error(err)),
+        };
         Ok(Self {
             config,
             groups,
             pending,
+            damaged,
             root,
             checked: None,
         })
@@ -153,31 +161,63 @@ impl CustodyReader {
         }
         Ok(())
     }
-    /// Visit the member keys of exactly `group`, in key order.
+    /// Visit the member keys of exactly `group`, in key order. The group head
+    /// is built on the stack; a group name longer than the stack head is
+    /// admitted to `memory` before its head is allocated, and released after.
     pub(crate) fn visit_group(
         &self,
         group: &str,
+        memory: &crate::read_image_memory::ImageMemory,
         mut visit: impl FnMut(&str) -> Result<()>,
     ) -> Result<()> {
         let Some(groups) = &self.groups else {
             return Ok(());
         };
-        let head = group_head(group)?;
+        let length = u64::try_from(group.len())
+            .map_err(|_| crate::custody::canonical::invalid())?
+            .to_be_bytes();
+        let size = group
+            .len()
+            .checked_add(8)
+            .ok_or_else(crate::custody::canonical::invalid)?;
+        let mut stack = [0_u8; GROUP_HEAD_STACK];
+        let mut heap = None;
+        let head: &mut [u8] = if size <= GROUP_HEAD_STACK {
+            &mut stack[..size]
+        } else {
+            let bytes = size
+                .checked_add(crate::sync_types::held::ALLOCATION_BYTES)
+                .ok_or_else(crate::custody::canonical::invalid)?;
+            memory.reserve(bytes)?;
+            heap = Some(AdmittedHead {
+                bytes: vec![0; size],
+                memory,
+                admitted: bytes,
+            });
+            &mut heap.as_mut().expect("admitted head").bytes
+        };
+        head[..8].copy_from_slice(&length);
+        head[8..].copy_from_slice(group.as_bytes());
+        let head = &*head;
+        crate::custody::store::admission_probe(memory.held());
         for entry in groups
-            .range::<&[u8]>(head.as_slice()..)
+            .range::<&[u8]>(head..)
             .map_err(RedbPersistence::storage_error)?
         {
             let (member, _) = entry.map_err(RedbPersistence::storage_error)?;
-            let Some(key) = member.value().strip_prefix(head.as_slice()) else {
+            let Some(key) = member.value().strip_prefix(head) else {
                 break;
             };
             visit(std::str::from_utf8(key).map_err(|_| crate::custody::canonical::invalid())?)?;
         }
+        drop(heap);
         Ok(())
     }
     /// Visit at most `limit` pending submissions strictly after `after`, in
     /// submission order, and answer the last one visited (the resume point).
-    /// A store without the pending index refuses as an incomplete index.
+    /// A store without the pending index refuses as an incomplete index. A
+    /// store with any submission whose exclusion evidence failed verification
+    /// refuses as corruption: that root's delivery state is unknown.
     pub(crate) fn visit_pending(
         &self,
         after: Option<[u8; 16]>,
@@ -185,6 +225,12 @@ impl CustodyReader {
         mut visit: impl FnMut(uuid::Uuid) -> Result<()>,
     ) -> Result<Option<[u8; 16]>> {
         let pending = self.pending.as_ref().ok_or_else(incomplete_custody_index)?;
+        if let Some(damaged) = &self.damaged {
+            use redb::ReadableTableMetadata;
+            if !damaged.is_empty().map_err(RedbPersistence::storage_error)? {
+                return Err(crate::custody::canonical::invalid());
+            }
+        }
         let mut last = None;
         let range = match &after {
             Some(after) => pending.range::<&[u8]>((
@@ -215,18 +261,27 @@ impl CustodyReader {
         let Some(groups) = &self.groups else {
             return Ok(());
         };
-        let mut head = u64::try_from(group_len)
-            .map_err(|_| crate::custody::canonical::invalid())?
-            .to_be_bytes()
-            .to_vec();
-        head.extend_from_slice(prefix.as_bytes());
+        // A fixed stack head: the group length, then the prefix.
+        let size = prefix
+            .len()
+            .checked_add(8)
+            .filter(|size| *size <= GROUP_HEAD_STACK)
+            .ok_or_else(crate::custody::canonical::invalid)?;
+        let mut stack = [0_u8; GROUP_HEAD_STACK];
+        stack[..8].copy_from_slice(
+            &u64::try_from(group_len)
+                .map_err(|_| crate::custody::canonical::invalid())?
+                .to_be_bytes(),
+        );
+        stack[8..size].copy_from_slice(prefix.as_bytes());
+        let head = &stack[..size];
         for entry in groups
-            .range::<&[u8]>(head.as_slice()..)
+            .range::<&[u8]>(head..)
             .map_err(RedbPersistence::storage_error)?
         {
             let (member, _) = entry.map_err(RedbPersistence::storage_error)?;
             let member = member.value();
-            if !member.starts_with(head.as_slice()) {
+            if !member.starts_with(head) {
                 break;
             }
             let body = &member[8..];
@@ -242,15 +297,22 @@ impl CustodyReader {
     }
 }
 
-/// `[u64 BE group length][group]`, the shared head of one group's membership
-/// rows in `read_custody_groups` (see `custody_groups::fill_reverse`).
-fn group_head(group: &str) -> Result<Vec<u8>> {
-    let mut head = u64::try_from(group.len())
-        .map_err(|_| crate::custody::canonical::invalid())?
-        .to_be_bytes()
-        .to_vec();
-    head.extend_from_slice(group.as_bytes());
-    Ok(head)
+/// `[u64 BE group length][group]` is the shared head of one group's membership
+/// rows in `read_custody_groups` (see `custody_groups::fill_reverse`). Every
+/// fixed-format group name fits this stack head.
+const GROUP_HEAD_STACK: usize = 8 + 128;
+
+/// A group head too long for the stack, held with its admission.
+struct AdmittedHead<'a> {
+    bytes: Vec<u8>,
+    memory: &'a crate::read_image_memory::ImageMemory,
+    admitted: usize,
+}
+impl Drop for AdmittedHead<'_> {
+    fn drop(&mut self) {
+        drop(std::mem::take(&mut self.bytes));
+        self.memory.release(self.admitted);
+    }
 }
 
 impl RedbPersistence {

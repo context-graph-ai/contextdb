@@ -145,7 +145,10 @@ impl Database {
                 for prefix in ["tenant_table_policy.v1.", "tenant_policy_binding.v1."] {
                     entries.extend(persistence.load_config_values_raw_with_prefix(prefix)?);
                 }
-                *cache = Some(Store::durable(std::mem::take(&mut entries))?);
+                *cache = Some(Store::durable(
+                    std::mem::take(&mut entries),
+                    self.accountant.clone(),
+                )?);
             } else {
                 if let Some(image) = &self.committed_image_startup {
                     entries.extend(image.config_source.load_image_custody_config()?);
@@ -365,6 +368,140 @@ impl Database {
             .expect("file-backed fixture")
             .repair_transaction_order_for_test()
     }
+    /// Measurement only: build one durable custody store against a standalone
+    /// writer accountant of `limit` bytes: the ordinary form, or (`pinned`)
+    /// the detached received-unit form at the latest root. Returns the bytes
+    /// that accountant held while the store lived and after it dropped.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __custody_memo_admission_for_test(
+        &self,
+        limit: usize,
+        pinned: bool,
+    ) -> Result<(usize, usize)> {
+        let accountant: crate::memory_accounting::AccountantHandle = Arc::new(
+            crate::memory_accounting::MemoryAccountant::with_budget(limit),
+        )
+        .into();
+        let store = if pinned {
+            Store::durable_pinned(self.latest_custody_root()?, accountant.clone())?
+        } else {
+            Store::durable(BTreeMap::new(), accountant.clone())?
+        };
+        let during = accountant.usage().used;
+        drop(store);
+        Ok((during, accountant.usage().used))
+    }
+    /// Measurement only: the bytes one durable store's companion memo admits.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __custody_memo_bytes_for_test() -> usize {
+        crate::custody::store::CompanionMemo::BYTES
+    }
+    /// Measurement only: drop this handle's custody store; the next custody
+    /// read builds a fresh one.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __drop_custody_store_for_test(&self) {
+        *self.custody_cache.lock() = None;
+    }
+    /// Measurement only: report this thread's custody admission points (the
+    /// operation memory's admitted bytes at each) to `probe`.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __set_custody_admission_probe_for_test(probe: Option<fn(usize)>) {
+        crate::custody::store::set_admission_probe_for_test(probe);
+    }
+    /// Measurement only: visit one custody group by name under a standalone
+    /// memory of `limit` bytes. Answers its member count, or the refusal, and
+    /// the bytes still admitted afterwards.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __visit_custody_group_for_test(
+        &self,
+        group: &str,
+        limit: usize,
+    ) -> (Result<usize>, usize) {
+        let memory = crate::read_image_memory::ImageMemory::new(Some(limit));
+        let visited = self.with_custody_store(|store| store.visit_group_for_test(group, &memory));
+        (visited, memory.held())
+    }
+    /// Measurement only: the pending-delivery read under a standalone memory
+    /// of `limit` bytes. Answers the manifest keys or the refusal, the pending
+    /// entries examined, and the bytes still admitted after the answer drops.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __custody_pending_with_limit_for_test(
+        &self,
+        limit: usize,
+    ) -> (Result<Vec<String>>, u64, usize) {
+        let memory = crate::read_image_memory::ImageMemory::new(Some(limit));
+        let before = crate::custody::store::work::pending_examined_total();
+        let answer = self
+            .with_custody_store(|store| store.pending(memory.clone(), self))
+            .and_then(|answer| answer.iter().map(Record::key).collect::<Result<Vec<_>>>());
+        let examined = crate::custody::store::work::pending_examined_total() - before;
+        (answer, examined, memory.held())
+    }
+    /// Measurement only: the custody CONFIG writes and deletes staged in `tx`.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __staged_custody_writes_for_test(
+        &self,
+        tx: contextdb_core::TxId,
+    ) -> Result<(Vec<(String, Vec<u8>)>, Vec<String>)> {
+        self.tx_mgr.with_write_set(tx, |ws| {
+            (
+                ws.config_writes
+                    .iter()
+                    .filter(|(key, _)| owned_key(key))
+                    .cloned()
+                    .collect(),
+                ws.config_deletes
+                    .iter()
+                    .filter(|key| owned_key(key))
+                    .cloned()
+                    .collect(),
+            )
+        })
+    }
+    /// Measurement only: run commit-time custody validation of `writes` and
+    /// `deletes` against the latest root under a standalone memory of `limit`
+    /// bytes, without committing. Answers the outcome and the bytes still
+    /// admitted once the validated delta drops.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __validate_custody_writes_for_test(
+        &self,
+        writes: &[(String, Vec<u8>)],
+        deletes: &[String],
+        limit: usize,
+    ) -> (Result<()>, usize) {
+        let memory = crate::read_image_memory::ImageMemory::new(Some(limit));
+        let validated = self.with_custody_store_at(CustodyRoot::Latest, |store| {
+            store
+                .validate_delta(writes, deletes, memory.clone(), self)
+                .map(drop)
+        });
+        (validated, memory.held())
+    }
+    /// Measurement only: the canonical bytes of the record at `key` after one
+    /// named field change, signed fields untouched (`admission_owning_state`).
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __custody_mutated_record_for_test(&self, key: &str, mutation: &str) -> Result<Vec<u8>> {
+        let bytes = self
+            .__custody_record_bytes_for_test(key)?
+            .ok_or_else(crate::custody::canonical::invalid)?;
+        let mut record = crate::custody::records::decode(&bytes)?;
+        match (mutation, &mut record) {
+            ("admission_owning_state", Record::ObjectAdmission(admission)) => {
+                admission.owning_state.token[0] ^= 1;
+            }
+            _ => return Err(Error::Other(format!("no mutation {mutation} for {key}"))),
+        }
+        encode(&record)
+    }
     /// Measurement only: whether the committed custody group index is complete.
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
@@ -416,7 +553,7 @@ impl Database {
             }
         }
         let mut resident = Store::from_entries(all)?;
-        let mut durable = Store::durable(tenant)?;
+        let mut durable = Store::durable(tenant, self.accountant.clone())?;
         durable.set_read_root(Some(self.latest_custody_root()?));
         let read_memory = self.declared_reader_memory()?;
         let memory = || {
@@ -444,7 +581,7 @@ impl Database {
             selectors.push(format!("@row:{}", hex(&row.bytes())));
             selectors.push(format!("@{}", crate::custody::store::root_group(row)));
         }
-        for record in resident.select(&selectors[..1], memory())?.iter() {
+        for record in resident.select(&selectors[..1], memory(), self)?.iter() {
             if let Record::Manifest(m) = record {
                 selectors.push(format!(
                     "@{}",
@@ -457,29 +594,29 @@ impl Database {
             let one = std::slice::from_ref(selector);
             out.push((
                 selector.clone(),
-                encoded(&resident.select(one, memory())?)?,
-                encoded(&durable.select(one, memory())?)?,
+                encoded(&resident.select(one, memory(), self)?)?,
+                encoded(&durable.select(one, memory(), self)?)?,
             ));
         }
         out.push((
             "union".into(),
-            encoded(&resident.select(&selectors, memory())?)?,
-            encoded(&durable.select(&selectors, memory())?)?,
+            encoded(&resident.select(&selectors, memory(), self)?)?,
+            encoded(&durable.select(&selectors, memory(), self)?)?,
         ));
         out.push((
             format!("table:{root_table}"),
-            encoded(&resident.select_table(root_table, memory())?)?,
-            encoded(&durable.select_table(root_table, memory())?)?,
+            encoded(&resident.select_table(root_table, memory(), self)?)?,
+            encoded(&durable.select_table(root_table, memory(), self)?)?,
         ));
         out.push((
             "rows".into(),
-            encoded(&resident.select_rows(&rows, memory())?)?,
-            encoded(&durable.select_rows(&rows, memory())?)?,
+            encoded(&resident.select_rows(&rows, memory(), self)?)?,
+            encoded(&durable.select_rows(&rows, memory(), self)?)?,
         ));
         out.push((
             "pending".into(),
-            encoded(&resident.pending(memory())?)?,
-            encoded(&durable.pending(memory())?)?,
+            encoded(&resident.pending(memory(), self)?)?,
+            encoded(&durable.pending(memory(), self)?)?,
         ));
         Ok(Some(out))
     }
@@ -507,7 +644,7 @@ impl Database {
             read_memory.clone(),
         );
         self.with_custody_store_at(at, |store| {
-            let records = store.select(selectors, memory.clone())?;
+            let records = store.select(selectors, memory.clone(), self)?;
             self.verify_selected_custody_records(store, &records)?;
             Ok(records)
         })
@@ -547,7 +684,7 @@ impl Database {
             read_memory.clone(),
         );
         self.with_custody_store(|store| {
-            let records = store.select_table(table, memory.clone())?;
+            let records = store.select_table(table, memory.clone(), self)?;
             self.verify_selected_custody_records(store, &records)?;
             Ok(records)
         })
@@ -562,7 +699,7 @@ impl Database {
             read_memory.clone(),
         );
         self.with_custody_store(|store| {
-            let records = store.select_rows(rows, memory.clone())?;
+            let records = store.select_rows(rows, memory.clone(), self)?;
             self.verify_selected_custody_records(store, &records)?;
             Ok(records)
         })
@@ -621,7 +758,7 @@ impl Database {
             self.accountant.clone(),
             read_memory,
         );
-        self.with_custody_store(|store| store.pending(memory))
+        self.with_custody_store(|store| store.pending(memory, self))
     }
     // Only complete adjudication may publish a batch bookmark.
     pub(crate) fn finish_custody_push(
@@ -860,7 +997,7 @@ impl Database {
         let (records, retained, publication) =
             self.with_custody_store_at(CustodyRoot::Latest, |store| {
                 let (records, retained) =
-                    store.validate_delta(&ws.config_writes, &ws.config_deletes, memory)?;
+                    store.validate_delta(&ws.config_writes, &ws.config_deletes, memory, self)?;
                 Ok((
                     records,
                     retained,

@@ -3357,6 +3357,26 @@ impl ProofAdmission {
         self.held
     }
 
+    /// The owner that funds what custody pending maintenance renders to verify
+    /// a terminal's signatures inside this transaction: this admission's
+    /// reader budget or accountant, or an unlimited measuring owner when the
+    /// admission itself is unaccounted.
+    pub(crate) fn verification_owner(
+        &self,
+    ) -> Result<contextdb_core::read_memory::ReadMemoryOwner> {
+        let budget = match (&self.reader_budget, &self.accountant) {
+            (Some(reader), _) => reader.clone(),
+            (None, Some(accountant)) => accountant.read_budget()?,
+            (None, None) => crate::memory_accounting::AccountantHandle::from(Arc::new(
+                crate::memory_accounting::MemoryAccountant::no_limit(),
+            ))
+            .read_budget()?,
+        };
+        Ok(contextdb_core::read_memory::ReadMemoryOwner::from_legacy(
+            budget,
+        ))
+    }
+
     /// Whether what this admission admits is charged to a database accountant.
     /// An unaccounted admission measures but admits nothing, so an allocation
     /// it makes must not outlive the call that made it.
@@ -7101,6 +7121,15 @@ impl RedbPersistence {
             Self::write_vector_body_root_fingerprint(write_txn)?;
         }
 
+        let verification = if mutations.iter().any(|mutation| {
+            mutation.family == LogicalFamily::Configuration
+                && std::str::from_utf8(&mutation.logical_key)
+                    .is_ok_and(crate::custody::records::owned_key)
+        }) {
+            Some(admission.verification_owner()?)
+        } else {
+            None
+        };
         for mutation in mutations {
             if mutation.family != LogicalFamily::Configuration {
                 continue;
@@ -7123,6 +7152,9 @@ impl RedbPersistence {
                             None => super::custody_groups::Funding::Legacy(admission),
                         },
                         false,
+                        verification
+                            .as_ref()
+                            .ok_or_else(crate::custody::canonical::invalid)?,
                     )?;
                 }
             }
@@ -8611,6 +8643,15 @@ pub(crate) mod original_writer {
         pub(crate) fn detach_original(&mut self, bytes: usize) -> OwnedMemoryReservation {
             self.detach(bytes).reservation
         }
+        /// The owner that funds custody pending verification's signature
+        /// inputs: this admission's original writer frame.
+        pub(crate) fn verification_owner(
+            &self,
+        ) -> Result<contextdb_core::read_memory::ReadMemoryOwner> {
+            Ok(contextdb_core::read_memory::ReadMemoryOwner::from_legacy(
+                self.original.accountant().read_budget()?,
+            ))
+        }
         pub(crate) fn held(&self) -> usize {
             self.held
         }
@@ -9084,6 +9125,15 @@ pub(crate) mod original_writer {
                 Self::write_vector_body_root_fingerprint(write_txn)?;
             }
 
+            let verification = if mutations.iter().any(|mutation| {
+                mutation.family == LogicalFamily::Configuration
+                    && std::str::from_utf8(&mutation.logical_key)
+                        .is_ok_and(crate::custody::records::owned_key)
+            }) {
+                Some(admission.verification_owner()?)
+            } else {
+                None
+            };
             for mutation in mutations {
                 if mutation.family != LogicalFamily::Configuration {
                     continue;
@@ -9106,6 +9156,9 @@ pub(crate) mod original_writer {
                                 None => super::super::custody_groups::Funding::Unavailable,
                             },
                             false,
+                            verification
+                                .as_ref()
+                                .ok_or_else(crate::custody::canonical::invalid)?,
                         )?;
                     }
                 }

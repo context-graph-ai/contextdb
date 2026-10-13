@@ -3,7 +3,7 @@
 //! transaction, so after a reopen one native delivery request is accepted and
 //! answers every recorded outcome exactly.
 use crate::custody_fixture::*;
-use contextdb_core::TenantId;
+use contextdb_core::{Error, TenantId};
 use contextdb_engine::Database;
 use contextdb_server::InProcessBroker;
 use std::sync::Arc;
@@ -57,8 +57,12 @@ async fn native_delivery_is_served_after_transaction_repair_and_reopen() {
     let counts = hub.server.delivery_route_counts_for_test();
     println!("S3_MARKER refused={refused:?} counts={counts:?}");
     assert!(
-        matches!(&refused, Err(error) if error.to_string().contains("custody/durable_group_index")),
-        "an incomplete index is refused by the native route, never served: {refused:?}"
+        matches!(
+            &refused,
+            Err(Error::SyncError(message))
+                if message == "native reader admission unsupported: custody/durable_group_index"
+        ),
+        "an incomplete index is refused by the native route with exactly this text, never served: {refused:?}"
     );
     assert_eq!(counts, (1, 0), "no Legacy fetch answered in its place");
     hub.stop();
