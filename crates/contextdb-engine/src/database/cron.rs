@@ -2167,6 +2167,129 @@ fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
 mod tests {
     use super::*;
 
+    /// Every hand-built `Database` (the cron worker handle here, and the two
+    /// initializers in `database.rs`) must write each declared field exactly
+    /// once and under exactly the cfg gate the field is declared with. A field
+    /// that exists in a build but is skipped by an initializer is left
+    /// uninitialized behind `assume_init`, which is undefined behaviour: in
+    /// plain `cargo test` the cron worker handle used to segfault this way.
+    /// This check reads the sources so the mismatch fails here, by name,
+    /// instead of crashing whichever test first drops the handle.
+    #[test]
+    fn every_hand_built_database_writes_each_field_under_its_declared_gate() {
+        fn gate_before(lines: &[&str], index: usize) -> Option<String> {
+            index
+                .checked_sub(1)
+                .map(|previous| lines[previous].trim())
+                .filter(|previous| previous.starts_with("#[cfg("))
+                .map(str::to_string)
+        }
+        fn declared_fields(source: &str) -> Vec<(String, Option<String>)> {
+            let lines: Vec<&str> = source.lines().collect();
+            let start = lines
+                .iter()
+                .position(|line| *line == "pub struct Database {")
+                .expect("the Database declaration");
+            let mut fields = Vec::new();
+            for (offset, line) in lines[start + 1..].iter().enumerate() {
+                if *line == "}" {
+                    break;
+                }
+                let trimmed = line.trim();
+                if trimmed.starts_with("//") || trimmed.starts_with('#') {
+                    continue;
+                }
+                let declaration = trimmed
+                    .strip_prefix("pub(crate) ")
+                    .or_else(|| trimmed.strip_prefix("pub(super) "))
+                    .or_else(|| trimmed.strip_prefix("pub "))
+                    .unwrap_or(trimmed);
+                let Some((name, rest)) = declaration.split_once(':') else {
+                    continue;
+                };
+                if !rest.starts_with(':')
+                    && !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                {
+                    let mut index = start + 1 + offset;
+                    let mut gate = None;
+                    while index > start + 1 {
+                        let previous = lines[index - 1].trim();
+                        if previous.starts_with("#[cfg(") {
+                            gate = Some(previous.to_string());
+                            break;
+                        }
+                        if !(previous.starts_with("#[") || previous.starts_with("//")) {
+                            break;
+                        }
+                        index -= 1;
+                    }
+                    fields.push((name.to_string(), gate));
+                }
+            }
+            fields
+        }
+        fn written_fields(source: &str, anchor: &str) -> Vec<Vec<(String, Option<String>)>> {
+            const MARK: &str = "(*construction.source).";
+            let lines: Vec<&str> = source.lines().collect();
+            let mut sites = Vec::new();
+            for start in (0..lines.len()).filter(|index| lines[*index].trim() == anchor) {
+                let mut writes = Vec::new();
+                for index in start..lines.len() {
+                    if lines[index].contains("assume_init") {
+                        break;
+                    }
+                    let Some(at) = lines[index].find(MARK) else {
+                        continue;
+                    };
+                    let name: String = lines[index][at + MARK.len()..]
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                        .collect();
+                    let opener = (start..=index)
+                        .rev()
+                        .find(|candidate| lines[*candidate].trim() == "{")
+                        .expect("each field write sits in its own block");
+                    writes.push((name, gate_before(&lines, opener)));
+                }
+                sites.push(writes);
+            }
+            sites
+        }
+        let database = include_str!("../database.rs");
+        let declared = declared_fields(database);
+        assert!(declared.len() > 100, "parsed the Database declaration");
+        let mut sites = written_fields(include_str!("cron.rs"), "let mut construction = super::DatabaseConstruction {");
+        sites.extend(written_fields(database, "let mut construction = DatabaseConstruction {"));
+        assert_eq!(sites.len(), 3, "the three hand-built Database initializers");
+        for (site, writes) in sites.iter().enumerate() {
+            let mut mismatches = Vec::new();
+            for (field, gate) in &declared {
+                let found: Vec<_> = writes.iter().filter(|(name, _)| name == field).collect();
+                match found.as_slice() {
+                    [(_, written)] if written == gate => {}
+                    [] => mismatches.push(format!("{field}: never written")),
+                    [(_, written)] => mismatches.push(format!(
+                        "{field}: declared under {gate:?} but written under {written:?}"
+                    )),
+                    _ => mismatches.push(format!("{field}: written {} times", found.len())),
+                }
+            }
+            for (name, _) in writes {
+                if !declared.iter().any(|(field, _)| field == name) {
+                    mismatches.push(format!("{name}: written but not declared"));
+                }
+            }
+            assert!(
+                mismatches.is_empty(),
+                "hand-built Database initializer #{site} disagrees with the declaration:\n{}",
+                mismatches.join("\n")
+            );
+        }
+    }
+
     #[test]
     fn paused_manual_cron_guard_drop_does_not_restart_tickler() -> Result<()> {
         let db = Database::open_memory();
