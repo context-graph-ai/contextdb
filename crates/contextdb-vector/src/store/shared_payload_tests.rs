@@ -2668,7 +2668,7 @@ fn generation_price_and_admission_funder_observers_do_not_load_or_charge() {
         store.generation_copy_bytes_for_test(&index, &absent_key, 3),
         None
     );
-    assert!(!state.raw_vectors_resident());
+    assert!(!state.bodies_resident());
     assert_eq!(declared.used.load(Ordering::SeqCst), before);
     let funder: Arc<dyn MemoryBudget> = executing.clone();
     let admission = VectorCopyAdmission::new(funder.clone());
