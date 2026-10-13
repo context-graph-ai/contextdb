@@ -117,15 +117,17 @@ fn parse_hex<const N: usize>(hex: &str) -> Result<[u8; N]> {
     Ok(out)
 }
 
-/// A group head `[u64 BE len][prefix][lowercase hex of digest]`, on the stack.
+/// A group head or key `[u64 BE len][prefix][lowercase hex of digest]`, on
+/// the stack; prefixes are at most 32 bytes.
 struct DigestHead {
-    bytes: [u8; 8 + 16 + 64],
+    bytes: [u8; 8 + 32 + 64],
     len: usize,
 }
 impl DigestHead {
     fn new(prefix: &str, digest: &[u8; 32]) -> Self {
+        debug_assert!(prefix.len() <= 32);
         let name = prefix.len() + 64;
-        let mut bytes = [0u8; 8 + 16 + 64];
+        let mut bytes = [0u8; 8 + 32 + 64];
         bytes[..8].copy_from_slice(&(name as u64).to_be_bytes());
         bytes[8..8 + prefix.len()].copy_from_slice(prefix.as_bytes());
         const HEX: &[u8; 16] = b"0123456789abcdef";

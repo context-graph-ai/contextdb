@@ -405,6 +405,28 @@ impl Database {
     pub fn __drop_custody_store_for_test(&self) {
         *self.custody_cache.lock() = None;
     }
+    /// Measurement only: a standalone reader-style memory funded by its own
+    /// accountant of `limit` bytes; what that accountant still holds after the
+    /// memory drops is what the operation left admitted.
+    #[cfg(feature = "test-seams")]
+    fn measured_memory_for_test(
+        limit: usize,
+    ) -> (
+        crate::memory_accounting::AccountantHandle,
+        Arc<crate::read_image_memory::ImageMemory>,
+    ) {
+        let accountant: crate::memory_accounting::AccountantHandle = Arc::new(
+            crate::memory_accounting::MemoryAccountant::with_budget(limit),
+        )
+        .into();
+        let memory = crate::read_image_memory::ImageMemory::charging_for(
+            accountant.clone(),
+            "reader",
+            "custody_measurement",
+            "Raise the measurement limit.",
+        );
+        (accountant, memory)
+    }
     /// Measurement only: report this thread's custody admission points (the
     /// operation memory's admitted bytes at each) to `probe`.
     #[cfg(feature = "test-seams")]
@@ -422,9 +444,10 @@ impl Database {
         group: &str,
         limit: usize,
     ) -> (Result<usize>, usize) {
-        let memory = crate::read_image_memory::ImageMemory::new(Some(limit));
+        let (accountant, memory) = Self::measured_memory_for_test(limit);
         let visited = self.with_custody_store(|store| store.visit_group_for_test(group, &memory));
-        (visited, memory.held())
+        drop(memory);
+        (visited, accountant.usage().used)
     }
     /// Measurement only: the pending-delivery read under a standalone memory
     /// of `limit` bytes. Answers the manifest keys or the refusal, the pending
@@ -435,13 +458,14 @@ impl Database {
         &self,
         limit: usize,
     ) -> (Result<Vec<String>>, u64, usize) {
-        let memory = crate::read_image_memory::ImageMemory::new(Some(limit));
+        let (accountant, memory) = Self::measured_memory_for_test(limit);
         let before = crate::custody::store::work::pending_examined_total();
         let answer = self
             .with_custody_store(|store| store.pending(memory.clone(), self))
             .and_then(|answer| answer.iter().map(Record::key).collect::<Result<Vec<_>>>());
         let examined = crate::custody::store::work::pending_examined_total() - before;
-        (answer, examined, memory.held())
+        drop(memory);
+        (answer, examined, accountant.usage().used)
     }
     /// Measurement only: the custody CONFIG writes and deletes staged in `tx`.
     #[cfg(feature = "test-seams")]
@@ -468,7 +492,7 @@ impl Database {
     /// Measurement only: run commit-time custody validation of `writes` and
     /// `deletes` against the latest root under a standalone memory of `limit`
     /// bytes, without committing. Answers the outcome and the bytes still
-    /// admitted once the validated delta drops.
+    /// admitted once the operation's memory drops.
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
     pub fn __validate_custody_writes_for_test(
@@ -477,13 +501,14 @@ impl Database {
         deletes: &[String],
         limit: usize,
     ) -> (Result<()>, usize) {
-        let memory = crate::read_image_memory::ImageMemory::new(Some(limit));
+        let (accountant, memory) = Self::measured_memory_for_test(limit);
         let validated = self.with_custody_store_at(CustodyRoot::Latest, |store| {
             store
                 .validate_delta(writes, deletes, memory.clone(), self)
                 .map(drop)
         });
-        (validated, memory.held())
+        drop(memory);
+        (validated, accountant.usage().used)
     }
     /// Measurement only: the canonical bytes of the record at `key` after one
     /// named field change, signed fields untouched (`admission_owning_state`).
@@ -537,9 +562,10 @@ impl Database {
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
     pub fn __custody_probe_for_test(key: &str, bytes: &[u8], limit: usize) -> (Result<()>, usize) {
-        let memory = crate::read_image_memory::ImageMemory::new(Some(limit));
+        let (accountant, memory) = Self::measured_memory_for_test(limit);
         let probed = crate::custody::store::probe_for_test(&memory, key, bytes);
-        (probed, memory.held())
+        drop(memory);
+        (probed, accountant.usage().used)
     }
     /// Measurement only: whether the committed custody group index is complete.
     #[cfg(feature = "test-seams")]
