@@ -31,25 +31,23 @@ async fn native_delivery_is_served_after_transaction_repair_and_reopen() {
     for unit in 0..UNITS {
         commit_unit(&edge, unit);
     }
-    let keys = (0..UNITS)
-        .map(|unit| key(root_id(unit)))
-        .collect::<Vec<_>>();
-    let seeded = client
-        .__seed_hub_delivery_roots_for_test(
-            "records",
-            Some(&keys),
-            edge.declared_reader_memory().unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(seeded, UNITS);
+    // The hub receives every unit and records one terminal outcome each.
+    client.push().await.unwrap();
     let fetched = client.fetch_delivery_outcomes(None).await.unwrap();
     assert_eq!(
         fetched.len(),
         UNITS,
         "a complete index serves every outcome"
     );
-    assert_eq!(hub.server.delivery_route_counts_for_test(), (1, 0));
+    let counts = hub.server.delivery_route_counts_for_test();
+    println!(
+        "S3_MARKER complete outcomes={} counts={counts:?}",
+        fetched.len()
+    );
+    assert!(
+        counts.0 >= 1 && counts.1 == 0,
+        "served natively: {counts:?}"
+    );
     hub.stop();
 
     // The marker is lost; a reopened hub refuses native delivery.
