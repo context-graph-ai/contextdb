@@ -126,6 +126,8 @@ mod durable_custody_reads_refuse_missing_or_tampered_companions;
 mod custody_commit_validation_admits_before_it_allocates;
 #[path = "engine_seams/pending_delivery_reads_only_the_pending_tail.rs"]
 mod pending_delivery_reads_only_the_pending_tail;
+#[path = "engine_seams/delivery_status_answers_exactly_on_an_admitted_custody_fixture.rs"]
+mod delivery_status_answers_exactly_on_an_admitted_custody_fixture;
 #[path = "engine_seams/paged_initial_replacement_and_reclamation_progress_under_writes.rs"]
 mod paged_initial_replacement_and_reclamation_progress_under_writes;
 #[path = "engine_seams/unpartitioned_vector_membership_pages_reload_at_constant_residency.rs"]
