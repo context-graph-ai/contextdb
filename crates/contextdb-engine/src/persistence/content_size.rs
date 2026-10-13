@@ -402,7 +402,7 @@ fn open_relation_for<'slot, 'txn>(
     table: &str,
 ) -> Result<&'slot redb::Table<'txn, &'static [u8], &'static [u8]>> {
     if slot.as_ref().is_none_or(|(open, _)| open.as_str() != table) {
-        *slot = None;
+        drop(slot.take());
         let relation_name = RedbPersistence::rel_table_name(table);
         let relation = write
             .open_table(TableDefinition::<&[u8], &[u8]>::new(&relation_name))

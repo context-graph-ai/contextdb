@@ -1317,7 +1317,10 @@ impl ManifestOverlay for [ContentIdentityMutation] {
             commit_row_work::count_overlay_entries(1);
             let key = overlay_coordinate(mutation);
             if mutation.logical_value.is_none()
-                || !std::ptr::eq(latest_in_slice(self, key).expect("overlay member"), mutation)
+                || !std::ptr::eq(
+                    latest_in_slice(self, key).expect("overlay member"),
+                    mutation,
+                )
                 || key < start
                 || (exclusive && key == start)
                 || selected.is_some_and(|selected| key >= selected)
