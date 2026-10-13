@@ -1300,7 +1300,8 @@ impl<T: ManifestOverlay + ?Sized> ManifestOverlay for Option<&T> {
     }
 }
 
-fn overlay_coordinate(mutation: &ContentIdentityMutation) -> &[u8] {
+/// The manifest coordinate a pending delta addresses.
+pub(in super::super) fn overlay_coordinate(mutation: &ContentIdentityMutation) -> &[u8] {
     &mutation.logical_key[ORDERED_HISTORY_MAGIC.len() + 1..]
 }
 

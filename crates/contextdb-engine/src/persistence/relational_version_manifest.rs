@@ -1484,15 +1484,14 @@ impl RetainedReadSource {
     }
 }
 
-/// Publication-ordered manifest deltas plus an ordered index of the latest
-/// delta at each coordinate, so a row's overlay seek costs a lookup instead
-/// of a rescan of every delta the rows before it staged.
+/// Publication-ordered manifest deltas plus sorted runs of their positions,
+/// each run ordered by (coordinate, position). Runs merge like a binary
+/// counter, so a position is copied O(log n) times in all and an overlay seek
+/// is one binary search per run instead of a rescan of every delta the rows
+/// before it staged. The runs hold four-byte positions, never a coordinate.
 pub(super) struct PendingManifestMutations {
+    runs: Vec<Vec<u32>>,
     list: Vec<content_identity::ContentIdentityMutation>,
-    /// Coordinates whose latest delta adds them.
-    present: std::collections::BTreeSet<Vec<u8>>,
-    /// Coordinates whose latest delta removes them.
-    removed: std::collections::BTreeSet<Vec<u8>>,
 }
 impl std::ops::Deref for PendingManifestMutations {
     type Target = [content_identity::ContentIdentityMutation];
@@ -1500,38 +1499,83 @@ impl std::ops::Deref for PendingManifestMutations {
         &self.list
     }
 }
+impl PendingManifestMutations {
+    fn coordinate(&self, position: u32) -> &[u8] {
+        manifest::overlay_coordinate(&self.list[position as usize])
+    }
+
+    /// Bytes the next position's run and its merge cascade allocate.
+    fn index_bytes_for_next(&self) -> usize {
+        let mut bytes = PENDING_INDEX_POSITION_BYTES;
+        if self.runs.capacity() == 0 {
+            bytes += PENDING_INDEX_MAX_RUNS * std::mem::size_of::<Vec<u32>>();
+        }
+        let mut length = 1usize;
+        for run in self.runs.iter().rev() {
+            if run.len() != length {
+                break;
+            }
+            length *= 2;
+            bytes += length * PENDING_INDEX_POSITION_BYTES;
+        }
+        bytes
+    }
+
+    /// The position of the latest delta at `coordinate`.
+    fn latest_position(&self, coordinate: &[u8]) -> Option<u32> {
+        self.runs
+            .iter()
+            .filter_map(|run| {
+                let end = run.partition_point(|&position| self.coordinate(position) <= coordinate);
+                let last = *run.get(end.checked_sub(1)?)?;
+                (self.coordinate(last) == coordinate).then_some(last)
+            })
+            .max()
+    }
+
+    /// The smallest pending coordinate after `bound` (at it when inclusive).
+    fn next_coordinate(&self, bound: &[u8], exclusive: bool) -> Option<&[u8]> {
+        self.runs
+            .iter()
+            .filter_map(|run| {
+                let start = run.partition_point(|&position| {
+                    let key = self.coordinate(position);
+                    if exclusive { key <= bound } else { key < bound }
+                });
+                run.get(start).map(|&position| self.coordinate(position))
+            })
+            .min()
+    }
+}
 impl manifest::ManifestOverlay for PendingManifestMutations {
     fn latest_present(&self, coordinate: &[u8]) -> Option<bool> {
         #[cfg(any(test, feature = "test-seams"))]
         manifest::commit_row_work::count_overlay_entries(1);
-        if self.present.contains(coordinate) {
-            Some(true)
-        } else if self.removed.contains(coordinate) {
-            Some(false)
-        } else {
-            None
-        }
+        self.latest_position(coordinate)
+            .map(|position| self.list[position as usize].logical_value.is_some())
     }
 
     fn first_present_from(&self, start: &[u8], exclusive: bool) -> Option<&[u8]> {
-        use std::ops::Bound;
-        #[cfg(any(test, feature = "test-seams"))]
-        manifest::commit_row_work::count_overlay_entries(1);
-        let lower = if exclusive {
-            Bound::Excluded(start)
-        } else {
-            Bound::Included(start)
-        };
-        self.present
-            .range::<[u8], _>((lower, Bound::Unbounded))
-            .next()
-            .map(Vec::as_slice)
+        let (mut bound, mut exclusive) = (start, exclusive);
+        loop {
+            #[cfg(any(test, feature = "test-seams"))]
+            manifest::commit_row_work::count_overlay_entries(1);
+            let candidate = self.next_coordinate(bound, exclusive)?;
+            if self
+                .latest_position(candidate)
+                .is_some_and(|position| self.list[position as usize].logical_value.is_some())
+            {
+                return Some(candidate);
+            }
+            (bound, exclusive) = (candidate, true);
+        }
     }
 }
 
-/// Native bytes one index entry may hold beyond its coordinate: the owning
-/// vector header and its share of the ordered set's node.
-const PENDING_INDEX_ENTRY_BYTES: usize = 3 * std::mem::size_of::<Vec<u8>>();
+/// Runs a pending publication can hold: run lengths are distinct powers of
+/// two, so a `u32` position space never needs more than 33.
+const PENDING_INDEX_MAX_RUNS: usize = 33;
+const PENDING_INDEX_POSITION_BYTES: usize = std::mem::size_of::<u32>();
 
 /// Finite writer-funded publication deltas. Field order frees every mutation
 /// and the native container before its original proof invoices are returned.
@@ -1543,9 +1587,8 @@ impl PendingManifestPublication {
     pub(super) fn new(admission: content_identity::OwnedProofAdmission) -> Self {
         Self {
             mutations: PendingManifestMutations {
+                runs: Vec::new(),
                 list: Vec::new(),
-                present: std::collections::BTreeSet::new(),
-                removed: std::collections::BTreeSet::new(),
             },
             admission,
         }
@@ -1568,6 +1611,8 @@ impl PendingManifestPublication {
             self.admission
                 .release(old * std::mem::size_of::<content_identity::ContentIdentityMutation>());
         }
+        let position = u32::try_from(list.len())
+            .map_err(|_| Error::Other("manifest publication position overflow".into()))?;
         let bytes = manifest::manifest_mutation_bytes(coordinate, present)?;
         self.admission.admit(bytes)?;
         let mutation = manifest::manifest_mutation(coordinate, present)?;
@@ -1576,27 +1621,54 @@ impl PendingManifestPublication {
                 + mutation.logical_value.as_ref().map_or(0, Vec::capacity),
             bytes
         );
-        let (into, from) = if present {
-            (&mut self.mutations.present, &mut self.mutations.removed)
-        } else {
-            (&mut self.mutations.removed, &mut self.mutations.present)
-        };
-        if !into.contains(coordinate) {
-            let key = match from.take(coordinate) {
-                Some(key) => key,
-                None => {
-                    let entry = coordinate
-                        .len()
-                        .checked_add(PENDING_INDEX_ENTRY_BYTES)
-                        .ok_or_else(|| Error::Other("manifest index entry overflow".into()))?;
-                    self.admission.admit(entry)?;
-                    coordinate.to_vec()
-                }
-            };
-            into.insert(key);
+        let index_bytes = self.mutations.index_bytes_for_next();
+        if let Err(error) = self.admission.admit(index_bytes) {
+            drop(mutation);
+            self.admission.release(bytes);
+            return Err(error);
         }
         self.mutations.list.push(mutation);
+        self.index_position(position);
         Ok(())
+    }
+
+    /// Add `position` (the delta just pushed) as a run of one, then merge
+    /// equal-length tail runs. `index_bytes_for_next` admitted every buffer
+    /// this allocates, at exactly its length; each freed input is released.
+    fn index_position(&mut self, position: u32) {
+        if self.mutations.runs.capacity() == 0 {
+            self.mutations.runs.reserve_exact(PENDING_INDEX_MAX_RUNS);
+        }
+        let mut run = Vec::with_capacity(1);
+        run.push(position);
+        self.mutations.runs.push(run);
+        while let [.., older, newer] = self.mutations.runs.as_slice()
+            && older.len() == newer.len()
+        {
+            let newer = self.mutations.runs.pop().expect("tail run");
+            let older = self.mutations.runs.pop().expect("tail run");
+            let mut merged = Vec::with_capacity(older.len() + newer.len());
+            let (mut left, mut right) = (older.iter().peekable(), newer.iter().peekable());
+            // Every position in `newer` is later than every one in `older`,
+            // so equal coordinates keep publication order by taking `older`
+            // first.
+            while let (Some(&&l), Some(&&r)) = (left.peek(), right.peek()) {
+                if self.mutations.coordinate(l) <= self.mutations.coordinate(r) {
+                    merged.push(l);
+                    left.next();
+                } else {
+                    merged.push(r);
+                    right.next();
+                }
+            }
+            merged.extend(left);
+            merged.extend(right);
+            let freed = (older.len() + newer.len()) * PENDING_INDEX_POSITION_BYTES;
+            drop(older);
+            drop(newer);
+            self.admission.release(freed);
+            self.mutations.runs.push(merged);
+        }
     }
 }
 
