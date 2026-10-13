@@ -28,6 +28,14 @@ impl RedbPersistence {
             write.commit().map_err(Self::storage_error)
         })
     }
+    /// Measurement only: the full transaction-order repair over this store's
+    /// committed commit index and tables, in one committed transaction.
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn repair_transaction_order_for_test(&self) -> Result<()> {
+        let commit_index = self.load_commit_index()?;
+        let tables = self.load_all_table_meta()?;
+        self.repair_current_transaction_order(&commit_index, &tables)
+    }
     /// Measurement only: how many committed CONFIG keys start with `prefix`.
     /// Visits keys; never decodes or copies a value.
     #[cfg(feature = "test-seams")]

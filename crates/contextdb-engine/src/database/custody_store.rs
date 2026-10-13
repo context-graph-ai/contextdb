@@ -355,6 +355,16 @@ impl Database {
             .expect("file-backed fixture")
             .rebuild_custody_index_for_test()
     }
+    /// Measurement only: the full transaction-order repair. The store must be
+    /// closed and reopened before any other use.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __repair_transaction_order_for_test(&self) -> Result<()> {
+        self.persistence
+            .as_ref()
+            .expect("file-backed fixture")
+            .repair_transaction_order_for_test()
+    }
     /// Measurement only: whether the committed custody group index is complete.
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]

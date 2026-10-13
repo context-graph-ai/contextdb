@@ -186,3 +186,60 @@ pub async fn bound_edge(
     declare(&edge);
     (edge, client)
 }
+
+/// A file-backed hub served by `run_until_stopped`: the native delivery route
+/// and the Legacy companions beside it, on its own thread.
+pub struct NativeHub {
+    pub server: Arc<SyncServer>,
+    stop: contextdb_server::transport::NativeStop,
+    thread: std::thread::JoinHandle<()>,
+}
+impl NativeHub {
+    /// Stop serving and drop the server, so the caller holds the only store handle.
+    pub fn stop(self) {
+        self.stop.request_stop();
+        self.thread.join().expect("native hub thread");
+    }
+}
+/// Serve `hub_db` natively under the fabric key persisted at `key_path`, so a
+/// reopened hub keeps the node its edges bound to.
+pub async fn serve_native_hub(
+    broker: &InProcessBroker,
+    hub_db: Arc<Database>,
+    key_path: &Path,
+) -> NativeHub {
+    let identity = Arc::new(FabricIdentity::load_or_generate(key_path).unwrap());
+    let node = identity.node_id();
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            hub_db,
+            broker.server_as(&node),
+            TenantId::from(TENANT),
+            node,
+            identity,
+        )
+        .unwrap(),
+    );
+    let stop = server
+        .native_stop(Arc::new(AtomicBool::new(false)))
+        .expect("prepare the native delivery installation");
+    let thread = std::thread::spawn({
+        let server = server.clone();
+        let stop = stop.clone();
+        move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("hub runtime")
+                .block_on(server.run_until_stopped(stop))
+        }
+    });
+    broker
+        .wait_for_registered_route_for_test(&push_subject(TENANT))
+        .await;
+    NativeHub {
+        server,
+        stop,
+        thread,
+    }
+}

@@ -42126,6 +42126,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         for entry in config.iter().map_err(Self::storage_error)? {
             let (key, value) = entry.map_err(Self::storage_error)?;
             if crate::custody::records::owned_key(key.value()) {
+                let held = admission.held();
                 Self::write_read_custody_config_entry(
                     write_txn,
                     key.value(),
@@ -42133,6 +42134,9 @@ graph_commit_result }.map_err(Self::storage_error)?;
                     custody_groups::Funding::Legacy(&mut *admission),
                     true,
                 )?;
+                // The entry's reverse scratch is already dropped; return its
+                // debit so the rebuild holds one entry, never the journal sum.
+                admission.release(admission.held() - held);
             }
         }
         drop(config);

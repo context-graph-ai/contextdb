@@ -126,6 +126,8 @@ mod durable_custody_reads_refuse_missing_or_tampered_companions;
 mod history_sync_and_commit_cursors_reload_without_full_directories;
 #[path = "engine_seams/identity_preparation_refusal_leaves_the_store_unchanged.rs"]
 mod identity_preparation_refusal_leaves_the_store_unchanged;
+#[path = "engine_seams/native_delivery_is_served_after_transaction_repair_and_reopen.rs"]
+mod native_delivery_is_served_after_transaction_repair_and_reopen;
 #[path = "engine_seams/paged_initial_replacement_and_reclamation_progress_under_writes.rs"]
 mod paged_initial_replacement_and_reclamation_progress_under_writes;
 #[path = "engine_seams/pending_delivery_reads_only_the_pending_tail.rs"]
