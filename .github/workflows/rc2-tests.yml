@@ -99,8 +99,14 @@ jobs:
             args+=(--features "${{ matrix.features }}")
           fi
           set +e
-          cargo test --locked "${args[@]}" --all-targets -- --test-threads=1 2>&1 | tee "shard-out/${{ matrix.shard }}.log"
+          # Test-harness targets get the one-thread flag. Benches are run
+          # separately without it: a `harness = false` (criterion) bench
+          # rejects libtest arguments such as `--test-threads`.
+          cargo test --locked "${args[@]}" --lib --bins --tests --examples -- --test-threads=1 2>&1 | tee "shard-out/${{ matrix.shard }}.log"
           status=${PIPESTATUS[0]}
+          cargo test --locked "${args[@]}" --benches 2>&1 | tee -a "shard-out/${{ matrix.shard }}.log"
+          bench_status=${PIPESTATUS[0]}
+          if [[ "$status" -eq 0 ]]; then status=$bench_status; fi
           set -e
           end=$(date +%s)
           echo "${{ matrix.shard }} $((end - start))s exit=$status" > "shard-out/${{ matrix.shard }}.time"
