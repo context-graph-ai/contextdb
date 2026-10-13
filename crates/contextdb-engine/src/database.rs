@@ -14591,7 +14591,7 @@ impl DatabaseTransactionHost {
             Self::Owned(_) => Err(Self::producer_gap("with_write_set_detached")),
         }
     }
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn has_captured_commit_directory_for_test(&self) -> bool {
         match self {
             Self::Legacy(manager) => manager.has_captured_commit_directory_for_test(),
@@ -14602,7 +14602,7 @@ impl DatabaseTransactionHost {
             }),
         }
     }
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn visit_captured_read_memory_for_test(
         &self,
         visit: impl FnOnce(&Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>),
@@ -14616,7 +14616,7 @@ impl DatabaseTransactionHost {
             }),
         }
     }
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn retained_commit_directory_bytes_for_test(&self) -> usize {
         match self {
             Self::Legacy(manager) => manager.retained_commit_directory_bytes_for_test(),
