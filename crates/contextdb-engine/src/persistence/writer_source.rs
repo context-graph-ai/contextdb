@@ -2515,7 +2515,18 @@ mod tests {
         };
         let mut edges = (2..102).map(|id| edge(id, 200, 1)).collect::<Vec<_>>();
         edges.extend([edge(1, 200, 1), edge(1, 200, 2), edge(1, 201, 1)]);
-        store.append_graph_edges_batch(&edges).unwrap();
+        // Seed through the commit path so each graph LSN has the commit-index
+        // row every real commit writes; history reads verify it.
+        for lsn in [1, 2] {
+            let mut seed = WriteSet::new();
+            seed.commit_lsn = Some(Lsn(lsn));
+            seed.adj_inserts = edges
+                .iter()
+                .filter(|entry| entry.lsn == Lsn(lsn))
+                .cloned()
+                .collect();
+            store.flush_data(&seed).unwrap();
+        }
         let before = store
             .initialize_writer_snapshot(SnapshotId(2), Lsn(2))
             .unwrap();
