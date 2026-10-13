@@ -112,6 +112,7 @@ pub fn update_root(db: &Database, unit: usize) {
 
 pub struct Hub {
     pub db: Arc<Database>,
+    pub node: String,
     shutdown: Arc<AtomicBool>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -128,6 +129,7 @@ pub async fn start_hub(broker: &InProcessBroker, hub_db: Arc<Database>) -> Hub {
         .unwrap();
     let identity = Arc::new(FabricIdentity::generate());
     let node = identity.node_id();
+    let hub_node = node.clone();
     let server = Arc::new(
         SyncServer::with_authenticated_transport_and_identity_for_test(
             hub_db.clone(),
@@ -149,6 +151,7 @@ pub async fn start_hub(broker: &InProcessBroker, hub_db: Arc<Database>) -> Hub {
         .await;
     Hub {
         db: hub_db,
+        node: hub_node,
         shutdown,
         task,
     }

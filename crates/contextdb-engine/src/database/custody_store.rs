@@ -253,12 +253,38 @@ impl Database {
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
     pub fn __tamper_custody_record_for_test(&self, key: &str, value: Option<Vec<u8>>) -> Result<()> {
+        self.raw_custody_commit_for_test(key, value, true)
+    }
+    /// Measurement only: commit a raw custody CONFIG write or delete through
+    /// the ordinary commit path, with its ordinary custody validation.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __commit_custody_record_for_test(&self, key: &str, value: Option<Vec<u8>>) -> Result<()> {
+        self.raw_custody_commit_for_test(key, value, false)
+    }
+    /// Measurement only: the manifest keys the ordinary pending-delivery read
+    /// answers, and how many pending-index entries it examined.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __custody_pending_for_test(&self) -> Result<(Vec<String>, u64)> {
+        let before = crate::custody::store::work::pending_examined_total();
+        let answer = self.custody_pending_manifests(self.declared_reader_memory()?)?;
+        let keys = answer.iter().map(Record::key).collect::<Result<Vec<_>>>()?;
+        Ok((keys, crate::custody::store::work::pending_examined_total() - before))
+    }
+    #[cfg(feature = "test-seams")]
+    fn raw_custody_commit_for_test(
+        &self,
+        key: &str,
+        value: Option<Vec<u8>>,
+        skip_validation: bool,
+    ) -> Result<()> {
         let tx = self.begin()?;
         self.tx_mgr.with_write_set(tx, |ws| match value {
             Some(value) => ws.config_writes.push((key.to_owned(), value)),
             None => ws.config_deletes.push(key.to_owned()),
         })?;
-        SKIP_CUSTODY_VALIDATION_FOR_TEST.with(|skip| skip.set(true));
+        SKIP_CUSTODY_VALIDATION_FOR_TEST.with(|skip| skip.set(skip_validation));
         let committed = self.commit(tx);
         SKIP_CUSTODY_VALIDATION_FOR_TEST.with(|skip| skip.set(false));
         // A later reader starts from the committed (damaged) journal.

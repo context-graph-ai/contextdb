@@ -57,6 +57,7 @@ impl RedbPersistence {
 pub(crate) struct CustodyReader {
     config: Option<redb::ReadOnlyTable<&'static str, &'static [u8]>>,
     groups: Option<redb::ReadOnlyTable<&'static [u8], &'static [u8]>>,
+    pending: Option<redb::ReadOnlyTable<&'static [u8], &'static [u8]>>,
 }
 
 impl CustodyReader {
@@ -72,7 +73,16 @@ impl CustodyReader {
             Err(redb::TableError::TableDoesNotExist(_)) => None,
             Err(err) => return Err(RedbPersistence::storage_error(err)),
         };
-        Ok(Self { config, groups })
+        let pending = match read.open_table(custody_pending::PENDING) {
+            Ok(table) => Some(table),
+            Err(redb::TableError::TableDoesNotExist(_)) => None,
+            Err(err) => return Err(RedbPersistence::storage_error(err)),
+        };
+        Ok(Self {
+            config,
+            groups,
+            pending,
+        })
     }
     /// Visit exactly `key`'s stored value, if committed.
     pub(crate) fn get<T>(
@@ -131,6 +141,34 @@ impl CustodyReader {
             visit(std::str::from_utf8(key).map_err(|_| crate::custody::canonical::invalid())?)?;
         }
         Ok(())
+    }
+    /// Visit at most `limit` pending submissions strictly after `after`, in
+    /// submission order, and answer the last one visited (the resume point).
+    /// A store without the pending index refuses as an incomplete index.
+    pub(crate) fn visit_pending(
+        &self,
+        after: Option<[u8; 16]>,
+        limit: usize,
+        mut visit: impl FnMut(uuid::Uuid) -> Result<()>,
+    ) -> Result<Option<[u8; 16]>> {
+        let pending = self.pending.as_ref().ok_or_else(incomplete_custody_index)?;
+        let mut last = None;
+        let range = match &after {
+            Some(after) => pending.range::<&[u8]>((
+                std::ops::Bound::Excluded(after.as_slice()),
+                std::ops::Bound::Unbounded,
+            )),
+            None => pending.range::<&[u8]>(..),
+        }
+        .map_err(RedbPersistence::storage_error)?;
+        for entry in range.take(limit) {
+            let (submission, _) = entry.map_err(RedbPersistence::storage_error)?;
+            let submission = <[u8; 16]>::try_from(submission.value())
+                .map_err(|_| crate::custody::canonical::invalid())?;
+            visit(uuid::Uuid::from_bytes(submission))?;
+            last = Some(submission);
+        }
+        Ok(last)
     }
     /// Visit every `(group, member key)` whose group starts with `prefix`, in
     /// group then key order. Groups of one kind share a fixed length, so the

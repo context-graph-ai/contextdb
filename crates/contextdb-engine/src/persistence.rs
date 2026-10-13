@@ -135,6 +135,7 @@ use contextdb_relational::store::SyncSourceKind;
 use contextdb_tx::WriteSet;
 // Custody-only checked key reads.
 mod custody_records;
+mod custody_pending;
 pub(crate) mod custody_source;
 use contextdb_vector::VectorWorkspaceReservation;
 use contextdb_vector::hnsw::{ReadOnlyVectorGraphPageReader, ReadOnlyVectorGraphPageSource};
@@ -41974,8 +41975,10 @@ graph_commit_result }.map_err(Self::storage_error)?;
         key: &str,
         value: Option<&[u8]>,
         funding: custody_groups::Funding<'_>,
+        defer_pending: bool,
     ) -> Result<()> {
         custody_groups::maintain(write_txn, key, value, funding)?;
+        custody_pending::maintain(write_txn, key, value, defer_pending)?;
         Self::write_compact_config_entry(
             write_txn,
             READ_CUSTODY_CONFIG_TABLE,
@@ -42128,10 +42131,13 @@ graph_commit_result }.map_err(Self::storage_error)?;
                     key.value(),
                     Some(value.value()),
                     custody_groups::Funding::Legacy(&mut *admission),
+                    true,
                 )?;
             }
         }
-        Ok(())
+        drop(config);
+        // Pending membership is recomputed once the whole journal is indexed.
+        custody_pending::recompute_all(write_txn)
     }
 
     /// Rebuild after a bulk schema or repair rewrite. Ordinary row commits

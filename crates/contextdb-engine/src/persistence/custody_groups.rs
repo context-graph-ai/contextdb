@@ -42,7 +42,7 @@ pub(super) fn reset_complete(write: &redb::WriteTransaction) -> Result<()> {
         .map_err(RedbPersistence::storage_error)?
         .insert(COMPLETE, COMPLETE_VALUE)
         .map_err(RedbPersistence::storage_error)?;
-    Ok(())
+    super::custody_pending::create(write)
 }
 
 pub(super) fn initialize_empty(write: &redb::WriteTransaction) -> Result<()> {
@@ -64,7 +64,7 @@ pub(super) fn initialize_empty(write: &redb::WriteTransaction) -> Result<()> {
         .map_err(RedbPersistence::storage_error)?
         .insert(COMPLETE, COMPLETE_VALUE)
         .map_err(RedbPersistence::storage_error)?;
-    Ok(())
+    super::custody_pending::create(write)
 }
 
 mod native {

@@ -162,6 +162,13 @@ pub(crate) mod work {
     use std::sync::atomic::{AtomicU64, Ordering};
     pub(crate) static HYDRATED: AtomicU64 = AtomicU64::new(0);
     pub(crate) static DECODED: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static PENDING_EXAMINED: AtomicU64 = AtomicU64::new(0);
+    pub(crate) fn pending_examined(n: u64) {
+        PENDING_EXAMINED.fetch_add(n, Ordering::Relaxed);
+    }
+    pub(crate) fn pending_examined_total() -> u64 {
+        PENDING_EXAMINED.load(Ordering::Relaxed)
+    }
     pub(crate) fn hydrated(n: u64) {
         HYDRATED.fetch_add(n, Ordering::Relaxed);
     }
@@ -181,6 +188,8 @@ pub(crate) mod work {
     pub(crate) fn hydrated(_: u64) {}
     #[inline(always)]
     pub(crate) fn decoded(_: u64) {}
+    #[inline(always)]
+    pub(crate) fn pending_examined(_: u64) {}
 }
 
 /// Where a durable store reads: the database's own captured roots, or one root
@@ -1261,49 +1270,33 @@ mod durable {
     /// Manifests of local roots that hold no edge terminal at the registered
     /// destination, in submission order. Reads the current root ownership
     /// rows and one exact terminal key per root; never the signed history.
+    /// Pending entries one cursor page examines.
+    const PENDING_PAGE: usize = 64;
+
+    /// Manifests of local roots still pending delivery, in submission order,
+    /// read from the durable pending index page by page: the work is
+    /// proportional to the pending roots, never to delivered history.
     pub(super) fn pending(r: &CustodyReader, memory: Arc<ImageMemory>) -> Result<AdmittedRecords> {
         let mut scratch = Scratch::new(memory.clone());
-        let destination = match load(r, &memory, "delivery_destination.v1")?
-            .as_ref()
-            .map(Probed::record)
-        {
-            Some(Record::Destination(d)) => Some(d.namespace.key()?),
-            Some(_) => return Err(invalid()),
-            None => None,
-        };
-        let mut pending = BTreeSet::new();
-        r.visit_prefix("delivery_root.v1.", |key, bytes| {
-            let probed = probe_stored(&memory, key, bytes)?;
-            let Record::Root { submission, .. } = probed.record() else {
-                return Err(invalid());
-            };
-            let submission = *submission;
-            drop(probed);
-            let held = match &destination {
-                Some(namespace) => r.get(
-                    &format!(
-                        "delivery_edge_outcome.v1.{namespace}.{}",
-                        submission.simple()
-                    ),
-                    |value| Ok(value.is_some()),
-                )?,
-                None => false,
-            };
-            if !held {
-                scratch.admit(std::mem::size_of::<uuid::Uuid>() * 3)?;
-                pending.insert(submission);
-            }
-            Ok(())
-        })?;
         let mut keys = Vec::new();
-        for id in pending {
-            let key = format!("delivery_manifest.v1.{}", id.simple());
-            if r.get(&key, |value| Ok(value.is_some()))? {
-                scratch.admit_key(&key)?;
-                keys.push(key);
+        let mut after = None;
+        loop {
+            let mut page = 0usize;
+            let next = r.visit_pending(after, PENDING_PAGE, |submission| {
+                page += 1;
+                work::pending_examined(1);
+                let key = format!("delivery_manifest.v1.{}", submission.simple());
+                if r.get(&key, |value| Ok(value.is_some()))? {
+                    scratch.admit_key(&key)?;
+                    keys.push(key);
+                }
+                Ok(())
+            })?;
+            if page < PENDING_PAGE {
+                break;
             }
+            after = next;
         }
-        // Answer order follows submission order, as the resident index did.
         let answer = answer(r, &keys, memory)?;
         drop(keys);
         drop(scratch);
